@@ -445,8 +445,27 @@ not, and neither reveals anything about the configuration.
 | POST | `/api/v1/channels/{id}/resolve` | read | **semantic random access** |
 | POST | `/api/v1/channels/{id}/reply` | **write** | post as the bot |
 | POST | `/api/v1/channels/{id}/ask` | **write** | slow path — answers 501 in v0 |
+| GET | `/api/v1/conversations` | **write** | stored `/voice` transcripts, most recent first |
+| DELETE | `/api/v1/conversations` | **write** | erase every stored transcript |
+| GET | `/api/v1/conversations/{id}` | **write** | one stored transcript, oldest turn first |
+| DELETE | `/api/v1/conversations/{id}` | **write** | erase one stored transcript |
+| POST | `/api/v1/conversations/{id}/turns` | **write** | record one turn |
+| GET | `/api/v1/inbox` | read | how far this server thinks each channel has been read |
+| POST | `/api/v1/channels/{id}/read` | **write** | move this server's read mark forward |
+| DELETE | `/api/v1/channels/{id}/read` | **write** | drop this server's read mark |
 | POST | `/mcp` | read, or **write** per tool | MCP over Streamable HTTP — see below |
 | GET/DELETE | `/mcp` | none | `405`; this endpoint is stateless and has nothing to push |
+
+**The transcript routes require the write scope even to READ.** A stored transcript is the
+owner's own speech plus whatever channel text the assistant read out to him, which is a different
+and more sensitive thing than a digest of a channel he already allowlisted — and `/voice`, the
+only thing that uses them, already holds the write token. The read token gets `403`, and a test
+asserts it. **None of them is an MCP tool**, and a test holds that line too: text a tool can
+return is text that enters a model's context.
+
+**`/api/v1/inbox` carries `read_state_notice` on every answer**, including the mutating ones,
+saying that this read state is gent-talk's own and is synchronised with Discord in neither
+direction. See **Durable state** above.
 
 **Every message this API renders carries `author_id` next to `author`** — in the scrollback, in
 one-message reads, in `resolve` results, in the posted message echoed back by `reply`, and as a
@@ -1138,15 +1157,15 @@ layout facts and a fixture with no layout engine has no opinion about them.
 scripts/run.sh --screenshots
 ```
 
-Photographs the `/voice` page in the twenty-one states that look different — signed out, idle, live
+Photographs the `/voice` page in the twenty-two states that look different — signed out, idle, live
 call, muted, the agent's voice silenced, just after a hang-up, the end-of-call seam with its
 disclosure open, the clear control armed, settings, the Discord view, a long transcript parked
 mid-scroll, that same list with one folded answer opened among the closed ones, the moment a turn
 arrives while the reader is up in the history, the desktop reading column at each end of its
 range, and the two connection outcomes that used to look identical — a call suspended by the
 phone, and one that really failed — the reply screen with a short target and with one longer
-than the frame, one channel row picked out under the pointer, and a step further back through the
-channel — at four viewports: a tall phone, a short phone, a small laptop window and a maximised
+than the frame, one channel row picked out under the pointer, a step further back through the
+channel, and the earlier conversation restored from the server after a reload — at four viewports: a tall phone, a short phone, a small laptop window and a maximised
 desktop. It prints the absolute path of every image so an agent can open them directly.
 
 The last two states are DESKTOP ONLY, and say so in the run: `@media (min-width: 900px) and
@@ -1273,13 +1292,14 @@ Beyond the security list above:
   A configuration change is picked up by restarting, and the client re-lists on its next connect.
 * This crate is intentionally outside the repository's Rust workspace and is not part of
   `make check` / `make test`; it has its own CI workflow.
-* **No read/unread state, and no "since I last messaged" scoping.** Discord shares read state
-  with clients, not with bots — there is no ack route, no read-state field on the channel
-  object, and no `read_state` in the gateway READY payload — and this server cannot compute
-  the stand-in either: it has no owner identity, its own replies are posted as the bot, and a
-  fetch cannot reach past the 100-message window. So a digest covers "the most recent N
-  messages" and nothing narrower. The evidence, the code anchors, and the honest alternative
-  wordings are in `ai_docs/UNREAD_STATUS_20260819.md`.
+* **Discord's read state is still unreachable, and always will be.** Discord shares it with
+  clients, not with bots — no ack route, no read-state field on the channel object, no
+  `read_state` in the gateway READY payload. The evidence and the code anchors are in
+  `ai_docs/UNREAD_STATUS_20260819.md`. What `#48 transcript-storage` added is a *different*
+  record: gent-talk's own read marks, set through `/api/v1/channels/{id}/read` and never
+  synchronised with Discord in either direction. Nothing yet **uses** them — no digest is
+  scoped by one, and the `/voice` page does not set one — so "since I last read" is still not
+  a question this server answers. The entity exists; the feature built on it does not.
 
 ## License
 

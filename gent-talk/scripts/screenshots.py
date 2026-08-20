@@ -110,8 +110,8 @@ from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Iterable, Literal, TypedDict, cast
-from urllib.error import URLError
-from urllib.request import urlopen
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 if TYPE_CHECKING:
     from playwright.sync_api import Browser, Page, Playwright
@@ -1465,6 +1465,24 @@ def _act_discord_hover(driver: Driver) -> None:
 # Hang up is ABSENT, not disabled, whenever there is no call. Asserted as its own expectation on
 # every no-call state, because "dimmed but present" was the defect the rework removed and a
 # screenshot is the only thing that can tell the two apart.
+def _act_restored_conversation(driver: Driver) -> None:
+    """`#48 transcript-storage`: a RELOAD, and the conversation is still there.
+
+    The only scene that reloads the page. That is the whole content of the picture -- everything
+    before this point in the walk is one continuous session, and a transcript that survives a
+    session is not the claim being made. The turns come from the real calls the earlier scenes
+    drove, through the real server, into a real SQLite file in the throwaway directory.
+    """
+    driver.load(with_token=True)
+    driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
+    driver.page.wait_for_function(
+        "() => [...document.querySelectorAll('#transcript .seam-label')]"
+        ".some((n) => (n.textContent || '').trim() === 'earlier conversation')",
+        timeout=10_000,
+    )
+    driver.settle(400)
+
+
 NO_HANGUP = ("Hang up is absent, not merely dimmed", "!window.__visible('hang-up')")
 
 SCENES: tuple[Scene, ...] = (
@@ -2008,6 +2026,29 @@ SCENES: tuple[Scene, ...] = (
             ),
         ),
     ),
+    Scene(
+        name="22-restored-conversation",
+        what="after a RELOAD: the earlier conversation is back, behind a seam saying whose it was",
+        act=_act_restored_conversation,
+        expect=(
+            (
+                "the restored turns are on screen after a reload",
+                "document.querySelectorAll('#transcript li:not(.seam)').length >= 2",
+            ),
+            (
+                "the seam names them as an EARLIER conversation, not as this one",
+                "[...document.querySelectorAll('#transcript .seam-label')]"
+                ".some((n) => (n.textContent || '').trim() === 'earlier conversation')",
+            ),
+            (
+                "the restored seam sits ABOVE nothing else -- it closes the restored block",
+                "(() => { const kids = [...document.getElementById('transcript').children]; "
+                "const seam = kids.findIndex((li) => li.className === 'seam'); "
+                "return seam > 0 && seam === kids.length - 1; })()",
+            ),
+            NO_HANGUP,
+        ),
+    ),
 )
 
 
@@ -2119,6 +2160,36 @@ def run_captures(
         "valid_for_seconds": 900,
     }
 
+    def purge_stored_conversations() -> None:
+        """Empty the server's transcript store before a profile's walk starts.
+
+        `#48 transcript-storage` made the server keep what these scenes say, and the profiles
+        share one server. Without this the SECOND phone opens on a screen restored from the
+        FIRST one's invented conversation, and `02-idle` -- whose entire content is the empty
+        state -- becomes unreachable for a reason that reads like a page bug.
+
+        A server with no storage configured answers 503, which is not a failure here: there is
+        nothing to purge. Anything else is, because the alternative is a confusing failure three
+        scenes later.
+        """
+        request = Request(f"{url.rstrip('/')}/api/v1/conversations", method="DELETE")
+        request.add_header("Authorization", f"Bearer {token}")
+        try:
+            with urlopen(request, timeout=10):  # noqa: S310 - a loopback URL this script built
+                return
+        except HTTPError as error:
+            if error.code == 503:
+                return
+            raise RuntimeError(
+                f"could not empty the transcript store before the walk: HTTP {error.code}. "
+                "Every scene after 02-idle would be photographed on top of the previous "
+                "profile's conversation."
+            ) from error
+        except URLError as error:
+            raise RuntimeError(
+                f"could not reach {url} to empty the transcript store: {error}"
+            ) from error
+
     everything: list[tuple[str, Path, Verdict]] = []
     with sync_playwright() as playwright:
         browser = open_browser(playwright)
@@ -2140,6 +2211,7 @@ def run_captures(
                     page = context.new_page()
                     driver = Driver(page, url, token, out_dir, profile, theme)
                     print(f"==> {theme} · {profile.name}: {profile.what}")
+                    purge_stored_conversations()
                     for scene in scenes:
                         # A state that does not exist on this device is SKIPPED by name rather
                         # than attempted: the desktop reading column has nothing to photograph on
@@ -2293,7 +2365,7 @@ def check_state_controls() -> list[str]:
     """The scene table itself: an unreached state must fail by name, and none may be unguarded."""
     problems: list[str] = []
 
-    if len(SCENES) < 21:
+    if len(SCENES) < 22:
         problems.append(
             f"the scene table has only {len(SCENES)} states. The interface rework added three that "
             "are where the interesting defects now live -- the armed clear control, the seam with "
@@ -2308,7 +2380,8 @@ def check_state_controls() -> list[str]:
             "screen and the same screen with a target longer than the frame, and `#56 "
             "message-hover-highlight` added the row picked out under a pointer -- the only place "
             "that treatment can be looked at at all -- and `#65 scrollback-paging` added a step "
-            "further back through the channel, which is where the anchored prepend is judged."
+            "further back through the channel, which is where the anchored prepend is judged. "
+            "`#48 transcript-storage` added the one scene that RELOADS the page."
         )
     names = [scene.name for scene in SCENES]
     if len(set(names)) != len(names):
@@ -2412,6 +2485,10 @@ def check_state_controls() -> list[str]:
         # loaded older messages and threw the reader to the top would satisfy "more arrived", and
         # that is the defect, not the feature.
         "21-channel-older-loaded": "__anchorAfter",
+        # `#48 transcript-storage`. Pinned to the SEAM's own wording, not to "there are lines on
+        # screen": every other scene in this walk also has lines on screen, so only the label
+        # distinguishes a restored conversation from the live one it was captured after.
+        "22-restored-conversation": "earlier conversation",
     }
     for name, needles in required.items():
         required_scene = next((s for s in SCENES if s.name == name), None)

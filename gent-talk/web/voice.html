@@ -314,6 +314,9 @@
             replies keep arriving as text in the transcript.
             <strong>Clear</strong> empties this screen only and never makes the agent forget
             anything. It asks twice, because it sits under your thumb and it cannot be undone.
+            It also leaves the stored record on the server untouched, so the conversation comes
+            back the next time you sign in — <strong>Forget stored conversations</strong>, below,
+            is the only control that erases that, and it leaves the screen alone in return.
           </p>
 
           <h2>The channel</h2>
@@ -342,6 +345,19 @@
             aria-label="reading width in characters"
           />
           <p id="reading-width-state" class="hint" aria-live="polite"></p>
+
+          <h2>Stored conversations</h2>
+          <p class="hint">
+            This server keeps the transcript of each call in a database file on the machine it
+            runs on, so a reload no longer loses the conversation. It is not encrypted: anyone
+            with access to that machine's filesystem can read it, and it holds both your own
+            speech and any channel text the assistant read out to you. Older conversations are
+            dropped automatically once the server's retention limit is reached.
+          </p>
+          <p id="storage-state" class="hint" aria-live="polite"></p>
+          <button id="forget-conversations" class="secondary" type="button">
+            Forget stored conversations
+          </button>
 
           <h2>Token</h2>
           <button id="forget-token" class="secondary" type="button">Forget token and sign out</button>

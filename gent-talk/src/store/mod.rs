@@ -413,6 +413,18 @@ pub trait StateStore: Send + Sync {
     async fn purge_everything(&self) -> Result<(), StoreError>;
 }
 
+/// The standing statement that read state here is not Discord's.
+///
+/// It rides along on every inbox answer for the same reason
+/// [`crate::untrusted::NOTICE`] rides along on every read: the alternative is that the owner
+/// discovers it from a divergence — an unread badge in the Discord app that will not clear, or a
+/// channel gent-talk calls unread that he read on his laptop an hour ago — and has to guess which
+/// of the two is broken. Neither is. They are different records, and only one of them is ours.
+pub const INBOX_NOTICE: &str = "Read state is gent-talk's own. Discord shares none with a bot, so \
+                                nothing here is read from Discord and nothing here is written \
+                                back to it: marking a channel read here does not clear its badge \
+                                in the Discord app, and clearing it there does not change this.";
+
 /// Condense one turn into a listing preview.
 ///
 /// Shared by every backend so two of them cannot disagree about what a listing shows.

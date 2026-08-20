@@ -137,7 +137,20 @@ const session = {
   playAt: 0, // next start time on the audio clock
   playing: [], // scheduled AudioBufferSourceNodes, so an interruption can cancel them
   outputRate: 16000,
+  // `#48 transcript-storage`. The id the durable record is filed under. Taken from the vendor's
+  // `conversation_id` when it arrives, so a transcript can be lined up against the vendor's own
+  // record of the same call; invented locally otherwise, because a call that the vendor never
+  // named still happened and still deserves to survive a reload.
+  conversationId: null,
 };
+
+// Recording is FIRE-AND-FORGET and gives up after the first failure.
+//
+// A store that is down must not be able to interrupt a conversation: the owner is driving, the
+// agent is talking, and an error panel per turn would be worse than losing the record. So one
+// failure disables recording for the rest of the page's life and says so ONCE, in Settings,
+// where it can be read afterwards. It never reaches `teardown()` and never ends a call.
+let recordingBroken = false;
 
 const token = () => localStorage.getItem(TOKEN_KEY) || "";
 
@@ -390,8 +403,8 @@ function renderEmptyState() {
 }
 
 /** Wall-clock, as two numbers. A surface used as a debugging record has to say when. */
-function stamp() {
-  const now = new Date();
+function stamp(atMs) {
+  const now = atMs === undefined ? new Date() : new Date(atMs);
   const pad = (n) => String(n).padStart(2, "0");
   return `${pad(now.getHours())}:${pad(now.getMinutes())}`;
 }
@@ -520,7 +533,7 @@ function collapseAll() {
  * `mine` and `theirs` differ in side, colour and corner — three signals at once — because the two
  * speakers used to be told apart by nothing but a small grey word.
  */
-function line(who, text) {
+function line(who, text, atMs) {
   const mine = who === "you";
   // Measured BEFORE the append: appending is what changes the answer.
   const pinned = atBottom(el("scroll-area"));
@@ -533,7 +546,10 @@ function line(who, text) {
   author.textContent = who;
   const at = document.createElement("span");
   at.className = "at";
-  at.textContent = stamp();
+  // A RESTORED line carries the instant the server recorded, not the instant the page was
+  // reloaded. Stamping a two-hour-old sentence with the current clock is the specific way a
+  // durable transcript lies about itself.
+  at.textContent = atMs === undefined ? stamp() : stamp(atMs);
   meta.append(author, at);
   const body = document.createElement("div");
   body.className = "body";
@@ -766,6 +782,116 @@ async function api(path, options) {
     throw error;
   }
   return payload;
+}
+
+// --- the durable transcript --------------------------------------------------------------------
+//
+// `#48 transcript-storage`. Everything on this screen used to live only in the DOM: a reload, a
+// crash, or a phone deciding to reclaim the tab took the whole conversation with it. The server
+// now keeps it, and the two records must not be able to disagree about what erases what:
+//
+//   * Clear empties the SCREEN and leaves the stored record alone.
+//   * Forget stored conversations erases the RECORD and leaves the screen alone.
+//
+// Both sentences are on the Settings screen next to the button, because a control that quietly
+// does more than the screen says is the failure this whole page is written against.
+
+/** Ids the server will accept: letters, digits, '-' and '_', at most 64 characters. */
+function conversationIdFrom(vendorId) {
+  const cleaned = String(vendorId || "").replace(/[^A-Za-z0-9_-]/g, "");
+  if (cleaned.length > 0) {
+    return cleaned.slice(0, 64);
+  }
+  // A call the vendor never named still happened. Local, unguessable enough for a filename, and
+  // deliberately not a credential: it is only a key in this owner's own store.
+  return `local-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function setStorageState(text) {
+  const state = el("storage-state");
+  if (state) {
+    state.textContent = text;
+  }
+}
+
+/**
+ * Record one turn, without letting the store interfere with the call.
+ *
+ * Deliberately not awaited by its callers and deliberately silent on the call screen: the owner
+ * is in a car. The FIRST failure disables recording and is reported once, in Settings.
+ */
+function recordTurn(who, text) {
+  if (recordingBroken || !session.conversationId || !text) {
+    return;
+  }
+  const speaker = who === "you" ? "you" : "agent";
+  api(`/api/v1/conversations/${session.conversationId}/turns`, {
+    method: "POST",
+    body: { speaker, text },
+  }).catch((error) => {
+    recordingBroken = true;
+    setStorageState(
+      `Not recording: ${error.message}. What is already stored is untouched; the lines on ` +
+        `screen are only on screen.`
+    );
+  });
+}
+
+/**
+ * Put the most recent stored conversation back on the screen, once, at sign-in.
+ *
+ * A failure here is NOT an error panel. The page works perfectly well without a store — that is
+ * what it did until this landed — and a server with no `storage.path` answers 503 by design, so
+ * treating that as a fault would put a red banner on a correctly configured deployment.
+ */
+async function loadStoredConversation() {
+  let listing = null;
+  try {
+    listing = await api("/api/v1/conversations");
+  } catch (error) {
+    setStorageState(`No stored conversations available: ${error.message}`);
+    return;
+  }
+  const conversations = (listing && listing.conversations) || [];
+  if (conversations.length === 0) {
+    setStorageState("Nothing stored yet. This screen is recorded from the next call onwards.");
+    return;
+  }
+  let restored = null;
+  try {
+    restored = await api(`/api/v1/conversations/${conversations[0].id}`);
+  } catch (error) {
+    setStorageState(`Could not read the stored conversation: ${error.message}`);
+    return;
+  }
+  for (const turn of (restored && restored.turns) || []) {
+    line(turn.speaker === "you" ? "you" : "assistant", turn.text, turn.at_ms);
+  }
+  if (((restored && restored.turns) || []).length > 0) {
+    transcriptSeam(
+      "earlier conversation",
+      "These lines are from a conversation that has already ended, restored from this server. " +
+        "The agent has no memory of them: a new call starts from nothing."
+    );
+  }
+  setStorageState(
+    `${conversations.length} conversation${conversations.length === 1 ? "" : "s"} stored on the ` +
+      `server. Clear empties this screen only; Forget below is what erases them.`
+  );
+}
+
+/** Erase every stored conversation. Leaves the screen exactly as it is, and says so. */
+async function forgetConversations() {
+  try {
+    const result = await api("/api/v1/conversations", { method: "DELETE" });
+    const count = (result && result.forgotten) || 0;
+    setStorageState(
+      `Erased ${count} stored conversation${count === 1 ? "" : "s"}. The lines still on the ` +
+        `screen are unaffected — Clear is what empties those.`
+    );
+  } catch (error) {
+    setStorageState(`Nothing was erased: ${error.message}`);
+  }
 }
 
 async function mintSignedUrl() {
@@ -1337,6 +1463,7 @@ function handle(socket, message) {
   switch (message.type) {
     case "conversation_initiation_metadata": {
       const meta = message.conversation_initiation_metadata_event || {};
+      session.conversationId = conversationIdFrom(meta.conversation_id);
       session.outputRate = outputRateFrom(meta.agent_output_audio_format);
       addDetail(
         `conversation ${meta.conversation_id || "?"} · agent audio ${
@@ -1358,10 +1485,18 @@ function handle(socket, message) {
       // the reader to think one of those is talking. Only the displayed word changes: `line()`
       // still tells the two speakers apart by `who === "you"`, so side, tint and corner are
       // untouched.
-      line("assistant", (message.agent_response_event || {}).agent_response || "");
+      {
+        const said = (message.agent_response_event || {}).agent_response || "";
+        line("assistant", said);
+        recordTurn("assistant", said);
+      }
       break;
     case "user_transcript":
-      line("you", (message.user_transcription_event || {}).user_transcript || "");
+      {
+        const said = (message.user_transcription_event || {}).user_transcript || "";
+        line("you", said);
+        recordTurn("you", said);
+      }
       break;
     case "interruption":
       stopPlayback();
@@ -2291,6 +2426,9 @@ async function signIn() {
   // an idle screen — rather than competing for the one strip where a phone shows text worst.
   setStatus("Ready.");
   setState("idle");
+  // After the screen is up, never before: restoring is a convenience, and a store that is slow or
+  // absent must not hold the interface hostage. Not awaited for the same reason.
+  loadStoredConversation();
   return true;
 }
 
@@ -2385,6 +2523,8 @@ document.addEventListener("visibilitychange", onVisibility);
 el("talk").addEventListener("click", onTalk);
 el("hang-up").addEventListener("click", stop);
 el("clear-view").addEventListener("click", onClear);
+// `guardQuietly`, not `guard`: erasing a stored record must never be able to hang up a live call.
+el("forget-conversations").addEventListener("click", guardQuietly(forgetConversations));
 el("speaker").addEventListener("click", () => setSpeakerOff(!session.speakerOff));
 el("dismiss-banner").addEventListener("click", dismissBanner);
 el("dismiss-status").addEventListener("click", dismissStatus);

@@ -694,6 +694,15 @@ function newPage(store = new Map(), script = SCRIPT) {
      * A paging test replaces this with something that answers a `before` cursor.
      */
     channelPage: async () => json(200, { channel: CHANNEL, messages: page.messages }),
+    // `#48 transcript-storage`. The fixture is a real little store rather than a canned answer:
+    // a POSTed turn lands in `storedTurns` and a later GET returns it, so "the page recorded the
+    // turn" and "the page can read its own record back" are the same fact here as on the server.
+    storedTurns: new Map(),
+    /** Every request the page made against the store, in order, as `METHOD path`. */
+    storeCalls: [],
+    /** Set to a status to make the whole store answer that way — a 503 is the unconfigured one. */
+    storeStatus: null,
+
     setFetch(fn) {
       page.mint = fn;
     },
@@ -885,6 +894,46 @@ function newPage(store = new Map(), script = SCRIPT) {
           body: JSON.parse((options && options.body) || "null"),
         });
         return page.replyResponse(path, options);
+      }
+      const conversation = /^\/api\/v1\/conversations(?:\/([^/]+))?(\/turns)?$/.exec(String(path));
+      if (conversation) {
+        const method = (options && options.method) || "GET";
+        page.storeCalls.push(`${method} ${path}`);
+        if (page.storeStatus) {
+          return json(page.storeStatus, { error: "storage_not_configured", detail: "storage.path" });
+        }
+        const [, id, turns] = conversation;
+        if (turns) {
+          const body = JSON.parse(options.body);
+          const held = page.storedTurns.get(id) || [];
+          held.push({ speaker: body.speaker, text: body.text, at_ms: 1_700_000_000_000 });
+          page.storedTurns.set(id, held);
+          return json(200, { id, turn: held[held.length - 1] });
+        }
+        if (id) {
+          if (method === "DELETE") {
+            page.storedTurns.delete(id);
+            return json(200, { forgotten: 1 });
+          }
+          if (!page.storedTurns.has(id)) {
+            return json(404, { error: "not_found", detail: "no such conversation" });
+          }
+          return json(200, { id, turns: page.storedTurns.get(id) });
+        }
+        if (method === "DELETE") {
+          const forgotten = page.storedTurns.size;
+          page.storedTurns.clear();
+          return json(200, { forgotten });
+        }
+        return json(200, {
+          conversations: [...page.storedTurns.entries()].map(([key, held]) => ({
+            id: key,
+            turns: held.length,
+            preview: held.length > 0 ? held[0].text : "",
+            started_at_ms: held.length > 0 ? held[0].at_ms : 0,
+            last_at_ms: held.length > 0 ? held[held.length - 1].at_ms : 0,
+          })),
+        });
       }
       throw new Error(`the page fetched ${path}, which this fixture does not serve`);
     },
@@ -2252,23 +2301,42 @@ test("EVERY seam is the same size, so the essay cannot come back through the oth
   const sites = [
     [
       "new conversation",
-      async (page) => {
+      async () => {
+        const page = newPage();
+        await startTalking(page);
         await page.el("hang-up").click();
+        return page;
       },
     ],
     [
       "view cleared",
-      async (page) => {
+      async () => {
+        const page = newPage();
+        await startTalking(page);
         await page.el("clear-view").click(); // arms it
         await page.el("clear-view").click(); // and clears
+        return page;
+      },
+    ],
+    // `#48 transcript-storage` added a third door: a conversation restored from the server is a
+    // boundary the PAGE drew, and it is bound by the same budget as the other two. Extended here
+    // deliberately — the assertion at the end of this test exists to force exactly that.
+    [
+      "earlier conversation",
+      async () => {
+        const page = newPage();
+        page.storedTurns.set("conv_earlier", [
+          { speaker: "you", text: "what happened overnight", at_ms: 1_700_000_000_000 },
+        ]);
+        await signIn(page);
+        await page.settle();
+        return page;
       },
     ],
   ];
 
-  for (const [label, act] of sites) {
-    const page = newPage();
-    await startTalking(page);
-    await act(page);
+  for (const [label, drive] of sites) {
+    const page = await drive();
 
     const seamLine = page.el("transcript").children.find((li) => li.className === "seam");
     assert.ok(seamLine, `no seam was drawn for "${label}"`);
@@ -4744,4 +4812,182 @@ test("a VOICE turn does not raise a chip over the channel list", async () => {
   await page.el("view-switch").click();
   await page.settle();
   assert.equal(page.tab(), "voice");
+});
+
+// --- the durable transcript (#48 transcript-storage) --------------------------------------------
+
+/** Start a call whose vendor metadata names the conversation, which is what keys the store. */
+async function startTalkingNamed(page, conversationId = "conv_from_vendor") {
+  const socket = await startTalking(page);
+  socket.onmessage({
+    data: JSON.stringify({
+      type: "conversation_initiation_metadata",
+      conversation_initiation_metadata_event: {
+        conversation_id: conversationId,
+        agent_output_audio_format: "pcm_16000",
+      },
+    }),
+  });
+  return socket;
+}
+
+test("EVERY TURN IS RECORDED ON THE SERVER, EXACTLY ONCE, BOTH SPEAKERS", async () => {
+  // Before this, the transcript lived only in the DOM: a reload took the whole conversation. The
+  // failure that matters is a HALF-recorded one — the owner's questions kept and the answers lost,
+  // or the reverse — so both speakers are asserted, and so is the count.
+  const page = newPage();
+  await startTalkingNamed(page);
+
+  youSay(page, "what happened overnight");
+  assistantSays(page, "the mac runner stalled");
+  await page.settle();
+
+  const stored = page.storedTurns.get("conv_from_vendor");
+  assert.ok(stored, `nothing was recorded; the page called: ${page.storeCalls.join(", ")}`);
+  assert.deepEqual(
+    stored.map((t) => [t.speaker, t.text]),
+    [
+      ["you", "what happened overnight"],
+      ["agent", "the mac runner stalled"],
+    ],
+    "both speakers must be recorded, in the order they spoke"
+  );
+  assert.equal(
+    page.storeCalls.filter((c) => c.startsWith("POST")).length,
+    2,
+    `each turn is recorded once, not twice: ${page.storeCalls.join(", ")}`
+  );
+});
+
+test("a reload puts the stored conversation back, with its OWN timestamps", async () => {
+  // The whole point. And the specific lie to avoid: stamping a two-hour-old sentence with the
+  // clock of the moment it was restored.
+  const page = newPage();
+  const earlier = 1_700_000_000_000;
+  page.storedTurns.set("conv_earlier", [
+    { speaker: "you", text: "what happened overnight", at_ms: earlier },
+    { speaker: "agent", text: "the mac runner stalled", at_ms: earlier + 60_000 },
+  ]);
+
+  await signIn(page);
+  await page.settle();
+
+  const lines = page.el("transcript").children.filter((li) => li.className !== "seam");
+  assert.equal(lines.length, 2, `the stored conversation was not restored: ${page.renderedText()}`);
+  const body = (li) => li.descendants().find((n) => n.className === "body").textContent;
+  assert.equal(body(lines[0]), "what happened overnight");
+  assert.equal(body(lines[1]), "the mac runner stalled");
+  assert.equal(lines[0].className, "mine", "the owner's own line keeps its side");
+  assert.equal(lines[1].className, "theirs");
+
+  const at = (li) => li.descendants().find((n) => n.className === "at").textContent;
+  const expected = new Date(earlier);
+  const pad = (n) => String(n).padStart(2, "0");
+  assert.equal(
+    at(lines[0]),
+    `${pad(expected.getHours())}:${pad(expected.getMinutes())}`,
+    "a restored line must carry the instant it was SAID, not the instant it was restored"
+  );
+  assert.notEqual(
+    at(lines[0]),
+    at(lines[1]),
+    "two turns a minute apart must not share one timestamp"
+  );
+});
+
+test("CLEAR EMPTIES THE SCREEN AND ERASES NOTHING; FORGET ERASES AND LEAVES THE SCREEN", async () => {
+  // The two records must not be able to disagree about what erases what. This is the assertion
+  // that catches Clear quietly becoming a delete, and Forget quietly wiping the screen.
+  const page = newPage();
+  await startTalkingNamed(page);
+  youSay(page, "what happened overnight");
+  await page.settle();
+  assert.equal(page.storedTurns.size, 1, "nothing was stored, so this test proves nothing");
+
+  await page.el("clear-view").click(); // arms
+  await page.el("clear-view").click(); // clears
+  await page.settle();
+  assert.equal(
+    page.storedTurns.size,
+    1,
+    "Clear erased the durable record, which the settings screen promises it does not"
+  );
+  assert.equal(
+    page.storeCalls.filter((c) => c.startsWith("DELETE")).length,
+    0,
+    `Clear issued a DELETE: ${page.storeCalls.join(", ")}`
+  );
+
+  // The control: the other button really does erase, so the assertion above is about Clear and
+  // not about a page that cannot delete at all.
+  const before = page.el("transcript").children.length;
+  await page.el("forget-conversations").click();
+  await page.settle();
+  assert.equal(page.storedTurns.size, 0, "Forget stored conversations erased nothing");
+  assert.equal(
+    page.el("transcript").children.length,
+    before,
+    "Forget emptied the screen, which is Clear's job and not this one's"
+  );
+  assert.match(page.el("storage-state").textContent, /Erased 1 stored conversation\b/);
+});
+
+test("A STORE THAT IS DOWN NEVER INTERRUPTS THE CALL", async () => {
+  // The owner is driving. A dead store must cost the record, not the conversation — and it must
+  // say so once, in Settings, rather than raising a panel on every turn.
+  const page = newPage();
+  await startTalkingNamed(page);
+  page.storeStatus = 503;
+
+  youSay(page, "first");
+  await page.settle();
+  assistantSays(page, "second");
+  youSay(page, "third");
+  await page.settle();
+
+  assert.equal(state(page), "live", "a failing store hung up the call");
+  assert.equal(page.el("error").hidden, true, `the store raised an error panel: ${page.el("error").textContent}`);
+  assert.equal(
+    page.storeCalls.filter((c) => c.startsWith("POST")).length,
+    1,
+    `the page kept retrying a store it already knows is broken: ${page.storeCalls.join(", ")}`
+  );
+  assert.match(
+    page.el("storage-state").textContent,
+    /Not recording/,
+    "a store that gave up has to say so where it can be read afterwards"
+  );
+  assert.equal(
+    page.el("transcript").children.filter((li) => li.className !== "seam").length,
+    3,
+    "the lines must still reach the screen when only the recording failed"
+  );
+});
+
+test("a conversation id from the vendor is sanitised before it becomes a path", async () => {
+  // The id is vendor-controlled text that is about to be interpolated into a URL. The server
+  // refuses a bad one, but the page must not be the thing that sends it.
+  const page = newPage();
+  await startTalkingNamed(page, "../../etc/passwd");
+  youSay(page, "hello");
+  await page.settle();
+
+  const posted = page.storeCalls.filter((c) => c.startsWith("POST"));
+  assert.equal(posted.length, 1, `nothing was recorded: ${page.storeCalls.join(", ")}`);
+  assert.ok(
+    !posted[0].includes(".."),
+    `the page put a traversal in the URL it requested: ${posted[0]}`
+  );
+  assert.match(posted[0], /^POST \/api\/v1\/conversations\/[A-Za-z0-9_-]+\/turns$/);
+});
+
+test("the settings screen states which control erases the record and which does not", () => {
+  // Two controls, two different things erased. The page has to say which is which in the place
+  // the button is, or the owner learns it by losing something.
+  const note = HTML.slice(HTML.indexOf('id="continuity-note"'));
+  assert.match(note, /leaves the stored record on the server untouched/);
+  assert.match(note, /Forget stored conversations/);
+  const settings = HTML.slice(HTML.indexOf("Stored conversations"));
+  assert.match(settings, /not encrypted/, "an unencrypted record has to say so where it is offered");
+  assert.match(settings, /id="forget-conversations"/);
 });

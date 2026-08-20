@@ -18,6 +18,7 @@ use crate::model::{ChannelInfo, Message};
 use crate::ops::{self, OpError};
 use crate::retrieval::Resolution;
 use crate::state::AppState;
+use crate::store::{ConversationId, ConversationSummary, ReadMark, Speaker, StoreError, Turn};
 use crate::summary::DigestEntry;
 use crate::untrusted;
 
@@ -115,6 +116,25 @@ impl From<OpError> for ApiError {
             }
             OpError::ChannelNotWritable => StatusCode::FORBIDDEN,
             OpError::Discord(inner) => return Self::from(inner),
+            OpError::Store(inner) => return Self::from(inner),
+        };
+        Self::new(status, code, value.to_string())
+    }
+}
+
+impl From<StoreError> for ApiError {
+    fn from(value: StoreError) -> Self {
+        let code = value.code();
+        let status = match value {
+            // Not the caller's fault and not fixable by retrying: the operator has to configure a
+            // path and restart. Same reasoning, and the same status, as a missing ElevenLabs key.
+            StoreError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            StoreError::NotFound => StatusCode::NOT_FOUND,
+            StoreError::BadId(_) => StatusCode::BAD_REQUEST,
+            // 413 rather than 400: the request was well formed, it is the amount that is refused,
+            // and the client's correct response is to stop appending rather than to retry.
+            StoreError::TooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
+            StoreError::Backend(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         Self::new(status, code, value.to_string())
     }
@@ -722,4 +742,214 @@ mod tests {
              digest list silently fall back to UTC while the scrollback shows local time"
         );
     }
+}
+
+// --- durable state: the /voice transcript, and this server's own inbox ------------------------
+//
+// These five conversation routes are the only handlers on this server that do not consult
+// `ops::allowed`, because a conversation is not a channel: it is the owner's own session with
+// the agent, held on this page, and there is no allowlist for it. What takes the place of that
+// gate is `ConversationId::parse`, which every one of them runs first.
+//
+// ALL OF THEM REQUIRE THE WRITE SCOPE, including the reads. A transcript is the owner's own
+// speech plus whatever channel text the agent read aloud to him, which is strictly more sensitive
+// than a digest of a channel he already allowlisted — and /voice, the only thing that uses these,
+// already holds the write token. A read-scope token deliberately gets 403 here, and a test
+// asserts that rather than assuming it.
+//
+// NONE OF THEM IS AN MCP TOOL, and a test in tests/mcp.rs holds that line. The model does not
+// need the owner's transcript to answer a question about a channel, and text that reaches a model
+// is text that leaves this machine.
+
+/// A stored conversation listing.
+#[derive(Debug, Serialize)]
+pub struct ConversationsResponse {
+    /// Conversations, most recently active first.
+    pub conversations: Vec<ConversationSummary>,
+    /// Standing reminder that a transcript quotes third-party channel text.
+    pub untrusted_content_notice: &'static str,
+}
+
+/// `GET /api/v1/conversations`
+pub async fn list_conversations(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    require(&headers, &state, Scope::Write)?;
+    let conversations = state.store.conversations().await?;
+    Ok(no_store(Json(ConversationsResponse {
+        conversations,
+        untrusted_content_notice: untrusted::NOTICE,
+    })))
+}
+
+/// One stored conversation, in full.
+#[derive(Debug, Serialize)]
+pub struct ConversationResponse {
+    /// The conversation's id.
+    pub id: ConversationId,
+    /// Its turns, oldest first.
+    pub turns: Vec<Turn>,
+    /// Standing reminder that a transcript quotes third-party channel text.
+    pub untrusted_content_notice: &'static str,
+}
+
+/// `GET /api/v1/conversations/{conversation_id}`
+pub async fn conversation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(conversation_id): Path<String>,
+) -> Result<Response, ApiError> {
+    require(&headers, &state, Scope::Write)?;
+    let id = ConversationId::parse(&conversation_id)?;
+    let turns = state.store.turns(&id).await?;
+    Ok(no_store(Json(ConversationResponse {
+        id,
+        turns,
+        untrusted_content_notice: untrusted::NOTICE,
+    })))
+}
+
+/// One turn to record.
+#[derive(Debug, Deserialize)]
+pub struct AppendTurnRequest {
+    /// Who said it.
+    pub speaker: Speaker,
+    /// What was said.
+    pub text: String,
+}
+
+/// What the store did with it.
+#[derive(Debug, Serialize)]
+pub struct AppendTurnResponse {
+    /// The conversation it went into.
+    pub id: ConversationId,
+    /// The turn as stored, including the SERVER's timestamp — the page must render this rather
+    /// than its own clock, or a restored transcript is stamped with the moment it was reloaded.
+    pub turn: Turn,
+}
+
+/// `POST /api/v1/conversations/{conversation_id}/turns`
+pub async fn append_turn(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(conversation_id): Path<String>,
+    Json(request): Json<AppendTurnRequest>,
+) -> Result<Response, ApiError> {
+    require(&headers, &state, Scope::Write)?;
+    let id = ConversationId::parse(&conversation_id)?;
+    let turn = Turn::now(request.speaker, request.text);
+    state.store.append_turn(&id, &turn).await?;
+    Ok(no_store(Json(AppendTurnResponse { id, turn })))
+}
+
+/// `DELETE /api/v1/conversations/{conversation_id}`
+pub async fn forget_conversation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(conversation_id): Path<String>,
+) -> Result<Response, ApiError> {
+    require(&headers, &state, Scope::Write)?;
+    let id = ConversationId::parse(&conversation_id)?;
+    state.store.forget_conversation(&id).await?;
+    Ok(no_store(Json(serde_json::json!({ "forgotten": 1 }))))
+}
+
+/// `DELETE /api/v1/conversations`
+pub async fn forget_conversations(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    require(&headers, &state, Scope::Write)?;
+    let forgotten = state.store.forget_all_conversations().await?;
+    Ok(no_store(Json(
+        serde_json::json!({ "forgotten": forgotten }),
+    )))
+}
+
+/// This server's own inbox state.
+#[derive(Debug, Serialize)]
+pub struct InboxResponse {
+    /// Every configured channel, marked or not.
+    pub channels: Vec<ops::InboxEntry>,
+    /// Said on every inbox answer, not buried in a document: this read state is not Discord's,
+    /// in either direction. See [`crate::store::INBOX_NOTICE`].
+    pub read_state_notice: &'static str,
+}
+
+/// `GET /api/v1/inbox`
+pub async fn inbox(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    require(&headers, &state, Scope::Read)?;
+    let channels = ops::inbox(&state).await?;
+    Ok(no_store(Json(InboxResponse {
+        channels,
+        read_state_notice: crate::store::INBOX_NOTICE,
+    })))
+}
+
+/// How far to move a read mark.
+#[derive(Debug, Deserialize)]
+pub struct MarkReadRequest {
+    /// The newest message the owner has been shown.
+    pub message_id: String,
+}
+
+/// The mark after the move.
+#[derive(Debug, Serialize)]
+pub struct MarkReadResponse {
+    /// The channel it is about.
+    pub channel: ChannelInfo,
+    /// The mark as it now stands. Not necessarily what was asked for: a mark never moves
+    /// backwards, so a stale client is told where the mark really is.
+    pub mark: ReadMark,
+    /// See [`crate::store::INBOX_NOTICE`]. Repeated on the mutating route too, because this is
+    /// exactly where someone expects the Discord badge to clear.
+    pub read_state_notice: &'static str,
+}
+
+/// `POST /api/v1/channels/{channel_id}/read`
+pub async fn mark_read(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(channel_id): Path<String>,
+    Json(request): Json<MarkReadRequest>,
+) -> Result<Response, ApiError> {
+    require(&headers, &state, Scope::Write)?;
+    let (channel, mark) = ops::mark_read(
+        &state,
+        &channel_id,
+        &crate::model::MessageId(request.message_id),
+    )
+    .await?;
+    Ok(no_store(Json(MarkReadResponse {
+        channel,
+        mark,
+        read_state_notice: crate::store::INBOX_NOTICE,
+    })))
+}
+
+/// `DELETE /api/v1/channels/{channel_id}/read`
+pub async fn forget_read_mark(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(channel_id): Path<String>,
+) -> Result<Response, ApiError> {
+    require(&headers, &state, Scope::Write)?;
+    let channel = ops::forget_read_mark(&state, &channel_id).await?;
+    Ok(no_store(Json(serde_json::json!({
+        "channel": channel,
+        "read_state_notice": crate::store::INBOX_NOTICE,
+    }))))
+}
+
+/// Answer with `Cache-Control: no-store`.
+///
+/// Every durable-state answer is the owner's own speech or his reading position. Neither belongs
+/// in a proxy cache or in a browser's back-forward cache, and the transcript routes are the first
+/// on this server whose body is private to one person rather than merely credentialed.
+fn no_store<T: IntoResponse>(body: T) -> Response {
+    ([(header::CACHE_CONTROL, "no-store")], body).into_response()
 }

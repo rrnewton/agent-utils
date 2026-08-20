@@ -278,6 +278,44 @@ async fn no_tool_description_claims_a_read_state_the_bot_cannot_have() {
 }
 
 #[tokio::test]
+async fn the_owners_stored_transcript_is_not_reachable_by_a_model() {
+    // `#48 transcript-storage` gave this server a durable record of what the owner SAID — not
+    // channel text he allowlisted, his own speech, plus whatever the agent read back to him. No
+    // MCP tool exposes it, and this is the test that keeps it that way: text a tool can return is
+    // text that leaves this machine and enters a model's context, and nobody asked for that here.
+    //
+    // The read marks are held to the same line, for a different reason: they are gent-talk's own
+    // record and are never synchronised with Discord, so a tool that offered "unread" would be
+    // making a promise about a word that already means something else to a Discord user.
+    let harness = harness();
+    let (status, body) = rpc(
+        &harness,
+        Some(WRITE_TOKEN),
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let tools = body["result"]["tools"].as_array().expect("a tool array");
+    assert!(!tools.is_empty(), "{body}");
+    let listing = body["result"]["tools"].to_string().to_lowercase();
+    for forbidden in [
+        "conversation",
+        "transcript",
+        "inbox",
+        "mark_read",
+        "read_mark",
+    ] {
+        assert!(
+            !listing.contains(forbidden),
+            "the write scope's tool list mentions {forbidden:?}, so the owner's own durable state \
+             has become model-reachable: {listing}"
+        );
+    }
+    // The control, so this cannot pass on an empty listing.
+    assert!(listing.contains("digest_channel"), "{listing}");
+}
+
+#[tokio::test]
 async fn the_write_token_can_post_and_it_lands_in_the_channel_that_was_named() {
     let harness = harness();
     let (status, body) = rpc(

@@ -48,6 +48,9 @@ pub enum OpError {
     /// Discord itself failed, or refused the request before it was sent.
     #[error(transparent)]
     Discord(#[from] DiscordError),
+    /// The durable state store failed, or is not configured at all.
+    #[error(transparent)]
+    Store(#[from] crate::store::StoreError),
 }
 
 impl OpError {
@@ -63,6 +66,7 @@ impl OpError {
             Self::InvalidRange => "invalid_range",
             Self::Discord(DiscordError::Refused(_)) => "refused",
             Self::Discord(_) => "discord_error",
+            Self::Store(inner) => inner.code(),
         }
     }
 }
@@ -551,6 +555,82 @@ pub async fn reply(
         .await?;
     stamp(state, std::slice::from_mut(&mut posted));
     Ok((info, posted))
+}
+
+/// One channel's inbox state, as far as THIS SERVER is concerned.
+///
+/// See [`crate::store::INBOX_NOTICE`]: nothing here comes from Discord and nothing here goes back
+/// to it.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct InboxEntry {
+    /// The channel, as configured here.
+    pub channel: ChannelInfo,
+    /// The newest message the owner has been shown, when this server has been told.
+    pub last_read: Option<MessageId>,
+    /// When the mark was set, in milliseconds since the Unix epoch.
+    pub marked_at_ms: Option<i64>,
+}
+
+/// Inbox state for every configured channel, in configuration order. Read scope.
+///
+/// Every configured channel appears, including the ones with no mark: "never marked" is a state
+/// the interface has to be able to show, and an absent row would read as "no such channel".
+///
+/// # Errors
+///
+/// [`OpError::Store`] when no store is configured, or the read fails.
+pub async fn inbox(state: &AppState) -> Result<Vec<InboxEntry>, OpError> {
+    let marks = state.store.read_marks().await?;
+    Ok(state
+        .config
+        .channels
+        .iter()
+        .map(|channel| {
+            let mark = marks.iter().find(|m| m.channel == channel.id);
+            InboxEntry {
+                channel: channel.clone(),
+                last_read: mark.map(|m| m.last_read.clone()),
+                marked_at_ms: mark.map(|m| m.marked_at_ms),
+            }
+        })
+        .collect())
+}
+
+/// Move this server's read mark for one channel forward. Write scope.
+///
+/// **Write scope, and the reason is not that it touches Discord** — it does not, and cannot. It
+/// mutates durable server state that another device will read back, which is a strictly larger
+/// capability than any of the reads on this server, and the `/voice` page already holds the write
+/// token.
+///
+/// Goes through [`allowed`] like every other channel operation, so a snowflake outside the
+/// configuration cannot be used to grow the store one row at a time.
+///
+/// # Errors
+///
+/// [`OpError::UnknownChannel`] outside the allowlist; [`OpError::Store`] when no store is
+/// configured, the id cannot be ordered, or the write fails.
+pub async fn mark_read(
+    state: &AppState,
+    channel_id: &str,
+    upto: &MessageId,
+) -> Result<(ChannelInfo, crate::store::ReadMark), OpError> {
+    let channel = allowed(state, channel_id)?;
+    let mark = state.store.mark_read(&channel.id, upto).await?;
+    Ok((channel, mark))
+}
+
+/// Drop this server's read mark for one channel, making its whole window unread again. Write
+/// scope.
+///
+/// # Errors
+///
+/// [`OpError::UnknownChannel`] outside the allowlist; [`OpError::Store`] when there was no mark,
+/// when no store is configured, or when the write fails.
+pub async fn forget_read_mark(state: &AppState, channel_id: &str) -> Result<ChannelInfo, OpError> {
+    let channel = allowed(state, channel_id)?;
+    state.store.forget_read_mark(&channel.id).await?;
+    Ok(channel)
 }
 
 #[cfg(test)]

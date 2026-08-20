@@ -8,6 +8,9 @@
 //! * Everything under `/api/` requires a bearer token, and the write scope is required for
 //!   anything that reaches Discord with a message — and for minting a signed conversation URL,
 //!   which is a credential for talking to an agent that can itself post.
+//! * The write scope is ALSO required for everything that touches durable state, reads included.
+//!   A stored transcript is the owner's own speech, and moving a read mark changes what another
+//!   device will be shown. Neither is a read of a channel he already allowlisted.
 //! * Every request — routed or not, authorized or not — leaves exactly ONE line in the access
 //!   log at INFO. See [`crate::access`] for why that is load-bearing rather than nice to have.
 //! * `/mcp` is the Streamable HTTP MCP endpoint. It requires a bearer token too, and answers a
@@ -46,6 +49,27 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/channels/{channel_id}/resolve", post(api::resolve))
         .route("/api/v1/channels/{channel_id}/reply", post(api::reply))
         .route("/api/v1/channels/{channel_id}/ask", post(api::ask))
+        // Durable state. The conversation routes all require the WRITE scope, reads included —
+        // see the block comment above them in `api` for why a transcript is more sensitive than
+        // a digest. `/inbox` is a read; moving a mark is a write, because it mutates state
+        // another device reads back.
+        .route(
+            "/api/v1/conversations",
+            get(api::list_conversations).delete(api::forget_conversations),
+        )
+        .route(
+            "/api/v1/conversations/{conversation_id}",
+            get(api::conversation).delete(api::forget_conversation),
+        )
+        .route(
+            "/api/v1/conversations/{conversation_id}/turns",
+            post(api::append_turn),
+        )
+        .route("/api/v1/inbox", get(api::inbox))
+        .route(
+            "/api/v1/channels/{channel_id}/read",
+            post(api::mark_read).delete(api::forget_read_mark),
+        )
         // One path, three methods: POST carries the whole protocol, and GET/DELETE — which exist
         // in the spec for server-initiated streams and session teardown — are refused plainly
         // because this endpoint is stateless and has nothing to push.

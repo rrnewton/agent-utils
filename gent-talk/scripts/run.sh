@@ -70,7 +70,7 @@
 #                  otherwise pass cheaply, or when the channel's latest message is too plain to
 #                  match on. It always writes one line to the channel. You do not need this to get
 #                  the escalation: that happens by itself when the cheap check fails.
-#   --screenshots  Photograph the /voice page in all twenty-one states that look different, so an
+#   --screenshots  Photograph the /voice page in all twenty-two states that look different, so an
 #                  agent can LOOK at the interface before the owner does. FREE and offline: no vendor
 #                  conversation, no microphone, no money. The conversation WebSocket is replaced by
 #                  a fake and the microphone is Chromium's built-in fake capture device, so the
@@ -395,6 +395,13 @@ write_token = "$SHOTS_WRITE_TOKEN"
 id = "$SHOTS_CHANNEL"
 label = "lead team"
 writable = true
+
+# Storage inside the throwaway directory, which is removed with it. The harness drives real calls
+# through a real server, so without this line either the run would have no durable state to
+# photograph, or -- worse, if it inherited a real path -- it would write the screenshot script's
+# invented conversations into the owner's own store.
+[storage]
+path = "$SHOTS_TMP/state/gent-talk.sqlite3"
 EOF
 
     case "${SHOTS_THEME:-dark}" in

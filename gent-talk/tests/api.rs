@@ -124,6 +124,26 @@ async fn every_api_route_refuses_an_unauthenticated_caller() {
             format!("/api/v1/channels/{WRITE_CHANNEL}/ask"),
             Some(serde_json::json!({"question": "why?"})),
         ),
+        ("GET", "/api/v1/conversations".to_owned(), None),
+        ("DELETE", "/api/v1/conversations".to_owned(), None),
+        ("GET", "/api/v1/conversations/abc".to_owned(), None),
+        ("DELETE", "/api/v1/conversations/abc".to_owned(), None),
+        (
+            "POST",
+            "/api/v1/conversations/abc/turns".to_owned(),
+            Some(serde_json::json!({"speaker": "you", "text": "hello"})),
+        ),
+        ("GET", "/api/v1/inbox".to_owned(), None),
+        (
+            "POST",
+            format!("/api/v1/channels/{WRITE_CHANNEL}/read"),
+            Some(serde_json::json!({"message_id": "1000000000000000200"})),
+        ),
+        (
+            "DELETE",
+            format!("/api/v1/channels/{WRITE_CHANNEL}/read"),
+            None,
+        ),
     ];
     for (method, uri, body) in routes {
         let (status, payload) = call(&harness, method, uri, None, body.clone()).await;
@@ -929,5 +949,314 @@ async fn every_rendered_message_carries_its_authors_snowflake() {
             .as_str()
             .is_some_and(|id| !id.is_empty()),
         "even the posted message reports who posted it: {payload}"
+    );
+}
+
+// --- durable state -----------------------------------------------------------------------------
+
+fn store_harness() -> (Harness, std::sync::Arc<gent_talk::store::fake::FakeStore>) {
+    let (state, discord, store) = gent_talk::testing::state_with_store();
+    (
+        Harness {
+            router: router(state),
+            discord,
+        },
+        store,
+    )
+}
+
+#[tokio::test]
+async fn a_transcript_can_be_written_read_back_and_forgotten() {
+    let (harness, _store) = store_harness();
+
+    for (speaker, text) in [
+        ("you", "what happened overnight?"),
+        ("agent", "the mac runner stalled"),
+    ] {
+        let (status, payload) = call(
+            &harness,
+            "POST",
+            "/api/v1/conversations/conv_01/turns",
+            Some(WRITE_TOKEN),
+            Some(serde_json::json!({"speaker": speaker, "text": text})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{payload}");
+        assert!(
+            payload["turn"]["at_ms"].as_i64().is_some_and(|ms| ms > 0),
+            "the SERVER's timestamp has to come back, or a restored line is stamped with the \
+             moment it was reloaded: {payload}"
+        );
+    }
+
+    let (status, payload) = call(
+        &harness,
+        "GET",
+        "/api/v1/conversations",
+        Some(WRITE_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let listed = payload["conversations"].as_array().expect("array");
+    assert_eq!(listed.len(), 1, "{payload}");
+    assert_eq!(listed[0]["id"], "conv_01");
+    assert_eq!(listed[0]["turns"], 2);
+    assert_eq!(listed[0]["preview"], "what happened overnight?");
+
+    let (status, payload) = call(
+        &harness,
+        "GET",
+        "/api/v1/conversations/conv_01",
+        Some(WRITE_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let turns = payload["turns"].as_array().expect("array");
+    assert_eq!(turns.len(), 2);
+    assert_eq!(turns[0]["speaker"], "you");
+    assert_eq!(turns[1]["text"], "the mac runner stalled");
+
+    let (status, payload) = call(
+        &harness,
+        "DELETE",
+        "/api/v1/conversations/conv_01",
+        Some(WRITE_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["forgotten"], 1);
+
+    let (status, _) = call(
+        &harness,
+        "GET",
+        "/api/v1/conversations/conv_01",
+        Some(WRITE_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a forgotten conversation must be gone, not merely hidden from the listing"
+    );
+}
+
+#[tokio::test]
+async fn the_read_token_cannot_reach_a_transcript_or_move_a_mark() {
+    // Asserted, not assumed. A transcript is the owner's own speech plus channel text read aloud
+    // to him, and the read token is the one that gets pasted into an agent platform.
+    let (harness, _store) = store_harness();
+    let forbidden: &[(&str, String, Option<Value>)] = &[
+        ("GET", "/api/v1/conversations".to_owned(), None),
+        ("DELETE", "/api/v1/conversations".to_owned(), None),
+        ("GET", "/api/v1/conversations/conv_01".to_owned(), None),
+        ("DELETE", "/api/v1/conversations/conv_01".to_owned(), None),
+        (
+            "POST",
+            "/api/v1/conversations/conv_01/turns".to_owned(),
+            Some(serde_json::json!({"speaker": "you", "text": "hello"})),
+        ),
+        (
+            "POST",
+            format!("/api/v1/channels/{WRITE_CHANNEL}/read"),
+            Some(serde_json::json!({"message_id": "1000000000000000200"})),
+        ),
+        (
+            "DELETE",
+            format!("/api/v1/channels/{WRITE_CHANNEL}/read"),
+            None,
+        ),
+    ];
+    for (method, uri, body) in forbidden {
+        let (status, payload) = call(&harness, method, uri, Some(READ_TOKEN), body.clone()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}: {payload}");
+        assert_eq!(payload["error"], "forbidden", "{method} {uri}");
+    }
+
+    // The control: the read token CAN see the inbox, so the assertions above are about the
+    // decision rather than about the token being broken.
+    let (status, payload) = call(&harness, "GET", "/api/v1/inbox", Some(READ_TOKEN), None).await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+}
+
+#[tokio::test]
+async fn a_conversation_id_from_the_wire_cannot_be_a_path() {
+    let (harness, store) = store_harness();
+    let (status, payload) = call(
+        &harness,
+        "POST",
+        "/api/v1/conversations/..%2Fetc%2Fpasswd/turns",
+        Some(WRITE_TOKEN),
+        Some(serde_json::json!({"speaker": "you", "text": "hello"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{payload}");
+    assert_eq!(payload["error"], "bad_id");
+    assert_eq!(store.appended(), 0, "nothing may be written for a bad id");
+}
+
+#[tokio::test]
+async fn an_unconfigured_store_refuses_loudly_instead_of_answering_from_nowhere() {
+    let (state, discord) = gent_talk::testing::state_with(std::sync::Arc::new(
+        gent_talk::store::disabled::DisabledStore,
+    ));
+    let harness = Harness {
+        router: router(state),
+        discord,
+    };
+    for (method, uri) in [
+        ("GET", "/api/v1/conversations"),
+        ("GET", "/api/v1/conversations/conv_01"),
+        ("GET", "/api/v1/inbox"),
+    ] {
+        let token = if uri == "/api/v1/inbox" {
+            READ_TOKEN
+        } else {
+            WRITE_TOKEN
+        };
+        let (status, payload) = call(&harness, method, uri, Some(token), None).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{method} {uri}: {payload}"
+        );
+        assert_eq!(payload["error"], "storage_not_configured", "{method} {uri}");
+        assert!(
+            payload["detail"]
+                .as_str()
+                .is_some_and(|d| d.contains("storage.path")),
+            "the answer must name the setting to add: {payload}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_inbox_says_on_every_answer_that_this_read_state_is_not_discords() {
+    let (harness, _store) = store_harness();
+    let (status, payload) = call(&harness, "GET", "/api/v1/inbox", Some(READ_TOKEN), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let channels = payload["channels"].as_array().expect("array");
+    assert_eq!(
+        channels.len(),
+        2,
+        "every configured channel appears, marked or not: {payload}"
+    );
+    assert!(
+        channels[0]["last_read"].is_null(),
+        "never marked has to be showable: {payload}"
+    );
+    let notice = payload["read_state_notice"].as_str().expect("a notice");
+    assert!(
+        notice.contains("Discord shares none") && notice.contains("written"),
+        "the no-sync rule must be stated on the answer, not left in a document: {notice}"
+    );
+
+    let (status, payload) = call(
+        &harness,
+        "POST",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/read"),
+        Some(WRITE_TOKEN),
+        Some(serde_json::json!({"message_id": "1000000000000000200"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    assert_eq!(payload["mark"]["last_read"], "1000000000000000200");
+    assert!(
+        payload["read_state_notice"]
+            .as_str()
+            .is_some_and(|n| n.contains("Discord")),
+        "the mutating route is exactly where someone expects the Discord badge to clear: {payload}"
+    );
+    assert!(
+        harness.discord.posted().is_empty(),
+        "marking read must not reach Discord in any way"
+    );
+
+    // Backwards is refused by reporting the truth, not by erroring.
+    let (_status, payload) = call(
+        &harness,
+        "POST",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/read"),
+        Some(WRITE_TOKEN),
+        Some(serde_json::json!({"message_id": "1000000000000000100"})),
+    )
+    .await;
+    assert_eq!(
+        payload["mark"]["last_read"], "1000000000000000200",
+        "a stale client must be told where the mark really is: {payload}"
+    );
+
+    let (status, payload) = call(&harness, "GET", "/api/v1/inbox", Some(READ_TOKEN), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let marked = payload["channels"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|entry| entry["channel"]["id"] == WRITE_CHANNEL)
+        .expect("the writable channel");
+    assert_eq!(marked["last_read"], "1000000000000000200");
+}
+
+#[tokio::test]
+async fn a_read_mark_outside_the_allowlist_is_refused_like_every_other_channel_call() {
+    let (harness, _store) = store_harness();
+    let (status, payload) = call(
+        &harness,
+        "POST",
+        "/api/v1/channels/999999/read",
+        Some(WRITE_TOKEN),
+        Some(serde_json::json!({"message_id": "1000000000000000200"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{payload}");
+    assert_eq!(payload["error"], "unknown_channel");
+}
+
+#[tokio::test]
+async fn a_store_that_fails_is_reported_as_a_server_fault_not_as_an_empty_transcript() {
+    let (harness, store) = store_harness();
+    store.fail_next("the disk is full");
+    let (status, payload) = call(
+        &harness,
+        "GET",
+        "/api/v1/conversations",
+        Some(WRITE_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "an empty 200 would read as 'you have no conversations': {payload}"
+    );
+    assert_eq!(payload["error"], "storage_error");
+}
+
+#[tokio::test]
+async fn a_transcript_is_never_cached() {
+    let (harness, _store) = store_harness();
+    let response = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/conversations")
+                .header("authorization", format!("Bearer {WRITE_TOKEN}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("responds");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store"),
+        "the owner's own speech must not sit in a proxy or a back-forward cache"
     );
 }
