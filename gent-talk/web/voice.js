@@ -891,6 +891,100 @@ function sendTyped() {
   return sendUserMessage(el("compose-text").value);
 }
 
+// --- the canned prompts -------------------------------------------------------------------------
+//
+// `#60 canned-prompt-buttons`. Two questions worth a button because they are the ones actually
+// asked, every time. They go out through `sendUserMessage` like any typed turn, so a tap with no
+// call open reports itself rather than doing nothing, and the sentence lands in the transcript as
+// the reader's own words — which it is.
+//
+// A LIST, not two cases. More of these are expected, and the shape of that expectation is that a
+// third button is one entry here plus one pair of elements in web/voice.html — never a new code
+// path. Every loop below iterates this.
+
+const PROMPTS_KEY = "gent-talk.voice.prompts";
+
+const CANNED_PROMPTS = [
+  {
+    key: "summary",
+    button: "canned-summary",
+    field: "prompt-summary",
+    // WEAKER THAN THE ISSUE FILED, ON PURPOSE. The wording asked for was "Summarize my unread
+    // messages from the coding agent since I last messaged them", and `#61 unread-status` reported
+    // that both halves of that scoping are impossible here: Discord gives a bot no read state, and
+    // the fallback is not computable either — the owner has no identity in this server, his own
+    // replies are posted AS the bot, and the only author signal is `global_name`, which anyone can
+    // set to anything. A button whose text claims a scoping the data cannot support produces
+    // confident, wrong summaries, which is a failure this project has already paid for once. So
+    // this asks for what the digest genuinely provides. The full argument, with code anchors, is
+    // in ai_docs/UNREAD_STATUS_20260819.md; building the capability is a separate feature.
+    text: "Summarize the recent messages from the coding agent in this channel.",
+    said: "Asked for a summary of the recent messages in the channel.",
+  },
+  {
+    key: "blockers",
+    button: "canned-blockers",
+    field: "prompt-blockers",
+    // Unaffected by the above: it makes no claim about read state, it asks the coding agent to
+    // report on itself.
+    text:
+      "Tell the coding agent to summarize what it has accomplished since last interacting with " +
+      "the user, not assuming the user has read any updates in the intervening time, and list " +
+      "out any blockers or items that are waiting on the human user.",
+    said: "Asked the coding agent for progress and blockers.",
+  },
+];
+
+/** What was stored, defaulted PER KEY, so a corrupt or partial entry cannot empty a button. */
+function storedPrompts() {
+  let stored = null;
+  try {
+    stored = JSON.parse(localStorage.getItem(PROMPTS_KEY) || "null");
+  } catch (_error) {
+    stored = null;
+  }
+  const prompts = {};
+  for (const entry of CANNED_PROMPTS) {
+    const held = stored && typeof stored === "object" ? stored[entry.key] : null;
+    prompts[entry.key] = typeof held === "string" && held.trim() !== "" ? held : entry.text;
+  }
+  return prompts;
+}
+
+function persistPrompts() {
+  const prompts = {};
+  for (const entry of CANNED_PROMPTS) {
+    prompts[entry.key] = promptFor(entry);
+  }
+  const encoded = JSON.stringify(prompts);
+  try {
+    localStorage.setItem(PROMPTS_KEY, encoded);
+  } catch (_error) {
+    return false;
+  }
+  // Read back rather than assume, for the third time in this file and for the same reason: private
+  // browsing accepts setItem and stores nothing.
+  return localStorage.getItem(PROMPTS_KEY) === encoded;
+}
+
+/**
+ * What this button will actually send.
+ *
+ * An emptied field falls back to the default rather than sending nothing. A canned button that has
+ * been cleared out is otherwise a control that is present, looks live, and does nothing — the
+ * exact failure this page keeps removing.
+ */
+function promptFor(entry) {
+  return el(entry.field).value.trim() || entry.text;
+}
+
+function promptsChanged() {
+  el("prompt-state").textContent = persistPrompts()
+    ? "Saved. The buttons send this from now on."
+    : "This browser refused to store the prompts, so they will be back to the defaults when you " +
+      "reload (private browsing does this). The buttons send what is in the boxes for now.";
+}
+
 // --- the server ------------------------------------------------------------------------------
 
 /**
@@ -2890,6 +2984,25 @@ el("text-entry").addEventListener("click", () => setTextMode(!textMode));
 // the owner — which is the one thing a failed message must never do.
 el("send-text").addEventListener("click", guardQuietly(sendTyped));
 el("compose-text").addEventListener("input", noteComposing);
+// `#60 canned-prompt-buttons`. ONE loop over the list: the field is restored, the field is saved
+// when it changes, and the button sends whatever the field says. A third canned prompt is one more
+// entry in `CANNED_PROMPTS` and one more pair of elements in web/voice.html — there is deliberately
+// no third place to remember.
+//
+// The defaults are written into `.value` HERE rather than typed into web/voice.html, exactly as
+// `#api-token` is: text inside a <textarea> in the markup is its child text, and `.value` and the
+// markup would then be two different answers to "what does this button send".
+for (const entry of CANNED_PROMPTS) {
+  el(entry.field).value = storedPrompts()[entry.key];
+  el(entry.field).addEventListener("change", promptsChanged);
+  el(entry.button).addEventListener("click", () => {
+    if (sendUserMessage(promptFor(entry))) {
+      // AFTER the send, and only if it went: `sendUserMessage` says "Sent.", which is true of any
+      // message. This says WHICH question was asked, because the button carries five letters.
+      setStatus(entry.said);
+    }
+  });
+}
 el("compose-text").addEventListener("keydown", (event) => {
   if (!event || event.key !== "Enter") {
     return;

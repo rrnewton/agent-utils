@@ -1566,6 +1566,18 @@ def _act_text_entry_open(driver: Driver) -> None:
     driver.settle(300)
 
 
+def _act_canned_prompts(driver: Driver) -> None:
+    """`#60 canned-prompt-buttons`: the bar packed with every button it has.
+
+    Leaves text entry first, because the scene before this one is in it. The subject is PACKING —
+    gear, Type, Sumry, Blockers and the switch on one strip — and the iphone-se profile is the
+    frame that answers whether that survives a short, narrow phone.
+    """
+    driver.click("text-entry")
+    driver.page.wait_for_function("() => window.__visible('view-switch')", timeout=5_000)
+    driver.settle(300)
+
+
 NO_HANGUP = ("Hang up is absent, not merely dimmed", "!window.__visible('hang-up')")
 
 SCENES: tuple[Scene, ...] = (
@@ -2250,6 +2262,39 @@ SCENES: tuple[Scene, ...] = (
             ),
         ),
     ),
+    Scene(
+        name="27-canned-prompts",
+        what="the control bar packed: gear, Type, Sumry, Blockers and the view switch",
+        act=_act_canned_prompts,
+        expect=(
+            (
+                "every button the bar has is on it at once",
+                "['open-settings', 'text-entry', 'canned-summary', 'canned-blockers', "
+                "'view-switch'].every((id) => window.__visible(id))",
+            ),
+            # THE packing claim, and the only place it can be answered: on a 375px phone five
+            # controls have to fit a strip that also carries a switch with a 3.6rem word in it.
+            # Nothing may hang past the bar's own right edge, because that is where the switch is.
+            (
+                "no member is clipped past the right-hand edge of the bar",
+                "(() => { const b = document.getElementById('control-bar').getBoundingClientRect(); "
+                "const s = document.getElementById('view-switch').getBoundingClientRect(); "
+                "const g = document.getElementById('open-settings').getBoundingClientRect(); "
+                "return s.right <= b.right + 1 && g.left >= b.left - 1 && s.width > 40; })()",
+            ),
+            (
+                "...and it is still one strip, not two rows",
+                "(() => { const b = document.getElementById('control-bar').getBoundingClientRect(); "
+                "const p = document.getElementById('control-pane').getBoundingClientRect(); "
+                "return b.height < 70 && b.bottom <= p.top + 1; })()",
+            ),
+            (
+                "the heavier of the two canned buttons is drawn differently",
+                "getComputedStyle(document.getElementById('canned-blockers')).color !== "
+                "getComputedStyle(document.getElementById('canned-summary')).color",
+            ),
+        ),
+    ),
 )
 
 
@@ -2566,7 +2611,7 @@ def check_state_controls() -> list[str]:
     """The scene table itself: an unreached state must fail by name, and none may be unguarded."""
     problems: list[str] = []
 
-    if len(SCENES) < 26:
+    if len(SCENES) < 27:
         problems.append(
             f"the scene table has only {len(SCENES)} states. The interface rework added three that "
             "are where the interesting defects now live -- the armed clear control, the seam with "
@@ -2588,8 +2633,10 @@ def check_state_controls() -> list[str]:
             "transcript or overlapping the controls' can be answered at all. `#58 control-bar` "
             "added the bar in BOTH of its homes, because 'directly above the big buttons' is a "
             "measurement and nothing without a layout engine has an opinion about it, and `#59 "
-            "text-entry-button` added the bar converted into a text field -- whether a whole "
-            "composer fits inside one strip on a 375px phone is the same kind of question."
+            "text-entry-button` added the bar converted into a text field, and `#60 "
+            "canned-prompt-buttons` added the bar with every button it has on it at once -- "
+            "whether a whole composer, or five controls, fit inside one strip on a 375px phone "
+            "is the same kind of question, and no fixture can answer it."
         )
     names = [scene.name for scene in SCENES]
     if len(set(names)) != len(names):
@@ -2710,6 +2757,9 @@ def check_state_controls() -> list[str]:
         # `#59 text-entry-button`. `view-switch` is the conversion -- the rest of the bar getting
         # out of the way -- and `send-text` is the geometry: the composer inside the bar's own box.
         "26-text-entry-open": ("view-switch", "send-text"),
+        # `#60 canned-prompt-buttons`. `canned-blockers` is the pack, `control-bar` is the geometry
+        # -- nothing clipped past the edge, and still one strip rather than two rows.
+        "27-canned-prompts": ("canned-blockers", "control-bar"),
     }
     for name, needles in required.items():
         required_scene = next((s for s in SCENES if s.name == name), None)
@@ -2984,6 +3034,7 @@ SELF_TEST_CHECKS = (
     "the typed-turn state is pinned to the dock geometry, not just to the field being up",
     "both control-bar states are pinned to where the bar IS, not to the bar existing",
     "the text-entry state is pinned to the composer fitting inside the bar it converted",
+    "the packed-bar state is pinned to nothing being clipped, not to the buttons existing",
     "dark is the default theme, and both schemes stay capturable",
     "each theme really sets color_scheme on the browser context",
     "a non-PNG file is rejected",

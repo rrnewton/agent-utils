@@ -931,6 +931,34 @@ body {
   -webkit-user-select: none;
 }
 
+/* `#60 canned-prompt-buttons`. One of the two canned buttons asks the voice agent to read; the
+   other spends CODING-AGENT work on one tap. The issue asks for that difference in weight to be
+   legible rather than merely documented, so the heavier one is drawn in the same warm colour an
+   armed Clear uses — this page's existing way of saying "this one is not like its neighbours". */
+.bar-button.heavy {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+
+.bar-button.heavy .mini-label {
+  color: var(--warn);
+}
+
+/* style.css dresses `select` and `input` but not `textarea`, so the prompt fields on the settings
+   screen would otherwise be unstyled system boxes sitting between two that are not. */
+textarea {
+  width: 100%;
+  padding: 0.45rem 0.6rem;
+  background: var(--panel);
+  color: var(--ink);
+  border: 1px solid var(--edge);
+  border-radius: 0.6rem;
+  font: inherit;
+  font-size: 0.9rem;
+  line-height: 1.4;
+  resize: vertical;
+}
+
 /* ------------------------------------------------------------ text entry, in the bar ------- */
 /*
  * `#59 text-entry-button`. Pressing Type CONVERTS the control bar into a text field: the toggle

@@ -261,7 +261,7 @@ const FIXTURE_TREE = {
   // web/voice.js hides and shows them by ITERATING it rather than by name — which is what makes a
   // third button one list entry rather than a new code path. So the fixture has to really nest
   // them, or that loop runs over nothing and every test of it certifies an empty set.
-  "bar-pack": ["text-entry"],
+  "bar-pack": ["text-entry", "canned-summary", "canned-blockers"],
   // ...and the bar itself, in markup order, because "the toggle is the leftmost thing on the bar
   // once the gear has gone" is an ordering claim and a fixture that held the members in a flat
   // list could not check it. It is also what `setPlacement` re-parents, so the move has something
@@ -5292,6 +5292,194 @@ test("the field states its own layout rule: the size iOS will not zoom", () => {
   // uses. A toggle that looks identical in both modes is not a mode indicator.
   const pressed = cssBlock('#text-entry[aria-pressed="true"]');
   assert.match(pressed, /var\(--accent\)/, "the pressed toggle looks exactly like the unpressed one");
+});
+
+// --- the canned prompts (#60 canned-prompt-buttons) -----------------------------------------------
+
+/** The list the page is built around, read out of its own source rather than restated here. */
+const CANNED = (() => {
+  const block = /const CANNED_PROMPTS = \[([\s\S]*?)\n\];/.exec(SCRIPT_CODE);
+  assert.ok(block, "web/voice.js no longer declares CANNED_PROMPTS as a list");
+  return [...block[1].matchAll(/button:\s*"([^"]+)",\s*\n?\s*field:\s*"([^"]+)"/g)].map((m) => ({
+    button: m[1],
+    field: m[2],
+  }));
+})();
+
+test("THE CANNED BUTTONS ARE A LIST, SO A THIRD ONE IS AN ENTRY AND NOT A CODE PATH", () => {
+  // The issue says more of these are expected, and this is what makes that true rather than
+  // merely intended: every button is declared in one list, every one has a settings field, and
+  // both really exist in the markup. A button added as a special case fails here.
+  assert.ok(CANNED.length >= 2, `only ${CANNED.length} canned prompts found — the scan is broken`);
+  for (const entry of CANNED) {
+    assert.ok(PAGE_IDS.has(entry.button), `#${entry.button} is in the list but not in the page`);
+    assert.ok(PAGE_IDS.has(entry.field), `#${entry.button} has no field to edit its prompt in`);
+    assertMarkupContains("bar-pack", entry.button);
+    // SHIPPED EMPTY, and this is a trap rather than a preference: text typed between the tags of a
+    // <textarea> is its child text, not its `.value`, so a default written into web/voice.html
+    // would be invisible to everything that reads the field — and the tests would certify a
+    // prompt the button never sends. web/voice.js fills `.value` at load.
+    assert.equal(
+      PAGE_ELEMENTS.get(entry.field).text,
+      "",
+      `#${entry.field} carries its default in the markup, where .value cannot see it`
+    );
+  }
+  // ...and nothing outside the list knows the button ids. A `if (id === "canned-summary")` anywhere
+  // is the special case this test exists to prevent.
+  for (const entry of CANNED) {
+    assert.equal(
+      SCRIPT_CODE.split(`"${entry.button}"`).length - 1,
+      1,
+      `#${entry.button} is named more than once in web/voice.js, so it has a code path of its own`
+    );
+  }
+});
+
+test("tapping a canned button sends its prompt VERBATIM, as a turn of your own", async () => {
+  const page = newPage();
+  const socket = await startTalking(page);
+
+  await page.el("canned-summary").click();
+
+  const sent = socket.sent.filter((s) => s.includes('"user_message"'));
+  assert.equal(sent.length, 1, `exactly one message, not ${sent.length}`);
+  const frame = JSON.parse(sent[0]);
+  assert.equal(frame.type, "user_message");
+  assert.equal(frame.text, page.el("prompt-summary").value, "it did not send what the field says");
+  // The sentence lands in the transcript as the reader's own words, because it is: a button that
+  // asks a question the transcript has no record of is a conversation with a hole in it.
+  const said = page.el("transcript").children.filter((li) => li.className === "mine");
+  assert.equal(said.length, 1);
+  assert.match(said[0].text(), /Summarize the recent messages/);
+  // And the status line says WHICH question was asked, because the button carries five letters.
+  assert.match(page.el("status").textContent, /summary/i);
+  // The call is untouched, the same invariant every other control on this bar is held to.
+  assert.equal(page.tracks[0].stops, 0, "a canned prompt released the microphone");
+  assert.equal(page.sockets.length, 1, "a canned prompt opened a second conversation");
+  assert.equal(page.el("talk-label").textContent, "Listening");
+});
+
+test("THE SUMMARY BUTTON DOES NOT CLAIM A SCOPING THE DATA CANNOT SUPPORT", () => {
+  // `#61 unread-status` reported that "my unread messages ... since I last messaged them" — the
+  // wording `#60` was filed with — is impossible here twice over: Discord gives a bot no read
+  // state, and the fallback is not computable either, because the owner has no identity in this
+  // server, his own replies are posted AS the bot, and the only author signal is a display name
+  // anyone can set to anything. A button whose text claims that scoping produces confident, wrong
+  // summaries. So the shipped default is weaker and TRUE, and this is what stops it drifting back.
+  const summary = /text:\s*"([^"]+)"/.exec(
+    SCRIPT_CODE.slice(SCRIPT_CODE.indexOf('button: "canned-summary"'))
+  )[1];
+  assert.match(summary, /recent messages/i, "the default no longer says what it can actually get");
+  for (const claim of [/unread/i, /since I last/i, /last messaged/i]) {
+    assert.doesNotMatch(
+      summary,
+      claim,
+      `the Summary prompt claims a scoping #61 unread-status established is not computable: ${summary}`
+    );
+  }
+});
+
+test("editing a prompt changes what its button sends, and an emptied one falls back", async () => {
+  const page = newPage();
+  const socket = await startTalking(page);
+
+  page.el("prompt-blockers").value = "ask the coding agent what is stuck";
+  await page.el("prompt-blockers").dispatch("change");
+  await page.el("canned-blockers").click();
+
+  const sent = socket.sent.filter((s) => s.includes('"user_message"'));
+  assert.equal(JSON.parse(sent[0]).text, "ask the coding agent what is stuck");
+  assert.match(page.el("prompt-state").textContent, /Saved/);
+
+  // Emptied is NOT "sends nothing": a cleared field would otherwise leave a button that is
+  // present, looks live and does nothing at all.
+  page.el("prompt-blockers").value = "   ";
+  await page.el("prompt-blockers").dispatch("change");
+  await page.el("canned-blockers").click();
+
+  const again = socket.sent.filter((s) => s.includes('"user_message"'));
+  assert.equal(again.length, 2);
+  assert.match(JSON.parse(again[1]).text, /Tell the coding agent/, "an emptied field killed the button");
+});
+
+test("edited prompts survive a reload", async () => {
+  const page = newPage();
+  await signIn(page);
+  page.el("prompt-summary").value = "what did the overnight run say";
+  await page.el("prompt-summary").dispatch("change");
+
+  const again = newPage(page.storage);
+  await signIn(again);
+
+  assert.equal(again.el("prompt-summary").value, "what did the overnight run say");
+  assert.match(again.el("prompt-blockers").value, /Tell the coding agent/, "the other one was lost");
+});
+
+test("a browser that refuses to store the prompts says so instead of claiming saved", async () => {
+  const page = newPage();
+  await signIn(page);
+  page.storage.set = () => page.storage;
+
+  page.el("prompt-summary").value = "anything";
+  await page.el("prompt-summary").dispatch("change");
+
+  assert.doesNotMatch(page.el("prompt-state").textContent, /Saved/, "it claimed success");
+  assert.match(page.el("prompt-state").textContent, /refused to store/);
+});
+
+test("the heavier button is VISIBLY heavier, because one of them spends coding-agent work", () => {
+  // Sumry asks the voice agent to read; Blockers goes and makes the coding agent do work. The
+  // issue asks for that difference to be legible, and a difference that exists only in a `title`
+  // is not legible at arm's length.
+  assert.ok(
+    PAGE_ELEMENTS.get("canned-blockers") && HTML.includes('id="canned-blockers"'),
+    "the heavier button is gone"
+  );
+  const bar = barSlice();
+  const blockers = bar.slice(bar.indexOf('id="canned-blockers"'));
+  assert.match(blockers.slice(0, 200), /class="bar-button heavy"/, "the heavy button is not marked");
+  const heavy = cssBlock(".bar-button.heavy");
+  assert.match(heavy, /var\(--warn\)/, "the heavier button looks exactly like the lighter one");
+  assert.doesNotMatch(
+    cssBlock(".bar-button"),
+    /var\(--warn\)/,
+    "every bar button is warm, so the difference says nothing"
+  );
+  // The issue does NOT ask for an arm-twice confirm like #clear-view, so there is deliberately not
+  // one. Recorded here so that adding one later is a decision somebody makes rather than drifts
+  // into — and so that its absence is not mistaken for an oversight.
+  assert.doesNotMatch(SCRIPT_CODE, /armCanned|cannedArmed/, "a confirm step appeared unannounced");
+});
+
+test("the canned buttons get out of the way of the text field, like everything else in the pack", async () => {
+  // `#59 text-entry-button` hides pack members by ITERATING the pack rather than by name, which is
+  // the whole reason this behaviour came for free. It is only checkable now that the pack has a
+  // member the loop's one exception does not cover.
+  const page = newPage();
+  await startTalking(page);
+  assert.equal(page.el("canned-summary").hidden, false);
+
+  await page.el("text-entry").click();
+
+  assert.equal(page.el("canned-summary").hidden, true, "a canned button crowded the text field");
+  assert.equal(page.el("canned-blockers").hidden, true);
+  assert.equal(page.el("text-entry").hidden, false, "the way back out of the mode went away");
+
+  await page.el("text-entry").click();
+  assert.equal(page.el("canned-summary").hidden, false, "leaving text entry did not bring them back");
+});
+
+test("a canned prompt with no call open reports itself, like every other send", async () => {
+  const page = newPage();
+  await signIn(page);
+  page.el("status-line").hidden = true;
+
+  await page.el("canned-blockers").click();
+
+  assert.equal(page.sockets.length, 0, "a canned prompt opened a conversation by itself");
+  assert.equal(page.el("status-line").hidden, false, "the refusal was silent");
+  assert.match(page.el("status").textContent, /call/i);
 });
 
 // --- reading the transcript -----------------------------------------------------------------------

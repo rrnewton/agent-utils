@@ -300,6 +300,33 @@
           </select>
           <p id="bar-placement-state" class="hint" aria-live="polite"></p>
 
+          <h2>Canned prompts</h2>
+          <p class="hint">
+            What the two prompt buttons in the control bar say. They send exactly this text into the
+            live conversation, as though you had typed it. Emptying a field puts its default back
+            rather than leaving a button that does nothing.
+          </p>
+
+          <label for="prompt-summary">Sumry</label>
+          <p class="hint">
+            Deliberately says <strong>recent messages</strong> and not "my unread messages since I
+            last spoke". Discord gives a bot no read state at all, and this bridge cannot work out
+            where you last spoke either — your own replies are posted as the bot, and the only
+            author signal is a display name anyone can set to anything. A button that claimed that
+            scoping would produce confident, wrong summaries. See
+            <code>ai_docs/UNREAD_STATUS_20260819.md</code>.
+          </p>
+          <textarea id="prompt-summary" rows="3"></textarea>
+
+          <label for="prompt-blockers">Blockers</label>
+          <p class="hint">
+            <strong>This one makes the coding agent do work.</strong> It is not a question about
+            the channel; it asks the voice agent to go and get the coding agent to report. That is
+            why the button beside it is coloured differently from the other small controls.
+          </p>
+          <textarea id="prompt-blockers" rows="4"></textarea>
+          <p id="prompt-state" class="hint" aria-live="polite"></p>
+
           <h2>What the controls do</h2>
           <p id="continuity-note" class="hint">
             <strong>Mute</strong> keeps the call open and keeps the agent's context; it only stops
@@ -448,6 +475,45 @@
                 <path d="M8 10.5h8M8 13h5" />
               </svg>
               <span id="text-entry-label" class="mini-label">Type</span>
+            </button>
+
+            <!--
+              `#60 canned-prompt-buttons`. Two questions worth a button because they are the ones
+              actually asked, every time. They send the same `user_message` a typed one does, so
+              nothing here is a second way of talking to the agent — only a shorter way of saying
+              the same sentence.
+
+              They differ in WEIGHT and the difference is drawn, not merely documented: Sumry asks
+              the voice agent to read and summarize, while Blockers spends CODING-AGENT work on one
+              tap. That is what `heavy` colours in warm, the same idiom an armed Clear uses.
+
+              What each one says is EDITABLE, in Settings, and the defaults are filled in from
+              script rather than typed into the markup — see `CANNED_PROMPTS` in web/voice.js.
+            -->
+            <button
+              id="canned-summary"
+              class="bar-button"
+              type="button"
+              title="Ask the agent to summarize the recent messages from the coding agent in this channel. Editable in Settings."
+            >
+              <svg class="mini-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M5.5 4.5h13v15h-13z" />
+                <path d="M8.5 9h7M8.5 12h7M8.5 15h4" />
+              </svg>
+              <span id="canned-summary-label" class="mini-label">Sumry</span>
+            </button>
+
+            <button
+              id="canned-blockers"
+              class="bar-button heavy"
+              type="button"
+              title="Ask the agent to make the CODING AGENT report its progress and anything waiting on you. This spends coding-agent work. Editable in Settings."
+            >
+              <svg class="mini-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 4.5 21 19.5H3z" />
+                <path d="M12 10v4.2M12 17h.01" />
+              </svg>
+              <span id="canned-blockers-label" class="mini-label">Blockers</span>
             </button>
           </div>
 

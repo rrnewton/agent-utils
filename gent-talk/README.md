@@ -833,6 +833,46 @@ and a way back on Settings or Reply, or the bar itself when the reader has chose
 Members hide **individually**, not the bar as a whole, which is what keeps the gear reachable from
 the sign-in screen; the bar hides only when every member is hidden.
 
+### The canned prompts, and the one whose wording had to be weakened
+
+Two questions are worth a button because they are the ones actually asked, every time. **Sumry**
+asks the voice agent to summarize; **Blockers** asks it to make the *coding agent* report. They go
+out through the same `sendUserMessage` a typed turn does, so the sentence lands in the transcript
+as the reader's own words, and a tap with no call open reports itself instead of doing nothing.
+
+They differ in **weight**, and the difference is drawn rather than documented: Blockers spends
+coding-agent work on one tap, so it is coloured in the same warm tone an armed Clear uses. It
+deliberately does **not** ask twice — the issue did not ask for a confirm step, so adding one is a
+decision for somebody to make out loud rather than drift into, and the suite records its absence
+so it is not mistaken for an oversight.
+
+It is a **list**, not two cases: `CANNED_PROMPTS` in `web/voice.js`, one entry per button, and one
+loop that restores each field, saves it, and wires its button. A third canned prompt is one entry
+plus one pair of elements in the markup, and the suite asserts there is no third place — a button
+id named twice in the script fails, because the second mention is the special case starting.
+
+Each prompt is **editable in Settings** and kept in `localStorage`; emptying a field puts the
+default back rather than leaving a button that looks live and does nothing. The defaults are
+written into `.value` from script, never typed into the markup: text between the tags of a
+`<textarea>` is its child text, not its value, so a default written in HTML would be invisible to
+everything that reads the field.
+
+**The Summary prompt is deliberately weaker than the one the issue asked for.** It was filed as
+*"Summarize my unread messages from the coding agent since I last messaged them"*, and
+`#61 unread-status` established that both halves of that scoping are impossible here. Discord gives
+a bot no read state at all — it is a client concept, with no ack route and no read-state field. And
+the obvious fallback, *since the owner last spoke*, is not computable either: the owner has no
+identity in this server, his own replies are posted **as the bot**, the digest drops the
+bot/human flag, and the only author signal is a display name anyone can set to anything. A button
+whose text claims that scoping would produce confident, wrong summaries — the exact failure this
+project already paid for once, when an agent invented a digest. So the shipped default asks for
+what the data genuinely provides: *"Summarize the recent messages from the coding agent in this
+channel."* The suite pins that it says "recent messages" and says nothing about unread or about
+when anyone last spoke. Building the capability — an `owner_id` in config, `author_is_bot` carried
+into the digest, `before`/`after` on the Discord client — is a real feature and a separate one; the
+research is in `ai_docs/UNREAD_STATUS_20260819.md`. Blockers is unaffected, because it makes no
+claim about read state.
+
 ### Typing is the other way to say something, on the same conversation
 
 Speaking is not always available — a quiet room, a commit hash the transcriber keeps mangling, a
@@ -1314,7 +1354,7 @@ layout facts and a fixture with no layout engine has no opinion about them.
 scripts/run.sh --screenshots
 ```
 
-Photographs the `/voice` page in the twenty-six states that look different — signed out, idle, live
+Photographs the `/voice` page in the twenty-seven states that look different — signed out, idle, live
 call, muted, the agent's voice silenced, just after a hang-up, the end-of-call seam with its
 disclosure open, the clear control armed, settings, the Discord view, a long transcript parked
 mid-scroll, that same list with one folded answer opened among the closed ones, the moment a turn
@@ -1323,8 +1363,8 @@ range, and the two connection outcomes that used to look identical — a call su
 phone, and one that really failed — the reply screen with a short target and with one longer
 than the frame, one channel row picked out under the pointer, a step further back through the
 channel, the earlier conversation restored from the server after a reload, a turn that was typed
-rather than spoken, the control bar in each of its two homes, and that same bar converted into a
-text field — at four viewports: a tall phone, a short phone, a small laptop window and a maximised
+rather than spoken, the control bar in each of its two homes, that same bar converted into a
+text field, and the bar packed with every button it has — at four viewports: a tall phone, a short phone, a small laptop window and a maximised
 desktop. It prints the absolute path of every image so an agent can open them directly.
 
 The last two states are DESKTOP ONLY, and say so in the run: `@media (min-width: 900px) and
@@ -1376,7 +1416,7 @@ it. It measures the SAME message closed and then open — comparing the first op
 the first closed one compares two lengths rather than two states, and passed for the wrong reason
 at desktop width until it was fixed.
 
-`scripts/screenshots.py --self-test` runs 45 controls for those checks offline, with no browser and
+`scripts/screenshots.py --self-test` runs 46 controls for those checks offline, with no browser and
 no server; `scripts/test-run-sh.sh` runs them as part of its own suite. Screenshots are written to
 the gitignored `debug/screenshots/` and are never committed. Playwright and its Chromium are the
 only requirement, and a missing one fails by name with the install command.
