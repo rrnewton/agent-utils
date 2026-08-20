@@ -152,6 +152,50 @@ def _cpu_seconds_from_stats(stats: Mapping[str, int]) -> float | None:
     """
     usage_usec = stats.get("usage_usec")
     return None if usage_usec is None else usage_usec / 1_000_000
+#: Rendered for a capacity lookup that found NOTHING. A distinct token, never a value, because
+#: ``.get(r, 0)`` FUSES "not declared" with "declared as 0" and that fusion is the whole defect
+#: class here: an undeclared ``resource_caps`` entry reads identically to a deliberate
+#: zero-capacity bucket, so a config typo and a deliberate serialization are indistinguishable in
+#: the diagnostics as well as in the behavior. MUST match the `Observed::Absent` rendering in
+#: `rs/safe-ci-dag-runner/src/scheduler.rs`.
+_ABSENT = "<absent>"
+
+
+def _ungrantable_resources(
+    resource_avail: Mapping[str, int], steps: Mapping[str, Step], tags: Sequence[str]
+) -> list[str]:
+    """The starved steps whose demand LIVE capacity can never grant, rendered as refusals.
+
+    Each line carries enough to be fixed WITHOUT opening the source: where it was found, what was
+    required, what was actually observed (``<absent>`` distinct from a declared number), and the
+    surrounding declarations that turn a refusal into a spotted typo.
+
+    Safe to read ``resource_avail`` as DECLARED capacity only because the caller invokes it with
+    nothing running: every ``_acquire`` is matched by a ``_release`` when its step completes, so
+    with no live step the map has returned to the configured caps. Returns an empty list when the
+    starve has some other cause (dangling dep, dependency cycle) -- the detector still refuses;
+    this only supplies the named cause when the cause is capacity.
+
+    Reports EVERY violation rather than the first: a first-failure abort makes the reader iterate
+    N times for N typos, and the count is itself evidence of how wide the misdeclaration is.
+
+    MUST stay behaviorally identical to ``ungrantable_resources`` in
+    ``rs/safe-ci-dag-runner/src/scheduler.rs``, down to the rendered text: a refusal a reader
+    compares across the two editions must read the same in both.
+    """
+    declared = ", ".join(sorted(f"{k}={v}" for k, v in resource_avail.items()))
+    out: list[str] = []
+    for tag in tags:
+        step = steps.get(tag)
+        if step is None:
+            continue
+        for r, n in sorted(step.hint.resources.items()):
+            cap = resource_avail.get(r)
+            if (cap if cap is not None else 0) < n:
+                observed = _ABSENT if cap is None else f"{r}={cap}"
+                line = f'step "{tag}": requires {r}={n}, but got {observed}'
+                out.append(f"{line} (declared: {declared})" if declared else line)
+    return out
 
 
 def _psi_reading(pressure: Mapping[str, float] | None) -> PsiReading | None:
@@ -476,7 +520,14 @@ class Runner:
         return all(d in self.done for d in step.deps)
 
     def _res_free(self, step: Step) -> bool:
-        """True when the step's scarce-resource demand currently fits remaining capacity."""
+        """True when the step's scarce-resource demand currently fits remaining capacity.
+
+        An ABSENT cap counts as 0, i.e. never schedulable, deliberately: silently granting
+        unlimited capacity to an undeclared resource would turn a config typo into an unbounded
+        fan-out. The two cases are identical HERE (both block) but must never be identical in the
+        diagnostics -- see :func:`_ungrantable_resources`, which renders ``<absent>`` distinctly so
+        the reader can tell "you forgot to declare it" from "you set it to zero on purpose".
+        """
         return all(
             self.resource_avail.get(r, 0) >= n for r, n in step.hint.resources.items()
         )
@@ -706,6 +757,57 @@ class Runner:
                         self.running.add(tag)
                         self._acquire(step)
                         self.cores_used += self._step_width(step)
+                    # TERMINAL STARVE. Nothing is launchable, nothing is running, and work
+                    # remains: no future event can change that, because every state transition in
+                    # this loop is caused by a running step completing. Sleeping here is what
+                    # turned three distinct defects -- an unsatisfiable resource cap, a dangling
+                    # dep, and a dependency cycle -- into one indistinguishable symptom: a live
+                    # process at 0% CPU with a frozen log and no exit.
+                    #
+                    # SOUNDNESS: the --max-steps cap cannot be the cause of an empty `launchable`
+                    # here. `len(self.running) >= self.max_steps` can only break the scan while
+                    # `running` is NON-empty (max_steps is max(1, ...) in __init__, so it is >= 1).
+                    # And with nothing running, no supervisor thread can be mutating `done` or
+                    # `resource_avail`, so the counts read below are stable rather than merely
+                    # sampled, and `resource_avail` has returned to the configured caps.
+                    accounted = (
+                        len(self.done) + len(skipped) + len(self.intentional_skips)
+                    )
+                    remaining = max(0, len(self.steps) - accounted)
+                    if not launchable and not self.running and remaining > 0:
+                        stuck = sorted(
+                            tag
+                            for tag in self.order
+                            if tag not in self.done
+                            and tag not in skipped
+                            and tag not in self.intentional_skip_tags
+                        )
+                        print(
+                            f"[scheduler] REFUSED: terminal starve -- {remaining} step(s) can "
+                            "never be admitted; nothing is running and nothing is launchable, so "
+                            "no future event can unblock them.",
+                            file=sys.stderr,
+                        )
+                        for refusal in _ungrantable_resources(
+                            self.resource_avail, self.steps, stuck
+                        ):
+                            print(f"[scheduler]   {refusal}", file=sys.stderr)
+                        print(
+                            f"[scheduler]   starved step(s) ({len(stuck)}): "
+                            + ", ".join(stuck),
+                            file=sys.stderr,
+                        )
+                        if self.evidence is not None:
+                            self.evidence.record(
+                                "terminal_starve",
+                                [
+                                    ("starved", str(len(stuck))),
+                                    ("steps", ",".join(stuck)),
+                                ],
+                            )
+                        self.failed = True
+                        self.stop = True
+                        break
                 for step in launchable:
                     t = threading.Thread(
                         target=self._run_step, args=(step,), daemon=True

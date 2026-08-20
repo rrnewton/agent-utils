@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import subprocess
 import tempfile
+import threading
 import time
 
 import pytest
@@ -19,7 +20,14 @@ from safe_ci_dag_runner.model import (
     ResourceHint,
     Step,
 )
-from safe_ci_dag_runner.scheduler import Runner, run_dag, steps_violating_run_timeout
+from safe_ci_dag_runner.protocols import RunResult
+from safe_ci_dag_runner.scheduler import (
+    _ABSENT,
+    Runner,
+    run_dag,
+    steps_violating_run_timeout,
+    _ungrantable_resources,
+)
 
 
 def _step(
@@ -357,3 +365,105 @@ def test_clean_run_inside_its_outer_budget_is_untouched() -> None:
     assert res.run_timed_out is False
     assert all(not o.aborted for o in res.outcomes)
     assert len(res.step_profile_rows) == 2
+
+
+# ----------------------------------------------------------- terminal-starve brackets
+#
+# Both directions, with counts, because each leg alone is passed by a broken guard: a detector
+# that refuses EVERY run passes the negative legs, and a detector wired to nothing passes the
+# positive leg.
+#
+# Every negative leg goes through `_run_dag_bounded`, never `run_dag` directly. The defect these
+# guard against is an INFINITE SLEEP, and a test that hangs reports nothing at all -- it stalls
+# the suite instead of failing it. Bounding the call converts the regression into a named red.
+
+
+def _run_dag_bounded(cfg: DagConfig, *, jobs: int = 4, budget_s: float = 60.0) -> RunResult:
+    """Run ``cfg`` on a daemon thread and FAIL if it has not returned within ``budget_s``."""
+    box: list[RunResult] = []
+    worker = threading.Thread(
+        target=lambda: box.append(run_dag(cfg, jobs=jobs, verbosity=0)), daemon=True
+    )
+    worker.start()
+    worker.join(budget_s)
+    if worker.is_alive():
+        pytest.fail(
+            f"run_dag did not return within {budget_s}s: the terminal-starve detector has "
+            "regressed and the scheduler is sleeping on a state no future event can change"
+        )
+    assert box, "the worker exited without producing a RunResult"
+    return box[0]
+
+
+def test_positive_satisfiable_caps_yield_no_refusal_and_the_dag_still_runs() -> None:
+    a = _step("g", "a", "true", resources={"hg": 1})
+    b = _step("g", "b", "true", resources={"hg": 1})
+    cfg = DagConfig(steps=(a, b), resource_caps={"hg": 1})
+    assert (
+        _ungrantable_resources({"hg": 1}, {a.tag: a, b.tag: b}, [a.tag, b.tag]) == []
+    ), "positive: a satisfiable demand must produce ZERO refusals"
+    res = _run_dag_bounded(cfg)
+    assert res.ok is True, "positive: a satisfiable DAG must still run green"
+    assert len(res.outcomes) == 2
+    assert list(res.skipped) == []
+
+
+def test_absent_cap_reads_differently_from_a_declared_zero() -> None:
+    # Same BEHAVIOR (both block), different DIAGNOSTIC. `.get(r, 0)` alone makes these two
+    # literally indistinguishable, which is the reason the `<absent>` token exists.
+    needs_gpu = _step("g", "needs_gpu", "true", resources={"gpu": 1})
+    steps = {needs_gpu.tag: needs_gpu}
+
+    missing = _ungrantable_resources({"hg": 4}, steps, [needs_gpu.tag])
+    assert len(missing) == 1, "absent: exactly 1 refusal"
+    assert _ABSENT in missing[0], f"absent must render distinctly: {missing[0]}"
+    assert "gpu=1" in missing[0], f"must name the demand: {missing[0]}"
+    assert "hg=4" in missing[0], f"must show what WAS declared: {missing[0]}"
+
+    zero = _ungrantable_resources({"gpu": 0}, steps, [needs_gpu.tag])
+    assert len(zero) == 1, "declared zero: exactly 1 refusal"
+    assert "gpu=0" in zero[0], f"a declared 0 must show its value: {zero[0]}"
+    assert _ABSENT not in zero[0], f"a declared 0 must NOT read as absent: {zero[0]}"
+
+
+def test_ungrantable_cap_refuses_instead_of_sleeping_forever(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cfg = DagConfig(
+        steps=(
+            _step("g", "needs_gpu", "true", resources={"gpu": 1}),
+            _step("g", "plain", "true"),
+        ),
+        resource_caps={"hg": 4},
+    )
+    res = _run_dag_bounded(cfg)
+    assert res.ok is False, "an ungrantable demand must REFUSE, not hang"
+    assert len(res.outcomes) == 1, "the satisfiable step still ran"
+    assert all(o.ok for o in res.outcomes)
+    err = capsys.readouterr().err
+    assert "terminal starve" in err, err
+    assert _ABSENT in err, f"the refusal must name the undeclared resource distinctly: {err}"
+    assert "starved step(s) (1): g.needs_gpu" in err, err
+
+
+def test_dependency_cycle_refuses_instead_of_sleeping_forever() -> None:
+    # The general invariant: a cycle satisfies every declared cap, so no capacity check can see
+    # it -- only "nothing running, nothing launchable, work left" can.
+    cfg = DagConfig(
+        steps=(
+            _step("g", "a", "true", deps=["g.b"]),
+            _step("g", "b", "true", deps=["g.a"]),
+            _step("g", "ok", "true"),
+        )
+    )
+    res = _run_dag_bounded(cfg)
+    assert res.ok is False, "a cycle must REFUSE, not hang"
+    assert len(res.outcomes) == 1, "the one acyclic step still ran"
+    assert all(o.ok for o in res.outcomes)
+
+
+def test_dangling_dep_refuses_instead_of_sleeping_forever() -> None:
+    cfg = DagConfig(steps=(_step("g", "a", "true", deps=["g.nonexistent"]),))
+    res = _run_dag_bounded(cfg)
+    assert res.ok is False, "a dangling dep must REFUSE, not hang"
+    assert list(res.outcomes) == []
