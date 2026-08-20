@@ -451,6 +451,12 @@ class StepStream:
         self.evidence = evidence
         self._log = evidence.open_step_log(tag) if evidence is not None else None
         self._log_cap = log_cap_bytes
+        # The reserve can never exceed the cap. With a cap SMALLER than the
+        # nominal reserve the old arithmetic wrote no data (room went negative)
+        # and then emitted a full-length notice anyway, so the file overshot the
+        # number it advertised: measured, cap=128 produced 142 bytes. Both the
+        # withheld budget and the notice are now clamped to the cap.
+        self._log_reserve = min(_LOG_MARKER_RESERVE, log_cap_bytes)
         self._log_written = 0
         self._log_dropped = 0
         self._partial = ""
@@ -473,7 +479,7 @@ class StepStream:
                 # could stop the drain, the producer would block on a full pipe,
                 # and a hung run is worse than a full disk. A full disk crashes;
                 # a hang burns CPU for 28 hours looking like a product bug.
-                room = self._log_cap - _LOG_MARKER_RESERVE - self._log_written
+                room = self._log_cap - self._log_reserve - self._log_written
                 if room > 0:
                     take = data[:room]
                     try:
@@ -514,7 +520,7 @@ class StepStream:
             f"\n[dag-runner] *** STEP LOG CAPPED *** {self.tag}: this log stops at "
             f"{self._log_cap} bytes. The step CONTINUED past this point and its "
             f"later output is NOT below.\n"
-        ).encode()[:_LOG_MARKER_RESERVE]
+        ).encode()[: self._log_reserve]
         try:
             self._log.write(notice)
             self._log.flush()

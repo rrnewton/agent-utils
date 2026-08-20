@@ -71,12 +71,21 @@ def peak_for(chunks: list[bytes], limit: int = LIMIT) -> tuple[int, "BoundedCapt
 def test_capture_peak_stays_near_the_bound(label: str, size: int, count: int) -> None:
     peak, cap = peak_for([b"z" * size] * count)
     assert len(cap[0]) == LIMIT, f"{label}: retained {len(cap[0])}, want exactly the limit"
-    # 3x is the assertion, not the measurement. Observed worst across this sweep
-    # after the trim-before-append fix is 2.25x (64 KiB and 1 MiB chunks, where
-    # bytearray amortised growth dominates); limit-1 is now 1.00x. The headroom
-    # between 2.25 and 3 exists so an allocator change is not a test failure,
-    # NOT because a larger peak would be acceptable.
-    assert peak <= 3 * LIMIT, f"{label}: peak {peak / 2**20:.3f} MiB against a {LIMIT / 2**20} MiB bound"
+    # THE BAR IS 2.3x, NOT 3x. The previous 3x was unearned slack: measured worst
+    # is 2.250050x here (independently 2.250135x under adversarial review), so 3x
+    # left room for a 33% regression to land without failing a test. 2.3x is 2.2%
+    # over the measurement -- enough that an allocator detail is not a spurious
+    # failure, not enough to hide a regression.
+    #
+    # STATED PLAINLY: this does NOT meet the declared acceptance criterion of
+    # 2L + 64 KiB (2.015625x). The gap is bytearray reallocation on `+=` after the
+    # left-trim; meeting the declared bar needs a preallocated ring buffer rather
+    # than a growable bytearray, which is a rewrite I have not done. Asserting
+    # 2.3x is therefore reporting the real bound, not endorsing it.
+    assert peak <= 2.3 * LIMIT, (
+        f"{label}: peak {peak / 2**20:.3f} MiB = {peak / LIMIT:.4f}x against a "
+        f"{LIMIT / 2**20} MiB bound (measured worst 2.2501x)"
+    )
 
 
 def test_a_single_write_larger_than_the_bound_does_not_inflate_it() -> None:
@@ -120,3 +129,76 @@ def test_pending_line_bound_is_smaller_than_the_capture_bound() -> None:
     """They bound different things: what is BUFFERED awaiting a newline, versus
     what is KEPT. The stream buffer must not be able to dominate the total."""
     assert 0 < MAX_PENDING <= CAPTURE_TAIL_BYTES
+
+
+# --------------------------------------------------------------------------
+# The two bounds the first round of tests did NOT cover. A review pointed out
+# that `pending` was only compared as a CONSTANT and the disk cap was untested
+# entirely, so "14 passed" proved one bound out of three.
+# --------------------------------------------------------------------------
+
+
+def _drain_like_the_reader(chunks: list[bytes], limit: int) -> tuple[int, list[str]]:
+    """Mirror scheduler.py's stream loop: extend, flush-if-oversized, split lines.
+
+    A copy of the logic rather than the logic itself, because the real loop is
+    welded to a Popen. If they drift this test stops guarding anything, so the
+    shape is kept deliberately small and obvious.
+    """
+    pending = bytearray()
+    emitted: list[str] = []
+    peak = 0
+    for chunk in chunks:
+        pending.extend(chunk)
+        if len(pending) > limit:
+            emitted.append(bytes(pending).decode(errors="replace"))
+            pending.clear()
+        while b"\n" in pending:
+            index = pending.index(b"\n")
+            emitted.append(bytes(pending[: index + 1]).decode(errors="replace"))
+            del pending[: index + 1]
+        peak = max(peak, len(pending))
+    return peak, emitted
+
+
+def test_pending_buffer_is_bounded_on_newline_free_output() -> None:
+    """The verbosity>=2 path. Newline-free output grew this without limit, and it
+    sat OUTSIDE the capture bound -- so bounding `captured` alone would have left
+    the memory hole open on exactly the path that streams a runaway to a human."""
+    peak, emitted = _drain_like_the_reader([b"x" * 65536] * 1024, MAX_PENDING)
+    assert peak <= MAX_PENDING + 65536, f"pending reached {peak}"
+    assert emitted, "an unterminated run must be flushed, not hoarded"
+
+
+def test_pending_buffer_still_splits_ordinary_lines() -> None:
+    """The bound must not change behaviour for output that does have newlines."""
+    peak, emitted = _drain_like_the_reader([b"one\ntwo\nthree\n"], MAX_PENDING)
+    assert peak == 0
+    assert emitted == ["one\n", "two\n", "three\n"]
+
+
+def _disk_sim(cap: int, chunk: int, count: int, notice_len: int = 140) -> int:
+    """Mirror StepStream.ingest's cap arithmetic, including the reserve clamp."""
+    reserve = min(512, cap)
+    written = 0
+    for _ in range(count):
+        room = cap - reserve - written
+        written += min(chunk, room) if room > 0 else 0
+    return written + min(notice_len, reserve)
+
+
+@pytest.mark.parametrize("cap", [1, 16, 64, 128, 200, 512, 513, 1024, 8192, 1 << 20])
+def test_step_log_never_exceeds_its_advertised_cap(cap: int) -> None:
+    """A cap that overshoots to announce itself is not a cap.
+
+    Two measured failures this guards: cap=1024 produced 1167 bytes when the
+    notice was written past the budget, and cap=128 produced 142 bytes when the
+    reserve exceeded the cap itself and the notice was clamped to the reserve
+    rather than to the cap.
+    """
+    assert _disk_sim(cap, 100, 200) <= cap
+
+
+def test_step_log_keeps_data_when_the_cap_allows_it() -> None:
+    """The cap must not be satisfied by writing nothing -- that would 'pass' trivially."""
+    assert _disk_sim(1 << 20, 100, 200) > 512
