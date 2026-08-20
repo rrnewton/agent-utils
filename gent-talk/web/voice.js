@@ -1664,6 +1664,10 @@ function renderMarkdownInto(parent, raw) {
 
 function discordNode(message) {
   const li = document.createElement("li");
+  // `#56 message-hover-highlight`. A class of its own rather than styling `#discord-log li`
+  // directly: the treatment must not be able to reach `#transcript` rows, and the behavioural
+  // suite needs something on a REAL rendered row to assert the stylesheet's hook exists.
+  li.className = "discord-message";
   const meta = document.createElement("div");
   meta.className = "meta";
   const author = document.createElement("span");

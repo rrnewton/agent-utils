@@ -29,6 +29,11 @@
      because nothing else on this page is: the three states it has to be told apart from at a
      glance are green, orange and grey. */
   --paused: #9b8cf0;
+  /* `#56 message-hover-highlight`. The surface a channel row takes on under a pointer. A row rests
+     on `--panel` (web/style.css), so this has to be a visibly DIFFERENT surface rather than a hair
+     off it — and it has to be judged in DARK, because a tint that reads on white is invisible on
+     #1d2026, which is the theme the owner's devices are in. */
+  --row-hover: #262c36;
   /* THE reading column, in characters. Only the desktop regime at the foot of this file consults
      it — a phone has no room for a column and no margin to put beside one — but it is declared
      here, with the other tokens, rather than inside the media query, so that web/voice.js can set
@@ -47,6 +52,7 @@
     --ok: #1f8f4c;
     --idle: #98a1b0;
     --paused: #5b48c4;
+    --row-hover: #edf1f7;
   }
 }
 
@@ -621,6 +627,56 @@ body {
 
 .md-mention {
   color: var(--accent);
+}
+
+/* ------------------------------------------------------- one channel row at a time --------- */
+/*
+ * `#56 message-hover-highlight`. A long channel is a wall of blocks; Discord delineates the row
+ * under the pointer because a mouse gives it something to delineate WITH. That is the whole
+ * justification, and it is also the whole limit: on a touch screen there is no pointer, and a
+ * `:hover` rule fires on tap and then STAYS lit until you tap something else — a row that looks
+ * selected when nothing is.
+ *
+ * So the tint is behind `(hover: hover) and (pointer: fine)`, which asks the two questions that
+ * actually matter: can this device hover at all, and is its pointer precise. Not a width query —
+ * a touch laptop is wide and still must not get this — and not a user-agent string. This is the
+ * pointer half of the same capability regime `#55 voice-desktop-app` introduced at the foot of
+ * this file; they are deliberately two queries rather than one, because a narrow window with a
+ * mouse should still light its rows.
+ *
+ * NOT in web/style.css, which the phone app at `/` shares and where `.messages li.selected` means
+ * something else entirely.
+ */
+@media (hover: hover) and (pointer: fine) {
+  #discord-log li.discord-message:hover {
+    background: var(--row-hover);
+    border-color: var(--accent);
+  }
+
+  #discord-log li.discord-message:hover .reply-button {
+    color: var(--ink);
+    border-color: var(--accent);
+  }
+}
+
+/* The keyboard's equivalent, and deliberately UNGATED: a keyboard is not a pointer, and somebody
+   tabbing through the channel gets the same "you are here" a mouse gets, on every device. Discord's
+   principle is that the row lights up AND its actions become reachable; the actionable child is the
+   reply control `#51 reply-view` puts on the row, and `:focus-within` covers both the row and it. */
+#discord-log li.discord-message:focus-within {
+  background: var(--row-hover);
+  border-color: var(--accent);
+}
+
+/* The reply control gains the accent WITH its row rather than appearing out of nothing. Discord
+   hides its row actions until hover; this page does not, and that is a decision rather than an
+   omission — the standing rule here is that a control which cannot act is ABSENT, so a control
+   that CAN act must not be invisible. A reader who has never hovered a row still has to be able to
+   see that a reply is possible. (The hover half of this pair lives inside the query above; only
+   the focus half belongs out here.) */
+#discord-log li.discord-message:focus-within .reply-button {
+  color: var(--ink);
+  border-color: var(--accent);
 }
 
 /* The message id is the point of this view: it is what lets the operator say "that message does

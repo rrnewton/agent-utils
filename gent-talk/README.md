@@ -460,6 +460,29 @@ The `/voice` page expects the agent's output audio format to be **PCM** (`pcm_16
 default). It reads the format out of the conversation's initiation metadata and says so plainly if
 it is something it cannot decode, rather than playing noise.
 
+### One channel row at a time, but only where a pointer exists
+
+A long channel is a wall of blocks, and Discord picks out the row under the pointer because a mouse
+gives it something to pick out **with**. That is the whole justification and also the whole limit:
+on a touch screen a `:hover` rule fires on tap and then stays lit until you tap something else — a
+row that looks selected when nothing is.
+
+So the tint sits behind `@media (hover: hover) and (pointer: fine)`, which asks the two questions
+that matter: can this device hover at all, and is its pointer precise. Not a width query — a
+touchscreen laptop is wide and must not get it — and not a user-agent string. It is deliberately a
+*second* query rather than being folded into the desktop regime above, because a narrow window with
+a mouse should still pick out its rows.
+
+The keyboard's equivalent, `:focus-within`, is **ungated**: a keyboard is not a pointer, and
+somebody tabbing through the channel needs the same "you are here" on any device. The row's
+actionable child is the reply control, and hovering or focusing the row picks that out too. It is
+not *revealed* by hover the way Discord's row actions are — the standing rule on this page is that
+a control which cannot act is absent, so a control that can act must not be invisible.
+
+Contrast is the real deliverable here and no test can judge it, which is why `20-discord-hover`
+sits beside `10-discord-view` in the screenshot set: the pair is the with-and-without evidence, and
+it was reviewed in both schemes because a tint that reads on white can vanish on `#1d2026`.
+
 ### Replying from the page
 
 `POST /api/v1/channels/{id}/reply` existed from the start and, until now, had exactly one caller:
@@ -905,7 +928,7 @@ cargo run -- --config gent-talk.toml --fake-discord &
 scripts/verify-deployment.sh --url http://127.0.0.1:8080 --channel <a-configured-snowflake>
 ```
 
-315 Rust tests plus a 135-test suite for the `/voice` page: unit tests beside each module,
+315 Rust tests plus a 139-test suite for the `/voice` page: unit tests beside each module,
 end-to-end tests in `tests/api.rs` that drive the real router against the in-memory Discord, and
 `tests/mcp.rs` doing the same for the MCP endpoint. `tests/elevenlabs_mock.rs` is the one place
 the WHOLE chain runs — the real `HttpElevenLabsClient` mints against a loopback ElevenLabs
@@ -941,14 +964,14 @@ layout facts and a fixture with no layout engine has no opinion about them.
 scripts/run.sh --screenshots
 ```
 
-Photographs the `/voice` page in the nineteen states that look different — signed out, idle, live
+Photographs the `/voice` page in the twenty states that look different — signed out, idle, live
 call, muted, the agent's voice silenced, just after a hang-up, the end-of-call seam with its
 disclosure open, the clear control armed, settings, the Discord view, a long transcript parked
 mid-scroll, that same list with one folded answer opened among the closed ones, the moment a turn
 arrives while the reader is up in the history, the desktop reading column at each end of its
 range, and the two connection outcomes that used to look identical — a call suspended by the
-phone, and one that really failed — and the reply screen, with a short target and with one longer
-than the frame — at four viewports: a tall phone, a short phone, a small laptop window and a maximised
+phone, and one that really failed — the reply screen with a short target and with one longer
+than the frame, and one channel row picked out under the pointer — at four viewports: a tall phone, a short phone, a small laptop window and a maximised
 desktop. It prints the absolute path of every image so an agent can open them directly.
 
 The last two states are DESKTOP ONLY, and say so in the run: `@media (min-width: 900px) and
@@ -1000,7 +1023,7 @@ it. It measures the SAME message closed and then open — comparing the first op
 the first closed one compares two lengths rather than two states, and passed for the wrong reason
 at desktop width until it was fixed.
 
-`scripts/screenshots.py --self-test` runs 39 controls for those checks offline, with no browser and
+`scripts/screenshots.py --self-test` runs 40 controls for those checks offline, with no browser and
 no server; `scripts/test-run-sh.sh` runs them as part of its own suite. Screenshots are written to
 the gitignored `debug/screenshots/` and are never committed. Playwright and its Chromium are the
 only requirement, and a missing one fails by name with the install command.

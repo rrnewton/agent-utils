@@ -1344,6 +1344,30 @@ def _act_reply_long_target(driver: Driver) -> None:
     driver.settle(250)
 
 
+# `#56 message-hover-highlight`. The pointer half of the capability regime, and the ONLY place the
+# treatment can be looked at: the page suite can say which media query the rule sits in and nothing
+# more, because a fixture with no pointer cannot hover. `10-discord-view` is the without-hover
+# control, and the two frames side by side are the evidence.
+#
+# Desktop only, and that restriction is load-bearing rather than tidy. Chromium's `page.hover()` in
+# a `has_touch=True` context can produce a hover state, so without it this scene would run on both
+# iPhone profiles and CERTIFY a sticky hover on the device the rule exists to protect.
+
+
+def _act_discord_hover(driver: Driver) -> None:
+    _act_open_channel(driver)
+    driver.js(
+        "(() => { const rows = [...document.querySelectorAll('#discord-log li.discord-message')]; "
+        "if (rows.length < 3) throw new Error('not enough channel rows to hover one among them'); "
+        "rows[2].id = 'hover-probe'; return rows.length; })()"
+    )
+    driver.page.hover("#hover-probe")
+    driver.page.wait_for_function(
+        "() => document.getElementById('hover-probe').matches(':hover')", timeout=5_000
+    )
+    driver.settle(200)
+
+
 # Hang up is ABSENT, not disabled, whenever there is no call. Asserted as its own expectation on
 # every no-call state, because "dimmed but present" was the defect the rework removed and a
 # screenshot is the only thing that can tell the two apart.
@@ -1796,6 +1820,37 @@ SCENES: tuple[Scene, ...] = (
             ),
         ),
     ),
+    Scene(
+        name="20-discord-hover",
+        what="one channel row picked out under the pointer — the pair to 10-discord-view",
+        act=_act_discord_hover,
+        profiles=DESKTOP_PROFILES,
+        expect=(
+            ("the Discord pane is up", "window.__visible('pane-discord')"),
+            ("the pointer really is over a row", "!!document.querySelector('#hover-probe:hover')"),
+            # Pinned to the PIXEL-AFFECTING property, not to the element being hovered. Without
+            # this the state could be photographed with the rule deleted and filed as evidence of
+            # a treatment that is not there.
+            (
+                "the hovered row is a visibly different surface from its neighbours",
+                "(() => { const rows = "
+                "[...document.querySelectorAll('#discord-log li.discord-message')]; "
+                "const hot = document.getElementById('hover-probe'); "
+                "const cold = rows.find((r) => r !== hot); "
+                "return getComputedStyle(hot).backgroundColor !== "
+                "getComputedStyle(cold).backgroundColor; })()",
+            ),
+            (
+                "and its border is picked out too, not only its fill",
+                "(() => { const rows = "
+                "[...document.querySelectorAll('#discord-log li.discord-message')]; "
+                "const hot = document.getElementById('hover-probe'); "
+                "const cold = rows.find((r) => r !== hot); "
+                "return getComputedStyle(hot).borderTopColor !== "
+                "getComputedStyle(cold).borderTopColor; })()",
+            ),
+        ),
+    ),
 )
 
 
@@ -2081,7 +2136,7 @@ def check_state_controls() -> list[str]:
     """The scene table itself: an unreached state must fail by name, and none may be unguarded."""
     problems: list[str] = []
 
-    if len(SCENES) < 19:
+    if len(SCENES) < 20:
         problems.append(
             f"the scene table has only {len(SCENES)} states. The interface rework added three that "
             "are where the interesting defects now live -- the armed clear control, the seam with "
@@ -2093,7 +2148,9 @@ def check_state_controls() -> list[str]:
             "the last two: a suspended call and a failed one, which are the same close code and "
             "must not look the same -- and which nothing here photographed before, because no "
             "state above shows the error panel at all. `#51 reply-view` added the reply "
-            "screen and the same screen with a target longer than the frame."
+            "screen and the same screen with a target longer than the frame, and `#56 "
+            "message-hover-highlight` added the row picked out under a pointer -- the only place "
+            "that treatment can be looked at at all."
         )
     names = [scene.name for scene in SCENES]
     if len(set(names)) != len(names):
@@ -2109,6 +2166,10 @@ def check_state_controls() -> list[str]:
         # accept does not reach the foot of the screen, so the state would photograph a box that
         # happens to fit and file it as evidence that a long one scrolls.
         "19-reply-view-long-target": PHONE_PROFILES,
+        # `#56 message-hover-highlight`. Chromium's page.hover() in a touch context can produce a
+        # hover state, so without this the scene would run on both iPhone profiles and CERTIFY a
+        # sticky hover on the device the rule exists to protect from one.
+        "20-discord-hover": DESKTOP_PROFILES,
     }
     for name, wanted_profiles in restricted.items():
         scene = next((s for s in SCENES if s.name == name), None)
@@ -2185,6 +2246,10 @@ def check_state_controls() -> list[str]:
         # is not simply "a form is on screen". 19 is pinned to the target overflowing its own box.
         "18-reply-view": "__returnedTo",
         "19-reply-view-long-target": "scrollHeight > t.clientHeight",
+        # `#56 message-hover-highlight`. Pinned to the pixel-affecting property. Pinning it to the
+        # row being hovered would be satisfied with the rule deleted, which is the whole failure
+        # this state exists to catch -- there is nothing else in the repository that can see it.
+        "20-discord-hover": "backgroundColor",
     }
     for name, needle in required.items():
         required_scene = next((s for s in SCENES if s.name == name), None)
@@ -2449,6 +2514,7 @@ SELF_TEST_CHECKS = (
     "the failed state is pinned to its presence, so silencing errors cannot pass",
     "the reply state is pinned to the scroll round trip, not to the form being on screen",
     "the long-target state is pinned to the target really overflowing its own box",
+    "the hover state is pinned to the rendered colour, not to the row being hovered",
     "dark is the default theme, and both schemes stay capturable",
     "each theme really sets color_scheme on the browser context",
     "a non-PNG file is rejected",

@@ -37,6 +37,10 @@ const WEB = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "web");
 const SCRIPT = readFileSync(join(WEB, "voice.js"), "utf8");
 const HTML = readFileSync(join(WEB, "voice.html"), "utf8");
 const CSS = readFileSync(join(WEB, "voice.css"), "utf8");
+// The SHARED sheet, which this page is layered on and does not own. Read only so that a claim
+// about a colour differing from the resting one can be checked against the resting one, rather
+// than against a restatement of it here — `#56 message-hover-highlight`.
+const SHARED_CSS = readFileSync(join(WEB, "style.css"), "utf8");
 
 /**
  * The same files with their comments removed.
@@ -161,8 +165,54 @@ function cssWithout(query) {
 const cssBlockOutside = (query, selector) => cssRules(cssWithout(query), selector).join("\n");
 const cssRulesElsewhere = (query, selector) => cssRules(cssWithout(query), selector).length;
 
+/**
+ * The stylesheet with EVERY `@media` body removed: the rules that apply on every device.
+ *
+ * `cssWithout` above takes out one named query, which is enough to say "not also declared for
+ * everybody" and not enough to say "declared for everybody" — a rule moved into a SECOND block of
+ * the same query, or into any other query, satisfies the first and fails the second. That is not
+ * hypothetical: it is the mutation that slipped through the first version of these tests.
+ */
+const CSS_UNCONDITIONAL = (() => {
+  let out = "";
+  let at = 0;
+  for (;;) {
+    const start = CSS_CODE.indexOf("@media", at);
+    if (start < 0) {
+      return out + CSS_CODE.slice(at);
+    }
+    out += CSS_CODE.slice(at, start);
+    let depth = 0;
+    let i = CSS_CODE.indexOf("{", start);
+    for (; i < CSS_CODE.length; i += 1) {
+      if (CSS_CODE[i] === "{") {
+        depth += 1;
+      } else if (CSS_CODE[i] === "}") {
+        depth -= 1;
+        if (depth === 0) {
+          break;
+        }
+      }
+    }
+    at = i + 1;
+  }
+})();
+
 /** The one capability query the desktop composition lives in. Stated once, used by several tests. */
 const DESKTOP_QUERY = "(min-width: 900px) and (pointer: fine)";
+
+/** ...and the one the hover treatment lives in. Two queries on purpose: see web/voice.css. */
+const HOVER_QUERY = "(hover: hover) and (pointer: fine)";
+
+/**
+ * Every value a custom property is given in a stylesheet, in file order.
+ *
+ * Both sheets declare the dark value in their first `:root` and the light one inside
+ * `@media (prefers-color-scheme: light)`, in that order, so the pair reads [dark, light]. Used to
+ * compare a colour against one declared in the OTHER file rather than against a copy of it.
+ */
+const tokenValues = (text, name) =>
+  [...text.matchAll(new RegExp(`${name}:\\s*([^;]+);`, "g"))].map((m) => m[1].trim());
 
 // --- a very small layout model --------------------------------------------------------------
 //
@@ -3187,6 +3237,91 @@ test("a Discord read that fails reports itself and does NOT hang up on you", asy
 // enforces that, and it is written as an exact-object comparison on purpose — a `match` or a
 // property-by-property check would let an extra constraint through, and "we started sending one
 // more thing to getUserMedia" is precisely the regression that would be invisible from the page.
+
+// --- one channel row at a time --------------------------------------------------------------
+//
+// `#56 message-hover-highlight`. The fixture has no pointer and no renderer, so it cannot see a
+// hover happen. What it CAN decide is the property that actually matters — which query the rule
+// sits in — and that is the only place in the repository where "no sticky hover on a phone" can be
+// checked at all. The screenshots are the other half: `20-discord-hover` beside `10-discord-view`
+// is the with-and-without pair.
+
+test("every rendered channel row carries the hook the hover rule depends on", async () => {
+  const page = newPage();
+  await signIn(page);
+
+  const lines = await showDiscord(page, [
+    message({ id: "1", content: "one" }),
+    message({ id: "2", content: "two" }),
+  ]);
+
+  assert.equal(lines.length, 2);
+  for (const li of lines) {
+    assert.ok(
+      li.className.split(/\s+/).includes("discord-message"),
+      `a rendered channel row has className ${JSON.stringify(li.className)}, so the stylesheet's ` +
+        "hook is on nothing at all"
+    );
+  }
+});
+
+test("A TAPPED ROW CANNOT STAY LIT: the hover tint is behind a pointer query", async () => {
+  // The property. `:hover` on a touch screen fires on tap and stays until the next tap somewhere
+  // else — a row that looks selected when nothing is. Being INSIDE the query is only half of it;
+  // the other half is not being anywhere else, because a page that declares the rule twice is a
+  // page where the phone gets it.
+  const selector = "#discord-log li.discord-message:hover";
+  const tint = cssBlockIn(HOVER_QUERY, selector);
+  assert.match(tint, /background:\s*var\(--row-hover\)/);
+  assert.match(tint, /border-color:\s*var\(--accent\)/, "the tint alone is not a delineation");
+  assert.equal(
+    cssRulesElsewhere(HOVER_QUERY, selector),
+    0,
+    "the hover rule is ALSO declared outside the pointer query, so a phone gets it too"
+  );
+  // And the query asks the two questions that matter, not a width — a touch laptop is wide.
+  assert.equal(
+    (CSS_CODE.match(new RegExp(`@media ${HOVER_QUERY.replace(/[()]/g, "\\$&")}`, "g")) || []).length,
+    1,
+    "the pointer regime is declared in more than one block, so `cssBlockIn` is only reading the " +
+      "first of them and everything below is about half the rules"
+  );
+  assert.doesNotMatch(
+    mediaBody(HOVER_QUERY),
+    /#transcript/,
+    "the row treatment reached the voice transcript, which has two speakers and no rows to pick out"
+  );
+});
+
+test("the hovered surface is really a DIFFERENT surface, in both schemes", async () => {
+  // Checked against `--panel` as web/style.css declares it, not against a copy of it here: a tint
+  // a hair off the resting colour is a rule that runs and cannot be seen, which is the failure
+  // mode this treatment actually has.
+  const resting = tokenValues(SHARED_CSS, "--panel");
+  const hovered = tokenValues(CSS, "--row-hover");
+  assert.equal(resting.length, 2, "web/style.css no longer declares --panel for both schemes");
+  assert.equal(hovered.length, 2, "--row-hover is missing a colour scheme, so one of them is blank");
+  for (const [i, scheme] of ["dark", "light"].entries()) {
+    assert.notEqual(
+      hovered[i].toLowerCase(),
+      resting[i].toLowerCase(),
+      `in ${scheme} the hovered row is the same colour as a resting one`
+    );
+  }
+});
+
+test("a keyboard gets the same affordance, on every device", async () => {
+  // Ungated on purpose: a keyboard is not a pointer. Somebody tabbing through the channel on a
+  // phone with a keyboard attached still needs to know which row they are on.
+  const selector = "#discord-log li.discord-message:focus-within";
+  const focused = cssRules(CSS_UNCONDITIONAL, selector).join("\n");
+  assert.ok(
+    focused,
+    "the focus treatment is behind SOME media query, so a keyboard on the wrong device never gets it"
+  );
+  assert.match(focused, /background:\s*var\(--row-hover\)/, "focus gets no treatment at all");
+  assert.match(focused, /border-color:\s*var\(--accent\)/);
+});
 
 // --- replying to a channel message ---------------------------------------------------------------
 //
