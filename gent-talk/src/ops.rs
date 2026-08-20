@@ -51,6 +51,9 @@ pub enum OpError {
     /// The durable state store failed, or is not configured at all.
     #[error(transparent)]
     Store(#[from] crate::store::StoreError),
+    /// The summariser could not produce a summary.
+    #[error(transparent)]
+    Summarizer(#[from] crate::summarize::SummaryError),
 }
 
 impl OpError {
@@ -67,6 +70,7 @@ impl OpError {
             Self::Discord(DiscordError::Refused(_)) => "refused",
             Self::Discord(_) => "discord_error",
             Self::Store(inner) => inner.code(),
+            Self::Summarizer(inner) => inner.code(),
         }
     }
 }
@@ -631,6 +635,114 @@ pub async fn forget_read_mark(state: &AppState, channel_id: &str) -> Result<Chan
     let channel = allowed(state, channel_id)?;
     state.store.forget_read_mark(&channel.id).await?;
     Ok(channel)
+}
+
+/// What happened when a summary was asked for.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case", tag = "state", content = "summary")]
+pub enum SummaryOutcome {
+    /// The message was short enough to read as it is; nothing was generated and nothing was
+    /// cached. Distinguished from a summary on purpose: a page must be able to show the original
+    /// rather than a shortened copy of something that was already short.
+    BelowThreshold,
+    /// Served from the store, under the current policy.
+    Cached(String),
+    /// Generated now, and filed.
+    Generated(String),
+}
+
+impl SummaryOutcome {
+    /// The summary text, when there is one.
+    #[must_use]
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            Self::BelowThreshold => None,
+            Self::Cached(text) | Self::Generated(text) => Some(text),
+        }
+    }
+}
+
+/// One message, summarised — from the cache when the policy and the text are unchanged. Read
+/// scope.
+///
+/// The ORDER here is load-bearing and is the whole of the issue's first requirement: the
+/// threshold is checked BEFORE the cache and before the summariser, so a short message costs
+/// neither a lookup nor a call. Then the cache, then the summariser, then the write.
+///
+/// The summariser is a model being fed channel text, so the request is built through
+/// [`crate::untrusted`] exactly as the MCP path is. A summary is not exempt from the boundary for
+/// being short.
+///
+/// # Errors
+///
+/// [`OpError::UnknownChannel`] outside the allowlist; [`OpError::UnknownMessage`] when the
+/// message is not in the fetched window; [`OpError::Discord`] when the fetch fails;
+/// [`OpError::Summarizer`] when the summariser refuses. A store that is unavailable is NOT an
+/// error here — see below.
+pub async fn summarize_message(
+    state: &AppState,
+    channel_id: &str,
+    message_id: &str,
+    limit: Option<u16>,
+) -> Result<(ChannelInfo, SummaryOutcome), OpError> {
+    let window = messages(state, channel_id, limit).await?;
+    let position = window
+        .messages
+        .iter()
+        .position(|m| m.id.as_str() == message_id)
+        .ok_or(OpError::UnknownMessage)?;
+    let target = &window.messages[position];
+
+    if target.content.chars().count() < state.config.summaries.threshold_chars {
+        return Ok((window.channel.clone(), SummaryOutcome::BelowThreshold));
+    }
+
+    let key = crate::store::SummaryKey {
+        channel: window.channel.id.clone(),
+        message: target.id.clone(),
+        content_hash: crate::summarize::content_hash(&target.content),
+        version: state.summary_version.to_string(),
+    };
+    // A store that is absent or broken degrades to "generate every time", loudly in the log and
+    // silently to the caller. The alternative — refusing to summarise because the CACHE is not
+    // configured — would make an optional durability feature a hard dependency of a read.
+    match state.store.cached_summary(&key).await {
+        Ok(Some(hit)) => return Ok((window.channel.clone(), SummaryOutcome::Cached(hit))),
+        Ok(None) => {}
+        Err(error) => tracing::warn!(%error, "summary cache unreadable; generating uncached"),
+    }
+
+    let start = position.saturating_sub(state.config.summaries.context_messages);
+    let context = &window.messages[start..position];
+    let request = crate::summarize::SummaryRequest {
+        target,
+        context,
+        target_chars: state.config.summaries.target_chars,
+    };
+    let generated = state.summarizer.summarize(&request).await?;
+    if let Err(error) = state.store.cache_summary(&key, &generated).await {
+        tracing::warn!(%error, "summary could not be cached; it will be generated again");
+    }
+    Ok((window.channel, SummaryOutcome::Generated(generated)))
+}
+
+/// What a summariser is actually shown.
+///
+/// Separated from [`summarize_message`] so it is testable on its own, and so there is exactly one
+/// place where channel text is framed for a model on this path. The preamble sits OUTSIDE the
+/// fence; everything written by another party sits inside it.
+#[must_use]
+pub fn summary_prompt(request: &crate::summarize::SummaryRequest<'_>) -> String {
+    let mut out = String::from(crate::summarize::PROMPT);
+    out.push_str("\n\n");
+    if !request.context.is_empty() {
+        out.push_str("Earlier in the same channel, for context only:\n");
+        out.push_str(&crate::untrusted::render_for_model(request.context));
+        out.push_str("\n\n");
+    }
+    out.push_str("The message to summarise:\n");
+    out.push_str(&crate::untrusted::fenced(&request.target.content));
+    out
 }
 
 #[cfg(test)]

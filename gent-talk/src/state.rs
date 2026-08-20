@@ -9,6 +9,7 @@ use crate::elevenlabs::SignedUrlProvider;
 use crate::model::{ChannelId, ChannelInfo};
 use crate::retrieval::Ranker;
 use crate::store::StateStore;
+use crate::summarize::Summarizer;
 
 /// Everything a request handler needs.
 #[derive(Clone)]
@@ -23,6 +24,17 @@ pub struct AppState {
     pub elevenlabs: Arc<dyn SignedUrlProvider>,
     /// Slow-path backend (absent in v0).
     pub agent: Arc<dyn AgentBackend>,
+    /// Turns one long channel message into one short line.
+    ///
+    /// Behind a trait for the same reason the store is: the shipped implementation is extractive
+    /// truncation, and the point is that a model can replace it without a call site changing.
+    /// [`crate::summarize::Summarizer::describe`] is reported to the caller so a page can never
+    /// imply a model summary it did not get.
+    pub summarizer: Arc<dyn Summarizer>,
+    /// The policy every cached summary is filed under. Computed once at startup from
+    /// [`crate::summarize::policy_version`], because recomputing it per request is how the two
+    /// halves of a cache key drift apart.
+    pub summary_version: Arc<str>,
     /// The one place this server keeps anything between restarts.
     ///
     /// Reached only through the trait, never as a concrete database, so the backend can be

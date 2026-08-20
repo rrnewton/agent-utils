@@ -36,6 +36,7 @@ pub mod probe;
 pub mod retrieval;
 pub mod state;
 pub mod store;
+pub mod summarize;
 pub mod summary;
 pub mod testing;
 pub mod untrusted;

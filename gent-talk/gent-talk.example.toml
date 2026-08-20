@@ -110,3 +110,22 @@ writable = false
 # max_conversations = 50            # oldest dropped first; at least 1
 # max_turns_per_conversation = 1000 # further turns are refused with 413; at least 1
 # retain_days = 30                  # 0 means no age limit
+
+[summaries]
+# How a long channel message is turned into one short line. EVERY setting here is folded into the
+# cache key (see src/summarize/policy_version), so changing any of them makes every summary
+# produced under the old settings unreachable at once and a startup sweep deletes them. That is
+# the intent: a changed instruction is a changed summary, and serving the old text would be worse
+# than regenerating.
+#
+# threshold_chars: below this a message is not summarised at all — it is already short enough to
+# read, and it must be at least target_chars or the "summary" comes back longer than the original.
+# threshold_chars = 400
+# target_chars = 160
+# context_messages = 3        # how many preceding messages ride along as context
+#
+# The model to ask. Unset means the shipped extractive backend: truncation, no model, no network,
+# no cost. The server says which one it is using at startup, and every summary answer carries the
+# backend name, so a page can never imply a model summary it did not get.
+# Environment: GENT_TALK_SUMMARY_MODEL
+# model = "..."

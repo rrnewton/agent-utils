@@ -130,6 +130,26 @@ impl FakeDiscord {
         at
     }
 
+    /// Rewrite the content of a message already seeded, as an upstream EDIT would.
+    ///
+    /// Discord messages are editable and the id does not change, so anything derived from a
+    /// message's TEXT — `#49 cached-summaries`, in particular — has to be able to notice. Without
+    /// this the only way to get different text is a different id, and a cache keyed on the id
+    /// alone would pass that test while serving a stale summary forever.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no such message was seeded, which is a mistake in the test that called it.
+    pub fn edit(&self, id: &MessageId, content: &str) {
+        let mut state = self.lock();
+        let message = state
+            .messages
+            .iter_mut()
+            .find(|m| m.id == *id)
+            .unwrap_or_else(|| panic!("no seeded message {id}"));
+        message.content = content.to_owned();
+    }
+
     /// The snowflake this fake assigned to `author`, if it has ever seen them speak.
     ///
     /// Deliberately NOT a general directory: a name this fake has never seen has no id, exactly

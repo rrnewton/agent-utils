@@ -301,6 +301,35 @@ async fn main() -> anyhow::Result<()> {
          logged; message content is DEBUG only."
     );
 
+    // Say WHICH summariser is running, and under which policy version. A page that reported
+    // "summarised" without this could imply a model answer produced by truncation, and the
+    // version is what a person with a shell greps the cache by when they suspect a stale entry.
+    let summarizer: Arc<dyn gent_talk::summarize::Summarizer> =
+        Arc::new(gent_talk::summarize::extractive::ExtractiveSummarizer);
+    let summary_version = gent_talk::summarize::policy_version(
+        &config.summaries,
+        gent_talk::summarize::extractive::BACKEND,
+    );
+    tracing::info!(
+        backend = summarizer.describe(),
+        version = summary_version,
+        threshold_chars = config.summaries.threshold_chars,
+        target_chars = config.summaries.target_chars,
+        "summaries are produced by this backend under this policy version; every cached summary \
+         is filed under the version, so changing any summary setting makes the old ones \
+         unreachable at once"
+    );
+    // The sweep. Without it a changed policy leaves the old entries on disk forever: unreachable,
+    // invisible, and still a copy of other people's text at rest.
+    match store.forget_summaries_except(&summary_version).await {
+        Ok(0) => {}
+        Ok(swept) => tracing::info!(
+            swept,
+            "deleted cached summaries produced under an older policy"
+        ),
+        Err(error) => tracing::debug!(%error, "no summary cache to sweep"),
+    }
+
     let bind = config.bind;
     let elevenlabs: Arc<dyn SignedUrlProvider> =
         Arc::new(HttpElevenLabsClient::new().context("building the ElevenLabs client")?);
@@ -311,6 +340,8 @@ async fn main() -> anyhow::Result<()> {
         agent: Arc::new(NoAgentBackend),
         elevenlabs,
         store,
+        summarizer,
+        summary_version: summary_version.into(),
     };
     let app = gent_talk::http::router(state);
 

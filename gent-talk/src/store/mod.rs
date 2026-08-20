@@ -235,6 +235,29 @@ pub struct ReadMark {
     pub marked_at_ms: i64,
 }
 
+/// What one cached summary is filed under.
+///
+/// Four parts, and each one answers a different way the entry can go stale:
+///
+/// * `version` — the whole summarisation policy, from [`crate::summarize::policy_version`].
+///   Changing the prompt, the model, the width or the context window makes every old entry
+///   unreachable at once, and a startup sweep collects the directories they were in.
+/// * `channel` and `message` — which message it is about.
+/// * `content_hash` — the message TEXT. An upstream edit changes this and nothing else, so it
+///   invalidates one entry rather than the whole cache. An upstream DELETE simply orphans the
+///   entry, which is what the sweep is for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SummaryKey {
+    /// The channel the message is in.
+    pub channel: ChannelId,
+    /// The message summarised.
+    pub message: MessageId,
+    /// A change detector over the message text. See [`crate::summarize::content_hash`].
+    pub content_hash: u64,
+    /// The summarisation policy in force when this was produced.
+    pub version: String,
+}
+
 /// Bounds on how much the store keeps.
 ///
 /// Unbounded retention is the failure this exists to prevent: a transcript store that grows
@@ -400,6 +423,37 @@ pub trait StateStore: Send + Sync {
     ///
     /// [`StoreError::NotFound`] when there was no mark, plus the errors above.
     async fn forget_read_mark(&self, channel: &ChannelId) -> Result<(), StoreError>;
+
+    /// The summary already produced for this exact key, if there is one.
+    ///
+    /// A miss is `Ok(None)`, never an error: not having summarised something yet is the normal
+    /// case, not a failure.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on a read
+    /// failure.
+    async fn cached_summary(&self, key: &SummaryKey) -> Result<Option<String>, StoreError>;
+
+    /// File a summary under its key, replacing any entry already there.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on a
+    /// write failure.
+    async fn cache_summary(&self, key: &SummaryKey, summary: &str) -> Result<(), StoreError>;
+
+    /// Delete every cached summary produced under a policy other than `version`, returning how
+    /// many went.
+    ///
+    /// Run at startup. Without it a changed policy leaves the old entries on disk forever:
+    /// unreachable, invisible, and still a copy of other people's text at rest.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on a
+    /// write failure.
+    async fn forget_summaries_except(&self, version: &str) -> Result<u64, StoreError>;
 
     /// Erase everything this store holds.
     ///

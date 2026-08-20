@@ -42,6 +42,9 @@ pub const ENV_TIMEZONE: &str = "GENT_TALK_TIMEZONE";
 /// See [`crate::store`].
 pub const ENV_STORAGE_PATH: &str = "GENT_TALK_STORAGE_PATH";
 
+/// Environment variable overriding the model a summariser is asked for.
+pub const ENV_SUMMARY_MODEL: &str = "GENT_TALK_SUMMARY_MODEL";
+
 /// Shortest API token this server will accept.
 ///
 /// These tokens are the ONLY thing between the public internet and a bot that can post to the
@@ -112,7 +115,49 @@ pub struct Config {
     pub elevenlabs: ElevenLabsConfig,
     /// Durable state: where it lives, and how much of it is kept.
     pub storage: StorageConfig,
+    /// Summarisation policy. Every field is part of the cache key; see
+    /// [`crate::summarize::policy_version`].
+    pub summaries: SummariesConfig,
 }
+
+/// What a summary is, in numbers.
+///
+/// **Every field here changes what a summary says**, so every field is folded into
+/// [`crate::summarize::policy_version`] and therefore into the cache key. A field added later
+/// without a line in that function is a field the cache cannot see, and the unit test over it is
+/// what catches that.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SummariesConfig {
+    /// Below this many characters a message is not summarised at all — it is already short
+    /// enough to read, and summarising it would spend a model call to produce something longer
+    /// than the original.
+    pub threshold_chars: usize,
+    /// How long a summary should be.
+    pub target_chars: usize,
+    /// How many preceding messages ride along as context.
+    pub context_messages: usize,
+    /// The model to ask, when a model backend is configured. `None` means the extractive default.
+    pub model: Option<String>,
+}
+
+impl Default for SummariesConfig {
+    fn default() -> Self {
+        Self {
+            threshold_chars: DEFAULT_SUMMARY_THRESHOLD_CHARS,
+            target_chars: crate::summary::DEFAULT_SUMMARY_CHARS,
+            context_messages: DEFAULT_SUMMARY_CONTEXT_MESSAGES,
+            model: None,
+        }
+    }
+}
+
+/// Below this, a message is left alone.
+pub const DEFAULT_SUMMARY_THRESHOLD_CHARS: usize = 400;
+/// How many preceding messages ride along as context by default.
+///
+/// Three, and the honest note is that there is no offline oracle for this number: it was chosen,
+/// not measured. It is configuration precisely so a deployment can disagree.
+pub const DEFAULT_SUMMARY_CONTEXT_MESSAGES: usize = 3;
 
 /// Where durable state lives, and how much of it is kept.
 ///
@@ -224,6 +269,8 @@ struct FileConfig {
     elevenlabs: FileElevenLabs,
     #[serde(default)]
     storage: FileStorage,
+    #[serde(default)]
+    summaries: FileSummaries,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -266,6 +313,15 @@ struct FileElevenLabs {
     agent_id: Option<String>,
     api_key: Option<Secret>,
     api_base: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileSummaries {
+    threshold_chars: Option<usize>,
+    target_chars: Option<usize>,
+    context_messages: Option<usize>,
+    model: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -423,6 +479,7 @@ impl Config {
         }
 
         let storage = storage_config(get(ENV_STORAGE_PATH), file.storage)?;
+        let summaries = summaries_config(get(ENV_SUMMARY_MODEL), file.summaries)?;
 
         Ok(Self {
             bind,
@@ -458,8 +515,47 @@ impl Config {
                     .unwrap_or_else(|| DEFAULT_ELEVENLABS_API_BASE.to_owned()),
             },
             storage,
+            summaries,
         })
     }
+}
+
+/// Resolve the `[summaries]` section.
+fn summaries_config(
+    model_from_env: Option<&str>,
+    file: FileSummaries,
+) -> Result<SummariesConfig, ConfigError> {
+    let defaults = SummariesConfig::default();
+    let summaries = SummariesConfig {
+        threshold_chars: file.threshold_chars.unwrap_or(defaults.threshold_chars),
+        target_chars: file.target_chars.unwrap_or(defaults.target_chars),
+        context_messages: file.context_messages.unwrap_or(defaults.context_messages),
+        model: model_from_env
+            .map(str::to_owned)
+            .or(file.model)
+            .map(|m| m.trim().to_owned())
+            .filter(|m| !m.is_empty()),
+    };
+    if summaries.target_chars == 0 {
+        return Err(ConfigError::Invalid {
+            field: "summaries.target_chars".to_owned(),
+            detail: "must be at least 1, or every summary is the empty string".to_owned(),
+        });
+    }
+    if summaries.threshold_chars < summaries.target_chars {
+        // Otherwise the summary of a message just over the threshold is LONGER than the message,
+        // which is a cost with a negative benefit and reads on screen as the page padding things
+        // out.
+        return Err(ConfigError::Invalid {
+            field: "summaries.threshold_chars".to_owned(),
+            detail: format!(
+                "{} is below summaries.target_chars {}, so a summarised message would come back \
+                 longer than it started",
+                summaries.threshold_chars, summaries.target_chars
+            ),
+        });
+    }
+    Ok(summaries)
 }
 
 /// Resolve the `[storage]` section.
@@ -934,6 +1030,45 @@ writable = true
         assert!(
             matches!(err, ConfigError::Parse(_)),
             "a misspelled key must not silently leave storage off: {err}"
+        );
+    }
+
+    #[test]
+    fn the_summary_policy_defaults_and_is_configurable() {
+        let cfg = Config::from_toml_and_env(FULL, &env(&[])).expect("valid config");
+        assert_eq!(cfg.summaries, SummariesConfig::default());
+
+        let text = format!(
+            "{FULL}\n[summaries]\nthreshold_chars = 500\ntarget_chars = 80\n\
+             context_messages = 1\nmodel = \"some-model\"\n"
+        );
+        let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("valid config");
+        assert_eq!(cfg.summaries.threshold_chars, 500);
+        assert_eq!(cfg.summaries.target_chars, 80);
+        assert_eq!(cfg.summaries.context_messages, 1);
+        assert_eq!(cfg.summaries.model.as_deref(), Some("some-model"));
+
+        let cfg = Config::from_toml_and_env(&text, &env(&[(ENV_SUMMARY_MODEL, "from-env")]))
+            .expect("valid config");
+        assert_eq!(cfg.summaries.model.as_deref(), Some("from-env"));
+    }
+
+    #[test]
+    fn a_summary_longer_than_the_message_it_replaces_is_refused() {
+        // Otherwise a message just over the threshold comes back LONGER than it started, which is
+        // a cost with a negative benefit and reads on screen as the page padding things out.
+        let text = format!("{FULL}\n[summaries]\nthreshold_chars = 50\ntarget_chars = 160\n");
+        let err = Config::from_toml_and_env(&text, &env(&[])).expect_err("must refuse");
+        assert!(
+            matches!(&err, ConfigError::Invalid { field, .. } if field == "summaries.threshold_chars"),
+            "unexpected error: {err}"
+        );
+
+        let text = format!("{FULL}\n[summaries]\ntarget_chars = 0\n");
+        let err = Config::from_toml_and_env(&text, &env(&[])).expect_err("must refuse");
+        assert!(
+            matches!(&err, ConfigError::Invalid { field, .. } if field == "summaries.target_chars"),
+            "unexpected error: {err}"
         );
     }
 

@@ -138,11 +138,46 @@ fn state_pieces(
     Arc<FakeElevenLabs>,
     Arc<dyn crate::store::StateStore>,
 ) {
+    state_pieces_with(
+        text,
+        store,
+        Arc::new(crate::summarize::fake::FakeSummarizer::new()),
+    )
+}
+
+/// A server whose summariser is one the caller can count calls on.
+#[must_use]
+pub fn state_with_summarizer(
+    text: &str,
+) -> (
+    AppState,
+    Arc<FakeDiscord>,
+    Arc<FakeStore>,
+    Arc<crate::summarize::fake::FakeSummarizer>,
+) {
+    let store = Arc::new(FakeStore::new());
+    let summarizer = Arc::new(crate::summarize::fake::FakeSummarizer::new());
+    let (state, discord, _elevenlabs, _erased) =
+        state_pieces_with(text, store.clone(), summarizer.clone());
+    (state, discord, store, summarizer)
+}
+
+fn state_pieces_with(
+    text: &str,
+    store: Arc<dyn crate::store::StateStore>,
+    summarizer: Arc<dyn crate::summarize::Summarizer>,
+) -> (
+    AppState,
+    Arc<FakeDiscord>,
+    Arc<FakeElevenLabs>,
+    Arc<dyn crate::store::StateStore>,
+) {
     let fake = Arc::new(FakeDiscord::new());
     fake.register_channel(&crate::model::ChannelId(READ_CHANNEL.to_owned()));
     fake.register_channel(&crate::model::ChannelId(WRITE_CHANNEL.to_owned()));
     let elevenlabs = Arc::new(FakeElevenLabs::new());
     let config = Config::from_toml_and_env(text, &BTreeMap::new()).expect("test config is valid");
+    let config_for_version = config.summaries.clone();
     let state = AppState {
         config: Arc::new(config),
         discord: fake.clone(),
@@ -150,6 +185,12 @@ fn state_pieces(
         agent: Arc::new(NoAgentBackend),
         elevenlabs: elevenlabs.clone(),
         store: Arc::clone(&store),
+        summarizer: Arc::clone(&summarizer),
+        summary_version: crate::summarize::policy_version(
+            &config_for_version,
+            crate::summarize::extractive::BACKEND,
+        )
+        .into(),
     };
     (state, fake, elevenlabs, store)
 }

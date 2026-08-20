@@ -117,6 +117,13 @@ impl From<OpError> for ApiError {
             OpError::ChannelNotWritable => StatusCode::FORBIDDEN,
             OpError::Discord(inner) => return Self::from(inner),
             OpError::Store(inner) => return Self::from(inner),
+            OpError::Summarizer(inner) => {
+                let code = inner.code();
+                // 503 for both: a summariser that is not configured and one that cannot be
+                // reached are equally "this server cannot do this right now", and neither is the
+                // caller's fault. The CODE tells them apart, which is what a client branches on.
+                return Self::new(StatusCode::SERVICE_UNAVAILABLE, code, inner.to_string());
+            }
         };
         Self::new(status, code, value.to_string())
     }
@@ -943,6 +950,51 @@ pub async fn forget_read_mark(
         "channel": channel,
         "read_state_notice": crate::store::INBOX_NOTICE,
     }))))
+}
+
+/// One message, summarised.
+#[derive(Debug, Serialize)]
+pub struct MessageSummaryResponse {
+    /// The channel it came from.
+    pub channel: ChannelInfo,
+    /// The message it is about.
+    pub message_id: String,
+    /// Whether it was below the threshold, served from the cache, or generated now. A page shows
+    /// the original for `below_threshold`; a shortened copy of something already short would be
+    /// a claim that work was done.
+    #[serde(flatten)]
+    pub outcome: ops::SummaryOutcome,
+    /// Which backend produced it, said out loud so a page can never imply a model summary it did
+    /// not get.
+    pub backend: &'static str,
+    /// The cache key's policy component. Changes the moment any setting that decides what a
+    /// summary says changes.
+    pub version: String,
+    /// The length below which nothing is summarised, so a client can avoid asking at all.
+    pub threshold_chars: usize,
+    /// Standing reminder that a summary of third-party text is still third-party text.
+    pub untrusted_content_notice: &'static str,
+}
+
+/// `GET /api/v1/channels/{channel_id}/messages/{message_id}/summary`
+pub async fn message_summary(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((channel_id, message_id)): Path<(String, String)>,
+    Query(query): Query<LimitQuery>,
+) -> Result<Json<MessageSummaryResponse>, ApiError> {
+    require(&headers, &state, Scope::Read)?;
+    let (channel, outcome) =
+        ops::summarize_message(&state, &channel_id, &message_id, query.limit).await?;
+    Ok(Json(MessageSummaryResponse {
+        channel,
+        message_id,
+        outcome,
+        backend: state.summarizer.describe(),
+        version: state.summary_version.to_string(),
+        threshold_chars: state.config.summaries.threshold_chars,
+        untrusted_content_notice: untrusted::NOTICE,
+    }))
 }
 
 /// Answer with `Cache-Control: no-store`.

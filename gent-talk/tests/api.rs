@@ -110,6 +110,11 @@ async fn every_api_route_refuses_an_unauthenticated_caller() {
             None,
         ),
         (
+            "GET",
+            format!("/api/v1/channels/{WRITE_CHANNEL}/messages/1000000000000000001/summary"),
+            None,
+        ),
+        (
             "POST",
             format!("/api/v1/channels/{WRITE_CHANNEL}/resolve"),
             Some(serde_json::json!({"query": "anything"})),

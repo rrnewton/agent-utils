@@ -311,6 +311,10 @@ curl -s -X POST localhost:8080/mcp \
 | Conversations kept | `storage.max_conversations` | — | default `50`, oldest dropped first |
 | Turns per conversation | `storage.max_turns_per_conversation` | — | default `1000`, then `413` |
 | Retention age | `storage.retain_days` | — | default `30`; `0` means no age limit |
+| Summary threshold | `summaries.threshold_chars` | — | below this nothing is summarised, default `400` |
+| Summary width | `summaries.target_chars` | — | default `160` |
+| Summary context | `summaries.context_messages` | — | preceding messages shown as context, default `3` |
+| Summary model | `summaries.model` | `GENT_TALK_SUMMARY_MODEL` | unset means the extractive backend |
 | Config file path | — | `GENT_TALK_CONFIG` | or `--config` |
 
 Environment wins over file. An empty environment variable is treated as unset, so a runtime that
@@ -383,6 +387,30 @@ plus Discord text written by third parties.
 * Conversation ids are validated against `[A-Za-z0-9_-]{1,64}` before they are used as a key,
   because they arrive from the vendor and from the browser.
 
+### Cached summaries
+
+`src/summarize/` is a second trait over the same store. The shipped backend is extractive —
+truncation, no model, no network, no cost — and the server says which one is running at startup;
+every summary answer carries the backend name, so a page can never imply a model summary it did
+not get.
+
+What is actually load-bearing here is the **cache key**, because a cached derived value has one
+failure mode and it is silent. Five things decide what a summary says: the prompt, the model, the
+width, the context window, and the message text. The first four are folded into
+`summarize::policy_version` — one function, one string, part of every key — so changing any of
+them makes every summary produced under the old policy unreachable at once, and a startup sweep
+deletes the entries. The fifth is a separate `content_hash`, so an upstream **edit** invalidates
+one entry rather than the whole cache.
+
+The version is deliberately legible (`v1-extractive-w3-c160-8f1b…`), because a stale entry is
+diagnosed by someone with a shell. It is FNV-1a and is **not** a security hash: it detects a
+configuration change, and nothing more.
+
+A summariser is a model being fed channel text, so the request goes through `src/untrusted.rs`
+exactly as the MCP path does — the instruction outside the fence, the message inside it. Being
+short is not an exemption. A cached summary is a second at-rest copy of other people's text under
+the same file, with the same `0600`, and it goes with the rest on a purge.
+
 ### Migrations
 
 `src/store/sqlite.rs` holds an append-only `MIGRATIONS` list and records progress in SQLite's
@@ -440,6 +468,7 @@ not, and neither reveals anything about the configuration.
 | GET | `/api/v1/channels/{id}/messages?limit=` | read | full scrollback, oldest first |
 | GET | `/api/v1/channels/{id}/messages/{message_id}` | read | one message in full |
 | GET | `/api/v1/channels/{id}/digest?limit=&width=` | read | one speakable line per message |
+| GET | `/api/v1/channels/{id}/messages/{message_id}/summary` | read | one message summarised, from cache when it can be |
 | GET | `/api/v1/channels/{id}/page?limit=&before=&since=&until=` | read | **one step of a walk**, saying that it is one |
 | GET | `/api/v1/channels/{id}/count?since=&cap=` | read | a bounded, honest count |
 | POST | `/api/v1/channels/{id}/resolve` | read | **semantic random access** |
@@ -1246,6 +1275,7 @@ src/mcp/mod.rs        the tool manifest and per-tool approval policy
 src/mcp/protocol.rs   JSON-RPC 2.0 and the MCP method set
 src/mcp/transport.rs  the Streamable HTTP endpoint at /mcp
 src/store/            the StateStore trait, the SQLite backend, the fake, the refusing one
+src/summarize/        the Summarizer trait, the extractive backend, the counting fake, the cache key
 src/agent_backend.rs  the slow-path seam
 src/http/             router, handlers, and the access-log middleware
 web/                  the phone app and the /voice page (plain HTML/CSS/JS, no framework, no build step)
@@ -1264,7 +1294,10 @@ Beyond the security list above:
   are unreachable; there is no pagination and no store.
 * Ranking is lexical. It matches words, not meaning, so a paraphrase with no shared words will miss.
   The `Ranker` trait is the replacement point.
-* Summarization is extractive truncation, not a model. It shortens; it does not comprehend.
+* Summarization is extractive truncation, not a model. It shortens; it does not comprehend. The
+  `Summarizer` trait, the policy-versioned cache and the `/summary` route are in place and
+  tested; **no model backend is wired to them yet**, so `summaries.model` is recorded in the
+  cache key and otherwise unused, and no page requests a summary.
 * No caching: every question is a fresh Discord fetch, and Discord's rate limits are not handled.
 * No `Retry-After` handling; a 429 from Discord surfaces as HTTP 502.
 * The web app has no service worker and no offline mode.

@@ -25,8 +25,8 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 
 use super::{
-    now_ms, ConversationId, ConversationSummary, ReadMark, Retention, StateStore, StoreError, Turn,
-    MAX_TURN_CHARS,
+    now_ms, ConversationId, ConversationSummary, ReadMark, Retention, StateStore, StoreError,
+    SummaryKey, Turn, MAX_TURN_CHARS,
 };
 use crate::model::{ChannelId, MessageId};
 
@@ -34,6 +34,7 @@ use crate::model::{ChannelId, MessageId};
 struct State {
     conversations: BTreeMap<String, Vec<Turn>>,
     marks: BTreeMap<String, (MessageId, u64, i64)>,
+    summaries: BTreeMap<(String, String, String, String), String>,
     fail_next: Option<String>,
     appended: usize,
     purges: usize,
@@ -92,6 +93,16 @@ impl FakeStore {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+}
+
+/// The same four-part key the real store uses, so the fake cannot be more forgiving than it is.
+fn fake_key(key: &SummaryKey) -> (String, String, String, String) {
+    (
+        key.version.clone(),
+        key.channel.as_str().to_owned(),
+        key.message.as_str().to_owned(),
+        format!("{:016x}", key.content_hash),
+    )
 }
 
 fn armed(state: &mut State) -> Result<(), StoreError> {
@@ -274,11 +285,33 @@ impl StateStore for FakeStore {
             .ok_or(StoreError::NotFound)
     }
 
+    async fn cached_summary(&self, key: &SummaryKey) -> Result<Option<String>, StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        Ok(state.summaries.get(&fake_key(key)).cloned())
+    }
+
+    async fn cache_summary(&self, key: &SummaryKey, summary: &str) -> Result<(), StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        state.summaries.insert(fake_key(key), summary.to_owned());
+        Ok(())
+    }
+
+    async fn forget_summaries_except(&self, version: &str) -> Result<u64, StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        let before = state.summaries.len();
+        state.summaries.retain(|(held, _, _, _), _| held == version);
+        Ok((before - state.summaries.len()) as u64)
+    }
+
     async fn purge_everything(&self) -> Result<(), StoreError> {
         let mut state = self.lock();
         armed(&mut state)?;
         state.conversations.clear();
         state.marks.clear();
+        state.summaries.clear();
         state.purges += 1;
         Ok(())
     }

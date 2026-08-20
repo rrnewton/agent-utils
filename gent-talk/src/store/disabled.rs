@@ -13,7 +13,9 @@
 
 use async_trait::async_trait;
 
-use super::{ConversationId, ConversationSummary, ReadMark, StateStore, StoreError, Turn};
+use super::{
+    ConversationId, ConversationSummary, ReadMark, StateStore, StoreError, SummaryKey, Turn,
+};
 use crate::model::{ChannelId, MessageId};
 
 /// The setting whose absence installs [`DisabledStore`].
@@ -66,6 +68,18 @@ impl StateStore for DisabledStore {
     }
 
     async fn forget_read_mark(&self, _: &ChannelId) -> Result<(), StoreError> {
+        refuse()
+    }
+
+    async fn cached_summary(&self, _: &SummaryKey) -> Result<Option<String>, StoreError> {
+        refuse()
+    }
+
+    async fn cache_summary(&self, _: &SummaryKey, _: &str) -> Result<(), StoreError> {
+        refuse()
+    }
+
+    async fn forget_summaries_except(&self, _: &str) -> Result<u64, StoreError> {
         refuse()
     }
 

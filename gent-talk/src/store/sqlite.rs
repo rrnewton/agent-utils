@@ -35,7 +35,7 @@ use rusqlite::{Connection, OptionalExtension as _};
 
 use super::{
     now_ms, ConversationId, ConversationSummary, ReadMark, Retention, Speaker, StateStore,
-    StoreError, Turn, MAX_TURN_CHARS,
+    StoreError, SummaryKey, Turn, MAX_TURN_CHARS,
 };
 use crate::model::{ChannelId, MessageId};
 
@@ -65,6 +65,23 @@ pub const MIGRATIONS: &[&str] = &[
         last_read_message_id TEXT    NOT NULL,
         last_read_numeric    INTEGER NOT NULL,
         marked_at_ms         INTEGER NOT NULL
+    ) STRICT;
+    ",
+    // v2 — cached summaries. `#49 cached-summaries`. Added as a SECOND step rather than folded
+    // into v1 on purpose: the migration ladder is only real if it has been walked, and this is
+    // the first file in the wild that will be upgraded rather than created.
+    //
+    // `version` is first in the primary key so the startup sweep — DELETE everything not under
+    // the current policy — is one indexed range rather than a table scan.
+    "
+    CREATE TABLE summaries (
+        version      TEXT    NOT NULL,
+        channel_id   TEXT    NOT NULL,
+        message_id   TEXT    NOT NULL,
+        content_hash TEXT    NOT NULL,
+        summary      TEXT    NOT NULL,
+        made_at_ms   INTEGER NOT NULL,
+        PRIMARY KEY (version, channel_id, message_id, content_hash)
     ) STRICT;
     ",
 ];
@@ -137,6 +154,15 @@ impl SqliteStore {
         .await
         .map_err(|error| StoreError::Backend(format!("the storage task did not finish: {error}")))?
     }
+}
+
+/// A content hash as text.
+///
+/// TEXT rather than INTEGER because SQLite's integers are signed 64-bit and the hash is unsigned:
+/// storing it as a number means a wrapping cast at both ends, which is one more place for the two
+/// directions to disagree. Hexadecimal is also what a person greps for.
+fn hex(content_hash: u64) -> String {
+    format!("{content_hash:016x}")
 }
 
 fn backend(error: rusqlite::Error) -> StoreError {
@@ -491,6 +517,65 @@ impl StateStore for SqliteStore {
         .await
     }
 
+    async fn cached_summary(&self, key: &SummaryKey) -> Result<Option<String>, StoreError> {
+        let key = key.clone();
+        self.with_connection(move |connection| {
+            connection
+                .query_row(
+                    "SELECT summary FROM summaries
+                     WHERE version = ?1 AND channel_id = ?2 AND message_id = ?3
+                       AND content_hash = ?4",
+                    rusqlite::params![
+                        &key.version,
+                        key.channel.as_str(),
+                        key.message.as_str(),
+                        hex(key.content_hash)
+                    ],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(backend)
+        })
+        .await
+    }
+
+    async fn cache_summary(&self, key: &SummaryKey, summary: &str) -> Result<(), StoreError> {
+        let key = key.clone();
+        let summary = summary.to_owned();
+        self.with_connection(move |connection| {
+            connection
+                .execute(
+                    "INSERT INTO summaries
+                        (version, channel_id, message_id, content_hash, summary, made_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                     ON CONFLICT(version, channel_id, message_id, content_hash) DO UPDATE SET
+                        summary = excluded.summary, made_at_ms = excluded.made_at_ms",
+                    rusqlite::params![
+                        &key.version,
+                        key.channel.as_str(),
+                        key.message.as_str(),
+                        hex(key.content_hash),
+                        &summary,
+                        now_ms()
+                    ],
+                )
+                .map(|_| ())
+                .map_err(backend)
+        })
+        .await
+    }
+
+    async fn forget_summaries_except(&self, version: &str) -> Result<u64, StoreError> {
+        let version = version.to_owned();
+        self.with_connection(move |connection| {
+            let removed = connection
+                .execute("DELETE FROM summaries WHERE version <> ?1", [&version])
+                .map_err(backend)?;
+            Ok(removed as u64)
+        })
+        .await
+    }
+
     async fn purge_everything(&self) -> Result<(), StoreError> {
         self.with_connection(|connection| {
             let transaction = connection.transaction().map_err(backend)?;
@@ -499,6 +584,9 @@ impl StateStore for SqliteStore {
                 .map_err(backend)?;
             transaction
                 .execute("DELETE FROM read_marks", [])
+                .map_err(backend)?;
+            transaction
+                .execute("DELETE FROM summaries", [])
                 .map_err(backend)?;
             transaction.commit().map_err(backend)
         })
@@ -854,6 +942,144 @@ mod tests {
             error.to_string().contains("newer gent-talk"),
             "the operator has to be told why: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_cached_summary_is_returned_only_for_the_exact_key_it_was_filed_under() {
+        let dir = TempDir::new("sqlite-summaries");
+        let store = store(&dir, Retention::default());
+        let key = SummaryKey {
+            channel: ChannelId("1111111111".to_owned()),
+            message: MessageId("1000000000000000200".to_owned()),
+            content_hash: 0xdead_beef_dead_beef,
+            version: "v1-extractive-w3-c160-aaaa".to_owned(),
+        };
+        assert_eq!(store.cached_summary(&key).await.expect("miss"), None);
+
+        store
+            .cache_summary(&key, "the runner stalled overnight")
+            .await
+            .expect("cache");
+        assert_eq!(
+            store.cached_summary(&key).await.expect("hit").as_deref(),
+            Some("the runner stalled overnight")
+        );
+
+        // Each part of the key is asserted separately, because a lookup that ignored one of them
+        // would serve a stale summary for exactly one reason and pass every other check here.
+        let edited = SummaryKey {
+            content_hash: 0x0bad_c0de_0bad_c0de,
+            ..key.clone()
+        };
+        assert_eq!(
+            store.cached_summary(&edited).await.expect("miss"),
+            None,
+            "an edited message must not be served the old summary"
+        );
+        let repolicied = SummaryKey {
+            version: "v1-extractive-w3-c200-bbbb".to_owned(),
+            ..key.clone()
+        };
+        assert_eq!(
+            store.cached_summary(&repolicied).await.expect("miss"),
+            None,
+            "a changed policy must not be served a summary produced under the old one"
+        );
+        let elsewhere = SummaryKey {
+            message: MessageId("1000000000000000201".to_owned()),
+            ..key.clone()
+        };
+        assert_eq!(store.cached_summary(&elsewhere).await.expect("miss"), None);
+    }
+
+    #[tokio::test]
+    async fn the_sweep_collects_every_summary_from_an_older_policy_and_nothing_else() {
+        let dir = TempDir::new("sqlite-sweep");
+        let store = store(&dir, Retention::default());
+        let base = SummaryKey {
+            channel: ChannelId("1111111111".to_owned()),
+            message: MessageId("1000000000000000200".to_owned()),
+            content_hash: 1,
+            version: String::new(),
+        };
+        for version in ["old-a", "old-b", "current"] {
+            store
+                .cache_summary(
+                    &SummaryKey {
+                        version: version.to_owned(),
+                        ..base.clone()
+                    },
+                    version,
+                )
+                .await
+                .expect("cache");
+        }
+
+        assert_eq!(
+            store
+                .forget_summaries_except("current")
+                .await
+                .expect("sweep"),
+            2,
+            "the sweep must collect exactly the entries produced under an older policy"
+        );
+        assert_eq!(
+            store
+                .cached_summary(&SummaryKey {
+                    version: "current".to_owned(),
+                    ..base.clone()
+                })
+                .await
+                .expect("hit")
+                .as_deref(),
+            Some("current"),
+            "the sweep took the current policy's entries with it"
+        );
+        assert_eq!(
+            store
+                .forget_summaries_except("current")
+                .await
+                .expect("sweep"),
+            0,
+            "a second sweep must find nothing left to do"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_database_at_an_older_schema_version_is_brought_forward() {
+        // The migration ladder is only real once it has been walked. This builds a file with ONLY
+        // the first migration applied -- the shape every existing deployment is at -- and requires
+        // that opening it with today's code makes the newer tables usable.
+        let dir = TempDir::new("sqlite-upgrade");
+        let file = dir.path().join("gent-talk.sqlite3");
+        {
+            let connection = Connection::open(&file).expect("open");
+            connection.execute_batch(MIGRATIONS[0]).expect("v1");
+            connection
+                .pragma_update(None, "user_version", 1_i64)
+                .expect("stamp");
+        }
+        let store = SqliteStore::open(&file, Retention::default()).expect("upgrade");
+        let key = SummaryKey {
+            channel: ChannelId("1111111111".to_owned()),
+            message: MessageId("1000000000000000200".to_owned()),
+            content_hash: 7,
+            version: "current".to_owned(),
+        };
+        store
+            .cache_summary(&key, "it works")
+            .await
+            .expect("the newer table has to exist after the upgrade");
+        assert_eq!(
+            store.cached_summary(&key).await.expect("hit").as_deref(),
+            Some("it works")
+        );
+        // And the older table's data is still reachable, which is the half a DROP-and-recreate
+        // migration would silently lose.
+        store
+            .append_turn(&id("conv"), &Turn::now(Speaker::You, "still here"))
+            .await
+            .expect("append");
     }
 
     #[test]
