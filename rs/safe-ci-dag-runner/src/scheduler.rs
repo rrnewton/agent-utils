@@ -2314,6 +2314,9 @@ pub fn run_dag_boxed_deadline_limited(
             wall_s: 0.0,
             outcomes: Vec::new(),
             skipped: Vec::new(),
+            // A pre-flight refusal launched nothing, so nothing was LEFT unlaunched by a failure
+            // either. Same shape as the two refusal paths above it.
+            not_launched: Vec::new(),
             intentional_skips: Vec::new(),
             step_profile_rows: Vec::new(),
             run_timed_out: false,
