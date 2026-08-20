@@ -748,6 +748,15 @@ body {
  * under the reader's thumb — the very defect `#47 scrollback-stability` exists to remove. Floating
  * it costs no reflow at all. Do not "clean this up" into a grid row.
  *
+ * WHAT THE OVERLAY COSTS, said plainly rather than left for a screenshot to reveal: for the few
+ * seconds it is up, the pill COVERS the last line of the content underneath it — a channel message
+ * or the newest transcript line. That is a real trade against the reserved row, not a free win,
+ * and it is accepted because the row cost that strip on every frame forever while this costs it
+ * only while there is something to say. The cost is bounded here rather than merely regretted:
+ * `pointer-events: none` on the pill and `auto` on its dismiss control, the same idiom as
+ * #scroll-tools, so the line underneath can still be tapped, replied to and folded THROUGH the
+ * message covering it. A reader is never blocked by it, only briefly reading around it.
+ *
  * The HISTORY that must survive the move: it sits above the dock, not on the bottom edge. On a
  * phone with rounded corners the bottom edge is exactly where a line of text is eaten by the
  * curve, and the owner photographed the first word of this line missing on an iPhone 16. The
@@ -772,6 +781,7 @@ body {
   border-radius: 999px;
   box-shadow: 0 1px 8px rgb(0 0 0 / 35%);
   color: var(--muted);
+  pointer-events: none;
   /* The small type is on #status below, not here. Same reason as #connection-banner: the desktop
      regime caps this pill in `ch`, `ch` follows the element's own font size, and a pill set in
      0.8rem would be a fifth narrower than the control pane beneath it. */
@@ -780,6 +790,9 @@ body {
 /* Quiet, and the same size as the dot beside it. It is the way out for somebody who has read the
    message and does not want to wait six seconds; it is not a thing to notice. */
 #dismiss-status {
+  /* The one part of the pill that is still a target: the pill itself lets taps through to the
+     message it is covering (see above), and this button has to take its own back. */
+  pointer-events: auto;
   padding: 0 0.4rem;
   min-height: 0;
   line-height: 1.1;

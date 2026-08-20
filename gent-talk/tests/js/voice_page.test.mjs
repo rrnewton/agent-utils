@@ -1670,6 +1670,23 @@ test("the status line floats ABOVE the dock rather than reflowing the transcript
   // The control pane relied on the status row for separation from the dock's border; with the row
   // gone it has to say so itself.
   assert.match(cssBlock("#control-pane"), /padding:\s*[\d.]+rem/, "the controls sit on the border");
+
+  // WHAT THE OVERLAY COSTS, and the bound on it. A pill floating over the foot of the list covers
+  // the last line of a channel message for as long as it is up — that is the trade against the
+  // reserved row, and it is only acceptable while the reader can still reach what is under it. So
+  // the pill lets taps through and only its dismiss control takes one, the same idiom #scroll-tools
+  // already uses for the chips over the same corner. Without this, six seconds of "fetching the
+  // channel…" also means six seconds in which the reply button under it does nothing.
+  assert.match(
+    line,
+    /pointer-events:\s*none/,
+    "the message pill swallows taps meant for the message it is covering"
+  );
+  assert.match(
+    cssBlock("#dismiss-status"),
+    /pointer-events:\s*auto/,
+    "letting taps through the pill also disabled the way out of it"
+  );
 });
 
 test("THE STATUS LINE IS A MESSAGE, NOT A FIXTURE", async () => {
