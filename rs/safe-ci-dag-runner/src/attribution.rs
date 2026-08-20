@@ -49,55 +49,6 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 pub const LOG_DIR_ENV: &str = "SAFE_CI_DAG_RUNNER_LOG_DIR";
 /// Set to `1` to disable durable per-step logs and the journal entirely.
 pub const NO_LOGS_ENV: &str = "SAFE_CI_DAG_RUNNER_NO_STEP_LOGS";
-/// Per-step ceiling, in bytes, on the durable raw-output log. `0` means unlimited.
-pub const LOG_MAX_BYTES_ENV: &str = "SAFE_CI_DAG_RUNNER_LOG_MAX_BYTES";
-/// Default per-step durable-log ceiling: 1 GiB.
-///
-/// WHY A CEILING AT ALL. A step log is a byte-for-byte copy of the step's raw output --
-/// measured, not estimated: a step emitting exactly 100 MiB produced a 104,857,600-byte log.
-/// So a step that runs away on its output stream does not merely go unbounded here, it is
-/// DUPLICATED onto the filesystem: once by whatever the step itself writes, and again by this
-/// capture. A multi-terabyte runaway therefore costs twice its own size, on the same device the
-/// build is running from, at exactly the moment that device can least afford it.
-///
-/// WHY 1 GiB. Large enough that no honest step is truncated, and small enough that a runaway is
-/// stopped while the filesystem still has room to be useful.
-pub const DEFAULT_LOG_MAX_BYTES: u64 = 1024 * 1024 * 1024;
-
-/// Exact bytes appended once when a step log hits its ceiling.
-///
-/// A reader of a capped log must be able to tell "the step printed nothing more" from "we
-/// stopped writing", so the log says which one it is, in band, exactly once.
-// MAINTENANCE, deliberately not rustdoc: this crate ships a second engine whose logs are
-// compared against this one byte-for-byte by the differential harness. Change this string in
-// one engine only and that comparison fails. Keep both in step.
-pub const TRUNCATION_MARKER: &str = "\n[safe-ci-dag-runner] STEP LOG TRUNCATED at this ceiling \
-     (raise or lift it with SAFE_CI_DAG_RUNNER_LOG_MAX_BYTES; 0 = unlimited). \
-     Test classification and attribution CONTINUE; only durable capture stopped.\n";
-
-/// The configured per-step log ceiling in bytes, or `None` for unlimited.
-///
-/// An unparseable or negative value is a configuration error the operator must see, so it is
-/// reported and then treated as the default rather than silently ignored -- a misread ceiling
-/// that quietly becomes "unlimited" is the failure this whole ceiling exists to prevent.
-pub fn log_max_bytes() -> Option<u64> {
-    match std::env::var(LOG_MAX_BYTES_ENV) {
-        Err(_) => Some(DEFAULT_LOG_MAX_BYTES),
-        Ok(raw) if raw.trim().is_empty() => Some(DEFAULT_LOG_MAX_BYTES),
-        Ok(raw) => match raw.trim().parse::<u64>() {
-            Ok(0) => None,
-            Ok(n) => Some(n),
-            Err(_) => {
-                eprintln!(
-                    "[safe-ci-dag-runner] WARNING: {LOG_MAX_BYTES_ENV}={raw:?} is not a \
-                     non-negative integer; using the {DEFAULT_LOG_MAX_BYTES}-byte default."
-                );
-                Some(DEFAULT_LOG_MAX_BYTES)
-            }
-        },
-    }
-}
-
 /// Environment variable carrying the per-step ownership nonce (see `scheduler::kill_by_nonce`).
 pub const STEP_NONCE_ENV: &str = "SAFE_CI_DAG_RUNNER_STEP";
 const MAX_COMPONENT_BYTES: usize = 255;
@@ -806,30 +757,11 @@ pub struct StepStream {
     /// The last START already announced from an UNTERMINATED tail, so it is journaled once.
     tail_announced: Mutex<Option<String>>,
     evidence: Option<std::sync::Arc<RunEvidence>>,
-    /// Ceiling on durable bytes for this step's log; `None` = unlimited.
-    log_max_bytes: Option<u64>,
-    /// Durable bytes written so far, and whether the ceiling has already been announced.
-    /// Guarded by the same mutex as `log` so the count cannot drift from the writes.
-    written: Mutex<(u64, bool)>,
 }
 
 impl StepStream {
     /// Open a step's stream, creating its durable log file when evidence capture is enabled.
     pub fn new(tag: &str, evidence: Option<std::sync::Arc<RunEvidence>>) -> Self {
-        Self::with_log_ceiling(tag, evidence, log_max_bytes())
-    }
-
-    /// As [`StepStream::new`], with the durable-log ceiling supplied rather than read from the
-    /// environment. `None` is unlimited.
-    ///
-    /// The ceiling is injected rather than read here so the truncation behaviour can be tested
-    /// without setting a process-global environment variable, which would race the other tests
-    /// running on parallel threads and make this suite order-dependent.
-    pub fn with_log_ceiling(
-        tag: &str,
-        evidence: Option<std::sync::Arc<RunEvidence>>,
-        log_max_bytes: Option<u64>,
-    ) -> Self {
         let log = evidence.as_ref().and_then(|e| e.open_step_log(tag));
         StepStream {
             tag: tag.to_string(),
@@ -838,8 +770,6 @@ impl StepStream {
             tracker: Mutex::new(TestTracker::default()),
             tail_announced: Mutex::new(None),
             evidence,
-            log_max_bytes,
-            written: Mutex::new((0, false)),
         }
     }
 
@@ -867,58 +797,10 @@ impl StepStream {
 
     /// Absorb a chunk of raw output: write it through to disk, then split and classify lines.
     pub fn ingest(&self, bytes: &[u8]) {
-        // DURABLE CAPTURE IS BOUNDED; CLASSIFICATION IS NOT. Everything below this block --
-        // line splitting, test recognition, the unterminated-tail marker -- runs on every byte
-        // regardless of the ceiling. A step that floods stdout still gets its hung test named;
-        // it just stops being copied to disk. Bounding the disk must not cost the attribution
-        // the disk was there to support.
-        let mut truncated_now = false;
         if let Ok(mut guard) = self.log.lock() {
             if let Some(f) = guard.as_mut() {
-                let mut w = self.written.lock().expect("written mutex poisoned");
-                let (count, announced) = &mut *w;
-                match self.log_max_bytes {
-                    None => {
-                        let _ = f.write_all(bytes);
-                        let _ = f.flush();
-                        *count = count.saturating_add(bytes.len() as u64);
-                    }
-                    Some(limit) if *count < limit => {
-                        // Write only the prefix that fits, so the ceiling is exact rather than
-                        // "the last chunk that crossed it", which would make the bound depend on
-                        // the reader's buffer size and differ between the two engines.
-                        let room = (limit - *count) as usize;
-                        let take = room.min(bytes.len());
-                        let _ = f.write_all(&bytes[..take]);
-                        *count += take as u64;
-                        if *count >= limit && !*announced {
-                            let _ = f.write_all(TRUNCATION_MARKER.as_bytes());
-                            *announced = true;
-                            truncated_now = true;
-                        }
-                        let _ = f.flush();
-                    }
-                    Some(_) => {
-                        // At or past the ceiling and already announced: drop the bytes.
-                    }
-                }
-            }
-        }
-        // Journal the truncation OUTSIDE the log lock. A capped log that does not say it is
-        // capped is a silently incomplete evidence file, which is worse than no evidence file:
-        // a later reader cannot tell "the step printed nothing more" from "we stopped writing".
-        if truncated_now {
-            if let Some(e) = &self.evidence {
-                e.record(
-                    "step_log_truncated",
-                    &[
-                        ("step", self.tag.clone()),
-                        (
-                            "limit_bytes",
-                            self.log_max_bytes.unwrap_or_default().to_string(),
-                        ),
-                    ],
-                );
+                let _ = f.write_all(bytes);
+                let _ = f.flush();
             }
         }
         let text = String::from_utf8_lossy(bytes);
@@ -1167,64 +1049,6 @@ mod tests {
         let path = CString::new(path.as_os_str().as_bytes()).unwrap();
         // SAFETY: the CString is NUL-terminated and valid for the duration of mkfifo.
         assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
-    }
-
-    #[test]
-    fn step_log_is_bounded_exactly_and_says_so() {
-        // A capped log that does not say it is capped is a silently incomplete evidence file:
-        // a later reader cannot tell "the step printed nothing more" from "we stopped writing".
-        let dir = temp_evidence("cap");
-        let evidence = std::sync::Arc::new(RunEvidence::open(Some(dir.clone())).unwrap());
-        let stream = StepStream::with_log_ceiling("g.j", Some(evidence), Some(100));
-        stream.ingest(&vec![b'A'; 5000]);
-
-        let log = std::fs::read(dir.join("g.j.log")).unwrap();
-        // EXACT: 100 payload bytes, not "the chunk that crossed 100". A ceiling that depended on
-        // the reader's buffer size would differ between the engines and break `make cross`.
-        let mut want = vec![b'A'; 100];
-        want.extend_from_slice(TRUNCATION_MARKER.as_bytes());
-        assert_eq!(log, want);
-
-        let journal = std::fs::read_to_string(dir.join("journal.jsonl")).unwrap();
-        assert_eq!(journal.matches("\"step_log_truncated\"").count(), 1);
-        assert!(journal.contains("\"limit_bytes\":\"100\""));
-
-        // Announced ONCE, however many further chunks arrive.
-        stream.ingest(&vec![b'B'; 5000]);
-        assert_eq!(std::fs::read(dir.join("g.j.log")).unwrap(), want);
-        let journal = std::fs::read_to_string(dir.join("journal.jsonl")).unwrap();
-        assert_eq!(journal.matches("\"step_log_truncated\"").count(), 1);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn classification_survives_a_truncated_log() {
-        // Bounding the DISK must not cost the attribution the disk was there to support.
-        let dir = temp_evidence("cap-cls");
-        let evidence = std::sync::Arc::new(RunEvidence::open(Some(dir.clone())).unwrap());
-        let stream = StepStream::with_log_ceiling("g.j", Some(evidence), Some(10));
-        let mut flood = vec![b'A'; 500];
-        flood.push(b'\n');
-        stream.ingest(&flood);
-        stream.ingest(b"test mymod::mytest ... ");
-
-        let journal = std::fs::read_to_string(dir.join("journal.jsonl")).unwrap();
-        assert!(journal.contains("\"step_log_truncated\""));
-        assert!(
-            journal.contains("\"test\":\"mymod::mytest\""),
-            "the hung test must still be named after the log stopped being written: {journal}"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn unlimited_ceiling_writes_everything() {
-        let dir = temp_evidence("cap-none");
-        let evidence = std::sync::Arc::new(RunEvidence::open(Some(dir.clone())).unwrap());
-        let stream = StepStream::with_log_ceiling("g.j", Some(evidence), None);
-        stream.ingest(&vec![b'A'; 5000]);
-        assert_eq!(std::fs::read(dir.join("g.j.log")).unwrap().len(), 5000);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

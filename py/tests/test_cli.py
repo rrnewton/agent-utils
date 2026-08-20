@@ -528,16 +528,13 @@ def test_boxed_run_enforces_cpu_timeout() -> None:
     )
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "cpu.json"
-        evidence = Path(tmp) / "evidence"
         path.write_text(dag, encoding="utf-8")
-        env = dict(os.environ)
-        env["SAFE_CI_DAG_RUNNER_LOG_DIR"] = str(evidence)
         proc = subprocess.run(
             [sys.executable, "-m", "safe_ci_dag_runner", "run", "--dag", str(path),
              "-q", "--no-profile"],
             capture_output=True,
             text=True,
-            env=env,
+            env=dict(os.environ),
         )
         if proc.returncode == 3:
             pytest.skip(
@@ -553,52 +550,6 @@ def test_boxed_run_enforces_cpu_timeout() -> None:
             "expected a CPU-TIMEOUT report proving the per-step CPU-time budget fired "
             f"(not the wall TIMEOUT):\n{combined}"
         )
-        timeout_rows = [
-            json.loads(line)
-            for line in (evidence / "journal.jsonl").read_text(encoding="utf-8").splitlines()
-            if '"event":"cpu_timeout"' in line
-        ]
-        assert len(timeout_rows) == 1, timeout_rows
-        row = timeout_rows[0]
-        assert int(row["cpu_usage_usec"]) >= 1_000_000, row
-        assert float(row["cpu_used_s"]) >= 1.0, row
-        assert int(row["cpu_user_usec"]) + int(row["cpu_system_usec"]) > 0, row
-
-
-def test_boxed_wall_timeout_records_cpu_below_the_cpu_budget() -> None:
-    import os
-
-    dag = (
-        '{"steps": [{"group": "wall", "job": "wait", "desc": "wait past wall budget",'
-        ' "cmd": "sleep 30", "cpu_timeout": 30, "timeout": 1}]}'
-    )
-    with tempfile.TemporaryDirectory() as tmp:
-        path = Path(tmp) / "wall.json"
-        evidence = Path(tmp) / "evidence"
-        path.write_text(dag, encoding="utf-8")
-        env = dict(os.environ)
-        env["SAFE_CI_DAG_RUNNER_LOG_DIR"] = str(evidence)
-        proc = subprocess.run(
-            [sys.executable, "-m", "safe_ci_dag_runner", "run", "--dag", str(path),
-             "-q", "--no-profile"],
-            capture_output=True,
-            text=True,
-            env=env,
-        )
-        if proc.returncode == 3:
-            pytest.skip(
-                "cgroup boxing unavailable; cannot verify wall-timeout aggregate CPU evidence"
-            )
-        assert proc.returncode == 1, proc.stdout + proc.stderr
-        timeout_rows = [
-            json.loads(line)
-            for line in (evidence / "journal.jsonl").read_text(encoding="utf-8").splitlines()
-            if '"event":"step_timeout"' in line
-        ]
-        assert len(timeout_rows) == 1, timeout_rows
-        row = timeout_rows[0]
-        assert float(row["cpu_used_s"]) < 30.0, row
-        assert row["limit_s"] == "1", row
 
 
 def test_default_small_cpu_cap_is_enforced_and_allows_compliant_work() -> None:

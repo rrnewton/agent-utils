@@ -19,54 +19,6 @@ from typing import BinaryIO, Literal
 
 LOG_DIR_ENV = "SAFE_CI_DAG_RUNNER_LOG_DIR"
 NO_LOGS_ENV = "SAFE_CI_DAG_RUNNER_NO_STEP_LOGS"
-LOG_MAX_BYTES_ENV = "SAFE_CI_DAG_RUNNER_LOG_MAX_BYTES"
-
-# Default per-step durable-log ceiling: 1 GiB.
-#
-# WHY A CEILING AT ALL. A step log is a byte-for-byte copy of the step's raw output --
-# measured, not estimated: a step emitting exactly 100 MiB produced a 104,857,600-byte log.
-# So a step that runs away on stdout does not merely go unbounded, it is DUPLICATED onto the
-# filesystem. On 2026-08-17..19 three hermit invocations wrote ~4.5 TB of stderr each and
-# filled the device; had evidence capture been enabled for those runs, this log would have
-# written a second copy of every byte onto the same device.
-#
-# WHY 1 GiB. Large enough that no honest step is truncated, small enough that a runaway is
-# stopped while the filesystem still has room to be useful.
-DEFAULT_LOG_MAX_BYTES = 1024 * 1024 * 1024
-
-# Exact bytes appended once when a step log hits its ceiling.
-#
-# PARITY: the Rust and Python engines are compared byte-for-byte by the differential harness,
-# so this marker must stay identical in both. Keep the two in sync or `make cross` fails.
-TRUNCATION_MARKER = (
-    "\n[safe-ci-dag-runner] STEP LOG TRUNCATED at this ceiling "
-    "(raise or lift it with SAFE_CI_DAG_RUNNER_LOG_MAX_BYTES; 0 = unlimited). "
-    "Test classification and attribution CONTINUE; only durable capture stopped.\n"
-)
-
-
-def log_max_bytes() -> int | None:
-    """Return the per-step durable-log ceiling in bytes, or ``None`` for unlimited.
-
-    An unparseable value is reported and then treated as the default rather than silently
-    ignored -- a misread ceiling that quietly becomes "unlimited" is the failure this
-    ceiling exists to prevent.
-    """
-    raw = os.environ.get(LOG_MAX_BYTES_ENV)
-    if raw is None or not raw.strip():
-        return DEFAULT_LOG_MAX_BYTES
-    try:
-        value = int(raw.strip())
-        if value < 0:
-            raise ValueError(raw)
-    except ValueError:
-        print(
-            f"[safe-ci-dag-runner] WARNING: {LOG_MAX_BYTES_ENV}={raw!r} is not a "
-            f"non-negative integer; using the {DEFAULT_LOG_MAX_BYTES}-byte default.",
-            file=sys.stderr,
-        )
-        return DEFAULT_LOG_MAX_BYTES
-    return None if value == 0 else value
 _MAX_COMPONENT_BYTES = 255
 
 
@@ -490,51 +442,16 @@ class StepStream:
         self._tracker = TestTracker()
         self._tail_announced: str | None = None
         self._lock = threading.Lock()
-        self._log_max_bytes = log_max_bytes()
-        self._written = 0
-        self._truncation_announced = False
 
     def ingest(self, data: bytes) -> None:
         """Persist and classify one raw output chunk."""
-        truncated_now = False
         with self._lock:
-            # DURABLE CAPTURE IS BOUNDED; CLASSIFICATION IS NOT. Everything below this block --
-            # line splitting, test recognition, the unterminated-tail marker -- runs on every
-            # byte regardless of the ceiling. A step that floods stdout still gets its hung test
-            # named; it just stops being copied to disk. Bounding the disk must not cost the
-            # attribution the disk was there to support.
             if self._log is not None:
-                limit = self._log_max_bytes
                 try:
-                    if limit is None:
-                        self._log.write(data)
-                        self._log.flush()
-                        self._written += len(data)
-                    elif self._written < limit:
-                        # Write only the prefix that fits, so the ceiling is exact rather than
-                        # "the last chunk that crossed it", which would make the bound depend on
-                        # the reader's buffer size and differ between the two engines.
-                        take = min(limit - self._written, len(data))
-                        self._log.write(data[:take])
-                        self._written += take
-                        if self._written >= limit and not self._truncation_announced:
-                            self._log.write(TRUNCATION_MARKER.encode())
-                            self._truncation_announced = True
-                            truncated_now = True
-                        self._log.flush()
-                    # At or past the ceiling and already announced: drop the bytes.
+                    self._log.write(data)
+                    self._log.flush()
                 except OSError:
                     pass
-            # Journal the truncation BEFORE this chunk's classification records, matching the
-            # Rust engine's ordering so journal.jsonl compares equal under `make cross`. A
-            # capped log that does not say it is capped is a silently incomplete evidence
-            # file, which is worse than no evidence file: a later reader cannot tell "the step
-            # printed nothing more" from "we stopped writing".
-            if truncated_now and self.evidence is not None:
-                self.evidence.record(
-                    "step_log_truncated",
-                    [("step", self.tag), ("limit_bytes", str(self._log_max_bytes))],
-                )
             self._partial += data.decode(errors="replace")
             while "\n" in self._partial:
                 line, self._partial = self._partial.split("\n", 1)

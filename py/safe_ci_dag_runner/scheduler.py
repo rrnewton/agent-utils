@@ -479,26 +479,8 @@ class Runner:
         event: str,
         limit_s: int,
         elapsed_s: float,
-        cpu_stats: Mapping[str, int] | None = None,
     ) -> Culprit:
         """Persist test/process state before SIGTERM starts the graceful-kill window."""
-        cpu_fields: list[tuple[str, str]] = []
-        if cpu_stats is not None:
-            usage_usec = cpu_stats.get("usage_usec", 0)
-            user_usec = cpu_stats.get("user_usec", 0)
-            system_usec = cpu_stats.get("system_usec", 0)
-            cpu_fields = [
-                ("cpu_used_s", f"{usage_usec / 1_000_000:.6f}"),
-                ("cpu_usage_usec", str(usage_usec)),
-                ("cpu_user_usec", str(user_usec)),
-                ("cpu_system_usec", str(system_usec)),
-            ]
-            self._emit(
-                f"[{step.tag}] ↳ step cgroup CPU at termination: "
-                f"usage={usage_usec / 1_000_000:.6f}s "
-                f"user={user_usec / 1_000_000:.6f}s "
-                f"system={system_usec / 1_000_000:.6f}s"
-            )
         observations = process_snapshot(proc.pid, nonce)
         for row in observations:
             self._emit(
@@ -542,8 +524,7 @@ class Runner:
                             for test in culprit.in_flight
                         ),
                     ),
-                ]
-                + cpu_fields,
+                ],
             )
         return culprit
 
@@ -871,7 +852,6 @@ class Runner:
                                 event="cpu_timeout",
                                 limit_s=cpu_budget,
                                 elapsed_s=time.time() - start,
-                                cpu_stats=cs,
                             )
                             reap(proc, self.cgroups, step.tag, nonce=nonce)
                             return
@@ -894,7 +874,6 @@ class Runner:
                 event="step_timeout",
                 limit_s=step.timeout,
                 elapsed_s=time.time() - start,
-                cpu_stats=self.cgroups.cpu_stats(step.tag),
             )
             reap(proc, self.cgroups, step.tag, nonce=nonce)
             try:

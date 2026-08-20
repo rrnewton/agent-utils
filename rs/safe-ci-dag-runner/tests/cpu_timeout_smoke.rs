@@ -22,7 +22,6 @@ fn boxing_cpu_timeout_reaps_a_step_past_its_budget() {
     let dir = std::env::temp_dir().join(format!("scdr_cpu_smoke_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let dag = dir.join("cpu.json");
-    let evidence = dir.join("evidence");
     let mut f = std::fs::File::create(&dag).unwrap();
     f.write_all(CPU_DAG.as_bytes()).unwrap();
     drop(f);
@@ -32,20 +31,19 @@ fn boxing_cpu_timeout_reaps_a_step_past_its_budget() {
     // --no-profile keeps the default auto-logging profile store from writing into the test CWD.
     let output = Command::new(bin)
         .args(["run", "--dag", dag.to_str().unwrap(), "-q", "--no-profile"])
-        .env("SAFE_CI_DAG_RUNNER_LOG_DIR", &evidence)
         .output()
         .expect("failed to spawn the built binary");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let code = output.status.code();
+    let _ = std::fs::remove_dir_all(&dir);
 
     if code == Some(3) {
         eprintln!(
             "SKIP boxing_cpu_timeout_reaps_a_step_past_its_budget: cgroup boxing is unavailable in \
              this environment (need cgroup-v2 + a working systemd --user scope). Details:\n{stderr}"
         );
-        let _ = std::fs::remove_dir_all(&dir);
         return;
     }
 
@@ -61,81 +59,4 @@ fn boxing_cpu_timeout_reaps_a_step_past_its_budget() {
         "expected a CPU-TIMEOUT report proving the per-step CPU-time budget fired (not the wall \
          TIMEOUT); the Python runner enforces this, so the Rust runner must too:\n{combined}"
     );
-    let journal = std::fs::read_to_string(evidence.join("journal.jsonl"))
-        .expect("CPU-timeout run must retain a durable journal");
-    let row: serde_json::Value = journal
-        .lines()
-        .find(|line| line.contains("\"event\":\"cpu_timeout\""))
-        .map(|line| serde_json::from_str(line).expect("cpu_timeout journal row must be JSON"))
-        .expect("CPU-timeout run must retain a cpu_timeout event");
-    let usage_usec: i64 = row["cpu_usage_usec"]
-        .as_str()
-        .expect("cpu_usage_usec must be retained")
-        .parse()
-        .expect("cpu_usage_usec must be an integer");
-    let used_s: f64 = row["cpu_used_s"]
-        .as_str()
-        .expect("cpu_used_s must be retained")
-        .parse()
-        .expect("cpu_used_s must be numeric");
-    assert!(
-        usage_usec >= 1_000_000,
-        "aggregate CPU must meet the bound: {row}"
-    );
-    assert!(
-        used_s >= 1.0,
-        "aggregate CPU seconds must meet the bound: {row}"
-    );
-
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn boxing_wall_timeout_records_cpu_below_the_cpu_budget() {
-    let bin = env!("CARGO_BIN_EXE_safe-ci-dag-runner");
-    let dir = std::env::temp_dir().join(format!("scdr_wall_smoke_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let dag = dir.join("wall.json");
-    let evidence = dir.join("evidence");
-    std::fs::write(
-        &dag,
-        r#"{"steps": [{"group": "wall", "job": "wait", "desc": "wait past wall budget",
-          "cmd": "sleep 30", "cpu_timeout": 30, "timeout": 1}]}"#,
-    )
-    .unwrap();
-
-    let output = Command::new(bin)
-        .args(["run", "--dag", dag.to_str().unwrap(), "-q", "--no-profile"])
-        .env("SAFE_CI_DAG_RUNNER_LOG_DIR", &evidence)
-        .output()
-        .expect("failed to spawn the built binary");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if output.status.code() == Some(3) {
-        eprintln!(
-            "SKIP boxing_wall_timeout_records_cpu_below_the_cpu_budget: cgroup boxing is \
-             unavailable. Details:\n{stderr}"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-        return;
-    }
-
-    let journal = std::fs::read_to_string(evidence.join("journal.jsonl"))
-        .expect("wall-timeout run must retain a durable journal");
-    let row: serde_json::Value = journal
-        .lines()
-        .find(|line| line.contains("\"event\":\"step_timeout\""))
-        .map(|line| serde_json::from_str(line).expect("step_timeout journal row must be JSON"))
-        .expect("wall-timeout run must retain a step_timeout event");
-    let used_s: f64 = row["cpu_used_s"]
-        .as_str()
-        .expect("cpu_used_s must be retained")
-        .parse()
-        .expect("cpu_used_s must be numeric");
-    assert!(
-        used_s < 30.0,
-        "wall timeout must retain CPU below the independent CPU budget: {row}"
-    );
-    assert_eq!(row["limit_s"].as_str(), Some("1"), "{row}");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
