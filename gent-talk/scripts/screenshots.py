@@ -684,6 +684,10 @@ PROFILES: tuple[Profile, ...] = (
 # desktop composition is meaningless on a phone, and worse than meaningless if it PASSES there.
 DESKTOP_PROFILES = ("desktop", "laptop-1280")
 
+# ...and the phones, for the states that only go wrong when the screen is small. Kept beside the
+# desktop set so the two are visibly the same mechanism rather than one rule and one exception.
+PHONE_PROFILES = ("iphone15", "iphone-se")
+
 
 @dataclass(frozen=True)
 class Scene:
@@ -741,6 +745,18 @@ class Driver:
             )
         else:
             script += "\ntry { localStorage.removeItem('gent-talk.token'); } catch (e) {}\n"
+        # Every PREFERENCE the page keeps is cleared on a load, so a self-contained state really is
+        # self-contained. Without this the desktop states inherit the reading column the previous
+        # one dragged out, and every later desktop frame is a picture of the wrong width -- which
+        # is what the first capture of the reply screen actually showed. The token above is the one
+        # thing deliberately carried across, because signing in is not the subject of any state
+        # after the first.
+        script += (
+            "\ntry {\n"
+            "  localStorage.removeItem('gent-talk.voice.width');\n"
+            "  localStorage.removeItem('gent-talk.voice.drafts');\n"
+            "} catch (e) {}\n"
+        )
         self.page.add_init_script(script)
         self.page.goto(f"{self.base_url}/voice", wait_until="load")
 
@@ -1180,6 +1196,154 @@ def _act_connection_failed(driver: Driver) -> None:
     driver.settle(200)
 
 
+# `#51 reply-view`. The reply screen, opened on a real seeded channel message.
+#
+# Both states are self-contained and run everywhere: the phone is where a reply is actually typed,
+# and the thing most likely to be wrong on it -- the message you are answering pushing the text box
+# under the keyboard -- is a layout fact nothing else here can see.
+
+
+def _act_open_channel(driver: Driver) -> None:
+    driver.load(with_token=True)
+    driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
+    driver.click("view-switch")
+    driver.page.wait_for_function(
+        "() => document.querySelectorAll('#discord-log li').length > 0", timeout=15_000
+    )
+    driver.settle(300)
+
+
+def _act_reply_view(driver: Driver) -> None:
+    _act_open_channel(driver)
+    # Park in the middle of the channel, and record it. The round trip below is then a MEASURED
+    # claim about the reader's position rather than a hope -- and it is one no unit test can make,
+    # because the reset a browser performs on a hidden element's scrollTop is a browser fact.
+    driver.js(
+        "(() => { const a = document.getElementById('scroll-area'); "
+        "a.scrollTop = Math.round((a.scrollHeight - a.clientHeight) * 0.5); "
+        "window.__parkedAt = a.scrollTop; return a.scrollTop; })()"
+    )
+    driver.settle(200)
+    # A row that is ALREADY on screen at the parked position. Playwright scrolls an element into
+    # view before clicking it, so reaching for one further up would move the reader itself and this
+    # state would then be measuring the harness rather than the page. (It did, the first time.)
+    driver.js(
+        "(() => { const a = document.getElementById('scroll-area').getBoundingClientRect(); "
+        "const li = [...document.querySelectorAll('#discord-log li')].find((n) => { "
+        "const r = n.getBoundingClientRect(); return r.top >= a.top && r.bottom <= a.bottom; }); "
+        "if (!li) throw new Error('no channel row is fully on screen to reply to'); "
+        "li.id = 'reply-probe'; return li.id; })()"
+    )
+    driver.page.click("#reply-probe .reply-button")
+    driver.page.wait_for_function("() => window.__visible('screen-reply')", timeout=5_000)
+    driver.click("reply-cancel")
+    driver.page.wait_for_function("() => window.__visible('pane-discord')", timeout=5_000)
+    driver.settle(200)
+    driver.js(
+        "(() => { window.__returnedTo = document.getElementById('scroll-area').scrollTop; "
+        "return window.__returnedTo; })()"
+    )
+    # ...and open it again, because THAT is the screen this state is a picture of.
+    driver.page.click("#reply-probe .reply-button")
+    driver.page.wait_for_function("() => window.__visible('screen-reply')", timeout=5_000)
+    driver.js(
+        "(() => { const t = document.getElementById('reply-text'); t.value = "
+        "'looking now — the arm64 runner was wedged, not busy'; "
+        "t.dispatchEvent(new Event('input', { bubbles: true })); return t.value; })()"
+    )
+    driver.settle(250)
+
+
+# A message longer than any frame this harness captures. Posted into the channel through the REAL
+# route, with the page's own token, so the thing being replied to is a message the server actually
+# holds -- not one injected into the DOM, which would photograph a render of something that does
+# not exist. The seeded messages are all comfortably shorter than a phone screen, so without this
+# there is no long target to look at.
+LONG_CHANNEL_POST = " ".join(
+    [
+        "The overnight run, in full, because you asked for all of it in one message.",
+        "The retry-budget branch landed at 9c07d3e after the jitter ordering was fixed, and the",
+        "unrelated cache-key rewrite was pulled back out of it into a draft of its own.",
+        "The nightly cache rebuild finished in twenty-two minutes fourteen with three point one",
+        "gigabytes written and no evictions, a minute and a half faster than the night before and",
+        "inside the ordinary spread either way. The arm64 job is the only thing still outstanding:",
+        "it sat queued for forty-one minutes on a runner that was wedged rather than busy, it was",
+        "re-fired twice onto the same runner, and it only cleared when the runner was recycled by",
+        "hand. Of the two QA findings the first is a genuine flake that turns on wall-clock",
+        "ordering between two spawned processes, and the second is a real ordering bug that only",
+        "shows up on a loaded machine and was deliberately not labelled flaky, because that is how",
+        "a real bug gets ignored. The one thing waiting on you is the release token, which expires",
+        "in six days and needs the maintainer account to rotate; if it lapses the release job fails",
+        "at the publish step, after the build, which is the most expensive place to find out.",
+        "Nothing else is red. Eleven jobs completed, none skipped, four architectures green.",
+    ]
+)
+
+
+def _act_reply_long_target(driver: Driver) -> None:
+    _act_open_channel(driver)
+    posted = driver.page.evaluate(
+        "async (text) => {"
+        "  const log = document.getElementById('discord-log');"
+        "  if ([...log.children].some((n) => n.textContent.includes('in full, because you asked')))"
+        "    return 'already there';"
+        "  const channel = document.getElementById('discord-channel').value;"
+        "  const response = await fetch('/api/v1/channels/' + encodeURIComponent(channel) +"
+        "    '/reply', { method: 'POST', headers: {"
+        "      Authorization: 'Bearer ' + localStorage.getItem('gent-talk.token'),"
+        "      'Content-Type': 'application/json' },"
+        "    body: JSON.stringify({ text }) });"
+        "  return response.status;"
+        "}",
+        LONG_CHANNEL_POST,
+    )
+    if posted not in ("already there", 200):
+        raise Unreachable(
+            "19-reply-view-long-target",
+            "a long message could be posted into the channel to reply to",
+            f"the server answered {posted!r} to the reply route",
+        )
+    if posted != "already there":
+        # Only when there is something new to see. Asking for a re-read when the message is ALREADY
+        # rendered means the marker check below is satisfied by the render that is being replaced,
+        # and the element this scene then marks is detached from the document a moment later --
+        # which is exactly what happened on the second profile of the first run.
+        driver.click("refresh-discord")
+        driver.page.wait_for_function(
+            "() => [...document.querySelectorAll('#discord-log li')]"
+            ".some((n) => n.textContent.includes('in full, because you asked'))",
+            timeout=10_000,
+        )
+        driver.settle(400)
+    # The LONGEST message now in the channel. Chosen by measuring rather than by index: the seed is
+    # the server's, and an index would silently become a short message the day it changes.
+    driver.js(
+        "(() => { const items = [...document.querySelectorAll('#discord-log li')]; "
+        "const li = items.sort((a, b) => b.textContent.length - a.textContent.length)[0]; "
+        "li.id = 'reply-probe'; return li.textContent.length; })()"
+    )
+    # And the row really is still in the document with a control on it. Marking a detached element
+    # would otherwise fail thirty seconds later as an unexplained click timeout.
+    driver.page.wait_for_function(
+        "() => !!document.querySelector('#reply-probe .reply-button')", timeout=5_000
+    )
+    # Bring it to the MIDDLE of the list before clicking. The longest message is usually the newest
+    # one, which sits in the bottom corner where the floating chips live and where a short phone
+    # leaves it under them -- so a click there can be intercepted by something that is not this
+    # control. (It was, on the short phone, the first time.)
+    driver.js(
+        "(() => { const a = document.getElementById('scroll-area'); "
+        "const probe = document.getElementById('reply-probe'); "
+        "const offset = probe.getBoundingClientRect().top - a.getBoundingClientRect().top; "
+        "a.scrollTop = Math.max(0, a.scrollTop + offset - a.clientHeight * 0.4); "
+        "return a.scrollTop; })()"
+    )
+    driver.settle(150)
+    driver.page.click("#reply-probe .reply-button")
+    driver.page.wait_for_function("() => window.__visible('screen-reply')", timeout=5_000)
+    driver.settle(250)
+
+
 # Hang up is ABSENT, not disabled, whenever there is no call. Asserted as its own expectation on
 # every no-call state, because "dimmed but present" was the defect the rework removed and a
 # screenshot is the only thing that can tell the two apart.
@@ -1575,6 +1739,63 @@ SCENES: tuple[Scene, ...] = (
             ),
         ),
     ),
+    Scene(
+        name="18-reply-view",
+        what="answering one channel message, with a draft in the box",
+        act=_act_reply_view,
+        expect=(
+            ("the reply screen is up", "window.__visible('screen-reply')"),
+            (
+                "it names the message being answered, by id",
+                "/id \\d{5,}/.test(window.__text('reply-target-meta'))",
+            ),
+            (
+                "the dock is gone: those controls act on the call, not on this",
+                "!window.__visible('control-pane')",
+            ),
+            ("there is a way back in the header", "window.__visible('close-reply')"),
+            ("the draft really is in the box", "document.getElementById('reply-text').value.length > 10"),
+            # THE measured claim, and the reason this state parks mid-scroll first: leaving to
+            # reply and coming back lands on the same line. A browser is allowed to reset a hidden
+            # element's scrollTop to zero, which is exactly what no unit test can reproduce.
+            (
+                "leaving to reply and coming back landed on the same line",
+                "window.__parkedAt > 0 && Math.abs(window.__returnedTo - window.__parkedAt) <= 4",
+            ),
+        ),
+    ),
+    Scene(
+        name="19-reply-view-long-target",
+        what="a target longer than the frame — it scrolls itself, and the box stays reachable",
+        act=_act_reply_long_target,
+        # PHONES ONLY, and this is a scoping decision rather than an oversight. The property is
+        # that a message longer than the frame scrolls inside its own box instead of pushing the
+        # reply control off the bottom -- and at 1440x900, with the column capped at 72 characters,
+        # a message short enough for Discord to accept simply is not long enough to reach the foot
+        # of the screen. Photographing it there would capture a box that happens to fit and call it
+        # evidence. State 18 is the desktop picture of this screen.
+        profiles=PHONE_PROFILES,
+        expect=(
+            ("the reply screen is up", "window.__visible('screen-reply')"),
+            # The whole content of this picture: the message being answered overflows its own box
+            # rather than the screen, so the thing you type into is still there.
+            (
+                "the message being answered overflows its OWN box",
+                "(() => { const t = document.getElementById('reply-target'); "
+                "return t.scrollHeight > t.clientHeight + 10; })()",
+            ),
+            (
+                "the reply box and its Send control are still on screen, above the frame's foot",
+                "(() => { const b = document.getElementById('reply-send').getBoundingClientRect(); "
+                "return b.height > 0 && b.bottom <= window.innerHeight + 1; })()",
+            ),
+            (
+                "and so is the box you type into",
+                "(() => { const t = document.getElementById('reply-text').getBoundingClientRect(); "
+                "return t.height > 0 && t.bottom <= window.innerHeight + 1; })()",
+            ),
+        ),
+    ),
 )
 
 
@@ -1860,7 +2081,7 @@ def check_state_controls() -> list[str]:
     """The scene table itself: an unreached state must fail by name, and none may be unguarded."""
     problems: list[str] = []
 
-    if len(SCENES) < 17:
+    if len(SCENES) < 19:
         problems.append(
             f"the scene table has only {len(SCENES)} states. The interface rework added three that "
             "are where the interesting defects now live -- the armed clear control, the seam with "
@@ -1871,7 +2092,8 @@ def check_state_controls() -> list[str]:
             "only place the desktop composition can be judged at all. `#54 resume-recovery` added "
             "the last two: a suspended call and a failed one, which are the same close code and "
             "must not look the same -- and which nothing here photographed before, because no "
-            "state above shows the error panel at all."
+            "state above shows the error panel at all. `#51 reply-view` added the reply "
+            "screen and the same screen with a target longer than the frame."
         )
     names = [scene.name for scene in SCENES]
     if len(set(names)) != len(names):
@@ -1880,15 +2102,22 @@ def check_state_controls() -> list[str]:
     # Named here rather than inferred, because losing the restriction is silent: the scene would
     # then run on both iPhone profiles and photograph the phone composition -- which has no reading
     # column and no handle -- under a name that says desktop. That is worse than a failure.
-    desktop_only = {"14-desktop-narrow-column", "15-desktop-wide-column"}
-    for name in desktop_only:
+    restricted = {
+        "14-desktop-narrow-column": DESKTOP_PROFILES,
+        "15-desktop-wide-column": DESKTOP_PROFILES,
+        # `#51 reply-view`. Phones only: at desktop width a message short enough for Discord to
+        # accept does not reach the foot of the screen, so the state would photograph a box that
+        # happens to fit and file it as evidence that a long one scrolls.
+        "19-reply-view-long-target": PHONE_PROFILES,
+    }
+    for name, wanted_profiles in restricted.items():
         scene = next((s for s in SCENES if s.name == name), None)
         if scene is None:
             problems.append(f"the '{name}' state is gone from the scene table.")
-        elif scene.profiles != DESKTOP_PROFILES:
+        elif scene.profiles != wanted_profiles:
             problems.append(
-                f"scene '{name}' is no longer restricted to {DESKTOP_PROFILES}, so it would be "
-                "captured on a phone, where the state it is named for does not exist."
+                f"scene '{name}' is no longer restricted to {wanted_profiles}, so it would be "
+                "captured on a device where the state it is named for does not exist."
             )
 
     known_profiles = {profile.name for profile in PROFILES}
@@ -1950,6 +2179,12 @@ def check_state_controls() -> list[str]:
         # its presence, because a fix that simply stopped reporting failures would satisfy 16.
         "16-suspended-recoverable": "!window.__visible('error')",
         "17-connection-failed": "window.__visible('error')",
+        # `#51 reply-view`. 18 is pinned to the ROUND TRIP -- a browser is allowed to reset a
+        # hidden element's scrollTop to zero, so "coming back lands on the same line" is a browser
+        # fact no unit test can reproduce, and it is the only interesting thing in that frame that
+        # is not simply "a form is on screen". 19 is pinned to the target overflowing its own box.
+        "18-reply-view": "__returnedTo",
+        "19-reply-view-long-target": "scrollHeight > t.clientHeight",
     }
     for name, needle in required.items():
         required_scene = next((s for s in SCENES if s.name == name), None)
@@ -2212,6 +2447,8 @@ SELF_TEST_CHECKS = (
     "the seam state is pinned to the dock geometry, not just to the element",
     "the suspended state is pinned to the ABSENCE of the failure banner",
     "the failed state is pinned to its presence, so silencing errors cannot pass",
+    "the reply state is pinned to the scroll round trip, not to the form being on screen",
+    "the long-target state is pinned to the target really overflowing its own box",
     "dark is the default theme, and both schemes stay capturable",
     "each theme really sets color_scheme on the browser context",
     "a non-PNG file is rejected",
@@ -2226,7 +2463,7 @@ SELF_TEST_CHECKS = (
     "more than one desktop-class width survives, so a capped column can be compared",
     "every desktop-class profile really reports a fine pointer",
     "a desktop-only scene names profiles that exist",
-    "the desktop-column states are still restricted to the desktop profiles",
+    "every state that exists on only some devices is still restricted to them",
     "the missing-package error carries the pip install command",
     "the missing-browser error carries the browser install command",
     "removing viewport-fit=cover from the markup is reported",

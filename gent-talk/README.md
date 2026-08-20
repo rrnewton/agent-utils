@@ -460,6 +460,33 @@ The `/voice` page expects the agent's output audio format to be **PCM** (`pcm_16
 default). It reads the format out of the conversation's initiation metadata and says so plainly if
 it is something it cannot decode, rather than playing noise.
 
+### Replying from the page
+
+`POST /api/v1/channels/{id}/reply` existed from the start and, until now, had exactly one caller:
+the voice agent. So a reply typed by hand did not exist, and nothing could tell an answered message
+from an unanswered one — Discord records a `message_reference` only for replies made through the
+affordance.
+
+Every raw message in the channel view now carries a **Reply** control, and it opens a screen of its
+own rather than a box wedged under the list: the message being answered has to stay legible while
+you write, and on a phone a text field beneath a scrolling list means the keyboard covers both.
+Three decisions worth stating, because the issue left them open:
+
+- **The posted reply is appended, not re-fetched.** The server hands back the `Message` Discord
+  accepted, which is better evidence than a later read — and a refetch replaces every child of the
+  log, which would destroy the anchor the reader's position is measured against.
+- **Drafts are per message**, and mirrored to `localStorage` with the same read-after-write check
+  the token uses. One global draft would silently hand what you wrote about one message to a reply
+  to a different one.
+- **A send that fails changes nothing.** The text stays in the box, the reason appears beside it,
+  the reader stays on the screen, and — because posting is not the call — a live conversation is
+  untouched.
+
+Coming back from the reply screen lands on the same line you left, and it does that with the same
+anchor-and-offset mechanism the fold control uses rather than a saved `scrollTop`: hiding an
+element is allowed to reset its scroll position to zero, and a restore expressed as a delta against
+an anchor is correct either way.
+
 ### A conversation can end three ways, and they are three different sentences
 
 A WebSocket close is one event, and the page used to have two things to say about it. That is one
@@ -878,7 +905,7 @@ cargo run -- --config gent-talk.toml --fake-discord &
 scripts/verify-deployment.sh --url http://127.0.0.1:8080 --channel <a-configured-snowflake>
 ```
 
-315 Rust tests plus a 128-test suite for the `/voice` page: unit tests beside each module,
+315 Rust tests plus a 135-test suite for the `/voice` page: unit tests beside each module,
 end-to-end tests in `tests/api.rs` that drive the real router against the in-memory Discord, and
 `tests/mcp.rs` doing the same for the MCP endpoint. `tests/elevenlabs_mock.rs` is the one place
 the WHOLE chain runs — the real `HttpElevenLabsClient` mints against a loopback ElevenLabs
@@ -914,13 +941,14 @@ layout facts and a fixture with no layout engine has no opinion about them.
 scripts/run.sh --screenshots
 ```
 
-Photographs the `/voice` page in the seventeen states that look different — signed out, idle, live
+Photographs the `/voice` page in the nineteen states that look different — signed out, idle, live
 call, muted, the agent's voice silenced, just after a hang-up, the end-of-call seam with its
 disclosure open, the clear control armed, settings, the Discord view, a long transcript parked
 mid-scroll, that same list with one folded answer opened among the closed ones, the moment a turn
 arrives while the reader is up in the history, the desktop reading column at each end of its
 range, and the two connection outcomes that used to look identical — a call suspended by the
-phone, and one that really failed — at four viewports: a tall phone, a short phone, a small laptop window and a maximised
+phone, and one that really failed — and the reply screen, with a short target and with one longer
+than the frame — at four viewports: a tall phone, a short phone, a small laptop window and a maximised
 desktop. It prints the absolute path of every image so an agent can open them directly.
 
 The last two states are DESKTOP ONLY, and say so in the run: `@media (min-width: 900px) and
@@ -972,7 +1000,7 @@ it. It measures the SAME message closed and then open — comparing the first op
 the first closed one compares two lengths rather than two states, and passed for the wrong reason
 at desktop width until it was fixed.
 
-`scripts/screenshots.py --self-test` runs 37 controls for those checks offline, with no browser and
+`scripts/screenshots.py --self-test` runs 39 controls for those checks offline, with no browser and
 no server; `scripts/test-run-sh.sh` runs them as part of its own suite. Screenshots are written to
 the gitignored `debug/screenshots/` and are never committed. Playwright and its Chromium are the
 only requirement, and a missing one fails by name with the install command.

@@ -251,6 +251,78 @@ body {
   position: relative;
 }
 
+/* ------------------------------------------------------------------------ the reply screen -- */
+/*
+ * `#51 reply-view`. Six rows and one of them is elastic: the message being answered. It is the
+ * elastic one because it is the only part whose length is not this page's decision — everything
+ * else here is a label, a box of a size we chose, or two buttons.
+ *
+ * What `minmax(4rem, 1fr)` buys, observed rather than assumed: the box grows with the message up
+ * to whatever vertical space is left, and scrolls inside itself past that. It does NOT stretch a
+ * three-line message to fill a desktop window, because #screens is content-sized (the error panel
+ * above it is `display: none` most of the time, which makes #screens the grid's `auto` row rather
+ * than its `1fr` one). That is the behaviour worth having, so it is written down rather than
+ * "fixed": a short message in a screen-tall grey box would be worse.
+ */
+#screen-reply {
+  display: grid;
+  grid-template-rows: auto minmax(4rem, 1fr) auto auto auto auto;
+  gap: 0.4rem;
+  min-height: 0;
+  padding: 0.75rem calc(1rem + env(safe-area-inset-right)) 1rem
+    calc(1rem + env(safe-area-inset-left));
+}
+
+/* Its OWN scroll, contained. A long message you are answering has to be readable while you write,
+   and reaching the end of it must not become a scroll of anything behind it — which on a phone is
+   how you end up losing the reply box under the keyboard. */
+#reply-target {
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  padding: 0.6rem 0.7rem;
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: 0.5rem;
+}
+
+#reply-target-meta {
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.72rem;
+  overflow-wrap: anywhere;
+}
+
+/* The generic `input` rule in web/style.css does not reach a textarea, so it says its own size. */
+#reply-text {
+  min-height: 5rem;
+  padding: 0.5rem 0.6rem;
+  background: var(--panel);
+  color: var(--ink);
+  border: 1px solid var(--edge);
+  border-radius: 0.4rem;
+  font: inherit;
+  resize: vertical;
+}
+
+/* Sized like `.fold` beside it: a quiet control on the metadata row, not a second action
+   competing with the dock. */
+.reply-button {
+  flex: 0 0 auto;
+  padding: 0.05rem 0.5rem;
+  background: none;
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+  color: var(--muted);
+  font: inherit;
+  font-size: 0.72rem;
+  letter-spacing: 0.02em;
+  min-height: 0;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
 #screen-signin h1 {
   margin-top: 0;
 }
@@ -880,6 +952,14 @@ body {
      place by being a grid row, and the suite asserts that it still does. */
   #control-pane,
   #status-line {
+    max-width: var(--reading-width);
+    margin-inline: auto;
+  }
+
+  /* The reply screen is read the same way the channel is, so it is held to the same column.
+     (#screen-signin and #screen-settings are deliberately NOT capped here: they are forms rather
+     than reading, and giving them a column is a separate judgement nobody has made yet.) */
+  #screen-reply {
     max-width: var(--reading-width);
     margin-inline: auto;
   }

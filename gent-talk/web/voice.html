@@ -39,6 +39,13 @@
             <path d="M14.5 5 8 12l6.5 7" />
           </svg>
         </button>
+        <!-- The reply screen gets its OWN way back rather than borrowing the settings one. They
+             go to different places, and scripts/screenshots.py drives #close-settings by name. -->
+        <button id="close-reply" class="icon-button" type="button" aria-label="Back" title="Back" hidden>
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M14.5 5 8 12l6.5 7" />
+          </svg>
+        </button>
         <span id="topbar-title" class="topbar-title" hidden>Settings</span>
 
         <!-- ONE switch, not two labels. It carries the word for the view you are in, and a knob
@@ -175,6 +182,33 @@
               <span id="jump-newest-label">Newest</span>
             </button>
           </div>
+        </section>
+
+        <!-- -------------------------------------------------------------------- reply screen -->
+        <!--
+          `#51 reply-view`. A reply is a different ACT from reading, so it gets a screen rather
+          than a box wedged under the channel: the message being answered has to stay legible while
+          you write, and on a phone a text field under a list means the keyboard covers both.
+
+          Every id here is declared in the MARKUP and never created from script. The test fixture
+          derives the page's element set from this file by regex and throws for anything else, so
+          an element invented at runtime fails there rather than silently at the roadside.
+        -->
+        <section id="screen-reply" class="screen" hidden>
+          <p id="reply-target-meta" class="hint"></p>
+          <!-- Its OWN scroll, contained: reading a long message you are answering must not move
+               the channel behind it, and a flick that reaches the end must not become a page
+               gesture. -->
+          <div id="reply-target"></div>
+          <label for="reply-text">Your reply</label>
+          <textarea id="reply-text" rows="4" placeholder="write a reply"></textarea>
+          <div class="row">
+            <button id="reply-cancel" class="secondary" type="button">Cancel</button>
+            <button id="reply-send" type="button">Send reply</button>
+          </div>
+          <!-- A send that failed says so HERE, next to the text it did not send, and the text
+               stays in the box. -->
+          <p id="reply-state" class="hint" aria-live="polite"></p>
         </section>
 
         <!-- ----------------------------------------------------------------- settings screen -->

@@ -113,7 +113,11 @@ const token = () => localStorage.getItem(TOKEN_KEY) || "";
 // the sign-in screen; the connection details and the knobs live in settings; the main screen is
 // the transcript and the two controls, and nothing else.
 
-const SCREENS = ["signin", "main", "settings"];
+const SCREENS = ["signin", "main", "settings", "reply"];
+
+/** What the header calls each screen that is a DESTINATION rather than the app itself. */
+const SCREEN_TITLES = { settings: "Settings", reply: "Reply" };
+
 let screenBeforeSettings = "signin";
 let currentScreen = "signin";
 
@@ -122,13 +126,21 @@ function showScreen(name) {
     el(`screen-${screen}`).hidden = screen !== name;
   }
   const main = name === "main";
-  // The view switch belongs to the main screen; on the other two it would switch between two
-  // things neither of which is on the screen.
+  // Settings and Reply are both destinations: the header becomes a title bar with a way back, and
+  // the controls that act on the screen you have left are absent.
+  const destination = Object.prototype.hasOwnProperty.call(SCREEN_TITLES, name);
+  // The view switch belongs to the main screen; anywhere else it would switch between two things
+  // neither of which is on the screen.
   el("view-switch").hidden = !main;
-  el("open-settings").hidden = name === "settings";
-  // On settings the header is a title bar with a way back; everywhere else those are absent.
+  el("open-settings").hidden = destination;
+  // Two separate ways back, because they go to two different places — and because
+  // scripts/screenshots.py drives #close-settings by name.
   el("close-settings").hidden = name !== "settings";
-  el("topbar-title").hidden = name !== "settings";
+  el("close-reply").hidden = name !== "reply";
+  el("topbar-title").hidden = !destination;
+  if (destination) {
+    el("topbar-title").textContent = SCREEN_TITLES[name];
+  }
   // The control pane is a grid ROW inside the dock. Hiding it collapses the row, so the body grows
   // to fill the frame rather than leaving a band of empty pane under a sign-in form. The status
   // line above it is NOT hidden: a sign-in failure has to be able to say so.
@@ -276,19 +288,43 @@ function scrollAnchor(area) {
  * newest line, so the view follows it.
  */
 function preservingScroll(mutate) {
-  const area = el("scroll-area");
-  const pinned = atBottom(area);
-  const anchor = scrollAnchor(area);
-  const before = anchor ? anchor.getBoundingClientRect().top : 0;
+  const mark = captureScroll();
   mutate();
-  if (pinned) {
+  restoreScroll(mark);
+}
+
+/**
+ * Where the reader is: WHICH message their eye is on, and how far down the viewport it sits.
+ *
+ * Split out of `preservingScroll` so that `#51 reply-view` can use the same mechanism across a
+ * screen change, where the two halves are separated by everything the reader does on the reply
+ * screen. One mechanism, two callers: an anchor is strictly better than a saved `scrollTop` here
+ * as well, because hiding an element is allowed to reset its scroll position to zero — and a
+ * restore expressed as a DELTA against the anchor is correct whether the browser did that or not.
+ */
+function captureScroll() {
+  const area = el("scroll-area");
+  const anchor = scrollAnchor(area);
+  return {
+    pinned: atBottom(area),
+    anchor,
+    top: anchor ? anchor.getBoundingClientRect().top : 0,
+  };
+}
+
+/** Put the reader back where `captureScroll` found them. */
+function restoreScroll(mark) {
+  const area = el("scroll-area");
+  if (mark.pinned) {
     scrollToNewest();
     return;
   }
-  if (!anchor) {
+  // A list that was replaced while we were away has taken the anchor with it, and there is nothing
+  // left to measure against; leaving the position alone beats jumping somewhere arbitrary.
+  if (!mark.anchor || !mark.anchor.parentNode) {
     return;
   }
-  area.scrollTop += anchor.getBoundingClientRect().top - before;
+  area.scrollTop += mark.anchor.getBoundingClientRect().top - mark.top;
 }
 
 /**
@@ -650,8 +686,17 @@ function onClear() {
  * permission. Flattening that to "could not start" would throw away the only sentence that says
  * what to fix, so all of it is passed through.
  */
-async function api(path) {
-  const response = await fetch(path, { headers: { Authorization: `Bearer ${token()}` } });
+async function api(path, options) {
+  const headers = { Authorization: `Bearer ${token()}` };
+  const init = { method: (options && options.method) || "GET", headers };
+  // Only when there IS one. A GET with a Content-Type and no body is a request that says it is
+  // carrying JSON and is not, which some proxies treat as a malformed request rather than as a
+  // harmless extra header.
+  if (options && options.body !== undefined) {
+    headers["Content-Type"] = "application/json";
+    init.body = JSON.stringify(options.body);
+  }
+  const response = await fetch(path, init);
   const text = await response.text();
   let payload = null;
   try {
@@ -1642,6 +1687,23 @@ function discordNode(message) {
   // The SAME call the voice transcript makes, on the same arguments, so the two lists cannot end
   // up with two idioms for the one behaviour. `#47 scrollback-stability`.
   foldable(li, meta, body, message.content);
+  // `#51 reply-view`. Every raw message can be answered, and the affordance is on the row rather
+  // than in a menu — Discord's own idiom, and the thing that makes a reply a REPLY rather than a
+  // loose message.
+  //
+  // Its accessible name carries NO channel data. An author string is written by whoever is in the
+  // channel and a display name can be anything at all; the row already shows the author and the
+  // id, and a button that repeats them into an attribute buys nothing worth the question of
+  // whether that attribute is a sink.
+  const reply = document.createElement("button");
+  reply.className = "reply-button";
+  reply.setAttribute("type", "button");
+  reply.setAttribute("title", "Reply to this message");
+  reply.textContent = "Reply";
+  // A closure over the message OBJECT, not over its id: an id would be looked up again later
+  // against a list that the next poll may have replaced.
+  reply.addEventListener("click", () => openReply(message));
+  meta.append(reply);
   return li;
 }
 
@@ -1719,6 +1781,147 @@ async function loadDiscord(options) {
     renderScrollTools();
   } finally {
     discordFetchInFlight = false;
+  }
+}
+
+// --- replying to a channel message -------------------------------------------------------------
+//
+// `#51 reply-view`. The server half already existed and had no caller:
+// `POST /api/v1/channels/{id}/reply` takes `{text, reply_to}` and sets Discord's
+// `message_reference.message_id`, which is what makes the answer a REPLY in the channel rather
+// than a loose message that happens to follow. Until now the only way to reach it was the voice
+// agent, so a reply typed by hand did not exist and `#50` could not tell an answered message from
+// an unanswered one — Discord records a reference only for replies made through the affordance.
+//
+// Two decisions the issue leaves open, made here rather than left to the reader of a diff:
+//
+//   * THE POSTED REPLY IS APPENDED, not re-fetched. A refetch replaces every child of the log,
+//     which destroys the anchor the reader's position is measured against — so "your reply
+//     appeared" would cost "and you lost your place". The server hands back the Message it
+//     actually posted, which is better evidence than a refetch anyway: it is what Discord
+//     accepted, not what a later read happened to return.
+//   * DRAFTS ARE PER MESSAGE. One global draft would silently hand what you wrote about one
+//     message to a reply to a different one, which is the kind of mistake that gets posted.
+
+const DRAFTS_KEY = "gent-talk.voice.drafts";
+
+/** message id -> the unsent text. Mirrored to storage so a reload does not lose it. */
+const drafts = new Map();
+
+function loadDrafts() {
+  let stored = null;
+  try {
+    stored = JSON.parse(localStorage.getItem(DRAFTS_KEY) || "null");
+  } catch (_error) {
+    stored = null;
+  }
+  if (!stored || typeof stored !== "object") {
+    return;
+  }
+  for (const [id, text] of Object.entries(stored)) {
+    if (typeof text === "string" && text) {
+      drafts.set(id, text);
+    }
+  }
+}
+
+/** Written back with the same read-after-write check `persistMicSettings` makes, for the reason. */
+function persistDrafts() {
+  const encoded = JSON.stringify(Object.fromEntries(drafts));
+  try {
+    localStorage.setItem(DRAFTS_KEY, encoded);
+  } catch (_error) {
+    return false;
+  }
+  return localStorage.getItem(DRAFTS_KEY) === encoded;
+}
+
+let replyTarget = null;
+// Where the reader was in the channel when they opened this. Captured with the SAME mechanism the
+// fold control uses (`#47 scrollback-stability`), not a second one.
+let replyScrollMark = null;
+
+function rememberDraft() {
+  if (!replyTarget) {
+    return;
+  }
+  const text = el("reply-text").value;
+  if (text.trim()) {
+    drafts.set(replyTarget.id, text);
+  } else {
+    drafts.delete(replyTarget.id);
+  }
+  persistDrafts();
+}
+
+/** Open the reply screen on one specific message. */
+function openReply(message) {
+  replyTarget = message;
+  // BEFORE the screen changes: once #screen-main is hidden nothing in it has a rectangle, so the
+  // anchor has to be taken while the reader can still see it.
+  replyScrollMark = captureScroll();
+  const target = el("reply-target");
+  target.replaceChildren();
+  // The same renderer the channel list uses. Untrusted text, so the same guarantee: every fragment
+  // is an element built here with textContent, and there is no second path.
+  renderMarkdownInto(target, message.content);
+  el("reply-target-meta").textContent = `${
+    message.author_is_bot ? `${message.author} (bot)` : String(message.author)
+  } · id ${message.id}`;
+  el("reply-text").value = drafts.get(message.id) || "";
+  el("reply-state").textContent = "";
+  showScreen("reply");
+}
+
+function closeReply() {
+  rememberDraft();
+  showScreen("main");
+  if (replyScrollMark) {
+    restoreScroll(replyScrollMark);
+    replyScrollMark = null;
+  }
+  replyTarget = null;
+}
+
+/**
+ * Post it, as a real Discord reply.
+ *
+ * Failures are handled HERE rather than by `guard`, and that is the point: a reply that did not
+ * post must leave the text exactly where the reader typed it, on the screen they typed it on, and
+ * must not touch a live call. Losing what somebody wrote because the network blinked is the one
+ * outcome this must not have.
+ */
+async function sendReply() {
+  if (!replyTarget) {
+    return;
+  }
+  const text = el("reply-text").value.trim();
+  if (!text) {
+    el("reply-state").textContent = "Nothing to send yet — write something first.";
+    return;
+  }
+  const channel = el("discord-channel").value;
+  const target = replyTarget;
+  el("reply-state").textContent = "Posting…";
+  el("reply-send").disabled = true;
+  try {
+    const payload = await api(`/api/v1/channels/${encodeURIComponent(channel)}/reply`, {
+      method: "POST",
+      body: { text, reply_to: target.id },
+    });
+    if (payload && payload.posted) {
+      el("discord-log").append(discordNode(payload.posted));
+    }
+    drafts.delete(target.id);
+    persistDrafts();
+    el("reply-text").value = "";
+    el("reply-state").textContent = "";
+    closeReply();
+  } catch (error) {
+    // Stay put. The text is still in the box, and the reason is beside it.
+    el("reply-state").textContent = `Not posted: ${redact(error.message)}`;
+  } finally {
+    el("reply-send").disabled = false;
   }
 }
 
@@ -1915,6 +2118,16 @@ el("speaker").addEventListener("click", () => setSpeakerOff(!session.speakerOff)
 el("dismiss-banner").addEventListener("click", dismissBanner);
 el("open-settings").addEventListener("click", () => showScreen("settings"));
 el("close-settings").addEventListener("click", () => showScreen(screenBeforeSettings));
+// `#51 reply-view`. Both ways out of the reply screen go through `closeReply`, so neither can be
+// the one that forgets to put the reader back where they were reading.
+loadDrafts();
+el("close-reply").addEventListener("click", closeReply);
+el("reply-cancel").addEventListener("click", closeReply);
+el("reply-send").addEventListener("click", guardQuietly(sendReply));
+// A draft survives leaving the screen without sending, so it is written as it is typed rather than
+// only on the way out — a way out that is not a control (the browser's own back, a reload) would
+// otherwise lose it.
+el("reply-text").addEventListener("input", rememberDraft);
 el("view-switch").addEventListener("click", () => {
   const next = currentView === "voice" ? "discord" : "voice";
   showView(next);

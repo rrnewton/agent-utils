@@ -614,7 +614,9 @@ function newPage(store = new Map(), script = SCRIPT) {
     },
     /** Which screen is showing. Exactly one, or this throws — a page with none is a blank app. */
     screen() {
-      const showing = ["signin", "main", "settings"].filter((s) => !page.el(`screen-${s}`).hidden);
+      const showing = ["signin", "main", "settings", "reply"].filter(
+        (s) => !page.el(`screen-${s}`).hidden
+      );
       assert.equal(showing.length, 1, `exactly one screen must show, not ${showing.join("+")}`);
       return showing[0];
     },
@@ -645,6 +647,21 @@ function newPage(store = new Map(), script = SCRIPT) {
     processors: [],
     /** Every tag name the page has passed to createElement, in order. */
     createdTags: [],
+    /** Every reply the page has POSTed, exactly as it went out. */
+    repliesPosted: [],
+    /** What the reply route answers. Swap it for an error to test the failure path. */
+    replyResponse: async (path, options) =>
+      json(200, {
+        posted: {
+          id: "9000000000000000001",
+          channel_id: CHANNEL.id,
+          author: "rrnewton",
+          author_id: "1000000000000000009",
+          author_is_bot: false,
+          timestamp: "2026-08-19T20:40:00.000Z",
+          content: JSON.parse(options.body).text,
+        },
+      }),
   };
 
   // The root element, which every browser has and web/voice.html therefore does not declare an id
@@ -794,6 +811,18 @@ function newPage(store = new Map(), script = SCRIPT) {
       if (/\/messages$/.test(String(path))) {
         return page.channelMessages(path, options);
       }
+      // `#51 reply-view`. Recorded rather than merely answered: the assertion that matters is what
+      // the page really SENT — the channel it named and the message it referenced — and asserting
+      // that against the interface's own claim of success would prove nothing.
+      if (/\/reply$/.test(String(path))) {
+        page.repliesPosted.push({
+          path: String(path),
+          method: options && options.method,
+          contentType: options && options.headers && options.headers["Content-Type"],
+          body: JSON.parse((options && options.body) || "null"),
+        });
+        return page.replyResponse(path, options);
+      }
       throw new Error(`the page fetched ${path}, which this fixture does not serve`);
     },
   };
@@ -896,6 +925,9 @@ const atBottomOf = (area) =>
 
 /** The fold control on a rendered message, or undefined when it has none. */
 const foldButton = (li) => li.descendants().find((node) => node.className === "fold");
+
+/** The reply control on a rendered channel message. `#51 reply-view`. */
+const replyButton = (li) => li.descendants().find((node) => node.className === "reply-button");
 
 /** One buffer of microphone audio arriving from the browser's audio graph. */
 function speakInto(page) {
@@ -1381,11 +1413,15 @@ test("the header shows two things at a time, and which two depends on the screen
   // rather than leaving it empty and putting a Back button in the body.
   const row = HTML.slice(HTML.indexOf('class="topbar-row"'), HTML.indexOf("</header>"));
   const ids = [...row.matchAll(/<button[^>]*\bid="([^"]+)"/g)].map((m) => m[1]);
-  assert.deepStrictEqual(ids, ["close-settings", "view-switch", "open-settings"]);
+  // `#51 reply-view` added a SECOND way back, deliberately rather than by generalising the first:
+  // the two go to different places, and scripts/screenshots.py drives #close-settings by name.
+  // Both are hidden on every screen but their own, which is what the loop below asserts — the
+  // header still shows two things at a time.
+  assert.deepStrictEqual(ids, ["close-settings", "close-reply", "view-switch", "open-settings"]);
 
   const page = newPage();
   const showing = () =>
-    ["close-settings", "topbar-title", "view-switch", "open-settings"].filter(
+    ["close-settings", "close-reply", "topbar-title", "view-switch", "open-settings"].filter(
       (id) => !page.el(id).hidden
     );
   await signIn(page);
@@ -1395,6 +1431,14 @@ test("the header shows two things at a time, and which two depends on the screen
   assert.deepStrictEqual(showing(), ["close-settings", "topbar-title"]);
 
   await page.el("close-settings").click();
+  assert.deepStrictEqual(showing(), ["view-switch", "open-settings"]);
+
+  const [line] = await showDiscord(page, [message({ id: "1", content: "hello" })]);
+  await replyButton(line).click();
+  assert.deepStrictEqual(showing(), ["close-reply", "topbar-title"]);
+  assert.equal(page.el("topbar-title").textContent, "Reply", "the title bar still says Settings");
+
+  await page.el("close-reply").click();
   assert.deepStrictEqual(showing(), ["view-switch", "open-settings"]);
 });
 
@@ -2499,8 +2543,8 @@ test("COLLAPSING A MESSAGE ABOVE THE VIEWPORT LEAVES THE READER LOOKING AT THE S
   // able to SEE the difference, so it has to be shown seeing it.
   const control = await run(
     brokenScript(
-      "  area.scrollTop += anchor.getBoundingClientRect().top - before;",
-      "  void before;"
+      "  area.scrollTop += mark.anchor.getBoundingClientRect().top - mark.top;",
+      "  void mark;"
     )
   );
   assert.notEqual(
@@ -2881,7 +2925,22 @@ test("HOSTILE MESSAGE TEXT NEVER BECOMES MARKUP", async () => {
     }
   }
 
-  // 4. And the page really does have no HTML sink to reach for.
+  // 4. The reply control `#51 reply-view` puts on the row carries NOTHING from the message —
+  //    neither in its text nor in any attribute value. An attribute is not markup here, so this is
+  //    belt and braces rather than a live hazard; it is asserted because "the accessible name
+  //    quotes the author" is an obvious and tempting next change, and the author string is written
+  //    by whoever is in the channel.
+  const reply = replyButton(lines[0]);
+  assert.ok(reply, "the row grew no reply control");
+  assert.equal(reply.textContent, "Reply");
+  for (const value of reply.attributes.values()) {
+    assert.ok(
+      !value.includes("<script>") && !value.includes("onerror"),
+      `channel text reached a reply-button attribute: ${value}`
+    );
+  }
+
+  // 5. And the page really does have no HTML sink to reach for.
   assert.doesNotMatch(SCRIPT_CODE, /innerHTML|outerHTML|insertAdjacentHTML|document\.write/);
 });
 
@@ -3128,6 +3187,203 @@ test("a Discord read that fails reports itself and does NOT hang up on you", asy
 // enforces that, and it is written as an exact-object comparison on purpose — a `match` or a
 // property-by-property check would let an extra constraint through, and "we started sending one
 // more thing to getUserMedia" is precisely the regression that would be invisible from the page.
+
+// --- replying to a channel message ---------------------------------------------------------------
+//
+// `#51 reply-view`. The route already existed and had no caller. What these check is the thing a
+// screenshot cannot: that what LEFT the browser names the right channel and references the right
+// message, that a failure loses nothing the reader typed, and that coming back puts them where
+// they were.
+
+/** Open the reply screen on the nth rendered channel message. */
+async function openReplyOn(page, messages, index = 0) {
+  // `showDiscord` TOGGLES the view switch, so calling it twice would land back on the call. Once
+  // the channel is up and rendered, the rows already on screen are the ones to reach for.
+  const already = page.tab() === "discord" && page.el("discord-log").children.length > 0;
+  const lines = already ? page.el("discord-log").children : await showDiscord(page, messages);
+  const button = replyButton(lines[index]);
+  assert.ok(button, "the rendered channel message carries no reply control");
+  await button.click();
+  assert.equal(page.screen(), "reply", "the reply control did not open the reply screen");
+  return lines[index];
+}
+
+test("THE REPLY REALLY REFERENCES THE MESSAGE IT WAS OPENED ON", async () => {
+  // Asserted on the recorded request, never on the interface's own claim of success. `reply_to` is
+  // the whole point: it is what makes Discord record a reference, which is what makes the answer a
+  // REPLY instead of a loose message that happens to follow.
+  const page = newPage();
+  await signIn(page);
+  await openReplyOn(
+    page,
+    [message({ id: "111", content: "first" }), message({ id: "222", content: "second" })],
+    1
+  );
+
+  page.el("reply-text").value = "  looking at it now  ";
+  await page.el("reply-text").dispatch("input");
+  await page.el("reply-send").click();
+  await page.settle();
+
+  assert.equal(page.repliesPosted.length, 1, "the reply was not posted at all");
+  const sent = page.repliesPosted[0];
+  assert.deepStrictEqual(sent.body, { text: "looking at it now", reply_to: "222" });
+  assert.equal(sent.method, "POST");
+  assert.equal(sent.contentType, "application/json", "a JSON body went out with no content type");
+  assert.ok(
+    sent.path.includes(encodeURIComponent(CHANNEL.id)),
+    `the reply was posted to ${sent.path}, which does not name the channel being read`
+  );
+  // And it comes back onto the screen, from the server's own answer.
+  assert.equal(page.screen(), "main", "a successful send left the reader on the reply screen");
+  const lines = page.el("discord-log").children;
+  assert.match(lines[lines.length - 1].text(), /looking at it now/);
+});
+
+test("LEAVING TO REPLY AND COMING BACK LANDS ON THE SAME LINE", async () => {
+  // The easy instance of `#47 scrollback-stability`'s requirement, and it uses the SAME mechanism
+  // rather than a second one: an anchor and an offset, not a saved scrollTop. That matters here in
+  // particular, because hiding an element is allowed to reset its scroll position to zero — which
+  // is what the run below simulates.
+  const run = async (script) => {
+    const page = newPage(new Map(), script);
+    await signIn(page);
+    const area = page.el("scroll-area");
+    const lines = await showDiscord(page, tallChannel());
+    area.scrollTop = Math.round((area.scrollHeight - area.clientHeight) * 0.6);
+    const parked = area.scrollTop;
+    assert.ok(parked > 0, "the channel does not overflow, so this test would prove nothing");
+
+    await replyButton(lines[3]).click();
+    // What a browser does to a hidden element's scroll position.
+    area.scrollTop = 0;
+    await page.el("reply-cancel").click();
+    return { page, parked, landed: area.scrollTop };
+  };
+
+  const { page, parked, landed } = await run();
+  assert.equal(page.screen(), "main");
+  assert.equal(landed, parked, `the reader came back ${landed - parked}px from where they left`);
+
+  // THE CONTROL. Without it the fixture could be one that never moves scrollTop at all, and
+  // "it came back to the same place" would be satisfied by a page that does nothing.
+  const control = await run(
+    brokenScript(
+      "  area.scrollTop += mark.anchor.getBoundingClientRect().top - mark.top;",
+      "  void mark;"
+    )
+  );
+  assert.notEqual(
+    control.landed,
+    control.parked,
+    "with the restore deleted the reader still landed in the right place, so this test cannot " +
+      "tell a page that restores from one that does not"
+  );
+});
+
+test("a draft survives leaving without sending, and survives a reload", async () => {
+  const store = new Map();
+  const page = newPage(store);
+  await signIn(page);
+  const messages = [message({ id: "111", content: "first" }), message({ id: "222", content: "second" })];
+  await openReplyOn(page, messages, 0);
+
+  page.el("reply-text").value = "half a thought about the first one";
+  await page.el("reply-text").dispatch("input");
+  await page.el("reply-cancel").click();
+
+  // Per MESSAGE, not per page: a global draft would hand what you wrote about one message to a
+  // reply to a different one, which is the kind of mistake that gets posted.
+  await openReplyOn(page, messages, 1);
+  assert.equal(page.el("reply-text").value, "", "the draft leaked onto a different message");
+  await page.el("reply-cancel").click();
+  await openReplyOn(page, messages, 0);
+  assert.equal(page.el("reply-text").value, "half a thought about the first one");
+  await page.el("reply-cancel").click();
+
+  // A RELOAD: same storage, brand new execution.
+  const reloaded = newPage(store);
+  await signIn(reloaded);
+  await openReplyOn(reloaded, messages, 0);
+  assert.equal(
+    reloaded.el("reply-text").value,
+    "half a thought about the first one",
+    "the draft did not survive a reload"
+  );
+});
+
+test("A SEND THAT FAILS LOSES NOTHING THE READER TYPED", async () => {
+  const page = newPage();
+  await signIn(page);
+  await openReplyOn(page, [message({ id: "333", content: "the one being answered" })]);
+  page.replyResponse = errorResponse(502, "discord_error", "discord returned HTTP 500");
+
+  page.el("reply-text").value = "this took a while to write";
+  await page.el("reply-text").dispatch("input");
+  await page.el("reply-send").click();
+  await page.settle();
+
+  assert.equal(page.screen(), "reply", "a failed send threw the reader off the screen");
+  assert.equal(
+    page.el("reply-text").value,
+    "this took a while to write",
+    "a failed send erased what was typed"
+  );
+  assert.match(page.el("reply-state").textContent, /Not posted/);
+  assert.match(page.el("reply-state").textContent, /502/, "it does not say what went wrong");
+  assert.equal(page.el("reply-send").disabled, false, "Send is stuck disabled after a failure");
+  // Nothing was appended: the channel must not show a message Discord never accepted.
+  assert.equal(page.el("discord-log").children.length, 1);
+});
+
+test("a reply that fails does NOT hang up on you", async () => {
+  // Same property `guardQuietly` exists for on the channel read: posting is not the call, and a
+  // network blink while typing must not cost the conversation.
+  const page = newPage();
+  const socket = await startTalking(page);
+  await openReplyOn(page, [message({ id: "444", content: "answer me" })]);
+  page.replyResponse = errorResponse(502, "discord_error", "nope");
+
+  page.el("reply-text").value = "on it";
+  await page.el("reply-text").dispatch("input");
+  await page.el("reply-send").click();
+  await page.settle();
+
+  assert.equal(page.tracks[0].stops, 0, "a failed reply released the microphone");
+  assert.notEqual(socket.readyState, 3, "a failed reply hung up the call");
+  assert.equal(page.sockets.length, 1);
+  assert.equal(page.el("error").hidden, true, "a reply failure raised the CALL's failure panel");
+});
+
+test("the reply screen puts away the controls that act on the call, and keeps a way back", async () => {
+  const page = newPage();
+  await startTalking(page);
+  await openReplyOn(page, [message({ id: "555", content: "hello" })]);
+
+  assert.equal(page.el("control-pane").hidden, true, "the dock acts on the call, not on this");
+  assert.equal(page.el("view-switch").hidden, true, "it would switch to a screen that is not up");
+  assert.equal(page.el("close-reply").hidden, false, "there is no way back off the reply screen");
+  // The status line stays: a call is still running underneath, and it has to be able to say so.
+  assert.equal(page.el("status-line").hidden, false);
+});
+
+test("the reply screen shows the message being answered, in full, with its id", async () => {
+  const page = newPage();
+  await signIn(page);
+  const long = longMessage("the one being answered");
+  await openReplyOn(page, [message({ id: "666777888999000111", author: "build-bot", content: long })]);
+
+  assert.match(page.el("reply-target").text(), /the one being answered/);
+  assert.match(page.el("reply-target-meta").textContent, /666777888999000111/);
+  assert.match(page.el("reply-target-meta").textContent, /build-bot \(bot\)/);
+  // NOT folded. The fold exists so a list can be skimmed; there is one message here and answering
+  // it is the reason you are looking at it.
+  assert.equal(foldButton(page.el("reply-target")), undefined, "the message you are answering was folded");
+  // Its own scrolling box, so a long one does not push the reply control off the screen.
+  const target = cssBlock("#reply-target");
+  assert.match(target, /overflow-y:\s*auto/);
+  assert.match(target, /overscroll-behavior:\s*contain/);
+});
 
 test("with every toggle untouched, the page asks for EXACTLY what it asked for before the menu existed", async () => {
   const page = newPage();
