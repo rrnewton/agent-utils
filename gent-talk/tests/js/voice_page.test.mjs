@@ -3531,13 +3531,17 @@ test("a Discord read that fails reports itself and does NOT hang up on you", asy
  * way the route does — so a test can only get older messages by sending back the cursor it was
  * given, which is the property under test.
  */
-function pagedChannel(page, { steps = 3, size = 4 } = {}) {
+function pagedChannel(page, { steps = 3, size = 4, content = (i) => `message ${i}` } = {}) {
   // Deliberately spanning 999 -> 1000, so the ids change LENGTH partway through. Discord
   // snowflakes are decimal strings and `"999" < "1000"` is false lexicographically, which is
   // exactly the comparison a page merging two reads has to get right.
+  //
+  // `content` is a hook rather than a constant because the anchoring tests need rows TALL enough
+  // to overflow the modelled viewport, and a walk whose rows are one line each cannot overflow
+  // anything — the two properties want the same server and different message bodies.
   const all = [];
   for (let i = 0; i < steps * size; i += 1) {
-    all.push(message({ id: String(995 + i), content: `message ${i}` }));
+    all.push(message({ id: String(995 + i), content: content(i) }));
   }
   page.pagesServed = [];
   page.channelPage = async (path) => {
@@ -3638,6 +3642,42 @@ test("LOADING OLDER MESSAGES LEAVES THE READER LOOKING AT THE SAME LINE", async 
   );
 });
 
+test("THE LAST STEP OF THE WALK DOES NOT JERK THE READER EITHER", async () => {
+  // The step nobody photographs. Reaching the beginning HIDES #load-older, and that control is a
+  // sibling ABOVE #discord-log inside #scroll-area — so taking its height away is the same
+  // mutation as prepending, made in the same place, and it has to be inside the same anchor. A
+  // page that anchors the rows and then hides the button afterwards moves the reader by the height
+  // of a button on the one step where they have finally arrived somewhere.
+  const page = newPage();
+  await signIn(page);
+  pagedChannel(page, { steps: 2, size: 8, content: (i) => longMessage(`m${i}`) });
+  await showDiscord(page, []);
+
+  const area = page.el("scroll-area");
+  assert.ok(area.scrollHeight > area.clientHeight * 2, "the channel does not overflow");
+  assert.equal(page.el("load-older").hidden, false, "nothing says there is more above");
+  const grip = page.el("load-older").getBoundingClientRect().height;
+  assert.ok(grip > 0, "the control has no modelled height, so hiding it could not move anything");
+
+  area.scrollTop = Math.round((area.scrollHeight - area.clientHeight) * 0.5);
+  const anchor = page
+    .el("discord-log")
+    .children.find((li) => li.getBoundingClientRect().bottom > 0);
+  const before = anchor.getBoundingClientRect().top;
+
+  await page.el("load-older").click();
+  await page.settle();
+
+  assert.equal(page.el("discord-log").children.length, 16, "the older step did not arrive");
+  assert.equal(page.el("load-older").hidden, true, "the walk did not reach the beginning");
+  const moved = anchor.getBoundingClientRect().top - before;
+  assert.equal(
+    moved,
+    0,
+    `arriving at the beginning of the channel moved the line the reader was looking at ${moved}px`
+  );
+});
+
 test("reaching the top loads the next step without a tap, and only one at a time", async () => {
   const page = newPage();
   await signIn(page);
@@ -3668,6 +3708,46 @@ test("reaching the top loads the next step without a tap, and only one at a time
   assert.equal(page.el("discord-log").children.length, 12);
 });
 
+test("A SCROLL THAT IS NOT NEAR THE TOP LOADS NOTHING", async () => {
+  // The other edge of the automatic trigger, and the one the "reaching the top" test above cannot
+  // see: it sets scrollTop to exactly zero, so it stays green for ANY positive trigger, including
+  // one wider than the whole list. At that width every scroll event anywhere — a flick at the
+  // BOTTOM of the channel — takes another step back, and a reader who nudges the list once walks
+  // the entire history without asking for any of it.
+  const page = newPage();
+  await signIn(page);
+  pagedChannel(page, { steps: 4, size: 8, content: (i) => longMessage(`m${i}`) });
+  await showDiscord(page, []);
+  const area = page.el("scroll-area");
+
+  const bottom = area.scrollHeight - area.clientHeight;
+  assert.ok(
+    bottom > sourceConstant("OLDER_TRIGGER_PX"),
+    `the modelled channel is only ${bottom}px of scroll, which is inside the trigger — this test ` +
+      "would pass on any page at all"
+  );
+  area.scrollTop = bottom;
+  await area.dispatch("scroll");
+  await page.settle();
+
+  assert.equal(
+    page.pagesServed.length,
+    1,
+    "a scroll at the BOTTOM of the list fetched older messages"
+  );
+  assert.equal(page.el("discord-log").children.length, 8, "the list grew without being asked");
+
+  // ...and one step up from the bottom, still far from the top, is still not a request.
+  area.scrollTop = Math.round(bottom / 2);
+  await area.dispatch("scroll");
+  await page.settle();
+  assert.equal(
+    page.pagesServed.length,
+    1,
+    "a scroll in the MIDDLE of the list fetched older messages"
+  );
+});
+
 test("reaching the beginning of the channel stops offering more, and says the count", async () => {
   const page = newPage();
   await signIn(page);
@@ -3686,6 +3766,42 @@ test("reaching the beginning of the channel stops offering more, and says the co
   // ...and NOW the number is the channel's own, because there is nothing above it. That is the
   // `#62 message-count-accuracy` rule, and this is the first time this page can satisfy it.
   assert.match(channelSummaryText(page), /^6 messages from lead team$/);
+});
+
+test("AND THE COUNT SURVIVES THE NEXT POLL, WHICH NOBODY ASKED FOR", async () => {
+  // A truthful count that lasts forty-five seconds is not a truthful count. The poll re-reads the
+  // NEWEST page, whose `has_more` is true — it is the newest page of a channel with more behind it
+  // — and a summary written from that payload rather than from what is actually loaded goes back
+  // to "older ones are not loaded" while #load-older stays hidden. The page then claims more
+  // exists and offers no way to reach it, which is the two halves of the same answer disagreeing.
+  const page = newPage();
+  await signIn(page);
+  pagedChannel(page, { steps: 2, size: 3 });
+  await showDiscord(page, []);
+  await page.el("load-older").click();
+  await page.settle();
+  assert.match(channelSummaryText(page), /^6 messages from lead team$/);
+
+  assert.equal(page.expireTimers(DISCORD_POLL_MS), 1, "no poll was armed to test against");
+  await page.settle();
+
+  assert.equal(
+    page.el("discord-log").children.length,
+    6,
+    "the poll discarded what the reader had walked back to"
+  );
+  assert.equal(page.el("load-older").hidden, true, "the poll re-offered a step past the beginning");
+  assert.match(
+    channelSummaryText(page),
+    /^6 messages from lead team$/,
+    `a poll nobody asked for rewrote the count to: ${channelSummaryText(page)}`
+  );
+
+  // ...and the Refresh button is the same re-read by hand, so it must not do it either.
+  await page.el("refresh-discord").click();
+  await page.settle();
+  assert.match(channelSummaryText(page), /^6 messages from lead team$/);
+  assert.equal(page.el("load-older").hidden, true);
 });
 
 test("a step that FAILS keeps what is already on screen, and does not hang up", async () => {
@@ -3735,6 +3851,38 @@ test("A REFRESH DOES NOT THROW AWAY WHAT THE READER WALKED BACK TO", async () =>
   assert.deepStrictEqual(
     page.el("discord-log").children.map((li) => li.getAttribute("data-id")),
     ["999", "1000", "1001", "1002", "1003", "1004", "1005", "1006"]
+  );
+});
+
+test("AND THE STEP AFTER A REFRESH GOES FURTHER BACK, NOT OVER THE SAME GROUND", async () => {
+  // The half the test above stops one move short of. Keeping the rows is not enough: the CURSOR
+  // has to survive the re-read as well, because the newest page hands back a cursor belonging to
+  // ITSELF — `before=1003` — and adopting it points the walk at four messages that are already on
+  // screen. The reader taps Older messages, waits, and gets four duplicated rows and no progress,
+  // which is worse than the refresh having discarded them: the page looks like it is walking and
+  // is not. A background poll does this every forty-five seconds, unasked.
+  const page = newPage();
+  await signIn(page);
+  pagedChannel(page, { steps: 3, size: 4 });
+  await showDiscord(page, []);
+  await page.el("load-older").click();
+  await page.settle();
+  await page.el("refresh-discord").click();
+  await page.settle();
+
+  await page.el("load-older").click();
+  await page.settle();
+
+  assert.deepStrictEqual(
+    page.el("discord-log").children.map((li) => li.getAttribute("data-id")),
+    ["995", "996", "997", "998", "999", "1000", "1001", "1002", "1003", "1004", "1005", "1006"],
+    "the step after a refresh re-read messages already on screen instead of walking further back"
+  );
+  assert.match(
+    page.pagesServed[page.pagesServed.length - 1],
+    /[?&]before=999(&|$)/,
+    `the step after the refresh asked for ${page.pagesServed[page.pagesServed.length - 1]}, which ` +
+      "is a cursor the refresh handed back rather than the one the walk had reached"
   );
 });
 

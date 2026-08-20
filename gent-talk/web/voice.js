@@ -1813,9 +1813,29 @@ const DISCORD_PAGE_LIMIT = 50;
 // How close to the top counts as "the reader is looking for something older".
 const OLDER_TRIGGER_PX = 80;
 
-let discordHasOlder = false;
+/**
+ * Is anything older than the OLDEST ROW ON SCREEN still out there?
+ *
+ * THREE values, not two, and one variable rather than two that can disagree: `true` there is more
+ * above, `false` the reader has reached the beginning, `undefined` the server did not say (a
+ * server predating `has_more`). It is the single source for both things the page tells the reader
+ * about that question — whether #load-older is offered, and whether the summary may state a total
+ * — because when they were derived separately they disagreed: a background poll rewrote the
+ * summary from the NEWEST page's `has_more` while the control stayed hidden, so the page claimed
+ * more existed and offered no way to reach it. `#62 message-count-accuracy`.
+ */
+let discordMoreAbove = false;
 let discordOlderCursor = null;
 let olderFetchInFlight = false;
+
+/** `has_more` absent means a server too old to say — which is UNKNOWN, and never "no". */
+const normaliseHasMore = (hasMore) => (typeof hasMore === "boolean" ? hasMore : undefined);
+
+/**
+ * Is what is loaded the WHOLE channel? Read from the page's own state rather than from a payload,
+ * so that a re-read of the newest page cannot contradict a walk that is still holding older rows.
+ */
+const loadedIsWhole = () => (discordMoreAbove === undefined ? undefined : !discordMoreAbove);
 
 /**
  * Is snowflake `a` older than snowflake `b`?
@@ -1831,9 +1851,6 @@ function snowflakeOlder(a, b) {
   }
   return x.length === y.length ? x < y : x.length < y.length;
 }
-
-/** `has_more` absent means a server too old to say — which is UNKNOWN, and never "complete". */
-const knownComplete = (hasMore) => (typeof hasMore === "boolean" ? !hasMore : undefined);
 
 // `#63 status-line-placement`. The channel's own summary — how much is loaded, and whether that is
 // the whole channel — used to be a line on the status strip, and the strip is transient now: a
@@ -1869,7 +1886,7 @@ function renderChannelSeam(label) {
 
 function renderOlderControl() {
   const button = el("load-older");
-  button.hidden = !discordHasOlder;
+  button.hidden = discordMoreAbove !== true;
   button.disabled = olderFetchInFlight;
   button.textContent = olderFetchInFlight ? "Loading older messages…" : "Older messages";
 }
@@ -1894,7 +1911,7 @@ function applyNewestPage(payload) {
   // Only when nothing was kept. If older rows survived, the cursor that belongs to them is the one
   // the older walk left behind, and overwriting it with this page's would rewind the walk.
   if (kept.length === 0) {
-    discordHasOlder = payload.has_more === true;
+    discordMoreAbove = normaliseHasMore(payload.has_more);
     discordOlderCursor = payload.next_before || null;
   }
   renderOlderControl();
@@ -1908,7 +1925,7 @@ function applyNewestPage(payload) {
  * event, and a phone produces a lot of those.
  */
 async function loadOlder() {
-  if (!discordHasOlder || !discordOlderCursor || olderFetchInFlight) {
+  if (discordMoreAbove !== true || !discordOlderCursor || olderFetchInFlight) {
     return;
   }
   const channel = el("discord-channel").value;
@@ -1924,6 +1941,12 @@ async function loadOlder() {
     );
     const list = el("discord-log");
     const arriving = (payload.messages || []).map(discordNode);
+    // The step is OVER before the anchored mutation, so that every consequence of it — the rows,
+    // the summary and the control's final state — is one change of height rather than three. The
+    // block below is synchronous, so there is no window in which a second step could start.
+    discordMoreAbove = normaliseHasMore(payload.has_more);
+    discordOlderCursor = payload.next_before || null;
+    olderFetchInFlight = false;
     // Prepending is a mutation ABOVE the viewport, which is the one case browser scroll anchoring
     // does not handle. Same helper as the fold control, deliberately.
     preservingScroll(() => {
@@ -1932,17 +1955,18 @@ async function loadOlder() {
       // so rewriting it afterwards would be a second change of height above the viewport and the
       // reader would move by whatever the difference happened to be.
       renderChannelSeam(
-        channelSummary(
-          list.children.length,
-          knownComplete(payload.has_more),
-          payload.channel.label
-        )
+        channelSummary(list.children.length, loadedIsWhole(), payload.channel.label)
       );
+      // ...and so is this, for exactly the same reason and one nobody photographs: the LAST step
+      // of the walk HIDES #load-older, which is a sibling above the log inside the scrolling
+      // element. Taking its height away outside the anchor jerks the reader by the height of a
+      // button on the one step where they have finally arrived at the beginning.
+      renderOlderControl();
     });
-    discordHasOlder = payload.has_more === true;
-    discordOlderCursor = payload.next_before || null;
     renderScrollTools();
   } finally {
+    // The success path has already done both, and doing them again is a no-op. This is here for
+    // the FAILURE path, where the step must stop reporting itself in flight.
     olderFetchInFlight = false;
     renderOlderControl();
   }
@@ -1950,7 +1974,7 @@ async function loadOlder() {
 
 /** The reader has arrived at the top of what is loaded. Take the next step for them. */
 function maybeLoadOlder() {
-  if (currentView !== "discord" || !discordHasOlder || olderFetchInFlight) {
+  if (currentView !== "discord" || discordMoreAbove !== true || olderFetchInFlight) {
     return;
   }
   if (el("scroll-area").scrollTop <= OLDER_TRIGGER_PX) {
@@ -1991,7 +2015,7 @@ async function loadDiscord(options) {
     // Inline, at the head of the list, rather than on the transient strip. `#63
     // status-line-placement`: this is a standing fact about what you are looking at, and the strip
     // takes itself away after a few seconds.
-    renderChannelSeam(channelSummary(loaded, knownComplete(payload.has_more), payload.channel.label));
+    renderChannelSeam(channelSummary(loaded, loadedIsWhole(), payload.channel.label));
     const messages = payload.messages || [];
     const newest = messages.length ? messages[messages.length - 1].id : null;
     // Something ARRIVED only if the newest id moved. A refresh that returns the same messages must
@@ -2399,7 +2423,7 @@ el("refresh-discord").addEventListener("click", guardQuietly(() => loadDiscord({
 el("discord-channel").addEventListener(
   "change",
   guardQuietly(() => {
-    discordHasOlder = false;
+    discordMoreAbove = false;
     discordOlderCursor = null;
     discordNewestId = null;
     el("discord-log").replaceChildren();
