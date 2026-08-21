@@ -7,11 +7,14 @@ than wedging the suite it lives in.
 
 from __future__ import annotations
 
+import json
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
+from safe_ci_dag_runner.attribution import RunEvidence
 from safe_ci_dag_runner.cgroup import NoopCgroups
 from safe_ci_dag_runner.model import DagConfig, ResourceHint, Step
 from safe_ci_dag_runner.scheduler import Runner
@@ -219,6 +222,42 @@ def test_a_dead_cpu_budget_monitor_says_the_budget_is_no_longer_enforced(
     assert "monitor thread DIED" in err
     assert "NO LONGER" in err and "ENFORCED" in err
     assert "RuntimeError" in err
+
+
+def test_the_crash_record_in_the_journal_names_the_cause(tmp_path: Path) -> None:
+    """A run reconstructed from evidence alone must still say WHAT went wrong.
+
+    The console line is gone by the time anyone reads a journal, so an event carrying only a tag
+    and a duration reports that something failed without naming the cause — the state this whole
+    guard exists to eliminate. The sibling engine writes the same three fields under the same
+    event name, and ``make cross`` compares journals.
+    """
+    victim = _step("boom")
+    runner = Runner(
+        DagConfig(steps=(victim,)),
+        max_steps=1,
+        max_cpus=1,
+        cgroups=NoopCgroups(),
+        verbosity=0,
+    )
+    runner.evidence = RunEvidence.open(tmp_path / "evidence")
+    assert runner.evidence is not None
+    assert runner._publish_supervisor_failure(
+        victim,
+        reason="SUPERVISOR CRASHED (planted supervisor defect)",
+        summary="planted supervisor defect",
+        duration_s=0.25,
+    )
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "evidence" / "journal.jsonl").read_text().splitlines()
+    ]
+    crash = [r for r in records if r.get("event") == "supervisor_crash"]
+    assert len(crash) == 1, records
+    assert crash[0]["reason"] == "SUPERVISOR CRASHED (planted supervisor defect)"
+    assert crash[0]["step"] == victim.tag
+    assert crash[0]["elapsed_s"] == "0.250"
 
 
 def test_a_crash_after_a_normal_completion_does_not_overwrite_the_published_outcome() -> None:

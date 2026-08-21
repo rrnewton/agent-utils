@@ -847,16 +847,26 @@ fn publish_supervisor_failure(
                 executed_tests: None,
                 filtered_tests: None,
                 returncode: None,
-                reason,
+                reason: reason.clone(),
                 aborted: false,
             },
         );
         trip_fail_fast(&mut sh, cgroups, keep_going);
     }
     if let Some(e) = evidence {
+        // THE REASON IS THE RECORD. The whole point of the reason string is that it NAMES the
+        // cause -- which panic, or that the thread vanished with none -- and a run reconstructed
+        // from the journal alone is exactly the case where nobody has the console output that
+        // said so. An event that carries only the tag and a duration reports that something went
+        // wrong without saying what, which is the state this guard exists to eliminate. The
+        // sibling engine writes the same three fields under the same event name.
         e.record(
             "supervisor_crash",
-            &[("step", tag), ("elapsed_s", format!("{elapsed_s:.3}"))],
+            &[
+                ("step", tag),
+                ("reason", reason),
+                ("elapsed_s", format!("{elapsed_s:.3}")),
+            ],
         );
     }
     true
@@ -932,6 +942,25 @@ fn emit(line: &str) {
     println!("{line}");
 }
 
+/// Lines [`warn`] has written, recorded only in test builds. See [`warn`].
+#[cfg(test)]
+static WARNINGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// One diagnostic line to stderr, where a CI log looks.
+///
+/// The stderr counterpart of [`emit`], and it exists for one reason: a warning whose ONLY
+/// observable is stderr cannot otherwise be asserted on, because the test harness intercepts the
+/// print macros before they reach the descriptor. An unenforceable enforcement guard is exactly
+/// the thing that must not be pinned by reading the source, so test builds also record the line.
+fn warn(line: &str) {
+    eprintln!("{line}");
+    #[cfg(test)]
+    WARNINGS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(line.to_string());
+}
+
 /// The runner owns the immutable graph + policy and the shared mutable state.
 struct Runner {
     steps: Arc<HashMap<String, Step>>,
@@ -966,7 +995,23 @@ struct Runner {
     /// `None` when the operator opted out or the directory could not be created.
     evidence: Option<Arc<RunEvidence>>,
     shared: Arc<Mutex<Shared>>,
+    /// TEST-ONLY: run this instead of the guarded supervisor body, on the supervisor's own thread.
+    ///
+    /// Compiled out of every shipped build. It exists because layer TWO -- the dead-supervisor
+    /// sweep -- is by definition only reachable when layer one is absent, and layer one is
+    /// `with_supervisor_guard`, which is unconditional in production. Without a seam the sweep can
+    /// only be tested by calling it directly on hand-built state, which is exactly the test that
+    /// stays green when the call is deleted from the ready-set loop. The sibling engine gets the
+    /// same coverage by replacing a method at run time; a compiled language needs the seam
+    /// compiled in.
+    #[cfg(test)]
+    supervisor_override: Option<SupervisorBody>,
 }
+
+/// TEST-ONLY body a supervisor thread runs instead of the guarded one. See
+/// [`Runner::supervisor_override`].
+#[cfg(test)]
+type SupervisorBody = Arc<dyn Fn(&Step) + Send + Sync>;
 
 impl Runner {
     #[allow(clippy::too_many_arguments)]
@@ -1044,6 +1089,8 @@ impl Runner {
                 counted_processes: HashSet::new(),
                 retired: HashSet::new(),
             })),
+            #[cfg(test)]
+            supervisor_override: None,
         }
     }
 
@@ -1313,8 +1360,17 @@ impl Runner {
                     keep_going,
                 };
                 let swept_step = step.clone();
+                #[cfg(test)]
+                let supervisor_override = self.supervisor_override.clone();
                 handles.push((
                     thread::spawn(move || {
+                        // TEST-ONLY (see `Runner::supervisor_override`): stand in for the guarded
+                        // body so a supervisor can end WITHOUT layer one in the picture.
+                        #[cfg(test)]
+                        if let Some(body) = supervisor_override {
+                            body(&recovery.step);
+                            return;
+                        }
                         with_supervisor_guard(recovery, move || {
                             run_step(StepCtx {
                                 step,
@@ -2361,11 +2417,11 @@ fn run_step(ctx: StepCtx) {
             }));
             if let Err(payload) = body {
                 let detail = panic_detail(payload.as_ref());
-                eprintln!(
+                warn(&format!(
                     "[scheduler] \u{26a0} step {body_tag:?}: the CPU-budget monitor thread DIED \
                      with a panic ({detail}). The {cpu_timeout}s CPU-time budget is NO LONGER \
                      ENFORCED for this step; only the wall timeout still applies."
-                );
+                ));
             }
         }))
     } else {
@@ -4629,6 +4685,218 @@ mod tests {
             "the recorded success must stand; a crash while printing it is not a step failure"
         );
         assert!(!sh.failed);
+    }
+
+    /// Wall budget for one whole in-test run, mirroring the sibling engine's crash suite.
+    ///
+    /// Every step driven through `Runner::run` below is `true` or a short sleep, so a healthy run
+    /// finishes in well under a second. The deadline is what turns the defect these tests pin --
+    /// a WEDGE -- into a named assertion failure instead of a suite that never returns.
+    const CRASH_DEADLINE: Duration = Duration::from_secs(20);
+
+    /// Drive `runner.run()` on a side thread so a wedge FAILS this test rather than hanging it.
+    fn run_with_deadline(runner: Arc<Runner>) -> bool {
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let (ok, _wall) = runner.run();
+            let _ = tx.send(ok);
+        });
+        rx.recv_timeout(CRASH_DEADLINE).unwrap_or_else(|_| {
+            panic!(
+                "Runner::run did not return within {CRASH_DEADLINE:?}: the scheduler is WEDGED \
+                 waiting for a supervisor that will never publish an outcome"
+            )
+        })
+    }
+
+    /// Every line [`warn`] has recorded that mentions `needle`.
+    ///
+    /// Reading the recorder rather than the descriptor: the test harness intercepts the print
+    /// macros before they reach file descriptor 2, so a redirect of the descriptor sees nothing
+    /// and the assertion would pass on an empty string for any reason at all.
+    fn warnings_mentioning(needle: &str) -> Vec<String> {
+        WARNINGS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter(|line| line.contains(needle))
+            .cloned()
+            .collect()
+    }
+
+    /// A manager whose `thread_count` panics, which kills the per-step monitor thread.
+    #[derive(Default)]
+    struct CgroupsWithABrokenThreadCount;
+
+    impl CgroupManager for CgroupsWithABrokenThreadCount {
+        fn enabled(&self) -> bool {
+            true
+        }
+
+        fn prepare_command(
+            &self,
+            _tag: &str,
+            cmd: &str,
+            _mem_max: Option<i64>,
+            _cpu_count: Option<i64>,
+        ) -> String {
+            cmd.to_string()
+        }
+
+        fn kill(&self, _tag: &str) -> bool {
+            true
+        }
+
+        fn cleanup(&self, _tag: &str) {}
+
+        fn oom_kills(&self, _tag: &str) -> i64 {
+            0
+        }
+
+        fn peak_bytes(&self, _tag: &str) -> Option<i64> {
+            None
+        }
+
+        fn cpu_stats(&self, _tag: &str) -> Option<BTreeMap<String, i64>> {
+            None
+        }
+
+        fn cpu_pressure(&self, _tag: &str) -> Option<BTreeMap<String, f64>> {
+            None
+        }
+
+        fn thread_count(&self, _tag: &str) -> Option<i64> {
+            panic!("planted defect in the monitor's first cgroup read");
+        }
+
+        fn kill_all_remaining(&self) -> i64 {
+            0
+        }
+    }
+
+    #[test]
+    fn a_dead_cpu_budget_monitor_says_the_budget_is_no_longer_enforced() {
+        // The monitor is the ONLY enforcer of the per-step CPU-time budget, and nothing ever joins
+        // it for a result. If it dies the budget is not merely unmeasured -- it stops being
+        // enforced at all, silently, while still reading as configured. The step's own result is
+        // unaffected; the point is entirely the warning.
+        let slow = step("monitor-death", "slow", "sleep 1.5", &[], 0.0, &[]);
+        let cfg = DagConfig {
+            steps: vec![slow],
+            ..Default::default()
+        };
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = run_dag_boxed_limited(
+            &cfg,
+            1,
+            1,
+            false,
+            0,
+            Some(Arc::new(CgroupsWithABrokenThreadCount)),
+        );
+        std::panic::set_hook(previous);
+
+        assert!(
+            result.ok,
+            "the step's own result is unaffected by the monitor dying"
+        );
+        // Keyed on this step's own tag, so a peer test running in parallel cannot supply the
+        // evidence for it.
+        let said = warnings_mentioning("monitor-death.slow");
+        let died: Vec<&String> = said
+            .iter()
+            .filter(|line| line.contains("monitor thread DIED"))
+            .collect();
+        assert_eq!(
+            died.len(),
+            1,
+            "a dead monitor must be audible exactly once; warnings were {said:?}"
+        );
+        assert!(
+            died[0].contains("NO LONGER") && died[0].contains("ENFORCED"),
+            "the warning must say the budget stopped being enforced: {:?}",
+            died[0]
+        );
+        assert!(
+            died[0].contains("planted defect in the monitor's first cgroup read"),
+            "the cause must be NAMED, not merely counted: {:?}",
+            died[0]
+        );
+    }
+
+    #[test]
+    fn a_supervisor_that_ends_without_publishing_cannot_wedge_a_whole_run() {
+        // LAYER TWO, through `Runner::run` rather than by calling the sweep directly. Calling
+        // `sweep_dead_supervisors` on hand-built state proves the sweep works; it says nothing
+        // about the ready-set loop CALLING it, and deleting that call is what re-creates the
+        // wedge this whole issue is about. Only a real run can tell the two apart.
+        let lost = step("g", "lost", "true", &[], 0.0, &[]);
+        let mut runner = crash_test_runner(vec![lost.clone()], &[]);
+        // The supervisor thread ends immediately with nothing in `done` and no panic to catch --
+        // layer one is not in the picture, so only the sweep can end this run.
+        runner.supervisor_override = Some(Arc::new(|_step: &Step| {}));
+        let runner = Arc::new(runner);
+
+        assert!(
+            !run_with_deadline(Arc::clone(&runner)),
+            "a vanished supervisor must FAIL the run, not pass it"
+        );
+
+        let sh = lock_shared(&runner.shared);
+        let outcome = sh
+            .done
+            .get(&lost.tag())
+            .expect("the run must not finish while a launched step has no outcome");
+        assert!(
+            outcome.reason.contains("SUPERVISOR VANISHED"),
+            "reason was {:?}",
+            outcome.reason
+        );
+        assert!(outcome.reason.contains("UNKNOWN"));
+    }
+
+    #[test]
+    fn the_crash_record_in_the_journal_names_the_cause() {
+        // A run reconstructed from evidence alone is exactly the case where nobody still has the
+        // console output, so an event carrying only a tag and a duration says that something went
+        // wrong without saying what. The sibling engine writes step/reason/elapsed_s under this
+        // same event name, and `make cross` compares journals.
+        let dir = std::env::temp_dir().join(format!(
+            "scdr-crash-journal-{}-{:?}",
+            std::process::id(),
+            thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let evidence = Arc::new(RunEvidence::open(Some(dir.clone())).expect("an evidence dir"));
+        let victim = step("g", "boom", "true", &[], 0.0, &[]);
+        let runner = crash_test_runner(vec![victim.clone()], &[]);
+        publish_supervisor_failure(
+            &runner.shared,
+            &None,
+            &Some(evidence),
+            &victim,
+            false,
+            SupervisorFailure {
+                reason: "SUPERVISOR CRASHED (planted supervisor defect)".to_string(),
+                summary: "planted supervisor defect".to_string(),
+                elapsed_s: 0.25,
+            },
+        );
+
+        let journal = std::fs::read_to_string(dir.join("journal.jsonl")).expect("a journal");
+        let record = journal
+            .lines()
+            .find(|line| line.contains("\"event\":\"supervisor_crash\""))
+            .unwrap_or_else(|| panic!("no supervisor_crash record in {journal:?}"))
+            .to_string();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            record.contains("\"reason\":\"SUPERVISOR CRASHED (planted supervisor defect)\""),
+            "the record must NAME the cause; it was {record:?}"
+        );
+        assert!(record.contains("\"step\":\"g.boom\""));
+        assert!(record.contains("\"elapsed_s\":\"0.250\""));
     }
 
     #[test]
