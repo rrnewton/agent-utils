@@ -83,7 +83,7 @@ parallel-experiment-runner run \
   --cpu-cores 1 --memory 4G --cpu-timeout 120 --pids 512 \
   --hit-regex 'DIVERGENCE|panic' --max-concurrency 32 \
   --identity backend=ptrace image=demo5 \
-  -- target-runner --chaos --seed {seed} ./demo
+  -- ./workload --chaos --seed {seed}
 ```
 
 `--wall-timeout` is omitted above on purpose: with a `--cpu-timeout`, the wall backstop is
@@ -181,7 +181,7 @@ Instead of inline flags, pass `--spec sweep.json` (or `.yaml`, needing PyYAML):
 ```json
 {
   "name": "chaos-divergence",
-  "command": ["target-runner", "--chaos", "--seed", "{seed}", "./demo"],
+  "command": ["./workload", "--chaos", "--seed", "{seed}"],
   "worker_limits": {"cpu_cores": 1, "memory_bytes": 4294967296, "cpu_timeout_s": 120, "pids_max": 512},
   "hit": {"regex": "DIVERGENCE|panic", "hit_exit_codes": [134]},
   "identity": {"backend": "ptrace", "image": "demo5"}
