@@ -453,6 +453,7 @@ mod tests {
             id: ChannelId(id.to_owned()),
             label: label.to_owned(),
             writable,
+            alias: None,
         }
     }
 

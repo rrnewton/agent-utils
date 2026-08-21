@@ -3022,7 +3022,7 @@ async function loadOlder() {
       // so rewriting it afterwards would be a second change of height above the viewport and the
       // reader would move by whatever the difference happened to be.
       renderChannelSeam(
-        channelSummary(list.children.length, loadedIsWhole(), payload.channel.label)
+        channelSummary(list.children.length, loadedIsWhole(), channelName(payload.channel))
       );
       // ...and so is this, for exactly the same reason and one nobody photographs: the LAST step
       // of the walk HIDES #load-older, which is a sibling above the log inside the scrolling
@@ -3353,7 +3353,7 @@ async function loadDiscord(options) {
     // Inline, at the head of the list, rather than on the transient strip. `#63
     // status-line-placement`: this is a standing fact about what you are looking at, and the strip
     // takes itself away after a few seconds.
-    renderChannelSeam(channelSummary(loaded, loadedIsWhole(), payload.channel.label));
+    renderChannelSeam(channelSummary(loaded, loadedIsWhole(), channelName(payload.channel)));
     const messages = payload.messages || [];
     settleAfterRead(messages, { keepPosition, wasAtNewest, area, previousTop });
     renderScrollTools();
@@ -3507,7 +3507,7 @@ async function loadTodo(options) {
  * read at all, and the head of the list, the backlog count and the bulk control all have to move
  * with it or the view contradicts itself.
  */
-let todoView = { left: 0, window: 0, complete: false, label: "this channel" };
+let todoView = { left: 0, window: 0, complete: false, channelId: null };
 
 /** Take down what a `/todo` answer said about itself. */
 function noteTodoRead(payload) {
@@ -3516,7 +3516,10 @@ function noteTodoRead(payload) {
     left,
     window: typeof payload.window === "number" ? payload.window : left,
     complete: payload.complete === true,
-    label: payload.channel ? payload.channel.label : "this channel",
+    // The ID, not the name it was wearing at the time. `#39 channel-alias` lets the owner rename
+    // a channel from Settings without re-reading it, and a name captured here would leave this
+    // line saying what the channel used to be called.
+    channelId: payload.channel ? payload.channel.id : null,
   };
 }
 
@@ -3528,7 +3531,8 @@ function noteTodoRead(payload) {
  * the window is the channel's own only when the server says the set is whole.
  */
 function todoSummary() {
-  const { left, window, complete, label } = todoView;
+  const { left, window, complete } = todoView;
+  const label = channelName(knownChannel(todoView.channelId));
   if (left === 0) {
     return `nothing left to deal with in ${label}`;
   }
@@ -4375,6 +4379,160 @@ function relayToAgent(message, selfPosted, replayed) {
   return sendClientEvent({ type: "contextual_update", text: relayLine(message) });
 }
 
+// --- what to call a channel ----------------------------------------------------------------------
+//
+// `#39 channel-alias`. A name of the OWNER's own for a channel, because saying which channel he
+// means has to be possible out loud: `1532416065114607829` is unsayable, and a configured label
+// like "build noise" is not what anyone says either.
+//
+// THREE things this deliberately is not, each of them said on the screen as well as here:
+//
+//   * It is NOT a rename in Discord. The server keeps the name and never tells Discord; the
+//     channel keeps whatever it is called there. The server states that on every answer and this
+//     page shows THAT sentence rather than writing its own — same rule `#50 todo-view` follows
+//     with `read_state_notice`, and for the same reason: a second copy of a policy is a second
+//     thing that can go stale.
+//   * It is NOT visible to anyone outside this deployment.
+//   * It is NOT the agent's to choose. The agent is HANDED it — `list_channels` and the digest
+//     header carry it — and the server offers no tool that sets one. This editor is the only way
+//     in, and it is behind the write token, which is the operator's.
+//
+// ONE RULE, IN ONE PLACE: the alias when there is one, the configured label otherwise. Every
+// render of a channel's name on this page goes through `channelName`, so the picker, the head of
+// the channel and the head of the to-do list cannot come to disagree about what it is called.
+
+/**
+ * The name to show for a channel, from anything the server calls a channel.
+ *
+ * Trimmed and emptiness-checked rather than a bare `alias || label`: the server refuses a blank
+ * one, so an empty string arriving here means something upstream is wrong, and a picker with a
+ * blank entry in it is worse than one showing the configured label.
+ */
+function channelName(channel) {
+  if (!channel) {
+    return "this channel";
+  }
+  const alias = typeof channel.alias === "string" ? channel.alias.trim() : "";
+  return alias || String(channel.label || channel.id || "this channel");
+}
+
+/** What the server last said the channels were, including the names the owner gave them. */
+let knownChannels = [];
+
+function knownChannel(id) {
+  return knownChannels.find((channel) => String(channel.id) === String(id)) || null;
+}
+
+/**
+ * Redraw one channel picker from `knownChannels`, keeping it on the channel it was showing.
+ *
+ * A rename is a redraw, NOT a change of channel. Rebuilding the options moves a `select` to its
+ * first entry unless the value is put back, and doing that to `#discord-channel` would silently
+ * move the Discord view to a different channel because a name changed somewhere else.
+ */
+function fillChannelSelect(id) {
+  const select = el(id);
+  const chosen = select.value;
+  select.replaceChildren();
+  for (const channel of knownChannels) {
+    const option = document.createElement("option");
+    option.value = channel.id;
+    option.textContent = channelName(channel);
+    select.append(option);
+  }
+  if (knownChannels.some((channel) => String(channel.id) === String(chosen))) {
+    select.value = chosen;
+  } else if (knownChannels.length > 0) {
+    select.value = knownChannels[0].id;
+  }
+}
+
+/** What the editor says about the channel it is pointed at, including the label underneath. */
+function renderAliasEditor() {
+  const channel = knownChannel(el("alias-channel").value);
+  if (!channel) {
+    el("channel-alias").value = "";
+    el("alias-state").textContent = "This server has no channels configured.";
+    return;
+  }
+  el("channel-alias").value = channel.alias || "";
+  // The configured label is named either way. It is what clearing goes back to, and without it
+  // on screen the owner cannot tell what he would be returning to.
+  el("alias-state").textContent = channel.alias
+    ? `Called "${channel.alias}" here. The configured label is "${channel.label}".`
+    : `No name of your own yet. The configured label is "${channel.label}".`;
+}
+
+/**
+ * Rewrite the line at the head of the channel, which is already on screen saying the old name.
+ *
+ * From what is on the screen rather than by re-reading: a rename is not a reason to spend a
+ * request, and a seam left standing with the previous name is the most confident possible way of
+ * being wrong. It does nothing before the first read, when there is no seam to correct.
+ */
+function restateChannelSeam() {
+  if (el("channel-summary").children.length === 0) {
+    return;
+  }
+  if (todoMode) {
+    renderChannelSeam(todoSummary());
+    return;
+  }
+  renderChannelSeam(
+    channelSummary(
+      el("discord-log").children.length,
+      loadedIsWhole(),
+      channelName(knownChannel(el("discord-channel").value))
+    )
+  );
+}
+
+/**
+ * Take the server's answer as the truth about the name, and carry its notice through unchanged.
+ *
+ * The server is what decides what got stored — it trims, and it refuses what it will not keep —
+ * so the field is refilled from the answer rather than from what was typed.
+ */
+function adoptChannel(payload) {
+  const updated = payload && payload.channel;
+  if (updated) {
+    knownChannels = knownChannels.map((channel) =>
+      String(channel.id) === String(updated.id) ? updated : channel
+    );
+  }
+  el("alias-note").textContent = (payload && payload.alias_notice) || "";
+  fillChannelSelect("discord-channel");
+  fillChannelSelect("alias-channel");
+  renderAliasEditor();
+  restateChannelSeam();
+}
+
+function aliasPath() {
+  const channel = el("alias-channel").value;
+  return `/api/v1/channels/${encodeURIComponent(channel)}/alias`;
+}
+
+async function saveAlias() {
+  if (!knownChannel(el("alias-channel").value)) {
+    return;
+  }
+  const payload = await api(aliasPath(), {
+    method: "PUT",
+    body: { alias: el("channel-alias").value },
+  });
+  adoptChannel(payload);
+  setStatus("Saved. This app calls it that from now on.");
+}
+
+async function clearChannelAlias() {
+  if (!knownChannel(el("alias-channel").value)) {
+    return;
+  }
+  const payload = await api(aliasPath(), { method: "DELETE" });
+  adoptChannel(payload);
+  setStatus("Cleared. The configured label is back.");
+}
+
 // --- sign-in ---------------------------------------------------------------------------------
 
 function setTokenState(text) {
@@ -4389,15 +4547,14 @@ const NO_TOKEN_YET = "no token saved in this browser — paste your write-scope 
 
 function applyClientConfig(config) {
   const select = el("discord-channel");
-  select.replaceChildren();
-  for (const channel of config.channels || []) {
-    const option = document.createElement("option");
-    option.value = channel.id;
-    option.textContent = channel.label;
-    select.append(option);
-  }
-  if ((config.channels || []).length > 0) {
-    select.value = config.channels[0].id;
+  // `#39 channel-alias`. Both pickers are drawn from the same list and through the same naming
+  // rule, so the name in the bar and the name in Settings are one answer rather than two.
+  knownChannels = config.channels || [];
+  fillChannelSelect("discord-channel");
+  fillChannelSelect("alias-channel");
+  renderAliasEditor();
+  if (knownChannels.length > 0) {
+    select.value = knownChannels[0].id;
   }
   // `#44 live-push`. The server says whether it is watching the channel at all, and how often.
   // Without it the page would have to infer "live" from a stream that is attached and silent —
@@ -4689,6 +4846,11 @@ el("discord-channel").addEventListener(
     return loadDiscord();
   })
 );
+// `#39 channel-alias`. Pointing the editor at another channel shows THAT channel's name; it does
+// not change which channel the Discord view is reading, which is the picker on the bar.
+el("alias-channel").addEventListener("change", renderAliasEditor);
+el("save-alias").addEventListener("click", guardQuietly(saveAlias));
+el("clear-alias").addEventListener("click", guardQuietly(clearChannelAlias));
 el("load-older").addEventListener("click", guardQuietly(loadOlder));
 el("collapse-all").addEventListener("click", collapseAll);
 el("todo-filter").addEventListener("click", () => setTodoMode(!todoMode));

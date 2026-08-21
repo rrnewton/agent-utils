@@ -34,8 +34,8 @@ use async_trait::async_trait;
 use rusqlite::{Connection, OptionalExtension as _};
 
 use super::{
-    now_ms, ConversationId, ConversationSummary, ReadMark, Retention, Speaker, StateStore,
-    StoreError, SummaryKey, Turn, MAX_TURN_CHARS,
+    now_ms, ChannelAlias, ConversationId, ConversationSummary, ReadMark, Retention, Speaker,
+    StateStore, StoreError, SummaryKey, Turn, MAX_TURN_CHARS,
 };
 use crate::model::{ChannelId, MessageId};
 
@@ -105,6 +105,21 @@ pub const MIGRATIONS: &[&str] = &[
     ) STRICT;
 
     CREATE INDEX dismissals_by_position ON dismissals (channel_id, numeric);
+    ",
+    // v4 — the operator's own local names for channels. `#39 channel-alias`.
+    //
+    // One row per configured channel at most, which is why nothing in `Retention` reaches it: it
+    // is bounded by the allowlist rather than by use, exactly as `read_marks` is. An age bound
+    // would be worse than absent — it would rename a channel back without saying so.
+    //
+    // The alias is validated before it gets here (`super::validate_alias`), so this column holds
+    // a trimmed, non-empty, control-character-free string.
+    "
+    CREATE TABLE channel_aliases (
+        channel_id TEXT    PRIMARY KEY NOT NULL,
+        alias      TEXT    NOT NULL,
+        set_at_ms  INTEGER NOT NULL
+    ) STRICT;
     ",
 ];
 
@@ -608,6 +623,73 @@ impl StateStore for SqliteStore {
         .await
     }
 
+    async fn channel_aliases(&self) -> Result<Vec<ChannelAlias>, StoreError> {
+        self.with_connection(|connection| {
+            let mut statement = connection
+                .prepare(
+                    "SELECT channel_id, alias, set_at_ms FROM channel_aliases
+                     ORDER BY channel_id ASC",
+                )
+                .map_err(backend)?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok(ChannelAlias {
+                        channel: ChannelId(row.get::<_, String>(0)?),
+                        alias: row.get::<_, String>(1)?,
+                        set_at_ms: row.get::<_, i64>(2)?,
+                    })
+                })
+                .map_err(backend)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(backend)
+        })
+        .await
+    }
+
+    async fn set_channel_alias(
+        &self,
+        channel: &ChannelId,
+        alias: &str,
+    ) -> Result<ChannelAlias, StoreError> {
+        let alias = super::validate_alias(alias)?;
+        let channel = channel.clone();
+        self.with_connection(move |connection| {
+            let at = now_ms();
+            connection
+                .execute(
+                    "INSERT INTO channel_aliases (channel_id, alias, set_at_ms)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(channel_id) DO UPDATE SET
+                        alias     = excluded.alias,
+                        set_at_ms = excluded.set_at_ms",
+                    rusqlite::params![channel.as_str(), &alias, at],
+                )
+                .map_err(backend)?;
+            Ok(ChannelAlias {
+                channel,
+                alias,
+                set_at_ms: at,
+            })
+        })
+        .await
+    }
+
+    async fn clear_channel_alias(&self, channel: &ChannelId) -> Result<(), StoreError> {
+        let channel = channel.clone();
+        self.with_connection(move |connection| {
+            let removed = connection
+                .execute(
+                    "DELETE FROM channel_aliases WHERE channel_id = ?1",
+                    [channel.as_str()],
+                )
+                .map_err(backend)?;
+            if removed == 0 {
+                return Err(StoreError::NotFound);
+            }
+            Ok(())
+        })
+        .await
+    }
+
     async fn dismissals(&self, channel: &ChannelId) -> Result<Vec<MessageId>, StoreError> {
         let channel = channel.clone();
         self.with_connection(move |connection| {
@@ -763,6 +845,9 @@ impl StateStore for SqliteStore {
                 .map_err(backend)?;
             transaction
                 .execute("DELETE FROM dismissals", [])
+                .map_err(backend)?;
+            transaction
+                .execute("DELETE FROM channel_aliases", [])
                 .map_err(backend)?;
             transaction.commit().map_err(backend)
         })
@@ -1600,12 +1685,144 @@ mod tests {
             )
             .await
             .expect("the v3 table has to exist after the upgrade too");
+        // ...and the v4 one. `#39 channel-alias` added the newest rung, and a ladder is only
+        // proven at its top.
+        store
+            .set_channel_alias(&ChannelId("1111111111".to_owned()), "the build channel")
+            .await
+            .expect("the v4 table has to exist after the upgrade too");
         // And the older table's data is still reachable, which is the half a DROP-and-recreate
         // migration would silently lose.
         store
             .append_turn(&id("conv"), &Turn::now(Speaker::You, "still here"))
             .await
             .expect("append");
+    }
+
+    #[tokio::test]
+    async fn a_channel_alias_survives_a_restart_and_replaces_rather_than_accumulates() {
+        // `#39 channel-alias`. The point of putting the name in the store instead of in memory:
+        // the operator names a channel once and it is still named after a deploy.
+        let dir = TempDir::new("sqlite-alias");
+        let file = dir.path().join("state").join("gent-talk.sqlite3");
+        let build = ChannelId("1111111111".to_owned());
+        let lead = ChannelId("2222222222".to_owned());
+        {
+            let store = SqliteStore::open(&file, Retention::default()).expect("open");
+            store
+                .set_channel_alias(&build, "the build channel")
+                .await
+                .expect("name it");
+            store
+                .set_channel_alias(&lead, "the team")
+                .await
+                .expect("name the other one");
+            // Renaming REPLACES. Two rows for one channel would make "what is it called" a
+            // question with two answers and no tie-break.
+            store
+                .set_channel_alias(&build, "the noisy one")
+                .await
+                .expect("rename it");
+        }
+        let reopened = SqliteStore::open(&file, Retention::default()).expect("reopen");
+        let found = reopened.channel_aliases().await.expect("read back");
+        assert_eq!(found.len(), 2, "a rename must replace, not accumulate");
+        assert_eq!(found[0].channel, build);
+        assert_eq!(found[0].alias, "the noisy one");
+        assert_eq!(found[1].channel, lead);
+        assert_eq!(found[1].alias, "the team");
+
+        reopened
+            .clear_channel_alias(&build)
+            .await
+            .expect("clear one");
+        let error = reopened
+            .clear_channel_alias(&build)
+            .await
+            .expect_err("clearing a name that is gone is not a success");
+        assert_eq!(error.code(), "not_found", "{error}");
+        let left = reopened.channel_aliases().await.expect("read back");
+        assert_eq!(left.len(), 1, "clearing one must not clear the other");
+        assert_eq!(left[0].channel, lead);
+    }
+
+    #[tokio::test]
+    async fn retention_never_renames_a_channel_back_behind_the_operators_back() {
+        // Deliberately exempt from `Retention`, and this pins the exemption: an alias collected
+        // on age would put the configured label back months later, with nothing on screen saying
+        // why. The row is aged a year and every sweep this store runs is provoked.
+        let dir = TempDir::new("sqlite-alias-retention");
+        let store = store(
+            &dir,
+            Retention {
+                retain_days: 1,
+                max_conversations: 1,
+                max_summaries: 1,
+                max_dismissals: 1,
+                ..Retention::default()
+            },
+        );
+        let channel = ChannelId("1111111111".to_owned());
+        store
+            .set_channel_alias(&channel, "the build channel")
+            .await
+            .expect("name it");
+        {
+            let guard = store
+                .connection
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            guard
+                .execute(
+                    "UPDATE channel_aliases SET set_at_ms = ?1",
+                    [now_ms() - 365 * 86_400_000],
+                )
+                .expect("age the row");
+        }
+        // Every kind of write, because each one runs its own sweep and any of them could be the
+        // one that reaches this table.
+        store
+            .append_turn(&id("conv"), &Turn::now(Speaker::You, "anything"))
+            .await
+            .expect("append");
+        store
+            .cache_summary(&summary_key("1000000000000000200", 1), "a summary")
+            .await
+            .expect("cache");
+        store
+            .dismiss(&channel, &[MessageId("1000000000000000200".to_owned())])
+            .await
+            .expect("dismiss");
+        store
+            .mark_read(&channel, &MessageId("1000000000000000200".to_owned()))
+            .await
+            .expect("mark");
+
+        let found = store.channel_aliases().await.expect("read back");
+        assert_eq!(
+            found.len(),
+            1,
+            "no sweep may reach the operator's own names, however old they are"
+        );
+        assert_eq!(found[0].alias, "the build channel");
+    }
+
+    #[tokio::test]
+    async fn forgetting_everything_forgets_the_names_too() {
+        // The other side of the exemption above: "erase everything" has to mean everything, or
+        // the one thing left behind is the one nothing on the screen mentions.
+        let dir = TempDir::new("sqlite-alias-purge");
+        let store = store(&dir, Retention::default());
+        let channel = ChannelId("1111111111".to_owned());
+        store
+            .set_channel_alias(&channel, "the build channel")
+            .await
+            .expect("name it");
+        store.purge_everything().await.expect("purge");
+        assert!(
+            store.channel_aliases().await.expect("read back").is_empty(),
+            "a purge that leaves the aliases behind has not erased everything"
+        );
     }
 
     #[test]

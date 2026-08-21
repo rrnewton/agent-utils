@@ -72,15 +72,19 @@ pub struct ToolDescriptor {
 /// The tools this server offers a voice agent, given the configured channels.
 #[must_use]
 pub fn tool_manifest(channels: &[ChannelInfo]) -> Vec<ToolDescriptor> {
+    // `display_name`, not `label`: where the operator has given a channel his own name under
+    // `#39 channel-alias`, that is the name he will say out loud, so it has to be the name the
+    // model was given. The alias is ours and local — it is read here on the way out, and nothing
+    // about it is ever sent to Discord.
     let directory = channels
         .iter()
-        .map(|c| format!("{} (id {})", c.label, c.id))
+        .map(|c| format!("{} (id {})", c.display_name(), c.id))
         .collect::<Vec<_>>()
         .join(", ");
     let writable = channels
         .iter()
         .filter(|c| c.writable)
-        .map(|c| format!("{} (id {})", c.label, c.id))
+        .map(|c| format!("{} (id {})", c.display_name(), c.id))
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -281,11 +285,13 @@ mod tests {
                 id: ChannelId("111".to_owned()),
                 label: "lead team".to_owned(),
                 writable: true,
+                alias: None,
             },
             ChannelInfo {
                 id: ChannelId("222".to_owned()),
                 label: "build noise".to_owned(),
                 writable: false,
+                alias: None,
             },
         ]
     }
@@ -356,6 +362,7 @@ mod tests {
             id: ChannelId("222".to_owned()),
             label: "build noise".to_owned(),
             writable: false,
+            alias: None,
         }];
         let manifest = tool_manifest(&read_only);
         let post = manifest

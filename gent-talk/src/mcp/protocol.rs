@@ -133,8 +133,8 @@ pub enum Outcome {
 /// cannot be tempted by, or hallucinate a call to, a tool it was never told about, and a caller
 /// that somehow tries anyway is refused by [`dispatch`] regardless.
 #[must_use]
-pub fn tools_for(state: &AppState, scope: Scope) -> Vec<Value> {
-    tool_manifest(&state.config.channels)
+pub async fn tools_for(state: &AppState, scope: Scope) -> Vec<Value> {
+    tool_manifest(&ops::channels(state).await)
         .into_iter()
         .filter(|t| t.mcp_exposed)
         .filter(|t| !t.mutates || scope >= Scope::Write)
@@ -204,7 +204,7 @@ pub async fn dispatch(state: &AppState, scope: Scope, raw: &Value) -> Outcome {
         "ping" => Outcome::Reply(Box::new(RpcResponse::ok(id, json!({})))),
         "tools/list" => Outcome::Reply(Box::new(RpcResponse::ok(
             id,
-            json!({ "tools": tools_for(state, scope) }),
+            json!({ "tools": tools_for(state, scope).await }),
         ))),
         "tools/call" => call_tool(state, scope, id, request.params).await,
         other => Outcome::Reply(Box::new(RpcResponse::err(
@@ -339,7 +339,7 @@ async fn call_tool(state: &AppState, scope: Scope, id: Value, params: Option<Val
     }
 
     let outcome = match tool.name {
-        "list_channels" => Ok(list_channels_text(state)),
+        "list_channels" => Ok(list_channels_text(state).await),
         "digest_channel" => run_digest(state, &args).await,
         "read_page" => run_page(state, &args).await,
         "count_messages" => run_count(state, &args).await,
@@ -394,8 +394,8 @@ async fn call_tool(state: &AppState, scope: Scope, id: Value, params: Option<Val
     }
 }
 
-fn list_channels_text(state: &AppState) -> String {
-    let channels = ops::channels(state);
+async fn list_channels_text(state: &AppState) -> String {
+    let channels = ops::channels(state).await;
     if channels.is_empty() {
         return "No channels are configured on this bridge.".to_owned();
     }
@@ -403,7 +403,9 @@ fn list_channels_text(state: &AppState) -> String {
     for channel in channels {
         out.push_str(&format!(
             "- {} (id {}) — {}\n",
-            channel.label,
+            // The operator's own name for it when he set one. `#39 channel-alias`: the whole
+            // point is that the name he SAYS is the name the model was handed.
+            channel.display_name(),
             channel.id,
             if channel.writable {
                 "readable and postable"
@@ -452,7 +454,7 @@ fn digest_header(
 
 /// The first line of one step of a walk. Its whole job is to say that it IS a step.
 fn page_header(page: &ops::Page) -> String {
-    let (label, id) = (&page.channel.label, &page.channel.id);
+    let (label, id) = (page.channel.display_name(), &page.channel.id);
     let count = page.returned();
     if count == 0 {
         return format!("Page of {label} (id {id}): no messages in that part of the channel.\n");
@@ -510,7 +512,7 @@ async fn run_count(state: &AppState, args: &Value) -> Result<String, OpError> {
         .and_then(Value::as_u64)
         .and_then(|v| u32::try_from(v).ok());
     let tally = ops::count(state, &channel_id, since.as_deref(), cap).await?;
-    let (label, id) = (&tally.channel.label, &tally.channel.id);
+    let (label, id) = (tally.channel.display_name(), &tally.channel.id);
     let scope = match &since {
         Some(from) => format!(" since {from}"),
         None => String::new(),
@@ -551,7 +553,7 @@ async fn run_digest(state: &AppState, args: &Value) -> Result<String, OpError> {
         .first()
         .map(|e| crate::model::MessageId(e.id.clone()));
     let header = digest_header(
-        &info.label,
+        info.display_name(),
         &info.id,
         entries.len(),
         complete,
@@ -588,12 +590,13 @@ async fn run_find(state: &AppState, args: &Value) -> Result<String, OpError> {
         return Ok(format!(
             "No message in the last {searched} of {} matched \"{}\". Nothing is being guessed at; \
              ask for a digest or describe it differently.",
-            info.label, query
+            info.display_name(),
+            query
         ));
     };
     let header = format!(
         "Best match in {} (searched the last {searched} messages){}:\n",
-        info.label,
+        info.display_name(),
         if resolution.ambiguous {
             ", AMBIGUOUS — the runner-up scored nearly as well, so confirm which was meant"
         } else {
@@ -632,7 +635,7 @@ async fn run_read(state: &AppState, args: &Value) -> Result<String, OpError> {
     Ok(format!(
         "Message {} from {}:\n{}",
         id.as_str(),
-        info.label,
+        info.display_name(),
         untrusted::render_for_model(&[message])
     ))
 }
@@ -644,7 +647,7 @@ async fn run_post(state: &AppState, args: &Value) -> Result<String, OpError> {
     let (info, posted) = ops::reply(state, &channel_id, &text, reply_to.as_deref()).await?;
     Ok(format!(
         "Posted to {} (id {}) as message {}.",
-        info.label,
+        info.display_name(),
         info.id,
         posted.id.as_str()
     ))

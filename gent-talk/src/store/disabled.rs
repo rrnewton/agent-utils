@@ -14,7 +14,8 @@
 use async_trait::async_trait;
 
 use super::{
-    ConversationId, ConversationSummary, ReadMark, StateStore, StoreError, SummaryKey, Turn,
+    ChannelAlias, ConversationId, ConversationSummary, ReadMark, StateStore, StoreError,
+    SummaryKey, Turn,
 };
 use crate::model::{ChannelId, MessageId};
 
@@ -68,6 +69,18 @@ impl StateStore for DisabledStore {
     }
 
     async fn forget_read_mark(&self, _: &ChannelId) -> Result<(), StoreError> {
+        refuse()
+    }
+
+    async fn channel_aliases(&self) -> Result<Vec<ChannelAlias>, StoreError> {
+        refuse()
+    }
+
+    async fn set_channel_alias(&self, _: &ChannelId, _: &str) -> Result<ChannelAlias, StoreError> {
+        refuse()
+    }
+
+    async fn clear_channel_alias(&self, _: &ChannelId) -> Result<(), StoreError> {
         refuse()
     }
 
@@ -131,6 +144,15 @@ mod tests {
                 .await
                 .expect_err("mark read"),
             store.forget_read_mark(&channel).await.expect_err("unmark"),
+            store.channel_aliases().await.expect_err("aliases"),
+            store
+                .set_channel_alias(&channel, "the build channel")
+                .await
+                .expect_err("set alias"),
+            store
+                .clear_channel_alias(&channel)
+                .await
+                .expect_err("clear alias"),
             store.dismissals(&channel).await.expect_err("dismissals"),
             store
                 .dismiss(&channel, std::slice::from_ref(&message))

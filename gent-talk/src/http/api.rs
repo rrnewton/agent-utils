@@ -180,7 +180,7 @@ pub async fn not_found() -> ApiError {
 /// Channel listing.
 #[derive(Debug, Serialize)]
 pub struct ChannelsResponse {
-    /// Configured channels.
+    /// Configured channels, each carrying the operator's local alias when he has set one.
     pub channels: Vec<ChannelInfo>,
 }
 
@@ -191,8 +191,68 @@ pub async fn list_channels(
 ) -> Result<Json<ChannelsResponse>, ApiError> {
     require(&headers, &state, Scope::Read)?;
     Ok(Json(ChannelsResponse {
-        channels: state.config.channels.clone(),
+        channels: ops::channels(&state).await,
     }))
+}
+
+/// The name the operator wants to call a channel. `#39 channel-alias`.
+#[derive(Debug, Deserialize)]
+pub struct SetAliasRequest {
+    /// What to call it. Trimmed and length-checked by [`crate::store::validate_alias`]; blank is
+    /// refused rather than treated as a clear, because DELETE is the clear.
+    pub alias: String,
+}
+
+/// What this server is now calling a channel, and what it is called elsewhere.
+#[derive(Debug, Serialize)]
+pub struct AliasResponse {
+    /// The channel, with `alias` set or cleared as the call asked.
+    pub channel: ChannelInfo,
+    /// Said on every alias answer for the same reason [`crate::store::INBOX_NOTICE`] is said on
+    /// every inbox answer: this is the place a person expects the name to have changed in Discord.
+    pub alias_notice: &'static str,
+}
+
+/// The standing statement that a channel alias is local and ours.
+pub const ALIAS_NOTICE: &str = "A channel alias is gent-talk's own name for the channel. It is \
+                                stored on this server only: Discord is not told, the channel is \
+                                not renamed there, and nobody outside this deployment sees it. \
+                                Clearing it puts the configured label back.";
+
+/// `PUT /api/v1/channels/{channel_id}/alias`
+///
+/// WRITE scope, like every other durable write here. **The scope is not what keeps the agent
+/// out**, and saying so would be a comfortable overstatement: a hosted voice agent is routinely
+/// given the write token, because `post_reply` is a write tool it is meant to use. What keeps a
+/// model from renaming the channels it is also reporting on is that there is NO TOOL for it —
+/// [`crate::mcp::tool_manifest`] offers none, and [`crate::mcp::protocol::dispatch`] refuses any
+/// name it cannot find there. The model is handed the alias and cannot choose it.
+pub async fn set_alias(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(channel_id): Path<String>,
+    Json(request): Json<SetAliasRequest>,
+) -> Result<Response, ApiError> {
+    require(&headers, &state, Scope::Write)?;
+    let channel = ops::set_channel_alias(&state, &channel_id, &request.alias).await?;
+    Ok(no_store(Json(AliasResponse {
+        channel,
+        alias_notice: ALIAS_NOTICE,
+    })))
+}
+
+/// `DELETE /api/v1/channels/{channel_id}/alias` — go back to the configured label.
+pub async fn clear_alias(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(channel_id): Path<String>,
+) -> Result<Response, ApiError> {
+    require(&headers, &state, Scope::Write)?;
+    let channel = ops::clear_channel_alias(&state, &channel_id).await?;
+    Ok(no_store(Json(AliasResponse {
+        channel,
+        alias_notice: ALIAS_NOTICE,
+    })))
 }
 
 /// `GET /api/v1/agent-tools` — the voice agent's tool manifest.
@@ -201,7 +261,7 @@ pub async fn agent_tools(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require(&headers, &state, Scope::Read)?;
-    let manifest = crate::mcp::tool_manifest(&state.config.channels);
+    let manifest = crate::mcp::tool_manifest(&ops::channels(&state).await);
     Ok(Json(serde_json::json!({ "tools": manifest })))
 }
 
@@ -238,7 +298,7 @@ pub async fn client_config(
 ) -> Result<Json<ClientConfigResponse>, ApiError> {
     require(&headers, &state, Scope::Read)?;
     Ok(Json(ClientConfigResponse {
-        channels: state.config.channels.clone(),
+        channels: ops::channels(&state).await,
         elevenlabs_agent_id: state.config.elevenlabs.agent_id.clone(),
         version: env!("CARGO_PKG_VERSION"),
         live_poll_seconds: state.config.discord.live_poll_seconds,

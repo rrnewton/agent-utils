@@ -79,17 +79,102 @@ impl OpError {
 ///
 /// This is the single gate every channel-scoped operation goes through. A snowflake that is not
 /// configured does not exist here, however many channels the bot is actually in.
-fn allowed(state: &AppState, channel_id: &str) -> Result<ChannelInfo, OpError> {
+async fn allowed(state: &AppState, channel_id: &str) -> Result<ChannelInfo, OpError> {
+    let mut channel = configured(state, channel_id)?;
+    channel.alias = aliases(state).await.remove(channel.id.as_str());
+    Ok(channel)
+}
+
+/// The allowlist gate WITHOUT the alias overlay.
+///
+/// Two callers, and both of them have a reason not to pay for a store read: [`watch`], which is
+/// deliberately synchronous and throws the channel away, and the two alias operations themselves,
+/// which are about to learn the alias from the write they are making. Everything that RENDERS a
+/// channel name goes through [`allowed`] instead.
+fn configured(state: &AppState, channel_id: &str) -> Result<ChannelInfo, OpError> {
     state
         .channel(channel_id)
         .cloned()
         .ok_or(OpError::UnknownChannel)
 }
 
-/// The channels this server is configured for. Read scope.
-#[must_use]
-pub fn channels(state: &AppState) -> Vec<ChannelInfo> {
-    state.config.channels.clone()
+/// The channels this server is configured for, wearing the operator's own names. Read scope.
+pub async fn channels(state: &AppState) -> Vec<ChannelInfo> {
+    let aliases = aliases(state).await;
+    state
+        .config
+        .channels
+        .iter()
+        .cloned()
+        .map(|mut channel| {
+            channel.alias = aliases.get(channel.id.as_str()).cloned();
+            channel
+        })
+        .collect()
+}
+
+/// The operator's local channel names, by channel id. `#39 channel-alias`.
+///
+/// **A failure here is not a failure of the operation asking.** An alias is a decoration on a
+/// channel, so a store that is not configured — the ordinary state of a deployment that has never
+/// set `storage.path` — must not make reading a channel impossible; it degrades to the configured
+/// label, which is exactly what the reader saw before there were aliases at all. A real backend
+/// failure degrades the same way and says so in the log, because the alternative is that a
+/// corrupt row takes the whole bridge down.
+async fn aliases(state: &AppState) -> std::collections::BTreeMap<String, String> {
+    match state.store.channel_aliases().await {
+        Ok(found) => found
+            .into_iter()
+            .map(|a| (a.channel.as_str().to_owned(), a.alias))
+            .collect(),
+        // Expected whenever no store is configured. Not worth a line per request.
+        Err(crate::store::StoreError::Unavailable(_)) => std::collections::BTreeMap::new(),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "could not read channel aliases; falling back to the configured labels"
+            );
+            std::collections::BTreeMap::new()
+        }
+    }
+}
+
+/// Give one channel a local name. Write scope, and the OPERATOR's act alone.
+///
+/// Nothing about this reaches Discord: the channel keeps whatever name it has there, and no
+/// caller outside this deployment can see the one set here. It is deliberately absent from the
+/// MCP tool manifest — a model that could rename the channels it is also reporting on could
+/// quietly make its own reports unrecognisable.
+///
+/// # Errors
+///
+/// [`OpError::UnknownChannel`] outside the allowlist, so a snowflake nobody configured cannot be
+/// used to grow the store one row at a time; [`OpError::Store`] when the text is unusable, when
+/// no store is configured, or when the write fails.
+pub async fn set_channel_alias(
+    state: &AppState,
+    channel_id: &str,
+    alias: &str,
+) -> Result<ChannelInfo, OpError> {
+    let mut channel = configured(state, channel_id)?;
+    let stored = state.store.set_channel_alias(&channel.id, alias).await?;
+    channel.alias = Some(stored.alias);
+    Ok(channel)
+}
+
+/// Drop one channel's local name, putting the configured label back. Write scope.
+///
+/// # Errors
+///
+/// [`OpError::UnknownChannel`] outside the allowlist; [`OpError::Store`] when the channel had no
+/// alias, when no store is configured, or when the write fails.
+pub async fn clear_channel_alias(
+    state: &AppState,
+    channel_id: &str,
+) -> Result<ChannelInfo, OpError> {
+    let channel = configured(state, channel_id)?;
+    state.store.clear_channel_alias(&channel.id).await?;
+    Ok(channel)
 }
 
 /// Fill in [`Message::spoken_time`] for a freshly fetched batch.
@@ -147,7 +232,7 @@ pub async fn messages(
     channel_id: &str,
     limit: Option<u16>,
 ) -> Result<Window, OpError> {
-    let channel = allowed(state, channel_id)?;
+    let channel = allowed(state, channel_id).await?;
     // Clamped to Discord's own ceiling, not merely to the configured one. Nothing in
     // `Config::from_toml_and_env` stops an operator writing `max_fetch_limit = 200`, but both the
     // real client and the fake clamp the request to 100 — so comparing against the unclamped
@@ -307,7 +392,7 @@ pub async fn page(
     channel_id: &str,
     request: PageRequest<'_>,
 ) -> Result<Page, OpError> {
-    let channel = allowed(state, channel_id)?;
+    let channel = allowed(state, channel_id).await?;
     let before = cursor(request.before)?;
     let since = instant(request.since)?;
     let until = instant(request.until)?;
@@ -441,7 +526,7 @@ pub async fn count(
     since: Option<&str>,
     cap: Option<u32>,
 ) -> Result<MessageCount, OpError> {
-    let channel = allowed(state, channel_id)?;
+    let channel = allowed(state, channel_id).await?;
     let since = instant(since)?;
     let cap = state.effective_count_cap(cap);
 
@@ -515,7 +600,7 @@ pub async fn resolve(
     limit: Option<u16>,
     max_alternatives: Option<u16>,
 ) -> Result<(ChannelInfo, Resolution, usize), OpError> {
-    let info = allowed(state, channel_id)?;
+    let info = allowed(state, channel_id).await?;
     if query.trim().is_empty() {
         return Err(OpError::EmptyQuery);
     }
@@ -548,7 +633,7 @@ pub async fn reply(
     text: &str,
     reply_to: Option<&str>,
 ) -> Result<(ChannelInfo, Message), OpError> {
-    let info = allowed(state, channel_id)?;
+    let info = allowed(state, channel_id).await?;
     if !info.writable {
         return Err(OpError::ChannelNotWritable);
     }
@@ -587,7 +672,7 @@ pub fn watch(
     channel_id: &str,
     after: Option<&MessageId>,
 ) -> Result<(ChannelInfo, crate::live::Subscription), OpError> {
-    let channel = allowed(state, channel_id)?;
+    let channel = configured(state, channel_id)?;
     let subscription = state.live.subscribe(&channel.id, after);
     Ok((channel, subscription))
 }
@@ -650,7 +735,7 @@ pub async fn mark_read(
     channel_id: &str,
     upto: &MessageId,
 ) -> Result<(ChannelInfo, crate::store::ReadMark), OpError> {
-    let channel = allowed(state, channel_id)?;
+    let channel = allowed(state, channel_id).await?;
     let mark = state.store.mark_read(&channel.id, upto).await?;
     Ok((channel, mark))
 }
@@ -663,7 +748,7 @@ pub async fn mark_read(
 /// [`OpError::UnknownChannel`] outside the allowlist; [`OpError::Store`] when there was no mark,
 /// when no store is configured, or when the write fails.
 pub async fn forget_read_mark(state: &AppState, channel_id: &str) -> Result<ChannelInfo, OpError> {
-    let channel = allowed(state, channel_id)?;
+    let channel = allowed(state, channel_id).await?;
     state.store.forget_read_mark(&channel.id).await?;
     Ok(channel)
 }
@@ -852,7 +937,7 @@ pub async fn restore(
     channel_id: &str,
     wanted: &[MessageId],
 ) -> Result<InboxChange, OpError> {
-    let channel = allowed(state, channel_id)?;
+    let channel = allowed(state, channel_id).await?;
     state.store.restore(&channel.id, wanted).await?;
     Ok(InboxChange {
         channel,
@@ -965,6 +1050,7 @@ pub async fn summarize_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::StateStore as _;
     use crate::testing::{self, READ_CHANNEL, WRITE_CHANNEL};
 
     #[tokio::test]
@@ -1399,6 +1485,177 @@ mod tests {
             "m6 through m9, with the boundary itself counted as inside"
         );
         assert!(!tally.at_least);
+    }
+
+    // --- `#39 channel-alias` -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn the_operators_name_reaches_every_channel_this_server_hands_back() {
+        // The overlay, on both of the two paths a channel leaves this module by: the LISTING, and
+        // the per-channel gate every read goes through. A fix applied to only one of the two is
+        // how the picker and the digest header end up disagreeing about what the channel is
+        // called.
+        let (state, fake, store) = testing::state_with_store();
+        store
+            .set_channel_alias(
+                &crate::model::ChannelId(READ_CHANNEL.to_owned()),
+                "the build channel",
+            )
+            .await
+            .expect("the operator names it");
+
+        let listed = channels(&state).await;
+        let renamed = listed
+            .iter()
+            .find(|c| c.id.as_str() == READ_CHANNEL)
+            .expect("the read channel is configured");
+        assert_eq!(renamed.alias.as_deref(), Some("the build channel"));
+        assert_eq!(
+            renamed.label, "build noise",
+            "the configured label survives"
+        );
+        assert_eq!(renamed.display_name(), "the build channel");
+
+        let untouched = listed
+            .iter()
+            .find(|c| c.id.as_str() == WRITE_CHANNEL)
+            .expect("the write channel is configured");
+        assert_eq!(untouched.alias, None, "one alias must not rename the rest");
+        assert_eq!(untouched.display_name(), "lead team");
+
+        fake.seed(
+            &crate::model::ChannelId(READ_CHANNEL.to_owned()),
+            "agent",
+            "the arm64 job failed",
+        );
+        let window = messages(&state, READ_CHANNEL, None).await.expect("reads");
+        assert_eq!(
+            window.channel.display_name(),
+            "the build channel",
+            "a read must come back wearing the name the operator gave it"
+        );
+    }
+
+    #[tokio::test]
+    async fn clearing_the_alias_puts_the_configured_label_back_everywhere() {
+        let (state, _fake, store) = testing::state_with_store();
+        let channel = crate::model::ChannelId(READ_CHANNEL.to_owned());
+        set_channel_alias(&state, READ_CHANNEL, "the build channel")
+            .await
+            .expect("set");
+        let cleared = clear_channel_alias(&state, READ_CHANNEL)
+            .await
+            .expect("clear");
+        assert_eq!(cleared.alias, None);
+        assert_eq!(cleared.display_name(), "build noise");
+        assert!(
+            store.channel_aliases().await.expect("read").is_empty(),
+            "clearing must remove the row, not merely stop showing it"
+        );
+        assert_eq!(
+            channels(&state)
+                .await
+                .iter()
+                .find(|c| c.id == channel)
+                .expect("configured")
+                .display_name(),
+            "build noise"
+        );
+    }
+
+    #[tokio::test]
+    async fn setting_an_alias_is_confined_to_the_allowlist_and_writes_nothing_when_refused() {
+        // Otherwise an unconfigured snowflake grows this table one row at a time, and each row
+        // names a channel this server will never show.
+        let (state, _fake, store) = testing::state_with_store();
+        let error = set_channel_alias(&state, "9999999999", "somewhere else")
+            .await
+            .expect_err("an unconfigured channel must not be nameable");
+        assert!(matches!(error, OpError::UnknownChannel), "{error:?}");
+        assert!(
+            store.channel_aliases().await.expect("read").is_empty(),
+            "a refused rename must not have written anything"
+        );
+        let error = clear_channel_alias(&state, "9999999999")
+            .await
+            .expect_err("nor clearable");
+        assert!(matches!(error, OpError::UnknownChannel), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn a_blank_alias_is_refused_rather_than_silently_clearing_the_name() {
+        let (state, _fake, store) = testing::state_with_store();
+        set_channel_alias(&state, READ_CHANNEL, "the build channel")
+            .await
+            .expect("set");
+        let error = set_channel_alias(&state, READ_CHANNEL, "   ")
+            .await
+            .expect_err("a blank name must be refused");
+        assert_eq!(error.code(), "bad_id", "{error}");
+        assert_eq!(
+            store
+                .channel_aliases()
+                .await
+                .expect("read")
+                .first()
+                .map(|a| a.alias.clone()),
+            Some("the build channel".to_owned()),
+            "a refused rename must leave the name that was already there"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_channel_with_no_alias_cannot_be_cleared_and_is_told_so() {
+        let (state, _fake, _store) = testing::state_with_store();
+        let error = clear_channel_alias(&state, READ_CHANNEL)
+            .await
+            .expect_err("there was nothing to clear");
+        assert_eq!(error.code(), "not_found", "{error}");
+    }
+
+    #[tokio::test]
+    async fn with_no_store_configured_a_channel_still_reads_under_its_configured_label() {
+        // The ordinary deployment that never set `storage.path`. An alias is a DECORATION: a
+        // store that refuses every call must cost the operator his aliases and nothing else —
+        // certainly not the ability to read a channel at all.
+        let (state, fake) =
+            testing::state_with(std::sync::Arc::new(crate::store::disabled::DisabledStore));
+        fake.seed(
+            &crate::model::ChannelId(READ_CHANNEL.to_owned()),
+            "agent",
+            "the arm64 job failed",
+        );
+        let listed = channels(&state).await;
+        assert_eq!(listed.len(), 2, "the configured channels are still listed");
+        assert!(listed.iter().all(|c| c.alias.is_none()));
+        let window = messages(&state, READ_CHANNEL, None)
+            .await
+            .expect("a channel must stay readable with no store at all");
+        assert_eq!(window.channel.display_name(), "build noise");
+    }
+
+    #[tokio::test]
+    async fn a_store_that_fails_degrades_to_the_configured_label_instead_of_failing_the_read() {
+        let (state, _fake, store) = testing::state_with_store();
+        set_channel_alias(&state, READ_CHANNEL, "the build channel")
+            .await
+            .expect("set");
+        let named = |list: &[ChannelInfo]| {
+            list.iter()
+                .find(|c| c.id.as_str() == READ_CHANNEL)
+                .expect("configured")
+                .display_name()
+                .to_owned()
+        };
+        // The control, so the degraded answer below is not the only answer this can give.
+        assert_eq!(named(&channels(&state).await), "the build channel");
+
+        store.fail_next("the disk is full");
+        assert_eq!(
+            named(&channels(&state).await),
+            "build noise",
+            "a backend failure must degrade to the configured label, not take the listing down"
+        );
     }
 
     #[test]

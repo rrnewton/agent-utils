@@ -27,8 +27,8 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 
 use super::{
-    now_ms, ConversationId, ConversationSummary, ReadMark, Retention, StateStore, StoreError,
-    SummaryKey, Turn, MAX_TURN_CHARS,
+    now_ms, ChannelAlias, ConversationId, ConversationSummary, ReadMark, Retention, StateStore,
+    StoreError, SummaryKey, Turn, MAX_TURN_CHARS,
 };
 use crate::model::{ChannelId, MessageId};
 
@@ -54,6 +54,8 @@ struct State {
     /// `(channel, message)` to `(snowflake, when it was dismissed)`. The same shape the real
     /// table has, so the count bound and the ordering can be reproduced rather than assumed.
     dismissals: BTreeMap<(String, String), (u64, i64)>,
+    /// Channel to `(alias, when it was set)`. `#39 channel-alias`.
+    aliases: BTreeMap<String, (String, i64)>,
     next_summary_seq: u64,
     fail_next: Option<String>,
     appended: usize,
@@ -315,6 +317,52 @@ impl StateStore for FakeStore {
             .ok_or(StoreError::NotFound)
     }
 
+    async fn channel_aliases(&self) -> Result<Vec<ChannelAlias>, StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        Ok(state
+            .aliases
+            .iter()
+            .map(|(channel, (alias, set_at_ms))| ChannelAlias {
+                channel: ChannelId(channel.clone()),
+                alias: alias.clone(),
+                set_at_ms: *set_at_ms,
+            })
+            .collect())
+    }
+
+    async fn set_channel_alias(
+        &self,
+        channel: &ChannelId,
+        alias: &str,
+    ) -> Result<ChannelAlias, StoreError> {
+        // Validated BEFORE `armed`, exactly as `mark_read` refuses an unorderable snowflake
+        // before it touches the state: a fake that accepted a name the real store rejects is a
+        // fake that certifies a bug.
+        let alias = super::validate_alias(alias)?;
+        let mut state = self.lock();
+        armed(&mut state)?;
+        let set_at_ms = now_ms();
+        state
+            .aliases
+            .insert(channel.as_str().to_owned(), (alias.clone(), set_at_ms));
+        Ok(ChannelAlias {
+            channel: channel.clone(),
+            alias,
+            set_at_ms,
+        })
+    }
+
+    async fn clear_channel_alias(&self, channel: &ChannelId) -> Result<(), StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        state
+            .aliases
+            .remove(channel.as_str())
+            .map(|_| ())
+            .ok_or(StoreError::NotFound)
+    }
+
     async fn dismissals(&self, channel: &ChannelId) -> Result<Vec<MessageId>, StoreError> {
         let mut state = self.lock();
         armed(&mut state)?;
@@ -464,6 +512,7 @@ impl StateStore for FakeStore {
         state.marks.clear();
         state.summaries.clear();
         state.dismissals.clear();
+        state.aliases.clear();
         state.purges += 1;
         Ok(())
     }

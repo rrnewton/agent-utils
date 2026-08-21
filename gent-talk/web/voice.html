@@ -446,6 +446,50 @@
             against a real one — or shown not to exist.
           </p>
 
+          <!--
+            `#39 channel-alias`. A name of the OWNER's own for a channel, so that addressing one
+            out loud is possible at all: a snowflake is unsayable and a configured label like
+            "build noise" is not what anyone says either.
+
+            Three things this deliberately is not, each stated on the screen and not only here:
+            it is not a rename in Discord, it is not visible to anyone outside this deployment,
+            and it is not something the agent can set — the agent is given the name, and cannot
+            choose it, because a model that renames the channels it also reports on can make its
+            own reports unrecognisable.
+          -->
+          <h2>What to call a channel</h2>
+          <p class="hint">
+            Give a channel a name of your own. This app then uses it everywhere it would have
+            shown the configured label — the picker, the channel summary, and
+            <strong>the name the voice agent is given</strong>, so what you say out loud is what
+            it was told.
+          </p>
+          <p class="hint">
+            It is <strong>ours and local</strong>: it is kept on this server, Discord is never
+            told, the channel is not renamed there, and nobody outside this deployment sees it —
+            the same standing as which messages you have dealt with. Clearing it puts the
+            configured label back.
+          </p>
+          <label for="alias-channel">Channel</label>
+          <select id="alias-channel" aria-describedby="alias-state"></select>
+          <label for="channel-alias">Call it</label>
+          <input
+            id="channel-alias"
+            type="text"
+            maxlength="60"
+            autocomplete="off"
+            aria-describedby="alias-state"
+          />
+          <p id="alias-state" class="hint" aria-live="polite"></p>
+          <button id="save-alias" class="secondary" type="button">Save this name</button>
+          <button id="clear-alias" class="secondary" type="button">Use the configured label</button>
+          <!--
+            The SERVER's own standing statement about what an alias is, quoted and never rewritten
+            — the same rule `#inbox-note` follows. A second copy of a policy here would be a second
+            thing that can drift from the one the server actually enforces.
+          -->
+          <p id="alias-note" class="hint"></p>
+
           <h2>Reading width</h2>
           <p class="hint">
             On a wide screen with a mouse, the transcript and the channel are held to a column

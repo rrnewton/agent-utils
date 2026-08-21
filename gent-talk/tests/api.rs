@@ -180,6 +180,18 @@ async fn every_api_route_refuses_an_unauthenticated_caller() {
             format!("/api/v1/channels/{WRITE_CHANNEL}/restore"),
             Some(serde_json::json!({"messages": ["1000000000000000200"]})),
         ),
+        // `#39 channel-alias`. The operator's own name for a channel is a durable write like the
+        // two above, and belongs in this table for the same reason.
+        (
+            "PUT",
+            format!("/api/v1/channels/{WRITE_CHANNEL}/alias"),
+            Some(serde_json::json!({"alias": "the team"})),
+        ),
+        (
+            "DELETE",
+            format!("/api/v1/channels/{WRITE_CHANNEL}/alias"),
+            None,
+        ),
     ];
     for (method, uri, body) in routes {
         let (status, payload) = call(&harness, method, uri, None, body.clone()).await;
@@ -1118,6 +1130,19 @@ async fn the_read_token_cannot_reach_a_transcript_or_move_a_mark() {
             "POST",
             format!("/api/v1/channels/{WRITE_CHANNEL}/restore"),
             Some(serde_json::json!({"messages": ["1000000000000000200"]})),
+        ),
+        // `#39 channel-alias`. Same argument again: the name outlives the process and another
+        // device reads it back, so it is not something a read credential does. The read token may
+        // SEE the alias — every channel it is handed carries one — and may not choose it.
+        (
+            "PUT",
+            format!("/api/v1/channels/{WRITE_CHANNEL}/alias"),
+            Some(serde_json::json!({"alias": "the team"})),
+        ),
+        (
+            "DELETE",
+            format!("/api/v1/channels/{WRITE_CHANNEL}/alias"),
+            None,
         ),
     ];
     for (method, uri, body) in forbidden {

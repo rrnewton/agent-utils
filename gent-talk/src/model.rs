@@ -190,9 +190,40 @@ pub struct ChannelInfo {
     /// Snowflake of the channel.
     pub id: ChannelId,
     /// Human label used in speech and in the web app ("deepscry lead team").
+    ///
+    /// This one comes from the operator's CONFIGURATION file and cannot be changed at runtime.
+    /// What a person actually hears is [`ChannelInfo::display_name`], because `#39 channel-alias`
+    /// lets him rename a channel from inside the app without editing a file or redeploying.
     pub label: String,
     /// Whether posting into this channel is permitted at all.
     pub writable: bool,
+    /// The operator's own local name for this channel, when he has set one. `#39 channel-alias`.
+    ///
+    /// **Local, and only ours.** It lives in this server's store, exactly as read state does; it
+    /// is never sent to Discord, renames nothing there, and no one outside this deployment sees
+    /// it. It is set by the OPERATOR through the web app — never by the voice agent, which would
+    /// otherwise be renaming the things it is also reporting on.
+    ///
+    /// `None` means "no alias", which is not the same as an empty one: an empty alias is refused
+    /// at the door, and clearing an alias is a separate act that puts [`ChannelInfo::label`] back.
+    ///
+    /// It is `None` on a channel that came straight from [`crate::config::Config`]; the store
+    /// overlay in [`crate::ops`] is what fills it in, so anything reading configuration directly
+    /// — the startup banner, the preflight probe — still names the label the operator wrote.
+    #[serde(default)]
+    pub alias: Option<String>,
+}
+
+impl ChannelInfo {
+    /// The name to show and to say aloud.
+    ///
+    /// The alias when the operator set one, the configured label otherwise. Every place that
+    /// renders a channel's name for a person or hands it to a model goes through here, so
+    /// "the name the owner says out loud" and "the name the model was given" cannot drift.
+    #[must_use]
+    pub fn display_name(&self) -> &str {
+        self.alias.as_deref().unwrap_or(&self.label)
+    }
 }
 
 #[cfg(test)]
@@ -254,6 +285,46 @@ mod tests {
             "09:51:25 EDT",
             "once stamped, the spoken form is what a renderer must use"
         );
+    }
+
+    #[test]
+    fn the_operators_own_name_wins_and_clearing_it_returns_the_configured_label() {
+        // `#39 channel-alias`. Both directions, because "the alias wins" and "the label is the
+        // fallback" are two claims and a broken implementation satisfies one of them.
+        let mut channel = ChannelInfo {
+            id: ChannelId("1532416065114607829".to_owned()),
+            label: "build noise".to_owned(),
+            writable: false,
+            alias: None,
+        };
+        assert_eq!(
+            channel.display_name(),
+            "build noise",
+            "with no alias set, the configured label is the name"
+        );
+        channel.alias = Some("the build channel".to_owned());
+        assert_eq!(
+            channel.display_name(),
+            "the build channel",
+            "an alias the operator set must beat the configured label"
+        );
+        channel.alias = None;
+        assert_eq!(
+            channel.display_name(),
+            "build noise",
+            "clearing the alias must put the configured label back"
+        );
+    }
+
+    #[test]
+    fn a_channel_from_configuration_deserializes_without_an_alias_rather_than_failing() {
+        // Configuration and the older shape of this struct carry no `alias` at all. It has to
+        // read back as "no alias", not as a parse error.
+        let channel: ChannelInfo =
+            serde_json::from_str(r#"{"id":"1111111111","label":"build noise","writable":false}"#)
+                .expect("a channel with no alias field still parses");
+        assert_eq!(channel.alias, None);
+        assert_eq!(channel.display_name(), "build noise");
     }
 
     #[test]

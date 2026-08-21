@@ -514,6 +514,9 @@ impl Config {
                     id: ChannelId(c.id),
                     label: c.label,
                     writable: c.writable,
+                    // Configuration carries no alias: the operator's local name lives in the
+                    // store, and `crate::ops` overlays it. `#39 channel-alias`.
+                    alias: None,
                 })
                 .collect(),
         };
@@ -878,6 +881,7 @@ fn parse_channel_spec(spec: &str) -> Result<Vec<ChannelInfo>, ConfigError> {
             id: ChannelId(id.to_owned()),
             label: label.to_owned(),
             writable,
+            alias: None,
         });
     }
     Ok(out)

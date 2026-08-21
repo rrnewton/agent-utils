@@ -104,6 +104,15 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/channels/{channel_id}/read",
             post(api::mark_read).delete(api::forget_read_mark),
         )
+        // `#39 channel-alias`. The operator's own local name for a channel. WRITE scope both
+        // ways, because it outlives the process — and NO MCP TOOL at all, which is the part that
+        // actually keeps a model from renaming the channels it reports on. See `api::set_alias`
+        // for why the scope alone would not. Reading an alias needs no route of its own: it rides
+        // on every channel this server hands back.
+        .route(
+            "/api/v1/channels/{channel_id}/alias",
+            axum::routing::put(api::set_alias).delete(api::clear_alias),
+        )
         // One path, three methods: POST carries the whole protocol, and GET/DELETE — which exist
         // in the spec for server-initiated streams and session teardown — are refused plainly
         // because this endpoint is stateless and has nothing to push.

@@ -331,7 +331,7 @@ an error, not a shrug — a typo'd section name should not silently disable a se
 
 Almost nothing in this server is remembered. A channel is never cached as a channel: every
 question is a fresh Discord fetch, and it stays that way. There is exactly one store,
-`src/store/`, and it holds three things:
+`src/store/`, and it holds these:
 
 * the `/voice` **conversation transcript** — what the owner said and what the agent said back;
 * **read marks** — how far the owner has been shown each channel;
@@ -341,7 +341,10 @@ question is a fresh Discord fetch, and it stays that way. There is exactly one s
 * **cached summaries** — one short line per long message, filed under the policy that produced
   it. This is the one entry NOT authored by this server: with the shipped extractive backend a
   summary is literally the opening of somebody else's message, so it is a second at-rest copy of
-  third-party text and is treated as one everywhere below.
+  third-party text and is treated as one everywhere below; and
+* **channel aliases** — what THIS app calls a channel, one row per configured channel at most.
+  Ours and local in the same sense the read marks are: never sent to Discord, renaming nothing
+  there. See "What to call a channel". `#39 channel-alias`.
 
 The first three are the owner's own record. The last is a derived cache, bounded by the same
 retention as the rest, erased by the same purge, and never filled by a read-scope token.
@@ -388,6 +391,11 @@ dropped), at most `max_summaries` cached summaries (least recently written dropp
 nothing older than `retain_days` days — since its last turn for a conversation, since it was made
 for a summary. The defaults are 50, 1000, 2000 and 30.
 
+Two tables are deliberately outside all of it: the "dealt with" marks, which an age bound would
+put back into the to-do list purely because time passed, and the **channel aliases**, which an age
+bound would rename back months later with nothing on screen saying why. Both are bounded by
+something other than time — a count, and the channel allowlist.
+
 The age bound is the only thing that collects an **orphan**: a cached summary whose message was
 edited or deleted upstream is unreachable by key, is filed under the current policy version, and
 nothing will ever announce that it went. The startup sweep cannot help — it deletes by policy
@@ -395,7 +403,8 @@ version, and an orphan is under the live one.
 
 ### How an operator purges it
 
-Three ways, all of which erase everything — transcripts, read marks and cached summaries alike:
+Three ways, all of which erase everything — transcripts, read marks, "dealt with" marks,
+cached summaries and channel aliases alike:
 
 1. `DELETE /api/v1/storage` with the **write** token, on a running server. This is the only
    complete erase over HTTP: `DELETE /api/v1/conversations` clears transcripts and deliberately
@@ -532,7 +541,9 @@ not, and neither reveals anything about the configuration.
 | POST | `/api/v1/channels/{id}/restore` | **write** | `{messages:[…]}` — the undo, restoring exactly that set |
 | POST | `/api/v1/channels/{id}/read` | **write** | move this server's read mark forward |
 | DELETE | `/api/v1/channels/{id}/read` | **write** | drop this server's read mark |
-| DELETE | `/api/v1/storage` | **write** | erase EVERYTHING durable: transcripts, read marks, "dealt with" marks, cached summaries |
+| PUT | `/api/v1/channels/{id}/alias` | **write** | `{alias:"…"}` — what THIS app calls the channel; see "What to call a channel" |
+| DELETE | `/api/v1/channels/{id}/alias` | **write** | drop it, putting the configured label back |
+| DELETE | `/api/v1/storage` | **write** | erase EVERYTHING durable: transcripts, read marks, "dealt with" marks, cached summaries, channel aliases |
 | POST | `/mcp` | read, or **write** per tool | MCP over Streamable HTTP — see below |
 | GET/DELETE | `/mcp` | none | `405`; this endpoint is stateless and has nothing to push |
 
@@ -1106,6 +1117,45 @@ No host this has run on has had Playwright or Chromium, so what is checked today
 arithmetic above and `--self-test`, which confirms the scene is *pinned* to those claims without
 rendering a frame. The same is true of `31-pull-to-refresh-armed`. Both are written and neither is
 evidence yet; the first run with a browser is what turns them into any.
+
+### What to call a channel
+
+`#39 channel-alias`. A channel arrives with two names and neither is sayable: the snowflake
+`1532416065114607829`, and whatever `label` the operator wrote in the configuration file — which
+is often something like `build noise`, chosen when there was one channel and nobody was addressing
+it out loud. The motivation is the next feature rather than this one: with several channels
+configured, *"ask the build channel"* has to resolve to something, and a short name the owner
+chose is the only candidate.
+
+So the owner can **give a channel a name of his own, in this app**, from Settings. The alias wins
+wherever the configured label showed; the label is the fallback, and clearing the alias returns to
+it. `ChannelInfo::display_name` is the one place that rule lives, so the picker, the head of the
+channel and the digest header cannot come to disagree.
+
+**It is ours, and it is local.** It lives in the `#64 storage-backend` store beside the read
+state, exactly as `#50 todo-view`'s "dealt with" marks do — the same posture, and for the same
+reason. It is never sent to Discord, renames nothing there, and nobody outside this deployment
+sees it. Every answer that sets or clears one carries a standing statement saying so, and `/voice`
+shows *that* sentence rather than one of its own.
+
+**The voice agent hears it too.** `list_channels`, the digest header and the tool manifest all
+name the channel the way the owner does, so the name he says out loud is the name the model was
+given. That is a read of local state on the way out; nothing about it is a write to Discord.
+
+**The agent cannot choose it, and the reason is not the scope.** A hosted voice agent is routinely
+given the write token — `post_reply` needs it — so gating a rename behind the write scope would
+not keep a model out, and this README is not going to claim it does. What keeps it out is that
+**there is no tool**: the MCP manifest offers none at either scope, and `dispatch` refuses any name
+it cannot find there. `tests/alias.rs` asserts both, with the write token, and the page suite
+asserts the browser half — nothing arriving on the conversation socket reaches the alias route.
+
+Retention deliberately does not reach this table. There is at most one row per configured channel,
+so it cannot grow with use, and an age bound would be worse than absent: it would put the
+configured label back months later with nothing on screen saying why. `DELETE /api/v1/storage`
+still takes it, because "erase everything" has to mean everything.
+
+Out of scope, and stated so nobody reads more into it: the agent changing an alias, renaming
+anything in Discord, and multi-channel addressing itself — which this only prepares for.
 
 ### Pulling the channel down, and the other end of the same container
 
