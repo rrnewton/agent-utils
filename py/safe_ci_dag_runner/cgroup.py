@@ -610,7 +610,16 @@ def enter_delegated_scope(
 ) -> tuple[bool, str]:
     """Move this process into a constrained delegated child cgroup.
 
-    This is the systemd-free fallback. The cgroup probe has already established
+    NOT CALLED. This function has no caller anywhere in the repository — not in ``cli.py``, not in
+    the tests, and it is not exported from ``safe_ci_dag_runner/__init__.py``. The systemd re-exec
+    (``reexec_in_scope``) is the only containment entry point actually taken, so the build-width
+    announcement below cannot print today.
+    ``test_operator_build_width.py::test_the_systemd_free_fallback_still_has_no_caller`` holds this
+    sentence honest: wire the function up and that test fails, which is the prompt to delete this
+    paragraph rather than let it rot into a lie. It is kept, rather than deleted, because it is the
+    systemd-free fallback the cgroup probe's CONTAINER_* outcomes were written for.
+
+    The cgroup probe has already established
     that a delegated ancestor exposes cpu and memory; failures here are fatal to
     callers because continuing would make the advertised limits advisory only —
     which is why the whole body reports its ``OSError`` loudly via the returned

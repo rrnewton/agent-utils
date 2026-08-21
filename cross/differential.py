@@ -320,6 +320,14 @@ def _env(extra: Mapping[str, str] | None = None) -> dict[str, str]:
     # unrelated differential cases write into one shared directory or gain extra banners.
     env.pop("SAFE_CI_DAG_RUNNER_LOG_DIR", None)
     env.pop("SAFE_CI_DAG_RUNNER_NO_STEP_LOGS", None)
+    # Same reasoning, for the operator's build width. Both engines resolve intent from these two
+    # variables in the OUTERMOST process, which here is the differential's own child — so a
+    # developer who happens to export CARGO_BUILD_JOBS makes every case run under a width nobody
+    # in this file chose, and turns the `operator-build-width:unstated` leg red for a reason that
+    # has nothing to do with either engine. The cases that are ABOUT intent pass it in `extra`,
+    # which is applied after these pops.
+    env.pop("CARGO_BUILD_JOBS", None)
+    env.pop("SAFE_CI_OPERATOR_BUILD_JOBS", None)
     if extra:
         env.update(extra)
     return env
@@ -4387,10 +4395,9 @@ def compare_operator_build_width(py: list[str], rs: list[str], rep: Report) -> N
 
     ``derive_build_jobs`` used to overwrite ``CARGO_BUILD_JOBS`` unconditionally, so an operator
     who set it — having sized a memory cap against exactly that pool — lost it with no word said.
-    Reading the variable back as intent is not the fix either: the runner SETS it (Python's
-    ``enter_delegated_scope`` assigns it, and both engines pass ``--setenv=CARGO_BUILD_JOBS`` into
-    the scope), so the in-scope process would read its own derivation as an instruction and stop
-    refining per step.
+    Reading the variable back as intent is not the fix either: the runner SETS it — both engines
+    pass ``--setenv=CARGO_BUILD_JOBS`` into the scope, which is the path this check drives — so the
+    in-scope process would read its own derivation as an instruction and stop refining per step.
 
     This is the one mechanism that can see both engines resolve it, on the boxing path where the
     substitution actually happens. It checks two observables per leg, because the sentence alone

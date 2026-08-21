@@ -1121,6 +1121,29 @@ mod tests {
     }
 
     #[test]
+    fn the_awkward_digit_strings_are_not_intent() {
+        // THE DIVERGENCE `make cross` CAUGHT IN SPIRIT AND COULD NOT REACH. Python's
+        // `str.isdigit()` is not `is_ascii_digit`, and a Python int is not an i64. This table is
+        // hand-written here and duplicated verbatim in
+        // `py/tests/test_operator_build_width.py::test_the_awkward_digit_strings_answer_exactly_as_the_rust_twin_does`;
+        // the two must agree case for case.
+        assert_eq!(parse_build_jobs(Some("\u{ff18}")), None); // full-width eight
+        assert_eq!(parse_build_jobs(Some("8\u{b2}")), None); // superscript two
+        assert_eq!(parse_build_jobs(Some("\u{668}")), None); // Arabic-Indic eight
+        assert_eq!(parse_build_jobs(Some("99999999999999999999999")), None);
+        assert_eq!(parse_build_jobs(Some("9223372036854775808")), None);
+        assert_eq!(parse_build_jobs(Some(&"1".repeat(5000))), None);
+        // And the boundaries that must still be honoured, so "reject the awkward ones" cannot
+        // become "reject everything large".
+        assert_eq!(
+            parse_build_jobs(Some("9223372036854775807")),
+            Some(9223372036854775807)
+        );
+        // An i64 parse accepts leading zeros, so Python must too.
+        assert_eq!(parse_build_jobs(Some("000000008")), Some(8));
+    }
+
+    #[test]
     fn the_outermost_process_reads_the_ambient_variable() {
         assert_eq!(resolve_operator_build_jobs(None, Some("200")), Some(200));
         assert_eq!(resolve_operator_build_jobs(None, None), None);

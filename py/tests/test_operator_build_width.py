@@ -48,6 +48,34 @@ def test_nothing_else_is_intent() -> None:
     assert parse_build_jobs("8 jobs") is None
 
 
+def test_the_awkward_digit_strings_answer_exactly_as_the_rust_twin_does() -> None:
+    # THE DIVERGENCE `make cross` CAUGHT IN SPIRIT AND COULD NOT REACH. `str.isdigit()` is not
+    # `is_ascii_digit`, and a Python int is not an i64. This table is hand-written here and
+    # duplicated verbatim in `sizing::tests::the_awkward_digit_strings_are_not_intent` on the
+    # Rust side; the two must agree case for case.
+    #
+    # A full-width digit: int() parses it, so Python HONOURED it as operator intent while Rust
+    # ignored it — one input, two build widths, in the one function the differential exists to
+    # keep aligned.
+    assert parse_build_jobs("８") is None
+    # Superscript two is isdigit() but not int()-parseable. This raised ValueError, and because
+    # the capture below happens at IMPORT it killed `import safe_ci_dag_runner` outright.
+    assert parse_build_jobs("8²") is None
+    # Arabic-Indic digits: isdigit(), int()-parseable, not ASCII.
+    assert parse_build_jobs("٨") is None
+    # Wider than an i64 is not a width. Rust's parse fails; Python's int() would have succeeded
+    # and exported CARGO_BUILD_JOBS=99999999999999999999999.
+    assert parse_build_jobs("99999999999999999999999") is None
+    assert parse_build_jobs("9223372036854775808") is None
+    # A string long enough that CPython's int_max_str_digits refuses to convert it at all.
+    assert parse_build_jobs("1" * 5000) is None
+    # And the boundaries that must still be honoured, so "reject the awkward ones" cannot become
+    # "reject everything large".
+    assert parse_build_jobs("9223372036854775807") == 9223372036854775807
+    # Rust's i64 parse accepts leading zeros, so Python must too.
+    assert parse_build_jobs("000000008") == 8
+
+
 def test_the_outermost_process_reads_the_ambient_variable() -> None:
     # Nothing forwarded: we ARE the outermost process, so CARGO_BUILD_JOBS is the operator's.
     assert resolve_operator_build_jobs(None, "200") == 200
@@ -127,6 +155,17 @@ def test_the_capture_happens_at_import_from_the_real_environment() -> None:
     assert _captured_in_subprocess({}) == "None"
 
 
+def test_a_malformed_variable_cannot_take_the_package_down_at_import() -> None:
+    # The capture is a module-level statement, so anything it raises is raised by
+    # `import safe_ci_dag_runner` — and then `capabilities`, `--help` and every other subcommand
+    # die with a traceback because of an environment variable. `_captured_in_subprocess` runs a
+    # fresh interpreter with `check=True`, so a raising import fails this test rather than being
+    # swallowed.
+    assert _captured_in_subprocess({BUILD_JOBS_ENV: "8²"}) == "None"
+    assert _captured_in_subprocess({BUILD_JOBS_ENV: "1" * 5000}) == "None"
+    assert _captured_in_subprocess({OPERATOR_BUILD_JOBS_ENV: "8²"}) == "None"
+
+
 def test_an_inherited_scope_value_is_not_mistaken_for_intent() -> None:
     # Exactly the in-scope environment the runner creates: it wrote CARGO_BUILD_JOBS itself and
     # forwarded "the operator asked for nothing". Reading the first back as intent is the defect.
@@ -135,6 +174,29 @@ def test_an_inherited_scope_value_is_not_mistaken_for_intent() -> None:
     )
     assert (
         _captured_in_subprocess({BUILD_JOBS_ENV: "284", OPERATOR_BUILD_JOBS_ENV: "12"}) == "12"
+    )
+
+
+def test_the_systemd_free_fallback_still_has_no_caller() -> None:
+    """`enter_delegated_scope` is one of the "three sites" this work claimed to fix, and it is
+    dead: nothing calls it, so its build-width announcement cannot print and the import-time
+    capture's original justification ("it mutates os.environ later in the same process") names an
+    event that never happens. Its docstring now says NOT CALLED in as many words. This is what
+    stops that sentence rotting: wire the function up and this fails, which is the prompt to
+    rewrite the docstring and the two comments in `sizing.py` that depend on it."""
+    import re
+
+    package = Path(__file__).resolve().parents[1] / "safe_ci_dag_runner"
+    call = re.compile(r"(?<![\w.])enter_delegated_scope\s*\(")
+    callers = [
+        f"{path.name}:{n}"
+        for path in sorted(package.rglob("*.py"))
+        for n, line in enumerate(path.read_text().splitlines(), 1)
+        if call.search(line) and not line.lstrip().startswith("def ")
+    ]
+    assert callers == [], (
+        "enter_delegated_scope has acquired a caller, so it is no longer dead: update its "
+        f"NOT CALLED docstring and the sizing.py comments that cite it. Callers: {callers}"
     )
 
 

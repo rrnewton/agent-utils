@@ -331,9 +331,11 @@ BUILD_JOBS_ENV = "CARGO_BUILD_JOBS"
 #: The operator's own build width, carried ACROSS the runner's systemd re-exec.
 #:
 #: This exists because ``CARGO_BUILD_JOBS`` alone cannot answer "did a human ask for this?".
-#: The runner writes that variable itself — ``enter_delegated_scope`` assigns it and
-#: ``reexec_in_scope`` passes ``--setenv=CARGO_BUILD_JOBS=...`` into the scope — so the in-scope
-#: process reads back the runner's own derivation and would mistake it for an instruction. Then
+#: The runner writes that variable itself: ``reexec_in_scope`` passes
+#: ``--setenv=CARGO_BUILD_JOBS=...`` into the scope in BOTH engines, which is the live path.
+#: (``enter_delegated_scope`` assigns it too, but that function has no caller — see its docstring
+#: — so the re-exec is the only way this happens today.) The in-scope process therefore reads back
+#: the runner's own derivation and would mistake it for an instruction. Then
 #: per-step downward refinement stops, every step keeps the whole scope's width, and that is
 #: exactly the 284-wide-against-8-GiB condition this machinery exists to prevent.
 #:
@@ -349,13 +351,33 @@ def parse_build_jobs(raw: str | None) -> int | None:
     Absent, empty, malformed, or non-positive is ``None`` — not an instruction. A zero or a typo
     read as intent would hand the whole run a width nobody picked, which is worse than falling
     back to a derivation whose reasoning is stated.
+
+    ASCII, and bounded, both DELIBERATELY:
+
+    * ``str.isdigit()`` is true for characters ``int()`` cannot parse. ``CARGO_BUILD_JOBS='8²'``
+      raised ``ValueError`` out of this function — and since the module-level capture below runs
+      at IMPORT, that traceback took down ``import safe_ci_dag_runner`` itself, so even
+      ``capabilities`` and ``--help`` died. It is also true for characters ``int()`` CAN parse but
+      no ASCII-digit test accepts: a full-width ``'８'`` is not a width an operator typed into a
+      build variable, and honouring it while a stricter reader ignores it turns one input into two
+      answers.
+    * a width wider than a signed 64-bit integer is not a width. Python's ``int`` is unbounded and
+      has to be told, via the same :data:`_I64_MAX` the rest of this module already uses to keep
+      its arithmetic inside the domain every reader of these numbers shares. Leading zeros are
+      stripped first, because a signed-integer parse accepts them: ``'000000008'`` is 8.
     """
     if raw is None:
         return None
     text = raw.strip()
-    if not text.isdigit():
+    if not text.isascii() or not text.isdigit():
+        return None
+    if len(text.lstrip("0")) > len(str(_I64_MAX)):
+        # Bail before int(): CPython refuses to convert very long digit strings at all
+        # (``int_max_str_digits``), and that refusal is another ValueError at import time.
         return None
     value = int(text)
+    if value > _I64_MAX:
+        return None
     return value if value > 0 else None
 
 
@@ -373,8 +395,18 @@ def resolve_operator_build_jobs(forwarded: str | None, ambient: str | None) -> i
     return parse_build_jobs(ambient)
 
 
-#: Captured at IMPORT, deliberately: ``enter_delegated_scope`` mutates ``os.environ`` later in the
-#: same process, and a lazily-read value would see the runner's own write.
+#: Captured ONCE, at import, so that this process answers the same way before and after it has
+#: written a build width into any child's environment. Rust memoizes in a ``OnceLock`` for the
+#: same reason.
+#:
+#: BE PRECISE ABOUT WHY, because the obvious reason is not currently true. Nothing in this package
+#: mutates ``os.environ[CARGO_BUILD_JOBS]`` in-process: ``enter_delegated_scope`` would, and it
+#: has no caller. The live in-scope path is the systemd re-exec, and there a FRESH interpreter
+#: reads a ``CARGO_BUILD_JOBS`` its parent set via ``--setenv``, which the forwarded
+#: ``SAFE_CI_OPERATOR_BUILD_JOBS`` — present, possibly empty — is what disarms. So today the
+#: import-time capture is equivalent to a lazy read; it is written this way so that wiring up
+#: ``enter_delegated_scope``, or adding any other in-process write, cannot silently turn the
+#: runner's own number into "operator intent" without anyone noticing.
 _OPERATOR_BUILD_JOBS: int | None = resolve_operator_build_jobs(
     os.environ.get(OPERATOR_BUILD_JOBS_ENV), os.environ.get(BUILD_JOBS_ENV)
 )
