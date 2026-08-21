@@ -45,7 +45,10 @@ use crate::estimates::{
     plan_to_json, plan_to_text, Plan, Planner, DEFAULT_MIN_SAMPLES,
 };
 use crate::io::{dag_from_json, dag_from_yaml, dag_to_json, dag_to_yaml, DagJsonError};
-use crate::model::{effective_jobs_flag, step_classification, DagConfig, Step, StepOutcome};
+use crate::model::{
+    effective_jobs_flag, step_classification, DagConfig, ResourceHint, Step, StepOutcome,
+    DEFAULT_STEP_TIMEOUT,
+};
 use crate::perflog::{append_step_profiles, child_cpu_seconds, PerfWindow};
 use crate::profile_enrich::container_core_budget;
 use crate::scheduler::{
@@ -136,6 +139,7 @@ fn help_text(c: &Palette) -> String {
          {usage}\n  {PROG} <command> [options]\n\n\
          {commands}\n\
          \x20 run        run a DAG (exit 0 iff every step passes)\n\
+         \x20 box        box ONE command with --mem/--timeout/--cores (no DAG file)\n\
          \x20 sweep      parallel-speedup sweep of ONE step (inner -j1..-jN + timing table)\n\
          \x20 plan       show learned estimates + the scheduled order (does NOT run anything)\n\
          \x20 list       list the steps\n\
@@ -161,7 +165,7 @@ fn help_text(c: &Palette) -> String {
         commands = c.bold("commands"),
         examples = c.bold("examples"),
         e1 = ex(&format!("{PROG} quickstart")),
-        e2 = ex(&format!("{PROG} run --dag dag.json --profile")),
+        e2 = ex(&format!("{PROG} box --mem 512M --timeout 30 --cores 2 -- ./probe.sh")),
         e3 = ex(&format!("{PROG} run --dag dag.json --only build.app")),
         e6 = ex(&format!("{PROG} plan --dag dag.json --planner critical-path")),
         e4 = ex(&format!("{PROG} sweep --dag dag.json --step build.app --jobs 1..8")),
@@ -529,6 +533,256 @@ fn requested_summary_help(c: &Palette, rest: &[String]) -> Option<String> {
         Some("-h") | Some("--help") | None => Some(summary_help(c)),
         Some(_) => None,
     }
+}
+
+fn box_help(c: &Palette) -> String {
+    render_subcommand_help(
+        c,
+        "box [--mem SPEC] [--timeout SECS] [--cores K] [--label NAME] [--perf-dir DIR] \
+         [--allow-cgroup-failure] [-q] -- CMD [ARGS...]",
+        "Run ONE command under the same cgroup-v2 boxing a DAG step gets, without writing a DAG \
+         file.",
+        &[
+            (
+                "--mem SPEC",
+                "RAM ceiling for the boxed command (e.g. 512M, 8G): both the outer scope's \
+                 MemoryMax and the command's own inner memory.max",
+            ),
+            (
+                "--timeout SECS",
+                "WALL ceiling in seconds; the CPU ceiling is derived as SECS x K so the wall \
+                 bound is the one that fires",
+            ),
+            (
+                "--cores K",
+                "CPU BANDWIDTH (cpu.max of K cores, and an outer budget of K). NOT the hard \
+                 cpuset PIN that `run --cores` performs. Aliases: -j, --max-cpus",
+            ),
+            (
+                "--label NAME",
+                "name for the boxed step in output and evidence (default: the command's basename)",
+            ),
+            ("--perf-dir DIR", "write resource-usage CSVs into DIR"),
+            (
+                "--allow-cgroup-failure",
+                "downgrade to a best-effort UNBOXED run instead of refusing (exit 3)",
+            ),
+            ("-q, --quiet", "suppress the per-step summary lines"),
+            ("-- CMD [ARGS...]", "the command to box (put it after '--')"),
+            ("-h, --help", "show this help and exit"),
+        ],
+    )
+}
+
+/// Default per-command name when `box --label` is absent and the basename yields nothing usable.
+const BOX_DEFAULT_LABEL: &str = "command";
+
+/// Parse a `box` numeric flag, refusing zero and negatives by name rather than clamping them.
+fn parse_positive_i64(raw: &str, flag: &str) -> Result<i64, String> {
+    let value = raw
+        .parse::<i64>()
+        .map_err(|_| format!("{flag}: invalid int value: '{raw}'"))?;
+    if value < 1 {
+        return Err(format!("{flag}: must be >= 1"));
+    }
+    Ok(value)
+}
+
+#[derive(Debug)]
+struct BoxArgs {
+    mem: Option<String>,
+    timeout: Option<i64>,
+    cores: Option<i64>,
+    label: Option<String>,
+    perf_dir: Option<String>,
+    allow_cgroup_failure: bool,
+    quiet: bool,
+    command: Vec<String>,
+}
+
+fn parse_box_args(rest: &[String]) -> Result<BoxArgs, String> {
+    let mut a = BoxArgs {
+        mem: None,
+        timeout: None,
+        cores: None,
+        label: None,
+        perf_dir: None,
+        allow_cgroup_failure: false,
+        quiet: false,
+        command: Vec::new(),
+    };
+    let mut i = 0;
+    while i < rest.len() {
+        let arg = &rest[i];
+        let (key, inline) = match arg.split_once('=') {
+            Some((k, v)) => (k.to_string(), Some(v.to_string())),
+            None => (arg.clone(), None),
+        };
+        let take_value = |inline: Option<String>, i: &mut usize| -> Result<String, String> {
+            match inline {
+                Some(v) => Ok(v),
+                None => {
+                    *i += 1;
+                    rest.get(*i)
+                        .cloned()
+                        .ok_or_else(|| format!("expected one argument after {}", rest[*i - 1]))
+                }
+            }
+        };
+        match key.as_str() {
+            "--" => {
+                a.command.extend_from_slice(&rest[i + 1..]);
+                break;
+            }
+            "--mem" => a.mem = Some(take_value(inline, &mut i)?),
+            "--timeout" => {
+                a.timeout = Some(parse_positive_i64(
+                    &take_value(inline, &mut i)?,
+                    "--timeout",
+                )?)
+            }
+            "--cores" | "-j" | "--max-cpus" => {
+                a.cores = Some(parse_positive_i64(&take_value(inline, &mut i)?, "--cores")?)
+            }
+            "--label" => a.label = Some(take_value(inline, &mut i)?),
+            "--perf-dir" => a.perf_dir = Some(take_value(inline, &mut i)?),
+            "--allow-cgroup-failure" => a.allow_cgroup_failure = true,
+            "-q" | "--quiet" => a.quiet = true,
+            other if other.starts_with('-') => {
+                return Err(format!("unrecognized argument: {other}"))
+            }
+            _ => {
+                a.command.extend_from_slice(&rest[i..]);
+                break;
+            }
+        }
+        i += 1;
+    }
+    Ok(a)
+}
+
+/// Shell-quote one argv element for a `bash -c` command line.
+///
+/// A step's `cmd` is handed to `bash -c`, so an unquoted join would let an argument containing a
+/// space, a quote, a `;` or a `$(...)` become shell SYNTAX rather than an argument. Wrapping in
+/// single quotes and escaping embedded single quotes makes each element survive as exactly one
+/// word.
+fn box_shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// Build the singleton DAG that `box` runs, so ONE command needs no DAG file.
+///
+/// Deliberately a real [`DagConfig`] handed to the ordinary run path rather than a separate
+/// execution route. `box` must be indistinguishable from hand-writing the equivalent
+/// singleton-DAG file -- that is its entire value -- and the only way to guarantee that is for it
+/// to be the same code after this function returns.
+fn box_config(
+    argv: &[String],
+    label: &str,
+    mem_bytes: Option<i64>,
+    timeout_s: i64,
+    cores: i64,
+) -> DagConfig {
+    let cmd = argv
+        .iter()
+        .map(|part| box_shell_quote(part))
+        .collect::<Vec<_>>()
+        .join(" ");
+    DagConfig {
+        steps: vec![Step {
+            group: "box".to_string(),
+            job: label.to_string(),
+            desc: argv.join(" "),
+            description: String::new(),
+            cmd,
+            deps: Vec::new(),
+            env: BTreeMap::new(),
+            hint: ResourceHint {
+                hard_mem_max_bytes: mem_bytes,
+                ..Default::default()
+            },
+            networkonly: false,
+            engine_only: false,
+            timeout: timeout_s,
+            // THE CPU CEILING IS DERIVED, NOT DEFAULTED. Left unset, the step would inherit the
+            // deliberately tiny 10-second per-step CPU floor, which exists as a forcing function
+            // for an UNDECLARED DAG node -- and would cut an honest boxed command short for a
+            // reason its author never asked about. `--timeout x --cores` is the most CPU the
+            // command could possibly consume inside its wall budget, so the wall bound is the one
+            // that fires and the CPU guard stays a backstop.
+            cpu_timeout: timeout_s.saturating_mul(cores),
+            jobs_flag: None,
+            skip_reason: None,
+            write_domains: None,
+            write_domain_guarantee: None,
+        }],
+        // cpu.max for the boxed command. Set on the CONFIG rather than as preferred_inner_jobs,
+        // because the latter appends a `-j K` flag to the command -- correct for a build, wrong
+        // for an arbitrary command that may not accept one.
+        default_step_cpu_count: Some(cores),
+        ..Default::default()
+    }
+}
+
+fn cmd_box(a: &BoxArgs, c: &Palette) -> i32 {
+    if a.command.is_empty() {
+        eprintln!("{PROG}: box: no command given (use '-- CMD [ARGS...]')");
+        return 2;
+    }
+    let label = match a.label.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(name) => name.to_string(),
+        None => {
+            let base = a.command[0]
+                .rsplit('/')
+                .next()
+                .unwrap_or(BOX_DEFAULT_LABEL)
+                .trim()
+                .to_string();
+            if base.is_empty() {
+                BOX_DEFAULT_LABEL.to_string()
+            } else {
+                base
+            }
+        }
+    };
+    // The tag is `group.job`, so a dot in the job half would produce a tag that reads as a
+    // different group. Replace rather than refuse: a label is a convenience, not a declaration.
+    let label = label.replace('.', "-");
+
+    let cores = a.cores.unwrap_or(1);
+    let timeout_s = a.timeout.unwrap_or(DEFAULT_STEP_TIMEOUT);
+    let mem_bytes = requested_max_mem_bytes(a.mem.as_deref());
+    if a.mem.as_deref().is_some_and(|m| !m.is_empty()) && mem_bytes.is_none() {
+        eprintln!(
+            "{PROG}: box: --mem {:?} is not a positive size (e.g. 512M, 8G)",
+            a.mem.as_deref().unwrap_or("")
+        );
+        return 2;
+    }
+    let cfg = box_config(&a.command, &label, mem_bytes, timeout_s, cores);
+
+    // EVERY OTHER KNOB COMES FROM `run`'s OWN DEFAULTS, obtained by parsing a bare `run`
+    // invocation, rather than from a second list of defaults maintained here. A hand-copied list
+    // is exactly the thing that drifts the moment `run` gains a flag, and the drift would be
+    // invisible: `box` would keep working while quietly diverging from the singleton DAG file it
+    // claims to be shorthand for.
+    let mut run_args = match parse_run_args(&[]) {
+        Ok(args) => args,
+        Err(msg) => {
+            eprintln!("{PROG} box: error: {msg}");
+            return 2;
+        }
+    };
+    run_args.dag = Some("-".to_string());
+    run_args.max_steps = Some(1);
+    run_args.max_cpus = Some(cores);
+    run_args.max_cpus_source = Some("--max-cpus");
+    run_args.max_mem = a.mem.clone();
+    run_args.perf_dir = a.perf_dir.clone();
+    run_args.allow_cgroup_failure = a.allow_cgroup_failure;
+    run_args.quiet = a.quiet;
+    cmd_run(&cfg, &run_args, c)
 }
 
 fn pin_run_help(c: &Palette) -> String {
@@ -2762,6 +3016,20 @@ pub fn run(argv: &[String]) -> i32 {
             };
             cmd_run(&cfg, &a, &c)
         }
+        "box" => {
+            if wants_help(rest) {
+                print!("{}", box_help(&c));
+                return 0;
+            }
+            let a = match parse_box_args(rest) {
+                Ok(a) => a,
+                Err(msg) => {
+                    eprintln!("{PROG} box: error: {msg}");
+                    return 2;
+                }
+            };
+            cmd_box(&a, &c)
+        }
         "sweep" => {
             if wants_help(rest) {
                 print!("{}", sweep_help(&c));
@@ -2844,7 +3112,8 @@ pub fn run(argv: &[String]) -> i32 {
             eprintln!(
                 "usage: {PROG} [-h] [--version] <command> ...\n\
                  {PROG}: error: argument <command>: invalid choice: '{other}' \
-                 (choose from run, sweep, plan, summary, list, ascii, dot, json, yaml, quickstart, capabilities)"
+                 (choose from run, box, sweep, plan, summary, list, ascii, dot, json, yaml, pin-run, \
+                 quickstart, capabilities)"
             );
             2
         }
@@ -3689,5 +3958,132 @@ mod tests {
             let args: Vec<String> = raw.into_iter().map(str::to_string).collect();
             assert_eq!(run(&args), 2, "accepted invalid invocation: {args:?}");
         }
+    }
+
+    // ---- #82 runner-box-subcommand --------------------------------------------------------
+
+    fn box_args(argv: &[&str]) -> BoxArgs {
+        parse_box_args(&argv.iter().map(|s| s.to_string()).collect::<Vec<_>>()).expect("parses")
+    }
+
+    #[test]
+    fn argv_is_shell_quoted_element_by_element_not_joined() {
+        // A step's `cmd` goes to `bash -c`, so a joined argv turns arguments into shell SYNTAX.
+        let argv: Vec<String> = [
+            "printf",
+            "[%s]",
+            "a b",
+            "it's",
+            "semi;colon",
+            "$(echo pwned)",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let cfg = box_config(&argv, "probe", None, 30, 1);
+        assert_eq!(
+            cfg.steps[0].cmd,
+            r#"'printf' '[%s]' 'a b' 'it'\''s' 'semi;colon' '$(echo pwned)'"#
+        );
+    }
+
+    #[test]
+    fn the_cpu_ceiling_is_derived_from_the_wall_ceiling_and_the_core_count() {
+        // Left to default, the deliberately tiny 10-second per-step CPU floor -- a forcing
+        // function for an UNDECLARED DAG node -- would cut an honest ad-hoc command short for a
+        // reason its author never named.
+        let argv = vec!["true".to_string()];
+        let cfg = box_config(&argv, "probe", None, 30, 4);
+        assert_eq!(cfg.steps[0].timeout, 30);
+        assert_eq!(
+            cfg.steps[0].cpu_timeout, 120,
+            "30 wall-seconds across 4 cores is 120 CPU-seconds"
+        );
+    }
+
+    #[test]
+    fn cores_becomes_the_cgroup_width_and_not_a_synthetic_jobs_flag() {
+        // `preferred_inner_jobs` would append `-j K` to a command that may not accept one.
+        let argv = vec!["some-tool".to_string(), "--flag".to_string()];
+        let cfg = box_config(&argv, "probe", None, 30, 3);
+        assert_eq!(cfg.steps[0].hint.preferred_inner_jobs, None);
+        assert!(!cfg.steps[0].cmd.contains("-j "));
+        assert_eq!(cfg.default_step_cpu_count, Some(3));
+    }
+
+    #[test]
+    fn mem_becomes_the_steps_own_hard_inner_cap() {
+        let argv = vec!["true".to_string()];
+        let cfg = box_config(&argv, "probe", Some(512 * 1024 * 1024), 30, 1);
+        assert_eq!(
+            cfg.steps[0].hint.hard_mem_max_bytes,
+            Some(512 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn box_flags_parse_in_both_spellings_and_the_command_starts_at_the_separator() {
+        let a = box_args(&[
+            "--mem=512M",
+            "--timeout",
+            "45",
+            "-j",
+            "2",
+            "--label=probe",
+            "-q",
+            "--",
+            "echo",
+            "--not-a-flag",
+        ]);
+        assert_eq!(a.mem.as_deref(), Some("512M"));
+        assert_eq!(a.timeout, Some(45));
+        assert_eq!(a.cores, Some(2));
+        assert_eq!(a.label.as_deref(), Some("probe"));
+        assert!(a.quiet);
+        assert_eq!(
+            a.command,
+            vec!["echo".to_string(), "--not-a-flag".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_nonpositive_cores_or_timeout_is_refused_by_name_rather_than_clamped() {
+        for flag in ["--cores", "--timeout"] {
+            let err = parse_box_args(&[flag.to_string(), "0".to_string()])
+                .expect_err("zero must be refused");
+            assert!(err.contains(flag), "message was {err:?}");
+            assert!(err.contains(">= 1"), "message was {err:?}");
+        }
+    }
+
+    #[test]
+    fn box_with_no_command_is_a_named_usage_error_not_a_boxed_nothing() {
+        assert_eq!(run(&["box".to_string()]), 2);
+    }
+
+    #[test]
+    fn a_bad_memory_spec_is_refused_rather_than_run_uncapped() {
+        // Silently ignoring an unparseable `--mem` would run the command with NO cap at all --
+        // the opposite of what the flag was reached for. `--allow-cgroup-failure` is here so a
+        // regression FAILS rather than hanging on real cgroup bring-up.
+        let argv: Vec<String> = [
+            "box",
+            "--allow-cgroup-failure",
+            "--mem",
+            "lots",
+            "--",
+            "true",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(run(&argv), 2);
+    }
+
+    #[test]
+    fn box_is_listed_in_the_top_level_help_and_accepted_as_a_command() {
+        let c = Palette { enabled: false };
+        assert!(help_text(&c).contains(" box "));
+        assert_eq!(run(&["box".to_string(), "--help".to_string()]), 0);
     }
 }

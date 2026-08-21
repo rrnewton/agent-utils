@@ -401,6 +401,36 @@ profile summaries. `run --profile-sync BACKEND` can download a shared summary
 before planning and upload merged samples afterward. Run the relevant command
 with `--help` for backend and direction syntax.
 
+## Boxing one command
+
+Boxing is this tool's primary purpose, and a DAG is not required to use it:
+
+```sh
+safe-ci-dag-runner box --mem 512M --timeout 30 --cores 2 -- ./probe.sh
+```
+
+`box` builds a one-step DAG in memory and hands it to the ordinary run path, so
+it is exactly equivalent to hand-writing the corresponding singleton-DAG file --
+same containment, same evidence, same exit codes -- and nothing about the run is
+special-cased for it.
+
+`--mem` is applied twice on purpose: as the outer scope's `MemoryMax` and as the
+command's own inner `memory.max`, so a breach is an OOM kill inside the box
+rather than pressure on the host. `--timeout` is a WALL ceiling; the CPU ceiling
+is derived from it as `--timeout x --cores`, because the small ten-second
+per-step CPU floor is a forcing function for an undeclared DAG node and would
+otherwise cut an honest ad-hoc command short for a reason its author never asked
+about.
+
+`box --cores K` is a CPU BANDWIDTH cap (`cpu.max` of K cores, plus an outer
+budget of K), and is deliberately not the same thing as `run --cores K`, which
+is a hard cpuset PIN that fails closed without an exact cgroup cpuset. Boxing one
+command should not require that capability. Aliases `-j` and `--max-cpus` name
+the same knob.
+
+Argv after `--` is shell-quoted element by element, so an argument containing a
+space, a quote or a `$(...)` stays one argument instead of becoming shell syntax.
+
 ## Collision-free CPU reservations
 
 For benchmark isolation, reserve a chosen number of least-busy allowed cores
@@ -458,6 +488,7 @@ bound. CPU pinning is intended for controlled measurements, not ordinary CI.
 | Command | Purpose |
 |---|---|
 | `run` | Execute a DAG under scheduling and containment constraints. |
+| `box` | Box ONE ad-hoc command with `--mem`/`--timeout`/`--cores`, no DAG file. |
 | `plan` | Show estimates, critical path, widths, and order without running. |
 | `list` / `ascii` / `dot` | Inspect or visualize the graph. |
 | `json` / `yaml` | Validate and convert the DAG. |

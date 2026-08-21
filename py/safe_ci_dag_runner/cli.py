@@ -23,6 +23,7 @@ import argparse
 import dataclasses
 import os
 import resource
+import shlex
 import subprocess
 import sys
 import time
@@ -60,7 +61,9 @@ from safe_ci_dag_runner.model import (
     DEFAULT_SMALL_CPU_COUNT,
     DEFAULT_SMALL_CPU_TIMEOUT,
     DEFAULT_SMALL_MEM_CAP_BYTES,
+    DEFAULT_STEP_TIMEOUT,
     DagConfig,
+    ResourceHint,
     Step,
     effective_jobs_flag,
     resolve_cpu_timeout_multiplier,
@@ -796,6 +799,75 @@ def build_parser() -> argparse.ArgumentParser:
         nargs=argparse.REMAINDER,
         metavar="-- CMD [ARGS...]",
         help="the command to run pinned (put it after '--')",
+    )
+
+    box_p = sub.add_parser(
+        "box",
+        allow_abbrev=False,
+        help="box ONE command with --mem/--timeout/--cores, without writing a DAG file",
+        description=(
+            "Run ONE command under the same cgroup-v2 boxing a DAG step gets, without writing a "
+            "DAG file. Boxing one ad-hoc command is this tool's primary purpose, and until now "
+            "the only way to do it was to hand-write a singleton-DAG JSON file."
+        ),
+    )
+    box_p.add_argument(
+        "--mem",
+        metavar="SPEC",
+        default=None,
+        help="RAM ceiling for the boxed command (e.g. 512M, 8G). Applied BOTH as the outer "
+        "scope's MemoryMax and as the command's own inner memory.max, so a breach is an OOM kill "
+        "inside the box rather than pressure on the host. Absent uses the small default cap.",
+    )
+    box_p.add_argument(
+        "--timeout",
+        type=_positive_i64,
+        default=None,
+        metavar="SECS",
+        help="WALL-clock ceiling for the boxed command in seconds. The CPU-time ceiling is "
+        "derived from it (--timeout x --cores), so the wall bound is the one that fires and the "
+        "small 10-second per-step CPU floor cannot cut an honest command short.",
+    )
+    box_p.add_argument(
+        "--cores",
+        "-j",
+        "--max-cpus",
+        dest="cores",
+        type=_positive_int,
+        default=None,
+        metavar="K",
+        help="CPU BANDWIDTH for the boxed command: cpu.max of K cores inside the box and an "
+        "outer CPU-bandwidth budget of K. NOTE this is deliberately NOT what `run --cores` means "
+        "-- that flag is a hard cpuset PIN which fails closed without an exact cgroup cpuset. "
+        "Boxing one command should not require that capability, so this is a bandwidth cap.",
+    )
+    box_p.add_argument(
+        "--label",
+        default=None,
+        metavar="NAME",
+        help="name for the boxed step in output and in the per-step evidence log "
+        "(default: the command's basename)",
+    )
+    box_p.add_argument(
+        "--perf-dir",
+        metavar="DIR",
+        default=None,
+        help="write the boxed command's resource-usage CSVs into DIR",
+    )
+    box_p.add_argument(
+        "--allow-cgroup-failure",
+        action="store_true",
+        help="downgrade to a best-effort UNBOXED run when cgroup boxing is unavailable, instead "
+        "of refusing (exit 3)",
+    )
+    box_p.add_argument(
+        "-q", "--quiet", action="store_true", help="suppress the per-step summary lines"
+    )
+    box_p.add_argument(
+        "command_argv",
+        nargs=argparse.REMAINDER,
+        metavar="-- CMD [ARGS...]",
+        help="the command to box (put it after '--')",
     )
 
     sub.add_parser(
@@ -2151,6 +2223,96 @@ def _cmd_plan(ns: argparse.Namespace) -> int:
     return 0
 
 
+#: Default per-command name when ``box --label`` is absent and the basename yields nothing usable.
+_BOX_DEFAULT_LABEL = "command"
+
+
+def _box_step_and_config(
+    argv: Sequence[str], *, label: str, mem_bytes: int | None, timeout_s: int, cores: int
+) -> DagConfig:
+    """Build the singleton DAG that ``box`` runs, so ONE command needs no DAG file.
+
+    Deliberately a real :class:`DagConfig` handed to the ordinary run path rather than a separate
+    execution route. `box` must be indistinguishable from hand-writing the equivalent
+    singleton-DAG file -- that is its entire value -- and the only way to guarantee that is for it
+    to be the same code after this function returns.
+
+    ARGV IS SHELL-QUOTED, NOT JOINED. A step's ``cmd`` is handed to ``bash -c``, so an unquoted
+    join would let an argument containing a space, a quote, a ``;`` or a ``$(...)`` become shell
+    syntax rather than an argument. :func:`shlex.quote` per element makes every element survive as
+    exactly one word.
+    """
+    return DagConfig(
+        steps=(
+            Step(
+                "box",
+                label,
+                " ".join(argv),
+                " ".join(shlex.quote(part) for part in argv),
+                timeout=timeout_s,
+                # THE CPU CEILING IS DERIVED, NOT DEFAULTED. Left unset, the step would inherit
+                # the deliberately tiny 10-second per-step CPU floor, which exists as a forcing
+                # function for an UNDECLARED DAG node -- and would cut an honest boxed command
+                # short for a reason its author never asked about. `--timeout x --cores` is the
+                # most CPU the command could possibly consume inside its wall budget, so the wall
+                # bound is the one that fires and the CPU guard stays a backstop.
+                cpu_timeout=timeout_s * cores,
+                hint=ResourceHint(hard_mem_max_bytes=mem_bytes),
+            ),
+        ),
+        # cpu.max for the boxed command. Set on the CONFIG rather than as preferred_inner_jobs,
+        # because the latter appends a `-j K` flag to the command -- correct for a build, wrong
+        # for an arbitrary command that may not accept one.
+        default_step_cpu_count=cores,
+    )
+
+
+def _cmd_box(ns: argparse.Namespace, parser: argparse.ArgumentParser, c: Palette) -> int:
+    """Box ONE command: synthesize the singleton DAG, then take the ordinary run path."""
+    argv = [part for part in (ns.command_argv or []) if part != "--"]
+    if not argv:
+        print(f"{PROG}: box: no command given (use '-- CMD [ARGS...]')", file=sys.stderr)
+        return 2
+
+    label = ns.label if isinstance(ns.label, str) and ns.label.strip() else None
+    if label is None:
+        label = os.path.basename(argv[0]).strip() or _BOX_DEFAULT_LABEL
+    # The tag is `group.job`, so a dot in the job half would produce a tag that reads as a
+    # different group. Replace rather than refuse: a label is a convenience, not a declaration.
+    label = label.replace(".", "-")
+
+    cores = int(ns.cores) if ns.cores is not None else 1
+    timeout_s = int(ns.timeout) if ns.timeout is not None else DEFAULT_STEP_TIMEOUT
+    mem_bytes = _requested_max_mem_bytes(ns.mem if isinstance(ns.mem, str) else None)
+    if isinstance(ns.mem, str) and ns.mem and mem_bytes is None:
+        print(
+            f"{PROG}: box: --mem {ns.mem!r} is not a positive size (e.g. 512M, 8G)",
+            file=sys.stderr,
+        )
+        return 2
+
+    cfg = _box_step_and_config(
+        argv, label=label, mem_bytes=mem_bytes, timeout_s=timeout_s, cores=cores
+    )
+
+    # EVERY OTHER KNOB COMES FROM `run`'s OWN DEFAULTS, obtained by parsing a bare `run`
+    # invocation, rather than from a second list of defaults maintained here. A hand-copied list
+    # is exactly the thing that drifts the moment `run` gains a flag, and the drift would be
+    # invisible: `box` would keep working while quietly diverging from the singleton DAG file it
+    # claims to be shorthand for.
+    forwarded = ["run", "--dag", "-", "-s", "1", "-j", str(cores)]
+    if ns.perf_dir is not None:
+        forwarded += ["--perf-dir", str(ns.perf_dir)]
+    if bool(ns.allow_cgroup_failure):
+        forwarded.append("--allow-cgroup-failure")
+    if bool(ns.quiet):
+        forwarded.append("-q")
+    if ns.mem is not None:
+        forwarded += ["--max-mem", str(ns.mem)]
+    run_ns = parser.parse_args(forwarded)
+    return _run(cfg, run_ns, c)
+
+
 def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
     # Feature A: --only runs EXACTLY the named step(s). Validate/filter BEFORE cgroup bring-up so a
     # bad tag fails fast (exit 2) without needing a systemd scope.
@@ -2449,6 +2611,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         # in one build but not the other fails `cross`.
         print(enforcement_manifest())
         return 0
+    if command == "box":
+        return _cmd_box(ns, parser, c)
     if command == "pin-run":
         return _cmd_pin_run(ns)
     if command == "sweep":

@@ -1717,6 +1717,70 @@ def compare_capture_ceiling(py: list[str], rs: list[str], rep: Report) -> None:
             rep.ok(label)
 
 
+def compare_box_subcommand(py: list[str], rs: list[str], rep: Report) -> None:
+    """`box` boxes ONE command identically in both engines, argv quoting included.
+
+    A new user-visible subcommand in one engine and not the other is exactly the parity gap this
+    repository's `make both` / `make cross` contract exists to prevent, and it is the stated
+    reason the archived Rust-only implementation was never landed. The flag inventory is covered
+    by `compare_cli_schema`; what is compared here is BEHAVIOUR: the tag the step is given, the
+    label derivation, and -- the part most likely to diverge silently -- that argv is shell-quoted
+    element by element rather than joined, so an argument containing a space, a quote, a `;` or a
+    `$(...)` survives as ONE argument instead of becoming shell syntax.
+    """
+    label = "box:subcommand"
+    # Deliberately hostile argv: a space, an embedded single quote, a shell metacharacter, and a
+    # command substitution. Correct quoting echoes them back verbatim.
+    hostile = ["a b", "it's", "semi;colon", "$(echo pwned)"]
+    outs = {
+        name: run(
+            cmd,
+            (
+                "box",
+                "--allow-cgroup-failure",
+                "--label",
+                "probe",
+                "--timeout",
+                "60",
+                "--cores",
+                "1",
+                "--",
+                "printf",
+                "[%s]",
+                *hostile,
+            ),
+            {"SAFE_CI_DAG_RUNNER_PROFILE_DIR": os.path.join(tempfile.gettempdir(), "cross-box")},
+        )
+        for name, cmd in (("py", py), ("rs", rs))
+    }
+    if outs["py"].returncode != outs["rs"].returncode:
+        rep.bad(label, f"exit py={outs['py'].returncode} rs={outs['rs'].returncode}")
+        return
+    if outs["py"].returncode != 0:
+        rep.bad(label, f"box exited {outs['py'].returncode}\n{outs['py'].stdout}")
+        return
+    expected = "".join(f"[{part}]" for part in hostile)
+    for name, out in outs.items():
+        if f"[box.probe] \u2713 PASS" not in out.stdout:
+            rep.bad(label, f"{name}: no PASS line for box.probe\n{out.stdout}")
+            return
+        if expected not in out.stdout:
+            rep.bad(label, f"{name}: argv was not passed through verbatim: {out.stdout!r}")
+            return
+
+    # An empty command is a usage error in both, and says so rather than boxing nothing.
+    empty = {name: run(cmd, ("box",)) for name, cmd in (("py", py), ("rs", rs))}
+    if empty["py"].returncode != 2 or empty["rs"].returncode != 2:
+        rep.bad(
+            label,
+            f"empty box exit py={empty['py'].returncode} rs={empty['rs'].returncode}",
+        )
+    elif not all("no command given" in out.stderr for out in empty.values()):
+        rep.bad(label, f"empty box stderr py={empty['py'].stderr!r} rs={empty['rs'].stderr!r}")
+    else:
+        rep.ok(label)
+
+
 def compare_batch_teardown_grace(py: list[str], rs: list[str], rep: Report) -> None:
     """Eager cancellation grants one diagnostic window, not one window per sibling.
 
@@ -3837,6 +3901,10 @@ def compare_cli_schema(py: list[str], rs: list[str], rep: Report) -> None:
             "--allow-cgroup-failure",
             "--unsafe-no-cgroups", "--small-default-cap", "--quiet",
         ),
+        "box": (
+            "--mem", "--timeout", "--cores", "--label", "--perf-dir",
+            "--allow-cgroup-failure", "--quiet",
+        ),
         "sweep": (
             "--dag", "--step", "--jobs", "--repeat", "--perf-dir", "--no-profile",
             "--allow-cgroup-failure", "--unsafe-no-cgroups",
@@ -3847,6 +3915,9 @@ def compare_cli_schema(py: list[str], rs: list[str], rep: Report) -> None:
     command_forbidden_flags: dict[str, tuple[str, ...]] = {
         # Retained as a hidden 0.13 compatibility alias, not as public run vocabulary.
         "run": ("--jobs",),
+        # `box` is a front door for ONE command, not a second `run`. A `--dag` here would mean
+        # the two editions had grown different ideas of what the subcommand is for.
+        "box": ("--dag", "--only", "--stress"),
     }
     summary_action_contracts: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
         "build": (
@@ -3871,7 +3942,7 @@ def compare_cli_schema(py: list[str], rs: list[str], rep: Report) -> None:
         "merge one or more summary json files",
     )
     top_commands = (
-        "run", "sweep", "plan", "list", "ascii", "dot", "json", "yaml", "summary",
+        "run", "box", "sweep", "plan", "list", "ascii", "dot", "json", "yaml", "summary",
         "pin-run", "quickstart", "capabilities",
     )
     for engine, command in (("py", py), ("rs", rs)):
@@ -4736,6 +4807,7 @@ def compare_safe_ci_dag_runner(rand_count: int, seed: int) -> int:
     compare_test_attribution_evidence(py, rs, rep)
     compare_step_log_ceiling(py, rs, rep)
     compare_capture_ceiling(py, rs, rep)
+    compare_box_subcommand(py, rs, rep)
     compare_batch_teardown_grace(py, rs, rep)
     compare_run_timeout(py, rs, rep)
     compare_spawn_failure(py, rs, rep)
