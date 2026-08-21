@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import math
 import os
 import resource
 import shlex
@@ -32,6 +33,7 @@ from importlib.resources import files
 from pathlib import Path
 
 from safe_ci_dag_runner import __version__
+from safe_ci_dag_runner import admission
 from safe_ci_dag_runner.capabilities import enforcement_manifest
 from safe_ci_dag_runner import summary as summarylib
 from safe_ci_dag_runner import sync as synclib
@@ -547,6 +549,21 @@ def build_parser() -> argparse.ArgumentParser:
         "in-flight step's tree and still reports (rows written, verdict returned) instead of "
         "leaving the process to be killed from outside, which would take the evidence with it. "
         "Refuses to start if any step may run as long as the run itself.",
+    )
+    run_p.add_argument(
+        "--admission",
+        nargs="?",
+        const="0",
+        default=None,
+        metavar="WAIT_S",
+        help="HOST-WIDE memory admission (opt-in). Before any cgroup is brought up, reserve this "
+        "run's --max-mem against a durable ledger every runner on the host shares, so two runs "
+        "started a second apart cannot each take the same headroom. Three answers: GRANT (held "
+        "for the run), QUEUE (it would fit on a quiet host -- says how many holders are ahead), "
+        "REFUSE (bigger than the whole-host budget, so waiting can never help -- says the number "
+        "to ask for instead). WAIT_S is how long to wait while queued (default 0 = report and "
+        "exit 4 rather than wait). Requires --max-mem: admission needs a number, and guessing "
+        "one would be worse than not gating.",
     )
     run_p.add_argument(
         "--allow-cgroup-failure",
@@ -2375,6 +2392,82 @@ def _cmd_box(ns: argparse.Namespace, parser: argparse.ArgumentParser, c: Palette
     return _run(cfg, run_ns, c)
 
 
+#: Exit code for a run that admission would not let start. Distinct from 2 (bad usage) and 3
+#: (cgroup boxing unavailable) on purpose: a scheduler that retries should be able to tell "this
+#: host is busy, come back" from "this invocation is wrong", without parsing prose.
+ADMISSION_EXIT_CODE = 4
+
+
+def _apply_admission(ns: argparse.Namespace) -> int:
+    """Reserve this run's memory against the host-wide ledger, or refuse to start. 0 = proceed.
+
+    Absent ``--admission`` this is a no-op: admission is opt-in because a durable cross-process
+    ledger changes when a run may start, and that is not something to switch on underneath
+    existing callers.
+    """
+    raw = getattr(ns, "admission", None)
+    if raw is None:
+        return 0
+    try:
+        wait_s = float(raw)
+    except (TypeError, ValueError):
+        print(
+            f"{PROG}: run: --admission WAIT_S must be a number of seconds (got {raw!r})",
+            file=sys.stderr,
+        )
+        return 2
+    # NaN must be refused too, hence the explicit finite check: a wait budget that is not a
+    # number is a usage error, and `nan >= 0` is False while `nan < 0` is also False.
+    if not math.isfinite(wait_s) or wait_s < 0:
+        print(
+            f"{PROG}: run: --admission WAIT_S must be a finite number >= 0 (got {raw!r})",
+            file=sys.stderr,
+        )
+        return 2
+
+    requested = _requested_max_mem_bytes(getattr(ns, "max_mem", None))
+    if requested is None:
+        # REQUIRED, not guessed. The only numbers available without --max-mem describe the whole
+        # host, so guessing would reserve everything and turn admission into a global mutex --
+        # which would look like it was working right up until it deadlocked a CI fleet.
+        print(
+            f"{PROG}: run: --admission requires --max-mem: admission reserves a NUMBER against a "
+            "host-wide ledger, and the only figure available without it is the whole host.",
+            file=sys.stderr,
+        )
+        return 2
+
+    # ALREADY ADMITTED. Boxing re-execs this process into a systemd scope with `execvp`, which
+    # keeps the pid AND the /proc start time, so the record this run wrote before the exec is
+    # still its own live reservation. Asking again would count this run twice against the budget
+    # -- and on a tight budget the second ask would QUEUE behind the first, i.e. the run would
+    # wait for itself until the wait ran out. The ledger entry outlives the exec and is swept
+    # when the process finally dies, so there is nothing left to do here.
+    from safe_ci_dag_runner import cgroup as cg
+
+    if os.environ.get(cg.DEFAULT_NAMING.env_in_scope) == "1":
+        return 0
+
+    try:
+        decision, reservation = admission.admit(
+            requested, tag="run", wait_s=wait_s, poll_s=min(2.0, max(0.25, wait_s / 4))
+        )
+    except admission.AdmissionStateError as error:
+        # A ledger this process cannot read is not permission to proceed: it is the shared state
+        # admission exists to consult, and guessing past it would silently restore the contention.
+        print(f"{PROG}: run: admission ledger unusable: {error}", file=sys.stderr)
+        return ADMISSION_EXIT_CODE
+    if reservation is not None:
+        return 0
+    print(f"{PROG}: run: {decision.reason}", file=sys.stderr)
+    if decision.verdict is admission.Verdict.QUEUE and wait_s <= 0:
+        print(
+            f"{PROG}: run: pass --admission SECONDS to wait for a slot instead of exiting.",
+            file=sys.stderr,
+        )
+    return ADMISSION_EXIT_CODE
+
+
 def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
     # Feature A: --only runs EXACTLY the named step(s). Validate/filter BEFORE cgroup bring-up so a
     # bad tag fails fast (exit 2) without needing a systemd scope.
@@ -2429,6 +2522,15 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
         if code != 0:
             return code
         cfg = _expand_stress(cfg, stress_n)
+
+    # HOST-WIDE MEMORY ADMISSION, opt-in, and deliberately BEFORE cgroup bring-up. A run that is
+    # going to wait must not be holding a systemd scope while it waits, and a run that is going to
+    # be refused should not have created one at all. The reservation is held for the rest of the
+    # process (released by admission's atexit hook), so the ledger reflects this run for exactly as
+    # long as it is on the machine.
+    admission_code = _apply_admission(ns)
+    if admission_code != 0:
+        return admission_code
 
     # Bind the resolved CPU capacity to the outer scope's CPUQuota. Declared widths are not
     # reservations: --max-steps, dependencies, and named resources decide which steps overlap.

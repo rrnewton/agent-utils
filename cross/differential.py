@@ -1813,6 +1813,142 @@ def compare_box_subcommand(py: list[str], rs: list[str], rep: Report) -> None:
         rep.ok(label)
 
 
+def compare_memory_admission(py: list[str], rs: list[str], rep: Report) -> None:
+    """Both engines give the SAME admission verdict, in the same words, with the same exit code.
+
+    Admission is cross-process shared state: the two editions read and write ONE ledger on the
+    host, so they have to agree about its schema, about the arithmetic, and about what each
+    verdict is called. A Python-only implementation would not merely be a missing feature, it
+    would be a runner that ignores reservations the other engine is honouring -- which is worse
+    than no admission at all, because the ledger would then be actively misleading.
+
+    The host limits are pinned through the operator overrides so the comparison is about the
+    DECISION and not about whatever this machine happens to have free.
+    """
+    label = "admission:verdicts"
+    with tempfile.TemporaryDirectory() as tmp:
+        dag_path = os.path.join(tmp, "admission.json")
+        Path(dag_path).write_text(
+            json.dumps(
+                {
+                    "steps": [
+                        {
+                            "group": "g",
+                            "job": "ok",
+                            "cmd": "true",
+                            "timeout": 30,
+                            "cpu_timeout": 600,
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        gib = 1024**3
+        base = (
+            "run", "--dag", dag_path, "-s", "1", "-j", "1",
+            NOPROF, NOFB, "--unsafe-no-cgroups", "--admission",
+        )
+
+        def env(name: str, budget: int, headroom: int) -> dict[str, str]:
+            return {
+                "SAFE_CI_MEM_LEDGER": os.path.join(tmp, f"{name}.json"),
+                "SAFE_CI_ADMISSION_BUDGET_BYTES": str(budget),
+                "SAFE_CI_ADMISSION_HEADROOM_BYTES": str(headroom),
+            }
+
+        # 1. REFUSED: the request alone is bigger than the whole-host budget.
+        refused = {
+            name: run(cmd, (*base, "--max-mem", "64G"), env("refuse", 16 * gib, 64 * gib))
+            for name, cmd in (("py", py), ("rs", rs))
+        }
+        # 2. QUEUED on host memory a non-runner tenant is holding.
+        queued = {
+            name: run(cmd, (*base, "--max-mem", "32G"), env("queue", 64 * gib, 1024))
+            for name, cmd in (("py", py), ("rs", rs))
+        }
+        # 3. GRANTED, and the run then proceeds to completion.
+        granted = {
+            name: run(cmd, (*base, "--max-mem", "16G"), env("grant", 64 * gib, 64 * gib))
+            for name, cmd in (("py", py), ("rs", rs))
+        }
+        # 4. Admission without a number to reserve is a usage error, not a guess.
+        no_number = {
+            name: run(cmd, base, env("nonum", 64 * gib, 64 * gib))
+            for name, cmd in (("py", py), ("rs", rs))
+        }
+        # 5. ALREADY ADMITTED. Cgroup boxing re-execs the runner into a systemd scope with
+        # `execvp`, which keeps the pid AND the /proc start time, so the pre-exec reservation is
+        # still this run's own. Both engines must therefore SKIP admission when the in-scope
+        # sentinel is set; an engine that asks again counts one run twice, and on a tight budget
+        # queues the run behind itself with nothing that can ever release it. A budget of 1 GiB
+        # against a 16 GiB request makes the difference unmissable: re-asking is a REFUSAL.
+        in_scope = {
+            name: run(
+                cmd,
+                (*base, "--max-mem", "16G"),
+                {**env("inscope", gib, 64 * gib), "SAFE_CI_IN_SCOPE": "1"},
+            )
+            for name, cmd in (("py", py), ("rs", rs))
+        }
+        # 6. A ledger neither engine can read stops the run instead of waving it through: the
+        # ledger IS the shared state, and guessing past it silently restores the contention.
+        corrupt_path = os.path.join(tmp, "corrupt.json")
+        Path(corrupt_path).write_text("{not json at all", encoding="utf-8")
+        corrupt = {
+            name: run(
+                cmd,
+                (*base, "--max-mem", "16G"),
+                {
+                    "SAFE_CI_MEM_LEDGER": corrupt_path,
+                    "SAFE_CI_ADMISSION_BUDGET_BYTES": str(64 * gib),
+                    "SAFE_CI_ADMISSION_HEADROOM_BYTES": str(64 * gib),
+                },
+            )
+            for name, cmd in (("py", py), ("rs", rs))
+        }
+
+        # (name, outcomes, expected exit, phrase both engines must print, phrase is on stderr)
+        checks: list[tuple[str, dict[str, Outcome], int, str, bool]] = [
+            ("refuse", refused, 4, "REFUSED: 64.0 GiB exceeds the whole-host budget", True),
+            ("queue", queued, 4, "QUEUED on HOST MEMORY held outside this tool", True),
+            ("grant", granted, 0, "GRANTED 16.0 GiB", False),
+            ("no-max-mem", no_number, 2, "--admission requires --max-mem", True),
+            ("in-scope-reexec", in_scope, 0, "DELIBERATELY UNBOXED", True),
+            ("corrupt-ledger", corrupt, 4, "admission ledger unusable", True),
+        ]
+        for name, outs, expected_code, phrase, on_stderr in checks:
+            if outs["py"].returncode != outs["rs"].returncode:
+                rep.bad(
+                    label,
+                    f"{name}: exit py={outs['py'].returncode} rs={outs['rs'].returncode}",
+                )
+                return
+            if outs["py"].returncode != expected_code:
+                rep.bad(
+                    label,
+                    f"{name}: expected exit {expected_code}, got {outs['py'].returncode}\n"
+                    f"{outs['py'].stdout}{outs['py'].stderr}",
+                )
+                return
+            for engine, out in outs.items():
+                text = out.stderr if on_stderr else out.stdout
+                if phrase not in text:
+                    rep.bad(label, f"{name}: {engine} did not say {phrase!r}\n{text}")
+                    return
+        # The in-scope leg is defined by what it must NOT do, so say that outright rather than
+        # leaning on exit 0: a re-admitting engine would print its verdict on the way past.
+        for engine, out in in_scope.items():
+            noise = out.stdout + out.stderr
+            if "[admission]" in noise or "REFUSED" in noise:
+                rep.bad(
+                    label,
+                    f"in-scope-reexec: {engine} re-admitted after the boxing re-exec\n{noise}",
+                )
+                return
+        rep.ok(label)
+
+
 def compare_batch_teardown_grace(py: list[str], rs: list[str], rep: Report) -> None:
     """Eager cancellation grants one diagnostic window, not one window per sibling.
 
@@ -4014,6 +4150,7 @@ def compare_cli_schema(py: list[str], rs: list[str], rep: Report) -> None:
             "--args", "--stress", "--perf-dir", "--no-profile", "--profile", "--planner",
             "--show-plan", "--no-profile-feedback", "--profile-sync",
             "--profile-sync-direction", "--keep-going", "--run-timeout",
+            "--admission",
             "--allow-cgroup-failure",
             "--unsafe-no-cgroups", "--small-default-cap", "--quiet",
         ),
@@ -4924,6 +5061,7 @@ def compare_safe_ci_dag_runner(rand_count: int, seed: int) -> int:
     compare_step_log_ceiling(py, rs, rep)
     compare_capture_ceiling(py, rs, rep)
     compare_box_subcommand(py, rs, rep)
+    compare_memory_admission(py, rs, rep)
     compare_batch_teardown_grace(py, rs, rep)
     compare_run_timeout(py, rs, rep)
     compare_spawn_failure(py, rs, rep)

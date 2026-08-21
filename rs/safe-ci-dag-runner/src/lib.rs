@@ -17,6 +17,7 @@
 // Cgroup boxing is environment-dependent, so the differential exercises the un-boxed core
 // (`--allow-cgroup-failure`) while a dedicated smoke test proves boxing caps memory.
 
+pub mod admission;
 pub mod ambient;
 pub mod attribution;
 pub mod capabilities;

@@ -526,6 +526,58 @@ the same knob.
 Argv after `--` is shell-quoted element by element, so an argument containing a
 space, a quote or a `$(...)` stays one argument instead of becoming shell syntax.
 
+## Host-wide memory admission
+
+`--max-mem` gates ONE process against a snapshot of the host. It has no notion
+of what other runner invocations have already committed to, so two runs started
+a second apart each see the same headroom and both take it. `run --admission`
+adds the missing shared state:
+
+```sh
+safe-ci-dag-runner run --dag dag.json --max-mem 16G --admission
+safe-ci-dag-runner run --dag dag.json --max-mem 16G --admission 600   # wait up to 10 min
+```
+
+Admission reserves the run's `--max-mem` against a durable, `flock`-serialized
+ledger every runner on the host shares -- the sibling of the core-reservation
+ledger, with the same `(pid, /proc starttime)` dead-holder reclaim, so a crashed
+run cannot subtract memory forever. It requires `--max-mem`: admission reserves
+a NUMBER, and the only figure available without one describes the whole host.
+
+There are three answers, not two:
+
+| Verdict | Meaning |
+|---|---|
+| GRANT | Reserved and held for the life of the run. |
+| QUEUE | It would fit on a quiet host, so waiting can help. Says how many holders are ahead, and which resource is in the way. |
+| REFUSE | Bigger than the whole-host budget, so waiting can never help. Says the largest number that could be granted. |
+
+A queued run exits 4 by default and prints why; pass `--admission SECONDS` to
+wait instead. Exit 4 is distinct from 2 (bad usage) and 3 (cgroup boxing
+unavailable) so a retrying scheduler can tell "the host is busy, come back" from
+"this invocation is wrong" without parsing prose.
+
+A grant needs BOTH `reserved + requested <= whole-host budget` (the condition
+other runners affect) and `requested <= live headroom` (the condition non-runner
+tenants affect -- a ledger cannot see a database that grew). The two are
+reported separately because the remedies differ.
+
+The budget defaults to 85% of `MemTotal` less a flat 8 GiB margin, and that
+margin is capped at one eighth of `MemTotal` so it can never swallow a small
+host's whole budget: held back whole, 8 GiB of an 8 GiB machine would leave a
+budget of zero and refuse every run on that host.
+
+Override the ledger path with `SAFE_CI_MEM_LEDGER`, the aggregate budget with
+`SAFE_CI_ADMISSION_BUDGET_BYTES`, and the live-headroom reading with
+`SAFE_CI_ADMISSION_HEADROOM_BYTES`; an unparseable override is reported and the
+host is measured instead, never silently taken as zero.
+
+A boxed run admits ONCE, before cgroup bring-up: a run that is going to wait
+should not be holding a systemd scope while it waits, and a run that is going to
+be refused should never have created one. Boxing then re-execs the runner into
+that scope, which keeps the pid and the `/proc` start time, so the reservation
+already recorded is still this run's own and is not taken a second time.
+
 ## Collision-free CPU reservations
 
 For benchmark isolation, reserve a chosen number of least-busy allowed cores

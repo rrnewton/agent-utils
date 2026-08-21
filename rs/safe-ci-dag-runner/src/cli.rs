@@ -350,6 +350,7 @@ fn run_help(c: &Palette) -> String {
             ("--profile-sync-direction D", "both (default) | download | upload"),
             ("-k, --keep-going", "after failure, continue independent work; skip failed dependents"),
             ("--run-timeout SECONDS", "OUTER wall budget for the WHOLE run; cuts in-flight steps and still reports"),
+            ("--admission [WAIT_S]", "HOST-WIDE memory admission (opt-in): reserve --max-mem against a durable ledger every runner on the host shares. GRANT / QUEUE (says how many holders are ahead) / REFUSE (says the number to ask for). WAIT_S = how long to wait while queued (default 0 = report and exit 4). Requires --max-mem"),
             ("--allow-cgroup-failure", "if cgroup boxing is unavailable, run UNBOXED with a warning instead of erroring"),
             ("--unsafe-no-cgroups", "DELIBERATELY skip cgroup boxing entirely (unsafe)"),
             ("--small-default-cap", "compatibility no-op (small caps are already on by default)"),
@@ -913,6 +914,9 @@ struct RunArgs {
     keep_going: bool,
     /// OUTER wall budget for the WHOLE run, in seconds (`None` = unbounded).
     run_timeout: Option<i64>,
+    /// Host-wide memory admission (opt-in). `None` = off; `Some(wait_s)` = on, waiting that long
+    /// while QUEUED.
+    admission: Option<f64>,
     allow_cgroup_failure: bool,
     unsafe_no_cgroups: bool,
     small_default_cap: bool,
@@ -942,6 +946,7 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
         profile_sync_direction: "both".to_string(),
         keep_going: false,
         run_timeout: env_run_timeout(),
+        admission: None,
         allow_cgroup_failure: false,
         unsafe_no_cgroups: false,
         small_default_cap: false,
@@ -1043,6 +1048,30 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
                     ));
                 }
                 a.run_timeout = Some(secs);
+            }
+            "--admission" => {
+                // Optional value, mirroring the Python `nargs="?"`: a bare `--admission` means
+                // "do not wait", and only a token that is not itself a flag is taken as SECONDS.
+                let seconds = match inline {
+                    Some(v) => v,
+                    None => match rest.get(i + 1) {
+                        Some(next) if !next.starts_with('-') => {
+                            i += 1;
+                            next.clone()
+                        }
+                        _ => "0".to_string(),
+                    },
+                };
+                let parsed = seconds
+                    .parse::<f64>()
+                    .map_err(|_| format!("--admission: invalid seconds value: '{seconds}'"))?;
+                // NaN must be refused too, hence the explicit finite check rather than a
+                // negated comparison: `!(nan >= 0.0)` is true, but so is every other comparison
+                // with NaN, and a wait budget that is not a number is a usage error either way.
+                if !parsed.is_finite() || parsed < 0.0 {
+                    return Err("--admission: WAIT_S must be a finite number >= 0".to_string());
+                }
+                a.admission = Some(parsed);
             }
             "--allow-cgroup-failure" => a.allow_cgroup_failure = true,
             "--unsafe-no-cgroups" => a.unsafe_no_cgroups = true,
@@ -2546,6 +2575,61 @@ fn cmd_plan(a: &PlanArgs) -> i32 {
     0
 }
 
+/// Exit code for a run that admission would not let start.
+///
+/// Distinct from 2 (bad usage) and 3 (cgroup boxing unavailable) on purpose: a scheduler that
+/// retries should be able to tell "this host is busy, come back" from "this invocation is wrong",
+/// without parsing prose.
+const ADMISSION_EXIT_CODE: i32 = 4;
+
+/// Reserve this run's memory against the host-wide ledger, or refuse to start.
+///
+/// Absent `--admission` this is a no-op: admission is opt-in because a durable cross-process
+/// ledger changes WHEN a run may start, and that is not something to switch on underneath existing
+/// callers. The returned reservation must be held for the life of the run.
+fn apply_admission(a: &RunArgs) -> Result<Option<crate::admission::MemoryReservation>, i32> {
+    let Some(wait_s) = a.admission else {
+        return Ok(None);
+    };
+    let Some(requested) = requested_max_mem_bytes(a.max_mem.as_deref()) else {
+        // REQUIRED, not guessed. The only numbers available without --max-mem describe the whole
+        // host, so guessing would reserve everything and turn admission into a global mutex --
+        // which would look like it was working right up until it deadlocked a CI fleet.
+        eprintln!(
+            "{PROG}: run: --admission requires --max-mem: admission reserves a NUMBER against a \
+             host-wide ledger, and the only figure available without it is the whole host."
+        );
+        return Err(2);
+    };
+    // ALREADY ADMITTED. Boxing re-execs this process into a systemd scope with `execvp`, which
+    // keeps the pid AND the /proc start time, so the record this run wrote before the exec is
+    // still its own live reservation. Asking again would count this run twice against the budget
+    // -- and on a tight budget the second ask would QUEUE behind the first, i.e. the run would
+    // wait for itself until the wait ran out. The ledger entry outlives the exec and is swept
+    // when the process finally dies, so there is nothing left to do here.
+    if crate::cgroup::is_in_scope() {
+        return Ok(None);
+    }
+    let requested = u64::try_from(requested).unwrap_or(0);
+    let poll_s = (wait_s / 4.0).clamp(0.25, 2.0);
+    match crate::admission::admit(requested, "run", None, poll_s, wait_s, true) {
+        Ok((_decision, Some(reservation))) => Ok(Some(reservation)),
+        Ok((decision, None)) => {
+            eprintln!("{PROG}: run: {}", decision.reason);
+            if decision.verdict == crate::admission::Verdict::Queue && wait_s <= 0.0 {
+                eprintln!(
+                    "{PROG}: run: pass --admission SECONDS to wait for a slot instead of exiting."
+                );
+            }
+            Err(ADMISSION_EXIT_CODE)
+        }
+        Err(error) => {
+            eprintln!("{PROG}: run: admission ledger unusable: {error}");
+            Err(ADMISSION_EXIT_CODE)
+        }
+    }
+}
+
 fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
     // Feature A: --only runs EXACTLY the named step(s). Validate/filter BEFORE cgroup bring-up so
     // a bad tag fails fast (exit 2) without needing a systemd scope.
@@ -2606,6 +2690,15 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
         expand_stress(&stress_sized, a.stress)
     } else {
         with_args
+    };
+
+    // HOST-WIDE MEMORY ADMISSION, opt-in, and deliberately BEFORE cgroup bring-up. A run that is
+    // going to wait must not be holding a systemd scope while it waits, and a run that is going to
+    // be refused should not have created one at all. The reservation is kept alive for the rest of
+    // this function, so the ledger reflects this run for exactly as long as it is on the machine.
+    let _memory_admission = match apply_admission(a) {
+        Ok(reservation) => reservation,
+        Err(code) => return code,
     };
 
     // Cgroup boxing is ON by default (may re-exec into a systemd scope and not return). Bind the
@@ -3697,9 +3790,16 @@ mod tests {
             "--stress",
             "--cores",
             "--profile-sync",
+            // `run` owns admission; `box` does not take it, and a help entry filed under the
+            // wrong subcommand advertises a flag that subcommand will reject.
+            "--admission",
         ] {
             assert!(help.contains(flag), "missing {flag} from run help");
         }
+        assert!(
+            !box_help(&palette).contains("--admission"),
+            "box has no --admission; advertising it there is a promise the parser breaks"
+        );
         assert!(!help.contains("--jobs"), "legacy alias must stay hidden");
         assert!(help.contains("maximum active DAG steps"));
         assert!(help.contains("outer CPU-bandwidth limit"));
