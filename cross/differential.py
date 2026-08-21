@@ -4840,13 +4840,23 @@ def compare_run_parallel_limits(py: list[str], rs: list[str], rep: Report) -> No
                 ("--max-steps=3", "--max-cpus=2", "--jobs=2"),
                 CpuFootprintFacts(3, (1, 1, 1), 3, 3),
             ),
-            # #36 dag-core-budget-split. Every case above passes an explicit `-s`, so none of
-            # them observes the ONE coupling the split deliberately kept: with `-s` absent, the
-            # active-step ceiling defaults to the resolved `-j`. A user who types `-j1` for
-            # bandwidth also gets a serial DAG, and a user who types `-j3` also gets three-way
-            # overlap. Both numbers are literal here, and the two directions are separate cases
-            # so a regression that pinned the default at 1 (or at the CPU count) cannot pass by
-            # satisfying the other one.
+            # #36 dag-core-budget-split. These watch the ONE coupling the split deliberately
+            # kept: with `-s` absent, the active-step ceiling defaults to the RESOLVED `-j`.
+            #
+            # Every case in the list above passes an explicit `-s`, so none of THEM can see it,
+            # but that is a statement about this list and not about the tree. Two cases earlier
+            # in this function do omit `-s` without observing the ceiling (one refuses at exit
+            # 2, one only checks the exit status), and `memory:nonbinding-max-mem-keeps-cpu-base`
+            # over in compare_memory_hardening genuinely does observe it: `--max-cpus 1` with no
+            # `-s`, asserting a base ceiling of 1. Raise the default and that case goes red too
+            # (verified: defaulting both engines to the host CPU count reddens it alongside
+            # `...-cpu-budget-one` and `...-two-hundred`). So the tree was never blind to the
+            # default; what it could not see is the default following a `-j` ABOVE one -- the
+            # direction a user actually feels -- and it saw none of it against live guest
+            # evidence. A user who types `-j1` for bandwidth also gets a serial DAG, and a user
+            # who types `-j3` also gets three-way overlap. Both numbers are literal here, and
+            # the two directions are separate cases so a regression that pinned the default at 1
+            # (or at the CPU count) cannot pass by satisfying the other one.
             (
                 "absent-step-ceiling-follows-cpu-budget-one",
                 (1, 1, 1),
@@ -4928,6 +4938,53 @@ def compare_run_parallel_limits(py: list[str], rs: list[str], rep: Report) -> No
                 rep.bad(f"run-limits:{label}", f"limit verdicts={verdicts}")
             else:
                 rep.ok(f"run-limits:{label}")
+
+        # The magnitude the shipped README and user guide actually promise: `run -j200` alone
+        # permits TWO HUNDRED active nodes. Launching two hundred spinning guests to watch that
+        # happen would be a host-size lottery, so it is pinned where both engines ANNOUNCE the
+        # number instead: with `--max-mem` present each prints the base active-step ceiling it
+        # derived, and from `-j200` with no `-s` that must read 200 in both. Every guest-evidence
+        # case above uses 1 or 3, so a clamp on the default -- `min(max_cpus, 8)` is the
+        # one-token version -- leaves all of them green while falsifying the shipped sentence.
+        # Only the base is asserted: the modelled memory ceiling is a property of the host, and
+        # _sizing_details already refuses any line whose final ceiling is not min(base, memory).
+        gib = 1024**3
+        wide_default = {
+            "mem_cap_factor": 1.0,
+            "mem_cap_floor_bytes": 0,
+            "outer_mem_safety_factor": 1.0,
+            "steps": [
+                {
+                    "group": "wide-default",
+                    "job": f"s{index}",
+                    "cmd": "true",
+                    "jobs_flag": "",
+                    "hint": {"hard_mem_max_bytes": gib},
+                }
+                for index in range(2)
+            ],
+        }
+        wide_path = os.path.join(td, "absent-step-ceiling-two-hundred.json")
+        Path(wide_path).write_text(json.dumps(wide_default), encoding="utf-8")
+        wide_args = (
+            "run", "--dag", wide_path, "--max-mem", "16G", "-j", "200",
+            "--unsafe-no-cgroups", "-q", NOPROF, NOFB,
+        )
+        pwide, rwide = run(py, wide_args), run(rs, wide_args)
+        pwd, rwd = _sizing_details(pwide.stderr), _sizing_details(rwide.stderr)
+        if (
+            pwide.returncode == rwide.returncode == 0
+            and pwd is not None
+            and pwd == rwd
+            and pwd[3] == 200
+        ):
+            rep.ok("run-limits:absent-step-ceiling-follows-cpu-budget-two-hundred")
+        else:
+            rep.bad(
+                "run-limits:absent-step-ceiling-follows-cpu-budget-two-hundred",
+                f"expected both engines to derive base active-step ceiling 200 from -j200 with "
+                f"no -s; py={pwide} details={pwd} rs={rwide} details={rwd}",
+            )
 
 
 def _boxing_capability_unavailable(outcome: Outcome) -> bool:

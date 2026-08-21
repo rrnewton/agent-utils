@@ -352,6 +352,38 @@ def test_python_api_keeps_cpu_jobs_compatibility_aliases() -> None:
         )
 
 
+def test_an_absent_step_ceiling_defaults_to_the_resolved_cpu_budget() -> None:
+    """#36 dag-core-budget-split: an absent ``-s`` follows the RESOLVED ``-j``, at any size.
+
+    ``test_max_mem_and_explicit_max_steps_use_tighter_ceiling`` already pins the default at 7,
+    but it hands ``_select_max_steps`` a bare 7 rather than resolving a typed flag, and 7 is
+    small enough that a clamp on the default (``min(max_cpus, 8)`` is the one-token version)
+    would leave it green.  The README and the user guide tell a user that ``run -j200`` alone
+    permits two hundred active nodes, so that literal magnitude is pinned here, resolved from
+    the flag a user actually types.  The Rust edition pins the same numbers in
+    ``an_absent_step_ceiling_defaults_to_the_resolved_cpu_budget``.
+
+    Every value below is written literally; none is read back out of the constant it pins.
+    """
+    cfg = _sleep_cfg(count=1)
+
+    two_hundred = build_parser().parse_args(["run", "--dag", "dag.json", "-j", "200"])
+    assert two_hundred.max_steps is None
+    assert _select_max_cpus(two_hundred) == 200
+    assert _select_max_steps(cfg, two_hundred, 200) == 200
+
+    # The hidden 0.13 alias resolves to --max-cpus first and therefore sets the same default.
+    legacy = build_parser().parse_args(["run", "--dag", "dag.json", "--jobs", "200"])
+    assert legacy.max_steps is None
+    assert _select_max_cpus(legacy) == 200
+    assert _select_max_steps(cfg, legacy, 200) == 200
+
+    # Nothing runs in the other direction: an explicit -s is not the CPU budget.
+    both = build_parser().parse_args(["run", "--dag", "dag.json", "-j", "3", "-s", "5"])
+    assert _select_max_cpus(both) == 3
+    assert _select_max_steps(cfg, both, 3) == 5
+
+
 def test_max_mem_and_explicit_max_steps_use_tighter_ceiling(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

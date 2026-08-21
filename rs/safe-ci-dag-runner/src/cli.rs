@@ -4044,6 +4044,17 @@ mod tests {
             parse_run_args(&["--max-cpus".into(), "3".into(), "-s".into(), "5".into()]).unwrap();
         assert_eq!(select_max_cpus(&both), 3);
         assert_eq!(select_max_steps(&cfg, &both, 3), 5);
+
+        // The exact sentence the README and the user guide put in front of a user: `run -j200`
+        // alone permits TWO HUNDRED active nodes. Pinned at that literal magnitude on purpose.
+        // Every other value here and in the differential is 1, 3, 5 or 7, so a clamp on the
+        // default -- `unwrap_or(max_cpus.min(8))` is the one-token version -- would leave the
+        // whole suite green while falsifying the shipped sentence. 200 is not the host CPU
+        // count, not a configured default, and not read back out of any constant.
+        let two_hundred = parse_run_args(&["-j".into(), "200".into()]).unwrap();
+        assert_eq!(two_hundred.max_steps, None);
+        assert_eq!(select_max_cpus(&two_hundred), 200);
+        assert_eq!(select_max_steps(&cfg, &two_hundred, 200), 200);
     }
 
     #[test]
