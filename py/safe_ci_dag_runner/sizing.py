@@ -11,6 +11,7 @@ import math
 import os
 import re
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 from safe_ci_dag_runner.model import (
@@ -321,6 +322,122 @@ def derive_build_jobs(cpu_count: int | None, mem_max_bytes: int | None) -> int:
     if mem_max_bytes is not None and mem_max_bytes > 0:
         jobs = min(jobs, mem_max_bytes // PER_BUILD_JOB_MEM_BYTES)
     return max(1, int(jobs))
+
+
+#: The build-width variable the runner controls. cargo reads it, and the ``NUM_JOBS`` it exports
+#: to build scripts follows it.
+BUILD_JOBS_ENV = "CARGO_BUILD_JOBS"
+
+#: The operator's own build width, carried ACROSS the runner's systemd re-exec.
+#:
+#: This exists because ``CARGO_BUILD_JOBS`` alone cannot answer "did a human ask for this?".
+#: The runner writes that variable itself — ``enter_delegated_scope`` assigns it and
+#: ``reexec_in_scope`` passes ``--setenv=CARGO_BUILD_JOBS=...`` into the scope — so the in-scope
+#: process reads back the runner's own derivation and would mistake it for an instruction. Then
+#: per-step downward refinement stops, every step keeps the whole scope's width, and that is
+#: exactly the 284-wide-against-8-GiB condition this machinery exists to prevent.
+#:
+#: So intent is resolved ONCE, in the outermost process, from the truly ambient environment, and
+#: passed forward under its own name. PRESENCE of this variable means "already resolved"; an
+#: empty value means "resolved, and the operator asked for nothing".
+OPERATOR_BUILD_JOBS_ENV = "SAFE_CI_OPERATOR_BUILD_JOBS"
+
+
+def parse_build_jobs(raw: str | None) -> int | None:
+    """A build width an operator can be said to have CHOSEN: a positive decimal integer.
+
+    Absent, empty, malformed, or non-positive is ``None`` — not an instruction. A zero or a typo
+    read as intent would hand the whole run a width nobody picked, which is worse than falling
+    back to a derivation whose reasoning is stated.
+    """
+    if raw is None:
+        return None
+    text = raw.strip()
+    if not text.isdigit():
+        return None
+    value = int(text)
+    return value if value > 0 else None
+
+
+def resolve_operator_build_jobs(forwarded: str | None, ambient: str | None) -> int | None:
+    """Resolve operator intent from the two variables, without touching the environment.
+
+    ``forwarded`` is ``SAFE_CI_OPERATOR_BUILD_JOBS`` and ``ambient`` is ``CARGO_BUILD_JOBS``.
+    PRESENCE of the first wins outright, empty included: an outer runner already asked this
+    question of the real environment, and its answer — including "the operator asked for
+    nothing" — is the only one that is still trustworthy, because that same runner has since
+    written ``ambient`` itself.
+    """
+    if forwarded is not None:
+        return parse_build_jobs(forwarded)
+    return parse_build_jobs(ambient)
+
+
+#: Captured at IMPORT, deliberately: ``enter_delegated_scope`` mutates ``os.environ`` later in the
+#: same process, and a lazily-read value would see the runner's own write.
+_OPERATOR_BUILD_JOBS: int | None = resolve_operator_build_jobs(
+    os.environ.get(OPERATOR_BUILD_JOBS_ENV), os.environ.get(BUILD_JOBS_ENV)
+)
+
+
+def operator_build_jobs() -> int | None:
+    """The build width the operator chose, or ``None`` if they expressed none."""
+    return _OPERATOR_BUILD_JOBS
+
+
+@dataclass(frozen=True)
+class BuildJobsChoice:
+    """Which build width governs, what the alternative was, and why — so an OOM is explicable."""
+
+    #: The width that will actually be exported.
+    jobs: int
+    #: What the containment derivation would have chosen from the caps in force.
+    derived: int
+    #: The operator's stated width, or ``None`` when they stated none.
+    operator: int | None
+
+    @property
+    def source(self) -> str:
+        """``"operator"`` when a stated width governs, ``"containment"`` when the derivation does."""
+        return "operator" if self.operator is not None else "containment"
+
+    def describe(self) -> str:
+        """One sentence naming the winner, the loser, and the consequence."""
+        if self.operator is not None:
+            return (
+                f"build width: honouring {BUILD_JOBS_ENV}={self.operator} from the environment; "
+                f"the containment default would have chosen {self.derived}. Per-step downward "
+                "refinement is OFF for this run, so a memory cap sized for a narrower pool can "
+                "still OOM."
+            )
+        return (
+            f"build width: no {BUILD_JOBS_ENV} in the environment, so the containment default "
+            f"governs at {self.derived} for this scope, refined downward per step."
+        )
+
+
+def choose_build_jobs(
+    operator: int | None, cpu_count: int | None, mem_max_bytes: int | None
+) -> BuildJobsChoice:
+    """Choose the build width for a scope or a step, and record what lost.
+
+    A cgroup quota is a CEILING, not a parallelism instruction. When an operator has stated a
+    width — having, presumably, sized their memory cap against exactly that pool — the derived
+    number does not get to replace it silently. When they have stated nothing, the derivation
+    governs and stays free to narrow per step, which is the behaviour
+    ``test_derive_build_jobs_caps_the_284_leak`` and ``test_build_job_cap.py`` pin.
+    """
+    derived = derive_build_jobs(cpu_count, mem_max_bytes)
+    return BuildJobsChoice(
+        jobs=operator if operator is not None else derived,
+        derived=derived,
+        operator=operator,
+    )
+
+
+def select_build_jobs(cpu_count: int | None, mem_max_bytes: int | None) -> BuildJobsChoice:
+    """:func:`choose_build_jobs` against this process's captured operator intent."""
+    return choose_build_jobs(_OPERATOR_BUILD_JOBS, cpu_count, mem_max_bytes)
 
 
 _SIZE_RE = re.compile(r"\s*(\d+(?:\.\d+)?)\s*([KkMmGgTt]?)([Bb]?)\s*")

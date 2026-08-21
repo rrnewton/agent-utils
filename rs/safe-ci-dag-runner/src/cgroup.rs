@@ -1009,13 +1009,28 @@ fn attempt_scope_reexec_inner(
              whole scope; the runner's own budget must fire first)."
         );
     }
-    // Scope-wide build-job default, derived from the granted cores + memory cap, so a command
-    // run directly in the scope (not via a per-step child) still can't compute NUM_JOBS=<all
-    // cores>. Per-step prepare_command refines it downward; this is the inherited floor.
+    // Scope-wide build width. When the operator stated none, this is derived from the granted
+    // cores + memory cap, so a command run directly in the scope (not via a per-step child) still
+    // can't compute NUM_JOBS=<all cores>, and per-step prepare_command refines it downward. When
+    // the operator DID state one, theirs wins.
+    let build_jobs = crate::sizing::select_build_jobs(cpu_count, memory_max);
+    eprintln!("{LOG_PREFIX} {}", build_jobs.describe());
     args.push(format!(
-        "--setenv=CARGO_BUILD_JOBS={}",
-        crate::sizing::derive_build_jobs(cpu_count, memory_max)
+        "--setenv={}={}",
+        crate::sizing::BUILD_JOBS_ENV,
+        build_jobs.jobs
     ));
+    // ACROSS THE RE-EXEC, INTENT TRAVELS UNDER ITS OWN NAME. The line above puts the runner's own
+    // number into the child's CARGO_BUILD_JOBS; without this the child would read it back as an
+    // operator instruction and stop refining per step.
+    args.push(format!(
+        "--setenv={}={}",
+        crate::sizing::OPERATOR_BUILD_JOBS_ENV,
+        build_jobs
+            .operator
+            .map_or_else(String::new, |value| value.to_string())
+    ));
+
     args.push(format!("--setenv={ENV_IN_SCOPE}=1"));
     args.push(format!("--setenv={ENV_SCOPE_UNIT}={unit}.scope"));
     args.push(format!(
@@ -1964,13 +1979,19 @@ impl CgroupManager for Cgroups {
         // cpu.max/memory.max. Only CARGO_BUILD_JOBS (never MAKEFLAGS): a global make -j could
         // parallelize a determinism-sensitive target (cf. make -jN nondeterminism #1157). An
         // explicit `cargo -j` in the step command still overrides this env floor.
+        //
+        // An operator's OWN width, resolved once in the outermost process, is not refined: they
+        // sized their caps against that pool. Only the derivation refines downward.
         let eff_cores = cpu_count.or_else(|| cpu_max_cores(read_trim(root, "cpu.max")));
         let eff_mem = mem_max.or_else(|| memory_max_bytes(read_trim(root, "memory.max")));
-        let jobs = crate::sizing::derive_build_jobs(eff_cores, eff_mem);
+        let jobs = crate::sizing::select_build_jobs(eff_cores, eff_mem).jobs;
         // $$ is the bash leader's pid; writing it migrates the leader so every subsequently
         // forked descendant inherits this cgroup at fork. A cap on an empty child is not
         // containment, so a failed migration refuses to execute the user command.
-        join_cgroup_command(&child, &format!("export CARGO_BUILD_JOBS={jobs}\n{cmd}"))
+        join_cgroup_command(
+            &child,
+            &format!("export {}={jobs}\n{cmd}", crate::sizing::BUILD_JOBS_ENV),
+        )
     }
 
     fn kill(&self, tag: &str) -> bool {

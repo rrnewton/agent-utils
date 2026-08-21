@@ -4377,6 +4377,108 @@ def _boxing_capability_unavailable(outcome: Outcome) -> bool:
     )
 
 
+_BUILD_WIDTH_RE = re.compile(r"build width: (.+)$", re.MULTILINE)
+#: The width the STEP received, echoed by the step's own command.
+_STEP_WIDTH_RE = re.compile(r"WIDTH=(\d+)")
+
+
+def compare_operator_build_width(py: list[str], rs: list[str], rep: Report) -> None:
+    """Both builds must resolve the operator-vs-containment build width the same way, and say so.
+
+    ``derive_build_jobs`` used to overwrite ``CARGO_BUILD_JOBS`` unconditionally, so an operator
+    who set it — having sized a memory cap against exactly that pool — lost it with no word said.
+    Reading the variable back as intent is not the fix either: the runner SETS it (Python's
+    ``enter_delegated_scope`` assigns it, and both engines pass ``--setenv=CARGO_BUILD_JOBS`` into
+    the scope), so the in-scope process would read its own derivation as an instruction and stop
+    refining per step.
+
+    This is the one mechanism that can see both engines resolve it, on the boxing path where the
+    substitution actually happens. It checks two observables per leg, because the sentence alone
+    is cheap to keep true while the wiring rots:
+
+    * the SENTENCE each build prints, which must be identical and name the right authority; and
+    * the width the STEP actually received, echoed by the step's own command. Unstated, that must
+      be strictly below the scope-wide number (downward refinement still happening); stated, it
+      must be exactly the operator's number, unrefined.
+
+    Deleting the ``SAFE_CI_OPERATOR_BUILD_JOBS`` forwarding in one engine leaves the sentence
+    correct and breaks the second observable, which is the whole reason it is here.
+    """
+    with tempfile.TemporaryDirectory(prefix="safe-ci-cross-build-width-") as td:
+        dag_path = os.path.join(td, "dag.json")
+        # A hard 2 GiB per-step cap makes the derived per-step width small and host-independent
+        # relative to the scope's, so "refined downward" is observable rather than incidental.
+        Path(dag_path).write_text(
+            '{"steps": [{"group": "g", "job": "a", "kind": "compile", '
+            '"cmd": "echo WIDTH=$CARGO_BUILD_JOBS", "timeout": 60, '
+            '"hint": {"hard_mem_max_bytes": 2147483648}}]}',
+            encoding="utf-8",
+        )
+        args = ("run", "--dag", dag_path, "-s1", "-j16", NOPROF, NOFB)
+        base = {
+            "SAFE_CI_DAG_RUNNER_NO_STEP_LOGS": "1",
+            "SAFE_CI_FORCE_SCOPE_ATTEMPT": "1",
+        }
+        for leg, extra_env, want in (
+            ("stated", {"CARGO_BUILD_JOBS": "200"}, "honouring CARGO_BUILD_JOBS=200"),
+            ("unstated", {}, "no CARGO_BUILD_JOBS in the environment"),
+        ):
+            env = {**base, **extra_env}
+            outcomes = {"py": run(py, args, env), "rs": run(rs, args, env)}
+            label = f"operator-build-width:{leg}"
+            if all(_boxing_capability_unavailable(out) for out in outcomes.values()):
+                print(
+                    f"cross[safe-ci-dag-runner]: SKIP boxed build-width differential ({leg}): "
+                    "cgroup-v2 + a working systemd --user scope are unavailable"
+                )
+                rep.ok(f"{label}:capability-unavailable")
+                continue
+            combined = {name: out.stdout + out.stderr for name, out in outcomes.items()}
+            said = {name: _BUILD_WIDTH_RE.findall(text) for name, text in combined.items()}
+            applied = {name: _STEP_WIDTH_RE.findall(text) for name, text in combined.items()}
+            if not said["py"] or not said["rs"]:
+                rep.bad(
+                    label,
+                    "each build must announce which width governs; "
+                    f"py={said['py']!r} rs={said['rs']!r}",
+                )
+                continue
+            if said["py"] != said["rs"]:
+                rep.bad(label, f"differing announcement py={said['py']!r} rs={said['rs']!r}")
+                continue
+            if want not in said["py"][0]:
+                rep.bad(label, f"expected {want!r} in {said['py'][0]!r}")
+                continue
+            if not applied["py"] or not applied["rs"]:
+                rep.bad(
+                    label,
+                    "the step must report the width it actually received; "
+                    f"py={applied['py']!r} rs={applied['rs']!r}",
+                )
+                continue
+            if applied["py"] != applied["rs"]:
+                rep.bad(label, f"differing step width py={applied['py']!r} rs={applied['rs']!r}")
+                continue
+            step_width = int(applied["py"][0])
+            if leg == "stated":
+                if step_width != 200:
+                    rep.bad(
+                        label,
+                        "an operator's stated width must reach the step unrefined; "
+                        f"got {step_width}",
+                    )
+                    continue
+            elif step_width >= 16:
+                rep.bad(
+                    label,
+                    "with nothing stated the step must be refined DOWNWARD from the scope's "
+                    f"16-core width by its own 2 GiB cap; got {step_width}. This is what a "
+                    "lost SAFE_CI_OPERATOR_BUILD_JOBS forwarding looks like.",
+                )
+                continue
+            rep.ok(label)
+
+
 def compare_boxed_cpu_bandwidth(py: list[str], rs: list[str], rep: Report) -> None:
     """Anchor ``-j`` / ``--max-cpus`` to live quota and aggregate CPU counters."""
 
@@ -4555,6 +4657,7 @@ def compare_safe_ci_dag_runner(rand_count: int, seed: int) -> int:
     compare_args_stress(py, rs, rep)
     compare_run_parallel_limits(py, rs, rep)
     compare_boxed_cpu_bandwidth(py, rs, rep)
+    compare_operator_build_width(py, rs, rep)
     compare_pin_run(py, rs, rep)
     yaml_paths = yaml_fixture_paths()
     n_fixtures = len(fixtures) + len(examples) + len(yaml_paths)

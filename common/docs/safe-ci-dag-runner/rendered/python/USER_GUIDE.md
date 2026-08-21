@@ -215,6 +215,19 @@ arbitrary guest may still create more threads than `--max-cpus`; outer
 `jobs_flag`, fix the command's own worker setting, or use `--cores` when fixed
 CPU eligibility is required.
 
+Under boxing the runner also exports a bounded build-worker width to each step
+(never through `MAKEFLAGS`, which would reach determinism-sensitive targets), so
+that a build tool cannot compute a width from the granted quota alone and
+OOM-race the linker. **If you set that variable yourself, your value wins.** A
+quota is a ceiling, not a parallelism instruction, so the derived width applies
+only when you expressed nothing — and in that case it is refined downward per
+step from that step's own cores and memory cap. Either way the run prints one
+line on stderr naming the variable, which value governs, and what the other one
+would have been, so a later OOM is explicable. Your value is read once, in the
+outermost process, and forwarded across the systemd re-exec under the separate
+name `SAFE_CI_OPERATOR_BUILD_JOBS`; the runner therefore never mistakes its own
+scope-wide export for something you asked for.
+
 `--max-mem` is a containment limit as well as a sizing input. Under boxing it becomes the
 outer scope's `MemoryMax`, obeying the same one-way rule as
 `SAFE_CI_OUTER_MEMORY_MAX_BYTES`: it can tighten the derived 90%-of-`MemAvailable`

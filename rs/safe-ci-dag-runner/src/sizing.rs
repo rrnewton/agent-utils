@@ -392,6 +392,126 @@ pub fn derive_build_jobs(cpu_count: Option<i64>, mem_max_bytes: Option<i64>) -> 
     jobs.max(1)
 }
 
+/// The build-width variable the runner controls. cargo reads it, and the `NUM_JOBS` it exports to
+/// build scripts follows it.
+pub const BUILD_JOBS_ENV: &str = "CARGO_BUILD_JOBS";
+
+/// The operator's own build width, carried ACROSS the runner's systemd re-exec.
+///
+/// This exists because `CARGO_BUILD_JOBS` alone cannot answer "did a human ask for this?". The
+/// runner writes that variable itself — `attempt_scope_reexec` passes
+/// `--setenv=CARGO_BUILD_JOBS=...` into the scope — so the in-scope process reads back the
+/// runner's own derivation and would mistake it for an instruction. Then per-step downward
+/// refinement stops, every step keeps the whole scope's width, and that is exactly the
+/// 284-wide-against-8-GiB condition this machinery exists to prevent.
+///
+/// So intent is resolved ONCE, in the outermost process, from the truly ambient environment, and
+/// passed forward under its own name. PRESENCE of this variable means "already resolved"; an
+/// empty value means "resolved, and the operator asked for nothing".
+pub const OPERATOR_BUILD_JOBS_ENV: &str = "SAFE_CI_OPERATOR_BUILD_JOBS";
+
+/// A build width an operator can be said to have CHOSEN: a positive decimal integer.
+///
+/// Absent, empty, malformed, or non-positive is `None` — not an instruction. A zero or a typo
+/// read as intent would hand the whole run a width nobody picked, which is worse than falling
+/// back to a derivation whose reasoning is stated.
+pub fn parse_build_jobs(raw: Option<&str>) -> Option<i64> {
+    let text = raw?.trim();
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    text.parse::<i64>().ok().filter(|value| *value > 0)
+}
+
+/// Resolve operator intent from the two variables, without touching the environment.
+///
+/// `forwarded` is `SAFE_CI_OPERATOR_BUILD_JOBS` and `ambient` is `CARGO_BUILD_JOBS`. PRESENCE of
+/// the first wins outright, empty included: an outer runner already asked this question of the
+/// real environment, and its answer — including "the operator asked for nothing" — is the only
+/// one that is still trustworthy, because that same runner has since written `ambient` itself.
+pub fn resolve_operator_build_jobs(forwarded: Option<&str>, ambient: Option<&str>) -> Option<i64> {
+    match forwarded {
+        Some(value) => parse_build_jobs(Some(value)),
+        None => parse_build_jobs(ambient),
+    }
+}
+
+/// The build width the operator chose, or `None` if they expressed none.
+///
+/// Read once and memoized: this process must answer the same way before and after it has written
+/// anything into a child's environment.
+pub fn operator_build_jobs() -> Option<i64> {
+    static CAPTURED: std::sync::OnceLock<Option<i64>> = std::sync::OnceLock::new();
+    *CAPTURED.get_or_init(|| {
+        let forwarded = std::env::var(OPERATOR_BUILD_JOBS_ENV).ok();
+        let ambient = std::env::var(BUILD_JOBS_ENV).ok();
+        resolve_operator_build_jobs(forwarded.as_deref(), ambient.as_deref())
+    })
+}
+
+/// Which build width governs, what the alternative was, and why — so an OOM is explicable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuildJobsChoice {
+    /// The width that will actually be exported.
+    pub jobs: i64,
+    /// What the containment derivation would have chosen from the caps in force.
+    pub derived: i64,
+    /// The operator's stated width, or `None` when they stated none.
+    pub operator: Option<i64>,
+}
+
+impl BuildJobsChoice {
+    /// `"operator"` or `"containment"`.
+    pub fn source(&self) -> &'static str {
+        if self.operator.is_some() {
+            "operator"
+        } else {
+            "containment"
+        }
+    }
+
+    /// One sentence naming the winner, the loser, and the consequence.
+    pub fn describe(&self) -> String {
+        match self.operator {
+            Some(chosen) => format!(
+                "build width: honouring {BUILD_JOBS_ENV}={chosen} from the environment; the \
+                 containment default would have chosen {}. Per-step downward refinement is OFF \
+                 for this run, so a memory cap sized for a narrower pool can still OOM.",
+                self.derived
+            ),
+            None => format!(
+                "build width: no {BUILD_JOBS_ENV} in the environment, so the containment default \
+                 governs at {} for this scope, refined downward per step.",
+                self.derived
+            ),
+        }
+    }
+}
+
+/// Choose the build width for a scope or a step, and record what lost.
+///
+/// A cgroup quota is a CEILING, not a parallelism instruction. When an operator has stated a
+/// width — having, presumably, sized their memory cap against exactly that pool — the derived
+/// number does not get to replace it silently. When they have stated nothing, the derivation
+/// governs and stays free to narrow per step.
+pub fn choose_build_jobs(
+    operator: Option<i64>,
+    cpu_count: Option<i64>,
+    mem_max_bytes: Option<i64>,
+) -> BuildJobsChoice {
+    let derived = derive_build_jobs(cpu_count, mem_max_bytes);
+    BuildJobsChoice {
+        jobs: operator.unwrap_or(derived),
+        derived,
+        operator,
+    }
+}
+
+/// [`choose_build_jobs`] against this process's captured operator intent.
+pub fn select_build_jobs(cpu_count: Option<i64>, mem_max_bytes: Option<i64>) -> BuildJobsChoice {
+    choose_build_jobs(operator_build_jobs(), cpu_count, mem_max_bytes)
+}
+
 /// Return the online logical CPU count, independent of process affinity.
 ///
 /// Reads the Linux online-CPU range first, then falls back to runtime parallelism and finally four.
@@ -971,5 +1091,91 @@ mod tests {
                 .map(|index| format!("wide.s{index:02}"))
                 .collect::<Vec<_>>()
         );
+    }
+
+    // ------------------------------------------- operator build width vs the containment default
+    //
+    // Reading `CARGO_BUILD_JOBS` back as "operator intent" is NOT the fix: the runner SETS that
+    // variable itself, so the in-scope process would read its own scope-wide derivation as an
+    // instruction and stop refining downward per step — the 284-wide-against-8-GiB condition.
+    // Intent is resolved once, in the outermost process, and forwarded under its own name.
+
+    #[test]
+    fn a_positive_integer_is_intent() {
+        assert_eq!(parse_build_jobs(Some("12")), Some(12));
+        assert_eq!(parse_build_jobs(Some(" 12 ")), Some(12));
+    }
+
+    #[test]
+    fn nothing_else_is_intent() {
+        // Each case named, because "return None for everything" would pass a single-case test
+        // and would also throw away the real value above.
+        assert_eq!(parse_build_jobs(None), None);
+        assert_eq!(parse_build_jobs(Some("")), None);
+        assert_eq!(parse_build_jobs(Some("   ")), None);
+        assert_eq!(parse_build_jobs(Some("0")), None);
+        assert_eq!(parse_build_jobs(Some("-4")), None);
+        assert_eq!(parse_build_jobs(Some("8.5")), None);
+        assert_eq!(parse_build_jobs(Some("many")), None);
+        assert_eq!(parse_build_jobs(Some("8 jobs")), None);
+    }
+
+    #[test]
+    fn the_outermost_process_reads_the_ambient_variable() {
+        assert_eq!(resolve_operator_build_jobs(None, Some("200")), Some(200));
+        assert_eq!(resolve_operator_build_jobs(None, None), None);
+    }
+
+    #[test]
+    fn a_forwarded_answer_beats_the_runners_own_write() {
+        // THE DEFECT THIS PREVENTS. In-scope, CARGO_BUILD_JOBS=8 is the runner's own derivation.
+        // An empty forwarded value says "already asked; the operator wanted nothing", and that
+        // must win over the runner's own number, or per-step refinement stops.
+        assert_eq!(resolve_operator_build_jobs(Some(""), Some("8")), None);
+        assert_eq!(
+            resolve_operator_build_jobs(Some("200"), Some("8")),
+            Some(200)
+        );
+    }
+
+    #[test]
+    fn the_containment_default_governs_when_nothing_was_stated() {
+        let choice = choose_build_jobs(None, Some(284), Some(8 * GIB));
+        assert_eq!(choice.jobs, 8);
+        assert_eq!(choice.derived, 8);
+        assert_eq!(choice.source(), "containment");
+        assert_eq!(choice.jobs, derive_build_jobs(Some(284), Some(8 * GIB)));
+    }
+
+    #[test]
+    fn a_stated_width_wins_and_the_derivation_is_still_recorded() {
+        let choice = choose_build_jobs(Some(200), Some(284), Some(8 * GIB));
+        assert_eq!(choice.jobs, 200);
+        assert_eq!(
+            choice.derived, 8,
+            "the number that lost must survive, or an OOM is inexplicable"
+        );
+        assert_eq!(choice.source(), "operator");
+    }
+
+    #[test]
+    fn the_notice_names_the_winner_the_loser_and_the_risk() {
+        let said = choose_build_jobs(Some(200), Some(284), Some(8 * GIB)).describe();
+        assert!(said.contains("honouring CARGO_BUILD_JOBS=200"), "{said}");
+        assert!(said.contains("would have chosen 8"), "{said}");
+        assert!(said.contains("can still OOM"), "{said}");
+    }
+
+    #[test]
+    fn the_notice_also_says_when_nothing_was_overridden() {
+        // "Told it was overridden, or not overridden" — silence in the second case would leave
+        // an operator unable to tell a honoured setting from an ignored one.
+        let said = choose_build_jobs(None, Some(284), Some(8 * GIB)).describe();
+        assert!(
+            said.contains("no CARGO_BUILD_JOBS in the environment"),
+            "{said}"
+        );
+        assert!(said.contains("governs at 8"), "{said}");
+        assert!(said.contains("refined downward per step"), "{said}");
     }
 }

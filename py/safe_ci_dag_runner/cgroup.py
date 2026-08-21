@@ -25,7 +25,12 @@ from types import FrameType
 from typing import TYPE_CHECKING
 
 from safe_ci_dag_runner.capabilities import Lane, is_enforced
-from safe_ci_dag_runner.sizing import derive_build_jobs, mem_available_bytes
+from safe_ci_dag_runner.sizing import (
+    BUILD_JOBS_ENV,
+    OPERATOR_BUILD_JOBS_ENV,
+    mem_available_bytes,
+    select_build_jobs,
+)
 
 CGROUP_ROOT = Path("/sys/fs/cgroup")
 
@@ -644,11 +649,18 @@ def enter_delegated_scope(
                   "(mis-attributed blast radius)")
         quota = cpu_count * 100 if cpu_count is not None else cpu_quota_percent()
         (child / "cpu.max").write_text(f"{quota * 1000} 100000")
-        # Scope-wide build-job default, derived from THIS granted quota + memory cap, so a
-        # command run directly in the scope (not via a per-step child) still can't compute
-        # NUM_JOBS=<all-cores>. Per-step prepare_command refines it downward per step; this
-        # is the floor every boxed child inherits (see derive_build_jobs).
-        os.environ["CARGO_BUILD_JOBS"] = str(derive_build_jobs(quota // 100, memory_max))
+        # Scope-wide build width. When the operator stated none, this is derived from THIS
+        # granted quota + memory cap, so a command run directly in the scope (not via a per-step
+        # child) still can't compute NUM_JOBS=<all-cores>, and per-step prepare_command refines it
+        # downward. When the operator DID state one, theirs wins and is said out loud.
+        choice = select_build_jobs(quota // 100, memory_max)
+        print(f"{naming.log_prefix} {choice.describe()}", file=sys.stderr)
+        os.environ[BUILD_JOBS_ENV] = str(choice.jobs)
+        # Forward the resolved INTENT under its own name, so this write cannot later be read
+        # back as an instruction by anything that inherits this environment.
+        os.environ[OPERATOR_BUILD_JOBS_ENV] = (
+            "" if choice.operator is None else str(choice.operator)
+        )
         (child / "cgroup.procs").write_text(str(os.getpid()))
         os.environ[naming.env_in_scope] = "1"
         os.environ[naming.env_direct_cgroup] = str(child)
@@ -1029,13 +1041,20 @@ def reexec_in_scope(
         print(f"{naming.log_prefix} outer scope memory cap: MemoryMax="
               f"{_fmt_bytes(memory_max)} (hard-cap-only, swap=0).")
 
+    # Scope-wide build width. When the operator stated none, this is derived from the granted
+    # cores + memory cap, so a command run directly in the scope (not via a per-step child) still
+    # can't compute NUM_JOBS=<all cores>, and per-step prepare_command refines it downward. When
+    # the operator DID state one, theirs wins. Mirrors reexec_in_scope in the Rust engine.
+    build_jobs = select_build_jobs(cpu_count, memory_max)
+    print(f"{naming.log_prefix} {build_jobs.describe()}", file=sys.stderr)
     cmd = ["systemd-run", "--user", "--scope", "--collect", "--quiet",
            f"--unit={unit}", *slice_args, *props,
-           # Scope-wide build-job default, derived from the granted cores + memory cap, so a
-           # command run directly in the scope (not via a per-step child) still can't compute
-           # NUM_JOBS=<all cores>. Per-step prepare_command refines it downward; this is the
-           # inherited floor. Mirrors reexec_in_scope in the Rust engine.
-           f"--setenv=CARGO_BUILD_JOBS={derive_build_jobs(cpu_count, memory_max)}",
+           f"--setenv={BUILD_JOBS_ENV}={build_jobs.jobs}",
+           # ACROSS THE RE-EXEC, INTENT TRAVELS UNDER ITS OWN NAME. The line above puts the
+           # runner's own number into the child's CARGO_BUILD_JOBS; without this the child would
+           # read it back as an operator instruction and stop refining per step.
+           f"--setenv={OPERATOR_BUILD_JOBS_ENV}="
+           f"{'' if build_jobs.operator is None else build_jobs.operator}",
            f"--setenv={naming.env_in_scope}=1",
            f"--setenv={naming.env_scope_unit}={unit}.scope",
            f"--setenv={EXPECTED_OUTER_MEMORY_MAX_ENV}={memory_max or ''}",
@@ -1953,11 +1972,15 @@ class Cgroups:
         # CARGO_BUILD_JOBS is set (never MAKEFLAGS): a global make -j could parallelize a
         # determinism-sensitive target (cf. make -jN nondeterminism #1157). An explicit
         # ``cargo -j`` in the step command still overrides this env floor.
+        #
+        # An operator's OWN width, resolved once in the outermost process, is not refined: they
+        # sized their caps against that pool. Only the derivation refines downward, and that is
+        # the leg `test_unpinned_step_is_bounded_not_284` pins.
         eff_cores = cpu_count if cpu_count else _cpu_max_cores(
             _read_cgroup_value(self.root, "cpu.max"))
         eff_mem = mem_max if mem_max else _memory_max_bytes(
             _read_cgroup_value(self.root, "memory.max"))
-        jobs = derive_build_jobs(eff_cores, eff_mem)
+        jobs = select_build_jobs(eff_cores, eff_mem).jobs
         procs = child / "cgroup.procs"
         # $$ is the bash leader's own pid. Writing it migrates the leader; every
         # subsequently-forked child/grandchild inherits this cgroup at fork.
@@ -1970,7 +1993,7 @@ class Cgroups:
             "  echo 'ERROR: step could not join its safe-ci cgroup; refusing uncontained run' >&2\n"
             "  exit 125\n"
             "fi\n"
-            f"export CARGO_BUILD_JOBS={jobs}\n{cmd}"
+            f"export {BUILD_JOBS_ENV}={jobs}\n{cmd}"
         )
 
     def set_worker_pids_max(self, limit: int | None) -> None:
