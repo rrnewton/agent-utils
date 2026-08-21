@@ -45,6 +45,10 @@ use crate::estimates::{
     plan_to_json, plan_to_text, Plan, Planner, DEFAULT_MIN_SAMPLES,
 };
 use crate::io::{dag_from_json, dag_from_yaml, dag_to_json, dag_to_yaml, DagJsonError};
+use crate::memory_feedback::{
+    apply_memory_admissions, load_memory_admissions, memory_admission_line, DEFAULT_MARGIN_PCT,
+    DEFAULT_MIN_UNCENSORED_SAMPLES,
+};
 use crate::model::{
     effective_jobs_flag, step_classification, DagConfig, ResourceHint, Step, StepOutcome,
     DEFAULT_STEP_TIMEOUT,
@@ -346,6 +350,10 @@ fn run_help(c: &Palette) -> String {
             ("--planner NAME", "dispatch-ordering planner: greedy-lpt (default) | critical-path | cpa"),
             ("--show-plan", "before running, print the scheduled plan"),
             ("--no-profile-feedback", "do NOT read the profile store to refine time/RAM estimates"),
+            (
+                "--profile-memory-feedback",
+                "OPT-IN: derive rss_baseline_bytes from the store's UNCENSORED peaks only",
+            ),
             ("--profile-sync BACKEND", "download+upload the shared profile summary (for ephemeral CI)"),
             ("--profile-sync-direction D", "both (default) | download | upload"),
             ("-k, --keep-going", "after failure, continue independent work; skip failed dependents"),
@@ -909,6 +917,8 @@ struct RunArgs {
     planner: String,
     show_plan: bool,
     no_profile_feedback: bool,
+    /// OPT-IN censoring-aware memory feedback (see [`crate::memory_feedback`]).
+    profile_memory_feedback: bool,
     profile_sync: Option<String>,
     profile_sync_direction: String,
     keep_going: bool,
@@ -973,6 +983,7 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
         planner: Planner::GreedyLpt.value().to_string(),
         show_plan: false,
         no_profile_feedback: false,
+        profile_memory_feedback: false,
         profile_sync: None,
         profile_sync_direction: "both".to_string(),
         keep_going: false,
@@ -1052,6 +1063,7 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
             "--planner" => a.planner = validate_planner(take_value(inline, &mut i)?)?,
             "--show-plan" => a.show_plan = true,
             "--no-profile-feedback" => a.no_profile_feedback = true,
+            "--profile-memory-feedback" => a.profile_memory_feedback = true,
             "--profile-sync" => a.profile_sync = Some(take_value(inline, &mut i)?),
             "--profile-sync-direction" => {
                 let v = take_value(inline, &mut i)?;
@@ -1564,6 +1576,55 @@ fn validate_planner(value: String) -> Result<String, String> {
             "--planner: invalid choice: '{value}' (choose from greedy-lpt, critical-path, cpa)"
         )),
     }
+}
+
+// Apply censoring-aware profile memory feedback, reporting every decision.
+//
+// OFF unless the caller asked for it. The default plan-time feedback already refines
+// `rss_baseline_bytes` from recorded peaks WITHOUT asking what those peaks were measured under;
+// this path refuses to learn a smaller number from a peak that met its ceiling, which is a
+// different and stricter contract, so it is a separate opt-in rather than a change of meaning for
+// the existing one. Every step the store knows about is reported, including the ones that did NOT
+// move and why, because otherwise "the cap did not change" and "the store had nothing usable to
+// say" look identical from the outside.
+//
+// `--no-profile-feedback` turns the store reader off entirely, which makes this flag a no-op.
+// That combination is legal but empty, and it is announced rather than obeyed in silence: a
+// caller who asked for a learned cap by name and got the authored one has been told something
+// untrue by omission.
+fn apply_memory_feedback(cfg: &DagConfig, feedback_dir: Option<&str>, enabled: bool) -> DagConfig {
+    if !enabled {
+        return cfg.clone();
+    }
+    let Some(dir) = feedback_dir else {
+        eprintln!(
+            "{PROG}: --profile-memory-feedback: --no-profile-feedback disables the profile-store \
+             reader, so no estimate is derived and every authored hint is used as written"
+        );
+        return cfg.clone();
+    };
+    let admissions = load_memory_admissions(
+        std::path::Path::new(dir),
+        None,
+        None,
+        DEFAULT_MIN_UNCENSORED_SAMPLES,
+        DEFAULT_MARGIN_PCT,
+        None,
+    );
+    if admissions.is_empty() {
+        eprintln!(
+            "{PROG}: --profile-memory-feedback: no profile store for this machine/container \
+             identity under {dir}; every authored hint is retained"
+        );
+        return cfg.clone();
+    }
+    let tags: std::collections::BTreeSet<String> = cfg.steps.iter().map(|s| s.tag()).collect();
+    for tag in &tags {
+        if let Some(admission) = admissions.get(tag) {
+            eprintln!("{}", memory_admission_line(PROG, admission));
+        }
+    }
+    apply_memory_admissions(cfg, &admissions)
 }
 
 // The directory the plan-time FEEDBACK reader loads the profile store from, or `None` when
@@ -2859,6 +2920,9 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
         return 2;
     }
     let mut applied = cap_config_max_cpus(&apply_plan_to_config(cfg, &plan), max_cpus);
+    // Censoring-aware memory feedback (opt-in), applied AFTER the ordinary plan so it has the last
+    // word on rss_baseline_bytes and BEFORE the memory-aware --max-steps sizing that reads it.
+    applied = apply_memory_feedback(&applied, feedback_dir.as_deref(), a.profile_memory_feedback);
     // Compatibility flag: the SMALL forcing-function caps are already active by default. Reassert
     // the same values so older callers keep working and announce that the flag is now redundant.
     if a.small_default_cap {

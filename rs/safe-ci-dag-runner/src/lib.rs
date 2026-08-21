@@ -26,6 +26,7 @@ pub mod cli;
 pub mod cpuset_allocator;
 pub mod estimates;
 pub mod io;
+pub mod memory_feedback;
 pub mod model;
 pub mod perflog;
 pub mod profile_enrich;
@@ -63,6 +64,11 @@ pub use estimates::{
 };
 pub use io::{
     dag_from_json, dag_from_value, dag_from_yaml, dag_to_json, dag_to_yaml, DagJsonError,
+};
+pub use memory_feedback::{
+    apply_memory_admissions, load_memory_admissions, memory_admission_from_rows,
+    memory_admission_line, peak_observation_from_row, Censoring, MemoryAdmission, PeakObservation,
+    DEFAULT_MARGIN_PCT, DEFAULT_MIN_UNCENSORED_SAMPLES,
 };
 pub use model::{
     command_with_inner_jobs, dag_config_carry_diff, effective_jobs_flag, preferred_inner_jobs,

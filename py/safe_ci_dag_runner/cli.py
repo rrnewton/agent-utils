@@ -48,6 +48,11 @@ from safe_ci_dag_runner.estimates import (
     plan_to_json,
     plan_to_text,
 )
+from safe_ci_dag_runner.memory_feedback import (
+    MemoryAdmission,
+    apply_memory_admissions,
+    load_memory_admissions,
+)
 from safe_ci_dag_runner.summary import DEFAULT_RESERVOIR_K, Summary
 from safe_ci_dag_runner.io import (
     DagJsonError,
@@ -517,6 +522,11 @@ def build_parser() -> argparse.ArgumentParser:
         "time; use only the DAG-authored hints (for reproducibility)",
     )
     run_p.add_argument(
+        "--profile-memory-feedback",
+        action="store_true",
+        help="OPT-IN: additionally derive rss_baseline_bytes from the profile store's UNCENSORED peaks only. A peak that reached its applied memory.max proves the step used all it was allowed, not what it wanted, so such samples raise the estimate as a floor and never lower it; a step without enough uncensored evidence keeps its authored hint and the reason is printed",
+    )
+    run_p.add_argument(
         "--profile-sync",
         metavar="BACKEND",
         default=None,
@@ -974,6 +984,62 @@ def _resolve_feedback_dir(perf_dir_arg: str | None, no_feedback: bool) -> str | 
     if env:
         return env
     return DEFAULT_PROFILE_DIR
+
+
+def _apply_memory_feedback(
+    cfg: DagConfig, feedback_dir: str | None, enabled: bool
+) -> DagConfig:
+    """Apply censoring-aware profile memory feedback to ``cfg``, reporting every decision.
+
+    OFF unless the caller asked for it. The default plan-time feedback already refines
+    ``rss_baseline_bytes`` from recorded peaks WITHOUT asking what those peaks were measured
+    under; this path refuses to learn a smaller number from a peak that met its ceiling, which
+    is a different and stricter contract, so it is a separate opt-in rather than a change of
+    meaning for the existing one.
+
+    Every step the store knows about is reported on stderr, including the ones that did NOT
+    move and why, because "the cap did not change" and "the store had nothing usable to say"
+    look identical from the outside otherwise.
+
+    ``--no-profile-feedback`` turns the store reader off entirely, which makes this flag a
+    no-op. That combination is legal but empty, and it is announced rather than obeyed in
+    silence: a caller who asked for a learned cap by name and got the authored one has been
+    told something untrue by omission.
+    """
+    if not enabled:
+        return cfg
+    if feedback_dir is None:
+        print(
+            f"{PROG}: --profile-memory-feedback: --no-profile-feedback disables the profile-store "
+            "reader, so no estimate is derived and every authored hint is used as written",
+            file=sys.stderr,
+        )
+        return cfg
+    admissions = load_memory_admissions(feedback_dir)
+    if not admissions:
+        print(
+            f"{PROG}: --profile-memory-feedback: no profile store for this machine/container "
+            f"identity under {feedback_dir}; every authored hint is retained",
+            file=sys.stderr,
+        )
+        return cfg
+    tags = {step.tag for step in cfg.steps}
+    for tag in sorted(tags & admissions.keys()):
+        print(_memory_admission_line(admissions[tag]), file=sys.stderr)
+    return apply_memory_admissions(cfg, admissions)
+
+
+def _memory_admission_line(admission: MemoryAdmission) -> str:
+    """One human-readable line stating the decision AND the evidence behind it."""
+    if admission.source == "profile":
+        verdict = f"rss_baseline_bytes={admission.rss_baseline_bytes}"
+    else:
+        verdict = "keeping the authored hint"
+    return (
+        f"{PROG}: --profile-memory-feedback: {admission.step}: {verdict} "
+        f"[{admission.uncensored_samples} uncensored, {admission.censored_samples} censored, "
+        f"{admission.unknown_samples} unprovenanced of {admission.samples}; {admission.reason}]"
+    )
 
 
 def _build_feedback_plan(
@@ -2649,6 +2715,11 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
             core_reservation.release()
         return 2
     cfg = cap_config_max_cpus(apply_plan_to_config(cfg, plan), max_cpus)
+    # Censoring-aware memory feedback (opt-in), applied AFTER the ordinary plan so it has the last
+    # word on rss_baseline_bytes and BEFORE the memory-aware --max-steps sizing that reads it.
+    cfg = _apply_memory_feedback(
+        cfg, feedback_dir, bool(getattr(ns, "profile_memory_feedback", False))
+    )
     # Compatibility flag: the SMALL forcing-function caps are already active by default. Reassert
     # the same values so older callers keep working and announce that the flag is now redundant.
     if bool(getattr(ns, "small_default_cap", False)):

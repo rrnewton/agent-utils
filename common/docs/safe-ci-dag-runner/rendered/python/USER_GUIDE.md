@@ -177,6 +177,45 @@ tag ordering breaks ties, so repeated plans over the same inputs are identical.
 By default, past profile samples refine duration and resident-memory estimates.
 Use `--no-profile-feedback` when only authored hints may influence a plan.
 
+### Learning a memory cap from profiles, safely
+
+`run --profile-memory-feedback` is a separate, opt-in path that derives
+`rss_baseline_bytes` from the store's **uncensored** peaks only.
+
+A recorded `peak_bytes` does not on its own say what it measured. A step whose
+peak reached the `memory.max` applied to it, or that the kernel reclaimed,
+throttled or OOM-killed at that ceiling, used everything it was allowed and may
+have wanted more. Treating that number as an observed maximum re-derives the cap
+that produced it and freezes the mistake. So:
+
+- a censored sample is used only as a **floor** — proof demand was at least that
+  large — and can raise an estimate, never lower one;
+- a sample that cannot say (no applied cap recorded, no event counters, no peak)
+  is not evidence, and is counted and reported rather than assumed comfortable;
+- a step needs at least five uncensored samples before its authored hint is
+  replaced at all, and the estimate carries a 20% margin above the 9/10
+  percentile;
+- `hard_mem_max_bytes` is never rewritten: an explicit hard cap is an
+  instruction, not a guess.
+
+Every step the store knows about gets one line on stderr saying what was decided
+and on what evidence, including the steps that did **not** move — otherwise "the
+cap did not change" and "the store had nothing usable to say" look the same:
+
+```
+safe-ci-dag-runner: --profile-memory-feedback: g.build: rss_baseline_bytes=2576980377 [6 uncensored, 0 censored, 0 unprovenanced of 6; 6 uncensored sample(s), 9/10 percentile +20%]
+safe-ci-dag-runner: --profile-memory-feedback: g.link: keeping the authored hint [0 uncensored, 6 censored, 0 unprovenanced of 6; every one of 6 recorded peak(s) was censored by its applied cap]
+```
+
+The provenance columns this reads are written by the runner itself; a store
+recorded before they existed reads as unprovenanced, which keeps every authored
+hint. Combining the flag with `--no-profile-feedback` (which turns the store
+reader off) derives nothing, and says so.
+
+The estimate is applied after the plan is built, so `--show-plan` prints the
+authored figures and the stderr lines above are the record of what actually
+took effect.
+
 ## Run safely
 
 ```sh

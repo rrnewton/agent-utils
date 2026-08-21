@@ -4197,6 +4197,230 @@ def _summary_sync_case(
                     f"merge(a,b) != merge(b,a)\n--- ab ---\n{m_ab}\n--- ba ---\n{m_ba}")
 
 
+#: A fixed synthetic store for :func:`compare_memory_feedback`, carrying the applied-cap and
+#: event-counter provenance the censoring-aware reader needs. All three steps recorded the SAME
+#: 8 GiB applied cap and never OOMed:
+#:
+#: * ``g.learned`` sat at 2 GiB with every counter at zero, so its peaks are real observations.
+#: * ``g.pinned`` peaked EXACTLY at the ceiling every time: identical ``memory_max_bytes``,
+#:   opposite meaning. A build that ignored the provenance would derive a number for it too.
+#: * ``g.throttled`` peaked at the same comfortable 2 GiB as ``g.learned`` but recorded
+#:   ``memory_events_high > 0`` — a SOFT ceiling was throttling it into direct reclaim, so its
+#:   peak is suppressed. Byte-for-byte its ``peak_bytes`` and ``memory_max_bytes`` match
+#:   ``g.learned``; only the counter differs, so a build that reads ``max``/``oom_kill`` but not
+#:   ``high`` gives it the same learned cap and this fixture catches that.
+_CENSORED_STORE_CSV = (
+    "step,peak_bytes,memory_max_bytes,memory_events_high,memory_events_max,"
+    "memory_events_oom,memory_events_oom_kill\n"
+    + "".join(
+        f"g.learned,{2 * 1024**3},{8 * 1024**3},0,0,0,0\n" for _ in range(6)
+    )
+    + "".join(
+        f"g.pinned,{8 * 1024**3},{8 * 1024**3},0,0,0,0\n" for _ in range(6)
+    )
+    + "".join(
+        f"g.throttled,{2 * 1024**3},{8 * 1024**3},4,0,0,0\n" for _ in range(6)
+    )
+)
+
+#: What ``g.learned``'s six identical 2147483648 B samples must produce, written out literally:
+#: the 9/10 nearest-rank percentile of six equal values is that value, plus the 20% margin
+#: (429496729 B). Naming it here rather than recomputing it from the builds' own constants is
+#: what makes this a contract instead of a restatement of whatever they currently do.
+_LEARNED_EXPECTED_BYTES = 2576980377
+
+_CENSORED_DAG = {
+    "steps": [
+        {"group": "g", "job": "learned", "cmd": "true"},
+        {"group": "g", "job": "pinned", "cmd": "true"},
+        {"group": "g", "job": "throttled", "cmd": "true"},
+    ],
+}
+
+
+def _memory_feedback_reaches_admission(
+    py: list[str], rs: list[str], rep: Report, tmp: str, extra: dict[str, str]
+) -> None:
+    """Prove the derived baseline changes what ``--max-mem`` admission models, identically.
+
+    ONE step, so the modeled worst case is that step's own cap and does not depend on this
+    host's CPU count (only the step-count ceiling in the same line does, which is why the
+    footprint substring is matched rather than the whole line). Its six uncensored samples
+    peaked at 21474836480 B under a 107374182400 B cap, and the DAG authors a much smaller
+    104857600 B hint.
+
+    Without the flag the ordinary feedback takes the peak at face value and admission models
+    26843545600 B; with it the censoring-aware estimate adds the 20% margin (25769803776 B) and
+    admission models 32212254720 B. Both are named literally: a build that applied the estimate
+    after admission had already read the config would report the first number twice.
+    """
+    store = os.path.join(tmp, "admission-store")
+    os.makedirs(store, exist_ok=True)
+    csv_name = f"step_profiles_{SYNTH_MACHINE}_{SYNTH_CONTAINER}.csv"
+    with open(os.path.join(store, csv_name), "w", encoding="utf-8") as fh:
+        fh.write(
+            "step,peak_bytes,memory_max_bytes,memory_events_high,memory_events_max,"
+            "memory_events_oom,memory_events_oom_kill\n"
+            + "".join("g.learned,21474836480,107374182400,0,0,0,0\n" for _ in range(6))
+        )
+    dag_path = os.path.join(tmp, "admission-dag.json")
+    with open(dag_path, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"steps": [{
+            "group": "g", "job": "learned", "cmd": "true",
+            "hint": {"rss_baseline_bytes": 104857600},
+        }]}))
+    args = (
+        "run", "--dag", dag_path, "--perf-dir", store, "--no-profile",
+        "--unsafe-no-cgroups", "-q", "--max-mem", "400G",
+    )
+
+    def footprint(outcome: Outcome) -> str | None:
+        for line in outcome.stderr.splitlines():
+            match = re.search(r"worst-case (\d+) bytes", line)
+            if match:
+                return match.group(1)
+        return None
+
+    off = {"py": run(py, args, extra), "rs": run(rs, args, extra)}
+    on_args = (*args, "--profile-memory-feedback")
+    on = {"py": run(py, on_args, extra), "rs": run(rs, on_args, extra)}
+    seen = {
+        f"{engine}/{state}": footprint(outcome)
+        for state, group in (("off", off), ("on", on))
+        for engine, outcome in group.items()
+    }
+    if (
+        seen != {"py/off": "26843545600", "rs/off": "26843545600",
+                 "py/on": "32212254720", "rs/on": "32212254720"}
+        or any(o.returncode != 0 for o in (*off.values(), *on.values()))
+        or "rss_baseline_bytes=25769803776" not in on["py"].stderr
+        or "rss_baseline_bytes=25769803776" not in on["rs"].stderr
+    ):
+        rep.bad("memory-feedback/reaches-max-mem-admission", f"footprints={seen!r}")
+    else:
+        rep.ok("memory-feedback/reaches-max-mem-admission")
+
+
+def compare_memory_feedback(py: list[str], rs: list[str], rep: Report) -> None:
+    """Prove the OPT-IN censoring-aware memory feedback agrees across builds, and is really off.
+
+    Against a fixed synthetic store where three steps recorded peaks under the same applied cap
+    — one comfortably, one pinned to the ceiling, one throttled at a soft ceiling:
+
+    * without the flag neither build says anything about memory feedback (it is opt-in, and a
+      default-on reader would be a silent behaviour change for every existing store);
+    * with the flag both builds emit BYTE-IDENTICAL decision lines, so the classification, the
+      percentile, the margin and the wording are one contract rather than two;
+    * the pinned step keeps its authored hint and the reason names censoring, while the
+      comfortable step gets a LITERALLY NAMED number — proving the two are not treated alike;
+    * the throttled step, whose ``peak_bytes`` and ``memory_max_bytes`` are byte-identical to the
+      comfortable one and which differs only in ``memory_events_high``, also keeps its hint;
+    * asking for the flag while ``--no-profile-feedback`` disables the reader says so in both
+      builds instead of doing nothing quietly.
+    """
+    extra = {
+        "SAFE_CI_DAG_RUNNER_MACHINE_ID": SYNTH_MACHINE,
+        "SAFE_CI_DAG_RUNNER_CONTAINER_CLASS": SYNTH_CONTAINER,
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        store = os.path.join(tmp, "store")
+        os.makedirs(store, exist_ok=True)
+        csv_name = f"step_profiles_{SYNTH_MACHINE}_{SYNTH_CONTAINER}.csv"
+        with open(os.path.join(store, csv_name), "w", encoding="utf-8") as fh:
+            fh.write(_CENSORED_STORE_CSV)
+        dag_path = os.path.join(tmp, "dag.json")
+        with open(dag_path, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(_CENSORED_DAG))
+        base = (
+            "run", "--dag", dag_path, "--perf-dir", store, "--no-profile",
+            "--unsafe-no-cgroups", "-q",
+        )
+
+        def lines(outcome: Outcome) -> list[str]:
+            return [
+                line for line in outcome.stderr.splitlines()
+                if "--profile-memory-feedback:" in line
+            ]
+
+        off = {"py": run(py, base, extra), "rs": run(rs, base, extra)}
+        for engine, outcome in off.items():
+            if outcome.returncode != 0 or lines(outcome):
+                rep.bad(
+                    f"memory-feedback:{engine}/off-by-default",
+                    f"exit={outcome.returncode}; unexpected report={lines(outcome)}",
+                )
+            else:
+                rep.ok(f"memory-feedback:{engine}/off-by-default")
+
+        on = (*base, "--profile-memory-feedback")
+        po, ro = run(py, on, extra), run(rs, on, extra)
+        py_lines, rs_lines = lines(po), lines(ro)
+        if po.returncode != 0 or ro.returncode != 0:
+            rep.bad(
+                "memory-feedback/exit",
+                f"exit py={po.returncode} rs={ro.returncode}\n{po.stderr}\n{ro.stderr}",
+            )
+        elif py_lines != rs_lines:
+            rep.bad(
+                "memory-feedback/identical",
+                "decision lines differ\n--- py ---\n"
+                + "\n".join(py_lines)
+                + "\n--- rs ---\n"
+                + "\n".join(rs_lines),
+            )
+        else:
+            rep.ok("memory-feedback/identical")
+        learned = [line for line in py_lines if "g.learned:" in line]
+        pinned = [line for line in py_lines if "g.pinned:" in line]
+        throttled = [line for line in py_lines if "g.throttled:" in line]
+        if (
+            len(learned) != 1
+            or len(pinned) != 1
+            or f"rss_baseline_bytes={_LEARNED_EXPECTED_BYTES}" not in learned[0]
+            or "keeping the authored hint" not in pinned[0]
+            or "censored by its applied cap" not in pinned[0]
+        ):
+            rep.bad(
+                "memory-feedback/censoring-separates-equal-peaks",
+                "learned=" + repr(learned) + " pinned=" + repr(pinned),
+            )
+        else:
+            rep.ok("memory-feedback/censoring-separates-equal-peaks")
+        # The soft ceiling. Same peak, same cap, same absent OOM as g.learned; only
+        # memory_events_high differs, so this fails in exactly the build that skips that counter.
+        if (
+            len(throttled) != 1
+            or "keeping the authored hint" not in throttled[0]
+            or "rss_baseline_bytes=" in throttled[0]
+        ):
+            rep.bad(
+                "memory-feedback/soft-ceiling-throttling-censors",
+                "throttled=" + repr(throttled),
+            )
+        else:
+            rep.ok("memory-feedback/soft-ceiling-throttling-censors")
+
+        _memory_feedback_reaches_admission(py, rs, rep, tmp, extra)
+
+        inert = (*base, "--profile-memory-feedback", "--no-profile-feedback")
+        pi, ri = run(py, inert, extra), run(rs, inert, extra)
+        py_inert, rs_inert = lines(pi), lines(ri)
+        if (
+            pi.returncode != 0
+            or ri.returncode != 0
+            or py_inert != rs_inert
+            or len(py_inert) != 1
+            or "no estimate is derived" not in py_inert[0]
+        ):
+            rep.bad(
+                "memory-feedback/inert-under-no-profile-feedback",
+                f"exit py={pi.returncode} rs={ri.returncode}\n"
+                f"py={py_inert!r}\nrs={rs_inert!r}",
+            )
+        else:
+            rep.ok("memory-feedback/inert-under-no-profile-feedback")
+
+
 def compare_summary_sync(py: list[str], rs: list[str], rep: Report) -> None:
     """Prove the mergeable profile SUMMARY (the profile-artifact sync feature's correctness core) is
     byte-identical py<->rs for serialization, merge, and recomputed plan — on BOTH the feedback store
@@ -4264,7 +4488,8 @@ def compare_cli_schema(py: list[str], rs: list[str], rep: Report) -> None:
             "--max-mem",
             "--only",
             "--args", "--stress", "--perf-dir", "--no-profile", "--profile", "--planner",
-            "--show-plan", "--no-profile-feedback", "--profile-sync",
+            "--show-plan", "--no-profile-feedback", "--profile-memory-feedback",
+            "--profile-sync",
             "--profile-sync-direction", "--keep-going", "--run-timeout",
             "--admission",
             "--allow-cgroup-failure",
@@ -5273,6 +5498,7 @@ def compare_safe_ci_dag_runner(rand_count: int, seed: int) -> int:
     compare_speedup_model(py, rs, rep)
     compare_cpa_planner(py, rs, rep)
     compare_memory_hardening(py, rs, rep)
+    compare_memory_feedback(py, rs, rep)
     compare_summary_sync(py, rs, rep)
     compare_sweep_success(py, rs, rep)
     compare_sweep_errors(py, rs, rep)

@@ -343,7 +343,7 @@ fn robust_median(values: &[f64]) -> f64 {
 // The 90th percentile of a non-empty int slice by NEAREST-RANK with integer arithmetic (mirrors
 // Python's `_high_percentile`): `rank = ceil(num*n/den) == (num*n + den - 1) / den`, clamped to
 // `1..=n`, returning the rank-th smallest.
-fn high_percentile(values: &[i64]) -> i64 {
+pub(crate) fn high_percentile(values: &[i64]) -> i64 {
     let mut xs = values.to_vec();
     xs.sort_unstable();
     let n = xs.len() as i64;
@@ -393,7 +393,7 @@ fn parse_float(cell: Option<&String>) -> Option<f64> {
         .filter(|v| v.is_finite())
 }
 
-fn parse_int(cell: Option<&String>) -> Option<i64> {
+pub(crate) fn parse_int(cell: Option<&String>) -> Option<i64> {
     clean_numeric_cell(cell).and_then(|t| t.parse::<i64>().ok())
 }
 
