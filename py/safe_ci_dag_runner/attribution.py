@@ -28,8 +28,7 @@ LOG_MAX_BYTES_ENV = "SAFE_CI_DAG_RUNNER_LOG_MAX_BYTES"
 # So a step that runs away on stdout does not merely go unbounded, it is DUPLICATED onto the
 # filesystem. On 2026-08-17..19 three invocations in a consuming repository wrote ~4.5 TB of
 # stderr each and filled the device; had evidence capture been enabled for those runs, this
-# log would have
-# written a second copy of every byte onto the same device.
+# log would have written a second copy of every byte onto the same device.
 #
 # WHY 1 GiB. Large enough that no honest step is truncated, small enough that a runaway is
 # stopped while the filesystem still has room to be useful.
