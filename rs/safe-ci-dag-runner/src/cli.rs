@@ -4016,6 +4016,37 @@ mod tests {
     }
 
     #[test]
+    fn an_absent_step_ceiling_defaults_to_the_resolved_cpu_budget() {
+        // #36 dag-core-budget-split. `-s` and `-j` are separate controls, but ONE coupling
+        // between them survives on purpose: an absent `-s` defaults to whatever `-j` resolved
+        // to. That is the last place a CPU number silently decides DAG concurrency, so it is
+        // pinned here rather than left to be rediscovered from the scheduler source. Python
+        // pins the same default in tests/test_run_parallel_limits.py; this side had no test at
+        // all, which is exactly the one-edition gap the differential exists to close.
+        //
+        // Every number below is written literally, never read back out of the flag it pins.
+        let cfg = tiny();
+
+        let explicit_cpus = parse_run_args(&["--max-cpus".into(), "3".into()]).unwrap();
+        assert_eq!(explicit_cpus.max_steps, None);
+        assert_eq!(select_max_cpus(&explicit_cpus), 3);
+        assert_eq!(select_max_steps(&cfg, &explicit_cpus, 3), 3);
+
+        // The hidden 0.13 alias must reach the same default, or a 0.13 script would keep its
+        // CPU budget and silently lose its step ceiling.
+        let legacy = parse_run_args(&["--jobs".into(), "7".into()]).unwrap();
+        assert_eq!(legacy.max_steps, None);
+        assert_eq!(select_max_cpus(&legacy), 7);
+        assert_eq!(select_max_steps(&cfg, &legacy, 7), 7);
+
+        // And an explicit `-s` is NOT the CPU budget: the two numbers stay apart.
+        let both =
+            parse_run_args(&["--max-cpus".into(), "3".into(), "-s".into(), "5".into()]).unwrap();
+        assert_eq!(select_max_cpus(&both), 3);
+        assert_eq!(select_max_steps(&cfg, &both, 3), 5);
+    }
+
+    #[test]
     fn the_parsed_max_mem_flag_is_what_the_outer_scope_ceiling_is_built_from() {
         // #33: --max-mem used to feed the sizing model ONLY. This is the accessor scope bring-up
         // reads, so a rename that stopped feeding the scope would fail here rather than quietly

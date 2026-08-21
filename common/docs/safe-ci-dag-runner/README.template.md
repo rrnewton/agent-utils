@@ -59,7 +59,10 @@ maximum inner width to 200 core-equivalents. The two active steps may request
 more than 200 workers in aggregate: the verified outer `cpu.max` makes them
 share 200 core-equivalents instead of treating declared widths as reservations.
 That quota is not an instantaneous thread-count or CPU-identity bound; use
-`--cores K` for an exclusive fixed cpuset. The long
+`--cores K` for an exclusive fixed cpuset. Drop the `-s2` and the same command
+permits **two hundred** active nodes: an absent `--max-steps` defaults to the
+resolved `--max-cpus`, so a bandwidth number you type is also a concurrency
+number unless you say otherwise. The long
 spelling of `-j` is `--max-cpus`; migrate the 0.13 `run --jobs` spelling to it.
 A hidden compatibility alias keeps existing 0.13 scripts working but is not
 public run vocabulary; differing simultaneous values conflict and are rejected.

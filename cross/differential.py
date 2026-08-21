@@ -4840,6 +4840,34 @@ def compare_run_parallel_limits(py: list[str], rs: list[str], rep: Report) -> No
                 ("--max-steps=3", "--max-cpus=2", "--jobs=2"),
                 CpuFootprintFacts(3, (1, 1, 1), 3, 3),
             ),
+            # #36 dag-core-budget-split. Every case above passes an explicit `-s`, so none of
+            # them observes the ONE coupling the split deliberately kept: with `-s` absent, the
+            # active-step ceiling defaults to the resolved `-j`. A user who types `-j1` for
+            # bandwidth also gets a serial DAG, and a user who types `-j3` also gets three-way
+            # overlap. Both numbers are literal here, and the two directions are separate cases
+            # so a regression that pinned the default at 1 (or at the CPU count) cannot pass by
+            # satisfying the other one.
+            (
+                "absent-step-ceiling-follows-cpu-budget-one",
+                (1, 1, 1),
+                ("-j", "1"),
+                CpuFootprintFacts(3, (1, 1, 1), 1, 1),
+            ),
+            (
+                "absent-step-ceiling-follows-cpu-budget-three",
+                (1, 1, 1),
+                ("-j", "3"),
+                CpuFootprintFacts(3, (1, 1, 1), 3, 3),
+            ),
+            # The hidden 0.13 alias must reach the same default. A 0.13 script that kept its CPU
+            # budget while silently losing its step ceiling is precisely the "old spelling still
+            # works but means something else" outcome the split was supposed to avoid.
+            (
+                "absent-step-ceiling-follows-legacy-jobs-three",
+                (1, 1, 1),
+                ("--jobs=3",),
+                CpuFootprintFacts(3, (1, 1, 1), 3, 3),
+            ),
         )
         for label, widths, flags, expected in cases:
             dag_path = os.path.join(td, f"{label}.json")

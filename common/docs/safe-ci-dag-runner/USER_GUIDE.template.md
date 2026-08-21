@@ -158,8 +158,16 @@ two `-j8` steps together: their sixteen workers contend inside the outer
 eight-core-equivalent quota. This oversubscription can help when work stalls or
 parallel phases do not align, and can hurt when both steps are CPU-bound. The default CPU total is
 the effective container/affinity capacity tightened by the shared aggregate
-slice's 90% host budget. `--max-steps` defaults to that value; an undeclared
+slice's 90% host budget. An undeclared
 step separately keeps `default_step_cpu_count` (one in the CLI defaults).
+
+**One coupling survives on purpose: an absent `--max-steps` defaults to the
+RESOLVED `--max-cpus`** — the value you typed, not the ambient default. So `-j1`
+alone runs the DAG serially, `-j3` alone permits three-way overlap, and `-j200`
+alone permits two hundred active nodes. If you meant to change bandwidth only,
+say what you meant about overlap too: pass `-s` as well. The hidden 0.13
+`--jobs N` alias resolves to `--max-cpus` first and therefore sets the same
+default. Nothing runs in the other direction: `-s` never changes the CPU budget.
 
 A non-empty effective `jobs_flag` makes the inner width runner-controlled: when
 an authored or profile-derived width exceeds `--max-cpus`, the planner and
