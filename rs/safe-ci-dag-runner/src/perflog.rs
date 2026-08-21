@@ -42,7 +42,25 @@ pub const CSV_COLUMNS: [&str; 15] = [
 ///
 /// Dynamic `cpu.*` keys follow these columns. Parallel-speedup fields remain empty when the
 /// corresponding cgroup measurement is unavailable.
-pub const STEP_PROFILE_COLUMNS: [&str; 49] = [
+///
+/// The final block is the provenance a later reader needs to tell a TRUE peak from a CENSORED
+/// one, and to know which rows ran at the same time. `peak_bytes` on its own does not say what it
+/// measured: a step whose peak equals the `memory.max` applied to it used everything it was
+/// allowed and may have wanted more, and treating that as an observed maximum under-estimates the
+/// workload permanently.
+///
+/// * `run_id` groups the rows of exactly ONE DAG execution. Two concurrent runs on one machine
+///   share `machine_id`, `container_class`, `git_sha` and often `outer_jobs`, and `timestamp` is
+///   stamped once per BATCH, so no other key separates them.
+/// * `started_offset_s` / `finished_offset_s` are seconds from that run's own monotonic origin, so
+///   the overlap of two steps is a comparison of two intervals.
+/// * `memory_max_bytes` is the cap the KERNEL held: a decimal byte count, the literal `max` when
+///   unbounded, or BLANK when unknown. Blank and `max` are different answers — unknown cannot rule
+///   out censoring, unbounded does.
+/// * `memory_events_*` are the step cgroup's `memory.events` counters, already per-step deltas
+///   because the cgroup lives exactly as long as the step. `memory_events_max > 0` with
+///   `memory_events_oom_kill == 0` is reclaim-at-cap: a PASSING step pinned to its ceiling.
+pub const STEP_PROFILE_COLUMNS: [&str; 58] = [
     "timestamp",
     "machine_id",
     "container_class",
@@ -93,6 +111,16 @@ pub const STEP_PROFILE_COLUMNS: [&str; 49] = [
     "step_cpu_psi_avg10_end",
     "step_cpu_psi_avg60_start",
     "step_cpu_psi_avg60_end",
+    // --- run-overlap + applied-cap provenance (blank when unavailable) ---
+    "run_id",
+    "started_offset_s",
+    "finished_offset_s",
+    "memory_max_bytes",
+    "memory_events_low",
+    "memory_events_high",
+    "memory_events_max",
+    "memory_events_oom",
+    "memory_events_oom_kill",
 ];
 
 /// A per-step measurement row (heterogeneous column -> value, matching the CSV).
@@ -126,6 +154,20 @@ pub fn machine_id() -> String {
     } else {
         cleaned
     }
+}
+
+/// A fresh identifier for ONE DAG execution: nanoseconds since the epoch and the runner PID, both
+/// hex, concatenated.
+///
+/// Uniqueness comes from the pair, not either half. Two runs on one host cannot share a start
+/// nanosecond, and a PID reused after a clock step cannot collide with the earlier run that held
+/// it. The value is opaque: a reader groups rows by equality and never parses it.
+pub fn new_run_id() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    format!("{:016x}{:08x}", nanos, std::process::id())
 }
 
 /// Return the process CPU-affinity width.
@@ -492,6 +534,11 @@ fn with_file_lock<F: FnOnce()>(csv_path: &Path, f: F) {
 
 /// Append per-step measurement `rows` to a machine/container-specific CSV. Returns the path, or
 /// `None` when the output dir could not be created (a visible warning is emitted).
+///
+/// `run_id` identifies the one DAG execution these rows came from; pass the run's own id so every
+/// batch of a single execution carries the same value, because that column is the only thing that
+/// separates two concurrent runs sharing this machine, container class and commit. `None` mints a
+/// fresh one via [`new_run_id`].
 #[allow(clippy::too_many_arguments)]
 pub fn append_step_profiles(
     output_dir: &Path,
@@ -501,6 +548,7 @@ pub fn append_step_profiles(
     profile_base_sha: Option<&str>,
     enforcement_kind: &str,
     runner_name: &str,
+    run_id: Option<&str>,
 ) -> Option<PathBuf> {
     let dir = ensure_dir(output_dir)?;
     let mid = machine_id();
@@ -518,6 +566,10 @@ pub fn append_step_profiles(
     );
     common.insert("enforcement_kind".into(), enforcement_kind.into());
     common.insert("runner_name".into(), runner_name.into());
+    common.insert(
+        "run_id".into(),
+        run_id.map_or_else(new_run_id, str::to_string),
+    );
 
     let full_rows: Vec<BTreeMap<String, String>> = rows
         .iter()
@@ -671,8 +723,9 @@ mod tests {
         row.insert("elapsed_s".into(), "0.1".into());
         row.insert("ok".into(), "true".into());
         row.insert("cpu.usage_usec".into(), "1234".into()); // dynamic key appended after standard
-        let path = append_step_profiles(&dir, &[row], "abc123", 4, None, "unverified", "local")
-            .expect("path");
+        let path =
+            append_step_profiles(&dir, &[row], "abc123", 4, None, "unverified", "local", None)
+                .expect("path");
         let text = fs::read_to_string(&path).unwrap();
         let header = text.lines().next().unwrap();
         assert!(header.starts_with("timestamp,machine_id,container_class,git_sha,outer_jobs"));
@@ -702,8 +755,9 @@ mod tests {
         ] {
             row.insert(key.into(), "1".into());
         }
-        let path = append_step_profiles(&dir, &[row], "abc123", 4, None, "unverified", "local")
-            .expect("path");
+        let path =
+            append_step_profiles(&dir, &[row], "abc123", 4, None, "unverified", "local", None)
+                .expect("path");
         let text = fs::read_to_string(&path).unwrap();
         let header = text.lines().next().unwrap();
         let tail: Vec<&str> = header

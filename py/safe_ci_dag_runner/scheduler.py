@@ -409,6 +409,14 @@ class _NoopCgroupManager:
     def oom_kills(self, tag: str) -> int:
         return 0
 
+    def memory_events(self, tag: str) -> Mapping[str, int] | None:
+        return None
+
+    def applied_memory_max(self, tag: str) -> str | None:
+        # None (cap UNKNOWN), never "max": nothing was contained here, so nothing is
+        # known about what bounded the step.
+        return None
+
     def peak_bytes(self, tag: str) -> int | None:
         return None
 
@@ -561,6 +569,12 @@ class Runner:
         self.run_timeout_s = run_timeout_s if (run_timeout_s or 0) > 0 else None
         self.run_timed_out = False
         self.evidence = RunEvidence.open(default_log_dir())
+        # Monotonic origin every profiled step measures its start/finish offset from, so two
+        # rows of one run can be tested for OVERLAP. Set here so a step supervised without a
+        # preceding :meth:`run` still has an origin, and re-set at the top of :meth:`run` so
+        # the offsets are measured from the execution, not from construction. Monotonic, not
+        # wall clock: a clock step mid-run must not make one step appear to precede another.
+        self.run_origin_monotonic = time.monotonic()
 
     # -- gating helpers (mirror validate.py Runner._deps_ok / _deps_known / _res_free) --
 
@@ -823,6 +837,7 @@ class Runner:
         """
         threads: list[tuple[threading.Thread, Step]] = []
         wall_start = time.time()
+        self.run_origin_monotonic = time.monotonic()
         for tag, reason in self.intentional_skips:
             self._emit(f"[{tag}] SKIPPED reason={reason.value}")
             if self.evidence is not None:
@@ -1088,6 +1103,7 @@ class Runner:
             step, self.cfg.default_step_timeout, self.cfg.cpu_timeout_multiplier
         )
         start = time.time()
+        started_offset_s = time.monotonic() - self.run_origin_monotonic
         stream = self.verbosity >= 2
         timed_out = False
         cpu_timed_out = False
@@ -1362,9 +1378,22 @@ class Runner:
         reap(proc, self.cgroups, step.tag, nonce=nonce)
 
         # Read the step's cgroup measurements BEFORE cleanup() rmdirs the child cgroup.
-        # `oom_detection` is the memory.events read itself: unenforced means the counter is
-        # not consulted, so nothing downstream can attribute a failure to an OOM.
-        oom = self.cgroups.oom_kills(step.tag) if is_enforced("oom_detection", lane) else 0
+        # memory_events is read once and oom is taken from it, so the OOM count and the
+        # recorded event counters can never disagree about the same step.
+        memory_events = self.cgroups.memory_events(step.tag)
+        # `oom_detection` is the ATTRIBUTION, and it is what the `capabilities` manifest
+        # advertises: unenforced means the oom_kill counter is not consulted, so nothing
+        # downstream can call a failure an OOM. The rest of memory.events is a recorded
+        # measurement, not a guard, and is kept either way -- a profile that stops recording is
+        # a different loss from a guard that stops guarding.
+        oom = (
+            0
+            if memory_events is None or not is_enforced("oom_detection", lane)
+            else memory_events.get("oom_kill", 0)
+        )
+        # The cap the KERNEL held, not the cap that was requested: a peak is only
+        # interpretable against the ceiling that was actually in force.
+        applied_memory_max = self.cgroups.applied_memory_max(step.tag)
         pids_events = self.cgroups.pids_events(step.tag)
         peak = self.cgroups.peak_bytes(step.tag)
         cpu_stats = self.cgroups.cpu_stats(step.tag)
@@ -1397,7 +1426,23 @@ class Runner:
             "oom_kills": oom,
             "peak_bytes": peak,
             "thread_peak": thread_peak,
+            # Run-overlap + applied-cap provenance. Offsets share one monotonic run origin, so
+            # two rows of the same run_id overlap iff their [started, finished] intervals do.
+            "started_offset_s": round(started_offset_s, 3),
+            "finished_offset_s": round(
+                time.monotonic() - self.run_origin_monotonic, 3
+            ),
+            # Blank means UNKNOWN and the literal "max" means unbounded; they are not the
+            # same answer and the writer must not flatten one into the other.
+            "memory_max_bytes": "" if applied_memory_max is None else applied_memory_max,
         }
+        # memory.events counters, which need no subtraction to be per-step deltas (the child
+        # cgroup lives exactly as long as the step). Left blank wholesale when the file could
+        # not be read, so "the step had no such event" and "we never looked" stay distinct.
+        for counter in ("low", "high", "max", "oom", "oom_kill"):
+            row[f"memory_events_{counter}"] = (
+                "" if memory_events is None else memory_events.get(counter, 0)
+            )
         # NOTE: pids_events is deliberately NOT a CSV column — it rides on the in-memory
         # StepOutcome instead (see StepOutcome.pids_events), so the Python/Rust CSV-header
         # differential stays byte-identical while a PID-cap breach is still classifiable.

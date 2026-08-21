@@ -2208,6 +2208,8 @@ fn run_single_step(
         );
     }
     if let Some(d) = perf_dir {
+        // The whole run's rows are appended in this one call, so a freshly minted run_id
+        // (`None`) groups exactly this execution.
         append_step_profiles(
             Path::new(d),
             &result.step_profile_rows,
@@ -2216,6 +2218,7 @@ fn run_single_step(
             None,
             "unverified",
             "local",
+            None,
         );
     }
     let row = result.step_profile_rows.first();
@@ -2816,6 +2819,8 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
                 max_steps,
             );
         }
+        // The whole run's rows are appended in this one call, so a freshly minted run_id
+        // (`None`) groups exactly this execution.
         append_step_profiles(
             Path::new(d),
             &result.step_profile_rows,
@@ -2824,6 +2829,7 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
             None,
             "unverified",
             "local",
+            None,
         );
         report_profile_written(d, source);
     }

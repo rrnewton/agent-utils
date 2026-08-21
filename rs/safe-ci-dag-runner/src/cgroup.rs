@@ -94,7 +94,34 @@ pub trait CgroupManager: Send + Sync {
     /// Kernel OOM-kill events inside the step's cgroup (`memory.events` `oom_kill`).
     fn oom_kills(&self, tag: &str) -> i64;
     /// Peak resident memory (bytes) of the step's cgroup (`memory.peak`).
+    ///
+    /// A peak alone does not say whether it measured DEMAND. A peak equal to the cap reported by
+    /// [`CgroupManager::applied_memory_max`] is a censored observation — the step used all it was
+    /// allowed — so read the two together before treating this as an observed maximum.
     fn peak_bytes(&self, tag: &str) -> Option<i64>;
+    /// The step cgroup's whole `memory.events` file as counter -> value.
+    ///
+    /// These are per-step deltas without subtraction: the child cgroup is created for the step
+    /// and removed after it, so every counter starts at zero. `max > 0` with `oom_kill == 0` is
+    /// reclaim-at-cap — a step that PASSED while pinned to its ceiling.
+    ///
+    /// DEFAULTS TO `None`, DELIBERATELY: a manager that does not answer has said nothing, and
+    /// nothing must not read as "no events occurred".
+    fn memory_events(&self, _tag: &str) -> Option<BTreeMap<String, i64>> {
+        None
+    }
+    /// The step cgroup's `memory.max` read back verbatim: a decimal byte count, or the literal
+    /// `"max"` when nothing bounds the step at this level.
+    ///
+    /// Read back rather than echoed from the requested cap, because the case that matters — a cap
+    /// the kernel never accepted — is exactly where the two disagree.
+    ///
+    /// DEFAULTS TO `None`, DELIBERATELY. `None` (cap unknown) and `Some("max")` (known unbounded)
+    /// are different answers: only the second rules out censoring, so a silent manager must not
+    /// be read as having reported an unbounded step.
+    fn applied_memory_max(&self, _tag: &str) -> Option<String> {
+        None
+    }
     /// Per-step cgroup-v2 CPU counters from `cpu.stat`.
     fn cpu_stats(&self, tag: &str) -> Option<BTreeMap<String, i64>>;
     /// Per-step CPU pressure-stall averages (`cpu.pressure` `some` line: `avg10`, `avg60`),
@@ -2017,21 +2044,38 @@ impl CgroupManager for Cgroups {
         }
     }
 
+    // Derived from `memory_events` rather than parsing `memory.events` a second time, so the OOM
+    // count and the recorded event counters can never disagree about the same step.
     fn oom_kills(&self, tag: &str) -> i64 {
-        let child = match self.child(tag) {
-            Some(c) if self.enabled => c,
-            _ => return 0,
-        };
-        let events = match read_trim(&child, "memory.events") {
-            Some(e) => e,
-            None => return 0,
-        };
-        for line in events.lines() {
-            if let Some(rest) = line.strip_prefix("oom_kill ") {
-                return rest.trim().parse().unwrap_or(0);
+        self.memory_events(tag)
+            .and_then(|events| events.get("oom_kill").copied())
+            .unwrap_or(0)
+    }
+
+    fn memory_events(&self, tag: &str) -> Option<BTreeMap<String, i64>> {
+        let child = self.child(tag)?;
+        if !self.enabled {
+            return None;
+        }
+        let text = read_trim(&child, "memory.events")?;
+        let mut out = BTreeMap::new();
+        for line in text.lines() {
+            let mut parts = line.split_whitespace();
+            if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
+                if let Ok(n) = v.parse::<i64>() {
+                    out.insert(k.to_string(), n);
+                }
             }
         }
-        0
+        Some(out)
+    }
+
+    fn applied_memory_max(&self, tag: &str) -> Option<String> {
+        let child = self.child(tag)?;
+        if !self.enabled {
+            return None;
+        }
+        read_trim(&child, "memory.max").filter(|value| !value.is_empty())
     }
 
     fn peak_bytes(&self, tag: &str) -> Option<i64> {
@@ -2755,5 +2799,112 @@ mod tests {
         assert_eq!(outer_memory_max_from(1_000_000, None, Some(0)), None);
         assert_eq!(outer_memory_max_from(1_000_000, None, Some(-1)), None);
         assert_eq!(outer_memory_max_from(1_000_000, Some("0"), None), None);
+    }
+
+    /// A manager pointed at a planted directory tree instead of a real cgroup hierarchy.
+    fn planted_manager(root: PathBuf) -> Cgroups {
+        Cgroups {
+            enabled: true,
+            root: Some(root),
+            containment: Containment::Full,
+        }
+    }
+
+    #[test]
+    fn the_applied_cap_is_read_back_and_unbounded_is_not_unknown() {
+        // `None` (we do not know the ceiling) and `Some("max")` (we know there was none) are
+        // different answers. Only the second rules out censoring, so flattening either into the
+        // other is what makes a recorded peak un-interpretable.
+        let root = temp_scope("applied-cap");
+        let child = root.join(sanitize("g.job"));
+        fs::create_dir_all(&child).unwrap();
+        let cg = planted_manager(root.clone());
+
+        assert_eq!(
+            cg.applied_memory_max("g.job"),
+            None,
+            "absent file is UNKNOWN"
+        );
+
+        fs::write(child.join("memory.max"), "max\n").unwrap();
+        assert_eq!(cg.applied_memory_max("g.job"), Some("max".to_string()));
+
+        fs::write(child.join("memory.max"), "8589934592\n").unwrap();
+        assert_eq!(
+            cg.applied_memory_max("g.job"),
+            Some("8589934592".to_string())
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn memory_events_carry_every_counter_and_the_oom_count_agrees() {
+        let root = temp_scope("memory-events");
+        let child = root.join(sanitize("g.job"));
+        fs::create_dir_all(&child).unwrap();
+        let cg = planted_manager(root.clone());
+
+        assert_eq!(cg.memory_events("g.job"), None, "absent file is UNKNOWN");
+        assert_eq!(cg.oom_kills("g.job"), 0);
+
+        fs::write(
+            child.join("memory.events"),
+            "low 0\nhigh 12\nmax 41\noom 3\noom_kill 2\n",
+        )
+        .unwrap();
+        let events = cg.memory_events("g.job").unwrap();
+        assert_eq!(events.get("low"), Some(&0));
+        assert_eq!(events.get("high"), Some(&12));
+        // Reclaim-at-cap: the step was held at its ceiling 41 times.
+        assert_eq!(events.get("max"), Some(&41));
+        assert_eq!(events.get("oom"), Some(&3));
+        assert_eq!(events.get("oom_kill"), Some(&2));
+        // One parse, one answer: the OOM count cannot drift from the recorded counters.
+        assert_eq!(cg.oom_kills("g.job"), 2);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_silent_manager_reports_an_unknown_cap_rather_than_an_unbounded_one() {
+        // The trait defaults must not let silence read as "nothing was capping this step".
+        struct Quiet;
+        impl CgroupManager for Quiet {
+            fn enabled(&self) -> bool {
+                true
+            }
+            fn prepare_command(
+                &self,
+                _t: &str,
+                c: &str,
+                _m: Option<i64>,
+                _p: Option<i64>,
+            ) -> String {
+                c.to_string()
+            }
+            fn kill(&self, _t: &str) -> bool {
+                false
+            }
+            fn cleanup(&self, _t: &str) {}
+            fn oom_kills(&self, _t: &str) -> i64 {
+                0
+            }
+            fn peak_bytes(&self, _t: &str) -> Option<i64> {
+                None
+            }
+            fn cpu_stats(&self, _t: &str) -> Option<BTreeMap<String, i64>> {
+                None
+            }
+            fn cpu_pressure(&self, _t: &str) -> Option<BTreeMap<String, f64>> {
+                None
+            }
+            fn thread_count(&self, _t: &str) -> Option<i64> {
+                None
+            }
+            fn kill_all_remaining(&self) -> i64 {
+                0
+            }
+        }
+        assert_eq!(Quiet.applied_memory_max("g.job"), None);
+        assert_eq!(Quiet.memory_events("g.job"), None);
     }
 }

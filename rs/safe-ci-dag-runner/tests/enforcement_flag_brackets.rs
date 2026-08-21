@@ -56,6 +56,19 @@ impl CgroupManager for SyntheticReadings {
         self.oom_kills
     }
 
+    /// The scheduler reads `memory.events` ONCE and takes the OOM count from it, so this is the
+    /// method the oom_detection bracket actually exercises; answering only `oom_kills` would
+    /// leave that leg silently inert.
+    fn memory_events(&self, _tag: &str) -> Option<BTreeMap<String, i64>> {
+        Some(BTreeMap::from([
+            ("oom_kill".to_string(), self.oom_kills),
+            ("oom".to_string(), self.oom_kills),
+            ("low".to_string(), 0),
+            ("high".to_string(), 0),
+            ("max".to_string(), 0),
+        ]))
+    }
+
     fn peak_bytes(&self, _tag: &str) -> Option<i64> {
         None
     }

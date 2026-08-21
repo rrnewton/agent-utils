@@ -129,6 +129,39 @@ class CgroupManager(Protocol):
         """Peak resident memory (bytes) of the step's cgroup (``memory.peak``), for
         baseline characterization / retuning caps. ``None`` when disabled, unknown, or
         unreadable. Read BEFORE :meth:`cleanup`.
+
+        A peak read alone does NOT say whether it is a true demand measurement: a peak
+        equal to the cap in :meth:`applied_memory_max` is a CENSORED observation (the step
+        used everything it was allowed), not an observed maximum. Pair it with
+        :meth:`applied_memory_max` and :meth:`memory_events` before treating it as demand.
+        """
+        ...
+
+    def applied_memory_max(self, tag: str) -> str | None:
+        """The step cgroup's ``memory.max`` AS THE KERNEL HOLDS IT, verbatim: a decimal byte
+        count, or the literal ``"max"`` when nothing bounds the step at this level.
+
+        Read back rather than echoed from the requested cap, because a requested cap that
+        the kernel did not accept (an undelegated ``memory`` controller) is exactly the case
+        where the two disagree, and only the accepted value explains a measured peak.
+
+        ``None`` when disabled, unknown, or unreadable — which is DIFFERENT from ``"max"``:
+        ``"max"`` says the step was unbounded here, ``None`` says the cap is unknown. A
+        consumer must not collapse the two, because an unknown cap cannot rule out
+        censoring. Read BEFORE :meth:`cleanup`.
+        """
+        ...
+
+    def memory_events(self, tag: str) -> Mapping[str, int] | None:
+        """The step cgroup's whole ``memory.events`` file as counter -> value (``low``,
+        ``high``, ``max``, ``oom``, ``oom_kill``, and any others the kernel exposes).
+
+        These are per-step DELTAS without any subtraction: the child cgroup is created for
+        this step and removed after it, so every counter starts at zero. ``max > 0`` with
+        ``oom_kill == 0`` is the reclaim-at-cap case — the step completed, but only because
+        the kernel kept evicting page cache at the ceiling, so its peak is censored and it
+        was NOT OOM-killed. ``None`` when disabled, unknown, or unreadable.
+        Read BEFORE :meth:`cleanup`.
         """
         ...
 

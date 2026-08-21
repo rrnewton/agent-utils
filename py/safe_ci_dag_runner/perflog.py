@@ -23,6 +23,8 @@ __all__ = [
     "CSV_COLUMNS",
     "STEP_PROFILE_COLUMNS",
     "ENRICHMENT_COLUMNS",
+    "CENSORING_COLUMNS",
+    "new_run_id",
     "machine_id",
     "nproc",
     "container_class",
@@ -94,6 +96,41 @@ ENRICHMENT_COLUMNS = [
     "step_cpu_psi_avg60_start", "step_cpu_psi_avg60_end",
 ]
 
+#: Provenance a later reader needs to tell a TRUE peak from a CENSORED one, and to know which
+#: rows ran at the same time. Appended after the enrichment block (append-only: never reorder).
+#:
+#: ``peak_bytes`` on its own does not say what it measured. A step whose peak equals the
+#: ``memory.max`` that was applied to it used everything it was allowed and may have wanted more;
+#: treating that number as an observed maximum under-estimates the workload permanently, and
+#: nothing in the row as it stood could detect the case. These columns make it detectable:
+#:
+#: * ``run_id`` groups the rows of exactly ONE DAG execution. Two concurrent runs on one machine
+#:   share ``machine_id``, ``container_class``, ``git_sha`` and often ``outer_jobs``, and
+#:   ``timestamp`` is stamped once per BATCH, so without this there is no key that separates them.
+#: * ``started_offset_s`` / ``finished_offset_s`` are seconds from that run's own origin, so the
+#:   overlap between any two steps of a run is a comparison of two intervals. Wall-clock
+#:   timestamps cannot do this: the batch carries one.
+#: * ``memory_max_bytes`` is the cap the KERNEL held for the step — a decimal byte count, the
+#:   literal ``max`` when the step was unbounded at that level, or BLANK when the cap is unknown.
+#:   Blank and ``max`` are different answers and must not be merged: unknown cannot rule out
+#:   censoring, unbounded does.
+#: * ``memory_events_*`` are the step cgroup's ``memory.events`` counters. They need no
+#:   subtraction to be deltas — the cgroup is created for the step and destroyed after it.
+#:   ``memory_events_max > 0`` with ``memory_events_oom_kill == 0`` is the reclaim-at-cap case: a
+#:   step that PASSED while pinned to its ceiling, which is precisely the sample a naive reader
+#:   would mistake for a comfortable fit.
+CENSORING_COLUMNS = [
+    "run_id",
+    "started_offset_s",
+    "finished_offset_s",
+    "memory_max_bytes",
+    "memory_events_low",
+    "memory_events_high",
+    "memory_events_max",
+    "memory_events_oom",
+    "memory_events_oom_kill",
+]
+
 STEP_PROFILE_COLUMNS = [
     # Run context, stamped onto every row by append_step_profiles().
     "timestamp", "machine_id", "container_class", "git_sha", "outer_jobs",
@@ -103,6 +140,8 @@ STEP_PROFILE_COLUMNS = [
     "timed_out", "cpu_timed_out", "oom_kills", "peak_bytes", "thread_peak",
     # Rich parallel-speedup enrichment (appended; blank when unavailable).
     *ENRICHMENT_COLUMNS,
+    # Run-overlap and applied-cap provenance (appended; blank when unavailable).
+    *CENSORING_COLUMNS,
 ]
 
 
@@ -124,6 +163,17 @@ def machine_id() -> str:
     except OSError:
         pass
     return re.sub(r"[^A-Za-z0-9_-]", "", os.uname().nodename) or "unknown"
+
+
+def new_run_id() -> str:
+    """A fresh identifier for ONE DAG execution: nanoseconds since the epoch and the runner
+    PID, both hex, concatenated.
+
+    Uniqueness comes from the pair, not from either half. Two runs on one host cannot share
+    a start nanosecond, and a PID reused after a clock step cannot collide with the earlier
+    run that held it. The value is opaque: a reader groups rows by equality and never parses
+    it, so nothing depends on how it was built."""
+    return f"{time.time_ns():016x}{os.getpid():08x}"
 
 
 def nproc() -> int:
@@ -279,6 +329,7 @@ def append_step_profiles(
     profile_base_sha: str | None = None,
     enforcement_kind: str = "unverified",
     runner_name: str = "local",
+    run_id: str | None = None,
 ) -> Path | None:
     """Append per-step measurement ``rows`` to a machine/container-specific CSV.
 
@@ -298,7 +349,10 @@ def append_step_profiles(
     if the output directory could not be created (a visible warning is emitted).
 
     ``profile_base_sha`` defaults to ``git_sha``. ``enforcement_kind`` and ``runner_name``
-    are recorded verbatim."""
+    are recorded verbatim. ``run_id`` identifies the one DAG execution these rows came from
+    and defaults to a fresh :func:`new_run_id`; pass the run's own id so every batch of a
+    single execution carries the same value, because that column is the ONLY thing that
+    separates two concurrent runs sharing this machine, container class and commit."""
     logs_dir = _ensure_dir(output_dir)
     if logs_dir is None:
         return None
@@ -313,6 +367,7 @@ def append_step_profiles(
         "profile_base_sha": git_sha if profile_base_sha is None else profile_base_sha,
         "enforcement_kind": enforcement_kind,
         "runner_name": runner_name,
+        "run_id": new_run_id() if run_id is None else run_id,
     }
     full_rows = [{**common, **row} for row in rows]
     fieldnames = _step_profile_fieldnames(full_rows)
@@ -551,6 +606,7 @@ class CsvMetricsSink(MetricsSink):
         runner_name: str = "local",
         ipc: object = "",
         cache_miss_pct: object = "",
+        run_id: str | None = None,
     ) -> None:
         self.output_dir = output_dir
         self.git_sha = git_sha
@@ -560,6 +616,11 @@ class CsvMetricsSink(MetricsSink):
         self.runner_name = runner_name
         self.ipc = ipc
         self.cache_miss_pct = cache_miss_pct
+        #: Identifies the ONE DAG execution this sink records. Minted here, at sink
+        #: construction, rather than per batch: a run that records its rows in more than one
+        #: call must still be one group, and a sink that re-minted per call would silently
+        #: split it.
+        self.run_id = new_run_id() if run_id is None else run_id
 
     def start_run_window(self) -> RunWindow:
         """Open the whole-run window bound to this sink's context."""
@@ -588,5 +649,6 @@ class CsvMetricsSink(MetricsSink):
             profile_base_sha=self.profile_base_sha,
             enforcement_kind=self.enforcement_kind,
             runner_name=self.runner_name,
+            run_id=self.run_id,
         )
         return None if path is None else str(path)

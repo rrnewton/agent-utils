@@ -2026,21 +2026,51 @@ class Cgroups:
             pass
         return 0
 
+    def memory_events(self, tag: str) -> Mapping[str, int] | None:
+        """The step cgroup's whole ``memory.events`` file as counter -> value.
+
+        These need no baseline subtraction to be per-step deltas: the child cgroup is
+        created by :meth:`prepare_command` for this step and removed by :meth:`cleanup`
+        after it, so every counter starts at zero. ``None`` if absent/unreadable. Read
+        BEFORE :meth:`cleanup`."""
+        if not self.enabled or self.root is None or tag not in self._made:
+            return None
+        try:
+            lines = (self.root / _sanitize(tag) / "memory.events").read_text().splitlines()
+            return {
+                key: int(value)
+                for key, value in (line.split(maxsplit=1) for line in lines)
+            }
+        except (OSError, ValueError):
+            return None
+
+    def applied_memory_max(self, tag: str) -> str | None:
+        """The step cgroup's ``memory.max`` read back verbatim: a decimal byte count, or the
+        literal ``"max"`` when nothing bounds the step here.
+
+        Read back rather than echoed from the ``mem_max`` argument to
+        :meth:`prepare_command`, because the case that matters — a requested cap the kernel
+        never accepted — is exactly the case where the two disagree, and only the accepted
+        value explains the measured peak. ``None`` (unknown) is deliberately distinct from
+        ``"max"`` (known to be unbounded). Read BEFORE :meth:`cleanup`."""
+        if not self.enabled or self.root is None or tag not in self._made:
+            return None
+        try:
+            value = (self.root / _sanitize(tag) / "memory.max").read_text().strip()
+        except OSError:
+            return None
+        return value or None
+
     def oom_kills(self, tag: str) -> int:
         """OOM-kill event count inside the step's cgroup (``memory.events``
         ``oom_kill``). ``> 0`` means the step (or a descendant) hit its INNER
-        ``memory.max`` — the actionable-OOM signal. 0 if absent/unreadable. Read
+        ``memory.max`` AND the kernel killed it — the actionable-OOM signal. It does NOT
+        cover reclaim-at-cap: a step held at its ceiling by eviction reports
+        ``memory.events`` ``max > 0`` with ``oom_kill == 0`` and exits cleanly, which is
+        why :meth:`memory_events` exists alongside this. 0 if absent/unreadable. Read
         BEFORE :meth:`cleanup`."""
-        if not self.enabled or self.root is None or tag not in self._made:
-            return 0
-        try:
-            events = (self.root / _sanitize(tag) / "memory.events").read_text()
-            for line in events.splitlines():
-                if line.startswith("oom_kill "):
-                    return int(line.split()[1])
-        except (OSError, ValueError, IndexError):
-            pass
-        return 0
+        events = self.memory_events(tag)
+        return 0 if events is None else events.get("oom_kill", 0)
 
     def peak_bytes(self, tag: str) -> int | None:
         """Peak RSS (bytes) of the step's cgroup (``memory.peak``), for baseline
@@ -2184,6 +2214,18 @@ class NoopCgroups:
     def oom_kills(self, tag: str) -> int:
         """Return zero because no cgroup OOM counter is available."""
         return 0
+
+    def memory_events(self, tag: str) -> Mapping[str, int] | None:
+        """Return ``None`` because no cgroup memory event counters are available."""
+        return None
+
+    def applied_memory_max(self, tag: str) -> str | None:
+        """Return ``None`` (cap UNKNOWN) because no cgroup cap was applied or read.
+
+        Not ``"max"``: this manager did not observe an unbounded step, it observed
+        nothing, and a consumer must be able to tell those apart before deciding whether
+        a peak is censored."""
+        return None
 
     def peak_bytes(self, tag: str) -> int | None:
         """Return ``None`` because no cgroup memory peak is available."""

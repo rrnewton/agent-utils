@@ -298,12 +298,17 @@ def test_per_step_wall_ceiling_follows_the_wall_timeout_capability_flag() -> Non
 
 
 class _OomingCgroups(NoopCgroups):
-    """A boxed manager whose cgroup reports two OOM kills for every step."""
+    """A boxed manager whose cgroup reports two OOM kills for every step.
+
+    The scheduler reads ``memory.events`` once and takes the OOM count from it, so that is the
+    method a stand-in has to answer; overriding ``oom_kills`` alone would leave this test
+    silently inert.
+    """
 
     enabled = True
 
-    def oom_kills(self, tag: str) -> int:
-        return 2
+    def memory_events(self, tag: str) -> Mapping[str, int]:
+        return {"oom_kill": 2, "oom": 2, "low": 0, "high": 0, "max": 0}
 
 
 def test_oom_attribution_follows_the_oom_detection_capability_flag() -> None:

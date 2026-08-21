@@ -1387,6 +1387,7 @@ impl Runner {
                                 evidence,
                                 cpu_timeout_multiplier,
                                 cpu_timeout_platform,
+                                run_origin: wall_start,
                             });
                         });
                     }),
@@ -1824,6 +1825,10 @@ struct StepCtx {
     evidence: Option<Arc<RunEvidence>>,
     cpu_timeout_multiplier: f64,
     cpu_timeout_platform: String,
+    /// Monotonic origin every profiled step measures its start/finish offset from, so two rows of
+    /// one run can be tested for OVERLAP. Monotonic, not wall clock: a clock step mid-run must not
+    /// make one step appear to precede another.
+    run_origin: Instant,
 }
 
 /// Tear down one step's whole process tree: SIGTERM grace, then `cgroup.kill`/SIGKILL.
@@ -2062,6 +2067,7 @@ fn run_step(ctx: StepCtx) {
         evidence,
         cpu_timeout_multiplier,
         cpu_timeout_platform,
+        run_origin,
     } = ctx;
     let tag = step.tag();
     emit(&format!("[{tag}] \u{25b6} START  {}", step.desc));
@@ -2145,6 +2151,7 @@ fn run_step(ctx: StepCtx) {
     cmd.stderr(Stdio::piped());
 
     let start = Instant::now();
+    let started_offset_s = start.saturating_duration_since(run_origin).as_secs_f64();
     // Set this AFTER the step's declared environment so a manifest cannot forge the epoch that
     // downstream timeout ordering relies on.  The serialized clock is sampled beside the
     // supervisor's `Instant`; both precede spawn, so child setup spends from the same allowance.
@@ -2518,19 +2525,31 @@ fn run_step(ctx: StepCtx) {
     };
 
     // Read the step's cgroup measurements BEFORE cleanup() removes the child cgroup.
-    let (oom, peak, cpu_stats) = match &cgroups {
-        // `oom_detection` is the memory.events read itself: unenforced means the counter is not
-        // consulted, so nothing downstream can attribute a failure to an OOM.
+    // memory_events is read once and `oom` is taken from it, so the OOM count and the recorded
+    // event counters can never disagree about the same step. applied_memory_max is the cap the
+    // KERNEL held, not the cap that was requested: a peak is only interpretable against the
+    // ceiling that was actually in force.
+    let (memory_events, applied_memory_max, peak, cpu_stats) = match &cgroups {
         Some(cg) if cg.enabled() => (
-            if crate::capabilities::is_enforced("oom_detection", lane) {
-                cg.oom_kills(&tag)
-            } else {
-                0
-            },
+            cg.memory_events(&tag),
+            cg.applied_memory_max(&tag),
             cg.peak_bytes(&tag),
             cg.cpu_stats(&tag),
         ),
-        _ => (0, None, None),
+        _ => (None, None, None, None),
+    };
+    // `oom_detection` is the ATTRIBUTION, and it is what the `capabilities` manifest advertises:
+    // unenforced means the oom_kill counter is not consulted, so nothing downstream can call a
+    // failure an OOM. The rest of memory.events is a recorded measurement, not a guard, and is
+    // kept either way — a profile that stops recording is a different loss from a guard that
+    // stops guarding.
+    let oom = if crate::capabilities::is_enforced("oom_detection", lane) {
+        memory_events
+            .as_ref()
+            .and_then(|events| events.get("oom_kill").copied())
+            .unwrap_or(0)
+    } else {
+        0
     };
     let step_pressure_end = if boxed {
         cgroups
@@ -2603,6 +2622,35 @@ fn run_step(ctx: StepCtx) {
         "thread_peak".into(),
         thread_peak.map(|t| t.to_string()).unwrap_or_default(),
     );
+    // Run-overlap + applied-cap provenance. Offsets share one monotonic run origin, so two rows of
+    // the same run_id overlap iff their [started, finished] intervals do.
+    row.insert("started_offset_s".into(), format!("{started_offset_s:.3}"));
+    row.insert(
+        "finished_offset_s".into(),
+        format!(
+            "{:.3}",
+            Instant::now()
+                .saturating_duration_since(run_origin)
+                .as_secs_f64()
+        ),
+    );
+    // Blank means UNKNOWN and the literal "max" means unbounded; they are not the same answer and
+    // the writer must not flatten one into the other.
+    row.insert(
+        "memory_max_bytes".into(),
+        applied_memory_max.clone().unwrap_or_default(),
+    );
+    // memory.events counters, which need no subtraction to be per-step deltas (the child cgroup
+    // lives exactly as long as the step). Left blank wholesale when the file could not be read, so
+    // "the step had no such event" and "we never looked" stay distinct.
+    for counter in ["low", "high", "max", "oom", "oom_kill"] {
+        row.insert(
+            format!("memory_events_{counter}"),
+            memory_events.as_ref().map_or_else(String::new, |events| {
+                events.get(counter).copied().unwrap_or(0).to_string()
+            }),
+        );
+    }
     if let Some(stats) = &cpu_stats {
         for (k, v) in stats {
             row.insert(format!("cpu.{k}"), v.to_string());
