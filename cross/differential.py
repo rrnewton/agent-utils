@@ -4209,17 +4209,31 @@ def _summary_sync_case(
 #:   peak is suppressed. Byte-for-byte its ``peak_bytes`` and ``memory_max_bytes`` match
 #:   ``g.learned``; only the counter differs, so a build that reads ``max``/``oom_kill`` but not
 #:   ``high`` gives it the same learned cap and this fixture catches that.
+#: * ``g.failed`` peaked at the same comfortable 2 GiB with every counter at zero, but every one
+#:   of its six runs was KILLED: ``ok=false``, ``returncode=137`` (SIGKILL, which is what an
+#:   ancestor-scope OOM kill looks like from inside the reader). Its peaks are where the step got
+#:   to before it died.
+#: * ``g.four`` recorded only FOUR comfortable samples. Nothing here passes a sample threshold to
+#:   either build, so this step is the only thing that observes the SHIPPED
+#:   ``DEFAULT_MIN_UNCENSORED_SAMPLES``, and the two builds disagreeing about it shows up as a
+#:   difference in its line.
 _CENSORED_STORE_CSV = (
     "step,peak_bytes,memory_max_bytes,memory_events_high,memory_events_max,"
-    "memory_events_oom,memory_events_oom_kill\n"
+    "memory_events_oom,memory_events_oom_kill,ok,returncode\n"
     + "".join(
-        f"g.learned,{2 * 1024**3},{8 * 1024**3},0,0,0,0\n" for _ in range(6)
+        f"g.learned,{2 * 1024**3},{8 * 1024**3},0,0,0,0,true,0\n" for _ in range(6)
     )
     + "".join(
-        f"g.pinned,{8 * 1024**3},{8 * 1024**3},0,0,0,0\n" for _ in range(6)
+        f"g.pinned,{8 * 1024**3},{8 * 1024**3},0,0,0,0,true,0\n" for _ in range(6)
     )
     + "".join(
-        f"g.throttled,{2 * 1024**3},{8 * 1024**3},4,0,0,0\n" for _ in range(6)
+        f"g.throttled,{2 * 1024**3},{8 * 1024**3},4,0,0,0,true,0\n" for _ in range(6)
+    )
+    + "".join(
+        f"g.failed,{2 * 1024**3},{8 * 1024**3},0,0,0,0,false,137\n" for _ in range(6)
+    )
+    + "".join(
+        f"g.four,{2 * 1024**3},{8 * 1024**3},0,0,0,0,true,0\n" for _ in range(4)
     )
 )
 
@@ -4234,6 +4248,8 @@ _CENSORED_DAG = {
         {"group": "g", "job": "learned", "cmd": "true"},
         {"group": "g", "job": "pinned", "cmd": "true"},
         {"group": "g", "job": "throttled", "cmd": "true"},
+        {"group": "g", "job": "failed", "cmd": "true"},
+        {"group": "g", "job": "four", "cmd": "true"},
     ],
 }
 
@@ -4299,6 +4315,68 @@ def _memory_feedback_reaches_admission(
         rep.bad("memory-feedback/reaches-max-mem-admission", f"footprints={seen!r}")
     else:
         rep.ok("memory-feedback/reaches-max-mem-admission")
+
+
+def _memory_feedback_declines_reach_admission(
+    py: list[str], rs: list[str], rep: Report, tmp: str, extra: dict[str, str]
+) -> None:
+    """Prove a DECLINE removes the censoring-blind estimate too, identically in both builds.
+
+    This is the point of the flag, and the half that is easy to leave undone. ONE step whose six
+    recorded runs were every one of them pinned to their 8589934592 B cap — the all-censored
+    history the path exists for — and a DAG authoring 42949672960 B.
+
+    Without the flag the ordinary feedback takes those censored peaks at face value and admission
+    models 10737418240 B: a cap derived from the cap. With the flag the step is declined, and a
+    decline has to mean the AUTHORED figure reaches admission: 53687091200 B. Both are named
+    literally, because a build that reported "keeping the authored hint" while leaving the
+    censored estimate in the config would report the first number twice.
+    """
+    store = os.path.join(tmp, "decline-store")
+    os.makedirs(store, exist_ok=True)
+    csv_name = f"step_profiles_{SYNTH_MACHINE}_{SYNTH_CONTAINER}.csv"
+    with open(os.path.join(store, csv_name), "w", encoding="utf-8") as fh:
+        fh.write(
+            "step,peak_bytes,memory_max_bytes,memory_events_high,memory_events_max,"
+            "memory_events_oom,memory_events_oom_kill\n"
+            + "".join("g.pinned,8589934592,8589934592,0,0,0,0\n" for _ in range(6))
+        )
+    dag_path = os.path.join(tmp, "decline-dag.json")
+    with open(dag_path, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"steps": [{
+            "group": "g", "job": "pinned", "cmd": "true",
+            "hint": {"rss_baseline_bytes": 42949672960},
+        }]}))
+    args = (
+        "run", "--dag", dag_path, "--perf-dir", store, "--no-profile",
+        "--unsafe-no-cgroups", "-q", "--max-mem", "400G",
+    )
+
+    def footprint(outcome: Outcome) -> str | None:
+        for line in outcome.stderr.splitlines():
+            match = re.search(r"worst-case (\d+) bytes", line)
+            if match:
+                return match.group(1)
+        return None
+
+    off = {"py": run(py, args, extra), "rs": run(rs, args, extra)}
+    on_args = (*args, "--profile-memory-feedback")
+    on = {"py": run(py, on_args, extra), "rs": run(rs, on_args, extra)}
+    seen = {
+        f"{engine}/{state}": footprint(outcome)
+        for state, group in (("off", off), ("on", on))
+        for engine, outcome in group.items()
+    }
+    if (
+        seen != {"py/off": "10737418240", "rs/off": "10737418240",
+                 "py/on": "53687091200", "rs/on": "53687091200"}
+        or any(o.returncode != 0 for o in (*off.values(), *on.values()))
+        or "g.pinned: keeping the authored hint" not in on["py"].stderr
+        or "g.pinned: keeping the authored hint" not in on["rs"].stderr
+    ):
+        rep.bad("memory-feedback/a-decline-undoes-the-censored-estimate", f"footprints={seen!r}")
+    else:
+        rep.ok("memory-feedback/a-decline-undoes-the-censored-estimate")
 
 
 def compare_memory_feedback(py: list[str], rs: list[str], rep: Report) -> None:
@@ -4400,7 +4478,35 @@ def compare_memory_feedback(py: list[str], rs: list[str], rep: Report) -> None:
         else:
             rep.ok("memory-feedback/soft-ceiling-throttling-censors")
 
+        # A step whose six runs were KILLED. Byte-for-byte its peak, cap and counters match
+        # g.learned; only ok/returncode differ, so this fails in exactly the build that reads a
+        # peak measured by a dead run as an observation of demand.
+        failed = [line for line in py_lines if "g.failed:" in line]
+        if (
+            len(failed) != 1
+            or "keeping the authored hint" not in failed[0]
+            or "rss_baseline_bytes=" in failed[0]
+            or "6 sample(s) recorded a step that FAILED" not in failed[0]
+        ):
+            rep.bad("memory-feedback/a-failed-run-is-not-evidence", "failed=" + repr(failed))
+        else:
+            rep.ok("memory-feedback/a-failed-run-is-not-evidence")
+
+        # FOUR comfortable samples, and no threshold passed to either build: the only place the
+        # SHIPPED minimum-sample count is observable end to end. The numbers are named literally,
+        # so a build that shipped anything but 5 produces a different line here.
+        four = [line for line in py_lines if "g.four:" in line]
+        if (
+            len(four) != 1
+            or "keeping the authored hint" not in four[0]
+            or "only 4 uncensored sample(s); 5 required" not in four[0]
+        ):
+            rep.bad("memory-feedback/five-uncensored-samples-are-required", "four=" + repr(four))
+        else:
+            rep.ok("memory-feedback/five-uncensored-samples-are-required")
+
         _memory_feedback_reaches_admission(py, rs, rep, tmp, extra)
+        _memory_feedback_declines_reach_admission(py, rs, rep, tmp, extra)
 
         inert = (*base, "--profile-memory-feedback", "--no-profile-feedback")
         pi, ri = run(py, inert, extra), run(rs, inert, extra)

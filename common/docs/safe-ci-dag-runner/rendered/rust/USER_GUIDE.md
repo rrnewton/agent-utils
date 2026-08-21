@@ -197,11 +197,20 @@ that produced it and freezes the mistake. So:
 
 - a censored sample is used only as a **floor** — proof demand was at least that
   large — and can raise an estimate, never lower one;
+- a row recording a step that **failed** — `ok` false, or a non-zero
+  `returncode` such as 137 (SIGKILL, what an OOM kill from an enclosing cgroup
+  looks like) — is censored for the same reason: it says where the step got to
+  before it died, not where it was going;
 - a sample that cannot say (no applied cap recorded, no event counters, no peak)
   is not evidence, and is counted and reported rather than assumed comfortable;
 - a step needs at least five uncensored samples before its authored hint is
   replaced at all, and the estimate carries a 20% margin above the 9/10
   percentile;
+- a step this path **declines** to estimate goes back to the baseline its author
+  wrote. That matters because the ordinary feedback above has already refined
+  the same hint from the same peaks *without* asking what they were measured
+  under: turning this flag on has to remove that number too, or a decline would
+  quietly mean "use the censoring-blind estimate instead";
 - `hard_mem_max_bytes` is never rewritten: an explicit hard cap is an
   instruction, not a guess.
 

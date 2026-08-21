@@ -12,6 +12,9 @@ The rules here are the ones a caller can rely on:
 
 * A censored sample never lowers anything. It is used only as a FLOOR — proof that demand was
   at least that large — never as an estimate of the maximum.
+* A row that records a step which FAILED is censored too. A step that did not finish its work
+  stopped somewhere short of where it was going, and ``returncode`` 137 — SIGKILL — is exactly
+  what an ancestor-scope OOM kill looks like from inside this reader.
 * A sample whose censoring cannot be determined (no applied-cap column, no event counters, no
   peak) is not evidence at all. It is counted and reported, and it never moves the estimate.
 * With no uncensored evidence, the static hint is retained and the reason says which of the
@@ -99,6 +102,10 @@ class PeakObservation:
     #: ``memory.events`` ``oom`` — times the OOM killer was invoked in the cgroup. A step can
     #: record this with ``oom_kill == 0`` (no task was reapable), and it is still a ceiling hit.
     oom_events: int | None = None
+    #: Whether the row records a step that FAILED — ``ok`` explicitly falsy or a non-zero
+    #: ``returncode``. Such a peak is where the step got to before it died, not where it was
+    #: going, so it is censored rather than an observation of demand.
+    run_failed: bool = False
 
 
 def _blank(value: str | None) -> bool:
@@ -116,9 +123,10 @@ def peak_observation_from_row(row: Mapping[str, str]) -> PeakObservation:
 
     CENSORED when ANY of the four pressure counters #34 records fired — ``high`` (throttled
     into direct reclaim by a soft ceiling), ``max`` (held at the hard ceiling by reclaim),
-    ``oom`` (the OOM killer was invoked) or ``oom_kill`` (a task was reaped) — or when the peak
-    reached the applied cap. The last is a ``>=`` and not a ``==`` deliberately: a cap the
-    kernel rounded down to a page boundary still censors a peak that sits above it.
+    ``oom`` (the OOM killer was invoked) or ``oom_kill`` (a task was reaped) — when the row
+    records a step that FAILED or was cut short by a guard, or when the peak reached the applied
+    cap. The last is a ``>=`` and not a ``==`` deliberately: a cap the kernel rounded down to a
+    page boundary still censors a peak that sits above it.
 
     ``memory_events_low`` is deliberately NOT read: it counts reclaim that breached a
     ``memory.low`` PROTECTION, which sets a floor the kernel tries to preserve rather than a
@@ -146,6 +154,7 @@ def peak_observation_from_row(row: Mapping[str, str]) -> PeakObservation:
     throttle_events = throttle if (throttle is not None and throttle >= 0) else None
     invoked = _parse_int(row.get("memory_events_oom"))
     oom_events = invoked if (invoked is not None and invoked >= 0) else None
+    run_failed = _row_records_failure(row)
 
     verdict = _verdict(
         peak_bytes=peak_bytes,
@@ -157,6 +166,7 @@ def peak_observation_from_row(row: Mapping[str, str]) -> PeakObservation:
         throttle_events=throttle_events,
         oom_events=oom_events,
         timed_out=_truthy(row.get("timed_out")) or _truthy(row.get("cpu_timed_out")),
+        run_failed=run_failed,
     )
     return PeakObservation(
         step=step,
@@ -169,11 +179,28 @@ def peak_observation_from_row(row: Mapping[str, str]) -> PeakObservation:
         verdict=verdict,
         throttle_events=throttle_events,
         oom_events=oom_events,
+        run_failed=run_failed,
     )
 
 
 def _truthy(value: str | None) -> bool:
     return (value or "").strip().lower() in {"true", "1", "yes"}
+
+
+def _row_records_failure(row: Mapping[str, str]) -> bool:
+    """Whether the row records a step that did NOT complete its work.
+
+    The same two EXPLICIT signals :func:`safe_ci_dag_runner.estimates.row_is_measurement` reads,
+    and for the same reason: a blank or absent cell is silence, not a failure, so a store with no
+    verdict columns is not condemned wholesale. ``returncode`` 137 is SIGKILL, which is what an
+    OOM kill delivered by an ANCESTOR cgroup looks like from here — no counter in this step's own
+    ``memory.events`` fired, and the peak is the least trustworthy sample in the store.
+    """
+    ok_cell = (row.get("ok") or "").strip().lower()
+    if ok_cell and ok_cell not in {"true", "1", "yes"}:
+        return True
+    rc = _parse_int(row.get("returncode"))
+    return rc is not None and rc != 0
 
 
 def _verdict(
@@ -187,10 +214,17 @@ def _verdict(
     throttle_events: int | None,
     oom_events: int | None,
     timed_out: bool,
+    run_failed: bool,
 ) -> Censoring:
     """The classification rules, separated so they can be read and tested without a CSV row."""
     if peak_bytes is None:
         return Censoring.UNKNOWN
+    if run_failed:
+        # The step did not finish its work, so its peak is where it stopped and not where it was
+        # going — a lower bound, exactly like a ceiling hit. rc 137 is SIGKILL: an OOM kill from
+        # an ancestor cgroup leaves this step's own memory.events untouched and would otherwise
+        # read as a comfortable observation.
+        return Censoring.CENSORED
     if oom_kills is not None and oom_kills > 0:
         return Censoring.CENSORED
     if oom_events is not None and oom_events > 0:
@@ -323,12 +357,16 @@ def _admission_for_step(
         if o.verdict is Censoring.CENSORED and o.peak_bytes is not None
     ]
     unknown = sum(1 for o in observations if o.verdict is Censoring.UNKNOWN)
+    failed = sum(1 for o in observations if o.verdict is Censoring.CENSORED and o.run_failed)
     floor = max(censored) if censored else None
     observed = max(uncensored) if uncensored else None
     sha_note = (
         f"; {dropped_by_sha} sample(s) excluded as recorded against another source revision"
         if dropped_by_sha
         else ""
+    )
+    failed_note = (
+        f"; {failed} sample(s) recorded a step that FAILED, counted as censored" if failed else ""
     )
     base = MemoryAdmission(
         step=step,
@@ -345,7 +383,11 @@ def _admission_for_step(
         observed_peak_bytes=observed,
     )
     if not uncensored:
-        if censored and not unknown:
+        if censored and not unknown and failed:
+            # Do not blame the applied cap for a peak that a failed run cut short; `failed_note`
+            # says how many, and the two causes call for different operator responses.
+            why = f"every one of {len(censored)} recorded peak(s) was censored"
+        elif censored and not unknown:
             why = (
                 f"every one of {len(censored)} recorded peak(s) was censored by its applied cap"
             )
@@ -360,12 +402,13 @@ def _admission_for_step(
             )
         else:
             why = "no recorded peaks for this step"
-        return replace(base, reason=why + sha_note)
+        return replace(base, reason=why + failed_note + sha_note)
     if len(uncensored) < min_uncensored_samples:
         return replace(
             base,
             reason=(
                 f"only {len(uncensored)} uncensored sample(s); {min_uncensored_samples} required"
+                + failed_note
                 + sha_note
             ),
         )
@@ -381,7 +424,7 @@ def _admission_for_step(
         base,
         rss_baseline_bytes=estimate,
         source="profile",
-        reason=detail + sha_note,
+        reason=detail + failed_note + sha_note,
     )
 
 
@@ -418,7 +461,9 @@ def load_memory_admissions(
 
 
 def apply_memory_admissions(
-    cfg: DagConfig, admissions: Mapping[str, MemoryAdmission]
+    cfg: DagConfig,
+    admissions: Mapping[str, MemoryAdmission],
+    authored_baselines: Mapping[str, int | None] | None = None,
 ) -> DagConfig:
     """Return a copy of ``cfg`` whose steps carry the profile-derived ``rss_baseline_bytes``.
 
@@ -428,19 +473,39 @@ def apply_memory_admissions(
     reinterpret it. Intentionally skipped steps are left alone for the same reason
     :func:`safe_ci_dag_runner.estimates.apply_plan_to_config` leaves them alone — a skip is not
     a licence to erase authored hints.
+
+    ``authored_baselines`` maps a step tag to the ``rss_baseline_bytes`` its AUTHOR wrote, before
+    any planner feedback touched it, and it is what makes a DECLINE mean something. ``cfg`` here
+    has normally already been through
+    :func:`safe_ci_dag_runner.estimates.apply_plan_to_config`, whose feedback learns from the
+    same recorded peaks WITHOUT asking whether a cap was clamping them. Without this mapping,
+    every step this module declines to estimate would silently keep that censoring-blind number
+    while the report said "keeping the authored hint" — the unsafe estimate surviving under the
+    name of the safe one. So a declined step is RESTORED to its authored baseline: a decline
+    means no learned estimate at all, not a fall-back to the other one.
     """
     new_steps: list[Step] = []
+    baseline: int | None
     for step in cfg.steps:
-        admission = admissions.get(step.tag)
-        if (
-            admission is None
-            or admission.source != "profile"
-            or admission.rss_baseline_bytes is None
-            or step.skip_reason is not None
-        ):
+        if step.skip_reason is not None:
             new_steps.append(step)
             continue
-        new_hint = replace(step.hint, rss_baseline_bytes=admission.rss_baseline_bytes)
+        admission = admissions.get(step.tag)
+        if (
+            admission is not None
+            and admission.source == "profile"
+            and admission.rss_baseline_bytes is not None
+        ):
+            baseline = admission.rss_baseline_bytes
+        elif authored_baselines is not None and step.tag in authored_baselines:
+            baseline = authored_baselines[step.tag]
+        else:
+            new_steps.append(step)
+            continue
+        if baseline == step.hint.rss_baseline_bytes:
+            new_steps.append(step)
+            continue
+        new_hint = replace(step.hint, rss_baseline_bytes=baseline)
         new_steps.append(
             replace(step, hint=new_hint, deps=list(step.deps), env=dict(step.env))
         )

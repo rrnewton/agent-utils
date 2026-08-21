@@ -987,7 +987,7 @@ def _resolve_feedback_dir(perf_dir_arg: str | None, no_feedback: bool) -> str | 
 
 
 def _apply_memory_feedback(
-    cfg: DagConfig, feedback_dir: str | None, enabled: bool
+    cfg: DagConfig, authored: DagConfig, feedback_dir: str | None, enabled: bool
 ) -> DagConfig:
     """Apply censoring-aware profile memory feedback to ``cfg``, reporting every decision.
 
@@ -996,6 +996,12 @@ def _apply_memory_feedback(
     under; this path refuses to learn a smaller number from a peak that met its ceiling, which
     is a different and stricter contract, so it is a separate opt-in rather than a change of
     meaning for the existing one.
+
+    ``cfg`` is the config the ordinary plan has ALREADY been applied to and ``authored`` is the
+    same config before that, which is what lets a decline mean "no learned estimate" instead of
+    "fall back to the censoring-blind one": every step this path does not estimate is restored
+    to the baseline its author wrote. Turning the flag on therefore removes the unsafe estimate
+    even where it does not supply a safe one, which is the whole reason the flag exists.
 
     Every step the store knows about is reported on stderr, including the ones that did NOT
     move and why, because "the cap did not change" and "the store had nothing usable to say"
@@ -1008,7 +1014,9 @@ def _apply_memory_feedback(
     """
     if not enabled:
         return cfg
+    baselines = {step.tag: step.hint.rss_baseline_bytes for step in authored.steps}
     if feedback_dir is None:
+        # Nothing to undo: with the reader off, the plan never learned a baseline either.
         print(
             f"{PROG}: --profile-memory-feedback: --no-profile-feedback disables the profile-store "
             "reader, so no estimate is derived and every authored hint is used as written",
@@ -1022,11 +1030,11 @@ def _apply_memory_feedback(
             f"identity under {feedback_dir}; every authored hint is retained",
             file=sys.stderr,
         )
-        return cfg
+        return apply_memory_admissions(cfg, {}, baselines)
     tags = {step.tag for step in cfg.steps}
     for tag in sorted(tags & admissions.keys()):
         print(_memory_admission_line(admissions[tag]), file=sys.stderr)
-    return apply_memory_admissions(cfg, admissions)
+    return apply_memory_admissions(cfg, admissions, baselines)
 
 
 def _memory_admission_line(admission: MemoryAdmission) -> str:
@@ -2714,11 +2722,14 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
         if core_reservation is not None:
             core_reservation.release()
         return 2
+    authored = cfg
     cfg = cap_config_max_cpus(apply_plan_to_config(cfg, plan), max_cpus)
     # Censoring-aware memory feedback (opt-in), applied AFTER the ordinary plan so it has the last
-    # word on rss_baseline_bytes and BEFORE the memory-aware --max-steps sizing that reads it.
+    # word on rss_baseline_bytes and BEFORE the memory-aware --max-steps sizing that reads it. It
+    # is handed the PRE-plan config as well, so a step it declines to estimate goes back to its
+    # authored baseline instead of keeping the censoring-blind one the plan just wrote.
     cfg = _apply_memory_feedback(
-        cfg, feedback_dir, bool(getattr(ns, "profile_memory_feedback", False))
+        cfg, authored, feedback_dir, bool(getattr(ns, "profile_memory_feedback", False))
     )
     # Compatibility flag: the SMALL forcing-function caps are already active by default. Reassert
     # the same values so older callers keep working and announce that the flag is now redundant.

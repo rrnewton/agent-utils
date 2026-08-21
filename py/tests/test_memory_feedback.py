@@ -16,13 +16,14 @@ import pytest
 
 from safe_ci_dag_runner.memory_feedback import (
     DEFAULT_MARGIN_PCT,
+    DEFAULT_MIN_UNCENSORED_SAMPLES,
     Censoring,
     apply_memory_admissions,
     load_memory_admissions,
     memory_admission_from_rows,
     peak_observation_from_row,
 )
-from safe_ci_dag_runner.model import DagConfig, ResourceHint, Step
+from safe_ci_dag_runner.model import DagConfig, IntentionalSkipReason, ResourceHint, Step
 
 GIB = 1024**3
 
@@ -136,6 +137,55 @@ def test_an_unbounded_step_that_never_reclaimed_is_a_real_observation() -> None:
     assert observed.verdict is Censoring.UNCENSORED
 
 
+@pytest.mark.parametrize(
+    ("why", "cells"),
+    [
+        ("killed by a signal (137 == SIGKILL)", {"returncode": "137"}),
+        ("ordinary non-zero exit", {"returncode": "2"}),
+        ("ok recorded false", {"ok": "false"}),
+        ("ok recorded False", {"ok": "False"}),
+    ],
+)
+def test_a_row_that_records_a_failed_step_is_censored(why: str, cells: dict[str, str]) -> None:
+    """A peak measured by a run that DIED is the least trustworthy sample in the store.
+
+    ``returncode`` 137 is SIGKILL, which is exactly what an OOM kill delivered by an ANCESTOR
+    cgroup looks like from here: this step's own ``memory.events`` counters are all zero and the
+    peak sits comfortably under its own cap, so nothing else in the row gives the failure away.
+    """
+    observed = peak_observation_from_row(_row(**cells))
+
+    assert observed.run_failed, why
+    assert observed.verdict is Censoring.CENSORED, why
+
+
+def test_a_row_that_says_nothing_about_the_verdict_is_not_treated_as_a_failure() -> None:
+    """Silence is not failure: a store carrying no verdict columns is still usable evidence."""
+    assert not peak_observation_from_row(_row()).run_failed
+    assert peak_observation_from_row(_row()).verdict is Censoring.UNCENSORED
+    passed = peak_observation_from_row(_row(ok="true", returncode="0"))
+    assert not passed.run_failed
+    assert passed.verdict is Censoring.UNCENSORED
+
+
+def test_a_step_whose_recorded_runs_all_failed_keeps_the_authored_hint() -> None:
+    """Six runs killed at ~1 GiB by something outside this cgroup must not license a 1.2 GiB cap.
+
+    That is the exact ratchet-down this path exists to prevent, and the reason must not blame an
+    applied cap these peaks never came near.
+    """
+    rows = [_row(peak=str(GIB), cap=str(8 * GIB), returncode="137", ok="false") for _ in range(6)]
+
+    admission = memory_admission_from_rows(rows)["g.build"]
+
+    assert admission.source == "hint"
+    assert admission.rss_baseline_bytes is None
+    assert admission.uncensored_samples == 0
+    assert admission.censored_samples == 6
+    assert "6 sample(s) recorded a step that FAILED, counted as censored" in admission.reason
+    assert "by its applied cap" not in admission.reason
+
+
 def test_the_legacy_oom_column_still_censors_when_the_event_counter_is_absent() -> None:
     """A store written before the event counters existed still records ``oom_kills``."""
     row = _row(peak=str(8 * GIB), oom="")
@@ -171,6 +221,30 @@ def test_the_default_margin_is_twenty_percent() -> None:
     assert DEFAULT_MARGIN_PCT == 20
 
 
+def test_the_default_minimum_uncensored_sample_count_is_five() -> None:
+    """The shipped default, named LITERALLY, for the same reason the margin is.
+
+    Every other test here either passes a threshold in explicitly or supplies six samples, so
+    nothing else would notice the shipped number changing. The user guide, the commit body and
+    the report all state five; this is where that claim is enforced.
+    """
+    assert DEFAULT_MIN_UNCENSORED_SAMPLES == 5
+
+
+def test_the_shipped_default_threshold_refuses_four_samples_and_accepts_five() -> None:
+    """The constant is a number until something reads it.
+
+    Neither call passes a threshold, so both exercise whatever the build ships, and the boundary
+    either side of it is named literally: moving the constant off 5 flips one of these verdicts.
+    """
+    four = memory_admission_from_rows([_row(peak=str(GIB)) for _ in range(4)])["g.build"]
+    five = memory_admission_from_rows([_row(peak=str(GIB)) for _ in range(5)])["g.build"]
+
+    assert four.source == "hint"
+    assert "only 4 uncensored sample(s); 5 required" in four.reason
+    assert five.source == "profile"
+
+
 def test_the_estimate_never_falls_below_the_largest_censored_peak() -> None:
     """A censored peak proves demand was AT LEAST that large, so it can only raise the cap.
 
@@ -192,7 +266,12 @@ def test_the_estimate_never_falls_below_the_largest_censored_peak() -> None:
 
 
 def test_the_estimate_never_falls_below_the_largest_uncensored_peak() -> None:
-    """The percentile can sit under the maximum; the maximum is a thing that really happened."""
+    """The percentile can sit under the maximum; the maximum is a thing that really happened.
+
+    Nine 1 GiB samples and one 6 GiB sample: n=10, so the 9/10 nearest-rank percentile is the
+    9th smallest (1073741824 B) and +20% is 1288490188 B — under the 6442450944 B this step
+    really used. The floor, not the percentile, must decide, and the number is named literally.
+    """
     rows = [_row(peak=str(GIB)) for _ in range(9)]
     rows.append(_row(peak=str(6 * GIB)))
 
@@ -201,6 +280,7 @@ def test_the_estimate_never_falls_below_the_largest_uncensored_peak() -> None:
     assert admission.observed_peak_bytes == 6 * GIB
     assert admission.rss_baseline_bytes is not None
     assert admission.rss_baseline_bytes >= 6 * GIB
+    assert admission.rss_baseline_bytes == 6442450944
 
 
 def test_every_peak_censored_keeps_the_static_hint_and_says_so() -> None:
@@ -278,6 +358,53 @@ def test_only_a_profile_backed_admission_replaces_the_authored_hint() -> None:
     assert by_tag["g.learned"].hint.rss_baseline_bytes == admissions["g.learned"].rss_baseline_bytes
     assert by_tag["g.censored"].hint.rss_baseline_bytes == 99
     assert by_tag["g.absent"].hint.rss_baseline_bytes == 99
+
+
+def test_a_declined_step_is_restored_to_the_baseline_its_author_wrote() -> None:
+    """The DeepScry case at the seam where it actually bites.
+
+    By the time this runs, the ordinary censoring-BLIND plan feedback has already replaced the
+    authored 42949672960 B hint with 8589934592 B — the very censored peak this module refuses to
+    learn from. Declining has to UNDO that, or turning the flag on leaves the unsafe number in
+    place under the words "keeping the authored hint".
+    """
+    rows = [_row("g.pinned", peak=str(8 * GIB), cap=str(8 * GIB)) for _ in range(6)]
+    admissions = memory_admission_from_rows(rows)
+    assert admissions["g.pinned"].source == "hint"
+    planned = Step("g", "pinned", "", "true", timeout=1234,
+                   hint=ResourceHint(rss_baseline_bytes=8 * GIB))
+
+    applied = apply_memory_admissions(
+        _cfg(planned), admissions, {"g.pinned": 42949672960}
+    )
+
+    assert applied.steps[0].hint.rss_baseline_bytes == 42949672960
+    # Clone-and-override: nothing else moves.
+    assert applied.steps[0].timeout == 1234
+
+
+def test_a_step_with_no_authored_baseline_at_all_is_restored_to_none() -> None:
+    """The same undo when the author wrote nothing: the plan's learned number must not survive as
+    a hint the author never gave."""
+    rows = [_row("g.pinned", peak=str(8 * GIB), cap=str(8 * GIB)) for _ in range(6)]
+    planned = _step("g.pinned", rss=8 * GIB)
+
+    applied = apply_memory_admissions(
+        _cfg(planned), memory_admission_from_rows(rows), {"g.pinned": None}
+    )
+
+    assert applied.steps[0].hint.rss_baseline_bytes is None
+
+
+def test_a_skipped_step_is_left_alone_even_when_the_authored_baseline_is_known() -> None:
+    """A skip is not a licence to rewrite authored hints in either direction."""
+    planned = Step("g", "pinned", "", "true",
+                   hint=ResourceHint(rss_baseline_bytes=8 * GIB),
+                   skip_reason=IntentionalSkipReason.EMPTY_MANIFEST_BUCKET)
+
+    applied = apply_memory_admissions(_cfg(planned), {}, {"g.pinned": 42949672960})
+
+    assert applied.steps[0].hint.rss_baseline_bytes == 8 * GIB
 
 
 def test_an_explicit_hard_cap_is_never_rewritten_by_the_profile_path() -> None:
@@ -445,6 +572,50 @@ def test_the_derived_baseline_reaches_max_mem_admission(tmp_path: Path) -> None:
     assert "worst-case 26843545600 bytes" in off_err, off_err
     assert "rss_baseline_bytes=25769803776" in on_err, on_err
     assert "worst-case 32212254720 bytes" in on_err, on_err
+
+
+def test_a_censored_peak_cannot_reach_max_mem_admission_once_the_flag_is_on(
+    tmp_path: Path,
+) -> None:
+    """Turning the flag ON must STOP the runner learning a cap from censored peaks.
+
+    One step, six recorded runs, every one of them pinned to its 8589934592 B cap: the
+    all-censored history this whole path exists for. The DAG authors 42949672960 B.
+
+    * Without the flag the ordinary, censoring-blind feedback takes those peaks at face value and
+      ``--max-mem`` models a worst case of 10737418240 B — a cap derived from the cap.
+    * With the flag the step is DECLINED, and a decline has to mean the authored 42949672960 B is
+      what admission sees: worst case 53687091200 B.
+
+    Both numbers are named literally. Reporting "keeping the authored hint" while the censored
+    estimate stayed in the config would leave the second equal to the first.
+    """
+    machine, container = "synthhost", "affinity4_cpu-max-max"
+    store = tmp_path / "store"
+    store.mkdir()
+    _write_store(store, machine, container,
+                 [_row("g.pinned", peak="8589934592", cap="8589934592") for _ in range(6)])
+    dag = tmp_path / "dag.json"
+    dag.write_text(
+        '{"steps": [{"group": "g", "job": "pinned", "cmd": "true", "deps": [],'
+        ' "hint": {"rss_baseline_bytes": 42949672960}}]}',
+        encoding="utf-8",
+    )
+    env = {
+        "SAFE_CI_DAG_RUNNER_MACHINE_ID": machine,
+        "SAFE_CI_DAG_RUNNER_CONTAINER_CLASS": container,
+    }
+    common = ["run", "--dag", str(dag), "--perf-dir", str(store), "--no-profile",
+              "--unsafe-no-cgroups", "-q", "--max-mem", "400G"]
+
+    off_rc, _o1, off_err = _run_cli(common, env)
+    on_rc, _o2, on_err = _run_cli([*common, "--profile-memory-feedback"], env)
+
+    assert off_rc == 0, off_err
+    assert on_rc == 0, on_err
+    assert "worst-case 10737418240 bytes" in off_err, off_err
+    assert "g.pinned: keeping the authored hint" in on_err, on_err
+    assert "worst-case 53687091200 bytes" in on_err, on_err
 
 
 def test_asking_for_memory_feedback_with_reading_disabled_says_it_is_inert(

@@ -11,6 +11,9 @@
 //!
 //! * A censored sample never lowers anything. It is used only as a FLOOR — proof that demand was
 //!   at least that large — never as an estimate of the maximum.
+//! * A row that records a step which FAILED is censored too. A step that did not finish its work
+//!   stopped short of where it was going, and `returncode` 137 — SIGKILL — is exactly what an
+//!   ancestor-scope OOM kill looks like from inside this reader.
 //! * A sample whose censoring cannot be determined (no applied-cap column, no event counters, no
 //!   peak) is not evidence at all. It is counted and reported, and never moves the estimate.
 //! * With no uncensored evidence the static hint is retained, and the reason says how the evidence
@@ -75,6 +78,9 @@ pub struct PeakObservation {
     /// `memory.events` `oom`: times the OOM killer was invoked in the cgroup. A step can record
     /// this with `oom_kill == 0` (nothing reapable), and it is still a ceiling hit.
     pub oom_events: Option<i64>,
+    /// Whether the row records a step that FAILED — `ok` explicitly falsy or a non-zero
+    /// `returncode`. Such a peak is where the step got to before it died, not where it was going.
+    pub run_failed: bool,
     /// The verdict.
     pub verdict: Censoring,
 }
@@ -97,8 +103,9 @@ fn truthy(row: &HashMap<String, String>, name: &str) -> bool {
 /// `Unknown` whenever the row cannot answer, which is the safe direction: an unknown row is
 /// excluded from the estimate rather than assumed comfortable. `Censored` when ANY of the four
 /// pressure counters #34 records fired — `high`, `max`, `oom` or `oom_kill` — when a guard cut
-/// the step short, or when the peak reached the applied cap: a `>=` and not a `==`, because a cap
-/// the kernel rounded down to a page boundary still censors a peak sitting above it.
+/// the step short, when the row records a step that FAILED, or when the peak reached the applied
+/// cap: a `>=` and not a `==`, because a cap the kernel rounded down to a page boundary still
+/// censors a peak sitting above it.
 ///
 /// `memory_events_low` is deliberately NOT read: it counts reclaim that breached a `memory.low`
 /// PROTECTION, which sets a floor rather than a ceiling, so it does not bound the peak.
@@ -128,6 +135,7 @@ pub fn peak_observation_from_row(row: &HashMap<String, String>) -> PeakObservati
     let oom_kills = parse_int(oom_cell).filter(|v| *v >= 0);
     let throttle_events = parse_int(cell(row, "memory_events_high")).filter(|v| *v >= 0);
     let oom_events = parse_int(cell(row, "memory_events_oom")).filter(|v| *v >= 0);
+    let run_failed = row_records_failure(row);
     let verdict = verdict(
         peak_bytes,
         cap_known,
@@ -138,6 +146,7 @@ pub fn peak_observation_from_row(row: &HashMap<String, String>) -> PeakObservati
         throttle_events,
         oom_events,
         truthy(row, "timed_out") || truthy(row, "cpu_timed_out"),
+        run_failed,
     );
     PeakObservation {
         step,
@@ -149,8 +158,26 @@ pub fn peak_observation_from_row(row: &HashMap<String, String>) -> PeakObservati
         oom_kills,
         throttle_events,
         oom_events,
+        run_failed,
         verdict,
     }
+}
+
+/// Whether the row records a step that did NOT complete its work.
+///
+/// The same two EXPLICIT signals [`crate::estimates::row_is_measurement`] reads, and for the same
+/// reason: a blank or absent cell is silence, not a failure, so a store carrying no verdict
+/// columns is not condemned wholesale. `returncode` 137 is SIGKILL, which is what an OOM kill
+/// delivered by an ANCESTOR cgroup looks like from here — no counter in this step's own
+/// `memory.events` fired, and the peak is the least trustworthy sample in the store.
+fn row_records_failure(row: &HashMap<String, String>) -> bool {
+    if let Some(ok) = row.get("ok") {
+        let ok = ok.trim().to_ascii_lowercase();
+        if !ok.is_empty() && !matches!(ok.as_str(), "true" | "1" | "yes") {
+            return true;
+        }
+    }
+    parse_int(cell(row, "returncode")).is_some_and(|rc| rc != 0)
 }
 
 // The classification rules, separated so they can be read and tested without a CSV row.
@@ -165,10 +192,18 @@ fn verdict(
     throttle_events: Option<i64>,
     oom_events: Option<i64>,
     timed_out: bool,
+    run_failed: bool,
 ) -> Censoring {
     let Some(peak) = peak_bytes else {
         return Censoring::Unknown;
     };
+    if run_failed {
+        // The step did not finish its work, so its peak is where it stopped and not where it was
+        // going — a lower bound, exactly like a ceiling hit. rc 137 is SIGKILL: an OOM kill from
+        // an ancestor cgroup leaves this step's own memory.events untouched and would otherwise
+        // read as a comfortable observation.
+        return Censoring::Censored;
+    }
     if oom_kills.is_some_and(|n| n > 0) {
         return Censoring::Censored;
     }
@@ -324,10 +359,19 @@ fn admission_for_step(
         .iter()
         .filter(|o| o.verdict == Censoring::Unknown)
         .count();
+    let failed = observations
+        .iter()
+        .filter(|o| o.verdict == Censoring::Censored && o.run_failed)
+        .count();
     let floor = censored.iter().copied().max();
     let observed = uncensored.iter().copied().max();
     let sha_note = if dropped_by_sha > 0 {
         format!("; {dropped_by_sha} sample(s) excluded as recorded against another source revision")
+    } else {
+        String::new()
+    };
+    let failed_note = if failed > 0 {
+        format!("; {failed} sample(s) recorded a step that FAILED, counted as censored")
     } else {
         String::new()
     };
@@ -347,7 +391,14 @@ fn admission_for_step(
         observed_peak_bytes: observed,
     };
     if uncensored.is_empty() {
-        let why = if !censored.is_empty() && unknown == 0 {
+        let why = if !censored.is_empty() && unknown == 0 && failed > 0 {
+            // Do not blame the applied cap for a peak that a failed run cut short; `failed_note`
+            // says how many, and the two causes call for different operator responses.
+            format!(
+                "every one of {} recorded peak(s) was censored",
+                censored.len()
+            )
+        } else if !censored.is_empty() && unknown == 0 {
             format!(
                 "every one of {} recorded peak(s) was censored by its applied cap",
                 censored.len()
@@ -365,12 +416,12 @@ fn admission_for_step(
         } else {
             "no recorded peaks for this step".to_string()
         };
-        admission.reason = format!("{why}{sha_note}");
+        admission.reason = format!("{why}{failed_note}{sha_note}");
         return admission;
     }
     if uncensored.len() < min_uncensored_samples {
         admission.reason = format!(
-            "only {} uncensored sample(s); {min_uncensored_samples} required{sha_note}",
+            "only {} uncensored sample(s); {min_uncensored_samples} required{failed_note}{sha_note}",
             uncensored.len()
         );
         return admission;
@@ -398,7 +449,7 @@ fn admission_for_step(
     }
     admission.rss_baseline_bytes = Some(estimate);
     admission.source = "profile".to_string();
-    admission.reason = format!("{detail}{sha_note}");
+    admission.reason = format!("{detail}{failed_note}{sha_note}");
     admission
 }
 
@@ -432,26 +483,47 @@ pub fn load_memory_admissions(
 /// explicit hard cap is the caller's instruction and this path does not reinterpret it. An
 /// intentionally skipped step is left alone, for the same reason
 /// [`crate::estimates::apply_plan_to_config`] leaves it alone.
+///
+/// `authored_baselines` maps a step tag to the `rss_baseline_bytes` its AUTHOR wrote, before any
+/// planner feedback touched it, and it is what makes a DECLINE mean something. `cfg` here has
+/// normally already been through [`crate::estimates::apply_plan_to_config`], whose feedback learns
+/// from the same recorded peaks WITHOUT asking whether a cap was clamping them. Without this
+/// mapping, every step this module declines to estimate would silently keep that censoring-blind
+/// number while the report said "keeping the authored hint" — the unsafe estimate surviving under
+/// the name of the safe one. So a declined step is RESTORED to its authored baseline: a decline
+/// means no learned estimate at all, not a fall-back to the other one.
 pub fn apply_memory_admissions(
     cfg: &DagConfig,
     admissions: &BTreeMap<String, MemoryAdmission>,
+    authored_baselines: Option<&BTreeMap<String, Option<i64>>>,
 ) -> DagConfig {
     let steps: Vec<Step> = cfg
         .steps
         .iter()
         .map(|step| {
-            let tag = step.tag();
-            let Some(admission) = admissions.get(&tag) else {
-                return step.clone();
-            };
-            if admission.source != "profile" || step.skip_reason.is_some() {
+            if step.skip_reason.is_some() {
                 return step.clone();
             }
-            let Some(bytes) = admission.rss_baseline_bytes else {
-                return step.clone();
+            let tag = step.tag();
+            let learned = admissions.get(&tag).and_then(|admission| {
+                if admission.source == "profile" {
+                    admission.rss_baseline_bytes
+                } else {
+                    None
+                }
+            });
+            let baseline = match learned {
+                Some(bytes) => Some(bytes),
+                None => match authored_baselines.and_then(|m| m.get(&tag)) {
+                    Some(authored) => *authored,
+                    None => return step.clone(),
+                },
             };
+            if baseline == step.hint.rss_baseline_bytes {
+                return step.clone();
+            }
             let mut out = step.clone();
-            out.hint.rss_baseline_bytes = Some(bytes);
+            out.hint.rss_baseline_bytes = baseline;
             out
         })
         .collect();
@@ -678,6 +750,122 @@ mod tests {
     }
 
     #[test]
+    fn the_default_minimum_uncensored_sample_count_is_five() {
+        // The shipped default, named LITERALLY, for the same reason the margin is: every other
+        // test in this module passes the threshold in explicitly or supplies six samples, so
+        // nothing else would notice the shipped number changing. The user guide, the commit body
+        // and the report all state five; this is where that claim is enforced.
+        assert_eq!(DEFAULT_MIN_UNCENSORED_SAMPLES, 5);
+    }
+
+    #[test]
+    fn the_shipped_default_threshold_refuses_four_samples_and_accepts_five() {
+        // The constant is a number until something reads it. Both calls pass the SHIPPED default
+        // — as the CLI does — while the boundary either side of it is named literally, so moving
+        // the constant to anything but 5 flips one of the two verdicts below.
+        let four: Vec<_> = (0..4).map(|_| row(&[])).collect();
+        let five: Vec<_> = (0..5).map(|_| row(&[])).collect();
+        let refused = memory_admission_from_rows(
+            &four,
+            DEFAULT_MIN_UNCENSORED_SAMPLES,
+            DEFAULT_MARGIN_PCT,
+            None,
+        );
+        let accepted = memory_admission_from_rows(
+            &five,
+            DEFAULT_MIN_UNCENSORED_SAMPLES,
+            DEFAULT_MARGIN_PCT,
+            None,
+        );
+        assert_eq!(refused["g.build"].source, "hint");
+        assert!(
+            refused["g.build"]
+                .reason
+                .contains("only 4 uncensored sample(s); 5 required"),
+            "{}",
+            refused["g.build"].reason
+        );
+        assert_eq!(accepted["g.build"].source, "profile");
+    }
+
+    #[test]
+    fn a_row_that_records_a_failed_step_is_censored() {
+        // A peak measured by a run that DIED is the least trustworthy sample in the store, and
+        // rc 137 is SIGKILL — what an ancestor-scope OOM kill looks like from here, with this
+        // step's own memory.events all zero. Every row below is otherwise pristine: 1 GiB under
+        // an 8 GiB cap with no counter set.
+        for (why, pairs) in [
+            (
+                "killed by a signal (137 == SIGKILL)",
+                vec![("returncode", "137")],
+            ),
+            ("ordinary non-zero exit", vec![("returncode", "2")]),
+            ("ok recorded false", vec![("ok", "false")]),
+            ("ok recorded False", vec![("ok", "False")]),
+        ] {
+            let observed = peak_observation_from_row(&row(&pairs));
+            assert!(observed.run_failed, "{why}");
+            assert_eq!(observed.verdict, Censoring::Censored, "{why}");
+        }
+        // Silence is not failure: a store with no verdict columns is still usable.
+        assert!(!peak_observation_from_row(&row(&[])).run_failed);
+        assert_eq!(
+            peak_observation_from_row(&row(&[("ok", "true"), ("returncode", "0")])).verdict,
+            Censoring::Uncensored,
+        );
+    }
+
+    #[test]
+    fn a_step_whose_recorded_runs_all_failed_keeps_the_authored_hint() {
+        // Six runs killed at ~1 GiB by something outside this cgroup must not license a 1.2 GiB
+        // learned cap: that is the ratchet-down this path exists to prevent.
+        let rows: Vec<_> = (0..6)
+            .map(|_| row(&[("returncode", "137"), ("ok", "false")]))
+            .collect();
+        let admissions = memory_admission_from_rows(
+            &rows,
+            DEFAULT_MIN_UNCENSORED_SAMPLES,
+            DEFAULT_MARGIN_PCT,
+            None,
+        );
+        let a = &admissions["g.build"];
+        assert_eq!(a.source, "hint");
+        assert_eq!(a.rss_baseline_bytes, None);
+        assert_eq!(a.uncensored_samples, 0);
+        assert_eq!(a.censored_samples, 6);
+        assert!(
+            a.reason
+                .contains("6 sample(s) recorded a step that FAILED, counted as censored"),
+            "{}",
+            a.reason
+        );
+        // And it does not blame the applied cap, which these peaks never came near.
+        assert!(!a.reason.contains("by its applied cap"), "{}", a.reason);
+    }
+
+    #[test]
+    fn the_estimate_never_falls_below_the_largest_uncensored_peak() {
+        // The percentile can sit under the maximum; the maximum is a thing that really happened.
+        // Nine 1 GiB samples and one 6 GiB sample: n=10, so the 9/10 nearest-rank percentile is
+        // the 9th smallest = 1073741824 B, and +20% is 1288490188 B — under the 6442450944 B this
+        // step really used. The floor, not the percentile, must decide, and the expected number is
+        // written out literally so that removing the floor cannot leave this green.
+        let mut rows: Vec<_> = (0..9).map(|_| row(&[])).collect();
+        rows.push(row(&[("peak_bytes", "6442450944")]));
+        let admissions = memory_admission_from_rows(
+            &rows,
+            DEFAULT_MIN_UNCENSORED_SAMPLES,
+            DEFAULT_MARGIN_PCT,
+            None,
+        );
+        let a = &admissions["g.build"];
+        assert_eq!(a.uncensored_samples, 10);
+        assert_eq!(a.censored_samples, 0);
+        assert_eq!(a.observed_peak_bytes, Some(6442450944));
+        assert_eq!(a.rss_baseline_bytes, Some(6442450944));
+    }
+
+    #[test]
     fn the_estimate_never_falls_below_the_largest_censored_peak() {
         // Five quiet 1 GiB samples would justify 1.2 GiB. One sample that hit an 8 GiB ceiling
         // says the step has wanted 8 GiB at least once, so 1.2 GiB is a number it has exceeded.
@@ -803,7 +991,7 @@ mod tests {
         step.timeout = 1234;
         let cfg = cfg_of(vec![step]);
 
-        let applied = apply_memory_admissions(&cfg, &admissions);
+        let applied = apply_memory_admissions(&cfg, &admissions, None);
 
         let out = &applied.steps[0];
         assert_eq!(out.hint.hard_mem_max_bytes, Some(5 * GIB));
@@ -830,13 +1018,87 @@ mod tests {
         pinned.hint.rss_baseline_bytes = Some(99);
         let cfg = cfg_of(vec![learned, pinned]);
 
-        let applied = apply_memory_admissions(&cfg, &admissions);
+        let applied = apply_memory_admissions(&cfg, &admissions, None);
 
         assert_eq!(
             applied.steps[0].hint.rss_baseline_bytes,
             admissions["g.learned"].rss_baseline_bytes
         );
         assert_eq!(applied.steps[1].hint.rss_baseline_bytes, Some(99));
+    }
+
+    #[test]
+    fn a_declined_step_is_restored_to_the_baseline_its_author_wrote() {
+        // The DeepScry case, at the seam where it actually bites. By the time this runs, the
+        // ordinary censoring-BLIND plan feedback has already replaced the authored 40 GiB hint
+        // with 8589934592 B — the very censored peak this module refuses to learn from. Declining
+        // has to UNDO that, or turning the flag on leaves the unsafe number in place under the
+        // words "keeping the authored hint".
+        let rows: Vec<_> = (0..6)
+            .map(|_| row(&[("step", "g.pinned"), ("peak_bytes", "8589934592")]))
+            .collect();
+        let admissions = memory_admission_from_rows(
+            &rows,
+            DEFAULT_MIN_UNCENSORED_SAMPLES,
+            DEFAULT_MARGIN_PCT,
+            None,
+        );
+        assert_eq!(admissions["g.pinned"].source, "hint");
+        let mut planned = mk("pinned");
+        planned.hint.rss_baseline_bytes = Some(8589934592);
+        planned.timeout = 1234;
+        let authored: BTreeMap<String, Option<i64>> = [("g.pinned".to_string(), Some(42949672960))]
+            .into_iter()
+            .collect();
+
+        let applied = apply_memory_admissions(&cfg_of(vec![planned]), &admissions, Some(&authored));
+
+        assert_eq!(
+            applied.steps[0].hint.rss_baseline_bytes,
+            Some(42949672960),
+            "a decline must mean no estimate, not the censoring-blind one"
+        );
+        // Clone-and-override: nothing else moves.
+        assert_eq!(applied.steps[0].timeout, 1234);
+    }
+
+    #[test]
+    fn a_step_with_no_authored_baseline_at_all_is_restored_to_none() {
+        // The same undo when the author wrote nothing: the plan's learned number must not survive
+        // as a hint the author never gave.
+        let rows: Vec<_> = (0..6)
+            .map(|_| row(&[("step", "g.pinned"), ("peak_bytes", "8589934592")]))
+            .collect();
+        let admissions = memory_admission_from_rows(
+            &rows,
+            DEFAULT_MIN_UNCENSORED_SAMPLES,
+            DEFAULT_MARGIN_PCT,
+            None,
+        );
+        let mut planned = mk("pinned");
+        planned.hint.rss_baseline_bytes = Some(8589934592);
+        let authored: BTreeMap<String, Option<i64>> =
+            [("g.pinned".to_string(), None)].into_iter().collect();
+
+        let applied = apply_memory_admissions(&cfg_of(vec![planned]), &admissions, Some(&authored));
+
+        assert_eq!(applied.steps[0].hint.rss_baseline_bytes, None);
+    }
+
+    #[test]
+    fn a_skipped_step_is_left_alone_even_when_the_authored_baseline_is_known() {
+        // A skip is not a licence to rewrite authored hints in either direction.
+        let mut planned = mk("pinned");
+        planned.hint.rss_baseline_bytes = Some(8589934592);
+        planned.skip_reason = Some(crate::model::IntentionalSkipReason::EmptyManifestBucket);
+        let authored: BTreeMap<String, Option<i64>> = [("g.pinned".to_string(), Some(42949672960))]
+            .into_iter()
+            .collect();
+
+        let applied =
+            apply_memory_admissions(&cfg_of(vec![planned]), &BTreeMap::new(), Some(&authored));
+
+        assert_eq!(applied.steps[0].hint.rss_baseline_bytes, Some(8589934592));
     }
 
     #[test]
@@ -856,7 +1118,7 @@ mod tests {
         step.hint.rss_baseline_bytes = Some(7 * GIB);
         let cfg = cfg_of(vec![step]);
         assert_eq!(
-            apply_memory_admissions(&cfg, &admissions).steps[0]
+            apply_memory_admissions(&cfg, &admissions, None).steps[0]
                 .hint
                 .rss_baseline_bytes,
             Some(7 * GIB)

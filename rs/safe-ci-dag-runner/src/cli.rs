@@ -1588,15 +1588,31 @@ fn validate_planner(value: String) -> Result<String, String> {
 // move and why, because otherwise "the cap did not change" and "the store had nothing usable to
 // say" look identical from the outside.
 //
+// `cfg` is the config the ordinary plan has ALREADY been applied to and `authored` is the same
+// config before that, which is what lets a decline mean "no learned estimate" rather than "fall
+// back to the censoring-blind one": every step this path does not estimate is restored to the
+// baseline its author wrote.
+//
 // `--no-profile-feedback` turns the store reader off entirely, which makes this flag a no-op.
 // That combination is legal but empty, and it is announced rather than obeyed in silence: a
 // caller who asked for a learned cap by name and got the authored one has been told something
 // untrue by omission.
-fn apply_memory_feedback(cfg: &DagConfig, feedback_dir: Option<&str>, enabled: bool) -> DagConfig {
+fn apply_memory_feedback(
+    cfg: &DagConfig,
+    authored: &DagConfig,
+    feedback_dir: Option<&str>,
+    enabled: bool,
+) -> DagConfig {
     if !enabled {
         return cfg.clone();
     }
+    let baselines: BTreeMap<String, Option<i64>> = authored
+        .steps
+        .iter()
+        .map(|s| (s.tag(), s.hint.rss_baseline_bytes))
+        .collect();
     let Some(dir) = feedback_dir else {
+        // Nothing to undo: with the reader off, the plan never learned a baseline either.
         eprintln!(
             "{PROG}: --profile-memory-feedback: --no-profile-feedback disables the profile-store \
              reader, so no estimate is derived and every authored hint is used as written"
@@ -1616,7 +1632,7 @@ fn apply_memory_feedback(cfg: &DagConfig, feedback_dir: Option<&str>, enabled: b
             "{PROG}: --profile-memory-feedback: no profile store for this machine/container \
              identity under {dir}; every authored hint is retained"
         );
-        return cfg.clone();
+        return apply_memory_admissions(cfg, &BTreeMap::new(), Some(&baselines));
     }
     let tags: std::collections::BTreeSet<String> = cfg.steps.iter().map(|s| s.tag()).collect();
     for tag in &tags {
@@ -1624,7 +1640,7 @@ fn apply_memory_feedback(cfg: &DagConfig, feedback_dir: Option<&str>, enabled: b
             eprintln!("{}", memory_admission_line(PROG, admission));
         }
     }
-    apply_memory_admissions(cfg, &admissions)
+    apply_memory_admissions(cfg, &admissions, Some(&baselines))
 }
 
 // The directory the plan-time FEEDBACK reader loads the profile store from, or `None` when
@@ -2921,8 +2937,15 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
     }
     let mut applied = cap_config_max_cpus(&apply_plan_to_config(cfg, &plan), max_cpus);
     // Censoring-aware memory feedback (opt-in), applied AFTER the ordinary plan so it has the last
-    // word on rss_baseline_bytes and BEFORE the memory-aware --max-steps sizing that reads it.
-    applied = apply_memory_feedback(&applied, feedback_dir.as_deref(), a.profile_memory_feedback);
+    // word on rss_baseline_bytes and BEFORE the memory-aware --max-steps sizing that reads it. It
+    // is handed the PRE-plan config as well, so a step it declines to estimate goes back to its
+    // authored baseline instead of keeping the censoring-blind one the plan just wrote.
+    applied = apply_memory_feedback(
+        &applied,
+        cfg,
+        feedback_dir.as_deref(),
+        a.profile_memory_feedback,
+    );
     // Compatibility flag: the SMALL forcing-function caps are already active by default. Reassert
     // the same values so older callers keep working and announce that the flag is now redundant.
     if a.small_default_cap {
