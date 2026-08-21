@@ -29,10 +29,11 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufReader, Read};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::panic::AssertUnwindSafe;
 use std::process::ExitStatus;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -187,6 +188,13 @@ struct Shared {
     /// Child processes currently alive, and the largest count observed during this run.
     active_processes: usize,
     max_concurrent_steps: usize,
+    /// Tags whose child lifetime is counted into `active_processes` and still awaiting its
+    /// matching uncount. A supervisor that dies between the two would otherwise leave the count
+    /// permanently inflated, and `max_concurrent_steps` is a max over it.
+    counted_processes: HashSet<String>,
+    /// Tags whose admission-time accounting (named resources, running/pids/nonces) has already
+    /// been handed back. See [`retire`].
+    retired: HashSet<String>,
 }
 
 /// Signal a process group without consulting `PATH`.
@@ -726,6 +734,198 @@ fn release(sh: &mut Shared, step: &Step) {
     }
 }
 
+/// Lock the shared scheduler state, RECOVERING from poisoning rather than panicking again.
+///
+/// A supervisor thread that panics while holding this lock poisons it, and every other
+/// `lock().unwrap()` in the run then panics too. That buries the ORIGINAL cause under a cascade of
+/// secondary panics in threads that did nothing wrong, and takes the run down with no attributable
+/// reason -- the unattributable, wedge-shaped failure #80 runner-supervisor-crash-loud exists to
+/// eliminate. The state behind this lock is a set of maps and counters with no cross-field
+/// invariant that a mid-update panic can leave unrecoverably half-applied (and the once-only
+/// [`retire`] guard is precisely what keeps the accounting consistent across such a panic), so
+/// continuing with the data as it stands is strictly better than a cascade.
+fn lock_shared(shared: &Mutex<Shared>) -> MutexGuard<'_, Shared> {
+    shared
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Stop counting `tag`'s child toward `active_processes`, AT MOST ONCE.
+///
+/// Idempotent for the same reason [`retire`] is: the normal path uncounts as soon as the child is
+/// reaped, well before the step retires, so a supervisor that dies in between must be able to
+/// uncount without double-counting a step that already did.
+fn uncount_process(sh: &mut Shared, tag: &str) {
+    if sh.counted_processes.remove(tag) {
+        sh.active_processes = sh.active_processes.saturating_sub(1);
+    }
+}
+
+/// Hand back everything `step`'s admission took, EXACTLY ONCE. Returns whether this call did it.
+///
+/// Every release site -- spawn failure, normal completion, and the supervisor-panic paths added
+/// for #80 runner-supervisor-crash-loud -- gives back the same named-resource counts, and a panic
+/// landing AFTER a normal release would otherwise release a second time. That drifts
+/// `resource_avail` ABOVE its declared cap, which is worse than the leak it resembles: the cap
+/// silently stops being a cap and the next run's over-admission has no visible cause.
+fn retire(sh: &mut Shared, step: &Step) -> bool {
+    let tag = step.tag();
+    if !sh.retired.insert(tag.clone()) {
+        return false;
+    }
+    sh.running.remove(&tag);
+    sh.running_pids.remove(&tag);
+    sh.running_nonces.remove(&tag);
+    uncount_process(sh, &tag);
+    release(sh, step);
+    true
+}
+
+/// Record the run as failed and, unless `keep_going`, cut every in-flight peer short.
+///
+/// Shared by the ordinary step-failure path, the spawn-failure path and the supervisor-panic
+/// paths so all three cancel peers identically.
+fn trip_fail_fast(sh: &mut Shared, cgroups: &BoxedCgroups, keep_going: bool) {
+    sh.failed = true;
+    if keep_going {
+        return;
+    }
+    sh.stop = true;
+    let admitted: Vec<String> = sh.running.iter().cloned().collect();
+    for other in admitted {
+        sh.aborted.insert(other);
+    }
+    let others: Vec<(String, u32, Option<String>)> = sh
+        .running_pids
+        .iter()
+        .map(|(k, v)| (k.clone(), *v, sh.running_nonces.get(k).cloned()))
+        .collect();
+    reap_many(cgroups, &others);
+}
+
+/// Give a step whose supervisor died a TERMINAL outcome, so the run can finish.
+///
+/// Returns `true` when this call published the outcome, `false` when the step already had one (a
+/// panic in the reporting tail, after `done` was written, is a real bug but not a wedge: the run
+/// can still terminate and must not be told the step failed twice).
+struct SupervisorFailure {
+    /// The step's `reason`, which MUST name the cause; "something went wrong" is the state this
+    /// whole guard exists to eliminate.
+    reason: String,
+    summary: String,
+    elapsed_s: f64,
+}
+
+fn publish_supervisor_failure(
+    shared: &Mutex<Shared>,
+    cgroups: &BoxedCgroups,
+    evidence: &Option<Arc<RunEvidence>>,
+    step: &Step,
+    keep_going: bool,
+    failure: SupervisorFailure,
+) -> bool {
+    let SupervisorFailure {
+        reason,
+        summary,
+        elapsed_s,
+    } = failure;
+    let tag = step.tag();
+    {
+        let mut sh = lock_shared(shared);
+        if sh.done.contains_key(&tag) {
+            return false;
+        }
+        retire(&mut sh, step);
+        sh.done.insert(
+            tag.clone(),
+            StepOutcome {
+                tag: tag.clone(),
+                ok: false,
+                duration_s: elapsed_s,
+                summary,
+                executed_tests: None,
+                filtered_tests: None,
+                returncode: None,
+                reason,
+                aborted: false,
+            },
+        );
+        trip_fail_fast(&mut sh, cgroups, keep_going);
+    }
+    if let Some(e) = evidence {
+        e.record(
+            "supervisor_crash",
+            &[("step", tag), ("elapsed_s", format!("{elapsed_s:.3}"))],
+        );
+    }
+    true
+}
+
+/// Render a `catch_unwind` payload as text. A panic whose cause is not NAMED is barely better
+/// than the silence this guard replaced.
+fn panic_detail(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "a panic payload of an unprintable type".to_string()
+    }
+}
+
+/// Everything the panic-recovery path needs after the supervisor's own context is gone.
+struct SupervisorRecovery {
+    step: Step,
+    shared: Arc<Mutex<Shared>>,
+    cgroups: BoxedCgroups,
+    evidence: Option<Arc<RunEvidence>>,
+    keep_going: bool,
+}
+
+/// Run one supervisor `body`, converting ANY panic into a NAMED step failure.
+///
+/// LAYER ONE of the two guards behind #80 runner-supervisor-crash-loud. Before it existed,
+/// exactly one failure mode inside the supervisor was handled (`spawn` returning `Err`) and any
+/// other panic unwound off the worker thread: the tag stayed in `running` with nothing in `done`,
+/// so the ready-set loop could never reach its break condition. The run then produced no outcome,
+/// no exit and no attributable cause -- a wedge that looks exactly like work in progress, which
+/// is the worst thing this tool can do.
+///
+/// The panic is re-reported, never swallowed: the message goes to BOTH stdout (where the step's
+/// own output is) and stderr (where a CI system looks), and the step's `reason` NAMES it. The
+/// default panic hook has already printed the payload and its location by the time we get here.
+///
+/// `AssertUnwindSafe` is a judgement, not a shrug: the only state crossing the boundary is behind
+/// `Mutex<Shared>`, whose poisoning is recovered by [`lock_shared`] and whose accounting is made
+/// panic-safe by the once-only [`retire`].
+fn with_supervisor_guard<F: FnOnce()>(recovery: SupervisorRecovery, body: F) {
+    let start = Instant::now();
+    let Err(payload) = std::panic::catch_unwind(AssertUnwindSafe(body)) else {
+        return;
+    };
+    let tag = recovery.step.tag();
+    let detail = panic_detail(payload.as_ref());
+    let header = format!(
+        "[{tag}] \u{2717} SUPERVISOR CRASHED: the supervisor thread for this step panicked \
+         ({detail}). The step's own result is UNKNOWN; it is being reported as FAILED so the run \
+         cannot wedge. This is a runner bug, not a step failure."
+    );
+    emit(&header);
+    eprintln!("{header}");
+    publish_supervisor_failure(
+        &recovery.shared,
+        &recovery.cgroups,
+        &recovery.evidence,
+        &recovery.step,
+        recovery.keep_going,
+        SupervisorFailure {
+            reason: format!("SUPERVISOR CRASHED ({detail})"),
+            summary: detail,
+            elapsed_s: start.elapsed().as_secs_f64(),
+        },
+    );
+}
+
 /// Serialize one status line to stdout (each `println!` is atomic, so lines never interleave).
 fn emit(line: &str) {
     println!("{line}");
@@ -840,6 +1040,8 @@ impl Runner {
                 run_timed_out: false,
                 active_processes: 0,
                 max_concurrent_steps: 0,
+                counted_processes: HashSet::new(),
+                retired: HashSet::new(),
             })),
         }
     }
@@ -872,9 +1074,60 @@ impl Runner {
         sk
     }
 
+    /// Give an outcome to every supervisor thread that ENDED without publishing one.
+    ///
+    /// LAYER TWO of the two guards behind #80 runner-supervisor-crash-loud. Layer one -- the
+    /// `catch_unwind` around `run_step` -- cannot cover a failure of layer one itself (a panic
+    /// while reporting the first panic, or an abort-on-double-panic), and a wedge is not an
+    /// acceptable second-order failure mode.
+    ///
+    /// THE KEY IS (launched) AND (finished) AND (no terminal outcome), and deliberately NOT "the
+    /// tag is still in `running`". [`retire`] removes the tag from `running` BEFORE `done` is
+    /// written, so a supervisor that dies between those two lines is in NEITHER set. A
+    /// running-keyed sweep is blind to exactly that window -- which is the window a panic in the
+    /// outcome-construction code lands in. That distinction was found by mutation, not by
+    /// reasoning, and it is the detail most easily lost in a rewrite.
+    fn sweep_dead_supervisors(&self, handles: &[(thread::JoinHandle<()>, Step)]) {
+        let vanished: Vec<Step> = {
+            let sh = lock_shared(&self.shared);
+            handles
+                .iter()
+                .filter(|(h, step)| h.is_finished() && !sh.done.contains_key(&step.tag()))
+                .map(|(_, step)| step.clone())
+                .collect()
+        };
+        for step in vanished {
+            let tag = step.tag();
+            let published = publish_supervisor_failure(
+                &self.shared,
+                &self.cgroups,
+                &self.evidence,
+                &step,
+                self.keep_going,
+                SupervisorFailure {
+                    reason: "SUPERVISOR VANISHED (its thread ended without publishing an outcome \
+                             and without a recorded panic; the step's real result is UNKNOWN)"
+                        .to_string(),
+                    summary: "supervisor thread ended without publishing an outcome".to_string(),
+                    elapsed_s: 0.0,
+                },
+            );
+            if published {
+                let message = format!(
+                    "[scheduler] \u{2717} SUPERVISOR VANISHED for step {tag:?}: its thread is no \
+                     longer alive and it never recorded a terminal outcome. Reporting the step as \
+                     FAILED so the run terminates instead of waiting for a thread that is already \
+                     gone. This is a runner bug; the step's own result is UNKNOWN."
+                );
+                emit(&message);
+                eprintln!("{message}");
+            }
+        }
+    }
+
     /// Drive the DAG to completion; returns `(ok, wall_seconds)`.
     fn run(&self) -> (bool, f64) {
-        let mut handles: Vec<thread::JoinHandle<()>> = Vec::new();
+        let mut handles: Vec<(thread::JoinHandle<()>, Step)> = Vec::new();
         let wall_start = Instant::now();
         for (tag, reason) in &self.intentional_skips {
             emit(&format!("[{tag}] SKIPPED reason={}", reason.value()));
@@ -893,9 +1146,10 @@ impl Runner {
             .filter(|s| *s > 0)
             .map(|s| wall_start + Duration::from_secs(s as u64));
         loop {
+            self.sweep_dead_supervisors(&handles);
             let mut launchable: Vec<Step> = Vec::new();
             {
-                let mut sh = self.shared.lock().unwrap();
+                let mut sh = lock_shared(&self.shared);
                 // OUTER BUDGET, CHECKED IN OUR OWN LOOP AND NOT BY AN EXTERNAL KILLER. Stopping
                 // the run from inside is the entire reason this exists: an outside kill (a CI job
                 // cancellation, a systemd RuntimeMaxSec) also destroys the evidence, so the bound
@@ -1050,28 +1304,41 @@ impl Runner {
                 let evidence = self.evidence.clone();
                 let cpu_timeout_multiplier = self.cpu_timeout_multiplier;
                 let cpu_timeout_platform = self.cpu_timeout_platform.clone();
-                handles.push(thread::spawn(move || {
-                    run_step(StepCtx {
-                        step,
-                        shared,
-                        keep_going,
-                        verbosity,
-                        default_jobs_flag,
-                        cgroups,
-                        mem_cap_factor,
-                        default_step_mem_cap_bytes,
-                        default_step_cpu_count,
-                        default_step_cpu_timeout,
-                        default_step_timeout,
-                        evidence,
-                        cpu_timeout_multiplier,
-                        cpu_timeout_platform,
-                    });
-                }));
+                let recovery = SupervisorRecovery {
+                    step: step.clone(),
+                    shared: Arc::clone(&shared),
+                    cgroups: cgroups.clone(),
+                    evidence: evidence.clone(),
+                    keep_going,
+                };
+                let swept_step = step.clone();
+                handles.push((
+                    thread::spawn(move || {
+                        with_supervisor_guard(recovery, move || {
+                            run_step(StepCtx {
+                                step,
+                                shared,
+                                keep_going,
+                                verbosity,
+                                default_jobs_flag,
+                                cgroups,
+                                mem_cap_factor,
+                                default_step_mem_cap_bytes,
+                                default_step_cpu_count,
+                                default_step_cpu_timeout,
+                                default_step_timeout,
+                                evidence,
+                                cpu_timeout_multiplier,
+                                cpu_timeout_platform,
+                            });
+                        });
+                    }),
+                    swept_step,
+                ));
             }
             thread::sleep(LOOP_SLEEP);
         }
-        for h in handles {
+        for (h, _step) in handles {
             let _ = h.join();
         }
         // NORMAL-exit backstop: reap any step cgroup that still has live procs (a setsid orphan a
@@ -1087,12 +1354,12 @@ impl Runner {
                 }
             }
         }
-        let failed = self.shared.lock().unwrap().failed;
+        let failed = lock_shared(&self.shared).failed;
         (!failed, wall_start.elapsed().as_secs_f64())
     }
 
     fn result(&self, wall: f64) -> RunResult {
-        let sh = self.shared.lock().unwrap();
+        let sh = lock_shared(&self.shared);
         let outcomes: Vec<StepOutcome> = self
             .order
             .iter()
@@ -1694,11 +1961,8 @@ fn run_step(ctx: StepCtx) {
                     cg.cleanup(&tag);
                 }
             }
-            let mut sh = shared.lock().unwrap();
-            sh.running.remove(&tag);
-            sh.running_pids.remove(&tag);
-            sh.running_nonces.remove(&tag);
-            release(&mut sh, &step);
+            let mut sh = lock_shared(&shared);
+            retire(&mut sh, &step);
             let outcome = StepOutcome::failed(
                 tag.clone(),
                 elapsed,
@@ -1718,22 +1982,7 @@ fn run_step(ctx: StepCtx) {
                 None,
             );
             sh.done.insert(tag.clone(), outcome);
-            sh.failed = true;
-            if !keep_going {
-                sh.stop = true;
-                let admitted: Vec<String> = sh.running.iter().cloned().collect();
-                for other in admitted {
-                    sh.aborted.insert(other);
-                }
-                let others: Vec<(String, u32, Option<String>)> = sh
-                    .running_pids
-                    .iter()
-                    .map(|(other, pid)| {
-                        (other.clone(), *pid, sh.running_nonces.get(other).cloned())
-                    })
-                    .collect();
-                reap_many(&cgroups, &others);
-            }
+            trip_fail_fast(&mut sh, &cgroups, keep_going);
             drop(sh);
             emit(&format!(
                 "[{tag}] \u{2717} FAIL   {} (spawn failed: {e})",
@@ -1744,10 +1993,11 @@ fn run_step(ctx: StepCtx) {
     };
     let pid = child.id();
     let abort_after_spawn = {
-        let mut sh = shared.lock().unwrap();
+        let mut sh = lock_shared(&shared);
         sh.running_pids.insert(tag.clone(), pid);
         sh.running_nonces.insert(tag.clone(), nonce.clone());
         sh.active_processes += 1;
+        sh.counted_processes.insert(tag.clone());
         sh.max_concurrent_steps = sh.max_concurrent_steps.max(sh.active_processes);
         sh.aborted.contains(&tag)
     };
@@ -1874,78 +2124,93 @@ fn run_step(ctx: StepCtx) {
         let mstart = start;
         let mlane = lane;
         Some(thread::spawn(move || {
-            let mut since = Duration::ZERO;
-            // One-shot, so an unmeasurable budget is stated once per step, not once per tick.
-            let mut unmeasurable_warned = false;
-            let tick = Duration::from_millis(50);
-            while !stop.load(Ordering::Relaxed) {
-                thread::sleep(tick);
-                since += tick;
-                if since < MONITOR_INTERVAL {
-                    continue;
-                }
-                since = Duration::ZERO;
-                if let Some(c) = &cg {
-                    if let Some(n) = c.thread_count(&t) {
-                        let mut p = peak.lock().unwrap();
-                        *p = Some(p.map_or(n, |cur| cur.max(n)));
+            // THE MONITOR IS THE ONLY ENFORCER of the per-step CPU-time budget, and nothing ever
+            // joins it for a result. If it dies the budget is not merely unmeasured -- it stops
+            // being enforced at all, silently, while still reading as configured. Say so out loud.
+            // (#80 runner-supervisor-crash-loud)
+            let body_tag = t.clone();
+            let body = std::panic::catch_unwind(AssertUnwindSafe(move || {
+                let mut since = Duration::ZERO;
+                // One-shot, so an unmeasurable budget is stated once per step, not once per tick.
+                let mut unmeasurable_warned = false;
+                let tick = Duration::from_millis(50);
+                while !stop.load(Ordering::Relaxed) {
+                    thread::sleep(tick);
+                    since += tick;
+                    if since < MONITOR_INTERVAL {
+                        continue;
                     }
-                    // CPU-time budget: a load-invariant per-step ceiling on consumed user+system
-                    // CPU (cgroup cpu.stat usage_usec), mirroring the Python runner exactly. Reap
-                    // the whole tree once when over budget, then exit the monitor.
-                    // The `cpu_timeout` guard the `capabilities` manifest advertises IS this
-                    // branch, so it asks the registry that publishes the claim
-                    // (`crate::capabilities`). An engine that stops reaping here stops
-                    // advertising it, in the same edit.
-                    // This thread only exists on the boxed lane (see the `if boxed` above), so
-                    // the lane it asks about is CONTAINED; the uncontained answer is that there
-                    // is no cpu.stat to read, which is the whole of #75.
-                    if cpu_timeout > 0
-                        && !cpu_flag.load(Ordering::Relaxed)
-                        && crate::capabilities::is_enforced("cpu_timeout", mlane)
-                    {
-                        if let Some(cs) = c.cpu_stats(&t) {
-                            // ABSENT IS NOT ZERO: see `cpu_seconds_from_stats`. Say so once and
-                            // leave the budget explicitly unenforced rather than reading a
-                            // missing counter as "has consumed none".
-                            let Some(cpu_used_s) = cpu_seconds_from_stats(&cs) else {
-                                if !unmeasurable_warned {
-                                    unmeasurable_warned = true;
-                                    eprintln!(
+                    since = Duration::ZERO;
+                    if let Some(c) = &cg {
+                        if let Some(n) = c.thread_count(&t) {
+                            let mut p = peak.lock().unwrap();
+                            *p = Some(p.map_or(n, |cur| cur.max(n)));
+                        }
+                        // CPU-time budget: a load-invariant per-step ceiling on consumed user+system
+                        // CPU (cgroup cpu.stat usage_usec), mirroring the Python runner exactly. Reap
+                        // the whole tree once when over budget, then exit the monitor.
+                        // The `cpu_timeout` guard the `capabilities` manifest advertises IS this
+                        // branch, so it asks the registry that publishes the claim
+                        // (`crate::capabilities`). An engine that stops reaping here stops
+                        // advertising it, in the same edit. This thread only exists on the boxed
+                        // lane (see the `if boxed` above), so the lane it asks about is CONTAINED;
+                        // the uncontained answer is that there is no cpu.stat to read, which is
+                        // the whole of #75.
+                        if cpu_timeout > 0
+                            && !cpu_flag.load(Ordering::Relaxed)
+                            && crate::capabilities::is_enforced("cpu_timeout", mlane)
+                        {
+                            if let Some(cs) = c.cpu_stats(&t) {
+                                // ABSENT IS NOT ZERO: see `cpu_seconds_from_stats`. Say so once and
+                                // leave the budget explicitly unenforced rather than reading a
+                                // missing counter as "has consumed none".
+                                let Some(cpu_used_s) = cpu_seconds_from_stats(&cs) else {
+                                    if !unmeasurable_warned {
+                                        unmeasurable_warned = true;
+                                        eprintln!(
                                         "[scheduler] \u{26a0} step {t:?}: cgroup cpu.stat has no \
                                          'usage_usec', so the {cpu_timeout}s CPU-time budget \
                                          CANNOT be enforced for this step; only the wall timeout \
                                          still applies."
                                     );
+                                    }
+                                    continue;
+                                };
+                                if cpu_used_s >= cpu_timeout as f64 {
+                                    cpu_flag.store(true, Ordering::Relaxed);
+                                    let culprit = capture_termination_evidence(
+                                        &mevidence,
+                                        &msink,
+                                        &t,
+                                        mpid,
+                                        &mnonce,
+                                        TerminationBoundary {
+                                            event: "cpu_timeout",
+                                            unit: BudgetUnit::CpuSeconds,
+                                            limit_s: cpu_timeout,
+                                            // The very reading the comparison above was made on.
+                                            measured_s: cpu_used_s,
+                                            wall_elapsed_s: mstart.elapsed().as_secs_f64(),
+                                        },
+                                    );
+                                    if let Ok(mut slot) = mculprit.lock() {
+                                        *slot = Some(culprit);
+                                    }
+                                    reap(&cg, &t, mpid, Some(&mnonce));
+                                    return;
                                 }
-                                continue;
-                            };
-                            if cpu_used_s >= cpu_timeout as f64 {
-                                cpu_flag.store(true, Ordering::Relaxed);
-                                let culprit = capture_termination_evidence(
-                                    &mevidence,
-                                    &msink,
-                                    &t,
-                                    mpid,
-                                    &mnonce,
-                                    TerminationBoundary {
-                                        event: "cpu_timeout",
-                                        unit: BudgetUnit::CpuSeconds,
-                                        limit_s: cpu_timeout,
-                                        // The very reading the comparison above was made on.
-                                        measured_s: cpu_used_s,
-                                        wall_elapsed_s: mstart.elapsed().as_secs_f64(),
-                                    },
-                                );
-                                if let Ok(mut slot) = mculprit.lock() {
-                                    *slot = Some(culprit);
-                                }
-                                reap(&cg, &t, mpid, Some(&mnonce));
-                                return;
                             }
                         }
                     }
                 }
+            }));
+            if let Err(payload) = body {
+                let detail = panic_detail(payload.as_ref());
+                eprintln!(
+                    "[scheduler] \u{26a0} step {body_tag:?}: the CPU-budget monitor thread DIED \
+                     with a panic ({detail}). The {cpu_timeout}s CPU-time budget is NO LONGER \
+                     ENFORCED for this step; only the wall timeout still applies."
+                );
             }
         }))
     } else {
@@ -2001,8 +2266,8 @@ fn run_step(ctx: StepCtx) {
     // The child has exited. Stop counting it before teardown and reader joins, which can outlive
     // the child when a grandchild keeps an output pipe open.
     {
-        let mut sh = shared.lock().unwrap();
-        sh.active_processes = sh.active_processes.saturating_sub(1);
+        let mut sh = lock_shared(&shared);
+        uncount_process(&mut sh, &tag);
     }
 
     // Reap the whole tree (cgroup.kill + killpg) so orphan grandchildren die now and the readers
@@ -2147,11 +2412,8 @@ fn run_step(ctx: StepCtx) {
     }
 
     let (was_aborted, cut_by_run_budget, reason) = {
-        let mut sh = shared.lock().unwrap();
-        sh.running.remove(&tag);
-        sh.running_pids.remove(&tag);
-        sh.running_nonces.remove(&tag);
-        release(&mut sh, &step);
+        let mut sh = lock_shared(&shared);
+        retire(&mut sh, &step);
         sh.step_profile_rows.push(row);
         let was_aborted = sh.aborted.contains(&tag);
         // Distinguish the two ways a step gets cancelled. "Another step failed" and "the whole run
@@ -2203,20 +2465,7 @@ fn run_step(ctx: StepCtx) {
             // step still running so a fast failure does not wait for a slow in-flight build.
             // keep_going records the failure but leaves scheduling open: independent ready steps
             // continue, while dependency-failure closure skips only true dependents.
-            sh.failed = true;
-            if !keep_going {
-                sh.stop = true;
-                let admitted: Vec<String> = sh.running.iter().cloned().collect();
-                for other in admitted {
-                    sh.aborted.insert(other);
-                }
-                let others: Vec<(String, u32, Option<String>)> = sh
-                    .running_pids
-                    .iter()
-                    .map(|(k, v)| (k.clone(), *v, sh.running_nonces.get(k).cloned()))
-                    .collect();
-                reap_many(&cgroups, &others);
-            }
+            trip_fail_fast(&mut sh, &cgroups, keep_going);
         }
         (was_aborted, cut_by_run_budget, reason)
     };
@@ -3978,5 +4227,268 @@ mod tests {
             ..Default::default()
         };
         assert!(run_dag(&declared, 1, false, 0).ok);
+    }
+
+    // ---- #80 runner-supervisor-crash-loud -------------------------------------------------
+    //
+    // A wedged run is the worst outcome this tool has, because it looks like work in progress.
+    // Each test below pins one of the two layers, or one of the accounting properties that make
+    // a mid-flight panic survivable, and each asserts the CAUSE IS NAMED rather than merely that
+    // something failed.
+
+    fn crash_test_runner(steps: Vec<Step>, caps: &[(&str, i64)]) -> Runner {
+        let cfg = DagConfig {
+            steps,
+            resource_caps: caps
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), *v))
+                .collect::<BTreeMap<String, i64>>(),
+            ..Default::default()
+        };
+        Runner::new(&cfg, 1, 1, false, 0, None, None, None)
+    }
+
+    #[test]
+    fn a_panicking_supervisor_becomes_a_failed_step_that_names_the_panic() {
+        let victim = step("g", "boom", "true", &[], 0.0, &[("slot", 1)]);
+        let runner = crash_test_runner(vec![victim.clone()], &[("slot", 1)]);
+        {
+            // Admit the step exactly as the ready-set loop would, so the accounting the guard has
+            // to unwind is real rather than assumed.
+            let mut sh = lock_shared(&runner.shared);
+            sh.running.insert(victim.tag());
+            acquire(&mut sh, &victim);
+            assert_eq!(sh.resource_avail.get("slot"), Some(&0));
+        }
+        let recovery = SupervisorRecovery {
+            step: victim.clone(),
+            shared: Arc::clone(&runner.shared),
+            cgroups: None,
+            evidence: None,
+            keep_going: false,
+        };
+        // The default hook would print this planted panic and make the test log look like a
+        // failure; silence it for the duration and restore it afterwards.
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        with_supervisor_guard(recovery, || panic!("planted supervisor defect"));
+        std::panic::set_hook(previous);
+
+        let sh = lock_shared(&runner.shared);
+        let outcome = sh
+            .done
+            .get(&victim.tag())
+            .expect("a panicking supervisor must still publish a TERMINAL outcome");
+        assert!(!outcome.ok);
+        assert!(
+            !outcome.aborted,
+            "a supervisor crash is a FAILURE, not a peer-triggered abort"
+        );
+        assert!(
+            outcome.reason.contains("SUPERVISOR CRASHED"),
+            "reason was {:?}",
+            outcome.reason
+        );
+        assert!(
+            outcome.reason.contains("planted supervisor defect"),
+            "the panic must be NAMED, not merely counted; reason was {:?}",
+            outcome.reason
+        );
+        assert!(sh.failed, "the run must be marked failed");
+        assert!(!sh.running.contains(&victim.tag()));
+        assert_eq!(
+            sh.resource_avail.get("slot"),
+            Some(&1),
+            "the crash path must give the admitted slot back"
+        );
+    }
+
+    #[test]
+    fn the_sweep_reaps_a_supervisor_that_ended_without_publishing() {
+        let lost = step("g", "lost", "true", &[], 0.0, &[]);
+        let runner = crash_test_runner(vec![lost.clone()], &[]);
+        {
+            let mut sh = lock_shared(&runner.shared);
+            sh.running.insert(lost.tag());
+        }
+        // A thread that has already ended, with nothing in `done`: layer one is not in the
+        // picture at all here, so only the sweep can end this run.
+        let handle = thread::spawn(|| {});
+        while !handle.is_finished() {
+            thread::sleep(Duration::from_millis(1));
+        }
+        runner.sweep_dead_supervisors(&[(handle, lost.clone())]);
+
+        let sh = lock_shared(&runner.shared);
+        let outcome = sh.done.get(&lost.tag()).expect("the sweep must publish");
+        assert!(
+            outcome.reason.contains("SUPERVISOR VANISHED"),
+            "reason was {:?}",
+            outcome.reason
+        );
+        assert!(outcome.reason.contains("UNKNOWN"));
+        assert!(sh.failed);
+    }
+
+    #[test]
+    fn the_sweep_sees_a_crash_that_lands_between_retiring_and_publishing() {
+        // `retire` drops the tag from `running` and only then is `done` written. A supervisor that
+        // dies in that window is in NEITHER set, so a sweep keyed on "still in `running`" is blind
+        // to exactly it. This is the case that forced the (finished AND no outcome) key.
+        let ghost = step("g", "ghost", "true", &[], 0.0, &[("slot", 1)]);
+        let runner = crash_test_runner(vec![ghost.clone()], &[("slot", 1)]);
+        {
+            let mut sh = lock_shared(&runner.shared);
+            sh.running.insert(ghost.tag());
+            acquire(&mut sh, &ghost);
+            // ... and now the supervisor retires, then dies before inserting into `done`.
+            retire(&mut sh, &ghost);
+            assert!(!sh.running.contains(&ghost.tag()));
+            assert!(!sh.done.contains_key(&ghost.tag()));
+        }
+        let handle = thread::spawn(|| {});
+        while !handle.is_finished() {
+            thread::sleep(Duration::from_millis(1));
+        }
+        runner.sweep_dead_supervisors(&[(handle, ghost.clone())]);
+
+        let sh = lock_shared(&runner.shared);
+        assert!(sh
+            .done
+            .get(&ghost.tag())
+            .expect("the sweep must see a tag that is in neither `running` nor `done`")
+            .reason
+            .contains("SUPERVISOR VANISHED"));
+    }
+
+    #[test]
+    fn the_sweep_never_contradicts_a_supervisor_that_did_publish() {
+        let fine = step("g", "fine", "true", &[], 0.0, &[]);
+        let runner = crash_test_runner(vec![fine.clone()], &[]);
+        {
+            let mut sh = lock_shared(&runner.shared);
+            sh.done.insert(
+                fine.tag(),
+                StepOutcome::passed(fine.tag(), 0.1, String::new(), Some(0), None, None),
+            );
+        }
+        let handle = thread::spawn(|| {});
+        while !handle.is_finished() {
+            thread::sleep(Duration::from_millis(1));
+        }
+        runner.sweep_dead_supervisors(&[(handle, fine.clone())]);
+
+        let sh = lock_shared(&runner.shared);
+        assert!(
+            sh.done[&fine.tag()].ok,
+            "a finished thread that DID publish must be left alone"
+        );
+        assert!(!sh.failed);
+    }
+
+    #[test]
+    fn retiring_twice_gives_the_resource_back_only_once() {
+        // A panic landing after a normal release would otherwise release a SECOND time, drifting
+        // `resource_avail` ABOVE its declared cap -- a cap that silently stopped being a cap.
+        let one = step("g", "one", "true", &[], 0.0, &[("slot", 1)]);
+        let runner = crash_test_runner(vec![one.clone()], &[("slot", 1)]);
+        let mut sh = lock_shared(&runner.shared);
+        sh.running.insert(one.tag());
+        acquire(&mut sh, &one);
+        // TWO live children, only ONE of them this step's. A second uncount would silently steal
+        // the OTHER step's child from the count -- and `saturating_sub` would hide that if the
+        // count were allowed to reach zero, so the peer is what makes the defect observable.
+        sh.active_processes = 2;
+        sh.counted_processes.insert(one.tag());
+        sh.counted_processes.insert("g.peer".to_string());
+
+        // The child-exit path uncounts as soon as `try_wait` returns, LONG before the step
+        // retires. `retire` then uncounts again, which is why `uncount_process` needs its own
+        // once-only guard rather than borrowing `retire`'s.
+        uncount_process(&mut sh, &one.tag());
+        assert_eq!(sh.active_processes, 1);
+
+        assert!(retire(&mut sh, &one));
+        assert_eq!(sh.resource_avail.get("slot"), Some(&1));
+        assert_eq!(
+            sh.active_processes, 1,
+            "retiring after the child-exit uncount must not decrement a second time"
+        );
+
+        assert!(
+            !retire(&mut sh, &one),
+            "a second retire must report that it did nothing"
+        );
+        assert_eq!(
+            sh.resource_avail.get("slot"),
+            Some(&1),
+            "the declared cap of 1 must not read as 2"
+        );
+        assert_eq!(
+            sh.active_processes, 1,
+            "retiring twice must not uncount a child that belongs to another step"
+        );
+    }
+
+    #[test]
+    fn publishing_a_crash_does_not_overwrite_an_outcome_the_step_already_recorded() {
+        // A panic in the REPORTING TAIL is a runner bug, not evidence that the step failed.
+        let late = step("g", "late", "true", &[], 0.0, &[]);
+        let runner = crash_test_runner(vec![late.clone()], &[]);
+        {
+            let mut sh = lock_shared(&runner.shared);
+            sh.done.insert(
+                late.tag(),
+                StepOutcome::passed(late.tag(), 0.1, String::new(), Some(0), None, None),
+            );
+        }
+        let published = publish_supervisor_failure(
+            &runner.shared,
+            &None,
+            &None,
+            &late,
+            false,
+            SupervisorFailure {
+                reason: "SUPERVISOR CRASHED (planted)".to_string(),
+                summary: "planted".to_string(),
+                elapsed_s: 0.0,
+            },
+        );
+        assert!(!published);
+        let sh = lock_shared(&runner.shared);
+        assert!(
+            sh.done[&late.tag()].ok,
+            "the recorded success must stand; a crash while printing it is not a step failure"
+        );
+        assert!(!sh.failed);
+    }
+
+    #[test]
+    fn a_poisoned_lock_is_recovered_instead_of_cascading_into_every_other_thread() {
+        // A supervisor that panics while holding the lock poisons it. With `lock().unwrap()`
+        // everywhere, every OTHER thread then panics too, burying the original cause under a
+        // cascade and taking the run down with no attributable reason.
+        let victim = step("g", "poison", "true", &[], 0.0, &[]);
+        let runner = crash_test_runner(vec![victim.clone()], &[]);
+        let shared = Arc::clone(&runner.shared);
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let poisoner = thread::spawn(move || {
+            let mut sh = lock_shared(&shared);
+            sh.failed = true;
+            panic!("planted panic while holding the scheduler lock");
+        });
+        assert!(poisoner.join().is_err());
+        std::panic::set_hook(previous);
+
+        assert!(
+            runner.shared.lock().is_err(),
+            "the planted panic must really have poisoned the lock, or this proves nothing"
+        );
+        let sh = lock_shared(&runner.shared);
+        assert!(
+            sh.failed,
+            "lock_shared must hand back the state as it stands rather than panicking again"
+        );
     }
 }
