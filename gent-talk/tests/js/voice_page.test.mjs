@@ -1974,6 +1974,24 @@ test("the page declares no standalone mode and no manifest", () => {
   assert.match(HTML, /apple-mobile-web-app-capable/, "the reason it is absent must stay recorded");
 });
 
+test("no function in the page is declared twice, because the second one wins in silence", () => {
+  // A real trap, not a style rule. `sendClientEvent` and `canSendText` were each declared TWICE in
+  // this file — once beside the long note explaining the send path, once beside the Discord relay
+  // — with different conditions, and function declarations hoist, so the later pair won every call
+  // including the ones under the comment describing the earlier pair. Nothing warned: no build
+  // step, no linter, no runtime error, and the tests passed either way because they only ever
+  // exercised the winner. It cost `#73 mute-is-invisible` a wrongly placed announcement, put on
+  // the socket at a moment the LIVE definition refuses to send at.
+  const declared = [...SCRIPT_CODE.matchAll(/^function ([A-Za-z0-9_]+)\(/gm)].map((m) => m[1]);
+  const twice = declared.filter((name, i) => declared.indexOf(name) !== i);
+  assert.deepStrictEqual(
+    [...new Set(twice)],
+    [],
+    "these functions are declared more than once in web/voice.js; the LAST declaration is the one " +
+      "that runs, so every comment on the others describes code nobody calls"
+  );
+});
+
 test("the page fetches nothing from anywhere but this server", () => {
   // No framework, no CDN, no build step: the whole reason the frame is CSS.
   assert.doesNotMatch(HTML_CODE, /https?:\/\//, "web/voice.html reaches off-origin");
@@ -3259,9 +3277,70 @@ test("the announcement is context, NOT a turn the agent has to answer", async ()
     0,
     "muting spent a conversational turn on housekeeping"
   );
-  const [sent] = framesOfType(socket, "contextual_update");
-  assert.deepStrictEqual(Object.keys(sent).sort(), ["text", "type"]);
-  assert.equal(sent.type, "contextual_update");
+  await page.el("talk").click();
+
+  // BOTH frames, not the first one: the shape claim is made about the pair, and an unmute carrying
+  // an invented key is exactly as rejectable as a mute carrying one. Checking only `sent[0]` left
+  // the second frame covered by nothing at all.
+  const sent = framesOfType(socket, "contextual_update");
+  assert.equal(sent.length, 2, "mute and unmute did not both announce themselves");
+  for (const frame of sent) {
+    assert.deepStrictEqual(Object.keys(frame).sort(), ["text", "type"], JSON.stringify(frame));
+    assert.equal(frame.type, "contextual_update");
+    assert.equal(typeof frame.text, "string");
+  }
+  assert.equal(
+    socket.sent.filter((raw) => raw.includes('"user_message"')).length,
+    0,
+    "unmuting spent a conversational turn on housekeeping"
+  );
+});
+
+test("a mute engaged while the call is still connecting is announced when it opens", async () => {
+  // The socket is assigned before it is open, so the talk control mutes rather than dialling a
+  // second call — and `sendClientEvent` refuses a socket that is not OPEN, so the announcement is
+  // dropped. If nothing made that good, the WHOLE call would then run muted with the agent never
+  // told: the worst possible version of the "are you there?" this issue is about, because it lasts
+  // for the entire conversation rather than for one pause.
+  const page = newPage();
+  page.el("api-token").value = "write-token-aaaaaaaaaaaaaaaa";
+  await page.el("save-token").click();
+  await page.settle();
+  page.setFetch(MINTED);
+
+  await page.el("talk").click();
+  assert.equal(page.sockets.length, 1, "start() opened no websocket");
+  const socket = page.sockets[0];
+  socket.readyState = 0; // CONNECTING: the window between `new WebSocket` and `onopen`.
+
+  await page.el("talk").click();
+
+  assert.equal(page.sockets.length, 1, "muting while connecting dialled a second call");
+  assert.equal(
+    page.el("talk-label").textContent,
+    "Connecting…",
+    "the control claims a state the call has not reached"
+  );
+  assert.equal(
+    framesOfType(socket, "contextual_update").length,
+    0,
+    "a frame was written to a socket that was not open yet"
+  );
+
+  socket.readyState = 1;
+  socket.onopen();
+
+  const sent = framesOfType(socket, "contextual_update");
+  assert.equal(sent.length, 1, "the call opened muted and the agent was never told");
+  assert.match(sent[0].text, /muted/i, "the announcement never says what happened");
+  assert.match(
+    sent[0].text,
+    /do not ask whether they are still there/i,
+    "the re-announcement is not the one that asks the agent to hold"
+  );
+  assert.equal(page.el("talk-label").textContent, "Muted", "connecting cleared the mute");
+  speakInto(page);
+  assert.equal(audioFrames(socket).length, 0, "the agent could hear you on a muted call");
 });
 
 test("announcing a mute uses the call already open — no re-initiation, no second socket", async () => {

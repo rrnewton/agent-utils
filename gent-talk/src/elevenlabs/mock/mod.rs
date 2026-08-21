@@ -38,6 +38,21 @@
 //! would destroy both the screenshot comparability and the trace assertions, so the mock
 //! deliberately does NOT grow toward being a usable local voice agent.
 //!
+//! # What of the client's half it models, and what it merely tolerates
+//!
+//! [`agent::on_client_event`](agent) understands `conversation_initiation_client_data`, `pong`,
+//! `user_audio_chunk`, `user_message` and `contextual_update`, and each records in the trace under
+//! its own name. Anything else is recorded as `client_event` — accepted, traced and answered with
+//! silence, but not understood.
+//!
+//! That line matters more than it looks, and it is written here because it was learned the hard
+//! way. `contextual_update` had no arm at all, so `#46 conversation-replay`'s preamble and `#73
+//! mute-is-invisible`'s announcement both fell into the catch-all, and a test asserting "the
+//! vendor accepts this frame" passed unchanged when the frame was renamed to something invented.
+//! **A test that asserts on `client_event` is asserting that the mock did NOT model the frame**;
+//! anything stronger has to name the kind, and the kinds are only there for events that are
+//! modelled.
+//!
 //! # RFC6455 is a dependency, not a hand-roll
 //!
 //! The socket is [`tokio_tungstenite`]. An earlier plan for this module hand-rolled SHA-1, base64
@@ -271,6 +286,7 @@ pub struct MockState {
     trace: Trace,
     scenario: Mutex<Scenario>,
     nonces: Mutex<BTreeMap<String, Nonce>>,
+    context: Mutex<Vec<String>>,
     minted: AtomicU64,
     conversations: AtomicU64,
     rpc_ids: AtomicU64,
@@ -314,6 +330,45 @@ impl MockState {
     #[must_use]
     pub fn bridge(&self) -> &reqwest::Client {
         &self.bridge
+    }
+
+    /// Everything a `contextual_update` has put into this conversation's context, in order.
+    ///
+    /// This exists because the trace cannot carry the claim on its own. The vendor's contract for
+    /// `contextual_update`, as this repository models it, has two halves — the text enters the
+    /// agent's context, and no turn is spent answering it — and only the second is visible as an
+    /// absence of frames. An event that was dropped on the floor is *also* answered with silence,
+    /// so a test that asserted only silence would pass against a mock that had never heard of the
+    /// event. This is the first half, made assertable.
+    ///
+    /// See [`super::mock::agent`]'s `on_contextual_update` for what is and is not known about the
+    /// real vendor here: none of it has been observed against ElevenLabs.
+    #[must_use]
+    pub fn context(&self) -> Vec<String> {
+        self.context
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Remember one accepted contextual update.
+    ///
+    /// Redacted on the way in, for the reason [`Trace::record`] is: this is read by tests and
+    /// written into diagnostics, and a secret that reached it would be just as leaked.
+    pub(super) fn note_context(&self, text: &str) {
+        let text = self.trace.redacted(text);
+        self.context
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(text);
+    }
+
+    /// Forget the accepted contextual updates, as part of `/_mock/reset`.
+    fn forget_context(&self) {
+        self.context
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
     }
 
     /// Mint a single-use nonce and record it as a secret so it cannot reach the trace.
@@ -407,6 +462,12 @@ impl MockHandle {
         self.state.trace()
     }
 
+    /// What `contextual_update` frames have told the agent, in order.
+    #[must_use]
+    pub fn context(&self) -> Vec<String> {
+        self.state.context()
+    }
+
     /// Set the scenario in force.
     pub fn set_scenario(&self, scenario: Scenario) {
         self.state.set_scenario(scenario);
@@ -482,6 +543,7 @@ impl MockElevenLabs {
             ws_addr,
             trace,
             nonces: Mutex::new(BTreeMap::new()),
+            context: Mutex::new(Vec::new()),
             minted: AtomicU64::new(0),
             conversations: AtomicU64::new(0),
             rpc_ids: AtomicU64::new(0),
@@ -658,12 +720,20 @@ async fn say_something(State(state): State<Arc<MockState>>, Json(body): Json<Val
 
 async fn reset(State(state): State<Arc<MockState>>) -> Response {
     state.trace.reset();
+    state.forget_context();
     state.set_scenario(Scenario::Full);
     json_response(StatusCode::OK, json!({"reset": true}))
 }
 
 async fn read_trace(State(state): State<Arc<MockState>>) -> Response {
-    json_response(StatusCode::OK, state.trace.to_json())
+    // The accepted contextual updates ride along with the trace rather than living behind their
+    // own route: they are part of the same "what did the mock see" question, and a caller reading
+    // the trace over HTTP has no other way to see them.
+    let mut payload = state.trace.to_json();
+    if let Some(fields) = payload.as_object_mut() {
+        fields.insert("context".to_owned(), json!(state.context()));
+    }
+    json_response(StatusCode::OK, payload)
 }
 
 async fn not_found(headers: HeaderMap, uri: axum::http::Uri) -> Response {

@@ -1042,23 +1042,35 @@ function onClear() {
  * only thing that knows — and a send on a closing socket throws, which from a click handler would
  * reach the console and nowhere else.
  *
+ * "ONE place" is now literally true, and until this was written it was not. This file carried a
+ * SECOND `function sendClientEvent`, several thousand lines down, next to the Discord relay — and
+ * because function declarations hoist, that later one silently won every call in the file,
+ * including the ones directly under this comment. The two were not equivalent: this one tested
+ * only `readyState`, the later one also required `session.connected`. Reading the wrong one gives
+ * the wrong answer to "when does a frame actually go", and it did: `#73 mute-is-invisible`'s
+ * connect-window announcement was first placed where this definition would have sent it and the
+ * live one would not. The single definition below is the behaviour that was already running; only
+ * the confusion is gone. A guard in `tests/js/voice_page.test.mjs` keeps the duplicate from
+ * growing back.
+ *
  * The per-frame `user_audio_chunk` send in `startCapture()` deliberately does NOT come through
  * here. It is a hot path called every 4096 samples, it holds the socket in a closure and does its
  * own `readyState` check, and routing it through a shared function would put a lookup and a branch
  * in the middle of the audio thread for no gain.
  */
-function sendClientEvent(payload) {
-  const socket = session.socket;
-  if (!socket || socket.readyState !== WebSocket.OPEN) {
+function sendClientEvent(event) {
+  if (!canSendText()) {
     return false;
   }
-  socket.send(JSON.stringify(payload));
+  session.socket.send(JSON.stringify(event));
   return true;
 }
 
-/** Is there a live conversation for typed text to reach? */
+/** Is there a live conversation for a client event or typed text to reach? */
 function canSendText() {
-  return Boolean(session.socket) && session.connected;
+  return Boolean(
+    session.socket && session.connected && session.socket.readyState === WebSocket.OPEN
+  );
 }
 
 // The vendor does not document whether a typed `user_message` is echoed back as a
@@ -2141,6 +2153,18 @@ async function start() {
     }
     session.connected = true;
     conversationOpen = true;
+    // A mute engaged during the CONNECT WINDOW could not be announced when it happened. The socket
+    // is assigned before it is open, deliberately — that is what makes the talk control mute
+    // rather than dial a second call — but `sendClientEvent` refuses a socket the page is not yet
+    // connected on, so the announcement was dropped. Without this the call then runs muted with
+    // the agent never told, which is precisely the "are you there?" that `#73 mute-is-invisible`
+    // exists to prevent, and it is the worst case of it: the whole call rather than one pause.
+    //
+    // It goes here, AFTER `session.connected`, because that is what `sendClientEvent` tests, and
+    // before `startCapture` so that nothing about this call happens before the agent is told.
+    if (session.muted) {
+      announceMute(true);
+    }
     setState("live");
     setStatus("Connected — say something.");
     renderControls();
@@ -2471,7 +2495,10 @@ function renderControls() {
 //
 // It is a client event on the socket that is already open, which is the whole reason this is a
 // small change: the page already sends `conversation_initiation_client_data`, `pong`,
-// `user_audio_chunk`, `user_message` and `user_activity`. It CANNOT be an MCP tool — MCP here is
+// `user_audio_chunk`, `user_message` and `user_activity` — and `contextual_update` itself is not
+// even new here, since `#46 conversation-replay` sends one after the initiation frame and the
+// Discord relay sends one per relayed message. This is a THIRD use of an event already on the
+// wire, not a new event type and not a new mechanism. It CANNOT be an MCP tool — MCP here is
 // request/response with the agent as the client, and this server issues no `Mcp-Session-Id` and
 // answers `GET`/`DELETE /mcp` with 405 precisely because it has nothing to push. The conversation
 // socket is the only door.
@@ -2484,8 +2511,11 @@ function renderControls() {
 // agent that reads it actually HOLDS instead of prompting. Both are answered by one billed
 // `scripts/run.sh --smoke-agent` conversation — mute for a minute and listen — and THAT RUN HAS NOT
 // BEEN MADE. What is checked offline is our half: `tests/js/voice_page.test.mjs` pins what this page
-// puts on the wire, and `tests/elevenlabs_mock.rs` pins that a vendor-shaped server accepts the
-// frame mid-conversation, answers no turn to it, and keeps talking afterwards.
+// puts on the wire, and `tests/elevenlabs_mock.rs` sends that sentence to the mock vendor, which
+// MODELS this event in `src/elevenlabs/mock/agent.rs` — the frame is recognised, its text enters
+// the agent's context, and no turn is spent on it. That model is this repository's belief about the
+// contract written down where a test can state it; it is emphatically not evidence about
+// ElevenLabs, and an unrecognised event would be answered with the same silence.
 //
 // The fallback, if the event turns out not to exist, is a short `user_message`, which is definitely
 // in the protocol — and which consumes a turn, so the agent would ANSWER the announcement out loud.
@@ -2509,6 +2539,11 @@ const UNMUTE_NOTICE =
  * That ordering is deliberate: mute is a LOCAL fact first — it withholds audio whatever the vendor
  * does with this frame — and a mute that refused to engage because an announcement could not be
  * delivered would be strictly worse than a mute the agent cannot see.
+ *
+ * A dropped announcement is not always harmless, though, and there is one case where it must be
+ * made good: a mute engaged in the CONNECT WINDOW, before `onopen`, would otherwise leave the
+ * entire call muted with the agent never told. `socket.onopen` re-announces for exactly that case.
+ * A mute on a CLOSING socket is the harmless one — there is no call left to be prompted in.
  */
 function announceMute(muted) {
   return sendClientEvent({
@@ -4292,21 +4327,9 @@ function receiveLiveMessage(message, selfPosted, replayed) {
   relayToAgent(message, selfPosted, replayed);
 }
 
-/** Can this page put text on the conversation socket right now? */
-function canSendText() {
-  return Boolean(
-    session.socket && session.connected && session.socket.readyState === WebSocket.OPEN
-  );
-}
-
-/** Send one client event on the conversation socket. Answers whether it went. */
-function sendClientEvent(event) {
-  if (!canSendText()) {
-    return false;
-  }
-  session.socket.send(JSON.stringify(event));
-  return true;
-}
+// `canSendText` and `sendClientEvent` used to be defined a second time HERE, shadowing the pair
+// near `startCapture`. They are declared once now, where the long note about the send path already
+// lived; the relay below calls exactly the same function it was already getting.
 
 /** The label the channel select shows for a snowflake, or the snowflake itself. */
 function channelLabel(channelId) {

@@ -347,6 +347,7 @@ async fn on_client_event(
             )
             .await
         }
+        "contextual_update" => on_contextual_update(state, &parsed, text.len()),
         "conversation_initiation_client_data" => {
             state.trace().record(
                 Direction::Inbound,
@@ -357,12 +358,60 @@ async fn on_client_event(
             None
         }
         other => {
+            // An event this mock does not model, recorded under a kind of its own so that
+            // "accepted and ignored" can never be mistaken for "understood". Every modelled event
+            // above records under its own name; a test that asserts on `client_event` is asserting
+            // that the mock did NOT understand the frame.
             state
                 .trace()
                 .record(Direction::Inbound, "client_event", other, text.len());
             None
         }
     }
+}
+
+/// Our model of the vendor's `contextual_update`: context in, no turn out.
+///
+/// # UNVERIFIED AGAINST THE LIVE VENDOR
+///
+/// Nothing below has ever been observed against ElevenLabs. `contextual_update` is *believed* to
+/// be a client event that injects text into the agent's context without consuming a turn, and that
+/// belief came from a recon plan rather than from the vendor's protocol reference. One billed
+/// `scripts/run.sh --smoke-agent` conversation would settle it, and that run has not been made.
+///
+/// It is modelled here anyway, and deliberately, because two shipped features already put this
+/// frame on the wire — `#46 conversation-replay`'s default transport and `#73 mute-is-invisible`'s
+/// announcement that a mute is deliberate — and a mock that let both fall into the catch-all above
+/// would answer them exactly as it answers `totally_made_up_event`. A test written against that
+/// mock proves only that unknown frames are ignored. This function is where this repository's
+/// model of the contract lives, so that a test can state the model and a future observation of the
+/// real vendor has one place to correct.
+///
+/// The model has three parts:
+///
+/// 1. **The frame carries a non-empty `text`.** One without is malformed rather than an update
+///    that says nothing, and is recorded under its own kind. What the vendor does with such a
+///    frame is unknown; what is *not* unknown is that the page must never send one.
+/// 2. **An accepted update enters the conversation's context** — [`MockState::context`], which is
+///    the half that silence cannot demonstrate.
+/// 3. **It consumes no turn.** Nothing is spoken back, which is the reason the page prefers it to
+///    `user_message` for both features.
+fn on_contextual_update(state: &Arc<MockState>, parsed: &Value, size: usize) -> Option<Ending> {
+    let text = parsed.get("text").and_then(Value::as_str).unwrap_or("");
+    if text.trim().is_empty() {
+        state.trace().record(
+            Direction::Inbound,
+            "contextual_update_without_text",
+            "a contextual update carried no text, so the agent was told nothing",
+            size,
+        );
+        return None;
+    }
+    state.note_context(text);
+    state
+        .trace()
+        .record(Direction::Inbound, "contextual_update", text, text.len());
+    None
 }
 
 /// Act on one instruction, from `/_mock/say` or from a spoken `user_message`.

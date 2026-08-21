@@ -785,11 +785,20 @@ async fn the_bridge_the_mock_was_pointed_at_is_the_one_it_calls() {
 // there. So the page now says it, as a `contextual_update` client event on the conversation socket.
 //
 // WHAT THIS FILE CAN AND CANNOT SETTLE. It can settle our half: the frame the page ships is
-// well-formed, a vendor-shaped server accepts it in the middle of a live conversation, it does not
-// consume a turn, and the conversation still works afterwards. It CANNOT settle the vendor's half —
-// whether ElevenLabs implements `contextual_update` at all, and whether a real agent reading it
-// holds instead of prompting. The mock is our model of the vendor, not the vendor. One billed
-// `scripts/run.sh --smoke-agent` conversation answers that, and it has not been run.
+// well-formed, a server that MODELS this event accepts it in the middle of a live conversation, it
+// does not consume a turn, the text reaches the agent's context, and the conversation still works
+// afterwards. It CANNOT settle the vendor's half — whether ElevenLabs implements
+// `contextual_update` at all, and whether a real agent reading it holds instead of prompting. The
+// mock is our model of the vendor, not the vendor. One billed `scripts/run.sh --smoke-agent`
+// conversation answers that, and it has not been run.
+//
+// AND THE MODELLING IS THE POINT, because the first version of these tests did not have it. The
+// mock had no `contextual_update` arm at all, so the frame fell into the catch-all for events it
+// does not understand — recorded, answered with silence — and every assertion here was equally
+// true of `totally_made_up_event`. `src/elevenlabs/mock/agent.rs` now models the event, and
+// `an_unrecognised_client_event_is_not_mistaken_for_a_contextual_update` below is the control that
+// keeps these tests from sliding back into that: it pins that an unknown type is recorded under a
+// DIFFERENT kind and reaches no context, so renaming the frame here turns this file red.
 
 /// The page's own source, so the frame under test is the frame that ships.
 const VOICE_JS: &str = include_str!("../web/voice.js");
@@ -852,13 +861,134 @@ async fn the_pages_mute_notice_is_accepted_mid_call_and_answered_with_silence() 
         "the conversation stopped working after a contextual update: {events:?}"
     );
 
-    // And it is on the record rather than silently swallowed.
-    let seen = harness.mock.trace().of_kind("client_event");
-    assert!(
-        seen.iter().any(|e| e.summary == "contextual_update"),
-        "the update never reached the vendor side: {:?}",
-        seen.iter().map(|e| e.summary.clone()).collect::<Vec<_>>()
+    // RECOGNISED, not merely tolerated. An event the mock does not model is recorded under
+    // `client_event` with the type string as its summary; a `contextual_update` is recorded under
+    // its own kind with the TEXT as its summary. Asserting the second is what makes this test say
+    // something about this frame rather than about unknown frames in general.
+    let updates = harness.mock.trace().of_kind("contextual_update");
+    assert_eq!(
+        updates.len(),
+        1,
+        "the mute notice was not recognised as a contextual update: {:?}",
+        harness
+            .mock
+            .trace()
+            .of_kind("client_event")
+            .iter()
+            .map(|e| e.summary.clone())
+            .collect::<Vec<_>>()
     );
+    assert_eq!(updates[0].summary, notice);
+    assert_eq!(
+        harness.mock.trace().count("client_event"),
+        0,
+        "the frame fell through to the mock's unknown-event catch-all"
+    );
+
+    // And the half silence cannot show: the sentence is IN the agent's context. A frame that was
+    // dropped on the floor is also answered with silence, so without this the assertions above are
+    // satisfied by a server that has never heard of the event.
+    assert_eq!(
+        harness.mock.context(),
+        vec![notice.clone()],
+        "the mute notice never reached the agent's context"
+    );
+}
+
+#[tokio::test]
+async fn an_unrecognised_client_event_is_not_mistaken_for_a_contextual_update() {
+    // THE CONTROL for everything above, and the reason it exists is a real review finding: with no
+    // `contextual_update` arm in the mock, the mute test passed unchanged when its frame type was
+    // renamed to `totally_made_up_event`. This pins the difference, so that regression cannot come
+    // back quietly — the modelled event and the unmodelled one must land in different places.
+    let harness = Harness::start(Scenario::Full).await;
+    let mut socket = harness.open().await;
+    wait_for(&mut socket, "conversation_initiation_metadata").await;
+
+    socket
+        .send(&json!({ "type": "totally_made_up_event", "text": page_notice("MUTE_NOTICE") }))
+        .await
+        .expect("an invented event goes on the wire");
+    socket.ask("what is new?").await.expect("asks");
+    wait_for(&mut socket, "agent_response").await;
+
+    let unknown = harness.mock.trace().of_kind("client_event");
+    assert_eq!(
+        unknown.len(),
+        1,
+        "an invented event was not recorded as an unrecognised one"
+    );
+    assert_eq!(unknown[0].summary, "totally_made_up_event");
+    assert_eq!(
+        harness.mock.trace().count("contextual_update"),
+        0,
+        "an invented event was recorded as though the mock understood it"
+    );
+    assert!(
+        harness.mock.context().is_empty(),
+        "an invented event put text into the agent's context: {:?}",
+        harness.mock.context()
+    );
+}
+
+#[tokio::test]
+async fn a_contextual_update_with_no_text_tells_the_agent_nothing_and_says_so() {
+    // The frame's whole payload is its `text`. One without is malformed rather than an update that
+    // says nothing, and the distinction is worth a kind of its own: "the page sent an empty
+    // announcement" and "the page sent no announcement" have different fixes, and only the first
+    // is invisible from the socket. What the REAL vendor does with such a frame is unknown; what
+    // this pins is that the mock will not silently count it as context the agent has been given.
+    let harness = Harness::start(Scenario::Full).await;
+    let mut socket = harness.open().await;
+    wait_for(&mut socket, "conversation_initiation_metadata").await;
+
+    socket
+        .send(&json!({ "type": "contextual_update" }))
+        .await
+        .expect("sends");
+    socket
+        .send(&json!({ "type": "contextual_update", "text": "   " }))
+        .await
+        .expect("sends");
+    socket.ask("still there?").await.expect("asks");
+    wait_for(&mut socket, "agent_response").await;
+
+    assert_eq!(
+        harness.mock.trace().count("contextual_update_without_text"),
+        2
+    );
+    assert_eq!(harness.mock.trace().count("contextual_update"), 0);
+    assert!(
+        harness.mock.context().is_empty(),
+        "an empty update was counted as something the agent was told: {:?}",
+        harness.mock.context()
+    );
+}
+
+#[tokio::test]
+async fn the_replay_preamble_is_the_same_event_and_lands_in_the_agents_context() {
+    // `#46 conversation-replay` has been putting a `contextual_update` on this socket since before
+    // `#73 mute-is-invisible` existed — `web/voice.js` sends it immediately after the initiation
+    // frame on the default transport — and the mock never modelled that one either. Same event,
+    // same contract, so it is pinned in the same place: the previous conversation's summary must
+    // reach the agent's context, and must not cost the turn the reader is waiting for.
+    let harness = Harness::start(Scenario::Full).await;
+    let mut socket = harness.open().await;
+    wait_for(&mut socket, "conversation_initiation_metadata").await;
+
+    let preamble = "Earlier today you and he discussed the mac runner stalling.";
+    socket
+        .send(&json!({ "type": "contextual_update", "text": preamble }))
+        .await
+        .expect("the replay preamble goes on the wire");
+
+    let quiet = socket.next_within(Duration::from_millis(300)).await;
+    assert!(
+        quiet.is_err(),
+        "the replay preamble was answered out loud, before the reader said anything: {quiet:?}"
+    );
+    assert_eq!(harness.mock.context(), vec![preamble.to_owned()]);
+    assert_eq!(harness.mock.trace().count("agent_response"), 0);
 }
 
 #[tokio::test]
@@ -894,14 +1024,11 @@ async fn the_unmute_notice_is_the_other_sentence_and_lifts_the_hold() {
     let events = wait_for(&mut socket, "agent_response").await;
     assert!(agent_said(&events).is_some(), "{events:?}");
     assert_eq!(
-        harness
-            .mock
-            .trace()
-            .of_kind("client_event")
-            .iter()
-            .filter(|e| e.summary == "contextual_update")
-            .count(),
+        harness.mock.trace().count("contextual_update"),
         2,
         "a mute and an unmute are two announcements, not one"
     );
+    // In that order, and both of them: an agent that was told to hold and then told nothing else
+    // holds for the rest of the call, which is the failure this pair exists to prevent.
+    assert_eq!(harness.mock.context(), vec![muted.clone(), back.clone()]);
 }

@@ -1391,11 +1391,19 @@ going quiet is exactly the condition that makes an agent check whether anyone is
 dashboard setting can separate two cases that arrive identical.
 
 So the page says it. Muting and unmuting each put one `contextual_update` client event on the
-conversation socket that is already open — a fourth client event beside
-`conversation_initiation_client_data`, `pong` and `user_audio_chunk`, not a new mechanism. It
-**cannot** be an MCP tool: MCP here is request/response with the agent as the client, and this
-server issues no `Mcp-Session-Id` and answers `GET`/`DELETE /mcp` with 405 precisely because it
-has nothing to push. The conversation socket is the only door.
+conversation socket that is already open. That is **not a new event type and not a new mechanism**:
+the page already sends `conversation_initiation_client_data`, `pong`, `user_audio_chunk`,
+`user_message` and `user_activity`, and it already sends `contextual_update` twice over — once
+after the initiation frame for `#46 conversation-replay`, and once per relayed message for the
+Discord relay. Mute is a third use of a frame that was already on the wire. It **cannot** be an MCP
+tool: MCP here is request/response with the agent as the client, and this server issues no
+`Mcp-Session-Id` and answers `GET`/`DELETE /mcp` with 405 precisely because it has nothing to push.
+The conversation socket is the only door.
+
+A mute engaged in the **connect window** — after the socket exists and before it opens, which is
+when the control reads "Connecting…" — cannot be announced at the time, because there is nothing
+open to announce it on. It is re-announced from `onopen`, or the whole call would run muted with
+the agent never told: the same complaint, for the length of the conversation instead of a pause.
 
 **Half of this is unverified, and it is the vendor's half.** `contextual_update` is believed to
 inject context without consuming a turn — the same event `#46 conversation-replay` uses — but that
@@ -1404,15 +1412,26 @@ open: whether ElevenLabs accepts the frame, and whether an agent that reads it *
 prompts. **One billed `scripts/run.sh --smoke-agent` conversation answers both** — mute for a
 minute and listen — **and that run has not been made.** What is checked offline is our half:
 `tests/js/voice_page.test.mjs` pins what the page puts on the wire, and `tests/elevenlabs_mock.rs`
-sends the page's own sentence, read out of `web/voice.js`, to a vendor-shaped server and pins that
-it is accepted mid-call, answered with silence, and followed by a conversation that still works.
+sends the page's own sentence, read out of `web/voice.js`, to the loopback vendor and pins that it
+is recognised as a contextual update mid-call, that its text reaches the agent's context, that no
+turn is spent on it, and that the conversation still works afterwards.
+
+**That last paragraph is a statement about our model, and it is only worth reading because the
+model exists.** Until it did, `src/elevenlabs/mock/` had no `contextual_update` handling at all:
+the frame fell into the catch-all for events the mock does not understand, so the test above passed
+unchanged when the frame was renamed to `totally_made_up_event` — it pinned that unknown events are
+ignored and nothing else. The mock now models the event, in one documented place, with a control
+test that keeps an unrecognised event landing somewhere different. It is still our model of the
+vendor's contract, not an observation of the vendor.
 The fallback if the event does not exist is a short `user_message`, which is definitely in the
 protocol and *does* consume a turn — the agent would say "understood, I'll wait" out loud, which is
 more interruption than the prompting it replaces.
 
 Pair it with the agent's system prompt: the starting prompt in
-[`QUICKSTART.md`](QUICKSTART.md) now tells the agent to hold, and to use `skip_turn`, when it is
-told the microphone is muted.
+[`QUICKSTART.md`](QUICKSTART.md) now tells the agent, in prose, to hold — "skip your turn, say
+nothing, and do not ask whether he is still there" — when it is told the microphone is muted. It
+does **not** name the `skip_turn` tool, which is a separate native vendor feature described further
+down; nothing here wires the two together.
 
 **None of this makes a mute cheaper.** Billing continues while muted; the vendor discounts silent
 periods but does not stop the meter. This makes a long mute quieter, not free.
@@ -2043,8 +2062,10 @@ Beyond the security list above:
 * **Whether ElevenLabs implements `contextual_update` at all has never been observed**, and two
   features now depend on it: `#46 conversation-replay`'s default transport, and `#73
   mute-is-invisible`'s announcement that a mute is deliberate. The page's half is tested offline
-  against the mock vendor; whether a real agent accepts the frame, and whether reading it actually
-  stops it asking "are you there?", takes one billed `--smoke-agent` run that has not been made.
+  against the mock vendor, which *models* the event — the model being this repository's belief
+  about the contract, written where a test can state it, and not evidence of anything. Whether a
+  real agent accepts the frame, and whether reading it actually stops it asking "are you there?",
+  takes one billed `--smoke-agent` run that has not been made.
 * The `/voice` page captures the microphone through a `ScriptProcessorNode`, which is deprecated
   (though universally supported). Moving it to an `AudioWorklet` would mean a second asset for no
   behavioural gain today.
