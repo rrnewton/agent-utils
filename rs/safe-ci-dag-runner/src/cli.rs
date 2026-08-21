@@ -32,6 +32,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::capabilities::enforcement_manifest;
 use crate::cgroup::{
     aggregate_slice_max_cpus, apply_specific_cores, attempt_scope_reexec, enable_outer_oom_group,
     expected_outer_cpu_count, expected_outer_memory_max_bytes, expected_scope_runtime_max_s,
@@ -58,7 +59,7 @@ use crate::sizing::{
 use crate::summary::{self, Summary, DEFAULT_MAX_BUCKETS, DEFAULT_RESERVOIR_K};
 use crate::sync::{self, SyncBackend};
 use crate::viz::{to_ascii, to_dot};
-use crate::{ENFORCEMENT_CAPABILITIES, PROG, VERSION};
+use crate::{PROG, VERSION};
 
 /// Environment variable overriding the default profile-store location (Feature D). An explicit
 /// `--perf-dir` still wins over this; `--no-profile` disables logging entirely.
@@ -2702,9 +2703,10 @@ pub fn run(argv: &[String]) -> i32 {
             0
         }
         "capabilities" => {
-            // Machine-readable enforcement manifest; byte-identical to the Python build and
-            // cross-checked, so an enforcement guard in one build but not the other fails `cross`.
-            println!("{ENFORCEMENT_CAPABILITIES}");
+            // Machine-readable enforcement manifest, DERIVED from the guard registry rather than
+            // typed out: byte-identical to the Python build and cross-checked, so an enforcement
+            // guard in one build but not the other fails `cross`.
+            println!("{}", enforcement_manifest());
             0
         }
         "--userguide" => {

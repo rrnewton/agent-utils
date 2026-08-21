@@ -1842,7 +1842,14 @@ fn run_step(ctx: StepCtx) {
                     // CPU-time budget: a load-invariant per-step ceiling on consumed user+system
                     // CPU (cgroup cpu.stat usage_usec), mirroring the Python runner exactly. Reap
                     // the whole tree once when over budget, then exit the monitor.
-                    if cpu_timeout > 0 && !cpu_flag.load(Ordering::Relaxed) {
+                    // The `cpu_timeout` guard the `capabilities` manifest advertises IS this
+                    // branch, so it asks the registry that publishes the claim
+                    // (`crate::capabilities`). An engine that stops reaping here stops
+                    // advertising it, in the same edit.
+                    if cpu_timeout > 0
+                        && !cpu_flag.load(Ordering::Relaxed)
+                        && crate::capabilities::is_enforced("cpu_timeout")
+                    {
                         if let Some(cs) = c.cpu_stats(&t) {
                             // ABSENT IS NOT ZERO: see `cpu_seconds_from_stats`. Say so once and
                             // leave the budget explicitly unenforced rather than reading a
@@ -1897,7 +1904,12 @@ fn run_step(ctx: StepCtx) {
         match child.try_wait() {
             Ok(Some(st)) => break st,
             Ok(None) => {
-                if start.elapsed().as_secs() as i64 >= step.timeout {
+                // `wall_timeout` likewise: the deadline is not even compared when the
+                // registry says this engine does not enforce one, so the advertisement and the
+                // wait agree by construction rather than by two people remembering.
+                if crate::capabilities::is_enforced("wall_timeout")
+                    && start.elapsed().as_secs() as i64 >= step.timeout
+                {
                     timed_out = true;
                     // Freeze test + process evidence BEFORE SIGTERM. The subsequent reap retains
                     // the existing gentle TERM/flush window and only then escalates to SIGKILL.
@@ -1976,7 +1988,17 @@ fn run_step(ctx: StepCtx) {
 
     // Read the step's cgroup measurements BEFORE cleanup() removes the child cgroup.
     let (oom, peak, cpu_stats) = match &cgroups {
-        Some(cg) if cg.enabled() => (cg.oom_kills(&tag), cg.peak_bytes(&tag), cg.cpu_stats(&tag)),
+        // `oom_detection` is the memory.events read itself: unenforced means the counter is not
+        // consulted, so nothing downstream can attribute a failure to an OOM.
+        Some(cg) if cg.enabled() => (
+            if crate::capabilities::is_enforced("oom_detection") {
+                cg.oom_kills(&tag)
+            } else {
+                0
+            },
+            cg.peak_bytes(&tag),
+            cg.cpu_stats(&tag),
+        ),
         _ => (0, None, None),
     };
     let step_pressure_end = if boxed {
@@ -3752,6 +3774,37 @@ mod tests {
             ..Default::default()
         };
         assert!(undeclared_resource_demands(&skipped_cfg).is_empty());
+    }
+
+    /// #79 derived-enforcement-manifest: the `wall_timeout` flag is load-bearing. The manifest
+    /// promising a per-step wall ceiling and the supervisor actually applying one are now the
+    /// same decision, so flipping the registry entry must move BOTH -- assert the manifest text
+    /// and the observed outcome of a step that outlives its own timeout.
+    #[test]
+    fn per_step_wall_ceiling_follows_the_wall_timeout_capability_flag() {
+        let mut slow = step("g", "slow", "sleep 2", &[], 0.0, &[]);
+        slow.timeout = 1;
+        let cfg = DagConfig {
+            steps: vec![slow],
+            ..Default::default()
+        };
+
+        assert!(crate::capabilities::enforcement_manifest().contains("\"wall_timeout\":true"));
+        let enforced = run_dag_boxed_deadline(&cfg, 1, false, 0, None, None, Some(1), Some(20));
+        assert!(
+            !enforced.ok,
+            "a 2s step under a 1s wall ceiling must be cut, but the run succeeded"
+        );
+
+        let unenforced = crate::capabilities::with_registry_override("wall_timeout", false, || {
+            assert!(crate::capabilities::enforcement_manifest().contains("\"wall_timeout\":false"));
+            run_dag_boxed_deadline(&cfg, 1, false, 0, None, None, Some(1), Some(20))
+        });
+        assert!(
+            unenforced.ok,
+            "with wall_timeout declared unenforced the step must be allowed to finish; instead it \
+             was still cut, so the manifest and the guard can disagree"
+        );
     }
 
     /// The refusal is what turns a hang into a bug report, so assert the RUN, not just the

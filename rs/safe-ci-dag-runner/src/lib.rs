@@ -19,6 +19,7 @@
 
 pub mod ambient;
 pub mod attribution;
+pub mod capabilities;
 pub mod cgroup;
 pub mod cli;
 pub mod cpuset_allocator;
@@ -43,6 +44,7 @@ pub use attribution::{
     recognize, Culprit, InFlightTest, ProcessObservation, RunEvidence, StepStream, TestEvent,
     TestTracker, LOG_DIR_ENV, NO_LOGS_ENV, STEP_NONCE_ENV,
 };
+pub use capabilities::{enforcement_manifest, is_enforced, Capability, ENFORCEMENT_REGISTRY};
 #[allow(deprecated)]
 pub use cgroup::{
     aggregate_slice_cpu_jobs, aggregate_slice_max_cpus, attempt_scope_reexec,
@@ -91,28 +93,3 @@ pub const PROG: &str = "safe-ci-dag-runner";
 
 /// Published package version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-// Machine-readable manifest of the enforcement guards THIS engine implements, emitted verbatim by
-// the `capabilities` subcommand. Each engine declares its own truth; the py-vs-rs differential
-// asserts the two manifests are BYTE-IDENTICAL, so any enforcement guard present in one build but
-// missing from the other is a cross-check failure (the recurrence guard for the historical
-// Rust-vs-Python `cpu_timeout` gap). Keys are sorted; values reflect real behavior:
-//   cpu_affinity  opt-in --cores K: constrain the WHOLE run tree to K least-busy free cores
-//                 with an exact verified cgroup cpuset; refuse when unavailable
-//   cpu_bandwidth boxed run: exact outer cpu.max = --max-cpus x period, read back before execution
-//   cpu_timeout   per-step user+system CPU budget (cgroup cpu.stat), reaped over budget
-//   memory_max    per-step inner memory.max cap (kernel OOM-kills the step at its cap)
-//   oom_detection failure attributed to OOM via cgroup memory.events oom_kill count
-//   pids_guard    per-step PID/thread ceiling (plumbed in both, enforced in neither → false)
-//   run_timeout   OUTER wall budget for the WHOLE run: the scheduler cuts in-flight steps and
-//                 still reports (works boxed or unboxed); under boxing it is additionally backed
-//                 by the scope's systemd RuntimeMaxSec, set strictly later so the reporting
-//                 bound fires first
-//   wall_timeout  per-step wall-clock ceiling (load-dependent; active with or without boxing)
-//   write_domains pre-execution closed-vocabulary declaration guard; omission/unknown/duplicate
-//                 domains refuse before any node starts when the DAG opts in
-// The cgroup-dependent guards take effect only under boxing; the boxed smoke tests in each build
-// anchor these declarations to real behavior wherever a cgroup-v2 + systemd --user scope exists.
-/// Canonical JSON manifest emitted by the `capabilities` subcommand.
-pub const ENFORCEMENT_CAPABILITIES: &str =
-    "{\"cpu_affinity\":true,\"cpu_bandwidth\":true,\"cpu_timeout\":true,\"memory_max\":true,\"oom_detection\":true,\"pids_guard\":false,\"run_timeout\":true,\"wall_timeout\":true,\"write_domains\":true}";

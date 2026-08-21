@@ -24,6 +24,7 @@ from pathlib import Path
 from types import FrameType
 from typing import TYPE_CHECKING
 
+from safe_ci_dag_runner.capabilities import is_enforced
 from safe_ci_dag_runner.sizing import derive_build_jobs, mem_available_bytes
 
 CGROUP_ROOT = Path("/sys/fs/cgroup")
@@ -1901,7 +1902,10 @@ class Cgroups:
         except OSError as exc:
             _warn(self._naming, f"step {tag}: could not set memory.oom.group ({exc}); an OOM may "
                   "kill a single process instead of the whole step (mis-attributed blast radius)")
-        if mem_max:
+        # `memory_max` is one of the guards the `capabilities` manifest advertises, so the
+        # decision to apply it is read from the same registry that publishes it: turning the
+        # advertisement off turns the write off, and vice versa. See capabilities.py.
+        if mem_max and is_enforced("memory_max"):
             try:
                 (child / "memory.max").write_text(str(int(mem_max)))
             except OSError as exc:
@@ -1920,10 +1924,13 @@ class Cgroups:
             except OSError as exc:
                 return (f"echo 'ERROR: step {tag} cpu.max could not be applied: {exc}' >&2\n"
                         "exit 1\n")
-        if self.worker_pids_max is not None:
-            # A PID cap contains a fork bomb (fork() returns EAGAIN past the cap) rather than
-            # killing it. The runner surfaces the breach via pids_events and the cpu/wall guard
-            # reaps the contained process.
+        # A PID cap contains a fork bomb (fork() returns EAGAIN past the cap) rather than
+        # killing it, and the breach surfaces via pids_events. The manifest advertises
+        # `pids_guard` as NOT enforced -- nothing sets `worker_pids_max` and the Rust engine has
+        # no pids plumbing at all -- so the write is gated on that same declaration instead of
+        # being reachable behind it. A caller that sets the limit today gets what the manifest
+        # promises: nothing. Flipping the registry flag turns both the claim and the write on.
+        if self.worker_pids_max is not None and is_enforced("pids_guard"):
             try:
                 (child / "pids.max").write_text(str(int(self.worker_pids_max)))
             except OSError as exc:

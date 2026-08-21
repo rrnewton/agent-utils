@@ -30,7 +30,8 @@ from collections.abc import Mapping, Sequence
 from importlib.resources import files
 from pathlib import Path
 
-from safe_ci_dag_runner import ENFORCEMENT_CAPABILITIES, __version__
+from safe_ci_dag_runner import __version__
+from safe_ci_dag_runner.capabilities import enforcement_manifest
 from safe_ci_dag_runner import summary as summarylib
 from safe_ci_dag_runner import sync as synclib
 from safe_ci_dag_runner.estimates import (
@@ -2443,9 +2444,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(_quickstart(c))
         return 0
     if command == "capabilities":
-        # Machine-readable enforcement manifest; byte-identical to the Rust build and cross-checked,
-        # so an enforcement guard in one build but not the other fails `cross`.
-        print(ENFORCEMENT_CAPABILITIES)
+        # Machine-readable enforcement manifest, DERIVED from the guard registry rather than
+        # typed out: byte-identical to the Rust build and cross-checked, so an enforcement guard
+        # in one build but not the other fails `cross`.
+        print(enforcement_manifest())
         return 0
     if command == "pin-run":
         return _cmd_pin_run(ns)

@@ -26,6 +26,12 @@ from safe_ci_dag_runner.ambient import (
     capture_ambient_snapshot,
 )
 from safe_ci_dag_runner.analyze import summarize
+from safe_ci_dag_runner.capabilities import (
+    ENFORCEMENT_REGISTRY,
+    Capability,
+    enforcement_manifest,
+    is_enforced,
+)
 from safe_ci_dag_runner.cgroup import Cgroups, CgroupEnforcementKind, NoopCgroups
 from safe_ci_dag_runner.estimates import (
     DEFAULT_MIN_SAMPLES,
@@ -109,33 +115,13 @@ from safe_ci_dag_runner.viz import to_ascii, to_dot
 
 __version__: str = "0.15.0"
 
-#: Machine-readable manifest emitted by the ``capabilities`` subcommand. Keys are sorted;
-#: values describe the enforcement guards implemented by this package:
-#:   cpu_affinity  opt-in --cores K: constrain the WHOLE run tree to K least-busy free cores
-#:                 with an exact, verified cgroup cpuset; refuse when unavailable
-#:   cpu_bandwidth boxed run: exact outer cpu.max = --max-cpus x period, read back before execution
-#:   cpu_timeout   per-step user+system CPU budget (cgroup cpu.stat), reaped over budget
-#:   memory_max    per-step inner memory.max cap (kernel OOM-kills the step at its cap)
-#:   oom_detection failure attributed to OOM via cgroup memory.events oom_kill count
-#:   pids_guard    per-step PID/thread ceiling (plumbed in both, enforced in neither -> false)
-#:   run_timeout   OUTER wall budget for the WHOLE run: the scheduler cuts in-flight steps and
-#:                 still reports (works boxed or unboxed); under boxing it is additionally backed
-#:                 by the scope's systemd RuntimeMaxSec, set strictly later so the reporting
-#:                 bound fires first
-#:   wall_timeout  per-step wall-clock ceiling (load-dependent; active with or without boxing)
-#:   write_domains pre-execution closed-vocabulary declaration guard; omission/unknown/duplicate
-#:                 domains refuse before any node starts when the DAG opts in
-#: The cgroup-dependent guards take effect only under boxing; the boxed smoke tests in each build
-#: anchor these declarations to real behavior wherever a cgroup-v2 + systemd --user scope exists.
-ENFORCEMENT_CAPABILITIES: str = (
-    '{"cpu_affinity":true,"cpu_bandwidth":true,"cpu_timeout":true,"memory_max":true,'
-    '"oom_detection":true,"pids_guard":false,"run_timeout":true,"wall_timeout":true,'
-    '"write_domains":true}'
-)
-
 __all__ = [
     "__version__",
-    "ENFORCEMENT_CAPABILITIES",
+    # Enforcement manifest (derived from the guards that implement it)
+    "Capability",
+    "ENFORCEMENT_REGISTRY",
+    "enforcement_manifest",
+    "is_enforced",
     # DAG model
     "Step",
     "StepClass",

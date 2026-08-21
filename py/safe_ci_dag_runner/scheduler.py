@@ -34,6 +34,7 @@ from safe_ci_dag_runner.attribution import (
     process_snapshot,
     sanitize as sanitize_evidence_tag,
 )
+from safe_ci_dag_runner.capabilities import is_enforced
 from safe_ci_dag_runner.model import (
     DagConfig,
     Step,
@@ -1015,7 +1016,10 @@ class Runner:
                 count = self.cgroups.thread_count(step.tag)
                 if count is not None:
                     thread_peak = count if thread_peak is None else max(thread_peak, count)
-                if cpu_budget > 0 and not cpu_timed_out:
+                # The `cpu_timeout` guard the `capabilities` manifest advertises IS this
+                # branch, so it asks the registry that publishes the claim (capabilities.py).
+                # An engine that stops reaping here stops advertising it, in the same edit.
+                if cpu_budget > 0 and not cpu_timed_out and is_enforced("cpu_timeout"):
                     cs = self.cgroups.cpu_stats(step.tag)
                     if cs is not None:
                         # ABSENT IS NOT ZERO: see :func:`_cpu_seconds_from_stats`. Say so once
@@ -1056,7 +1060,10 @@ class Runner:
         reader.start()
         monitor.start()
         try:
-            proc.wait(timeout=step.timeout)
+            # `wall_timeout` likewise: no deadline is passed at all when the registry says this
+            # engine does not enforce one, so the advertisement and the wait agree by
+            # construction rather than by two people remembering.
+            proc.wait(timeout=step.timeout if is_enforced("wall_timeout") else None)
         except subprocess.TimeoutExpired:
             # Genuine hang: reap the step's whole process group now (safe because
             # start_new_session gave it its own group; reap guards the runner's group).
@@ -1092,7 +1099,9 @@ class Runner:
         reap(proc, self.cgroups, step.tag, nonce=nonce)
 
         # Read the step's cgroup measurements BEFORE cleanup() rmdirs the child cgroup.
-        oom = self.cgroups.oom_kills(step.tag)
+        # `oom_detection` is the memory.events read itself: unenforced means the counter is
+        # not consulted, so nothing downstream can attribute a failure to an OOM.
+        oom = self.cgroups.oom_kills(step.tag) if is_enforced("oom_detection") else 0
         pids_events = self.cgroups.pids_events(step.tag)
         peak = self.cgroups.peak_bytes(step.tag)
         cpu_stats = self.cgroups.cpu_stats(step.tag)

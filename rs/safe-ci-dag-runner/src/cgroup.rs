@@ -1920,7 +1920,10 @@ impl CgroupManager for Cgroups {
                  process instead of the whole step (mis-attributed blast radius)"
             ));
         }
-        if let Some(m) = mem_max {
+        // `memory_max` is one of the guards the `capabilities` manifest advertises, so the
+        // decision to apply it is read from the same registry that publishes it: turning the
+        // advertisement off turns the write off, and vice versa. See `crate::capabilities`.
+        if let Some(m) = mem_max.filter(|_| crate::capabilities::is_enforced("memory_max")) {
             if let Err(e) = fs::write(child.join("memory.max"), m.to_string()) {
                 warn(&format!(
                     "step {tag}: could not apply inner memory cap memory.max={m} ({e}); step runs \
@@ -2557,6 +2560,39 @@ mod tests {
             .unwrap();
         assert_eq!(status.code(), Some(125));
         assert!(!marker.exists());
+        let _ = fs::remove_dir_all(scope);
+    }
+
+    /// #79 derived-enforcement-manifest: the `memory_max` flag is load-bearing, not decorative.
+    /// Flipping it off in the registry must stop the inner cap being written -- otherwise the
+    /// manifest could say `"memory_max":false` while the kernel cap was still applied, which is
+    /// the same class of lie the manifest used to be able to tell in the other direction.
+    #[test]
+    fn inner_memory_cap_follows_the_memory_max_capability_flag() {
+        let scope = temp_scope("memory-max-capability");
+        let cg = Cgroups {
+            enabled: true,
+            root: Some(scope.clone()),
+            containment: Containment::Full,
+        };
+        let applied = scope.join(sanitize("g.j")).join("memory.max");
+
+        crate::capabilities::with_registry_pinned(|| {
+            cg.prepare_command("g.j", "true", Some(4096), None);
+            assert_eq!(fs::read_to_string(&applied).unwrap(), "4096");
+            assert!(crate::capabilities::enforcement_manifest().contains("\"memory_max\":true"));
+        });
+
+        fs::remove_file(&applied).unwrap();
+        crate::capabilities::with_registry_override("memory_max", false, || {
+            assert!(crate::capabilities::enforcement_manifest().contains("\"memory_max\":false"));
+            cg.prepare_command("g.j", "true", Some(4096), None);
+        });
+        assert!(
+            !applied.exists(),
+            "memory.max was written even though the registry says memory_max is unenforced"
+        );
+
         let _ = fs::remove_dir_all(scope);
     }
 
