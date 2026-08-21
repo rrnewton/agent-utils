@@ -490,6 +490,144 @@ def test_the_boxing_re_exec_does_not_make_a_run_queue_behind_its_own_reservation
     held.release()
 
 
+def test_an_inherited_in_scope_sentinel_does_not_wave_an_unreserved_run_through(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The skip belongs to the run that HOLDS the reservation, not to anything that inherits a flag.
+
+    ``systemd-run --setenv=SAFE_CI_IN_SCOPE=1`` sets the sentinel for the whole scope, and every
+    step's environment is built from ``os.environ``, so a runner invoked as a STEP of a boxed run
+    reads exactly the same "1" -- a different pid, holding nothing. Skipping on the flag alone
+    reserved nothing, printed no verdict and exited 0 for a 16 GiB request against a 1 GiB budget.
+    The ledger, not the environment, says whether this process is already admitted.
+    """
+    from safe_ci_dag_runner import cgroup as cg
+    from safe_ci_dag_runner import cli
+
+    ledger = _ledger(tmp_path)
+    gib = 1024**3
+    monkeypatch.setenv(cg.DEFAULT_NAMING.env_in_scope, "1")
+    monkeypatch.setenv(admission.MEM_LEDGER_ENV, str(ledger))
+    monkeypatch.setenv(MEM_BUDGET_BYTES_ENV, str(gib))
+    monkeypatch.setenv(MEM_HEADROOM_BYTES_ENV, str(64 * gib))
+    code = cli.main(
+        [
+            "run",
+            "--dag",
+            str(_tiny_dag(tmp_path)),
+            "--unsafe-no-cgroups",
+            "--no-profile",
+            "--max-mem",
+            "16G",
+            "--admission",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == cli.ADMISSION_EXIT_CODE, captured.out + captured.err
+    assert "REFUSED: 16.0 GiB exceeds the whole-host budget of 1.0 GiB" in captured.err
+    assert held_bytes(ledger) == 0, "a refused run must hold nothing"
+
+
+def test_only_this_processes_own_record_counts_as_already_admitted(tmp_path: Path) -> None:
+    """The fingerprint is ``(pid, /proc starttime)``, which ``execvp`` carries across the re-exec.
+
+    A peer's live reservation is visible in the aggregate and is emphatically NOT this process's
+    licence to skip admission: pid 1 is alive on every Linux host, and counting it here would
+    hand the bypass to any run that started second.
+    """
+    ledger = _ledger(tmp_path)
+    assert admission.held_by_this_process(ledger) == 0
+
+    _decision, held = request_with_limits(
+        4096, tag="run", ledger=ledger, budget=1 << 30, headroom=1 << 30
+    )
+    assert held is not None
+    assert admission.held_by_this_process(ledger) == 4096
+
+    ledger.write_text(
+        json.dumps(
+            {
+                "admissions": [
+                    {"pid": 1, "starttime": None, "bytes": 8192, "tag": "run", "ts": 1.0}
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert held_bytes(ledger) == 8192, "a live peer's reservation is still counted in aggregate"
+    assert admission.held_by_this_process(ledger) == 0
+    held.release()
+
+
+def test_the_default_budget_arithmetic_is_pinned_to_the_named_fraction() -> None:
+    """The fraction is a production constant TWO engines share through one ledger.
+
+    Pinned by value, and by the same literals the Rust suite pins, because every other test in
+    this module supplies the budget explicitly: shrinking the constant used to leave both suites
+    and the differential green while the engines disagreed about what a real host may hold.
+    """
+    assert admission.DEFAULT_MEM_BUDGET_FRACTION == 0.85
+    # 85% of 64 GiB, less the flat 8 GiB margin.
+    assert admission._budget_from_total(64 * 1024**3) == 49821620633
+    # 85% of 8 GiB, less one eighth of 8 GiB rather than the whole 8 GiB.
+    assert admission._budget_from_total(8 * 1024**3) == 6227702579
+    assert admission._budget_from_total(0) == 0
+    assert admission._headroom_from(8 * 1024**3, 8 * 1024**3) == 7516192768
+    assert admission._headroom_from(1024, 8 * 1024**3) == 0
+
+
+def test_a_wait_beyond_the_ceiling_is_refused_rather_than_accepted_and_then_aborted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--admission 1e19`` is a usage error in both engines, and says the same ceiling.
+
+    It used to be accepted here and to ABORT the Rust engine (exit 101, "overflow when adding
+    duration to instant") on the very same command line. A validated input that then panics is
+    worse than a rejected one, so both editions reject it, in words that name the bound.
+    """
+    from safe_ci_dag_runner import cli
+
+    gib = 1024**3
+    monkeypatch.setenv(admission.MEM_LEDGER_ENV, str(_ledger(tmp_path)))
+    monkeypatch.setenv(MEM_BUDGET_BYTES_ENV, str(64 * gib))
+    monkeypatch.setenv(MEM_HEADROOM_BYTES_ENV, str(64 * gib))
+    dag = str(_tiny_dag(tmp_path))
+    base = ["run", "--dag", dag, "--unsafe-no-cgroups", "--no-profile", "--max-mem", "16G"]
+
+    for absurd in ("1e19", "1e15", "99999999999999999999", "86400.001", "nan", "-1"):
+        assert cli.main([*base, "--admission", absurd]) == 2, absurd
+        err = capsys.readouterr().err
+        assert (
+            f"--admission WAIT_S must be a finite number of seconds in [0, 86400] "
+            f"(got {absurd!r})" in err
+        ), err
+
+    # The ceiling itself is accepted: the bound is inclusive, and a granted run never waits.
+    assert cli.main([*base, "--admission", "86400"]) == 0, capsys.readouterr().err
+
+
+def test_an_absurd_wait_is_clamped_rather_than_honoured_forever(tmp_path: Path) -> None:
+    """``admit`` is a library entry point, so it bounds the wait itself as the Rust engine does.
+
+    There the deadline is ``Instant + Duration`` and an unclamped seconds value aborts the
+    process; here it would simply never return. One finite ceiling, spelled the same in both.
+    """
+    assert admission.MAX_WAIT_SECONDS == 31536000
+    assert admission._wait_budget_s(1e19) == 31536000.0
+    assert admission._wait_budget_s(1e20) == 31536000.0
+    assert admission._wait_budget_s(float("nan")) == 0.0
+    assert admission._wait_budget_s(-5.0) == 0.0
+    assert admission._wait_budget_s(30.5) == 30.5
+    decision, granted = admission.admit(
+        1 << 62, tag="run", ledger=_ledger(tmp_path), poll_s=0.01, wait_s=1e19, announce=False
+    )
+    assert decision.verdict is not Verdict.QUEUE, (
+        "a request bigger than any host is refused outright, not queued behind a year-long wait"
+    )
+    if granted is not None:  # only on a host whose memory cannot be measured at all
+        granted.release()
+
+
 def test_a_ledger_this_process_cannot_read_stops_the_run_rather_than_waving_it_through(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

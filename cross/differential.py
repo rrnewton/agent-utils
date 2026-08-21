@@ -1845,10 +1845,11 @@ def compare_memory_admission(py: list[str], rs: list[str], rep: Report) -> None:
             encoding="utf-8",
         )
         gib = 1024**3
-        base = (
+        base_no_admission = (
             "run", "--dag", dag_path, "-s", "1", "-j", "1",
-            NOPROF, NOFB, "--unsafe-no-cgroups", "--admission",
+            NOPROF, NOFB, "--unsafe-no-cgroups",
         )
+        base = (*base_no_admission, "--admission")
 
         def env(name: str, budget: int, headroom: int) -> dict[str, str]:
             return {
@@ -1877,18 +1878,88 @@ def compare_memory_admission(py: list[str], rs: list[str], rep: Report) -> None:
             name: run(cmd, base, env("nonum", 64 * gib, 64 * gib))
             for name, cmd in (("py", py), ("rs", rs))
         }
-        # 5. ALREADY ADMITTED. Cgroup boxing re-execs the runner into a systemd scope with
-        # `execvp`, which keeps the pid AND the /proc start time, so the pre-exec reservation is
-        # still this run's own. Both engines must therefore SKIP admission when the in-scope
-        # sentinel is set; an engine that asks again counts one run twice, and on a tight budget
-        # queues the run behind itself with nothing that can ever release it. A budget of 1 GiB
-        # against a 16 GiB request makes the difference unmissable: re-asking is a REFUSAL.
-        in_scope = {
+        # 5. ALREADY ADMITTED, PROVEN BY THE LEDGER. Cgroup boxing re-execs the runner into a
+        # systemd scope with `execvp`, which keeps the pid AND the /proc start time, so the
+        # pre-exec reservation is still this run's own and both engines must SKIP admission: an
+        # engine that asks again counts one run twice, and on a tight budget queues the run behind
+        # itself with nothing that can ever release it. The seed below writes exactly that record
+        # -- this pid, this start time -- and then `exec`s the engine, which keeps both.
+        own_ledger = os.path.join(tmp, "own-record.json")
+        seed = os.path.join(tmp, "seed_own_record.py")
+        Path(seed).write_text(
+            "import json, sys, time\n"
+            "pid = int(sys.argv[1])\n"
+            "stat = open(f'/proc/{pid}/stat', encoding='utf-8').read()\n"
+            "starttime = int(stat[stat.rfind(')') + 2:].split()[19])\n"
+            "json.dump({'admissions': [{'pid': pid, 'starttime': starttime,\n"
+            "    'bytes': 16 * 1024**3, 'tag': 'run', 'ts': time.time()}]},\n"
+            "    open(sys.argv[2], 'w', encoding='utf-8'))\n",
+            encoding="utf-8",
+        )
+        # `$$` is the shell's own pid, and `exec` hands that very pid to the engine -- the same
+        # identity preservation the boxing re-exec relies on.
+        seeded_shell = (
+            f'{shlex.quote(sys.executable)} {shlex.quote(seed)} "$$" '
+            f'{shlex.quote(own_ledger)} && exec "$@"'
+        )
+        own_record = {
+            name: run(
+                ["sh", "-c", seeded_shell, "sh", *cmd],
+                (*base, "--max-mem", "16G"),
+                {
+                    "SAFE_CI_MEM_LEDGER": own_ledger,
+                    "SAFE_CI_ADMISSION_BUDGET_BYTES": str(gib),
+                    "SAFE_CI_ADMISSION_HEADROOM_BYTES": str(64 * gib),
+                    "SAFE_CI_IN_SCOPE": "1",
+                },
+            )
+            for name, cmd in (("py", py), ("rs", rs))
+        }
+        # 5b. AN INHERITED SENTINEL IS NOT AN ADMISSION. `systemd-run --setenv=SAFE_CI_IN_SCOPE=1`
+        # sets the variable for the WHOLE scope and every step inherits it, so a runner invoked as
+        # a step of a boxed run reads the same "1" while holding nothing. An engine that skips on
+        # the flag alone reserves nothing, prints no verdict and exits 0 -- here, for a 16 GiB
+        # request against a 1 GiB budget on an EMPTY ledger. Both engines must refuse it instead.
+        inherited = {
             name: run(
                 cmd,
                 (*base, "--max-mem", "16G"),
-                {**env("inscope", gib, 64 * gib), "SAFE_CI_IN_SCOPE": "1"},
+                {**env("inherited", gib, 64 * gib), "SAFE_CI_IN_SCOPE": "1"},
             )
+            for name, cmd in (("py", py), ("rs", rs))
+        }
+        # 5c. THE DEFAULT BUDGET, MEASURED RATHER THAN OVERRIDDEN. Every other leg pins both host
+        # limits through the operator overrides, which makes the two engines agree about the
+        # DECISION while saying nothing about the fraction of MemTotal each of them would claim on
+        # a real host. A request larger than any machine forces both to print that number.
+        default_budget = {
+            name: run(
+                cmd,
+                (*base, "--max-mem", "8000000G"),
+                {"SAFE_CI_MEM_LEDGER": os.path.join(tmp, "default.json")},
+            )
+            for name, cmd in (("py", py), ("rs", rs))
+        }
+        # 5d. A WAIT_S NEITHER ENGINE CAN HONOUR IS A USAGE ERROR IN BOTH, with the same ceiling
+        # in the message. 1e19 used to be accepted by both validators and then ABORT the Rust
+        # engine (exit 101, overflow when adding a duration to an instant) while Python ran on.
+        # `-1` pins the other half: argparse eats a negative number as the flag's VALUE, so an
+        # engine that left the token unconsumed would diagnose the same typo differently.
+        too_long = {
+            name: run(
+                cmd,
+                (*base_no_admission, "--max-mem", "16G", "--admission=1e19"),
+                env("long", 64 * gib, 64 * gib),
+            )
+            for name, cmd in (("py", py), ("rs", rs))
+        }
+        negative = {
+            name: run(cmd, (*base, "-1", "--max-mem", "16G"), env("neg", 64 * gib, 64 * gib))
+            for name, cmd in (("py", py), ("rs", rs))
+        }
+        # A day is the ceiling, and it is INCLUSIVE -- a granted run does not wait at all.
+        at_ceiling = {
+            name: run(cmd, (*base, "86400", "--max-mem", "16G"), env("ceil", 64 * gib, 64 * gib))
             for name, cmd in (("py", py), ("rs", rs))
         }
         # 6. A ledger neither engine can read stops the run instead of waving it through: the
@@ -1914,7 +1985,36 @@ def compare_memory_admission(py: list[str], rs: list[str], rep: Report) -> None:
             ("queue", queued, 4, "QUEUED on HOST MEMORY held outside this tool", True),
             ("grant", granted, 0, "GRANTED 16.0 GiB", False),
             ("no-max-mem", no_number, 2, "--admission requires --max-mem", True),
-            ("in-scope-reexec", in_scope, 0, "DELIBERATELY UNBOXED", True),
+            ("in-scope-own-record", own_record, 0, "DELIBERATELY UNBOXED", True),
+            (
+                "in-scope-inherited-sentinel",
+                inherited,
+                4,
+                "REFUSED: 16.0 GiB exceeds the whole-host budget of 1.0 GiB",
+                True,
+            ),
+            (
+                "default-budget",
+                default_budget,
+                4,
+                "exceeds the whole-host budget",
+                True,
+            ),
+            (
+                "wait-above-ceiling",
+                too_long,
+                2,
+                "--admission WAIT_S must be a finite number of seconds in [0, 86400] (got '1e19')",
+                True,
+            ),
+            (
+                "wait-negative",
+                negative,
+                2,
+                "--admission WAIT_S must be a finite number of seconds in [0, 86400] (got '-1')",
+                True,
+            ),
+            ("wait-at-ceiling", at_ceiling, 0, "GRANTED 16.0 GiB", False),
             ("corrupt-ledger", corrupt, 4, "admission ledger unusable", True),
         ]
         for name, outs, expected_code, phrase, on_stderr in checks:
@@ -1936,16 +2036,32 @@ def compare_memory_admission(py: list[str], rs: list[str], rep: Report) -> None:
                 if phrase not in text:
                     rep.bad(label, f"{name}: {engine} did not say {phrase!r}\n{text}")
                     return
-        # The in-scope leg is defined by what it must NOT do, so say that outright rather than
-        # leaning on exit 0: a re-admitting engine would print its verdict on the way past.
-        for engine, out in in_scope.items():
+        # The own-record leg is defined by what it must NOT do, so say that outright rather than
+        # leaning on exit 0: a re-admitting engine would print its verdict on the way past, and
+        # would leave a SECOND record in the ledger for one run.
+        for engine, out in own_record.items():
             noise = out.stdout + out.stderr
             if "[admission]" in noise or "REFUSED" in noise:
                 rep.bad(
                     label,
-                    f"in-scope-reexec: {engine} re-admitted after the boxing re-exec\n{noise}",
+                    f"in-scope-own-record: {engine} re-admitted after the boxing re-exec\n{noise}",
                 )
                 return
+        held = json.loads(Path(own_ledger).read_text(encoding="utf-8"))["admissions"]
+        if len(held) != 1:
+            rep.bad(label, f"in-scope-own-record: one run left {len(held)} records: {held}")
+            return
+        # The measured default budget is the same number in both engines, to the byte. This is
+        # what an unpinned budget FRACTION would break: the decision legs above would stay green
+        # while the two editions disagreed about how much of a real host they may hold.
+        if default_budget["py"].stderr != default_budget["rs"].stderr:
+            rep.bad(
+                label,
+                "default-budget: the two engines measured different host budgets\n"
+                f"--- py ---\n{default_budget['py'].stderr}"
+                f"--- rs ---\n{default_budget['rs'].stderr}",
+            )
+            return
         rep.ok(label)
 
 

@@ -562,8 +562,8 @@ def build_parser() -> argparse.ArgumentParser:
         "for the run), QUEUE (it would fit on a quiet host -- says how many holders are ahead), "
         "REFUSE (bigger than the whole-host budget, so waiting can never help -- says the number "
         "to ask for instead). WAIT_S is how long to wait while queued (default 0 = report and "
-        "exit 4 rather than wait). Requires --max-mem: admission needs a number, and guessing "
-        "one would be worse than not gating.",
+        "exit 4 rather than wait; at most 86400). Requires --max-mem: admission needs a number, "
+        "and guessing one would be worse than not gating.",
     )
     run_p.add_argument(
         "--allow-cgroup-failure",
@@ -2397,6 +2397,15 @@ def _cmd_box(ns: argparse.Namespace, parser: argparse.ArgumentParser, c: Palette
 #: host is busy, come back" from "this invocation is wrong", without parsing prose.
 ADMISSION_EXIT_CODE = 4
 
+#: Largest ``--admission WAIT_S`` this CLI will accept, in seconds (one day).
+#:
+#: An UPPER bound, not only a lower one, because "finite and >= 0" admits 1e19 -- a number no
+#: operator means and no CI job can outlive. The paired Rust engine builds its deadline with
+#: `Instant + Duration`, which PANICS (exit 101, "overflow when adding duration to instant") on
+#: exactly such a value, so an unbounded WAIT_S was an input one engine validated and then
+#: aborted on. A day is longer than any real queue and short enough to be arithmetic.
+MAX_ADMISSION_WAIT_S = 86400.0
+
 
 def _apply_admission(ns: argparse.Namespace) -> int:
     """Reserve this run's memory against the host-wide ledger, or refuse to start. 0 = proceed.
@@ -2417,10 +2426,13 @@ def _apply_admission(ns: argparse.Namespace) -> int:
         )
         return 2
     # NaN must be refused too, hence the explicit finite check: a wait budget that is not a
-    # number is a usage error, and `nan >= 0` is False while `nan < 0` is also False.
-    if not math.isfinite(wait_s) or wait_s < 0:
+    # number is a usage error, and `nan >= 0` is False while `nan < 0` is also False. The UPPER
+    # bound is refused in the same breath and with the same words as the lower one: see
+    # MAX_ADMISSION_WAIT_S for why an unbounded wait is not merely silly but unsafe.
+    if not math.isfinite(wait_s) or wait_s < 0 or wait_s > MAX_ADMISSION_WAIT_S:
         print(
-            f"{PROG}: run: --admission WAIT_S must be a finite number >= 0 (got {raw!r})",
+            f"{PROG}: run: --admission WAIT_S must be a finite number of seconds in "
+            f"[0, {MAX_ADMISSION_WAIT_S:g}] (got {raw!r})",
             file=sys.stderr,
         )
         return 2
@@ -2437,16 +2449,29 @@ def _apply_admission(ns: argparse.Namespace) -> int:
         )
         return 2
 
-    # ALREADY ADMITTED. Boxing re-execs this process into a systemd scope with `execvp`, which
-    # keeps the pid AND the /proc start time, so the record this run wrote before the exec is
-    # still its own live reservation. Asking again would count this run twice against the budget
-    # -- and on a tight budget the second ask would QUEUE behind the first, i.e. the run would
-    # wait for itself until the wait ran out. The ledger entry outlives the exec and is swept
-    # when the process finally dies, so there is nothing left to do here.
+    # ALREADY ADMITTED -- AND THIS RUN PROVES IT IS THE ONE ADMITTED. Boxing re-execs this process
+    # into a systemd scope with `execvp`, which keeps the pid AND the /proc start time, so the
+    # record this run wrote before the exec is still its own live reservation. Asking again would
+    # count this run twice against the budget -- and on a tight budget the second ask would QUEUE
+    # behind the first, i.e. the run would wait for itself until the wait ran out.
+    #
+    # THE SENTINEL ALONE CANNOT ESTABLISH THAT. `systemd-run --setenv=SAFE_CI_IN_SCOPE=1` sets it
+    # for the whole scope, and every step's environment is built from `os.environ`, so a runner
+    # invoked as a STEP of a boxed run inherits the same "1" while holding no reservation at all
+    # -- and skipping on the flag alone would wave that nested run through with nothing reserved
+    # and no verdict printed. So ask the LEDGER whether a live record is fingerprinted with this
+    # pid and this /proc start time: only its own record licenses the skip. Anything else falls
+    # through and admits normally.
     from safe_ci_dag_runner import cgroup as cg
 
     if os.environ.get(cg.DEFAULT_NAMING.env_in_scope) == "1":
-        return 0
+        try:
+            own_bytes = admission.held_by_this_process()
+        except admission.AdmissionStateError as error:
+            print(f"{PROG}: run: admission ledger unusable: {error}", file=sys.stderr)
+            return ADMISSION_EXIT_CODE
+        if own_bytes > 0:
+            return 0
 
     try:
         decision, reservation = admission.admit(

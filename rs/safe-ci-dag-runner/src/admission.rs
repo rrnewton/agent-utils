@@ -72,6 +72,15 @@ pub const MEM_SAFETY_MARGIN_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 /// precisely on the small hosts the flat margin was added to protect.
 pub const MEM_SAFETY_MARGIN_MAX_DIVISOR: u64 = 8;
 
+/// Longest wait [`admit`] will honour, however large `wait_s` is.
+///
+/// A year is not a wait, it is a hang with a timestamp -- but the reason this exists is
+/// arithmetic: `Instant + Duration` PANICS on overflow, so an unbounded seconds value aborts the
+/// process (exit 101) on a number the caller has just been told is acceptable. Every paired
+/// implementation of this runner clamps to the same ceiling, so an absurd wait folds to one
+/// finite answer in all of them.
+pub const MAX_WAIT_SECONDS: u64 = 365 * 24 * 60 * 60;
+
 const MAX_BYTES: u64 = 1 << 62;
 
 /// The flat margin, capped so it can never consume the whole of `scale`.
@@ -81,6 +90,22 @@ const MAX_BYTES: u64 = 1 << 62;
 /// instead of collapsing to zero and refusing everything.
 fn safety_margin_bytes(scale: u64) -> u64 {
     MEM_SAFETY_MARGIN_BYTES.min(scale / MEM_SAFETY_MARGIN_MAX_DIVISOR)
+}
+
+/// The aggregate budget implied by a host of `total` bytes.
+///
+/// Split out from [`host_budget_bytes`] so the ARITHMETIC can be pinned against literal numbers
+/// without a readable `/proc/meminfo`. Every paired implementation carries the same function and
+/// pins the same literals: the fraction is a production constant the paired engines share through
+/// one ledger, and a constant no test names is a constant either engine can shrink unnoticed.
+fn budget_from_total(total: u64) -> u64 {
+    let scaled = (total as f64 * DEFAULT_MEM_BUDGET_FRACTION) as u64;
+    scaled.saturating_sub(safety_margin_bytes(total))
+}
+
+/// The live headroom implied by `available` bytes free on a host of `scale` bytes.
+fn headroom_from(available: u64, scale: u64) -> u64 {
+    available.saturating_sub(safety_margin_bytes(scale))
 }
 
 /// The three answers admission can give. The values are part of the printed contract, so every
@@ -264,8 +289,7 @@ pub fn host_budget_bytes() -> Option<u64> {
         return Some(override_bytes);
     }
     let total = meminfo_bytes("MemTotal")?;
-    let scaled = (total as f64 * DEFAULT_MEM_BUDGET_FRACTION) as u64;
-    Some(scaled.saturating_sub(safety_margin_bytes(total)))
+    Some(budget_from_total(total))
 }
 
 /// Memory actually available on the host right now, minus the margin; `None` if unknown.
@@ -283,7 +307,7 @@ pub fn live_headroom_bytes() -> Option<u64> {
     // exactly when the margin matters. MemTotal is readable whenever MemAvailable is; the fallback
     // only keeps this honest if that ever stops being true.
     let scale = meminfo_bytes("MemTotal").unwrap_or(available);
-    Some(available.saturating_sub(safety_margin_bytes(scale)))
+    Some(headroom_from(available, scale))
 }
 
 fn proc_starttime(pid: u32) -> Option<u64> {
@@ -537,6 +561,19 @@ impl Drop for MemoryReservation {
     }
 }
 
+/// The wait [`admit`] will actually honour: negative and NaN fold to none, absurd to the cap.
+///
+/// This is the line that used to abort the process. `Duration::from_secs_f64` panics above
+/// `u64::MAX` seconds, and `Instant + Duration` panics on overflow, so a wait value the CLI had
+/// just validated could kill the run with exit 101 instead of returning a verdict. Every paired
+/// implementation folds the same three cases to the same three answers.
+fn wait_budget(wait_s: f64) -> Duration {
+    let cap = Duration::from_secs(MAX_WAIT_SECONDS);
+    Duration::try_from_secs_f64(wait_s.max(0.0))
+        .unwrap_or(cap)
+        .min(cap)
+}
+
 fn now_secs() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -724,7 +761,14 @@ pub fn admit(
     wait_s: f64,
     announce: bool,
 ) -> Result<(Decision, Option<MemoryReservation>), String> {
-    let deadline = Instant::now() + Duration::from_secs_f64(wait_s.max(0.0));
+    // NO DEADLINE ARITHMETIC ON AN UNBOUNDED NUMBER. `Duration::from_secs_f64` panics above
+    // `u64::MAX` seconds and `Instant + Duration` panics on overflow, so the obvious
+    // `Instant::now() + Duration::from_secs_f64(wait_s)` ABORTS the process (exit 101) on a wait
+    // the caller was just told is acceptable -- worse than refusing it, because the run dies
+    // without a verdict. Measure elapsed time against a clamped budget instead: no addition to an
+    // Instant, no panic reachable, and the same ceiling the Python engine applies.
+    let started = Instant::now();
+    let budget = wait_budget(wait_s);
     let mut last_reason: Option<String> = None;
     loop {
         let (decision, reservation) = request(requested_bytes, tag, ledger)?;
@@ -738,13 +782,38 @@ pub fn admit(
             println!("[admission] {}", decision.reason);
             last_reason = Some(decision.reason.clone());
         }
-        let now = Instant::now();
-        if now >= deadline {
+        let spent = started.elapsed();
+        if spent >= budget {
             return Ok((decision, None));
         }
-        let remaining = deadline.saturating_duration_since(now);
-        std::thread::sleep(remaining.min(Duration::from_secs_f64(poll_s.max(0.01))));
+        let remaining = budget - spent;
+        let poll = Duration::try_from_secs_f64(poll_s.max(0.01))
+            .unwrap_or(Duration::from_secs(MAX_WAIT_SECONDS));
+        std::thread::sleep(remaining.min(poll));
     }
+}
+
+/// Bytes THIS process already holds in the ledger, by `(pid, /proc starttime)`.
+///
+/// The identity, not a flag. `execvp` keeps both fields, so a runner that has re-exec'd into its
+/// systemd scope can ask the ledger whether the reservation it is about to skip re-asking for is
+/// genuinely its OWN. An environment variable cannot answer that: the scope exports the in-scope
+/// sentinel to every process inside it, so a runner invoked as a STEP of a boxed run reads the
+/// same "1" while holding nothing at all. Zero means "go and ask properly".
+pub fn held_by_this_process(ledger: Option<&Path>) -> Result<u64, String> {
+    let path = match ledger {
+        Some(p) => p.to_path_buf(),
+        None => default_ledger_path(),
+    };
+    let pid = std::process::id();
+    let starttime = proc_starttime(pid);
+    let _lock = LedgerLock::acquire(&path)?;
+    let records = load(&path)?;
+    Ok(records
+        .iter()
+        .filter(|r| r.pid == pid && r.starttime == starttime)
+        .map(|r| r.bytes)
+        .sum())
 }
 
 /// Total bytes currently reserved by LIVE holders. Sweeps dead holders first.
@@ -953,6 +1022,87 @@ mod tests {
         // where the uncapped margin left 0 B and refused every run on the host.
         let small_budget = (8589934592.0_f64 * 0.85) as u64 - safety_margin_bytes(8589934592);
         assert_eq!(small_budget, 6227702579);
+    }
+
+    #[test]
+    fn the_default_budget_keeps_back_the_named_fraction_and_the_flat_margin() {
+        // THE FRACTION IS PINNED BY VALUE, HERE. Every other test in this module supplies the
+        // budget explicitly (or through the operator override), so shrinking
+        // DEFAULT_MEM_BUDGET_FRACTION used to leave the whole suite and the cross-language
+        // differential green while the two engines disagreed by 9x about what a real host may
+        // hold. The numbers below are literals, and they are the SAME literals the Python suite
+        // pins, because the two editions share one ledger and must do one arithmetic.
+        assert_eq!(DEFAULT_MEM_BUDGET_FRACTION, 0.85);
+        // 85% of 64 GiB, less the flat 8 GiB margin.
+        assert_eq!(budget_from_total(64 * 1024 * 1024 * 1024), 49821620633);
+        // 85% of 8 GiB, less one eighth of 8 GiB rather than the whole 8 GiB.
+        assert_eq!(budget_from_total(8 * 1024 * 1024 * 1024), 6227702579);
+        assert_eq!(budget_from_total(0), 0);
+        // Headroom keeps back the same margin, scaled by the HOST rather than by what is free.
+        assert_eq!(
+            headroom_from(8 * 1024 * 1024 * 1024, 8 * 1024 * 1024 * 1024),
+            7516192768
+        );
+        assert_eq!(headroom_from(1024, 8 * 1024 * 1024 * 1024), 0);
+    }
+
+    #[test]
+    fn this_process_can_recognise_its_own_reservation_in_the_ledger() {
+        // What the in-scope skip is allowed to rely on. A run that re-execs into its systemd
+        // scope keeps its pid and /proc start time, so its own record is findable; a runner
+        // started as a STEP of that scope inherits the sentinel but has no record of its own,
+        // and must be told so rather than waved through.
+        let path = ledger_in("own-record");
+        assert_eq!(held_by_this_process(Some(&path)).expect("empty"), 0);
+
+        let (decision, reservation) =
+            request_with_limits(4096, "run", Some(&path), Some(1 << 30), Some(1 << 30))
+                .expect("request");
+        assert_eq!(decision.verdict, Verdict::Grant);
+        let mut reservation = reservation.expect("granted");
+        assert_eq!(held_by_this_process(Some(&path)).expect("own"), 4096);
+
+        // A live record belonging to SOMEONE ELSE is not this process's licence to skip: pid 1
+        // is alive on every Linux host, and its bytes are counted by `held_bytes` and by nothing
+        // this process may claim.
+        let foreign =
+            r#"{"admissions":[{"pid":1,"starttime":null,"bytes":8192,"tag":"run","ts":1.0}]}"#;
+        fs::write(&path, foreign).expect("write foreign ledger");
+        assert_eq!(held_bytes(Some(&path)).expect("held"), 8192);
+        assert_eq!(held_by_this_process(Some(&path)).expect("foreign"), 0);
+        let _ = reservation.release();
+    }
+
+    #[test]
+    fn an_absurd_wait_is_clamped_instead_of_aborting_the_process() {
+        // `Instant + Duration::from_secs_f64(1e19)` panics ("overflow when adding duration to
+        // instant"), and `from_secs_f64(1e20)` panics before that ("cannot convert float seconds
+        // to Duration"). Either way the run died with exit 101 on a wait value the CLI had just
+        // validated. Granting must survive both, and must not sit here for a year.
+        // A 4 EiB request is larger than any host, so the answer comes back without waiting --
+        // but the deadline is built BEFORE the first request, which is exactly where the abort
+        // happened. Nothing here may hang and nothing here may panic.
+        let path = ledger_in("absurd-wait");
+        for wait in [1e19_f64, 1e20_f64, f64::MAX] {
+            let (decision, reservation) =
+                admit(1 << 62, "run", Some(&path), 0.01, wait, false).expect("admit");
+            assert_ne!(
+                decision.verdict,
+                Verdict::Queue,
+                "a request bigger than any host is refused outright, not queued (wait_s={wait})"
+            );
+            if let Some(mut reservation) = reservation {
+                let _ = reservation.release();
+            }
+        }
+        // A year, named literally: the clamp is what keeps the deadline arithmetic in range, and
+        // the Python edition folds the same three cases to the same three answers.
+        assert_eq!(MAX_WAIT_SECONDS, 31536000);
+        assert_eq!(wait_budget(1e19), Duration::from_secs(31536000));
+        assert_eq!(wait_budget(1e20), Duration::from_secs(31536000));
+        assert_eq!(wait_budget(f64::NAN), Duration::ZERO);
+        assert_eq!(wait_budget(-5.0), Duration::ZERO);
+        assert_eq!(wait_budget(30.5), Duration::from_secs_f64(30.5));
     }
 
     #[test]

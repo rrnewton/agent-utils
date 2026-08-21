@@ -350,7 +350,7 @@ fn run_help(c: &Palette) -> String {
             ("--profile-sync-direction D", "both (default) | download | upload"),
             ("-k, --keep-going", "after failure, continue independent work; skip failed dependents"),
             ("--run-timeout SECONDS", "OUTER wall budget for the WHOLE run; cuts in-flight steps and still reports"),
-            ("--admission [WAIT_S]", "HOST-WIDE memory admission (opt-in): reserve --max-mem against a durable ledger every runner on the host shares. GRANT / QUEUE (says how many holders are ahead) / REFUSE (says the number to ask for). WAIT_S = how long to wait while queued (default 0 = report and exit 4). Requires --max-mem"),
+            ("--admission [WAIT_S]", "HOST-WIDE memory admission (opt-in): reserve --max-mem against a durable ledger every runner on the host shares. GRANT / QUEUE (says how many holders are ahead) / REFUSE (says the number to ask for). WAIT_S = how long to wait while queued (default 0 = report and exit 4; at most 86400). Requires --max-mem"),
             ("--allow-cgroup-failure", "if cgroup boxing is unavailable, run UNBOXED with a warning instead of erroring"),
             ("--unsafe-no-cgroups", "DELIBERATELY skip cgroup boxing entirely (unsafe)"),
             ("--small-default-cap", "compatibility no-op (small caps are already on by default)"),
@@ -925,6 +925,37 @@ struct RunArgs {
     quiet: bool,
 }
 
+/// Largest `--admission WAIT_S` this CLI will accept, in seconds (one day).
+///
+/// An UPPER bound, not only a lower one, because "finite and >= 0" admits 1e19 -- a number no
+/// operator means and no CI job can outlive, and one this engine used to accept and then PANIC
+/// on (exit 101, "overflow when adding duration to instant") while the paired engine ran the
+/// same command normally. A validated input that then aborts is worse than a rejected one. A day
+/// is longer than any real queue and short enough to be arithmetic.
+const MAX_ADMISSION_WAIT_S: f64 = 86400.0;
+
+/// Does this token read as a negative number, the way the paired engine's parser reads one?
+///
+/// There `-1` is taken as an option VALUE rather than a flag when the parser declares no
+/// negative-number-like options, by the matcher `^-\d+$|^-\d*\.\d+$`. This is that expression,
+/// spelled out: `-1e19` is deliberately NOT a match, because that matcher does not match it.
+fn looks_like_negative_number(token: &str) -> bool {
+    let Some(body) = token.strip_prefix('-') else {
+        return false;
+    };
+    if body.is_empty() {
+        return false;
+    }
+    match body.split_once('.') {
+        None => body.bytes().all(|b| b.is_ascii_digit()),
+        Some((whole, frac)) => {
+            !frac.is_empty()
+                && whole.bytes().all(|b| b.is_ascii_digit())
+                && frac.bytes().all(|b| b.is_ascii_digit())
+        }
+    }
+}
+
 fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
     let mut a = RunArgs {
         dag: None,
@@ -1052,24 +1083,34 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
             "--admission" => {
                 // Optional value, mirroring the Python `nargs="?"`: a bare `--admission` means
                 // "do not wait", and only a token that is not itself a flag is taken as SECONDS.
+                // A NEGATIVE NUMBER IS A VALUE, NOT A FLAG -- argparse consumes `-1` here (its
+                // negative-number matcher, no negative-number-like options declared), so an
+                // engine that left it unconsumed would report a different usage error for the
+                // same command line. Same matcher, same token consumed, same message.
                 let seconds = match inline {
                     Some(v) => v,
                     None => match rest.get(i + 1) {
-                        Some(next) if !next.starts_with('-') => {
+                        Some(next)
+                            if !next.starts_with('-') || looks_like_negative_number(next) =>
+                        {
                             i += 1;
                             next.clone()
                         }
                         _ => "0".to_string(),
                     },
                 };
-                let parsed = seconds
-                    .parse::<f64>()
-                    .map_err(|_| format!("--admission: invalid seconds value: '{seconds}'"))?;
+                let parsed = seconds.parse::<f64>().map_err(|_| {
+                    format!("--admission WAIT_S must be a number of seconds (got '{seconds}')")
+                })?;
                 // NaN must be refused too, hence the explicit finite check rather than a
                 // negated comparison: `!(nan >= 0.0)` is true, but so is every other comparison
                 // with NaN, and a wait budget that is not a number is a usage error either way.
-                if !parsed.is_finite() || parsed < 0.0 {
-                    return Err("--admission: WAIT_S must be a finite number >= 0".to_string());
+                // The UPPER bound is refused in the same breath: see MAX_ADMISSION_WAIT_S.
+                if !parsed.is_finite() || !(0.0..=MAX_ADMISSION_WAIT_S).contains(&parsed) {
+                    return Err(format!(
+                        "--admission WAIT_S must be a finite number of seconds in \
+                         [0, {MAX_ADMISSION_WAIT_S}] (got '{seconds}')"
+                    ));
                 }
                 a.admission = Some(parsed);
             }
@@ -2601,14 +2642,29 @@ fn apply_admission(a: &RunArgs) -> Result<Option<crate::admission::MemoryReserva
         );
         return Err(2);
     };
-    // ALREADY ADMITTED. Boxing re-execs this process into a systemd scope with `execvp`, which
-    // keeps the pid AND the /proc start time, so the record this run wrote before the exec is
-    // still its own live reservation. Asking again would count this run twice against the budget
-    // -- and on a tight budget the second ask would QUEUE behind the first, i.e. the run would
-    // wait for itself until the wait ran out. The ledger entry outlives the exec and is swept
-    // when the process finally dies, so there is nothing left to do here.
+    // ALREADY ADMITTED -- AND THIS RUN PROVES IT IS THE ONE ADMITTED. Boxing re-execs this
+    // process into a systemd scope with `execvp`, which keeps the pid AND the /proc start time,
+    // so the record this run wrote before the exec is still its own live reservation. Asking
+    // again would count this run twice against the budget -- and on a tight budget the second
+    // ask would QUEUE behind the first, i.e. the run would wait for itself until the wait ran
+    // out.
+    //
+    // THE SENTINEL ALONE CANNOT ESTABLISH THAT. `systemd-run --setenv=SAFE_CI_IN_SCOPE=1` sets it
+    // for the whole scope, and every step inherits the runner's environment, so a runner invoked
+    // as a STEP of a boxed run reads the same "1" while holding no reservation at all -- and
+    // skipping on the flag alone would wave that nested run through with nothing reserved and no
+    // verdict printed. So ask the LEDGER whether a live record is fingerprinted with this pid and
+    // this /proc start time: only its own record licenses the skip. Anything else falls through
+    // and admits normally.
     if crate::cgroup::is_in_scope() {
-        return Ok(None);
+        match crate::admission::held_by_this_process(None) {
+            Ok(own_bytes) if own_bytes > 0 => return Ok(None),
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!("{PROG}: run: admission ledger unusable: {error}");
+                return Err(ADMISSION_EXIT_CODE);
+            }
+        }
     }
     let requested = u64::try_from(requested).unwrap_or(0);
     let poll_s = (wait_s / 4.0).clamp(0.25, 2.0);
@@ -3836,6 +3892,82 @@ mod tests {
                 .as_deref(),
             Some("--max-cpus: must be <= 92233720368547")
         );
+    }
+
+    #[test]
+    fn admission_wait_is_bounded_above_so_a_validated_value_cannot_abort_the_run() {
+        // 1e19 seconds used to pass this validator and then panic the process (exit 101,
+        // "overflow when adding duration to instant") the moment `admit` built its deadline,
+        // while the Python engine ran the same command line normally. Refuse it HERE, in words
+        // both engines print, and name the ceiling literally: a test that recomputed it from
+        // MAX_ADMISSION_WAIT_S would follow the constant anywhere it was moved.
+        for absurd in ["1e19", "1e15", "99999999999999999999", "86400.001"] {
+            let err = parse_run_args(&[format!("--admission={absurd}")])
+                .err()
+                .unwrap_or_else(|| panic!("--admission={absurd} must be refused"));
+            assert_eq!(
+                err,
+                format!(
+                    "--admission WAIT_S must be a finite number of seconds in [0, 86400] \
+                     (got '{absurd}')"
+                )
+            );
+        }
+        assert_eq!(
+            parse_run_args(&["--admission=nan".into()]).err().as_deref(),
+            Some("--admission WAIT_S must be a finite number of seconds in [0, 86400] (got 'nan')")
+        );
+        assert_eq!(
+            parse_run_args(&["--admission=eleven".into()])
+                .err()
+                .as_deref(),
+            Some("--admission WAIT_S must be a number of seconds (got 'eleven')")
+        );
+        // The ceiling itself is accepted: the bound is inclusive, and a day-long queue is legal.
+        assert_eq!(
+            parse_run_args(&["--admission=86400".into()])
+                .unwrap()
+                .admission,
+            Some(86400.0)
+        );
+        assert_eq!(
+            parse_run_args(&["--admission".into()]).unwrap().admission,
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn admission_consumes_a_negative_number_the_way_argparse_does() {
+        // Both engines parse the same command line, so both must agree on which token the flag
+        // ATE. Python's argparse takes `-1` as the value (its negative-number matcher) and then
+        // rejects it as out of range; an engine that left it unconsumed would report
+        // "unrecognized argument" instead -- same exit code, different diagnosis of the typo.
+        assert_eq!(
+            parse_run_args(&["--admission".into(), "-1".into()])
+                .err()
+                .as_deref(),
+            Some("--admission WAIT_S must be a finite number of seconds in [0, 86400] (got '-1')")
+        );
+        assert_eq!(
+            parse_run_args(&["--admission".into(), "-0.5".into()])
+                .err()
+                .as_deref(),
+            Some(
+                "--admission WAIT_S must be a finite number of seconds in [0, 86400] (got '-0.5')"
+            )
+        );
+        // A real flag is still a flag: `--admission --quiet` is a bare admission plus --quiet,
+        // exactly as argparse's `nargs="?"` reads it.
+        let parsed = parse_run_args(&["--admission".into(), "--quiet".into()]).unwrap();
+        assert_eq!(parsed.admission, Some(0.0));
+        assert!(parsed.quiet);
+        // And `-1e19` is NOT a negative number to argparse, so it is not one here either.
+        assert!(!looks_like_negative_number("-1e19"));
+        assert!(!looks_like_negative_number("-"));
+        assert!(!looks_like_negative_number("--quiet"));
+        assert!(looks_like_negative_number("-1"));
+        assert!(looks_like_negative_number("-.5"));
+        assert!(looks_like_negative_number("-12.75"));
     }
 
     #[test]

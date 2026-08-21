@@ -553,9 +553,19 @@ There are three answers, not two:
 | REFUSE | Bigger than the whole-host budget, so waiting can never help. Says the largest number that could be granted. |
 
 A queued run exits 4 by default and prints why; pass `--admission SECONDS` to
-wait instead. Exit 4 is distinct from 2 (bad usage) and 3 (cgroup boxing
-unavailable) so a retrying scheduler can tell "the host is busy, come back" from
-"this invocation is wrong" without parsing prose.
+wait instead, up to a ceiling of 86400 (one day) -- a longer wait is refused as
+a usage error rather than accepted and then never honoured. Exit 4 is distinct
+from 2 (bad usage) and 3 (cgroup boxing unavailable) so a retrying scheduler can
+tell "the host is busy, come back" from "this invocation is wrong" without
+parsing prose.
+
+Inside a boxed run the reservation is made ONCE. Boxing re-execs the runner into
+its systemd scope with `execvp`, which keeps the pid and the `/proc` start time,
+so the run finds its OWN record in the ledger and does not ask again -- it would
+otherwise queue behind itself. That skip is granted by the ledger record, not by
+the in-scope environment variable: a runner invoked as a *step* of a boxed run
+inherits the same variable while holding no reservation, and is admitted on its
+own merits like any other run.
 
 A grant needs BOTH `reserved + requested <= whole-host budget` (the condition
 other runners affect) and `requested <= live headroom` (the condition non-runner

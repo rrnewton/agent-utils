@@ -60,6 +60,7 @@ __all__ = [
     "MemoryReservation",
     "Verdict",
     "admit",
+    "held_by_this_process",
     "held_bytes",
     "host_budget_bytes",
     "live_headroom_bytes",
@@ -105,6 +106,16 @@ MEM_SAFETY_MARGIN_BYTES = 8 * 1024**3
 #: can queue its way in either. That is not a conservative gate, it is a broken one, and it breaks
 #: precisely on the small hosts the flat margin was added to protect.
 MEM_SAFETY_MARGIN_MAX_DIVISOR = 8
+
+#: Longest wait :func:`admit` will honour, in seconds, however large ``wait_s`` is.
+#:
+#: A year is not a wait, it is a hang with a timestamp -- but the reason this is a CLAMP rather
+#: than a rejection is arithmetic parity with the paired engine: there, the deadline is
+#: ``Instant + Duration`` and an unbounded seconds value PANICS the process (overflow when adding
+#: a duration to an instant) on a number this very function has just accepted. Both editions
+#: therefore fold an absurd wait down to the same finite ceiling instead of one waiting forever
+#: while the other aborts.
+MAX_WAIT_SECONDS = 365 * 24 * 60 * 60
 
 _MAX_U32 = (1 << 32) - 1
 _MAX_U64 = (1 << 64) - 1
@@ -182,6 +193,22 @@ def _safety_margin_bytes(scale: int) -> int:
     return min(MEM_SAFETY_MARGIN_BYTES, max(0, scale) // MEM_SAFETY_MARGIN_MAX_DIVISOR)
 
 
+def _budget_from_total(total: int) -> int:
+    """The aggregate budget implied by a host of ``total`` bytes.
+
+    Split out from :func:`host_budget_bytes` so the ARITHMETIC can be pinned against literal
+    numbers without a readable ``/proc/meminfo``. Both editions carry this function and both
+    pin the same literals: the fraction is a production constant two engines share through one
+    ledger, and a constant no test names is a constant either engine can drift on quietly.
+    """
+    return max(0, int(total * DEFAULT_MEM_BUDGET_FRACTION) - _safety_margin_bytes(total))
+
+
+def _headroom_from(available: int, scale: int) -> int:
+    """The live headroom implied by ``available`` bytes free on a host of ``scale`` bytes."""
+    return max(0, available - _safety_margin_bytes(scale))
+
+
 def host_budget_bytes() -> int | None:
     """The aggregate this tool will ever let its runs hold on this host, or ``None`` if unknown.
 
@@ -195,7 +222,7 @@ def host_budget_bytes() -> int | None:
     total = _meminfo_bytes("MemTotal")
     if total is None:
         return None
-    return max(0, int(total * DEFAULT_MEM_BUDGET_FRACTION) - _safety_margin_bytes(total))
+    return _budget_from_total(total)
 
 
 def live_headroom_bytes() -> int | None:
@@ -216,7 +243,7 @@ def live_headroom_bytes() -> int | None:
     # exactly when the margin matters. MemTotal is readable whenever MemAvailable is; the fallback
     # only keeps this honest if that ever stops being true.
     total = _meminfo_bytes("MemTotal")
-    return max(0, available - _safety_margin_bytes(total if total is not None else available))
+    return _headroom_from(available, total if total is not None else available)
 
 
 def _default_ledger_path() -> Path:
@@ -701,6 +728,16 @@ def request_with_limits(
     )
 
 
+def _wait_budget_s(wait_s: float) -> float:
+    """The wait :func:`admit` will honour: negative and NaN fold to none, absurd to the cap.
+
+    A separate function because the paired engine's version of this line is the one that used to
+    ABORT the process -- there the deadline is ``Instant + Duration`` and an unbounded seconds
+    value panics -- so both editions pin the folded value rather than trusting the caller.
+    """
+    return min(max(0.0, wait_s), float(MAX_WAIT_SECONDS))
+
+
 def admit(
     requested_bytes: int,
     *,
@@ -719,7 +756,7 @@ def admit(
     ``wait_s = 0`` waits not at all and returns the first decision, so the caller can choose
     between queuing and reporting. REFUSE never waits, by construction.
     """
-    deadline = time.monotonic() + max(0.0, wait_s)
+    deadline = time.monotonic() + _wait_budget_s(wait_s)
     last_reason: str | None = None
     while True:
         decision, reservation = request(requested_bytes, tag=tag, ledger=ledger)
@@ -744,6 +781,25 @@ def reclaim_dead(ledger: Path | None = None) -> list[dict[str, object]]:
         if dead:
             _store(path, live)
     return [r.to_json() for r in dead]
+
+
+def held_by_this_process(ledger: Path | None = None) -> int:
+    """Bytes THIS process already holds in the ledger, by ``(pid, /proc starttime)``.
+
+    The identity, not a flag. ``execvp`` keeps both fields, so a runner that has re-exec'd into
+    its systemd scope can ask the ledger whether the reservation it is about to skip re-asking
+    for is genuinely its OWN. An environment variable cannot answer that question: the scope
+    exports the in-scope sentinel to every process inside it, so a runner invoked as a STEP of a
+    boxed run reads the same "1" while holding nothing at all.
+
+    Zero is the honest answer for an untracked process, and it means "go and ask properly".
+    """
+    path = ledger or _default_ledger_path()
+    pid = os.getpid()
+    starttime = _proc_starttime(pid)
+    with _LedgerLock(path):
+        records = _load(path)
+    return sum(r.bytes_ for r in records if r.pid == pid and r.starttime == starttime)
 
 
 def held_bytes(ledger: Path | None = None) -> int:
