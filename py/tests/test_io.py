@@ -14,6 +14,7 @@ from safe_ci_dag_runner.model import (
     StepClass,
     WriteDomainGuarantee,
     WriteDomainPolicy,
+    resolved_wall_timeout,
 )
 from safe_ci_dag_runner.scheduler import run_dag
 
@@ -79,7 +80,8 @@ def test_minimal_document_defaults() -> None:
     assert step.tag == "g.j"
     assert step.desc == "" and step.deps == [] and step.env == {}
     assert step.description == "" and cfg.description == ""  # default empty
-    assert step.timeout == 1800
+    assert step.timeout == 0  # the "derive it" sentinel, not "no bound"
+    assert resolved_wall_timeout(step, cfg.default_step_timeout) == 1800
     assert step.cpu_timeout == 0  # CPU-time guard disabled by default
     assert step.hint.classification is StepClass.LIGHT
     assert cfg.resource_caps == {} and cfg.mem_cap_factor == 1.25
@@ -122,10 +124,13 @@ def test_default_step_timeout_applied() -> None:
 
 
 def test_default_step_timeout_falls_back_to_module_constant() -> None:
-    # Without a document-level default, steps fall back to the module DEFAULT_STEP_TIMEOUT.
+    # Without a document-level default, NOTHING is materialized: both stay at the 0 "derive it"
+    # sentinel, and the module constant reappears only as the RESOLVED bound. Materializing 1800
+    # here is what baked a load-sensitive number into every graph.
     cfg = dag_from_json('{"steps": [{"group": "g", "job": "a", "cmd": "true"}]}')
-    assert cfg.steps[0].timeout == 1800
-    assert cfg.default_step_timeout == 1800
+    assert cfg.steps[0].timeout == 0
+    assert cfg.default_step_timeout == 0
+    assert resolved_wall_timeout(cfg.steps[0], cfg.default_step_timeout) == 1800
 
 
 def test_typed_intentional_skip_roundtrips_and_rejects_dependents() -> None:

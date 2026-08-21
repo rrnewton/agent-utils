@@ -44,8 +44,9 @@ use crate::attribution::{
 use crate::cgroup::CgroupManager;
 use crate::model::{
     canonical_cpu_timeout, command_with_inner_jobs, effective_cpu_count, effective_cpu_timeout,
-    effective_jobs_flag, preferred_inner_jobs, scale_cpu_timeout, step_classification,
-    undeclared_resource_demands, write_domain_violations, DagConfig, RunResult, Step, StepOutcome,
+    effective_jobs_flag, preferred_inner_jobs, resolved_wall_timeout, scale_cpu_timeout,
+    step_classification, undeclared_resource_demands, write_domain_violations, DagConfig,
+    RunResult, Step, StepOutcome,
 };
 use crate::profile_enrich::{resolve_effective_inner_jobs, step_enrichment_columns};
 
@@ -751,6 +752,8 @@ struct Runner {
     default_step_mem_cap_bytes: Option<i64>,
     default_step_cpu_count: Option<i64>,
     default_step_cpu_timeout: i64,
+    /// Document-wide wall budget for steps that omit their own; `0` means each step derives one.
+    default_step_timeout: i64,
     cpu_timeout_multiplier: f64,
     cpu_timeout_platform: String,
     /// OUTER wall budget for the WHOLE run, in seconds; `None` leaves the run unbounded.
@@ -819,6 +822,7 @@ impl Runner {
             default_step_mem_cap_bytes: capped.default_step_mem_cap_bytes,
             default_step_cpu_count: capped.default_step_cpu_count,
             default_step_cpu_timeout: capped.default_step_cpu_timeout,
+            default_step_timeout: capped.default_step_timeout,
             cpu_timeout_multiplier: capped.cpu_timeout_multiplier,
             cpu_timeout_platform: capped.cpu_timeout_platform.clone(),
             run_timeout_s,
@@ -1042,6 +1046,7 @@ impl Runner {
                 let default_step_mem_cap_bytes = self.default_step_mem_cap_bytes;
                 let default_step_cpu_count = self.default_step_cpu_count;
                 let default_step_cpu_timeout = self.default_step_cpu_timeout;
+                let default_step_timeout = self.default_step_timeout;
                 let evidence = self.evidence.clone();
                 let cpu_timeout_multiplier = self.cpu_timeout_multiplier;
                 let cpu_timeout_platform = self.cpu_timeout_platform.clone();
@@ -1057,6 +1062,7 @@ impl Runner {
                         default_step_mem_cap_bytes,
                         default_step_cpu_count,
                         default_step_cpu_timeout,
+                        default_step_timeout,
                         evidence,
                         cpu_timeout_multiplier,
                         cpu_timeout_platform,
@@ -1345,6 +1351,8 @@ struct StepCtx {
     default_step_mem_cap_bytes: Option<i64>,
     default_step_cpu_count: Option<i64>,
     default_step_cpu_timeout: i64,
+    /// Document-wide wall budget for steps that omit their own; `0` means each step derives one.
+    default_step_timeout: i64,
     /// Run-level durable evidence sink (per-step log + test-boundary journal), if enabled.
     evidence: Option<Arc<RunEvidence>>,
     cpu_timeout_multiplier: f64,
@@ -1583,6 +1591,7 @@ fn run_step(ctx: StepCtx) {
         default_step_mem_cap_bytes,
         default_step_cpu_count,
         default_step_cpu_timeout,
+        default_step_timeout,
         evidence,
         cpu_timeout_multiplier,
         cpu_timeout_platform,
@@ -1613,6 +1622,10 @@ fn run_step(ctx: StepCtx) {
     // The ENFORCED budget is the canonical one scaled for this platform; both are kept so a
     // breach can name the graph's number and the policy that changed it.
     let cpu_budget = scale_cpu_timeout(cpu_canonical, cpu_timeout_multiplier);
+    // The wall ceiling this step actually runs under. A step that declared none carries the 0
+    // sentinel and gets a backstop derived from its own CPU budget instead of the graph's
+    // baked-in 1800 (see `resolved_wall_timeout`).
+    let wall_budget = resolved_wall_timeout(&step, default_step_timeout, cpu_timeout_multiplier);
     // When boxing is enabled, prepare_command wraps the command so the bash leader self-moves into
     // the step's child cgroup BEFORE forking any grandchild (the cgroup-v2 fork-inheritance rule),
     // applying the inner memory/CPU caps. Disabled / absent -> the command is unchanged.
@@ -1694,7 +1707,7 @@ fn run_step(ctx: StepCtx) {
                 false,
                 0,
                 false,
-                step.timeout,
+                wall_budget,
                 false,
                 cpu_budget,
                 cpu_canonical,
@@ -1754,7 +1767,7 @@ fn run_step(ctx: StepCtx) {
             &[
                 ("step", tag.clone()),
                 ("pid", pid.to_string()),
-                ("timeout_s", step.timeout.to_string()),
+                ("timeout_s", wall_budget.to_string()),
                 ("cmd", run_cmd.clone()),
             ],
         );
@@ -1946,10 +1959,11 @@ fn run_step(ctx: StepCtx) {
             Ok(Some(st)) => break st,
             Ok(None) => {
                 // `wall_timeout` likewise: the deadline is not even compared when the
-                // registry says this engine does not enforce one, so the advertisement and the
-                // wait agree by construction rather than by two people remembering.
+                // registry says this engine does not enforce one on this lane, so the
+                // advertisement and the wait agree by construction rather than by two people
+                // remembering. The deadline itself is the DERIVED backstop, not `step.timeout`.
                 if crate::capabilities::is_enforced("wall_timeout", lane)
-                    && start.elapsed().as_secs() as i64 >= step.timeout
+                    && start.elapsed().as_secs() as i64 >= wall_budget
                 {
                     timed_out = true;
                     // Freeze test + process evidence BEFORE SIGTERM. The subsequent reap retains
@@ -1963,7 +1977,7 @@ fn run_step(ctx: StepCtx) {
                         TerminationBoundary {
                             event: "step_timeout",
                             unit: BudgetUnit::WallSeconds,
-                            limit_s: step.timeout,
+                            limit_s: wall_budget,
                             measured_s: start.elapsed().as_secs_f64(),
                             wall_elapsed_s: start.elapsed().as_secs_f64(),
                         },
@@ -2171,7 +2185,7 @@ fn run_step(ctx: StepCtx) {
                 oom > 0, // oomed: a step (or descendant) hit its inner memory.max
                 oom,
                 timed_out,
-                step.timeout,
+                wall_budget,
                 cpu_timed_out,
                 cpu_budget,
                 cpu_canonical,
@@ -2288,8 +2302,8 @@ fn run_step(ctx: StepCtx) {
         if cpu_budget > 0 {
             fields.push(("cpu_limit_s", cpu_budget.to_string()));
         }
-        if step.timeout > 0 {
-            fields.push(("wall_limit_s", step.timeout.to_string()));
+        if wall_budget > 0 {
+            fields.push(("wall_limit_s", wall_budget.to_string()));
         }
         fields.extend(cpu_journal_fields(cpu_stats.as_ref()));
         e.record("step_end", &fields);
@@ -2416,11 +2430,19 @@ pub fn steps_violating_run_timeout(cfg: &DagConfig, run_timeout_s: i64) -> Vec<(
     if run_timeout_s <= 0 {
         return Vec::new();
     }
+    // The RESOLVED bound, not the declared field. A step that declares no wall budget carries
+    // the 0 sentinel, which would pass a `>= run_timeout_s` test trivially while the value it
+    // will actually run under — derived from its CPU budget, or 1800 — might not.
     let mut bad: Vec<(String, i64)> = cfg
         .steps
         .iter()
-        .filter(|s| s.timeout >= run_timeout_s)
-        .map(|s| (s.tag(), s.timeout))
+        .map(|s| {
+            (
+                s.tag(),
+                resolved_wall_timeout(s, cfg.default_step_timeout, cfg.cpu_timeout_multiplier),
+            )
+        })
+        .filter(|(_, bound)| *bound >= run_timeout_s)
         .collect();
     bad.sort();
     bad

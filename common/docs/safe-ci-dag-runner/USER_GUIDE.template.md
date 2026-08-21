@@ -255,6 +255,34 @@ so on stderr, once, naming how many steps carry a budget and the largest of
 them, and `capabilities` reports the two lanes separately so the claim can be
 read rather than assumed.
 
+### A wall budget you did not write is derived, not guessed
+
+A step's `timeout` is a wall-clock ceiling, and wall time is load-dependent: the
+same number means something different on a laptop and on a 300-core host. So it
+is only ever a hang backstop, and it is chosen to sit generously ABOVE the
+CPU-second budget, which is the load-immune guard that should actually fire.
+
+Omitting `timeout` therefore does not mean "unbounded", and it no longer means a
+baked-in 1800 either. The effective bound is resolved, most specific first:
+
+1. the step's own `timeout`, when it declares one;
+2. the document's `default_step_timeout`, when it declares one;
+3. **three times the step's platform-scaled `cpu_timeout`**, when the step
+   declared a CPU budget;
+4. otherwise 1800 seconds.
+
+Rule 3 uses the **declared** CPU budget, not the small default every step
+carries, so a step that declares nothing keeps its 1800-second backstop instead
+of silently dropping to thirty seconds. It tracks the **platform-scaled** budget,
+so raising `cpu_timeout_multiplier` for a slow platform moves the backstop with
+it rather than letting the wall guard start racing the CPU guard there.
+
+Because omission is now meaningful, an omitted `timeout` is also omitted when the
+DAG is written back out — writing `0` would read as "no wall bound", which is the
+opposite of what it means. The `--run-timeout` ordering check below is applied to
+the resolved value, so a step that never wrote a number is still refused when its
+effective ceiling would reach the run's.
+
 ### Bound the whole run, not only its steps
 
 Per-step budgets cannot bound a run: any number of individually-legal steps can

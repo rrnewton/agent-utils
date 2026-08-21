@@ -11,8 +11,21 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
-/// Default wall-clock timeout for one step, in seconds.
+/// Wall-clock backstop (seconds) for a step that declares NO wall budget AND no CPU budget to
+/// derive one from. Wall time is LOAD-DEPENDENT, so it is only a defence-in-depth hang backstop;
+/// the CPU-time budget is the real, load-immune guard.
 pub const DEFAULT_STEP_TIMEOUT: i64 = 1800;
+
+/// When a step declares a CPU-second budget but no wall budget, the wall backstop is derived at
+/// this multiple of the (platform-scaled) CPU budget. A step legitimately spending C CPU-seconds
+/// can take up to ~C wall-seconds when serialized on one core, plus scheduling slack under load;
+/// 3x leaves generous headroom so the wall guard only ever fires on a true hang and never races
+/// the authoritative CPU-second guard.
+///
+/// The value and the name are DELIBERATELY the same as
+/// `parallel_experiment_runner.model.WALL_CPU_BACKSTOP_FACTOR`, which established this idiom in
+/// this repository. One policy, spelled once per project rather than invented twice.
+pub const WALL_CPU_BACKSTOP_FACTOR: i64 = 3;
 
 /// Default command-line template for a step's inner-job width.
 pub const DEFAULT_JOBS_FLAG: &str = "-j";
@@ -213,7 +226,10 @@ pub struct Step {
     pub networkonly: bool,
     /// Selected only by an engine-only subset preset.
     pub engine_only: bool,
-    /// Wall-clock timeout in seconds.
+    /// Wall-clock ceiling in seconds. `0` means UNDECLARED, not unlimited: the effective bound
+    /// is then derived (see [`resolved_wall_timeout`]) from the step's CPU budget, or falls back
+    /// to [`DEFAULT_STEP_TIMEOUT`]. A hardcoded 1800 here was the load-sensitive number baked
+    /// into every graph that the derivation exists to remove.
     pub timeout: i64,
     // CPU-time budget in seconds (user+system, from the step's cgroup `cpu.stat`). `0` disables
     // the CPU-time guard, leaving only the wall `timeout`. CPU time is immune to machine load, so
@@ -335,6 +351,43 @@ pub fn scale_cpu_timeout(canonical: i64, multiplier: f64) -> i64 {
 /// the platform multiplier. With the default 1.0 multiplier this is exactly the canonical budget.
 pub fn effective_cpu_timeout(step: &Step, default_cpu_timeout: i64, multiplier: f64) -> i64 {
     scale_cpu_timeout(canonical_cpu_timeout(step, default_cpu_timeout), multiplier)
+}
+
+/// The wall-clock ceiling a step is actually run under, deriving one when none was declared.
+///
+/// Precedence, most specific first:
+///
+/// 1. the step's own `timeout` (>0) — an explicit author decision always wins;
+/// 2. the document's `default_step_timeout` (>0) — an explicit document-wide decision;
+/// 3. `WALL_CPU_BACKSTOP_FACTOR` x the step's PLATFORM-SCALED `cpu_timeout`, when the step
+///    DECLARED one;
+/// 4. [`DEFAULT_STEP_TIMEOUT`].
+///
+/// Two choices in rule 3 are deliberate and were the open questions in the design:
+///
+/// *DECLARED, not canonical.* [`canonical_cpu_timeout`] fills in the DAG's small default (10 s)
+/// for a step that declares nothing, and it is ALWAYS in force. Deriving from that would hand
+/// every undeclared step a 30-second wall ceiling where it currently gets 1800 — a silent,
+/// enormous tightening applied to exactly the steps whose needs nobody has measured yet. So the
+/// derivation fires only for a step whose author stated a CPU budget, and everything else falls
+/// to rule 4 with the behaviour it has always had.
+///
+/// *SCALED, not canonical.* `cpu_timeout_multiplier` exists to loosen the CPU guard on a slow
+/// platform. A wall backstop pinned to the unscaled number would shrink to 3/multiplier of the
+/// enforced budget and start racing — firing FIRST on precisely the platform the multiplier was
+/// added for, and reporting a wall hang where the truth is a slow machine. Tracking the scaled
+/// budget keeps the 3x ratio wherever the multiplier goes.
+pub fn resolved_wall_timeout(step: &Step, default_step_timeout: i64, multiplier: f64) -> i64 {
+    if step.timeout > 0 {
+        return step.timeout;
+    }
+    if default_step_timeout > 0 {
+        return default_step_timeout;
+    }
+    if step.cpu_timeout > 0 {
+        return WALL_CPU_BACKSTOP_FACTOR * scale_cpu_timeout(step.cpu_timeout, multiplier);
+    }
+    DEFAULT_STEP_TIMEOUT
 }
 
 /// Resolve the platform CPU-budget multiplier and its label from an explicit value then the
@@ -511,7 +564,8 @@ pub struct DagConfig {
     pub mem_cap_floor_bytes: i64,
     /// Multiplier applied to the modeled peak to leave headroom. 1.0 = no inflation.
     pub outer_mem_safety_factor: f64,
-    /// Default wall-clock timeout for steps, in seconds.
+    /// Document-wide wall budget for steps that omit their own. `0` means the document declared
+    /// none, so each step derives its own (see [`resolved_wall_timeout`]).
     pub default_step_timeout: i64,
     /// Default inner-parallelism flag template for steps that don't set their own `jobs_flag`.
     pub default_jobs_flag: String,
@@ -543,7 +597,7 @@ impl Default for DagConfig {
             mem_cap_factor: 1.25,
             mem_cap_floor_bytes: 8 * 1024i64.pow(3),
             outer_mem_safety_factor: 1.0,
-            default_step_timeout: DEFAULT_STEP_TIMEOUT,
+            default_step_timeout: 0,
             default_jobs_flag: DEFAULT_JOBS_FLAG.to_string(),
             // The SMALL forcing-function caps are active by default. The declarations-first
             // migration supplied measured budgets for nodes that exceed the floor; an explicit
@@ -1500,7 +1554,7 @@ mod carry_tests {
         assert_eq!(named, expected, "carry diff: {diff:?}");
         // The loudest one in the live incident, spelled out: 600 s became 1800 s.
         assert!(
-            diff.contains(&"default_step_timeout: 600 -> 1800".to_string()),
+            diff.contains(&"default_step_timeout: 600 -> 0".to_string()),
             "{diff:?}"
         );
     }

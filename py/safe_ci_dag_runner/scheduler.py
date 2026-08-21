@@ -43,6 +43,7 @@ from safe_ci_dag_runner.model import (
     effective_cpu_timeout,
     effective_jobs_flag,
     canonical_cpu_timeout,
+    resolved_wall_timeout,
     scale_cpu_timeout,
     preferred_inner_jobs,
     step_classification,
@@ -877,6 +878,12 @@ class Runner:
         # The ENFORCED budget is the canonical one scaled for this platform; both are kept
         # so a breach can name the graph's number and the policy that changed it.
         cpu_budget = scale_cpu_timeout(cpu_canonical, self.cfg.cpu_timeout_multiplier)
+        # The wall ceiling this step actually runs under. A step that declared none carries the
+        # 0 sentinel and gets a backstop derived from its own CPU budget instead of the graph's
+        # baked-in 1800 (see resolved_wall_timeout).
+        wall_budget = resolved_wall_timeout(
+            step, self.cfg.default_step_timeout, self.cfg.cpu_timeout_multiplier
+        )
         start = time.time()
         stream = self.verbosity >= 2
         timed_out = False
@@ -941,7 +948,7 @@ class Runner:
                 oomed=False,
                 oom_kills=0,
                 timed_out=False,
-                timeout=step.timeout,
+                timeout=wall_budget,
                 cpu_timed_out=False,
                 cpu_timeout=cpu_budget,
                 pids_guard_tripped=False,
@@ -995,7 +1002,7 @@ class Runner:
                 [
                     ("step", step.tag),
                     ("pid", str(proc.pid)),
-                    ("timeout_s", str(step.timeout)),
+                    ("timeout_s", str(wall_budget)),
                     ("cmd", run_cmd),
                 ],
             )
@@ -1100,9 +1107,10 @@ class Runner:
         monitor.start()
         try:
             # `wall_timeout` likewise: no deadline is passed at all when the registry says this
-            # engine does not enforce one, so the advertisement and the wait agree by
-            # construction rather than by two people remembering.
-            proc.wait(timeout=step.timeout if is_enforced("wall_timeout", lane) else None)
+            # engine does not enforce one on this lane, so the advertisement and the wait agree
+            # by construction rather than by two people remembering. The deadline itself is the
+            # DERIVED backstop, not the graph's raw `timeout`.
+            proc.wait(timeout=wall_budget if is_enforced("wall_timeout", lane) else None)
         except subprocess.TimeoutExpired:
             # Genuine hang: reap the step's whole process group now (safe because
             # start_new_session gave it its own group; reap guards the runner's group).
@@ -1114,7 +1122,7 @@ class Runner:
                 nonce=nonce,
                 event="step_timeout",
                 unit=BudgetUnit.WALL_SECONDS,
-                limit_s=step.timeout,
+                limit_s=wall_budget,
                 measured_s=time.time() - start,
                 wall_elapsed_s=time.time() - start,
             )
@@ -1236,7 +1244,7 @@ class Runner:
                     oomed=oom > 0,
                     oom_kills=oom,
                     timed_out=timed_out,
-                    timeout=step.timeout,
+                    timeout=wall_budget,
                     cpu_timed_out=cpu_timed_out,
                     cpu_timeout=cpu_budget,
                     pids_guard_tripped=pids_events > 0,
@@ -1346,8 +1354,8 @@ class Runner:
             # reading as 0.
             if cpu_budget > 0:
                 fields.append(("cpu_limit_s", str(cpu_budget)))
-            if step.timeout > 0:
-                fields.append(("wall_limit_s", str(step.timeout)))
+            if wall_budget > 0:
+                fields.append(("wall_limit_s", str(wall_budget)))
             fields.extend(_cpu_journal_fields(cpu_stats))
             self.evidence.record("step_end", fields)
 
@@ -1394,9 +1402,14 @@ def steps_violating_run_timeout(
     """
     if run_timeout_s <= 0:
         return []
-    return sorted(
-        (s.tag, s.timeout) for s in cfg.steps if s.timeout >= run_timeout_s
+    # The RESOLVED bound, not the declared field. A step that declares no wall budget carries the
+    # 0 sentinel, which would pass a `>= run_timeout_s` test trivially while the value it will
+    # actually run under — derived from its CPU budget, or 1800 — might not.
+    resolved = (
+        (s.tag, resolved_wall_timeout(s, cfg.default_step_timeout, cfg.cpu_timeout_multiplier))
+        for s in cfg.steps
     )
+    return sorted((tag, bound) for tag, bound in resolved if bound >= run_timeout_s)
 
 
 def run_dag(

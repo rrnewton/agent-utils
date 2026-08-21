@@ -27,7 +27,7 @@ use serde_json::Value;
 
 use crate::model::{
     write_domain_violations, DagConfig, IntentionalSkipReason, ResourceHint, Step, StepClass,
-    WriteDomainGuarantee, WriteDomainPolicy, DEFAULT_JOBS_FLAG, DEFAULT_STEP_TIMEOUT,
+    WriteDomainGuarantee, WriteDomainPolicy, DEFAULT_JOBS_FLAG,
 };
 
 const DEFAULT_MEM_CAP_FLOOR: i64 = 8 * 1024 * 1024 * 1024;
@@ -389,7 +389,11 @@ pub fn dag_from_value(raw: &Value) -> Result<DagConfig, DagJsonError> {
     if let Some(refusal) = uncarried_config_key(doc) {
         return Err(err(refusal));
     }
-    let default_step_timeout = opt_int(doc, "default_step_timeout", DEFAULT_STEP_TIMEOUT)?;
+    // ABSENT IS NOT 1800: an omitted default leaves both it and the step at the 0 sentinel, and
+    // `resolved_wall_timeout` derives the bound from the step's declared CPU budget (or falls
+    // back to DEFAULT_STEP_TIMEOUT). Materializing 1800 here is what baked the load-sensitive
+    // number into every graph.
+    let default_step_timeout = opt_int(doc, "default_step_timeout", 0)?;
     let policy = write_domain_policy(doc.get("write_domain_policy"))?;
     let steps_raw = match doc.get("steps") {
         Some(Value::Array(items)) => items,
@@ -779,8 +783,12 @@ fn emit_step(s: &mut String, step: &Step, base: usize) {
     s.push_str(&format!("\"networkonly\": {},\n", step.networkonly));
     s.push_str(&key);
     s.push_str(&format!("\"engine_only\": {},\n", step.engine_only));
-    s.push_str(&key);
-    s.push_str(&format!("\"timeout\": {},\n", step.timeout));
+    // Both timeout fields are emitted only when SET. 0 is the "derive it" sentinel, and writing
+    // it out would read as "no wall bound" — the opposite of what it means.
+    if step.timeout != 0 {
+        s.push_str(&key);
+        s.push_str(&format!("\"timeout\": {},\n", step.timeout));
+    }
     // Emitted only when set, so existing DAGs (all cpu_timeout=0) stay byte-for-byte
     // unchanged and absence parses back to 0. Mirrors the Python serializer exactly.
     if step.cpu_timeout != 0 {
@@ -850,10 +858,12 @@ pub fn dag_to_json(cfg: &DagConfig) -> String {
         "  \"outer_mem_safety_factor\": {},\n",
         json_float(cfg.outer_mem_safety_factor)
     ));
-    s.push_str(&format!(
-        "  \"default_step_timeout\": {},\n",
-        cfg.default_step_timeout
-    ));
+    if cfg.default_step_timeout != 0 {
+        s.push_str(&format!(
+            "  \"default_step_timeout\": {},\n",
+            cfg.default_step_timeout
+        ));
+    }
     s.push_str(&format!(
         "  \"default_jobs_flag\": {},\n",
         json_str(&cfg.default_jobs_flag)
@@ -1025,7 +1035,14 @@ steps:
         assert_eq!(cfg.description, "");
         assert!(step.deps.is_empty());
         assert!(step.env.is_empty());
-        assert_eq!(step.timeout, 1800);
+        // 0 is the "derive it" sentinel, not "no bound": a minimal step declares no wall
+        // budget and no CPU budget, so the resolved bound is still the 1800-second backstop.
+        assert_eq!(step.timeout, 0);
+        assert_eq!(cfg.default_step_timeout, 0);
+        assert_eq!(
+            crate::model::resolved_wall_timeout(step, cfg.default_step_timeout, 1.0),
+            1800
+        );
         assert_eq!(step.hint.classification, StepClass::Light);
         assert_eq!(step.jobs_flag, None);
         assert!(cfg.resource_caps.is_empty());

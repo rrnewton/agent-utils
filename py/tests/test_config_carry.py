@@ -87,8 +87,10 @@ def test_carry_diff_names_every_field_a_default_rebuild_drops() -> None:
     named = [line.split(":")[0] for line in diff]
     # Every field EXCEPT `steps` -- the one the call named, and the only one that survived.
     assert named == [f for f in DAG_CONFIG_FIELDS if f != "steps"], diff
-    # The loudest one in the live incident, spelled out: 600 s became 1800 s.
-    assert "default_step_timeout: 600 -> 1800" in diff
+    # The loudest one in the live incident, spelled out. The rebuilt default is now the 0
+    # "derive it" sentinel rather than a materialized 1800, so a dropped 600 lands there; the
+    # effective bound a step would then run under is still resolved, not zero.
+    assert "default_step_timeout: 600 -> 0" in diff
 
 
 def test_with_steps_carries_every_field_the_default_rebuild_drops() -> None:

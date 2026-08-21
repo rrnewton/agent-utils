@@ -65,10 +65,10 @@ pub use io::{
 };
 pub use model::{
     command_with_inner_jobs, dag_config_carry_diff, effective_jobs_flag, preferred_inner_jobs,
-    render_jobs_flag, step_classification, step_failure_reason, undeclared_resource_demands,
-    write_domain_violations, DagConfig, ResourceHint, RunResult, Step, StepClass, StepOutcome,
-    WriteDomainGuarantee, WriteDomainPolicy, DAG_CONFIG_FIELDS, DEFAULT_JOBS_FLAG,
-    DEFAULT_STEP_TIMEOUT,
+    render_jobs_flag, resolved_wall_timeout, step_classification, step_failure_reason,
+    undeclared_resource_demands, write_domain_violations, DagConfig, ResourceHint, RunResult, Step,
+    StepClass, StepOutcome, WriteDomainGuarantee, WriteDomainPolicy, DAG_CONFIG_FIELDS,
+    DEFAULT_JOBS_FLAG, DEFAULT_STEP_TIMEOUT, WALL_CPU_BACKSTOP_FACTOR,
 };
 pub use perflog::{append_step_profiles, PerfWindow};
 pub use profile_enrich::{

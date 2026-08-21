@@ -21,7 +21,6 @@ if TYPE_CHECKING:
 
 from safe_ci_dag_runner.model import (
     DEFAULT_JOBS_FLAG,
-    DEFAULT_STEP_TIMEOUT,
     DagConfig,
     IntentionalSkipReason,
     ResourceHint,
@@ -445,9 +444,12 @@ def _dag_from_obj(raw: object) -> DagConfig:
     doc = _as_obj(raw, "<root>")
     _refuse_uncarried_config_keys(doc)
     # The document-level default_step_timeout is the per-step default for any step that omits
-    # its own `timeout` (falling back to the module constant only when the document omits it
-    # too). Parse it BEFORE the step loop so it can be threaded in as each step's default.
-    default_step_timeout = _opt_int(doc, "default_step_timeout", DEFAULT_STEP_TIMEOUT)
+    # its own `timeout`. Parse it BEFORE the step loop so it can be threaded in as each step's
+    # default. ABSENT IS NOT 1800: an omitted default leaves both it and the step at the 0
+    # sentinel, and `resolved_wall_timeout` derives the bound from the step's declared CPU budget
+    # (or falls back to DEFAULT_STEP_TIMEOUT). Materializing 1800 here is what baked the
+    # load-sensitive number into every graph.
+    default_step_timeout = _opt_int(doc, "default_step_timeout", 0)
     steps_raw = doc.get("steps")
     if not isinstance(steps_raw, list):
         raise DagJsonError("<root>: 'steps' must be a list")
@@ -546,6 +548,8 @@ def _step_to_json(step: Step) -> dict[str, object]:
         "env": dict(sorted(step.env.items())),
         "networkonly": step.networkonly,
         "engine_only": step.engine_only,
+        # Both timeout fields are emitted only when SET. 0 is the "derive it" sentinel, and
+        # writing it out would read as "no wall bound" — the opposite of what it means.
         "timeout": step.timeout,
         # Emitted only when set, so existing DAGs (all cpu_timeout=0) stay byte-for-byte
         # unchanged; absence parses back to 0, keeping round-trip stable. Positioned
@@ -555,6 +559,8 @@ def _step_to_json(step: Step) -> dict[str, object]:
         "skip_reason": step.skip_reason.value if step.skip_reason is not None else None,
         "hint": _hint_to_json(step.hint),
     }
+    if step.timeout == 0:
+        del obj["timeout"]
     if step.cpu_timeout == 0:
         del obj["cpu_timeout"]
     if step.skip_reason is None:
@@ -581,6 +587,8 @@ def _dag_to_obj(cfg: DagConfig) -> dict[str, object]:
         "default_jobs_flag": cfg.default_jobs_flag,
         "steps": [_step_to_json(s) for s in cfg.steps],
     }
+    if cfg.default_step_timeout == 0:
+        del obj["default_step_timeout"]
     policy = cfg.write_domain_policy
     if policy.require_explicit or policy.allowed_domains:
         obj["write_domain_policy"] = {

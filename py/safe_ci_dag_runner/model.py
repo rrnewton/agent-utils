@@ -14,7 +14,22 @@ from dataclasses import dataclass, field, replace
 from dataclasses import fields as dataclass_fields
 from enum import Enum
 
+#: Wall-clock backstop (seconds) for a step that declares NO wall budget AND no CPU budget to
+#: derive one from. Wall time is LOAD-DEPENDENT, so it is only a defence-in-depth hang backstop;
+#: the CPU-time budget is the real, load-immune guard.
 DEFAULT_STEP_TIMEOUT = 1800
+
+#: When a step declares a CPU-second budget but no wall budget, the wall backstop is derived at
+#: this multiple of the (platform-scaled) CPU budget. A step legitimately spending C CPU-seconds
+#: can take up to ~C wall-seconds when serialized on one core, plus scheduling slack under load;
+#: 3x leaves generous headroom so the wall guard only ever fires on a true hang and never races
+#: the authoritative CPU-second guard.
+#:
+#: The value and the name are DELIBERATELY the same as
+#: ``parallel_experiment_runner.model.WALL_CPU_BACKSTOP_FACTOR``, which established this idiom in
+#: this repository. One policy, spelled once per project rather than invented twice;
+#: ``test_wall_timeout_derivation.py`` asserts the two constants are equal so they cannot drift.
+WALL_CPU_BACKSTOP_FACTOR = 3
 
 #: Deliberately SMALL default caps for a step that DECLARES NOTHING — the "forcing function".
 #: An undeclared step is boxed into a tight 1-core / 1-GiB / 10-s-CPU floor, so a real step
@@ -145,7 +160,11 @@ class Step:
     hint: ResourceHint = field(default_factory=ResourceHint)
     networkonly: bool = False  # skipped when networking is disabled
     engine_only: bool = False  # selected only by an engine-only subset preset
-    timeout: int = DEFAULT_STEP_TIMEOUT
+    # Wall-clock ceiling in seconds. 0 means UNDECLARED, not unlimited: the effective bound is
+    # then derived (see :func:`resolved_wall_timeout`) from the step's CPU budget, or falls back
+    # to DEFAULT_STEP_TIMEOUT. A hardcoded 1800 here was the load-sensitive number baked into
+    # every graph that the derivation exists to remove.
+    timeout: int = 0
     # CPU-time budget in seconds (user+system, measured from the step's cgroup
     # cpu.stat). 0 disables the CPU-time guard, leaving only the wall `timeout`.
     # Unlike wall time, CPU time is immune to machine load, so a CPU budget can be
@@ -273,6 +292,45 @@ def effective_cpu_timeout(
     (:func:`scale_cpu_timeout`). With the default 1.0 multiplier this is exactly the canonical
     budget, so an unconfigured platform behaves as it always did."""
     return scale_cpu_timeout(canonical_cpu_timeout(step, default_cpu_timeout), multiplier)
+
+
+def resolved_wall_timeout(
+    step: Step,
+    default_step_timeout: int,
+    multiplier: float = DEFAULT_CPU_TIMEOUT_MULTIPLIER,
+) -> int:
+    """The wall-clock ceiling a step is actually run under, deriving one when none was declared.
+
+    Precedence, most specific first:
+
+    1. the step's own ``timeout`` (>0) — an explicit author decision always wins;
+    2. the document's ``default_step_timeout`` (>0) — an explicit document-wide decision;
+    3. ``WALL_CPU_BACKSTOP_FACTOR`` x the step's PLATFORM-SCALED ``cpu_timeout``, when the step
+       DECLARED one;
+    4. :data:`DEFAULT_STEP_TIMEOUT`.
+
+    Two choices in rule 3 are deliberate and were the open questions in the design:
+
+    *DECLARED, not canonical.* :func:`canonical_cpu_timeout` fills in the DAG's small default
+    (10 s) for a step that declares nothing, and it is ALWAYS in force. Deriving from that would
+    hand every undeclared step a 30-second wall ceiling where it currently gets 1800 — a silent,
+    enormous tightening applied to exactly the steps whose needs nobody has measured yet. So the
+    derivation fires only for a step whose author stated a CPU budget, and everything else falls
+    to rule 4 with the behaviour it has always had.
+
+    *SCALED, not canonical.* ``cpu_timeout_multiplier`` exists to loosen the CPU guard on a slow
+    platform. A wall backstop pinned to the unscaled number would shrink to 3/multiplier of the
+    enforced budget and start racing — firing FIRST on precisely the platform the multiplier was
+    added for, and reporting a wall hang where the truth is a slow machine. Tracking the scaled
+    budget keeps the 3x ratio wherever the multiplier goes.
+    """
+    if step.timeout > 0:
+        return step.timeout
+    if default_step_timeout > 0:
+        return default_step_timeout
+    if step.cpu_timeout > 0:
+        return WALL_CPU_BACKSTOP_FACTOR * scale_cpu_timeout(step.cpu_timeout, multiplier)
+    return DEFAULT_STEP_TIMEOUT
 
 
 def resolve_cpu_timeout_multiplier(
@@ -407,7 +465,9 @@ class DagConfig:
     mem_cap_floor_bytes: int = 8 * 1024**3
     # Multiplier applied to the modeled peak to leave headroom. 1.0 = no inflation.
     outer_mem_safety_factor: float = 1.0
-    default_step_timeout: int = DEFAULT_STEP_TIMEOUT
+    # Document-wide wall budget for steps that omit their own. 0 means the document declared
+    # none, so each step derives its own (see :func:`resolved_wall_timeout`).
+    default_step_timeout: int = 0
     # Default inner-parallelism flag template for steps that don't set their own `jobs_flag`.
     default_jobs_flag: str = DEFAULT_JOBS_FLAG
     # --- Deliberately SMALL default caps applied to a step that DECLARES NOTHING ---
