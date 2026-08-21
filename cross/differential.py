@@ -1642,6 +1642,15 @@ def compare_capture_ceiling(py: list[str], rs: list[str], rep: Report) -> None:
     Without this pairing, bounding one engine's capture and not the other's creates a divergence
     that no existing check can see: both runs still pass, both still print a dump, and only the
     engine that OOMs under a real runaway tells you which one was fixed.
+
+    THE STEP FLOODS BOTH PIPES, and that is not incidental. A stdout-only fixture cannot see the
+    divergence that a per-stream ring produces -- one ring per pipe holds TWICE the ceiling and
+    announces the drop once per pipe, each notice counting only its own half -- so it would have
+    passed while the two engines disagreed about both numbers in the notice and about how much of
+    the step the runner was holding. The step writes its whole stdout burst, pauses so the order
+    is settled rather than raced, then its whole stderr burst: the surviving tail is then pure
+    stderr in both engines, so "the earlier stdout is gone" is a stable assertion about a single
+    step-wide ring rather than a statement about thread scheduling.
     """
     with tempfile.TemporaryDirectory() as tmp:
         dag_path = os.path.join(tmp, "capture-ceiling.json")
@@ -1651,10 +1660,13 @@ def compare_capture_ceiling(py: list[str], rs: list[str], rep: Report) -> None:
                     "steps": [
                         {
                             "group": "flood",
-                            "job": "stdout",
+                            "job": "both",
                             # Far past the 300-byte ceiling set below, emitted in many writes so
                             # the cut lands mid-stream, and FAILING so the dump is printed.
-                            "cmd": "for i in $(seq 1 200); do echo \"line$i\"; done; exit 3",
+                            "cmd": (
+                                'for i in $(seq 1 200); do echo "line$i"; done; sleep 0.5; '
+                                'for i in $(seq 1 200); do echo "oops$i" >&2; done; exit 3'
+                            ),
                             "timeout": 30,
                             "cpu_timeout": 600,
                         }
@@ -1697,22 +1709,34 @@ def compare_capture_ceiling(py: list[str], rs: list[str], rep: Report) -> None:
             return lines[start + 1 : end]
 
         dumps = {name: detail(out.stdout) for name, out in outs.items()}
+        # 1492 bytes of "lineN" plus 1492 of "oopsN": the ceiling is over the STEP, so the notice
+        # counts both pipes. A per-stream ring says 1492, twice.
         notice = (
-            "[safe-ci-dag-runner] EARLIER OUTPUT DROPPED: this step produced 1492 bytes but "
+            "[safe-ci-dag-runner] EARLIER OUTPUT DROPPED: this step produced 2984 bytes but "
             "only the last 300 were kept in memory (raise or lift the ceiling with "
             "SAFE_CI_DAG_RUNNER_CAPTURE_MAX_BYTES; 0 = unlimited). The durable per-step log is "
             "unaffected and still has the rest."
         )
+        notices = {
+            name: [line for line in dump if "EARLIER OUTPUT DROPPED" in line]
+            for name, dump in dumps.items()
+        }
         if dumps["py"] != dumps["rs"]:
             rep.bad(label, f"detail py={dumps['py']!r} rs={dumps['rs']!r}")
         elif not dumps["py"]:
             rep.bad(label, "neither engine printed a failure detail block")
-        elif dumps["py"][0] != f"[flood.stdout] {notice}":
+        elif len(notices["py"]) != 1 or len(notices["rs"]) != 1:
+            # ONE ceiling, ONE notice: a per-pipe notice reports neither what the step produced
+            # nor what survived, and holds twice the bytes the operator asked for.
+            rep.bad(label, f"expected exactly one dropped-notice: {notices!r}")
+        elif dumps["py"][0] != f"[flood.both] {notice}":
             rep.bad(label, f"notice line was {dumps['py'][0]!r}")
-        elif "[flood.stdout] line200" not in dumps["py"]:
+        elif "[flood.both] oops200" not in dumps["py"]:
             rep.bad(label, "the TAIL of the output was not retained")
-        elif any(line == "[flood.stdout] line1" for line in dumps["py"]):
-            rep.bad(label, "the ceiling did not bite: the head of the output survived")
+        elif any(line.startswith("[flood.both] line") for line in dumps["py"]):
+            # The stdout burst is 1492 bytes ending 1492 bytes before the end, so a step-wide
+            # 300-byte ring cannot have kept ANY of it. A ring per pipe keeps 300 bytes of it.
+            rep.bad(label, "the ceiling did not bite: stdout survived a stderr-filled tail")
         else:
             rep.ok(label)
 

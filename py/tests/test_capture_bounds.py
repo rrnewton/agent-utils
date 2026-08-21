@@ -103,6 +103,33 @@ def test_last_line_skips_trailing_blank_lines_and_tolerates_bad_utf8() -> None:
     assert invalid.last_line() == "��"
 
 
+def test_the_default_capture_ceiling_is_four_mebibytes_stated_as_a_number() -> None:
+    """The DEFAULT is pinned to a LITERAL, because every other assertion on it is circular.
+
+    ``capture_max_bytes() == DEFAULT_CAPTURE_MAX_BYTES`` is true for every value the constant
+    could ever hold, so shrinking the ceiling by three orders of magnitude — the difference
+    between "the tail a human reads" and "a few lines" — passed the whole suite. The sibling
+    engine pins the same literal (``the_default_capture_ceiling_is_four_mebibytes_literally``),
+    so the two defaults cannot drift apart without one of the two failing by name; nothing else
+    compares them, because the differential sets the environment override and never observes the
+    default at all.
+    """
+    assert DEFAULT_CAPTURE_MAX_BYTES == 4194304
+    assert capture_max_bytes() == 4194304
+
+
+def test_the_console_line_bound_is_one_mebibyte_stated_as_a_number() -> None:
+    """Same reasoning, for the ``-vv`` live-stream bound.
+
+    Its own end-to-end test monkeypatches the constant to 3 KiB to stay fast, which means that
+    test says nothing about the shipped value. Both engines carry a "MUST match" note beside this
+    number; this is what turns that note into something that can fail.
+    """
+    from safe_ci_dag_runner import scheduler
+
+    assert scheduler._STREAM_LINE_MAX_BYTES == 1048576
+
+
 def test_an_unlimited_capture_is_an_explicit_opt_out_not_a_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

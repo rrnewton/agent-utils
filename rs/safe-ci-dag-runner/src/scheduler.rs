@@ -1516,8 +1516,14 @@ fn spawn_reader<R: Read + Send + 'static>(
 /// The live-stream buffer is drained only when it CONTAINS a newline, so output with no newline
 /// in it grows without limit. This is deliberately a fixed display bound rather than another
 /// environment knob: it decides how a line is broken on a console, never what is retained, and
-/// both the durable log and the in-memory capture are unaffected by it. MUST match
-/// `_STREAM_LINE_MAX_BYTES` in `py/safe_ci_dag_runner/scheduler.py`.
+/// both the durable log and the in-memory capture are unaffected by it.
+//
+// The value is pinned literally, at one MiB, by
+// `the_console_line_bound_is_pinned_to_one_mib_literally` below; the sibling engine pins the same
+// literal, so a change to one that is not made in the other fails a test by name rather than
+// drifting. This note is a plain comment, NOT rustdoc: the published crate's documentation must
+// stand alone, and a source-tree path in it is a reference the reader of a packaged crate cannot
+// follow.
 const STREAM_LINE_MAX_BYTES: usize = 1024 * 1024;
 
 /// The last `limit` bytes of one output stream, in a buffer that never grows past `limit`.
@@ -1629,9 +1635,10 @@ impl BoundedCapture {
 fn failure_detail_lines(tag: &str, streams: &[&[u8]], verbosity: i64) -> Vec<String> {
     let mut rendered = Vec::new();
     for bytes in streams {
-        // stdout and stderr are independent pipes: neither stream may borrow a
-        // test boundary observed on the other. A fresh context per stream makes
-        // cross-pipe scheduling incapable of assigning the wrong test name.
+        // A fresh context PER SLICE: a test boundary observed in one body of output may not be
+        // borrowed by the next, so nothing can assign a test name across a discontinuity. A step
+        // is dumped as ONE slice (its single capture ring, both pipes in arrival order), so
+        // within a step the boundary tracking is continuous, exactly as the durable log sees it.
         let mut identity = ConsoleTestIdentity::default();
         let text = String::from_utf8_lossy(bytes);
         for line in text.lines() {
@@ -2160,17 +2167,24 @@ fn run_step(ctx: StepCtx) {
         );
     }
 
-    // ONE ceiling per stream, read once per step so an operator override applies uniformly to
-    // both. The two are separate rings rather than one shared ring because stdout and stderr are
-    // independent pipes whose failure dumps must not borrow each other's test boundaries.
+    // ONE RING FOR THE STEP, not one per stream, and the distinction is the whole ceiling.
+    //
+    // The number an operator sets is what the runner may hold for a step. Two rings of that size
+    // hold TWICE it, and a step that writes to both pipes then reports the drop twice -- each
+    // notice naming only its own half of the total -- while the sibling engine, which reads the
+    // two streams merged into one, reports it once over the whole. Same flag, same step, two
+    // different answers and two different peak footprints; the durable log has always merged
+    // these two pipes into one order through the shared `sink` above, so a single ring is also
+    // the shape the rest of this step already uses. `compare_capture_ceiling` now floods BOTH
+    // streams, so a return to per-stream accounting fails the differential rather than silently
+    // doubling the bound in one edition.
     let capture_ceiling = capture_max_bytes();
-    let out_buf = Arc::new(Mutex::new(BoundedCapture::new(capture_ceiling)));
-    let err_buf = Arc::new(Mutex::new(BoundedCapture::new(capture_ceiling)));
+    let step_capture = Arc::new(Mutex::new(BoundedCapture::new(capture_ceiling)));
     let mut readers = Vec::new();
     if let Some(out) = child.stdout.take() {
         readers.push(spawn_reader(
             out,
-            Arc::clone(&out_buf),
+            Arc::clone(&step_capture),
             tag.clone(),
             verbosity,
             Arc::clone(&sink),
@@ -2180,7 +2194,7 @@ fn run_step(ctx: StepCtx) {
     if let Some(err) = child.stderr.take() {
         readers.push(spawn_reader(
             err,
-            Arc::clone(&err_buf),
+            Arc::clone(&step_capture),
             tag.clone(),
             verbosity,
             Arc::clone(&sink),
@@ -2490,21 +2504,14 @@ fn run_step(ctx: StepCtx) {
     };
     let ok = returncode == Some(0) && !timed_out && !cpu_timed_out;
 
-    // Combined captured output (stdout then stderr) for the summary + failure detail.
-    let (stdout, stdout_total, stdout_dropped) = {
-        let cap = out_buf
+    // The step's captured output -- both pipes, in arrival order -- for the summary + failure
+    // detail. ONE tail, because there is one ring (see `step_capture`).
+    let (combined, captured_total, captured_dropped) = {
+        let cap = step_capture
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         (cap.tail(), cap.total, cap.dropped())
     };
-    let (stderr, stderr_total, stderr_dropped) = {
-        let cap = err_buf
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        (cap.tail(), cap.total, cap.dropped())
-    };
-    let mut combined: Vec<u8> = stdout.clone();
-    combined.extend_from_slice(&stderr);
     let summary = last_line(&combined);
     let test_counts = captured_test_counts(&combined);
 
@@ -2671,19 +2678,16 @@ fn run_step(ctx: StepCtx) {
         }
         emit(&format!("[{tag}] ----- detail -----"));
         // The dump is a TAIL (see `BoundedCapture`), so when anything was dropped it says so IN
-        // BAND and in numbers, rather than presenting a partial dump as the whole output.
-        for (dropped, total, kept) in [
-            (stdout_dropped, stdout_total, stdout.len()),
-            (stderr_dropped, stderr_total, stderr.len()),
-        ] {
-            if dropped {
-                emit(&format!(
-                    "[{tag}] {}",
-                    capture_truncation_notice(total, kept)
-                ));
-            }
+        // BAND and in numbers, rather than presenting a partial dump as the whole output. ONE
+        // notice for the step, over the step's whole output: two, each counting one pipe, would
+        // tell a reader neither how much the step produced nor how much survived.
+        if captured_dropped {
+            emit(&format!(
+                "[{tag}] {}",
+                capture_truncation_notice(captured_total, combined.len())
+            ));
         }
-        for line in failure_detail_lines(&tag, &[&stdout, &stderr], verbosity) {
+        for line in failure_detail_lines(&tag, &[&combined], verbosity) {
             emit(&line);
         }
         emit(&format!("[{tag}] ----- end detail -----"));
@@ -4743,6 +4747,15 @@ mod tests {
         cap.feed(&vec![b'a'; 5000]);
         assert_eq!(cap.kept(), 5000);
         assert!(!cap.dropped());
+    }
+
+    #[test]
+    fn the_console_line_bound_is_pinned_to_one_mib_literally() {
+        // The `MUST match` note beside this constant is prose until something can fail. The
+        // sibling engine pins the same literal, so a change made in one edition and not the other
+        // fails a test by name instead of drifting; and the end-to-end test of this code path
+        // overrides the value to stay fast, so it says nothing about the number that ships.
+        assert_eq!(STREAM_LINE_MAX_BYTES, 1_048_576);
     }
 
     #[test]

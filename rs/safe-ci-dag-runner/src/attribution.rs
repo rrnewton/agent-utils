@@ -1224,6 +1224,18 @@ mod tests {
     }
 
     #[test]
+    fn the_default_capture_ceiling_is_four_mebibytes_literally() {
+        // The DEFAULT is pinned to a LITERAL, because an assertion written in terms of the
+        // constant is circular: it holds for every value the constant could ever have, so
+        // shrinking the ceiling by three orders of magnitude -- the difference between "the tail
+        // a human reads" and "a few lines" -- passes. The sibling engine pins the same literal,
+        // so the two defaults cannot drift apart without one of the two failing by name; nothing
+        // else compares them, because the differential sets the environment override and so never
+        // observes the default at all.
+        assert_eq!(DEFAULT_CAPTURE_MAX_BYTES, 4_194_304);
+    }
+
+    #[test]
     fn step_log_is_bounded_exactly_and_says_so() {
         // A capped log that does not say it is capped is a silently incomplete evidence file:
         // a later reader cannot tell "the step printed nothing more" from "we stopped writing".
