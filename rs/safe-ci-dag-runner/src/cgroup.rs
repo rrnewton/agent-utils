@@ -110,15 +110,23 @@ pub trait CgroupManager: Send + Sync {
     fn memory_events(&self, _tag: &str) -> Option<BTreeMap<String, i64>> {
         None
     }
-    /// The step cgroup's `memory.max` read back verbatim: a decimal byte count, or the literal
-    /// `"max"` when nothing bounds the step at this level.
+    /// The TIGHTEST `memory.max` in force over the step, read back from cgroupfs: a decimal byte
+    /// count, or the literal `"max"` when no level the runner can see bounds it.
+    ///
+    /// cgroup-v2 limits are hierarchical, so the step's OWN `memory.max` is not on its own the
+    /// ceiling it ran under; the runner always installs an outer scope cap, and a step given no
+    /// inner cap reads `"max"` at its own level while the scope's ceiling is what held it. The
+    /// minimum over the levels the runner can see is what `peak_bytes` is interpretable against.
     ///
     /// Read back rather than echoed from the requested cap, because the case that matters — a cap
     /// the kernel never accepted — is exactly where the two disagree.
     ///
+    /// `"max"` means "no ceiling at any level this runner can see"; ancestors ABOVE the delegated
+    /// scope (a container limit, a user slice) are outside its view.
+    ///
     /// DEFAULTS TO `None`, DELIBERATELY. `None` (cap unknown) and `Some("max")` (known unbounded)
-    /// are different answers: only the second rules out censoring, so a silent manager must not
-    /// be read as having reported an unbounded step.
+    /// are different answers: only the second rules out censoring by the runner's own caps, so a
+    /// silent manager must not be read as having reported an unbounded step.
     fn applied_memory_max(&self, _tag: &str) -> Option<String> {
         None
     }
@@ -2058,6 +2066,10 @@ impl CgroupManager for Cgroups {
             return None;
         }
         let text = read_trim(&child, "memory.events")?;
+        // A line that does not parse as `<name> <integer>` is SKIPPED, not fatal: the kernel is
+        // free to add counters, and discarding the whole file over one unrecognised line would
+        // blank all five CSV cells and silently drop the recorded OOM count. The Python build
+        // skips per line too, and the two must not disagree on the same file.
         let mut out = BTreeMap::new();
         for line in text.lines() {
             let mut parts = line.split_whitespace();
@@ -2075,7 +2087,22 @@ impl CgroupManager for Cgroups {
         if !self.enabled {
             return None;
         }
-        read_trim(&child, "memory.max").filter(|value| !value.is_empty())
+        let own = read_trim(&child, "memory.max").filter(|value| !value.is_empty())?;
+        // Hierarchical: the step's OWN memory.max is not the ceiling it ran under. The runner
+        // always installs an outer scope cap, so a step given no inner cap reads "max" here
+        // while the scope's ceiling is what held it — and the child's memory.events does not
+        // count an ancestor's limit events, so nothing else in the row would show it. Report the
+        // tighter of the two, because that is the number peak_bytes is interpretable against.
+        let Some(root) = self.root.as_ref() else {
+            return Some(own);
+        };
+        let Some(outer_bytes) = memory_max_bytes(read_trim(root, "memory.max")) else {
+            return Some(own);
+        };
+        Some(match memory_max_bytes(Some(own.clone())) {
+            Some(own_bytes) => own_bytes.min(outer_bytes).to_string(),
+            None => outer_bytes.to_string(),
+        })
     }
 
     fn peak_bytes(&self, tag: &str) -> Option<i64> {
@@ -2812,9 +2839,10 @@ mod tests {
 
     #[test]
     fn the_applied_cap_is_read_back_and_unbounded_is_not_unknown() {
-        // `None` (we do not know the ceiling) and `Some("max")` (we know there was none) are
-        // different answers. Only the second rules out censoring, so flattening either into the
-        // other is what makes a recorded peak un-interpretable.
+        // `None` (we do not know the ceiling) and `Some("max")` (we know of none at any level
+        // this manager can see) are different answers. Only the second rules out censoring by
+        // the runner's own caps, so flattening either into the other is what makes a recorded
+        // peak un-interpretable. The planted scope root here carries no memory.max of its own.
         let root = temp_scope("applied-cap");
         let child = root.join(sanitize("g.job"));
         fs::create_dir_all(&child).unwrap();
@@ -2833,6 +2861,58 @@ mod tests {
         assert_eq!(
             cg.applied_memory_max("g.job"),
             Some("8589934592".to_string())
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_uncapped_step_reports_the_outer_scope_cap_it_actually_ran_under() {
+        // An uncharacterised step gets no INNER cap, but it is never actually unbounded: the
+        // runner refuses to run without an outer scope memory.max, and cgroup-v2 limits are
+        // hierarchical. Reporting the child's own "max" would label it "known unbounded", and
+        // reclaim at the ancestor's limit is not charged to the child's memory.events either,
+        // so the whole row would read as a comfortable fit.
+        let root = temp_scope("outer-cap");
+        let child = root.join(sanitize("g.job"));
+        fs::create_dir_all(&child).unwrap();
+        fs::write(root.join("memory.max"), "8589934592\n").unwrap();
+        fs::write(child.join("memory.max"), "max\n").unwrap();
+        let cg = planted_manager(root.clone());
+
+        assert_eq!(
+            cg.applied_memory_max("g.job"),
+            Some("8589934592".to_string())
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_applied_cap_is_the_tighter_of_the_step_and_scope_caps() {
+        // Both directions, so the answer is a MINIMUM and not "whichever we happened to read".
+        let root = temp_scope("tighter-cap");
+        let child = root.join(sanitize("g.job"));
+        fs::create_dir_all(&child).unwrap();
+        fs::write(root.join("memory.max"), "8589934592\n").unwrap();
+        let cg = planted_manager(root.clone());
+
+        fs::write(child.join("memory.max"), "2147483648\n").unwrap();
+        assert_eq!(
+            cg.applied_memory_max("g.job"),
+            Some("2147483648".to_string())
+        );
+
+        fs::write(child.join("memory.max"), "17179869184\n").unwrap();
+        assert_eq!(
+            cg.applied_memory_max("g.job"),
+            Some("8589934592".to_string())
+        );
+
+        // An unbounded scope leaves the step's own cap untouched.
+        fs::write(root.join("memory.max"), "max\n").unwrap();
+        fs::write(child.join("memory.max"), "2147483648\n").unwrap();
+        assert_eq!(
+            cg.applied_memory_max("g.job"),
+            Some("2147483648".to_string())
         );
         let _ = fs::remove_dir_all(&root);
     }
@@ -2860,6 +2940,34 @@ mod tests {
         assert_eq!(events.get("oom"), Some(&3));
         assert_eq!(events.get("oom_kill"), Some(&2));
         // One parse, one answer: the OOM count cannot drift from the recorded counters.
+        assert_eq!(cg.oom_kills("g.job"), 2);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn one_unparsable_memory_events_line_does_not_discard_the_others() {
+        // The kernel may add counters, and a blank trailing line costs nothing to skip.
+        // Discarding the whole file would blank all five CSV cells AND drop the OOM count to 0
+        // — a step that was actually killed would then read as one that was never pressured.
+        // Both builds must skip PER LINE, or the same /sys/fs/cgroup file yields two CSV rows.
+        let root = temp_scope("memory-events-partial");
+        let child = root.join(sanitize("g.job"));
+        fs::create_dir_all(&child).unwrap();
+        let cg = planted_manager(root.clone());
+
+        fs::write(
+            child.join("memory.events"),
+            "low 0\nhigh not-a-number\n\nmax 41\nfuture_counter 9\noom 3\noom_kill 2\n",
+        )
+        .unwrap();
+
+        let events = cg.memory_events("g.job").unwrap();
+        assert_eq!(events.get("low"), Some(&0));
+        assert_eq!(events.get("max"), Some(&41));
+        assert_eq!(events.get("oom"), Some(&3));
+        assert_eq!(events.get("oom_kill"), Some(&2));
+        assert_eq!(events.get("future_counter"), Some(&9));
+        assert_eq!(events.get("high"), None, "the bad line alone is dropped");
         assert_eq!(cg.oom_kills("g.job"), 2);
         let _ = fs::remove_dir_all(&root);
     }

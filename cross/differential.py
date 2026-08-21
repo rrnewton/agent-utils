@@ -2137,6 +2137,90 @@ def compare_profile_store(py: list[str], rs: list[str], rep: Report) -> None:
                 rep.ok(sub)
 
 
+# --------------------------------------------------------------------- profile run identity
+
+
+def _run_id_shape(directory: str) -> list[int] | None:
+    """The GROUPING the ``run_id`` column induces over a store's rows, as run indices.
+
+    A ``run_id`` is opaque (nanoseconds + PID) so its literal value cannot be compared across two
+    builds, and comparing headers — all :func:`compare_profile_store` does — cannot see a column's
+    values at all. What a reader actually depends on IS comparable: which rows the column says
+    belong to the same DAG execution. Two rows in one group are asserted to have run at the same
+    time (their offsets share an origin), so the grouping is the whole semantic content.
+
+    Returns run indices in first-appearance order (``[0, 0]`` = one run of two steps, ``[0, 1, 2]``
+    = three separate runs), or ``None`` when the store is unreadable or any ``run_id`` is blank.
+    """
+    names = [name for name in _store_csv_names(directory) if name.startswith("step_profiles_")]
+    if len(names) != 1:
+        return None
+    with open(os.path.join(directory, names[0]), newline="", encoding="utf-8") as handle:
+        ids = [row.get("run_id", "") for row in csv.DictReader(handle)]
+    if not ids or any(not value for value in ids):
+        return None
+    seen: dict[str, int] = {}
+    return [seen.setdefault(value, len(seen)) for value in ids]
+
+
+def compare_profile_run_identity(py: list[str], rs: list[str], rep: Report) -> None:
+    """Assert both builds agree on WHICH ROWS the ``run_id`` column calls one DAG execution.
+
+    Header parity cannot see this: the header comes from the column-list constant, so an edition
+    could mint one id per run, per batch or per process and still pass. The two shapes below are
+    the ones the documented reconstruction rests on:
+
+    * ``run``: every step of one execution shares one id (``[0, 0]``), even though the rows are
+      flushed by the same sink, so an id minted per BATCH would split a single run into groups
+      that never overlap by construction.
+    * ``sweep``: every iteration is its OWN execution with its own Runner and its own monotonic
+      origin, so it must get its own id (``[0, 1, 2]``). One shared id across a strictly
+      sequential sweep makes the documented rule — same ``run_id`` rows overlap iff their
+      ``[started, finished]`` intervals do — declare all three concurrent.
+    """
+    with tempfile.TemporaryDirectory(prefix="run-identity-cross-") as tmp:
+        run_dag = os.path.join(tmp, "run.json")
+        with open(run_dag, "w", encoding="utf-8") as handle:
+            handle.write(
+                '{"steps": [{"group": "g", "job": "a", "cmd": "true"}, '
+                '{"group": "g", "job": "b", "cmd": "true", "deps": ["g.a"]}]}'
+            )
+        for label, args_for, expected in (
+            (
+                "profile-run-identity:one-run-one-id",
+                lambda store: (
+                    "run", "--dag", run_dag, "-q", "-s", "1", "-j", "2",
+                    "--perf-dir", store, NOFB, "--unsafe-no-cgroups",
+                ),
+                [0, 0],
+            ),
+            (
+                "profile-run-identity:sweep-per-execution",
+                lambda store: (
+                    "sweep", "--dag", run_dag, "--step", "g.a", "--jobs", "1..3",
+                    "--perf-dir", store, "--unsafe-no-cgroups",
+                ),
+                [0, 1, 2],
+            ),
+        ):
+            py_dir = os.path.join(tmp, f"py-{label.rsplit(':', 1)[1]}")
+            rs_dir = os.path.join(tmp, f"rs-{label.rsplit(':', 1)[1]}")
+            po = run(py, args_for(py_dir))
+            ro = run(rs, args_for(rs_dir))
+            if po.returncode != 0 or ro.returncode != 0:
+                rep.bad(label, f"exit py={po.returncode} rs={ro.returncode}\n{po}\n{ro}")
+                continue
+            py_shape = _run_id_shape(py_dir)
+            rs_shape = _run_id_shape(rs_dir)
+            if py_shape != expected or rs_shape != expected:
+                rep.bad(
+                    label,
+                    f"run_id grouping must be {expected}; py={py_shape} rs={rs_shape}",
+                )
+            else:
+                rep.ok(label)
+
+
 # --------------------------------------------------------------------------- plan feedback
 
 #: A DAG whose steps carry only est_duration HINTS (no rss baselines) so the SYNTHETIC store below
@@ -4844,6 +4928,7 @@ def compare_safe_ci_dag_runner(rand_count: int, seed: int) -> int:
     compare_run_timeout(py, rs, rep)
     compare_spawn_failure(py, rs, rep)
     compare_profile_store(py, rs, rep)
+    compare_profile_run_identity(py, rs, rep)
     compare_plan_feedback(py, rs, rep)
     compare_hostile_numeric_cells(py, rs, rep)
     compare_speedup_model(py, rs, rep)

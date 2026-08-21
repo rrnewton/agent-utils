@@ -110,15 +110,21 @@ ENRICHMENT_COLUMNS = [
 #: * ``started_offset_s`` / ``finished_offset_s`` are seconds from that run's own origin, so the
 #:   overlap between any two steps of a run is a comparison of two intervals. Wall-clock
 #:   timestamps cannot do this: the batch carries one.
-#: * ``memory_max_bytes`` is the cap the KERNEL held for the step — a decimal byte count, the
-#:   literal ``max`` when the step was unbounded at that level, or BLANK when the cap is unknown.
-#:   Blank and ``max`` are different answers and must not be merged: unknown cannot rule out
-#:   censoring, unbounded does.
+#: * ``memory_max_bytes`` is the TIGHTEST cap the KERNEL held over the step across every level
+#:   the runner can see — its own cgroup and the delegated scope, because cgroup-v2 limits are
+#:   hierarchical and a step given no inner cap is still held by the scope's ceiling. A decimal
+#:   byte count, the literal ``max`` when no such level bounds it, or BLANK when the cap is
+#:   unknown. Blank and ``max`` are different answers and must not be merged: unknown cannot
+#:   rule out censoring, while ``max`` rules out censoring BY THE RUNNER'S OWN CAPS. It does not
+#:   rule out an ancestor above the delegated scope (a container memory limit, a user slice),
+#:   which the runner cannot see.
 #: * ``memory_events_*`` are the step cgroup's ``memory.events`` counters. They need no
 #:   subtraction to be deltas — the cgroup is created for the step and destroyed after it.
 #:   ``memory_events_max > 0`` with ``memory_events_oom_kill == 0`` is the reclaim-at-cap case: a
 #:   step that PASSED while pinned to its ceiling, which is precisely the sample a naive reader
-#:   would mistake for a comfortable fit.
+#:   would mistake for a comfortable fit. They are the STEP cgroup's own counters, and the kernel
+#:   does not charge an ancestor's limit events to a descendant, so ``memory_events_max == 0`` is
+#:   not by itself proof that nothing clamped the step.
 CENSORING_COLUMNS = [
     "run_id",
     "started_offset_s",

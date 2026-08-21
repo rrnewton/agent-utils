@@ -3980,6 +3980,375 @@ mod tests {
         }
     }
 
+    // ------------------------------------------------------------------ censoring provenance
+    //
+    // A `peak_bytes` recorded while a `memory.max` was clamping is a CENSORED observation: it
+    // proves the step used everything it was allowed, not what it wanted. The row columns that
+    // make that detectable — `memory_max_bytes`, the five `memory_events_*` counters, and the
+    // run-relative offsets — are wired up in `run_step` above, and these tests are what hold
+    // that wiring in place. Mirrors py/tests/test_censored_peak_profiles.py.
+
+    /// A cgroup manager that reports PLANTED per-step memory measurements.
+    ///
+    /// `enabled()` is true so the scheduler takes exactly the boxed measurement path it takes on
+    /// a real cgroup-v2 host, while the numbers come from the test rather than the kernel.
+    struct PlantedCgroups {
+        /// tag -> (peak_bytes, applied memory.max verbatim, memory.events counters)
+        planted: BTreeMap<String, (i64, String, BTreeMap<String, i64>)>,
+    }
+
+    /// One planted step: `(tag, peak_bytes, applied memory.max verbatim, memory.events pairs)`.
+    type PlantedStep<'a> = (&'a str, i64, &'a str, &'a [(&'a str, i64)]);
+
+    impl PlantedCgroups {
+        fn new(planted: &[PlantedStep<'_>]) -> Self {
+            let mut map = BTreeMap::new();
+            for (tag, peak, cap, events) in planted {
+                let counters: BTreeMap<String, i64> =
+                    events.iter().map(|(k, v)| ((*k).to_string(), *v)).collect();
+                map.insert((*tag).to_string(), (*peak, (*cap).to_string(), counters));
+            }
+            Self { planted: map }
+        }
+    }
+
+    impl CgroupManager for PlantedCgroups {
+        fn enabled(&self) -> bool {
+            true
+        }
+
+        fn prepare_command(
+            &self,
+            _tag: &str,
+            cmd: &str,
+            _mem_max: Option<i64>,
+            _cpu_count: Option<i64>,
+        ) -> String {
+            cmd.to_string()
+        }
+
+        fn kill(&self, _tag: &str) -> bool {
+            false
+        }
+
+        fn cleanup(&self, _tag: &str) {}
+
+        fn oom_kills(&self, tag: &str) -> i64 {
+            self.memory_events(tag)
+                .and_then(|events| events.get("oom_kill").copied())
+                .unwrap_or(0)
+        }
+
+        fn peak_bytes(&self, tag: &str) -> Option<i64> {
+            self.planted.get(tag).map(|entry| entry.0)
+        }
+
+        fn memory_events(&self, tag: &str) -> Option<BTreeMap<String, i64>> {
+            self.planted.get(tag).map(|entry| entry.2.clone())
+        }
+
+        fn applied_memory_max(&self, tag: &str) -> Option<String> {
+            self.planted.get(tag).map(|entry| entry.1.clone())
+        }
+
+        fn cpu_stats(&self, _tag: &str) -> Option<BTreeMap<String, i64>> {
+            None
+        }
+
+        fn cpu_pressure(&self, _tag: &str) -> Option<BTreeMap<String, f64>> {
+            None
+        }
+
+        fn thread_count(&self, _tag: &str) -> Option<i64> {
+            None
+        }
+
+        fn kill_all_remaining(&self) -> i64 {
+            0
+        }
+    }
+
+    fn profile_cell(result: &RunResult, tag: &str, column: &str) -> String {
+        result
+            .step_profile_rows
+            .iter()
+            .find(|row| row.get("step").is_some_and(|s| s == tag))
+            .unwrap_or_else(|| panic!("no profile row for {tag}"))
+            .get(column)
+            .cloned()
+            .unwrap_or_else(|| panic!("row for {tag} has no column {column}"))
+    }
+
+    const CENSORING_CAP: i64 = 8 * 1024 * 1024 * 1024;
+
+    #[test]
+    fn an_exact_cap_pass_and_an_oom_kill_stay_distinguishable_in_the_profile_row() {
+        // Both steps peak exactly at their cap, so `peak_bytes` alone sees ONE population. The
+        // event counters are what say that one was evicted into finishing and the other shot.
+        let cgroups = Arc::new(PlantedCgroups::new(&[
+            (
+                "g.clamped",
+                CENSORING_CAP,
+                "8589934592",
+                &[
+                    ("low", 0),
+                    ("high", 4),
+                    ("max", 17),
+                    ("oom", 0),
+                    ("oom_kill", 0),
+                ],
+            ),
+            (
+                "g.killed",
+                CENSORING_CAP,
+                "8589934592",
+                &[
+                    ("low", 0),
+                    ("high", 1),
+                    ("max", 3),
+                    ("oom", 2),
+                    ("oom_kill", 2),
+                ],
+            ),
+        ]));
+        let cfg = DagConfig {
+            steps: vec![
+                step("g", "clamped", "true", &[], 0.0, &[]),
+                step("g", "killed", "true", &[], 0.0, &[]),
+            ],
+            ..Default::default()
+        };
+
+        let result = run_dag_boxed_limited(&cfg, 2, 2, false, 0, Some(cgroups));
+
+        assert!(result.ok);
+        assert_eq!(
+            profile_cell(&result, "g.clamped", "peak_bytes"),
+            "8589934592"
+        );
+        assert_eq!(
+            profile_cell(&result, "g.killed", "peak_bytes"),
+            "8589934592"
+        );
+        assert_eq!(
+            profile_cell(&result, "g.clamped", "memory_max_bytes"),
+            "8589934592",
+            "the cap the peak was measured under must reach the row"
+        );
+        assert_eq!(
+            profile_cell(&result, "g.killed", "memory_max_bytes"),
+            "8589934592"
+        );
+        // Reclaim-at-cap: held at the ceiling, never killed.
+        assert_eq!(profile_cell(&result, "g.clamped", "memory_events_low"), "0");
+        assert_eq!(
+            profile_cell(&result, "g.clamped", "memory_events_high"),
+            "4"
+        );
+        assert_eq!(
+            profile_cell(&result, "g.clamped", "memory_events_max"),
+            "17"
+        );
+        assert_eq!(profile_cell(&result, "g.clamped", "memory_events_oom"), "0");
+        assert_eq!(
+            profile_cell(&result, "g.clamped", "memory_events_oom_kill"),
+            "0"
+        );
+        assert_eq!(profile_cell(&result, "g.clamped", "oom_kills"), "0");
+        // OOM: the kernel killed it at the same ceiling.
+        assert_eq!(profile_cell(&result, "g.killed", "memory_events_high"), "1");
+        assert_eq!(profile_cell(&result, "g.killed", "memory_events_max"), "3");
+        assert_eq!(profile_cell(&result, "g.killed", "memory_events_oom"), "2");
+        assert_eq!(
+            profile_cell(&result, "g.killed", "memory_events_oom_kill"),
+            "2"
+        );
+        assert_eq!(profile_cell(&result, "g.killed", "oom_kills"), "2");
+    }
+
+    #[test]
+    fn a_peak_below_its_cap_is_not_reported_as_touching_it() {
+        // The uncensored case must be recognisable, or every sample looks censored.
+        let cgroups = Arc::new(PlantedCgroups::new(&[(
+            "g.roomy",
+            2 * 1024 * 1024 * 1024,
+            "8589934592",
+            &[
+                ("low", 0),
+                ("high", 0),
+                ("max", 0),
+                ("oom", 0),
+                ("oom_kill", 0),
+            ],
+        )]));
+        let cfg = DagConfig {
+            steps: vec![step("g", "roomy", "true", &[], 0.0, &[])],
+            ..Default::default()
+        };
+
+        let result = run_dag_boxed_limited(&cfg, 1, 1, false, 0, Some(cgroups));
+
+        assert!(result.ok);
+        let peak: i64 = profile_cell(&result, "g.roomy", "peak_bytes")
+            .parse()
+            .unwrap();
+        let cap: i64 = profile_cell(&result, "g.roomy", "memory_max_bytes")
+            .parse()
+            .unwrap();
+        assert!(peak < cap, "peak {peak} should sit below cap {cap}");
+        assert_eq!(profile_cell(&result, "g.roomy", "memory_events_max"), "0");
+    }
+
+    #[test]
+    fn an_unbounded_step_says_max_and_an_unmeasured_one_says_nothing() {
+        // "max" (known unbounded at this level) and blank (unknown) are DIFFERENT answers, and
+        // collapsing them is what makes a store dangerous to learn from.
+        let cgroups = Arc::new(PlantedCgroups::new(&[(
+            "g.unbounded",
+            1024,
+            "max",
+            &[
+                ("low", 0),
+                ("high", 0),
+                ("max", 0),
+                ("oom", 0),
+                ("oom_kill", 0),
+            ],
+        )]));
+        let cfg = DagConfig {
+            steps: vec![
+                step("g", "unbounded", "true", &[], 0.0, &[]),
+                step("g", "unmeasured", "true", &[], 0.0, &[]),
+            ],
+            ..Default::default()
+        };
+
+        let result = run_dag_boxed_limited(&cfg, 2, 2, false, 0, Some(cgroups));
+
+        assert!(result.ok);
+        assert_eq!(
+            profile_cell(&result, "g.unbounded", "memory_max_bytes"),
+            "max"
+        );
+        assert_eq!(
+            profile_cell(&result, "g.unbounded", "memory_events_max"),
+            "0"
+        );
+        assert_eq!(
+            profile_cell(&result, "g.unmeasured", "memory_max_bytes"),
+            ""
+        );
+        // An unmeasured step reports no counters at all, rather than zeroes that would read as
+        // "we looked and nothing happened".
+        for counter in ["low", "high", "max", "oom", "oom_kill"] {
+            assert_eq!(
+                profile_cell(&result, "g.unmeasured", &format!("memory_events_{counter}")),
+                "",
+                "unmeasured memory_events_{counter} must stay blank"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unboxed_run_leaves_every_censoring_column_blank() {
+        let cfg = DagConfig {
+            steps: vec![step("g", "only", "true", &[], 0.0, &[])],
+            ..Default::default()
+        };
+
+        let result = run_dag_limited(&cfg, 1, 1, false, 0);
+
+        assert!(result.ok);
+        assert_eq!(profile_cell(&result, "g.only", "memory_max_bytes"), "");
+        for counter in ["low", "high", "max", "oom", "oom_kill"] {
+            assert_eq!(
+                profile_cell(&result, "g.only", &format!("memory_events_{counter}")),
+                ""
+            );
+        }
+        // The run's own timing does not need a cgroup, so the offsets are still there.
+        let started: f64 = profile_cell(&result, "g.only", "started_offset_s")
+            .parse()
+            .unwrap();
+        let finished: f64 = profile_cell(&result, "g.only", "finished_offset_s")
+            .parse()
+            .unwrap();
+        assert!(finished >= started);
+    }
+
+    #[test]
+    fn run_offsets_place_concurrent_steps_on_one_overlapping_timeline() {
+        let cfg = DagConfig {
+            steps: vec![
+                step("g", "one", "sleep 0.5", &[], 0.0, &[]),
+                step("g", "two", "sleep 0.5", &[], 0.0, &[]),
+            ],
+            ..Default::default()
+        };
+
+        let result = run_dag_limited(&cfg, 2, 2, false, 0);
+
+        assert!(result.ok);
+        let cell = |tag: &str, column: &str| -> f64 {
+            profile_cell(&result, tag, column).parse().unwrap()
+        };
+        let (one_start, one_end) = (
+            cell("g.one", "started_offset_s"),
+            cell("g.one", "finished_offset_s"),
+        );
+        let (two_start, two_end) = (
+            cell("g.two", "started_offset_s"),
+            cell("g.two", "finished_offset_s"),
+        );
+        // Overlap is the interval test, computed from the row cells alone.
+        assert!(one_start < two_end && two_start < one_end);
+        // Both steps slept half a second, so offsets that merely happened to satisfy the
+        // interval test (all zero, say) would not describe the run. Each must span its sleep.
+        assert!(
+            one_end - one_start >= 0.4,
+            "g.one spanned {}",
+            one_end - one_start
+        );
+        assert!(
+            two_end - two_start >= 0.4,
+            "g.two spanned {}",
+            two_end - two_start
+        );
+    }
+
+    #[test]
+    fn run_offsets_place_dependent_steps_in_order_without_overlap() {
+        // The same reconstruction must be able to say NO: a test that only ever sees
+        // overlapping steps cannot tell a real measurement from a constant.
+        let cfg = DagConfig {
+            steps: vec![
+                step("g", "first", "sleep 0.3", &[], 0.0, &[]),
+                step("g", "second", "sleep 0.3", &["g.first"], 0.0, &[]),
+            ],
+            ..Default::default()
+        };
+
+        let result = run_dag_limited(&cfg, 2, 2, false, 0);
+
+        assert!(result.ok);
+        let first_end: f64 = profile_cell(&result, "g.first", "finished_offset_s")
+            .parse()
+            .unwrap();
+        let second_start: f64 = profile_cell(&result, "g.second", "started_offset_s")
+            .parse()
+            .unwrap();
+        assert!(
+            first_end <= second_start,
+            "g.first finished at {first_end} but g.second started at {second_start}"
+        );
+        // And the second step's offsets are measured from the RUN's origin, not its own start,
+        // so they carry the ordering rather than restarting at zero.
+        assert!(
+            second_start >= 0.25,
+            "g.second should start after g.first's 0.3s sleep, got {second_start}"
+        );
+    }
+
     #[test]
     fn undeclared_step_profiles_the_default_cpu_cap_as_inner_jobs() {
         let cfg = DagConfig {

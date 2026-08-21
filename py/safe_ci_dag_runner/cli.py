@@ -1665,18 +1665,33 @@ def _cmd_sweep(ns: argparse.Namespace, c: Palette) -> int:
         return code
 
     perf_dir, source = _resolve_profile_dir(ns.perf_dir, bool(ns.no_profile))
-    metrics: MetricsSink | None = None
-    if perf_dir is not None:
+    sweep_git_sha = _git_sha() if perf_dir is not None else ""
+
+    def _sink_for_one_iteration() -> MetricsSink | None:
+        """A FRESH sink — and therefore a fresh ``run_id`` — for each sweep iteration.
+
+        Every iteration below is its own DAG execution: its own :func:`run_dag_limited`, its
+        own Runner, and its own monotonic origin from which ``started_offset_s`` restarts at
+        zero. One sink shared across the sweep would stamp all of those rows with ONE
+        ``run_id``, and the documented reconstruction ("two rows of the same run_id overlap iff
+        their [started, finished] intervals do") would then report a strictly sequential sweep
+        as fully concurrent. This also keeps the Python sweep at parity with the Rust build,
+        which mints per call.
+        """
+        if perf_dir is None:
+            return None
         from safe_ci_dag_runner.perflog import CsvMetricsSink
 
-        metrics = CsvMetricsSink(perf_dir, git_sha=_git_sha())
+        return CsvMetricsSink(perf_dir, git_sha=sweep_git_sha)
 
     verbosity = int(ns.verbosity)
     measures: list[tuple[int, _SweepMeasure]] = []
     for jobs in range(lo, hi + 1):
         best: _SweepMeasure | None = None
         for _ in range(repeat):
-            m = _run_single_step(base_step, cfg, jobs, cgroups, metrics, verbosity)
+            m = _run_single_step(
+                base_step, cfg, jobs, cgroups, _sink_for_one_iteration(), verbosity
+            )
             if not m.ok:
                 print(
                     f"{PROG}: sweep: step {step_tag!r} FAILED at -j{jobs}; aborting the sweep",

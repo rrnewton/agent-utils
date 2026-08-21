@@ -54,12 +54,17 @@ pub const CSV_COLUMNS: [&str; 15] = [
 ///   stamped once per BATCH, so no other key separates them.
 /// * `started_offset_s` / `finished_offset_s` are seconds from that run's own monotonic origin, so
 ///   the overlap of two steps is a comparison of two intervals.
-/// * `memory_max_bytes` is the cap the KERNEL held: a decimal byte count, the literal `max` when
-///   unbounded, or BLANK when unknown. Blank and `max` are different answers — unknown cannot rule
-///   out censoring, unbounded does.
+/// * `memory_max_bytes` is the TIGHTEST cap the KERNEL held over the step across every level the
+///   runner can see (its own cgroup and the delegated scope): a decimal byte count, the literal
+///   `max` when no such level bounds it, or BLANK when unknown. Blank and `max` are different
+///   answers — unknown cannot rule out censoring, `max` rules out censoring by the runner's own
+///   caps. It does NOT rule out an ancestor ABOVE the delegated scope (a container limit, a user
+///   slice), which is outside the runner's view.
 /// * `memory_events_*` are the step cgroup's `memory.events` counters, already per-step deltas
 ///   because the cgroup lives exactly as long as the step. `memory_events_max > 0` with
-///   `memory_events_oom_kill == 0` is reclaim-at-cap: a PASSING step pinned to its ceiling.
+///   `memory_events_oom_kill == 0` is reclaim-at-cap: a PASSING step pinned to its ceiling. They
+///   are the STEP cgroup's own counters: reclaim forced by an ancestor's limit is not counted
+///   here, so `memory_events_max == 0` is not by itself proof of a comfortable fit.
 pub const STEP_PROFILE_COLUMNS: [&str; 58] = [
     "timestamp",
     "machine_id",

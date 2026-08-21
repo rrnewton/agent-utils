@@ -2032,34 +2032,67 @@ class Cgroups:
         These need no baseline subtraction to be per-step deltas: the child cgroup is
         created by :meth:`prepare_command` for this step and removed by :meth:`cleanup`
         after it, so every counter starts at zero. ``None`` if absent/unreadable. Read
-        BEFORE :meth:`cleanup`."""
+        BEFORE :meth:`cleanup`.
+
+        A line that does not parse as ``<name> <integer>`` is SKIPPED, not fatal: the kernel is
+        free to add counters, and discarding every counter in the file because one line was new
+        or blank would blank all five CSV cells and silently drop the recorded OOM count. The
+        sibling implementation of this runner skips per line too, and two builds must not
+        disagree about the same file."""
         if not self.enabled or self.root is None or tag not in self._made:
             return None
         try:
             lines = (self.root / _sanitize(tag) / "memory.events").read_text().splitlines()
-            return {
-                key: int(value)
-                for key, value in (line.split(maxsplit=1) for line in lines)
-            }
-        except (OSError, ValueError):
+        except OSError:
             return None
+        events: dict[str, int] = {}
+        for line in lines:
+            fields = line.split()
+            if len(fields) < 2:
+                continue
+            try:
+                events[fields[0]] = int(fields[1])
+            except ValueError:
+                continue
+        return events
 
     def applied_memory_max(self, tag: str) -> str | None:
-        """The step cgroup's ``memory.max`` read back verbatim: a decimal byte count, or the
-        literal ``"max"`` when nothing bounds the step here.
+        """The TIGHTEST ``memory.max`` in force over the step, read back from cgroupfs: a
+        decimal byte count, or the literal ``"max"`` when no level the runner can see bounds it.
 
-        Read back rather than echoed from the ``mem_max`` argument to
-        :meth:`prepare_command`, because the case that matters — a requested cap the kernel
-        never accepted — is exactly the case where the two disagree, and only the accepted
-        value explains the measured peak. ``None`` (unknown) is deliberately distinct from
-        ``"max"`` (known to be unbounded). Read BEFORE :meth:`cleanup`."""
+        The step's OWN ``memory.max`` is not on its own the ceiling it ran under. cgroup-v2
+        limits are hierarchical, and this runner always installs an outer cap on the delegated
+        scope, so a step that got no inner cap (an uncharacterised step has no
+        ``rss_baseline_bytes``, so :func:`~safe_ci_dag_runner.sizing.step_mem_cap` returns
+        ``None`` and no child ``memory.max`` is written) reads ``"max"`` at its own level while
+        the scope's ceiling is what actually held it. Reporting the child value alone would say
+        "known unbounded" for exactly the population being profiled to learn its footprint, and
+        the child's ``memory.events`` cannot correct the record either: those counters do not
+        count an ANCESTOR's limit events. So the minimum of the step's own cap and the scope's
+        is reported, because that is the number ``peak_bytes`` is interpretable against.
+
+        Read back rather than echoed from the ``mem_max`` argument to :meth:`prepare_command`,
+        because the case that matters — a requested cap the kernel never accepted — is exactly
+        the case where the two disagree, and only the accepted value explains the measured peak.
+        ``None`` (unknown) is deliberately distinct from ``"max"`` (known unbounded).
+
+        ``"max"`` means "no ceiling at any level this runner can see". Ancestors ABOVE the
+        delegated scope — a container memory limit, a user slice — are outside its view, so
+        ``"max"`` rules out censoring by the runner's own caps, not by the whole machine. Read
+        BEFORE :meth:`cleanup`."""
         if not self.enabled or self.root is None or tag not in self._made:
             return None
         try:
-            value = (self.root / _sanitize(tag) / "memory.max").read_text().strip()
+            own = (self.root / _sanitize(tag) / "memory.max").read_text().strip()
         except OSError:
             return None
-        return value or None
+        if not own:
+            return None
+        outer_bytes = _memory_max_bytes(_read_cgroup_value(self.root, "memory.max"))
+        if outer_bytes is None:
+            return own
+        own_bytes = _memory_max_bytes(own)
+        return str(outer_bytes if own_bytes is None else min(own_bytes, outer_bytes))
 
     def oom_kills(self, tag: str) -> int:
         """OOM-kill event count inside the step's cgroup (``memory.events``

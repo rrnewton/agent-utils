@@ -9,11 +9,14 @@ end to end, through a real scheduler run and a CSV round trip.
 
 from __future__ import annotations
 
+import contextlib
 import csv
+import io
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from safe_ci_dag_runner.cgroup import Cgroups, NoopCgroups, _sanitize
+from safe_ci_dag_runner.cli import main
 from safe_ci_dag_runner.model import DagConfig, ResourceHint, Step
 from safe_ci_dag_runner.perflog import CsvMetricsSink, new_run_id
 from safe_ci_dag_runner.protocols import CgroupManager
@@ -191,6 +194,48 @@ def test_one_sink_recording_two_batches_keeps_them_in_one_run(tmp_path: Path) ->
     assert rows["g.early"]["run_id"] == rows["g.late"]["run_id"]
 
 
+def test_a_sweep_gives_each_iteration_its_own_run_id(tmp_path: Path) -> None:
+    """Every sweep iteration is a SEPARATE DAG execution and must be its own run.
+
+    The three iterations below run strictly one after another, but each gets a fresh Runner
+    with a fresh monotonic origin, so all three rows report ``started_offset_s`` at (near)
+    zero. Stamping one shared ``run_id`` across them therefore makes the documented rule —
+    two rows of the same run_id overlap iff their [started, finished] intervals do — declare a
+    strictly sequential sweep fully concurrent, which is precisely the reconstruction error the
+    column exists to prevent.
+    """
+    dag = tmp_path / "dag.json"
+    dag.write_text('{"steps": [{"group": "g", "job": "j", "cmd": "true"}]}', encoding="utf-8")
+    store = tmp_path / "perf"
+
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        rc = main(
+            [
+                "sweep",
+                "--dag",
+                str(dag),
+                "--step",
+                "g.j",
+                "--jobs",
+                "1..3",
+                "--perf-dir",
+                str(store),
+                "--unsafe-no-cgroups",
+            ]
+        )
+    assert rc == 0, err.getvalue()
+
+    rows = _rows(store)
+    assert len(rows) == 3
+    # The offsets really do all restart, so the ids are the only thing separating the runs.
+    assert all(float(row["started_offset_s"]) < 0.5 for row in rows)
+    assert len({row["run_id"] for row in rows}) == 3, (
+        "three sequential executions sharing one run_id would read as three concurrent steps: "
+        f"{[row['run_id'] for row in rows]}"
+    )
+
+
 def test_an_explicit_run_id_is_recorded_verbatim(tmp_path: Path) -> None:
     chosen = new_run_id()
     sink = CsvMetricsSink(tmp_path, git_sha="deadbee", run_id=chosen)
@@ -259,11 +304,13 @@ def test_a_peak_below_its_cap_is_not_reported_as_touching_it(tmp_path: Path) -> 
 def test_an_unbounded_step_says_max_and_an_unmeasured_one_says_nothing(
     tmp_path: Path,
 ) -> None:
-    """``max`` (known unbounded) and blank (unknown) are different answers.
+    """``max`` (no ceiling the runner can see) and blank (unknown) are different answers.
 
     Collapsing them is what makes a store dangerous to learn from: an unknown cap cannot rule
-    out censoring, while a known-unbounded one can. ``unbounded`` ran with no ceiling at that
-    level; ``unmeasured`` was never contained, so nothing is known about its ceiling.
+    out censoring at all, while ``max`` rules out censoring by the runner's own caps — see
+    :meth:`Cgroups.applied_memory_max`, which reports the tightest of the step's own cap and the
+    delegated scope's precisely so ``max`` can mean that much. ``unbounded`` ran with no such
+    ceiling; ``unmeasured`` was never contained, so nothing is known about its ceiling.
     """
     planted = {
         "g.unbounded": (
@@ -335,8 +382,49 @@ def test_applied_memory_max_distinguishes_unbounded_from_unreadable(tmp_path: Pa
     assert cgroups.applied_memory_max("g.job") is None
 
     (child / "memory.max").write_text("max\n")
-    # Now it is known, and known to be unbounded.
+    # Now it is known, and known to be unbounded at every level this manager can see (the
+    # planted scope root below carries no memory.max of its own).
     assert cgroups.applied_memory_max("g.job") == "max"
+
+
+def test_an_uncapped_step_reports_the_outer_scope_cap_it_actually_ran_under(
+    tmp_path: Path,
+) -> None:
+    """An uncharacterised step gets no INNER cap, but it is never actually unbounded.
+
+    The runner refuses to run without an outer scope ``memory.max``, and cgroup-v2 limits are
+    hierarchical, so such a step is held at the scope's ceiling for its whole life. Reporting
+    the child's own ``max`` would label it "known unbounded" — reclaim at the ancestor's limit
+    is not charged to the child's ``memory.events`` either, so the row would read as a
+    comfortable fit for exactly the population being profiled to learn its footprint.
+    """
+    cgroups, child = _planted_cgroupfs(tmp_path, "g.job")
+    (tmp_path / "memory.max").write_text("8589934592\n")
+    (child / "memory.max").write_text("max\n")
+
+    assert cgroups.applied_memory_max("g.job") == "8589934592"
+
+
+def test_applied_memory_max_reports_the_tighter_of_the_step_and_scope_caps(
+    tmp_path: Path,
+) -> None:
+    """Both directions, so the answer is a minimum and not "whichever we happened to read"."""
+    cgroups, child = _planted_cgroupfs(tmp_path, "g.job")
+    (tmp_path / "memory.max").write_text("8589934592\n")
+
+    (child / "memory.max").write_text("2147483648\n")
+    assert cgroups.applied_memory_max("g.job") == "2147483648"
+
+    (child / "memory.max").write_text("17179869184\n")
+    assert cgroups.applied_memory_max("g.job") == "8589934592"
+
+
+def test_an_unbounded_scope_leaves_the_step_cap_untouched(tmp_path: Path) -> None:
+    cgroups, child = _planted_cgroupfs(tmp_path, "g.job")
+    (tmp_path / "memory.max").write_text("max\n")
+    (child / "memory.max").write_text("2147483648\n")
+
+    assert cgroups.applied_memory_max("g.job") == "2147483648"
 
 
 def test_memory_events_carries_every_counter_and_agrees_with_oom_kills(
@@ -349,6 +437,27 @@ def test_memory_events_carries_every_counter_and_agrees_with_oom_kills(
 
     assert events == {"low": 0, "high": 12, "max": 41, "oom": 3, "oom_kill": 2}
     # One parse, one answer: the OOM count cannot drift from the recorded counters.
+    assert cgroups.oom_kills("g.job") == 2
+
+
+def test_one_unparsable_memory_events_line_does_not_discard_the_others(
+    tmp_path: Path,
+) -> None:
+    """The kernel may add counters, and a blank trailing line costs nothing to skip.
+
+    Discarding the whole file would blank all five CSV cells AND drop the recorded OOM count to
+    zero, so a step that was actually killed would read as one that was never pressured. The
+    Rust build skips per line, so both builds must, or the same ``/sys/fs/cgroup`` file yields
+    two different CSV rows depending on which binary wrote it.
+    """
+    cgroups, child = _planted_cgroupfs(tmp_path, "g.job")
+    (child / "memory.events").write_text(
+        "low 0\nhigh not-a-number\n\nmax 41\nfuture_counter 9\noom 3\noom_kill 2\n"
+    )
+
+    events = cgroups.memory_events("g.job")
+
+    assert events == {"low": 0, "max": 41, "future_counter": 9, "oom": 3, "oom_kill": 2}
     assert cgroups.oom_kills("g.job") == 2
 
 

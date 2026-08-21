@@ -138,17 +138,25 @@ class CgroupManager(Protocol):
         ...
 
     def applied_memory_max(self, tag: str) -> str | None:
-        """The step cgroup's ``memory.max`` AS THE KERNEL HOLDS IT, verbatim: a decimal byte
-        count, or the literal ``"max"`` when nothing bounds the step at this level.
+        """The TIGHTEST ``memory.max`` AS THE KERNEL HOLDS IT over the step, verbatim: a
+        decimal byte count, or the literal ``"max"`` when no level the runner can see bounds it.
+
+        Not the step's own ``memory.max`` alone. cgroup-v2 limits are hierarchical and the
+        runner always installs an outer scope cap, so a step given no inner cap reads ``"max"``
+        at its own level while the scope's ceiling is what actually held it — and its own
+        ``memory.events`` will not show it, because those counters do not count an ANCESTOR's
+        limit events. An implementation reports the minimum over the levels it can see.
 
         Read back rather than echoed from the requested cap, because a requested cap that
         the kernel did not accept (an undelegated ``memory`` controller) is exactly the case
         where the two disagree, and only the accepted value explains a measured peak.
 
         ``None`` when disabled, unknown, or unreadable — which is DIFFERENT from ``"max"``:
-        ``"max"`` says the step was unbounded here, ``None`` says the cap is unknown. A
-        consumer must not collapse the two, because an unknown cap cannot rule out
-        censoring. Read BEFORE :meth:`cleanup`.
+        ``"max"`` says no ceiling was found at any level the runner can see, ``None`` says the
+        cap is unknown. A consumer must not collapse the two, because an unknown cap cannot
+        rule out censoring while ``"max"`` rules out censoring by the runner's own caps (never
+        by ancestors above the delegated scope, which are outside its view). Read BEFORE
+        :meth:`cleanup`.
         """
         ...
 
