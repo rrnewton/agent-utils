@@ -1132,6 +1132,18 @@ wherever the configured label showed; the label is the fallback, and clearing th
 it. `ChannelInfo::display_name` is the one place that rule lives, so the picker, the head of the
 channel and the digest header cannot come to disagree.
 
+**Both served pages, not just the one with the editor.** The alias is set from `/voice` Settings,
+but it is shown at `/` too — both channel pickers there and the channel-name header — because two
+pages of one deployment showing two names for one channel is precisely the disagreement
+`display_name` exists to prevent. In the browser the rule is a function called `channelName`, and
+it exists twice: `/` and `/voice` are separate assets with no build step between them, so they
+cannot share a module. What holds them together is a test in `src/http/api.rs` over the bytes of
+**both** files, asserting that each defines the rule and that every place either one names a
+channel goes through it. That guard is not new — it was widened after `#52 operator-timezone` and
+`#62 message-count-accuracy` were each fixed on one page and carried across afterwards — and
+`#39` is the third time the same trap was walked into. `tests/js/app_page.test.mjs` is the
+behavioural half for `/`, alongside the long-standing suite for `/voice`.
+
 **It is ours, and it is local.** It lives in the `#64 storage-backend` store beside the read
 state, exactly as `#50 todo-view`'s "dealt with" marks do — the same posture, and for the same
 reason. It is never sent to Discord, renames nothing there, and nobody outside this deployment

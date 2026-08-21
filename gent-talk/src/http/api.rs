@@ -803,12 +803,21 @@ mod tests {
     ///
     /// Crude on purpose: it is enough to ask "does THIS function call that one", which is the
     /// only question the guard below has, and it needs no parser to answer it.
+    ///
+    /// `async function` counts as the next one. It did not used to, and the consequence was that
+    /// a body ran on through every `async` declaration after it until the next synchronous one —
+    /// so an assertion about one function was quietly an assertion about three. web/app.js is
+    /// mostly `async`, which is where that first mattered.
     fn function_body<'a>(source: &'a str, signature: &str) -> &'a str {
         let start = source
             .find(signature)
             .unwrap_or_else(|| panic!("the asset no longer defines `{signature}`"));
         let rest = &source[start + signature.len()..];
-        let end = rest.find("\nfunction ").unwrap_or(rest.len());
+        let end = ["\nfunction ", "\nasync function "]
+            .iter()
+            .filter_map(|marker| rest.find(marker))
+            .min()
+            .unwrap_or(rest.len());
         &rest[..end]
     }
 
@@ -940,6 +949,103 @@ mod tests {
             APP_JS.contains("spoken_time: entry.spoken_time"),
             "a digest entry carries the converted time too; dropping it here would make the \
              digest list silently fall back to UTC while the scrollback shows local time"
+        );
+    }
+
+    /// Every place either served page names a channel, and the one function that decides the name.
+    ///
+    /// The list is the point. `#52 operator-timezone` and `#62 message-count-accuracy` were each
+    /// fixed on one of these two files and carried across afterwards, at the cost of a round trip
+    /// both times, and `#39 channel-alias` walked into it a third time: the alias reached
+    /// /voice and the voice agent while `/` went on printing the configured label, so one
+    /// deployment showed two names for one channel.
+    const NAMES_A_CHANNEL: [(&str, &str, &[&str]); 2] = [
+        (
+            "web/app.js",
+            APP_JS,
+            // Both pickers are filled by one function; the header is written on both read paths.
+            &[
+                "function fillChannelSelects(",
+                "function loadDigest(",
+                "function loadScrollback(",
+            ],
+        ),
+        (
+            "web/voice.js",
+            VOICE_JS,
+            // Both pickers again, the head of the channel on each of its three writers, and the
+            // head of the to-do list.
+            &[
+                "function fillChannelSelect(",
+                "function loadDiscord(",
+                "function loadOlder(",
+                "function restateChannelSeam(",
+                "function todoSummary(",
+            ],
+        ),
+    ];
+
+    #[test]
+    fn both_served_pages_call_a_channel_what_the_operator_called_it() {
+        // `#39 channel-alias`. `ChannelInfo::display_name` is the rule on this side of the wire;
+        // `channelName` is the same rule in the browser, and it exists twice because two served
+        // assets with no build step between them cannot share a module. That is exactly the
+        // arrangement the guards above were written for, so it gets the same treatment: the RULE
+        // is asserted over the bytes of BOTH files, and so is every call site of it.
+        for (name, source, renderers) in NAMES_A_CHANNEL {
+            let rule = function_body(source, "function channelName(");
+            assert!(
+                rule.contains("channel.alias"),
+                "{name} defines channelName without consulting the operator's own name for the \
+                 channel"
+            );
+            assert!(
+                rule.contains("channel.label"),
+                "{name} defines channelName without the configured label as its fallback, so \
+                 clearing an alias would leave the channel with no name at all"
+            );
+            for renderer in renderers {
+                let body = function_body(source, renderer);
+                assert!(
+                    body.contains("channelName("),
+                    "`{renderer}` in {name} names a channel without going through channelName, \
+                     so this deployment can show two different names for one channel"
+                );
+                assert!(
+                    !body.contains(".label"),
+                    "`{renderer}` in {name} reads the configured label directly again, which is \
+                     the defect: the alias is ignored wherever that is done"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_served_page_grows_a_second_opinion_about_a_channels_name() {
+        // The other half, and the half that keeps the list above honest: a call site added later
+        // is not covered by a list written today. `.label` is the shape of the defect, so it is
+        // allowed in exactly two places — the fallback inside `channelName`, and the alias editor
+        // on /voice, which names the configured label deliberately so the owner can see what
+        // clearing would go back to.
+        assert_eq!(
+            APP_JS.matches(".label").count(),
+            1,
+            "web/app.js reads a channel's configured label somewhere other than the fallback \
+             inside channelName"
+        );
+        assert_eq!(
+            VOICE_JS.matches(".label").count(),
+            3,
+            "web/voice.js reads a channel's configured label somewhere other than the fallback \
+             inside channelName and the two sentences the alias editor shows"
+        );
+        assert_eq!(
+            function_body(VOICE_JS, "function renderAliasEditor(")
+                .matches(".label")
+                .count(),
+            2,
+            "the alias editor on /voice must be where the other two readings of the configured \
+             label are; if they moved, this count is guarding the wrong thing"
         );
     }
 }

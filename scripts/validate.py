@@ -74,7 +74,11 @@ GROUPS: dict[str, tuple[Check, ...]] = {
         Check("gent-talk-fmt", ("cargo", "fmt", "--check"), cwd="gent-talk"),
         Check("gent-talk-clippy", ("cargo", "clippy", "--all-targets", "--", "-D", "warnings"), cwd="gent-talk"),
         Check("gent-talk-test", ("cargo", "test"), cwd="gent-talk"),
-        Check("gent-talk-page", ("node", "--test", "tests/js/voice_page.test.mjs"), cwd="gent-talk"),
+        # EVERY page suite, not a named file. gent-talk serves two pages -- `/` and `/voice` --
+        # and naming one of them here is how the second suite comes to exist without ever running.
+        # The pattern is expanded by node, not by a shell, so there is no glob for a shell to eat.
+        # `cargo test` runs both through their own harnesses too; this keeps the fast loop honest.
+        Check("gent-talk-page", ("node", "--test", "tests/js/*.test.mjs"), cwd="gent-talk"),
     ),
 }
 

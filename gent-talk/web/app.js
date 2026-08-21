@@ -91,6 +91,33 @@ function messageNode(message, opts = {}) {
   return li;
 }
 
+// What to call a channel. `#39 channel-alias`.
+//
+// The alias when the owner has given the channel one, the configured label otherwise. It is the
+// server's `ChannelInfo::display_name` rule, and it is stated here because THIS page renders a
+// channel's name in three places -- both pickers and the header -- and a rule applied to one of
+// them is how a deployment comes to show "build noise" here and "the build channel" on /voice.
+//
+// The same function, under the same name, exists in web/voice.js. Two served assets with no build
+// step between them cannot share a module, so what keeps them from drifting is a test over the
+// bytes of BOTH files in src/http/api.rs -- the same guard that had to be widened after `#52
+// operator-timezone` and `#62 message-count-accuracy` were each fixed on one page and not the
+// other.
+//
+// Trimmed and emptiness-checked rather than a bare `alias || label`: the server refuses a blank
+// alias, so an empty string arriving here means something upstream is wrong, and a picker with a
+// blank entry in it is worse than one showing the configured label.
+//
+// Nothing on this page SETS an alias. That is the operator's control in /voice Settings, and the
+// agent has no tool for it at all; this page is a reader of the name, like everything else.
+function channelName(channel) {
+  if (!channel) {
+    return "this channel";
+  }
+  const alias = typeof channel.alias === "string" ? channel.alias.trim() : "";
+  return alias || String(channel.label || channel.id || "this channel");
+}
+
 function fillChannelSelects() {
   for (const id of ["talk-channel", "text-channel"]) {
     const select = el(id);
@@ -99,7 +126,8 @@ function fillChannelSelects() {
     for (const channel of state.channels) {
       const option = document.createElement("option");
       option.value = channel.id;
-      option.textContent = channel.writable ? `${channel.label} (postable)` : channel.label;
+      const name = channelName(channel);
+      option.textContent = channel.writable ? `${name} (postable)` : name;
       select.append(option);
     }
     if (previous) {
@@ -172,7 +200,7 @@ async function loadDigest() {
       )
     );
   }
-  el("channel-name").textContent = payload.channel.label;
+  el("channel-name").textContent = channelName(payload.channel);
   setStatus(messageCount(payload.entries.length, payload.complete));
 }
 
@@ -242,7 +270,7 @@ async function loadScrollback() {
   // The header names the channel you are looking at. Only the digest path used to set it, so
   // arriving on the Text tab first left the header reading "not connected" over a full,
   // freshly-fetched scrollback -- the one place the app lied about its own state.
-  el("channel-name").textContent = payload.channel.label;
+  el("channel-name").textContent = channelName(payload.channel);
   setStatus(messageCount(payload.messages.length, payload.complete));
   list.lastElementChild?.scrollIntoView({ block: "end" });
 }

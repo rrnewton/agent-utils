@@ -26,9 +26,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      # `cargo test` runs the /voice page's own suite through `node --test` (tests/voice_page.rs).
-      # That test FAILS rather than skips when node is absent, so the toolchain is pinned here
-      # instead of relying on whatever the runner image happens to ship.
+      # `cargo test` runs BOTH served pages' suites through `node --test` — tests/voice_page.rs
+      # for /voice and tests/app_page.rs for /. Those tests FAIL rather than skip when node is
+      # absent, so the toolchain is pinned here instead of relying on whatever the runner image
+      # happens to ship.
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
