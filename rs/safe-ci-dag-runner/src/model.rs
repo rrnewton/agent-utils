@@ -22,6 +22,10 @@ pub const DEFAULT_STEP_TIMEOUT: i64 = 1800;
 /// 3x leaves generous headroom so the wall guard only ever fires on a true hang and never races
 /// the authoritative CPU-second guard.
 ///
+/// That reasoning holds for CPU-BOUND work only, which is why [`resolved_wall_timeout`] floors the
+/// derived value at [`DEFAULT_STEP_TIMEOUT`] and never uses it to tighten a step: a step that
+/// blocks on the network or a lock spends almost no CPU and arbitrary wall time.
+///
 /// The value and the name are DELIBERATELY the same as
 /// `parallel_experiment_runner.model.WALL_CPU_BACKSTOP_FACTOR`, which established this idiom in
 /// this repository. One policy, spelled once per project rather than invented twice.
@@ -360,10 +364,22 @@ pub fn effective_cpu_timeout(step: &Step, default_cpu_timeout: i64, multiplier: 
 /// 1. the step's own `timeout` (>0) — an explicit author decision always wins;
 /// 2. the document's `default_step_timeout` (>0) — an explicit document-wide decision;
 /// 3. `WALL_CPU_BACKSTOP_FACTOR` x the step's PLATFORM-SCALED `cpu_timeout`, when the step
-///    DECLARED one;
+///    DECLARED one AND that is LARGER than [`DEFAULT_STEP_TIMEOUT`];
 /// 4. [`DEFAULT_STEP_TIMEOUT`].
 ///
-/// Two choices in rule 3 are deliberate and were the open questions in the design:
+/// *THE DERIVATION ONLY EVER LOOSENS.* Rule 3 is floored at [`DEFAULT_STEP_TIMEOUT`], so no step
+/// that ran under 1800 s before this rule existed runs under less now. Without that floor the rule
+/// silently retimed every already-authored step that declared a CPU budget: a `networkonly` step
+/// `{"cmd": "git fetch ...", "cpu_timeout": 5}` burns ~5 CPU-seconds and blocks for minutes on the
+/// network, and a 15-second ceiling SIGTERMs it and reports a hang. Wall time is unbounded
+/// relative to CPU time for anything that blocks, so a CPU-derived ceiling is only sound as an
+/// UPPER bound. The direction the derivation is for is the other one: a step declaring
+/// `cpu_timeout: 900` had a 1800 s wall ceiling that its own CPU guard could reach — at a 2.5x
+/// platform multiplier the enforced budget is 2250 s, ABOVE the wall bound — so the wall guard
+/// fired first and reported a hang where the truth was a slow machine. Rule 3 lifts that step to
+/// 2700 s and restores the 3x margin.
+///
+/// Two further choices in rule 3 are deliberate and were the open questions in the design:
 ///
 /// *DECLARED, not canonical.* [`canonical_cpu_timeout`] fills in the DAG's small default (10 s)
 /// for a step that declares nothing, and it is ALWAYS in force. Deriving from that would hand
@@ -385,7 +401,8 @@ pub fn resolved_wall_timeout(step: &Step, default_step_timeout: i64, multiplier:
         return default_step_timeout;
     }
     if step.cpu_timeout > 0 {
-        return WALL_CPU_BACKSTOP_FACTOR * scale_cpu_timeout(step.cpu_timeout, multiplier);
+        let derived = WALL_CPU_BACKSTOP_FACTOR * scale_cpu_timeout(step.cpu_timeout, multiplier);
+        return derived.max(DEFAULT_STEP_TIMEOUT);
     }
     DEFAULT_STEP_TIMEOUT
 }

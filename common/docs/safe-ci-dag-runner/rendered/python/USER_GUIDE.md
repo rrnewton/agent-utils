@@ -303,14 +303,33 @@ baked-in 1800 either. The effective bound is resolved, most specific first:
 1. the step's own `timeout`, when it declares one;
 2. the document's `default_step_timeout`, when it declares one;
 3. **three times the step's platform-scaled `cpu_timeout`**, when the step
-   declared a CPU budget;
+   declared a CPU budget and that is **larger** than 1800;
 4. otherwise 1800 seconds.
+
+**Rule 3 only ever loosens.** It is floored at 1800, so nothing that ran under
+1800 seconds before runs under less now. Without that floor it silently retimed
+every already-authored step that declared a CPU budget: `{"cmd": "git fetch
+...", "cpu_timeout": 5}` burns about five CPU-seconds and blocks for minutes on
+the network, and a fifteen-second ceiling reaps it and calls it a hang. Wall
+time is unbounded relative to CPU time for anything that blocks, so a
+CPU-derived ceiling is sound only as an upper bound. The case rule 3 is for is
+the other one: a step declaring `cpu_timeout: 900` had a 1800-second wall
+ceiling its own CPU guard could reach — at a 2.5x `cpu_timeout_multiplier` the
+enforced budget is 2250 seconds, above the wall bound — so the wall guard fired
+first and reported a hang where the truth was a slow machine. That step now gets
+2700 seconds.
 
 Rule 3 uses the **declared** CPU budget, not the small default every step
 carries, so a step that declares nothing keeps its 1800-second backstop instead
 of silently dropping to thirty seconds. It tracks the **platform-scaled** budget,
 so raising `cpu_timeout_multiplier` for a slow platform moves the backstop with
 it rather than letting the wall guard start racing the CPU guard there.
+
+One thing to know when upgrading: the `--run-timeout` ordering check below is
+applied to the resolved value, so a graph with a large `cpu_timeout` and a run
+budget between 1800 and the derived ceiling is now **refused before it starts**.
+That refusal is correct — the step really can occupy the run for that long — and
+it is loud, which is the opposite of the silent retiming the floor prevents.
 
 Because omission is now meaningful, an omitted `timeout` is also omitted when the
 DAG is written back out — writing `0` would read as "no wall bound", which is the

@@ -12,6 +12,11 @@ Two design questions had to be ANSWERED, not merely implemented, and both are pi
   undeclared step would silently drop from a 1800-second ceiling to a 30-second one; and
 * derive from the PLATFORM-SCALED budget, or the backstop would race the CPU guard on exactly
   the slow platform `cpu_timeout_multiplier` exists for.
+
+A third answer was added after review: the derivation is FLOORED at the default, so it can only
+ever move a step's ceiling away from its CPU guard. Unfloored it retimed every already-authored
+step that declared a CPU budget, and for anything that blocks — a fetch, a lock wait — wall time
+is unbounded relative to CPU time, so three times a small budget is not a hang.
 """
 
 from __future__ import annotations
@@ -57,14 +62,38 @@ def test_a_document_default_wins_over_the_derivation() -> None:
 
 
 def test_a_declared_cpu_budget_derives_the_backstop() -> None:
-    assert resolved_wall_timeout(_step(cpu_timeout=7), 0) == 21
+    # 900 CPU-seconds is the case the rule exists for: a baked-in 1800 is only 2x that budget,
+    # and the CPU guard can reach it. 2700 restores the 3x margin.
+    assert resolved_wall_timeout(_step(cpu_timeout=900), 0) == 2700
+
+
+def test_a_small_cpu_budget_does_not_retime_an_already_authored_step() -> None:
+    # THE REGRESSION THE FLOOR PREVENTS. `{"cmd": "git fetch ...", "cpu_timeout": 5}` burns ~5
+    # CPU-seconds and blocks for minutes on the network. Unfloored, rule 3 gives it a 15-second
+    # wall ceiling and SIGTERMs it as a hang — a silent retiming of every existing step that
+    # declared a CPU budget. Wall time is unbounded relative to CPU time for anything that
+    # blocks, so the derivation is allowed to loosen and never to tighten.
+    assert resolved_wall_timeout(_step(cpu_timeout=5), 0) != 15
+    assert resolved_wall_timeout(_step(cpu_timeout=5), 0) == DEFAULT_STEP_TIMEOUT == 1800
+    # A networkonly step is the same story, said by the schema: it is DECLARED to depend on a
+    # resource whose latency has nothing to do with its CPU budget.
+    net = dataclasses.replace(_step(cpu_timeout=5), networkonly=True)
+    assert resolved_wall_timeout(net, 0) == 1800
+
+
+def test_the_floor_is_exactly_where_the_derivation_overtakes_the_default() -> None:
+    # Named literally on both sides of the boundary, so "always return 1800" and "never floor"
+    # are each caught by one of these two lines.
+    assert resolved_wall_timeout(_step(cpu_timeout=600), 0) == 1800
+    assert resolved_wall_timeout(_step(cpu_timeout=601), 0) == 1803
 
 
 def test_the_derivation_tracks_the_platform_scaled_budget() -> None:
-    # 4 CPU-seconds on a platform 2.5x slower is a 10-second enforced budget, so the wall
-    # backstop is 30 and keeps its 3x margin. Pinned to the DECLARED 4 it would be 12 — only
-    # 1.2x the enforced guard, i.e. racing it on exactly the platform the multiplier exists for.
-    assert resolved_wall_timeout(_step(cpu_timeout=4), 0, 2.5) == 30
+    # 400 CPU-seconds on a platform 2.5x slower is a 1000-second enforced budget, so the wall
+    # backstop is 3000 and keeps its 3x margin. Pinned to the DECLARED 400 it would be 1200,
+    # which the floor would then round back up to 1800 — BELOW the 1000-second enforced guard's
+    # 3x margin, i.e. racing it on exactly the platform the multiplier exists for.
+    assert resolved_wall_timeout(_step(cpu_timeout=400), 0, 2.5) == 3000
 
 
 def test_a_step_that_declared_nothing_keeps_the_1800_second_backstop() -> None:
@@ -110,10 +139,10 @@ def test_a_document_default_still_round_trips_as_a_number() -> None:
 def test_the_run_budget_ordering_is_checked_on_the_resolved_value() -> None:
     # A 0 sentinel passes `>= run_timeout_s` trivially, so the fail-closed inner-below-outer
     # ordering has to be expressed on the value the step will actually run under.
-    step = _step(cpu_timeout=100)  # derives a 300-second wall backstop
+    step = _step(cpu_timeout=900)  # derives a 2700-second wall backstop
     cfg = DagConfig(steps=(step,))
-    assert steps_violating_run_timeout(cfg, 200) == [("g.a", 300)]
-    assert steps_violating_run_timeout(cfg, 400) == []
+    assert steps_violating_run_timeout(cfg, 2000) == [("g.a", 2700)]
+    assert steps_violating_run_timeout(cfg, 3000) == []
 
 
 def test_an_undeclared_step_is_still_caught_by_the_run_budget_check() -> None:
@@ -123,8 +152,10 @@ def test_an_undeclared_step_is_still_caught_by_the_run_budget_check() -> None:
     assert steps_violating_run_timeout(cfg, 900) == [("g.a", 1800)]
 
 
-def test_a_step_the_derivation_brings_under_the_run_budget_is_not_refused() -> None:
-    # And the direction that matters for usability: deriving a SMALL backstop lets a graph that
-    # a baked-in 1800 would have refused actually run.
+def test_the_derivation_does_not_quietly_admit_a_graph_the_ordering_check_refused() -> None:
+    # The other direction, RESTATED after the floor landed. An unfloored rule 3 would derive a
+    # 15-second ceiling for this step and let a 60-second run budget accept a graph that has
+    # always been refused — a loosening of a fail-closed pre-flight check, obtained by pretending
+    # a network-blocked step cannot outlive 3x its CPU budget. It is still refused, at 1800.
     cfg = DagConfig(steps=(dataclasses.replace(_step(), cpu_timeout=5),))
-    assert steps_violating_run_timeout(cfg, 60) == []
+    assert steps_violating_run_timeout(cfg, 60) == [("g.a", 1800)]
