@@ -383,6 +383,55 @@ printf '%s\n' '{"steps":[{"group":"stress","job":"singleton","cmd":"sleep 2"}]}'
   safe-ci-dag-runner run --dag - --stress 100 --max-steps 100 --max-cpus 100 --no-profile
 ```
 
+### Repeat runs that write N distinct outputs
+
+Every copy runs the *same* command, so a command that writes a fixed path has
+`N` copies writing one file: the last writer wins, nothing errors, and anyone
+reading the result is looking at one sample wearing the label of `N`. Each copy
+therefore gets two variables in its environment:
+
+| variable | value |
+| --- | --- |
+| `SAFE_CI_DAG_RUNNER_COPY` | this copy's index, zero-padded to the width of `N` (`03` of `10`) |
+| `SAFE_CI_DAG_RUNNER_COPIES` | `N` |
+
+Both are unset when the graph was not multiplied, so a command can tell a single
+run from a copy:
+
+```yaml
+- group: demo
+  job: repeat
+  cmd: ./measure --out out/run-${SAFE_CI_DAG_RUNNER_COPY:-single}.log
+```
+
+```sh
+safe-ci-dag-runner run --dag pipeline.yaml --only demo.repeat --stress 10 -j 10
+```
+
+That produces `out/run-01.log` ... `out/run-10.log` from one invocation.
+Repeating a run N times and comparing the results is a common reason to multiply
+a graph, so prefer this to a hand-rolled loop.
+
+> **If you are comparing the runs themselves, keep the identifier out of the
+> program under test.** A process's environment is placed on its initial stack,
+> so a tool that hashes or compares process state sees a per-copy variable as a
+> difference -- and then N copies differ for a reason you introduced rather than
+> one you were measuring. Measured with such a tool: with no extra variable the
+> hash was stable across runs; adding `X=aaaa` changed it, and `X=bbbb` -- the
+> same *length*, different content -- changed it again to a third value, so this
+> is not only an alignment shift.
+>
+> Launch the program under test with whatever it offers for a fixed, minimal
+> environment. Measured on the same tool, doing so made it blind to all of the
+> above, 4 of 4 identical, while the copies still wrote 10 distinct files. The
+> same DAG *without* that isolation produced 10 different results from 10
+> identical runs -- and the runner reported `10/10 passed` either way, so nothing
+> warns you.
+>
+> This applies equally to `SAFE_CI_DAG_RUNNER_STEP`, the ownership nonce the
+> scheduler sets on every step, which contains a pid and a nanosecond timestamp
+> and so differs on every run.
+
 ## Profiles, sweeps, and portable summaries
 
 Runs append resource samples to `./.safe-ci-dag-runner/profiles/` by default.

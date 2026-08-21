@@ -931,6 +931,33 @@ def test_expand_stress_replicates_steps_and_rewires_deps() -> None:
     assert _expand_stress(cfg, 1).steps == cfg.steps
 
 
+def test_expand_stress_gives_each_copy_a_stable_index_in_its_environment() -> None:
+    # Every copy runs the SAME `cmd`, so without a per-copy value in the environment the
+    # command cannot choose a distinct output path: N copies write one file, the last writer
+    # wins, and nothing errors. The `#NN` suffix does not help -- it is part of the job NAME,
+    # which the command never sees.
+    from safe_ci_dag_runner.cli import STRESS_COPIES_ENV
+    from safe_ci_dag_runner.cli import STRESS_COPY_ENV
+    from safe_ci_dag_runner.cli import _expand_stress
+    from safe_ci_dag_runner.io import dag_from_json
+
+    cfg = dag_from_json(
+        '{"steps": [{"group": "demo", "job": "run", "cmd": "true", "env": {"KEEP": "me"}}]}'
+    )
+    expanded = _expand_stress(cfg, 10)
+    indices = [s.env[STRESS_COPY_ENV] for s in expanded.steps]
+    # Distinct, so a path built from the index cannot collide...
+    assert len(set(indices)) == 10
+    # ...zero-padded to the job suffix's width, so those paths sort in copy order...
+    assert sorted(indices) == [f"{i:02d}" for i in range(1, 11)]
+    # ...and every copy is told the total, so a split does not have to be given N twice.
+    assert {s.env[STRESS_COPIES_ENV] for s in expanded.steps} == {"10"}
+    # A step's own environment survives the expansion.
+    assert all(s.env["KEEP"] == "me" for s in expanded.steps)
+    # Unmultiplied graphs are untouched, so a command can tell one run from a copy.
+    assert STRESS_COPY_ENV not in _expand_stress(cfg, 1).steps[0].env
+
+
 # --------------------------------------------------------------------------- --args passthrough
 def test_args_passthrough_substitutes_placeholder() -> None:
     # A step DECLARES it accepts args via the {args} token; --args is forwarded there verbatim.

@@ -467,7 +467,13 @@ def build_parser() -> argparse.ArgumentParser:
         "the per-copy PASS/FAIL RATIO (e.g. '7/10 passed'), and which copies failed. Combine with "
         "--only to copy one suspect node (e.g. --only test.unit). The ratio is the finding, so "
         "this implies --keep-going. N is still capped by the box memory budget (N x per-copy "
-        "footprint must fit) and expansion may create at most 100,000 DAG nodes/control units.",
+        "footprint must fit) and expansion may create at most 100,000 DAG nodes/control units. "
+        "Each copy gets SAFE_CI_DAG_RUNNER_COPY (zero-padded index, e.g. 03) and "
+        "SAFE_CI_DAG_RUNNER_COPIES (N) in its environment; interpolate the index into any "
+        "output path, or N copies write one file and the last writer silently wins. If you "
+        "are comparing the runs themselves, keep these out of the program under test: a "
+        "process's environment sits on its initial stack, so a tool that hashes process "
+        "state sees a per-copy variable as a difference.",
     )
     run_p.add_argument(
         "--perf-dir",
@@ -1226,6 +1232,14 @@ def _stress_suffix(index: int, count: int) -> str:
     return f"#{index:0{width}d}"
 
 
+#: Zero-padded index of this copy under ``--stress N``, e.g. ``"03"`` for copy 3 of 10.
+#: Unset when the graph was not multiplied, so a command can tell one run from a copy.
+STRESS_COPY_ENV = "SAFE_CI_DAG_RUNNER_COPY"
+
+#: The ``N`` of ``--stress N``, so a command can size a split without being told twice.
+STRESS_COPIES_ENV = "SAFE_CI_DAG_RUNNER_COPIES"
+
+
 def _expand_stress(cfg: DagConfig, n: int) -> DagConfig:
     """Return a DAG with every step of ``cfg`` DUPLICATED into ``n`` independent copies (shards).
 
@@ -1251,6 +1265,20 @@ def _expand_stress(cfg: DagConfig, n: int) -> DagConfig:
                     job=f"{step.job}{suffix}",
                     deps=[f"{dep}{suffix}" for dep in step.deps],
                     hint=dataclasses.replace(step.hint, resources={}),
+                    # Zero-padded to the same width as the job suffix, so a path built from
+                    # the index sorts in copy order like the tags do. Every copy runs the
+                    # SAME cmd, so without this the command cannot choose a distinct output
+                    # path: N copies write one file, the last writer wins, nothing errors,
+                    # and the result is one sample wearing the label of N. The #NN suffix
+                    # cannot serve -- it is part of the job NAME, which the command never
+                    # sees -- and SAFE_CI_DAG_RUNNER_STEP is an ownership nonce
+                    # (pid:counter:time_ns), so it is unstable across reruns and is not an
+                    # index.
+                    env={
+                        **step.env,
+                        STRESS_COPY_ENV: f"{index:0{len(str(n))}d}",
+                        STRESS_COPIES_ENV: str(n),
+                    },
                 )
             )
     return dataclasses.replace(cfg.with_steps(new_steps), resource_caps={})
