@@ -982,6 +982,110 @@ def test_remove_refuses_registered_liveness_without_deleting(
     assert len(active_slots(project)) == 1
 
 
+def test_remove_refuses_unexpected_liveness_exit_status_without_deleting(
+    tmp_path: Path,
+) -> None:
+    """An exit status the liveness protocol does not define is not a licence to delete.
+
+    The registered authority speaks exactly three codes: 0 verified-dead, 1 alive,
+    2 unverifiable. A crashed, upgraded, or mis-wired probe that exits with anything
+    else has said nothing about the owner, and the destructive boundary must treat
+    that as a refusal rather than as the absence of a "not dead" answer.
+    """
+    project, repository, _remote = make_project(tmp_path)
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    commit_task(repository, checkout(project), "codex/task")
+    handed_off = finish(project)
+    assert handed_off.returncode == 0, handed_off.stderr
+    mark_owner_dead(project)
+    # The fixture probe exits 3 for any state name it does not recognise.
+    set_liveness(project, "probe-crashed")
+
+    refused = remove(project)
+
+    assert refused.returncode == 3
+    assert "unexpected rc 3" in refused.stderr
+    assert checkout(project).is_dir()
+    assert len(active_slots(project)) == 1
+
+
+@pytest.mark.parametrize("owner", ["live", "other-machine"])
+def test_remove_refuses_a_not_proven_dead_owner_even_when_the_authority_says_dead(
+    tmp_path: Path, owner: str
+) -> None:
+    """The recorded owner generation is a second, independent veto on deletion.
+
+    This is the reaper incident: an authority that answers "dead" is not enough
+    when the row's own owner generation is still running here, or belongs to a
+    machine this host cannot speak for. Either case must preserve the slot.
+    """
+    project, repository, _remote = make_project(tmp_path)
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    commit_task(repository, checkout(project), "codex/task")
+    handed_off = finish(project)
+    assert handed_off.returncode == 0, handed_off.stderr
+    if owner == "other-machine":
+        state_path = project / "worktrees" / "ACTIVE.testhost.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["slots"][0]["owner"]["host_id"] = "a-different-machine"
+        state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+    # The registered authority is made to agree that the owner is gone. It is wrong.
+    set_liveness(project, "dead")
+
+    refused = remove(project)
+
+    assert refused.returncode == 3
+    assert "requires a proven-dead recorded owner" in refused.stderr
+    expected = "owner is live" if owner == "live" else "owner is indeterminate"
+    assert expected in refused.stderr
+    assert checkout(project).is_dir()
+    assert len(active_slots(project)) == 1
+
+
+def test_remove_refuses_an_unbound_owner_with_no_coordinator_recovery_evidence(
+    tmp_path: Path,
+) -> None:
+    """A row with neither an owner lease nor recovery evidence has no authority to delete.
+
+    Slots left unbound by an older allocation path are exactly the 31 that became
+    unreclaimable. Reclaiming them must go through coordinator recovery, which
+    records why the historical owner is gone; a bare unbound row is refused.
+    """
+    project, _repository, _remote = make_project(tmp_path)
+    made = create(project, bind_owner=False)
+    assert made.returncode == 0, made.stderr
+    set_liveness(project, "dead")
+    recovered = command(
+        project,
+        "recover-unbound-owner",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        "--recovery-note",
+        "historical owner never bound; registered liveness returned dead",
+        "--validation",
+        "inert fixture",
+    )
+    assert recovered.returncode == 0, recovered.stderr
+    # Strip the recovery evidence, leaving the handoff: a row an older build could write.
+    state_path = project / "worktrees" / "ACTIVE.testhost.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["slots"][0]["owner"] is None
+    state["slots"][0]["coordinator_recovery_note"] = None
+    state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+
+    refused = remove(project)
+
+    assert refused.returncode == 3
+    assert "no owner lease and no coordinator recovery evidence" in refused.stderr
+    assert checkout(project).is_dir()
+    assert len(active_slots(project)) == 1
+
+
 def test_cross_shard_duplicate_refuses_before_deletion(tmp_path: Path) -> None:
     project, repository, _remote = make_project(tmp_path)
     made = create(project)
