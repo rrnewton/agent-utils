@@ -1,6 +1,6 @@
 ---
 name: parallel-experiment-runner
-description: Run N concurrent seed-sweep workers under RESOURCE CONTAINMENT via safe-ci-dag-runner. A seed sweep is one command template with a {seed} placeholder run over a range of seeds — a chaos search, fuzz sweep, flaky-repro hunt, or parameter scan. Concurrency is a declared, enforced number (not unbounded fan-out) sized from MEASURED idle-core headroom (from /proc/stat, not total cores and not load average); every worker is contained on FOUR resource axes — cpu (CPU-second budget = 'run forever'), memory (memory.max = 'leak'), pids (pids.max = 'fork bomb' / PID-slot exhaustion, which zombies cause at zero CPU and zero memory), and a wall backstop derived at ~3× the CPU budget — with a clean kill naming what breached and by how much; a breach kill is a cgroup-subtree cgroup.kill that reclaims the whole subtree AND the PID namespace, so a hung worker (e.g. hermit run --strict --verify parked in epoll_wait, the real cause of the zombie pile-up) is killed with its namespace rather than leaving orphans behind; per-worker footprint is measured via a 1→2→4 calibration ramp; an up-front derived cost estimate (or honest UNSET) is printed before the sweep and measured actuals after. This is a resource box against a BUG in our own code, NOT a security sandbox — no seccomp, no user-namespace isolation. Use when running many parallel experiment instances that must not saturate the host, when a sweep needs real per-worker resource limits, or when hunting a seed that reproduces a bug. It reuses safe-ci-dag-runner's containment — it is not a second runner.
+description: Run N concurrent seed-sweep workers under RESOURCE CONTAINMENT via safe-ci-dag-runner. A seed sweep is one command template with a {seed} placeholder run over a range of seeds — a chaos search, fuzz sweep, flaky-repro hunt, or parameter scan. Concurrency is a declared, enforced number (not unbounded fan-out) sized from MEASURED idle-core headroom (from /proc/stat, not total cores and not load average); every worker is contained on FOUR resource axes — cpu (CPU-second budget = 'run forever'), memory (memory.max = 'leak'), pids (pids.max = 'fork bomb' / PID-slot exhaustion, which zombies cause at zero CPU and zero memory), and a wall backstop derived at ~3× the CPU budget — with a clean kill naming what breached and by how much; a breach kill is a cgroup-subtree cgroup.kill that reclaims the whole subtree AND the PID namespace, so a hung worker (e.g. a consumer's own `run --strict --verify` parked in epoll_wait, the real cause of the zombie pile-up) is killed with its namespace rather than leaving orphans behind; per-worker footprint is measured via a 1→2→4 calibration ramp; an up-front derived cost estimate (or honest UNSET) is printed before the sweep and measured actuals after. This is a resource box against a BUG in our own code, NOT a security sandbox — no seccomp, no user-namespace isolation. Use when running many parallel experiment instances that must not saturate the host, when a sweep needs real per-worker resource limits, or when hunting a seed that reproduces a bug. It reuses safe-ci-dag-runner's containment — it is not a second runner.
 ---
 
 # parallel-experiment-runner
@@ -18,7 +18,7 @@ and measured after; a breach is a clean kill naming what breached and by how muc
 
 The zombie pile-up that motivated this tool was NOT a leaked teardown thread (reproduction refuted
 that: five abandonment scenarios stranded zero workers; the `tracing-appende` name was a 15-char
-`comm` truncation). It was a **live, hung** `hermit run --strict --verify` (main parked in tokio
+`comm` truncation). It was a **live, hung** `run --strict --verify` of a consuming repository's own tool (main parked in tokio
 `epoll_wait`) holding a PID namespace open. A hang is what the **cpu-time / wall backstop** kills,
 and the kill is a **cgroup-subtree `cgroup.kill`** that reclaims the whole subtree AND the PID
 namespace (killing the hung main with every namespace peer, so the kernel reaps the zombies) —
@@ -32,7 +32,7 @@ The CLI is the source of truth for usage — do not rely on this file for detail
 
 Canonical commands:
 
-- `parallel-experiment-runner run --name S --seeds 0-199 --cpu-cores 1 --memory 4G --cpu-timeout 120 --pids 512 --hit-regex 'panic|DIVERGENCE' --max-concurrency 32 --identity backend=ptrace image=demo5 -- hermit run --chaos --seed {seed} ./demo` — run a contained sweep.
+- `parallel-experiment-runner run --name S --seeds 0-199 --cpu-cores 1 --memory 4G --cpu-timeout 120 --pids 512 --hit-regex 'panic|DIVERGENCE' --max-concurrency 32 --identity backend=ptrace image=demo5 -- ./workload --chaos --seed {seed}` — run a contained sweep.
 - `parallel-experiment-runner plan-round --seeds 0-99 --cpu-cores 2 --memory 8G --max-concurrency 40 -- ./workload {seed}` — resolve + print one round's enforced width and DAG (dry, no cgroups).
 - `parallel-experiment-runner run --spec sweep.json` — drive the sweep from a JSON/YAML spec file.
 

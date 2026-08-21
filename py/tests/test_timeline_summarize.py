@@ -40,7 +40,7 @@ def _job(
 ) -> SummaryJob:
     return SummaryJob(
         key=key,
-        team_slug="codex-hermit",
+        team_slug="codex-widget",
         agent_label="coordinator" if key == "root" else key,
         start_ms=1_800_000_000_000,
         end_ms=1_800_000_060_000,
@@ -394,7 +394,7 @@ for job in jobs:
     style = job.get("summary_style", "phase")
     if style == "project-overview":
         phrase = "Project overview supported"
-        paragraph = "Hermit runs guest software in a controlled, repeatable environment."
+        paragraph = "Widget runs guest software in a controlled, repeatable environment."
         work_summary = []
     elif style == "glossary-definition":
         phrase = "Definition supported"

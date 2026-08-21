@@ -39,13 +39,13 @@ def _job(
         "The coordinator called this the CPU budget overlap audit before spawning the child."
     ),
     work_summary: str = (
-        "The completed audit separated Hermit CPU-second budgets from Reverie wall-time "
+        "The completed audit separated Widget CPU-second budgets from Reverie wall-time "
         "throughput ratchets and verified the exact PR heads."
     ),
 ) -> AgentNameJob:
     return AgentNameJob(
         key=key,
-        team_slug="codex-hermit",
+        team_slug="codex-widget",
         thread_id=thread_id,
         start_ms=1_800_000_000_000,
         end_ms=1_800_000_060_000,
@@ -340,7 +340,7 @@ def test_heuristic_uses_only_nested_official_leaf(tmp_path: Path) -> None:
     assert "budget_overlap_audit" in result.rationale
     assert "transcript auditor" not in result.short_name.lower()
     assert result.lifetime_summary is not None
-    assert "separated Hermit CPU-second budgets" in result.lifetime_summary
+    assert "separated Widget CPU-second budgets" in result.lifetime_summary
 
 
 def test_pre_lifetime_cache_version_is_regenerated_once(tmp_path: Path) -> None:

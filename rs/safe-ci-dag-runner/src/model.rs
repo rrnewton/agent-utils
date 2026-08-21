@@ -1440,7 +1440,7 @@ mod carry_tests {
     /// `outer_mem_safety_factor` 1.0 were harmless in the live bug only by that coincidence.
     fn configured() -> DagConfig {
         let mut caps = BTreeMap::new();
-        caps.insert("hermit_guest".to_string(), 1);
+        caps.insert("widget_guest".to_string(), 1);
         caps.insert("manifest_guest".to_string(), 4);
         let policy = WriteDomainPolicy {
             require_explicit: true,

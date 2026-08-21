@@ -414,7 +414,7 @@ mod tests {
         PaneEvidence {
             pane_id: "wE:p1".to_owned(),
             tab_id: Some("wE:t1".to_owned()),
-            tab_label: Some("hermit-w1".to_owned()),
+            tab_label: Some("widget-w1".to_owned()),
             workspace_label: Some("agent-cmds".to_owned()),
             in_scope: true,
             run_exit_codes_recorded: vec![true],

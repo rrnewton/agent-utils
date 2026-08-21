@@ -1282,7 +1282,7 @@ mod tests {
         // A false positive renames the culprit, so these must all stay unrecognized.
         for line in [
             "",
-            "Compiling hermit v0.1.0",
+            "Compiling widget v0.1.0",
             "test suite finished",
             "ok",
             "ok then, moving on",

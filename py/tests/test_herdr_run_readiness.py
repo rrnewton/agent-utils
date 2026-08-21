@@ -70,7 +70,7 @@ def test_inference_abstains_when_no_rc_file_is_readable() -> None:
 
 def test_prompt_clean_on_bare_prompt() -> None:
     """`herdr pane read` strips trailing spaces, so an idle "$ " prompt renders as the line "$"."""
-    signal = assess_prompt("[newton@devbig014 ~/work/dev-hermit]\n$\n", "$ ")
+    signal = assess_prompt("[newton@devbig014 ~/work/dev-widget]\n$\n", "$ ")
     assert signal.verdict == "clean"
 
 

@@ -92,7 +92,7 @@ def test_summary_artifact_provenance_has_stable_validated_identity() -> None:
     provenance = make_summary_provenance(
         PHASE_SUMMARIZER,
         logical_key="phase:one",
-        team_slug="codex-hermit",
+        team_slug="codex-widget",
         start_ms=100,
         end_ms=200,
         input_hash="abc123",

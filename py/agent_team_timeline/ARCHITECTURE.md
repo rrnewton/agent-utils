@@ -6,12 +6,12 @@ selection rule changes.
 
 ## Durable project and export layout
 
-The durable Hermit archive is `~/agent_logs_archive/summary/hermit`. One archive may contain
+A durable archive is a directory such as `~/agent_logs_archive/summary/<project>`. One archive may contain
 multiple teams under `teams/<team-slug>/`; source snapshots remain ignored, while normalized data,
 expensive summary artifacts, model-usage receipts, and deterministic presentation files can be
-version controlled. The current Hermit archive combines the registered Codex, Claude, and Orc
+version controlled. A typical archive combines the registered Codex, Claude, and Orc
 coordinator sessions from all source hosts; team registration lives outside the package in the
-archive project's `projects/hermit.json` configuration rather than in application code.
+archive project's `projects/<project>.json` configuration rather than in application code.
 
 The durable archive and a website export are distinct concepts:
 

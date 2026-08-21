@@ -34,7 +34,7 @@ from parallel_experiment_runner.planner import (
 def _spec(**kw: object) -> ExperimentSpec:
     base: dict[str, object] = {
         "name": "s",
-        "command": ("hermit", "run", "--seed", "{seed}", "./demo"),
+        "command": ("widget", "run", "--seed", "{seed}", "./demo"),
     }
     base.update(kw)
     return ExperimentSpec(**base)  # type: ignore[arg-type]

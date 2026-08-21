@@ -1938,7 +1938,7 @@ class Cgroups:
         # exports to build scripts) auto-detects parallelism from the effective CPU quota;
         # an UNPINNED step (cpu_count None -> no per-step cpu.max) inherits the wide scope
         # quota and computes NUM_JOBS=<all-granted-cores> (observed 284), OOM-racing the
-        # linker (hermit#1584 build.dbi_release, 8.0 GiB cap, oom_kill=2). Derive the cap
+        # linker (<repo>#1584 build.dbi_release, 8.0 GiB cap, oom_kill=2). Derive the cap
         # here, where the quota is granted, from the step's cores+mem if pinned else the
         # SCOPE's effective cpu.max/memory.max, so even an unpinned step is bounded. Only
         # CARGO_BUILD_JOBS is set (never MAKEFLAGS): a global make -j could parallelize a

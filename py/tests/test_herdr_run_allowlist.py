@@ -236,8 +236,8 @@ def test_leading_tilde_is_expanded_so_git_c_works(config: Config) -> None:
     import os
 
     home = os.path.expanduser("~")
-    admission = admit("with-proxy git -C ~/work/dev-hermit/hermit ls-remote origin main", config)
-    assert f"{home}/work/dev-hermit/hermit" in admission.rendered
+    admission = admit("with-proxy git -C ~/work/dev-widget/widget ls-remote origin main", config)
+    assert f"{home}/work/dev-widget/widget" in admission.rendered
     assert "~" not in admission.rendered
 
 

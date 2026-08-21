@@ -22,7 +22,7 @@ GIB = 1024**3
 
 
 def test_derive_build_jobs_caps_the_284_leak() -> None:
-    """Three-part bracket for the CARGO_BUILD_JOBS/NUM_JOBS quota leak (hermit#1584)."""
+    """Three-part bracket for the CARGO_BUILD_JOBS/NUM_JOBS quota leak (<repo>#1584)."""
     # CAUGHT: an unpinned wide-quota step under an 8 GiB cap must be bounded by memory,
     # never the granted core count (the observed NUM_JOBS=284 -> OOM-killed linker).
     assert derive_build_jobs(284, 8 * GIB) == 8

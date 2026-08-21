@@ -58,7 +58,7 @@ def test_raw_local_label_is_cache_only_but_dereferenced_record_is_evidence() -> 
                 1,
                 labels=(
                     "locally-validated",
-                    "agent:hermit-a",
+                    "agent:widget-a",
                     "landing-policy:ci-hygiene",
                     "mechanism:cancel-in-progress",
                 ),
@@ -69,7 +69,7 @@ def test_raw_local_label_is_cache_only_but_dereferenced_record_is_evidence() -> 
     )
     # Negative bracket: one bare cache label produces zero validation evidence.
     assert nodes[0].validation_evidence is ValidationEvidence.NONE
-    assert nodes[0].assigned_agent == "hermit-a"
+    assert nodes[0].assigned_agent == "widget-a"
     assert nodes[0].policy_class is PolicyClass.CI_HYGIENE
     assert build_mechanism_edges(nodes)[0].mechanisms == ("cancel-in-progress",)
     plan, _ = compute_plan(nodes, [], [], [])
@@ -150,7 +150,7 @@ def test_local_evidence_bypasses_ci_wait_but_gate_policy_escalates() -> None:
                     "base_sha": "base",
                     "validation_evidence": "clean-validate-record",
                     "policy_class": "ci-hygiene",
-                    "assigned_agent": "hermit-ci",
+                    "assigned_agent": "widget-ci",
                 },
                 {
                     "pr": 2,

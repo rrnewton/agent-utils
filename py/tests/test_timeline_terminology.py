@@ -64,10 +64,10 @@ def test_plain_language_context_excludes_unsupported_definitions() -> None:
     )
 
     context = plain_language_context_text(
-        "Hermit runs guest software deterministically.", (supported, unsupported)
+        "Widget runs guest software deterministically.", (supported, unsupported)
     )
 
-    assert "Hermit runs guest software deterministically" in context
+    assert "Widget runs guest software deterministically" in context
     assert "exact-head" in context
     assert "DBI" not in context
 
@@ -92,7 +92,7 @@ def test_operational_backticks_do_not_leak_nested_terms() -> None:
     sources = (
         TermSource(
             1_775_000_000_000,
-            "Use `tg --db hermit`, `tg --help`, `agents_v17.db`, "
+            "Use `tg --db widget`, `tg --help`, `agents_v17.db`, "
             "`~/.orc/sessions/<session-id>/`, and `~/temp/orc_transcripts/`. "
             "Keep `safe-ci-dag-runner`, `conversation_state`, `Node.js`, and `ALL`. "
             "The prose says ALL work is ready. KVM PMU IPC CI.",
@@ -110,7 +110,7 @@ def test_operational_backticks_do_not_leak_nested_terms() -> None:
     )
     assert names.isdisjoint(
         {
-            "tg --db hermit",
+            "tg --db widget",
             "tg --help",
             "agents_v17.db",
             "~/.orc/sessions/<session-id>/",

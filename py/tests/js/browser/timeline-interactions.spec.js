@@ -543,7 +543,7 @@ test("transcript search uses search shards and opens safe linked message context
     shards: [{
       kind: "utc-day",
       day: day.day,
-      team: "codex-hermit",
+      team: "codex-widget",
       start_ms: day.start_ms,
       end_ms: day.end_ms,
       url: searchUrl,
@@ -557,18 +557,18 @@ test("transcript search uses search shards and opens safe linked message context
       }
     }]
   };
-  const promptARef = "message:codex-hermit::prompt-a";
-  const promptBRef = "message:codex-hermit::prompt-b";
-  const responseARef = "message:codex-hermit::response-a";
-  const responseBRef = "message:codex-hermit::response-b";
+  const promptARef = "message:codex-widget::prompt-a";
+  const promptBRef = "message:codex-widget::prompt-b";
+  const responseARef = "message:codex-widget::response-a";
+  const responseBRef = "message:codex-widget::response-b";
   function record(overrides) {
     return Object.assign({
       schema_version: 1,
       record_type: "response",
       role: "assistant",
-      team: "codex-hermit",
+      team: "codex-widget",
       agent_id: "agent-a",
-      agent_ref: "agent:codex-hermit::agent-a",
+      agent_ref: "agent:codex-widget::agent-a",
       agent_path: "/root/agent-a",
       event_id: "event",
       turn_id: "turn",
@@ -584,7 +584,7 @@ test("transcript search uses search shards and opens safe linked message context
   const searchShard = {
     schema_version: 1,
     kind: "timeline-search-day",
-    team: "codex-hermit",
+    team: "codex-widget",
     range: { start_ms: day.start_ms, end_ms: day.end_ms },
     records: [
       record({
@@ -604,7 +604,7 @@ test("transcript search uses search shards and opens safe linked message context
         record_type: "prompt",
         role: "user",
         agent_id: "agent-b",
-        agent_ref: "agent:codex-hermit::agent-b",
+        agent_ref: "agent:codex-widget::agent-b",
         agent_path: "/root/agent-b",
         event_id: "prompt-b",
         at_ms: BASE_MS + 31 * 60 * 1000,
@@ -618,7 +618,7 @@ test("transcript search uses search shards and opens safe linked message context
         record_type: "inter_agent_response",
         role: "agent",
         agent_id: "agent-b",
-        agent_ref: "agent:codex-hermit::agent-b",
+        agent_ref: "agent:codex-widget::agent-b",
         agent_path: "/root/agent-b",
         event_id: "response-b",
         at_ms: BASE_MS + 34 * 60 * 1000,
@@ -626,9 +626,9 @@ test("transcript search uses search shards and opens safe linked message context
         prompt_ref: promptBRef
       }),
       record({
-        ref: "message:codex-hermit::hash-only",
+        ref: "message:codex-widget::hash-only",
         agent_id: "agent-c",
-        agent_ref: "agent:codex-hermit::agent-c",
+        agent_ref: "agent:codex-widget::agent-c",
         agent_path: "/root/agent-c",
         event_id: "hash-only",
         at_ms: BASE_MS + 40 * 60 * 1000,
@@ -637,7 +637,7 @@ test("transcript search uses search shards and opens safe linked message context
         prompt_author_kind: null
       }),
       record({
-        ref: "message:codex-hermit::system-checkpoint",
+        ref: "message:codex-widget::system-checkpoint",
         record_type: "system",
         role: "system",
         event_id: "system-checkpoint",
@@ -647,7 +647,7 @@ test("transcript search uses search shards and opens safe linked message context
         prompt_author_kind: null
       }),
       record({
-        ref: "message:codex-hermit::lifecycle-event",
+        ref: "message:codex-widget::lifecycle-event",
         record_type: "subagent_started",
         role: "event",
         event_id: "lifecycle-event",
@@ -761,10 +761,10 @@ test("linked transcript context loads across Bloom-pruned day shards", async fun
   const dayMs = 24 * 60 * 60 * 1000;
   const firstStart = fixture.bootstrap.detail_shards[0].start_ms;
   const secondStart = firstStart + dayMs;
-  const promptRef = "message:codex-hermit::cross-day-prompt";
-  const responseRef = "message:codex-hermit::cross-day-response";
-  const promptBRef = "message:codex-hermit::same-day-prompt";
-  const responseBRef = "message:codex-hermit::same-day-response";
+  const promptRef = "message:codex-widget::cross-day-prompt";
+  const responseRef = "message:codex-widget::cross-day-response";
+  const promptBRef = "message:codex-widget::same-day-prompt";
+  const responseBRef = "message:codex-widget::same-day-response";
   const promptAt = firstStart + 23 * 60 * 60 * 1000;
   const responseAt = secondStart + 60 * 60 * 1000;
   const promptBAt = secondStart + 30 * 60 * 1000;
@@ -783,7 +783,7 @@ test("linked transcript context loads across Bloom-pruned day shards", async fun
     return Object.assign({
       kind: "utc-day",
       day: day,
-      team: "codex-hermit",
+      team: "codex-widget",
       start_ms: start,
       end_ms: start + dayMs,
       counts: Object.assign({ records: 1 }, counts),
@@ -821,7 +821,7 @@ test("linked transcript context loads across Bloom-pruned day shards", async fun
       schema_version: 1,
       kind: "timeline-search-day",
       source_digest: TIMELINE.source_digest,
-      team: "codex-hermit",
+      team: "codex-widget",
       range: { start_ms: start, end_ms: start + dayMs },
       records: records
     };
@@ -831,9 +831,9 @@ test("linked transcript context loads across Bloom-pruned day shards", async fun
     ref: promptRef,
     record_type: "prompt",
     role: "user",
-    team: "codex-hermit",
+    team: "codex-widget",
     agent_id: "agent-a",
-    agent_ref: "agent:codex-hermit::agent-a",
+    agent_ref: "agent:codex-widget::agent-a",
     event_id: "cross-day-prompt",
     at_ms: promptAt,
     text: "Original maturity question",
@@ -847,9 +847,9 @@ test("linked transcript context loads across Bloom-pruned day shards", async fun
     ref: promptBRef,
     record_type: "prompt",
     role: "user",
-    team: "codex-hermit",
+    team: "codex-widget",
     agent_id: "agent-b",
-    agent_ref: "agent:codex-hermit::agent-b",
+    agent_ref: "agent:codex-widget::agent-b",
     event_id: "same-day-prompt",
     at_ms: promptBAt,
     text: "Second maturity question",
@@ -862,9 +862,9 @@ test("linked transcript context loads across Bloom-pruned day shards", async fun
     ref: responseRef,
     record_type: "response",
     role: "assistant",
-    team: "codex-hermit",
+    team: "codex-widget",
     agent_id: "agent-a",
-    agent_ref: "agent:codex-hermit::agent-a",
+    agent_ref: "agent:codex-widget::agent-a",
     event_id: "cross-day-response",
     at_ms: responseAt,
     text: "The backend reached B3",
@@ -876,9 +876,9 @@ test("linked transcript context loads across Bloom-pruned day shards", async fun
     ref: responseBRef,
     record_type: "response",
     role: "assistant",
-    team: "codex-hermit",
+    team: "codex-widget",
     agent_id: "agent-b",
-    agent_ref: "agent:codex-hermit::agent-b",
+    agent_ref: "agent:codex-widget::agent-b",
     event_id: "same-day-response",
     at_ms: responseBAt,
     text: "The backend remains B3",
@@ -891,7 +891,7 @@ test("linked transcript context loads across Bloom-pruned day shards", async fun
       schema_version: 1,
       kind: "timeline-search-links-day",
       source_digest: TIMELINE.source_digest,
-      team: "codex-hermit",
+      team: "codex-widget",
       range: { start_ms: start, end_ms: start + dayMs },
       prompts: prompts,
       responses: responses
@@ -908,12 +908,12 @@ test("linked transcript context loads across Bloom-pruned day shards", async fun
     ref: responseRef,
     prompt_ref: promptRef,
     at_ms: responseAt,
-    agent_ref: "agent:codex-hermit::agent-a"
+    agent_ref: "agent:codex-widget::agent-a"
   }, {
     ref: responseBRef,
     prompt_ref: promptBRef,
     at_ms: responseBAt,
-    agent_ref: "agent:codex-hermit::agent-b"
+    agent_ref: "agent:codex-widget::agent-b"
   }]);
   const storedPrompt = contentAddressedJson(promptShard);
   const storedResponse = contentAddressedJson(responseShard);
@@ -1003,7 +1003,7 @@ test("transcript search rejects a shard whose record count disagrees with its ca
     shards: [{
       kind: "utc-day",
       day: day.day,
-      team: "codex-hermit",
+      team: "codex-widget",
       start_ms: day.start_ms,
       end_ms: day.end_ms,
       url: "data/timeline-v2/objects/" + searchDigest + ".json",
@@ -1014,14 +1014,14 @@ test("transcript search rejects a shard whose record count disagrees with its ca
   const invalidCountShard = {
     schema_version: 1,
     kind: "timeline-search-day",
-    team: "codex-hermit",
+    team: "codex-widget",
     range: { start_ms: day.start_ms, end_ms: day.end_ms },
     records: [{
       schema_version: 1,
-      ref: "message:codex-hermit::one",
+      ref: "message:codex-widget::one",
       record_type: "response",
       role: "assistant",
-      team: "codex-hermit",
+      team: "codex-widget",
       agent_id: "agent-a",
       at_ms: BASE_MS + 12 * 60 * 1000,
       text: "Only one record"
@@ -1066,7 +1066,7 @@ test("transcript search rejects a shard from a different source generation", asy
     shards: [{
       kind: "utc-day",
       day: day.day,
-      team: "codex-hermit",
+      team: "codex-widget",
       start_ms: day.start_ms,
       end_ms: day.end_ms,
       url: "data/timeline-v2/objects/" + searchDigest + ".json",
@@ -1078,14 +1078,14 @@ test("transcript search rejects a shard from a different source generation", asy
     schema_version: 1,
     kind: "timeline-search-day",
     source_digest: "different-generation",
-    team: "codex-hermit",
+    team: "codex-widget",
     range: { start_ms: day.start_ms, end_ms: day.end_ms },
     records: [{
       schema_version: 1,
-      ref: "message:codex-hermit::stale",
+      ref: "message:codex-widget::stale",
       record_type: "response",
       role: "assistant",
-      team: "codex-hermit",
+      team: "codex-widget",
       agent_id: "agent-a",
       at_ms: BASE_MS + 12 * 60 * 1000,
       text: "Stale B3 response"
@@ -1124,16 +1124,16 @@ test("transcript search verifies content-addressed shard bytes", async function 
     schema_version: 1,
     kind: "timeline-search-day",
     source_digest: TIMELINE.source_digest,
-    team: "codex-hermit",
+    team: "codex-widget",
     range: { start_ms: day.start_ms, end_ms: day.end_ms },
     records: [{
       schema_version: 1,
-      ref: "message:codex-hermit::verified",
+      ref: "message:codex-widget::verified",
       record_type: "response",
       role: "assistant",
-      team: "codex-hermit",
+      team: "codex-widget",
       agent_id: "agent-a",
-      agent_ref: "agent:codex-hermit::agent-a",
+      agent_ref: "agent:codex-widget::agent-a",
       at_ms: BASE_MS + 12 * 60 * 1000,
       text: "B3 good"
     }]
@@ -1147,7 +1147,7 @@ test("transcript search verifies content-addressed shard bytes", async function 
     shards: [Object.assign({
       kind: "utc-day",
       day: day.day,
-      team: "codex-hermit",
+      team: "codex-widget",
       start_ms: day.start_ms,
       end_ms: day.end_ms,
       counts: { records: 1 }
@@ -1189,7 +1189,7 @@ test("transcript Bloom filters defer negative shards and load them for a later p
     return {
       kind: "utc-day",
       day: day,
-      team: "codex-hermit",
+      team: "codex-widget",
       start_ms: start,
       end_ms: start + 24 * 60 * 60 * 1000,
       url: "data/timeline-v2/objects/" + digest + ".json",
@@ -1222,16 +1222,16 @@ test("transcript Bloom filters defer negative shards and load them for a later p
     return {
       schema_version: 1,
       kind: "timeline-search-day",
-      team: "codex-hermit",
+      team: "codex-widget",
       range: { start_ms: start, end_ms: start + 24 * 60 * 60 * 1000 },
       records: [{
         schema_version: 1,
-        ref: "message:codex-hermit::" + eventId,
+        ref: "message:codex-widget::" + eventId,
         record_type: "response",
         role: "assistant",
-        team: "codex-hermit",
+        team: "codex-widget",
         agent_id: "agent-a",
-        agent_ref: "agent:codex-hermit::agent-a",
+        agent_ref: "agent:codex-widget::agent-a",
         event_id: eventId,
         at_ms: at,
         text: value
@@ -1314,16 +1314,16 @@ test("superseded searches share one global shard-load limit", async function ({ 
         schema_version: 1,
         kind: "timeline-search-day",
         source_digest: TIMELINE.source_digest,
-        team: "codex-hermit",
+        team: "codex-widget",
         range: { start_ms: start, end_ms: start + dayMs },
         records: [{
           schema_version: 1,
-          ref: "message:codex-hermit::" + eventId,
+          ref: "message:codex-widget::" + eventId,
           record_type: "response",
           role: "assistant",
-          team: "codex-hermit",
+          team: "codex-widget",
           agent_id: "agent-a",
-          agent_ref: "agent:codex-hermit::agent-a",
+          agent_ref: "agent:codex-widget::agent-a",
           event_id: eventId,
           at_ms: start + 1000,
           text: index % 2 === 0 ? "B3 result" : "B4 result"
@@ -1333,7 +1333,7 @@ test("superseded searches share one global shard-load limit", async function ({ 
         schema_version: 1,
         kind: "timeline-search-links-day",
         source_digest: TIMELINE.source_digest,
-        team: "codex-hermit",
+        team: "codex-widget",
         range: { start_ms: start, end_ms: start + dayMs },
         prompts: [],
         responses: []
@@ -1342,7 +1342,7 @@ test("superseded searches share one global shard-load limit", async function ({ 
       return Object.assign({
         kind: "utc-day",
         day: "2026-03-" + String(9 + index).padStart(2, "0"),
-        team: "codex-hermit",
+        team: "codex-widget",
         start_ms: start,
         end_ms: start + dayMs,
         counts: { records: 1 },
@@ -1585,16 +1585,16 @@ test("a delayed lifetime shard refreshes a detail view after the modal closes", 
 
 test("the header identifies the project, execution host, and archive timezone", async function ({ page }) {
   const heading = page.locator("#site-title");
-  await expect(heading).toHaveText("Agent Timeline: dev-hermit, devbig014");
-  await expect(heading.getByRole("link", { name: "dev-hermit" })).toHaveAttribute(
+  await expect(heading).toHaveText("Agent Timeline: dev-widget, devbig014");
+  await expect(heading.getByRole("link", { name: "dev-widget" })).toHaveAttribute(
     "href",
-    "https://github.com/rrnewton/dev-hermit"
+    "https://github.com/rrnewton/dev-widget"
   );
-  await expect(heading.getByRole("link", { name: "dev-hermit" })).toHaveAttribute(
+  await expect(heading.getByRole("link", { name: "dev-widget" })).toHaveAttribute(
     "rel",
     "noopener noreferrer"
   );
-  await expect(page).toHaveTitle("Agent Timeline: dev-hermit, devbig014");
+  await expect(page).toHaveTitle("Agent Timeline: dev-widget, devbig014");
   await expect(page.locator("#dataset-meta")).toContainText(
     "display America/New_York (explicit)"
   );
@@ -1609,7 +1609,7 @@ test("the header identifies the project, execution host, and archive timezone", 
     "from session metadata"
   );
   await expect(page.locator("#site-identity-list")).toContainText("agent-utils");
-  await expect(page.locator("#site-identity-list")).toContainText("hermit");
+  await expect(page.locator("#site-identity-list")).toContainText("widget");
 });
 
 test("a horizontal trackpad gesture pans the zoomed timeline", async function ({ page }) {
@@ -2038,7 +2038,7 @@ test("full-transcript role filters support user-only, none, and all", async func
     "transcript entries do not expose normalized data-role values yet"
   );
   expect(await entries.count()).toBe(5);
-  const pullRequest = page.locator('.pr-reference[href="https://github.com/rrnewton/dev-hermit/pull/38"]');
+  const pullRequest = page.locator('.pr-reference[href="https://github.com/rrnewton/dev-widget/pull/38"]');
   await expect(pullRequest).toHaveAttribute("title", "Repair malformed-input handling");
 
   await filters.getByRole("button", { name: /user only/i }).click();
@@ -2238,11 +2238,11 @@ test("artifact outputs and references stay distinct across phase, rollup, and ag
   const pullRequest = outputs.locator('[data-artifact-id="artifact-pr38"] .artifact-primary-link');
   await expect(pullRequest).toHaveAttribute(
     "href",
-    "https://github.com/rrnewton/dev-hermit/pull/38"
+    "https://github.com/rrnewton/dev-widget/pull/38"
   );
   await expect(pullRequest).toHaveAttribute("target", "_blank");
   await expect(pullRequest).toHaveAttribute("rel", "noopener noreferrer");
-  await expect(outputs.locator(".artifact-project-link")).toHaveText("rrnewton/dev-hermit");
+  await expect(outputs.locator(".artifact-project-link")).toHaveText("rrnewton/dev-widget");
 
   const unsafeCard = references.locator('[data-artifact-id="artifact-unsafe-link"]');
   await expect(unsafeCard.locator("a.artifact-primary-link")).toHaveCount(0);

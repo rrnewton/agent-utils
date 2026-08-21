@@ -30,7 +30,7 @@ def scoped(**kw: object) -> PaneEvidence:
     base: dict[str, object] = {
         "pane_id": "wE:p1",
         "tab_id": "wE:t1",
-        "tab_label": "hermit-w1",
+        "tab_label": "widget-w1",
         "workspace_label": "agent-cmds",
         "in_scope": True,
         "run_exit_codes_recorded": (True,),

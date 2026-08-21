@@ -84,13 +84,13 @@ function state(kind, startMinute, endMinute) {
 const agents = [
   {
     id: "coordinator",
-    team: "codex-hermit",
+    team: "codex-widget",
     parent_id: "",
     depth: 0,
     path: "/root",
     official_name: "/root",
     official_leaf: "root",
-    short_name: "Hermit coordinator",
+    short_name: "Widget coordinator",
     nickname: "Coordinator",
     lifetime_summary: "Coordinated the parser, continuous-integration, and documentation work into one verified result.",
     start_ms: DATA_START_MS,
@@ -99,7 +99,7 @@ const agents = [
   },
   {
     id: "agent-a",
-    team: "codex-hermit",
+    team: "codex-widget",
     parent_id: "coordinator",
     depth: 1,
     path: "/root/transcript_auditor/owner_turn_miner/plugin_layout_audit/parser_boundary_regression_audit",
@@ -116,7 +116,7 @@ const agents = [
   },
   {
     id: "agent-b",
-    team: "codex-hermit",
+    team: "codex-widget",
     parent_id: "coordinator",
     depth: 1,
     path: "/root/ci_audit",
@@ -131,7 +131,7 @@ const agents = [
   },
   {
     id: "agent-c",
-    team: "codex-hermit",
+    team: "codex-widget",
     parent_id: "coordinator",
     depth: 1,
     path: "/root/docs_audit",
@@ -152,7 +152,7 @@ const phases = [
     agent_id: "coordinator",
     start_ms: DATA_START_MS,
     end_ms: BASE_MS + 100 * minute,
-    phrase: "Coordinate Hermit work",
+    phrase: "Coordinate Widget work",
     paragraph: "Spawned focused audits and integrated their findings.",
     detail_path: "details/phase-root.json",
     stats: stats({ user_prompts: 2, agent_responses: 4 }),
@@ -227,7 +227,7 @@ const AGGREGATE_LATER_START_MS = AGGREGATE_HOUR_START_MS + 3 * 60 * minute;
 
 function activityBin(role, resolution, startMs, endMs, average, peak, coverage, agents) {
   return {
-    team: "codex-hermit",
+    team: "codex-widget",
     role: role,
     resolution: resolution,
     start_ms: startMs,
@@ -285,12 +285,12 @@ const timeline = {
     end_ms: DATA_END_MS
   },
   teams: [{
-    slug: "codex-hermit",
-    label: "Codex Hermit",
+    slug: "codex-widget",
+    label: "Codex Widget",
     projects: [
       {
-        label: "dev-hermit",
-        repository_url: "https://github.com/rrnewton/dev-hermit",
+        label: "dev-widget",
+        repository_url: "https://github.com/rrnewton/dev-widget",
         primary: true,
         source: "session_metadata"
       },
@@ -301,8 +301,8 @@ const timeline = {
         source: "session_metadata"
       },
       {
-        label: "hermit",
-        repository_url: "https://github.com/facebookexperimental/hermit",
+        label: "widget",
+        repository_url: "https://github.com/example-org/widget",
         primary: false,
         source: "session_metadata"
       }
@@ -374,7 +374,7 @@ const timeline = {
     }
   ],
   artifact_catalog_path: "data/artifacts.json",
-  glossary_path: "summaries/glossary/codex-hermit-glossary.md",
+  glossary_path: "summaries/glossary/codex-widget-glossary.md",
   summary_files: [
     {
       kind: "daily",
@@ -391,7 +391,7 @@ const timeline = {
   ]
 };
 
-const pullUrl = "https://github.com/rrnewton/dev-hermit/pull/38";
+const pullUrl = "https://github.com/rrnewton/dev-widget/pull/38";
 const pullText = "I will trace the malformed-input path for " + pullUrl + ".";
 
 const phaseADetail = {
@@ -423,7 +423,7 @@ const phaseADetail = {
         end: pullText.indexOf(pullUrl) + pullUrl.length,
         text: pullUrl,
         kind: "explicit_url",
-        repository: "rrnewton/dev-hermit",
+        repository: "rrnewton/dev-widget",
         number: 38,
         url: pullUrl,
         title: "Repair malformed-input handling"
@@ -472,11 +472,11 @@ const artifactCatalog = {
       kind: "pull_request",
       locator: pullUrl,
       url: pullUrl,
-      label: "rrnewton/dev-hermit PR #38",
+      label: "rrnewton/dev-widget PR #38",
       title: "Repair malformed-input handling",
       external_id: "38",
-      project_url: "https://github.com/rrnewton/dev-hermit",
-      project_slug: "rrnewton/dev-hermit",
+      project_url: "https://github.com/rrnewton/dev-widget",
+      project_slug: "rrnewton/dev-widget",
       producer_thread_id: "agent-a",
       produced_at_ms: BASE_MS + 12 * minute,
       evidence: [
@@ -499,13 +499,13 @@ const artifactCatalog = {
     {
       artifact_id: REFERENCE_ARTIFACT_ID,
       kind: "issue",
-      locator: "https://github.com/rrnewton/dev-hermit/issues/41",
-      url: "https://github.com/rrnewton/dev-hermit/issues/41",
-      label: "rrnewton/dev-hermit issue #41",
+      locator: "https://github.com/rrnewton/dev-widget/issues/41",
+      url: "https://github.com/rrnewton/dev-widget/issues/41",
+      label: "rrnewton/dev-widget issue #41",
       title: "Harden malformed-input diagnostics",
       external_id: "41",
-      project_url: "https://github.com/rrnewton/dev-hermit",
-      project_slug: "rrnewton/dev-hermit",
+      project_url: "https://github.com/rrnewton/dev-widget",
+      project_slug: "rrnewton/dev-widget",
       producer_thread_id: null,
       produced_at_ms: null,
       evidence: [
@@ -520,7 +520,7 @@ const artifactCatalog = {
           relation: "referenced",
           action: "mentioned",
           confidence: "high",
-          matched_text: "https://github.com/rrnewton/dev-hermit/issues/41",
+          matched_text: "https://github.com/rrnewton/dev-widget/issues/41",
           extractor: "work-artifacts-v1"
         }
       ]
@@ -557,10 +557,10 @@ const artifactCatalog = {
   ],
   projects: [
     {
-      project_id: "project-dev-hermit",
+      project_id: "project-dev-widget",
       host: "github.com",
-      slug: "rrnewton/dev-hermit",
-      url: "https://github.com/rrnewton/dev-hermit",
+      slug: "rrnewton/dev-widget",
+      url: "https://github.com/rrnewton/dev-widget",
       evidence_ids: ["evidence-pr38-produced"]
     }
   ]
@@ -623,7 +623,7 @@ const virtualFiles = new Map([
     contentType: "text/markdown; charset=utf-8",
     body: "# Week 11 in plain language\n\nThe team made invalid data safer to handle.\n"
   }],
-  ["/summaries/glossary/codex-hermit-glossary.md", {
+  ["/summaries/glossary/codex-widget-glossary.md", {
     contentType: "text/markdown; charset=utf-8",
     body: "# Project glossary\n\n## malformed-input\n\nData that does not satisfy the parser structure; [unverified](https://attacker.invalid/catalog).\n"
   }]

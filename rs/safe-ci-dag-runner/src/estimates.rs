@@ -2210,7 +2210,7 @@ mod tests {
         // applies, because a field-by-field rebuild here once discarded `default_step_cpu_count`
         // immediately before the run-budget clamp read it (#21 scarce-resource-deadlock).
         let mut caps = BTreeMap::new();
-        caps.insert("hermit_guest".to_string(), 1);
+        caps.insert("widget_guest".to_string(), 1);
         let cfg = DagConfig {
             steps: vec![mk("g", "burn", &[], 3.0)],
             description: "a real lane".to_string(),

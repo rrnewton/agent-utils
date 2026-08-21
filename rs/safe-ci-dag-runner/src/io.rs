@@ -1257,7 +1257,7 @@ steps:
         // format itself is silently substituting defaults.
         let doc = r#"{
             "description": "a real lane",
-            "resource_caps": {"hermit_guest": 1, "manifest_guest": 4},
+            "resource_caps": {"widget_guest": 1, "manifest_guest": 4},
             "mem_cap_factor": 1.5,
             "mem_cap_floor_bytes": 4294967296,
             "outer_mem_safety_factor": 1.2,

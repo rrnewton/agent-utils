@@ -158,10 +158,11 @@ def collect_graph(
     # ONE bulk fetch for the whole planning run, never a per-PR fan-out. Every merge-tree / ancestry
     # probe below is a plain local git command once the objects are present, so the only network cost
     # that matters is getting the base ref + every PR head into the local graph. We gather all those
-    # refspecs first and hand them to the host in a single round-trip. Measured 2026-08-04 (warm, 25
-    # hermit PR heads): per-PR `git fetch` fan-out = 21.5 s wall / 14.3 s sys; one batched fetch =
-    # 0.85 s wall — ~25× faster, and O(1) round-trips instead of O(N). This is what makes `merge-tree`
-    # (the default conflict detector) cheap enough to run over the entire open set (~37 ms/probe local).
+    # refspecs first and hand them to the host in a single round-trip. Measured 2026-08-04 (warm,
+    # 25 PR heads in a consuming repository): per-PR `git fetch` fan-out = 21.5 s wall / 14.3 s sys;
+    # one batched fetch = 0.85 s wall — ~25× faster, and O(1) round-trips instead of O(N). This is
+    # what makes `merge-tree` (the default conflict detector) cheap enough to run over the entire
+    # open set (~37 ms/probe local).
     base_dest: dict[str, str] = {}
     pr_dest: dict[int, str] = {}
     refspecs: list[tuple[str, str]] = []

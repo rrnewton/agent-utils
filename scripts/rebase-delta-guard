@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # TRACKED tool: prove a rebase moved the base and changed nothing else.
 #
-# WHY THIS EXISTS. On 2026-08-08 a conflict-free `git rebase` in the Hermit
+# WHY THIS EXISTS. On 2026-08-08 a conflict-free `git rebase` in a consuming
 # checkout silently re-serialized ci/dag/portable.json end to end: the delta went
 # from 99,021 bytes to 155,143, keys reordered, hunk `@@ -1,492 +1,947 @@`, with
 # NO conflict, NO warning, and a clean `git status`. The cause was an UNTRACKED,

@@ -295,7 +295,7 @@ def jobs_for_budget(cfg: DagConfig, budget: int) -> tuple[int, int]:
 
 # Worst-case peak RSS of ONE compile/link job, used to bound build parallelism by the
 # memory a boxed scope actually grants. DERIVED from a measured footprint, never guessed:
-# hermit#1584's build.dbi_release OOM-killed at the 8.0 GiB cap under j=32 (memory.events
+# <repo>#1584's build.dbi_release OOM-killed at the 8.0 GiB cap under j=32 (memory.events
 # oom_kill=2) yet is stable at j8 (dag-mem-caps-pinned-jobs-fix #1583), i.e. ~8.0 GiB / 8
 # ~= 1.0 GiB is the largest per-job footprint that still fits. This constant is the single
 # source for "how many build jobs does a given memory cap afford" so the -j a cap implies

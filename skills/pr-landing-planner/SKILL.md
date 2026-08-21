@@ -5,8 +5,8 @@ description: Produce an advisory PR landing plan from merge conflicts, exact-rev
 
 # PR landing planner
 
-**Follow skill `hermit-validation-authority` in the consuming dev-hermit workspace for
-validation authority and evidence semantics.**
+**Follow the consuming workspace's own validation-authority skill for validation authority
+and evidence semantics.**
 
 Use the planner to produce a shared, machine-readable landing plan. It detects real merge conflicts,
 classifies supplied validation evidence, surfaces mechanism overlaps, and forms conflict-safe groups.

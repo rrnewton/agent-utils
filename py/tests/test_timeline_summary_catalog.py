@@ -32,7 +32,7 @@ def _reference(
     provenance = make_summary_provenance(
         TECHNICAL_ROLLUP_SUMMARIZER,
         logical_key="rollup:daily:2026-08-07",
-        team_slug="codex-hermit",
+        team_slug="codex-widget",
         start_ms=100,
         end_ms=200,
         input_hash=input_hash,
@@ -77,16 +77,16 @@ def test_catalog_merge_retains_versions_and_has_deterministic_counts(
     path = tmp_path / "artifacts.json"
 
     first, changed = merge_summary_catalog(
-        path, "codex-hermit", (version_two, version_one)
+        path, "codex-widget", (version_two, version_one)
     )
     replay, replay_changed = merge_summary_catalog(
-        path, "codex-hermit", (version_one, version_two)
+        path, "codex-widget", (version_one, version_two)
     )
 
     assert changed is True
     assert replay_changed is False
     assert replay == first
-    assert load_summary_catalog(path, "codex-hermit") == first
+    assert load_summary_catalog(path, "codex-widget") == first
     rendered = first.to_json_obj()
     assert rendered["artifact_count"] == 2
     assert rendered["logical_key_count"] == 1
@@ -113,7 +113,7 @@ def test_catalog_selects_latest_compatible_or_requested_model() -> None:
         generated_at="2026-08-07T11:00:00Z",
     )
     catalog = SummaryArtifactCatalog(
-        team_slug="codex-hermit",
+        team_slug="codex-widget",
         records=(version_one, version_two),
     )
 
@@ -147,7 +147,7 @@ def test_catalog_rejects_unsafe_paths_and_tampered_aggregates() -> None:
     with pytest.raises(ValueError, match="unsafe"):
         SummaryArtifactReference(reference.provenance, "../outside.json")
 
-    catalog = SummaryArtifactCatalog("codex-hermit", (reference,))
+    catalog = SummaryArtifactCatalog("codex-widget", (reference,))
     tampered = catalog.to_json_obj()
     tampered["artifact_count"] = 9
     with pytest.raises(ValueError, match="derived"):

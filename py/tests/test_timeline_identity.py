@@ -14,8 +14,8 @@ from agent_team_timeline.identity import (
 
 
 def test_repository_remotes_become_safe_browser_urls() -> None:
-    assert canonical_repository_url("git@github.com:rrnewton/dev-hermit.git") == (
-        "https://github.com/rrnewton/dev-hermit"
+    assert canonical_repository_url("git@github.com:rrnewton/dev-widget.git") == (
+        "https://github.com/rrnewton/dev-widget"
     )
     assert canonical_repository_url(
         "https://GitHub.com/rrnewton/agent-utils.git?token=secret#fragment"
@@ -26,9 +26,9 @@ def test_structured_codex_metadata_infers_projects_without_prompt_scanning() -> 
     projects, hosts = infer_structured_identity(
         (
             {
-                "cwd": "/home/newton/work/dev-hermit",
+                "cwd": "/home/newton/work/dev-widget",
                 "git": {
-                    "repository_url": "https://github.com/rrnewton/dev-hermit.git"
+                    "repository_url": "https://github.com/rrnewton/dev-widget.git"
                 },
             },
             {
@@ -42,7 +42,7 @@ def test_structured_codex_metadata_infers_projects_without_prompt_scanning() -> 
     )
 
     assert [(item.label, item.primary) for item in projects] == [
-        ("dev-hermit", True),
+        ("dev-widget", True),
         ("agent-utils", False),
     ]
     assert [item.hostname for item in hosts] == ["devbig014.example.com"]
@@ -52,11 +52,11 @@ def test_structured_codex_metadata_infers_projects_without_prompt_scanning() -> 
 
 def test_identity_merge_accumulates_distinct_projects_and_hosts() -> None:
     previous = SiteIdentity(
-        "codex-hermit",
+        "codex-widget",
         (
             ProjectIdentity(
-                "dev-hermit",
-                "https://github.com/rrnewton/dev-hermit",
+                "dev-widget",
+                "https://github.com/rrnewton/dev-widget",
                 True,
                 "session_metadata",
             ),
@@ -74,12 +74,12 @@ def test_identity_merge_accumulates_distinct_projects_and_hosts() -> None:
         ),
     )
     explicit, explicit_hosts = parse_identity_overrides(
-        ("Hermit=https://github.com/facebookexperimental/hermit.git",),
+        ("Widget=https://github.com/example-org/widget.git",),
         ("devbig015",),
     )
 
     merged = merge_site_identity(
-        "codex-hermit",
+        "codex-widget",
         "America/New_York",
         "explicit",
         inferred,
@@ -90,11 +90,11 @@ def test_identity_merge_accumulates_distinct_projects_and_hosts() -> None:
     )
 
     assert [item.label for item in merged.projects] == [
-        "dev-hermit",
+        "dev-widget",
         "agent-utils",
-        "Hermit",
+        "Widget",
     ]
-    assert [item.label for item in merged.projects if item.primary] == ["Hermit"]
+    assert [item.label for item in merged.projects if item.primary] == ["Widget"]
     assert [item.hostname for item in merged.hosts] == [
         "devbig014.example.com",
         "devbig015",
@@ -103,11 +103,11 @@ def test_identity_merge_accumulates_distinct_projects_and_hosts() -> None:
 
 def test_site_identity_json_round_trip() -> None:
     identity = SiteIdentity(
-        "codex-hermit",
+        "codex-widget",
         (
             ProjectIdentity(
-                "dev-hermit",
-                "https://github.com/rrnewton/dev-hermit",
+                "dev-widget",
+                "https://github.com/rrnewton/dev-widget",
                 True,
                 "explicit",
             ),
@@ -126,7 +126,7 @@ def test_site_identity_json_round_trip() -> None:
 
 def test_default_timezone_rerun_preserves_explicit_provenance() -> None:
     previous = SiteIdentity(
-        "codex-hermit",
+        "codex-widget",
         (),
         (),
         "America/New_York",
@@ -134,7 +134,7 @@ def test_default_timezone_rerun_preserves_explicit_provenance() -> None:
     )
 
     unchanged = merge_site_identity(
-        "codex-hermit",
+        "codex-widget",
         "America/New_York",
         "default",
         (),
@@ -144,7 +144,7 @@ def test_default_timezone_rerun_preserves_explicit_provenance() -> None:
         previous,
     )
     changed = merge_site_identity(
-        "codex-hermit",
+        "codex-widget",
         "UTC",
         "default",
         (),

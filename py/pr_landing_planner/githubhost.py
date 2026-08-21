@@ -38,7 +38,7 @@ GH_FIELDS: tuple[str, ...] = (
 )
 
 #: The heavy ``statusCheckRollup`` field makes a single ``gh pr list`` over a large open set 504 at
-#: the GraphQL layer (measured: fails at 60 PRs on rrnewton/hermit). So the light metadata is fetched
+#: the GraphQL layer (measured: fails at 60 PRs on <org>/<repo>). So the light metadata is fetched
 #: in one cheap list call (:data:`LIGHT_FIELDS`) and the rollup is enriched per PR, in parallel,
 #: below. Each per-PR ``gh pr view`` is small and reliable; a rollup that still fails degrades that one
 #: PR to "no checks" (classified pending) with a LOUD stderr NOTE rather than aborting the whole plan.
@@ -225,12 +225,13 @@ class GitHubHost:
         """Fetch all requested refs in one operation and return their object IDs by destination."""
 
         # ONE `git fetch` for every (source, dest) — a single remote round-trip instead of a per-PR
-        # fan-out. Measured cost of the two shapes (2026-08-04, warm, 25 hermit PR heads into a local
-        # rrnewton/hermit clone): N separate `git fetch` = 21.5 s wall / 14.3 s sys (≈0.86 s/PR, almost
-        # all process-spawn + round-trip overhead); one batched `git fetch` = 0.85 s wall / 0.57 s sys
-        # — ~25× faster and O(1) in round-trips. This is why the planner's default conflict detector is
-        # `merge-tree`: once the graph is local, each merge-tree probe is ~37 ms, so conflict-analysing
-        # the whole open set costs seconds, not the "expensive fan-out" the per-PR model implied.
+        # fan-out. Measured cost of the two shapes (2026-08-04, warm, 25 PR heads into a local
+        # clone of a consuming repository): N separate `git fetch` = 21.5 s wall / 14.3 s sys
+        # (≈0.86 s/PR, almost all process-spawn + round-trip overhead); one batched `git fetch` =
+        # 0.85 s wall / 0.57 s sys — ~25× faster and O(1) in round-trips. This is why the planner's
+        # default conflict detector is `merge-tree`: once the graph is local, each merge-tree probe
+        # is ~37 ms, so conflict-analysing the whole open set costs seconds, not the "expensive
+        # fan-out" the per-PR model implied.
         if not refspecs:
             return {}
         pairs = [f"+{source}:{dest}" for source, dest in refspecs]

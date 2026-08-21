@@ -491,7 +491,7 @@ worker, hunting a divergence in the log, capped at 32 concurrent workers:
     --cpu-cores 1 --memory 4G --cpu-timeout 120 --pids 512 \\
     --hit-regex 'DIVERGENCE|panic' --max-concurrency 32 \\
     --identity backend=ptrace image=demo5 \\
-    -- hermit run --chaos --seed {{seed}} ./demo
+    -- ./workload --chaos --seed {{seed}}
 
 Notes:
   * CPU-time is the real, load-immune guard; omit --cpu-timeout to leave it UNSET (honest).

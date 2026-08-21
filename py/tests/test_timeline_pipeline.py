@@ -852,8 +852,8 @@ def test_build_embeds_standalone_site_identity(tmp_path: Path) -> None:
         team.team_slug,
         (
             ProjectIdentity(
-                "dev-hermit",
-                "https://github.com/rrnewton/dev-hermit",
+                "dev-widget",
+                "https://github.com/rrnewton/dev-widget",
                 True,
                 "session_metadata",
             ),
@@ -887,7 +887,7 @@ def test_build_embeds_standalone_site_identity(tmp_path: Path) -> None:
 
 def test_phase_details_emit_conservative_pull_request_link_spans(tmp_path: Path) -> None:
     team = _team(
-        "Reviewed https://github.com/rrnewton/dev-hermit/pull/38 and "
+        "Reviewed https://github.com/rrnewton/dev-widget/pull/38 and "
         "sched-ext/scx#3668; naked #7 is ambiguous."
     )
     _write_team(tmp_path, team)
@@ -902,11 +902,11 @@ def test_phase_details_emit_conservative_pull_request_link_spans(tmp_path: Path)
         transcript_entry
         for detail in detail_objects
         for transcript_entry in detail["transcript"]
-        if "dev-hermit/pull/38" in transcript_entry["text"]
+        if "dev-widget/pull/38" in transcript_entry["text"]
     )
     references = entry["pull_requests"]
     assert [reference["repository"] for reference in references] == [
-        "rrnewton/dev-hermit",
+        "rrnewton/dev-widget",
         "sched-ext/scx",
     ]
     assert [reference["number"] for reference in references] == [38, 3668]
@@ -917,7 +917,7 @@ def test_phase_details_emit_conservative_pull_request_link_spans(tmp_path: Path)
     assert all(reference["text"] != "#7" for reference in references)
 
     pull = PullRequestMetadata(
-        key=PullRequestKey("rrnewton/dev-hermit", 38),
+        key=PullRequestKey("rrnewton/dev-widget", 38),
         title="Repair archive refresh",
         state="closed",
         draft=False,
@@ -943,7 +943,7 @@ def test_phase_details_emit_conservative_pull_request_link_spans(tmp_path: Path)
         transcript_entry
         for detail in enriched_details
         for transcript_entry in detail["transcript"]
-        if "dev-hermit/pull/38" in transcript_entry["text"]
+        if "dev-widget/pull/38" in transcript_entry["text"]
     )
     assert enriched_entry["pull_requests"][0]["title"] == "Repair archive refresh"
     assert enriched_entry["pull_requests"][0]["merged_at"] == "2026-08-05T10:00:00Z"
@@ -2712,7 +2712,7 @@ def test_plain_rollup_gets_overview_and_supported_definitions_only() -> None:
         PLAIN_LANGUAGE_ROLLUP_STYLE,
         _rollup_result(
             "project-overview",
-            "Hermit runs guest software in a repeatable environment.",
+            "Widget runs guest software in a repeatable environment.",
         ),
         {"day:daily": same_period_technical},
     )[0]
@@ -2732,7 +2732,7 @@ def test_plain_rollup_gets_overview_and_supported_definitions_only() -> None:
     )[0]
 
     assert technical.glossary == technical_without_definitions.glossary
-    assert "Hermit runs guest software" in plain.glossary
+    assert "Widget runs guest software" in plain.glossary
     assert "A release check that requires one exact revision" in plain.glossary
     assert "DBI" not in plain.glossary
     assert "did not land" in plain.factual_context

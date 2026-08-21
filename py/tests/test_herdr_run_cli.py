@@ -42,7 +42,7 @@ def test_help_exits_cleanly() -> None:
 
 
 def test_agent_is_taken_from_the_orc_environment_variable() -> None:
-    assert _default_agent({"DG_AGENT_NAME": "hermit-coord"}) == "hermit-coord"
+    assert _default_agent({"DG_AGENT_NAME": "widget-coord"}) == "widget-coord"
 
 
 def test_explicit_override_beats_the_environment() -> None:
@@ -130,11 +130,11 @@ def test_config_subcommand_reports_the_effective_policy(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.chdir(str(tmp_path))
-    monkeypatch.setenv("DG_AGENT_NAME", "hermit-lander")
+    monkeypatch.setenv("DG_AGENT_NAME", "widget-lander")
     assert main(["config"]) == 0
     document = json.loads(capsys.readouterr().out)
     assert document["workspace"] == "agent-cmds"
-    assert document["tab_label"] == "hermit-lander"
+    assert document["tab_label"] == "widget-lander"
     assert document["allow"] == ["git", "gh"]
     assert document["max_panes"] == 64
 

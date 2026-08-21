@@ -42,24 +42,24 @@ def _client(fake: FakeHerdrClient) -> HerdrClient:
 def test_first_run_creates_workspace_and_renames_the_default_tab(tmp_path: object) -> None:
     root = str(tmp_path)
     fake = FakeHerdrClient()
-    target = resolve_target(_client(fake), _config(root), "hermit-coord")
+    target = resolve_target(_client(fake), _config(root), "widget-coord")
 
     assert target.created == ("workspace", "tab")
-    assert target.tab_label == "hermit-coord"
+    assert target.tab_label == "widget-coord"
     # The default tab is RENAMED, not supplemented: a fresh workspace must end with exactly one tab.
     workspace = fake.workspaces[target.workspace_id]
     assert len(workspace.tabs) == 1
-    assert workspace.tabs[target.tab_id].label == "hermit-coord"
+    assert workspace.tabs[target.tab_id].label == "widget-coord"
 
 
 def test_second_run_creates_nothing(tmp_path: object) -> None:
     root = str(tmp_path)
     fake = FakeHerdrClient()
     config = _config(root)
-    first = resolve_target(_client(fake), config, "hermit-coord")
+    first = resolve_target(_client(fake), config, "widget-coord")
     creates_after_first = [call for call in fake.calls if call.startswith("create_")]
 
-    second = resolve_target(_client(fake), config, "hermit-coord")
+    second = resolve_target(_client(fake), config, "widget-coord")
 
     assert second.pane_id == first.pane_id
     assert second.created == ()
@@ -76,8 +76,8 @@ def test_second_agent_reuses_the_workspace_and_adds_only_a_tab(tmp_path: object)
     root = str(tmp_path)
     fake = FakeHerdrClient()
     config = _config(root)
-    first = resolve_target(_client(fake), config, "hermit-coord")
-    second = resolve_target(_client(fake), config, "hermit-lander")
+    first = resolve_target(_client(fake), config, "widget-coord")
+    second = resolve_target(_client(fake), config, "widget-lander")
 
     assert second.workspace_id == first.workspace_id
     assert second.created == ("tab",)
@@ -90,7 +90,7 @@ def test_partial_state_is_completed_not_recreated(tmp_path: object) -> None:
     root = str(tmp_path)
     fake = FakeHerdrClient()
     fake.create_workspace(label="agent-cmds", cwd=root)
-    target = resolve_target(_client(fake), _config(root), "hermit-dbi")
+    target = resolve_target(_client(fake), _config(root), "widget-dbi")
     assert target.created == ("tab",)
     assert len(fake.workspaces) == 1
 
@@ -266,12 +266,12 @@ def test_split_tab_is_refused(tmp_path: object) -> None:
 
 
 def test_tab_label_default_is_the_agent_name() -> None:
-    assert tab_label_for(Config(project_root="/tmp/dev-hermit"), "hermit-coord") == "hermit-coord"
+    assert tab_label_for(Config(project_root="/tmp/dev-widget"), "widget-coord") == "widget-coord"
 
 
 def test_tab_label_schema_supports_project_placeholder() -> None:
-    config = Config(tab_name="{project}-{agent}", project_root="/tmp/dev-hermit")
-    assert tab_label_for(config, "kvm") == "dev-hermit-kvm"
+    config = Config(tab_name="{project}-{agent}", project_root="/tmp/dev-widget")
+    assert tab_label_for(config, "kvm") == "dev-widget-kvm"
 
 
 def test_unknown_placeholder_is_a_clear_error() -> None:

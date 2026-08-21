@@ -77,8 +77,8 @@ assert.deepStrictEqual(
 );
 assert.deepStrictEqual(Array.from(grouped.references), ["artifact-issue41"]);
 
-const external = context.safeArtifactTarget("https://github.com/rrnewton/dev-hermit/pull/38");
-assert.strictEqual(external.href, "https://github.com/rrnewton/dev-hermit/pull/38");
+const external = context.safeArtifactTarget("https://github.com/rrnewton/dev-widget/pull/38");
+assert.strictEqual(external.href, "https://github.com/rrnewton/dev-widget/pull/38");
 assert.strictEqual(external.external, true);
 
 const internal = context.safeArtifactTarget("#glossary/term-parser");

@@ -162,7 +162,7 @@ fn a_forced_attempt_that_fails_reports_a_probe_failure_not_a_skip() {
 
 /// C (control): `--allow-cgroup-failure` is unaffected — the sanctioned opt-out still runs unboxed.
 ///
-/// This is the path every hermit CI lane actually takes, and it short-circuits ahead of the scope
+/// This is the path every consuming CI lane actually takes, and it short-circuits ahead of the scope
 /// logic entirely. If this changed, the finding would have cost a green CI to report.
 #[test]
 fn the_sanctioned_opt_out_is_untouched() {

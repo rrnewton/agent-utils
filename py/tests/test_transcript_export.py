@@ -235,7 +235,7 @@ def test_provenance_overlay_migrates_occurrence_without_duplicates_or_id_churn(
     tmp_path: Path,
 ) -> None:
     legacy_prompt = replace(
-        _event("stable-prompt", "turn", 200, "user_prompt", "Resume Hermit", 10),
+        _event("stable-prompt", "turn", 200, "user_prompt", "Resume Widget", 10),
         source_native_id="legacy-message",
         ingress_kind="submitted_web",
         author_kind="external_or_unknown",

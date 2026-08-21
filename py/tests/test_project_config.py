@@ -30,15 +30,15 @@ from agent_team_timeline.transcript_export import PromptAuthorshipRule
 from agent_team_timeline.window import DateWindow
 
 
-def _manifest(output: str = "../summary/hermit") -> dict[str, object]:
+def _manifest(output: str = "../summary/widget") -> dict[str, object]:
     return {
         "schema_version": 1,
         "output": output,
         "timezone": "America/New_York",
         "projects": [
             {
-                "label": "dev-hermit",
-                "repository_url": "https://github.com/rrnewton/dev-hermit.git",
+                "label": "dev-widget",
+                "repository_url": "https://github.com/rrnewton/dev-widget.git",
             }
         ],
         "source_hosts": ["shared.example.com"],
@@ -93,7 +93,7 @@ def _manifest(output: str = "../summary/hermit") -> dict[str, object]:
 
 
 def _write_manifest(tmp_path: Path, value: dict[str, object]) -> Path:
-    path = tmp_path / "configs" / "hermit.json"
+    path = tmp_path / "configs" / "widget.json"
     path.parent.mkdir(parents=True)
     path.write_text(json.dumps(value), encoding="utf-8")
     return path
@@ -134,7 +134,7 @@ def test_load_project_config_resolves_paths_and_provider_schema(tmp_path: Path) 
 
     config = load_project_ingest_config(config_path)
 
-    assert config.output == (tmp_path / "summary" / "hermit").resolve()
+    assert config.output == (tmp_path / "summary" / "widget").resolve()
     assert tuple(team.slug for team in config.teams) == (
         "codex-team",
         "claude-team",
@@ -149,7 +149,7 @@ def test_load_project_config_resolves_paths_and_provider_schema(tmp_path: Path) 
     assert codex.date_window is not None
     assert codex.date_window.start_date == "2026-08-01"
     assert codex.identity_overrides.projects[0].repository_url == (
-        "https://github.com/rrnewton/dev-hermit"
+        "https://github.com/rrnewton/dev-widget"
     )
     assert codex.identity_overrides.hosts[0].hostname == "codex.example.com"
     assert isinstance(claude.source, ClaudeProjectSource)
@@ -490,7 +490,7 @@ def test_ingest_project_cli_records_zero_model_contract(
     output = capsys.readouterr().out
     assert "7 prompts" in output
     assert "website: not built" in output
-    run_paths = tuple((tmp_path / "summary" / "hermit" / "runs").glob("*.json"))
+    run_paths = tuple((tmp_path / "summary" / "widget" / "runs").glob("*.json"))
     assert len(run_paths) == 1
     run = json.loads(run_paths[0].read_text(encoding="utf-8"))
     assert run["mechanical"]["project_ingest"]["model_calls"] == 0

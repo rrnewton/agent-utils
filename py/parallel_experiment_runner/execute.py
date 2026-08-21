@@ -112,13 +112,14 @@ def resolve_cgroup_manager(allow_failure: bool) -> tuple[CgroupManager | None, i
         )
         return None, 3
     # OUTER process (not yet in a scope): re-exec into a fresh transient scope. We do NOT try to
-    # "reap abandoned prior-run scopes" here — reproduction (hermit-ci, 5 abandonment scenarios)
-    # showed abandonment strands NOTHING: a SIGKILLed launcher's direct children die with it, and
-    # install_scope_teardown's SIGTERM/SIGKILL/atexit hook cgroup.kill's the whole scope on the
-    # exits that DO run a handler. The zombie pile-up that motivated this tool was a LIVE hung
-    # `hermit run --strict --verify` (main parked in tokio epoll_wait) holding a PID namespace
-    # open, NOT a leaked appender thread — and a live hang is exactly what the per-worker cpu-time
-    # / wall backstop kills, via a cgroup-subtree cgroup.kill that reclaims the namespace (see
+    # "reap abandoned prior-run scopes" here — reproduction (a consuming repository's CI, five
+    # abandonment scenarios) showed abandonment strands NOTHING: a SIGKILLed launcher's direct
+    # children die with it, and install_scope_teardown's SIGTERM/SIGKILL/atexit hook cgroup.kill's
+    # the whole scope on the exits that DO run a handler. The zombie pile-up that motivated this
+    # tool was a LIVE hung `run --strict --verify` of a consuming repository's own tool (main
+    # parked in tokio epoll_wait) holding a PID namespace open, NOT a leaked appender thread — and
+    # a live hang is exactly what the per-worker cpu-time / wall backstop kills, via a
+    # cgroup-subtree cgroup.kill that reclaims the namespace (see
     # safe_ci_dag_runner.teardown.reap). Containment IS the fix; a next-run reaper is not needed.
     if allow_failure:
         print(

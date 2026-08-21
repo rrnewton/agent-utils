@@ -58,7 +58,7 @@ def _root_bytes(*, incomplete_tail: bytes = b"") -> bytes:
                 "timestamp": _iso(1_000),
                 "cwd": "/work/project",
                 "git": {
-                    "repository_url": "git@github.com:rrnewton/dev-hermit.git"
+                    "repository_url": "git@github.com:rrnewton/dev-widget.git"
                 },
                 "source": "cli",
             },
@@ -423,8 +423,8 @@ def test_ingest_copies_complete_lines_then_parses_the_backup(tmp_path: Path) -> 
     )
     assert identity["projects"] == [
         {
-            "label": "dev-hermit",
-            "repository_url": "https://github.com/rrnewton/dev-hermit",
+            "label": "dev-widget",
+            "repository_url": "https://github.com/rrnewton/dev-widget",
             "primary": True,
             "source": "session_metadata",
         }

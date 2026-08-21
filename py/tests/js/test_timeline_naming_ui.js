@@ -76,7 +76,7 @@ vm.runInContext(names.map(functionSource).join("\n"), context);
 
 const agent = {
   id: "thread-7",
-  team: "codex-hermit",
+  team: "codex-widget",
   short_name: "Budget overlap audit",
   official_name: "/root/transcript_auditor/owner_turn_miner/plugin_layout_audit/budget_overlap_audit",
   official_leaf: "budget_overlap_audit",

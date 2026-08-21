@@ -8,7 +8,7 @@ clean, and the delta is no longer the one you wrote.
 Every case here is **planted**. A check that has only been seen not to misbehave
 is not evidence, and a guard that fails on everything looks vigilant while being
 worthless -- so the positive cases are asserted just as hard as the negative
-ones. Both were live risks: the first bracket run of the Hermit predecessor
+ones. Both were live risks: the first bracket run of this guard's predecessor
 reported the *positive* case failing, because the test recovered a pre-rebase
 SHA by searching the log instead of recording it.
 

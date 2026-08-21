@@ -1274,7 +1274,7 @@ def test_bounded_reused_root_is_hermetic_and_excludes_unrelated_task_db(
                     "source": None,
                     "created_at_ms": purpose_at,
                     "blocks": [
-                        {"type": "InterjectionBlock", "id": 101, "text": "# Purpose Hermit"}
+                        {"type": "InterjectionBlock", "id": 101, "text": "# Purpose Widget"}
                     ],
                 },
             ),
@@ -1289,7 +1289,7 @@ def test_bounded_reused_root_is_hermetic_and_excludes_unrelated_task_db(
                         {"Submitted": {"source": {"Web": {"view": "Transcript"}}}}
                     ),
                     "created_at_ms": owner_at,
-                    "blocks": [{"type": "text", "id": 102, "text": "Recover Hermit agents"}],
+                    "blocks": [{"type": "text", "id": 102, "text": "Recover Widget agents"}],
                 },
             ),
         ),
@@ -1336,7 +1336,7 @@ def test_bounded_reused_root_is_hermetic_and_excludes_unrelated_task_db(
     _task_database(hatch_db)
     _task_database(task_only_task_db)
     for path, text in (
-        (project_db, "Hermit result after restart"),
+        (project_db, "Widget result after restart"),
         (hatch_db, "Unrelated Hatch result after restart"),
         (task_only_task_db, "Task-only child result after restart"),
     ):
@@ -1380,7 +1380,7 @@ def test_bounded_reused_root_is_hermetic_and_excludes_unrelated_task_db(
     assert not any(
         "Earlier row must not cross" in (item.text or "") for item in team.events
     )
-    assert not any("# Purpose Hermit" in (item.text or "") for item in team.events)
+    assert not any("# Purpose Widget" in (item.text or "") for item in team.events)
     owner = next(item for item in team.events if item.source_native_id == "owner-restart")
     assert owner.kind == "user_prompt"
     assert owner.timestamp_ms == owner_at
@@ -1393,7 +1393,7 @@ def test_bounded_reused_root_is_hermetic_and_excludes_unrelated_task_db(
     )
     assert task_only_agent.parent_thread_id == bounded
     assert task_only_agent.started_at_ms == purpose_at
-    assert any("Hermit result after restart" in (item.text or "") for item in team.events)
+    assert any("Widget result after restart" in (item.text or "") for item in team.events)
     assert not any(
         "Unrelated Hatch result" in (item.text or "") for item in team.events
     )
@@ -1416,7 +1416,7 @@ def test_bounded_reused_root_is_hermetic_and_excludes_unrelated_task_db(
                 50,
                 "user",
                 "text",
-                "Recover Hermit agents",
+                "Recover Widget agents",
                 None,
                 None,
                 None,
