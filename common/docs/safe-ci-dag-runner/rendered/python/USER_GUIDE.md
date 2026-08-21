@@ -199,11 +199,19 @@ that produced it and freezes the mistake. So:
 - a step needs at least five uncensored samples before its authored hint is
   replaced at all, and the estimate carries a 20% margin above the 9/10
   percentile;
-- a step this path **declines** to estimate goes back to the baseline its author
-  wrote. That matters because the ordinary feedback above has already refined
-  the same hint from the same peaks *without* asking what they were measured
-  under: turning this flag on has to remove that number too, or a decline would
-  quietly mean "use the censoring-blind estimate instead";
+- a step this path **declines** to estimate goes back to the larger of the
+  baseline its author wrote and the floor its recorded peaks prove. Going back
+  to the author's figure matters because the ordinary feedback above has already
+  refined the same hint from the same peaks *without* asking what they were
+  measured under: turning this flag on has to remove that number too, or a
+  decline would quietly mean "use the censoring-blind estimate instead". Keeping
+  the floor matters for the same reason in the other direction: a step whose
+  every run was pinned to a 32 GiB ceiling has proven it needs at least that,
+  and modelling it at the 1 GiB its author guessed would be the same ratchet
+  running the other way. "We do not know the peak" and "we know the peak is at
+  least X" are different answers, and a decline gives the second one whenever
+  the evidence supports it — so a decline can only ever **raise** a step's
+  baseline above what its author wrote, never lower it;
 - `hard_mem_max_bytes` is never rewritten: an explicit hard cap is an
   instruction, not a guess.
 
@@ -214,7 +222,13 @@ cap did not change" and "the store had nothing usable to say" look the same:
 ```
 safe-ci-dag-runner: --profile-memory-feedback: g.build: rss_baseline_bytes=2576980377 [6 uncensored, 0 censored, 0 unprovenanced of 6; 6 uncensored sample(s), 9/10 percentile +20%]
 safe-ci-dag-runner: --profile-memory-feedback: g.link: keeping the authored hint [0 uncensored, 6 censored, 0 unprovenanced of 6; every one of 6 recorded peak(s) was censored by its applied cap]
+safe-ci-dag-runner: --profile-memory-feedback: g.test: no estimate; rss_baseline_bytes=34359738368, the proven floor [0 uncensored, 6 censored, 0 unprovenanced of 6; every one of 6 recorded peak(s) was censored by its applied cap]
 ```
+
+`g.link` and `g.test` were declined on identical evidence; they differ only in
+what their authors wrote. `g.link`'s hint already covers the floor its peaks
+prove, so it is left alone. `g.test`'s does not, so the floor is used and the
+line names the number rather than claiming the authored hint was kept.
 
 The provenance columns this reads are written by the runner itself; a store
 recorded before they existed reads as unprovenanced, which keeps every authored

@@ -999,9 +999,11 @@ def _apply_memory_feedback(
 
     ``cfg`` is the config the ordinary plan has ALREADY been applied to and ``authored`` is the
     same config before that, which is what lets a decline mean "no learned estimate" instead of
-    "fall back to the censoring-blind one": every step this path does not estimate is restored
-    to the baseline its author wrote. Turning the flag on therefore removes the unsafe estimate
-    even where it does not supply a safe one, which is the whole reason the flag exists.
+    "fall back to the censoring-blind one": every step this path does not estimate drops that
+    number for the LARGER of the baseline its author wrote and the peak the store proves it has
+    already reached. Turning the flag on therefore removes the unsafe estimate even where it
+    does not supply a safe one, which is the whole reason the flag exists — and it does so
+    without discarding what the censored samples did prove.
 
     Every step the store knows about is reported on stderr, including the ones that did NOT
     move and why, because "the cap did not change" and "the store had nothing usable to say"
@@ -1033,14 +1035,23 @@ def _apply_memory_feedback(
         return apply_memory_admissions(cfg, {}, baselines)
     tags = {step.tag for step in cfg.steps}
     for tag in sorted(tags & admissions.keys()):
-        print(_memory_admission_line(admissions[tag]), file=sys.stderr)
+        print(_memory_admission_line(admissions[tag], baselines.get(tag)), file=sys.stderr)
     return apply_memory_admissions(cfg, admissions, baselines)
 
 
-def _memory_admission_line(admission: MemoryAdmission) -> str:
-    """One human-readable line stating the decision AND the evidence behind it."""
+def _memory_admission_line(admission: MemoryAdmission, authored: int | None) -> str:
+    """One human-readable line stating the decision AND the evidence behind it.
+
+    ``authored`` is the baseline the step's author wrote, which is what makes the decline half
+    of this line specific: a decline that nevertheless raises the step to a proven floor says
+    so and names the number, because "keeping the authored hint" would be as untrue there as it
+    was when the censoring-blind estimate was silently left in place.
+    """
+    floor = admission.proven_floor_bytes()
     if admission.source == "profile":
         verdict = f"rss_baseline_bytes={admission.rss_baseline_bytes}"
+    elif floor is not None and floor > (authored or 0):
+        verdict = f"no estimate; rss_baseline_bytes={floor}, the proven floor"
     else:
         verdict = "keeping the authored hint"
     return (

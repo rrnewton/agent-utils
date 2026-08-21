@@ -17,8 +17,11 @@ The rules here are the ones a caller can rely on:
   what an ancestor-scope OOM kill looks like from inside this reader.
 * A sample whose censoring cannot be determined (no applied-cap column, no event counters, no
   peak) is not evidence at all. It is counted and reported, and it never moves the estimate.
-* With no uncensored evidence, the static hint is retained and the reason says which of the
-  three ways the evidence failed.
+* With no uncensored evidence, no estimate is made and the reason says which of the three ways
+  the evidence failed. That is a decline, not amnesia: the largest peak the step is proven to
+  have reached still applies as a floor, so a declined step is modelled at the LARGER of its
+  authored hint and that floor. "We do not know the peak" and "we know the peak is at least X"
+  are different states and must not collapse into "we know nothing".
 * ``hard_mem_max_bytes`` is never touched. An explicit hard cap is an instruction, not a guess.
 
 Every estimate carries its own provenance — the sample counts by verdict, the percentile, the
@@ -286,6 +289,18 @@ class MemoryAdmission:
         """Whether any sample was withheld from the central estimate because of censoring."""
         return self.censored_samples > 0
 
+    def proven_floor_bytes(self) -> int | None:
+        """The largest peak this step is PROVEN to have reached, however it was classified.
+
+        A censored peak under-states demand, so it may never be read as the maximum — but the
+        step really did allocate that much, so it is a valid minimum. So is an uncensored peak
+        that never reached the sample threshold: too thin to fit a distribution to, still a
+        thing that happened. "We do not know the peak" and "we know the peak is at least X" are
+        different states, and this is the second one; ``None`` is the first.
+        """
+        candidates = [b for b in (self.censored_floor_bytes, self.observed_peak_bytes) if b]
+        return max(candidates) if candidates else None
+
 
 _PERCENTILE = f"{_RSS_PCTL_NUM}/{_RSS_PCTL_DEN}"
 
@@ -481,8 +496,17 @@ def apply_memory_admissions(
     same recorded peaks WITHOUT asking whether a cap was clamping them. Without this mapping,
     every step this module declines to estimate would silently keep that censoring-blind number
     while the report said "keeping the authored hint" — the unsafe estimate surviving under the
-    name of the safe one. So a declined step is RESTORED to its authored baseline: a decline
-    means no learned estimate at all, not a fall-back to the other one.
+    name of the safe one. So a declined step loses that number: a decline means no learned
+    estimate at all, not a fall-back to the other one.
+
+    A decline is nonetheless not amnesia. Where the evidence proves a FLOOR —
+    :meth:`MemoryAdmission.proven_floor_bytes`, the largest peak the step is known to have
+    reached, censored or merely too scarce to fit — the declined step is restored to
+    ``max(authored baseline, that floor)``. Dropping to the authored figure alone would let a
+    step with six runs pinned to a 32 GiB ceiling be modelled at the 1 GiB its author guessed,
+    which is turning the flag on to get a SMALLER number than the evidence proves: the same
+    ratchet in the other direction. So the contract a decline offers is one-sided — it can only
+    raise a step's baseline above what its author wrote, never lower it.
     """
     new_steps: list[Step] = []
     baseline: int | None
@@ -498,7 +522,14 @@ def apply_memory_admissions(
         ):
             baseline = admission.rss_baseline_bytes
         elif authored_baselines is not None and step.tag in authored_baselines:
-            baseline = authored_baselines[step.tag]
+            authored = authored_baselines[step.tag]
+            floor = admission.proven_floor_bytes() if admission is not None else None
+            if floor is None:
+                baseline = authored
+            elif authored is None:
+                baseline = floor
+            else:
+                baseline = max(authored, floor)
         else:
             new_steps.append(step)
             continue

@@ -4243,13 +4243,23 @@ _CENSORED_STORE_CSV = (
 #: what makes this a contract instead of a restatement of whatever they currently do.
 _LEARNED_EXPECTED_BYTES = 2576980377
 
+#: Every step that this store makes the builds DECLINE authors a hint of 17179869184 B, above the
+#: largest peak any of them recorded (8589934592 B for ``g.pinned``, 2147483648 B for the rest).
+#: That is deliberate: a decline keeps the LARGER of the authored hint and the floor the evidence
+#: proves, so authoring above the floor is what makes "keeping the authored hint" the true verdict
+#: for these four and leaves the floor half of the rule to
+#: :func:`_memory_feedback_floor_survives_a_decline`, where it is the only thing under test.
 _CENSORED_DAG = {
     "steps": [
         {"group": "g", "job": "learned", "cmd": "true"},
-        {"group": "g", "job": "pinned", "cmd": "true"},
-        {"group": "g", "job": "throttled", "cmd": "true"},
-        {"group": "g", "job": "failed", "cmd": "true"},
-        {"group": "g", "job": "four", "cmd": "true"},
+        {"group": "g", "job": "pinned", "cmd": "true",
+         "hint": {"rss_baseline_bytes": 17179869184}},
+        {"group": "g", "job": "throttled", "cmd": "true",
+         "hint": {"rss_baseline_bytes": 17179869184}},
+        {"group": "g", "job": "failed", "cmd": "true",
+         "hint": {"rss_baseline_bytes": 17179869184}},
+        {"group": "g", "job": "four", "cmd": "true",
+         "hint": {"rss_baseline_bytes": 17179869184}},
     ],
 }
 
@@ -4331,6 +4341,10 @@ def _memory_feedback_declines_reach_admission(
     decline has to mean the AUTHORED figure reaches admission: 53687091200 B. Both are named
     literally, because a build that reported "keeping the authored hint" while leaving the
     censored estimate in the config would report the first number twice.
+
+    The authored 42949672960 B is deliberately ABOVE the 8589934592 B floor those peaks prove, so
+    the decline really does land on the author's number here. The opposite arrangement is
+    :func:`_memory_feedback_floor_survives_a_decline`.
     """
     store = os.path.join(tmp, "decline-store")
     os.makedirs(store, exist_ok=True)
@@ -4379,6 +4393,80 @@ def _memory_feedback_declines_reach_admission(
         rep.ok("memory-feedback/a-decline-undoes-the-censored-estimate")
 
 
+def _memory_feedback_floor_survives_a_decline(
+    py: list[str], rs: list[str], rep: Report, tmp: str, extra: dict[str, str]
+) -> None:
+    """Prove a decline keeps the FLOOR its censored peaks prove, identically in both builds.
+
+    The other half of the decline contract, and the half that is easy to over-correct into. ONE
+    step whose ten recorded runs were every one of them pinned to the ceiling they were given:
+    nine at 8589934592 B and one at 34359738368 B. The DAG authors 1073741824 B — BELOW what the
+    store proves the step has already used, which is the direction
+    :func:`_memory_feedback_declines_reach_admission` does not cover.
+
+    Without the flag the censoring-blind feedback fits the 9/10 nearest-rank percentile of those
+    peaks — the ninth smallest, 8589934592 B — and admission models 10737418240 B. With the flag
+    the step is DECLINED, because no peak says what it wanted; but one of them says it reached
+    34359738368 B, so that is the floor the decline keeps and admission models 42949672960 B.
+
+    So turning the flag on RAISES the modelled footprint here, which is the only direction a
+    censored sample may move it. Both numbers are named literally: a build that restored the
+    authored figure alone would report a far smaller second number, and a build that added the
+    20% margin to the floor — a floor is a fact about the past, not an estimate of the next run —
+    would report a different one again.
+    """
+    store = os.path.join(tmp, "floor-store")
+    os.makedirs(store, exist_ok=True)
+    csv_name = f"step_profiles_{SYNTH_MACHINE}_{SYNTH_CONTAINER}.csv"
+    with open(os.path.join(store, csv_name), "w", encoding="utf-8") as fh:
+        fh.write(
+            "step,peak_bytes,memory_max_bytes,memory_events_high,memory_events_max,"
+            "memory_events_oom,memory_events_oom_kill\n"
+            + "".join("g.pinned,8589934592,8589934592,0,0,0,0\n" for _ in range(9))
+            + "g.pinned,34359738368,34359738368,0,0,0,0\n"
+        )
+    dag_path = os.path.join(tmp, "floor-dag.json")
+    with open(dag_path, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"steps": [{
+            "group": "g", "job": "pinned", "cmd": "true",
+            "hint": {"rss_baseline_bytes": 1073741824},
+        }]}))
+    args = (
+        "run", "--dag", dag_path, "--perf-dir", store, "--no-profile",
+        "--unsafe-no-cgroups", "-q", "--max-mem", "400G",
+    )
+
+    def footprint(outcome: Outcome) -> str | None:
+        for line in outcome.stderr.splitlines():
+            match = re.search(r"worst-case (\d+) bytes", line)
+            if match:
+                return match.group(1)
+        return None
+
+    off = {"py": run(py, args, extra), "rs": run(rs, args, extra)}
+    on_args = (*args, "--profile-memory-feedback")
+    on = {"py": run(py, on_args, extra), "rs": run(rs, on_args, extra)}
+    seen = {
+        f"{engine}/{state}": footprint(outcome)
+        for state, group in (("off", off), ("on", on))
+        for engine, outcome in group.items()
+    }
+    said = "g.pinned: no estimate; rss_baseline_bytes=34359738368, the proven floor"
+    if (
+        seen != {"py/off": "10737418240", "rs/off": "10737418240",
+                 "py/on": "42949672960", "rs/on": "42949672960"}
+        or any(o.returncode != 0 for o in (*off.values(), *on.values()))
+        or said not in on["py"].stderr
+        or said not in on["rs"].stderr
+    ):
+        rep.bad(
+            "memory-feedback/a-decline-keeps-the-proven-floor",
+            f"footprints={seen!r}\n--- py ---\n{on['py'].stderr}\n--- rs ---\n{on['rs'].stderr}",
+        )
+    else:
+        rep.ok("memory-feedback/a-decline-keeps-the-proven-floor")
+
+
 def compare_memory_feedback(py: list[str], rs: list[str], rep: Report) -> None:
     """Prove the OPT-IN censoring-aware memory feedback agrees across builds, and is really off.
 
@@ -4389,8 +4477,9 @@ def compare_memory_feedback(py: list[str], rs: list[str], rep: Report) -> None:
       default-on reader would be a silent behaviour change for every existing store);
     * with the flag both builds emit BYTE-IDENTICAL decision lines, so the classification, the
       percentile, the margin and the wording are one contract rather than two;
-    * the pinned step keeps its authored hint and the reason names censoring, while the
-      comfortable step gets a LITERALLY NAMED number — proving the two are not treated alike;
+    * the pinned step keeps its authored hint — which it authored ABOVE the floor its peaks
+      prove — and the reason names censoring, while the comfortable step gets a LITERALLY NAMED
+      number, proving the two are not treated alike;
     * the throttled step, whose ``peak_bytes`` and ``memory_max_bytes`` are byte-identical to the
       comfortable one and which differs only in ``memory_events_high``, also keeps its hint;
     * asking for the flag while ``--no-profile-feedback`` disables the reader says so in both
@@ -4507,6 +4596,7 @@ def compare_memory_feedback(py: list[str], rs: list[str], rep: Report) -> None:
 
         _memory_feedback_reaches_admission(py, rs, rep, tmp, extra)
         _memory_feedback_declines_reach_admission(py, rs, rep, tmp, extra)
+        _memory_feedback_floor_survives_a_decline(py, rs, rep, tmp, extra)
 
         inert = (*base, "--profile-memory-feedback", "--no-profile-feedback")
         pi, ri = run(py, inert, extra), run(rs, inert, extra)

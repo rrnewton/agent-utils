@@ -385,8 +385,13 @@ def test_a_declined_step_is_restored_to_the_baseline_its_author_wrote() -> None:
 
 def test_a_step_with_no_authored_baseline_at_all_is_restored_to_none() -> None:
     """The same undo when the author wrote nothing: the plan's learned number must not survive as
-    a hint the author never gave."""
-    rows = [_row("g.pinned", peak=str(8 * GIB), cap=str(8 * GIB)) for _ in range(6)]
+    a hint the author never gave.
+
+    Six UNPROVENANCED rows — a peak but no applied cap — so nothing here is proof of anything,
+    not even a floor. The censoring-BLIND plan feedback still reads their ``peak_bytes`` and
+    learns 8589934592 from them, which is the number that must not survive.
+    """
+    rows = [_row("g.pinned", peak=str(8 * GIB), cap="") for _ in range(6)]
     planned = _step("g.pinned", rss=8 * GIB)
 
     applied = apply_memory_admissions(
@@ -394,6 +399,88 @@ def test_a_step_with_no_authored_baseline_at_all_is_restored_to_none() -> None:
     )
 
     assert applied.steps[0].hint.rss_baseline_bytes is None
+
+
+def test_a_decline_keeps_the_censored_floor_when_it_is_above_the_authored_hint() -> None:
+    """A decline says "we do not know the peak", never "we know nothing".
+
+    Six runs pinned to a 34359738368 B ceiling prove demand was AT LEAST that, whatever the
+    true maximum is. The author guessed 1073741824 B. Restoring that guess would use the flag
+    to model the step at a thirty-second of its proven demand — the ratchet this path exists to
+    prevent, running the other way. The declined baseline is the floor, named literally, with
+    NO margin: a floor is a fact about the past, not an estimate of the next run.
+    """
+    rows = [_row("g.pinned", peak="34359738368", cap="34359738368") for _ in range(6)]
+    admissions = memory_admission_from_rows(rows)
+    assert admissions["g.pinned"].source == "hint"
+    assert admissions["g.pinned"].proven_floor_bytes() == 34359738368
+    planned = _step("g.pinned", rss=34359738368)
+
+    applied = apply_memory_admissions(_cfg(planned), admissions, {"g.pinned": 1073741824})
+
+    assert applied.steps[0].hint.rss_baseline_bytes == 34359738368
+
+
+def test_a_decline_keeps_sub_threshold_uncensored_evidence_as_a_floor() -> None:
+    """Four comfortable samples are too thin to fit a distribution to, and still happened.
+
+    Under a 68719476736 B cap, four uncensored peaks of 34359738368 B do not reach the
+    five-sample threshold, so no estimate is made. They are nonetheless proof that the step has
+    already used 34359738368 B, which the author's 1073741824 B guess does not cover.
+    """
+    rows = [_row("g.scarce", peak="34359738368", cap="68719476736") for _ in range(4)]
+    admissions = memory_admission_from_rows(rows)
+    assert admissions["g.scarce"].source == "hint"
+    assert admissions["g.scarce"].censored_floor_bytes is None
+    assert admissions["g.scarce"].proven_floor_bytes() == 34359738368
+
+    applied = apply_memory_admissions(
+        _cfg(_step("g.scarce", rss=99)), admissions, {"g.scarce": 1073741824}
+    )
+
+    assert applied.steps[0].hint.rss_baseline_bytes == 34359738368
+
+
+def test_a_decline_never_lowers_a_baseline_the_author_already_set_high_enough() -> None:
+    """The floor only ever raises. An author who wrote more than the evidence proves keeps it."""
+    rows = [_row("g.pinned", peak=str(8 * GIB), cap=str(8 * GIB)) for _ in range(6)]
+
+    applied = apply_memory_admissions(
+        _cfg(_step("g.pinned", rss=8 * GIB)),
+        memory_admission_from_rows(rows),
+        {"g.pinned": 42949672960},
+    )
+
+    assert applied.steps[0].hint.rss_baseline_bytes == 42949672960
+
+
+def test_a_step_with_no_authored_baseline_still_takes_the_floor_its_peaks_prove() -> None:
+    """No authored hint is not a reason to forget a 8589934592 B peak the step really reached."""
+    rows = [_row("g.pinned", peak=str(8 * GIB), cap=str(8 * GIB)) for _ in range(6)]
+
+    applied = apply_memory_admissions(
+        _cfg(_step("g.pinned", rss=8 * GIB)),
+        memory_admission_from_rows(rows),
+        {"g.pinned": None},
+    )
+
+    assert applied.steps[0].hint.rss_baseline_bytes == 8589934592
+
+
+def test_the_proven_floor_is_the_larger_of_the_censored_and_uncensored_peaks() -> None:
+    """Both kinds of peak are lower bounds, so the floor is whichever of them is bigger."""
+    censored_wins = memory_admission_from_rows(
+        [_row(peak=str(2 * GIB)) for _ in range(4)]
+        + [_row(peak=str(8 * GIB), cap=str(8 * GIB))]
+    )["g.build"]
+    uncensored_wins = memory_admission_from_rows(
+        [_row(peak=str(6 * GIB)) for _ in range(4)]
+        + [_row(peak=str(2 * GIB), cap=str(2 * GIB))]
+    )["g.build"]
+
+    assert censored_wins.proven_floor_bytes() == 8589934592
+    assert uncensored_wins.proven_floor_bytes() == 6442450944
+    assert memory_admission_from_rows([_row(cap="")])["g.build"].proven_floor_bytes() is None
 
 
 def test_a_skipped_step_is_left_alone_even_when_the_authored_baseline_is_known() -> None:
@@ -500,7 +587,11 @@ def _run_cli(args: list[str], env: dict[str, str]) -> tuple[int, str, str]:
 
 
 def test_the_flag_is_off_by_default_and_reports_every_decision_when_on(tmp_path: Path) -> None:
-    """The report must name the steps that did NOT move, or silence reads as agreement."""
+    """The report must name the steps that did NOT move, or silence reads as agreement.
+
+    ``g.pinned`` authors 42949672960 B, comfortably above the 8589934592 B its censored peaks
+    prove, so the decline really does leave it where its author put it and the line says so.
+    """
     machine, container = "synthhost", "affinity4_cpu-max-max"
     store = tmp_path / "store"
     store.mkdir()
@@ -511,7 +602,8 @@ def test_the_flag_is_off_by_default_and_reports_every_decision_when_on(tmp_path:
     dag.write_text(
         '{"steps": ['
         '{"group": "g", "job": "learned", "cmd": "true", "deps": []},'
-        '{"group": "g", "job": "pinned", "cmd": "true", "deps": []}]}',
+        '{"group": "g", "job": "pinned", "cmd": "true", "deps": [],'
+        ' "hint": {"rss_baseline_bytes": 42949672960}}]}',
         encoding="utf-8",
     )
     env = {
@@ -616,6 +708,56 @@ def test_a_censored_peak_cannot_reach_max_mem_admission_once_the_flag_is_on(
     assert "worst-case 10737418240 bytes" in off_err, off_err
     assert "g.pinned: keeping the authored hint" in on_err, on_err
     assert "worst-case 53687091200 bytes" in on_err, on_err
+
+
+def test_a_proven_floor_reaches_max_mem_admission_even_though_the_step_is_declined(
+    tmp_path: Path,
+) -> None:
+    """Turning the flag ON must never model a step BELOW what its own history proves it used.
+
+    One step, ten recorded runs, every one of them pinned to the ceiling it was given: nine at
+    8589934592 B and one at 34359738368 B. The DAG authors 1073741824 B.
+
+    * Without the flag the censoring-blind feedback fits the 9/10 percentile of those peaks —
+      the ninth smallest, 8589934592 B — and ``--max-mem`` models 10737418240 B.
+    * With the flag the step is DECLINED, because every peak is censored and none of them says
+      what the step actually wanted. But one of them says the step reached 34359738368 B, so
+      that is the floor the decline keeps, and admission models 42949672960 B.
+
+    The flag therefore RAISES the modelled footprint here, which is the direction a censored
+    sample is allowed to move it. Restoring the authored 1073741824 B instead — throwing the
+    floor away with the estimate — makes the second number far smaller than the first, and both
+    are named literally so that cannot pass.
+    """
+    machine, container = "synthhost", "affinity4_cpu-max-max"
+    store = tmp_path / "store"
+    store.mkdir()
+    rows = [_row("g.pinned", peak="8589934592", cap="8589934592") for _ in range(9)]
+    rows.append(_row("g.pinned", peak="34359738368", cap="34359738368"))
+    _write_store(store, machine, container, rows)
+    dag = tmp_path / "dag.json"
+    dag.write_text(
+        '{"steps": [{"group": "g", "job": "pinned", "cmd": "true", "deps": [],'
+        ' "hint": {"rss_baseline_bytes": 1073741824}}]}',
+        encoding="utf-8",
+    )
+    env = {
+        "SAFE_CI_DAG_RUNNER_MACHINE_ID": machine,
+        "SAFE_CI_DAG_RUNNER_CONTAINER_CLASS": container,
+    }
+    common = ["run", "--dag", str(dag), "--perf-dir", str(store), "--no-profile",
+              "--unsafe-no-cgroups", "-q", "--max-mem", "400G"]
+
+    off_rc, _o1, off_err = _run_cli(common, env)
+    on_rc, _o2, on_err = _run_cli([*common, "--profile-memory-feedback"], env)
+
+    assert off_rc == 0, off_err
+    assert on_rc == 0, on_err
+    assert "worst-case 10737418240 bytes" in off_err, off_err
+    assert (
+        "g.pinned: no estimate; rss_baseline_bytes=34359738368, the proven floor" in on_err
+    ), on_err
+    assert "worst-case 42949672960 bytes" in on_err, on_err
 
 
 def test_asking_for_memory_feedback_with_reading_disabled_says_it_is_inert(

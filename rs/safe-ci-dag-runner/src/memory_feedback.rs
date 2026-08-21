@@ -16,8 +16,11 @@
 //!   ancestor-scope OOM kill looks like from inside this reader.
 //! * A sample whose censoring cannot be determined (no applied-cap column, no event counters, no
 //!   peak) is not evidence at all. It is counted and reported, and never moves the estimate.
-//! * With no uncensored evidence the static hint is retained, and the reason says how the evidence
-//!   fell short.
+//! * With no uncensored evidence no estimate is made, and the reason says how the evidence fell
+//!   short. That is a decline, not amnesia: the largest peak the step is proven to have reached
+//!   still applies as a floor, so a declined step is modelled at the LARGER of its authored hint
+//!   and that floor. "We do not know the peak" and "we know the peak is at least X" are different
+//!   states and must not collapse into "we know nothing".
 //! * `hard_mem_max_bytes` is never touched. An explicit hard cap is an instruction, not a guess.
 //!
 //! The columns read here are the ones the writer records per step; see
@@ -282,6 +285,21 @@ impl MemoryAdmission {
     pub fn censoring_excluded_samples(&self) -> bool {
         self.censored_samples > 0
     }
+
+    /// The largest peak this step is PROVEN to have reached, however it was classified.
+    ///
+    /// A censored peak under-states demand, so it may never be read as the maximum — but the
+    /// step really did allocate that much, so it is a valid minimum. So is an uncensored peak
+    /// that never reached the sample threshold: too thin to fit a distribution to, still a thing
+    /// that happened. "We do not know the peak" and "we know the peak is at least X" are
+    /// different states, and this is the second one; `None` is the first.
+    pub fn proven_floor_bytes(&self) -> Option<i64> {
+        [self.censored_floor_bytes, self.observed_peak_bytes]
+            .into_iter()
+            .flatten()
+            .filter(|bytes| *bytes > 0)
+            .max()
+    }
 }
 
 /// Aggregate profile `rows` into one [`MemoryAdmission`] per step.
@@ -490,8 +508,17 @@ pub fn load_memory_admissions(
 /// from the same recorded peaks WITHOUT asking whether a cap was clamping them. Without this
 /// mapping, every step this module declines to estimate would silently keep that censoring-blind
 /// number while the report said "keeping the authored hint" — the unsafe estimate surviving under
-/// the name of the safe one. So a declined step is RESTORED to its authored baseline: a decline
-/// means no learned estimate at all, not a fall-back to the other one.
+/// the name of the safe one. So a declined step loses that number: a decline means no learned
+/// estimate at all, not a fall-back to the other one.
+///
+/// A decline is nonetheless not amnesia. Where the evidence proves a FLOOR —
+/// [`MemoryAdmission::proven_floor_bytes`], the largest peak the step is known to have reached,
+/// censored or merely too scarce to fit — the declined step is restored to
+/// `max(authored baseline, that floor)`. Dropping to the authored figure alone would let a step
+/// with six runs pinned to a 32 GiB ceiling be modelled at the 1 GiB its author guessed, which is
+/// turning the flag on to get a SMALLER number than the evidence proves: the same ratchet in the
+/// other direction. So the contract a decline offers is one-sided — it can only raise a step's
+/// baseline above what its author wrote, never lower it.
 pub fn apply_memory_admissions(
     cfg: &DagConfig,
     admissions: &BTreeMap<String, MemoryAdmission>,
@@ -505,7 +532,8 @@ pub fn apply_memory_admissions(
                 return step.clone();
             }
             let tag = step.tag();
-            let learned = admissions.get(&tag).and_then(|admission| {
+            let admission = admissions.get(&tag);
+            let learned = admission.and_then(|admission| {
                 if admission.source == "profile" {
                     admission.rss_baseline_bytes
                 } else {
@@ -515,7 +543,13 @@ pub fn apply_memory_admissions(
             let baseline = match learned {
                 Some(bytes) => Some(bytes),
                 None => match authored_baselines.and_then(|m| m.get(&tag)) {
-                    Some(authored) => *authored,
+                    Some(authored) => {
+                        match (*authored, admission.and_then(|a| a.proven_floor_bytes())) {
+                            (authored, None) => authored,
+                            (None, Some(floor)) => Some(floor),
+                            (Some(authored), Some(floor)) => Some(authored.max(floor)),
+                        }
+                    }
                     None => return step.clone(),
                 },
             };
@@ -535,10 +569,25 @@ pub fn apply_memory_admissions(
 /// Every step the store knows about gets one, including the ones that did NOT move, because
 /// "the cap did not change" and "the store had nothing usable to say" are otherwise
 /// indistinguishable from the outside.
-pub fn memory_admission_line(prog: &str, admission: &MemoryAdmission) -> String {
+///
+/// `authored` is the baseline the step's author wrote, which is what makes the decline half of
+/// this line specific: a decline that nevertheless raises the step to a proven floor says so and
+/// names the number, because "keeping the authored hint" would be as untrue there as it was when
+/// the censoring-blind estimate was silently left in place.
+pub fn memory_admission_line(
+    prog: &str,
+    admission: &MemoryAdmission,
+    authored: Option<i64>,
+) -> String {
+    let floor = admission.proven_floor_bytes();
     let verdict = match admission.rss_baseline_bytes {
         Some(bytes) if admission.source == "profile" => format!("rss_baseline_bytes={bytes}"),
-        _ => "keeping the authored hint".to_string(),
+        _ => match floor {
+            Some(floor) if floor > authored.unwrap_or(0) => {
+                format!("no estimate; rss_baseline_bytes={floor}, the proven floor")
+            }
+            _ => "keeping the authored hint".to_string(),
+        },
     };
     format!(
         "{prog}: --profile-memory-feedback: {}: {verdict} [{} uncensored, {} censored, \
@@ -1065,9 +1114,18 @@ mod tests {
     #[test]
     fn a_step_with_no_authored_baseline_at_all_is_restored_to_none() {
         // The same undo when the author wrote nothing: the plan's learned number must not survive
-        // as a hint the author never gave.
+        // as a hint the author never gave. Six UNPROVENANCED rows — a peak but no applied cap —
+        // so nothing here is proof of anything, not even a floor. The censoring-BLIND plan
+        // feedback still reads their `peak_bytes` and learns 8589934592 from them, which is the
+        // number that must not survive.
         let rows: Vec<_> = (0..6)
-            .map(|_| row(&[("step", "g.pinned"), ("peak_bytes", "8589934592")]))
+            .map(|_| {
+                row(&[
+                    ("step", "g.pinned"),
+                    ("peak_bytes", "8589934592"),
+                    ("memory_max_bytes", ""),
+                ])
+            })
             .collect();
         let admissions = memory_admission_from_rows(
             &rows,
@@ -1086,6 +1144,164 @@ mod tests {
     }
 
     #[test]
+    fn a_decline_keeps_the_censored_floor_when_it_is_above_the_authored_hint() {
+        // A decline says "we do not know the peak", never "we know nothing". Six runs pinned to a
+        // 34359738368 B ceiling prove demand was AT LEAST that. The author guessed 1073741824 B.
+        // Restoring that guess would use the flag to model the step at a thirty-second of its
+        // proven demand — the ratchet this path exists to prevent, running the other way. The
+        // declined baseline is the floor, with NO margin: a floor is a fact about the past.
+        let rows: Vec<_> = (0..6)
+            .map(|_| {
+                row(&[
+                    ("step", "g.pinned"),
+                    ("peak_bytes", "34359738368"),
+                    ("memory_max_bytes", "34359738368"),
+                ])
+            })
+            .collect();
+        let admissions = memory_admission_from_rows(
+            &rows,
+            DEFAULT_MIN_UNCENSORED_SAMPLES,
+            DEFAULT_MARGIN_PCT,
+            None,
+        );
+        assert_eq!(admissions["g.pinned"].source, "hint");
+        assert_eq!(
+            admissions["g.pinned"].proven_floor_bytes(),
+            Some(34359738368)
+        );
+        let mut planned = mk("pinned");
+        planned.hint.rss_baseline_bytes = Some(34359738368);
+        let authored: BTreeMap<String, Option<i64>> = [("g.pinned".to_string(), Some(1073741824))]
+            .into_iter()
+            .collect();
+
+        let applied = apply_memory_admissions(&cfg_of(vec![planned]), &admissions, Some(&authored));
+
+        assert_eq!(
+            applied.steps[0].hint.rss_baseline_bytes,
+            Some(34359738368),
+            "a decline must keep the floor its censored peaks prove"
+        );
+    }
+
+    #[test]
+    fn a_decline_keeps_sub_threshold_uncensored_evidence_as_a_floor() {
+        // Four comfortable samples are too thin to fit a distribution to, and still happened.
+        // Under a 68719476736 B cap they do not reach the five-sample threshold, so no estimate
+        // is made — but they prove the step has already used 34359738368 B, which the author's
+        // 1073741824 B guess does not cover.
+        let rows: Vec<_> = (0..4)
+            .map(|_| {
+                row(&[
+                    ("step", "g.scarce"),
+                    ("peak_bytes", "34359738368"),
+                    ("memory_max_bytes", "68719476736"),
+                ])
+            })
+            .collect();
+        let admissions = memory_admission_from_rows(
+            &rows,
+            DEFAULT_MIN_UNCENSORED_SAMPLES,
+            DEFAULT_MARGIN_PCT,
+            None,
+        );
+        assert_eq!(admissions["g.scarce"].source, "hint");
+        assert_eq!(admissions["g.scarce"].censored_floor_bytes, None);
+        assert_eq!(
+            admissions["g.scarce"].proven_floor_bytes(),
+            Some(34359738368)
+        );
+        let mut planned = mk("scarce");
+        planned.hint.rss_baseline_bytes = Some(99);
+        let authored: BTreeMap<String, Option<i64>> = [("g.scarce".to_string(), Some(1073741824))]
+            .into_iter()
+            .collect();
+
+        let applied = apply_memory_admissions(&cfg_of(vec![planned]), &admissions, Some(&authored));
+
+        assert_eq!(applied.steps[0].hint.rss_baseline_bytes, Some(34359738368));
+    }
+
+    #[test]
+    fn a_decline_never_lowers_a_baseline_the_author_already_set_high_enough() {
+        // The floor only ever raises. An author who wrote more than the evidence proves keeps it.
+        let rows: Vec<_> = (0..6)
+            .map(|_| row(&[("step", "g.pinned"), ("peak_bytes", "8589934592")]))
+            .collect();
+        let admissions = memory_admission_from_rows(
+            &rows,
+            DEFAULT_MIN_UNCENSORED_SAMPLES,
+            DEFAULT_MARGIN_PCT,
+            None,
+        );
+        let mut planned = mk("pinned");
+        planned.hint.rss_baseline_bytes = Some(8589934592);
+        let authored: BTreeMap<String, Option<i64>> = [("g.pinned".to_string(), Some(42949672960))]
+            .into_iter()
+            .collect();
+
+        let applied = apply_memory_admissions(&cfg_of(vec![planned]), &admissions, Some(&authored));
+
+        assert_eq!(applied.steps[0].hint.rss_baseline_bytes, Some(42949672960));
+    }
+
+    #[test]
+    fn a_step_with_no_authored_baseline_still_takes_the_floor_its_peaks_prove() {
+        // No authored hint is not a reason to forget a 8589934592 B peak the step really reached.
+        let rows: Vec<_> = (0..6)
+            .map(|_| row(&[("step", "g.pinned"), ("peak_bytes", "8589934592")]))
+            .collect();
+        let admissions = memory_admission_from_rows(
+            &rows,
+            DEFAULT_MIN_UNCENSORED_SAMPLES,
+            DEFAULT_MARGIN_PCT,
+            None,
+        );
+        let mut planned = mk("pinned");
+        planned.hint.rss_baseline_bytes = Some(8589934592);
+        let authored: BTreeMap<String, Option<i64>> =
+            [("g.pinned".to_string(), None)].into_iter().collect();
+
+        let applied = apply_memory_admissions(&cfg_of(vec![planned]), &admissions, Some(&authored));
+
+        assert_eq!(applied.steps[0].hint.rss_baseline_bytes, Some(8589934592));
+    }
+
+    #[test]
+    fn the_proven_floor_is_the_larger_of_the_censored_and_uncensored_peaks() {
+        // Both kinds of peak are lower bounds, so the floor is whichever of them is bigger.
+        let mut censored_rows: Vec<_> = (0..4)
+            .map(|_| row(&[("peak_bytes", "2147483648")]))
+            .collect();
+        censored_rows.push(row(&[
+            ("peak_bytes", "8589934592"),
+            ("memory_max_bytes", "8589934592"),
+        ]));
+        let mut uncensored_rows: Vec<_> = (0..4)
+            .map(|_| row(&[("peak_bytes", "6442450944")]))
+            .collect();
+        uncensored_rows.push(row(&[
+            ("peak_bytes", "2147483648"),
+            ("memory_max_bytes", "2147483648"),
+        ]));
+        let unprovenanced = vec![row(&[("memory_max_bytes", "")])];
+        let floor = |rows: &[HashMap<String, String>]| {
+            memory_admission_from_rows(
+                rows,
+                DEFAULT_MIN_UNCENSORED_SAMPLES,
+                DEFAULT_MARGIN_PCT,
+                None,
+            )["g.build"]
+                .proven_floor_bytes()
+        };
+
+        assert_eq!(floor(&censored_rows), Some(8589934592));
+        assert_eq!(floor(&uncensored_rows), Some(6442450944));
+        assert_eq!(floor(&unprovenanced), None);
+    }
+
+    #[test]
     fn a_skipped_step_is_left_alone_even_when_the_authored_baseline_is_known() {
         // A skip is not a licence to rewrite authored hints in either direction.
         let mut planned = mk("pinned");
@@ -1099,6 +1315,40 @@ mod tests {
             apply_memory_admissions(&cfg_of(vec![planned]), &BTreeMap::new(), Some(&authored));
 
         assert_eq!(applied.steps[0].hint.rss_baseline_bytes, Some(8589934592));
+    }
+
+    #[test]
+    fn the_decision_line_says_when_a_decline_still_raised_the_baseline() {
+        // "keeping the authored hint" would be as untrue on a raised step as it was when the
+        // censoring-blind estimate was silently left in place. The two verdicts are named here
+        // as whole literal strings, because the cross-language differential compares this text
+        // byte for byte and a paraphrase in one engine is a divergence in the other.
+        let rows: Vec<_> = (0..6)
+            .map(|_| row(&[("step", "g.pinned"), ("peak_bytes", "8589934592")]))
+            .collect();
+        let admission = &memory_admission_from_rows(
+            &rows,
+            DEFAULT_MIN_UNCENSORED_SAMPLES,
+            DEFAULT_MARGIN_PCT,
+            None,
+        )["g.pinned"];
+
+        let raised = memory_admission_line("scdr", admission, Some(1073741824));
+        let kept = memory_admission_line("scdr", admission, Some(42949672960));
+
+        assert!(
+            raised.starts_with(
+                "scdr: --profile-memory-feedback: g.pinned: no estimate; \
+                 rss_baseline_bytes=8589934592, the proven floor ["
+            ),
+            "{raised}"
+        );
+        assert!(
+            kept.starts_with(
+                "scdr: --profile-memory-feedback: g.pinned: keeping the authored hint ["
+            ),
+            "{kept}"
+        );
     }
 
     #[test]

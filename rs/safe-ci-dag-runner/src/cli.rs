@@ -1590,8 +1590,9 @@ fn validate_planner(value: String) -> Result<String, String> {
 //
 // `cfg` is the config the ordinary plan has ALREADY been applied to and `authored` is the same
 // config before that, which is what lets a decline mean "no learned estimate" rather than "fall
-// back to the censoring-blind one": every step this path does not estimate is restored to the
-// baseline its author wrote.
+// back to the censoring-blind one": every step this path does not estimate drops that number for
+// the LARGER of the baseline its author wrote and the peak the store proves it has already
+// reached, so the unsafe estimate goes without the censored evidence going with it.
 //
 // `--no-profile-feedback` turns the store reader off entirely, which makes this flag a no-op.
 // That combination is legal but empty, and it is announced rather than obeyed in silence: a
@@ -1637,7 +1638,10 @@ fn apply_memory_feedback(
     let tags: std::collections::BTreeSet<String> = cfg.steps.iter().map(|s| s.tag()).collect();
     for tag in &tags {
         if let Some(admission) = admissions.get(tag) {
-            eprintln!("{}", memory_admission_line(PROG, admission));
+            eprintln!(
+                "{}",
+                memory_admission_line(PROG, admission, baselines.get(tag).copied().flatten())
+            );
         }
     }
     apply_memory_admissions(cfg, &admissions, Some(&baselines))
