@@ -14,7 +14,7 @@ import sys
 import threading
 import time
 import traceback
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import replace
 from enum import Enum
 from typing import overload
@@ -25,12 +25,14 @@ from safe_ci_dag_runner.ambient import (
     capture_ambient_snapshot,
 )
 from safe_ci_dag_runner.attribution import (
+    CAPTURE_TRUNCATION_NOTICE,
     LOG_DIR_ENV,
     NO_LOGS_ENV,
     Culprit,
     RunEvidence,
     StepStream,
     bind_process_tests,
+    capture_max_bytes,
     default_log_dir,
     process_snapshot,
     sanitize as sanitize_evidence_tag,
@@ -91,6 +93,15 @@ _POST_TIMEOUT_WAIT_S = 10.0
 
 #: Brief join timeout for the daemon reader/monitor threads at step end (seconds).
 _THREAD_JOIN_S = 2.0
+
+#: Largest console line the ``-vv`` live stream will hold back waiting for a newline.
+#:
+#: The live-stream buffer is drained only when it CONTAINS a newline, so output with no newline
+#: in it grows without limit. This is deliberately a fixed display bound rather than another
+#: environment knob: it decides how a line is broken on a console, never what is retained, and
+#: the durable log and the in-memory capture are both unaffected by it. MUST match
+#: ``STREAM_LINE_MAX_BYTES`` in ``rs/safe-ci-dag-runner/src/scheduler.rs``.
+_STREAM_LINE_MAX_BYTES = 1024 * 1024
 
 
 class BudgetUnit(Enum):
@@ -1183,7 +1194,7 @@ class Runner:
                     ("cmd", run_cmd),
                 ],
             )
-        captured: list[bytes] = []
+        captured = _BoundedCapture(capture_max_bytes())
 
         def _pump() -> None:
             # A step may spawn grandchildren (servers, browsers) that outlive it and hold the
@@ -1198,7 +1209,7 @@ class Runner:
                 # directly so an unterminated libtest start marker is journaled while the test is
                 # still running, rather than only after teardown closes the pipe.
                 while raw := os.read(stdout.fileno(), 8192):
-                    captured.append(raw)
+                    captured.feed(raw)
                     sink.ingest(raw)
                     if stream:
                         pending.extend(raw)
@@ -1209,6 +1220,18 @@ class Runner:
                             self._emit(
                                 f"[{step.tag}] "
                                 + line.decode(errors="replace").rstrip("\n")
+                            )
+                        # THE SECOND UNBOUNDED BUFFER. `pending` is drained only while it CONTAINS
+                        # a newline, so newline-free output grows it without limit -- on exactly
+                        # the path that streams a runaway to a human. Bounding the capture alone
+                        # would have left this hole open. Flush the oversized prefix as its own
+                        # console line: a console line is a display artifact, and splitting one is
+                        # a far smaller cost than holding an unbounded one in memory.
+                        while len(pending) >= _STREAM_LINE_MAX_BYTES:
+                            forced = bytes(pending[:_STREAM_LINE_MAX_BYTES])
+                            del pending[:_STREAM_LINE_MAX_BYTES]
+                            self._emit(
+                                f"[{step.tag}] " + forced.decode(errors="replace")
                             )
                 if stream and pending:
                     self._emit(
@@ -1353,7 +1376,7 @@ class Runner:
         dur = round(elapsed)
         returncode = proc.returncode
         ok = returncode == 0 and not timed_out and not cpu_timed_out
-        summary = _last_line(captured)
+        summary = captured.last_line()
         culprit: Culprit | None = (
             termination_culprit or sink.culprit()
             if timed_out or cpu_timed_out
@@ -1507,9 +1530,18 @@ class Runner:
                     "inner cgroup pids.max (PID-exhaustion / fork-bomb containment). The process "
                     "was contained, not kernel-killed; the cpu/wall guard reaps it."
                 )
-            # Self-contained failure: dump the captured child output, tagged.
+            # Self-contained failure: dump the captured child output, tagged. The dump is a TAIL
+            # (see :class:`_BoundedCapture`), so when anything was dropped it says so IN BAND and
+            # in numbers, rather than presenting a partial dump as if it were the whole output.
             self._emit(f"[{step.tag}] ----- detail -----")
-            for line in b"".join(captured).decode(errors="replace").splitlines():
+            if captured.dropped:
+                self._emit(
+                    f"[{step.tag}] "
+                    + CAPTURE_TRUNCATION_NOTICE.format(
+                        total=captured.total, kept=captured.kept
+                    )
+                )
+            for line in captured.iter_lines():
                 self._emit(f"[{step.tag}] {line}")
             self._emit(f"[{step.tag}] ----- end detail -----")
 
@@ -1819,13 +1851,129 @@ def run_dag_limited(
     return result
 
 
-def _last_line(chunks: Sequence[bytes]) -> str:
-    """Best-effort one-line summary: the last non-empty decoded line of captured output."""
-    for raw in reversed(chunks):
-        text = raw.decode(errors="replace").strip()
-        if text:
-            return text
-    return ""
+class _BoundedCapture:
+    """The last ``limit`` bytes of a step's output, in a buffer that never grows past ``limit``.
+
+    WHAT THIS REPLACES, and why the shape matters. The capture used to be a ``list[bytes]`` with
+    one unconditional append per 8 KiB read, so a step held its ENTIRE output in the runner's RSS
+    for the step's whole lifetime, and the failure path's ``b"".join(...)`` doubled that peak at
+    exactly the wrong moment. A runaway step OOM-killed the RUNNER — taking the run's verdict, its
+    profile rows and its evidence with it — before it could fill the disk that
+    :data:`~safe_ci_dag_runner.attribution.DEFAULT_LOG_MAX_BYTES` was protecting.
+
+    A PREALLOCATED RING, not a deque of chunks and not a growable ``bytearray``, and that is a
+    measured choice rather than a stylistic one:
+
+    * a deque of chunks bounded by total bytes still holds whole chunks, so its peak depends on
+      the step's write sizes rather than on the ceiling, and the join to serve the tail costs the
+      whole content again;
+    * ``bytearray.__iadd__`` keeps amortised growth headroom, so a bytearray trimmed to the
+      ceiling still peaks meaningfully above it;
+    * a ring allocated once at exactly ``limit`` bytes has a steady-state cost of exactly
+      ``limit``, independent of both the step's output size and its chunk sizes. The only
+      transient above that is the single tail copy a failure dump needs, giving ``2L + O(1)``.
+
+    ``limit=None`` means unlimited and is the explicit opt-out, not a fallback.
+    """
+
+    __slots__ = ("_buf", "_limit", "_pos", "_wrapped", "total")
+
+    def __init__(self, limit: int | None) -> None:
+        self._limit = limit
+        self._buf = bytearray() if limit is None else bytearray(limit)
+        self._pos = 0
+        self._wrapped = False
+        #: EVERY byte the step produced, including the ones dropped. Kept because "you are seeing
+        #: a tail" is only actionable next to how much tail there was.
+        self.total = 0
+
+    def feed(self, chunk: bytes) -> None:
+        """Absorb one read, in O(len(chunk)) and with no allocation proportional to ``total``."""
+        self.total += len(chunk)
+        limit = self._limit
+        if limit is None:
+            self._buf.extend(chunk)
+            return
+        if limit == 0:
+            return
+        if len(chunk) >= limit:
+            # This read alone overruns the ring: only its own tail can survive, so write that
+            # and reset the cursor rather than walking the ring len(chunk) times.
+            self._buf[:] = chunk[len(chunk) - limit :]
+            self._pos = 0
+            self._wrapped = True
+            return
+        head = limit - self._pos
+        if len(chunk) <= head:
+            self._buf[self._pos : self._pos + len(chunk)] = chunk
+            self._pos += len(chunk)
+            if self._pos == limit:
+                self._pos = 0
+                self._wrapped = True
+        else:
+            self._buf[self._pos :] = chunk[:head]
+            rest = len(chunk) - head
+            self._buf[:rest] = chunk[head:]
+            self._pos = rest
+            self._wrapped = True
+
+    @property
+    def dropped(self) -> bool:
+        """True when output was discarded, i.e. what remains is a TAIL and not the whole thing."""
+        return self.kept < self.total
+
+    @property
+    def kept(self) -> int:
+        """How many bytes the ring is currently holding."""
+        if self._limit is None:
+            return len(self._buf)
+        return self._limit if self._wrapped else self._pos
+
+    def tail(self) -> bytes:
+        """The retained bytes, oldest first. The ONE allocation proportional to the ceiling."""
+        if self._limit is None:
+            return bytes(self._buf)
+        if not self._wrapped:
+            return bytes(self._buf[: self._pos])
+        return bytes(self._buf[self._pos :]) + bytes(self._buf[: self._pos])
+
+    def last_line(self) -> str:
+        """Best-effort one-line summary: the last non-empty line of the retained output.
+
+        A step whose output exceeded the ceiling still has its last line, because the ring keeps
+        the TAIL — which is exactly why a tail is the right thing to keep.
+        """
+        buf = self.tail()
+        end = len(buf)
+        while end > 0:
+            start = buf.rfind(b"\n", 0, end)
+            text = buf[start + 1 : end].decode(errors="replace").strip()
+            if text:
+                return text
+            if start < 0:
+                break
+            end = start
+        return ""
+
+    def iter_lines(self) -> Iterator[str]:
+        """Decode the retained bytes into lines INCREMENTALLY, one line at a time.
+
+        ``b"".join(chunks).decode().splitlines()`` materialised the whole decoded text AND a list
+        object per line on top of the capture that was already in memory — for the same input,
+        several times the size of the thing being bounded. Bounding the capture and then blowing
+        the budget rendering it would have moved the peak rather than removed it. Yielding keeps
+        the transient at one line.
+        """
+        buf = self.tail()
+        start = 0
+        length = len(buf)
+        while start < length:
+            end = buf.find(b"\n", start)
+            if end == -1:
+                yield buf[start:].decode(errors="replace")
+                return
+            yield buf[start:end].decode(errors="replace").rstrip("\r")
+            start = end + 1
 
 
 def _fmt_bytes(n: int | None) -> str:

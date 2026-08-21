@@ -1631,6 +1631,92 @@ def compare_step_log_ceiling(py: list[str], rs: list[str], rep: Report) -> None:
             rep.ok(label)
 
 
+def compare_capture_ceiling(py: list[str], rs: list[str], rep: Report) -> None:
+    """The IN-MEMORY capture ceiling drops the same bytes and says so identically in both engines.
+
+    This is the check the archived work could not have: the property is a MEMORY property, so
+    nothing about a normal run reveals it. Its one observable consequence is the failure dump --
+    which tail survived, and the notice that says how much did not -- so that is what is compared,
+    byte for byte, on a step whose output is far past the ceiling.
+
+    Without this pairing, bounding one engine's capture and not the other's creates a divergence
+    that no existing check can see: both runs still pass, both still print a dump, and only the
+    engine that OOMs under a real runaway tells you which one was fixed.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        dag_path = os.path.join(tmp, "capture-ceiling.json")
+        Path(dag_path).write_text(
+            json.dumps(
+                {
+                    "steps": [
+                        {
+                            "group": "flood",
+                            "job": "stdout",
+                            # Far past the 300-byte ceiling set below, emitted in many writes so
+                            # the cut lands mid-stream, and FAILING so the dump is printed.
+                            "cmd": "for i in $(seq 1 200); do echo \"line$i\"; done; exit 3",
+                            "timeout": 30,
+                            "cpu_timeout": 600,
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        args = (
+            "run", "--dag", dag_path, "-s", "1", "-j", "1",
+            NOPROF, NOFB, "--unsafe-no-cgroups",
+        )
+        outs = {
+            name: run(
+                cmd,
+                args,
+                {
+                    "SAFE_CI_DAG_RUNNER_NO_STEP_LOGS": "1",
+                    "SAFE_CI_DAG_RUNNER_CAPTURE_MAX_BYTES": "300",
+                },
+            )
+            for name, cmd in (("py", py), ("rs", rs))
+        }
+        label = "attribution:capture-ceiling"
+        if outs["py"].returncode != outs["rs"].returncode:
+            rep.bad(label, f"exit py={outs['py'].returncode} rs={outs['rs'].returncode}")
+            return
+
+        def detail(text: str) -> list[str]:
+            lines = text.splitlines()
+            try:
+                start = next(
+                    i for i, line in enumerate(lines) if line.endswith("----- detail -----")
+                )
+                end = next(
+                    i for i, line in enumerate(lines) if line.endswith("----- end detail -----")
+                )
+            except StopIteration:
+                return []
+            return lines[start + 1 : end]
+
+        dumps = {name: detail(out.stdout) for name, out in outs.items()}
+        notice = (
+            "[safe-ci-dag-runner] EARLIER OUTPUT DROPPED: this step produced 1492 bytes but "
+            "only the last 300 were kept in memory (raise or lift the ceiling with "
+            "SAFE_CI_DAG_RUNNER_CAPTURE_MAX_BYTES; 0 = unlimited). The durable per-step log is "
+            "unaffected and still has the rest."
+        )
+        if dumps["py"] != dumps["rs"]:
+            rep.bad(label, f"detail py={dumps['py']!r} rs={dumps['rs']!r}")
+        elif not dumps["py"]:
+            rep.bad(label, "neither engine printed a failure detail block")
+        elif dumps["py"][0] != f"[flood.stdout] {notice}":
+            rep.bad(label, f"notice line was {dumps['py'][0]!r}")
+        elif "[flood.stdout] line200" not in dumps["py"]:
+            rep.bad(label, "the TAIL of the output was not retained")
+        elif any(line == "[flood.stdout] line1" for line in dumps["py"]):
+            rep.bad(label, "the ceiling did not bite: the head of the output survived")
+        else:
+            rep.ok(label)
+
+
 def compare_batch_teardown_grace(py: list[str], rs: list[str], rep: Report) -> None:
     """Eager cancellation grants one diagnostic window, not one window per sibling.
 
@@ -4649,6 +4735,7 @@ def compare_safe_ci_dag_runner(rand_count: int, seed: int) -> int:
     compare_term_attribution(py, rs, rep)
     compare_test_attribution_evidence(py, rs, rep)
     compare_step_log_ceiling(py, rs, rep)
+    compare_capture_ceiling(py, rs, rep)
     compare_batch_teardown_grace(py, rs, rep)
     compare_run_timeout(py, rs, rep)
     compare_spawn_failure(py, rs, rep)

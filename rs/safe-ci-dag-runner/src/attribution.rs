@@ -98,6 +98,60 @@ pub fn log_max_bytes() -> Option<u64> {
     }
 }
 
+/// Environment variable overriding the per-step IN-MEMORY capture ceiling (0 = unlimited).
+pub const CAPTURE_MAX_BYTES_ENV: &str = "SAFE_CI_DAG_RUNNER_CAPTURE_MAX_BYTES";
+
+/// Default per-step in-memory capture ceiling: 4 MiB of the step's output TAIL.
+///
+/// WHY A SECOND CEILING. [`DEFAULT_LOG_MAX_BYTES`] bounds the copy on DISK. It says nothing about
+/// the copy the runner holds in its OWN address space for the whole life of the step, and that is
+/// the copy that kills the runner first: a step whose output runs away is held entirely in RSS,
+/// and the failure path then joins it into one contiguous buffer, doubling the peak at exactly
+/// the worst moment. A multi-terabyte runaway OOMs the runner -- taking the run's verdict, its
+/// profile rows and its evidence with it -- long before it fills the device the disk ceiling
+/// protects.
+///
+/// WHY A TAIL, AND WHY THIS SIZE. Everything the in-memory capture feeds is a tail: the one-line
+/// summary and the failure dump a human actually reads. 4 MiB is far more tail than anyone reads
+/// and still bounds the whole-step peak at twice that plus a constant. The durable log is
+/// unaffected and remains the place to go for the complete output.
+pub const DEFAULT_CAPTURE_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// Exact notice prepended to a failure dump whose in-memory capture dropped earlier output.
+// MAINTENANCE, deliberately not rustdoc: this crate ships a second engine whose output is
+// compared against this one byte-for-byte by the differential harness. Keep both in step.
+pub fn capture_truncation_notice(total: u64, kept: usize) -> String {
+    format!(
+        "[safe-ci-dag-runner] EARLIER OUTPUT DROPPED: this step produced {total} bytes but only \
+         the last {kept} were kept in memory (raise or lift the ceiling with \
+         SAFE_CI_DAG_RUNNER_CAPTURE_MAX_BYTES; 0 = unlimited). The durable per-step log is \
+         unaffected and still has the rest."
+    )
+}
+
+/// The configured per-step in-memory capture ceiling in bytes, or `None` for unlimited.
+///
+/// Same posture as [`log_max_bytes`]: an unparseable value is REPORTED and then treated as the
+/// default, because a misread ceiling that quietly becomes "unlimited" is precisely the failure
+/// the ceiling exists to prevent.
+pub fn capture_max_bytes() -> Option<usize> {
+    match std::env::var(CAPTURE_MAX_BYTES_ENV) {
+        Err(_) => Some(DEFAULT_CAPTURE_MAX_BYTES),
+        Ok(raw) if raw.trim().is_empty() => Some(DEFAULT_CAPTURE_MAX_BYTES),
+        Ok(raw) => match raw.trim().parse::<usize>() {
+            Ok(0) => None,
+            Ok(n) => Some(n),
+            Err(_) => {
+                eprintln!(
+                    "[safe-ci-dag-runner] WARNING: {CAPTURE_MAX_BYTES_ENV}={raw:?} is not a \
+                     non-negative integer; using the {DEFAULT_CAPTURE_MAX_BYTES}-byte default."
+                );
+                Some(DEFAULT_CAPTURE_MAX_BYTES)
+            }
+        },
+    }
+}
+
 /// Environment variable carrying the per-step ownership nonce (see `scheduler::kill_by_nonce`).
 pub const STEP_NONCE_ENV: &str = "SAFE_CI_DAG_RUNNER_STEP";
 const MAX_COMPONENT_BYTES: usize = 255;

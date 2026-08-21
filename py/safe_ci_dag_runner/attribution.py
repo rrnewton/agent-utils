@@ -45,6 +45,59 @@ TRUNCATION_MARKER = (
 )
 
 
+CAPTURE_MAX_BYTES_ENV = "SAFE_CI_DAG_RUNNER_CAPTURE_MAX_BYTES"
+
+# Default per-step IN-MEMORY capture ceiling: 4 MiB of the step's output TAIL.
+#
+# WHY A SECOND CEILING. :data:`DEFAULT_LOG_MAX_BYTES` bounds the copy on DISK. It says nothing
+# about the copy the runner holds in its own address space for the whole life of the step, and
+# that one is the copy that kills the runner first: a step whose output runs away is held
+# entirely in RSS, and the failure path then joins it into one contiguous buffer, doubling the
+# peak at exactly the worst moment. A multi-terabyte runaway OOMs the runner long before it
+# fills the device the disk ceiling is protecting.
+#
+# WHY A TAIL, AND WHY THIS SIZE. Everything the in-memory capture feeds is a tail: the one-line
+# summary, and the failure dump a human actually reads. 4 MiB is far more of a tail than any
+# human reads and still bounds the whole-step peak at 2x that plus a constant. The DURABLE log
+# is unaffected and remains the place to go for the complete output.
+DEFAULT_CAPTURE_MAX_BYTES = 4 * 1024 * 1024
+
+# Exact notice prepended to a failure dump whose in-memory capture dropped earlier output.
+#
+# PARITY: the Rust and Python engines are compared byte-for-byte by the differential harness,
+# so this must stay identical in both. It takes (total_bytes, kept_bytes).
+CAPTURE_TRUNCATION_NOTICE = (
+    "[safe-ci-dag-runner] EARLIER OUTPUT DROPPED: this step produced {total} bytes but only "
+    "the last {kept} were kept in memory (raise or lift the ceiling with "
+    "SAFE_CI_DAG_RUNNER_CAPTURE_MAX_BYTES; 0 = unlimited). The durable per-step log is "
+    "unaffected and still has the rest."
+)
+
+
+def capture_max_bytes() -> int | None:
+    """The per-step in-memory capture ceiling in bytes, or ``None`` for unlimited.
+
+    Same posture as :func:`log_max_bytes`: an unparseable value is REPORTED and then treated as
+    the default, because a misread ceiling that quietly becomes "unlimited" is precisely the
+    failure the ceiling exists to prevent.
+    """
+    raw = os.environ.get(CAPTURE_MAX_BYTES_ENV)
+    if raw is None or not raw.strip():
+        return DEFAULT_CAPTURE_MAX_BYTES
+    try:
+        value = int(raw.strip())
+        if value < 0:
+            raise ValueError(raw)
+    except ValueError:
+        print(
+            f"[safe-ci-dag-runner] WARNING: {CAPTURE_MAX_BYTES_ENV}={raw!r} is not a "
+            f"non-negative integer; using the {DEFAULT_CAPTURE_MAX_BYTES}-byte default.",
+            file=sys.stderr,
+        )
+        return DEFAULT_CAPTURE_MAX_BYTES
+    return None if value == 0 else value
+
+
 def log_max_bytes() -> int | None:
     """Return the per-step durable-log ceiling in bytes, or ``None`` for unlimited.
 

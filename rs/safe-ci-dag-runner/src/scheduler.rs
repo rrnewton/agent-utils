@@ -39,8 +39,9 @@ use std::time::{Duration, Instant};
 
 use crate::ambient::{capture_ambient_snapshot, PsiReading};
 use crate::attribution::{
-    bind_process_tests, default_log_dir, mint_step_nonce, process_snapshot, recognize, Culprit,
-    RunEvidence, StepStream, TestEvent, STEP_NONCE_ENV,
+    bind_process_tests, capture_max_bytes, capture_truncation_notice, default_log_dir,
+    mint_step_nonce, process_snapshot, recognize, Culprit, RunEvidence, StepStream, TestEvent,
+    STEP_NONCE_ENV,
 };
 use crate::cgroup::CgroupManager;
 use crate::model::{
@@ -1433,7 +1434,7 @@ impl ConsoleTestIdentity {
 
 fn spawn_reader<R: Read + Send + 'static>(
     reader: R,
-    buf: Arc<Mutex<Vec<u8>>>,
+    buf: Arc<Mutex<BoundedCapture>>,
     tag: String,
     verbosity: i64,
     sink: Arc<StepStream>,
@@ -1448,7 +1449,9 @@ fn spawn_reader<R: Read + Send + 'static>(
                 Ok(0) => break,
                 Ok(n) => {
                     let bytes = &chunk[..n];
-                    buf.lock().unwrap().extend_from_slice(bytes);
+                    buf.lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .feed(bytes);
                     sink.ingest(bytes);
                     if verbosity >= 2 {
                         // Console streaming stays line-at-a-time: hold back the unterminated tail
@@ -1462,6 +1465,25 @@ fn spawn_reader<R: Read + Send + 'static>(
                                 let decorated = console_identity
                                     .lock()
                                     .map(|mut c| c.decorate(&tag, text))
+                                    .unwrap_or_else(|_| format!("[{tag}][test={tag}] {text}"));
+                                emit(&decorated);
+                            } else {
+                                emit(&format!("[{tag}] {text}"));
+                            }
+                        }
+                        // THE SECOND UNBOUNDED BUFFER. `pending` is drained only while it
+                        // CONTAINS a newline, so newline-free output grows it without limit -- on
+                        // exactly the path that streams a runaway to a human. Bounding the
+                        // capture alone would have left this hole open. Flush the oversized
+                        // prefix as its own console line: a console line is a display artifact,
+                        // and splitting one costs far less than holding an unbounded one.
+                        while pending.len() >= STREAM_LINE_MAX_BYTES {
+                            let forced: Vec<u8> = pending.drain(..STREAM_LINE_MAX_BYTES).collect();
+                            let text = String::from_utf8_lossy(&forced);
+                            if verbosity >= 5 {
+                                let decorated = console_identity
+                                    .lock()
+                                    .map(|mut c| c.decorate(&tag, &text))
                                     .unwrap_or_else(|_| format!("[{tag}][test={tag}] {text}"));
                                 emit(&decorated);
                             } else {
@@ -1487,6 +1509,121 @@ fn spawn_reader<R: Read + Send + 'static>(
             }
         }
     })
+}
+
+/// Largest console line the `-vv` live stream will hold back waiting for a newline.
+///
+/// The live-stream buffer is drained only when it CONTAINS a newline, so output with no newline
+/// in it grows without limit. This is deliberately a fixed display bound rather than another
+/// environment knob: it decides how a line is broken on a console, never what is retained, and
+/// both the durable log and the in-memory capture are unaffected by it. MUST match
+/// `_STREAM_LINE_MAX_BYTES` in `py/safe_ci_dag_runner/scheduler.py`.
+const STREAM_LINE_MAX_BYTES: usize = 1024 * 1024;
+
+/// The last `limit` bytes of one output stream, in a buffer that never grows past `limit`.
+///
+/// WHAT THIS REPLACES, and why the shape matters. The capture used to be a `Vec<u8>` extended
+/// once per 8 KiB read, so a step held its ENTIRE output in the runner's RSS for the step's whole
+/// lifetime, and the failure path concatenated stdout and stderr into a third copy on top. A
+/// runaway step OOM-killed the RUNNER -- taking the run's verdict, its profile rows and its
+/// evidence with it -- before it could fill the disk that [`DEFAULT_LOG_MAX_BYTES`] protects.
+///
+/// A PREALLOCATED RING, not a queue of chunks and not a `Vec` truncated after the fact: a ring
+/// allocated once at exactly `limit` bytes costs exactly `limit` in steady state, independent of
+/// both the step's total output and its write sizes, and the only transient above that is the
+/// single ordered copy a failure dump needs.
+///
+/// `limit == None` means unlimited and is the explicit opt-out, not a fallback.
+struct BoundedCapture {
+    buf: Vec<u8>,
+    limit: Option<usize>,
+    pos: usize,
+    wrapped: bool,
+    /// EVERY byte the stream produced, including the dropped ones. Kept because "you are seeing a
+    /// tail" is only actionable next to how much tail there was.
+    total: u64,
+}
+
+impl BoundedCapture {
+    fn new(limit: Option<usize>) -> Self {
+        BoundedCapture {
+            buf: match limit {
+                Some(n) => vec![0u8; n],
+                None => Vec::new(),
+            },
+            limit,
+            pos: 0,
+            wrapped: false,
+            total: 0,
+        }
+    }
+
+    fn feed(&mut self, chunk: &[u8]) {
+        self.total += chunk.len() as u64;
+        let Some(limit) = self.limit else {
+            self.buf.extend_from_slice(chunk);
+            return;
+        };
+        if limit == 0 {
+            return;
+        }
+        if chunk.len() >= limit {
+            // This read alone overruns the ring: only its own tail can survive, so write that and
+            // reset the cursor rather than walking the ring `chunk.len()` times.
+            self.buf.copy_from_slice(&chunk[chunk.len() - limit..]);
+            self.pos = 0;
+            self.wrapped = true;
+            return;
+        }
+        let head = limit - self.pos;
+        if chunk.len() <= head {
+            self.buf[self.pos..self.pos + chunk.len()].copy_from_slice(chunk);
+            self.pos += chunk.len();
+            if self.pos == limit {
+                self.pos = 0;
+                self.wrapped = true;
+            }
+        } else {
+            self.buf[self.pos..].copy_from_slice(&chunk[..head]);
+            let rest = chunk.len() - head;
+            self.buf[..rest].copy_from_slice(&chunk[head..]);
+            self.pos = rest;
+            self.wrapped = true;
+        }
+    }
+
+    /// How many bytes the ring is currently holding.
+    fn kept(&self) -> usize {
+        match self.limit {
+            None => self.buf.len(),
+            Some(limit) => {
+                if self.wrapped {
+                    limit
+                } else {
+                    self.pos
+                }
+            }
+        }
+    }
+
+    /// True when output was discarded, i.e. what remains is a TAIL and not the whole thing.
+    fn dropped(&self) -> bool {
+        (self.kept() as u64) < self.total
+    }
+
+    /// The retained bytes, oldest first. The ONE allocation proportional to the ceiling.
+    fn tail(&self) -> Vec<u8> {
+        match self.limit {
+            None => self.buf.clone(),
+            Some(_) if !self.wrapped => self.buf[..self.pos].to_vec(),
+            Some(_) => {
+                let mut out = Vec::with_capacity(self.kept());
+                out.extend_from_slice(&self.buf[self.pos..]);
+                out.extend_from_slice(&self.buf[..self.pos]);
+                out
+            }
+        }
+    }
 }
 
 fn failure_detail_lines(tag: &str, streams: &[&[u8]], verbosity: i64) -> Vec<String> {
@@ -2023,8 +2160,12 @@ fn run_step(ctx: StepCtx) {
         );
     }
 
-    let out_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-    let err_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+    // ONE ceiling per stream, read once per step so an operator override applies uniformly to
+    // both. The two are separate rings rather than one shared ring because stdout and stderr are
+    // independent pipes whose failure dumps must not borrow each other's test boundaries.
+    let capture_ceiling = capture_max_bytes();
+    let out_buf = Arc::new(Mutex::new(BoundedCapture::new(capture_ceiling)));
+    let err_buf = Arc::new(Mutex::new(BoundedCapture::new(capture_ceiling)));
     let mut readers = Vec::new();
     if let Some(out) = child.stdout.take() {
         readers.push(spawn_reader(
@@ -2350,8 +2491,18 @@ fn run_step(ctx: StepCtx) {
     let ok = returncode == Some(0) && !timed_out && !cpu_timed_out;
 
     // Combined captured output (stdout then stderr) for the summary + failure detail.
-    let stdout = out_buf.lock().unwrap().clone();
-    let stderr = err_buf.lock().unwrap().clone();
+    let (stdout, stdout_total, stdout_dropped) = {
+        let cap = out_buf
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (cap.tail(), cap.total, cap.dropped())
+    };
+    let (stderr, stderr_total, stderr_dropped) = {
+        let cap = err_buf
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (cap.tail(), cap.total, cap.dropped())
+    };
     let mut combined: Vec<u8> = stdout.clone();
     combined.extend_from_slice(&stderr);
     let summary = last_line(&combined);
@@ -2519,6 +2670,19 @@ fn run_step(ctx: StepCtx) {
             ));
         }
         emit(&format!("[{tag}] ----- detail -----"));
+        // The dump is a TAIL (see `BoundedCapture`), so when anything was dropped it says so IN
+        // BAND and in numbers, rather than presenting a partial dump as the whole output.
+        for (dropped, total, kept) in [
+            (stdout_dropped, stdout_total, stdout.len()),
+            (stderr_dropped, stderr_total, stderr.len()),
+        ] {
+            if dropped {
+                emit(&format!(
+                    "[{tag}] {}",
+                    capture_truncation_notice(total, kept)
+                ));
+            }
+        }
         for line in failure_detail_lines(&tag, &[&stdout, &stderr], verbosity) {
             emit(&line);
         }
@@ -4489,6 +4653,109 @@ mod tests {
         assert!(
             sh.failed,
             "lock_shared must hand back the state as it stands rather than panicking again"
+        );
+    }
+
+    // ---- #81 runner-capture-memory-bound -------------------------------------------------
+    //
+    // The disk ceiling stops a runaway step filling the device; it does nothing about the copy
+    // the runner holds in its OWN address space, and that is the copy that kills the runner
+    // first, taking the run's verdict and evidence with it.
+
+    #[test]
+    fn the_ring_never_allocates_more_than_its_ceiling_however_much_is_fed() {
+        // The allocation, not merely the retained length, is the property: the previous `Vec<u8>`
+        // capture grew with the step's output, so 16 MiB of output cost 16 MiB of live memory.
+        let limit = 64 * 1024;
+        let mut cap = BoundedCapture::new(Some(limit));
+        let chunk = vec![b'x'; 8192];
+        for _ in 0..2048 {
+            // 16 MiB, 256 times the ceiling.
+            cap.feed(&chunk);
+        }
+        assert_eq!(cap.total, 2048 * 8192);
+        assert_eq!(cap.kept(), limit);
+        assert_eq!(
+            cap.buf.len(),
+            limit,
+            "the ring must be exactly its ceiling, however much was fed through it"
+        );
+        assert_eq!(
+            cap.buf.capacity(),
+            limit,
+            "and must never have reallocated above it"
+        );
+    }
+
+    #[test]
+    fn the_ring_keeps_the_tail_and_reports_how_much_it_dropped() {
+        let mut cap = BoundedCapture::new(Some(10));
+        cap.feed(b"0123456789abcdef");
+        assert_eq!(cap.tail(), b"6789abcdef", "the TAIL is what a dump needs");
+        assert_eq!(cap.kept(), 10);
+        assert_eq!(cap.total, 16);
+        assert!(cap.dropped());
+    }
+
+    #[test]
+    fn the_ring_is_byte_exact_across_a_wrap() {
+        // Wrap-around is where a ring silently corrupts; pin the exact bytes, not just the length.
+        let mut cap = BoundedCapture::new(Some(8));
+        for chunk in [b"abc".as_slice(), b"de".as_slice(), b"fghij".as_slice()] {
+            cap.feed(chunk);
+        }
+        assert_eq!(cap.tail(), b"cdefghij");
+        assert_eq!(cap.total, 10);
+
+        // A single read LARGER than the whole ring must also leave exactly its own tail.
+        let mut big = BoundedCapture::new(Some(4));
+        big.feed(b"0123456789");
+        assert_eq!(big.tail(), b"6789");
+        assert_eq!(big.total, 10);
+    }
+
+    #[test]
+    fn an_unwrapped_ring_is_exactly_what_was_fed() {
+        // Below the ceiling nothing is a tail: the capture must be lossless and say so.
+        let mut cap = BoundedCapture::new(Some(1024));
+        cap.feed(b"first\n");
+        cap.feed(b"second\n");
+        assert_eq!(cap.tail(), b"first\nsecond\n");
+        assert!(!cap.dropped());
+        assert_eq!(cap.kept(), 13);
+        assert_eq!(last_line(&cap.tail()), "second");
+    }
+
+    #[test]
+    fn the_last_line_survives_a_step_that_overran_the_ceiling() {
+        // Keeping the TAIL is what makes the one-line summary work on a runaway step.
+        let mut cap = BoundedCapture::new(Some(32));
+        for _ in 0..4 {
+            cap.feed(b"early noise that will be dropped\n");
+        }
+        cap.feed(b"the real verdict\n");
+        assert_eq!(last_line(&cap.tail()), "the real verdict");
+    }
+
+    #[test]
+    fn an_unlimited_capture_is_an_explicit_opt_out_not_a_fallback() {
+        let mut cap = BoundedCapture::new(None);
+        cap.feed(&vec![b'a'; 5000]);
+        assert_eq!(cap.kept(), 5000);
+        assert!(!cap.dropped());
+    }
+
+    #[test]
+    fn the_capture_truncation_notice_is_identical_to_the_python_engines() {
+        // Byte-for-byte with `CAPTURE_TRUNCATION_NOTICE` in py/safe_ci_dag_runner/attribution.py.
+        // The two editions' output is compared by the differential harness, so a drift here is a
+        // real failure and not a cosmetic one.
+        assert_eq!(
+            capture_truncation_notice(1234, 300),
+            "[safe-ci-dag-runner] EARLIER OUTPUT DROPPED: this step produced 1234 bytes but only \
+             the last 300 were kept in memory (raise or lift the ceiling with \
+             SAFE_CI_DAG_RUNNER_CAPTURE_MAX_BYTES; 0 = unlimited). The durable per-step log is \
+             unaffected and still has the rest."
         );
     }
 }
