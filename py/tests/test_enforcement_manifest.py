@@ -1,42 +1,104 @@
-"""#79 derived-enforcement-manifest: the manifest and the guards move together.
+"""The manifest is derived from the guards that implement it, PER LANE.
 
-The ``capabilities`` manifest used to be a hand-typed JSON literal with nothing tying it to
-the code that enforces the guards it advertises, so it could claim enforcement that was not
-happening. It is now generated from
+Two defects met here, and the fix is one mechanism.
+
+#79 derived-enforcement-manifest: the ``capabilities`` manifest used to be a hand-typed JSON
+literal with nothing tying it to the code that enforces the guards it advertises, so it could
+claim enforcement that was not happening. It is now generated from
 :data:`safe_ci_dag_runner.capabilities.ENFORCEMENT_REGISTRY`, and five of its nine keys are
 consulted by :func:`safe_ci_dag_runner.capabilities.is_enforced` at the guard site itself.
 
-These tests pin exactly that. The manifest test writes the published bytes out LITERALLY --
-re-deriving them from the registry would pass no matter what the registry said. The
-behaviour tests flip one flag and assert BOTH the advertisement and the observed guard move.
+#75 cpu-timeout-unboxed-fallback: that literal was also one flat object asserting
+``"cpu_timeout":true``, and that sentence is true only under cgroup boxing. On an uncontained
+lane -- ``--allow-cgroup-failure``, ``--unsafe-no-cgroups``, or a library call with no manager
+-- the CPU guard reads ``cpu.stat`` zero times, so a step may burn unbounded CPU against a
+declared budget, exit 0, and be reported green while the manifest says the budget was enforced.
+
+So each registry entry carries one flag PER LANE, ``is_enforced`` takes the lane the run is on,
+and the manifest publishes both columns. What is pinned here:
+
+* the published bytes, written out LITERALLY -- re-deriving them from the registry would pass no
+  matter what the registry said, and a test parametrised over the constant it protects asserts
+  nothing;
+* each lane's table, likewise written out by hand;
+* the behaviour: flip one flag and BOTH the advertisement and the observed guard move, on each
+  lane independently; and
+* an uncontained run says out loud which guard it is not running, so the degradation is legible
+  at the console and not only in a manifest nobody printed.
 """
 
 from __future__ import annotations
 
+import dataclasses
+import json
 import subprocess
 from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
 
+from safe_ci_dag_runner import DagConfig, Step, run_dag
 from safe_ci_dag_runner.capabilities import (
     ENFORCEMENT_REGISTRY,
+    Lane,
     enforcement_manifest,
     is_enforced,
     registry_override,
 )
 from safe_ci_dag_runner.cgroup import Cgroups, NoopCgroups
-from safe_ci_dag_runner.model import DagConfig, ResourceHint, Step
-from safe_ci_dag_runner.scheduler import run_dag_limited
+from safe_ci_dag_runner.model import ResourceHint
+from safe_ci_dag_runner.scheduler import run_dag_limited, uncontained_cpu_budget_warning
 
 #: The exact bytes the `capabilities` subcommand promises, and which the Rust engine must
 #: print too. Deliberately a literal: a test that rebuilt this from ENFORCEMENT_REGISTRY
 #: would pin nothing, because it would agree with any registry at all.
 PUBLISHED_MANIFEST = (
-    '{"cpu_affinity":true,"cpu_bandwidth":true,"cpu_timeout":true,"memory_max":true,'
-    '"oom_detection":true,"pids_guard":false,"run_timeout":true,"wall_timeout":true,'
-    '"write_domains":true}'
+    '{"contained":{"cpu_affinity":true,"cpu_bandwidth":true,"cpu_timeout":true,'
+    '"memory_max":true,"oom_detection":true,"pids_guard":false,"run_timeout":true,'
+    '"wall_timeout":true,"write_domains":true},'
+    '"uncontained":{"cpu_affinity":false,"cpu_bandwidth":false,"cpu_timeout":false,'
+    '"memory_max":false,"oom_detection":false,"pids_guard":false,"run_timeout":true,'
+    '"wall_timeout":true,"write_domains":true}}'
 )
+
+#: What each guard is worth on each lane, written out by hand. Duplicating the production table
+#: is the point: this file is the second opinion, so it may not import the first one.
+_CONTAINED = {
+    "cpu_affinity": True,
+    "cpu_bandwidth": True,
+    "cpu_timeout": True,
+    "memory_max": True,
+    "oom_detection": True,
+    "pids_guard": False,
+    "run_timeout": True,
+    "wall_timeout": True,
+    "write_domains": True,
+}
+_UNCONTAINED = {
+    # `--cores` REFUSES on this lane rather than degrading, so the guard is not in force here.
+    "cpu_affinity": False,
+    "cpu_bandwidth": False,
+    # THE BUG THIS FILE EXISTS FOR: no cgroup, no cpu.stat, no CPU-time enforcement.
+    "cpu_timeout": False,
+    "memory_max": False,
+    "oom_detection": False,
+    "pids_guard": False,
+    # Scheduler-side wall bounds and a pre-execution declaration check: no cgroup needed.
+    "run_timeout": True,
+    "wall_timeout": True,
+    "write_domains": True,
+}
+
+
+def _manifest() -> dict[str, dict[str, bool]]:
+    parsed = json.loads(enforcement_manifest())
+    assert isinstance(parsed, dict)
+    return parsed
+
+
+# --------------------------------------------------------------------------------------------
+# What is published
+# --------------------------------------------------------------------------------------------
 
 
 def test_manifest_is_exactly_the_published_bytes() -> None:
@@ -54,6 +116,45 @@ def test_capabilities_subcommand_prints_the_derived_manifest() -> None:
     assert out == PUBLISHED_MANIFEST + "\n"
 
 
+def test_the_manifest_declares_both_lanes_and_nothing_else() -> None:
+    assert sorted(_manifest()) == ["contained", "uncontained"]
+
+
+def test_the_contained_lane_matches_the_hand_written_table() -> None:
+    assert _manifest()["contained"] == _CONTAINED
+
+
+def test_the_uncontained_lane_matches_the_hand_written_table() -> None:
+    assert _manifest()["uncontained"] == _UNCONTAINED
+
+
+def test_the_uncontained_lane_does_not_claim_the_cgroup_guards() -> None:
+    # Named one at a time so a regression says WHICH claim came back.
+    uncontained = _manifest()["uncontained"]
+    assert uncontained["cpu_timeout"] is False
+    assert uncontained["memory_max"] is False
+    assert uncontained["oom_detection"] is False
+    assert uncontained["cpu_bandwidth"] is False
+    assert uncontained["cpu_affinity"] is False
+
+
+def test_both_lanes_carry_the_same_sorted_key_set() -> None:
+    # A reader diffs the two columns, so a key present in one and absent from the other would
+    # read as "not applicable" when it means "nobody wrote it down".
+    manifest = _manifest()
+    keys = sorted(_CONTAINED)
+    assert list(manifest["contained"]) == keys
+    assert list(manifest["uncontained"]) == keys
+
+
+def test_the_manifest_is_compact_json_with_no_incidental_whitespace() -> None:
+    # The Rust twin derives its own manifest and `make cross` holds the two byte-identical; a
+    # stray space here is a cross-language failure, so catch it in-engine first.
+    assert enforcement_manifest() == json.dumps(
+        _manifest(), separators=(",", ":"), sort_keys=True
+    )
+
+
 def test_every_registry_summary_says_something() -> None:
     # The summaries are the only prose left describing each guard; an empty one would make
     # the registry strictly less informative than the comment block it replaced.
@@ -63,20 +164,46 @@ def test_every_registry_summary_says_something() -> None:
     assert keys == sorted(keys), "registry order should read as the manifest does"
 
 
+def test_every_published_flag_is_what_a_guard_site_would_be_told() -> None:
+    # The manifest is DERIVED, so the thing worth pinning is that the derivation agrees with the
+    # answer each guard site gets. Both tables above are literals, so this is not circular.
+    for lane, table in ((Lane.CONTAINED, _CONTAINED), (Lane.UNCONTAINED, _UNCONTAINED)):
+        for key, want in table.items():
+            assert is_enforced(key, lane) is want, (
+                f"{lane.value}.{key}: the manifest and the guard site disagree"
+            )
+
+
 def test_a_misspelled_guard_site_raises_instead_of_reading_as_unenforced() -> None:
     # The quiet reading -- "unknown, so False" -- would silently disable the guard whose
     # name was typo'd, which is the failure this module exists to prevent.
     with pytest.raises(KeyError, match="unknown enforcement capability 'cpu_timout'"):
-        is_enforced("cpu_timout")
+        is_enforced("cpu_timout", Lane.CONTAINED)
 
 
 def test_registry_override_moves_the_manifest_and_restores_it() -> None:
     with registry_override("memory_max", False):
-        assert '"memory_max":false' in enforcement_manifest()
+        assert '"memory_max":true' not in enforcement_manifest()
     assert enforcement_manifest() == PUBLISHED_MANIFEST
     with pytest.raises(KeyError):
         with registry_override("no_such_guard", False):
             pass
+
+
+def test_a_single_lane_override_leaves_the_other_lane_alone() -> None:
+    # A bracket that moved both columns could not prove the lane argument is honoured.
+    with registry_override("wall_timeout", False, lane=Lane.UNCONTAINED):
+        assert is_enforced("wall_timeout", Lane.CONTAINED) is True
+        assert is_enforced("wall_timeout", Lane.UNCONTAINED) is False
+        manifest = _manifest()
+        assert manifest["contained"]["wall_timeout"] is True
+        assert manifest["uncontained"]["wall_timeout"] is False
+    assert enforcement_manifest() == PUBLISHED_MANIFEST
+
+
+# --------------------------------------------------------------------------------------------
+# The guards follow the flags
+# --------------------------------------------------------------------------------------------
 
 
 def _boxed_scope(root: Path) -> Cgroups:
@@ -100,11 +227,13 @@ def test_inner_memory_cap_follows_the_memory_max_capability_flag(tmp_path: Path)
 
     cg.prepare_command("g.j", "true", mem_max=4096)
     assert applied.read_text() == "4096"
-    assert '"memory_max":true' in enforcement_manifest()
+    assert _manifest()["contained"]["memory_max"] is True
 
     applied.unlink()
     with registry_override("memory_max", False):
-        assert '"memory_max":false' in enforcement_manifest()
+        # Read the CONTAINED column by name: the uncontained one already says false, so a bare
+        # substring search for `"memory_max":false` would hold whatever the bracket did.
+        assert _manifest()["contained"]["memory_max"] is False
         cg.prepare_command("g.j", "true", mem_max=4096)
     assert not applied.exists(), (
         "memory.max was written even though the registry says memory_max is unenforced"
@@ -112,7 +241,7 @@ def test_inner_memory_cap_follows_the_memory_max_capability_flag(tmp_path: Path)
 
 
 def test_pids_ceiling_follows_the_pids_guard_capability_flag(tmp_path: Path) -> None:
-    """``pids_guard`` is declared FALSE, and that declaration is now real.
+    """``pids_guard`` is declared FALSE on both lanes, and that declaration is now real.
 
     Before this change the manifest said "no PID ceiling" while ``prepare_command`` would
     happily write ``pids.max`` for any caller that set the limit. Nothing in the runner does,
@@ -129,7 +258,7 @@ def test_pids_ceiling_follows_the_pids_guard_capability_flag(tmp_path: Path) -> 
     )
 
     with registry_override("pids_guard", True):
-        assert '"pids_guard":true' in enforcement_manifest()
+        assert _manifest()["contained"]["pids_guard"] is True
         cg.prepare_command("g.j", "true")
     assert applied.read_text() == "64"
 
@@ -154,13 +283,13 @@ def _one_step_dag(cmd: str, *, timeout: int, cpu_timeout: int = 0) -> DagConfig:
 def test_per_step_wall_ceiling_follows_the_wall_timeout_capability_flag() -> None:
     cfg = _one_step_dag("sleep 2", timeout=1)
 
-    assert '"wall_timeout":true' in enforcement_manifest()
+    assert _manifest()["contained"]["wall_timeout"] is True
     enforced = run_dag_limited(cfg, max_steps=1, max_cpus=1, verbosity=0)
     assert not enforced.ok, "a 2s step under a 1s wall ceiling must be cut"
     assert "TIMEOUT >1s" in enforced.outcomes[0].reason
 
     with registry_override("wall_timeout", False):
-        assert '"wall_timeout":false' in enforcement_manifest()
+        assert '"wall_timeout":true' not in enforcement_manifest()
         unenforced = run_dag_limited(cfg, max_steps=1, max_cpus=1, verbosity=0)
     assert unenforced.ok, (
         "with wall_timeout declared unenforced the step must be allowed to finish; it was "
@@ -180,14 +309,14 @@ class _OomingCgroups(NoopCgroups):
 def test_oom_attribution_follows_the_oom_detection_capability_flag() -> None:
     cfg = _one_step_dag("exit 1", timeout=30)
 
-    assert '"oom_detection":true' in enforcement_manifest()
+    assert _manifest()["contained"]["oom_detection"] is True
     enforced = run_dag_limited(
         cfg, max_steps=1, max_cpus=1, cgroups=_OomingCgroups(), verbosity=0
     )
     assert "OOM-KILLED" in enforced.outcomes[0].reason
 
     with registry_override("oom_detection", False):
-        assert '"oom_detection":false' in enforcement_manifest()
+        assert _manifest()["contained"]["oom_detection"] is False
         unenforced = run_dag_limited(
             cfg, max_steps=1, max_cpus=1, cgroups=_OomingCgroups(), verbosity=0
         )
@@ -206,11 +335,22 @@ class _BurningCgroups(NoopCgroups):
         return {"usage_usec": 10_000_000, "user_usec": 10_000_000, "system_usec": 0}
 
 
+class _UnboxedBurningCgroups(_BurningCgroups):
+    """The same readings on the UNCONTAINED lane, which is the lane #75 is about.
+
+    A real uncontained run has no counter at all, so this manager is deliberately more
+    generous than reality: it hands the monitor a live over-budget reading and dares it to
+    act on one. Nothing may reap, because the lane advertises no CPU-time guard.
+    """
+
+    enabled = False
+
+
 def test_cpu_budget_reaping_follows_the_cpu_timeout_capability_flag() -> None:
     # Wall timeout is generous: the only thing that can cut this step is the CPU-time guard.
     cfg = _one_step_dag("sleep 4", timeout=60, cpu_timeout=1)
 
-    assert '"cpu_timeout":true' in enforcement_manifest()
+    assert _manifest()["contained"]["cpu_timeout"] is True
     enforced = run_dag_limited(
         cfg, max_steps=1, max_cpus=1, cgroups=_BurningCgroups(), verbosity=0
     )
@@ -218,7 +358,7 @@ def test_cpu_budget_reaping_follows_the_cpu_timeout_capability_flag() -> None:
     assert "CPU-TIMEOUT" in enforced.outcomes[0].reason
 
     with registry_override("cpu_timeout", False):
-        assert '"cpu_timeout":false' in enforcement_manifest()
+        assert '"cpu_timeout":true' not in enforcement_manifest()
         unenforced = run_dag_limited(
             cfg, max_steps=1, max_cpus=1, cgroups=_BurningCgroups(), verbosity=0
         )
@@ -226,3 +366,104 @@ def test_cpu_budget_reaping_follows_the_cpu_timeout_capability_flag() -> None:
         "the step was still reaped over its CPU budget although cpu_timeout is declared "
         "unenforced; the manifest and the monitor can disagree"
     )
+
+
+def test_an_uncontained_run_does_not_reap_over_a_budget_it_never_advertised() -> None:
+    """#75, as behaviour rather than prose: the UNCONTAINED column reaches the guard site.
+
+    The manifest says ``uncontained.cpu_timeout`` is false, so a step on that lane must not be
+    cut even when the monitor is handed an over-budget reading. Flipping only the uncontained
+    column must then cut it -- if the guard site ignored its lane argument, one of these two
+    assertions is false whichever way it guessed.
+    """
+    cfg = _one_step_dag("sleep 4", timeout=60, cpu_timeout=1)
+
+    unboxed = run_dag_limited(
+        cfg, max_steps=1, max_cpus=1, cgroups=_UnboxedBurningCgroups(), verbosity=0
+    )
+    assert unboxed.ok, (
+        "an UNCONTAINED run reaped over a CPU budget its own manifest says it does not "
+        f"enforce: {unboxed.outcomes[0].reason}"
+    )
+
+    with registry_override("cpu_timeout", True, lane=Lane.UNCONTAINED):
+        assert _manifest()["uncontained"]["cpu_timeout"] is True
+        flipped = run_dag_limited(
+            cfg, max_steps=1, max_cpus=1, cgroups=_UnboxedBurningCgroups(), verbosity=0
+        )
+    assert not flipped.ok
+    assert "CPU-TIMEOUT" in flipped.outcomes[0].reason, (
+        "the uncontained column was flipped on but the guard site did not follow it, so that "
+        "column advertises something no code reads"
+    )
+
+
+# --------------------------------------------------------------------------------------------
+# An uncontained run says so at the console
+# --------------------------------------------------------------------------------------------
+
+
+def _step(cpu_timeout: int) -> Step:
+    return Step("g", "j", "burns cpu", "true", cpu_timeout=cpu_timeout, timeout=5)
+
+
+def test_a_live_budget_produces_a_notice_that_counts_it_and_names_the_largest() -> None:
+    cfg = DagConfig(steps=(_step(7), _step(3)))
+    notice = uncontained_cpu_budget_warning(cfg)
+    assert notice is not None
+    assert "UNCONTAINED run" in notice
+    assert "NOT enforced" in notice
+    assert "2 step(s) carry one" in notice
+    assert "largest 7s" in notice
+
+
+def test_the_default_budget_counts_because_it_is_equally_unenforced() -> None:
+    # A step that declares nothing still gets `default_step_cpu_timeout`, and that budget is
+    # just as absent on this lane as a declared one. Silence here would under-report the gap.
+    cfg = DagConfig(steps=(Step("g", "j", "declares nothing", "true"),))
+    notice = uncontained_cpu_budget_warning(cfg)
+    assert notice is not None
+    assert "1 step(s) carry one" in notice
+    assert "largest 10s" in notice
+
+
+def test_a_graph_with_the_guard_switched_off_everywhere_is_not_nagged() -> None:
+    # The other side of the assertion: this must not become an unconditional banner. A graph
+    # that disabled the CPU guard on purpose is owed nothing.
+    cfg = DagConfig(steps=(_step(0),), default_step_cpu_timeout=0)
+    assert uncontained_cpu_budget_warning(cfg) is None
+
+
+def test_the_platform_multiplier_is_applied_before_the_notice_quotes_a_number() -> None:
+    # The notice must quote the budget that WOULD have been enforced, not the graph's canonical
+    # number, or a slow platform reads a figure that never existed.
+    cfg = DagConfig(steps=(_step(4),), cpu_timeout_multiplier=2.5)
+    notice = uncontained_cpu_budget_warning(cfg)
+    assert notice is not None
+    assert "largest 10s" in notice
+
+
+def test_an_uncontained_run_says_the_cpu_budget_is_unenforced(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cfg = DagConfig(steps=(dataclasses.replace(_step(7), cmd="true"),))
+    result = run_dag(cfg, jobs=1, verbosity=0)
+    assert result.ok
+    message = capsys.readouterr().err
+    assert "UNCONTAINED run" in message
+    assert "the per-step CPU-time budget is NOT enforced" in message
+    assert "largest 7s" in message
+
+
+def test_a_contained_run_does_not_print_the_uncontained_notice(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # The other side: an enabled manager really does read cpu.stat, so warning there would be a
+    # false alarm and would train operators to ignore the line.
+    class _Enabled(NoopCgroups):
+        enabled = True
+
+    cfg = DagConfig(steps=(dataclasses.replace(_step(7), cmd="true"),))
+    result = run_dag(cfg, jobs=1, verbosity=0, cgroups=_Enabled())
+    assert result.ok
+    assert "UNCONTAINED run" not in capsys.readouterr().err

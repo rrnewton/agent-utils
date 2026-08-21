@@ -16,7 +16,9 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use safe_ci_dag_runner::capabilities::{enforcement_manifest, with_registry_override};
+use safe_ci_dag_runner::capabilities::{
+    enforcement_manifest, with_lane_registry_override, with_registry_override, Lane,
+};
 use safe_ci_dag_runner::model::{DagConfig, ResourceHint, Step};
 use safe_ci_dag_runner::scheduler::run_dag_boxed_limited;
 use safe_ci_dag_runner::CgroupManager;
@@ -118,7 +120,9 @@ fn scheduler_guards_follow_their_published_capability_flags() {
     );
 
     let unenforced = with_registry_override("wall_timeout", false, || {
-        assert!(enforcement_manifest().contains("\"wall_timeout\":false"));
+        // ABSENCE of the `true`, not presence of a `false`: the manifest publishes two
+        // lanes, so a bare `contains(":false")` can hold whatever the bracket did.
+        assert!(!enforcement_manifest().contains("\"wall_timeout\":true"));
         run_dag_boxed_limited(&slow, 1, 1, false, 0, None)
     });
     assert!(
@@ -145,7 +149,9 @@ fn scheduler_guards_follow_their_published_capability_flags() {
     );
 
     let unenforced = with_registry_override("oom_detection", false, || {
-        assert!(enforcement_manifest().contains("\"oom_detection\":false"));
+        // ABSENCE of the `true`, not presence of a `false`: the manifest publishes two
+        // lanes, so a bare `contains(":false")` can hold whatever the bracket did.
+        assert!(!enforcement_manifest().contains("\"oom_detection\":true"));
         run_dag_boxed_limited(&failing, 1, 1, false, 0, Some(ooming()))
     });
     assert!(
@@ -174,7 +180,9 @@ fn scheduler_guards_follow_their_published_capability_flags() {
     );
 
     let unenforced = with_registry_override("cpu_timeout", false, || {
-        assert!(enforcement_manifest().contains("\"cpu_timeout\":false"));
+        // ABSENCE of the `true`, not presence of a `false`: the manifest publishes two
+        // lanes, so a bare `contains(":false")` can hold whatever the bracket did.
+        assert!(!enforcement_manifest().contains("\"cpu_timeout\":true"));
         run_dag_boxed_limited(&burning, 1, 1, false, 0, Some(hot()))
     });
     assert!(
@@ -183,4 +191,40 @@ fn scheduler_guards_follow_their_published_capability_flags() {
          unenforced: {}",
         unenforced.outcomes[0].reason
     );
+
+    // ---- the LANE reaches the guard site -------------------------------------------------
+    // #75 cpu-timeout-unboxed-fallback: the manifest has a column per lane, and the column is
+    // only worth publishing if the guard reads the one the run is actually on. `wall_timeout` is
+    // the key that is true on BOTH lanes, so flipping just the uncontained column must change an
+    // unboxed run and leave a boxed one alone. If the guard site ignored its lane argument, one
+    // of these two assertions is false whichever way it guessed.
+    let slow_unboxed = one_step("sleep 2", 1, 0);
+    with_lane_registry_override("wall_timeout", false, Lane::Uncontained, || {
+        let manifest = enforcement_manifest();
+        assert!(manifest.contains("\"wall_timeout\":true"), "{manifest}");
+        assert!(manifest.contains("\"wall_timeout\":false"), "{manifest}");
+
+        let unboxed = run_dag_boxed_limited(&slow_unboxed, 1, 1, false, 0, None);
+        assert!(
+            unboxed.ok,
+            "the UNCONTAINED column says no wall ceiling, but the unboxed step was still cut: {}",
+            unboxed.outcomes[0].reason
+        );
+
+        let boxed = run_dag_boxed_limited(
+            &slow_unboxed,
+            1,
+            1,
+            false,
+            0,
+            Some(Arc::new(SyntheticReadings {
+                oom_kills: 0,
+                cpu_usage_usec: 0,
+            })),
+        );
+        assert!(
+            !boxed.ok,
+            "only the UNCONTAINED column was flipped, so a boxed step must still be cut"
+        );
+    });
 }

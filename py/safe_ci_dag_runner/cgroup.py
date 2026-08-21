@@ -24,7 +24,7 @@ from pathlib import Path
 from types import FrameType
 from typing import TYPE_CHECKING
 
-from safe_ci_dag_runner.capabilities import is_enforced
+from safe_ci_dag_runner.capabilities import Lane, is_enforced
 from safe_ci_dag_runner.sizing import derive_build_jobs, mem_available_bytes
 
 CGROUP_ROOT = Path("/sys/fs/cgroup")
@@ -1904,8 +1904,10 @@ class Cgroups:
                   "kill a single process instead of the whole step (mis-attributed blast radius)")
         # `memory_max` is one of the guards the `capabilities` manifest advertises, so the
         # decision to apply it is read from the same registry that publishes it: turning the
-        # advertisement off turns the write off, and vice versa. See capabilities.py.
-        if mem_max and is_enforced("memory_max"):
+        # advertisement off turns the write off, and vice versa. See capabilities.py. This
+        # method only ever runs for a real, enabled manager, so the lane is CONTAINED by
+        # construction -- there is no cgroup child to write to on the other one.
+        if mem_max and is_enforced("memory_max", Lane.CONTAINED):
             try:
                 (child / "memory.max").write_text(str(int(mem_max)))
             except OSError as exc:
@@ -1930,7 +1932,7 @@ class Cgroups:
         # no pids plumbing at all -- so the write is gated on that same declaration instead of
         # being reachable behind it. A caller that sets the limit today gets what the manifest
         # promises: nothing. Flipping the registry flag turns both the claim and the write on.
-        if self.worker_pids_max is not None and is_enforced("pids_guard"):
+        if self.worker_pids_max is not None and is_enforced("pids_guard", Lane.CONTAINED):
             try:
                 (child / "pids.max").write_text(str(int(self.worker_pids_max)))
             except OSError as exc:

@@ -29,6 +29,7 @@ from safe_ci_dag_runner.analyze import summarize
 from safe_ci_dag_runner.capabilities import (
     ENFORCEMENT_REGISTRY,
     Capability,
+    Lane,
     enforcement_manifest,
     is_enforced,
 )
@@ -117,9 +118,10 @@ __version__: str = "0.15.0"
 
 __all__ = [
     "__version__",
-    # Enforcement manifest (derived from the guards that implement it)
+    # Enforcement manifest (derived per lane from the guards that implement it)
     "Capability",
     "ENFORCEMENT_REGISTRY",
+    "Lane",
     "enforcement_manifest",
     "is_enforced",
     # DAG model

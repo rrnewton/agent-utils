@@ -43,9 +43,9 @@ use crate::attribution::{
 };
 use crate::cgroup::CgroupManager;
 use crate::model::{
-    canonical_cpu_timeout, command_with_inner_jobs, effective_cpu_count, effective_jobs_flag,
-    preferred_inner_jobs, scale_cpu_timeout, step_classification, undeclared_resource_demands,
-    write_domain_violations, DagConfig, RunResult, Step, StepOutcome,
+    canonical_cpu_timeout, command_with_inner_jobs, effective_cpu_count, effective_cpu_timeout,
+    effective_jobs_flag, preferred_inner_jobs, scale_cpu_timeout, step_classification,
+    undeclared_resource_demands, write_domain_violations, DagConfig, RunResult, Step, StepOutcome,
 };
 use crate::profile_enrich::{resolve_effective_inner_jobs, step_enrichment_columns};
 
@@ -586,6 +586,38 @@ fn ungrantable_resources(
         }
     }
     out
+}
+
+/// The one line an UNCONTAINED run owes its operator about per-step CPU-time budgets.
+///
+/// The CPU guard is implemented by reading the step cgroup's `cpu.stat`. With no cgroup there is
+/// no counter, so the budget is not merely approximate — it does not run at all, and a step that
+/// burns unbounded CPU against a declared 3-second budget exits 0 and is reported green. That
+/// silence is the defect: `--allow-cgroup-failure` is an explicit choice, but nothing said which
+/// guards the choice gave up, and the capability manifest asserted the opposite.
+///
+/// Returns `None` when no step carries a live budget, so a graph that has genuinely disabled the
+/// guard everywhere is not nagged about a bound it never asked for.
+pub fn uncontained_cpu_budget_warning(cfg: &DagConfig) -> Option<String> {
+    let live: Vec<i64> = cfg
+        .steps
+        .iter()
+        .map(|step| {
+            effective_cpu_timeout(
+                step,
+                cfg.default_step_cpu_timeout,
+                cfg.cpu_timeout_multiplier,
+            )
+        })
+        .filter(|budget| *budget > 0)
+        .collect();
+    let largest = live.iter().copied().max()?;
+    Some(format!(
+        "UNCONTAINED run: cpu.stat is unreadable without a cgroup, so the per-step CPU-time \
+         budget is NOT enforced; {} step(s) carry one (largest {largest}s) and are bounded only \
+         by their wall timeout. `capabilities` says which guards hold on this lane.",
+        live.len()
+    ))
 }
 
 /// Return a run configuration whose declared per-step CPU widths cannot exceed `max_cpus`.
@@ -1593,6 +1625,11 @@ fn run_step(ctx: StepCtx) {
     // build). prepare_command has created the step's child cgroup, so cpu.pressure is readable;
     // bracket the step with two host-load snapshots so contention can be attributed later.
     let boxed = matches!(&cgroups, Some(cg) if cg.enabled());
+    // WHICH LANE THIS STEP IS ON. Every guard below asks the capability registry about THIS lane
+    // rather than about the engine in the abstract, so the `uncontained` column of the published
+    // manifest is load-bearing in exactly the way the `contained` one is: an unboxed run that
+    // advertises no CPU-time enforcement does not perform any.
+    let lane = crate::capabilities::Lane::of_boxed(boxed);
     // Profile the width the step ACTUALLY ran under. An undeclared boxed command intentionally
     // gets no jobs flag but is constrained by the default per-step cpu.max, so it belongs in that
     // width bucket. Unboxed execution has no applied default cap and retains the ambient fallback.
@@ -1822,6 +1859,7 @@ fn run_step(ctx: StepCtx) {
         let msink = Arc::clone(&sink);
         let mculprit = Arc::clone(&termination_culprit);
         let mstart = start;
+        let mlane = lane;
         Some(thread::spawn(move || {
             let mut since = Duration::ZERO;
             // One-shot, so an unmeasurable budget is stated once per step, not once per tick.
@@ -1846,9 +1884,12 @@ fn run_step(ctx: StepCtx) {
                     // branch, so it asks the registry that publishes the claim
                     // (`crate::capabilities`). An engine that stops reaping here stops
                     // advertising it, in the same edit.
+                    // This thread only exists on the boxed lane (see the `if boxed` above), so
+                    // the lane it asks about is CONTAINED; the uncontained answer is that there
+                    // is no cpu.stat to read, which is the whole of #75.
                     if cpu_timeout > 0
                         && !cpu_flag.load(Ordering::Relaxed)
-                        && crate::capabilities::is_enforced("cpu_timeout")
+                        && crate::capabilities::is_enforced("cpu_timeout", mlane)
                     {
                         if let Some(cs) = c.cpu_stats(&t) {
                             // ABSENT IS NOT ZERO: see `cpu_seconds_from_stats`. Say so once and
@@ -1907,7 +1948,7 @@ fn run_step(ctx: StepCtx) {
                 // `wall_timeout` likewise: the deadline is not even compared when the
                 // registry says this engine does not enforce one, so the advertisement and the
                 // wait agree by construction rather than by two people remembering.
-                if crate::capabilities::is_enforced("wall_timeout")
+                if crate::capabilities::is_enforced("wall_timeout", lane)
                     && start.elapsed().as_secs() as i64 >= step.timeout
                 {
                     timed_out = true;
@@ -1991,7 +2032,7 @@ fn run_step(ctx: StepCtx) {
         // `oom_detection` is the memory.events read itself: unenforced means the counter is not
         // consulted, so nothing downstream can attribute a failure to an OOM.
         Some(cg) if cg.enabled() => (
-            if crate::capabilities::is_enforced("oom_detection") {
+            if crate::capabilities::is_enforced("oom_detection", lane) {
                 cg.oom_kills(&tag)
             } else {
                 0
@@ -2527,6 +2568,14 @@ pub fn run_dag_boxed_deadline_limited(
             );
         }
     }
+    if !matches!(&cgroups, Some(cg) if cg.enabled()) {
+        // NAME THE GUARD THAT IS NOT RUNNING, not just the containment state. Covers every
+        // uncontained lane at once — no manager at all, or a present-but-disabled one — because
+        // both read `cpu.stat` exactly zero times.
+        if let Some(notice) = uncontained_cpu_budget_warning(cfg) {
+            eprintln!("[scheduler] \u{26a0} {notice}");
+        }
+    }
     let runner = Runner::new(
         cfg,
         max_steps,
@@ -2730,6 +2779,68 @@ mod tests {
             write_domains: None,
             write_domain_guarantee: None,
         }
+    }
+
+    // ------------------------------------------------- the uncontained CPU-budget notice
+    //
+    // A declared `cpu_timeout` is enforced by reading the step cgroup's `cpu.stat`. Without a
+    // cgroup there is no counter and the guard never runs, so the run owes its operator a line
+    // saying so. Both directions are asserted: a graph that switched the guard off on purpose
+    // must NOT be nagged, or the line becomes noise nobody reads.
+
+    fn cpu_budget_step(group: &str, job: &str, cpu_timeout: i64) -> Step {
+        let mut s = step(group, job, "true", &[], 0.0, &[]);
+        s.cpu_timeout = cpu_timeout;
+        s
+    }
+
+    #[test]
+    fn the_uncontained_notice_counts_the_budgets_and_names_the_largest() {
+        let cfg = DagConfig {
+            steps: vec![cpu_budget_step("g", "a", 7), cpu_budget_step("g", "b", 3)],
+            ..Default::default()
+        };
+        let notice = uncontained_cpu_budget_warning(&cfg).expect("a live budget must be named");
+        assert!(notice.contains("UNCONTAINED run"), "{notice}");
+        assert!(notice.contains("NOT enforced"), "{notice}");
+        assert!(notice.contains("2 step(s) carry one"), "{notice}");
+        assert!(notice.contains("largest 7s"), "{notice}");
+    }
+
+    #[test]
+    fn the_default_budget_counts_because_it_is_equally_unenforced() {
+        // A step that declares nothing still gets `default_step_cpu_timeout`, and that budget is
+        // just as absent on this lane as a declared one.
+        let cfg = DagConfig {
+            steps: vec![cpu_budget_step("g", "a", 0)],
+            ..Default::default()
+        };
+        let notice = uncontained_cpu_budget_warning(&cfg).expect("the default budget counts");
+        assert!(notice.contains("1 step(s) carry one"), "{notice}");
+        assert!(notice.contains("largest 10s"), "{notice}");
+    }
+
+    #[test]
+    fn a_graph_with_the_guard_switched_off_everywhere_is_not_nagged() {
+        let cfg = DagConfig {
+            steps: vec![cpu_budget_step("g", "a", 0)],
+            default_step_cpu_timeout: 0,
+            ..Default::default()
+        };
+        assert!(uncontained_cpu_budget_warning(&cfg).is_none());
+    }
+
+    #[test]
+    fn the_platform_multiplier_is_applied_before_the_notice_quotes_a_number() {
+        // The notice must quote the budget that WOULD have been enforced, not the graph's
+        // canonical number, or a slow platform reads a figure that never existed.
+        let cfg = DagConfig {
+            steps: vec![cpu_budget_step("g", "a", 4)],
+            cpu_timeout_multiplier: 2.5,
+            ..Default::default()
+        };
+        let notice = uncontained_cpu_budget_warning(&cfg).expect("a live budget must be named");
+        assert!(notice.contains("largest 10s"), "{notice}");
     }
 
     // ------------------------------------------------------- terminal-starve brackets
@@ -3797,7 +3908,9 @@ mod tests {
         );
 
         let unenforced = crate::capabilities::with_registry_override("wall_timeout", false, || {
-            assert!(crate::capabilities::enforcement_manifest().contains("\"wall_timeout\":false"));
+            // ABSENCE of the `true`: the manifest has two lanes, and `wall_timeout` is true on
+            // BOTH of them unbracketed, so this is the assertion that can actually fail.
+            assert!(!crate::capabilities::enforcement_manifest().contains("\"wall_timeout\":true"));
             run_dag_boxed_deadline(&cfg, 1, false, 0, None, None, Some(1), Some(20))
         });
         assert!(

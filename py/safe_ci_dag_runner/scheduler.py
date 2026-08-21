@@ -34,12 +34,13 @@ from safe_ci_dag_runner.attribution import (
     process_snapshot,
     sanitize as sanitize_evidence_tag,
 )
-from safe_ci_dag_runner.capabilities import is_enforced
+from safe_ci_dag_runner.capabilities import Lane, is_enforced
 from safe_ci_dag_runner.model import (
     DagConfig,
     Step,
     command_with_inner_jobs,
     effective_cpu_count,
+    effective_cpu_timeout,
     effective_jobs_flag,
     canonical_cpu_timeout,
     scale_cpu_timeout,
@@ -205,6 +206,37 @@ def _psi_reading(pressure: Mapping[str, float] | None) -> PsiReading | None:
     if pressure is None:
         return None
     return PsiReading(avg10=pressure["avg10"], avg60=pressure["avg60"])
+
+
+def uncontained_cpu_budget_warning(cfg: DagConfig) -> str | None:
+    """The one line an UNCONTAINED run owes its operator about per-step CPU-time budgets.
+
+    The CPU guard is implemented by reading the step cgroup's ``cpu.stat``. With no cgroup there
+    is no counter, so the budget is not merely approximate — it does not run at all, and a step
+    that burns unbounded CPU against a declared 3-second budget exits 0 and is reported green.
+    That silence is the defect: ``--allow-cgroup-failure`` is an explicit choice, but nothing said
+    which guards the choice gave up, and the capability manifest asserted the opposite.
+
+    Returns ``None`` when no step carries a live budget, so a graph that has genuinely disabled
+    the guard everywhere is not nagged about a bound it never asked for.
+    """
+    live = [
+        budget
+        for step in cfg.steps
+        if (
+            budget := effective_cpu_timeout(
+                step, cfg.default_step_cpu_timeout, cfg.cpu_timeout_multiplier
+            )
+        )
+        > 0
+    ]
+    if not live:
+        return None
+    return (
+        "UNCONTAINED run: cpu.stat is unreadable without a cgroup, so the per-step CPU-time "
+        f"budget is NOT enforced; {len(live)} step(s) carry one (largest {max(live)}s) and are "
+        "bounded only by their wall timeout. `capabilities` says which guards hold on this lane."
+    )
 
 
 def cap_config_max_cpus(cfg: DagConfig, max_cpus: int) -> DagConfig:
@@ -867,6 +899,11 @@ class Runner:
         # prepare_command has already created the step's child cgroup, so cpu.pressure is readable;
         # bracket the step with two host-load snapshots so contention can be attributed later.
         boxed = self.cgroups.enabled
+        # WHICH LANE THIS STEP IS ON. Every guard below asks the capability registry about
+        # THIS lane rather than about the engine in the abstract, so the `uncontained` column
+        # of the published manifest is load-bearing in exactly the way the `contained` one
+        # is: an unboxed run that advertises no CPU-time enforcement does not perform any.
+        lane = Lane.CONTAINED if boxed else Lane.UNCONTAINED
         # Profile the width the step ACTUALLY ran under. An undeclared boxed command intentionally
         # gets no jobs flag but is constrained by the default per-step cpu.max, so it belongs in
         # that width bucket. Unboxed execution has no applied default cap and must retain the
@@ -1019,7 +1056,9 @@ class Runner:
                 # The `cpu_timeout` guard the `capabilities` manifest advertises IS this
                 # branch, so it asks the registry that publishes the claim (capabilities.py).
                 # An engine that stops reaping here stops advertising it, in the same edit.
-                if cpu_budget > 0 and not cpu_timed_out and is_enforced("cpu_timeout"):
+                # On the UNCONTAINED lane the registry says false and the branch is skipped
+                # outright: there is no cpu.stat to read, which is the whole of #75.
+                if cpu_budget > 0 and not cpu_timed_out and is_enforced("cpu_timeout", lane):
                     cs = self.cgroups.cpu_stats(step.tag)
                     if cs is not None:
                         # ABSENT IS NOT ZERO: see :func:`_cpu_seconds_from_stats`. Say so once
@@ -1063,7 +1102,7 @@ class Runner:
             # `wall_timeout` likewise: no deadline is passed at all when the registry says this
             # engine does not enforce one, so the advertisement and the wait agree by
             # construction rather than by two people remembering.
-            proc.wait(timeout=step.timeout if is_enforced("wall_timeout") else None)
+            proc.wait(timeout=step.timeout if is_enforced("wall_timeout", lane) else None)
         except subprocess.TimeoutExpired:
             # Genuine hang: reap the step's whole process group now (safe because
             # start_new_session gave it its own group; reap guards the runner's group).
@@ -1101,7 +1140,7 @@ class Runner:
         # Read the step's cgroup measurements BEFORE cleanup() rmdirs the child cgroup.
         # `oom_detection` is the memory.events read itself: unenforced means the counter is
         # not consulted, so nothing downstream can attribute a failure to an OOM.
-        oom = self.cgroups.oom_kills(step.tag) if is_enforced("oom_detection") else 0
+        oom = self.cgroups.oom_kills(step.tag) if is_enforced("oom_detection", lane) else 0
         pids_events = self.cgroups.pids_events(step.tag)
         peak = self.cgroups.peak_bytes(step.tag)
         cpu_stats = self.cgroups.cpu_stats(step.tag)
@@ -1543,6 +1582,13 @@ def run_dag_limited(
             "per-step cgroup manager is present but disabled; containment is DEGRADED "
             "(falling back to process-group kill for teardown, no inner memory/CPU caps)."
         )
+    if not manager.enabled:
+        # NAME THE GUARD THAT IS NOT RUNNING, not just the containment state. Covers every
+        # uncontained lane at once — no manager at all, or a present-but-disabled one — because
+        # both read `cpu.stat` exactly zero times.
+        notice = uncontained_cpu_budget_warning(cfg)
+        if notice is not None:
+            _warn(notice)
 
     runner = Runner(
         cfg,

@@ -1109,6 +1109,83 @@ def compare_uncarried_config_keys(py: list[str], rs: list[str], rep: Report) -> 
             rep.ok(label)
 
 
+def compare_uncontained_cpu_budget_notice(py: list[str], rs: list[str], rep: Report) -> None:
+    """Both builds must SAY, identically, that an uncontained run does not enforce cpu_timeout.
+
+    The CPU-time guard is a read of the step cgroup's ``cpu.stat``. Under
+    ``--allow-cgroup-failure`` there is no cgroup, so the guard never runs: a step can burn
+    unbounded CPU against a declared budget, exit 0, and be reported green. That was silent, and
+    the ``capabilities`` manifest asserted the opposite.
+
+    The manifest half of the fix is already covered — ``capabilities`` is byte-identical across
+    engines and now carries a ``uncontained`` lane with ``"cpu_timeout":false``. This is the
+    behavioural half: the notice has to reach the operator's console on the very lane the
+    differential itself runs on, and it has to be the SAME sentence in both builds, because a
+    warning present in one engine and missing from the other is exactly the historical
+    ``cpu_timeout`` divergence wearing a different hat.
+
+    The "a graph that disabled the guard is owed no notice" direction is NOT checked here, and
+    deliberately: ``default_step_cpu_timeout`` is an uncarried document key in both builds, so no
+    DAG file reachable from the CLI can zero the default and there is nothing for this mechanism
+    to drive. That leg is pinned in-engine instead
+    (``a_graph_with_the_guard_switched_off_everywhere_is_not_nagged``, both suites). What this
+    mechanism CAN see, and does check, is that the notice fires once per RUN rather than once per
+    step or once per monitor tick.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        live = os.path.join(tmp, "live.json")
+        with open(live, "w", encoding="utf-8") as fh:
+            fh.write(
+                '{"steps": [{"group": "g", "job": "a", "kind": "compile", '
+                '"cmd": "true", "cpu_timeout": 7, "timeout": 30}]}'
+            )
+        po = run(py, ("run", "--dag", live, ACF))
+        ro = run(rs, ("run", "--dag", live, ACF))
+        label = "uncontained-cpu-budget-notice"
+        phrase = "the per-step CPU-time budget is NOT enforced"
+        py_lines = [ln for ln in po.stderr.splitlines() if phrase in ln]
+        rs_lines = [ln for ln in ro.stderr.splitlines() if phrase in ln]
+        if not py_lines or not rs_lines:
+            rep.bad(
+                label,
+                "an UNCONTAINED run must name the guard it is not running; "
+                f"py={py_lines!r} rs={rs_lines!r}",
+            )
+        elif py_lines != rs_lines:
+            rep.bad(label, f"notice differs: py={py_lines!r} rs={rs_lines!r}")
+        elif "largest 7s" not in py_lines[0]:
+            rep.bad(label, f"the notice must quote the budget it gave up: {py_lines[0]!r}")
+        else:
+            rep.ok(label)
+
+        # Once per RUN. A multi-step graph is the case that separates a run-level notice from a
+        # per-step one; a per-tick regression would show up as a much larger count still.
+        many = os.path.join(tmp, "many.json")
+        with open(many, "w", encoding="utf-8") as fh:
+            fh.write(
+                '{"steps": ['
+                '{"group": "g", "job": "a", "kind": "compile", "cmd": "true", '
+                '"cpu_timeout": 7, "timeout": 30}, '
+                '{"group": "g", "job": "b", "kind": "compile", "cmd": "true", '
+                '"cpu_timeout": 5, "timeout": 30}, '
+                '{"group": "g", "job": "c", "kind": "compile", "cmd": "true", '
+                '"cpu_timeout": 3, "timeout": 30}]}'
+            )
+        po = run(py, ("run", "--dag", many, ACF))
+        ro = run(rs, ("run", "--dag", many, ACF))
+        label = "uncontained-cpu-budget-notice:once-per-run"
+        py_count = sum(1 for ln in po.stderr.splitlines() if phrase in ln)
+        rs_count = sum(1 for ln in ro.stderr.splitlines() if phrase in ln)
+        if (py_count, rs_count) != (1, 1):
+            rep.bad(
+                label,
+                "the notice belongs once per RUN, not once per step or once per tick; "
+                f"py={py_count} rs={rs_count}",
+            )
+        else:
+            rep.ok(label)
+
+
 #: How long the planted escapee lives. It MUST exceed `run`'s own expiry, or the case cannot
 #: distinguish a build that finishes from one that blocks: a self-limiting escapee releases the
 #: pipes on its own, the blocked build returns just before the harness gives up, and the two builds
@@ -3617,7 +3694,8 @@ INVOCATIONS: tuple[Invocation, ...] = (
     Invocation("userguide", ("--userguide",)),
     # `capabilities` prints each engine's machine-readable enforcement manifest (which guards it
     # actually implements: cpu_affinity, cpu_bandwidth, cpu_timeout, memory_max, oom_detection,
-    # pids_guard, run_timeout, wall_timeout, and write_domains). The
+    # pids_guard, run_timeout, wall_timeout, and write_domains) — per LANE, since most of them are
+    # a cgroup read or write and simply do not happen on an uncontained run. The
     # WHOLE POINT is that the two engines must enforce the SAME set, so the manifests are asserted
     # byte-identical. This is the recurrence guard for the historical gap where the Rust runner
     # silently did NOT enforce `cpu_timeout` while the Python runner did: with this check, that
@@ -4457,6 +4535,7 @@ def compare_safe_ci_dag_runner(rand_count: int, seed: int) -> int:
     compare_scalar_parity(py, rs, rep)
     compare_only_errors(py, rs, rep)
     compare_uncarried_config_keys(py, rs, rep)
+    compare_uncontained_cpu_budget_notice(py, rs, rep)
     compare_escapee_teardown(py, rs, rep)
     compare_term_attribution(py, rs, rep)
     compare_test_attribution_evidence(py, rs, rep)

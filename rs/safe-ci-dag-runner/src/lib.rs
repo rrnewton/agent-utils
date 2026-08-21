@@ -44,7 +44,7 @@ pub use attribution::{
     recognize, Culprit, InFlightTest, ProcessObservation, RunEvidence, StepStream, TestEvent,
     TestTracker, LOG_DIR_ENV, NO_LOGS_ENV, STEP_NONCE_ENV,
 };
-pub use capabilities::{enforcement_manifest, is_enforced, Capability, ENFORCEMENT_REGISTRY};
+pub use capabilities::{enforcement_manifest, is_enforced, Capability, Lane, ENFORCEMENT_REGISTRY};
 #[allow(deprecated)]
 pub use cgroup::{
     aggregate_slice_cpu_jobs, aggregate_slice_max_cpus, attempt_scope_reexec,

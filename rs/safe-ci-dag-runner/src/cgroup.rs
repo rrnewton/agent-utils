@@ -1922,8 +1922,12 @@ impl CgroupManager for Cgroups {
         }
         // `memory_max` is one of the guards the `capabilities` manifest advertises, so the
         // decision to apply it is read from the same registry that publishes it: turning the
-        // advertisement off turns the write off, and vice versa. See `crate::capabilities`.
-        if let Some(m) = mem_max.filter(|_| crate::capabilities::is_enforced("memory_max")) {
+        // advertisement off turns the write off, and vice versa. See `crate::capabilities`. This
+        // method returned early above unless boxing is on, so the lane is CONTAINED by
+        // construction — there is no cgroup child to write to on the other one.
+        if let Some(m) = mem_max.filter(|_| {
+            crate::capabilities::is_enforced("memory_max", crate::capabilities::Lane::Contained)
+        }) {
             if let Err(e) = fs::write(child.join("memory.max"), m.to_string()) {
                 warn(&format!(
                     "step {tag}: could not apply inner memory cap memory.max={m} ({e}); step runs \
@@ -2585,7 +2589,10 @@ mod tests {
 
         fs::remove_file(&applied).unwrap();
         crate::capabilities::with_registry_override("memory_max", false, || {
-            assert!(crate::capabilities::enforcement_manifest().contains("\"memory_max\":false"));
+            // ABSENCE of the `true`, not presence of a `false`: the manifest publishes two lanes
+            // and the uncontained one already says false, so `contains("false")` would hold
+            // whatever the bracket did.
+            assert!(!crate::capabilities::enforcement_manifest().contains("\"memory_max\":true"));
             cg.prepare_command("g.j", "true", Some(4096), None);
         });
         assert!(

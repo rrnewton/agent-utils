@@ -234,6 +234,14 @@ is to stop with a capability error. `--allow-cgroup-failure` accepts a
 best-effort unboxed fallback with a warning. `--unsafe-no-cgroups` deliberately
 skips containment even when available and should be reserved for reviewed use.
 
+An unboxed run is **uncontained, not degraded**. The CPU-time budget in
+particular is a read of the step cgroup's `cpu.stat`, so with no cgroup it does
+not run at all: a step may burn unbounded CPU against a declared `cpu_timeout`,
+exit 0, and be reported green, bounded only by its wall timeout. Such a run says
+so on stderr, once, naming how many steps carry a budget and the largest of
+them, and `capabilities` reports the two lanes separately so the claim can be
+read rather than assumed.
+
 ### Bound the whole run, not only its steps
 
 Per-step budgets cannot bound a run: any number of individually-legal steps can
@@ -270,7 +278,9 @@ the node that caused it — a run whose steps declare a wall budget at least as
 large as `--run-timeout` is **refused before anything starts**, with the
 offending steps named.
 
-Use `capabilities` for the machine-readable enforcement manifest.
+Use `capabilities` for the machine-readable enforcement manifest. It has two
+objects, `contained` and `uncontained`, carrying the same key set: the first is
+what a boxed run enforces, the second is what survives when boxing is off.
 
 ## Select, parameterize, and stress a step
 
