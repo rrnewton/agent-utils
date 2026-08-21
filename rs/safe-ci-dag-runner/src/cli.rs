@@ -677,6 +677,14 @@ fn box_shell_quote(value: &str) -> String {
 /// execution route. `box` must be indistinguishable from hand-writing the equivalent
 /// singleton-DAG file -- that is its entire value -- and the only way to guarantee that is for it
 /// to be the same code after this function returns.
+///
+/// `--mem` ALSO LOWERS THE MODELED FLOOR, or the flag is unusable for the values anyone actually
+/// types. `DagConfig::mem_cap_floor_bytes` defaults to 8 GiB: a lower bound on the modeled
+/// worst-case footprint so that sizing an UNCHARACTERIZED graph never concludes "zero steps fit".
+/// A boxed command is the opposite of uncharacterized -- `--mem` states its hard inner cap exactly
+/// -- so leaving the floor at 8 GiB made the run's own budget check (`--max-mem`, which sizes
+/// through [`jobs_for_budget`]) compare a 512 MiB budget against a fictional 8 GiB step and
+/// REFUSE, for every value below the very default the flag was reached for in order to lower.
 fn box_config(
     argv: &[String],
     label: &str,
@@ -721,6 +729,11 @@ fn box_config(
         // because the latter appends a `-j K` flag to the command -- correct for a build, wrong
         // for an arbitrary command that may not accept one.
         default_step_cpu_count: Some(cores),
+        // Read from the model rather than copied, so `box` can only ever LOWER the floor.
+        mem_cap_floor_bytes: match mem_bytes {
+            None => DagConfig::default().mem_cap_floor_bytes,
+            Some(requested) => DagConfig::default().mem_cap_floor_bytes.min(requested),
+        },
         ..Default::default()
     }
 }
@@ -762,18 +775,30 @@ fn cmd_box(a: &BoxArgs, c: &Palette) -> i32 {
     }
     let cfg = box_config(&a.command, &label, mem_bytes, timeout_s, cores);
 
-    // EVERY OTHER KNOB COMES FROM `run`'s OWN DEFAULTS, obtained by parsing a bare `run`
-    // invocation, rather than from a second list of defaults maintained here. A hand-copied list
-    // is exactly the thing that drifts the moment `run` gains a flag, and the drift would be
-    // invisible: `box` would keep working while quietly diverging from the singleton DAG file it
-    // claims to be shorthand for.
-    let mut run_args = match parse_run_args(&[]) {
+    let run_args = match box_run_args(a) {
         Ok(args) => args,
         Err(msg) => {
             eprintln!("{PROG} box: error: {msg}");
             return 2;
         }
     };
+    cmd_run(&cfg, &run_args, c)
+}
+
+/// The `run` arguments a `box` invocation stands for.
+///
+/// EVERY KNOB NOT NAMED HERE COMES FROM `run`'s OWN DEFAULTS, obtained by parsing a bare `run`
+/// invocation, rather than from a second list of defaults maintained here. A hand-copied list is
+/// exactly the thing that drifts the moment `run` gains a flag, and the drift would be invisible:
+/// `box` would keep working while quietly diverging from the singleton DAG file it claims to be
+/// shorthand for.
+///
+/// Separate from [`cmd_box`] so the arguments can be READ without executing anything: `--mem`
+/// becomes `--max-mem`, which is what the outer scope's `MemoryMax` is derived from, and that
+/// half of the flag is otherwise observable only by creating a real systemd scope.
+fn box_run_args(a: &BoxArgs) -> Result<RunArgs, String> {
+    let cores = a.cores.unwrap_or(1);
+    let mut run_args = parse_run_args(&[])?;
     run_args.dag = Some("-".to_string());
     run_args.max_steps = Some(1);
     run_args.max_cpus = Some(cores);
@@ -782,7 +807,7 @@ fn cmd_box(a: &BoxArgs, c: &Palette) -> i32 {
     run_args.perf_dir = a.perf_dir.clone();
     run_args.allow_cgroup_failure = a.allow_cgroup_failure;
     run_args.quiet = a.quiet;
-    cmd_run(&cfg, &run_args, c)
+    Ok(run_args)
 }
 
 fn pin_run_help(c: &Palette) -> String {
@@ -4018,6 +4043,58 @@ mod tests {
         assert_eq!(
             cfg.steps[0].hint.hard_mem_max_bytes,
             Some(512 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn a_mem_below_the_modeled_floor_still_runs_the_command() {
+        // 512 MiB is the value the guide, the help text and #82 all show. It has to WORK.
+        //
+        // `--mem` reaches the run as `--max-mem`, which is checked against the graph's MODELED
+        // worst-case footprint. That model is floored at `mem_cap_floor_bytes` (8 GiB by default)
+        // so sizing an uncharacterized graph never concludes "zero steps fit" -- and a boxed
+        // command that states its own hard cap is not uncharacterized. With the floor left alone,
+        // EVERY `--mem` below 8 GiB exited 2 with "REFUSED — minimum runnable footprint
+        // 8589934592 bytes cannot fit safely within budget 536870912 bytes": the flag worked only
+        // at or above the default it exists to lower.
+        let dir = std::env::temp_dir().join(format!("scdr_box_mem_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let argv: Vec<String> = [
+            "box",
+            "--allow-cgroup-failure",
+            "--perf-dir",
+            dir.to_str().unwrap(),
+            "--mem",
+            "512M",
+            "--timeout",
+            "30",
+            "--",
+            "true",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            run(&argv),
+            0,
+            "a 512 MiB box must RUN, not be refused as too small to hold a fictional 8 GiB step"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mem_is_also_the_ceiling_the_outer_scope_is_brought_up_with() {
+        // The other half of "applied TWICE": the scope's own MemoryMax, not just the step's inner
+        // cap. `requested_max_mem_bytes` is the exact accessor `cmd_run` uses to feed scope
+        // bring-up, so reading the run arguments `box` builds through it is reading the number the
+        // scope would be created with. Deleting the forwarding leaves this `None`.
+        let a = box_args(&["--mem", "512M", "--", "true"]);
+        let run_args = box_run_args(&a).expect("run's own defaults must parse");
+        assert_eq!(
+            requested_max_mem_bytes(run_args.max_mem.as_deref()),
+            Some(512 * 1024 * 1024),
+            "--mem must be the MemoryMax the outer scope is created with"
         );
     }
 

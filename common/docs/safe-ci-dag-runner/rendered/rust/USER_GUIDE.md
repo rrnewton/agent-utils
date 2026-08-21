@@ -458,7 +458,11 @@ special-cased for it.
 
 `--mem` is applied twice on purpose: as the outer scope's `MemoryMax` and as the
 command's own inner `memory.max`, so a breach is an OOM kill inside the box
-rather than pressure on the host. `--timeout` is a WALL ceiling; the CPU ceiling
+rather than pressure on the host. It is also what the boxed step is MODELLED at,
+so a small ceiling is admitted on its own terms: a DAG file's uncharacterized
+steps are sized against an 8 GiB floor, and measuring `--mem 512M` against that
+floor would refuse every value the flag exists to ask for. `--timeout` is a WALL
+ceiling; the CPU ceiling
 is derived from it as `--timeout x --cores`, because the small ten-second
 per-step CPU floor is a forcing function for an undeclared DAG node and would
 otherwise cut an honest ad-hoc command short for a reason its author never asked

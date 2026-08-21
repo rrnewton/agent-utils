@@ -2226,6 +2226,11 @@ def _cmd_plan(ns: argparse.Namespace) -> int:
 #: Default per-command name when ``box --label`` is absent and the basename yields nothing usable.
 _BOX_DEFAULT_LABEL = "command"
 
+#: The modeled-footprint floor an ordinary DAG gets, READ FROM THE MODEL rather than copied here.
+#: `box` may only ever LOWER it (to a `--mem` the caller stated), and a copied constant is exactly
+#: what would let the two drift apart without anything noticing.
+_DEFAULT_MEM_CAP_FLOOR_BYTES: int = DagConfig(steps=()).mem_cap_floor_bytes
+
 
 def _box_step_and_config(
     argv: Sequence[str], *, label: str, mem_bytes: int | None, timeout_s: int, cores: int
@@ -2241,6 +2246,15 @@ def _box_step_and_config(
     join would let an argument containing a space, a quote, a ``;`` or a ``$(...)`` become shell
     syntax rather than an argument. :func:`shlex.quote` per element makes every element survive as
     exactly one word.
+
+    ``--mem`` ALSO LOWERS THE MODELED FLOOR, or the flag is unusable for the values anyone
+    actually types. ``DagConfig.mem_cap_floor_bytes`` defaults to 8 GiB: a lower bound on the
+    modeled worst-case footprint so that sizing an UNCHARACTERIZED graph never concludes "zero
+    steps fit". A boxed command is the opposite of uncharacterized -- ``--mem`` states its hard
+    inner cap exactly -- so leaving the floor at 8 GiB made the run's own budget check
+    (``--max-mem`` -> :func:`jobs_for_budget`) compare a 512 MiB budget against a fictional 8 GiB
+    step and REFUSE, for every value below the very default the flag was reached for in order to
+    lower. Pinned by ``test_a_mem_below_the_modeled_floor_still_runs_the_command``.
     """
     return DagConfig(
         steps=(
@@ -2264,6 +2278,11 @@ def _box_step_and_config(
         # because the latter appends a `-j K` flag to the command -- correct for a build, wrong
         # for an arbitrary command that may not accept one.
         default_step_cpu_count=cores,
+        mem_cap_floor_bytes=(
+            _DEFAULT_MEM_CAP_FLOOR_BYTES
+            if mem_bytes is None
+            else min(_DEFAULT_MEM_CAP_FLOOR_BYTES, mem_bytes)
+        ),
     )
 
 

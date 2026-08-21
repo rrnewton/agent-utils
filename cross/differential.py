@@ -1756,6 +1756,12 @@ def compare_box_subcommand(py: list[str], rs: list[str], rep: Report) -> None:
     # Deliberately hostile argv: a space, an embedded single quote, a shell metacharacter, and a
     # command substitution. Correct quoting echoes them back verbatim.
     hostile = ["a b", "it's", "semi;colon", "$(echo pwned)"]
+    # `--mem 512M` IS PART OF THE FIXTURE, not decoration. It is the value #82, the user guide and
+    # both `--help` texts all show, and it reaches the run as `--max-mem`, which is checked
+    # against the graph's MODELED footprint. Both engines floored that model at 8 GiB and so
+    # REFUSED (exit 2) every `--mem` below the default the flag exists to lower. Boxing one
+    # command with a small memory ceiling is the whole feature; a fixture that omits the ceiling
+    # cannot see it broken, and cannot see it broken in one engine only.
     outs = {
         name: run(
             cmd,
@@ -1764,6 +1770,8 @@ def compare_box_subcommand(py: list[str], rs: list[str], rep: Report) -> None:
                 "--allow-cgroup-failure",
                 "--label",
                 "probe",
+                "--mem",
+                "512M",
                 "--timeout",
                 "60",
                 "--cores",
