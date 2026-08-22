@@ -18,9 +18,10 @@ pub const CONFIG_FILENAMES: [&str; 2] = [".herdr-run.yaml", ".herdr-run.yml"];
 /// Every agent that ever runs a command leaves a tab behind and nothing closes it, so without a
 /// ceiling the workspace grows for as long as agents are coined. The number is not arbitrary:
 /// measured on devbig014 2026-08-10, a session with 260 panes drove the Herdr server to >1000% CPU
-/// with every control call timing out. 64 keeps a fourfold margin below that while being far more
-/// tabs than a project's agents legitimately need.
-pub const DEFAULT_MAX_PANES: u64 = 64;
+/// with every control call timing out. 32 keeps an eightfold margin below that while being far
+/// more tabs than one project's agents legitimately need, and the cap is per workspace, so several
+/// projects on one server each want headroom of their own.
+pub const DEFAULT_MAX_PANES: u64 = 32;
 
 /// Largest accepted `max_panes`. A shared finite bound keeps the two implementations identical.
 pub const MAX_PANE_CAP: u64 = 1_000_000;
@@ -802,6 +803,10 @@ mod tests {
         assert_eq!(config.prefixes, strings(&["with-proxy"]));
         assert_eq!(config.timeout_seconds, 900.0);
         assert_eq!(config.retention_days, 4);
+        // Named literally rather than compared against DEFAULT_MAX_PANES: a test that reads the
+        // production constant would agree with any value the constant ever takes, including a
+        // typo, and so would pin nothing at all.
+        assert_eq!(config.max_panes, 32);
         assert_eq!(config.readiness, "both");
         assert_eq!(config.broker, "direct");
     }

@@ -133,7 +133,7 @@ spool_dir: .herdr-run
 
 timeout_seconds: 900          # wait for the command's exit code
 retention_days: 4             # completed run spools older than this are pruned on a later write
-max_panes: 64                 # refuse to open a NEW tab once the workspace holds this many panes
+max_panes: 32                 # refuse to open a NEW tab once the workspace holds this many panes
 ready_timeout_seconds: 0      # wait for the pane to go idle (0 = refuse immediately)
 
 readiness: both               # 'both' = process signal AND prompt veto; 'process' = drop the veto
@@ -263,14 +263,14 @@ coined and destroyed continuously, so the command workspace grows for as long as
 a 316-core host a session with 260 panes drove the server to over 1000% CPU, with roughly 98% of
 cycles in the allocator's futex spinlock and every control call timing out.
 
-`max_panes` (64 by default) turns that slow collapse into one legible refusal. When the workspace
+`max_panes` (32 by default) turns that slow collapse into one legible refusal. When the workspace
 already holds that many panes and this agent has **no tab yet**, bring-up fails with exit 69 and a
 message naming the remedy. The check is deliberately only on the create path: an agent whose tab
 already exists is never locked out of it, because a cap that can break work in progress is a cap
 that gets switched off. Set `max_panes: 0` to disable it.
 
-The cap is **per workspace**, while the measurement behind the number is **per server**. Five
-projects each with their own `workspace:` and each sitting at 63 panes reproduce the measured
+The cap is **per workspace**, while the measurement behind the number is **per server**. Nine
+projects each with their own `workspace:` and each sitting at 31 panes reproduce the measured
 condition without any of them breaching its cap. `max_panes` bounds one project's contribution to
 the leak, not a host's total.
 

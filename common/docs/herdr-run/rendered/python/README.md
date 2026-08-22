@@ -75,7 +75,7 @@ tab_name: "{agent}"       # one tab per agent
 allow: [git, gh]          # cooperative policy rail - keep it small
 prefixes: [with-proxy]    # wrappers that may precede an allowlisted program
 spool_dir: .herdr-run     # git-ignored: holds command output, not source
-max_panes: 64             # refuse a NEW tab once the workspace holds this many panes (0 = off)
+max_panes: 32             # refuse a NEW tab once the workspace holds this many panes (0 = off)
 ```
 
 ## Quick reference

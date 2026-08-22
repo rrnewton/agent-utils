@@ -466,7 +466,7 @@ def _config_success(harness: Harness, report: Report) -> None:
         '"source": "(built-in defaults)"' in python.stdout
         and '"project_root": "<ROOT>"' in python.stdout
         and '"tab_label": "fixture-agent"' in python.stdout
-        and '"max_panes": 64' in python.stdout,
+        and '"max_panes": 32' in python.stdout,
         f"default config omitted resolved fields: {_describe(python)}",
     )
 
