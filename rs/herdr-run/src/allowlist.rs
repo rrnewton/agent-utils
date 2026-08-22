@@ -168,7 +168,7 @@ pub fn admit(command: &str, config: &Config) -> Result<Admission> {
             python_repr(&program)
         )));
     }
-    if !config.allow.contains(&program) {
+    if !config.allows_any_program() && !config.allow.contains(&program) {
         let hint = if config.prefixes.contains(&program) {
             format!(
                 " ({} is a wrapper prefix, not a program)",
@@ -594,6 +594,64 @@ mod tests {
             assert_eq!(error.exit_code(), crate::error::EXIT_REFUSED);
             assert!(error.to_string().contains(fragment), "{error}");
         }
+    }
+
+    /// The wildcard turns off the PROGRAM-NAME check and nothing else.
+    ///
+    /// Naming each surviving rule matters more than checking that `curl` now runs: the value of an
+    /// allow-everything mode a project can actually reach for is that it is still not a way to
+    /// smuggle control characters into a shared pane or to execute a planted binary by path.
+    #[test]
+    fn the_allow_wildcard_admits_any_program_and_keeps_every_other_rule() {
+        let config = Config {
+            allow: vec!["*".into()],
+            ..Config::default()
+        };
+        for (command, program) in [
+            ("curl https://example.invalid", "curl"),
+            ("bash -lc true", "bash"),
+            ("rm -rf /x", "rm"),
+        ] {
+            assert_eq!(admit(command, &config).expect(command).program, program);
+        }
+        assert_eq!(
+            admit("with-proxy curl https://example.invalid", &config)
+                .unwrap()
+                .prefix,
+            vec!["with-proxy"]
+        );
+        for (command, fragment) in [
+            ("/bin/curl x", "bare command name"),
+            ("./curl x", "bare command name"),
+            ("curl x\u{0007}", "terminal control U+0007"),
+            ("with-proxy with-proxy curl x", "repeated"),
+            ("git --exec-path=/tmp/evil status", "is denied for git"),
+            ("git push --receive-pack=/tmp/evil origin", "is denied"),
+            (
+                "cargo build --release",
+                "subcommand 'cargo build' is not allowlisted",
+            ),
+            ("with-proxy", "no program"),
+        ] {
+            let error = admit(command, &config).expect_err(command);
+            assert_eq!(error.exit_code(), crate::error::EXIT_REFUSED, "{command}");
+            assert!(error.to_string().contains(fragment), "{command}: {error}");
+        }
+
+        // The wildcard does not reach cargo's own guard: without a positive subcommand list,
+        // cargo stays refused outright rather than inheriting "everything is allowed".
+        let no_cargo_list = Config {
+            allow: vec!["*".into()],
+            allow_subcommand: std::collections::BTreeMap::new(),
+            ..Config::default()
+        };
+        let error = admit("cargo fetch", &no_cargo_list).expect_err("cargo fetch");
+        assert!(
+            error
+                .to_string()
+                .contains("requires an explicit allow_subcommand entry"),
+            "{error}"
+        );
     }
 
     #[test]

@@ -13,6 +13,18 @@ use crate::error::{HerdrRunError, Result};
 /// Accepted configuration basenames, in preference order at each directory.
 pub const CONFIG_FILENAMES: [&str; 2] = [".herdr-run.yaml", ".herdr-run.yml"];
 
+/// The single `allow` entry that turns the allowlist off: any bare program name is admitted.
+///
+/// This is a named mode rather than something to be worked out, because the alternative — writing
+/// out every program a project might ever want — is the kind of list people abandon halfway and
+/// then widen by accident. It is deliberately the only entry permitted when it is present: an
+/// `allow` reading `["*", "git"]` looks narrower than it is.
+///
+/// Everything except the program-name check still applies in this mode: terminal control
+/// characters are still refused, the program must still be a bare name resolved from the pane's
+/// `PATH`, wrapper prefixes must still be declared, and every `deny_*` rule still bites.
+pub const ALLOW_ANY_PROGRAM: &str = "*";
+
 /// Default ceiling on panes in the command workspace before a NEW tab is refused.
 ///
 /// Every agent that ever runs a command leaves a tab behind and nothing closes it, so without a
@@ -82,6 +94,14 @@ pub struct Config {
     pub source_path: Option<String>,
     /// Absolute project root used to resolve relative paths.
     pub project_root: String,
+}
+
+impl Config {
+    /// Report whether `allow` has been set to the [`ALLOW_ANY_PROGRAM`] wildcard.
+    #[must_use]
+    pub fn allows_any_program(&self) -> bool {
+        self.allow.iter().any(|entry| entry == ALLOW_ANY_PROGRAM)
+    }
 }
 
 impl Default for Config {
@@ -478,6 +498,11 @@ pub fn parse_config(
             "{what}.allow: refusing an EMPTY allowlist — no command could ever run"
         )));
     }
+    if config.allows_any_program() && config.allow.len() > 1 {
+        return Err(HerdrRunError::config(format!(
+            "{what}.allow: {ALLOW_ANY_PROGRAM:?} already admits every program, so it must be the only entry; listing programs beside it makes the policy look narrower than it is"
+        )));
+    }
     if config.allow.iter().any(|program| program == "cargo")
         && !config.allow_subcommand.contains_key("cargo")
     {
@@ -860,6 +885,30 @@ mod tests {
                 .expect_err("malformed config must fail");
             assert_eq!(error.exit_code(), crate::error::EXIT_CONFIG);
         }
+    }
+
+    #[test]
+    fn the_allow_wildcard_must_stand_alone() {
+        let error = parse_config(
+            &serde_json::json!({"allow": ["*", "git"]}),
+            Some("x.yaml".into()),
+            "/tmp".into(),
+        )
+        .expect_err("a wildcard mixed with named programs must fail");
+        assert_eq!(error.exit_code(), crate::error::EXIT_CONFIG);
+        assert!(
+            error.message().contains("must be the only entry"),
+            "{error}"
+        );
+
+        let wildcard = parse_config(
+            &serde_json::json!({"allow": ["*"]}),
+            Some("x.yaml".into()),
+            "/tmp".into(),
+        )
+        .expect("a lone wildcard is a valid allowlist");
+        assert!(wildcard.allows_any_program());
+        assert!(!Config::default().allows_any_program());
     }
 
     #[test]
