@@ -971,18 +971,72 @@ prefixes: []
 """
 
 
-def _documentation(harness: Harness, report: Report) -> None:
-    """Both documentation commands must print the same document in both editions.
+#: The one heading whose section is allowed to differ between the two editions.
+_INSTALLATION_HEADING = "## Installation"
 
-    They are also compared to each other: `quickstart` is supposed to be a much shorter amended
-    version, and two commands that print the same text would be one command with two names.
+
+def _split_installation(text: str) -> tuple[str, str]:
+    """Split a user guide into (everything else, the per-edition installation section).
+
+    The two guides ship ONE deliberately different section: how you install THAT edition — `pip`
+    against `cargo`, a Python version against a Rust version. Everything else — the subcommands,
+    the options, the exit codes, the retention rules, the trust model — is one shared source, so it
+    is compared byte for byte with that single section lifted out rather than the comparison being
+    abandoned because one paragraph is allowed to differ.
+    """
+    lines = text.splitlines(keepends=True)
+    start = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if line.startswith(_INSTALLATION_HEADING)
+        ),
+        None,
+    )
+    if start is None:
+        return text, ""
+    end = next(
+        (index for index in range(start + 1, len(lines)) if lines[index].startswith("## ")),
+        len(lines),
+    )
+    return "".join(lines[:start] + lines[end:]), "".join(lines[start:end])
+
+
+def _documentation(harness: Harness, report: Report) -> None:
+    """Both documentation commands must say the same thing in both editions.
+
+    `quickstart` is one shared source and is compared byte for byte. The user guide is shared
+    everywhere except its installation section, which names the edition's own package manager on
+    purpose, so it is compared byte for byte with that one section lifted out — and the lifted
+    sections are separately required to DIFFER, so a normalisation that quietly removed the whole
+    document could not pass.
+
+    The two documents are also compared to each other: `quickstart` is supposed to be a much
+    shorter amended version, and two commands printing the same text would be one command with two
+    names.
     """
 
     case = harness.case("documentation")
     quickstart_python, quickstart_rust = harness.invoke(case, ("quickstart",))
     report.exact("documentation/quickstart", quickstart_python, quickstart_rust, expected_rc=0)
     guide_python, guide_rust = harness.invoke(case, ("userguide",))
-    report.exact("documentation/userguide", guide_python, guide_rust, expected_rc=0)
+    shared_python, install_python = _split_installation(guide_python.stdout)
+    shared_rust, install_rust = _split_installation(guide_rust.stdout)
+    report.exact(
+        "documentation/userguide-outside-installation",
+        Outcome(guide_python.returncode, shared_python, guide_python.stderr),
+        Outcome(guide_rust.returncode, shared_rust, guide_rust.stderr),
+        expected_rc=0,
+    )
+    report.require(
+        "documentation/userguide-installation-is-the-only-difference",
+        bool(install_python)
+        and bool(install_rust)
+        and install_python != install_rust
+        and len(shared_python) > 500,
+        "the installation section is the ONE section allowed to differ, and it must be found in "
+        f"both editions and actually differ: python={install_python!r} rust={install_rust!r}",
+    )
     report.require(
         "documentation/quickstart-is-shorter",
         quickstart_python.stdout != guide_python.stdout
@@ -994,9 +1048,15 @@ def _documentation(harness: Harness, report: Report) -> None:
 
     # A configuration file too broken to load must not be able to withhold the documentation.
     broken = harness.case("documentation-broken-config", {".herdr-run.yaml": "allow: [\n"})
-    for subcommand in ("quickstart", "userguide"):
-        python, rust = harness.invoke(broken, (subcommand,))
-        report.exact(f"documentation/{subcommand}-despite-broken-config", python, rust, expected_rc=0)
+    python, rust = harness.invoke(broken, ("quickstart",))
+    report.exact("documentation/quickstart-despite-broken-config", python, rust, expected_rc=0)
+    python, rust = harness.invoke(broken, ("userguide",))
+    report.require(
+        "documentation/userguide-despite-broken-config",
+        python == guide_python and rust == guide_rust,
+        "a configuration file too broken to load withheld the user guide: "
+        f"python={_describe(python)} rust={_describe(rust)}",
+    )
 
     help_python, _ = harness.invoke(case, ("--help",))
     report.require(
