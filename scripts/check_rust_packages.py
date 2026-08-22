@@ -91,6 +91,14 @@ _COMMON_DOC_TERMS: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 
 
+#: How each command is asked to print its own user guide.
+#:
+#: A global `--userguide` flag is the norm here, but a command whose surface is
+#: `<command> <subcommand>` says it as a subcommand instead, because a documentation flag sitting
+#: beside a subcommand list is the mixing that surface exists to avoid.
+_USERGUIDE_INVOCATION: dict[str, tuple[str, ...]] = {"herdr-run": ("userguide",)}
+
+
 class CheckError(RuntimeError):
     """A crate failed its publishable-artifact contract."""
 
@@ -364,9 +372,10 @@ def _smoke(
         if not executable.is_file():
             raise CheckError(f"{crate.name}: verified binary is missing: {executable}")
         command_guides = dict(crate.command_userguides)
-        invocations = [("--help",), ("--version",)]
+        guide_args = _USERGUIDE_INVOCATION.get(binary, ("--userguide",))
+        invocations: list[tuple[str, ...]] = [("--help",), ("--version",)]
         if binary in command_guides:
-            invocations.append(("--userguide",))
+            invocations.append(guide_args)
         for args in invocations:
             result = _run(
                 [str(executable), *args],
@@ -379,10 +388,12 @@ def _smoke(
                 raise CheckError(
                     f"{binary} --version did not report {version!r}: {combined!r}"
                 )
-            if args == ("--userguide",) and (
+            if args == guide_args and (
                 result.stdout != documents[command_guides[binary]] or result.stderr
             ):
-                raise CheckError(f"{binary} --userguide differs from packaged user guide")
+                raise CheckError(
+                    f"{binary} {' '.join(guide_args)} differs from packaged user guide"
+                )
 
 
 def main() -> int:
