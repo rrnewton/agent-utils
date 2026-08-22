@@ -106,6 +106,7 @@ mod tests {
             author_is_bot: false,
             timestamp: "2026-08-18T12:00:00+00:00".to_owned(),
             spoken_time: "08:00:00 EDT".to_owned(),
+            reply_to: None,
             content: content.to_owned(),
         }
     }

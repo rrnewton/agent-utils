@@ -1031,6 +1031,13 @@ function newPage(store = new Map(), script = SCRIPT) {
           author_id: "1000000000000000009",
           author_is_bot: false,
           timestamp: "2026-08-19T20:40:00.000Z",
+          // ECHOED FROM THE REQUEST, because that is what the server does. `post_message` sends
+          // Discord a `message_reference` and returns the message Discord recorded, so a posted
+          // reply really does come back carrying the id of what it answers. A canned response that
+          // dropped the field made the fixture less faithful than the server, and the specific
+          // thing it would have hidden is the inbox loop: replying to a message is what marks it
+          // answered, and with the field missing the row stayed open.
+          reply_to: JSON.parse(options.body).reply_to,
           content: JSON.parse(options.body).text,
         },
       }),
@@ -1587,6 +1594,14 @@ const TUNING_BANDS = {
     "how much of an arriving message is spoken into a live call. Too short and the agent is told " +
     "a headline it cannot act on; too long and one chatty channel message costs a paragraph of " +
     "billed conversation"],
+  SWIPE_START_PX: [4, 40,
+    "how far a finger travels before the gesture is committed to an axis. Below a few pixels a " +
+    "tap with any tremor in it becomes a swipe; far above that the row does not begin to follow " +
+    "the finger until the finger has already stopped, which reads as a dead control"],
+  SWIPE_COMMIT_PX: [40, 400,
+    "how far a row must be dragged for the archive to happen. Too short and a scroll that started " +
+    "slightly sideways files a message away without being asked; too long and the gesture cannot " +
+    "be completed on a narrow phone at all"],
 };
 test("every number this page is tuned by stays inside a band that says what would be wrong", () => {
   for (const [name, [low, high, why]] of Object.entries(TUNING_BANDS)) {
@@ -7329,6 +7344,128 @@ test("the reply screen shows the message being answered, in full, with its id", 
   const target = cssBlock("#reply-target");
   assert.match(target, /overflow-y:\s*auto/);
   assert.match(target, /overscroll-behavior:\s*contain/);
+});
+
+// --- the inbox view ---------------------------------------------------------------------------
+//
+// The channel read as a QUEUE. Three states, known three different ways: REPLIED is derived from
+// the channel, ARCHIVED is the reader's own judgement stored in this browser, and HIDDEN is the
+// filter that turns the second into an inbox.
+
+const row = (page, i) => page.el("discord-log").children[i];
+const archiveButton = (li) =>
+  li.descendants().find((node) => node.className === "archive-button");
+const rowState = (page, i) => ({ replied: row(page, i).getAttribute("data-replied") });
+
+/** Two messages where the second answers the first, as Discord records a reply. */
+function conversation() {
+  return [
+    message({ id: "1000000000000000001", content: "is the runner wedged?" }),
+    message({
+      id: "1000000000000000002",
+      content: "yes, restarted it",
+      reply_to: "1000000000000000001",
+    }),
+    message({ id: "1000000000000000003", content: "nobody has answered this one" }),
+  ];
+}
+
+test("A MESSAGE SOMEBODY HAS ANSWERED IS DIMMED; AN UNANSWERED ONE IS NOT", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, conversation());
+
+  assert.deepStrictEqual(rowState(page, 0), { replied: "true" });
+  // The ANSWER is not itself answered. Discord marks only the answering message, so a naive
+  // implementation that set the flag on whichever row carried a pointer would dim this one.
+  assert.deepStrictEqual(rowState(page, 1), { replied: "false" });
+  assert.deepStrictEqual(rowState(page, 2), { replied: "false" });
+
+  // And it is DRAWN, not merely recorded in an attribute.
+  const dimmed = cssBlock('#discord-log li.discord-message[data-replied="true"]');
+  assert.match(dimmed, /opacity/, "an answered row looks exactly like an unanswered one");
+});
+
+test("the replied state is re-derived over the WHOLE list, not decided when a row is built", async () => {
+  // The answer to a message can arrive long after it. A row's state is a fact about the SET.
+  const page = newPage();
+  // `withLiveChannel` signs in and switches to the channel itself, so nothing may do either first.
+  const stream = await withLiveChannel(page, [
+    message({ id: "1000000000000000001", content: "open question" }),
+  ]);
+  assert.equal(rowState(page, 0).replied, "false", "it started out answered");
+
+  // A live arrival that answers it.
+  await deliver(
+    page,
+    stream,
+    sseMessage(
+      message({
+        id: "1000000000000000002",
+        content: "answering it now",
+        reply_to: "1000000000000000001",
+      })
+    )
+  );
+
+  assert.equal(
+    rowState(page, 0).replied,
+    "true",
+    "an arriving answer did not dim the message it answers"
+  );
+});
+
+test("THE SWIPE DRIVES THE SAME DISMISSAL THE DONE BUTTON DOES, NOT A SECOND ONE", () => {
+  // `#50 todo-view` deferred the gesture layer on one condition: the acts must exist first, each
+  // reachable by a control a keyboard can also get to, so a gesture is a SECOND way in and never
+  // the only one. That condition is what makes this safe — a swipe that recorded something only
+  // this browser knew, with no undo, would be the worst control on the page.
+  //
+  // So there is exactly one notion of "dealt with", it is the server's, and the swipe posts to it.
+  assert.match(
+    SCRIPT_CODE,
+    /function swipeable\([\s\S]*?dismissMessages\(/,
+    "the swipe does not go through the same dismissal the Done button uses"
+  );
+  // And no second, browser-local one is left behind. `#66 inbox-view` arrived with an archive kept
+  // in localStorage and a filter of its own; two controls that both mean "show me what is left" is
+  // worse than either alone, and the server's state is the one with an undo behind it.
+  for (const gone of ["ARCHIVED_KEY", "setArchived", "inboxOnly", "renderInboxToggle"]) {
+    assert.ok(!SCRIPT_CODE.includes(gone), gone + " survived the consolidation onto #50's state");
+  }
+  assert.ok(!HTML.includes('id="inbox-only"'), "a second filter is still in the markup");
+  // TOUCH AND PEN ONLY. A horizontal mouse drag across a message is how a person selects text, and
+  // this list exists so a specific real message can be quoted and checked.
+  assert.match(
+    SCRIPT_CODE,
+    /pointerType === "mouse"/,
+    "a mouse drag across a message would now dismiss it instead of selecting text"
+  );
+});
+
+test("REPLYING FROM THE PAGE DIMS WHAT YOU ANSWERED, WITHOUT WAITING FOR A POLL", async () => {
+  // The whole loop: the reply this page posts carries `message_reference`, so the message it
+  // answers becomes an answered one immediately rather than at the next forty-five-second re-read.
+  const page = newPage();
+  await signIn(page);
+  await openReplyOn(page, conversation(), 2);
+  assert.equal(rowState(page, 2).replied, "false", "it was already dimmed before the reply");
+
+  page.el("reply-text").value = "answering the open one";
+  await page.el("reply-send").click();
+  await page.settle();
+
+  const posted = page.repliesPosted.at(-1);
+  assert.equal(
+    posted.body.reply_to,
+    "1000000000000000003",
+    "the reply did not reference the message"
+  );
+  assert.equal(
+    rowState(page, 2).replied,
+    "true",
+    "the message just answered is still shown as open"
+  );
 });
 
 test("with every toggle untouched, the page asks for EXACTLY what it asked for before the menu existed", async () => {

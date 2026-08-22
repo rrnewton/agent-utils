@@ -97,8 +97,46 @@ impl FakeDiscord {
             // about the operator's zone. A fake that pre-filled it would let a test pass with
             // `ops::stamp` deleted. See `crate::model::Message::spoken_time`.
             spoken_time: String::new(),
+            // Seeding an ordinary message. `seed_reply` is how a fixture makes one that answers
+            // another, and it is a separate call so that "this is a reply" is always something a
+            // test said out loud rather than something it inherited.
+            reply_to: None,
             content: content.to_owned(),
         });
+        id
+    }
+
+    /// Make an already-seeded message a reply to `parent`.
+    ///
+    /// The counterpart of [`FakeDiscord::seed_reply`] for a fixture that seeded a whole backlog
+    /// first and only then decided which of its messages answer which — which is what a
+    /// development seed does, because the answers are chosen by reading the text.
+    pub fn set_reply_to(&self, message: &MessageId, parent: &MessageId) {
+        let mut state = self.lock();
+        if let Some(found) = state.messages.iter_mut().find(|m| &m.id == message) {
+            found.reply_to = Some(parent.clone());
+        }
+    }
+
+    /// Seed a message that REPLIES to `parent`, as Discord records a reply.
+    ///
+    /// The pointer lives on the answering message and nowhere else, which is exactly the fact the
+    /// inbox view is built on, so a fixture has to be able to produce that shape.
+    pub fn seed_reply(
+        &self,
+        channel: &ChannelId,
+        author: &str,
+        content: &str,
+        parent: &MessageId,
+    ) -> MessageId {
+        let id = self.seed(channel, author, content);
+        let mut state = self.lock();
+        let message = state
+            .messages
+            .iter_mut()
+            .find(|m| m.id == id)
+            .expect("the message just seeded is present");
+        message.reply_to = Some(parent.clone());
         id
     }
 
@@ -270,7 +308,15 @@ impl DiscordClient for FakeDiscord {
         if let Some(unknown) = self.unknown_channel(channel) {
             return Err(unknown);
         }
-        let id = self.seed(channel, "gent-talk", content);
+        // Through `seed_reply` when this really is a reply, so the fake's own channel ends up in
+        // the shape Discord's would: the pointer on the ANSWERING message. Without this, posting a
+        // reply here produced a loose message and the parent never showed as answered — which is
+        // exactly the behaviour the inbox view is built on, so the fake would have been unable to
+        // exercise the one loop that matters.
+        let id = match reply_to {
+            Some(parent) => self.seed_reply(channel, "gent-talk", content, parent),
+            None => self.seed(channel, "gent-talk", content),
+        };
         self.lock().posted.push(PostedMessage {
             channel: channel.clone(),
             content: content.to_owned(),

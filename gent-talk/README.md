@@ -1276,6 +1276,48 @@ anchor-and-offset mechanism the fold control uses rather than a saved `scrollTop
 element is allowed to reset its scroll position to zero, and a restore expressed as a delta against
 an anchor is correct either way.
 
+### Two ways a channel row can already have been dealt with, and only one of them hides it
+
+`#66 inbox-view` lands the two follow-ups `#50 todo-view` named for itself — the **swipe**, and the
+**derived "replied" signal** that needed a reply reference on the server's `Message`.
+
+`#50` filters the channel on **dismissal**: declared by the reader, recorded on the server, with an
+undo and a bulk clear behind it. That stays exactly as it was, and it is still the only filter.
+`#66` adds the other half:
+
+| State | Where it comes from | What it does |
+|---|---|---|
+| **Dismissed** | *declared* by the reader, held on the server | removes the row from the To do list |
+| **Replied** | *derived* — some **loaded** message points at this one | dims the row; never hides it |
+
+**`#50` left one question open** — "nothing in this file has to decide what happens when derived and
+declared disagree" — and landing the derived half is what forces the answer. **They never meet**,
+because they drive different affordances. Declared decides what is in the *list*: dismissing is an
+act with an undo behind it, so it may remove a row. Derived decides how a row is *drawn*: replying
+dims, and that is all. An observation must not make messages disappear, and this observation admits
+it is incomplete.
+
+**That incompleteness is the reason for the split, not a caveat bolted onto it.** Discord records a
+reply only on the *answering* message — there is no field at all on the message being answered — so
+the server carries the raw pointer (`Message::reply_to`, deliberately not a `has_replies` boolean,
+which could only ever have meant "within this fetch window" while being read as more) and the page
+derives the rest from what is loaded. A reply further back than the reader has walked is invisible,
+so a row can be dimmed *later* than it should have been, never earlier. Being late to dim costs
+nothing; being late to **hide** would lose a message.
+
+The derivation is **one pass over the whole list after every mutation**, never a decision taken when
+a row is built. Rows arrive from three places, and "has this been answered" is a fact about the
+*set*: an answer can arrive in the next poll, and a step backwards can reveal the question a loaded
+answer belongs to.
+
+**The swipe drives the same dismissal the Done button does** — one act, one record, one undo. That
+ordering was `#50`'s condition for a gesture layer at all, and it still holds: the gesture is a
+second way in, never the only one, and a horizontal *mouse* drag is left alone because that is how
+a person selects the text of a message they want to quote.
+
+Replying from the page closes the loop on the spot: the reply carries a `message_reference`, so what
+it answers dims immediately rather than at the next forty-five-second re-read.
+
 ### A conversation can end three ways, and they are three different sentences
 
 A WebSocket close is one event, and the page used to have two things to say about it. That is one

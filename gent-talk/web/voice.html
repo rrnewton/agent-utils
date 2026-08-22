@@ -168,6 +168,14 @@
                   filtered, and a tab would imply a second place messages live. It sits in the
                   view's own header rather than among the floating chips because it changes what
                   the list IS, where those change how it is displayed.
+
+                  THE ONLY FILTER, and deliberately so. `#66 inbox-view` arrived with a second one
+                  — an "Inbox" toggle over an archive kept in this browser — and two controls that
+                  both mean "show me what is left" is worse than either alone. This one wins on the
+                  merits: dismissal is recorded on the SERVER, so it survives a different browser
+                  and a cleared cache, and it already has an undo and a bulk clear. What that issue
+                  contributed instead is the two things `#50` listed as its own follow-ups — the
+                  swipe, and the derived "replied" signal.
                 -->
                 <button id="todo-filter" type="button" aria-pressed="false">To do</button>
               </div>

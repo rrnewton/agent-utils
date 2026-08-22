@@ -388,6 +388,53 @@ body {
   -webkit-tap-highlight-color: transparent;
 }
 
+/* --------------------------------------------------------------------------- the inbox view -- */
+/*
+ * `#66 inbox-view`. A row somebody has already ANSWERED recedes.
+ *
+ * One axis — how much of the reader's attention the row is still asking for — and the baseline is
+ * the loud one: an unattended row carries no badge and gains nothing, because the whole point is
+ * that what still wants you is what stands out.
+ *
+ * DIMS AND DOES NOT HIDE, and that is the boundary between this and the To do filter. Being
+ * answered is DERIVED from whatever happens to be loaded, so it is an observation; being dismissed
+ * is DECLARED by the reader and has an undo, so it may remove a row. See the note at the head of
+ * the section in web/voice.js.
+ *
+ * Opacity rather than a grey colour, deliberately: it composes with the light and dark themes, with
+ * the hover treatment and with the accent border, none of which would survive a hard-coded ink.
+ */
+#discord-log li.discord-message[data-replied="true"] {
+  opacity: 0.55;
+}
+
+/* Anchor for the mark above, and the reason a swipe can move the row: a transform on a static
+   element still paints, but the strike would travel with it and the row's own box would not. */
+#discord-log li.discord-message {
+  position: relative;
+}
+
+/* Bringing a dimmed row back to full attention when it is FOCUSED, whatever its state: it still
+   has a Reply and an Unarchive on it, and a control at 40% opacity that somebody has tabbed to is
+   a control that looks broken.
+
+   The hover half of this pair is inside the pointer query above, and the split is not cosmetic — a
+   tap on a touch screen leaves `:hover` stuck on the row it landed on, so a phone would end up with
+   one permanently undimmed row and no way to clear it. Same rule, same reason, as the row tint. */
+#discord-log li.discord-message:focus-within {
+  opacity: 1;
+}
+
+/* The swipe. `pan-y` gives the vertical axis to the scroller and keeps the horizontal one for the
+   row, which is what stops a swipe and a scroll fighting; web/voice.js still decides the axis per
+   gesture and bails out of anything that is mostly vertical. The transition is for the SNAP BACK —
+   the drag itself sets `transition: none` while a finger is down, because a transform that eases
+   toward the finger reads as lag. */
+#discord-log li.discord-message {
+  touch-action: pan-y;
+  transition: transform 0.18s ease-out;
+}
+
 #screen-signin h1 {
   margin-top: 0;
 }
@@ -838,9 +885,17 @@ body {
     border-color: var(--accent);
   }
 
-  #discord-log li.discord-message:hover .reply-button {
+  #discord-log li.discord-message:hover .reply-button,
+  #discord-log li.discord-message:hover .done-button {
     color: var(--ink);
     border-color: var(--accent);
+  }
+
+  /* An answered or archived row is dimmed, and comes back to full contrast under the pointer. In
+     here rather than outside, because `:hover` sticks to the last-tapped row on a touch screen and
+     a phone would be left with exactly one permanently bright row. */
+  #discord-log li.discord-message:hover {
+    opacity: 1;
   }
 }
 

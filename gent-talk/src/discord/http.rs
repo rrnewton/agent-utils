@@ -208,6 +208,17 @@ pub fn parse_message(value: &serde_json::Value) -> Result<Message, DiscordError>
         // operator's zone; `crate::ops::stamp` is the single place that fills it in. See
         // `crate::model::Message::spoken_time`.
         spoken_time: String::new(),
+        // `message_reference.message_id`. Discord uses this object for several kinds of reference
+        // — a reply, a forward, a crosspost — and only reports the id we care about on the ones
+        // that have one, so a missing or non-string value is an ordinary message rather than a
+        // shape error. This is deliberately NOT read from `referenced_message`: that is the whole
+        // embedded parent object, it is absent when the parent was deleted, and this server needs
+        // only the id.
+        reply_to: value
+            .get("message_reference")
+            .and_then(|reference| reference.get("message_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(|id| MessageId(id.to_owned())),
         // A message can legitimately have empty content (an embed or an attachment only), so this
         // one is defaulted rather than required.
         content: value
@@ -563,6 +574,59 @@ mod tests {
             "author": { "id": "400000000000000004", "username": "rrnewton", "global_name": "Ryan", "bot": false }
           }
         ])
+    }
+
+    #[test]
+    fn a_reply_carries_the_id_of_what_it_answers_and_an_ordinary_message_carries_none() {
+        // Discord records a reply on the ANSWERING message, as `message_reference.message_id`, and
+        // there is no field at all on the message being answered. Everything the inbox view does
+        // with "this has been replied to" is derived from this one pointer, so it has to survive
+        // the mapping.
+        let payload = serde_json::json!([
+          {
+            "id": "1000000000000000002",
+            "channel_id": "123",
+            "content": "answering you",
+            "timestamp": "2026-08-18T12:01:00.000000+00:00",
+            "author": { "id": "3", "username": "coder-bot", "global_name": null, "bot": true },
+            "message_reference": { "message_id": "1000000000000000001", "channel_id": "123" }
+          },
+          {
+            "id": "1000000000000000001",
+            "channel_id": "123",
+            "content": "asking you",
+            "timestamp": "2026-08-18T12:00:00.000000+00:00",
+            "author": { "id": "4", "username": "rrnewton", "global_name": "Ryan", "bot": false }
+          }
+        ]);
+        let messages = parse_message_list(&payload).expect("parses");
+        assert_eq!(messages[0].content, "asking you");
+        assert_eq!(
+            messages[0].reply_to, None,
+            "the message being ANSWERED must not claim to be a reply; Discord marks only the answer"
+        );
+        assert_eq!(
+            messages[1].reply_to.as_ref().map(MessageId::as_str),
+            Some("1000000000000000001"),
+            "the reply lost the id of what it answers"
+        );
+    }
+
+    #[test]
+    fn a_reference_without_a_message_id_is_an_ordinary_message_rather_than_a_shape_error() {
+        // Discord uses `message_reference` for forwards and crossposts too, and those need not
+        // carry the field this server reads. A missing pointer is "not a reply we can resolve",
+        // never a refusal to parse the channel.
+        let payload = serde_json::json!([{
+            "id": "1000000000000000009",
+            "channel_id": "123",
+            "content": "forwarded",
+            "timestamp": "2026-08-18T12:02:00.000000+00:00",
+            "author": { "id": "5", "username": "someone", "global_name": null, "bot": false },
+            "message_reference": { "channel_id": "456" }
+        }]);
+        let messages = parse_message_list(&payload).expect("parses");
+        assert_eq!(messages[0].reply_to, None);
     }
 
     #[test]

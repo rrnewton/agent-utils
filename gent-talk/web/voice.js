@@ -2938,6 +2938,166 @@ function renderMarkdownInto(parent, raw) {
   return parent;
 }
 
+// --- what a channel row has already had done to it ------------------------------------------
+//
+// `#66 inbox-view`, landing the two follow-ups `#50 todo-view` named for itself.
+//
+// TWO states, and they are two rather than one because they are known two different ways:
+//
+//   DISMISSED  DECLARED, by the reader, and recorded on the SERVER. That is `#50`'s state, it has
+//              an undo and a bulk clear, and it is what the To do filter filters on.
+//   REPLIED    DERIVED, from the channel itself: some other LOADED message points at this one.
+//              Nobody sets it and nobody can clear it. It is a fact about the conversation.
+//
+// `#50` left one question open — "nothing in this file has to decide what happens when derived and
+// declared disagree" — and landing the derived half is what forces the answer. THE ANSWER IS THAT
+// THEY NEVER MEET, because they drive different affordances:
+//
+//   * DECLARED decides what is in the LIST. Dismissing is an act with an undo behind it, so it may
+//     remove a row; the reader can always put it back.
+//   * DERIVED decides how a row is DRAWN. Replying dims, and never hides. It is an observation, not
+//     an instruction, and an observation that made messages disappear would be the page deciding
+//     something on the reader's behalf from evidence it admits is incomplete.
+//
+// WHAT "REPLIED" HONESTLY MEANS, because the label would otherwise claim more than it can: Discord
+// records a reply only on the ANSWERING message, so this can only ever see the answers that are
+// LOADED. A reply further back than the reader has walked is invisible here, and a message can
+// therefore be dimmed later than it "should" have been. It never goes the other way — a dimmed row
+// really was answered — so the error is always in the safe direction, and walking further back with
+// Older messages only ever reveals more of them. That asymmetry is precisely why this half only
+// dims: being late to dim costs nothing, and being late to HIDE would lose a message.
+
+/**
+ * The first descendant of `node` carrying `className`.
+ *
+ * Deliberately NOT `querySelector`. This page's behavioural suite drives the real web/voice.js
+ * against a strict fake DOM that models the subset of the API the page is allowed to use, and a
+ * selector engine is not in it — so a `querySelector` call does not throw there, it silently finds
+ * nothing, and the assertion that fails is about a label rather than about the lookup. Walking
+ * `children` is the idiom the rest of this file and the suite both already use, and it behaves
+ * identically against a real HTMLCollection and against the fixture's array.
+ */
+function childByClass(node, className) {
+  for (const child of node.children || []) {
+    if (child.className === className) {
+      return child;
+    }
+    const deeper = childByClass(child, className);
+    if (deeper) {
+      return deeper;
+    }
+  }
+  return null;
+}
+
+/**
+ * Re-derive every row's state from the list as it now stands.
+ *
+ * ONE PASS OVER THE WHOLE LIST, called after every mutation, rather than a decision taken when a
+ * row is built. Rows arrive from three places — the newest page, a step further back, and a live
+ * arrival — and "has this been replied to" is a fact about the SET, not about the row: the answer
+ * to a message loaded an hour ago can arrive in the next poll, and a step back through the channel
+ * can reveal the question a loaded answer belongs to. Deciding it per row at construction time
+ * would be right only until the next thing happened.
+ */
+function renderChannelRows() {
+  const list = el("discord-log");
+  const rows = [...list.children];
+  // Every message some LOADED message answers.
+  const answered = new Set();
+  for (const row of rows) {
+    const parent = row.getAttribute("data-reply-to");
+    if (parent) {
+      answered.add(parent);
+    }
+  }
+  for (const row of rows) {
+    const id = row.getAttribute("data-id") || "";
+    // DIMS, never hides. See the note at the head of this section: this is derived from what
+    // happens to be loaded, and evidence that admits it is incomplete must not remove anything.
+    row.setAttribute("data-replied", answered.has(id) ? "true" : "false");
+  }
+}
+
+/**
+ * Swipe a row away, on a device that has swipes.
+ *
+ * TOUCH AND PEN ONLY. A horizontal mouse drag across a message is how a person SELECTS TEXT, and
+ * this list exists so that a specific real message can be quoted and checked — taking that gesture
+ * away to save a pointer user one click would be a bad trade. The button in the row's meta line is
+ * the way in on a desktop, and it is present on every device, so nothing is reachable only by
+ * gesture.
+ */
+const SWIPE_START_PX = 12;
+const SWIPE_COMMIT_PX = 90;
+
+function swipeable(li, id) {
+  let startX = 0;
+  let startY = 0;
+  let dragging = false;
+  let active = false;
+
+  const reset = () => {
+    li.style.transform = "";
+    li.style.transition = "";
+    dragging = false;
+    active = false;
+  };
+
+  li.addEventListener("pointerdown", (event) => {
+    if (!event || event.pointerType === "mouse") {
+      return;
+    }
+    active = true;
+    startX = event.clientX;
+    startY = event.clientY;
+    li.style.transition = "none";
+  });
+
+  li.addEventListener("pointermove", (event) => {
+    if (!active) {
+      return;
+    }
+    const dx = event.clientX - startX;
+    const dy = event.clientY - startY;
+    // The axis is decided ONCE, on the first movement that is big enough to have a direction, and
+    // then held. Re-deciding per event turns a diagonal flick into a row that judders sideways
+    // while the list scrolls under it.
+    if (!dragging) {
+      if (Math.abs(dx) < SWIPE_START_PX && Math.abs(dy) < SWIPE_START_PX) {
+        return;
+      }
+      if (Math.abs(dy) >= Math.abs(dx)) {
+        active = false; // a scroll, not a swipe. Leave it entirely alone.
+        return;
+      }
+      dragging = true;
+    }
+    li.style.transform = `translateX(${dx}px)`;
+  });
+
+  const finish = (event) => {
+    if (!active) {
+      return;
+    }
+    const dx = dragging ? event.clientX - startX : 0;
+    li.style.transition = "";
+    li.style.transform = "";
+    const committed = Math.abs(dx) >= SWIPE_COMMIT_PX;
+    reset();
+    if (committed) {
+      // THE SAME ACT the Done button performs, not a second notion of "dealt with": one dismissal,
+      // recorded on the server, with `#50`'s undo behind it. That is what makes this gesture safe
+      // enough to be a gesture — a swipe that did something only this browser remembered, with no
+      // way back, would be the worst control on the page.
+      guardQuietly(() => dismissMessages({ messages: [id] }))();
+    }
+  };
+
+  li.addEventListener("pointerup", finish);
+  li.addEventListener("pointercancel", reset);
+}
+
 function discordNode(message) {
   const li = document.createElement("li");
   // `#56 message-hover-highlight`. A class of its own rather than styling `#discord-log li`
@@ -2948,6 +3108,13 @@ function discordNode(message) {
   // The newest page and the older walk both put rows in the same list, and telling one from the
   // other is a comparison of snowflakes.
   li.setAttribute("data-id", String(message.id));
+  // The reply pointer, on the row, as the ATTRIBUTE the inbox pass reads. It lives here rather
+  // than in a side map because the row is already the page's record of which message this is, and
+  // a second structure keyed by id would have to be kept in step with a list that is rebuilt from
+  // three different places. Absent when this message answers nothing.
+  if (message.reply_to) {
+    li.setAttribute("data-reply-to", String(message.reply_to));
+  }
   const meta = document.createElement("div");
   meta.className = "meta";
   const author = document.createElement("span");
@@ -3009,6 +3176,11 @@ function discordNode(message) {
     guardQuietly(() => dismissMessages({ messages: [String(message.id)] }))()
   );
   meta.append(done);
+  // `#66 inbox-view`. THE SWIPE `#50` deferred, and it drives the same act the Done button does
+  // rather than a second notion of "dealt with": one dismissal, recorded on the server, reachable
+  // by gesture OR by a control a keyboard can get to. That ordering was `#50`'s condition for the
+  // gesture layer and it still holds — the gesture is a second way in, never the only one.
+  swipeable(li, String(message.id));
   return li;
 }
 
@@ -3154,6 +3326,9 @@ function applyNewestPage(payload) {
       ? [...list.children].filter((li) => snowflakeOlder(li.getAttribute("data-id"), oldest))
       : [];
   list.replaceChildren(...kept, ...messages.map(discordNode));
+  // AFTER the rows exist: every row's replied state and speaker are facts about the list as it now
+  // stands rather than about the page that just arrived.
+  renderChannelRows();
   // Only when nothing was kept. If older rows survived, the cursor that belongs to them is the one
   // the older walk left behind, and overwriting it with this page's would rewind the walk.
   if (kept.length === 0) {
@@ -3197,6 +3372,10 @@ async function loadOlder() {
     // does not handle. Same helper as the fold control, deliberately.
     preservingScroll(() => {
       list.replaceChildren(...arriving, ...list.children);
+      // Inside the anchored mutation with everything else that changes height. A step back can
+      // reveal the QUESTION a loaded answer belongs to, so this is not merely bookkeeping for the
+      // new rows — older rows already on screen can become "replied" because of them.
+      renderChannelRows();
       // Re-stated inside the SAME anchored mutation. It sits above everything that just arrived,
       // so rewriting it afterwards would be a second change of height above the viewport and the
       // reader would move by whatever the difference happened to be.
@@ -3735,6 +3914,10 @@ function todoSummary() {
  */
 function appendChannelRow(message) {
   el("discord-log").append(discordNode(message));
+  // `#66 inbox-view`. Re-derive the row states with the new row in place. It is here, in the one
+  // appender, rather than at each of its callers: an arriving message can be the ANSWER to
+  // something already on screen, so the row that changes is not necessarily the one just added.
+  renderChannelRows();
   if (!todoMode) {
     return;
   }
@@ -3965,7 +4148,8 @@ async function sendReply() {
     if (payload && payload.posted) {
       // Through the same appender as a live arrival: the reply is in the window from now on, so
       // the next `/todo` read will count it, and a list that counted it one read later would
-      // disagree with itself in between.
+      // disagree with itself in between. `appendChannelRow` also re-derives the row states, which
+      // is what dims the message just answered on the spot rather than at the next poll.
       appendChannelRow(payload.posted);
     }
     drafts.delete(target.id);
@@ -4968,6 +5152,9 @@ el("close-settings").addEventListener("click", () => showScreen(screenBeforeSett
 // `#51 reply-view`. Both ways out of the reply screen go through `closeReply`, so neither can be
 // the one that forgets to put the reader back where they were reading.
 loadDrafts();
+// Before the first channel read, so the very first list of rows is already filtered rather
+// than appearing unfiltered for a frame and then rearranging under the reader.
+renderChannelRows();
 el("close-reply").addEventListener("click", closeReply);
 el("reply-cancel").addEventListener("click", closeReply);
 el("reply-send").addEventListener("click", guardQuietly(sendReply));

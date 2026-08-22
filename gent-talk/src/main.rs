@@ -223,8 +223,19 @@ async fn main() -> anyhow::Result<()> {
         );
         let fake = Arc::new(FakeDiscord::new());
         for channel in &config.channels {
+            let mut seeded = Vec::new();
             for (author, content) in SEEDED_BACKLOG {
-                fake.seed(&channel.id, author, content);
+                seeded.push(fake.seed(&channel.id, author, content));
+            }
+            // A couple of the seeded messages ANSWER earlier ones, because a channel in which
+            // nothing has been replied to cannot exercise the inbox view at all: every row would
+            // be open, and "replied dims the row" would look identical to "the feature is not
+            // wired up". Indices are into SEEDED_BACKLOG and chosen where the text really does
+            // read as a reply to the earlier message.
+            for (answer, question) in [(5_usize, 4_usize), (9, 3)] {
+                if let (Some(a), Some(q)) = (seeded.get(answer), seeded.get(question)) {
+                    fake.set_reply_to(a, q);
+                }
             }
         }
         fake

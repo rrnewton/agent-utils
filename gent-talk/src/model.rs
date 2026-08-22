@@ -157,6 +157,25 @@ pub struct Message {
     /// than to a blank.
     #[serde(default)]
     pub spoken_time: String,
+    /// The message this one is a reply to, when it is one.
+    ///
+    /// Discord records a reply on the REPLYING message, as `message_reference.message_id`, and
+    /// nowhere else — there is no "replies" field on the message being answered. So "has this been
+    /// replied to?" is not a fact a single message carries; it is derived by looking at what else
+    /// is loaded. That derivation belongs to the reader, which is why this field is the raw pointer
+    /// and not a `has_replies` boolean:
+    ///
+    /// 1. **A boolean computed here would be a lie about scope.** The server answers a read with a
+    ///    WINDOW of a channel, so it could only ever mean "replied to within this window", and a
+    ///    field named `has_replies` would be believed to mean more than that.
+    /// 2. **The pointer is the durable fact.** It is true of the message forever, independently of
+    ///    what else happens to be loaded beside it.
+    ///
+    /// `None` for an ordinary message, and also for a reply whose reference Discord did not
+    /// include. Absent is not "not a reply"; it is "no pointer was reported", and nothing should
+    /// present the two differently.
+    #[serde(default)]
+    pub reply_to: Option<MessageId>,
     /// Raw message body. UNTRUSTED: written by whoever is in the channel.
     pub content: String,
 }
@@ -239,6 +258,7 @@ mod tests {
             author_is_bot: false,
             timestamp: "t".to_owned(),
             spoken_time: String::new(),
+            reply_to: None,
             content: String::new(),
         }
     }

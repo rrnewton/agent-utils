@@ -1079,6 +1079,7 @@ mod tests {
             author_is_bot: false,
             timestamp: "2026-08-20T10:00:00+00:00".to_owned(),
             spoken_time: String::new(),
+            reply_to: None,
             content: content.to_owned(),
         }
     }
