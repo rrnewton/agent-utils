@@ -136,7 +136,7 @@ def test_config_subcommand_reports_the_effective_policy(
     assert document["workspace"] == "agent-cmds"
     assert document["tab_label"] == "widget-lander"
     assert document["allow"] == ["git", "gh"]
-    assert document["max_panes"] == 64
+    assert document["max_panes"] == 32
 
 
 def test_reap_subcommand_reports_both_sides_and_closes_nothing(

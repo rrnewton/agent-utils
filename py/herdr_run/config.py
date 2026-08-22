@@ -41,12 +41,13 @@ CONFIG_FILENAMES: tuple[str, ...] = (".herdr-run.yaml", ".herdr-run.yml")
 #: so without a ceiling the workspace grows for as long as agents are coined. The number is not
 #: arbitrary: measured on devbig014 2026-08-10, a session with 260 panes drove the Herdr server to
 #: >1000% CPU with every control call timing out (see ``client.SERVER_WORKER_THREADS``, which is the
-#: in-tree mitigation for that same convoy). 64 is far more tabs than a project's agents
-#: legitimately need. Be honest about what the margin is worth, though: the measurement is
-#: SERVER-scoped and this cap is WORKSPACE-scoped, so five projects each configured with their own
-#: ``workspace`` and each sitting at 63 panes reproduce the measured condition without any of them
-#: breaching its cap. The cap bounds one project's contribution to the leak, not the host's total.
-DEFAULT_MAX_PANES = 64
+#: in-tree mitigation for that same convoy). 32 keeps an eightfold margin below that and is far more
+#: tabs than one project's agents legitimately need. Be honest about what the margin is worth,
+#: though: the measurement is SERVER-scoped and this cap is WORKSPACE-scoped, so several projects
+#: each configured with their own ``workspace`` and each sitting just under the cap reproduce the
+#: measured condition without any of them breaching it. The cap bounds one project's contribution
+#: to the leak, not the host's total, which is the other reason not to set it generously.
+DEFAULT_MAX_PANES = 32
 
 #: Largest accepted ``max_panes``. A shared finite bound keeps the two implementations identical and
 #: keeps an absurd integer out of the comparison.

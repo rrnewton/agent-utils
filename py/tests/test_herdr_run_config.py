@@ -34,6 +34,10 @@ def test_defaults_match_the_intended_policy() -> None:
     assert "build" not in config.allow_subcommand["cargo"]
     assert "fetch" in config.allow_subcommand["cargo"]
     assert config.readiness == "both"
+    # Named as a literal 32 rather than compared against DEFAULT_MAX_PANES: a test that read the
+    # production constant would agree with any value the constant ever took, including a typo, and
+    # so would pin nothing at all.
+    assert config.max_panes == 32
 
 
 def test_no_config_file_anywhere_yields_defaults(tmp_path: object) -> None:
