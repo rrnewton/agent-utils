@@ -186,6 +186,22 @@ STANDALONE_DOCUMENTS: tuple[StandaloneDocument, ...] = (
         language="rust",
         source="common/docs/herdr-run/AGENT_USER_GUIDE.md",
     ),
+    # The generated `.herdr-run.yaml` is shared byte-for-byte by both herdr-run packages, so it
+    # is linted under both rule sets. It documents `cargo` as an allowlisted TARGET program, which
+    # is subject matter rather than a reference to a sibling implementation.
+    StandaloneDocument(
+        tool="herdr-run",
+        document="CONFIG_TEMPLATE",
+        language="python",
+        source="common/docs/herdr-run/CONFIG_TEMPLATE.yaml",
+        exemptions=("target Cargo command",),
+    ),
+    StandaloneDocument(
+        tool="herdr-run",
+        document="CONFIG_TEMPLATE",
+        language="rust",
+        source="common/docs/herdr-run/CONFIG_TEMPLATE.yaml",
+    ),
     StandaloneDocument(
         tool="agent-team-timeline",
         document="README",
@@ -249,6 +265,10 @@ def _package_links() -> tuple[PackageLink, ...]:
             PackageLink(
                 "rs/herdr-run/src/embedded_agent_userguide.md",
                 "common/docs/herdr-run/AGENT_USER_GUIDE.md",
+            ),
+            PackageLink(
+                "rs/herdr-run/src/config_template.yaml",
+                "common/docs/herdr-run/CONFIG_TEMPLATE.yaml",
             ),
             PackageLink(
                 "py/agent_team_timeline/README.md",

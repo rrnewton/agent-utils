@@ -43,6 +43,10 @@ const SUBCOMMANDS: &[Subcommand] = &[
         summary: "say whether a command would be admitted; touch no pane",
     },
     Subcommand {
+        name: "init",
+        summary: "write an annotated .herdr-run.yaml in this directory",
+    },
+    Subcommand {
         name: "config",
         summary: "print the fully resolved configuration as JSON",
     },
@@ -88,6 +92,7 @@ struct RunOptions {
 enum Selected {
     Run(RunOptions),
     Check(String),
+    Init { force: bool },
     Config,
     Target { no_cache: bool },
     Reap,
@@ -158,6 +163,7 @@ fn local_option_owners(name: &str) -> &'static [&'static str] {
     match name {
         "--cwd" | "--timeout" | "--wait-ready" | "--dry-run" => &["run"],
         "--no-cache" => &["run", "target"],
+        "--force" => &["init"],
         _ => &[],
     }
 }
@@ -332,6 +338,24 @@ fn parse_subcommand(name: &str, rest: &[String]) -> std::result::Result<Option<S
                 _ => Selected::Userguide,
             }))
         }
+        "init" => {
+            let mut force = false;
+            let mut index = 0;
+            while index < rest.len() {
+                let token = &rest[index];
+                if token == "--help" || token == "-h" {
+                    print_subcommand_help(name);
+                    return Ok(None);
+                }
+                if token == "--force" {
+                    force = true;
+                    index += 1;
+                    continue;
+                }
+                return Err(local_argument_error(name, token));
+            }
+            Ok(Some(Selected::Init { force }))
+        }
         "target" => {
             let mut no_cache = false;
             let mut index = 0;
@@ -496,6 +520,12 @@ fn dispatch(invocation: Invocation) -> Result<i32> {
     let start = std::env::current_dir().map_err(|error| {
         HerdrRunError::config(format!("cannot determine current directory: {error}"))
     })?;
+    if let Selected::Init { force } = invocation.selected {
+        // Deliberately before load_config: the reason to reach for `init` is often that discovery
+        // found nothing, or found something broken, and refusing to write a fresh template because
+        // the old one will not parse would be exactly the wrong moment to be strict.
+        return command_init(&start, force, invocation.globals.json);
+    }
     let config = load_config(invocation.globals.config.as_deref(), &start)?;
     let agent = invocation
         .globals
@@ -507,6 +537,7 @@ fn dispatch(invocation: Invocation) -> Result<i32> {
     match invocation.selected {
         Selected::Run(options) => run_command(&config, &agent, json, &options),
         Selected::Check(command) => command_check(&config, &command, json),
+        Selected::Init { .. } => unreachable!("init is handled before configuration is loaded"),
         Selected::Config => command_config(&config, &agent),
         Selected::Target { no_cache } => command_target(&config, &agent, !no_cache),
         Selected::Reap => command_reap(&config),
@@ -525,6 +556,19 @@ fn default_agent() -> String {
                 .filter(|value| !value.is_empty())
         })
         .unwrap_or_else(|| "unknown-agent".to_owned())
+}
+
+fn command_init(directory: &Path, force: bool, json_output: bool) -> Result<i32> {
+    let path = crate::init::write_config_template(directory, force)?;
+    if json_output {
+        print_json(&json!({"created": true, "path": path.display().to_string()}))?;
+    } else {
+        println!("wrote {}", path.display());
+        println!(
+            "Every knob is in that file, set to the value in force today. The allowlist near the\ntop is a HUMAN-ONLY knob: an agent that can widen its own allowlist does not have one."
+        );
+    }
+    Ok(0)
 }
 
 fn command_config(config: &Config, agent: &str) -> Result<i32> {
@@ -1146,6 +1190,15 @@ fn print_subcommand_help(name: &str) {
             println!("\npositional arguments:\n  <command>             the whole command line, as a single quoted argument");
             println!("\noptions:\n  -h, --help            show this help message and exit");
         }
+        "init" => {
+            println!("usage: herdr-run [GLOBAL OPTIONS] init [OPTIONS]");
+            println!(
+                "\nWrite an annotated .herdr-run.yaml into the current directory, the way 'git init'\nwrites into the current directory. Every knob is present and set to the value in\nforce today, so adopting the file changes nothing until you edit it. Refuses to\noverwrite an existing configuration."
+            );
+            println!(
+                "\noptions:\n  -h, --help            show this help message and exit\n  --force               overwrite an existing configuration file"
+            );
+        }
         "config" => {
             println!("usage: herdr-run [GLOBAL OPTIONS] config");
             println!(
@@ -1359,7 +1412,7 @@ mod tests {
     fn every_subcommand_is_reachable_and_uniquely_named() {
         assert_eq!(
             subcommand_names(),
-            "check, config, net-doctor, reap, run, target, userguide"
+            "check, config, init, net-doctor, reap, run, target, userguide"
         );
         for subcommand in SUBCOMMANDS {
             assert!(

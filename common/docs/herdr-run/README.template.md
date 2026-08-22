@@ -59,21 +59,20 @@ submitted twice. `status` and `read` inspect a validated target without altering
 
 ## Configuration
 
-Policy is per project, in the nearest `.herdr-run.yaml`. Every field has a working default, so a
-project can adopt the tool with no configuration at all:
+Policy is per project, in the nearest `.herdr-run.yaml`. `herdr-run init` writes an annotated one
+into the current directory with every knob present, commented, and set to the value already in
+force -- so adopting it changes nothing until you edit something, and that file, rather than any
+documentation, is the reference for what is configurable.
 
-```yaml
-workspace: agent-cmds     # Herdr workspace holding this project's command tabs
-tab_name: "{agent}"       # one tab per agent
-allow: [git, gh]          # cooperative policy rail - keep it small
-prefixes: [with-proxy]    # wrappers that may precede an allowlisted program
-spool_dir: .herdr-run     # git-ignored: holds command output, not source
-max_panes: 32             # refuse a NEW tab once the workspace holds this many panes (0 = off)
-```
+`allow` is a **human-only knob**: an agent that can widen its own allowlist does not have one.
+Keep `.herdr-run.yaml` at the top of the project, outside whatever directory the agents write in.
+`allow: ["*"]` is a supported allow-everything mode for projects where the pane is not meant to be
+a trust boundary at all.
 
 ## Quick reference
 
 ```
+herdr-run init                   write an annotated .herdr-run.yaml in this directory
 herdr-run run '<command>'        run the command; exits with the command's own exit code
 herdr-run check '<command>'      policy only: allowed or refused. Touches no pane.
 herdr-run target                 resolve/bring up the pane; print ids and readiness

@@ -12,6 +12,7 @@ pub mod client;
 pub mod config;
 pub mod error;
 pub mod identity;
+pub mod init;
 pub mod readiness;
 pub mod reap;
 pub mod retention;

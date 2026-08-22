@@ -513,35 +513,41 @@ pub fn parse_config(
     Ok(config)
 }
 
+/// Every configuration key the parser accepts.
+///
+/// Public because it is also the definition of "every knob", which the generated
+/// `.herdr-run.yaml` has to cover for the user guide to be able to point at that file instead of
+/// restating it.
+pub const KNOWN_KEYS: [&str; 20] = [
+    "workspace",
+    "tab_name",
+    "cwd",
+    "allow",
+    "prefixes",
+    "deny_global",
+    "deny_subcommand",
+    "deny_anywhere",
+    "allow_subcommand",
+    "value_options",
+    "spool_dir",
+    "timeout_seconds",
+    "retention_days",
+    "max_panes",
+    "ready_timeout_seconds",
+    "readiness",
+    "prompt_tail",
+    "shells",
+    "broker",
+    "probe_remote",
+];
+
 fn reject_unknown_keys(mapping: &Map<String, Value>, what: &str) -> Result<()> {
-    const KNOWN: [&str; 20] = [
-        "workspace",
-        "tab_name",
-        "cwd",
-        "allow",
-        "prefixes",
-        "deny_global",
-        "deny_subcommand",
-        "deny_anywhere",
-        "allow_subcommand",
-        "value_options",
-        "spool_dir",
-        "timeout_seconds",
-        "retention_days",
-        "max_panes",
-        "ready_timeout_seconds",
-        "readiness",
-        "prompt_tail",
-        "shells",
-        "broker",
-        "probe_remote",
-    ];
     if mapping.keys().any(|key| contains_terminal_control(key)) {
         return Err(HerdrRunError::config(format!(
             "{what}: control characters are not allowed in keys"
         )));
     }
-    let known: BTreeSet<&str> = KNOWN.iter().copied().collect();
+    let known: BTreeSet<&str> = KNOWN_KEYS.iter().copied().collect();
     let mut unknown: Vec<&str> = mapping
         .keys()
         .map(String::as_str)

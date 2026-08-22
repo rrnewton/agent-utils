@@ -108,58 +108,32 @@ an accidental unbounded wait.
 
 ## Configuration — `.herdr-run.yaml`
 
-The tool is generic; the policy is per-project. The nearest `.herdr-run.yaml` (or `.herdr-run.yml`)
-searched from the working directory upward wins, `.gitignore`-style. With no config file at all the
-built-in defaults apply, so a project can adopt the tool with zero configuration.
+The tool is generic; the policy is per project.
 
-```yaml
-# Herdr workspace LABEL holding this project's command tabs.
-workspace: agent-cmds
-
-# Tab-label schema. {agent} = invoking agent, {project} = project directory basename.
-tab_name: "{agent}"
-
-# Working directory for commands. null = caller's cwd; relative paths use the project root.
-cwd: null
-
-# Cooperative allowlist. Programs that may run. Keep it small.
-allow:
-  - git
-  - gh
-
-# Optional Cargo trust widening: add `cargo` to `allow` only if the project accepts that even
-# dependency-oriented Cargo commands may execute ambient wrappers/helpers. This fail-closed list
-# then prevents compilation-oriented and unknown subcommands; see Threat model.
-allow_subcommand:
-  cargo: [fetch, update, generate-lockfile, vendor, metadata, tree, search]
-
-# Wrapper programs that may PRECEDE an allowlisted program, never run on their own.
-prefixes:
-  - with-proxy
-
-# Defense in depth (see Threat model) — not the boundary.
-deny_global:
-  git: ["-c", "--config-env", "--exec-path", "--namespace"]
-  # Cargo accepts these before or after its subcommand; attached forms are also refused.
-  cargo: ["--config", "-Z"]
-deny_subcommand:
-  git: ["filter-branch", "daemon", "instaweb"]
-  gh:  ["alias", "extension", "ext", "codespace", "cs"]
-deny_anywhere: ["--upload-pack", "--receive-pack"]
-
-# Git-IGNORED directory for run spools and the audit log.
-spool_dir: .herdr-run
-
-timeout_seconds: 900          # wait for the command's exit code
-retention_days: 4             # completed run spools older than this are pruned on a later write
-max_panes: 32                 # refuse to open a NEW tab once the workspace holds this many panes
-ready_timeout_seconds: 0      # wait for the pane to go idle (0 = refuse immediately)
-
-readiness: both               # 'both' = process signal AND prompt veto; 'process' = drop the veto
-prompt_tail: null             # e.g. "$ ". null = infer from ~/.bashrc / ~/.zshrc, abstain on failure
-
-broker: direct                # 'direct' | 'systemd-run' (see Brokering)
 ```
+herdr-run init
+```
+
+writes an annotated `.herdr-run.yaml` into the current directory, the way `git init` writes into
+the current directory. **That file is the reference for what is configurable.** Every key is in
+it, commented, set to the value already in force — so adopting it changes nothing until you edit
+something, and this guide does not restate the list and then drift from it. `herdr-run init`
+refuses to overwrite an existing configuration; `--force` overrides that.
+
+The nearest `.herdr-run.yaml` (or `.herdr-run.yml`) found by searching upward from the working
+directory wins, `.gitignore`-style. With no configuration file at all the built-in defaults apply,
+so a project can adopt the tool with no file at all. `herdr-run status` says which file is in
+effect and `herdr-run config` prints every value resolved from it.
+
+Two things in that file are worth naming here, because they are decisions rather than settings:
+
+- **`allow` is a human-only knob.** An agent that can widen its own allowlist does not have one.
+  The usual arrangement is agents working inside `worktrees/slotNN/` while `.herdr-run.yaml` stays
+  at the top of the project, outside their write scope. The generated file says so in place.
+- **`allow: ["*"]` is a supported mode**, not a workaround: it admits any program. Everything else
+  still applies — control characters are still refused, the program must still be a bare name
+  resolved from the pane's `PATH`, wrapper prefixes must still be declared, and every `deny_*` rule
+  still bites. `"*"` must be the only entry, because `["*", "git"]` reads narrower than it is.
 
 Unknown or duplicate keys, merge keys, non-finite/excessive timeouts, fractional/negative retention
 days, retention beyond 365,000 days, a fractional/negative/oversized `max_panes`, control

@@ -265,6 +265,7 @@ def _describe(outcome: Outcome) -> str:
 _SUBCOMMANDS: tuple[str, ...] = (
     "check",
     "config",
+    "init",
     "net-doctor",
     "reap",
     "run",
@@ -282,11 +283,36 @@ _LOCAL_OPTIONS: dict[str, frozenset[str]] = {
     ),
     "check": frozenset({"--help"}),
     "config": frozenset({"--help"}),
+    "init": frozenset({"--help", "--force"}),
     "target": frozenset({"--help", "--no-cache"}),
     "reap": frozenset({"--help"}),
     "net-doctor": frozenset({"--help"}),
     "userguide": frozenset({"--help"}),
 }
+
+#: Every configuration key the two editions accept, and therefore every key `init` must write.
+_CONFIG_KEYS: tuple[str, ...] = (
+    "allow",
+    "allow_subcommand",
+    "broker",
+    "cwd",
+    "deny_anywhere",
+    "deny_global",
+    "deny_subcommand",
+    "max_panes",
+    "prefixes",
+    "probe_remote",
+    "prompt_tail",
+    "readiness",
+    "ready_timeout_seconds",
+    "retention_days",
+    "shells",
+    "spool_dir",
+    "tab_name",
+    "timeout_seconds",
+    "value_options",
+    "workspace",
+)
 
 _OPTION_TOKEN = re.compile(r"--[a-z][a-z0-9-]*")
 
@@ -925,6 +951,59 @@ def _reap(harness: Harness, report: Report) -> None:
     )
 
 
+def _init(harness: Harness, report: Report) -> None:
+    """`init` must write the same bytes in both editions, and both must then read them the same.
+
+    Comparing the generated `.herdr-run.yaml` byte for byte is what lets the user guide point at
+    that file instead of restating it: the file is the reference, so a reference that differed
+    between editions would be two references.
+    """
+
+    case = harness.case("init")
+    python, rust = harness.invoke(case, ("init",))
+    report.exact("init/first-write", python, rust, expected_rc=0)
+
+    python_file = _read_normalized(case.python_root / ".herdr-run.yaml", case.python_root)
+    rust_file = _read_normalized(case.rust_root / ".herdr-run.yaml", case.rust_root)
+    report.exact("init/template-bytes", python_file, rust_file, expected_rc=0)
+    for marker in (
+        "a human-only knob",
+        "DO NOT LET AN AGENT EDIT THIS SECTION",
+        "worktrees/slotNN/",
+        "ALLOW-EVERYTHING MODE",
+        'allow: ["*"]',
+    ):
+        report.require(
+            f"init/template-says/{marker[:24]}",
+            marker in python_file.stdout,
+            f"the generated configuration never says {marker!r}",
+        )
+
+    # Every knob has to be there, or the guide cannot point at this file instead of listing them.
+    missing = [key for key in _CONFIG_KEYS if f"\n{key}:" not in python_file.stdout]
+    report.require(
+        "init/template-covers-every-key",
+        not missing,
+        f"the generated configuration never sets {missing}",
+    )
+
+    resolved_python, resolved_rust = harness.invoke(
+        case, ("--agent", "fixture-agent", "config")
+    )
+    report.exact("init/config-after-init", resolved_python, resolved_rust, expected_rc=0)
+
+    python, rust = harness.invoke(case, ("init",))
+    report.exact("init/refuses-to-clobber", python, rust, expected_rc=78)
+    report.require(
+        "init/refuses-to-clobber-names-force",
+        "--force" in python.stderr and python.stdout == "",
+        f"a refused init must name --force on stderr and print nothing: {_describe(python)}",
+    )
+
+    python, rust = harness.invoke(case, ("init", "--force"))
+    report.exact("init/force-overwrites", python, rust, expected_rc=0)
+
+
 def build_report(
     python_command: Sequence[str],
     rust_command: Sequence[str],
@@ -939,6 +1018,7 @@ def build_report(
         _config_success(harness, report)
         _config_malformed(harness, report)
         _dry_run(harness, report)
+        _init(harness, report)
         _reap(harness, report)
     report.notes.append(
         "external fake-Herdr lifecycle/protocol checks were not run: production resolution "
