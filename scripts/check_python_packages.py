@@ -153,6 +153,17 @@ _DIST_SEP = re.compile(r"[-_.]+")
 _FOREIGN_DOC_TERMS = re.compile(
     r"\b(?:cargo|crate|crates\.io|rust|rustc|rustup)\b", re.IGNORECASE
 )
+#: How each command -- and each ``python -m`` module -- is asked to print its own user guide.
+#:
+#: A global ``--userguide`` flag is the norm here, but a command whose surface is
+#: ``<command> <subcommand>`` says it as a subcommand instead, because a documentation flag sitting
+#: beside a subcommand list is the mixing that surface exists to avoid.
+_USERGUIDE_INVOCATION: dict[str, tuple[str, ...]] = {
+    "herdr-run": ("userguide",),
+    "herdr_run": ("userguide",),
+}
+
+
 _COMMON_DOC_TERMS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("suite name", re.compile(r"agent-utils", re.IGNORECASE)),
     ("unrelated project", re.compile(r"\b(?:DeepScry|Hermit)\b", re.IGNORECASE)),
@@ -845,7 +856,8 @@ def _smoke_wheel(
     )
     _run([str(python), "-c", version_code], env=env, cwd=run_root)
 
-    module_invocations = (("--help",), ("--version",), ("--userguide",))
+    module_guide_args = list(_USERGUIDE_INVOCATION.get(project.package, ("--userguide",)))
+    module_invocations = (["--help"], ["--version"], module_guide_args)
     for args in module_invocations:
         result = _run(
             [str(python), "-m", project.package, *args],
@@ -856,13 +868,14 @@ def _smoke_wheel(
         combined = result.stdout + result.stderr
         if "Traceback (most recent call last)" in combined:
             raise CheckError(f"python -m {project.package} {' '.join(args)} emitted a traceback")
-        if args == ("--version",) and version not in combined:
+        if args == ["--version"] and version not in combined:
             raise CheckError(
                 f"python -m {project.package} --version did not report {version!r}: {combined!r}"
             )
-        if args == ("--userguide",) and (result.stdout != userguide or result.stderr):
+        if args == module_guide_args and (result.stdout != userguide or result.stderr):
             raise CheckError(
-                f"python -m {project.package} --userguide differs from packaged USER_GUIDE.md"
+                f"python -m {project.package} {' '.join(module_guide_args)} differs from "
+                "packaged USER_GUIDE.md"
             )
 
     command_userguides = dict(project.command_userguides)
@@ -871,9 +884,10 @@ def _smoke_wheel(
         executable = bindir / command
         if not executable.is_file():
             raise CheckError(f"{project.distribution}: installed command missing: {executable}")
+        guide_args = list(_USERGUIDE_INVOCATION.get(command, ("--userguide",)))
         invocations: list[list[str]] = [["--help"], ["--version"]]
         if command != "cpuset-alloc":
-            invocations.append(["--userguide"])
+            invocations.append(guide_args)
         for command_args in invocations:
             result = _run(
                 [str(executable), *command_args], env=env, cwd=run_root, timeout=30
@@ -885,11 +899,11 @@ def _smoke_wheel(
                 raise CheckError(f"{command} --version did not report {version!r}: {combined!r}")
             expected_guide_name = command_userguides.get(command, "USER_GUIDE.md")
             expected_guide = userguide if expected_guide_name == "USER_GUIDE.md" else resource_text[expected_guide_name]
-            if command_args == ["--userguide"] and (
+            if command_args == guide_args and (
                 result.stdout != expected_guide or result.stderr
             ):
                 raise CheckError(
-                    f"{command} --userguide differs from packaged {expected_guide_name}"
+                    f"{command} {' '.join(guide_args)} differs from packaged {expected_guide_name}"
                 )
 
 
