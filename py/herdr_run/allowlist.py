@@ -151,7 +151,10 @@ def admit(command: str, config: Config) -> Admission:
             f"program must be a bare command name resolved from PATH, not a path: {program!r}"
         )
 
-    if program not in config.allow:
+    # The wildcard turns off THIS check and nothing else: control characters, the bare-name rule
+    # above, the wrapper-prefix rule, every `deny_*` rule, and the positive subcommand lists below
+    # all still apply.
+    if not config.allows_any_program() and program not in config.allow:
         allowed = ", ".join(sorted(config.allow))
         hint = ""
         if program in config.prefixes:

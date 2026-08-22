@@ -23,8 +23,10 @@ from herdr_run.retention import MAX_RETENTION_DAYS
 from herdr_run.yamlcore import core_load
 
 __all__ = [
+    "ALLOW_ANY_PROGRAM",
     "CONFIG_FILENAMES",
     "DEFAULT_MAX_PANES",
+    "KNOWN_KEYS",
     "MAX_PANE_CAP",
     "MAX_RETENTION_DAYS",
     "MAX_TIMEOUT_SECONDS",
@@ -35,6 +37,18 @@ __all__ = [
 
 #: Accepted config basenames, in search order, looked up from the working directory upward.
 CONFIG_FILENAMES: tuple[str, ...] = (".herdr-run.yaml", ".herdr-run.yml")
+
+#: The single ``allow`` entry that turns the allowlist off: any bare program name is admitted.
+#:
+#: This is a named mode rather than something to be worked out, because the alternative -- writing
+#: out every program a project might ever want -- is the kind of list people abandon halfway and
+#: then widen by accident. It is deliberately the only entry permitted when it is present: an
+#: ``allow`` reading ``["*", "git"]`` looks narrower than it is.
+#:
+#: Everything except the program-name check still applies in this mode: terminal control characters
+#: are still refused, the program must still be a bare name resolved from the pane's ``PATH``,
+#: wrapper prefixes must still be declared, and every ``deny_*`` rule still bites.
+ALLOW_ANY_PROGRAM = "*"
 
 #: Default ceiling on how many panes the command workspace may hold before herdr-run refuses to
 #: open ANOTHER tab. Every agent that ever runs a command leaves a tab behind and nothing closes it,
@@ -200,8 +214,8 @@ class Config:
 
     shells: tuple[str, ...] = _DEFAULT_SHELLS
 
-    #: Remote used by the ``doctor`` self-test. It only needs to be a reachable repository that
-    #: the sandbox blocks and the pane does not.
+    #: Remote used by the ``net-doctor`` smoke test. It only needs to be a reachable repository
+    #: that the caller's own network policy blocks and the pane's does not.
     probe_remote: str = "https://github.com/git/git"
 
     #: How herdr control calls reach the server. ``direct`` uses the server's Unix socket;
@@ -214,6 +228,38 @@ class Config:
 
     #: Project root: the directory holding the config file, else the starting directory.
     project_root: str = "."
+
+    def allows_any_program(self) -> bool:
+        """Report whether ``allow`` has been set to the :data:`ALLOW_ANY_PROGRAM` wildcard."""
+        return ALLOW_ANY_PROGRAM in self.allow
+
+
+#: Every configuration key the parser accepts.
+#:
+#: Public because it is also the definition of "every knob", which the generated ``.herdr-run.yaml``
+#: has to cover for the user guide to be able to point at that file instead of restating it.
+KNOWN_KEYS: tuple[str, ...] = (
+    "workspace",
+    "tab_name",
+    "cwd",
+    "allow",
+    "prefixes",
+    "deny_global",
+    "deny_subcommand",
+    "deny_anywhere",
+    "allow_subcommand",
+    "value_options",
+    "spool_dir",
+    "timeout_seconds",
+    "retention_days",
+    "max_panes",
+    "ready_timeout_seconds",
+    "readiness",
+    "prompt_tail",
+    "shells",
+    "broker",
+    "probe_remote",
+)
 
 
 def find_config_file(start: str) -> str | None:
@@ -355,28 +401,7 @@ def _parse_config(
     what = source_path or "<config>"
     mapping = as_mapping(document, what)
 
-    known = {
-        "workspace",
-        "tab_name",
-        "cwd",
-        "allow",
-        "prefixes",
-        "deny_global",
-        "deny_subcommand",
-        "allow_subcommand",
-        "deny_anywhere",
-        "value_options",
-        "spool_dir",
-        "timeout_seconds",
-        "retention_days",
-        "max_panes",
-        "ready_timeout_seconds",
-        "readiness",
-        "prompt_tail",
-        "shells",
-        "broker",
-        "probe_remote",
-    }
+    known = set(KNOWN_KEYS)
     unknown = sorted(set(mapping) - known)
     if unknown:
         # Reject rather than ignore: a typo'd `allowlist:` key silently falling back to the default
@@ -496,6 +521,11 @@ def _parse_config(
     if not config.allow:
         raise ConfigError(
             f"{what}.allow: refusing an EMPTY allowlist — no command could ever run"
+        )
+    if config.allows_any_program() and len(config.allow) > 1:
+        raise ConfigError(
+            f'{what}.allow: "{ALLOW_ANY_PROGRAM}" already admits every program, so it must be the '
+            "only entry; listing programs beside it makes the policy look narrower than it is"
         )
     if "cargo" in config.allow and "cargo" not in config.allow_subcommand:
         raise ConfigError(

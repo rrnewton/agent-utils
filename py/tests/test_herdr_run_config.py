@@ -40,6 +40,18 @@ def test_defaults_match_the_intended_policy() -> None:
     assert config.max_panes == 32
 
 
+def test_the_allow_wildcard_must_stand_alone() -> None:
+    """``allow: ["*", "git"]`` reads narrower than it is, so it is a configuration error."""
+    with pytest.raises(ConfigError, match="must be the only entry"):
+        parse_config({"allow": ["*", "git"]}, source_path="x.yaml", project_root="/tmp")
+
+    wildcard = parse_config(
+        {"allow": ["*"]}, source_path="x.yaml", project_root="/tmp"
+    )
+    assert wildcard.allows_any_program()
+    assert not Config().allows_any_program()
+
+
 def test_no_config_file_anywhere_yields_defaults(tmp_path: object) -> None:
     root = str(tmp_path)
     config = load_config(explicit_path=None, start_dir=root)
