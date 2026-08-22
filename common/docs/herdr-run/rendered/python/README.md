@@ -1,11 +1,16 @@
 # herdr-run and herdr-agent
 
-Run an **allowlisted** command in a Herdr terminal pane that lives **outside** an AI agent's
-sandbox, and get its real stdout, stderr, and exit code back.
+Run an **allowlisted** command in a terminal pane belonging to a separate terminal server, and get
+its real stdout, stderr, and exit code back.
 
 ```
-herdr-run --agent release-agent run 'with-proxy git ls-remote origin main'
+herdr-run --agent release-agent run 'git ls-remote origin main'
 ```
+
+The pane is not a child of the calling process, so whatever constrains that process does not
+constrain the command: not its network policy, not its environment, not its lifetime. A pane also
+outlives the caller, carries a different ambient environment, and can be watched and taken over by
+a person.
 
 The same package also installs `herdr-agent`, a durable FIFO transport for messaging an
 already-running interactive agent without losing or accidentally duplicating a prompt:
@@ -15,14 +20,15 @@ herdr-agent send --session-agent codex --session "$CODEX_SESSION_ID" \
   --agent codex --workspace project --cwd /work/project --file ./next-task.md
 ```
 
-A sandboxed coding agent often cannot reach the network, so `git fetch`, `git push`, and `gh` fail
-even though the agent legitimately needs them to publish its work. The Herdr terminal server runs
-outside that confinement, so a shell in one of its panes is not confined either. `herdr-run` turns
-that into one narrow, audited door instead of an ad-hoc pile of keystroke injection.
+One common case, kept as an example rather than as the definition: an AI coding agent inside a
+sandbox that blocks the network cannot `git push` or run `gh`, even though it legitimately needs
+to in order to publish its work. The terminal server runs outside that confinement, so a shell in
+one of its panes is not confined either. `herdr-run net-doctor` checks exactly that situation and
+says so before it starts.
 
-> **This tool deliberately uses an out-of-sandbox channel.** Its allowlist prevents accidental and
-> cooperative misuse; it is not a containment boundary against a hostile process running as the
-> same user. Read the trust model in the user guide before widening policy.
+> **The allowlist is a cooperative safety rail.** It prevents accidental and cooperative misuse; it
+> is not a containment boundary against a hostile process running as the same user. Read the trust
+> model in the user guide before widening policy.
 
 ## Installation
 
@@ -87,6 +93,7 @@ herdr-run target                 resolve/bring up the pane; print ids and readin
 herdr-run config                 print the effective configuration
 herdr-run reap                   report which command tabs are provably finished. Closes nothing.
 herdr-run net-doctor             smoke-test one scenario: a caller whose own network is blocked
+herdr-run quickstart             the one-screen introduction
 herdr-run userguide              the full user guide
 herdr-agent send ...             durably submit one prompt to an interactive agent
 herdr-agent drain ...            resume a bound queue without duplicating ambiguous prompts
@@ -100,4 +107,5 @@ Requires Linux with a working systemd user manager and a separately installed
 `~/.local/bin`, or `~/bin`. The integration is tested with Herdr 0.8.0; compatible
 newer releases must provide its `status`, `workspace`, `tab`, and `pane` command APIs.
 
-Full documentation: `herdr-run userguide` and `herdr-agent userguide`.
+Start with `herdr-run quickstart`, one screen. `herdr-run userguide` is the complete reference,
+and `herdr-agent userguide` covers the messaging contract.

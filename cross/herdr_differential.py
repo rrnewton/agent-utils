@@ -267,6 +267,7 @@ _SUBCOMMANDS: tuple[str, ...] = (
     "config",
     "init",
     "net-doctor",
+    "quickstart",
     "reap",
     "run",
     "status",
@@ -289,6 +290,7 @@ _LOCAL_OPTIONS: dict[str, frozenset[str]] = {
     "target": frozenset({"--help", "--no-cache"}),
     "reap": frozenset({"--help"}),
     "net-doctor": frozenset({"--help"}),
+    "quickstart": frozenset({"--help"}),
     "userguide": frozenset({"--help"}),
 }
 
@@ -969,6 +971,43 @@ prefixes: []
 """
 
 
+def _documentation(harness: Harness, report: Report) -> None:
+    """Both documentation commands must print the same document in both editions.
+
+    They are also compared to each other: `quickstart` is supposed to be a much shorter amended
+    version, and two commands that print the same text would be one command with two names.
+    """
+
+    case = harness.case("documentation")
+    quickstart_python, quickstart_rust = harness.invoke(case, ("quickstart",))
+    report.exact("documentation/quickstart", quickstart_python, quickstart_rust, expected_rc=0)
+    guide_python, guide_rust = harness.invoke(case, ("userguide",))
+    report.exact("documentation/userguide", guide_python, guide_rust, expected_rc=0)
+    report.require(
+        "documentation/quickstart-is-shorter",
+        quickstart_python.stdout != guide_python.stdout
+        and 2 * quickstart_python.stdout.count("\n") < guide_python.stdout.count("\n"),
+        "quickstart is supposed to be a much shorter amended version of the guide: "
+        f"{quickstart_python.stdout.count(chr(10))} lines against "
+        f"{guide_python.stdout.count(chr(10))}",
+    )
+
+    # A configuration file too broken to load must not be able to withhold the documentation.
+    broken = harness.case("documentation-broken-config", {".herdr-run.yaml": "allow: [\n"})
+    for subcommand in ("quickstart", "userguide"):
+        python, rust = harness.invoke(broken, (subcommand,))
+        report.exact(f"documentation/{subcommand}-despite-broken-config", python, rust, expected_rc=0)
+
+    help_python, _ = harness.invoke(case, ("--help",))
+    report.require(
+        "documentation/help-distinguishes-them",
+        "quickstart" in help_python.stdout
+        and "userguide" in help_python.stdout
+        and "Two documentation commands" in help_python.stdout,
+        f"the top-level help does not say what each document is for: {_describe(help_python)}",
+    )
+
+
 def _status(harness: Harness, report: Report) -> None:
     """`status` must read the same and say the same, and must still be read-only in both."""
 
@@ -1094,6 +1133,7 @@ def build_report(
         _dry_run(harness, report)
         _init(harness, report)
         _status(harness, report)
+        _documentation(harness, report)
         _reap(harness, report)
     report.notes.append(
         "external fake-Herdr lifecycle/protocol checks were not run: production resolution "

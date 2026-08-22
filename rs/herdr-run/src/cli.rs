@@ -67,6 +67,10 @@ const SUBCOMMANDS: &[Subcommand] = &[
         summary: "smoke-test one scenario: a caller whose own network is blocked",
     },
     Subcommand {
+        name: "quickstart",
+        summary: "print the one-screen introduction",
+    },
+    Subcommand {
         name: "userguide",
         summary: "print the complete reference",
     },
@@ -102,6 +106,7 @@ enum Selected {
     Target { no_cache: bool },
     Reap,
     NetDoctor,
+    Quickstart,
     Userguide,
 }
 
@@ -134,10 +139,10 @@ where
         ParseResult::Invocation(invocation) => *invocation,
         ParseResult::Exit(code) => return code,
     };
-    if invocation.selected == Selected::Userguide {
-        // Printed before any configuration is read: the guide is exactly what somebody with a
-        // broken configuration file needs, and refusing to show it would be perverse.
-        print!("{}", crate::USER_GUIDE);
+    // Printed before any configuration is read: documentation is exactly what somebody with a
+    // broken configuration file needs, and refusing to show it would be perverse.
+    if let Some(document) = document_for(&invocation.selected) {
+        print!("{document}");
         return 0;
     }
     match dispatch(invocation) {
@@ -146,6 +151,15 @@ where
             let _ = writeln!(io::stderr(), "herdr-run: {error}");
             error.exit_code()
         }
+    }
+}
+
+/// Return the document a documentation subcommand prints, or `None` for the working subcommands.
+fn document_for(selected: &Selected) -> Option<&'static str> {
+    match selected {
+        Selected::Quickstart => Some(crate::QUICKSTART),
+        Selected::Userguide => Some(crate::USER_GUIDE),
+        _ => None,
     }
 }
 
@@ -326,7 +340,7 @@ fn parse_subcommand(name: &str, rest: &[String]) -> std::result::Result<Option<S
                 _ => Err(one_argument_error("check", &positional)),
             }
         }
-        "status" | "config" | "reap" | "net-doctor" | "userguide" => {
+        "status" | "config" | "reap" | "net-doctor" | "quickstart" | "userguide" => {
             let Some(positional) = parse_bare(name, rest)? else {
                 return Ok(None);
             };
@@ -341,6 +355,7 @@ fn parse_subcommand(name: &str, rest: &[String]) -> std::result::Result<Option<S
                 "config" => Selected::Config,
                 "reap" => Selected::Reap,
                 "net-doctor" => Selected::NetDoctor,
+                "quickstart" => Selected::Quickstart,
                 _ => Selected::Userguide,
             }))
         }
@@ -549,7 +564,7 @@ fn dispatch(invocation: Invocation) -> Result<i32> {
         Selected::Target { no_cache } => command_target(&config, &agent, !no_cache),
         Selected::Reap => command_reap(&config),
         Selected::NetDoctor => command_net_doctor(&config, &agent),
-        Selected::Userguide => Ok(0),
+        Selected::Quickstart | Selected::Userguide => Ok(0),
     }
 }
 
@@ -1175,102 +1190,98 @@ fn usage_line() -> &'static str {
     "herdr-run [-h] [--version] [--config PATH] [--agent NAME] [--json] <subcommand> [OPTIONS]"
 }
 
-fn print_help() {
-    println!("usage: {}", usage_line());
-    println!(
-        "\nRun an allowlisted command in a terminal pane that is not subject to whatever\nconstrains the caller, and get its real stdout, stderr, and exit code back."
-    );
-    println!("\nsubcommands:");
+/// Build the top-level help so it can be asserted on as text, not only printed.
+fn help_text() -> String {
+    let mut text = String::new();
+    text.push_str(&format!(
+        "usage: {}
+",
+        usage_line()
+    ));
+    text.push_str("\nRun an allowlisted command in a terminal pane that is not subject to whatever\nconstrains the caller, and get its real stdout, stderr, and exit code back.\n");
+    text.push_str("\nsubcommands:\n");
     for subcommand in SUBCOMMANDS {
-        println!("  {:<11} {}", subcommand.name, subcommand.summary);
+        text.push_str(&format!(
+            "  {:<11} {}\n",
+            subcommand.name, subcommand.summary
+        ));
     }
-    println!(
-        "\nglobal options (before the subcommand):\n  -h, --help            show this help message and exit\n  --version             show version and exit\n  --config PATH         explicit configuration file\n  --agent NAME          the agent this invocation speaks for; names its tab\n  --json                emit machine-readable output where a subcommand has it"
-    );
-    println!(
-        "\nEach subcommand has its own options: run 'herdr-run <subcommand> --help'.\nOptions are not shared between the two levels — '--cwd' is a 'run' option and\ngoes after 'run'; '--agent' is global and goes before it."
-    );
-    println!(
-        "\nDocumentation:\n  userguide   the complete reference: configuration, exit codes, readiness,\n              retention, the pane cap, and the trust model"
-    );
+    text.push_str("\nglobal options (before the subcommand):\n  -h, --help            show this help message and exit\n  --version             show version and exit\n  --config PATH         explicit configuration file\n  --agent NAME          the agent this invocation speaks for; names its tab\n  --json                emit machine-readable output where a subcommand has it\n");
+    text.push_str("\nEach subcommand has its own options: run 'herdr-run <subcommand> --help'.\nOptions are not shared between the two levels — '--cwd' is a 'run' option and\ngoes after 'run'; '--agent' is global and goes before it.\n");
+    text.push_str("\nTwo documentation commands, and they are for different moments:\n  quickstart  one screen. What this is for, the four commands worth trying\n              first, and the five things to know before running anything real.\n  userguide   the complete reference: configuration, exit codes, readiness,\n              retention, the pane cap, and the trust model.\n");
+    text
+}
+
+fn print_help() {
+    print!("{}", help_text());
+}
+
+/// Build one subcommand's help so it can be asserted on as text, not only printed.
+fn subcommand_help_text(name: &str) -> String {
+    let mut text = String::new();
+    match name {
+        "run" => {
+            text.push_str("usage: herdr-run [GLOBAL OPTIONS] run [OPTIONS] '<command>'\n");
+            text.push_str("\nRun one allowlisted command in this agent's pane and return its stdout, stderr,\nand exit code. The command is ONE argument: quote it.\n");
+            text.push_str("\npositional arguments:\n  <command>             the whole command line, as a single quoted argument\n");
+            text.push_str("\noptions:\n  -h, --help            show this help message and exit\n  --cwd PATH            working directory for the command\n  --timeout SECONDS     how long to wait for the command to finish\n  --wait-ready SECONDS  how long to wait for the pane to go idle\n  --no-cache            ignore the session cache and re-resolve from labels\n  --dry-run             admit and render the command; execute nothing\n");
+            text.push_str(
+                "\nExample:\n  herdr-run --agent release-agent run 'git push origin HEAD'\n",
+            );
+        }
+        "check" => {
+            text.push_str("usage: herdr-run [GLOBAL OPTIONS] check '<command>'\n");
+            text.push_str("\nDecide whether a command would be admitted by the policy in effect. Touches no\npane and executes nothing. Exits 0 when allowed and 77 when refused.\n");
+            text.push_str("\npositional arguments:\n  <command>             the whole command line, as a single quoted argument\n");
+            text.push_str("\noptions:\n  -h, --help            show this help message and exit\n");
+        }
+        "init" => {
+            text.push_str("usage: herdr-run [GLOBAL OPTIONS] init [OPTIONS]\n");
+            text.push_str("\nWrite an annotated .herdr-run.yaml into the current directory, the way 'git init'\nwrites into the current directory. Every knob is present and set to the value in\nforce today, so adopting the file changes nothing until you edit it. Refuses to\noverwrite an existing configuration.\n");
+            text.push_str("\noptions:\n  -h, --help            show this help message and exit\n  --force               overwrite an existing configuration file\n");
+        }
+        "status" => {
+            text.push_str("usage: herdr-run [GLOBAL OPTIONS] status\n");
+            text.push_str("\nReport what is in effect here: which configuration file was found and where its\nroot is, what the policy admits, whether Herdr is reachable and running, and how\nmany panes the workspace already holds. Strictly non-mutating — it starts no\nserver and creates no workspace, tab, or pane.\n");
+            text.push_str("\noptions:\n  -h, --help            show this help message and exit\n");
+        }
+        "config" => {
+            text.push_str("usage: herdr-run [GLOBAL OPTIONS] config\n");
+            text.push_str("\nPrint the fully resolved configuration as JSON: every value in effect, the file\nit came from, and the tab label it renders for this agent.\n");
+            text.push_str("\noptions:\n  -h, --help            show this help message and exit\n");
+        }
+        "target" => {
+            text.push_str("usage: herdr-run [GLOBAL OPTIONS] target [OPTIONS]\n");
+            text.push_str("\nResolve this agent's pane, creating the workspace, tab, and pane if they are\nmissing, and print their ids together with the readiness verdict.\n");
+            text.push_str("\noptions:\n  -h, --help            show this help message and exit\n  --no-cache            ignore the session cache and re-resolve from labels\n");
+        }
+        "reap" => {
+            text.push_str("usage: herdr-run [GLOBAL OPTIONS] reap\n");
+            text.push_str("\nReport which command tabs are provably finished with, and why every other one\nwas declined. Closes nothing.\n");
+            text.push_str("\noptions:\n  -h, --help            show this help message and exit\n");
+        }
+        "net-doctor" => {
+            text.push_str("usage: herdr-run [GLOBAL OPTIONS] net-doctor\n");
+            text.push_str("\nSmoke-test one narrow scenario: a caller whose own network access is blocked,\nreaching the network through a pane that is not blocked. It runs one probe\ndirectly and again through the pane and compares the two. This is not a health\ncheck of the command as a whole.\n");
+            text.push_str("\noptions:\n  -h, --help            show this help message and exit\n");
+        }
+        "quickstart" => {
+            text.push_str("usage: herdr-run [GLOBAL OPTIONS] quickstart\n");
+            text.push_str("\nPrint the one-screen introduction: what this command is for, the four commands\nworth trying first, the shape of the command line, and the five things worth\nknowing before running anything real.\n");
+            text.push_str("\noptions:\n  -h, --help            show this help message and exit\n");
+        }
+        "userguide" => {
+            text.push_str("usage: herdr-run [GLOBAL OPTIONS] userguide\n");
+            text.push_str("\nPrint the complete reference: configuration, exit codes, readiness, retention,\nthe pane cap, and the trust model.\n");
+            text.push_str("\noptions:\n  -h, --help            show this help message and exit\n");
+        }
+        other => text.push_str(&format!("usage: herdr-run [GLOBAL OPTIONS] {other}\n")),
+    }
+    text
 }
 
 fn print_subcommand_help(name: &str) {
-    match name {
-        "run" => {
-            println!("usage: herdr-run [GLOBAL OPTIONS] run [OPTIONS] '<command>'");
-            println!(
-                "\nRun one allowlisted command in this agent's pane and return its stdout, stderr,\nand exit code. The command is ONE argument: quote it."
-            );
-            println!("\npositional arguments:\n  <command>             the whole command line, as a single quoted argument");
-            println!(
-                "\noptions:\n  -h, --help            show this help message and exit\n  --cwd PATH            working directory for the command\n  --timeout SECONDS     how long to wait for the command to finish\n  --wait-ready SECONDS  how long to wait for the pane to go idle\n  --no-cache            ignore the session cache and re-resolve from labels\n  --dry-run             admit and render the command; execute nothing"
-            );
-            println!("\nExample:\n  herdr-run --agent release-agent run 'git push origin HEAD'");
-        }
-        "check" => {
-            println!("usage: herdr-run [GLOBAL OPTIONS] check '<command>'");
-            println!(
-                "\nDecide whether a command would be admitted by the policy in effect. Touches no\npane and executes nothing. Exits 0 when allowed and 77 when refused."
-            );
-            println!("\npositional arguments:\n  <command>             the whole command line, as a single quoted argument");
-            println!("\noptions:\n  -h, --help            show this help message and exit");
-        }
-        "init" => {
-            println!("usage: herdr-run [GLOBAL OPTIONS] init [OPTIONS]");
-            println!(
-                "\nWrite an annotated .herdr-run.yaml into the current directory, the way 'git init'\nwrites into the current directory. Every knob is present and set to the value in\nforce today, so adopting the file changes nothing until you edit it. Refuses to\noverwrite an existing configuration."
-            );
-            println!(
-                "\noptions:\n  -h, --help            show this help message and exit\n  --force               overwrite an existing configuration file"
-            );
-        }
-        "status" => {
-            println!("usage: herdr-run [GLOBAL OPTIONS] status");
-            println!(
-                "\nReport what is in effect here: which configuration file was found and where its\nroot is, what the policy admits, whether Herdr is reachable and running, and how\nmany panes the workspace already holds. Strictly non-mutating — it starts no\nserver and creates no workspace, tab, or pane."
-            );
-            println!("\noptions:\n  -h, --help            show this help message and exit");
-        }
-        "config" => {
-            println!("usage: herdr-run [GLOBAL OPTIONS] config");
-            println!(
-                "\nPrint the fully resolved configuration as JSON: every value in effect, the file\nit came from, and the tab label it renders for this agent."
-            );
-            println!("\noptions:\n  -h, --help            show this help message and exit");
-        }
-        "target" => {
-            println!("usage: herdr-run [GLOBAL OPTIONS] target [OPTIONS]");
-            println!(
-                "\nResolve this agent's pane, creating the workspace, tab, and pane if they are\nmissing, and print their ids together with the readiness verdict."
-            );
-            println!(
-                "\noptions:\n  -h, --help            show this help message and exit\n  --no-cache            ignore the session cache and re-resolve from labels"
-            );
-        }
-        "reap" => {
-            println!("usage: herdr-run [GLOBAL OPTIONS] reap");
-            println!(
-                "\nReport which command tabs are provably finished with, and why every other one\nwas declined. Closes nothing."
-            );
-            println!("\noptions:\n  -h, --help            show this help message and exit");
-        }
-        "net-doctor" => {
-            println!("usage: herdr-run [GLOBAL OPTIONS] net-doctor");
-            println!(
-                "\nSmoke-test one narrow scenario: a caller whose own network access is blocked,\nreaching the network through a pane that is not blocked. It runs one probe\ndirectly and again through the pane and compares the two. This is not a health\ncheck of the command as a whole."
-            );
-            println!("\noptions:\n  -h, --help            show this help message and exit");
-        }
-        "userguide" => {
-            println!("usage: herdr-run [GLOBAL OPTIONS] userguide");
-            println!(
-                "\nPrint the complete reference: configuration, exit codes, readiness, retention,\nthe pane cap, and the trust model."
-            );
-            println!("\noptions:\n  -h, --help            show this help message and exit");
-        }
-        other => println!("usage: herdr-run [GLOBAL OPTIONS] {other}"),
-    }
+    print!("{}", subcommand_help_text(name));
 }
 
 #[cfg(test)]
@@ -1445,7 +1456,7 @@ mod tests {
     fn every_subcommand_is_reachable_and_uniquely_named() {
         assert_eq!(
             subcommand_names(),
-            "check, config, init, net-doctor, reap, run, status, target, userguide"
+            "check, config, init, net-doctor, quickstart, reap, run, status, target, userguide"
         );
         for subcommand in SUBCOMMANDS {
             assert!(
@@ -1455,6 +1466,131 @@ mod tests {
             );
             assert!(!subcommand.summary.is_empty(), "{}", subcommand.name);
         }
+    }
+
+    /// Neither help level may document the other's options.
+    ///
+    /// The complaint that produced this surface was that every flag was global whether or not it
+    /// meant anything to the thing being invoked, and help that lists the wrong options is how
+    /// that state of affairs comes back without anybody deciding to bring it back.
+    /// Return the contiguous indented lines that follow the first line starting with `header`.
+    ///
+    /// Only the option BLOCK is inspected: an example line naming a global option is teaching
+    /// where that option goes, which is the opposite of the mixing being guarded against.
+    fn option_block(text: &str, header: &str) -> String {
+        text.lines()
+            .skip_while(|line| !line.starts_with(header))
+            .skip(1)
+            .take_while(|line| !line.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn each_help_level_documents_exactly_its_own_options() {
+        let top = help_text();
+        for subcommand in SUBCOMMANDS {
+            assert!(
+                top.contains(subcommand.name) && top.contains(subcommand.summary),
+                "top-level help omits {}",
+                subcommand.name
+            );
+        }
+        for global in ["--config", "--agent", "--json", "--version", "--help"] {
+            assert!(top.contains(global), "top-level help omits {global}");
+        }
+        let top_options = option_block(&top, "global options");
+        for global in ["--config", "--agent", "--json", "--version"] {
+            assert!(
+                top_options.contains(global),
+                "the global option block omits {global}"
+            );
+        }
+        for local in [
+            "--cwd",
+            "--timeout",
+            "--wait-ready",
+            "--force",
+            "--no-cache",
+            "--dry-run",
+        ] {
+            assert!(
+                !top_options.contains(local),
+                "the global option block documents the subcommand option {local}"
+            );
+        }
+
+        let run = option_block(&subcommand_help_text("run"), "options:");
+        for local in [
+            "--cwd",
+            "--timeout",
+            "--wait-ready",
+            "--no-cache",
+            "--dry-run",
+        ] {
+            assert!(run.contains(local), "'run --help' omits {local}");
+        }
+        for global in ["--config", "--agent", "--json", "--version"] {
+            assert!(
+                !run.contains(global),
+                "'run --help' documents the global option {global}"
+            );
+        }
+        assert!(option_block(&subcommand_help_text("init"), "options:").contains("--force"));
+        assert!(option_block(&subcommand_help_text("target"), "options:").contains("--no-cache"));
+        for bare in [
+            "check",
+            "config",
+            "reap",
+            "net-doctor",
+            "quickstart",
+            "userguide",
+            "status",
+        ] {
+            let text = option_block(&subcommand_help_text(bare), "options:");
+            assert!(text.contains("-h, --help"), "'{bare} --help' omits --help");
+            for local in ["--cwd", "--timeout", "--dry-run", "--force", "--no-cache"] {
+                assert!(
+                    !text.contains(local),
+                    "'{bare} --help' documents {local}, which it does not accept"
+                );
+            }
+        }
+    }
+
+    /// The top-level help must say what each of the two documentation commands is FOR.
+    #[test]
+    fn help_distinguishes_the_quickstart_from_the_userguide() {
+        let top = help_text();
+        assert!(top.contains("Two documentation commands"), "{top}");
+        assert!(top.contains("one screen"), "{top}");
+        assert!(top.contains("the complete reference"), "{top}");
+    }
+
+    /// Each documentation subcommand prints ITS OWN document.
+    #[test]
+    fn each_documentation_subcommand_prints_its_own_document() {
+        assert!(document_for(&Selected::Quickstart)
+            .expect("quickstart prints a document")
+            .starts_with("# herdr-run — quickstart\n"));
+        assert!(document_for(&Selected::Userguide)
+            .expect("userguide prints a document")
+            .starts_with("# herdr-run — user guide\n"));
+        assert_eq!(document_for(&Selected::Config), None);
+        assert_eq!(document_for(&Selected::Reap), None);
+    }
+
+    /// The two documents are different documents, and the short one is the short one.
+    #[test]
+    fn the_quickstart_is_a_shorter_amended_version_of_the_guide() {
+        assert_ne!(crate::QUICKSTART, crate::USER_GUIDE);
+        assert!(
+            crate::QUICKSTART.lines().count() * 2 < crate::USER_GUIDE.lines().count(),
+            "the quickstart is {} lines against the guide's {}; it is supposed to be much shorter",
+            crate::QUICKSTART.lines().count(),
+            crate::USER_GUIDE.lines().count()
+        );
+        assert!(crate::QUICKSTART.contains("herdr-run userguide"));
     }
 
     #[test]

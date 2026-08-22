@@ -1,15 +1,20 @@
 # herdr-run — user guide
 
-Run an **allowlisted** command in a Herdr pane that lives **outside** the agent sandbox, and get its
-real stdout, stderr, and exit code back.
+Run an **allowlisted** command in a terminal pane belonging to a separate terminal server, and get
+its real stdout, stderr, and exit code back.
 
 ```
-herdr-run --agent release-agent run 'with-proxy git ls-remote origin main'
+herdr-run --agent release-agent run 'git ls-remote origin main'
 ```
 
-> **This tool deliberately uses an out-of-sandbox channel.** It exists because an agent's
-> confinement can block network access needed to land work. Its allowlist is a cooperative safety
-> rail, not a containment boundary against a hostile same-user process. Read the trust model below.
+The pane is not a child of the calling process. Whatever constrains that process therefore does
+not constrain the command — its network policy, its environment, its working directory, its
+lifetime. `herdr-run` makes that one narrow, audited, allowlisted door rather than an ad-hoc pile
+of keystroke-injection calls.
+
+> **Read the trust model before widening `allow`.** The allowlist is a cooperative safety rail: it
+> keeps a well-behaved caller inside a policy. It is not a containment boundary against a hostile
+> process running as the same user, and it makes no claim to be one.
 
 ## Installation
 
@@ -27,19 +32,45 @@ compatible newer releases must provide its `status`, `workspace`, `tab`, and `pa
 
 ---
 
-## Why it exists
+## Why you would want this
 
-An agent process may run inside a sandbox whose network policy blocks a destination it legitimately
-needs in order to publish work. Inside that confinement:
+A pane on a separate terminal server differs from a subprocess in ways that are occasionally
+exactly what you need:
+
+- **It is not inside your confinement.** A process under a restrictive network policy, a seccomp
+  filter, or a container cannot reach something the terminal server can. Running the command in a
+  pane sidesteps that without weakening the caller's own policy.
+- **It outlives you.** The pane keeps running after the calling process exits, so a long operation
+  is not tied to the lifetime of whatever launched it. When a command outruns its timeout,
+  `herdr-run` says so and leaves it running rather than killing it.
+- **It has a different ambient environment.** A different `PATH`, a different `HOME`, a login
+  session, credentials an unattended process does not carry, a working directory somewhere else on
+  the machine.
+- **A human can watch it and take it over.** The pane is a real terminal somebody can look at,
+  scroll back through, and type into. That is why readiness detection is conservative: the tool
+  refuses to type over a person rather than assuming the pane is its own.
+- **Every use is on the record.** Refusals, admissions, failures, and completions are appended to a
+  private log, and each run keeps its command, byte-exact output, and exit code on disk.
+
+What you give up is that the command runs somewhere your process does not control. Hence the
+allowlist, the readiness checks, the locking, and the audit log — most of this guide is about
+making that trade safely.
+
+### One example: an agent whose sandbox blocks the network
+
+The scenario this was first built for, kept here as an example rather than as the definition. An
+AI coding agent runs inside a sandbox whose network policy blocks a destination it legitimately
+needs in order to publish its work:
 
 ```
-$ with-proxy git ls-remote https://github.com/example-org/example-repo main
+$ git ls-remote https://github.com/example-org/example-repo main
 fatal: unable to access 'https://github.com/example-org/example-repo/': CONNECT tunnel failed, response 403
 ```
 
-The Herdr terminal server runs outside the confinement, so shells in its panes are not confined. The
-same command through a pane returns the real SHA. `herdr-run` turns that into one narrow, audited
-door instead of an ad-hoc pile of `send-keys` calls.
+The terminal server runs outside that confinement, so shells in its panes are not confined, and the
+same command through a pane returns the real SHA. `herdr-run net-doctor` checks precisely this
+situation and nothing else. The rest of the tool has no opinion about sandboxes: it is a way to run
+a policy-admitted command in a pane.
 
 ---
 
@@ -212,10 +243,10 @@ bring-up work once; running it against half-built state completes only the missi
 
 ### Why the server must start via `systemd-run`
 
-Panes are children of the Herdr **server**. If a confined agent starts the server, every pane it
-creates inherits that confinement, and the tool silently reproduces the very `403` it exists to
-avoid — nothing about such a pane looks different from a good one. `systemd-run --user` reparents the
-server onto the user manager, outside the jail.
+Panes are children of the Herdr **server**. If a confined process starts the server, every pane it
+creates inherits that confinement, and the tool quietly reproduces the very limit it was reached
+for — nothing about such a pane looks different from a good one. `systemd-run --user` reparents the
+server onto the user manager, clear of the caller's confinement.
 
 The launcher ignores caller-provided `HOME` and `PATH` for brokered execution. It reads the account
 home from the user database, resolves `herdr` from a fixed set of install locations, canonicalizes
@@ -391,21 +422,22 @@ commands "download only" would overstate the boundary. A project may explicitly 
 `allow` when it accepts that trust widening. The built-in `allow_subcommand` policy then limits the
 opt-in to dependency-oriented commands; `build`, `test`, `run`, `install`, `clippy` and every
 third-party `cargo-*` subcommand remain refused. `--config` and unstable `-Z` flags are refused in
-every argument position, including attached forms. Fetching outside and building in-jail with
-`--offline` can still be operationally useful, but it is not a no-code-execution guarantee.
+every argument position, including attached forms. Fetching through the pane and then building
+locally with `--offline` can still be operationally useful, but it is not a no-code-execution
+guarantee.
 
 **What is NOT guaranteed:** anything an allowlisted program can do by itself. `git` writes files,
 runs hooks from the repository being operated on, and honours ambient configuration. `gh`
 authenticates as you and can modify repositories. The `deny_*` lists remove the best-known
 self-escapes (`git -c alias.x='!sh'`, `git --exec-path=…`, `gh extension exec`) but they are
-**defense in depth, not the boundary** — treat "an agent can run `git`" as the actual privilege being
-granted, and size the allowlist accordingly.
+**defense in depth, not the boundary** — treat "the caller can run `git`" as the actual privilege
+being granted, and size the allowlist accordingly.
 
 This process runs under the same user identity as the caller. If that caller can access Herdr's
 socket or the user-systemd bus directly, it can bypass this command, its project policy, and its
-audit. An enforceable security boundary requires an out-of-jail broker that owns immutable policy
-and audit storage, plus sandbox rules denying direct Herdr and systemd access. This package does not
-claim to provide that stronger architecture.
+audit. An enforceable security boundary requires a broker outside the caller's confinement that
+owns immutable policy and audit storage, plus rules denying the caller direct Herdr and systemd
+access. This package does not claim to provide that stronger architecture.
 
 **Operational notes:**
 

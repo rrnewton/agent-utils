@@ -27,5 +27,8 @@ mod timefmt;
 /// Full installed-package reference, also printed by `herdr-run userguide`.
 pub const USER_GUIDE: &str = include_str!("embedded_userguide.md");
 
+/// One-screen introduction, printed by `herdr-run quickstart`.
+pub const QUICKSTART: &str = include_str!("embedded_quickstart.md");
+
 /// Full installed messaging reference, also printed by `herdr-agent userguide`.
 pub const AGENT_USER_GUIDE: &str = include_str!("embedded_agent_userguide.md");

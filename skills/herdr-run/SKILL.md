@@ -1,6 +1,6 @@
 ---
 name: herdr-run
-description: Run a cooperatively allowlisted network command through an out-of-sandbox Herdr pane while preserving output, status, readiness evidence, serialization, and an operational audit trail. Use when an agent sandbox blocks a legitimate git, gh, or dependency-fetch operation.
+description: Run a cooperatively allowlisted command in a terminal pane belonging to a separate terminal server, preserving output, status, readiness evidence, serialization, and an operational audit trail. Use when a command needs to run outside whatever constrains this process - most often because a sandbox blocks a legitimate git, gh, or dependency-fetch operation.
 ---
 
 # herdr-run
@@ -12,6 +12,7 @@ model.
 The installed CLI is the source of truth:
 
 - `herdr-run --help`
+- `herdr-run quickstart` for the one-screen introduction
 - `herdr-run status` to see the configuration, policy, and session in effect; it changes nothing
 - `herdr-run config` to inspect the fully resolved policy
 - `herdr-run init` to write an annotated `.herdr-run.yaml` -- but note that `allow` inside it is a

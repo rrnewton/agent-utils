@@ -186,6 +186,20 @@ STANDALONE_DOCUMENTS: tuple[StandaloneDocument, ...] = (
         language="rust",
         source="common/docs/herdr-run/AGENT_USER_GUIDE.md",
     ),
+    # The quickstart is shared byte-for-byte by both herdr-run packages, so it is linted under
+    # both rule sets and must name neither edition's toolchain.
+    StandaloneDocument(
+        tool="herdr-run",
+        document="QUICKSTART",
+        language="python",
+        source="common/docs/herdr-run/QUICKSTART.md",
+    ),
+    StandaloneDocument(
+        tool="herdr-run",
+        document="QUICKSTART",
+        language="rust",
+        source="common/docs/herdr-run/QUICKSTART.md",
+    ),
     # The generated `.herdr-run.yaml` is shared byte-for-byte by both herdr-run packages, so it
     # is linted under both rule sets. It documents `cargo` as an allowlisted TARGET program, which
     # is subject matter rather than a reference to a sibling implementation.
@@ -269,6 +283,10 @@ def _package_links() -> tuple[PackageLink, ...]:
             PackageLink(
                 "rs/herdr-run/src/config_template.yaml",
                 "common/docs/herdr-run/CONFIG_TEMPLATE.yaml",
+            ),
+            PackageLink(
+                "rs/herdr-run/src/embedded_quickstart.md",
+                "common/docs/herdr-run/QUICKSTART.md",
             ),
             PackageLink(
                 "py/agent_team_timeline/README.md",
