@@ -2938,6 +2938,251 @@ function renderMarkdownInto(parent, raw) {
   return parent;
 }
 
+// --- who is speaking in the channel -------------------------------------------------------------
+//
+// The voice transcript tells its two speakers apart by side, colour and corner — three signals at
+// once — and the channel view told them apart by nothing at all: a wall of identical rows whose
+// only distinguishing mark was a display name anyone can set to anything. The owner asked for the
+// same treatment here, and for a way to say which account is which.
+//
+// FOUR BUCKETS, and the two that matter are drawn exactly as the transcript's two speakers:
+//
+//   me      the owner — INCLUDING the voice bot, which posts on his behalf through this bridge.
+//           Drawn as `mine`. That the words reached the channel through an intermediary does not
+//           make them somebody else's.
+//   coder   the coding agent. Drawn as `theirs`. These are the two halves of the conversation the
+//           reader is actually having, which is why they get the transcript's own idiom.
+//   human   another person.
+//   bot     another bot.
+//
+// KEYED ON THE AUTHOR SNOWFLAKE, never on the display name. `global_name` is chosen by whoever owns
+// the account and can be changed at any moment, and this whole page exists partly because an agent
+// once described messages that did not exist — a mapping that a rename silently redirects is the
+// same class of defect.
+
+const IDENTITY_KEY = "gent-talk.voice.identities";
+const AUTHORS_KEY = "gent-talk.voice.authors";
+const SELF_ID_KEY = "gent-talk.voice.self-id";
+
+const BUCKETS = ["me", "coder", "human", "bot"];
+
+const BUCKET_LABELS = {
+  me: "Me (including my voice bot)",
+  coder: "Coding agent",
+  human: "Another person",
+  bot: "Another bot",
+};
+
+/** Explicit choices the reader has made, `{ [authorId]: bucket }`. Beats every guess below. */
+let identities = {};
+
+/** Everyone seen in a channel, `{ [authorId]: { name, bot } }`, so Settings has rows to offer
+ *  before the reader has opened the channel in this session. */
+let authorsSeen = {};
+
+/**
+ * The snowflake THIS SERVER posts as.
+ *
+ * Learned rather than configured, and learned for free: every reply this page sends comes back as
+ * the `Message` Discord recorded, and the live feed marks a message this server posted with
+ * `self_posted`. Either one identifies the bridge's own account by construction — which is the one
+ * account whose messages are the owner's own words. No `/users/@me` call, no configuration, and no
+ * name matching.
+ */
+let selfAuthorId = null;
+
+function loadIdentities() {
+  const read = (key, fallback) => {
+    try {
+      const held = JSON.parse(localStorage.getItem(key) || "null");
+      return held && typeof held === "object" && !Array.isArray(held) ? held : fallback;
+    } catch (_error) {
+      return fallback;
+    }
+  };
+  identities = read(IDENTITY_KEY, {});
+  authorsSeen = read(AUTHORS_KEY, {});
+  // A bucket that is not one of ours would otherwise become a `data-who` nobody styles, which reads
+  // as "this row is special" rather than as "this entry is corrupt".
+  for (const [id, bucket] of Object.entries(identities)) {
+    if (!BUCKETS.includes(bucket)) {
+      delete identities[id];
+    }
+  }
+  const held = localStorage.getItem(SELF_ID_KEY);
+  selfAuthorId = held || null;
+}
+
+function persistJson(key, value) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch (_error) {
+    // Shared origin storage, and this is a presentation preference: a browser that refuses it
+    // still gets the guesses below, which are what an unconfigured reader sees anyway.
+  }
+}
+
+/** Record that this id is the account this bridge posts as. */
+function noteSelfAuthor(id) {
+  const found = String(id || "");
+  if (!found || selfAuthorId === found) {
+    return;
+  }
+  selfAuthorId = found;
+  try {
+    localStorage.setItem(SELF_ID_KEY, found);
+  } catch (_error) {
+    // As above.
+  }
+  renderChannelRows();
+  renderIdentityRows();
+}
+
+/**
+ * What bucket this author falls in, and why, in priority order.
+ *
+ * The guesses are exactly the ones the owner described, and they are GUESSES — every one of them
+ * is overridden by an explicit choice, and Settings shows what was guessed so a wrong one is
+ * visible rather than merely wrong.
+ */
+function bucketFor(authorId, isBot) {
+  const id = String(authorId || "");
+  // 1. The reader said so.
+  if (identities[id]) {
+    return identities[id];
+  }
+  // 2. It is us. Known by construction, not by name.
+  if (selfAuthorId && id === selfAuthorId) {
+    return "me";
+  }
+  if (!isBot) {
+    // 3. Not a bot, so a person. Which person is not something this page can know.
+    return "human";
+  }
+  // 4. A bot, and if it is the ONLY bot that is not us then it is the coding agent — the owner's
+  //    own heuristic, and true of every channel this bridge is pointed at so far. With two or more
+  //    it is a coin toss, so it stays "another bot" and Settings is where it gets decided.
+  const otherBots = Object.entries(authorsSeen).filter(
+    ([seen, who]) => who.bot && seen !== selfAuthorId
+  );
+  if (otherBots.length === 1 && otherBots[0][0] === id) {
+    return "coder";
+  }
+  return "bot";
+}
+
+/**
+ * The Settings panel: one row per account seen, saying what it is and letting that be changed.
+ *
+ * Rebuilt wholesale rather than patched, because the set of accounts grows as channels are read
+ * and the guesses for accounts ALREADY listed can change when a new one arrives — the sole-other-
+ * bot rule is a statement about the whole census. A partial update would leave a stale "coding
+ * agent" beside the second bot that has just disqualified it.
+ */
+function renderIdentityRows() {
+  const host = el("identity-list");
+  const ids = Object.keys(authorsSeen).sort((a, b) => {
+    const left = authorsSeen[a];
+    const right = authorsSeen[b];
+    // People first, then bots, then by name: the reader is looking for a name, and grouping the
+    // two kinds keeps the bridge and the coding agent beside each other.
+    if (left.bot !== right.bot) {
+      return left.bot ? 1 : -1;
+    }
+    return left.name < right.name ? -1 : left.name > right.name ? 1 : 0;
+  });
+  if (ids.length === 0) {
+    const empty = document.createElement("p");
+    empty.className = "hint";
+    empty.textContent =
+      "Nobody yet. Open the Discord view and read a channel, and everyone who has spoken in it " +
+      "appears here.";
+    host.replaceChildren(empty);
+    return;
+  }
+  const rows = ids.map((id) => {
+    const who = authorsSeen[id];
+    // A <label> WRAPPING its control, rather than a <div> plus `for="identity-<id>"`.
+    //
+    // The id would have to be minted from the author's snowflake at runtime, and this page's test
+    // fixture derives the element set from web/voice.html by regex and refuses anything else —
+    // deliberately, so that an element invented at runtime fails loudly instead of silently at the
+    // roadside. That rule is worth more than the attribute: a label containing its control is
+    // associated with it implicitly, which is the same accessibility outcome with no id at all.
+    const wrap = document.createElement("label");
+    wrap.className = "identity-row";
+
+    const label = document.createElement("span");
+    label.className = "identity-name";
+    // textContent, not innerHTML: a display name is channel data like any other, and this panel is
+    // the one place the page renders one outside the message list.
+    label.textContent = who.name || "(no name)";
+    if (who.bot) {
+      const tag = document.createElement("span");
+      tag.className = "identity-tag";
+      tag.textContent = "bot";
+      label.append(tag);
+    }
+    if (selfAuthorId && id === selfAuthorId) {
+      const tag = document.createElement("span");
+      tag.className = "identity-tag";
+      // Says WHY this one is you, so "me" on a bot account does not read as a mistake.
+      tag.textContent = "this bridge";
+      label.append(tag);
+    }
+
+    const select = document.createElement("select");
+    // Named for a screen reader without an id, since the wrapping label is doing the association.
+    select.setAttribute("aria-label", `what ${who.name || id} is`);
+    // The snowflake, so a handler and the suite can both say WHICH row this is without an id.
+    select.setAttribute("data-author-id", id);
+    for (const bucket of BUCKETS) {
+      const option = document.createElement("option");
+      option.value = bucket;
+      option.textContent = BUCKET_LABELS[bucket];
+      select.append(option);
+    }
+    select.value = bucketFor(id, who.bot);
+    // Whether the value on screen is a CHOICE or a GUESS, which is the difference between "this is
+    // wrong" and "nobody has said". Without it a wrong guess is indistinguishable from a decision.
+    // Always set, both ways, rather than present-or-absent: "false" and "missing" are the same
+    // thing to a stylesheet but not to anything reading the attribute back, and a reader asking
+    // "was this a guess?" should get an answer rather than an absence.
+    select.setAttribute("data-guessed", identities[id] ? "false" : "true");
+    select.addEventListener("change", () => {
+      identities[id] = select.value;
+      persistJson(IDENTITY_KEY, identities);
+      select.setAttribute("data-guessed", "false");
+      el("identity-state").textContent = "Saved. The channel is drawn this way from now on.";
+      renderChannelRows();
+    });
+
+    const id_ = document.createElement("span");
+    id_.className = "identity-id";
+    id_.textContent = id;
+
+    wrap.append(label, select, id_);
+    return wrap;
+  });
+  host.replaceChildren(...rows);
+}
+
+/** Remember an author so Settings can offer a row for them later. */
+function noteAuthor(id, name, isBot) {
+  const key = String(id || "");
+  if (!key) {
+    return false;
+  }
+  const held = authorsSeen[key];
+  if (held && held.name === name && held.bot === isBot) {
+    return false;
+  }
+  authorsSeen[key] = { name: String(name || ""), bot: Boolean(isBot) };
+  return true;
+}
+
+// --- the inbox view -------------------------------------------------------------------------
+
 // --- what a channel row has already had done to it ------------------------------------------
 //
 // `#66 inbox-view`, landing the two follow-ups `#50 todo-view` named for itself.
@@ -2995,27 +3240,56 @@ function childByClass(node, className) {
  *
  * ONE PASS OVER THE WHOLE LIST, called after every mutation, rather than a decision taken when a
  * row is built. Rows arrive from three places — the newest page, a step further back, and a live
- * arrival — and "has this been replied to" is a fact about the SET, not about the row: the answer
- * to a message loaded an hour ago can arrive in the next poll, and a step back through the channel
- * can reveal the question a loaded answer belongs to. Deciding it per row at construction time
- * would be right only until the next thing happened.
+ * arrival — and every state here is a fact about the SET rather than about the row:
+ *
+ *   * "has this been replied to" — the answer to a message loaded an hour ago can arrive in the
+ *     next poll, and a step back through the channel can reveal the question a loaded answer
+ *     belongs to;
+ *   * "is this author the coding agent" — the sole-other-bot guess is a statement about who ELSE
+ *     is in the channel, so one more author arriving can change the answer for a row that is
+ *     already on screen.
+ *
+ * Deciding either per row at construction time would be right only until the next thing happened.
  */
 function renderChannelRows() {
   const list = el("discord-log");
   const rows = [...list.children];
   // Every message some LOADED message answers.
   const answered = new Set();
+  // The author census FIRST and in full, because `bucketFor` asks how many other bots there are —
+  // a question no single row can answer, and one whose answer must not change halfway through the
+  // loop that is applying it.
+  let learned = false;
   for (const row of rows) {
     const parent = row.getAttribute("data-reply-to");
     if (parent) {
       answered.add(parent);
     }
+    learned =
+      noteAuthor(
+        row.getAttribute("data-author-id"),
+        row.getAttribute("data-author"),
+        row.getAttribute("data-author-bot") === "true"
+      ) || learned;
+  }
+  if (learned) {
+    persistJson(AUTHORS_KEY, authorsSeen);
+    renderIdentityRows();
   }
   for (const row of rows) {
     const id = row.getAttribute("data-id") || "";
     // DIMS, never hides. See the note at the head of this section: this is derived from what
     // happens to be loaded, and evidence that admits it is incomplete must not remove anything.
     row.setAttribute("data-replied", answered.has(id) ? "true" : "false");
+    // The speaker treatment, on the same pass and from the same census. `me` and `coder` are drawn
+    // as the transcript's two speakers; see web/voice.css.
+    row.setAttribute(
+      "data-who",
+      bucketFor(
+        row.getAttribute("data-author-id"),
+        row.getAttribute("data-author-bot") === "true"
+      )
+    );
   }
 }
 
@@ -3115,6 +3389,12 @@ function discordNode(message) {
   if (message.reply_to) {
     li.setAttribute("data-reply-to", String(message.reply_to));
   }
+  // WHO, as the snowflake, so the speaker pass has something stable to key on. The display name
+  // rides along only so Settings can show a recognisable label beside the id; nothing is ever
+  // decided from it, because it is chosen by whoever owns the account.
+  li.setAttribute("data-author-id", String(message.author_id || ""));
+  li.setAttribute("data-author", String(message.author || ""));
+  li.setAttribute("data-author-bot", message.author_is_bot ? "true" : "false");
   const meta = document.createElement("div");
   meta.className = "meta";
   const author = document.createElement("span");
@@ -4146,6 +4426,10 @@ async function sendReply() {
       body: { text, reply_to: target.id },
     });
     if (payload && payload.posted) {
+      // The account Discord recorded this reply under is THIS BRIDGE'S OWN, and it is the one
+      // account whose messages are the owner's words. Learned here, for free, from a reply he was
+      // sending anyway — no `/users/@me` call and no name matching. `#66 channel-identities`.
+      noteSelfAuthor(payload.posted.author_id);
       // Through the same appender as a live arrival: the reply is in the window from now on, so
       // the next `/todo` read will count it, and a list that counted it one read later would
       // disagree with itself in between. `appendChannelRow` also re-derives the row states, which
@@ -4666,6 +4950,13 @@ function onStreamFrame(frame) {
  * arrive twice.
  */
 function receiveLiveMessage(message, selfPosted, replayed) {
+  // The other free way to learn which account is ours: the server marks what IT posted, so the
+  // author of a self-posted message is this bridge by construction. Done before the channel guard
+  // below, because the fact is true regardless of which channel the reader happens to be looking
+  // at. `#66 channel-identities`.
+  if (selfPosted) {
+    noteSelfAuthor(message.author_id);
+  }
   if (String(message.channel_id) !== String(el("discord-channel").value)) {
     return;
   }
@@ -5154,6 +5445,8 @@ el("close-settings").addEventListener("click", () => showScreen(screenBeforeSett
 loadDrafts();
 // Before the first channel read, so the very first list of rows is already filtered rather
 // than appearing unfiltered for a frame and then rearranging under the reader.
+loadIdentities();
+renderIdentityRows();
 renderChannelRows();
 el("close-reply").addEventListener("click", closeReply);
 el("reply-cancel").addEventListener("click", closeReply);

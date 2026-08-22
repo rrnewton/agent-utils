@@ -388,6 +388,92 @@ body {
   -webkit-tap-highlight-color: transparent;
 }
 
+/* ----------------------------------------------------------------- who is speaking, in the channel */
+/*
+ * `#66 channel-identities`. The transcript tells its two speakers apart by SIDE, COLOUR and CORNER
+ * — three signals at once, because one small grey word was not enough — and the channel view told
+ * them apart by nothing. These rules give the channel the same idiom, and deliberately the SAME
+ * custom properties rather than a parallel palette: `me` in the channel and `mine` in the
+ * transcript are the same person saying things in two places, and they must not be two colours.
+ *
+ * `me` includes the voice bot, because it posts on the owner's behalf. The words are his; the
+ * account that delivered them is an implementation detail of this bridge.
+ */
+#discord-log li.discord-message[data-who="me"] {
+  background: var(--mine);
+  border-color: var(--mine-edge);
+  margin-left: 15%;
+  border-bottom-right-radius: 0.15rem;
+}
+
+#discord-log li.discord-message[data-who="coder"] {
+  background: var(--theirs);
+  margin-right: 15%;
+  border-bottom-left-radius: 0.15rem;
+}
+
+/* The other two are NOT given a third and fourth colour. Two speakers is what the eye can sort at a
+   glance, and this list is read to find one specific message; a four-colour channel would be a
+   legend the reader has to learn. They keep the default row and are distinguished by indentation
+   alone — present, clearly neither of the two principals, and not competing for attention. */
+#discord-log li.discord-message[data-who="human"],
+#discord-log li.discord-message[data-who="bot"] {
+  margin-right: 7%;
+  margin-left: 7%;
+}
+
+/* The percentage insets are proportionate in a capped column and absurd across a full-width one,
+   exactly as they are for the transcript. They are bounded in THE desktop block at the foot of
+   this file, beside the transcript's own pair — there is one such block, deliberately, and adding
+   a second would split the composition across two places that can drift apart. */
+
+/* The Settings panel that assigns them. A grid rather than a flex row so the selects line up down
+   the column instead of each one starting wherever its neighbour's name ended. */
+.identity-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 0.35rem 0.6rem;
+  padding: 0.45rem 0;
+  border-bottom: 1px solid var(--edge);
+}
+
+.identity-name {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.9rem;
+  overflow-wrap: anywhere;
+}
+
+.identity-tag {
+  flex: 0 0 auto;
+  padding: 0 0.35rem;
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 0.68rem;
+  letter-spacing: 0.02em;
+}
+
+/* The snowflake, under the name and spanning both columns: it is the thing that actually IDENTIFIES
+   the account, and the only way to tell two accounts with the same display name apart. Small,
+   because it is evidence rather than a label. */
+.identity-id {
+  grid-column: 1 / -1;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.68rem;
+}
+
+/* A value nobody has confirmed. The distinction is the point of showing the guesses at all: a
+   wrong guess and a deliberate choice look identical otherwise, so there is no way to tell what
+   still needs attention. */
+.identity-row select[data-guessed="true"] {
+  color: var(--muted);
+  font-style: italic;
+}
+
 /* --------------------------------------------------------------------------- the inbox view -- */
 /*
  * `#66 inbox-view`. A row somebody has already ANSWERED recedes.
@@ -1576,6 +1662,22 @@ textarea {
 
   .messages li.theirs {
     margin-right: min(15%, 6rem);
+  }
+
+  /* `#66 channel-identities`. The channel's two principals, bounded exactly as the transcript's
+     two speakers directly above — same numbers, because they are the same two people and a reader
+     switching views must not see the column change shape under them. */
+  #discord-log li.discord-message[data-who="me"] {
+    margin-left: min(15%, 6rem);
+  }
+
+  #discord-log li.discord-message[data-who="coder"] {
+    margin-right: min(15%, 6rem);
+  }
+
+  #discord-log li.discord-message[data-who="human"],
+  #discord-log li.discord-message[data-who="bot"] {
+    margin-inline: min(7%, 3rem);
   }
 
   /* The handle, on the right edge of the column and the height of the body. Absolutely positioned

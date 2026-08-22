@@ -463,7 +463,28 @@
             is the only control that erases that, and it leaves the screen alone in return.
           </p>
 
-          <h2>The channel</h2>
+          <h2>Who is who in the channel</h2>
+        <p class="hint">
+          The call transcript tells its two speakers apart by side, colour and corner. The channel
+          can do the same, but only once it knows which account is which — Discord offers no such
+          thing, and a display name is chosen by whoever owns the account. Everyone who has spoken
+          in a channel you have opened appears here, with what this page GUESSED; change any of
+          them and the channel is redrawn.
+        </p>
+        <p class="hint">
+          The guesses, in the order they are tried: the account this bridge posts as is
+          <strong>you</strong> — your own replies and anything your voice bot says go out through
+          it, so they are your words even though a bot delivered them; a lone bot that is not this
+          bridge is the <strong>coding agent</strong>; everyone else is another person or another
+          bot. Nothing here is sent anywhere: it is stored in this browser and affects only how the
+          channel is drawn.
+        </p>
+        <!-- Rows are built by `renderIdentityRows` in web/voice.js. Empty until a channel has been
+             read, and it says so rather than showing a blank panel. -->
+        <div id="identity-list"></div>
+        <p id="identity-state" class="hint" aria-live="polite"></p>
+
+        <h2>The channel</h2>
           <p class="hint">
             The Discord view shows the channel as Discord holds it, rendered from a small, fixed
             markdown subset. Message text is written by other people and bots: it is escaped before

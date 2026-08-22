@@ -7468,6 +7468,154 @@ test("REPLYING FROM THE PAGE DIMS WHAT YOU ANSWERED, WITHOUT WAITING FOR A POLL"
   );
 });
 
+// --- who is speaking, in the channel ------------------------------------------------------------
+//
+// `#66 channel-identities`. The transcript tells its two speakers apart by side, colour and corner;
+// the channel told them apart by nothing. These assert the two halves: that the buckets are guessed
+// the way the owner described, and that the two principals are drawn as the transcript's two
+// speakers rather than in a parallel palette.
+
+const whoOf = (page, i) => row(page, i).getAttribute("data-who");
+
+function crowd() {
+  return [
+    message({ id: "1000000000000000001", author: "unormal", author_id: "10", author_is_bot: false }),
+    message({ id: "1000000000000000002", author: "DeepScryCoder1", author_id: "20", author_is_bot: true }),
+    message({ id: "1000000000000000003", author: "unormal", author_id: "10", author_is_bot: false }),
+  ];
+}
+
+test("A LONE BOT IS GUESSED TO BE THE CODING AGENT, AND PEOPLE ARE GUESSED TO BE PEOPLE", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, crowd());
+
+  assert.equal(whoOf(page, 0), "human");
+  assert.equal(whoOf(page, 1), "coder", "the only bot in the channel is not the coding agent");
+  assert.equal(whoOf(page, 2), "human");
+});
+
+test("...and with TWO bots the guess refuses rather than picking one", async () => {
+  // The heuristic is "the only bot that is not us". With two candidates it is a coin toss, and a
+  // coin toss that dresses one of them as the principal speaker is worse than saying nothing.
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [
+    ...crowd(),
+    message({ id: "1000000000000000004", author: "some-other-bot", author_id: "30", author_is_bot: true }),
+  ]);
+
+  assert.equal(whoOf(page, 1), "bot", "it still claims to know which bot is the coding agent");
+  assert.equal(whoOf(page, 3), "bot");
+});
+
+test("REPLYING TEACHES THE PAGE WHICH ACCOUNT IS ITS OWN, AND THAT ACCOUNT IS 'ME'", async () => {
+  // Learned for free and by construction: the reply comes back as the Message Discord recorded, so
+  // its author IS this bridge. No /users/@me call, no name matching, nothing configured.
+  const store = new Map();
+  const page = newPage(store);
+  await signIn(page);
+  await openReplyOn(page, crowd(), 0);
+  page.el("reply-text").value = "answering";
+  await page.el("reply-send").click();
+  await page.settle();
+
+  const rows = page.el("discord-log").children;
+  const posted = rows[rows.length - 1];
+  assert.equal(posted.getAttribute("data-who"), "me", "our own reply is not shown as ours");
+  assert.equal(store.get("gent-talk.voice.self-id"), "1000000000000000009");
+
+  // ...and it is remembered, so the next session already knows without another reply.
+  const again = newPage(store);
+  await signIn(again);
+  await showDiscord(again, [
+    message({ id: "1000000000000000050", author: "Ryan Voice Bot", author_id: "1000000000000000009", author_is_bot: true }),
+  ]);
+  assert.equal(
+    whoOf(again, 0),
+    "me",
+    "a bot posting on the owner's behalf is not shown as the owner"
+  );
+});
+
+test("the reader's own choice beats every guess, and survives a reload", async () => {
+  const store = new Map();
+  const page = newPage(store);
+  await signIn(page);
+  await showDiscord(page, crowd());
+  assert.equal(whoOf(page, 1), "coder", "the guess under test never happened");
+
+  await page.el("open-settings").click();
+  const select = page
+    .el("identity-list")
+    .descendants()
+    .find((node) => node.getAttribute("data-author-id") === "20");
+  assert.ok(select, "Settings offers no row for an author that has spoken");
+  assert.equal(select.getAttribute("data-guessed"), "true", "a guess is not marked as one");
+  select.value = "bot";
+  await select.dispatch("change");
+
+  assert.equal(whoOf(page, 1), "bot", "the channel was not redrawn from the choice");
+  assert.equal(select.getAttribute("data-guessed"), "false", "it still reads as a guess");
+
+  const again = newPage(store);
+  await signIn(again);
+  await showDiscord(again, crowd());
+  assert.equal(whoOf(again, 1), "bot", "the choice did not survive a reload");
+});
+
+test("the channel's two principals are drawn as the TRANSCRIPT's two speakers, not a second palette", () => {
+  // The same person saying things in two views must not be two colours. This is the assertion that
+  // keeps the two idioms one idiom.
+  const mine = cssBlock(".messages li.mine");
+  const theirs = cssBlock(".messages li.theirs");
+  const me = cssBlock('#discord-log li.discord-message[data-who="me"]');
+  const coder = cssBlock('#discord-log li.discord-message[data-who="coder"]');
+
+  for (const [property, transcript, channel] of [
+    ["background", mine, me],
+    ["background", theirs, coder],
+  ]) {
+    const want = new RegExp(`${property}:\\s*var\\((--[a-z-]+)\\)`).exec(transcript);
+    assert.ok(want, `the transcript rule does not set ${property} from a custom property`);
+    assert.match(
+      channel,
+      new RegExp(`${property}:\\s*var\\(${want[1]}\\)`),
+      `the channel uses a different ${property} from the transcript for the same speaker`
+    );
+  }
+  // And the side, which is the other half of the signal.
+  assert.match(me, /margin-left/, "the owner's own messages are not offset like the transcript's");
+  assert.match(coder, /margin-right/, "the coding agent's messages are not offset the other way");
+});
+
+test("an author label is never treated as markup, even in Settings", async () => {
+  // The one place outside the message list where a display name is rendered. A name is written by
+  // whoever owns the account, and this panel exists because it can be anything at all.
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [
+    message({
+      id: "1000000000000000001",
+      author: "<img src=x onerror=alert(1)>",
+      author_id: "77",
+      author_is_bot: false,
+    }),
+  ]);
+  await page.el("open-settings").click();
+
+  assert.deepStrictEqual(
+    page.createdTags.filter((tag) => tag === "img"),
+    [],
+    "a display name became an element"
+  );
+  const name = page
+    .el("identity-list")
+    .descendants()
+    .find((node) => node.className === "identity-name");
+  assert.match(name.text(), /<img src=x/, "the name was not rendered as the text it is");
+});
+
 test("with every toggle untouched, the page asks for EXACTLY what it asked for before the menu existed", async () => {
   const page = newPage();
 
