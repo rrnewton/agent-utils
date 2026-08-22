@@ -1,9 +1,9 @@
-"""Best-effort append-only records of attempts to cross the sandbox boundary.
+"""Best-effort append-only records of every command submitted to a pane.
 
-A tool whose whole purpose is to bypass a confinement boundary must leave a trail that is complete
-rather than convenient: REFUSED attempts are logged as prominently as successful ones, because a
-run of refusals is exactly the signal worth noticing, and a log that only recorded successes would
-make the allowlist's behaviour unobservable after the fact.
+A tool that runs commands somewhere the caller's own constraints do not reach must leave a trail
+that is complete rather than convenient: REFUSED attempts are logged as prominently as successful
+ones, because a run of refusals is exactly the signal worth noticing, and a log that only recorded
+successes would make the allowlist's behaviour unobservable after the fact.
 
 JSONL, one object per line, appended with one ``write`` of a line that ends in ``\\n``. Nothing here
 locks. Linux ``O_APPEND`` assigns each write its end-of-file offset atomically, but this remains an
