@@ -215,7 +215,7 @@ function showScreen(name) {
   }
   // Help is reached FROM settings and returns TO it, so it must not become the thing settings
   // remembers to go back to — that would make the gear's way out lead into the document the
-  // reader just left. `#67 settings-and-help`.
+  // reader just left. `#85 voice-desktop-review`.
   if (name !== "settings" && name !== "help") {
     screenBeforeSettings = name;
   }
@@ -252,7 +252,7 @@ const HELP_TOPICS = [
 /**
  * Open Help, optionally at one entry.
  *
- * `#67 settings-and-help`. The deep link is the thing that makes the split survivable: moving the
+ * `#85 voice-desktop-review`. The deep link is the thing that makes the split survivable: moving the
  * paragraphs off the settings screen is only an improvement if the paragraph about the switch you
  * are looking at is still one tap away. Without it this would be a filing cabinet.
  *
@@ -3238,7 +3238,7 @@ function noteAuthor(id, name, isBot) {
 
 // --- what a channel row has already had done to it ------------------------------------------
 //
-// `#66 inbox-view`, landing the two follow-ups `#50 todo-view` named for itself.
+// `#84 reply-aware-dismissal`, landing the two follow-ups `#50 todo-view` named for itself.
 //
 // TWO states, and they are two rather than one because they are known two different ways:
 //
@@ -3486,7 +3486,7 @@ function discordNode(message) {
     guardQuietly(() => dismissMessages({ messages: [String(message.id)] }))()
   );
   meta.append(done);
-  // `#66 inbox-view`. THE SWIPE `#50` deferred, and it drives the same act the Done button does
+  // `#84 reply-aware-dismissal`. THE SWIPE `#50` deferred, and it drives the same act the Done button does
   // rather than a second notion of "dealt with": one dismissal, recorded on the server, reachable
   // by gesture OR by a control a keyboard can get to. That ordering was `#50`'s condition for the
   // gesture layer and it still holds — the gesture is a second way in, never the only one.
@@ -4224,7 +4224,7 @@ function todoSummary() {
  */
 function appendChannelRow(message) {
   el("discord-log").append(discordNode(message));
-  // `#66 inbox-view`. Re-derive the row states with the new row in place. It is here, in the one
+  // `#84 reply-aware-dismissal`. Re-derive the row states with the new row in place. It is here, in the one
   // appender, rather than at each of its callers: an arriving message can be the ANSWER to
   // something already on screen, so the row that changes is not necessarily the one just added.
   renderChannelRows();
@@ -4458,7 +4458,7 @@ async function sendReply() {
     if (payload && payload.posted) {
       // The account Discord recorded this reply under is THIS BRIDGE'S OWN, and it is the one
       // account whose messages are the owner's words. Learned here, for free, from a reply he was
-      // sending anyway — no `/users/@me` call and no name matching. `#66 channel-identities`.
+      // sending anyway — no `/users/@me` call and no name matching. `#85 voice-desktop-review`.
       noteSelfAuthor(payload.posted.author_id);
       // Through the same appender as a live arrival: the reply is in the window from now on, so
       // the next `/todo` read will count it, and a list that counted it one read later would
@@ -4983,7 +4983,7 @@ function receiveLiveMessage(message, selfPosted, replayed) {
   // The other free way to learn which account is ours: the server marks what IT posted, so the
   // author of a self-posted message is this bridge by construction. Done before the channel guard
   // below, because the fact is true regardless of which channel the reader happens to be looking
-  // at. `#66 channel-identities`.
+  // at. `#85 voice-desktop-review`.
   if (selfPosted) {
     noteSelfAuthor(message.author_id);
   }
@@ -5471,7 +5471,7 @@ el("dismiss-status").addEventListener("click", dismissStatus);
 el("open-settings").addEventListener("click", () => showScreen("settings"));
 el("close-settings").addEventListener("click", () => showScreen(screenBeforeSettings));
 
-// `#67 settings-and-help`. The paragraphs that used to stand between the reader and every switch
+// `#85 voice-desktop-review`. The paragraphs that used to stand between the reader and every switch
 // now live on their own screen, and each `?` on the settings screen opens the matching entry.
 //
 // ONE DELEGATED HANDLER over `data-help`, not a listener per button. The alternative is an id per

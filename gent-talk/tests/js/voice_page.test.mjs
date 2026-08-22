@@ -322,7 +322,7 @@ const FIXTURE_TREE = {
 /**
  * The markup of one settings group, `<section class="settings-group">` .. `</section>`.
  *
- * `#67 settings-and-help`. Sliced between markers rather than parsed, like every other markup
+ * `#85 voice-desktop-review`. Sliced between markers rather than parsed, like every other markup
  * assertion in this file — but bounded by the group's OWN closing tag rather than by "the next
  * heading", because the groups are now cards and a slice that ran to the next `<h2>` would sweep in
  * whatever card follows and let a disclosure pass by being present somewhere nearby.
@@ -2261,7 +2261,7 @@ test("the header shows two things at a time, and which two depends on the screen
   const ids = [...row.matchAll(/<button[^>]*\bid="([^"]+)"/g)].map((m) => m[1]);
   // `#51 reply-view` added a SECOND way back, deliberately rather than by generalising the first:
   // the two go to different places, and scripts/screenshots.py drives #close-settings by name.
-  // `#67 settings-and-help` added a THIRD for the same reason: Settings returns to the call, Reply
+  // `#85 voice-desktop-review` added a THIRD for the same reason: Settings returns to the call, Reply
   // returns to the channel, and Help returns to Settings.
   assert.deepStrictEqual(ids, ["close-settings", "close-reply", "close-help"]);
 
@@ -7458,7 +7458,7 @@ test("THE SWIPE DRIVES THE SAME DISMISSAL THE DONE BUTTON DOES, NOT A SECOND ONE
     /function swipeable\([\s\S]*?dismissMessages\(/,
     "the swipe does not go through the same dismissal the Done button uses"
   );
-  // And no second, browser-local one is left behind. `#66 inbox-view` arrived with an archive kept
+  // And no second, browser-local one is left behind. `#84 reply-aware-dismissal` arrived with an archive kept
   // in localStorage and a filter of its own; two controls that both mean "show me what is left" is
   // worse than either alone, and the server's state is the one with an undo behind it.
   for (const gone of ["ARCHIVED_KEY", "setArchived", "inboxOnly", "renderInboxToggle"]) {
@@ -7501,7 +7501,7 @@ test("REPLYING FROM THE PAGE DIMS WHAT YOU ANSWERED, WITHOUT WAITING FOR A POLL"
 
 // --- settings and help ---------------------------------------------------------------------------
 //
-// `#67 settings-and-help`. Settings had become a document with controls buried in it: every knob
+// `#85 voice-desktop-review`. Settings had become a document with controls buried in it: every knob
 // carried two or three paragraphs, so reaching the switch you wanted meant reading past everything
 // you already knew. The prose is not deleted — it is one tap away, and these assert that the tap
 // exists, because a split without it is just a filing cabinet.
@@ -7628,7 +7628,7 @@ test("both documents are held to a column, so a checkbox is not a metre from its
 
 // --- who is speaking, in the channel ------------------------------------------------------------
 //
-// `#66 channel-identities`. The transcript tells its two speakers apart by side, colour and corner;
+// `#85 voice-desktop-review`. The transcript tells its two speakers apart by side, colour and corner;
 // the channel told them apart by nothing. These assert the two halves: that the buckets are guessed
 // the way the owner described, and that the two principals are drawn as the transcript's two
 // speakers rather than in a parallel palette.
@@ -9729,7 +9729,7 @@ test("Settings tells the truth about live updates in all three of its states", a
 });
 
 test("Settings says plainly what the relay costs and what it cannot do", () => {
-  // `#67 settings-and-help` moved the PARAGRAPHS to their own screen and left the CONTROL here.
+  // `#85 voice-desktop-review` moved the PARAGRAPHS to their own screen and left the CONTROL here.
   // The disclosure is therefore asserted in two halves, and the second half is what keeps the move
   // honest: the prose still exists, and the `?` beside this control is what reaches it. A test that
   // only looked at the help screen would pass just as well if nothing linked to it.

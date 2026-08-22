@@ -1278,7 +1278,7 @@ an anchor is correct either way.
 
 ### Two ways a channel row can already have been dealt with, and only one of them hides it
 
-`#66 inbox-view` lands the two follow-ups `#50 todo-view` named for itself — the **swipe**, and the
+`#84 reply-aware-dismissal` lands the two follow-ups `#50 todo-view` named for itself — the **swipe**, and the
 **derived "replied" signal** that needed a reply reference on the server's `Message`.
 
 `#50` filters the channel on **dismissal**: declared by the reader, recorded on the server, with an
