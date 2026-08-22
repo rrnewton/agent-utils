@@ -1,4 +1,10 @@
-//! Allowlisted, audited command execution through an out-of-sandbox Herdr pane.
+//! Allowlisted, audited command execution through a terminal pane the caller does not own.
+//!
+//! The pane belongs to a separate terminal server and is not a child of the calling process, so
+//! whatever constrains that process does not constrain the command: not its network policy, not
+//! its environment, not its lifetime. An agent whose sandbox blocks a destination it legitimately
+//! needs is ONE use of that, and the one `herdr-run net-doctor` checks; it is an example, not the
+//! definition.
 //!
 //! The crate exposes the policy and transport layers used by the `herdr-run` command so callers
 //! can validate configuration and admission without starting a Herdr session.
