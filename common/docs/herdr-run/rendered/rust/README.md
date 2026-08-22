@@ -4,7 +4,7 @@ Run an **allowlisted** command in a Herdr terminal pane that lives **outside** a
 sandbox, and get its real stdout, stderr, and exit code back.
 
 ```
-herdr-run release-agent 'with-proxy git ls-remote origin main'
+herdr-run --agent release-agent run 'with-proxy git ls-remote origin main'
 ```
 
 The same package also installs `herdr-agent`, a durable FIFO transport for messaging an
@@ -80,12 +80,12 @@ max_panes: 32             # refuse a NEW tab once the workspace holds this many 
 ## Quick reference
 
 ```
-herdr-run <agent> '<command>'    run the command; exits with the command's own exit code
+herdr-run run '<command>'        run the command; exits with the command's own exit code
 herdr-run check '<command>'      policy only: allowed or refused. Touches no pane.
 herdr-run target                 resolve/bring up the pane; print ids and readiness
 herdr-run config                 print the effective configuration
 herdr-run reap                   report which command tabs are provably finished. Closes nothing.
-herdr-run doctor                 verify the sandbox-crossing actually works, both directions
+herdr-run net-doctor             smoke-test one scenario: a caller whose own network is blocked
 herdr-run userguide              the full user guide
 herdr-agent send ...             durably submit one prompt to an interactive agent
 herdr-agent drain ...            resume a bound queue without duplicating ambiguous prompts

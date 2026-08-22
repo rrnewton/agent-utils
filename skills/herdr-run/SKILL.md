@@ -14,8 +14,8 @@ The installed CLI is the source of truth:
 - `herdr-run --help`
 - `herdr-run config` to inspect the fully resolved policy
 - `herdr-run check '<command>'`
-- `herdr-run --agent NAME --dry-run '<command>'` to validate and render without touching a pane
-- `herdr-run doctor`
+- `herdr-run --agent NAME run --dry-run '<command>'` to validate and render without touching a pane
+- `herdr-run net-doctor`
 - `herdr-run userguide`
 
 Dry-runs and refusals still append operational evidence to `.herdr-run/audit.jsonl`. Successful

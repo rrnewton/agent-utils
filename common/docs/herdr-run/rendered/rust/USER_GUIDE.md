@@ -4,7 +4,7 @@ Run an **allowlisted** command in a Herdr pane that lives **outside** the agent 
 real stdout, stderr, and exit code back.
 
 ```
-herdr-run release-agent 'with-proxy git ls-remote origin main'
+herdr-run --agent release-agent run 'with-proxy git ls-remote origin main'
 ```
 
 > **This tool deliberately uses an out-of-sandbox channel.** It exists because an agent's
@@ -45,31 +45,50 @@ door instead of an ad-hoc pile of `send-keys` calls.
 
 ## Usage
 
+The shape is `herdr-run [GLOBAL OPTIONS] <subcommand> [OPTIONS]`. There is no subcommand-less form:
+running a command is what `run` is for.
+
 ```
-herdr-run <agent> '<command>'      # explicit agent -> tab name
-herdr-run '<command>'              # agent taken from $DG_AGENT_NAME / $HERDR_RUN_AGENT
+herdr-run run '<command>'          # run it; exits with the command's own exit code
 herdr-run check '<command>'        # policy only: allowed or refused. Touches no pane.
 herdr-run target                   # resolve/bring up the pane; print ids and readiness
-herdr-run config                   # print the effective configuration
+herdr-run config                   # print the effective configuration as JSON
 herdr-run reap                     # report which command tabs are provably finished. Closes nothing.
-herdr-run doctor                   # bracket the premise in both directions (see below)
+herdr-run net-doctor               # smoke-test one narrow scenario (see below)
 herdr-run userguide                # this document
 ```
 
-Useful flags:
+**Global options** identify the invocation and its configuration, and go **before** the subcommand:
 
-| Flag | Effect |
+| Option | Effect |
+| --- | --- |
+| `--config PATH` | Use an explicit configuration file instead of the discovered one. |
+| `--agent NAME` | The agent this invocation speaks for; names its tab. Otherwise `$HERDR_RUN_AGENT`, `$DG_AGENT_NAME`, or `$ORC_AGENT_NAME`. |
+| `--json` | Emit machine-readable output where the subcommand has one. |
+| `--version` | Print the version and exit. |
+
+**`run` options** only mean something to `run`, and go **after** it:
+
+| Option | Effect |
 | --- | --- |
 | `--dry-run` | Admit the command and print the exact rendered line; execute nothing. |
 | `--wait-ready S` | Wait up to `S` seconds for the pane to go idle instead of refusing at once. |
 | `--timeout S` | Override the command timeout. |
-| `--json` | One JSON object with exit status, readable text, byte-exact base64 streams, target, and spool paths. |
 | `--cwd PATH` | Working directory for the command. |
 | `--no-cache` | Ignore the session cache and re-resolve the pane from labels. |
-| `--config PATH` | Use an explicit config file. |
+
+`target` also takes `--no-cache`. Every other subcommand takes no options of its own.
+Offering an option at the wrong level is an error that says which level it belongs to, so
+`herdr-run --cwd /tmp run …` tells you to write `herdr-run run --cwd /tmp …` rather than failing
+as an unrecognized argument. Run `herdr-run <subcommand> --help` for one subcommand's own options;
+neither level's help documents the other's.
+
+```
+herdr-run --agent release-agent run --timeout 60 'with-proxy git ls-remote origin main'
+```
 
 By default stdout and stderr are passed straight through and **the process exits with the command's
-own exit code**, so `herdr-run` composes in a shell script like the command it wraps.
+own exit code**, so `herdr-run run` composes in a shell script like the command it wraps.
 
 ### Exit codes
 
@@ -187,7 +206,7 @@ home from the user database, resolves `herdr` from a fixed set of install locati
 the result, and passes that absolute path to systemd. This blocks a planted workspace executable;
 it cannot make an owner-writable per-user install trustworthy against another same-user process.
 
-If a bad server is already running, `herdr-run doctor` will catch it. Its fix is
+If a bad server is already running, `herdr-run net-doctor` will catch it. Its fix is
 `herdr server stop`, then let `herdr-run` restart it.
 
 ### Readiness detection
@@ -321,7 +340,7 @@ output.
 ### Audit log
 
 `herdr-run` attempts to append JSON lines to `<spool_dir>/audit.jsonl` for **refusals**, dry runs,
-admission before target resolution/launch, wrapper failures, and completed commands. The `doctor`
+admission before target resolution/launch, wrapper failures, and completed commands. The `net-doctor`
 pane probe follows the same path. This makes a successful run a two-phase record (`ADMITTED`, then
 `RAN`) and leaves an admission marker when a later control operation fails.
 
@@ -388,15 +407,21 @@ claim to provide that stronger architecture.
 
 ---
 
-## Verifying it works
+## Verifying one narrow scenario
 
 ```
-herdr-run doctor
+herdr-run net-doctor
 ```
 
-Brackets the premise in **both** directions rather than asserting it: the probe command must **fail**
-in-jail and **succeed** through the pane. Three verdicts:
+`net-doctor` is deliberately about **one** situation and says so before it does anything: a caller
+whose own network access is blocked, reaching the network through a pane that is not blocked. It is
+not a health check of the tool as a whole, and a project using `herdr-run` for one of the other
+reasons above should not read its verdict as one.
 
-- blocked in-jail, succeeds via pane → working as intended;
-- succeeds both ways → the pane is buying nothing here, run the command directly;
-- fails via pane → the path is broken, most likely a server started from inside a sandbox.
+Within that scenario it brackets the premise in **both** directions rather than asserting it: the
+probe (`git ls-remote` against `probe_remote`) must **fail** run directly and **succeed** through
+the pane. Three verdicts:
+
+- blocked directly, succeeds via pane → this scenario works;
+- succeeds both ways → for this scenario the pane is buying nothing, run the command directly;
+- fails via pane → the pane path is broken, most likely a server started from inside a confinement.

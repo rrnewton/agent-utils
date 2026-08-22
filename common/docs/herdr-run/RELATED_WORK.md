@@ -38,7 +38,7 @@ Herdr **server**. If a confined agent starts the server itself, every pane it cr
 confinement, and the tool becomes an elaborate way to reproduce the same `403` — *silently*, because
 nothing about such a pane looks different from a good one. `HerdrClient.ensure_server` therefore
 always launches through `systemd-run --user`, which reparents the server onto the user manager
-outside the jail. `herdr-run doctor` exists to catch the case where a bad server is already running.
+outside the jail. `herdr-run net-doctor` exists to catch the case where a bad server is already running.
 
 **Not touched.** `pane_owner.py` stays as it is. It is validate-specific (it binds panes to
 `validate-*.service` units, durable logs, and `safe-ci-*` cgroup discovery), and folding it into a

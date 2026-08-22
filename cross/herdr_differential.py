@@ -258,6 +258,164 @@ def _describe(outcome: Outcome) -> str:
     )
 
 
+#: Every subcommand the surface promises, at both levels.
+#:
+#: Named literally rather than scraped from either edition, so an edition that quietly loses a
+#: subcommand fails here instead of teaching the harness its own smaller idea of the surface.
+_SUBCOMMANDS: tuple[str, ...] = (
+    "check",
+    "config",
+    "net-doctor",
+    "reap",
+    "run",
+    "target",
+    "userguide",
+)
+
+#: Options accepted BEFORE the subcommand, and nowhere else.
+_GLOBAL_OPTIONS = frozenset({"--help", "--version", "--config", "--agent", "--json"})
+
+#: Options accepted AFTER each subcommand, and nowhere else.
+_LOCAL_OPTIONS: dict[str, frozenset[str]] = {
+    "run": frozenset(
+        {"--help", "--cwd", "--timeout", "--wait-ready", "--no-cache", "--dry-run"}
+    ),
+    "check": frozenset({"--help"}),
+    "config": frozenset({"--help"}),
+    "target": frozenset({"--help", "--no-cache"}),
+    "reap": frozenset({"--help"}),
+    "net-doctor": frozenset({"--help"}),
+    "userguide": frozenset({"--help"}),
+}
+
+_OPTION_TOKEN = re.compile(r"--[a-z][a-z0-9-]*")
+
+
+def _block(text: str, header_prefix: str) -> list[str]:
+    """Return the contiguous indented lines that follow the first line starting with a header."""
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if line.startswith(header_prefix):
+            body: list[str] = []
+            for candidate in lines[index + 1 :]:
+                if not candidate.strip():
+                    break
+                body.append(candidate)
+            return body
+    return []
+
+
+def _declared_subcommands(text: str) -> tuple[str, ...]:
+    return tuple(
+        sorted(line.split()[0] for line in _block(text, "subcommands:") if line.split())
+    )
+
+
+def _declared_options(text: str, header_prefix: str) -> frozenset[str]:
+    return frozenset(
+        token
+        for line in _block(text, header_prefix)
+        for token in _OPTION_TOKEN.findall(line)
+    )
+
+
+def _help_surface(harness: Harness, report: Report, case: PairCase) -> None:
+    """Compare the whole two-level help schema, not merely that some words appear in it.
+
+    ``report.exact`` on every help text already makes one edition growing a subcommand or an option
+    the other lacks a divergence.  The literal expectations below add the case ``exact`` cannot
+    catch: both editions dropping the same thing at once, which is agreement about a surface that
+    no longer matches what the tool promises.
+    """
+
+    python, rust = harness.invoke(case, ("--help",))
+    report.exact("help/top-level", python, rust, expected_rc=0)
+    report.require(
+        "help/top-level-subcommands",
+        _declared_subcommands(python.stdout) == tuple(sorted(_SUBCOMMANDS)),
+        f"top-level help does not list exactly {sorted(_SUBCOMMANDS)}: {_describe(python)}",
+    )
+    report.require(
+        "help/top-level-global-options",
+        _declared_options(python.stdout, "global options") == _GLOBAL_OPTIONS,
+        f"global option list changed: {_describe(python)}",
+    )
+    # The two levels must not document each other. This is the defect the surface exists to fix.
+    top_level_local = _declared_options(python.stdout, "global options") & {
+        option for options in _LOCAL_OPTIONS.values() for option in options
+    } - {"--help"}
+    report.require(
+        "help/top-level-omits-local-options",
+        not top_level_local,
+        f"top-level help documents subcommand options {sorted(top_level_local)}",
+    )
+
+    for subcommand in _SUBCOMMANDS:
+        python, rust = harness.invoke(case, (subcommand, "--help"))
+        report.exact(f"help/{subcommand}", python, rust, expected_rc=0)
+        declared = _declared_options(python.stdout, "options:")
+        report.require(
+            f"help/{subcommand}-options",
+            declared == _LOCAL_OPTIONS[subcommand],
+            f"'{subcommand} --help' declares {sorted(declared)}, "
+            f"expected {sorted(_LOCAL_OPTIONS[subcommand])}: {_describe(python)}",
+        )
+        leaked = declared & (_GLOBAL_OPTIONS - {"--help"})
+        report.require(
+            f"help/{subcommand}-omits-global-options",
+            not leaked,
+            f"'{subcommand} --help' documents global options {sorted(leaked)}",
+        )
+
+
+def _levels(harness: Harness, report: Report, case: PairCase) -> None:
+    """An option offered at the wrong level must be refused, identically, by both editions."""
+
+    misplaced = (
+        ("global-cwd", ("--cwd", "/tmp", "run", "git status")),
+        ("global-timeout", ("--timeout", "5", "run", "git status")),
+        ("global-wait-ready", ("--wait-ready", "5", "run", "git status")),
+        ("global-no-cache", ("--no-cache", "target")),
+        ("global-dry-run", ("--dry-run", "run", "git status")),
+        ("local-agent", ("run", "--agent", "fixture-agent", "git status")),
+        ("local-config", ("run", "--config", "x.yaml", "git status")),
+        ("local-json", ("run", "--json", "git status")),
+        ("foreign-dry-run", ("check", "--dry-run", "git status")),
+        ("foreign-cwd", ("reap", "--cwd", "/tmp")),
+    )
+    for label, args in misplaced:
+        python, rust = harness.invoke(case, args)
+        report.exact(f"levels/{label}", python, rust, expected_rc=2)
+
+
+def _removed_bare_form(harness: Harness, report: Report, case: PairCase) -> None:
+    """Running a command with no subcommand must fail, and must name what to type instead."""
+
+    python, rust = harness.invoke(case, ("git status",))
+    report.exact("bare-form/command-only", python, rust, expected_rc=2)
+    report.require(
+        "bare-form/command-only-names-run",
+        "herdr-run run 'git status'" in python.stderr,
+        f"the removed bare form did not name its replacement: {_describe(python)}",
+    )
+
+    python, rust = harness.invoke(case, ("release-agent", "git status"))
+    report.exact("bare-form/agent-and-command", python, rust, expected_rc=2)
+    report.require(
+        "bare-form/agent-and-command-names-run",
+        "herdr-run --agent release-agent run 'git status'" in python.stderr,
+        f"the removed agent form did not name its replacement: {_describe(python)}",
+    )
+
+    python, rust = harness.invoke(case, ("run", "git", "status"))
+    report.exact("bare-form/loose-words", python, rust, expected_rc=2)
+    report.require(
+        "bare-form/loose-words-refuse-rejoining",
+        "ONE quoted argument" in python.stderr,
+        f"loose command words were not refused: {_describe(python)}",
+    )
+
+
 def _bootstrap(harness: Harness, report: Report) -> None:
     case = harness.case("bootstrap")
     python, rust = harness.invoke(case, ("--version",))
@@ -283,48 +441,24 @@ def _bootstrap(harness: Harness, report: Report) -> None:
         f"python={_describe(python)} rust={_describe(rust)}",
     )
 
-    help_python, help_rust = harness.invoke(case, ("--help",))
-    required = (
-        "check",
-        "doctor",
-        "config",
-        "target",
-        "reap",
-        "userguide",
-        "--version",
-        "--userguide",
-        "--config",
-        "--agent",
-        "--cwd",
-        "--timeout",
-        "--wait-ready",
-        "--no-cache",
-        "--json",
-        "--dry-run",
-    )
-    for edition, outcome in (("python", help_python), ("rust", help_rust)):
-        report.require(
-            f"bootstrap/help-schema/{edition}",
-            outcome.returncode == 0
-            and outcome.stderr == ""
-            and all(token in outcome.stdout for token in required),
-            f"help omitted a required command/option: {_describe(outcome)}",
-        )
+    _help_surface(harness, report, case)
+    _levels(harness, report, case)
+    _removed_bare_form(harness, report, case)
 
     bare_python, bare_rust = harness.invoke(case, ())
+    report.exact("bootstrap/bare", bare_python, bare_rust, expected_rc=0)
     for edition, outcome in (("python", bare_python), ("rust", bare_rust)):
         report.require(
             f"bootstrap/bare/{edition}",
             outcome.returncode == 0
             and outcome.stderr == ""
-            and "Nothing to do" in outcome.stdout
-            and "userguide" in outcome.stdout,
-            f"bare invocation did not print the successful bootstrap help: {_describe(outcome)}",
+            and "subcommands:" in outcome.stdout,
+            f"a bare invocation must print the subcommand list: {_describe(outcome)}",
         )
 
     python, rust = harness.invoke(
         case,
-        ("--dry-run", "--agent", "fixture-agent", "--", "git --help"),
+        ("--agent", "fixture-agent", "run", "--dry-run", "--", "git --help"),
     )
     report.exact("bootstrap/double-dash-command-help", python, rust, expected_rc=0)
     report.require(
@@ -335,7 +469,7 @@ def _bootstrap(harness: Harness, report: Report) -> None:
 
     python, rust = harness.invoke(
         case,
-        ("--dry", "--ag", "fixture-agent", "git status"),
+        ("--ag", "fixture-agent", "run", "--dry", "git status"),
     )
     report.require(
         "bootstrap/no-option-abbreviations",
@@ -459,7 +593,7 @@ def _policy(harness: Harness, report: Report) -> None:
 
 def _config_success(harness: Harness, report: Report) -> None:
     case = harness.case("config-default")
-    python, rust = harness.invoke(case, ("config", "--agent", "fixture-agent"))
+    python, rust = harness.invoke(case, ("--agent", "fixture-agent", "config"))
     report.exact("config/default", python, rust, expected_rc=0)
     report.require(
         "config/default-fields",
@@ -520,7 +654,7 @@ probe_remote: https://example.invalid/repository
 broker: systemd-run
 """
     case = harness.case("config-full", {".herdr-run.yaml": full})
-    python, rust = harness.invoke(case, ("config", "--agent", "fixture-agent"))
+    python, rust = harness.invoke(case, ("--agent", "fixture-agent", "config"))
     report.exact("config/full", python, rust, expected_rc=0)
 
     discovery = {
@@ -530,7 +664,7 @@ broker: systemd-run
     case = harness.case("config-nearest", discovery)
     python, rust = harness.invoke(
         case,
-        ("config", "--agent", "fixture-agent"),
+        ("--agent", "fixture-agent", "config"),
         cwd="slot/deep",
     )
     report.exact("config/discovery-nearest", python, rust, expected_rc=0)
@@ -659,7 +793,7 @@ spool_dir: .audit-spool
     command = "printf '[%s]' 'two words' '; rm -rf /' '$(id)'"
     python, rust = harness.invoke(
         case,
-        ("--dry-run", "--json", "fixture-agent", command),
+        ("--json", "--agent", "fixture-agent", "run", "--dry-run", command),
     )
     report.exact("dry-run/success-json", python, rust, expected_rc=0)
     expected = (
