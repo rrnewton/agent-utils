@@ -291,19 +291,23 @@ def test_yaml_unicode_surrogate_is_a_typed_config_error(tmp_path: object) -> Non
         load_config(explicit_path=path, start_dir=str(tmp_path))
 
 
-# --- the shipped example is a valid config --------------------------------------------------------
+# --- the one shipped configuration document is a valid config ---------------------------------------
 
 
-def test_shipped_example_config_parses() -> None:
-    """The example in the package must stay loadable; a stale example is a broken doc."""
+def test_shipped_config_template_parses() -> None:
+    """The single configuration document the package ships must stay loadable.
+
+    This used to point at a second file, ``examples/project.yaml``. A partial example alongside
+    the template ``init`` writes is the duplicate-that-drifts the template exists to prevent, so
+    the example is gone and the assertion now guards the template itself — the one artefact the
+    guide points at.
+    """
     yaml = pytest.importorskip("yaml")
     from importlib.resources import files
 
-    text = (files("herdr_run") / "examples" / "project.yaml").read_text(
-        encoding="utf-8"
-    )
+    text = (files("herdr_run") / "config_template.yaml").read_text(encoding="utf-8")
     config = parse_config(
-        yaml.safe_load(text), source_path="example", project_root="/tmp"
+        yaml.safe_load(text), source_path="template", project_root="/tmp"
     )
     assert config.workspace == "agent-cmds"
     assert config.allow == ("git", "gh")

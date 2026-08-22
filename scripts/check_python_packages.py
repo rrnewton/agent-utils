@@ -140,9 +140,11 @@ PROJECTS: tuple[Project, ...] = (
             "USER_GUIDE.md",
             "QUICKSTART.md",
             "AGENT_USER_GUIDE.md",
+            # There is deliberately no `examples/` here. `config_template.yaml` is what
+            # `herdr-run init` writes, and it is the configuration reference; a second, partial
+            # example file in the wheel would be a duplicate free to drift away from it.
             "config_template.yaml",
             "py.typed",
-            "examples/project.yaml",
         ),
         required_dependencies=("pyyaml",),
         command_userguides=(("herdr-agent", "AGENT_USER_GUIDE.md"),),
