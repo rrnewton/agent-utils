@@ -1318,6 +1318,42 @@ a person selects the text of a message they want to quote.
 Replying from the page closes the loop on the spot: the reply carries a `message_reference`, so what
 it answers dims immediately rather than at the next forty-five-second re-read.
 
+### Settings is controls; Help is the paragraphs that used to be in the way
+
+The settings screen had become a document with switches buried in it. Every knob carried two or
+three paragraphs explaining itself — all of them worth having, none of them worth reading again on
+the way to a checkbox — and on a desktop browser the whole thing ran the full width of the window,
+which puts a checkbox at one end of a metre of desk and its label at the other.
+
+So it is two screens now. **Settings is controls and labels**: each group is a bordered card with at
+most one short line of orientation and a `?`. **Help holds the prose**, and every `?` opens the
+matching entry. Nothing was deleted, and that is the part that makes the split survivable — the
+paragraph about the switch you are looking at is still exactly one tap away, which is the only
+reason moving it is an improvement rather than a filing cabinet.
+
+Three things follow from that, and each is asserted rather than trusted:
+
+- **The link is checked in both directions.** A settings group that links to an entry which does not
+  exist fails; so does an entry nothing links to. The script's `HELP_TOPICS` must equal the markup's
+  `data-help` set, so a new group cannot ship with a `?` that does nothing.
+- **No paragraph on the settings screen may exceed a budget.** That is the measurable form of the
+  complaint, and without it the prose creeps back one sentence at a time.
+- **The disclosures are still disclosures.** The tests that guard what resuming and the relay cost
+  now assert the control and its summary on Settings *and* the full text in the matching Help
+  entry *and* the `?` that reaches it. A test that only looked at Help would pass just as well if
+  nothing linked to it.
+
+Both screens are held to a **fixed 34rem column** — not `var(--reading-width)`. That variable is the
+reader's choice about the transcript, and dragging the transcript wider has no business reflowing a
+form; a form's comfortable width is a property of the form. The desktop block had deliberately
+exempted these two screens ("they are forms rather than reading, and giving them a column is a
+separate judgement nobody has made yet"); this is that judgement.
+
+**Connection status moved to the end and gained a word.** It is a readout — what the conversation
+is, what audio format it negotiated, why the last one closed — and it was standing at the top of the
+screen, in the position a reader arrives at, when what they arrive wanting is a switch. "Connection"
+also read as somewhere you configure one.
+
 ### A conversation can end three ways, and they are three different sentences
 
 A WebSocket close is one event, and the page used to have two things to say about it. That is one

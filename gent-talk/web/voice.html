@@ -46,6 +46,14 @@
             <path d="M14.5 5 8 12l6.5 7" />
           </svg>
         </button>
+        <!-- `#67 settings-and-help`. Help gets its OWN way back, for the same reason the reply
+             screen does: it goes somewhere different. Settings returns to the call; Help returns
+             to Settings, which is where the reader was and what they were doing. -->
+        <button id="close-help" class="icon-button" type="button" aria-label="Back" title="Back" hidden>
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M14.5 5 8 12l6.5 7" />
+          </svg>
+        </button>
         <span id="topbar-title" class="topbar-title" hidden>Settings</span>
 
         <!--
@@ -341,302 +349,477 @@
         </section>
 
         <!-- ----------------------------------------------------------------- settings screen -->
+        <!--
+          `#67 settings-and-help`. TWO screens, and the split is the point.
+
+          Settings had become a document with controls buried in it: every knob carried two or
+          three paragraphs explaining itself, so finding the switch you wanted meant reading past
+          everything you already knew. The owner's report was exactly that — "the long explanations
+          should be in some separate help/support area, not on one big settings page".
+
+          So this screen is now CONTROLS AND LABELS ONLY. Each group is a bordered card with one
+          short line of orientation and a `?` that opens the same group's entry in Help. Nothing
+          explanatory longer than a sentence lives here; the paragraphs are all one tap away and
+          are still exactly one tap away, rather than being deleted.
+
+          The order is deliberate too. Connection status is LAST, because it is a readout rather
+          than a setting and it was standing at the top of the screen holding the position a reader
+          arrives at — and what they arrive wanting is a switch.
+        -->
         <section id="screen-settings" class="screen" hidden>
-          <h2>Connection</h2>
-          <div id="settings-detail" class="panel muted">no conversation yet</div>
+          <div class="settings-column">
+            <section class="settings-group">
+              <div class="group-head">
+                <h2>Microphone</h2>
+                <button class="help-link" id="help-link-microphone" type="button" data-help="microphone" aria-label="About the microphone settings" title="What these do">?</button>
+              </div>
+              <p class="hint">Applied to your next call, not the one in progress.</p>
 
-          <h2>Microphone</h2>
-          <p class="hint">
-            These are asked of the browser when the microphone opens, so a change here applies to
-            your <strong>next</strong> call, not the one in progress.
-          </p>
+              <label class="toggle">
+                <input id="mic-echo-cancellation" type="checkbox" checked />
+                Echo cancellation
+              </label>
+              <label class="toggle">
+                <input id="mic-noise-suppression" type="checkbox" checked />
+                Noise suppression
+              </label>
+              <label class="toggle">
+                <input id="mic-auto-gain" type="checkbox" checked />
+                Automatic gain control
+              </label>
+              <p id="mic-settings-state" class="hint" aria-live="polite"></p>
+            </section>
 
-          <label class="toggle">
-            <input id="mic-echo-cancellation" type="checkbox" checked />
-            Echo cancellation
-          </label>
-          <p class="hint">
-            Stops the agent hearing itself through your speaker and answering its own voice.
-            Headphones solve this too; leave it on if you are on speakerphone.
-          </p>
+            <section class="settings-group">
+              <div class="group-head">
+                <h2>Control bar</h2>
+                <button class="help-link" id="help-link-control-bar" type="button" data-help="control-bar" aria-label="About the control bar" title="What this does">?</button>
+              </div>
+              <label for="bar-placement">Where the control bar sits</label>
+              <select id="bar-placement" aria-describedby="bar-placement-state">
+                <option value="bottom">Bottom — above the big buttons</option>
+                <option value="top">Top — under the title</option>
+              </select>
+              <p id="bar-placement-state" class="hint" aria-live="polite"></p>
+            </section>
 
-          <label class="toggle">
-            <input id="mic-noise-suppression" type="checkbox" checked />
-            Noise suppression
-          </label>
-          <p class="hint">Filters steady background noise — a fan, road noise, a room's hum.</p>
+            <section class="settings-group">
+              <div class="group-head">
+                <h2>Canned prompts</h2>
+                <button class="help-link" id="help-link-canned-prompts" type="button" data-help="canned-prompts" aria-label="About the canned prompts" title="What these send">?</button>
+              </div>
+              <p class="hint">What the two prompt buttons send. Empty a field to restore its default.</p>
 
-          <label class="toggle">
-            <input id="mic-auto-gain" type="checkbox" checked />
-            Automatic gain control
-          </label>
-          <p class="hint">
-            Amplifies quiet input. In a near-silent room it boosts small incidental sounds — a
-            phone being set down — until they cross the speech threshold and get transcribed as
-            words. Turn it <strong>off</strong> if you are getting phantom transcripts.
-          </p>
+              <label for="prompt-summary">Sumry</label>
+              <textarea id="prompt-summary" rows="3"></textarea>
 
-          <p id="mic-settings-state" class="hint" aria-live="polite"></p>
+              <label for="prompt-blockers">Blockers — spends coding-agent work</label>
+              <textarea id="prompt-blockers" rows="4"></textarea>
+              <p id="prompt-state" class="hint" aria-live="polite"></p>
+            </section>
 
-          <h2>Control bar</h2>
-          <p class="hint">
-            The strip carrying the gear and the Voice/Discord switch. It can sit under the title at
-            the top of the screen, or in the dock directly above the big buttons —
-            <strong>bottom is the default</strong>, because that is where your thumb already is and
-            because the header then costs no row at all. The gear is deliberately at the far
-            <strong>left</strong> of it: it is the control you least want to hit by accident.
-          </p>
-          <label for="bar-placement">Where the control bar sits</label>
-          <select id="bar-placement" aria-describedby="bar-placement-state">
-            <option value="bottom">Bottom — above the big buttons</option>
-            <option value="top">Top — under the title</option>
-          </select>
-          <p id="bar-placement-state" class="hint" aria-live="polite"></p>
+            <section class="settings-group">
+              <div class="group-head">
+                <h2>Who is who in the channel</h2>
+                <button class="help-link" id="help-link-identities" type="button" data-help="identities" aria-label="About channel identities" title="How these are guessed">?</button>
+              </div>
+              <p class="hint">Everyone who has spoken in a channel you have opened. Italic means guessed.</p>
+              <!-- Rows are built by `renderIdentityRows` in web/voice.js. Empty until a channel has
+                   been read, and it says so rather than showing a blank panel. -->
+              <div id="identity-list"></div>
+              <p id="identity-state" class="hint" aria-live="polite"></p>
+            </section>
 
-          <h2>Canned prompts</h2>
-          <p class="hint">
-            What the two prompt buttons in the control bar say. They send exactly this text into the
-            live conversation, as though you had typed it. Emptying a field puts its default back
-            rather than leaving a button that does nothing.
-          </p>
+            <!--
+              `#39 channel-alias`. A name of the OWNER's own for a channel, so that addressing one
+              out loud is possible at all: a snowflake is unsayable and a configured label like
+              "build noise" is not what anyone says either. The three things it deliberately is
+              NOT are stated in Help, and they are the whole point of the feature.
+            -->
+            <section class="settings-group">
+              <div class="group-head">
+                <h2>What to call a channel</h2>
+                <button class="help-link" id="help-link-channel-alias" type="button" data-help="channel-alias" aria-label="About channel names" title="What this changes, and what it does not">?</button>
+              </div>
+              <p class="hint">Your own name for a channel. Not a rename in Discord.</p>
+              <label for="alias-channel">Channel</label>
+              <select id="alias-channel" aria-describedby="alias-state"></select>
+              <label for="channel-alias">Call it</label>
+              <input
+                id="channel-alias"
+                type="text"
+                maxlength="60"
+                autocomplete="off"
+                aria-describedby="alias-state"
+              />
+              <p id="alias-state" class="hint" aria-live="polite"></p>
+              <button id="save-alias" class="secondary" type="button">Save this name</button>
+              <button id="clear-alias" class="secondary" type="button">Use the configured label</button>
+              <!--
+                The SERVER's own standing statement about what an alias is, quoted and never
+                rewritten — the same rule `#inbox-note` follows. A second copy of a policy here
+                would be a second thing that can drift from the one the server actually enforces.
+              -->
+              <p id="alias-note" class="hint"></p>
+            </section>
 
-          <label for="prompt-summary">Sumry</label>
-          <p class="hint">
-            Deliberately says <strong>recent messages</strong> and not "my unread messages since I
-            last spoke". Discord gives a bot no read state at all, and this bridge cannot work out
-            where you last spoke either — your own replies are posted as the bot, and the only
-            author signal is a display name anyone can set to anything. A button that claimed that
-            scoping would produce confident, wrong summaries. See
-            <code>ai_docs/UNREAD_STATUS_20260819.md</code>.
-          </p>
-          <textarea id="prompt-summary" rows="3"></textarea>
+            <section class="settings-group">
+              <div class="group-head">
+                <h2>Reading width</h2>
+                <button class="help-link" id="help-link-reading-width" type="button" data-help="reading-width" aria-label="About the reading width" title="What this does">?</button>
+              </div>
+              <input
+                id="reading-width"
+                type="range"
+                min="45"
+                max="120"
+                step="1"
+                aria-label="reading width in characters"
+              />
+              <p id="reading-width-state" class="hint" aria-live="polite"></p>
+            </section>
 
-          <label for="prompt-blockers">Blockers</label>
-          <p class="hint">
-            <strong>This one makes the coding agent do work.</strong> It is not a question about
-            the channel; it asks the voice agent to go and get the coding agent to report. That is
-            why the button beside it is coloured differently from the other small controls.
-          </p>
-          <textarea id="prompt-blockers" rows="4"></textarea>
-          <p id="prompt-state" class="hint" aria-live="polite"></p>
+            <section class="settings-group">
+              <div class="group-head">
+                <h2>Resuming</h2>
+                <button class="help-link" id="help-link-resuming" type="button" data-help="resuming" aria-label="About resuming" title="What this really does">?</button>
+              </div>
+              <!--
+                `#46 conversation-replay`. FOUR states, and the screen must be able to say each of
+                them: off on the server, off here, resumed, and resumed IN PART. A single "resuming"
+                light would be the feature claiming a continuity it does not have, which is the one
+                failure this whole thing is arranged around.
+              -->
+              <p id="resume-state" class="hint" aria-live="polite"></p>
+              <label class="toggle">
+                <input id="resume-toggle" type="checkbox" />
+                Tell a new call what was already said
+              </label>
+              <p class="hint">Off by default: it re-sends earlier conversation content to the voice vendor.</p>
+            </section>
 
-          <h2>What the controls do</h2>
-          <p id="continuity-note" class="hint">
-            <strong>Mute</strong> keeps the call open and keeps the agent's context; it only stops
-            sending it your audio. Your phone will still show the microphone as in use, because the
-            microphone really is still open — which is what lets unmuting drop you back into the
-            same conversation rather than a new one. Muting and unmuting each send the agent a note
-            saying the pause is deliberate, because withholding your audio looks to it exactly like
-            you going quiet, and that is what makes it start asking whether you are still there.
-            Whether it honours that note has not been tested against the live service yet. The call
-            is billed while muted either way: what is metered is the conversation being open.
-            <strong>Hang up</strong> ends the conversation. The vendor cannot resume a call once
-            it has closed, so the next call is always a new one; the lines already on screen stay
-            there because they are still your own record of what was said, and the transcript marks
-            where one conversation ended and the next began. With <strong>Resuming</strong> below
-            turned on, this server reads the earlier lines back to the new call so it can carry on
-            from them — that is a reconstruction from our side, not the same conversation, and the
-            transcript seam says which of the two you got.
-            <strong>Sound</strong> silences the agent's voice without silencing the agent: its
-            replies keep arriving as text in the transcript. It keeps receiving that audio and
-            throws it away rather than asking for a text-only conversation, because the response
-            format is settled once when the conversation opens — switching it would mean closing
-            and reopening the socket, and a reopened socket is a new conversation that remembers
-            nothing. Silencing the agent must not cost you its memory.
-            <strong>Type</strong> turns the control bar into a text box. During a call it sends
-            what you write into the same conversation you are speaking in, so a typed turn and a
-            spoken one land in the same transcript and the agent answers either one out loud.
-            Pressed with <strong>nothing open</strong> it starts a <strong>typed
-            conversation</strong> instead: the microphone is never requested, so there is no
-            permission prompt and no in-use indicator, and there is no Talk or Sound button because
-            there is no microphone to mute and no voice to silence. That is a different kind of
-            conversation, chosen when it opens — not a call with two switches thrown, which is what
-            it used to take. This page also asks the agent for a text-only response, but that is an
-            override an agent's own settings can refuse; if it is refused the agent's audio is
-            received and thrown away, the connection details say so, and nothing about the
-            microphone changes. It is a toggle either way: the same button leaves text entry again,
-            and whatever you had half-written is still there when you come back to it.
-            <strong>Clear</strong> empties this screen only and never makes the agent forget
-            anything. It asks twice, because it sits under your thumb and it cannot be undone.
-            It also leaves the stored record on the server untouched, so the conversation comes
-            back the next time you sign in — <strong>Forget stored conversations</strong>, below,
-            is the only control that erases that, and it leaves the screen alone in return.
-          </p>
+            <section class="settings-group">
+              <div class="group-head">
+                <h2>Live messages</h2>
+                <button class="help-link" id="help-link-live-messages" type="button" data-help="live-messages" aria-label="About live messages" title="What this costs">?</button>
+              </div>
+              <!--
+                `#44 live-push`. Two separate facts, and the screen must not let them blur into one
+                "live" light: whether the CHANNEL VIEW updates by itself, and whether an arriving
+                message is spoken into a call in progress. The first costs nothing and is on whenever
+                the server is ingesting; the second spends money and interrupts, and is off until it
+                is asked for.
+              -->
+              <p id="live-state" class="hint" aria-live="polite"></p>
+              <label class="toggle">
+                <input id="relay-to-agent" type="checkbox" />
+                Tell the agent about arriving messages
+              </label>
+              <p class="hint">Off by default: it sends channel text to the voice vendor and costs conversation time.</p>
+            </section>
 
-          <h2>Who is who in the channel</h2>
-        <p class="hint">
-          The call transcript tells its two speakers apart by side, colour and corner. The channel
-          can do the same, but only once it knows which account is which — Discord offers no such
-          thing, and a display name is chosen by whoever owns the account. Everyone who has spoken
-          in a channel you have opened appears here, with what this page GUESSED; change any of
-          them and the channel is redrawn.
-        </p>
-        <p class="hint">
-          The guesses, in the order they are tried: the account this bridge posts as is
-          <strong>you</strong> — your own replies and anything your voice bot says go out through
-          it, so they are your words even though a bot delivered them; a lone bot that is not this
-          bridge is the <strong>coding agent</strong>; everyone else is another person or another
-          bot. Nothing here is sent anywhere: it is stored in this browser and affects only how the
-          channel is drawn.
-        </p>
-        <!-- Rows are built by `renderIdentityRows` in web/voice.js. Empty until a channel has been
-             read, and it says so rather than showing a blank panel. -->
-        <div id="identity-list"></div>
-        <p id="identity-state" class="hint" aria-live="polite"></p>
+            <section class="settings-group">
+              <div class="group-head">
+                <h2>Stored conversations</h2>
+                <button class="help-link" id="help-link-storage" type="button" data-help="storage" aria-label="About stored conversations" title="Where these are kept">?</button>
+              </div>
+              <p id="storage-state" class="hint" aria-live="polite"></p>
+              <button id="forget-conversations" class="secondary" type="button">
+                Forget stored conversations
+              </button>
+            </section>
 
-        <h2>The channel</h2>
-          <p class="hint">
-            The Discord view shows the channel as Discord holds it, rendered from a small, fixed
-            markdown subset. Message text is written by other people and bots: it is escaped before
-            anything else happens and is never treated as markup or as an instruction. Every line
-            shows its author and its message id, so a message the agent describes can be checked
-            against a real one — or shown not to exist.
-          </p>
+            <section class="settings-group">
+              <div class="group-head">
+                <h2>Token</h2>
+              </div>
+              <button id="forget-token" class="secondary" type="button">Forget token and sign out</button>
+            </section>
 
-          <!--
-            `#39 channel-alias`. A name of the OWNER's own for a channel, so that addressing one
-            out loud is possible at all: a snowflake is unsayable and a configured label like
-            "build noise" is not what anyone says either.
+            <!--
+              LAST, and that is the change. This is a READOUT, not a setting — it says what the
+              current conversation is and what the last close code was — and it was occupying the
+              first thing a reader sees on a screen they came to in order to change something.
+            -->
+            <section class="settings-group">
+              <div class="group-head">
+                <h2>Connection status</h2>
+                <button class="help-link" id="help-link-connection" type="button" data-help="connection" aria-label="About the connection status" title="What this is">?</button>
+              </div>
+              <div id="settings-detail" class="panel muted">no conversation yet</div>
+            </section>
 
-            Three things this deliberately is not, each stated on the screen and not only here:
-            it is not a rename in Discord, it is not visible to anyone outside this deployment,
-            and it is not something the agent can set — the agent is given the name, and cannot
-            choose it, because a model that renames the channels it also reports on can make its
-            own reports unrecognisable.
-          -->
-          <h2>What to call a channel</h2>
-          <p class="hint">
-            Give a channel a name of your own. This app then uses it everywhere it would have
-            shown the configured label — the picker, the channel summary, and
-            <strong>the name the voice agent is given</strong>, so what you say out loud is what
-            it was told.
-          </p>
-          <p class="hint">
-            It is <strong>ours and local</strong>: it is kept on this server, Discord is never
-            told, the channel is not renamed there, and nobody outside this deployment sees it —
-            the same standing as which messages you have dealt with. Clearing it puts the
-            configured label back.
-          </p>
-          <label for="alias-channel">Channel</label>
-          <select id="alias-channel" aria-describedby="alias-state"></select>
-          <label for="channel-alias">Call it</label>
-          <input
-            id="channel-alias"
-            type="text"
-            maxlength="60"
-            autocomplete="off"
-            aria-describedby="alias-state"
-          />
-          <p id="alias-state" class="hint" aria-live="polite"></p>
-          <button id="save-alias" class="secondary" type="button">Save this name</button>
-          <button id="clear-alias" class="secondary" type="button">Use the configured label</button>
-          <!--
-            The SERVER's own standing statement about what an alias is, quoted and never rewritten
-            — the same rule `#inbox-note` follows. A second copy of a policy here would be a second
-            thing that can drift from the one the server actually enforces.
-          -->
-          <p id="alias-note" class="hint"></p>
+            <p class="hint">
+              <button id="open-help" class="secondary" type="button">Open help</button>
+            </p>
+          </div>
+        </section>
 
-          <h2>Reading width</h2>
-          <p class="hint">
-            On a wide screen with a mouse, the transcript and the channel are held to a column
-            rather than filling the window: a line of text stops being readable somewhere past
-            ninety characters, and a maximised browser is twice that. Drag the edge of the column,
-            or use this — they set the same thing. On a phone it does nothing, because there is no
-            room for a column and no margin to put beside it.
-          </p>
-          <input
-            id="reading-width"
-            type="range"
-            min="45"
-            max="120"
-            step="1"
-            aria-label="reading width in characters"
-          />
-          <p id="reading-width-state" class="hint" aria-live="polite"></p>
+        <!-- --------------------------------------------------------------------- help screen -->
+        <!--
+          `#67 settings-and-help`. Everything that used to stand between the reader and a switch.
 
-          <h2>Resuming</h2>
-          <!--
-            `#46 conversation-replay`. FOUR states, and the screen must be able to say each of
-            them: off on the server, off here, resumed, and resumed IN PART. A single "resuming"
-            light would be the feature claiming a continuity it does not have, which is the one
-            failure this whole thing is arranged around.
-          -->
-          <p id="resume-state" class="hint" aria-live="polite"></p>
+          Not deleted, and that distinction is the whole design: every paragraph here was on the
+          settings screen, and each one is still exactly one tap from the control it is about,
+          because each `?` scrolls this screen to the matching entry. What changed is that a reader
+          who already knows what echo cancellation is no longer reads about it to reach the switch.
 
-          <label class="toggle">
-            <input id="resume-toggle" type="checkbox" />
-            Tell a new call what was already said
-          </label>
-          <p class="hint">
-            The vendor cannot resume a conversation once the connection closes. What this does
-            instead is hand the new call a written record of the earlier one, so it can carry on
-            from it. It is a <strong>reconstruction</strong>: a new conversation that has been told
-            what happened, not the old one continued.
-          </p>
-          <p class="hint">
-            It <strong>re-sends earlier conversation content to the voice vendor on every new
-            call</strong> — your own speech, and any Discord text the agent read out to you, which
-            was written by other people. That is why it is off by default. The record is capped by
-            the server; when it does not all fit, the oldest lines are dropped and both you and the
-            agent are told the reconstruction is partial.
-          </p>
+          Each entry's id is `help-<slug>`, matching the `data-help` on its `?`. Both are declared
+          in the MARKUP: the page suite derives its element set from this file and refuses an id
+          invented at runtime.
+        -->
+        <section id="screen-help" class="screen" hidden>
+          <div class="settings-column">
+            <p class="hint">
+              What each control does, and what it costs. Every entry here is reachable from the
+              matching <strong>?</strong> on the settings screen.
+            </p>
 
-          <h2>Live messages</h2>
-          <!--
-            `#44 live-push`. Two separate facts, and the screen must not let them blur into one
-            "live" light: whether the CHANNEL VIEW updates by itself, and whether an arriving
-            message is spoken into a call in progress. The first costs nothing and is on whenever
-            the server is ingesting; the second spends money and interrupts, and is off until it
-            is asked for.
-          -->
-          <p id="live-state" class="hint" aria-live="polite"></p>
-          <p class="hint">
-            When this server is set to watch the channel, new messages appear here on their own
-            rather than at the next refresh. It is a poll, not a push from Discord: the newest
-            message can be up to one interval old, and the interval is set on the server.
-          </p>
+            <article id="help-controls" class="help-entry">
+              <h2>What the controls do</h2>
+              <p id="continuity-note" class="hint">
+                <strong>Mute</strong> keeps the call open and keeps the agent's context; it only
+                stops sending it your audio. Your phone will still show the microphone as in use,
+                because the microphone really is still open — which is what lets unmuting drop you
+                back into the same conversation rather than a new one. Muting and unmuting each
+                send the agent a note saying the pause is deliberate, because withholding your
+                audio looks to it exactly like you going quiet, and that is what makes it start
+                asking whether you are still there. Whether it honours that note has not been
+                tested against the live service yet. The call is billed while muted either way:
+                what is metered is the conversation being open.
+                <strong>Hang up</strong> ends the conversation. The vendor cannot resume a call once
+                it has closed, so the next call is always a new one; the lines already on screen stay
+                there because they are still your own record of what was said, and the transcript
+                marks where one conversation ended and the next began. With <strong>Resuming</strong>
+                turned on, this server reads the earlier lines back to the new call so it can carry
+                on from them — that is a reconstruction from our side, not the same conversation, and
+                the transcript seam says which of the two you got.
+                <strong>Sound</strong> silences the agent's voice without silencing the agent: its
+                replies keep arriving as text in the transcript. It keeps receiving that audio and
+                throws it away rather than asking for a text-only conversation, because the response
+                format is settled once when the conversation opens — switching it would mean closing
+                and reopening the socket, and a reopened socket is a new conversation that remembers
+                nothing. Silencing the agent must not cost you its memory.
+                <strong>Type</strong> turns the control bar into a text box. During a call it sends
+                what you write into the same conversation you are speaking in, so a typed turn and a
+                spoken one land in the same transcript and the agent answers either one out loud.
+                Pressed with <strong>nothing open</strong> it starts a <strong>typed
+                conversation</strong> instead: the microphone is never requested, so there is no
+                permission prompt and no in-use indicator, and there is no Talk or Sound button
+                because there is no microphone to mute and no voice to silence. That is a different
+                kind of conversation, chosen when it opens — not a call with two switches thrown,
+                which is what it used to take. This page also asks the agent for a text-only
+                response, but that is an override an agent's own settings can refuse; if it is
+                refused the agent's audio is received and thrown away, the connection details say
+                so, and nothing about the microphone changes. It is a toggle either way: the same
+                button leaves text entry again, and whatever you had half-written is still there
+                when you come back to it.
+                <strong>Clear</strong> empties this screen only and never makes the agent forget
+                anything. It asks twice, because it sits under your thumb and it cannot be undone.
+                It also leaves the stored record on the server untouched, so the conversation comes
+                back the next time you sign in — <strong>Forget stored conversations</strong> is the
+                only control that erases that, and it leaves the screen alone in return.
+              </p>
+            </article>
 
-          <label class="toggle">
-            <input id="relay-to-agent" type="checkbox" />
-            Tell the agent about arriving messages
-          </label>
-          <p class="hint">
-            While a call is live, each arriving channel message is sent to the agent as background
-            information, so it can mention a reply that lands mid-conversation instead of waiting
-            to be asked. This <strong>sends channel text to the voice vendor</strong> and it costs
-            conversation time, so it is off by default. Replies this server posted are never sent
-            back — otherwise the agent would hear its own answer and reply to it.
-          </p>
-          <p class="hint">
-            It only works <strong>while this page is open</strong>. The conversation socket belongs
-            to this browser, not to the server, so closing the tab ends the relay even though the
-            server keeps watching the channel.
-          </p>
-          <p class="hint">
-            <strong>Only messages that arrive while the feed is connected are sent.</strong> When
-            this page attaches to the channel it is first handed what the server already published,
-            so the list catches up; that catch-up is never announced to the agent, because a burst
-            of older messages read out as though they had just been said is worse than not hearing
-            them at all. Anything that landed while the feed was reconnecting is on screen but was
-            not spoken.
-          </p>
+            <article id="help-microphone" class="help-entry">
+              <h2>Microphone</h2>
+              <p class="hint">
+                These are asked of the browser when the microphone opens, so a change applies to
+                your <strong>next</strong> call, not the one in progress.
+              </p>
+              <p class="hint">
+                <strong>Echo cancellation</strong> stops the agent hearing itself through your
+                speaker and answering its own voice. Headphones solve this too; leave it on if you
+                are on speakerphone.
+              </p>
+              <p class="hint">
+                <strong>Noise suppression</strong> filters steady background noise — a fan, road
+                noise, a room's hum.
+              </p>
+              <p class="hint">
+                <strong>Automatic gain control</strong> amplifies quiet input. In a near-silent room
+                it boosts small incidental sounds — a phone being set down — until they cross the
+                speech threshold and get transcribed as words. Turn it <strong>off</strong> if you
+                are getting phantom transcripts.
+              </p>
+            </article>
 
-          <h2>Stored conversations</h2>
-          <p class="hint">
-            This server keeps the transcript of each call in a database file on the machine it
-            runs on, so a reload no longer loses the conversation. It is not encrypted: anyone
-            with access to that machine's filesystem can read it, and it holds both your own
-            speech and any channel text the assistant read out to you. Older conversations are
-            dropped automatically once the server's retention limit is reached.
-          </p>
-          <p id="storage-state" class="hint" aria-live="polite"></p>
-          <button id="forget-conversations" class="secondary" type="button">
-            Forget stored conversations
-          </button>
+            <article id="help-control-bar" class="help-entry">
+              <h2>Control bar</h2>
+              <p class="hint">
+                The strip carrying the gear and the Voice/Discord switch. It can sit under the title
+                at the top of the screen, or in the dock directly above the big buttons —
+                <strong>bottom is the default</strong>, because that is where your thumb already is
+                and because the header then costs no row at all. The gear is deliberately at the far
+                <strong>left</strong> of it: it is the control you least want to hit by accident.
+              </p>
+            </article>
 
-          <h2>Token</h2>
-          <button id="forget-token" class="secondary" type="button">Forget token and sign out</button>
+            <article id="help-canned-prompts" class="help-entry">
+              <h2>Canned prompts</h2>
+              <p class="hint">
+                What the two prompt buttons in the control bar say. They send exactly this text into
+                the live conversation, as though you had typed it. Emptying a field puts its default
+                back rather than leaving a button that does nothing. Both are greyed out when there
+                is no call, because there is nothing for the sentence to reach.
+              </p>
+              <p class="hint">
+                <strong>Sumry</strong> deliberately says <strong>recent messages</strong> and not
+                "my unread messages since I last spoke". Discord gives a bot no read state at all,
+                and this bridge cannot work out where you last spoke either — your own replies are
+                posted as the bot, and the only author signal is a display name anyone can set to
+                anything. A button that claimed that scoping would produce confident, wrong
+                summaries. See <code>ai_docs/UNREAD_STATUS_20260819.md</code>.
+              </p>
+              <p class="hint">
+                <strong>Blockers makes the coding agent do work.</strong> It is not a question about
+                the channel; it asks the voice agent to go and get the coding agent to report. It is
+                drawn as an ordinary button rather than a warning: the cost is real, but a control
+                that looks like a fault report is worse than one whose cost is stated here.
+              </p>
+            </article>
+
+            <article id="help-identities" class="help-entry">
+              <h2>Who is who in the channel</h2>
+              <p class="hint">
+                The call transcript tells its two speakers apart by side, colour and corner. The
+                channel can do the same, but only once it knows which account is which — Discord
+                offers no such thing, and a display name is chosen by whoever owns the account.
+                Everyone who has spoken in a channel you have opened is listed, with what this page
+                guessed shown in italics; change any of them and the channel is redrawn.
+              </p>
+              <p class="hint">
+                The guesses, in the order they are tried: the account this bridge posts as is
+                <strong>you</strong> — your own replies and anything your voice bot says go out
+                through it, so they are your words even though a bot delivered them; a lone bot that
+                is not this bridge is the <strong>coding agent</strong>; everyone else is another
+                person or another bot. With two candidate bots the guess refuses rather than picking
+                one. Nothing here is sent anywhere: it is stored in this browser and affects only
+                how the channel is drawn.
+              </p>
+            </article>
+
+            <article id="help-channel" class="help-entry">
+              <h2>The channel, and the inbox</h2>
+              <p class="hint">
+                The Discord view shows the channel as Discord holds it, rendered from a small, fixed
+                markdown subset. Message text is written by other people and bots: it is escaped
+                before anything else happens and is never treated as markup or as an instruction.
+                Every line shows its author and its message id, so a message the agent describes can
+                be checked against a real one — or shown not to exist.
+              </p>
+              <p class="hint">
+                A message somebody has <strong>answered</strong> is dimmed. That is derived from the
+                channel itself — Discord records a reply only on the answering message — so it can
+                only see answers that are <strong>loaded</strong>: a reply further back than you have
+                walked is invisible, and a message can be dimmed later than it should have been,
+                never earlier. <strong>Archive</strong> is your own judgement, stored in this
+                browser; swipe a row on a touch screen, or use the button on any device. The
+                <strong>Inbox</strong> toggle hides everything archived, which is what turns the
+                channel from a log into a queue.
+              </p>
+            </article>
+
+            <article id="help-channel-alias" class="help-entry">
+              <h2>What to call a channel</h2>
+              <p class="hint">
+                Give a channel a name of your own. This app then uses it everywhere it would have
+                shown the configured label — the picker, the channel summary, and <strong>the name
+                the voice agent is given</strong>, so what you say out loud is what it was told.
+              </p>
+              <p class="hint">
+                It is <strong>ours and local</strong>: it is kept on this server, Discord is never
+                told, the channel is not renamed there, and nobody outside this deployment sees it
+                — the same standing as which messages you have dealt with. Clearing it puts the
+                configured label back.
+              </p>
+              <p class="hint">
+                It is also <strong>not something the agent can set</strong>. The agent is given the
+                name and cannot choose it, because a model that renames the channels it also
+                reports on can make its own reports unrecognisable.
+              </p>
+            </article>
+
+            <article id="help-reading-width" class="help-entry">
+              <h2>Reading width</h2>
+              <p class="hint">
+                On a wide screen with a mouse, the transcript and the channel are held to a column
+                rather than filling the window: a line of text stops being readable somewhere past
+                ninety characters, and a maximised browser is twice that. Drag the edge of the
+                column, or use the slider — they set the same thing. On a phone it does nothing,
+                because there is no room for a column and no margin to put beside it.
+              </p>
+            </article>
+
+            <article id="help-resuming" class="help-entry">
+              <h2>Resuming</h2>
+              <p class="hint">
+                The vendor cannot resume a conversation once the connection closes. What this does
+                instead is hand the new call a written record of the earlier one, so it can carry on
+                from it. It is a <strong>reconstruction</strong>: a new conversation that has been
+                told what happened, not the old one continued.
+              </p>
+              <p class="hint">
+                It <strong>re-sends earlier conversation content to the voice vendor on every new
+                call</strong> — your own speech, and any Discord text the agent read out to you,
+                which was written by other people. That is why it is off by default. The record is
+                capped by the server; when it does not all fit, the oldest lines are dropped and
+                both you and the agent are told the reconstruction is partial.
+              </p>
+            </article>
+
+            <article id="help-live-messages" class="help-entry">
+              <h2>Live messages</h2>
+              <p class="hint">
+                When this server is set to watch the channel, new messages appear on their own
+                rather than at the next refresh. It is a poll, not a push from Discord: the newest
+                message can be up to one interval old, and the interval is set on the server.
+              </p>
+              <p class="hint">
+                <strong>Telling the agent</strong> about arriving messages sends each one into a
+                live call as background information, so it can mention a reply that lands
+                mid-conversation instead of waiting to be asked. This <strong>sends channel text to
+                the voice vendor</strong> and it costs conversation time, so it is off by default.
+                Replies this server posted are never sent back — otherwise the agent would hear its
+                own answer and reply to it.
+              </p>
+              <p class="hint">
+                It only works <strong>while this page is open</strong>. The conversation socket
+                belongs to this browser, not to the server, so closing the tab ends the relay even
+                though the server keeps watching the channel.
+              </p>
+              <p class="hint">
+                <strong>Only messages that arrive while the feed is connected are sent.</strong>
+                When this page attaches to the channel it is first handed what the server already
+                published, so the list catches up; that catch-up is never announced to the agent,
+                because a burst of older messages read out as though they had just been said is
+                worse than not hearing them at all. Anything that landed while the feed was
+                reconnecting is on screen but was not spoken.
+              </p>
+            </article>
+
+            <article id="help-storage" class="help-entry">
+              <h2>Stored conversations</h2>
+              <p class="hint">
+                This server keeps the transcript of each call in a database file on the machine it
+                runs on, so a reload no longer loses the conversation. It is not encrypted: anyone
+                with access to that machine's filesystem can read it, and it holds both your own
+                speech and any channel text the assistant read out to you. Older conversations are
+                dropped automatically once the server's retention limit is reached.
+              </p>
+            </article>
+
+            <article id="help-connection" class="help-entry">
+              <h2>Connection status</h2>
+              <p class="hint">
+                What the current conversation is, what audio format it negotiated, and why the last
+                one closed — including the close code, which is the one thing on this page written
+                for whoever is debugging it rather than for you. It is a readout, not a setting,
+                which is why it sits at the end.
+              </p>
+            </article>
+          </div>
         </section>
       </div>
     </main>

@@ -292,14 +292,98 @@ body {
   min-height: 0;
 }
 
-/* The two secondary screens are ordinary documents and may be longer than the frame, so they get
+/* The secondary screens are ordinary documents and may be longer than the frame, so they get
    their own scroll — still inside the frame, never the page. */
 #screen-signin,
-#screen-settings {
+#screen-settings,
+#screen-help {
   overflow-y: auto;
   overscroll-behavior: contain;
   padding: 0.75rem calc(1rem + env(safe-area-inset-right)) 1rem
     calc(1rem + env(safe-area-inset-left));
+}
+
+/*
+ * `#67 settings-and-help`. A COLUMN, on every screen size.
+ *
+ * The reading-column rule at the foot of this file deliberately exempted the settings screen —
+ * "they are forms rather than reading, and giving them a column is a separate judgement nobody has
+ * made yet". The owner has now made it: on a desktop browser the settings screen ran the full width
+ * of the window, which puts a checkbox at one end of a metre of desk and its label at the other.
+ *
+ * A form is read before it is used, so it gets the same treatment as the transcript — but a FIXED
+ * measure rather than `var(--reading-width)`. That variable is the reader's choice about the
+ * transcript, and dragging the transcript wider has no business reflowing the settings screen; a
+ * form's comfortable width is a property of the form.
+ */
+.settings-column {
+  max-width: 34rem;
+  margin-inline: auto;
+}
+
+/*
+ * The separators the owner asked for, as CARDS rather than rules.
+ *
+ * A horizontal rule between groups says "these are different" and nothing else. A bordered block
+ * says which controls belong to which heading, which is the actual question when a screen is a
+ * dozen switches long — and it is what stops a stray `aria-live` line reading as though it belonged
+ * to the group below it.
+ */
+.settings-group {
+  margin: 0 0 0.75rem;
+  padding: 0.6rem 0.8rem 0.8rem;
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: 0.8rem;
+}
+
+/* The heading and its `?` on one line, the `?` hard right. */
+.group-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+/* Small, round, and quiet: it is an offer, not an instruction, and there is one on nearly every
+   group. Sized to the 2.4rem tap target everything else on this page uses even though it is drawn
+   much smaller than that. */
+.help-link {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.5rem;
+  height: 1.5rem;
+  padding: 0;
+  background: none;
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+  color: var(--muted);
+  font: inherit;
+  font-size: 0.8rem;
+  line-height: 1;
+  min-height: 0;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.help-link:focus-visible {
+  color: var(--ink);
+  border-color: var(--accent);
+}
+
+/* One entry per settings group, and the target of its `?`. `scroll-margin-top` is what makes the
+   deep link land with the heading visible rather than jammed under the top edge of the scroller. */
+.help-entry {
+  margin: 0 0 1rem;
+  padding-bottom: 0.75rem;
+  border-bottom: 1px solid var(--edge);
+  scroll-margin-top: 0.75rem;
+}
+
+.help-entry:last-child {
+  border-bottom: none;
 }
 
 #screen-main {
@@ -525,13 +609,12 @@ body {
   margin-top: 0;
 }
 
-#screen-settings h2 {
+/* Inside a card now, so the big top margin that used to separate one group from the next is the
+   card's own gap and this only has to sit tidily against the card's edge. */
+#screen-settings h2,
+#screen-help h2 {
   font-size: 0.95rem;
-  margin: 1.25rem 0 0.25rem;
-}
-
-#screen-settings h2:first-child {
-  margin-top: 0.25rem;
+  margin: 0.15rem 0 0.35rem;
 }
 
 /* The generic `input` rule in web/style.css stretches and pads a text field, which is wrong for a

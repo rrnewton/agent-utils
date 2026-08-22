@@ -319,6 +319,30 @@ const FIXTURE_TREE = {
 };
 
 /** Where web/voice.html defines an id: which line, and how deeply indented. */
+/**
+ * The markup of one settings group, `<section class="settings-group">` .. `</section>`.
+ *
+ * `#67 settings-and-help`. Sliced between markers rather than parsed, like every other markup
+ * assertion in this file — but bounded by the group's OWN closing tag rather than by "the next
+ * heading", because the groups are now cards and a slice that ran to the next `<h2>` would sweep in
+ * whatever card follows and let a disclosure pass by being present somewhere nearby.
+ */
+function settingsGroup(heading) {
+  const at = HTML.indexOf(`<h2>${heading}</h2>`);
+  assert.ok(at > 0, `web/voice.html has no settings group headed "${heading}"`);
+  const opens = HTML.lastIndexOf('<section class="settings-group">', at);
+  assert.ok(opens > 0, `"${heading}" is not inside a settings group`);
+  const closes = HTML.indexOf("</section>", at);
+  return HTML.slice(opens, closes);
+}
+
+/** The markup of one help entry, `<article id="help-<slug>">` .. `</article>`. */
+function helpEntry(slug) {
+  const at = HTML.indexOf(`id="help-${slug}"`);
+  assert.ok(at > 0, `web/voice.html has no help entry "help-${slug}"`);
+  return HTML.slice(at, HTML.indexOf("</article>", at));
+}
+
 function markupPlace(id) {
   const lines = HTML.split("\n");
   const at = lines.findIndex((line) => line.includes(`id="${id}"`));
@@ -870,7 +894,7 @@ function newPage(store = new Map(), script = SCRIPT) {
     },
     /** Which screen is showing. Exactly one, or this throws — a page with none is a blank app. */
     screen() {
-      const showing = ["signin", "main", "settings", "reply"].filter(
+      const showing = ["signin", "main", "settings", "reply", "help"].filter(
         (s) => !page.el(`screen-${s}`).hidden
       );
       assert.equal(showing.length, 1, `exactly one screen must show, not ${showing.join("+")}`);
@@ -2237,13 +2261,20 @@ test("the header shows two things at a time, and which two depends on the screen
   const ids = [...row.matchAll(/<button[^>]*\bid="([^"]+)"/g)].map((m) => m[1]);
   // `#51 reply-view` added a SECOND way back, deliberately rather than by generalising the first:
   // the two go to different places, and scripts/screenshots.py drives #close-settings by name.
-  assert.deepStrictEqual(ids, ["close-settings", "close-reply"]);
+  // `#67 settings-and-help` added a THIRD for the same reason: Settings returns to the call, Reply
+  // returns to the channel, and Help returns to Settings.
+  assert.deepStrictEqual(ids, ["close-settings", "close-reply", "close-help"]);
 
   const page = newPage();
   const showing = () =>
-    ["close-settings", "close-reply", "topbar-title", "view-switch", "open-settings"].filter(
-      (id) => !page.el(id).hidden
-    );
+    [
+      "close-settings",
+      "close-reply",
+      "close-help",
+      "topbar-title",
+      "view-switch",
+      "open-settings",
+    ].filter((id) => !page.el(id).hidden);
   await signIn(page);
   assert.deepStrictEqual(showing(), ["view-switch", "open-settings"]);
 
@@ -7468,6 +7499,133 @@ test("REPLYING FROM THE PAGE DIMS WHAT YOU ANSWERED, WITHOUT WAITING FOR A POLL"
   );
 });
 
+// --- settings and help ---------------------------------------------------------------------------
+//
+// `#67 settings-and-help`. Settings had become a document with controls buried in it: every knob
+// carried two or three paragraphs, so reaching the switch you wanted meant reading past everything
+// you already knew. The prose is not deleted — it is one tap away, and these assert that the tap
+// exists, because a split without it is just a filing cabinet.
+
+test("EVERY SETTINGS GROUP THAT EXPLAINS ITSELF HAS A HELP ENTRY, AND A WAY TO REACH IT", () => {
+  // The generalising assertion, and the one that keeps the next group honest: pinning the entries
+  // that happen to exist today leaves the next one unlinked, which is exactly where the split
+  // silently stops being a split.
+  const wanted = [...HTML.matchAll(/data-help="([a-z-]+)"/g)].map((m) => m[1]);
+  assert.ok(wanted.length >= 8, `only ${wanted.length} help links found — the scan is broken`);
+  for (const slug of wanted) {
+    assert.ok(
+      HTML.includes(`id="help-${slug}"`),
+      `a settings group links to "${slug}" and no help entry answers to it`
+    );
+    assert.ok(
+      HTML.includes(`id="help-link-${slug}"`),
+      `the "${slug}" link has no id, so nothing can wire it`
+    );
+  }
+  // The script's own list has to agree with the markup in BOTH directions, or a group ships with a
+  // ? that does nothing.
+  const listed = /const HELP_TOPICS = \[([\s\S]*?)\]/.exec(SCRIPT_CODE);
+  assert.ok(listed, "web/voice.js no longer declares HELP_TOPICS");
+  const topics = [...listed[1].matchAll(/"([a-z-]+)"/g)].map((m) => m[1]);
+  assert.deepStrictEqual(
+    topics.slice().sort(),
+    wanted.slice().sort(),
+    "HELP_TOPICS and the markup's help links disagree"
+  );
+  // ...and nothing the other way either: an entry nobody links to is unreachable except by
+  // scrolling, which is the state this issue exists to remove.
+  // `help-link-<slug>` is the BUTTON, not an entry; the negative lookahead keeps the two apart.
+  const entries = [...HTML.matchAll(/id="help-(?!link-)([a-z-]+)"/g)].map((m) => m[1]);
+  const orphans = entries.filter((slug) => !wanted.includes(slug) && slug !== "controls" && slug !== "channel");
+  assert.deepStrictEqual(orphans, [], `nothing links to the help entries ${orphans.join(", ")}`);
+});
+
+test("the settings screen is CONTROLS, not paragraphs", () => {
+  // The measurable form of the owner's complaint. Not a style rule — a budget: no single hint on
+  // the settings screen may be an essay, because that is what pushed the switches off the screen.
+  const settings = HTML.slice(
+    HTML.indexOf('id="screen-settings"'),
+    HTML.indexOf('id="screen-help"')
+  );
+  const hints = [...settings.matchAll(/<p class="hint">([\s\S]*?)<\/p>/g)].map((m) =>
+    m[1].replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim()
+  );
+  const essays = hints.filter((text) => text.length > 160);
+  assert.deepStrictEqual(
+    essays.map((text) => `${text.slice(0, 60)}…`),
+    [],
+    "a paragraph that long belongs on the help screen"
+  );
+  // And the long ones really are on the other screen rather than having been deleted.
+  const help = HTML.slice(HTML.indexOf('id="screen-help"'));
+  assert.ok(
+    [...help.matchAll(/<p[^>]*class="hint"[^>]*>([\s\S]*?)<\/p>/g)].some(
+      (m) => m[1].replace(/\s+/g, " ").length > 400
+    ),
+    "the paragraphs were removed rather than moved"
+  );
+});
+
+test("CONNECTION STATUS IS LAST, because it is a readout and not a setting", () => {
+  const settings = HTML.slice(
+    HTML.indexOf('id="screen-settings"'),
+    HTML.indexOf('id="screen-help"')
+  );
+  const headings = [...settings.matchAll(/<h2>([^<]+)<\/h2>/g)].map((m) => m[1]);
+  assert.ok(headings.length > 3, "the settings screen lost its groups");
+  assert.equal(
+    headings[headings.length - 1],
+    "Connection status",
+    "the readout is still standing where a reader arrives looking for a switch"
+  );
+  assert.notEqual(headings[0], "Connection status");
+  // Renamed as well as moved: "Connection" reads as somewhere you configure one.
+  assert.ok(!headings.includes("Connection"), "the old bare heading is still there");
+});
+
+test("a ? opens Help, and the way back goes to Settings rather than out of it", async () => {
+  const page = newPage();
+  await signIn(page);
+  await page.el("open-settings").click();
+  assert.equal(page.screen(), "settings");
+
+  await page.el("help-link-resuming").click();
+
+  assert.equal(page.screen(), "help", "the ? did not open Help");
+  assert.equal(page.el("topbar-title").textContent, "Help");
+  assert.equal(page.el("close-help").hidden, false, "Help has no way back");
+  assert.equal(page.el("close-settings").hidden, true, "two ways back are showing at once");
+
+  await page.el("close-help").click();
+  assert.equal(page.screen(), "settings", "leaving Help did not return to Settings");
+
+  // ...and Settings still leaves to where the reader actually was, rather than back into Help.
+  await page.el("close-settings").click();
+  assert.equal(page.screen(), "main");
+});
+
+test("both documents are held to a column, so a checkbox is not a metre from its label", () => {
+  // The reading-column block at the foot of the stylesheet deliberately exempted these two — "they
+  // are forms rather than reading, and giving them a column is a separate judgement nobody has
+  // made yet". The owner has now made it.
+  const column = cssBlock(".settings-column");
+  assert.match(column, /max-width/, "the settings column is not bounded at all");
+  assert.match(column, /margin-inline:\s*auto/, "a bounded column that is not centred");
+  // NOT the reader's transcript width: that is a choice about the transcript, and dragging it has
+  // no business reflowing a form.
+  assert.doesNotMatch(
+    column,
+    /var\(--reading-width\)/,
+    "the form's width now follows the transcript handle"
+  );
+  for (const id of ["screen-settings", "screen-help"]) {
+    assert.ok(
+      HTML.slice(HTML.indexOf(`id="${id}"`)).indexOf('class="settings-column"') > 0,
+      `#${id} does not put its content in a column`
+    );
+  }
+});
+
 // --- who is speaking, in the channel ------------------------------------------------------------
 //
 // `#66 channel-identities`. The transcript tells its two speakers apart by side, colour and corner;
@@ -9571,12 +9729,24 @@ test("Settings tells the truth about live updates in all three of its states", a
 });
 
 test("Settings says plainly what the relay costs and what it cannot do", () => {
-  const block = HTML.slice(HTML.indexOf("Live messages"), HTML.indexOf("Stored conversations"));
-  assert.match(block, /id="relay-to-agent"/);
+  // `#67 settings-and-help` moved the PARAGRAPHS to their own screen and left the CONTROL here.
+  // The disclosure is therefore asserted in two halves, and the second half is what keeps the move
+  // honest: the prose still exists, and the `?` beside this control is what reaches it. A test that
+  // only looked at the help screen would pass just as well if nothing linked to it.
+  const settings = settingsGroup("Live messages");
+  assert.match(settings, /id="relay-to-agent"/);
   assert.ok(
-    !/id="relay-to-agent"[^>]*\bchecked\b/.test(block),
+    !/id="relay-to-agent"[^>]*\bchecked\b/.test(settings),
     "a control that sends channel text to a paid vendor must not ship on"
   );
+  assert.match(
+    settings,
+    /data-help="live-messages"/,
+    "the group offers no way to reach what it costs"
+  );
+  assert.match(settings, /voice vendor/, "the cost is not even summarised beside the switch");
+
+  const block = helpEntry("live-messages");
   assert.match(block, /voice vendor/, "where the channel text goes has to be said, not implied");
   assert.match(
     block,
@@ -9842,12 +10012,18 @@ test("turning resuming off forgets what the last call under the old setting did"
 });
 
 test("Settings states the privacy cost of resuming, and that it is a reconstruction", () => {
-  const block = HTML.slice(HTML.indexOf("<h2>Resuming</h2>"), HTML.indexOf("<h2>Live messages</h2>"));
-  assert.match(block, /id="resume-toggle"/);
+  // Two halves, as above: the control and its summary here, the full disclosure one tap away, and
+  // the `?` that is the tap.
+  const settings = settingsGroup("Resuming");
+  assert.match(settings, /id="resume-toggle"/);
   assert.ok(
-    !/id="resume-toggle"[^>]*\bchecked\b/.test(block),
+    !/id="resume-toggle"[^>]*\bchecked\b/.test(settings),
     "a control that re-sends prior conversation content to a vendor must not ship on"
   );
+  assert.match(settings, /data-help="resuming"/, "the group offers no way to reach what it costs");
+  assert.match(settings, /voice vendor/, "the cost is not even summarised beside the switch");
+
+  const block = helpEntry("resuming");
   assert.match(
     block,
     /re-sends earlier conversation content to the voice vendor/,

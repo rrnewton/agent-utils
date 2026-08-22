@@ -173,10 +173,10 @@ const token = () => localStorage.getItem(TOKEN_KEY) || "";
 // the sign-in screen; the connection details and the knobs live in settings; the main screen is
 // the transcript and the two controls, and nothing else.
 
-const SCREENS = ["signin", "main", "settings", "reply"];
+const SCREENS = ["signin", "main", "settings", "reply", "help"];
 
 /** What the header calls each screen that is a DESTINATION rather than the app itself. */
-const SCREEN_TITLES = { settings: "Settings", reply: "Reply" };
+const SCREEN_TITLES = { settings: "Settings", reply: "Reply", help: "Help" };
 
 let screenBeforeSettings = "signin";
 let currentScreen = "signin";
@@ -193,6 +193,7 @@ function showScreen(name) {
   // scripts/screenshots.py drives #close-settings by name.
   el("close-settings").hidden = name !== "settings";
   el("close-reply").hidden = name !== "reply";
+  el("close-help").hidden = name !== "help";
   el("topbar-title").hidden = !destination;
   if (destination) {
     el("topbar-title").textContent = SCREEN_TITLES[name];
@@ -212,13 +213,65 @@ function showScreen(name) {
     // Settings. `#59 text-entry-button`. `renderControlBar` below is what actually redraws it.
     textMode = false;
   }
-  if (name !== "settings") {
+  // Help is reached FROM settings and returns TO it, so it must not become the thing settings
+  // remembers to go back to — that would make the gear's way out lead into the document the
+  // reader just left. `#67 settings-and-help`.
+  if (name !== "settings" && name !== "help") {
     screenBeforeSettings = name;
   }
   currentScreen = name;
   // LAST, and after `currentScreen` is set: the bar decides what it shows from the screen that is
   // now up, and it is also what collapses the header when nothing is left in it. `#58 control-bar`.
   renderControlBar();
+}
+
+/**
+ * The settings groups that have an explanation, and the slug that names it.
+ *
+ * ONE LIST, and three things are keyed off it: the `?` in the group is `#help-link-<slug>`, the
+ * entry it opens is `#help-<slug>`, and this is what wires them together. Both elements are
+ * declared in web/voice.html — the page suite refuses an id invented at runtime, and that rule is
+ * why this is a list here rather than a scan of the document.
+ *
+ * The suite also asserts this list against the markup in both directions, so a group added with no
+ * entry, or an entry nothing links to, fails rather than merely being unreachable.
+ */
+const HELP_TOPICS = [
+  "microphone",
+  "control-bar",
+  "canned-prompts",
+  "identities",
+  "channel-alias",
+  "reading-width",
+  "resuming",
+  "live-messages",
+  "storage",
+  "connection",
+];
+
+/**
+ * Open Help, optionally at one entry.
+ *
+ * `#67 settings-and-help`. The deep link is the thing that makes the split survivable: moving the
+ * paragraphs off the settings screen is only an improvement if the paragraph about the switch you
+ * are looking at is still one tap away. Without it this would be a filing cabinet.
+ *
+ * A null slug opens the top, which is what the standing "Open help" button at the foot of Settings
+ * wants: it is not about any one control.
+ *
+ * `scrollIntoView` is called defensively because the page's test fixture models the DOM the page is
+ * allowed to use and a layout method is not part of that — the SCREEN still changes there, which is
+ * the behaviour worth asserting, and scrolling is a thing only a real browser can do anyway.
+ */
+function showHelp(slug) {
+  showScreen("help");
+  if (!slug) {
+    return;
+  }
+  const entry = document.getElementById(`help-${slug}`);
+  if (entry && entry.scrollIntoView) {
+    entry.scrollIntoView({ block: "start" });
+  }
 }
 
 let currentView = "voice";
@@ -3213,29 +3266,6 @@ function noteAuthor(id, name, isBot) {
 // dims: being late to dim costs nothing, and being late to HIDE would lose a message.
 
 /**
- * The first descendant of `node` carrying `className`.
- *
- * Deliberately NOT `querySelector`. This page's behavioural suite drives the real web/voice.js
- * against a strict fake DOM that models the subset of the API the page is allowed to use, and a
- * selector engine is not in it — so a `querySelector` call does not throw there, it silently finds
- * nothing, and the assertion that fails is about a label rather than about the lookup. Walking
- * `children` is the idiom the rest of this file and the suite both already use, and it behaves
- * identically against a real HTMLCollection and against the fixture's array.
- */
-function childByClass(node, className) {
-  for (const child of node.children || []) {
-    if (child.className === className) {
-      return child;
-    }
-    const deeper = childByClass(child, className);
-    if (deeper) {
-      return deeper;
-    }
-  }
-  return null;
-}
-
-/**
  * Re-derive every row's state from the list as it now stands.
  *
  * ONE PASS OVER THE WHOLE LIST, called after every mutation, rather than a decision taken when a
@@ -5440,6 +5470,19 @@ el("dismiss-banner").addEventListener("click", dismissBanner);
 el("dismiss-status").addEventListener("click", dismissStatus);
 el("open-settings").addEventListener("click", () => showScreen("settings"));
 el("close-settings").addEventListener("click", () => showScreen(screenBeforeSettings));
+
+// `#67 settings-and-help`. The paragraphs that used to stand between the reader and every switch
+// now live on their own screen, and each `?` on the settings screen opens the matching entry.
+//
+// ONE DELEGATED HANDLER over `data-help`, not a listener per button. The alternative is an id per
+// `?` — and this page's suite refuses ids that are not declared in web/voice.html, so a new
+// settings group would mean inventing one there purely to hang a listener on. The attribute names
+// the entry, the entry's id is `help-<that>`, and adding a group is one button plus one article.
+el("close-help").addEventListener("click", () => showScreen("settings"));
+el("open-help").addEventListener("click", () => showHelp(null));
+for (const topic of HELP_TOPICS) {
+  el(`help-link-${topic}`).addEventListener("click", () => showHelp(topic));
+}
 // `#51 reply-view`. Both ways out of the reply screen go through `closeReply`, so neither can be
 // the one that forgets to put the reader back where they were reading.
 loadDrafts();
