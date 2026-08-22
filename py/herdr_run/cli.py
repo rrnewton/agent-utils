@@ -1,18 +1,17 @@
 """``herdr-run`` command line.
 
-Default shape, matching how an agent actually uses it::
+The surface is a plain multiplexed CLI::
 
-    herdr-run <agent> '<command>'          # run; stdout/stderr/exit code are the command's own
-    herdr-run '<command>'                  # agent inferred from $DG_AGENT_NAME
+    herdr-run [GLOBAL OPTIONS] <subcommand> [OPTIONS]
 
-Subcommands (``check``, ``doctor``, ``config``, ``target``, ``reap``) are opt-in and never shadow an
-agent name, because the agent argument is only interpreted as a subcommand when it is the FIRST
-token and no command string follows.
+Options that identify the invocation and its configuration are global and go before the
+subcommand; options that only mean something to one subcommand go after it. Neither level
+documents nor accepts the other's options, so ``--help`` at each level describes exactly the
+options that level takes.
 """
 
 from __future__ import annotations
 
-import argparse
 import base64
 import json
 import math
@@ -20,6 +19,7 @@ import os
 import shlex
 import sys
 from collections.abc import Sequence
+from dataclasses import dataclass, replace
 
 from herdr_run import __version__
 from herdr_run.allowlist import Admission, admit
@@ -39,25 +39,540 @@ from herdr_run.runner import RunResult, execute, read_output_bytes, write_meta
 from herdr_run.session import resolve_target, tab_label_for
 from herdr_run.sweep import sweep
 
-__all__ = ["main", "build_parser"]
-
-_SUBCOMMANDS = ("check", "doctor", "config", "target", "reap", "userguide")
+__all__ = ["main", "help_text", "subcommand_help_text", "usage_line"]
 
 
-def _nonnegative_finite(value: str) -> float:
+#: Every subcommand, in the order ``herdr-run --help`` lists them, with its one-line summary.
+#:
+#: Listed by what a reader is most likely to want first rather than alphabetically: the action,
+#: then the two questions asked about it, then setup, then the reports.
+SUBCOMMANDS: tuple[tuple[str, str], ...] = (
+    ("run", "run one allowlisted command in a pane and return its result"),
+    ("check", "say whether a command would be admitted; touch no pane"),
+    (
+        "status",
+        "report the configuration, policy, and session in effect; change nothing",
+    ),
+    ("init", "write an annotated .herdr-run.yaml in this directory"),
+    ("config", "print the fully resolved configuration as JSON"),
+    ("target", "resolve this agent's pane and print its ids and readiness"),
+    ("reap", "report which command tabs are provably finished with"),
+    ("net-doctor", "smoke-test one scenario: a caller whose own network is blocked"),
+    ("quickstart", "print the one-screen introduction"),
+    ("userguide", "print the complete reference"),
+)
+
+#: Packaged document each documentation subcommand prints.
+_DOCUMENTS: dict[str, str] = {
+    "quickstart": "QUICKSTART.md",
+    "userguide": "USER_GUIDE.md",
+}
+
+_GLOBAL_OPTIONS = ("--help", "-h", "--version", "--json", "--config", "--agent")
+
+
+class _UsageError(Exception):
+    """A command line this surface cannot accept, carrying the message to print."""
+
+
+class _EarlyExit(Exception):
+    """A help or version request that has already printed everything it owes the caller."""
+
+
+@dataclass(frozen=True)
+class _Globals:
+    """Options accepted only before the subcommand."""
+
+    config: str | None = None
+    agent: str | None = None
+    json: bool = False
+
+
+@dataclass(frozen=True)
+class _RunOptions:
+    """Options accepted only after ``run``."""
+
+    command: str = ""
+    cwd: str | None = None
+    timeout: float | None = None
+    wait_ready: float | None = None
+    no_cache: bool = False
+    dry_run: bool = False
+
+
+@dataclass(frozen=True)
+class _Invocation:
+    """One fully parsed invocation."""
+
+    globals: _Globals
+    subcommand: str
+    run: _RunOptions | None = None
+    command: str | None = None
+    force: bool = False
+    no_cache: bool = False
+
+
+# --- the option tables the two levels are built from --------------------------------------------
+
+
+def _local_option_owners(name: str) -> tuple[str, ...]:
+    """Return the subcommands that own ``name``, or an empty tuple if no subcommand does.
+
+    Knowing the owner is what turns "unrecognized argument" into a usable message. A caller who
+    writes ``herdr-run --cwd /tmp run ...`` has the right option and the wrong level, and being
+    told which level it belongs to is the whole difference between a typo and a dead end.
+    """
+    if name in ("--cwd", "--timeout", "--wait-ready", "--dry-run"):
+        return ("run",)
+    if name == "--no-cache":
+        return ("run", "target")
+    if name == "--force":
+        return ("init",)
+    return ()
+
+
+def _is_global_option(name: str) -> bool:
+    return name in _GLOBAL_OPTIONS
+
+
+def _find_subcommand(name: str) -> bool:
+    return any(entry[0] == name for entry in SUBCOMMANDS)
+
+
+def _subcommand_names() -> str:
+    return ", ".join(sorted(name for name, _summary in SUBCOMMANDS))
+
+
+def _join_quoted(values: Sequence[str]) -> str:
+    return " or ".join(f"'{value}'" for value in values)
+
+
+def _split_option(token: str) -> tuple[str, str | None]:
+    """Split ``--name=value`` into its parts; a bare ``--name`` yields no inline value."""
+    name, separator, value = token.partition("=")
+    return (name, value if separator else None)
+
+
+def _debug_repr(value: str) -> str:
+    """Quote a string the way both editions quote an unparseable option value."""
+    out = ['"']
+    for character in value:
+        code = ord(character)
+        if character in ('"', "\\"):
+            out.append("\\" + character)
+        elif character == "\n":
+            out.append("\\n")
+        elif character == "\r":
+            out.append("\\r")
+        elif character == "\t":
+            out.append("\\t")
+        elif code < 0x20 or code == 0x7F:
+            out.append(f"\\u{{{code:x}}}")
+        else:
+            out.append(character)
+    out.append('"')
+    return "".join(out)
+
+
+# --- parsing ------------------------------------------------------------------------------------
+
+
+def usage_line() -> str:
+    """The one-line synopsis printed above every argument error."""
+    return (
+        "herdr-run [-h] [--version] [--config PATH] [--agent NAME] [--json] "
+        "<subcommand> [OPTIONS]"
+    )
+
+
+def _option_value(
+    raw: Sequence[str], index: int, name: str, inline: str | None
+) -> tuple[str, int]:
+    if inline is not None:
+        return inline, index
+    if index + 1 >= len(raw):
+        raise _UsageError(f"argument {name}: expected one value")
+    value = raw[index + 1]
+    if value.startswith("-") and value != "-":
+        raise _UsageError(f"argument {name}: expected one value")
+    return value, index + 1
+
+
+def _parse_seconds(option: str, value: str) -> float:
+    if value != value.strip() or "_" in value:
+        raise _UsageError(
+            f"argument {option}: invalid numeric value: {_debug_repr(value)}"
+        )
     try:
         parsed = float(value)
-    except (OverflowError, ValueError) as exc:
-        raise argparse.ArgumentTypeError(
-            "must be a finite non-negative number"
-        ) from exc
+    except (OverflowError, ValueError):
+        raise _UsageError(
+            f"argument {option}: invalid numeric value: {_debug_repr(value)}"
+        ) from None
     if not math.isfinite(parsed) or parsed < 0:
-        raise argparse.ArgumentTypeError("must be a finite non-negative number")
+        raise _UsageError(f"argument {option}: must be a finite non-negative number")
     if parsed > MAX_TIMEOUT_SECONDS:
-        raise argparse.ArgumentTypeError(
-            f"must not exceed {MAX_TIMEOUT_SECONDS:g} seconds"
+        raise _UsageError(
+            f"argument {option}: must not exceed {MAX_TIMEOUT_SECONDS:.0f} seconds"
         )
     return parsed
+
+
+def _local_argument_error(subcommand: str, token: str) -> str:
+    """Describe an option that appeared after the subcommand but does not belong to it."""
+    name, _inline = _split_option(token)
+    if _is_global_option(name) and name not in ("--help", "-h"):
+        return (
+            f"argument {name}: this is a GLOBAL option; put it before the subcommand:\n"
+            f"  herdr-run {name} ... {subcommand} ..."
+        )
+    owners = _local_option_owners(name)
+    if owners and subcommand not in owners:
+        return (
+            f"argument {name}: this is a {_join_quoted(owners)} option, "
+            f"not a '{subcommand}' option"
+        )
+    return f"{subcommand}: unrecognized arguments: {token}"
+
+
+def _misplaced_global(name: str) -> str:
+    """Describe an option that appeared before the subcommand but belongs to one of them."""
+    owners = _local_option_owners(name)
+    if not owners:
+        return f"unrecognized arguments: {name}"
+    return (
+        f"argument {name}: this is a {_join_quoted(owners)} option; "
+        f"put it AFTER the subcommand:\n  herdr-run {owners[0]} {name} ..."
+    )
+
+
+def _unknown_subcommand(token: str, following: Sequence[str]) -> str:
+    """Describe a first positional that is not a subcommand, naming the removed form's replacement.
+
+    ``herdr-run <agent> '<command>'`` and ``herdr-run '<command>'`` used to run a command with no
+    subcommand at all. Removing that is the point of this surface, so the removal has to be said
+    out loud, with the exact line to type instead -- an "unknown subcommand" alone would leave a
+    caller guessing that the tool had been withdrawn.
+    """
+    message = f"unknown subcommand '{token}'"
+    replacement: str | None = None
+    if len(following) == 1 and not following[0].startswith("-"):
+        replacement = f"herdr-run --agent {token} run '{following[0]}'"
+    elif not following and " " in token:
+        replacement = f"herdr-run run '{token}'"
+    if replacement is not None:
+        message += (
+            "\nRunning a command without a subcommand is no longer accepted. "
+            f"Use 'run':\n    {replacement}"
+        )
+    return message + f"\nSubcommands: {_subcommand_names()}"
+
+
+def _one_argument_error(subcommand: str, positional: Sequence[str]) -> str:
+    joined = " ".join(positional)
+    return (
+        f"{subcommand}: pass the command as ONE quoted argument, not as separate words.\n"
+        f"  you wrote:  herdr-run {subcommand} {joined}\n"
+        f"  instead:    herdr-run {subcommand} '{joined}'\n"
+        "Re-joining loose words would silently change the quoting of your arguments."
+    )
+
+
+def _parse_bare(name: str, rest: Sequence[str]) -> list[str]:
+    """Parse a subcommand that takes no options, returning its positional arguments."""
+    positional: list[str] = []
+    options = True
+    for token in rest:
+        if options and token == "--":
+            options = False
+            continue
+        if options and token in ("--help", "-h"):
+            _print_subcommand_help(name)
+            raise _EarlyExit()
+        if options and token.startswith("-"):
+            raise _UsageError(_local_argument_error(name, token))
+        positional.append(token)
+    return positional
+
+
+def _parse_run(rest: Sequence[str]) -> _RunOptions:
+    options = _RunOptions()
+    positional: list[str] = []
+    parsing = True
+    index = 0
+    while index < len(rest):
+        token = rest[index]
+        if parsing and token == "--":
+            parsing = False
+            index += 1
+            continue
+        if not parsing or not token.startswith("-"):
+            positional.append(token)
+            index += 1
+            continue
+        if token in ("--help", "-h"):
+            _print_subcommand_help("run")
+            raise _EarlyExit()
+        if token == "--no-cache":
+            options = replace(options, no_cache=True)
+        elif token == "--dry-run":
+            options = replace(options, dry_run=True)
+        else:
+            name, inline = _split_option(token)
+            if name == "--cwd":
+                value, index = _option_value(rest, index, name, inline)
+                options = replace(options, cwd=value)
+            elif name == "--timeout":
+                value, index = _option_value(rest, index, name, inline)
+                options = replace(options, timeout=_parse_seconds(name, value))
+            elif name == "--wait-ready":
+                value, index = _option_value(rest, index, name, inline)
+                options = replace(options, wait_ready=_parse_seconds(name, value))
+            else:
+                raise _UsageError(_local_argument_error("run", name))
+        index += 1
+    if not positional:
+        raise _UsageError("run: needs a command to run")
+    if len(positional) > 1:
+        raise _UsageError(_one_argument_error("run", positional))
+    return replace(options, command=positional[0])
+
+
+def _parse_flag_only(name: str, rest: Sequence[str], flag: str) -> bool:
+    present = False
+    for token in rest:
+        if token in ("--help", "-h"):
+            _print_subcommand_help(name)
+            raise _EarlyExit()
+        if token == flag:
+            present = True
+            continue
+        raise _UsageError(_local_argument_error(name, token))
+    return present
+
+
+def _parse_subcommand(name: str, rest: Sequence[str], globals_: _Globals) -> _Invocation:
+    """Parse one subcommand's own arguments."""
+    if name == "run":
+        return _Invocation(globals_, name, run=_parse_run(rest))
+    if name == "check":
+        positional = _parse_bare(name, rest)
+        if not positional:
+            raise _UsageError("check: needs a command to check")
+        if len(positional) > 1:
+            raise _UsageError(_one_argument_error("check", positional))
+        return _Invocation(globals_, name, command=positional[0])
+    if name == "init":
+        return _Invocation(
+            globals_, name, force=_parse_flag_only(name, rest, "--force")
+        )
+    if name == "target":
+        return _Invocation(
+            globals_, name, no_cache=_parse_flag_only(name, rest, "--no-cache")
+        )
+    positional = _parse_bare(name, rest)
+    if positional:
+        raise _UsageError(
+            f"{name}: takes no positional arguments; got {len(positional)}"
+        )
+    return _Invocation(globals_, name)
+
+
+def _parse(raw: Sequence[str]) -> _Invocation:
+    if any(
+        any(0xD800 <= ord(character) <= 0xDFFF for character in token) for token in raw
+    ):
+        raise _UsageError("arguments must be valid UTF-8")
+
+    globals_ = _Globals()
+    index = 0
+    chosen: str | None = None
+    while index < len(raw):
+        token = raw[index]
+        if not token.startswith("-"):
+            if not _find_subcommand(token):
+                raise _UsageError(_unknown_subcommand(token, raw[index + 1 :]))
+            chosen = token
+            index += 1
+            break
+        if token == "--":
+            raise _UsageError(
+                f"expected a subcommand before '--'. Subcommands: {_subcommand_names()}"
+            )
+        if token in ("--help", "-h"):
+            _print_help()
+            raise _EarlyExit()
+        if token == "--version":
+            print(f"herdr-run {__version__}")
+            raise _EarlyExit()
+        if token == "--json":
+            globals_ = replace(globals_, json=True)
+        else:
+            name, inline = _split_option(token)
+            if name == "--config":
+                value, index = _option_value(raw, index, name, inline)
+                globals_ = replace(globals_, config=value)
+            elif name == "--agent":
+                value, index = _option_value(raw, index, name, inline)
+                globals_ = replace(globals_, agent=value)
+            elif name in ("--json", "--help", "--version"):
+                raise _UsageError(f"argument {name}: takes no value")
+            else:
+                raise _UsageError(_misplaced_global(name))
+        index += 1
+
+    if chosen is None:
+        # No subcommand at all is not an error: it is somebody asking what this command is.
+        _print_help()
+        raise _EarlyExit()
+    return _parse_subcommand(chosen, raw[index:], globals_)
+
+
+# --- help ---------------------------------------------------------------------------------------
+
+
+def help_text() -> str:
+    """Build the top-level help so it can be asserted on as text, not only printed."""
+    lines = [
+        f"usage: {usage_line()}\n",
+        "\nRun an allowlisted command in a terminal pane that is not subject to whatever\n"
+        "constrains the caller, and get its real stdout, stderr, and exit code back.\n",
+        "\nsubcommands:\n",
+    ]
+    for name, summary in SUBCOMMANDS:
+        lines.append(f"  {name:<11} {summary}\n")
+    lines.append(
+        "\nglobal options (before the subcommand):\n"
+        "  -h, --help            show this help message and exit\n"
+        "  --version             show version and exit\n"
+        "  --config PATH         explicit configuration file\n"
+        "  --agent NAME          the agent this invocation speaks for; names its tab\n"
+        "  --json                emit machine-readable output where a subcommand has it\n"
+    )
+    lines.append(
+        "\nEach subcommand has its own options: run 'herdr-run <subcommand> --help'.\n"
+        "Options are not shared between the two levels — '--cwd' is a 'run' option and\n"
+        "goes after 'run'; '--agent' is global and goes before it.\n"
+    )
+    lines.append(
+        "\nTwo documentation commands, and they are for different moments:\n"
+        "  quickstart  one screen. What this is for, the four commands worth trying\n"
+        "              first, and the five things to know before running anything real.\n"
+        "  userguide   the complete reference: configuration, exit codes, readiness,\n"
+        "              retention, the pane cap, and the trust model.\n"
+    )
+    return "".join(lines)
+
+
+#: Each subcommand's own help: usage line, what it does, and the options it alone accepts.
+_SUBCOMMAND_HELP: dict[str, str] = {
+    "run": (
+        "usage: herdr-run [GLOBAL OPTIONS] run [OPTIONS] '<command>'\n"
+        "\nRun one allowlisted command in this agent's pane and return its stdout, stderr,\n"
+        "and exit code. The command is ONE argument: quote it.\n"
+        "\npositional arguments:\n"
+        "  <command>             the whole command line, as a single quoted argument\n"
+        "\noptions:\n"
+        "  -h, --help            show this help message and exit\n"
+        "  --cwd PATH            working directory for the command\n"
+        "  --timeout SECONDS     how long to wait for the command to finish\n"
+        "  --wait-ready SECONDS  how long to wait for the pane to go idle\n"
+        "  --no-cache            ignore the session cache and re-resolve from labels\n"
+        "  --dry-run             admit and render the command; execute nothing\n"
+        "\nExample:\n"
+        "  herdr-run --agent release-agent run 'git push origin HEAD'\n"
+    ),
+    "check": (
+        "usage: herdr-run [GLOBAL OPTIONS] check '<command>'\n"
+        "\nDecide whether a command would be admitted by the policy in effect. Touches no\n"
+        "pane and executes nothing. Exits 0 when allowed and 77 when refused.\n"
+        "\npositional arguments:\n"
+        "  <command>             the whole command line, as a single quoted argument\n"
+        "\noptions:\n"
+        "  -h, --help            show this help message and exit\n"
+    ),
+    "init": (
+        "usage: herdr-run [GLOBAL OPTIONS] init [OPTIONS]\n"
+        "\nWrite an annotated .herdr-run.yaml into the current directory, the way 'git init'\n"
+        "writes into the current directory. Every knob is present and set to the value in\n"
+        "force today, so adopting the file changes nothing until you edit it. Refuses to\n"
+        "overwrite an existing configuration.\n"
+        "\noptions:\n"
+        "  -h, --help            show this help message and exit\n"
+        "  --force               overwrite an existing configuration file\n"
+    ),
+    "status": (
+        "usage: herdr-run [GLOBAL OPTIONS] status\n"
+        "\nReport what is in effect here: which configuration file was found and where its\n"
+        "root is, what the policy admits, whether Herdr is reachable and running, and how\n"
+        "many panes the workspace already holds. Strictly non-mutating — it starts no\n"
+        "server and creates no workspace, tab, or pane.\n"
+        "\noptions:\n"
+        "  -h, --help            show this help message and exit\n"
+    ),
+    "config": (
+        "usage: herdr-run [GLOBAL OPTIONS] config\n"
+        "\nPrint the fully resolved configuration as JSON: every value in effect, the file\n"
+        "it came from, and the tab label it renders for this agent.\n"
+        "\noptions:\n"
+        "  -h, --help            show this help message and exit\n"
+    ),
+    "target": (
+        "usage: herdr-run [GLOBAL OPTIONS] target [OPTIONS]\n"
+        "\nResolve this agent's pane, creating the workspace, tab, and pane if they are\n"
+        "missing, and print their ids together with the readiness verdict.\n"
+        "\noptions:\n"
+        "  -h, --help            show this help message and exit\n"
+        "  --no-cache            ignore the session cache and re-resolve from labels\n"
+    ),
+    "reap": (
+        "usage: herdr-run [GLOBAL OPTIONS] reap\n"
+        "\nReport which command tabs are provably finished with, and why every other one\n"
+        "was declined. Closes nothing.\n"
+        "\noptions:\n"
+        "  -h, --help            show this help message and exit\n"
+    ),
+    "net-doctor": (
+        "usage: herdr-run [GLOBAL OPTIONS] net-doctor\n"
+        "\nSmoke-test one narrow scenario: a caller whose own network access is blocked,\n"
+        "reaching the network through a pane that is not blocked. It runs one probe\n"
+        "directly and again through the pane and compares the two. This is not a health\n"
+        "check of the command as a whole.\n"
+        "\noptions:\n"
+        "  -h, --help            show this help message and exit\n"
+    ),
+    "quickstart": (
+        "usage: herdr-run [GLOBAL OPTIONS] quickstart\n"
+        "\nPrint the one-screen introduction: what this command is for, the four commands\n"
+        "worth trying first, the shape of the command line, and the five things worth\n"
+        "knowing before running anything real.\n"
+        "\noptions:\n"
+        "  -h, --help            show this help message and exit\n"
+    ),
+    "userguide": (
+        "usage: herdr-run [GLOBAL OPTIONS] userguide\n"
+        "\nPrint the complete reference: configuration, exit codes, readiness, retention,\n"
+        "the pane cap, and the trust model.\n"
+        "\noptions:\n"
+        "  -h, --help            show this help message and exit\n"
+    ),
+}
+
+
+def subcommand_help_text(name: str) -> str:
+    """Build one subcommand's help so it can be asserted on as text, not only printed."""
+    return _SUBCOMMAND_HELP.get(name, f"usage: herdr-run [GLOBAL OPTIONS] {name}\n")
+
+
+def _print_help() -> None:
+    sys.stdout.write(help_text())
+
+
+def _print_subcommand_help(name: str) -> None:
+    sys.stdout.write(subcommand_help_text(name))
+
+
+# --- shared helpers -----------------------------------------------------------------------------
 
 
 def _default_agent(environ: dict[str, str]) -> str:
@@ -69,85 +584,16 @@ def _default_agent(environ: dict[str, str]) -> str:
     return "unknown-agent"
 
 
-def build_parser() -> argparse.ArgumentParser:
-    """Construct the argument parser."""
-    parser = argparse.ArgumentParser(
-        prog="herdr-run",
-        allow_abbrev=False,
-        description=(
-            "Run an allowlisted command in a Herdr pane OUTSIDE the agent sandbox. "
-            "Intended for git/gh network operations that the in-jail proxy allowlist blocks."
-        ),
-        epilog="Full documentation: herdr-run userguide",
-    )
-    parser.add_argument(
-        "--version", action="version", version=f"herdr-run {__version__}"
-    )
-    parser.add_argument(
-        "--userguide",
-        action="store_true",
-        help="print the full embedded user guide (the complete reference)",
-    )
-    parser.add_argument(
-        "positional",
-        nargs="*",
-        metavar="ARG",
-        help="Either '<agent> <command>', '<command>', or one of: "
-        + ", ".join(_SUBCOMMANDS),
-    )
-    parser.add_argument(
-        "--config",
-        metavar="PATH",
-        help="Explicit config file (default: nearest .herdr-run.yaml)",
-    )
-    parser.add_argument(
-        "--agent", metavar="NAME", help="Override the invoking agent name"
-    )
-    parser.add_argument(
-        "--cwd", metavar="PATH", help="Working directory for the command"
-    )
-    parser.add_argument(
-        "--timeout",
-        type=_nonnegative_finite,
-        metavar="SECONDS",
-        help="Override the command timeout",
-    )
-    parser.add_argument(
-        "--wait-ready",
-        type=_nonnegative_finite,
-        metavar="SECONDS",
-        help="Wait up to SECONDS for the pane to become idle instead of refusing immediately",
-    )
-    parser.add_argument(
-        "--no-cache",
-        action="store_true",
-        help="Ignore the session cache and re-resolve from labels",
-    )
-    parser.add_argument(
-        "--json", action="store_true", help="Emit one JSON object instead of raw output"
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Check the command against the allowlist and print the rendered line; execute nothing",
-    )
-    return parser
-
-
-def _load(args: argparse.Namespace, environ: dict[str, str]) -> Config:
-    try:
-        start_dir = os.getcwd()
-    except OSError as exc:
-        raise ConfigError(f"cannot determine current directory: {exc}") from exc
-    config = load_config(explicit_path=args.config, start_dir=start_dir)
-    return config
-
-
 def _client(config: Config, environ: dict[str, str]) -> HerdrClient:
     return HerdrClient(broker=config.broker, environ=environ)
 
 
-def _resolved_cwd(config: Config, args: argparse.Namespace) -> str:
+def _emit_json(document: object) -> None:
+    json.dump(document, sys.stdout, indent=2, sort_keys=True, ensure_ascii=False)
+    sys.stdout.write("\n")
+
+
+def _resolved_cwd(config: Config, override: str | None) -> str:
     """Where the command runs: --cwd, else the project's configured cwd, else THE CALLER'S CWD.
 
     Defaulting to ``project_root`` was a silent-mistargeting bug. Config discovery walks UP to the
@@ -157,7 +603,7 @@ def _resolved_cwd(config: Config, args: argparse.Namespace) -> str:
     the wrong repository answering. "Where the policy lives" and "where the command runs" are
     different questions, and only the first is anchored to the config file.
     """
-    cwd = args.cwd if args.cwd is not None else config.cwd
+    cwd = override if override is not None else config.cwd
     if cwd is None:
         try:
             return os.getcwd()
@@ -166,6 +612,70 @@ def _resolved_cwd(config: Config, args: argparse.Namespace) -> str:
     if not os.path.isabs(cwd):
         cwd = os.path.abspath(os.path.join(config.project_root, cwd))
     return cwd
+
+
+def _print_document(subcommand: str) -> int:
+    resource = _DOCUMENTS[subcommand]
+    try:
+        from importlib.resources import files
+
+        text = (files("herdr_run") / resource).read_text(encoding="utf-8")
+    except (OSError, ModuleNotFoundError):
+        print(
+            f"herdr-run: the {subcommand} document is not available in this installation",
+            file=sys.stderr,
+        )
+        return 1
+    sys.stdout.write(text)
+    return 0
+
+
+# --- subcommands --------------------------------------------------------------------------------
+
+
+def _cmd_init(directory: str, *, force: bool, json_output: bool) -> int:
+    from herdr_run.init import write_config_template
+
+    path = write_config_template(directory, force=force)
+    if json_output:
+        _emit_json({"created": True, "path": path})
+    else:
+        print(f"wrote {path}")
+        print(
+            "Every knob is in that file, set to the value in force today. The allowlist near the\n"
+            "top is a HUMAN-ONLY knob: an agent that can widen its own allowlist does not have one."
+        )
+    return 0
+
+
+def _cmd_status(
+    config: Config, agent: str, environ: dict[str, str], *, json_output: bool
+) -> int:
+    """Report what is in effect here, and change nothing while doing it."""
+    from herdr_run.status import (
+        inspect_session,
+        status_document,
+        status_text,
+        unreachable,
+    )
+
+    tab_label = tab_label_for(config, agent)
+    # A resolution failure is a fact about the session worth REPORTING, not an error to exit on:
+    # "herdr is not installed" is one of the most useful things status can tell somebody.
+    try:
+        client = _client(config, environ)
+        # Resolve the executables eagerly, the way the Rust edition's constructor does, so an
+        # absent Herdr is reported as "not reachable" rather than as "no server is running".
+        client.preflight()
+    except HerdrUnavailable as exc:
+        session = unreachable(str(exc))
+    else:
+        session = inspect_session(client, config, tab_label)
+    if json_output:
+        _emit_json(status_document(config, agent, tab_label, session))
+    else:
+        sys.stdout.write(status_text(config, agent, tab_label, session))
+    return 0
 
 
 def _cmd_config(config: Config, agent: str) -> int:
@@ -200,22 +710,34 @@ def _cmd_config(config: Config, agent: str) -> int:
         "probe_remote": config.probe_remote,
         "broker": config.broker,
     }
-    json.dump(document, sys.stdout, indent=2, sort_keys=True, ensure_ascii=False)
-    sys.stdout.write("\n")
+    _emit_json(document)
     return 0
 
 
-def _cmd_check(config: Config, command: str) -> int:
+def _cmd_check(config: Config, command: str, *, json_output: bool) -> int:
     """Answer only the policy question, touching no pane and no Herdr server."""
     try:
         admission = admit(command, config)
     except Refused as exc:
-        print(f"REFUSED: {exc}", file=sys.stderr)
+        if json_output:
+            _emit_json({"reason": str(exc), "verdict": "refused"})
+        else:
+            print(f"REFUSED: {exc}", file=sys.stderr)
         return Refused.exit_code
-    print(
-        f"ALLOWED: program={admission.program} subcommand={admission.subcommand or '-'}"
-    )
-    print(f"rendered: {admission.rendered}")
+    if json_output:
+        _emit_json(
+            {
+                "program": admission.program,
+                "rendered": admission.rendered,
+                "subcommand": admission.subcommand,
+                "verdict": "allowed",
+            }
+        )
+    else:
+        print(
+            f"ALLOWED: program={admission.program} subcommand={admission.subcommand or '-'}"
+        )
+        print(f"rendered: {admission.rendered}")
     return 0
 
 
@@ -236,8 +758,7 @@ def _cmd_target(
         "readiness": readiness.describe(),
         "prompt_tail": prompt_tail,
     }
-    json.dump(document, sys.stdout, indent=2, sort_keys=True, ensure_ascii=False)
-    sys.stdout.write("\n")
+    _emit_json(document)
     return 0 if readiness.ready else EXIT_BUSY
 
 
@@ -292,18 +813,39 @@ def _cmd_reap(config: Config, environ: dict[str, str]) -> int:
             for decision in plan.declined
         ],
     }
-    json.dump(document, sys.stdout, indent=2, sort_keys=True, ensure_ascii=False)
-    sys.stdout.write("\n")
+    _emit_json(document)
     return 0
 
 
-def _cmd_doctor(config: Config, agent: str, environ: dict[str, str]) -> int:
-    """Bracket the premise in BOTH directions instead of asserting it.
+#: The scope disclaimer ``net-doctor`` prints before it does anything.
+#:
+#: It goes FIRST, not in the verdict, because a diagnostic that only says what it covered once it
+#: has already failed reads as an excuse. ``net-doctor`` answers exactly one question -- does
+#: routing a network command through a pane get past a block on the caller's own network -- and a
+#: reader whose interest in this command is something else should be able to stop at line one.
+NET_DOCTOR_SCOPE = (
+    "This is a smoke test for ONE scenario, not a health check of this command as a whole:\n"
+    "a caller whose own network access is blocked, running a network command through a pane\n"
+    "that is not blocked. It runs the same probe twice — directly, then through the pane —\n"
+    "and compares. If you route commands through a pane for some other reason, the verdict\n"
+    "below says nothing about that reason.\n"
+)
 
-    Positive: the same command through the pane must succeed. Negative: run in-process (inside the
-    jail) it must fail. If BOTH succeed the pane is not actually buying anything; if both fail the
-    egress path is broken. Reporting one side only would leave "the pane is outside the sandbox" as
-    an inference rather than an observation.
+
+def _net_doctor_error_fields(direct_exit_code: int | None = None) -> dict[str, object]:
+    fields: dict[str, object] = {"net_doctor": True}
+    if direct_exit_code is not None:
+        fields["direct_exit_code"] = direct_exit_code
+    return fields
+
+
+def _cmd_net_doctor(config: Config, agent: str, environ: dict[str, str]) -> int:
+    """Bracket ONE scenario in both directions instead of asserting it.
+
+    Positive: the probe through the pane must succeed. Negative: run directly, under whatever
+    constrains this process, it must fail. If BOTH succeed the pane is not buying anything for this
+    scenario; if both fail the pane path is broken. Reporting one side only would leave "the pane is
+    outside the caller's confinement" as an inference rather than an observation.
     """
     import subprocess
 
@@ -313,47 +855,51 @@ def _cmd_doctor(config: Config, agent: str, environ: dict[str, str]) -> int:
         if "with-proxy" in config.prefixes
         else probe
     )
+    print(
+        f"herdr-run net-doctor  (agent={agent}, config={config.source_path or 'defaults'})"
+    )
+    print()
+    print(NET_DOCTOR_SCOPE)
+
     log = audit_path(config.project_root, config.spool_dir)
     warn_if_spool_is_tracked(config.project_root, config.spool_dir)
     try:
         admission = admit(prefixed, config)
     except Refused as exc:
-        _record_audit(log, agent, prefixed, "REFUSED", str(exc), {"doctor": True})
+        _record_audit(
+            log, agent, prefixed, "REFUSED", str(exc), _net_doctor_error_fields()
+        )
         raise
     _record_audit(
         log,
         agent,
         prefixed,
         "ADMITTED",
-        "doctor probe accepted; target resolution and launch have not yet completed",
-        {"doctor": True, "rendered": admission.rendered},
+        "net-doctor probe accepted; target resolution and launch have not yet completed",
+        {"net_doctor": True, "rendered": admission.rendered},
     )
-
-    print(
-        f"herdr-run doctor  (agent={agent}, config={config.source_path or 'defaults'})"
-    )
-    print()
 
     try:
-        inside = _bounded_control_command(
-            ["/bin/bash", "-lc", prefixed],
-            timeout=120,
-        )
+        direct = _bounded_control_command(["/bin/bash", "-lc", prefixed], timeout=120)
     except (OSError, subprocess.SubprocessError) as exc:
-        error = HerdrUnavailable(f"cannot run the in-jail doctor probe: {exc}")
+        error = HerdrUnavailable(f"cannot run the direct probe: {exc}")
         _record_audit(
-            log, agent, prefixed, "HERDRUNAVAILABLE", str(error), {"doctor": True}
+            log,
+            agent,
+            prefixed,
+            "HERDRUNAVAILABLE",
+            str(error),
+            _net_doctor_error_fields(),
         )
         raise error from exc
-    inside_ok = inside.returncode == 0
-    print(f"[in-jail ] {prefixed}")
-    print(f"           rc={inside.returncode} {'SUCCEEDED' if inside_ok else 'failed'}")
-    if not inside_ok:
-        print(
-            f"           {(inside.stderr or '').strip().splitlines()[-1] if inside.stderr.strip() else ''}"
-        )
+    direct_ok = direct.returncode == 0
+    print(f"[direct  ] {prefixed}")
+    print(f"           rc={direct.returncode} {'SUCCEEDED' if direct_ok else 'failed'}")
+    if not direct_ok:
+        stderr_lines = (direct.stderr or "").splitlines()
+        print(f"           {stderr_lines[-1] if stderr_lines else ''}")
 
-    outside_rc = -1
+    pane_rc = -1
     try:
         client = _client(config, environ)
         target = resolve_target(client, config, agent)
@@ -363,20 +909,21 @@ def _cmd_doctor(config: Config, agent: str, environ: dict[str, str]) -> int:
             target,
             admission,
             agent=agent,
-            cwd=_resolved_cwd(config, argparse.Namespace(cwd=None)),
+            cwd=_resolved_cwd(config, None),
             ready_timeout=max(config.ready_timeout_seconds, 30.0),
             timeout=min(config.timeout_seconds, 180.0),
         )
-        outside_rc = result.exit_code
+        pane_rc = result.exit_code
         meta, meta_error = _write_meta_best_effort(result, admission, config, agent)
-        fields: dict[str, object] = {
-            "doctor": True,
-            "inside_exit_code": inside.returncode,
-            "exit_code": outside_rc,
-            "run_id": result.run_id,
-            "pane_id": result.target.pane_id,
-            "meta": meta,
-        }
+        fields = _net_doctor_error_fields(direct.returncode)
+        fields.update(
+            {
+                "exit_code": pane_rc,
+                "run_id": result.run_id,
+                "pane_id": result.target.pane_id,
+                "meta": meta,
+            }
+        )
         if meta_error is not None:
             fields["meta_error"] = meta_error
         _record_audit(
@@ -384,15 +931,13 @@ def _cmd_doctor(config: Config, agent: str, environ: dict[str, str]) -> int:
             agent,
             prefixed,
             "RAN",
-            f"doctor pane probe exited {outside_rc}",
+            f"net-doctor pane probe exited {pane_rc}",
             fields,
         )
         head = (result.stdout.strip().splitlines() or [""])[0]
+        print(f"[via pane] {prefixed}   (pane {target.pane_id}, tab {target.tab_label})")
         print(
-            f"[via pane] {prefixed}   (pane {target.pane_id}, tab {target.tab_label})"
-        )
-        print(
-            f"           rc={outside_rc} {'SUCCEEDED' if outside_rc == 0 else 'failed'}  {head[:80]}"
+            f"           rc={pane_rc} {'SUCCEEDED' if pane_rc == 0 else 'failed'}  {head[:80]}"
         )
     except HerdrRunError as exc:
         _record_audit(
@@ -401,25 +946,27 @@ def _cmd_doctor(config: Config, agent: str, environ: dict[str, str]) -> int:
             prefixed,
             type(exc).__name__.upper(),
             str(exc),
-            {"doctor": True, "inside_exit_code": inside.returncode},
+            _net_doctor_error_fields(direct.returncode),
         )
         print(f"[via pane] FAILED: {exc}")
 
     print()
-    if outside_rc == 0 and not inside_ok:
+    if pane_rc == 0 and not direct_ok:
         print(
-            "VERDICT: working as intended — blocked in-jail, succeeds through the pane."
+            "VERDICT: this scenario works — the probe is blocked directly and succeeds "
+            "through the pane."
         )
         return 0
-    if outside_rc == 0 and inside_ok:
+    if pane_rc == 0:
         print(
-            "VERDICT: the pane works, but so does the in-jail path. herdr-run is not buying you "
-            "anything here; prefer running the command directly."
+            "VERDICT: the pane works, but so does running the probe directly. For THIS scenario "
+            "the pane is buying you nothing; prefer running the command directly. Other reasons "
+            "to route a command through a pane are untouched by that."
         )
         return 0
     print(
         "VERDICT: the pane path is NOT working. Most likely the Herdr server was started from "
-        "inside a sandboxed process, so its panes inherit the confinement. Stop it "
+        "inside a confined process, so its panes inherit the confinement. Stop it "
         "('herdr server stop') and let herdr-run restart it via systemd-run, or start it from an "
         "unconfined shell."
     )
@@ -429,10 +976,12 @@ def _cmd_doctor(config: Config, agent: str, environ: dict[str, str]) -> int:
 def _run_command(
     config: Config,
     agent: str,
-    command: str,
-    args: argparse.Namespace,
+    options: _RunOptions,
     environ: dict[str, str],
+    *,
+    json_output: bool,
 ) -> int:
+    command = options.command
     log = audit_path(config.project_root, config.spool_dir)
     warn_if_spool_is_tracked(config.project_root, config.spool_dir)
 
@@ -443,21 +992,16 @@ def _run_command(
         print(f"herdr-run: REFUSED: {exc}", file=sys.stderr)
         return Refused.exit_code
 
-    if args.dry_run:
+    if options.dry_run:
         _record_audit(log, agent, command, "DRY-RUN", admission.rendered)
-        if args.json:
-            json.dump(
+        if json_output:
+            _emit_json(
                 {
                     "verdict": "allowed",
                     "program": admission.program,
                     "rendered": admission.rendered,
-                },
-                sys.stdout,
-                indent=2,
-                sort_keys=True,
-                ensure_ascii=False,
+                }
             )
-            sys.stdout.write("\n")
         else:
             print(admission.rendered)
         return 0
@@ -471,14 +1015,16 @@ def _run_command(
         {"rendered": admission.rendered},
     )
     ready_timeout = (
-        args.wait_ready if args.wait_ready is not None else config.ready_timeout_seconds
+        options.wait_ready
+        if options.wait_ready is not None
+        else config.ready_timeout_seconds
     )
-    timeout = args.timeout if args.timeout is not None else config.timeout_seconds
+    timeout = options.timeout if options.timeout is not None else config.timeout_seconds
 
     try:
         client = _client(config, environ)
-        cwd = _resolved_cwd(config, args)
-        target = resolve_target(client, config, agent, use_cache=not args.no_cache)
+        cwd = _resolved_cwd(config, options.cwd)
+        target = resolve_target(client, config, agent, use_cache=not options.no_cache)
         result = execute(
             client,
             config,
@@ -525,8 +1071,8 @@ def _run_command(
         audit_fields,
     )
 
-    if args.json:
-        json.dump(
+    if json_output:
+        _emit_json(
             {
                 "exit_code": result.exit_code,
                 "stdout": result.stdout,
@@ -540,13 +1086,8 @@ def _run_command(
                 "duration_seconds": round(result.duration_seconds, 3),
                 "spool_dir": result.spool.directory,
                 "meta": meta,
-            },
-            sys.stdout,
-            indent=2,
-            sort_keys=True,
-            ensure_ascii=False,
+            }
         )
-        sys.stdout.write("\n")
     else:
         _emit_raw_output(stdout_bytes, stderr_bytes)
     return result.exit_code
@@ -609,114 +1150,71 @@ def _emit_raw_output(stdout_bytes: bytes, stderr_bytes: bytes) -> None:
         raise HerdrRunError(f"cannot write stderr: {exc}") from exc
 
 
-def _print_userguide() -> int:
-    try:
-        from importlib.resources import files
+# --- dispatch -----------------------------------------------------------------------------------
 
-        text = (files("herdr_run") / "USER_GUIDE.md").read_text(encoding="utf-8")
-    except (OSError, ModuleNotFoundError):
-        print(
-            "herdr-run: user guide resource is not available in this installation",
-            file=sys.stderr,
+
+def _dispatch(invocation: _Invocation, environ: dict[str, str]) -> int:
+    try:
+        start_dir = os.getcwd()
+    except OSError as exc:
+        raise ConfigError(f"cannot determine current directory: {exc}") from exc
+
+    if invocation.subcommand == "init":
+        # Deliberately before load_config: the reason to reach for `init` is often that discovery
+        # found nothing, or found something broken, and refusing to write a fresh template because
+        # the old one will not parse would be exactly the wrong moment to be strict.
+        return _cmd_init(
+            start_dir, force=invocation.force, json_output=invocation.globals.json
         )
-        return 1
-    sys.stdout.write(text)
-    return 0
+
+    config = load_config(explicit_path=invocation.globals.config, start_dir=start_dir)
+    agent = invocation.globals.agent or ""
+    if not agent:
+        agent = _default_agent(environ)
+    json_output = invocation.globals.json
+
+    if invocation.subcommand == "run":
+        assert invocation.run is not None
+        return _run_command(
+            config, agent, invocation.run, environ, json_output=json_output
+        )
+    if invocation.subcommand == "check":
+        assert invocation.command is not None
+        return _cmd_check(config, invocation.command, json_output=json_output)
+    if invocation.subcommand == "status":
+        return _cmd_status(config, agent, environ, json_output=json_output)
+    if invocation.subcommand == "config":
+        return _cmd_config(config, agent)
+    if invocation.subcommand == "target":
+        return _cmd_target(
+            config, agent, environ, use_cache=not invocation.no_cache
+        )
+    if invocation.subcommand == "reap":
+        return _cmd_reap(config, environ)
+    if invocation.subcommand == "net-doctor":
+        return _cmd_net_doctor(config, agent, environ)
+    raise AssertionError(f"unhandled subcommand {invocation.subcommand!r}")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Entry point. Return the wrapped status or the documented code for a wrapper failure."""
-    parser = build_parser()
-    # parse_intermixed_args, not parse_args: with a greedy `nargs="*"` positional, plain parse_args
-    # cannot handle an option BETWEEN positionals, so `herdr-run agent --cwd DIR 'cmd'` failed with
-    # "unrecognized arguments" — and that is the natural way to write the call.
-    raw_args = list(argv) if argv is not None else sys.argv[1:]
-    if any(
-        any(0xD800 <= ord(character) <= 0xDFFF for character in token)
-        for token in raw_args
-    ):
-        parser.error("arguments must be valid UTF-8")
-    args = parser.parse_intermixed_args(raw_args)
-    environ = dict(os.environ)
-
-    positional: list[str] = list(args.positional)
-    subcommand: str | None = None
-    if positional and positional[0] in _SUBCOMMANDS:
-        subcommand = positional.pop(0)
-
-    if subcommand == "userguide" or args.userguide:
-        return _print_userguide()
-
-    # A truly bare invocation is a help probe, not an attempt to run anything.  Keep it independent
-    # of ambient project policy so a malformed repository config cannot break the dependency-free
-    # startup contract before there is even a command to authorize.
-    if not raw_args:
-        parser.print_help()
-        print("\nNothing to do: no command given. See 'herdr-run userguide'.")
+    raw = list(argv) if argv is not None else sys.argv[1:]
+    try:
+        invocation = _parse(raw)
+    except _EarlyExit:
         return 0
-
-    try:
-        config = _load(args, environ)
-    except HerdrRunError as exc:
-        _safe_diagnostic(f"herdr-run: {exc}")
-        return exc.exit_code
-
-    # Agent resolution: --agent wins, then a leading positional when a command follows it, then the
-    # environment. Requiring TWO positionals for the '<agent> <command>' form is what keeps a single
-    # quoted command from being mistaken for an agent name.
-    #
-    # When --agent is given explicitly, NO positional may be consumed as an agent name: every
-    # positional belongs to the command. Consuming positional[0] anyway used to silently DELETE a
-    # leading `with-proxy` wrapper from `herdr-run --agent X with-proxy '<cmd>'`. The command still
-    # ran -- just without its proxy -- so `gh` dialled GitHub direct and failed with "network is
-    # unreachable", which reads like an egress outage rather than a mangled argv. Anything past a
-    # single quoted command is now the loose-words shape, and is refused below like any other.
-    agent = args.agent or ""
-    command: str | None = None
-    if len(positional) == 2 and not args.agent:
-        agent = positional[0]
-        command = positional[1]
-    elif len(positional) == 1:
-        command = positional[0]
-    elif len(positional) > 1:
-        # REFUSE rather than re-join. Joining loose words and re-splitting them silently DESTROYS
-        # quoting: `herdr-run agent git commit -m "two words"` would arrive as four arguments
-        # (`-m`, `two`, `words`) instead of two, and the caller would never see that it happened.
-        # A loud refusal is the only safe reading of an ambiguous invocation.
-        joined = " ".join(positional)
-        print(
-            "herdr-run: pass the command as ONE quoted argument, not as separate words.\n"
-            f"  you wrote:  herdr-run {joined}\n"
-            f"  instead:    herdr-run --agent {agent or '<agent>'} "
-            f"'{' '.join(positional[1:] if not args.agent else positional)}'\n"
-            "Re-joining loose words would silently change the quoting of your arguments.",
-            file=sys.stderr,
-        )
+    except _UsageError as exc:
+        print(f"usage: {usage_line()}", file=sys.stderr)
+        print(f"herdr-run: error: {exc}", file=sys.stderr)
         return 2
-    if not agent:
-        agent = _default_agent(environ)
+
+    # Printed before any configuration is read: documentation is exactly what somebody with a
+    # broken configuration file needs, and refusing to show it would be perverse.
+    if invocation.subcommand in _DOCUMENTS:
+        return _print_document(invocation.subcommand)
 
     try:
-        if subcommand == "config":
-            return _cmd_config(config, agent)
-        if subcommand == "target":
-            return _cmd_target(config, agent, environ, use_cache=not args.no_cache)
-        if subcommand == "reap":
-            return _cmd_reap(config, environ)
-        if subcommand == "doctor":
-            return _cmd_doctor(config, agent, environ)
-        if subcommand == "check":
-            if command is None:
-                print("herdr-run check: needs a command to check", file=sys.stderr)
-                return 2
-            return _cmd_check(config, command)
-        if command is None:
-            # Bare invocation prints help and succeeds, matching every other tool in this repo (the
-            # `make check-deps` contract requires each entrypoint to start cleanly with no args).
-            parser.print_help()
-            print("\nNothing to do: no command given. See 'herdr-run userguide'.")
-            return 0
-        return _run_command(config, agent, command, args, environ)
+        return _dispatch(invocation, dict(os.environ))
     except HerdrRunError as exc:
         _safe_diagnostic(f"herdr-run: {exc}")
         return exc.exit_code

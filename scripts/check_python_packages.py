@@ -138,7 +138,9 @@ PROJECTS: tuple[Project, ...] = (
         resources=(
             "README.md",
             "USER_GUIDE.md",
+            "QUICKSTART.md",
             "AGENT_USER_GUIDE.md",
+            "config_template.yaml",
             "py.typed",
             "examples/project.yaml",
         ),

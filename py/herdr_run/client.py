@@ -358,6 +358,17 @@ class HerdrClient:
 
     # ---- server -----------------------------------------------------------------------------
 
+    def preflight(self) -> None:
+        """Resolve every executable this client would need, raising if one is missing.
+
+        Resolution is otherwise lazy, which is right for a client that is about to make a call and
+        will surface the failure there. A read-only caller needs it eagerly: ``status`` must be able
+        to distinguish "Herdr is not installed" from "Herdr is installed and no server is running",
+        and :meth:`server_running` deliberately answers ``False`` to both.
+        """
+        self._executable()
+        self._systemd_executable()
+
     def server_running(self) -> bool:
         """Is a compatible Herdr server currently up? Never raises; absence is a normal answer."""
         try:

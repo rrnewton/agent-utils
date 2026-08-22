@@ -285,7 +285,15 @@ def _package_links() -> tuple[PackageLink, ...]:
                 "common/docs/herdr-run/CONFIG_TEMPLATE.yaml",
             ),
             PackageLink(
+                "py/herdr_run/config_template.yaml",
+                "common/docs/herdr-run/CONFIG_TEMPLATE.yaml",
+            ),
+            PackageLink(
                 "rs/herdr-run/src/embedded_quickstart.md",
+                "common/docs/herdr-run/QUICKSTART.md",
+            ),
+            PackageLink(
+                "py/herdr_run/QUICKSTART.md",
                 "common/docs/herdr-run/QUICKSTART.md",
             ),
             PackageLink(

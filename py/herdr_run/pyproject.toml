@@ -36,4 +36,4 @@ package-dir = { herdr_run = "." }
 include-package-data = false
 
 [tool.setuptools.package-data]
-herdr_run = ["py.typed", "README.md", "USER_GUIDE.md", "AGENT_USER_GUIDE.md", "examples/*.yaml"]
+herdr_run = ["py.typed", "README.md", "USER_GUIDE.md", "QUICKSTART.md", "AGENT_USER_GUIDE.md", "config_template.yaml", "examples/*.yaml"]

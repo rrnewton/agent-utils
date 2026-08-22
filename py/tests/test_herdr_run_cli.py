@@ -17,7 +17,13 @@ import pytest
 
 from herdr_run.audit import audit_path, record
 import herdr_run.cli as cli_module
-from herdr_run.cli import _default_agent, build_parser, main
+from herdr_run.cli import (
+    SUBCOMMANDS,
+    _default_agent,
+    help_text,
+    main,
+    subcommand_help_text,
+)
 from herdr_run.config import Config
 from herdr_run.reap import ReapDecision, ReapPlan, Verdict
 from herdr_run.errors import (
@@ -35,10 +41,11 @@ from herdr_run.errors import (
 # --- argument shapes -------------------------------------------------------------------------------
 
 
-def test_help_exits_cleanly() -> None:
-    with pytest.raises(SystemExit) as excinfo:
-        build_parser().parse_args(["--help"])
-    assert excinfo.value.code == 0
+def test_help_exits_cleanly(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["--help"]) == 0
+    captured = capsys.readouterr()
+    assert captured.out.startswith("usage: herdr-run [-h] [--version]")
+    assert captured.err == ""
 
 
 def test_agent_is_taken_from_the_orc_environment_variable() -> None:
@@ -65,18 +72,210 @@ def test_bare_invocation_prints_help_and_succeeds(
     def fail_if_config_is_loaded(*_args: object, **_kwargs: object) -> Config:
         raise AssertionError("a bare help probe must not load ambient project policy")
 
-    monkeypatch.setattr(cli_module, "_load", fail_if_config_is_loaded)
+    monkeypatch.setattr(cli_module, "load_config", fail_if_config_is_loaded)
     assert main([]) == 0
-    out = capsys.readouterr().out
-    assert "usage: herdr-run" in out
-    assert "no command given" in out
+    captured = capsys.readouterr()
+    assert "usage: herdr-run" in captured.out
+    assert "subcommands:" in captured.out
+    assert captured.err == ""
 
 
 @pytest.mark.parametrize("value", ["nan", "inf", "-1", "1e300"])
-def test_invalid_cli_timeouts_are_rejected(value: str) -> None:
-    with pytest.raises(SystemExit) as excinfo:
-        build_parser().parse_args(["--timeout", value])
-    assert excinfo.value.code == 2
+def test_invalid_cli_timeouts_are_rejected(
+    value: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["run", "--timeout", value, "git status"]) == 2
+    assert "argument --timeout" in capsys.readouterr().err
+
+
+# --- the two levels ------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "argv,fragment",
+    [
+        (["--cwd", "/tmp", "run", "git status"], "put it AFTER the subcommand"),
+        (["--timeout", "1", "run", "git status"], "put it AFTER the subcommand"),
+        (["--wait-ready", "1", "run", "git status"], "put it AFTER the subcommand"),
+        (["--dry-run", "run", "git status"], "put it AFTER the subcommand"),
+        (["--no-cache", "target"], "'run' or 'target'"),
+        (["run", "--agent", "a", "git status"], "this is a GLOBAL option"),
+        (["run", "--config", "x.yaml", "git status"], "this is a GLOBAL option"),
+        (["run", "--json", "git status"], "this is a GLOBAL option"),
+        (["check", "--dry-run", "git status"], "a 'run' option, not a 'check' option"),
+        (["reap", "--cwd", "/tmp"], "a 'run' option, not a 'reap' option"),
+        (["target", "--dry-run"], "a 'run' option, not a 'target' option"),
+    ],
+)
+def test_an_option_at_the_wrong_level_is_refused_and_says_which_level_it_belongs_to(
+    argv: list[str], fragment: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The two levels must not leak into each other, in either direction.
+
+    This is the defect the surface exists to fix, so it is pinned as behaviour rather than left to
+    the help text: an accepted `herdr-run --cwd /tmp run ...` would quietly restore the very mixing
+    that made the old surface unreadable.
+    """
+    assert main(argv) == 2
+    captured = capsys.readouterr()
+    assert fragment in captured.err, captured.err
+    assert captured.out == ""
+
+
+def test_the_bare_command_form_is_refused_with_the_run_replacement(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The bare form is gone, and its removal names the exact replacement."""
+    assert main(["git status"]) == 2
+    err = capsys.readouterr().err
+    assert "unknown subcommand 'git status'" in err
+    assert "herdr-run run 'git status'" in err
+
+    assert main(["release-agent", "git status"]) == 2
+    err = capsys.readouterr().err
+    assert "herdr-run --agent release-agent run 'git status'" in err
+
+    assert main(["stauts"]) == 2
+    err = capsys.readouterr().err
+    assert "unknown subcommand 'stauts'" in err
+    assert "Subcommands: " in err
+    # A single word is a mistyped subcommand, not a command line; suggesting `run 'stauts'` would
+    # send the reader off to debug the wrong thing.
+    assert "run 'stauts'" not in err
+
+
+def test_run_needs_exactly_one_quoted_command(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert main(["run"]) == 2
+    assert "needs a command to run" in capsys.readouterr().err
+    assert main(["run", "git", "status"]) == 2
+    err = capsys.readouterr().err
+    assert "ONE quoted argument" in err
+    assert "herdr-run run 'git status'" in err
+
+
+def test_a_double_dash_hands_the_rest_to_the_command(
+    tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.chdir(str(tmp_path))
+    assert main(["run", "--dry-run", "--", "git --help"]) == 0
+    assert capsys.readouterr().out == "git --help\n"
+    assert main(["check", "--", "--version"]) == EXIT_REFUSED
+
+
+def test_option_values_cannot_be_stolen_by_help_or_version(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert main(["--agent", "--help", "run", "x"]) == 2
+    assert "argument --agent: expected one value" in capsys.readouterr().err
+    assert main(["run", "--cwd", "--version", "x"]) == 2
+    assert "argument --cwd: expected one value" in capsys.readouterr().err
+
+
+def test_every_subcommand_is_reachable_and_uniquely_named() -> None:
+    assert sorted(name for name, _summary in SUBCOMMANDS) == [
+        "check",
+        "config",
+        "init",
+        "net-doctor",
+        "quickstart",
+        "reap",
+        "run",
+        "status",
+        "target",
+        "userguide",
+    ]
+    assert all(summary for _name, summary in SUBCOMMANDS)
+
+
+def _option_block(text: str, header: str) -> str:
+    """Return the contiguous indented lines that follow the first line starting with `header`.
+
+    Only the option BLOCK is inspected: an example line naming a global option is teaching where
+    that option goes, which is the opposite of the mixing being guarded against.
+    """
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if line.startswith(header):
+            body: list[str] = []
+            for candidate in lines[index + 1 :]:
+                if not candidate.strip():
+                    break
+                body.append(candidate)
+            return "\n".join(body)
+    return ""
+
+
+def test_each_help_level_documents_exactly_its_own_options() -> None:
+    """Neither help level may document the other's options.
+
+    The complaint that produced this surface was that every flag was global whether or not it meant
+    anything to the thing being invoked, and help that lists the wrong options is how that state of
+    affairs comes back without anybody deciding to bring it back.
+    """
+    top = help_text()
+    for name, summary in SUBCOMMANDS:
+        assert name in top and summary in top, name
+    top_options = _option_block(top, "global options")
+    for option in ("--config", "--agent", "--json", "--version", "--help"):
+        assert option in top_options, option
+    for local in ("--cwd", "--timeout", "--wait-ready", "--force", "--dry-run", "--no-cache"):
+        assert local not in top_options, local
+
+    run_options = _option_block(subcommand_help_text("run"), "options:")
+    for local in ("--cwd", "--timeout", "--wait-ready", "--no-cache", "--dry-run"):
+        assert local in run_options, local
+    for global_option in ("--config", "--agent", "--json", "--version"):
+        assert global_option not in run_options, global_option
+
+    assert "--force" in _option_block(subcommand_help_text("init"), "options:")
+    assert "--no-cache" in _option_block(subcommand_help_text("target"), "options:")
+    for bare in ("check", "config", "reap", "net-doctor", "quickstart", "userguide", "status"):
+        block = _option_block(subcommand_help_text(bare), "options:")
+        assert "-h, --help" in block, bare
+        for local in ("--cwd", "--timeout", "--dry-run", "--force", "--no-cache"):
+            assert local not in block, f"{bare}: {local}"
+
+
+def test_help_distinguishes_the_quickstart_from_the_userguide() -> None:
+    """The top-level help must say what each of the two documentation commands is FOR."""
+    top = help_text()
+    assert "Two documentation commands" in top
+    assert "one screen" in top
+    assert "the complete reference" in top
+
+
+def test_each_documentation_subcommand_prints_its_own_document(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert main(["quickstart"]) == 0
+    quickstart = capsys.readouterr().out
+    assert quickstart.startswith("# herdr-run — quickstart\n")
+    assert main(["userguide"]) == 0
+    guide = capsys.readouterr().out
+    assert guide.startswith("# herdr-run — user guide\n")
+    # Two documentation commands printing the same text would be one command with two names.
+    assert quickstart != guide
+    assert 2 * quickstart.count("\n") < guide.count("\n")
+    assert "herdr-run userguide" in quickstart
+
+
+def test_documentation_prints_even_when_the_configuration_cannot_be_parsed(
+    tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A broken config must not be able to withhold the instructions for fixing it."""
+    root = str(tmp_path)
+    with open(os.path.join(root, ".herdr-run.yaml"), "w", encoding="utf-8") as handle:
+        handle.write("allow: [\n")
+    monkeypatch.chdir(root)
+    for subcommand in ("quickstart", "userguide"):
+        assert main([subcommand]) == 0, subcommand
+        assert capsys.readouterr().out.startswith("# herdr-run"), subcommand
 
 
 # --- policy-only paths touch no Herdr server ---------------------------------------------------------
@@ -110,7 +309,7 @@ def test_dry_run_refusal_never_reaches_a_pane(
     monkeypatch.chdir(root)
     pytest.importorskip("yaml")
 
-    assert main(["some-agent", "rm -rf /"]) == EXIT_REFUSED
+    assert main(["--agent", "some-agent", "run", "rm -rf /"]) == EXIT_REFUSED
     assert "REFUSED" in capsys.readouterr().err
 
 
@@ -120,7 +319,7 @@ def test_dry_run_prints_the_rendered_command(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.chdir(str(tmp_path))
-    assert main(["--dry-run", "agent", "git commit -m 'two words'"]) == 0
+    assert main(["--agent", "agent", "run", "--dry-run", "git commit -m 'two words'"]) == 0
     assert "git commit -m" in capsys.readouterr().out
 
 
@@ -235,7 +434,7 @@ def test_timeout_partial_output_write_failure_has_no_traceback(
         lambda *_args: _raise(HerdrRunError("cannot write stdout: closed")),
     )
 
-    assert main(["agent", "git status"]) == 1
+    assert main(["--agent", "agent", "run", "git status"]) == 1
     captured = capsys.readouterr()
     assert "cannot write stdout" in captured.err
     assert "Traceback" not in captured.err
@@ -274,7 +473,7 @@ def test_metadata_failure_does_not_mask_completed_command(
         cli_module, "read_output_bytes", lambda _result: (b"output", b"")
     )
 
-    assert main(["--json", "agent", "git status"]) == 23
+    assert main(["--json", "--agent", "agent", "run", "git status"]) == 23
     captured = capsys.readouterr()
     assert json.loads(captured.out)["meta"] is None
     assert "WARNING: cannot write run metadata" in captured.err
@@ -298,7 +497,7 @@ def _raise(error: Exception) -> object:
         ("execute", PaneBusy("pane stayed busy"), "PANEBUSY"),
     ],
 )
-def test_doctor_pane_failures_keep_doctor_output_exit_and_audit_shape(
+def test_net_doctor_pane_failures_keep_its_output_exit_and_audit_shape(
     failure_site: str,
     error: Exception,
     verdict: str,
@@ -310,7 +509,7 @@ def test_doctor_pane_failures_keep_doctor_output_exit_and_audit_shape(
     root = str(tmp_path)
     monkeypatch.chdir(root)
 
-    def inside_probe(
+    def direct_probe(
         command: object, *, timeout: float
     ) -> SimpleNamespace:
         assert command == [
@@ -324,7 +523,7 @@ def test_doctor_pane_failures_keep_doctor_output_exit_and_audit_shape(
     monkeypatch.setattr(
         cli_module,
         "_bounded_control_command",
-        inside_probe,
+        direct_probe,
     )
     target = SimpleNamespace(pane_id="p1", tab_label="agent")
     monkeypatch.setattr(
@@ -350,20 +549,26 @@ def test_doctor_pane_failures_keep_doctor_output_exit_and_audit_shape(
         lambda *_args, **_kwargs: _raise(error),
     )
 
-    assert main(["doctor"]) == 1
+    assert main(["net-doctor"]) == 1
     captured = capsys.readouterr()
     assert f"[via pane] FAILED: {error}" in captured.out
     assert "VERDICT: the pane path is NOT working." in captured.out
     assert "Traceback" not in captured.err
+    # The scope disclaimer leads, so a reader whose interest is something else can stop at line
+    # one instead of reading a verdict about a scenario they are not in.
+    assert captured.out.startswith("herdr-run net-doctor  (agent=")
+    assert "This is a smoke test for ONE scenario" in captured.out
+    assert captured.out.index("ONE scenario") < captured.out.index("[direct  ]")
+    assert "[in-jail ]" not in captured.out
 
     with open(audit_path(root, ".herdr-run"), encoding="utf-8") as handle:
         entries = [json.loads(line) for line in handle]
     assert [entry["verdict"] for entry in entries] == ["ADMITTED", verdict]
-    assert entries[-1]["doctor"] is True
-    assert entries[-1]["inside_exit_code"] == 1
+    assert entries[-1]["net_doctor"] is True
+    assert entries[-1]["direct_exit_code"] == 1
 
 
-def test_doctor_pre_admission_refusal_is_marked_as_doctor(
+def test_net_doctor_pre_admission_refusal_is_marked_as_net_doctor(
     tmp_path: object,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -374,33 +579,53 @@ def test_doctor_pre_admission_refusal_is_marked_as_doctor(
         cli_module, "admit", lambda *_args: _raise(Refused("probe refused"))
     )
 
-    assert main(["doctor"]) == EXIT_REFUSED
+    assert main(["net-doctor"]) == EXIT_REFUSED
     assert "herdr-run: probe refused" in capsys.readouterr().err
     with open(audit_path(root, ".herdr-run"), encoding="utf-8") as handle:
         entry = json.loads(handle.read())
     assert entry["verdict"] == "REFUSED"
-    assert entry["doctor"] is True
+    assert entry["net_doctor"] is True
 
 
-def test_vanished_caller_cwd_is_typed_and_audited_after_admission(
-    tmp_path: object,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
+def test_vanished_caller_cwd_is_a_typed_config_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Model getcwd(3)'s ENOENT after another process removes the caller's directory."""
-    root = str(tmp_path)
-    config = Config(project_root=root)
-    monkeypatch.setattr(cli_module, "_load", lambda *_args: config)
-    monkeypatch.setattr(cli_module, "_client", lambda *_args: object())
     monkeypatch.setattr(
         os,
         "getcwd",
         lambda: _raise(FileNotFoundError("caller directory was removed")),
     )
 
-    assert main(["agent", "git status"]) == EXIT_CONFIG
+    assert main(["--agent", "agent", "run", "git status"]) == EXIT_CONFIG
     captured = capsys.readouterr()
     assert "cannot determine current directory" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_a_configuration_failure_after_admission_is_audited(
+    tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A run that dies AFTER the policy said yes must still leave both halves in the log.
+
+    An audit that recorded only the admission would say a command was authorised and never say
+    what became of it, which is the one thing the log exists to answer.
+    """
+    root = str(tmp_path)
+    config = Config(project_root=root)
+    monkeypatch.setattr(cli_module, "load_config", lambda **_kwargs: config)
+    monkeypatch.setattr(cli_module, "_client", lambda *_args: object())
+    monkeypatch.setattr(
+        cli_module,
+        "_resolved_cwd",
+        lambda *_args: _raise(ConfigError("caller directory was removed")),
+    )
+
+    assert main(["--agent", "agent", "run", "git status"]) == EXIT_CONFIG
+    captured = capsys.readouterr()
+    assert "caller directory was removed" in captured.err
     assert "Traceback" not in captured.err
     with open(audit_path(root, ".herdr-run"), encoding="utf-8") as handle:
         entries = [json.loads(line) for line in handle]
@@ -416,7 +641,7 @@ def test_refusals_are_audited(
     """A log that recorded only successes would make the allowlist unobservable after the fact."""
     root = str(tmp_path)
     monkeypatch.chdir(root)
-    main(["agent", "curl https://evil.example"])
+    main(["--agent", "agent", "run", "curl https://evil.example"])
 
     path = audit_path(root, ".herdr-run")
     with open(path, encoding="utf-8") as handle:
@@ -517,30 +742,32 @@ def test_no_claim_outside_a_git_work_tree(tmp_path: object) -> None:
     assert spool_is_ignored(str(tmp_path), ".herdr-run") is None
 
 
-@pytest.mark.parametrize(
-    "argv",
-    [
-        ["--dry-run", "agent", "git status"],
-        ["agent", "--dry-run", "git status"],
-        ["agent", "git status", "--dry-run"],
-        ["--dry-run", "--cwd", "/tmp", "agent", "git status"],
-        ["agent", "--cwd", "/tmp", "--dry-run", "git status"],
-    ],
-)
-def test_options_may_appear_between_positionals(
-    argv: list[str],
+def test_run_options_are_accepted_after_the_subcommand(
     tmp_path: object,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Regression: `herdr-run agent --cwd DIR 'cmd'` must parse.
-
-    A greedy `nargs="*"` positional plus plain parse_args cannot split around an interleaved option,
-    which made the most natural invocation fail with "unrecognized arguments".
-    """
+    """Every `run` option belongs after `run`, in any order, including attached-value forms."""
     monkeypatch.chdir(str(tmp_path))
-    assert main(argv) == 0
-    assert "git status" in capsys.readouterr().out
+    assert (
+        main(
+            [
+                "--agent",
+                "agent",
+                "run",
+                "--cwd",
+                "/tmp",
+                "--timeout=12.5",
+                "--wait-ready",
+                "3",
+                "--no-cache",
+                "--dry-run",
+                "git status",
+            ]
+        )
+        == 0
+    )
+    assert capsys.readouterr().out == "git status\n"
 
 
 def test_loose_argv_words_are_refused_not_silently_rejoined(
@@ -548,66 +775,78 @@ def test_loose_argv_words_are_refused_not_silently_rejoined(
 ) -> None:
     """Re-joining loose words would silently destroy quoting; refuse instead.
 
-    `herdr-run agent git commit -m "two words"` would otherwise arrive at git as `-m two words`,
+    `herdr-run run git commit -m "two words"` would otherwise arrive at git as `-m two words`,
     and nothing in the output would reveal that the caller's quoting had been discarded.
     """
     monkeypatch.chdir(str(tmp_path))
-    # Flagless loose words: argparse accepts them as positionals, so OUR guard must refuse.
-    assert main(["agent", "git", "status", "--", "path with spaces"]) == 2
+    assert main(["run", "git", "status", "--", "path with spaces"]) == 2
     err = capsys.readouterr().err
     assert "ONE quoted argument" in err
     assert "silently change the quoting" in err
 
 
 def test_loose_argv_containing_an_unknown_flag_is_also_refused(
-    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The other loose shape: argparse itself rejects it, so it is refused too, just earlier.
+    """The other loose shape: the flag is refused before the command is ever assembled.
 
     Recorded because the two shapes fail through DIFFERENT paths and both must be non-silent:
-    `-m` is not a herdr-run flag, so argparse exits before the command is ever assembled.
+    `-m` is not a `run` option, so parsing stops there.
     """
     monkeypatch.chdir(str(tmp_path))
-    with pytest.raises(SystemExit) as excinfo:
-        main(["agent", "git", "commit", "-m", "two words"])
-    assert excinfo.value.code == 2
+    assert main(["run", "git", "commit", "-m", "two words"]) == 2
+    assert "run: unrecognized arguments: -m" in capsys.readouterr().err
 
 
-def test_the_documented_two_positional_form_still_works(
+def test_the_documented_form_still_works(
     tmp_path: object, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Positive control: agent + one quoted command is the supported shape and must not regress."""
+    """Positive control: a global agent plus one quoted command is the shape, and must not regress."""
     monkeypatch.chdir(str(tmp_path))
-    assert main(["--dry-run", "agent", "with-proxy git ls-remote origin main"]) == 0
+    assert (
+        main(
+            [
+                "--agent",
+                "someagent",
+                "run",
+                "--dry-run",
+                "with-proxy git ls-remote origin main",
+            ]
+        )
+        == 0
+    )
     assert "with-proxy git ls-remote origin main" in capsys.readouterr().out
 
 
-def test_explicit_agent_never_swallows_a_leading_wrapper(
+def test_a_leading_wrapper_is_never_swallowed_as_an_agent_name(
     tmp_path: object, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """`--agent X with-proxy '<cmd>'` must NOT drop `with-proxy`.
+    """`run with-proxy '<cmd>'` must NOT drop `with-proxy`.
 
-    It used to: with two positionals the leading one was discarded from the command even when
-    --agent had already supplied the name. The command still ran, minus its proxy wrapper, so `gh`
-    dialled GitHub directly and reported "network is unreachable" -- indistinguishable from a real
-    egress outage, and the reason a whole fleet concluded `gh` was unusable through the pane.
-    Refusing is the safe reading; silently running a DIFFERENT command is not.
+    The old surface did: with two positionals the leading one was discarded from the command even
+    when --agent had already supplied the name. The command still ran, minus its proxy wrapper, so
+    `gh` dialled GitHub directly and reported "network is unreachable" -- indistinguishable from a
+    real egress outage, and the reason a whole fleet concluded `gh` was unusable through the pane.
+    Now nothing before the command can be read as an agent name at all, and two positionals are
+    refused with the wrapper put back INSIDE the quotes.
     """
     monkeypatch.chdir(str(tmp_path))
-    assert main(["--dry-run", "--agent", "someagent", "with-proxy", "git ls-remote origin"]) == 2
+    assert (
+        main(
+            [
+                "--agent",
+                "someagent",
+                "run",
+                "--dry-run",
+                "with-proxy",
+                "git ls-remote origin",
+            ]
+        )
+        == 2
+    )
     err = capsys.readouterr().err
     assert "ONE quoted argument" in err
-    # The suggestion must put the wrapper back INSIDE the quotes, not drop it again.
     assert "'with-proxy git ls-remote origin'" in err
-
-
-def test_explicit_agent_with_one_quoted_command_still_works(
-    tmp_path: object, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """Positive control for the guard above: the correct shape must still render in full."""
-    monkeypatch.chdir(str(tmp_path))
-    assert main(["--dry-run", "--agent", "someagent", "with-proxy git ls-remote origin main"]) == 0
-    assert "with-proxy git ls-remote origin main" in capsys.readouterr().out
 
 
 def test_command_runs_in_the_callers_cwd_not_the_config_directory(
@@ -619,7 +858,6 @@ def test_command_runs_in_the_callers_cwd_not_the_config_directory(
     tree used to make every nested worktree run its command in that top directory instead of the
     one the caller was standing in -- silent mistargeting that reads as the wrong repo answering.
     """
-    import argparse
     import os
 
     from herdr_run.cli import _resolved_cwd
@@ -631,29 +869,23 @@ def test_command_runs_in_the_callers_cwd_not_the_config_directory(
     config = Config(project_root=root)  # config lives at the top...
     monkeypatch.chdir(nested)  # ...caller stands in the nested worktree
 
-    assert _resolved_cwd(config, argparse.Namespace(cwd=None)) == os.path.realpath(nested) or (
-        _resolved_cwd(config, argparse.Namespace(cwd=None)) == nested
+    assert _resolved_cwd(config, None) == os.path.realpath(nested) or (
+        _resolved_cwd(config, None) == nested
     )
 
 
 def test_explicit_cwd_still_wins(tmp_path: object) -> None:
     """Positive control: --cwd is still honoured over both the config and the caller's cwd."""
-    import argparse
-
     from herdr_run.cli import _resolved_cwd
     from herdr_run.config import Config
 
     target = str(tmp_path)
-    assert _resolved_cwd(Config(project_root="/elsewhere"), argparse.Namespace(cwd=target)) == target
+    assert _resolved_cwd(Config(project_root="/elsewhere"), target) == target
 
 
 def test_explicit_empty_cwd_means_the_project_root() -> None:
     """An explicitly supplied empty value is not the same as omitting --cwd."""
-    import argparse
-
     from herdr_run.cli import _resolved_cwd
     from herdr_run.config import Config
 
-    assert _resolved_cwd(
-        Config(project_root="/project", cwd="configured"), argparse.Namespace(cwd="")
-    ) == "/project"
+    assert _resolved_cwd(Config(project_root="/project", cwd="configured"), "") == "/project"
