@@ -18,6 +18,7 @@ pub mod reap;
 pub mod retention;
 pub mod runner;
 pub mod session;
+pub mod status;
 pub mod sweep;
 
 mod state;

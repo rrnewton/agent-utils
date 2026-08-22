@@ -366,6 +366,10 @@ mod tests {
             Ok(false)
         }
 
+        fn server_running(&self) -> bool {
+            true
+        }
+
         fn workspace_id_for_label(&self, _label: &str) -> Result<Option<String>> {
             Ok(self.workspace_exists.then(|| "w1".to_owned()))
         }

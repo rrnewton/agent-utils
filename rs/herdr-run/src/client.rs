@@ -244,6 +244,11 @@ impl Sleeper for ThreadSleeper {
 pub trait HerdrApi {
     /// Ensure a compatible server is running; return whether this call started it.
     fn ensure_server(&self) -> Result<bool>;
+    /// Report whether a server is running, WITHOUT starting one.
+    ///
+    /// Separate from [`HerdrApi::ensure_server`] because a read-only caller must be able to say
+    /// "no server" without becoming the reason there is one.
+    fn server_running(&self) -> bool;
     /// Resolve a workspace label, refusing ambiguous duplicate labels.
     fn workspace_id_for_label(&self, label: &str) -> Result<Option<String>>;
     /// Return the live label for a workspace ID, if that ID exists.
@@ -717,7 +722,8 @@ impl HerdrClient {
         object_entries(values, "workspace list entry")
     }
 
-    fn server_running(&self) -> bool {
+    /// Report whether a Herdr server is currently running, starting nothing.
+    pub fn server_running(&self) -> bool {
         let completed = match self.invoke(&strings(&["status", "--json"])) {
             Ok(completed) if completed.status == 0 => completed,
             _ => return false,
@@ -805,6 +811,10 @@ impl HerdrClient {
 impl HerdrApi for HerdrClient {
     fn ensure_server(&self) -> Result<bool> {
         HerdrClient::ensure_server(self)
+    }
+
+    fn server_running(&self) -> bool {
+        HerdrClient::server_running(self)
     }
 
     fn workspace_id_for_label(&self, label: &str) -> Result<Option<String>> {

@@ -490,6 +490,10 @@ mod tests {
             Ok(std::mem::take(&mut state.start_server))
         }
 
+        fn server_running(&self) -> bool {
+            true
+        }
+
         fn workspace_id_for_label(&self, label: &str) -> Result<Option<String>> {
             let mut state = self.state.lock().expect("state");
             state.calls.push(format!("workspace:{label}"));
@@ -639,6 +643,10 @@ mod tests {
     impl HerdrApi for CapFake {
         fn ensure_server(&self) -> Result<bool> {
             Ok(false)
+        }
+
+        fn server_running(&self) -> bool {
+            true
         }
 
         fn workspace_id_for_label(&self, _label: &str) -> Result<Option<String>> {

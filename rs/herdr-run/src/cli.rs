@@ -43,6 +43,10 @@ const SUBCOMMANDS: &[Subcommand] = &[
         summary: "say whether a command would be admitted; touch no pane",
     },
     Subcommand {
+        name: "status",
+        summary: "report the configuration, policy, and session in effect; change nothing",
+    },
+    Subcommand {
         name: "init",
         summary: "write an annotated .herdr-run.yaml in this directory",
     },
@@ -92,6 +96,7 @@ struct RunOptions {
 enum Selected {
     Run(RunOptions),
     Check(String),
+    Status,
     Init { force: bool },
     Config,
     Target { no_cache: bool },
@@ -321,7 +326,7 @@ fn parse_subcommand(name: &str, rest: &[String]) -> std::result::Result<Option<S
                 _ => Err(one_argument_error("check", &positional)),
             }
         }
-        "config" | "reap" | "net-doctor" | "userguide" => {
+        "status" | "config" | "reap" | "net-doctor" | "userguide" => {
             let Some(positional) = parse_bare(name, rest)? else {
                 return Ok(None);
             };
@@ -332,6 +337,7 @@ fn parse_subcommand(name: &str, rest: &[String]) -> std::result::Result<Option<S
                 ));
             }
             Ok(Some(match name {
+                "status" => Selected::Status,
                 "config" => Selected::Config,
                 "reap" => Selected::Reap,
                 "net-doctor" => Selected::NetDoctor,
@@ -537,6 +543,7 @@ fn dispatch(invocation: Invocation) -> Result<i32> {
     match invocation.selected {
         Selected::Run(options) => run_command(&config, &agent, json, &options),
         Selected::Check(command) => command_check(&config, &command, json),
+        Selected::Status => command_status(&config, &agent, json),
         Selected::Init { .. } => unreachable!("init is handled before configuration is loaded"),
         Selected::Config => command_config(&config, &agent),
         Selected::Target { no_cache } => command_target(&config, &agent, !no_cache),
@@ -567,6 +574,25 @@ fn command_init(directory: &Path, force: bool, json_output: bool) -> Result<i32>
         println!(
             "Every knob is in that file, set to the value in force today. The allowlist near the\ntop is a HUMAN-ONLY knob: an agent that can widen its own allowlist does not have one."
         );
+    }
+    Ok(0)
+}
+
+/// Report what is in effect here, and change nothing while doing it.
+fn command_status(config: &Config, agent: &str, json_output: bool) -> Result<i32> {
+    use crate::status::{inspect_session, status_document, status_text, Session};
+
+    let tab_label = tab_label_for(config, agent)?;
+    // A construction failure is a fact about the session worth REPORTING, not an error to exit on:
+    // "herdr is not installed" is one of the most useful things status can tell somebody.
+    let session = match HerdrClient::new(&config.broker) {
+        Ok(client) => inspect_session(&client, config, &tab_label),
+        Err(error) => Session::Unreachable(error.message().to_owned()),
+    };
+    if json_output {
+        print_json(&status_document(config, agent, &tab_label, &session))?;
+    } else {
+        print!("{}", status_text(config, agent, &tab_label, &session));
     }
     Ok(0)
 }
@@ -1199,6 +1225,13 @@ fn print_subcommand_help(name: &str) {
                 "\noptions:\n  -h, --help            show this help message and exit\n  --force               overwrite an existing configuration file"
             );
         }
+        "status" => {
+            println!("usage: herdr-run [GLOBAL OPTIONS] status");
+            println!(
+                "\nReport what is in effect here: which configuration file was found and where its\nroot is, what the policy admits, whether Herdr is reachable and running, and how\nmany panes the workspace already holds. Strictly non-mutating — it starts no\nserver and creates no workspace, tab, or pane."
+            );
+            println!("\noptions:\n  -h, --help            show this help message and exit");
+        }
         "config" => {
             println!("usage: herdr-run [GLOBAL OPTIONS] config");
             println!(
@@ -1412,7 +1445,7 @@ mod tests {
     fn every_subcommand_is_reachable_and_uniquely_named() {
         assert_eq!(
             subcommand_names(),
-            "check, config, init, net-doctor, reap, run, target, userguide"
+            "check, config, init, net-doctor, reap, run, status, target, userguide"
         );
         for subcommand in SUBCOMMANDS {
             assert!(

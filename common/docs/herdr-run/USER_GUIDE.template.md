@@ -45,6 +45,8 @@ running a command is what `run` is for.
 ```
 herdr-run run '<command>'          # run it; exits with the command's own exit code
 herdr-run check '<command>'        # policy only: allowed or refused. Touches no pane.
+herdr-run status                   # what is in effect here. Changes nothing.
+herdr-run init                     # write an annotated .herdr-run.yaml in this directory
 herdr-run target                   # resolve/bring up the pane; print ids and readiness
 herdr-run config                   # print the effective configuration as JSON
 herdr-run reap                     # report which command tabs are provably finished. Closes nothing.
@@ -71,7 +73,8 @@ herdr-run userguide                # this document
 | `--cwd PATH` | Working directory for the command. |
 | `--no-cache` | Ignore the session cache and re-resolve the pane from labels. |
 
-`target` also takes `--no-cache`. Every other subcommand takes no options of its own.
+`init` takes `--force`, and `target` also takes `--no-cache`. Every other subcommand takes no
+options of its own.
 Offering an option at the wrong level is an error that says which level it belongs to, so
 `herdr-run --cwd /tmp run …` tells you to write `herdr-run run --cwd /tmp …` rather than failing
 as an unrecognized argument. Run `herdr-run <subcommand> --help` for one subcommand's own options;
@@ -139,6 +142,45 @@ Unknown or duplicate keys, merge keys, non-finite/excessive timeouts, fractional
 days, retention beyond 365,000 days, a fractional/negative/oversized `max_panes`, control
 characters, and unsupported tab placeholders are hard errors. A typo'd policy key must not silently
 fall back to defaults.
+
+---
+
+## What is in effect here — `herdr-run status`
+
+```
+herdr-run status
+```
+
+Answers "what would happen if I ran something here?" the way `git status` does, and answers it by
+looking:
+
+```
+herdr-run status
+
+  configuration
+    file          /project/.herdr-run.yaml
+    project root  /project
+    spool dir     .herdr-run
+
+  policy
+    allow         git, gh
+    prefixes      with-proxy
+
+  session
+    agent         release-agent
+    workspace     agent-cmds
+    tab label     release-agent (not created yet)
+    herdr         installed; server is running
+    panes         3 in workspace 'agent-cmds'
+
+Nothing was changed: status only reads.
+```
+
+**Strictly non-mutating.** It starts no server and creates no workspace, tab, or pane — a status
+command that brought those up in order to describe them would be reporting on its own side
+effects, and the next reader could not tell the difference. Anything it could not observe is
+reported as unknown, with the reason, rather than guessed at. `--json` gives the same facts as one
+object.
 
 ---
 

@@ -78,6 +78,7 @@ a trust boundary at all.
 ## Quick reference
 
 ```
+herdr-run status                 what configuration, policy, and session are in effect
 herdr-run init                   write an annotated .herdr-run.yaml in this directory
 herdr-run run '<command>'        run the command; exits with the command's own exit code
 herdr-run check '<command>'      policy only: allowed or refused. Touches no pane.

@@ -630,6 +630,9 @@ mod tests {
         fn ensure_server(&self) -> Result<bool> {
             Ok(false)
         }
+        fn server_running(&self) -> bool {
+            true
+        }
         fn workspace_id_for_label(&self, _label: &str) -> Result<Option<String>> {
             Ok(None)
         }
@@ -750,6 +753,9 @@ mod tests {
         fn ensure_server(&self) -> Result<bool> {
             FakeApi.ensure_server()
         }
+        fn server_running(&self) -> bool {
+            FakeApi.server_running()
+        }
         fn workspace_id_for_label(&self, label: &str) -> Result<Option<String>> {
             FakeApi.workspace_id_for_label(label)
         }
@@ -851,6 +857,9 @@ mod tests {
     impl HerdrApi for NeverRunsApi {
         fn ensure_server(&self) -> Result<bool> {
             SelfShellApi.ensure_server()
+        }
+        fn server_running(&self) -> bool {
+            SelfShellApi.server_running()
         }
         fn workspace_id_for_label(&self, label: &str) -> Result<Option<String>> {
             SelfShellApi.workspace_id_for_label(label)

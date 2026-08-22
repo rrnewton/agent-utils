@@ -12,6 +12,7 @@ model.
 The installed CLI is the source of truth:
 
 - `herdr-run --help`
+- `herdr-run status` to see the configuration, policy, and session in effect; it changes nothing
 - `herdr-run config` to inspect the fully resolved policy
 - `herdr-run init` to write an annotated `.herdr-run.yaml` -- but note that `allow` inside it is a
   human-only knob: do not add programs to it on your own initiative

@@ -269,6 +269,7 @@ _SUBCOMMANDS: tuple[str, ...] = (
     "net-doctor",
     "reap",
     "run",
+    "status",
     "target",
     "userguide",
 )
@@ -284,6 +285,7 @@ _LOCAL_OPTIONS: dict[str, frozenset[str]] = {
     "check": frozenset({"--help"}),
     "config": frozenset({"--help"}),
     "init": frozenset({"--help", "--force"}),
+    "status": frozenset({"--help"}),
     "target": frozenset({"--help", "--no-cache"}),
     "reap": frozenset({"--help"}),
     "net-doctor": frozenset({"--help"}),
@@ -951,6 +953,78 @@ def _reap(harness: Harness, report: Report) -> None:
     )
 
 
+#: `status` fixtures name a workspace no real session would carry, so a host that happens to be
+#: running a live Herdr server cannot resolve it and the report stays the same everywhere.
+_STATUS_CONFIG = f"""\
+workspace: {_REAP_WORKSPACE}
+allow: [git, gh]
+prefixes: [with-proxy]
+spool_dir: .herdr-run
+"""
+
+_STATUS_ANY_CONFIG = f"""\
+workspace: {_REAP_WORKSPACE}
+allow: ["*"]
+prefixes: []
+"""
+
+
+def _status(harness: Harness, report: Report) -> None:
+    """`status` must read the same and say the same, and must still be read-only in both."""
+
+    case = harness.case("status", {".herdr-run.yaml": _STATUS_CONFIG})
+    python, rust = harness.invoke(case, ("--agent", "fixture-agent", "status"))
+    report.exact("status/text", python, rust, expected_rc=0)
+    for fragment in (
+        "    file          <ROOT>/.herdr-run.yaml\n",
+        "    project root  <ROOT>\n",
+        "    spool dir     .herdr-run\n",
+        "    allow         git, gh\n",
+        "    prefixes      with-proxy\n",
+        "    agent         fixture-agent\n",
+        f"    workspace     {_REAP_WORKSPACE}\n",
+        "    tab label     fixture-agent",
+        "\nNothing was changed: status only reads.\n",
+    ):
+        report.require(
+            f"status/text-says/{fragment.split()[0]}",
+            fragment in python.stdout,
+            f"status omitted {fragment!r}: {_describe(python)}",
+        )
+
+    json_python, json_rust = harness.invoke(
+        case, ("--json", "--agent", "fixture-agent", "status")
+    )
+    report.exact("status/json", json_python, json_rust, expected_rc=0)
+    report.require(
+        "status/json-shape",
+        '"agent": "fixture-agent"' in json_python.stdout
+        and '"allow_any_program": false' in json_python.stdout
+        and '"config_file": "<ROOT>/.herdr-run.yaml"' in json_python.stdout
+        and '"label": "fixture-agent"' in json_python.stdout
+        and f'"workspace": "{_REAP_WORKSPACE}"' in json_python.stdout,
+        f"status JSON changed shape: {_describe(json_python)}",
+    )
+
+    # Nothing status did may have created state on disk either.
+    for edition, root in (("python", case.python_root), ("rust", case.rust_root)):
+        report.require(
+            f"status/creates-nothing/{edition}",
+            not (root / ".herdr-run").exists(),
+            "status created spool state in a directory it was only supposed to describe",
+        )
+
+    wildcard = harness.case("status-allow-any", {".herdr-run.yaml": _STATUS_ANY_CONFIG})
+    python, rust = harness.invoke(wildcard, ("--agent", "fixture-agent", "status"))
+    report.exact("status/allow-everything", python, rust, expected_rc=0)
+    report.require(
+        "status/allow-everything-shape",
+        '    allow         any program ("*")\n' in python.stdout
+        and "    prefixes      (none)\n" in python.stdout,
+        f"the allow-everything mode was not reported as such: {_describe(python)}",
+    )
+
+
 def _init(harness: Harness, report: Report) -> None:
     """`init` must write the same bytes in both editions, and both must then read them the same.
 
@@ -1019,6 +1093,7 @@ def build_report(
         _config_malformed(harness, report)
         _dry_run(harness, report)
         _init(harness, report)
+        _status(harness, report)
         _reap(harness, report)
     report.notes.append(
         "external fake-Herdr lifecycle/protocol checks were not run: production resolution "
