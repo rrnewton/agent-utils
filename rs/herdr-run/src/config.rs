@@ -842,6 +842,87 @@ mod tests {
         assert_eq!(config.broker, "direct");
     }
 
+    /// Every ``  `key` (value by default)  `` the shipped guide states in prose.
+    fn prose_defaults(guide: &str) -> Vec<(String, String)> {
+        let mut found = Vec::new();
+        for (end, _) in guide.match_indices(" by default)") {
+            let head = &guide[..end];
+            let Some(open) = head.rfind('(') else {
+                continue;
+            };
+            let value = &head[open + 1..];
+            if value.is_empty() || value.contains(')') {
+                continue;
+            }
+            let before = head[..open].trim_end();
+            let Some(stripped) = before.strip_suffix('`') else {
+                continue;
+            };
+            let Some(tick) = stripped.rfind('`') else {
+                continue;
+            };
+            let key = &stripped[tick + 1..];
+            if key.is_empty()
+                || !key
+                    .chars()
+                    .all(|character| character.is_ascii_lowercase() || character == '_')
+            {
+                continue;
+            }
+            found.push((key.to_owned(), value.to_owned()));
+        }
+        found
+    }
+
+    /// The guide restates two defaults in prose; those sentences must say what the code does.
+    ///
+    /// `herdr-run init` exists so the guide can point at a generated file rather than list the
+    /// knobs, and it does that everywhere except the two sentences explaining why retention and
+    /// the pane cap exist. Those name the number, which is the same duplicate-free-to-drift one
+    /// layer up. As with `max_panes` above, the number is written LITERALLY here and the constant
+    /// is READ from the defaults, so changing either one alone goes red.
+    #[test]
+    fn user_guide_prose_defaults_are_the_built_in_defaults() {
+        let expected: &[(&str, &str, u64)] =
+            &[("retention_days", "four", 4), ("max_panes", "32", 32)];
+        let config = Config::default();
+        for (key, _spelling, number) in expected {
+            let actual = match *key {
+                "retention_days" => config.retention_days,
+                "max_panes" => config.max_panes,
+                other => panic!("nothing reads the default for {other}"),
+            };
+            assert_eq!(
+                actual, *number,
+                "the built-in {key} is not what the guide says"
+            );
+        }
+
+        let found = prose_defaults(crate::USER_GUIDE);
+        assert!(
+            !found.is_empty(),
+            "the user guide no longer restates any default in prose; drop the entries here too"
+        );
+        for (key, spelling) in &found {
+            let pinned = expected
+                .iter()
+                .find(|(name, _, _)| name == key)
+                .unwrap_or_else(|| {
+                    panic!("the guide restates a default for '{key}' that nothing pins")
+                });
+            assert_eq!(
+                spelling, pinned.1,
+                "the user guide says {key} defaults to '{spelling}'"
+            );
+        }
+        for (key, _spelling, _number) in expected {
+            assert!(
+                found.iter().any(|(name, _)| name == key),
+                "a pinned prose default is no longer in the shipped guide: {key}"
+            );
+        }
+    }
+
     #[test]
     fn parses_every_supported_key_and_replaces_maps_wholesale() {
         let document = serde_json::json!({
