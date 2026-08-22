@@ -70,6 +70,18 @@ _DOCUMENTS: dict[str, str] = {
 
 _GLOBAL_OPTIONS = ("--help", "-h", "--version", "--json", "--config", "--agent")
 
+#: Subcommands that never load a configuration file, and the reason each one does not.
+#:
+#: ``--config`` is refused for these rather than accepted and ignored. It is not an inert flag: it
+#: reads as an instruction about which configuration file to use, and ``herdr-run --config P init``
+#: reads as an instruction to write ``P``. Accepting an instruction and then disregarding it is the
+#: defect this surface exists to remove, so the answer is a refusal that says why.
+_CONFIG_BLIND: dict[str, str] = {
+    "init": "it WRITES one, into the current directory",
+    "quickstart": "it prints a packaged document",
+    "userguide": "it prints a packaged document",
+}
+
 
 class _UsageError(Exception):
     """A command line this surface cannot accept, carrying the message to print."""
@@ -233,6 +245,20 @@ def _local_argument_error(subcommand: str, token: str) -> str:
             f"not a '{subcommand}' option"
         )
     return f"{subcommand}: unrecognized arguments: {token}"
+
+
+def _config_blind_error(subcommand: str) -> str:
+    """Describe ``--config`` offered to a subcommand that reads no configuration file."""
+    message = (
+        f"argument --config: '{subcommand}' reads no configuration file; "
+        f"{_CONFIG_BLIND[subcommand]}."
+    )
+    if subcommand == "init":
+        return (
+            message + "\nRun it from the directory you want the file in:"
+            f"\n  cd DIRECTORY && herdr-run {subcommand}"
+        )
+    return message + "\nDrop --config."
 
 
 def _misplaced_global(name: str) -> str:
@@ -425,7 +451,12 @@ def _parse(raw: Sequence[str]) -> _Invocation:
         # No subcommand at all is not an error: it is somebody asking what this command is.
         _print_help()
         raise _EarlyExit()
-    return _parse_subcommand(chosen, raw[index:], globals_)
+    invocation = _parse_subcommand(chosen, raw[index:], globals_)
+    # After the subcommand's own parse, so that `--config P init --help` still prints init's help
+    # and `--config P init --nonsense` still names the option it could not accept.
+    if globals_.config is not None and chosen in _CONFIG_BLIND:
+        raise _UsageError(_config_blind_error(chosen))
+    return invocation
 
 
 # --- help ---------------------------------------------------------------------------------------
@@ -500,6 +531,8 @@ _SUBCOMMAND_HELP: dict[str, str] = {
         "\noptions:\n"
         "  -h, --help            show this help message and exit\n"
         "  --force               overwrite an existing configuration file\n"
+        "\nThis command reads no configuration file, so the global --config option is\n"
+        "refused here rather than accepted and ignored.\n"
     ),
     "status": (
         "usage: herdr-run [GLOBAL OPTIONS] status\n"
@@ -548,6 +581,8 @@ _SUBCOMMAND_HELP: dict[str, str] = {
         "knowing before running anything real.\n"
         "\noptions:\n"
         "  -h, --help            show this help message and exit\n"
+        "\nThis command reads no configuration file, so the global --config option is\n"
+        "refused here rather than accepted and ignored.\n"
     ),
     "userguide": (
         "usage: herdr-run [GLOBAL OPTIONS] userguide\n"
@@ -555,6 +590,8 @@ _SUBCOMMAND_HELP: dict[str, str] = {
         "the pane cap, and the trust model.\n"
         "\noptions:\n"
         "  -h, --help            show this help message and exit\n"
+        "\nThis command reads no configuration file, so the global --config option is\n"
+        "refused here rather than accepted and ignored.\n"
     ),
 }
 

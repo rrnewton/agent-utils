@@ -89,7 +89,7 @@ herdr-run userguide                # this document
 
 | Option | Effect |
 | --- | --- |
-| `--config PATH` | Use an explicit configuration file instead of the discovered one. |
+| `--config PATH` | Use an explicit configuration file instead of the discovered one. Refused by `init`, `quickstart`, and `userguide`, which read no configuration file at all. |
 | `--agent NAME` | The agent this invocation speaks for; names its tab. Otherwise `$HERDR_RUN_AGENT`, `$DG_AGENT_NAME`, or `$ORC_AGENT_NAME`. |
 | `--json` | Emit machine-readable output where the subcommand has one. |
 | `--version` | Print the version and exit. |
@@ -109,7 +109,10 @@ options of its own.
 Offering an option at the wrong level is an error that says which level it belongs to, so
 `herdr-run --cwd /tmp run …` tells you to write `herdr-run run --cwd /tmp …` rather than failing
 as an unrecognized argument. Run `herdr-run <subcommand> --help` for one subcommand's own options;
-neither level's help documents the other's.
+neither level's help documents the other's. An option at the right level that the chosen subcommand
+still cannot observe is refused too: `herdr-run --config P init` reads as an instruction to write
+`P` and would in fact write `./.herdr-run.yaml`, so it fails and says so rather than doing
+something else quietly.
 
 ```
 herdr-run --agent release-agent run --timeout 60 'with-proxy git ls-remote origin main'

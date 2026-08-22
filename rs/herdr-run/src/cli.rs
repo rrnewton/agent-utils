@@ -320,6 +320,13 @@ where
         Some(selected) => selected,
         None => return Ok(ParseResult::Exit(0)),
     };
+    // After the subcommand's own parse, so that `--config P init --help` still prints init's help
+    // and `--config P init --nonsense` still names the option it could not accept.
+    if globals.config.is_some() {
+        if let Some(reason) = config_blind_reason(subcommand.name) {
+            return Err(config_blind_error(subcommand.name, reason));
+        }
+    }
     Ok(ParseResult::Invocation(Box::new(Invocation {
         globals,
         selected,
@@ -497,6 +504,32 @@ fn local_argument_error(subcommand: &str, token: &str) -> String {
         );
     }
     format!("{subcommand}: unrecognized arguments: {token}")
+}
+
+/// Why a subcommand loads no configuration file, or `None` when it does load one.
+///
+/// `--config` is refused for these rather than accepted and ignored. It is not an inert flag: it
+/// reads as an instruction about which configuration file to use, and `herdr-run --config P init`
+/// reads as an instruction to write `P`. Accepting an instruction and then disregarding it is the
+/// defect this surface exists to remove, so the answer is a refusal that says why.
+fn config_blind_reason(subcommand: &str) -> Option<&'static str> {
+    match subcommand {
+        "init" => Some("it WRITES one, into the current directory"),
+        "quickstart" | "userguide" => Some("it prints a packaged document"),
+        _ => None,
+    }
+}
+
+/// Describe `--config` offered to a subcommand that reads no configuration file.
+fn config_blind_error(subcommand: &str, reason: &str) -> String {
+    let message =
+        format!("argument --config: '{subcommand}' reads no configuration file; {reason}.");
+    if subcommand == "init" {
+        return format!(
+            "{message}\nRun it from the directory you want the file in:\n  cd DIRECTORY && herdr-run {subcommand}"
+        );
+    }
+    format!("{message}\nDrop --config.")
 }
 
 /// Describe an option that appeared before the subcommand but belongs to one of them.
@@ -1216,6 +1249,9 @@ fn print_help() {
     print!("{}", help_text());
 }
 
+/// Said by every subcommand that `config_blind_reason` names, so the refusal is never a surprise.
+const CONFIG_BLIND_NOTE: &str = "\nThis command reads no configuration file, so the global --config option is\nrefused here rather than accepted and ignored.\n";
+
 /// Build one subcommand's help so it can be asserted on as text, not only printed.
 fn subcommand_help_text(name: &str) -> String {
     let mut text = String::new();
@@ -1239,6 +1275,7 @@ fn subcommand_help_text(name: &str) -> String {
             text.push_str("usage: herdr-run [GLOBAL OPTIONS] init [OPTIONS]\n");
             text.push_str("\nWrite an annotated .herdr-run.yaml into the current directory, the way 'git init'\nwrites into the current directory. Every knob is present and set to the value in\nforce today, so adopting the file changes nothing until you edit it. Refuses to\noverwrite an existing configuration.\n");
             text.push_str("\noptions:\n  -h, --help            show this help message and exit\n  --force               overwrite an existing configuration file\n");
+            text.push_str(CONFIG_BLIND_NOTE);
         }
         "status" => {
             text.push_str("usage: herdr-run [GLOBAL OPTIONS] status\n");
@@ -1269,11 +1306,13 @@ fn subcommand_help_text(name: &str) -> String {
             text.push_str("usage: herdr-run [GLOBAL OPTIONS] quickstart\n");
             text.push_str("\nPrint the one-screen introduction: what this command is for, the four commands\nworth trying first, the shape of the command line, and the five things worth\nknowing before running anything real.\n");
             text.push_str("\noptions:\n  -h, --help            show this help message and exit\n");
+            text.push_str(CONFIG_BLIND_NOTE);
         }
         "userguide" => {
             text.push_str("usage: herdr-run [GLOBAL OPTIONS] userguide\n");
             text.push_str("\nPrint the complete reference: configuration, exit codes, readiness, retention,\nthe pane cap, and the trust model.\n");
             text.push_str("\noptions:\n  -h, --help            show this help message and exit\n");
+            text.push_str(CONFIG_BLIND_NOTE);
         }
         other => text.push_str(&format!("usage: herdr-run [GLOBAL OPTIONS] {other}\n")),
     }
@@ -1392,6 +1431,53 @@ mod tests {
         // --no-cache belongs to two subcommands, and both must be named.
         let error = parse_args(&["--no-cache", "target"]).expect_err("global --no-cache");
         assert!(error.contains("'run' or 'target'"), "{error}");
+    }
+
+    /// A global option a subcommand cannot observe must be refused, not accepted and ignored.
+    ///
+    /// `--config` is not inert: it reads as an instruction about which configuration file to use,
+    /// and `herdr-run --config P init` reads as an instruction to write `P`. It used to be
+    /// accepted and silently disregarded, which is the same accept-anything defect the two-level
+    /// surface exists to remove.
+    #[test]
+    fn config_is_refused_by_the_subcommands_that_read_no_configuration() {
+        for arguments in [
+            vec!["--config", "x.yaml", "init"],
+            vec!["--config=x.yaml", "init"],
+            vec!["--config", "x.yaml", "init", "--force"],
+            vec!["--config", "x.yaml", "quickstart"],
+            vec!["--config", "x.yaml", "userguide"],
+        ] {
+            let error = parse_args(&arguments).expect_err(&arguments.join(" "));
+            assert!(
+                error.contains("argument --config:")
+                    && error.contains("reads no configuration file"),
+                "{arguments:?}: {error}"
+            );
+        }
+        let error = parse_args(&["--config", "x.yaml", "init"]).expect_err("init");
+        assert!(error.contains("cd DIRECTORY && herdr-run init"), "{error}");
+
+        // The subcommands that DO read configuration are untouched.
+        for subcommand in ["status", "config", "reap", "net-doctor", "target"] {
+            parse_args(&["--config", "x.yaml", subcommand])
+                .unwrap_or_else(|error| panic!("{subcommand}: {error}"));
+        }
+    }
+
+    /// The subcommand's own parse still wins: `--help` still helps, a bad local option is named.
+    #[test]
+    fn the_subcommands_own_parse_wins_over_the_config_refusal() {
+        let outcome = parse(
+            ["--config", "x.yaml", "init", "--help"]
+                .iter()
+                .map(OsString::from),
+        )
+        .expect("help is not an error");
+        assert!(matches!(outcome, ParseResult::Exit(0)));
+
+        let error = parse_args(&["--config", "x.yaml", "init", "--nonsense"]).expect_err("local");
+        assert!(error.contains("--nonsense"), "{error}");
     }
 
     /// The bare form is gone, and its removal names the exact replacement.

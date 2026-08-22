@@ -122,6 +122,63 @@ def test_an_option_at_the_wrong_level_is_refused_and_says_which_level_it_belongs
     assert captured.out == ""
 
 
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--config", "x.yaml", "init"],
+        ["--config=x.yaml", "init"],
+        ["--config", "x.yaml", "init", "--force"],
+        ["--config", "x.yaml", "quickstart"],
+        ["--config", "x.yaml", "userguide"],
+    ],
+)
+def test_config_is_refused_by_the_subcommands_that_read_no_configuration(
+    argv: list[str],
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: object,
+) -> None:
+    """A global option offered to a subcommand that cannot observe it must not be ignored.
+
+    `--config` is not inert: it reads as an instruction about which configuration file to use, and
+    `herdr-run --config P init` reads as an instruction to write `P`. It used to be accepted and
+    silently disregarded, which is the same accept-anything defect the two-level surface exists to
+    remove.
+
+    Run from a scratch directory, because a regression here means `init` really runs.
+    """
+    monkeypatch.chdir(str(tmp_path))
+    assert main(argv) == 2
+    captured = capsys.readouterr()
+    assert "argument --config:" in captured.err, captured.err
+    assert "reads no configuration file" in captured.err, captured.err
+    assert captured.out == ""
+
+
+def test_a_refused_config_before_init_writes_nothing(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: object,
+) -> None:
+    """The refusal is total: `init` never runs, so no configuration file appears."""
+    root = str(tmp_path)
+    monkeypatch.chdir(root)
+    assert main(["--config", os.path.join(root, "elsewhere.yaml"), "init"]) == 2
+    assert "cd DIRECTORY && herdr-run init" in capsys.readouterr().err
+    assert os.listdir(root) == []
+
+
+def test_the_subcommands_own_parse_still_wins_over_the_config_refusal(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`--help` still helps, and a bad local option is still named as the local option it is."""
+    assert main(["--config", "x.yaml", "init", "--help"]) == 0
+    assert "usage: herdr-run [GLOBAL OPTIONS] init" in capsys.readouterr().out
+
+    assert main(["--config", "x.yaml", "init", "--nonsense"]) == 2
+    assert "--nonsense" in capsys.readouterr().err
+
+
 def test_the_bare_command_form_is_refused_with_the_run_replacement(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

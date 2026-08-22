@@ -412,10 +412,29 @@ def _levels(harness: Harness, report: Report, case: PairCase) -> None:
         ("local-json", ("run", "--json", "git status")),
         ("foreign-dry-run", ("check", "--dry-run", "git status")),
         ("foreign-cwd", ("reap", "--cwd", "/tmp")),
+        # Right level, wrong subcommand: `--config` is global, but these three read no
+        # configuration file, so accepting it would be accepting an instruction and then
+        # disregarding it. `--config P init` is the acute one: it reads as "write P".
+        ("config-blind-init", ("--config", "x.yaml", "init")),
+        ("config-blind-init-inline", ("--config=x.yaml", "init")),
+        ("config-blind-init-force", ("--config", "x.yaml", "init", "--force")),
+        ("config-blind-quickstart", ("--config", "x.yaml", "quickstart")),
+        ("config-blind-userguide", ("--config", "x.yaml", "userguide")),
     )
     for label, args in misplaced:
         python, rust = harness.invoke(case, args)
         report.exact(f"levels/{label}", python, rust, expected_rc=2)
+
+    # The subcommand's own parse still wins, so `--help` and a bad local option are unaffected.
+    python, rust = harness.invoke(case, ("--config", "x.yaml", "init", "--help"))
+    report.exact("levels/config-blind-init-still-helps", python, rust, expected_rc=0)
+    python, rust = harness.invoke(case, ("--config", "x.yaml", "init", "--nonsense"))
+    report.exact("levels/config-blind-init-names-local-option", python, rust, expected_rc=2)
+    report.require(
+        "levels/config-blind-init-names-local-option-first",
+        "--nonsense" in python.stderr,
+        f"the local option error was replaced by the --config refusal: {_describe(python)}",
+    )
 
 
 def _removed_bare_form(harness: Harness, report: Report, case: PairCase) -> None:
@@ -1131,6 +1150,18 @@ def _init(harness: Harness, report: Report) -> None:
     that file instead of restating it: the file is the reference, so a reference that differed
     between editions would be two references.
     """
+
+    # `--config PATH` reads as "write PATH" here and would in fact write ./.herdr-run.yaml, so it
+    # is refused. The refusal has to be total: nothing written, in either edition.
+    refused = harness.case("init-config-refused")
+    python, rust = harness.invoke(refused, ("--config", "elsewhere.yaml", "init"))
+    report.exact("init/config-is-refused", python, rust, expected_rc=2)
+    report.require(
+        "init/config-refusal-writes-nothing",
+        not (refused.python_root / ".herdr-run.yaml").exists()
+        and not (refused.rust_root / ".herdr-run.yaml").exists(),
+        "a refused '--config PATH init' still wrote a configuration file",
+    )
 
     case = harness.case("init")
     python, rust = harness.invoke(case, ("init",))
