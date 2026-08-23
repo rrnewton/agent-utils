@@ -6,8 +6,12 @@
 > deliberately: rewriting a record to look tidier destroys the evidence it exists to be.
 > Nothing here describes `agent-utils` itself. See `#67 standalone-repo`.
 >
-> This record was written before the tool was renamed to `dagrun`; only the name has been
-> updated, and nothing else about the record has changed.
+> This record was written before the tool was renamed to `dagrun`. The rename was applied
+> throughout: not only the tool's name but the identifiers that carry it — environment
+> variables, paths, crate and package names, and cgroup scope prefixes — read as they do
+> today rather than as they did on the day. **The measurements, dates, commands and
+> findings are unchanged.** Said precisely because the paragraph above promises this record
+> is kept as written, and a claim that nothing changed would not have been true.
 
 Date: 2026-08-17
 

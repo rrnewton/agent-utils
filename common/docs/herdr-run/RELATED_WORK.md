@@ -41,7 +41,8 @@ always launches through `systemd-run --user`, which reparents the server onto th
 outside the jail. `herdr-run net-doctor` exists to catch the case where a bad server is already running.
 
 **Not touched.** `pane_owner.py` stays as it is. It is validate-specific (it binds panes to
-`validate-*.service` units, durable logs, and `dagrun-*` cgroup discovery), and folding it into a
+`validate-*.service` units, durable logs, and cgroup discovery keyed on the runner's own scope
+prefix), and folding it into a
 generic runner would drag validate's admission policy into a general utility.
 
 ---
