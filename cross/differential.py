@@ -2,9 +2,9 @@
 """Python-vs-Rust differential tester for dagrun.
 
 Prove the Python and Rust builds produce identical OBSERVABLE behavior. For a set of
-representative and randomized DAG fixtures, this runs BOTH the Python CLI
-(``python3 -m dagrun``) and a private copy of the executable resolved by the tracked
-``rs/bin`` Cargo launcher and asserts:
+representative and randomized DAG fixtures, this runs BOTH the Python CLI (``python3 -m dagrun``)
+and a private copy of the executable resolved by the tracked ``rs/bin`` Cargo launcher and
+asserts:
 
 * ``list``, ``ascii``, ``dot`` stdout are BYTE-IDENTICAL.
 * ``json`` stdout is BYTE-IDENTICAL (both builds emit ``ensure_ascii=False`` canonical JSON, so
@@ -113,9 +113,9 @@ NOPROF = "--no-profile"
 #: proven separately by :func:`compare_plan_feedback` against a fixed SYNTHETIC store.
 NOFB = "--no-profile-feedback"
 
-#: Feedback identity envs (mirrors dagrun.estimates): pin the machine id + container
-#: class so the feedback reader loads a fixed synthetic ``step_profiles_<mid>_<cc>.csv`` regardless
-#: of the host, making the plan/sizing feedback checks deterministic everywhere.
+#: Feedback identity envs (mirrors dagrun.estimates): pin the machine id + container class so the
+#: feedback reader loads a fixed synthetic ``step_profiles_<mid>_<cc>.csv`` regardless of the host,
+#: making the plan/sizing feedback checks deterministic everywhere.
 SYNTH_MACHINE = "cross_synth_machine"
 SYNTH_CONTAINER = "cross_synth_container"
 

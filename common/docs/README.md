@@ -15,8 +15,8 @@ Each template contains one `{{DISTRIBUTION}}` placeholder. The corresponding
 to the generated documents; packaged artifacts contain ordinary files and remain self-contained.
 
 `agent-team-timeline/` is a single-implementation tool, so its `README.md` and `USER_GUIDE.md` are
-canonical directly. `dagrun/PLANNER_DESIGN.md` specifies the CPA allocator shared by its
-implementations.
+canonical directly. `dagrun/PLANNER_DESIGN.md` specifies the CPA allocator shared by that tool's
+two implementations.
 
 After editing a template, fragment, or single-implementation document, refresh and verify the
 outputs:

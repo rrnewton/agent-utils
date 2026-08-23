@@ -4,9 +4,9 @@
 //
 // Pure data + pure helpers, no I/O. A caller describes their build/test graph as a set of
 // [`Step`] values (each carrying a [`ResourceHint`]) bundled in a [`DagConfig`], then hands
-// it to the runner. Direct port of `py/dagrun/model.py`; the enum serde values,
-// defaults, and the [`step_failure_reason`] precedence + strings are kept identical to the
-// Python build so the two are cross-differential-testable.
+// it to the runner. Direct port of `py/dagrun/model.py`; the enum serde values, defaults,
+// and the [`step_failure_reason`] precedence + strings are kept identical to the Python
+// build so the two are cross-differential-testable.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;

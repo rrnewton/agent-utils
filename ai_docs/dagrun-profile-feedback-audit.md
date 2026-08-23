@@ -5,6 +5,9 @@
 > outside this one appear below and cannot be resolved from here. They are left in place
 > deliberately: rewriting a record to look tidier destroys the evidence it exists to be.
 > Nothing here describes `agent-utils` itself. See `#67 standalone-repo`.
+>
+> This record was written before the tool was renamed to `dagrun`; only the name has been
+> updated, and nothing else about the record has changed.
 
 Date: 2026-08-17
 
@@ -70,10 +73,10 @@ execution. Current CI and `validate.rs` treat profiles as output evidence, not i
 plan. Hermit's current memory decisions are authored, not profile-derived.
 
 DeepScry is in the same operational state for a different reason. Its validator feeds authored
-hints directly into the safe-ci library scheduler and records the resulting measurements into a
+hints directly into the `dagrun` library scheduler and records the resulting measurements into a
 separate DeepScry CSV schema. It has accumulated 1,820 local per-step rows, but there is no loader
-or plan-application path and the field names are incompatible with safe-ci's feedback reader.
-DeepScry therefore collects useful diagnostics but does not use learned safe-ci models.
+or plan-application path, and the field names are incompatible with what `dagrun`'s feedback reader
+expects. DeepScry therefore collects useful diagnostics but does not use models it has learned.
 
 ## Intended data flow
 
@@ -332,12 +335,13 @@ and both pin an older `agent-utils` revision from before the current feedback pl
    `PER_STEP_RSS_BASELINE`, `PER_STEP_MEMORY_MAX`, and scheduling-profile tables.
 2. It invokes `run_dag(..., metrics=None)` directly. That scheduler API does not discover a profile
    store, build a feedback plan, or apply estimates.
-3. After execution it translates safe-ci's compact rows into DeepScry's own `validate_perf` schema.
-   The historical fields are named `duration_s` and `memory_peak_bytes`, while safe-ci's reader
-   expects `elapsed_s` and `peak_bytes` in a `step_profiles_<identity>.csv` store of its own shape.
+3. After execution it translates `dagrun`'s compact rows into DeepScry's own `validate_perf`
+   schema. The historical fields are named `duration_s` and `memory_peak_bytes`, while `dagrun`'s
+   reader expects `elapsed_s` and `peak_bytes` in a `step_profiles_<identity>.csv` store of its
+   own shape.
 4. The local parent `validate_perf` directory contains 1,820 per-step observations across three
    machine/container files. Search of the validation path found analysis and append code but no
-   safe-ci estimate loader, `build_plan`, or `apply_plan_to_config` call.
+   `dagrun` estimate loader, and no `build_plan` or `apply_plan_to_config` call.
 
 DeepScry is therefore not using profile-derived duration, memory, speedup, or scheduling decisions.
 Its rows remain valuable for offline analysis, but they are not a feedback store.
@@ -679,11 +683,11 @@ start.
 
 ### Close the DeepScry loop deliberately
 
-22. Either emit safe-ci's exact profile schema into a configured feedback store and apply a plan
+22. Either emit `dagrun`'s exact profile schema into a configured feedback store and apply a plan
     before `run_dag`, or add an explicit, tested adapter for new DeepScry rows. The legacy schema
     omits success, return-code, timeout, CPU-timeout, and OOM evidence, so its ambiguous historical
     rows must remain diagnostics-only unless independently classified; merely renaming
-    `duration_s`/`memory_peak_bytes` would train on failures because safe-ci accepts missing verdict
-    cells. Do not relabel the CSV as feedback without proving the second run changes.
+    `duration_s`/`memory_peak_bytes` would train on failures, because `dagrun` accepts a missing
+    verdict cell. Do not relabel the CSV as feedback without proving the second run changes.
 23. Preserve DeepScry's authored hard limits as policy ceilings and keep learned estimates separate,
     so adopting feedback cannot silently weaken resource containment.

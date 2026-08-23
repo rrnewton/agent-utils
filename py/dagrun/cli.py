@@ -98,9 +98,9 @@ CGROUP_SETUP_ENVIRONMENT_ERROR = (
 PROFILE_DIR_ENV = "DAGRUN_PROFILE_DIR"
 
 #: Default profile-store directory, RELATIVE TO THE CURRENT WORKING DIRECTORY, used when neither
-#: ``--perf-dir`` nor ``$DAGRUN_PROFILE_DIR`` is set and ``--no-profile`` is absent.
-#: Created on demand. Runs (and sweeps) auto-append here so profiling data lands somewhere obvious
-#: and browsable without any flag.
+#: ``--perf-dir`` nor ``$DAGRUN_PROFILE_DIR`` is set and ``--no-profile`` is absent. Created on
+#: demand. Runs (and sweeps) auto-append here so profiling data lands somewhere obvious and
+#: browsable without any flag.
 DEFAULT_PROFILE_DIR = os.path.join(".dagrun", "profiles")
 
 # Largest total-CPU limit safe to encode in the fixed 100000-us per-step cpu.max period.
@@ -1373,9 +1373,8 @@ def _expand_stress(cfg: DagConfig, n: int) -> DagConfig:
                     # path: N copies write one file, the last writer wins, nothing errors,
                     # and the result is one sample wearing the label of N. The #NN suffix
                     # cannot serve -- it is part of the job NAME, which the command never
-                    # sees -- and DAGRUN_STEP is an ownership nonce
-                    # (pid:counter:time_ns), so it is unstable across reruns and is not an
-                    # index.
+                    # sees -- and DAGRUN_STEP is an ownership nonce (pid:counter:time_ns),
+                    # so it is unstable across reruns and is not an index.
                     env={
                         **step.env,
                         STRESS_COPY_ENV: f"{index:0{len(str(n))}d}",
@@ -2154,12 +2153,12 @@ def _resolve_cgroup_manager(
             )
         return None, 0
     # Default: boxing is required -> re-exec into a transient systemd --user scope.
-    # Re-exec through __main__.py by absolute path (NOT '-m dagrun'): the tool is
-    # invoked via the py/bin symlink without a pip install, so a fresh child interpreter's
-    # sys.path lacks py/ and '-m dagrun' dies with 'No module named
-    # dagrun'. __main__.py does its own sys.path fixup, so invoking it directly
-    # imports the package cleanly. This keeps default-on boxing working outside CI (local
-    # validate.sh), not just in Actions where boxing is skipped.
+    # Re-exec through __main__.py by absolute path (NOT '-m dagrun'): the tool is invoked
+    # via the py/bin symlink without a pip install, so a fresh child interpreter's
+    # sys.path lacks py/ and '-m dagrun' dies with 'No module named dagrun'. __main__.py
+    # does its own sys.path fixup, so invoking it directly imports the package cleanly.
+    # This keeps default-on boxing working outside CI (local validate.sh), not just in
+    # Actions where boxing is skipped.
     _main_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "__main__.py")
     argv = [sys.executable, _main_py, *sys.argv[1:]]
     outer_memory_max = cg.outer_memory_max_bytes(max_mem_bytes)

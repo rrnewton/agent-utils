@@ -5,7 +5,8 @@ python3 -m pip install dagrun
 ```
 
 Python 3.10 or newer is required. Installation provides both console commands,
-the typed `dagrun` package, and this guide as package data.
+the typed `dagrun` package, and this guide as package data. The distribution and
+the import name are the same word.
 
 ```python
 from dagrun import DagConfig, Step, to_ascii

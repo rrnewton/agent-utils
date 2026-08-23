@@ -59,10 +59,10 @@ DEFAULT_SMALL_CPU_TIMEOUT = 10  # 10 s CPU-time budget when cpu_timeout is unset
 #: one (hiding the very hangs the budget exists to catch).
 #:
 #: 1.0 is a strict no-op: unset, every platform enforces the canonical budget exactly as before.
-#: A platform opts in explicitly (`--cpu-timeout-multiplier`, or
-#: $DAGRUN_CPU_TIMEOUT_MULTIPLIER in a lane's environment), and every breach message
-#: then states the canonical budget, the multiplier and the platform label, so a kill stays
-#: attributable to a specific policy rather than to an anonymous number.
+#: A platform opts in explicitly (`--cpu-timeout-multiplier`, or $DAGRUN_CPU_TIMEOUT_MULTIPLIER
+#: in a lane's environment), and every breach message then states the canonical budget, the
+#: multiplier and the platform label, so a kill stays attributable to a specific policy rather
+#: than to an anonymous number.
 DEFAULT_CPU_TIMEOUT_MULTIPLIER = 1.0
 
 #: Environment override for :data:`DEFAULT_CPU_TIMEOUT_MULTIPLIER`, so a CI lane can set the
@@ -499,8 +499,8 @@ class DagConfig:
     # Tags (``group.job``) whose FAILURE is a DECLARED known-failure: it is reported and named
     # loudly but does NOT flip the run's aggregate verdict, so one persistently-flaky node (e.g.
     # a host-dependent test) can't invalidate every other step's validate record. Derived from a
-    # declared file (see :func:`dagrun.io.load_known_failures`); NEVER silent — the
-    # scheduler names each excluded failure at runtime and the loader names what it loaded. A
+    # declared file (see :func:`dagrun.io.load_known_failures`); NEVER silent — the scheduler
+    # names each excluded failure at runtime and the loader names what it loaded. A
     # non-allowlisted failure still fails the run, and an allowlisted step that PASSES is
     # unaffected (membership is consulted only on failure). Empty by default (fail-closed).
     known_failures: frozenset[str] = frozenset()

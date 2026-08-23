@@ -1,24 +1,23 @@
 #!/usr/bin/env bash
 # TRACKED, deterministic engine resolver for repository-local tool commands.
 #
-# The paired commands (`dagrun`, `cpuset-alloc`, `tick-hub`,
-# `pr-landing-planner`, `herdr-run`, and `herdr-agent`) have tracked Python and Cargo-backed Rust launchers under
-# their respective `*/bin` directories. `agent-team-timeline` and
-# `parallel-experiment-runner` are intentionally Python-only.
+# The paired commands (`dagrun`, `cpuset-alloc`, `tick-hub`, `pr-landing-planner`, `herdr-run`, and
+# `herdr-agent`) have tracked Python and Cargo-backed Rust launchers under their respective `*/bin`
+# directories. `agent-team-timeline` and `parallel-experiment-runner` are intentionally Python-only.
 # Every tracked command link in this directory points here, so the top-level `./bin` symlink exposes
 # one consistent command surface after any setup mode.
 #
 # Contract enforced here
 # ----------------------
 #   * DETERMINISTIC + TRACKED default: with no override, ALWAYS the tracked Python entrypoint.
-#   * Rust is opt-in ONLY, via DAGRUN_ENGINE=rust. Its tracked launcher asks Cargo to
-#     validate the workspace cache and provenance before executing; it never silently falls back.
+#   * Rust is opt-in ONLY, via DAGRUN_ENGINE=rust. Its tracked launcher asks Cargo to validate the
+#     workspace cache and provenance before executing; it never silently falls back.
 #   * LOGS WHICH ENGINE WON on every invocation (one stderr line), so the resolved engine and its
 #     exact path are always visible in logs.
 #
-# The resolved tool name is this script's invocation basename. The tracked links for
-# `dagrun`, `cpuset-alloc`, `pr-landing-planner`, `tick-hub`, and
-# `agent-team-timeline`, `parallel-experiment-runner`, `herdr-run`, and `herdr-agent` all point here.
+# The resolved tool name is this script's invocation basename. The tracked links for `dagrun`,
+# `cpuset-alloc`, `pr-landing-planner`, `tick-hub`, `agent-team-timeline`,
+# `parallel-experiment-runner`, `herdr-run`, and `herdr-agent` all point here.
 set -euo pipefail
 
 # Locate the agent-utils root from the resolver's REAL path (follow the symlink chain), independent

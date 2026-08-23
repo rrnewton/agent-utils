@@ -1,9 +1,9 @@
 # dagrun user guide
 
-`dagrun` models build and test work as a DAG, plans it
-deterministically, and executes ready steps concurrently. Dependencies, memory
-budgets, named resource caps, timeouts, CPU reservations, and Linux containment
-all constrain execution without changing the graph's meaning.
+`dagrun` models build and test work as a DAG, plans it deterministically, and
+executes ready steps concurrently. Dependencies, memory budgets, named resource
+caps, timeouts, CPU reservations, and Linux containment all constrain execution
+without changing the graph's meaning.
 
 ## Installation and library use
 
@@ -12,7 +12,8 @@ python3 -m pip install dagrun
 ```
 
 Python 3.10 or newer is required. Installation provides both console commands,
-the typed `dagrun` package, and this guide as package data.
+the typed `dagrun` package, and this guide as package data. The distribution and
+the import name are the same word.
 
 ```python
 from dagrun import DagConfig, Step, to_ascii
@@ -539,10 +540,9 @@ a graph, so prefer this to a hand-rolled loop.
 
 ## Profiles, sweeps, and portable summaries
 
-Runs append resource samples to `./.dagrun/profiles/` by default.
-Override the directory with `--perf-dir` or
-`DAGRUN_PROFILE_DIR`; disable writes with `--no-profile`. `--profile`
-prints the current run's per-step table.
+Runs append resource samples to `./.dagrun/profiles/` by default. Override the
+directory with `--perf-dir` or `DAGRUN_PROFILE_DIR`; disable writes with
+`--no-profile`. `--profile` prints the current run's per-step table.
 
 Measure one step across inner widths with:
 
@@ -674,9 +674,8 @@ but ordinary `--max-cpus` deliberately remains a shared bandwidth and per-step
 width limit rather than pretending to hand out exclusive moving CPU slices.
 
 The ledger path is `DAGRUN_CORE_LEDGER` when that variable is set. Otherwise it
-is `$XDG_RUNTIME_DIR/dagrun/core-reservations.json` when the runtime
-directory exists, or
-`<system-temporary-directory>/dagrun-<uid>/core-reservations.json`.
+is `$XDG_RUNTIME_DIR/dagrun/core-reservations.json` when the runtime directory
+exists, or `<system-temporary-directory>/dagrun-<uid>/core-reservations.json`.
 Serialization uses the private sibling `core-reservations.json.lock`; both
 commands use the same files. A crashed holder is identified by PID plus process
 start time and reclaimed by the next ledger operation, so the state records live

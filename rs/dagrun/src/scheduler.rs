@@ -388,9 +388,9 @@ fn kill_descendants(root: u32) -> usize {
 ///
 /// This is the BEST-EFFORT ESCAPEE CLOSER for an unboxed run. A process-group kill misses a child
 /// that called `setsid`, and a parentage walk misses a double-fork survivor after it reparents.
-/// Ordinary descendants inherit `DAGRUN_STEP=<nonce>` through `fork`/`execve`, so the
-/// exact NUL-delimited environment entry can still associate those environment-preserving
-/// escapees with their step. It is never a process-name, command-line, or substring match.
+/// Ordinary descendants inherit `DAGRUN_STEP=<nonce>` through `fork`/`execve`, so the exact
+/// NUL-delimited environment entry can still associate those environment-preserving escapees
+/// with their step. It is never a process-name, command-line, or substring match.
 ///
 /// LIMIT: a hostile child can unset or replace its environment before escaping. The nonce is an
 /// ownership aid, not a security boundary and not a substitute for cgroup containment. Processes
@@ -5445,9 +5445,9 @@ mod tests {
 
     #[test]
     fn the_capture_truncation_notice_is_identical_to_the_python_engines() {
-        // Byte-for-byte with `CAPTURE_TRUNCATION_NOTICE` in py/dagrun/attribution.py.
-        // The two editions' output is compared by the differential harness, so a drift here is a
-        // real failure and not a cosmetic one.
+        // Byte-for-byte with `CAPTURE_TRUNCATION_NOTICE` in py/dagrun/attribution.py. The two
+        // editions' output is compared by the differential harness, so a drift here is a real
+        // failure and not a cosmetic one.
         assert_eq!(
             capture_truncation_notice(1234, 300),
             "[dagrun] EARLIER OUTPUT DROPPED: this step produced 1234 bytes but only \

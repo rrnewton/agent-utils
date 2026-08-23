@@ -9,12 +9,12 @@
 // it (Graphviz DOT / ASCII), and RUN it concurrently with dependency + scarce-resource
 // gating and eager-exit on first failure.
 //
-// This Rust build reproduces the OBSERVABLE behavior of the Python reference
-// (`py/dagrun`) for the scheduling core, proven identical by the randomized
-// differential test in `cross/differential.py`. It ALSO performs the real work: two-level
-// Linux cgroup-v2 per-step boxing ([`cgroup`]), zombie-free teardown, ambient-load sampling
-// ([`ambient`]), and CSV perf logging ([`perflog`]) — matching the Python build's behavior.
-// Cgroup boxing is environment-dependent, so the differential exercises the un-boxed core
+// This Rust build reproduces the OBSERVABLE behavior of the Python reference (`py/dagrun`)
+// for the scheduling core, proven identical by the randomized differential test in
+// `cross/differential.py`. It ALSO performs the real work: two-level Linux cgroup-v2
+// per-step boxing ([`cgroup`]), zombie-free teardown, ambient-load sampling ([`ambient`]),
+// and CSV perf logging ([`perflog`]) — matching the Python build's behavior. Cgroup boxing
+// is environment-dependent, so the differential exercises the un-boxed core
 // (`--allow-cgroup-failure`) while a dedicated smoke test proves boxing caps memory.
 
 pub mod admission;

@@ -5,8 +5,8 @@ description: Run N concurrent seed-sweep workers under RESOURCE CONTAINMENT via 
 
 # parallel-experiment-runner
 
-Runs a seed sweep as N resource-contained workers under `dagrun`'s two-level
-cgroup-v2 scope. Exists to prevent unbounded parallel experiments piling up processes on a host.
+Runs a seed sweep as N resource-contained workers under `dagrun`'s two-level cgroup-v2 scope.
+Exists to prevent unbounded parallel experiments piling up processes on a host.
 It is a resource box against a BUG in our own code (leak, run-forever, fork-bomb) — NOT a security
 sandbox: no seccomp, no user-namespace isolation. Concurrency is declared+enforced, sized from
 **measured idle-core headroom** (from `/proc/stat`, not total cores and not the misleading load

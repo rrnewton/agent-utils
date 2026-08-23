@@ -6,8 +6,8 @@ cargo install dagrun
 
 Rust 1.85 or newer is required.
 
-The crate installs the `dagrun` and `cpuset-alloc` binaries. Add it
-as a library dependency when the model or planning engine belongs inside an
+The crate installs the `dagrun` and `cpuset-alloc` binaries. Add it as a
+library dependency when the model or planning engine belongs inside an
 application:
 
 ```toml

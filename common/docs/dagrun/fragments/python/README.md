@@ -4,9 +4,9 @@
 python3 -m pip install dagrun
 ```
 
-Python 3.10 or newer is required. The installation provides the
-`dagrun` and `cpuset-alloc` console commands, an importable
-`dagrun` package, and typing metadata.
+Python 3.10 or newer is required. The installation provides the `dagrun` and
+`cpuset-alloc` console commands, an importable package of the same name, and
+typing metadata.
 
 ## Python API
 

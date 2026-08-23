@@ -73,8 +73,8 @@ use crate::{PROG, VERSION};
 const PROFILE_DIR_ENV: &str = "DAGRUN_PROFILE_DIR";
 
 /// Default profile-store directory, RELATIVE TO THE CURRENT WORKING DIRECTORY, used when neither
-/// `--perf-dir` nor `$DAGRUN_PROFILE_DIR` is set and `--no-profile` is absent. Created
-/// on demand; runs and sweeps auto-append here so profiling data lands somewhere obvious.
+/// `--perf-dir` nor `$DAGRUN_PROFILE_DIR` is set and `--no-profile` is absent. Created on
+/// demand; runs and sweeps auto-append here so profiling data lands somewhere obvious.
 const DEFAULT_PROFILE_DIR: &str = ".dagrun/profiles";
 
 const CGROUP_SETUP_ENVIRONMENT_ERROR: &str = "ENVIRONMENT: managed cgroup scope could not \
@@ -1555,8 +1555,8 @@ fn resolve_cgroups(
 /// Resolve the effective profile-store directory and a label for its source (Feature D).
 ///
 /// Precedence: `--no-profile` disables logging (returns `(None, "disabled")`); otherwise an
-/// explicit `--perf-dir` wins; otherwise `$DAGRUN_PROFILE_DIR`; otherwise the
-/// repo-local default `./.dagrun/profiles/`. Auto-logging is ON by default.
+/// explicit `--perf-dir` wins; otherwise `$DAGRUN_PROFILE_DIR`; otherwise the repo-local
+/// default `./.dagrun/profiles/`. Auto-logging is ON by default.
 fn resolve_profile_dir(perf_dir: Option<&str>, no_profile: bool) -> (Option<String>, &'static str) {
     if no_profile {
         return (None, "disabled");

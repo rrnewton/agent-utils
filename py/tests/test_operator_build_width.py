@@ -157,9 +157,9 @@ def test_the_capture_happens_at_import_from_the_real_environment() -> None:
 
 def test_a_malformed_variable_cannot_take_the_package_down_at_import() -> None:
     # The capture is a module-level statement, so anything it raises is raised by
-    # `import dagrun` — and then `capabilities`, `--help` and every other subcommand
-    # die with a traceback because of an environment variable. `_captured_in_subprocess` runs a
-    # fresh interpreter with `check=True`, so a raising import fails this test rather than being
+    # `import dagrun` — and then `capabilities`, `--help` and every other subcommand die with
+    # a traceback because of an environment variable. `_captured_in_subprocess` runs a fresh
+    # interpreter with `check=True`, so a raising import fails this test rather than being
     # swallowed.
     assert _captured_in_subprocess({BUILD_JOBS_ENV: "8²"}) == "None"
     assert _captured_in_subprocess({BUILD_JOBS_ENV: "1" * 5000}) == "None"

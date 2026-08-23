@@ -17,9 +17,9 @@ Run an example with the installed command:
 dagrun run --dag examples/01-linear-chain.json --allow-cgroup-failure
 ```
 
-From a source checkout, run `./setup` first and use
-`./bin/dagrun` in place of the installed command. The repository's
-behavioral differential runs the same examples against both implementations.
+From a source checkout, run `./setup` first and use `./bin/dagrun` in place of the installed
+command. The repository's behavioral differential runs the same examples against both
+implementations.
 
 **Why `--allow-cgroup-failure`?** Boxing each step in its own Linux cgroup-v2 sandbox is this
 tool's whole point, so `run` **boxes by default**: it re-execs the run inside a transient
@@ -163,12 +163,11 @@ dagrun sweep --dag examples/06-step-sweep.json --step build.app --jobs 1..8 --al
 ```
 
 Every `run` and `sweep` above **auto-logs** resource-usage CSVs to the default profile store,
-`./.dagrun/profiles/` (relative to your current directory) — you do not need
-`--perf-dir`. The tool prints exactly where it appended. Drop `--allow-cgroup-failure` on a Linux
-host with a systemd user session to get real per-step boxing, which also fills in the `rss_hwm`
-(peak memory) column from each step's cgroup. Override the location with `--perf-dir DIR` or
-`$DAGRUN_PROFILE_DIR`, or turn logging off with `--no-profile`. Consider gitignoring
-`./.dagrun/`.
+`./.dagrun/profiles/` (relative to your current directory) — you do not need `--perf-dir`. The
+tool prints exactly where it appended. Drop `--allow-cgroup-failure` on a Linux host with a
+systemd user session to get real per-step boxing, which also fills in the `rss_hwm` (peak memory)
+column from each step's cgroup. Override the location with `--perf-dir DIR` or
+`$DAGRUN_PROFILE_DIR`, or turn logging off with `--no-profile`. Consider gitignoring `./.dagrun/`.
 
 ## See also
 

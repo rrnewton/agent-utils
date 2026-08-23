@@ -2,12 +2,12 @@
 
 // Memory footprint model + memory-aware active-step selection (pure functions over a [`DagConfig`]).
 //
-// Direct port of `py/dagrun/sizing.py`. Rather than a flat per-job RAM estimate,
-// it enumerates which steps can actually co-run (no transitive dependency between them, and
-// their summed scarce-resource demand fits the caps) and takes the worst-case sum of their
-// per-step memory caps. Within a bounded subset-search budget this is exact; wider searches use a
-// conservative largest-caps upper bound so sizing cannot become exponential. The chosen ceiling
-// and footprint MUST equal the Python build's for the same DAG (cross-tested).
+// Direct port of `py/dagrun/sizing.py`. Rather than a flat per-job RAM estimate, it enumerates
+// which steps can actually co-run (no transitive dependency between them, and their summed
+// scarce-resource demand fits the caps) and takes the worst-case sum of their per-step memory
+// caps. Within a bounded subset-search budget this is exact; wider searches use a conservative
+// largest-caps upper bound so sizing cannot become exponential. The chosen ceiling and footprint
+// MUST equal the Python build's for the same DAG (cross-tested).
 
 use std::collections::{HashMap, HashSet};
 

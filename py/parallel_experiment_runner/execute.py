@@ -74,8 +74,8 @@ Emit = Callable[[str], None]
 
 
 def resolve_cgroup_manager(allow_failure: bool) -> tuple[CgroupManager | None, int]:
-    """Establish the two-level cgroup-v2 RESOURCE CONTAINMENT for a sweep (mirrors safe-ci's CLI
-    bring-up).
+    """Establish the two-level cgroup-v2 RESOURCE CONTAINMENT for a sweep (mirrors ``dagrun``'s
+    CLI bring-up).
 
     This is a resource box, not a security sandbox: it defends against a BUG in our own code
     (leak memory, run forever, fork bomb) via cgroup CPU-time / memory / PID caps, and does NOT
@@ -200,7 +200,7 @@ def _classify_outcome(
     row: Mapping[str, object],
     log_path: Path,
 ) -> SeedOutcome:
-    """Fold a safe-ci ``StepOutcome`` + its profile row into a :class:`SeedOutcome`.
+    """Fold a ``dagrun`` ``StepOutcome`` and its profile row into a :class:`SeedOutcome`.
 
     Breach precedence (cancel > cpu-timeout > memory-cap > pids-cap > timeout) is applied BEFORE
     any hit/miss decision, so an infrastructure kill is never counted as a discovered hit. The

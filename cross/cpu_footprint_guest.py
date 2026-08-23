@@ -6,7 +6,8 @@ independently schedulable task, so the GIL cannot turn a requested width into se
 Every JSONL record is emitted with one ``O_APPEND`` ``write(2)`` call.  Several DAG steps and all
 of their workers may therefore share one output file without a userspace lock or torn records.
 
-``--workers`` is intentionally suitable for a safe-ci ``jobs_flag`` such as ``--workers=``.  The
+``--workers`` is intentionally suitable for the ``jobs_flag`` a ``dagrun`` step declares, such as
+``--workers=``.  The
 ``-j`` and ``--jobs`` spellings are accepted as conveniences for hand-written fixtures.
 """
 

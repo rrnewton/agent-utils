@@ -57,8 +57,8 @@ findings are recorded in `reviews/herdr-run.md` and `reviews/rust-source-launche
 9. The repository dispatcher and dependency smoke test omitted the packaged `cpuset-alloc` companion
    command. `./bin/cpuset-alloc` now shares the tracked resolver, and all seven Python entry-point
    commands receive the dependency-free startup probes.
-10. `dagrun.analyze` mixed a stable public `summarize` library helper with an undeclared
-    Python-only `main()`. Removing the module would break the package API, so the helper remains
+10. `dagrun.analyze` mixed a stable public `summarize` library helper with an undeclared Python-only
+    `main()`. Removing the module would break the package API, so the helper remains
     documented and re-exported while only the CLI-shaped surface was retired. A compatibility test
     pins the helper, and a manifest-derived test rejects any public `main()` not backed by a declared
     console entry point.

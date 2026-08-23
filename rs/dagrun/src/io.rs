@@ -2,9 +2,9 @@
 
 // Canonical JSON (de)serialization for a [`DagConfig`].
 //
-// Direct port of `py/dagrun/io.py`. This is the on-disk / interchange form the
-// CLI loads via `--dag FILE` and the shared fixture format for the cross-language differential
-// tests. Parsing is STRICT and fails loudly on a malformed document ([`DagJsonError`]), never
+// Direct port of `py/dagrun/io.py`. This is the on-disk / interchange form the CLI loads via
+// `--dag FILE` and the shared fixture format for the cross-language differential tests.
+// Parsing is STRICT and fails loudly on a malformed document ([`DagJsonError`]), never
 // silently defaulting a wrong-typed field.
 //
 // Serialization ([`dag_to_json`]) is hand-rolled to reproduce Python's

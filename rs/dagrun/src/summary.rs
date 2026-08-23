@@ -3,9 +3,9 @@
 // A constant-sized, MERGEABLE profile SUMMARY that closes the profiling feedback loop on
 // EPHEMERAL CI.
 //
-// Direct port of `py/dagrun/summary.py`; the canonical JSON serialization and the
-// MERGE are BYTE-IDENTICAL to the Python build (cross-tested in `cross/differential.py`) — this is
-// the correctness core of the sync feature.
+// Direct port of `py/dagrun/summary.py`; the canonical JSON serialization and the MERGE are
+// BYTE-IDENTICAL to the Python build (cross-tested in `cross/differential.py`) — this is the
+// correctness core of the sync feature.
 //
 // The profile store auto-logs per-step CSVs and the planner reads them back, but that loop is
 // INERT on ephemeral CI (each runner starts with an empty store). This module is the artifact a

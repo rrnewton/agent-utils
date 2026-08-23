@@ -1,8 +1,8 @@
 # dagrun
 
-`dagrun` executes a directed acyclic graph of build and test steps
-with dependency ordering, bounded concurrency, resource-aware planning, Linux
-cgroup containment, and per-step profiling.
+`dagrun` executes a directed acyclic graph of build and test steps with
+dependency ordering, bounded concurrency, resource-aware planning, Linux cgroup
+containment, and per-step profiling.
 
 It provides:
 
@@ -79,10 +79,10 @@ may oversubscribe the outer CPU budget.
 
 ## Attributable test-runner timeouts
 
-A DAG node can contain a parallel test runner. On a node timeout,
-`dagrun` first freezes durable test and process evidence, sends
-`SIGTERM` so the inner runner can flush its state, waits a bounded grace, and
-only then escalates to cgroup-wide/process-group `SIGKILL`.
+A DAG node can contain a parallel test runner. On a node timeout, `dagrun`
+first freezes durable test and process evidence, sends `SIGTERM` so the inner
+runner can flush its state, waits a bounded grace, and only then escalates to
+cgroup-wide/process-group `SIGKILL`.
 
 Use three strictly nested bounds: the test runner's per-test timeout below the
 DAG step timeout, and the step timeout below the whole-DAG timeout. The
@@ -123,11 +123,11 @@ cpuset-alloc status
 cpuset-alloc reclaim
 ```
 
-`dagrun pin-run` provides the same hard reservation path from the
-main command. `run --cores K` applies an exact cpuset only inside the runner's
-own managed scope; it is incompatible with an unboxed opt-out. These commands
-never fall back to an escapable process-affinity mask. All release live
-reservations on exit and reclaim dead holders.
+`dagrun pin-run` provides the same hard reservation path from the main
+command. `run --cores K` applies an exact cpuset only inside the runner's own
+managed scope; it is incompatible with an unboxed opt-out. These commands never
+fall back to an escapable process-affinity mask. All release live reservations
+on exit and reclaim dead holders.
 
 ## License
 

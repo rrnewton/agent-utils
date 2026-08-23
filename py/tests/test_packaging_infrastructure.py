@@ -66,9 +66,7 @@ def test_embed_prevalidates_every_input_before_writing(
 ) -> None:
     docs = _load_script("embed_userguides")
     first = docs.Render("dagrun", "README", "python", "out/README.md")
-    second = docs.Render(
-        "dagrun", "USER_GUIDE", "python", "out/USER_GUIDE.md"
-    )
+    second = docs.Render("dagrun", "USER_GUIDE", "python", "out/USER_GUIDE.md")
     first_template = tmp_path / first.template
     first_fragment = tmp_path / first.fragment
     first_destination = tmp_path / first.destination
@@ -172,10 +170,10 @@ def test_python_sibling_dependency_requires_a_project_local_exemption() -> None:
         for project in python_check.PROJECTS
         if project.distribution == "parallel-experiment-runner"
     )
-    safe_ci_requirement = {"dagrun"}
+    dagrun_requirement = {"dagrun"}
 
     assert not python_check._unexpected_sibling_requirements(
-        parallel, safe_ci_requirement
+        parallel, dagrun_requirement
     )
     assert python_check._unexpected_sibling_requirements(
         python_check.PROJECTS[0], {"tick-hub"}
@@ -313,22 +311,14 @@ def test_public_api_docs_are_standalone_without_banning_native_package_terms() -
     )
 
 
-def test_safe_ci_rust_dependency_snippets_match_the_published_minor_version() -> None:
-    manifest = (
-        REPO_ROOT / "rs" / "dagrun" / "Cargo.toml"
-    ).read_text(encoding="utf-8")
+def test_dagrun_rust_dependency_snippets_match_the_published_minor_version() -> None:
+    manifest = (REPO_ROOT / "rs" / "dagrun" / "Cargo.toml").read_text(encoding="utf-8")
     matched = re.search(r'^version = "(\d+\.\d+)\.\d+"$', manifest, re.MULTILINE)
     assert matched is not None
     dependency = f'dagrun = "{matched.group(1)}"'
     for name in ("README.md", "USER_GUIDE.md"):
         fragment = (
-            REPO_ROOT
-            / "common"
-            / "docs"
-            / "dagrun"
-            / "fragments"
-            / "rust"
-            / name
+            REPO_ROOT / "common" / "docs" / "dagrun" / "fragments" / "rust" / name
         ).read_text(encoding="utf-8")
         assert dependency in fragment
 

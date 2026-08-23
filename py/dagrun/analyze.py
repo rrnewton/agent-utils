@@ -22,10 +22,10 @@ COL_INNER_JOBS = "inner_jobs"
 #: Ambient load bucket used to isolate comparable samples.
 COL_AMBIENT = "ambient_bucket"
 #: Measured wall-clock seconds for the step. This MUST match the column
-#: :data:`dagrun.perflog.STEP_PROFILE_COLUMNS` actually writes. It read
-#: ``duration_s`` until 2026-08-09, a column the store has never written, so every group was
-#: dropped as unparseable: executed against the real 52-step store this module returned ZERO
-#: rows. It failed loudly, which is why it went unnoticed -- nothing ran it.
+#: :data:`dagrun.perflog.STEP_PROFILE_COLUMNS` actually writes. It read ``duration_s`` until
+#: 2026-08-09, a column the store has never written, so every group was dropped as
+#: unparseable: executed against the real 52-step store this module returned ZERO rows. It
+#: failed loudly, which is why it went unnoticed -- nothing ran it.
 COL_DURATION_S = "elapsed_s"
 #: Measured effective cores kept busy by the step.
 COL_EFFECTIVE_CORES = "effective_cores"

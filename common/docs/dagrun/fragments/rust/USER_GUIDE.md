@@ -5,7 +5,7 @@ cargo install dagrun
 ```
 
 Rust 1.85 or newer is required. The crate installs both binaries. For library
-use, declare the dependency and import the crate as `dagrun`:
+use, declare the dependency; the crate and its import name are the same word:
 
 ```toml
 [dependencies]

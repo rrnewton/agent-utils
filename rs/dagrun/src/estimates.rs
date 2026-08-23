@@ -2,11 +2,10 @@
 
 // Profile-store FEEDBACK: turn recorded per-step samples into planning estimates.
 //
-// Direct port of `py/dagrun/estimates.py`; the derived numbers and the
-// `plan --format json` / `plan` text output are BYTE-IDENTICAL to the Python build for a given
-// store + DAG (cross-tested in `cross/differential.py`). This is the READING half of the
-// learned-duration profile store (ds-7pzdgm / ds-afzsqf); the writing half already ships in
-// [`crate::perflog`].
+// Direct port of `py/dagrun/estimates.py`; the derived numbers and the `plan --format json` /
+// `plan` text output are BYTE-IDENTICAL to the Python build for a given store + DAG
+// (cross-tested in `cross/differential.py`). This is the READING half of the learned-duration
+// profile store (ds-7pzdgm / ds-afzsqf); the writing half already ships in [`crate::perflog`].
 //
 // For the current `(machine_id, container_class)` it derives, per step:
 // * `est_duration_s` — a contention-discounted, MAD-trimmed MEDIAN of the recorded `elapsed_s`

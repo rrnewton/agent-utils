@@ -412,8 +412,8 @@ def test_run_profile_prints_table() -> None:
 def test_run_default_profile_store(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # With NEITHER --perf-dir NOR $DAGRUN_PROFILE_DIR set, a run auto-logs to the
-    # repo-local default ./.dagrun/profiles/ (relative to CWD) and says where.
+    # With NEITHER --perf-dir NOR $DAGRUN_PROFILE_DIR set, a run auto-logs to the repo-local
+    # default ./.dagrun/profiles/ (relative to CWD) and says where.
     monkeypatch.delenv("DAGRUN_PROFILE_DIR", raising=False)
     monkeypatch.chdir(tmp_path)
     dag = _demo_path(str(tmp_path))
@@ -646,12 +646,12 @@ def test_default_small_cpu_cap_is_enforced_and_allows_compliant_work() -> None:
 def test_boxed_reexec_via_symlink_imports_package() -> None:
     # Regression guard for the fleet-wide local-validate breakage: a DEFAULT boxed run invoked
     # through the py/bin symlink (NOT `python -m`, NOT pip-installed) must re-exec a child that
-    # can still import the package. The old code re-exec'd `python -m dagrun`, whose
-    # fresh child had py/ off sys.path -> `No module named dagrun`, so every non-CI
-    # `run` (i.e. validate.sh) died. The fix re-execs __main__.py by absolute path, which does its
-    # own sys.path fixup. Run from a CWD *outside* py/ so an accidental cwd-relative import can't
-    # mask the bug. Boxing is environment-dependent, so exit 3 (boxing genuinely unavailable) is a
-    # valid LOUD skip; the one thing that must NEVER appear is the import failure.
+    # can still import the package. The old code re-exec'd `python -m dagrun`, whose fresh child
+    # had py/ off sys.path -> `No module named dagrun`, so every non-CI `run` (i.e. validate.sh)
+    # died. The fix re-execs __main__.py by absolute path, which does its own sys.path fixup. Run
+    # from a CWD *outside* py/ so an accidental cwd-relative import can't mask the bug. Boxing is
+    # environment-dependent, so exit 3 (boxing genuinely unavailable) is a valid LOUD skip; the
+    # one thing that must NEVER appear is the import failure.
     import os
 
     symlink = Path(__file__).resolve().parent.parent / "bin" / "dagrun"

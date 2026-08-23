@@ -65,7 +65,7 @@ def test_depfree_invocations_never_touch_optional_deps(module: str, flag: str) -
 
 
 def test_cpuset_companion_help_starts_without_yaml() -> None:
-    """The safe-ci distribution's companion console command is independently startable."""
+    """The ``dagrun`` distribution's companion console command is independently startable."""
     result = _run_blocked("dagrun.cpuset_allocator", ["--help"])
     combined = result.stdout + result.stderr
     assert result.returncode == 0, combined

@@ -2,12 +2,14 @@
 
 ## Scope
 
-Reviewed both package implementations of `dagrun` and `cpuset-alloc`, with emphasis
-on tree-wide CPU containment, the shared reservation ledger, CLI failure behavior, stress-mode
-sizing, standalone package documentation, and live cross-implementation interoperability.
+Reviewed both package implementations of `dagrun` and `cpuset-alloc`, with emphasis on tree-wide
+CPU containment, the shared reservation ledger, CLI failure behavior, stress-mode sizing,
+standalone package documentation, and live cross-implementation interoperability.
 
 This review record entered the repository with implementation commit
-`5ef91c55036227b5dc2997ef069784f337b4cc5e`.
+`5ef91c55036227b5dc2997ef069784f337b4cc5e`. It was written before the tool was renamed to
+`dagrun`; only the name has been updated, including in the commands recorded under "Verification",
+and nothing else about the record — findings, counts, or hashes — has changed.
 
 ## Adversarial findings and resolutions
 

@@ -127,9 +127,9 @@ case "$WHAT" in
 esac
 # Wire ./bin at the TRACKED, deterministic engine resolver (common/bin) regardless of what was
 # built. The resolver defaults to the tracked Python entrypoint and runs Rust ONLY on explicit
-# DAGRUN_ENGINE=rust (never a silent fallback), logging which engine won on every run.
-# This replaces the old footgun where `both` wired ./bin straight at the UNTRACKED rs/bin, letting a
-# stale locally-built Rust binary silently beat the tracked entrypoint.
+# DAGRUN_ENGINE=rust (never a silent fallback), logging which engine won on every run. This replaces
+# the old footgun where `both` wired ./bin straight at the UNTRACKED rs/bin, letting a stale
+# locally-built Rust binary silently beat the tracked entrypoint.
 wire_bin "common/bin"
 if [ "$WHAT" = rs ]; then
   echo "==> note: run Rust via DAGRUN_ENGINE=rust ./bin/dagrun (default is tracked Python; rs/bin is Cargo-backed)"

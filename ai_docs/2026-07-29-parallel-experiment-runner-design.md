@@ -5,6 +5,9 @@
 > outside this one appear below and cannot be resolved from here. They are left in place
 > deliberately: rewriting a record to look tidier destroys the evidence it exists to be.
 > Nothing here describes `agent-utils` itself. See `#67 standalone-repo`.
+>
+> This record was written before the tool was renamed to `dagrun`; only the name has been
+> updated, and nothing else about the record has changed.
 
 **Date:** 2026-07-29
 **Status:** proposed; implementation waits for owner review
@@ -22,10 +25,10 @@ memory and disk footprints vary, host load changes, and an interrupted process
 can leave descendants behind.
 
 The proposed runner turns a seed search into a sequence of dynamically generated
-`dagrun` rounds. It does not introduce a second scheduler or a
-second isolation/reaping implementation. `dagrun` remains the
-executor and supplies its existing two-level cgroup containment, per-step
-profiling, process-group capture, eager teardown, and profile store.
+`dagrun` rounds. It does not introduce a second scheduler or a second
+isolation/reaping implementation. `dagrun` remains the executor and supplies its
+existing two-level cgroup containment, per-step profiling, process-group capture,
+eager teardown, and profile store.
 
 The first release targets Linux/cgroup-v2 and Hermit `--chaos`/QEMU-style
 workers, while keeping the experiment API generic enough for backend builds,
@@ -33,10 +36,9 @@ CI shards, fuzzers, and other independent parameter sweeps.
 
 ## 2. Today: a fixed DAG and per-step profiles
 
-Today `dagrun` consumes a caller-authored JSON or YAML `DagConfig`.
-The file normally lives in the repository and contains a stable set of steps,
-dependency edges, commands, resource hints, and scarce-resource caps. The
-runner:
+Today `dagrun` consumes a caller-authored JSON or YAML `DagConfig`. The file
+normally lives in the repository and contains a stable set of steps, dependency
+edges, commands, resource hints, and scarce-resource caps. The runner:
 
 - selects a memory-aware concurrency;
 - executes each step inside a child cgroup beneath a delegated outer scope;
@@ -62,7 +64,7 @@ ExperimentSpec + seed cursor + coordinator ResourceSlice + profile history
                     generate_round_dag(...)
                               |
                               v
-                 dagrun.run_dag(DagConfig)
+                  dagrun.run_dag(DagConfig)
                               |
                               v
               RoundResult -> hits, profiles, next width
@@ -131,10 +133,10 @@ the source of truth.
 ### 3.2 Why an on-the-fly executor is not a second executor
 
 The outer loop decides *which steps exist in the next round*. It must not run
-subprocesses itself. `execute_round` calls the same `dagrun`
-scheduler used for fixed DAGs, with the same cgroup manager, metrics sink,
-failure semantics, and reaper. This keeps one implementation of containment and
-prevents behavioral drift between CI and experiment workloads.
+subprocesses itself. `execute_round` calls the same `dagrun` scheduler used for
+fixed DAGs, with the same cgroup manager, metrics sink, failure semantics, and
+reaper. This keeps one implementation of containment and prevents behavioral
+drift between CI and experiment workloads.
 
 ## 4. Stable profile keys
 
@@ -328,8 +330,8 @@ What survives the refutation, and is a cleaner justification for the box:
 The requirement the real cause implies is about *how* the kill lands: it must
 reclaim the **namespace**, not just one process — otherwise the box kills the hung
 main and inherits its zombies. It does. Every breach and the normal exit route
-through `dagrun.teardown.reap`, which writes the step's child
-`cgroup.kill` — an **atomic SIGKILL of the entire cgroup subtree**, including
+through `dagrun.teardown.reap`, which writes the step's child `cgroup.kill` — an
+**atomic SIGKILL of the entire cgroup subtree**, including
 `setsid`/double-fork escapees a process-group kill misses. When the hung main and
 all its PID-namespace peers die together, the namespace refcount drops to zero and
 the kernel reaps the zombies inside. This reuses existing machinery (no new module,
@@ -384,8 +386,8 @@ This is additive and should release as **agent-utils v0.12.0**:
 - the `pids` axis rides an in-memory `StepOutcome.pids_events` field and adds no
   profile-store CSV column; measured-headroom capacity (a `/proc/stat` sample in
   `calibrate`) is likewise runtime-only, and the namespace-reclaiming breach kill
-  reuses `dagrun`'s existing subtree `cgroup.kill` (no new module), so
-  the `cross/` schema and the Rust runner are all unaffected; live cgroup boxing
+  reuses `dagrun`'s existing subtree `cgroup.kill` (no new module), so the
+  `cross/` schema and the Rust runner are all unaffected; live cgroup boxing
   (`cpu.*` columns) remains out of differential scope, as before;
 - no change to existing fixed JSON/YAML DAG behavior or schemas when
   `profile_key` is absent; and
@@ -397,7 +399,7 @@ without the key remain readable and retain their current tag-based identity.
 
 ## 10. Implementation sequence after review
 
-1. Add `profile_key` to the safe-ci model/profile store with compatibility and
+1. Add `profile_key` to the `dagrun` model/profile store with compatibility and
    deterministic tests.
 2. Add the dynamic round-planning types and pure calibration logic.
 3. Build the Python CLI as an outer loop that generates `DagConfig` values and

@@ -136,7 +136,7 @@ fn a_nonpositive_max_mem_is_refused_by_name_and_no_step_runs() {
     assert!(!ran, "the run must refuse before any step executes");
 }
 
-/// Write an executable `name` in `dir` that appends each of its arguments to `$SCDR_FAKE_ARGV`.
+/// Write an executable `name` in `dir` that appends each of its arguments to `$FAKE_ARGV_LOG`.
 ///
 /// The runner reaches systemd through `Command::new("systemd-run")`, i.e. through `PATH`, so a
 /// recording stand-in earlier on `PATH` observes the EXACT argument vector the real binary built
@@ -147,7 +147,7 @@ fn write_recorder(dir: &std::path::Path, name: &str, exit_code: i32) {
     let mut f = std::fs::File::create(&path).unwrap();
     f.write_all(
         format!(
-            "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> \"$SCDR_FAKE_ARGV\"; done\n\
+            "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> \"$FAKE_ARGV_LOG\"; done\n\
              exit {exit_code}\n"
         )
         .as_bytes(),
@@ -193,7 +193,7 @@ fn max_mem_is_the_memory_max_handed_to_systemd_run() {
             "1M",
         ])
         .env("PATH", &path)
-        .env("SCDR_FAKE_ARGV", &argv_log)
+        .env("FAKE_ARGV_LOG", &argv_log)
         // Force the scope attempt: under CI/GITHUB_ACTIONS the re-exec is skipped by policy and
         // no argument vector would ever be built.
         .env("DAGRUN_FORCE_SCOPE_ATTEMPT", "1")
