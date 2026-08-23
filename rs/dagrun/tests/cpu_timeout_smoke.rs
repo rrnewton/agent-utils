@@ -98,7 +98,7 @@ fn a_cpu_breach_journals_the_cpu_seconds_it_compared_not_the_wall_clock() {
 
     let output = Command::new(bin)
         .args(["run", "--dag", dag.to_str().unwrap(), "-q", "--no-profile"])
-        .env("SAFE_CI_DAG_RUNNER_LOG_DIR", &evidence)
+        .env("DAGRUN_LOG_DIR", &evidence)
         .output()
         .expect("failed to spawn the built binary");
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();

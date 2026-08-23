@@ -408,7 +408,7 @@ pub const BUILD_JOBS_ENV: &str = "CARGO_BUILD_JOBS";
 /// So intent is resolved ONCE, in the outermost process, from the truly ambient environment, and
 /// passed forward under its own name. PRESENCE of this variable means "already resolved"; an
 /// empty value means "resolved, and the operator asked for nothing".
-pub const OPERATOR_BUILD_JOBS_ENV: &str = "SAFE_CI_OPERATOR_BUILD_JOBS";
+pub const OPERATOR_BUILD_JOBS_ENV: &str = "DAGRUN_OPERATOR_BUILD_JOBS";
 
 /// A build width an operator can be said to have CHOSEN: a positive decimal integer.
 ///
@@ -425,7 +425,7 @@ pub fn parse_build_jobs(raw: Option<&str>) -> Option<i64> {
 
 /// Resolve operator intent from the two variables, without touching the environment.
 ///
-/// `forwarded` is `SAFE_CI_OPERATOR_BUILD_JOBS` and `ambient` is `CARGO_BUILD_JOBS`. PRESENCE of
+/// `forwarded` is `DAGRUN_OPERATOR_BUILD_JOBS` and `ambient` is `CARGO_BUILD_JOBS`. PRESENCE of
 /// the first wins outright, empty included: an outer runner already asked this question of the
 /// real environment, and its answer — including "the operator asked for nothing" — is the only
 /// one that is still trustworthy, because that same runner has since written `ambient` itself.

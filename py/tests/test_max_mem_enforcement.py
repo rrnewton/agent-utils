@@ -105,7 +105,7 @@ def _capture_reexec(
         seen.append(memory_max)
         return False  # never re-exec under test; the caller then reports and returns nonzero
 
-    monkeypatch.delenv("SAFE_CI_IN_SCOPE", raising=False)
+    monkeypatch.delenv("DAGRUN_IN_SCOPE", raising=False)
     monkeypatch.delenv(cg.OUTER_MEMORY_MAX_ENV, raising=False)
     monkeypatch.setattr(cg, "mem_available_bytes", lambda: available)
     monkeypatch.setattr(cg, "reexec_in_scope", fake_reexec)

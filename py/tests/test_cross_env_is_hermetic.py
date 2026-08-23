@@ -5,7 +5,7 @@ developer exported is inherited by both engines. That is deliberate for most var
 for the ones a case is asserting about: an ambient ``CARGO_BUILD_JOBS`` makes the
 ``operator-build-width:unstated`` leg see "honouring CARGO_BUILD_JOBS=200" where it requires "no
 CARGO_BUILD_JOBS in the environment", and ``make cross`` goes red on a difference that exists in
-neither engine. The harness already pops ``SAFE_CI_DAG_RUNNER_LOG_DIR`` for exactly this reason;
+neither engine. The harness already pops ``DAGRUN_LOG_DIR`` for exactly this reason;
 the build-width pair belongs beside it.
 
 Running the whole differential here would cost minutes, so this pins ``_env`` itself, which is the
@@ -43,10 +43,10 @@ def test_an_ambient_build_width_does_not_reach_either_engine(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("CARGO_BUILD_JOBS", "200")
-    monkeypatch.setenv("SAFE_CI_OPERATOR_BUILD_JOBS", "200")
+    monkeypatch.setenv("DAGRUN_OPERATOR_BUILD_JOBS", "200")
     env = _differential()._env()
     assert "CARGO_BUILD_JOBS" not in env
-    assert "SAFE_CI_OPERATOR_BUILD_JOBS" not in env
+    assert "DAGRUN_OPERATOR_BUILD_JOBS" not in env
 
 
 def test_a_case_that_is_about_intent_can_still_state_it(

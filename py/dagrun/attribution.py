@@ -1,7 +1,7 @@
 """Durable step output and conservative test-boundary attribution.
 
 This is the Python peer of the native runner's attribution stream. Evidence is explicit opt-in via
-``SAFE_CI_DAG_RUNNER_LOG_DIR``; paths are opened nonblocking/no-follow and accepted only as private,
+``DAGRUN_LOG_DIR``; paths are opened nonblocking/no-follow and accepted only as private,
 owned regular files so a stale FIFO or symlink cannot hang or redirect a run.
 """
 
@@ -17,9 +17,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import BinaryIO, Literal
 
-LOG_DIR_ENV = "SAFE_CI_DAG_RUNNER_LOG_DIR"
-NO_LOGS_ENV = "SAFE_CI_DAG_RUNNER_NO_STEP_LOGS"
-LOG_MAX_BYTES_ENV = "SAFE_CI_DAG_RUNNER_LOG_MAX_BYTES"
+LOG_DIR_ENV = "DAGRUN_LOG_DIR"
+NO_LOGS_ENV = "DAGRUN_NO_STEP_LOGS"
+LOG_MAX_BYTES_ENV = "DAGRUN_LOG_MAX_BYTES"
 
 # Default per-step durable-log ceiling: 1 GiB.
 #
@@ -40,12 +40,12 @@ DEFAULT_LOG_MAX_BYTES = 1024 * 1024 * 1024
 # so this marker must stay identical in both. Keep the two in sync or `make cross` fails.
 TRUNCATION_MARKER = (
     "\n[dagrun] STEP LOG TRUNCATED at this ceiling "
-    "(raise or lift it with SAFE_CI_DAG_RUNNER_LOG_MAX_BYTES; 0 = unlimited). "
+    "(raise or lift it with DAGRUN_LOG_MAX_BYTES; 0 = unlimited). "
     "Test classification and attribution CONTINUE; only durable capture stopped.\n"
 )
 
 
-CAPTURE_MAX_BYTES_ENV = "SAFE_CI_DAG_RUNNER_CAPTURE_MAX_BYTES"
+CAPTURE_MAX_BYTES_ENV = "DAGRUN_CAPTURE_MAX_BYTES"
 
 # Default per-step IN-MEMORY capture ceiling: 4 MiB of the step's output TAIL.
 #
@@ -69,7 +69,7 @@ DEFAULT_CAPTURE_MAX_BYTES = 4 * 1024 * 1024
 CAPTURE_TRUNCATION_NOTICE = (
     "[dagrun] EARLIER OUTPUT DROPPED: this step produced {total} bytes but only "
     "the last {kept} were kept in memory (raise or lift the ceiling with "
-    "SAFE_CI_DAG_RUNNER_CAPTURE_MAX_BYTES; 0 = unlimited). The durable per-step log is "
+    "DAGRUN_CAPTURE_MAX_BYTES; 0 = unlimited). The durable per-step log is "
     "unaffected and still has the rest."
 )
 
@@ -429,7 +429,7 @@ def process_snapshot(root: int, nonce: str | None) -> tuple[ProcessObservation, 
     if root <= 1:
         return ()
     rows: dict[int, tuple[int, str, int, int, int, list[str], bool]] = {}
-    needle = f"SAFE_CI_DAG_RUNNER_STEP={nonce}".encode() if nonce else None
+    needle = f"DAGRUN_STEP={nonce}".encode() if nonce else None
     try:
         entries = list(Path("/proc").iterdir())
     except OSError:

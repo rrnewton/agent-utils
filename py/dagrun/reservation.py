@@ -73,7 +73,7 @@ def _default_ledger_path() -> Path:
     Prefers ``$XDG_RUNTIME_DIR`` (a per-user tmpfs reaped on logout), falling
     back to a uid-scoped ``/tmp`` dir. The whole point is a SINGLE file all
     concurrent runners contend on, so the path must not vary by CWD."""
-    env = os.environ.get("SAFE_CI_CORE_LEDGER")
+    env = os.environ.get("DAGRUN_CORE_LEDGER")
     if env:
         return Path(env)
     base = os.environ.get("XDG_RUNTIME_DIR")

@@ -56,7 +56,7 @@ fn run_unboxed(name: &str, dag_text: &str) -> (Option<i32>, String, String) {
             "--no-profile",
             "--unsafe-no-cgroups",
         ])
-        .env("SAFE_CI_DAG_RUNNER_LOG_DIR", &evidence)
+        .env("DAGRUN_LOG_DIR", &evidence)
         .output()
         .expect("failed to spawn the built binary");
 

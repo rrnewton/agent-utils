@@ -46,11 +46,11 @@ use std::sync::Mutex;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// Environment variable that overrides the evidence directory.
-pub const LOG_DIR_ENV: &str = "SAFE_CI_DAG_RUNNER_LOG_DIR";
+pub const LOG_DIR_ENV: &str = "DAGRUN_LOG_DIR";
 /// Set to `1` to disable durable per-step logs and the journal entirely.
-pub const NO_LOGS_ENV: &str = "SAFE_CI_DAG_RUNNER_NO_STEP_LOGS";
+pub const NO_LOGS_ENV: &str = "DAGRUN_NO_STEP_LOGS";
 /// Per-step ceiling, in bytes, on the durable raw-output log. `0` means unlimited.
-pub const LOG_MAX_BYTES_ENV: &str = "SAFE_CI_DAG_RUNNER_LOG_MAX_BYTES";
+pub const LOG_MAX_BYTES_ENV: &str = "DAGRUN_LOG_MAX_BYTES";
 /// Default per-step durable-log ceiling: 1 GiB.
 ///
 /// WHY A CEILING AT ALL. A step log is a byte-for-byte copy of the step's raw output --
@@ -72,7 +72,7 @@ pub const DEFAULT_LOG_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 // compared against this one byte-for-byte by the differential harness. Change this string in
 // one engine only and that comparison fails. Keep both in step.
 pub const TRUNCATION_MARKER: &str = "\n[dagrun] STEP LOG TRUNCATED at this ceiling \
-     (raise or lift it with SAFE_CI_DAG_RUNNER_LOG_MAX_BYTES; 0 = unlimited). \
+     (raise or lift it with DAGRUN_LOG_MAX_BYTES; 0 = unlimited). \
      Test classification and attribution CONTINUE; only durable capture stopped.\n";
 
 /// The configured per-step log ceiling in bytes, or `None` for unlimited.
@@ -99,7 +99,7 @@ pub fn log_max_bytes() -> Option<u64> {
 }
 
 /// Environment variable overriding the per-step IN-MEMORY capture ceiling (0 = unlimited).
-pub const CAPTURE_MAX_BYTES_ENV: &str = "SAFE_CI_DAG_RUNNER_CAPTURE_MAX_BYTES";
+pub const CAPTURE_MAX_BYTES_ENV: &str = "DAGRUN_CAPTURE_MAX_BYTES";
 
 /// Default per-step in-memory capture ceiling: 4 MiB of the step's output TAIL.
 ///
@@ -124,7 +124,7 @@ pub fn capture_truncation_notice(total: u64, kept: usize) -> String {
     format!(
         "[dagrun] EARLIER OUTPUT DROPPED: this step produced {total} bytes but only \
          the last {kept} were kept in memory (raise or lift the ceiling with \
-         SAFE_CI_DAG_RUNNER_CAPTURE_MAX_BYTES; 0 = unlimited). The durable per-step log is \
+         DAGRUN_CAPTURE_MAX_BYTES; 0 = unlimited). The durable per-step log is \
          unaffected and still has the rest."
     )
 }
@@ -153,7 +153,7 @@ pub fn capture_max_bytes() -> Option<usize> {
 }
 
 /// Environment variable carrying the per-step ownership nonce (see `scheduler::kill_by_nonce`).
-pub const STEP_NONCE_ENV: &str = "SAFE_CI_DAG_RUNNER_STEP";
+pub const STEP_NONCE_ENV: &str = "DAGRUN_STEP";
 const MAX_COMPONENT_BYTES: usize = 255;
 
 /// Monotonic per-process counter making each step's nonce unique within this runner.
@@ -1211,7 +1211,7 @@ mod tests {
 
     fn temp_evidence(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
-            "safe-ci-evidence-{name}-{}-{}",
+            "dagrun-evidence-{name}-{}-{}",
             std::process::id(),
             NONCE_SEQ.fetch_add(1, Ordering::Relaxed)
         ))

@@ -201,8 +201,8 @@ def test_stress_expansion_guard_bounds_generated_nodes_before_allocation(
 def test_final_stress_guard_refuses_profile_raised_rss_before_spawn(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    monkeypatch.setenv("SAFE_CI_DAG_RUNNER_MACHINE_ID", "stress_final")
-    monkeypatch.setenv("SAFE_CI_DAG_RUNNER_CONTAINER_CLASS", "test")
+    monkeypatch.setenv("DAGRUN_MACHINE_ID", "stress_final")
+    monkeypatch.setenv("DAGRUN_CONTAINER_CLASS", "test")
     perf_dir = tmp_path / "perf"
     perf_dir.mkdir()
     profile = perf_dir / "step_profiles_stress_final_test.csv"

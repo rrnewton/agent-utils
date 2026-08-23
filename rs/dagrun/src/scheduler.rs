@@ -105,7 +105,7 @@ pub type BoxedCgroups = Option<Arc<dyn CgroupManager>>;
 /// numerically smaller timeout capable of outliving the enclosing step.  The runner owns the
 /// actual step clock, so it exports that clock's epoch before spawning the child.  Consumers add
 /// their own (smaller) allowance to this value and therefore keep one ordering across execs.
-pub const STEP_STARTED_MONOTONIC_NS_ENV: &str = "SAFE_CI_STEP_STARTED_MONOTONIC_NS";
+pub const STEP_STARTED_MONOTONIC_NS_ENV: &str = "DAGRUN_STEP_STARTED_MONOTONIC_NS";
 
 /// Read Linux's process-independent monotonic clock in nanoseconds.
 ///
@@ -388,7 +388,7 @@ fn kill_descendants(root: u32) -> usize {
 ///
 /// This is the BEST-EFFORT ESCAPEE CLOSER for an unboxed run. A process-group kill misses a child
 /// that called `setsid`, and a parentage walk misses a double-fork survivor after it reparents.
-/// Ordinary descendants inherit `SAFE_CI_DAG_RUNNER_STEP=<nonce>` through `fork`/`execve`, so the
+/// Ordinary descendants inherit `DAGRUN_STEP=<nonce>` through `fork`/`execve`, so the
 /// exact NUL-delimited environment entry can still associate those environment-preserving
 /// escapees with their step. It is never a process-name, command-line, or substring match.
 ///
@@ -5452,7 +5452,7 @@ mod tests {
             capture_truncation_notice(1234, 300),
             "[dagrun] EARLIER OUTPUT DROPPED: this step produced 1234 bytes but only \
              the last 300 were kept in memory (raise or lift the ceiling with \
-             SAFE_CI_DAG_RUNNER_CAPTURE_MAX_BYTES; 0 = unlimited). The durable per-step log is \
+             DAGRUN_CAPTURE_MAX_BYTES; 0 = unlimited). The durable per-step log is \
              unaffected and still has the rest."
         );
     }

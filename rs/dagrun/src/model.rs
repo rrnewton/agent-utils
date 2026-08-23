@@ -65,11 +65,11 @@ pub const DEFAULT_CPU_TIMEOUT_MULTIPLIER: f64 = 1.0;
 
 /// Environment override for [`DEFAULT_CPU_TIMEOUT_MULTIPLIER`], so a CI lane can set the policy
 /// once for its whole platform.
-pub const CPU_TIMEOUT_MULTIPLIER_ENV: &str = "SAFE_CI_DAG_RUNNER_CPU_TIMEOUT_MULTIPLIER";
+pub const CPU_TIMEOUT_MULTIPLIER_ENV: &str = "DAGRUN_CPU_TIMEOUT_MULTIPLIER";
 
 /// Companion label naming the platform the multiplier describes; appears verbatim in the breach
 /// message.
-pub const CPU_TIMEOUT_PLATFORM_ENV: &str = "SAFE_CI_DAG_RUNNER_CPU_TIMEOUT_PLATFORM";
+pub const CPU_TIMEOUT_PLATFORM_ENV: &str = "DAGRUN_CPU_TIMEOUT_PLATFORM";
 
 /// How a step uses the machine, used for scheduling decisions.
 ///

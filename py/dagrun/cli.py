@@ -95,10 +95,10 @@ CGROUP_SETUP_ENVIRONMENT_ERROR = (
 
 #: Environment variable overriding the default profile-store location (Feature D). An explicit
 #: ``--perf-dir`` still wins over this; ``--no-profile`` disables logging entirely.
-PROFILE_DIR_ENV = "SAFE_CI_DAG_RUNNER_PROFILE_DIR"
+PROFILE_DIR_ENV = "DAGRUN_PROFILE_DIR"
 
 #: Default profile-store directory, RELATIVE TO THE CURRENT WORKING DIRECTORY, used when neither
-#: ``--perf-dir`` nor ``$SAFE_CI_DAG_RUNNER_PROFILE_DIR`` is set and ``--no-profile`` is absent.
+#: ``--perf-dir`` nor ``$DAGRUN_PROFILE_DIR`` is set and ``--no-profile`` is absent.
 #: Created on demand. Runs (and sweeps) auto-append here so profiling data lands somewhere obvious
 #: and browsable without any flag.
 DEFAULT_PROFILE_DIR = os.path.join(".dagrun", "profiles")
@@ -475,8 +475,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--only to copy one suspect node (e.g. --only test.unit). The ratio is the finding, so "
         "this implies --keep-going. N is still capped by the box memory budget (N x per-copy "
         "footprint must fit) and expansion may create at most 100,000 DAG nodes/control units. "
-        "Each copy gets SAFE_CI_DAG_RUNNER_COPY (zero-padded index, e.g. 03) and "
-        "SAFE_CI_DAG_RUNNER_COPIES (N) in its environment; interpolate the index into any "
+        "Each copy gets DAGRUN_COPY (zero-padded index, e.g. 03) and "
+        "DAGRUN_COPIES (N) in its environment; interpolate the index into any "
         "output path, or N copies write one file and the last writer silently wins. If you "
         "are comparing the runs themselves, keep these out of the program under test: a "
         "process's environment sits on its initial stack, so a tool that hashes process "
@@ -954,7 +954,7 @@ def _resolve_profile_dir(
     """Resolve the effective profile-store directory and a human label for its source.
 
     Precedence (Feature D): ``--no-profile`` disables logging entirely (returns ``(None, ...)``);
-    otherwise an explicit ``--perf-dir`` wins; otherwise ``$SAFE_CI_DAG_RUNNER_PROFILE_DIR``;
+    otherwise an explicit ``--perf-dir`` wins; otherwise ``$DAGRUN_PROFILE_DIR``;
     otherwise the repo-local default ``./.dagrun/profiles/``. Auto-logging is ON by
     default so profiling data lands somewhere obvious without any flag; the caller MUST surface
     where it was appended (No Silent Failure)."""
@@ -975,7 +975,7 @@ def _resolve_feedback_dir(perf_dir_arg: str | None, no_feedback: bool) -> str | 
     Independent of ``--no-profile`` (which only governs WRITING): reading the store to refine
     estimates is a separate concern. Precedence mirrors the write path minus the disable:
     ``--no-profile-feedback`` turns it off; else ``--perf-dir``; else
-    ``$SAFE_CI_DAG_RUNNER_PROFILE_DIR``; else the repo-local default store."""
+    ``$DAGRUN_PROFILE_DIR``; else the repo-local default store."""
     if no_feedback:
         return None
     if perf_dir_arg:
@@ -1336,10 +1336,10 @@ def _stress_suffix(index: int, count: int) -> str:
 
 #: Zero-padded index of this copy under ``--stress N``, e.g. ``"03"`` for copy 3 of 10.
 #: Unset when the graph was not multiplied, so a command can tell one run from a copy.
-STRESS_COPY_ENV = "SAFE_CI_DAG_RUNNER_COPY"
+STRESS_COPY_ENV = "DAGRUN_COPY"
 
 #: The ``N`` of ``--stress N``, so a command can size a split without being told twice.
-STRESS_COPIES_ENV = "SAFE_CI_DAG_RUNNER_COPIES"
+STRESS_COPIES_ENV = "DAGRUN_COPIES"
 
 
 def _expand_stress(cfg: DagConfig, n: int) -> DagConfig:
@@ -1373,7 +1373,7 @@ def _expand_stress(cfg: DagConfig, n: int) -> DagConfig:
                     # path: N copies write one file, the last writer wins, nothing errors,
                     # and the result is one sample wearing the label of N. The #NN suffix
                     # cannot serve -- it is part of the job NAME, which the command never
-                    # sees -- and SAFE_CI_DAG_RUNNER_STEP is an ownership nonce
+                    # sees -- and DAGRUN_STEP is an ownership nonce
                     # (pid:counter:time_ns), so it is unstable across reruns and is not an
                     # index.
                     env={
@@ -1952,20 +1952,20 @@ def _effective_run_timeout(ns: argparse.Namespace) -> int | None:
     explicit = getattr(ns, "run_timeout", None)
     if explicit:
         return int(explicit)
-    raw = os.environ.get("SAFE_CI_DAG_RUNNER_RUN_TIMEOUT", "")
+    raw = os.environ.get("DAGRUN_RUN_TIMEOUT", "")
     if not raw:
         return None
     try:
         value = int(raw)
     except ValueError:
         print(
-            f"{PROG}: SAFE_CI_DAG_RUNNER_RUN_TIMEOUT={raw!r} is not a positive integer; ignoring",
+            f"{PROG}: DAGRUN_RUN_TIMEOUT={raw!r} is not a positive integer; ignoring",
             file=sys.stderr,
         )
         return None
     if value <= 0:
         print(
-            f"{PROG}: SAFE_CI_DAG_RUNNER_RUN_TIMEOUT={raw!r} is not a positive integer; ignoring",
+            f"{PROG}: DAGRUN_RUN_TIMEOUT={raw!r} is not a positive integer; ignoring",
             file=sys.stderr,
         )
         return None
@@ -2027,7 +2027,7 @@ def _resolve_cgroup_manager(
 
     Flow (mirrors DeepScry's validate cgroup bring-up):
 
-    * Already inside the managed scope (``SAFE_CI_IN_SCOPE=1``): construct :class:`Cgroups`. If
+    * Already inside the managed scope (``DAGRUN_IN_SCOPE=1``): construct :class:`Cgroups`. If
       per-step containment came up, install the scope teardown handler and box. If it did not,
       error (or, with ``allow_failure``, warn and run unboxed).
     * Not in a scope, ``allow_failure``: skip the re-exec and run unboxed with a visible warning
@@ -2540,7 +2540,7 @@ def _apply_admission(ns: argparse.Namespace) -> int:
     # count this run twice against the budget -- and on a tight budget the second ask would QUEUE
     # behind the first, i.e. the run would wait for itself until the wait ran out.
     #
-    # THE SENTINEL ALONE CANNOT ESTABLISH THAT. `systemd-run --setenv=SAFE_CI_IN_SCOPE=1` sets it
+    # THE SENTINEL ALONE CANNOT ESTABLISH THAT. `systemd-run --setenv=DAGRUN_IN_SCOPE=1` sets it
     # for the whole scope, and every step's environment is built from `os.environ`, so a runner
     # invoked as a STEP of a boxed run inherits the same "1" while holding no reservation at all
     # -- and skipping on the flag alone would wave that nested run through with nothing reserved
@@ -2917,7 +2917,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         and dag_arg == "-"
         and not bool(ns.allow_cgroup_failure)
         and not bool(getattr(ns, "unsafe_no_cgroups", False))
-        and os.environ.get("SAFE_CI_IN_SCOPE") != "1"
+        and os.environ.get("DAGRUN_IN_SCOPE") != "1"
     ):
         _manager, code = _resolve_cgroup_manager(
             False,

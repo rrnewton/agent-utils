@@ -295,12 +295,12 @@ step from that step's own cores and memory cap. Either way the run prints one
 line on stderr naming the variable, which value governs, and what the other one
 would have been, so a later OOM is explicable. Your value is read once, in the
 outermost process, and forwarded across the systemd re-exec under the separate
-name `SAFE_CI_OPERATOR_BUILD_JOBS`; the runner therefore never mistakes its own
+name `DAGRUN_OPERATOR_BUILD_JOBS`; the runner therefore never mistakes its own
 scope-wide export for something you asked for.
 
 `--max-mem` is a containment limit as well as a sizing input. Under boxing it becomes the
 outer scope's `MemoryMax`, obeying the same one-way rule as
-`SAFE_CI_OUTER_MEMORY_MAX_BYTES`: it can tighten the derived 90%-of-`MemAvailable`
+`DAGRUN_OUTER_MEMORY_MAX_BYTES`: it can tighten the derived 90%-of-`MemAvailable`
 boundary, never widen it. The binding ceiling is named on stderr and the live value is read
 back before work starts, so `--max-mem 20G` bounds what the run can actually take from the
 host rather than only what its arithmetic assumed. A `MemoryMax` is a CEILING, not a
@@ -421,7 +421,7 @@ On breach the scheduler stops launching, terminates every in-flight step's whole
 process tree, marks those steps aborted with that reason, and **returns** — it
 writes its profile rows and hands back a verdict rather than leaving the process
 to be killed from outside, which would discard the evidence the bound exists to
-capture. `SAFE_CI_DAG_RUNNER_RUN_TIMEOUT` sets the same budget for a wrapper that
+capture. `DAGRUN_RUN_TIMEOUT` sets the same budget for a wrapper that
 cannot edit the command line.
 
 The bounds are ordered, and the ordering is the point:
@@ -497,8 +497,8 @@ therefore gets two variables in its environment:
 
 | variable | value |
 | --- | --- |
-| `SAFE_CI_DAG_RUNNER_COPY` | this copy's index, zero-padded to the width of `N` (`03` of `10`) |
-| `SAFE_CI_DAG_RUNNER_COPIES` | `N` |
+| `DAGRUN_COPY` | this copy's index, zero-padded to the width of `N` (`03` of `10`) |
+| `DAGRUN_COPIES` | `N` |
 
 Both are unset when the graph was not multiplied, so a command can tell a single
 run from a copy:
@@ -506,7 +506,7 @@ run from a copy:
 ```yaml
 - group: demo
   job: repeat
-  cmd: ./measure --out out/run-${SAFE_CI_DAG_RUNNER_COPY:-single}.log
+  cmd: ./measure --out out/run-${DAGRUN_COPY:-single}.log
 ```
 
 ```sh
@@ -533,7 +533,7 @@ a graph, so prefer this to a hand-rolled loop.
 > identical runs -- and the runner reported `10/10 passed` either way, so nothing
 > warns you.
 >
-> This applies equally to `SAFE_CI_DAG_RUNNER_STEP`, the ownership nonce the
+> This applies equally to `DAGRUN_STEP`, the ownership nonce the
 > scheduler sets on every step, which contains a pid and a nanosecond timestamp
 > and so differs on every run.
 
@@ -541,7 +541,7 @@ a graph, so prefer this to a hand-rolled loop.
 
 Runs append resource samples to `./.dagrun/profiles/` by default.
 Override the directory with `--perf-dir` or
-`SAFE_CI_DAG_RUNNER_PROFILE_DIR`; disable writes with `--no-profile`. `--profile`
+`DAGRUN_PROFILE_DIR`; disable writes with `--no-profile`. `--profile`
 prints the current run's per-step table.
 
 Measure one step across inner widths with:
@@ -640,9 +640,9 @@ margin is capped at one eighth of `MemTotal` so it can never swallow a small
 host's whole budget: held back whole, 8 GiB of an 8 GiB machine would leave a
 budget of zero and refuse every run on that host.
 
-Override the ledger path with `SAFE_CI_MEM_LEDGER`, the aggregate budget with
-`SAFE_CI_ADMISSION_BUDGET_BYTES`, and the live-headroom reading with
-`SAFE_CI_ADMISSION_HEADROOM_BYTES`; an unparseable override is reported and the
+Override the ledger path with `DAGRUN_MEM_LEDGER`, the aggregate budget with
+`DAGRUN_ADMISSION_BUDGET_BYTES`, and the live-headroom reading with
+`DAGRUN_ADMISSION_HEADROOM_BYTES`; an unparseable override is reported and the
 host is measured instead, never silently taken as zero.
 
 A boxed run admits ONCE, before cgroup bring-up: a run that is going to wait
@@ -673,7 +673,7 @@ IDs. A future service could provide dynamic or fair machine-wide allocation,
 but ordinary `--max-cpus` deliberately remains a shared bandwidth and per-step
 width limit rather than pretending to hand out exclusive moving CPU slices.
 
-The ledger path is `SAFE_CI_CORE_LEDGER` when that variable is set. Otherwise it
+The ledger path is `DAGRUN_CORE_LEDGER` when that variable is set. Otherwise it
 is `$XDG_RUNTIME_DIR/dagrun/core-reservations.json` when the runtime
 directory exists, or
 `<system-temporary-directory>/dagrun-<uid>/core-reservations.json`.
@@ -702,6 +702,32 @@ The `--` separator before the wrapped command is required. `selftest` directly
 attempts to move a child onto an excluded CPU and verifies every assigned CPU is
 usable; a missing or inconclusive mutation is a failure, not evidence of a hard
 bound. CPU pinning is intended for controlled measurements, not ordinary CI.
+
+## The names runners coordinate through
+
+Independent runs on one host agree with each other through four named things:
+the environment variables that configure them, every one of which begins
+`DAGRUN_`; the shared systemd slice `dagrun.slice`, whose single `CPUQuota`
+bounds the sum of every boxed run; the core-reservation and memory-admission
+ledgers described above; and the default profile store `./.dagrun/`.
+
+Those names *are* the coordination, so a run that uses different ones does not
+coordinate at all — and none of these mismatches announces itself:
+
+- A variable whose name does not begin `DAGRUN_` is not read. The run takes its
+  default instead, and says nothing.
+- Runs that box under different slice names occupy different places in the
+  cgroup tree, so no single `CPUQuota` bounds their sum. Runs that read
+  different ledger files hand out the same cores to two owners and admit twice
+  against the same RAM. Let the host drain before changing which names are in
+  use, or accept that reservations and admissions hold only among the runs that
+  share them.
+- An operator drop-in applies to the slice it is filed under, so install it as
+  `dagrun.slice.d/`.
+- A profile store kept under some other directory name is not found. The
+  planner then works from the estimates written in the DAG rather than from
+  measurements; it does not fail, and `--profile` will show it learning again
+  from the first run onwards.
 
 ## Command summary
 

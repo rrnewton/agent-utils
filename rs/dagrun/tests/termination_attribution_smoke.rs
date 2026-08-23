@@ -159,7 +159,7 @@ fn hung_test_is_terminated_named_and_logged_while_a_bystander_survives() {
             "--no-profile-feedback",
             "--allow-cgroup-failure",
         ])
-        .env("SAFE_CI_DAG_RUNNER_LOG_DIR", fx.logs())
+        .env("DAGRUN_LOG_DIR", fx.logs())
         .env("ESCAPEE_PID", fx.escapee_pid_file())
         .output()
         .expect("failed to spawn the built binary");
@@ -255,7 +255,7 @@ fn clean_suite_still_passes_and_accuses_nobody() {
             "--no-profile-feedback",
             "--allow-cgroup-failure",
         ])
-        .env("SAFE_CI_DAG_RUNNER_LOG_DIR", fx.logs())
+        .env("DAGRUN_LOG_DIR", fx.logs())
         .env("ESCAPEE_PID", fx.escapee_pid_file())
         .output()
         .expect("failed to spawn the built binary");
@@ -312,7 +312,7 @@ fn journal_identifies_the_in_flight_test_after_the_runner_is_sigkilled() {
             "--no-profile-feedback",
             "--allow-cgroup-failure",
         ])
-        .env("SAFE_CI_DAG_RUNNER_LOG_DIR", fx.logs())
+        .env("DAGRUN_LOG_DIR", fx.logs())
         .env("ESCAPEE_PID", fx.escapee_pid_file())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

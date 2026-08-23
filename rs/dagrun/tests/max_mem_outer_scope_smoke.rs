@@ -50,16 +50,16 @@ fn max_mem_is_the_outer_scope_ceiling_the_run_announces() {
             "--max-mem",
             "1M",
         ])
-        .env_remove("SAFE_CI_IN_SCOPE")
-        .env_remove("SAFE_CI_OUTER_MEMORY_MAX_BYTES")
+        .env_remove("DAGRUN_IN_SCOPE")
+        .env_remove("DAGRUN_OUTER_MEMORY_MAX_BYTES")
         .output()
         .expect("failed to spawn the built binary");
     let with_stderr = String::from_utf8_lossy(&with_budget.stderr).to_string();
 
     let without_budget = Command::new(bin)
         .args(["run", "--dag", dag.to_str().unwrap(), "-q", "--no-profile"])
-        .env_remove("SAFE_CI_IN_SCOPE")
-        .env_remove("SAFE_CI_OUTER_MEMORY_MAX_BYTES")
+        .env_remove("DAGRUN_IN_SCOPE")
+        .env_remove("DAGRUN_OUTER_MEMORY_MAX_BYTES")
         .output()
         .expect("failed to spawn the built binary");
     let without_stderr = String::from_utf8_lossy(&without_budget.stderr).to_string();
@@ -120,8 +120,8 @@ fn a_nonpositive_max_mem_is_refused_by_name_and_no_step_runs() {
             "--max-mem",
             "0",
         ])
-        .env_remove("SAFE_CI_IN_SCOPE")
-        .env_remove("SAFE_CI_OUTER_MEMORY_MAX_BYTES")
+        .env_remove("DAGRUN_IN_SCOPE")
+        .env_remove("DAGRUN_OUTER_MEMORY_MAX_BYTES")
         .output()
         .expect("failed to spawn the built binary");
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
@@ -196,9 +196,9 @@ fn max_mem_is_the_memory_max_handed_to_systemd_run() {
         .env("SCDR_FAKE_ARGV", &argv_log)
         // Force the scope attempt: under CI/GITHUB_ACTIONS the re-exec is skipped by policy and
         // no argument vector would ever be built.
-        .env("SAFE_CI_FORCE_SCOPE_ATTEMPT", "1")
-        .env_remove("SAFE_CI_IN_SCOPE")
-        .env_remove("SAFE_CI_OUTER_MEMORY_MAX_BYTES")
+        .env("DAGRUN_FORCE_SCOPE_ATTEMPT", "1")
+        .env_remove("DAGRUN_IN_SCOPE")
+        .env_remove("DAGRUN_OUTER_MEMORY_MAX_BYTES")
         .output()
         .expect("failed to spawn the built binary");
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
@@ -220,7 +220,7 @@ fn max_mem_is_the_memory_max_handed_to_systemd_run() {
     // ceiling nobody asked for.
     assert!(
         recorded.lines().any(|line| line
-            == format!("--setenv=SAFE_CI_EXPECTED_OUTER_MEMORY_MAX_BYTES={TINY_BUDGET_BYTES}")),
+            == format!("--setenv=DAGRUN_EXPECTED_OUTER_MEMORY_MAX_BYTES={TINY_BUDGET_BYTES}")),
         "the expected-ceiling handoff must carry the same number:\n{recorded}"
     );
 }

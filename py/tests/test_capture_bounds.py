@@ -177,7 +177,7 @@ def test_a_failing_step_dumps_the_tail_and_says_how_much_it_dropped(
 
     out = capsys.readouterr().out
     assert "EARLIER OUTPUT DROPPED" in out
-    assert "SAFE_CI_DAG_RUNNER_CAPTURE_MAX_BYTES" in out
+    assert "DAGRUN_CAPTURE_MAX_BYTES" in out
     # The numbers must be real, not decorative: 200 lines of "lineN" is well over 300 bytes.
     assert "the last 300 were kept in memory" in out
     assert "line200" in out, "the TAIL is what is kept"

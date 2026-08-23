@@ -167,7 +167,7 @@ Every `run` and `sweep` above **auto-logs** resource-usage CSVs to the default p
 `--perf-dir`. The tool prints exactly where it appended. Drop `--allow-cgroup-failure` on a Linux
 host with a systemd user session to get real per-step boxing, which also fills in the `rss_hwm`
 (peak memory) column from each step's cgroup. Override the location with `--perf-dir DIR` or
-`$SAFE_CI_DAG_RUNNER_PROFILE_DIR`, or turn logging off with `--no-profile`. Consider gitignoring
+`$DAGRUN_PROFILE_DIR`, or turn logging off with `--no-profile`. Consider gitignoring
 `./.dagrun/`.
 
 ## See also

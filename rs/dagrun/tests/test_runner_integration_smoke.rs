@@ -53,7 +53,7 @@ impl Fixture {
             ])
             .arg("--run-timeout")
             .arg((timeout + 4).to_string())
-            .env("SAFE_CI_DAG_RUNNER_LOG_DIR", &evidence)
+            .env("DAGRUN_LOG_DIR", &evidence)
             .output()
             .unwrap();
         let console = format!(

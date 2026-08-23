@@ -36,7 +36,7 @@ def test_the_build_width_suites_pass_with_an_ambient_cargo_build_jobs() -> None:
     # Exactly the developer's shell that turned the suite red: a stated width, and no forwarded
     # answer, which is what makes the outermost process treat it as operator intent.
     env["CARGO_BUILD_JOBS"] = "200"
-    env.pop("SAFE_CI_OPERATOR_BUILD_JOBS", None)
+    env.pop("DAGRUN_OPERATOR_BUILD_JOBS", None)
     env["PYTHONPATH"] = str(py_root)
     out = subprocess.run(
         [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *_AFFECTED],

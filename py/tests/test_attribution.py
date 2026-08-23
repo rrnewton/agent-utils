@@ -121,7 +121,7 @@ def test_step_log_is_bounded_and_says_so(tmp_path: Path, monkeypatch: pytest.Mon
     a silently incomplete evidence file, and a later reader cannot distinguish "the step
     printed nothing more" from "we stopped writing" -- which is worse than no evidence at all.
     """
-    monkeypatch.setenv("SAFE_CI_DAG_RUNNER_LOG_MAX_BYTES", "100")
+    monkeypatch.setenv("DAGRUN_LOG_MAX_BYTES", "100")
     directory = tmp_path / "evidence"
     evidence = RunEvidence.open(directory)
     assert evidence is not None
@@ -153,7 +153,7 @@ def test_step_log_is_bounded_and_says_so(tmp_path: Path, monkeypatch: pytest.Mon
 
 def test_classification_survives_a_truncated_log(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Bounding the DISK must not cost the attribution the disk was there to support."""
-    monkeypatch.setenv("SAFE_CI_DAG_RUNNER_LOG_MAX_BYTES", "10")
+    monkeypatch.setenv("DAGRUN_LOG_MAX_BYTES", "10")
     directory = tmp_path / "evidence"
     evidence = RunEvidence.open(directory)
     assert evidence is not None
@@ -175,19 +175,19 @@ def test_classification_survives_a_truncated_log(tmp_path: Path, monkeypatch: py
 
 def test_log_ceiling_env_parsing() -> None:
     """`0` means unlimited; garbage is REPORTED and falls back, never silently unlimited."""
-    saved = os.environ.pop("SAFE_CI_DAG_RUNNER_LOG_MAX_BYTES", None)
+    saved = os.environ.pop("DAGRUN_LOG_MAX_BYTES", None)
     try:
         assert log_max_bytes() == DEFAULT_LOG_MAX_BYTES
-        os.environ["SAFE_CI_DAG_RUNNER_LOG_MAX_BYTES"] = "0"
+        os.environ["DAGRUN_LOG_MAX_BYTES"] = "0"
         assert log_max_bytes() is None
-        os.environ["SAFE_CI_DAG_RUNNER_LOG_MAX_BYTES"] = "4096"
+        os.environ["DAGRUN_LOG_MAX_BYTES"] = "4096"
         assert log_max_bytes() == 4096
-        os.environ["SAFE_CI_DAG_RUNNER_LOG_MAX_BYTES"] = "  8192  "
+        os.environ["DAGRUN_LOG_MAX_BYTES"] = "  8192  "
         assert log_max_bytes() == 8192
         for bad in ("banana", "-1", "1.5"):
-            os.environ["SAFE_CI_DAG_RUNNER_LOG_MAX_BYTES"] = bad
+            os.environ["DAGRUN_LOG_MAX_BYTES"] = bad
             assert log_max_bytes() == DEFAULT_LOG_MAX_BYTES, f"{bad} must fall back, not unlimit"
     finally:
-        os.environ.pop("SAFE_CI_DAG_RUNNER_LOG_MAX_BYTES", None)
+        os.environ.pop("DAGRUN_LOG_MAX_BYTES", None)
         if saved is not None:
-            os.environ["SAFE_CI_DAG_RUNNER_LOG_MAX_BYTES"] = saved
+            os.environ["DAGRUN_LOG_MAX_BYTES"] = saved

@@ -10,7 +10,7 @@
 #
 # Every mode wires ./bin at the TRACKED engine resolver (common/bin). The resolver runs the tracked
 # Python entrypoint by default and the tracked Cargo-backed Rust launcher only on explicit
-# SAFE_CI_DAG_RUNNER_ENGINE=rust, logging which engine won on every invocation.
+# DAGRUN_ENGINE=rust, logging which engine won on every invocation.
 #
 # `make` just calls `./setup`.
 set -euo pipefail
@@ -127,11 +127,11 @@ case "$WHAT" in
 esac
 # Wire ./bin at the TRACKED, deterministic engine resolver (common/bin) regardless of what was
 # built. The resolver defaults to the tracked Python entrypoint and runs Rust ONLY on explicit
-# SAFE_CI_DAG_RUNNER_ENGINE=rust (never a silent fallback), logging which engine won on every run.
+# DAGRUN_ENGINE=rust (never a silent fallback), logging which engine won on every run.
 # This replaces the old footgun where `both` wired ./bin straight at the UNTRACKED rs/bin, letting a
 # stale locally-built Rust binary silently beat the tracked entrypoint.
 wire_bin "common/bin"
 if [ "$WHAT" = rs ]; then
-  echo "==> note: run Rust via SAFE_CI_DAG_RUNNER_ENGINE=rust ./bin/dagrun (default is tracked Python; rs/bin is Cargo-backed)"
+  echo "==> note: run Rust via DAGRUN_ENGINE=rust ./bin/dagrun (default is tracked Python; rs/bin is Cargo-backed)"
 fi
 echo "setup: done ($WHAT)"

@@ -106,14 +106,14 @@ this order:
 
 1. `--no-profile`: do not write local CSVs.
 2. `--perf-dir DIR`.
-3. `SAFE_CI_DAG_RUNNER_PROFILE_DIR`.
+3. `DAGRUN_PROFILE_DIR`.
 4. `./.dagrun/profiles/`, relative to the caller's current directory.
 
 Feedback reading is separate:
 
 1. `--no-profile-feedback`: do not read.
 2. `--perf-dir DIR`.
-3. `SAFE_CI_DAG_RUNNER_PROFILE_DIR`.
+3. `DAGRUN_PROFILE_DIR`.
 4. `./.dagrun/profiles/`.
 
 Consequences:
@@ -400,7 +400,7 @@ duration and memory data immediately. With a one-sample threshold, one stale row
 
 ### High: identity overrides split the local reader from the writer
 
-`SAFE_CI_DAG_RUNNER_MACHINE_ID` and `SAFE_CI_DAG_RUNNER_CONTAINER_CLASS` are honored by the
+`DAGRUN_MACHINE_ID` and `DAGRUN_CONTAINER_CLASS` are honored by the
 feedback reader and summary sync, but the local CSV writer calls the physical-identity helpers
 directly. A run with either override reads `step_profiles_<override>.csv` and writes
 `step_profiles_<physical>.csv`; repeated executions never consume the history they just produced.

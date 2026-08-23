@@ -20,7 +20,7 @@ use serde_json::{Map, Number, Value};
 use crate::cgroup::pick_least_busy_free_cores_excluding;
 
 /// Environment variable overriding the host-wide reservation ledger.
-pub const LEDGER_ENV: &str = "SAFE_CI_CORE_LEDGER";
+pub const LEDGER_ENV: &str = "DAGRUN_CORE_LEDGER";
 
 #[derive(Clone, Debug, PartialEq)]
 struct Record {
@@ -460,7 +460,7 @@ mod tests {
 
     fn temp_ledger(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
-            "safe-ci-rs-reservation-{}-{name}.json",
+            "dagrun-rs-reservation-{}-{name}.json",
             std::process::id()
         ))
     }

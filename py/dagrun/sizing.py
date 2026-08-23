@@ -342,7 +342,7 @@ BUILD_JOBS_ENV = "CARGO_BUILD_JOBS"
 #: So intent is resolved ONCE, in the outermost process, from the truly ambient environment, and
 #: passed forward under its own name. PRESENCE of this variable means "already resolved"; an
 #: empty value means "resolved, and the operator asked for nothing".
-OPERATOR_BUILD_JOBS_ENV = "SAFE_CI_OPERATOR_BUILD_JOBS"
+OPERATOR_BUILD_JOBS_ENV = "DAGRUN_OPERATOR_BUILD_JOBS"
 
 
 def parse_build_jobs(raw: str | None) -> int | None:
@@ -384,7 +384,7 @@ def parse_build_jobs(raw: str | None) -> int | None:
 def resolve_operator_build_jobs(forwarded: str | None, ambient: str | None) -> int | None:
     """Resolve operator intent from the two variables, without touching the environment.
 
-    ``forwarded`` is ``SAFE_CI_OPERATOR_BUILD_JOBS`` and ``ambient`` is ``CARGO_BUILD_JOBS``.
+    ``forwarded`` is ``DAGRUN_OPERATOR_BUILD_JOBS`` and ``ambient`` is ``CARGO_BUILD_JOBS``.
     PRESENCE of the first wins outright, empty included: an outer runner already asked this
     question of the real environment, and its answer — including "the operator asked for
     nothing" — is the only one that is still trustworthy, because that same runner has since
@@ -403,7 +403,7 @@ def resolve_operator_build_jobs(forwarded: str | None, ambient: str | None) -> i
 #: mutates ``os.environ[CARGO_BUILD_JOBS]`` in-process: ``enter_delegated_scope`` would, and it
 #: has no caller. The live in-scope path is the systemd re-exec, and there a FRESH interpreter
 #: reads a ``CARGO_BUILD_JOBS`` its parent set via ``--setenv``, which the forwarded
-#: ``SAFE_CI_OPERATOR_BUILD_JOBS`` — present, possibly empty — is what disarms. So today the
+#: ``DAGRUN_OPERATOR_BUILD_JOBS`` — present, possibly empty — is what disarms. So today the
 #: import-time capture is equivalent to a lazy read; it is written this way so that wiring up
 #: ``enter_delegated_scope``, or adding any other in-process write, cannot silently turn the
 #: runner's own number into "operator intent" without anyone noticing.

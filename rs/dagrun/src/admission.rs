@@ -36,8 +36,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Number, Value};
 
-/// Environment override for the shared memory ledger path (sibling of `SAFE_CI_CORE_LEDGER`).
-pub const MEM_LEDGER_ENV: &str = "SAFE_CI_MEM_LEDGER";
+/// Environment override for the shared memory ledger path (sibling of `DAGRUN_CORE_LEDGER`).
+pub const MEM_LEDGER_ENV: &str = "DAGRUN_MEM_LEDGER";
 
 /// Environment override for the whole-host aggregate budget, in BYTES.
 ///
@@ -45,10 +45,10 @@ pub const MEM_LEDGER_ENV: &str = "SAFE_CI_MEM_LEDGER";
 /// guess about how much of the box this tool may claim, and the person who owns the machine knows
 /// better. An unparseable value is reported and ignored rather than silently taken as zero, which
 /// would refuse every run.
-pub const MEM_BUDGET_BYTES_ENV: &str = "SAFE_CI_ADMISSION_BUDGET_BYTES";
+pub const MEM_BUDGET_BYTES_ENV: &str = "DAGRUN_ADMISSION_BUDGET_BYTES";
 
 /// Environment override for the live-headroom reading, in BYTES.
-pub const MEM_HEADROOM_BYTES_ENV: &str = "SAFE_CI_ADMISSION_HEADROOM_BYTES";
+pub const MEM_HEADROOM_BYTES_ENV: &str = "DAGRUN_ADMISSION_HEADROOM_BYTES";
 
 /// Fraction of `MemTotal` this tool will let its runs hold IN AGGREGATE.
 ///

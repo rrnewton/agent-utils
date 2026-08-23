@@ -154,7 +154,7 @@ def test_mem_is_also_the_ceiling_the_outer_scope_is_brought_up_with(
         seen.append(memory_max)
         return False  # never re-exec under test; the run then reports and exits nonzero
 
-    monkeypatch.delenv("SAFE_CI_IN_SCOPE", raising=False)
+    monkeypatch.delenv("DAGRUN_IN_SCOPE", raising=False)
     monkeypatch.delenv(cg.OUTER_MEMORY_MAX_ENV, raising=False)
     # A host boundary far above the request, so the requested ceiling is the one that binds.
     monkeypatch.setattr(cg, "mem_available_bytes", lambda: 64 * 1024**3)

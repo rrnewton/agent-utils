@@ -7,7 +7,7 @@ const DAG: &str = r#"{"steps":[{"group":"box","job":"one","cmd":"echo SHOULD_NOT
 
 #[test]
 fn cores_flag_refuses_unboxed_soft_affinity() {
-    let dir = std::env::temp_dir().join(format!("safe_ci_corebox_{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("dagrun_corebox_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let dag = dir.join("dag.json");
     std::fs::File::create(&dag)

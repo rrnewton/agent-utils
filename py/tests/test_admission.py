@@ -495,7 +495,7 @@ def test_an_inherited_in_scope_sentinel_does_not_wave_an_unreserved_run_through(
 ) -> None:
     """The skip belongs to the run that HOLDS the reservation, not to anything that inherits a flag.
 
-    ``systemd-run --setenv=SAFE_CI_IN_SCOPE=1`` sets the sentinel for the whole scope, and every
+    ``systemd-run --setenv=DAGRUN_IN_SCOPE=1`` sets the sentinel for the whole scope, and every
     step's environment is built from ``os.environ``, so a runner invoked as a STEP of a boxed run
     reads exactly the same "1" -- a different pid, holding nothing. Skipping on the flag alone
     reserved nothing, printed no verdict and exited 0 for a 16 GiB request against a 1 GiB budget.

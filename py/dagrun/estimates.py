@@ -63,8 +63,8 @@ __all__ = [
 #: these let a test (or a caller pinning heterogeneous-but-equivalent runners to one identity)
 #: force the ``step_profiles_<machine>_<container>.csv`` the reader loads. Used by the cross
 #: differential to read a fixed synthetic store host-independently.
-MACHINE_ID_ENV = "SAFE_CI_DAG_RUNNER_MACHINE_ID"
-CONTAINER_CLASS_ENV = "SAFE_CI_DAG_RUNNER_CONTAINER_CLASS"
+MACHINE_ID_ENV = "DAGRUN_MACHINE_ID"
+CONTAINER_CLASS_ENV = "DAGRUN_CONTAINER_CLASS"
 
 #: Minimum recorded samples before the store overrides the DAG hint for a step. Below this the
 #: DAG-authored hint wins (the store has too little signal to trust yet).

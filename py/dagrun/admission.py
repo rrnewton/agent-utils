@@ -69,8 +69,8 @@ __all__ = [
     "request_with_limits",
 ]
 
-#: Environment override for the shared memory ledger path (sibling of ``SAFE_CI_CORE_LEDGER``).
-MEM_LEDGER_ENV = "SAFE_CI_MEM_LEDGER"
+#: Environment override for the shared memory ledger path (sibling of ``DAGRUN_CORE_LEDGER``).
+MEM_LEDGER_ENV = "DAGRUN_MEM_LEDGER"
 
 #: Environment override for the whole-host aggregate budget, in BYTES.
 #:
@@ -78,11 +78,11 @@ MEM_LEDGER_ENV = "SAFE_CI_MEM_LEDGER"
 #: guess about how much of the box this tool may claim, and the person who owns the machine knows
 #: better. An unparseable value is reported and ignored rather than silently taken as zero, which
 #: would refuse every run.
-MEM_BUDGET_BYTES_ENV = "SAFE_CI_ADMISSION_BUDGET_BYTES"
+MEM_BUDGET_BYTES_ENV = "DAGRUN_ADMISSION_BUDGET_BYTES"
 
 #: Environment override for the live-headroom reading, in BYTES. Same posture as above; exists so
 #: a host without a readable ``/proc/meminfo`` can still gate on a number the operator supplies.
-MEM_HEADROOM_BYTES_ENV = "SAFE_CI_ADMISSION_HEADROOM_BYTES"
+MEM_HEADROOM_BYTES_ENV = "DAGRUN_ADMISSION_HEADROOM_BYTES"
 
 #: Fraction of ``MemTotal`` this tool will let its runs hold IN AGGREGATE.
 #:

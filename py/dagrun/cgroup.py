@@ -54,15 +54,15 @@ _CONTROLLER_ENABLE_ATTEMPTS = 3
 
 #: Optional caller override used by containment tests and constrained hosts.
 #: It may only TIGHTEN the derived cap, never widen it.
-OUTER_MEMORY_MAX_ENV = "SAFE_CI_OUTER_MEMORY_MAX_BYTES"
+OUTER_MEMORY_MAX_ENV = "DAGRUN_OUTER_MEMORY_MAX_BYTES"
 #: Exact cap carried across the systemd re-exec for in-scope readback.
-EXPECTED_OUTER_MEMORY_MAX_ENV = "SAFE_CI_EXPECTED_OUTER_MEMORY_MAX_BYTES"
+EXPECTED_OUTER_MEMORY_MAX_ENV = "DAGRUN_EXPECTED_OUTER_MEMORY_MAX_BYTES"
 #: Exact total-CPU cap carried across the systemd re-exec for in-scope readback.
-EXPECTED_OUTER_CPU_COUNT_ENV = "SAFE_CI_EXPECTED_OUTER_CPU_COUNT"
+EXPECTED_OUTER_CPU_COUNT_ENV = "DAGRUN_EXPECTED_OUTER_CPU_COUNT"
 #: Carries the outer scope's requested ``RuntimeMaxSec`` into the in-scope child, so the child can
 #: read the property back off the live unit instead of trusting the argument vector that asked
 #: for it.
-EXPECTED_RUNTIME_MAX_ENV = "SAFE_CI_EXPECTED_RUNTIME_MAX_SEC"
+EXPECTED_RUNTIME_MAX_ENV = "DAGRUN_EXPECTED_RUNTIME_MAX_SEC"
 
 #: Per-step child cgroup directory prefix (also the scan key for the
 #: normal-exit backstop). cgroup-v2 directory names may not contain '/'.
@@ -82,17 +82,17 @@ class ScopeNaming:
     #: Shared parent slice for ALL concurrent runs. Every run's transient scope
     #: launches under it, so a single ``CPUQuota`` on the slice bounds the SUM of
     #: CPU across however many runs execute at once (not each one individually).
-    slice_name: str = "safe-ci.slice"
+    slice_name: str = "dagrun.slice"
     #: Prefix for the per-run transient scope unit (``<prefix>-<pid>``).
-    unit_prefix: str = "safe-ci"
+    unit_prefix: str = "dagrun"
     #: Environment sentinel set in the re-exec'd (in-scope) child.
-    env_in_scope: str = "SAFE_CI_IN_SCOPE"
+    env_in_scope: str = "DAGRUN_IN_SCOPE"
     #: Environment var carrying the outer scope unit name to the in-scope child.
-    env_scope_unit: str = "SAFE_CI_SCOPE_UNIT"
+    env_scope_unit: str = "DAGRUN_SCOPE_UNIT"
     #: Environment var carrying the delegated (systemd-free) cgroup path.
-    env_direct_cgroup: str = "SAFE_CI_DIRECT_CGROUP"
+    env_direct_cgroup: str = "DAGRUN_DIRECT_CGROUP"
     #: Prefix for every log/warning line this module prints.
-    log_prefix: str = "[safe-ci]"
+    log_prefix: str = "[dagrun]"
     #: Child cgroup the runner vacates into (cgroup-v2 no-internal-processes).
     supervisor_name: str = "supervisor"
 
@@ -144,7 +144,7 @@ def outer_memory_max_bytes(requested_bytes: int | None = None) -> int | None:
 
     The outer scope is a correctness boundary, not a per-step sizing model: it
     gets 90% of ``MemAvailable`` so the coordinator, neighbours, and kernel keep
-    headroom. ``SAFE_CI_OUTER_MEMORY_MAX_BYTES`` can tighten this for a smaller
+    headroom. ``DAGRUN_OUTER_MEMORY_MAX_BYTES`` can tighten this for a smaller
     host or container, but cannot widen the derived boundary.
 
     ``requested_bytes`` is the caller's own ceiling — ``--max-mem`` — and obeys the same
@@ -377,7 +377,7 @@ def _delegated_cgroupfs_available(group: Path | None) -> bool:
         return False
     if not {"cpu", "memory"}.issubset(enabled):
         return False
-    probe = group / f"safe-ci-probe-{os.getpid()}"
+    probe = group / f"dagrun-probe-{os.getpid()}"
     try:
         probe.mkdir()
         probe.rmdir()
@@ -485,7 +485,7 @@ def systemd_scope_available() -> bool:
             try:
                 r = subprocess.run(
                     ["systemd-run", "--user", "--scope", "--quiet",
-                     f"--unit=safe-ci-probe-{os.getpid()}", "true"],
+                     f"--unit=dagrun-probe-{os.getpid()}", "true"],
                     capture_output=True, timeout=8,
                 )
                 _SCOPE_PROBE = r.returncode == 0
@@ -865,7 +865,7 @@ def verify_scope_runtime_max(
 #: THE MEASUREMENT INSTRUMENT THE POLICY SKIP REMOVED. Ephemeral hosted runners are a population
 #: nobody has measured precisely because the skip means the probe never runs there. This makes the
 #: question answerable on any runner without editing code or changing the default.
-FORCE_ATTEMPT_ENV = "SAFE_CI_FORCE_SCOPE_ATTEMPT"
+FORCE_ATTEMPT_ENV = "DAGRUN_FORCE_SCOPE_ATTEMPT"
 
 
 class ScopeAttemptKind(Enum):
@@ -1999,7 +1999,7 @@ class Cgroups:
         quoted_procs = shlex.quote(str(procs))
         return (
             f"if ! printf '%s\\n' \"$$\" 2>/dev/null > {quoted_procs}; then\n"
-            "  echo 'ERROR: step could not join its safe-ci cgroup; refusing uncontained run' >&2\n"
+            "  echo 'ERROR: step could not join its dagrun cgroup; refusing uncontained run' >&2\n"
             "  exit 125\n"
             "fi\n"
             f"export {BUILD_JOBS_ENV}={jobs}\n{cmd}"

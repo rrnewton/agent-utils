@@ -41,7 +41,7 @@ __all__ = [
 
 #: cgroup-v2 unified hierarchy mount point. Linux-only.
 CGROUP_ROOT = Path("/sys/fs/cgroup")
-STEP_NONCE_ENV = "SAFE_CI_DAG_RUNNER_STEP"
+STEP_NONCE_ENV = "DAGRUN_STEP"
 
 _DESCENDANT_KILL_SWEEPS = 4
 _nonce_sequence = itertools.count()

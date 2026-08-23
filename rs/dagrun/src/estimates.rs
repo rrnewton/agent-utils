@@ -29,9 +29,9 @@ use crate::sizing::{
 };
 
 /// Environment variable that overrides the machine component of the feedback identity.
-pub const MACHINE_ID_ENV: &str = "SAFE_CI_DAG_RUNNER_MACHINE_ID";
+pub const MACHINE_ID_ENV: &str = "DAGRUN_MACHINE_ID";
 /// Environment variable that overrides the container-class component of the feedback identity.
-pub const CONTAINER_CLASS_ENV: &str = "SAFE_CI_DAG_RUNNER_CONTAINER_CLASS";
+pub const CONTAINER_CLASS_ENV: &str = "DAGRUN_CONTAINER_CLASS";
 
 /// Minimum recorded samples before the store overrides the DAG hint for a step.
 pub const DEFAULT_MIN_SAMPLES: i64 = 1;

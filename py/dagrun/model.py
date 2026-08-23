@@ -60,19 +60,19 @@ DEFAULT_SMALL_CPU_TIMEOUT = 10  # 10 s CPU-time budget when cpu_timeout is unset
 #:
 #: 1.0 is a strict no-op: unset, every platform enforces the canonical budget exactly as before.
 #: A platform opts in explicitly (`--cpu-timeout-multiplier`, or
-#: $SAFE_CI_DAG_RUNNER_CPU_TIMEOUT_MULTIPLIER in a lane's environment), and every breach message
+#: $DAGRUN_CPU_TIMEOUT_MULTIPLIER in a lane's environment), and every breach message
 #: then states the canonical budget, the multiplier and the platform label, so a kill stays
 #: attributable to a specific policy rather than to an anonymous number.
 DEFAULT_CPU_TIMEOUT_MULTIPLIER = 1.0
 
 #: Environment override for :data:`DEFAULT_CPU_TIMEOUT_MULTIPLIER`, so a CI lane can set the
 #: policy once for its whole platform without threading a flag through every invocation.
-CPU_TIMEOUT_MULTIPLIER_ENV = "SAFE_CI_DAG_RUNNER_CPU_TIMEOUT_MULTIPLIER"
+CPU_TIMEOUT_MULTIPLIER_ENV = "DAGRUN_CPU_TIMEOUT_MULTIPLIER"
 
 #: Companion label naming the platform the multiplier describes. Free-form (e.g.
 #: "github-hosted"); it appears verbatim in the breach message so the reader can find the lane
 #: that set it. Empty when the multiplier is 1.0 or the caller supplied no label.
-CPU_TIMEOUT_PLATFORM_ENV = "SAFE_CI_DAG_RUNNER_CPU_TIMEOUT_PLATFORM"
+CPU_TIMEOUT_PLATFORM_ENV = "DAGRUN_CPU_TIMEOUT_PLATFORM"
 
 #: Default template for the inner-parallelism (concurrency) flag appended to a step's command
 #: when the step declares ``preferred_inner_jobs``. See :func:`render_jobs_flag`.

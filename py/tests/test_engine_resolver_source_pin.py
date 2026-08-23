@@ -46,7 +46,7 @@ def _run_launcher(
     env = {
         **os.environ,
         "CARGO_NET_OFFLINE": "true",
-        "SAFE_CI_DAG_RUNNER_ENGINE": "rust",
+        "DAGRUN_ENGINE": "rust",
     }
     if ensure_only:
         env["AGENT_UTILS_RS_ENSURE_ONLY"] = "1"
@@ -387,7 +387,7 @@ def test_source_change_during_snapshot_retries_before_execution(tmp_path: Path) 
     env = {
         **os.environ,
         "CARGO_NET_OFFLINE": "true",
-        "SAFE_CI_DAG_RUNNER_ENGINE": "rust",
+        "DAGRUN_ENGINE": "rust",
         "PATH": str(wrapper_dir) + os.pathsep + os.environ["PATH"],
         "AGENT_UTILS_TEST_CP_STARTED": str(started),
         "AGENT_UTILS_TEST_CP_RELEASE": str(release),
@@ -432,7 +432,7 @@ def test_coordinated_clean_waits_for_build_and_does_not_break_launch(tmp_path: P
     env = {
         **os.environ,
         "CARGO_NET_OFFLINE": "true",
-        "SAFE_CI_DAG_RUNNER_ENGINE": "rust",
+        "DAGRUN_ENGINE": "rust",
     }
     launched = subprocess.Popen(
         [str(root / "common" / "bin" / "tick-hub")],

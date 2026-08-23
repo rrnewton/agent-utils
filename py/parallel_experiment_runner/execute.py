@@ -52,7 +52,7 @@ from parallel_experiment_runner.profile import (
     profile_identity,
 )
 
-#: The experiment scope's names — distinct from ``safe-ci.slice`` so a sweep and a CI run box
+#: The experiment scope's names — distinct from ``dagrun.slice`` so a sweep and a CI run box
 #: under separate slices/scopes and never share a CPUQuota by accident.
 EXPERIMENT_NAMING = ScopeNaming(
     slice_name="parallel-experiment.slice",

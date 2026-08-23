@@ -31,26 +31,26 @@ use crate::sizing::{cpu_count, mem_available_bytes};
 /// cgroup-v2 unified hierarchy mount point (Linux-only, matching the target).
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 /// Shared parent slice for ALL concurrent runs (one aggregate CPUQuota bounds their sum).
-const SLICE_NAME: &str = "safe-ci.slice";
+const SLICE_NAME: &str = "dagrun.slice";
 /// Prefix for the per-run transient scope unit (`<prefix>-<pid>`).
-const UNIT_PREFIX: &str = "safe-ci";
+const UNIT_PREFIX: &str = "dagrun";
 /// Environment sentinel set in the re-exec'd (in-scope) child.
-const ENV_IN_SCOPE: &str = "SAFE_CI_IN_SCOPE";
+const ENV_IN_SCOPE: &str = "DAGRUN_IN_SCOPE";
 /// Env var carrying the outer scope unit name to the in-scope child.
-const ENV_SCOPE_UNIT: &str = "SAFE_CI_SCOPE_UNIT";
+const ENV_SCOPE_UNIT: &str = "DAGRUN_SCOPE_UNIT";
 /// Optional caller override that may tighten, but never widen, the derived outer cap.
-const OUTER_MEMORY_MAX_ENV: &str = "SAFE_CI_OUTER_MEMORY_MAX_BYTES";
+const OUTER_MEMORY_MAX_ENV: &str = "DAGRUN_OUTER_MEMORY_MAX_BYTES";
 /// Exact cap carried across the systemd re-exec for in-scope readback.
-const EXPECTED_OUTER_MEMORY_MAX_ENV: &str = "SAFE_CI_EXPECTED_OUTER_MEMORY_MAX_BYTES";
+const EXPECTED_OUTER_MEMORY_MAX_ENV: &str = "DAGRUN_EXPECTED_OUTER_MEMORY_MAX_BYTES";
 /// Exact total CPU-core cap carried across the systemd re-exec for in-scope readback.
-const EXPECTED_OUTER_CPU_COUNT_ENV: &str = "SAFE_CI_EXPECTED_OUTER_CPU_COUNT";
+const EXPECTED_OUTER_CPU_COUNT_ENV: &str = "DAGRUN_EXPECTED_OUTER_CPU_COUNT";
 /// Child cgroup the runner vacates into (cgroup-v2 "no internal processes" rule).
 const SUPERVISOR: &str = "supervisor";
 /// Per-step child cgroup directory prefix (also the normal-exit backstop scan key).
 const STEP_PREFIX: &str = "step-";
 const MAX_CGROUP_COMPONENT_BYTES: usize = 255;
 /// Prefix for every log/warning line this module prints.
-const LOG_PREFIX: &str = "[safe-ci]";
+const LOG_PREFIX: &str = "[dagrun]";
 /// Fraction of WHOLE-SYSTEM CPU the shared aggregate slice may use (leaves ~10% headroom).
 const DEFAULT_CPU_BUDGET_FRACTION: f64 = 0.90;
 /// Generous last-resort run boundary, leaving memory for neighbours and the OS.
@@ -156,7 +156,7 @@ fn join_cgroup_command(child: &Path, cmd: &str) -> String {
     let procs = child.join("cgroup.procs");
     let quoted = shell_quote(&procs.to_string_lossy());
     format!(
-        "if ! printf '%s\\n' \"$$\" 2>/dev/null > {quoted}; then\n  echo 'ERROR: step could not join its safe-ci cgroup; refusing uncontained run' >&2\n  exit 125\nfi\n{cmd}"
+        "if ! printf '%s\\n' \"$$\" 2>/dev/null > {quoted}; then\n  echo 'ERROR: step could not join its dagrun cgroup; refusing uncontained run' >&2\n  exit 125\nfi\n{cmd}"
     )
 }
 
@@ -437,7 +437,7 @@ pub fn expected_outer_cpu_count() -> Option<i64> {
 }
 
 /// Whether this process is already running inside the managed cgroup scope (the re-exec set the
-/// `SAFE_CI_IN_SCOPE` sentinel). The CLI checks this to decide whether to re-exec.
+/// `DAGRUN_IN_SCOPE` sentinel). The CLI checks this to decide whether to re-exec.
 pub fn is_in_scope() -> bool {
     in_scope()
 }
@@ -474,7 +474,7 @@ fn systemd_scope_available() -> bool {
                 "--user",
                 "--scope",
                 "--quiet",
-                &format!("--unit=safe-ci-probe-{}", std::process::id()),
+                &format!("--unit=dagrun-probe-{}", std::process::id()),
                 "true",
             ])
             .output()
@@ -555,7 +555,7 @@ impl ContainmentEvidence {
 /// WHY THIS EXISTS AT ALL. `in_scope()` answers the question by reading an ENVIRONMENT VARIABLE
 /// this process set for itself before re-exec-ing. That sentinel is a promise, and every consumer
 /// downstream printed "cgroup boxing ACTIVE" on the strength of it. Anything can export
-/// `SAFE_CI_IN_SCOPE=1`; a scope can be stopped out from under a live process; systemd can place a
+/// `DAGRUN_IN_SCOPE=1`; a scope can be stopped out from under a live process; systemd can place a
 /// unit somewhere other than where it was asked to. None of those show up in an env var.
 ///
 /// TWO DIRECTIONS, DELIBERATELY, because each catches what the other cannot:
@@ -779,7 +779,7 @@ impl ScopeAttempt {
 /// nobody has measured precisely because the skip means the probe never runs there. This makes the
 /// question answerable on any runner without editing code or changing the default, which stays
 /// exactly as it was.
-pub const FORCE_ATTEMPT_ENV: &str = "SAFE_CI_FORCE_SCOPE_ATTEMPT";
+pub const FORCE_ATTEMPT_ENV: &str = "DAGRUN_FORCE_SCOPE_ATTEMPT";
 
 /// Whether policy says to skip scope setup here, and which variable said so.
 fn policy_skip_reason() -> Option<&'static str> {
@@ -821,7 +821,7 @@ pub fn attempt_scope_reexec(
 }
 
 /// Env var carrying the outer scope's requested `RuntimeMaxSec` into the in-scope child.
-const EXPECTED_RUNTIME_MAX_ENV: &str = "SAFE_CI_EXPECTED_RUNTIME_MAX_SEC";
+const EXPECTED_RUNTIME_MAX_ENV: &str = "DAGRUN_EXPECTED_RUNTIME_MAX_SEC";
 
 /// The `RuntimeMaxSec` the parent asked systemd to enforce on this run's scope, if any.
 pub fn expected_scope_runtime_max_s() -> Option<i64> {
@@ -976,7 +976,7 @@ fn attempt_scope_reexec_inner(
         );
         return ScopeAttempt::Unavailable {
             detail: "cannot derive a positive outer MemoryMax from MemAvailable/\
-                     $SAFE_CI_OUTER_MEMORY_MAX_BYTES"
+                     $DAGRUN_OUTER_MEMORY_MAX_BYTES"
                 .to_string(),
         };
     }
@@ -1807,7 +1807,7 @@ impl Cgroups {
 /// OFF BY DEFAULT, deliberately. Turning containment on where it is currently off changes the
 /// behaviour of every lane at once, and that is an owner decision, not a library default. This
 /// makes the capability available and testable without altering a single existing run.
-pub const DIRECT_CGROUP_ENV: &str = "SAFE_CI_DAG_RUNNER_DIRECT_CGROUP";
+pub const DIRECT_CGROUP_ENV: &str = "DAGRUN_DIRECT_CGROUP";
 
 impl Cgroups {
     /// Containment WITHOUT systemd: a cgroup we create under our own, torn down by `cgroup.kill`.
@@ -2610,7 +2610,7 @@ mod tests {
 
     fn temp_scope(name: &str) -> PathBuf {
         let path =
-            std::env::temp_dir().join(format!("safe-ci-cgroup-{name}-{}", std::process::id()));
+            std::env::temp_dir().join(format!("dagrun-cgroup-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();
         path

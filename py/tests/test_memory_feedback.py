@@ -607,8 +607,8 @@ def test_the_flag_is_off_by_default_and_reports_every_decision_when_on(tmp_path:
         encoding="utf-8",
     )
     env = {
-        "SAFE_CI_DAG_RUNNER_MACHINE_ID": machine,
-        "SAFE_CI_DAG_RUNNER_CONTAINER_CLASS": container,
+        "DAGRUN_MACHINE_ID": machine,
+        "DAGRUN_CONTAINER_CLASS": container,
     }
     common = ["run", "--dag", str(dag), "--perf-dir", str(store), "--no-profile",
               "--unsafe-no-cgroups", "-q"]
@@ -650,8 +650,8 @@ def test_the_derived_baseline_reaches_max_mem_admission(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     env = {
-        "SAFE_CI_DAG_RUNNER_MACHINE_ID": machine,
-        "SAFE_CI_DAG_RUNNER_CONTAINER_CLASS": container,
+        "DAGRUN_MACHINE_ID": machine,
+        "DAGRUN_CONTAINER_CLASS": container,
     }
     common = ["run", "--dag", str(dag), "--perf-dir", str(store), "--no-profile",
               "--unsafe-no-cgroups", "-q", "--max-mem", "400G"]
@@ -694,8 +694,8 @@ def test_a_censored_peak_cannot_reach_max_mem_admission_once_the_flag_is_on(
         encoding="utf-8",
     )
     env = {
-        "SAFE_CI_DAG_RUNNER_MACHINE_ID": machine,
-        "SAFE_CI_DAG_RUNNER_CONTAINER_CLASS": container,
+        "DAGRUN_MACHINE_ID": machine,
+        "DAGRUN_CONTAINER_CLASS": container,
     }
     common = ["run", "--dag", str(dag), "--perf-dir", str(store), "--no-profile",
               "--unsafe-no-cgroups", "-q", "--max-mem", "400G"]
@@ -742,8 +742,8 @@ def test_a_proven_floor_reaches_max_mem_admission_even_though_the_step_is_declin
         encoding="utf-8",
     )
     env = {
-        "SAFE_CI_DAG_RUNNER_MACHINE_ID": machine,
-        "SAFE_CI_DAG_RUNNER_CONTAINER_CLASS": container,
+        "DAGRUN_MACHINE_ID": machine,
+        "DAGRUN_CONTAINER_CLASS": container,
     }
     common = ["run", "--dag", str(dag), "--perf-dir", str(store), "--no-profile",
               "--unsafe-no-cgroups", "-q", "--max-mem", "400G"]
@@ -779,8 +779,8 @@ def test_asking_for_memory_feedback_with_reading_disabled_says_it_is_inert(
         encoding="utf-8",
     )
     env = {
-        "SAFE_CI_DAG_RUNNER_MACHINE_ID": machine,
-        "SAFE_CI_DAG_RUNNER_CONTAINER_CLASS": container,
+        "DAGRUN_MACHINE_ID": machine,
+        "DAGRUN_CONTAINER_CLASS": container,
     }
     args = ["run", "--dag", str(dag), "--perf-dir", str(store), "--no-profile",
             "--unsafe-no-cgroups", "-q", "--profile-memory-feedback", "--no-profile-feedback"]

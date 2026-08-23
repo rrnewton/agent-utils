@@ -3,7 +3,7 @@
 The default auto-logging profile store (Feature D) writes CSVs to ``./.dagrun/profiles/``
 relative to the CWD whenever a ``run``/``sweep`` executes without ``--perf-dir``/``--no-profile``.
 To keep the test run hermetic (no writes into the repo checkout), an autouse fixture points
-``$SAFE_CI_DAG_RUNNER_PROFILE_DIR`` at a throwaway temp directory for every test. Tests that
+``$DAGRUN_PROFILE_DIR`` at a throwaway temp directory for every test. Tests that
 specifically exercise the true default location or ``--no-profile`` unset this env var themselves.
 
 A second autouse fixture makes the operator build width ambient-proof. ``select_build_jobs``

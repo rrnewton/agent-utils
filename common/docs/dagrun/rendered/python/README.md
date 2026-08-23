@@ -127,7 +127,7 @@ For a controlled harness, emit explicit boundaries as work starts and ends:
 Several tests may be live concurrently. The timeout report lists the complete
 live set and elapsed time for each; the longest-running is labelled only as the
 *likely* culprit when more than one remains. Set
-`SAFE_CI_DAG_RUNNER_LOG_DIR` to retain the incrementally flushed per-step log
+`DAGRUN_LOG_DIR` to retain the incrementally flushed per-step log
 and `journal.jsonl` even if an outer supervisor later kills the runner.
 
 For third-party runners, the pre-signal `/proc` snapshot reports CPU-burning

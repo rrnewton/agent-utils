@@ -318,8 +318,8 @@ def _env(extra: Mapping[str, str] | None = None) -> dict[str, str]:
     env["NO_COLOR"] = "1"
     # Rust and Python both support explicit evidence, but an ambient caller setting must not make
     # unrelated differential cases write into one shared directory or gain extra banners.
-    env.pop("SAFE_CI_DAG_RUNNER_LOG_DIR", None)
-    env.pop("SAFE_CI_DAG_RUNNER_NO_STEP_LOGS", None)
+    env.pop("DAGRUN_LOG_DIR", None)
+    env.pop("DAGRUN_NO_STEP_LOGS", None)
     # Same reasoning, for the operator's build width. Both engines resolve intent from these two
     # variables in the OUTERMOST process, which here is the differential's own child — so a
     # developer who happens to export CARGO_BUILD_JOBS makes every case run under a width nobody
@@ -327,7 +327,7 @@ def _env(extra: Mapping[str, str] | None = None) -> dict[str, str]:
     # has nothing to do with either engine. The cases that are ABOUT intent pass it in `extra`,
     # which is applied after these pops.
     env.pop("CARGO_BUILD_JOBS", None)
-    env.pop("SAFE_CI_OPERATOR_BUILD_JOBS", None)
+    env.pop("DAGRUN_OPERATOR_BUILD_JOBS", None)
     if extra:
         env.update(extra)
     return env
@@ -1501,8 +1501,8 @@ def compare_test_attribution_evidence(py: list[str], rs: list[str], rep: Report)
             "--unsafe-no-cgroups",
         )
         outcomes = {
-            "py": run(py, args, {"SAFE_CI_DAG_RUNNER_LOG_DIR": dirs["py"]}),
-            "rs": run(rs, args, {"SAFE_CI_DAG_RUNNER_LOG_DIR": dirs["rs"]}),
+            "py": run(py, args, {"DAGRUN_LOG_DIR": dirs["py"]}),
+            "rs": run(rs, args, {"DAGRUN_LOG_DIR": dirs["rs"]}),
         }
         phrase = "culprit test suite::gamma_the_hang"
         if any(out.returncode == 0 or phrase not in out.stdout + out.stderr for out in outcomes.values()):
@@ -1588,8 +1588,8 @@ def compare_step_log_ceiling(py: list[str], rs: list[str], rep: Report) -> None:
                 cmd,
                 args,
                 {
-                    "SAFE_CI_DAG_RUNNER_LOG_DIR": dirs[name],
-                    "SAFE_CI_DAG_RUNNER_LOG_MAX_BYTES": "100",
+                    "DAGRUN_LOG_DIR": dirs[name],
+                    "DAGRUN_LOG_MAX_BYTES": "100",
                 },
             )
             for name, cmd in (("py", py), ("rs", rs))
@@ -1684,8 +1684,8 @@ def compare_capture_ceiling(py: list[str], rs: list[str], rep: Report) -> None:
                 cmd,
                 args,
                 {
-                    "SAFE_CI_DAG_RUNNER_NO_STEP_LOGS": "1",
-                    "SAFE_CI_DAG_RUNNER_CAPTURE_MAX_BYTES": "300",
+                    "DAGRUN_NO_STEP_LOGS": "1",
+                    "DAGRUN_CAPTURE_MAX_BYTES": "300",
                 },
             )
             for name, cmd in (("py", py), ("rs", rs))
@@ -1714,7 +1714,7 @@ def compare_capture_ceiling(py: list[str], rs: list[str], rep: Report) -> None:
         notice = (
             "[dagrun] EARLIER OUTPUT DROPPED: this step produced 2984 bytes but "
             "only the last 300 were kept in memory (raise or lift the ceiling with "
-            "SAFE_CI_DAG_RUNNER_CAPTURE_MAX_BYTES; 0 = unlimited). The durable per-step log is "
+            "DAGRUN_CAPTURE_MAX_BYTES; 0 = unlimited). The durable per-step log is "
             "unaffected and still has the rest."
         )
         notices = {
@@ -1781,7 +1781,7 @@ def compare_box_subcommand(py: list[str], rs: list[str], rep: Report) -> None:
                 "[%s]",
                 *hostile,
             ),
-            {"SAFE_CI_DAG_RUNNER_PROFILE_DIR": os.path.join(tempfile.gettempdir(), "cross-box")},
+            {"DAGRUN_PROFILE_DIR": os.path.join(tempfile.gettempdir(), "cross-box")},
         )
         for name, cmd in (("py", py), ("rs", rs))
     }
@@ -1853,9 +1853,9 @@ def compare_memory_admission(py: list[str], rs: list[str], rep: Report) -> None:
 
         def env(name: str, budget: int, headroom: int) -> dict[str, str]:
             return {
-                "SAFE_CI_MEM_LEDGER": os.path.join(tmp, f"{name}.json"),
-                "SAFE_CI_ADMISSION_BUDGET_BYTES": str(budget),
-                "SAFE_CI_ADMISSION_HEADROOM_BYTES": str(headroom),
+                "DAGRUN_MEM_LEDGER": os.path.join(tmp, f"{name}.json"),
+                "DAGRUN_ADMISSION_BUDGET_BYTES": str(budget),
+                "DAGRUN_ADMISSION_HEADROOM_BYTES": str(headroom),
             }
 
         # 1. REFUSED: the request alone is bigger than the whole-host budget.
@@ -1907,15 +1907,15 @@ def compare_memory_admission(py: list[str], rs: list[str], rep: Report) -> None:
                 ["sh", "-c", seeded_shell, "sh", *cmd],
                 (*base, "--max-mem", "16G"),
                 {
-                    "SAFE_CI_MEM_LEDGER": own_ledger,
-                    "SAFE_CI_ADMISSION_BUDGET_BYTES": str(gib),
-                    "SAFE_CI_ADMISSION_HEADROOM_BYTES": str(64 * gib),
-                    "SAFE_CI_IN_SCOPE": "1",
+                    "DAGRUN_MEM_LEDGER": own_ledger,
+                    "DAGRUN_ADMISSION_BUDGET_BYTES": str(gib),
+                    "DAGRUN_ADMISSION_HEADROOM_BYTES": str(64 * gib),
+                    "DAGRUN_IN_SCOPE": "1",
                 },
             )
             for name, cmd in (("py", py), ("rs", rs))
         }
-        # 5b. AN INHERITED SENTINEL IS NOT AN ADMISSION. `systemd-run --setenv=SAFE_CI_IN_SCOPE=1`
+        # 5b. AN INHERITED SENTINEL IS NOT AN ADMISSION. `systemd-run --setenv=DAGRUN_IN_SCOPE=1`
         # sets the variable for the WHOLE scope and every step inherits it, so a runner invoked as
         # a step of a boxed run reads the same "1" while holding nothing. An engine that skips on
         # the flag alone reserves nothing, prints no verdict and exits 0 -- here, for a 16 GiB
@@ -1924,7 +1924,7 @@ def compare_memory_admission(py: list[str], rs: list[str], rep: Report) -> None:
             name: run(
                 cmd,
                 (*base, "--max-mem", "16G"),
-                {**env("inherited", gib, 64 * gib), "SAFE_CI_IN_SCOPE": "1"},
+                {**env("inherited", gib, 64 * gib), "DAGRUN_IN_SCOPE": "1"},
             )
             for name, cmd in (("py", py), ("rs", rs))
         }
@@ -1936,7 +1936,7 @@ def compare_memory_admission(py: list[str], rs: list[str], rep: Report) -> None:
             name: run(
                 cmd,
                 (*base, "--max-mem", "8000000G"),
-                {"SAFE_CI_MEM_LEDGER": os.path.join(tmp, "default.json")},
+                {"DAGRUN_MEM_LEDGER": os.path.join(tmp, "default.json")},
             )
             for name, cmd in (("py", py), ("rs", rs))
         }
@@ -1971,9 +1971,9 @@ def compare_memory_admission(py: list[str], rs: list[str], rep: Report) -> None:
                 cmd,
                 (*base, "--max-mem", "16G"),
                 {
-                    "SAFE_CI_MEM_LEDGER": corrupt_path,
-                    "SAFE_CI_ADMISSION_BUDGET_BYTES": str(64 * gib),
-                    "SAFE_CI_ADMISSION_HEADROOM_BYTES": str(64 * gib),
+                    "DAGRUN_MEM_LEDGER": corrupt_path,
+                    "DAGRUN_ADMISSION_BUDGET_BYTES": str(64 * gib),
+                    "DAGRUN_ADMISSION_HEADROOM_BYTES": str(64 * gib),
                 },
             )
             for name, cmd in (("py", py), ("rs", rs))
@@ -2577,8 +2577,8 @@ def compare_hostile_numeric_cells(py: list[str], rs: list[str], rep: Report) -> 
     not merely that both builds fell back to the hint). This is the regression guard the earlier
     clean-only feedback fixture could not provide."""
     extra = {
-        "SAFE_CI_DAG_RUNNER_MACHINE_ID": SYNTH_MACHINE,
-        "SAFE_CI_DAG_RUNNER_CONTAINER_CLASS": SYNTH_CONTAINER,
+        "DAGRUN_MACHINE_ID": SYNTH_MACHINE,
+        "DAGRUN_CONTAINER_CLASS": SYNTH_CONTAINER,
     }
     with tempfile.TemporaryDirectory() as tmp:
         store = os.path.join(tmp, "store")
@@ -2657,8 +2657,8 @@ def compare_plan_feedback(py: list[str], rs: list[str], rep: Report) -> None:
       across builds AND throttles below the CPU count (proving the store feeds the memory model).
     """
     extra = {
-        "SAFE_CI_DAG_RUNNER_MACHINE_ID": SYNTH_MACHINE,
-        "SAFE_CI_DAG_RUNNER_CONTAINER_CLASS": SYNTH_CONTAINER,
+        "DAGRUN_MACHINE_ID": SYNTH_MACHINE,
+        "DAGRUN_CONTAINER_CLASS": SYNTH_CONTAINER,
     }
     with tempfile.TemporaryDirectory() as tmp:
         store = os.path.join(tmp, "store")
@@ -2846,8 +2846,8 @@ def compare_speedup_model(py: list[str], rs: list[str], rep: Report) -> None:
     the recommendations are the expected 4 / 2 / 1 / 8 (positive proof the model actually fired,
     not merely that both builds agree on ``null``)."""
     extra = {
-        "SAFE_CI_DAG_RUNNER_MACHINE_ID": _SPEEDUP_MACHINE,
-        "SAFE_CI_DAG_RUNNER_CONTAINER_CLASS": _SPEEDUP_CONTAINER,
+        "DAGRUN_MACHINE_ID": _SPEEDUP_MACHINE,
+        "DAGRUN_CONTAINER_CLASS": _SPEEDUP_CONTAINER,
     }
     with tempfile.TemporaryDirectory() as tmp:
         store = os.path.join(tmp, "store")
@@ -3116,8 +3116,8 @@ def compare_cpa_planner(py: list[str], rs: list[str], rep: Report) -> None:
       with no budget (and the run reports ``mem-capped``) — provided cores were not the limit.
     """
     extra = {
-        "SAFE_CI_DAG_RUNNER_MACHINE_ID": _CPA_MACHINE,
-        "SAFE_CI_DAG_RUNNER_CONTAINER_CLASS": _CPA_CONTAINER,
+        "DAGRUN_MACHINE_ID": _CPA_MACHINE,
+        "DAGRUN_CONTAINER_CLASS": _CPA_CONTAINER,
     }
     with tempfile.TemporaryDirectory() as tmp:
         store = os.path.join(tmp, "store")
@@ -3502,7 +3502,7 @@ def compare_memory_hardening(py: list[str], rs: list[str], rep: Report) -> None:
                 f"outcomes={outcomes} markers={marker}",
             )
 
-    with tempfile.TemporaryDirectory(prefix="safe-ci-cross-memory-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="dagrun-cross-memory-") as tmp:
         width_scaled = {
             "mem_cap_factor": 1.0,
             "mem_cap_floor_bytes": 0,
@@ -3712,8 +3712,8 @@ def compare_memory_hardening(py: list[str], rs: list[str], rep: Report) -> None:
                 handle,
             )
         extra = {
-            "SAFE_CI_DAG_RUNNER_MACHINE_ID": _CPA_MACHINE,
-            "SAFE_CI_DAG_RUNNER_CONTAINER_CLASS": _CPA_CONTAINER,
+            "DAGRUN_MACHINE_ID": _CPA_MACHINE,
+            "DAGRUN_CONTAINER_CLASS": _CPA_CONTAINER,
         }
         plan_args = (
             "plan", "--dag", learned_dag, "--perf-dir", store, "--planner", "cpa",
@@ -4082,8 +4082,8 @@ def _summary_sync_case(
     * ``summary merge`` is byte-identical AND COMMUTATIVE (merge(a,b) == merge(b,a)), across builds —
       the mergeable-summary property that makes concurrent contributions order-independent."""
     extra = {
-        "SAFE_CI_DAG_RUNNER_MACHINE_ID": machine,
-        "SAFE_CI_DAG_RUNNER_CONTAINER_CLASS": container,
+        "DAGRUN_MACHINE_ID": machine,
+        "DAGRUN_CONTAINER_CLASS": container,
     }
     with tempfile.TemporaryDirectory() as tmp:
         store = os.path.join(tmp, "store")
@@ -4108,7 +4108,7 @@ def _summary_sync_case(
         rep.ok(f"summary-build:{label}")
 
         fallback_extra = dict(extra)
-        fallback_extra["SAFE_CI_DAG_RUNNER_PROFILE_DIR"] = store
+        fallback_extra["DAGRUN_PROFILE_DIR"] = store
         empty_assignments = ("summary", "build", "--perf-dir=", "--out=")
         empty_py = run(py, empty_assignments, fallback_extra)
         empty_rs = run(rs, empty_assignments, fallback_extra)
@@ -4486,8 +4486,8 @@ def compare_memory_feedback(py: list[str], rs: list[str], rep: Report) -> None:
       builds instead of doing nothing quietly.
     """
     extra = {
-        "SAFE_CI_DAG_RUNNER_MACHINE_ID": SYNTH_MACHINE,
-        "SAFE_CI_DAG_RUNNER_CONTAINER_CLASS": SYNTH_CONTAINER,
+        "DAGRUN_MACHINE_ID": SYNTH_MACHINE,
+        "DAGRUN_CONTAINER_CLASS": SYNTH_CONTAINER,
     }
     with tempfile.TemporaryDirectory() as tmp:
         store = os.path.join(tmp, "store")
@@ -4884,7 +4884,7 @@ def compare_cli_schema(py: list[str], rs: list[str], rep: Report) -> None:
 
 def compare_args_stress(py: list[str], rs: list[str], rep: Report) -> None:
     """Cross-check the previously Python-only passthrough and stress surfaces."""
-    with tempfile.TemporaryDirectory(prefix="safe-ci-cross-args-stress-") as td:
+    with tempfile.TemporaryDirectory(prefix="dagrun-cross-args-stress-") as td:
         passthrough_path = os.path.join(td, "passthrough.json")
         with open(passthrough_path, "w", encoding="utf-8") as handle:
             json.dump(
@@ -5022,7 +5022,7 @@ def compare_args_stress(py: list[str], rs: list[str], rep: Report) -> None:
             "--no-profile",
             "-q",
         )
-        ledger = {"SAFE_CI_CORE_LEDGER": os.path.join(td, "hard-refusal-ledger.json")}
+        ledger = {"DAGRUN_CORE_LEDGER": os.path.join(td, "hard-refusal-ledger.json")}
         po, ro = run(py, hard_cores, ledger), run(rs, hard_cores, ledger)
         if (
             po.returncode == ro.returncode == 3
@@ -5111,7 +5111,7 @@ def _cpu_facts(log_path: str) -> tuple[FootprintStats, CpuFootprintFacts]:
 def compare_run_parallel_limits(py: list[str], rs: list[str], rep: Report) -> None:
     """Cross-check active-step overlap, per-step width caps, and outer CPU bandwidth."""
 
-    with tempfile.TemporaryDirectory(prefix="safe-ci-cross-cpu-limits-") as td:
+    with tempfile.TemporaryDirectory(prefix="dagrun-cross-cpu-limits-") as td:
         invalid_dag = os.path.join(td, "valid.json")
         Path(invalid_dag).write_text(
             '{"steps":[{"group":"g","job":"ok","cmd":"true"}]}', encoding="utf-8"
@@ -5321,7 +5321,7 @@ def compare_run_parallel_limits(py: list[str], rs: list[str], rep: Report) -> No
             extra = {
                 name: {
                     "CPU_FOOTPRINT_OUTPUT": path,
-                    "SAFE_CI_DAG_RUNNER_NO_STEP_LOGS": "1",
+                    "DAGRUN_NO_STEP_LOGS": "1",
                     "CPU_FOOTPRINT_BARRIER": os.path.join(td, f"{label}-{name}.barrier"),
                 }
                 for name, path in logs.items()
@@ -5440,10 +5440,10 @@ def compare_operator_build_width(py: list[str], rs: list[str], rep: Report) -> N
       be strictly below the scope-wide number (downward refinement still happening); stated, it
       must be exactly the operator's number, unrefined.
 
-    Deleting the ``SAFE_CI_OPERATOR_BUILD_JOBS`` forwarding in one engine leaves the sentence
+    Deleting the ``DAGRUN_OPERATOR_BUILD_JOBS`` forwarding in one engine leaves the sentence
     correct and breaks the second observable, which is the whole reason it is here.
     """
-    with tempfile.TemporaryDirectory(prefix="safe-ci-cross-build-width-") as td:
+    with tempfile.TemporaryDirectory(prefix="dagrun-cross-build-width-") as td:
         dag_path = os.path.join(td, "dag.json")
         # A hard 2 GiB per-step cap makes the derived per-step width small and host-independent
         # relative to the scope's, so "refined downward" is observable rather than incidental.
@@ -5455,8 +5455,8 @@ def compare_operator_build_width(py: list[str], rs: list[str], rep: Report) -> N
         )
         args = ("run", "--dag", dag_path, "-s1", "-j16", NOPROF, NOFB)
         base = {
-            "SAFE_CI_DAG_RUNNER_NO_STEP_LOGS": "1",
-            "SAFE_CI_FORCE_SCOPE_ATTEMPT": "1",
+            "DAGRUN_NO_STEP_LOGS": "1",
+            "DAGRUN_FORCE_SCOPE_ATTEMPT": "1",
         }
         for leg, extra_env, want in (
             ("stated", {"CARGO_BUILD_JOBS": "200"}, "honouring CARGO_BUILD_JOBS=200"),
@@ -5512,7 +5512,7 @@ def compare_operator_build_width(py: list[str], rs: list[str], rep: Report) -> N
                     label,
                     "with nothing stated the step must be refined DOWNWARD from the scope's "
                     f"16-core width by its own 2 GiB cap; got {step_width}. This is what a "
-                    "lost SAFE_CI_OPERATOR_BUILD_JOBS forwarding looks like.",
+                    "lost DAGRUN_OPERATOR_BUILD_JOBS forwarding looks like.",
                 )
                 continue
             rep.ok(label)
@@ -5521,7 +5521,7 @@ def compare_operator_build_width(py: list[str], rs: list[str], rep: Report) -> N
 def compare_boxed_cpu_bandwidth(py: list[str], rs: list[str], rep: Report) -> None:
     """Anchor ``-j`` / ``--max-cpus`` to live quota and aggregate CPU counters."""
 
-    with tempfile.TemporaryDirectory(prefix="safe-ci-cross-boxed-cpu-") as td:
+    with tempfile.TemporaryDirectory(prefix="dagrun-cross-boxed-cpu-") as td:
         dag_path = os.path.join(td, "dag.json")
         # Each runner-controlled step receives the full per-step ceiling J=8. Both steps must be
         # live together under -s2, so their sixteen requested workers exceed J in aggregate while
@@ -5545,8 +5545,8 @@ def compare_boxed_cpu_bandwidth(py: list[str], rs: list[str], rep: Report) -> No
             name: {
                 "CPU_FOOTPRINT_OUTPUT": path,
                 "CPU_FOOTPRINT_BARRIER": os.path.join(td, f"boxed-{name}.barrier"),
-                "SAFE_CI_DAG_RUNNER_NO_STEP_LOGS": "1",
-                "SAFE_CI_FORCE_SCOPE_ATTEMPT": "1",
+                "DAGRUN_NO_STEP_LOGS": "1",
+                "DAGRUN_FORCE_SCOPE_ATTEMPT": "1",
             }
             for name, path in logs.items()
         }
@@ -5606,8 +5606,8 @@ def compare_boxed_cpu_bandwidth(py: list[str], rs: list[str], rep: Report) -> No
 
 def compare_pin_run(py: list[str], rs: list[str], rep: Report) -> None:
     """Exercise shared reservation semantics through the paired safe-runner wrapper."""
-    with tempfile.TemporaryDirectory(prefix="safe-ci-cross-pin-") as td:
-        extra = {"SAFE_CI_CORE_LEDGER": os.path.join(td, "ledger.json")}
+    with tempfile.TemporaryDirectory(prefix="dagrun-cross-pin-") as td:
+        extra = {"DAGRUN_CORE_LEDGER": os.path.join(td, "ledger.json")}
         missing = ("pin-run", "--cores", "1")
         po, ro = run(py, missing, extra), run(rs, missing, extra)
         if po.returncode == ro.returncode == 2:
@@ -6051,7 +6051,7 @@ def compare_cpuset_alloc() -> int:
                 ("rs-then-py", rs, py),
             ):
                 shared_ledger = os.path.join(tmp, f"interop-{label}.json")
-                extra = {"SAFE_CI_CORE_LEDGER": shared_ledger}
+                extra = {"DAGRUN_CORE_LEDGER": shared_ledger}
                 hold = (
                     "run",
                     "--cores",

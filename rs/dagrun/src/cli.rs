@@ -70,10 +70,10 @@ use crate::{PROG, VERSION};
 
 /// Environment variable overriding the default profile-store location (Feature D). An explicit
 /// `--perf-dir` still wins over this; `--no-profile` disables logging entirely.
-const PROFILE_DIR_ENV: &str = "SAFE_CI_DAG_RUNNER_PROFILE_DIR";
+const PROFILE_DIR_ENV: &str = "DAGRUN_PROFILE_DIR";
 
 /// Default profile-store directory, RELATIVE TO THE CURRENT WORKING DIRECTORY, used when neither
-/// `--perf-dir` nor `$SAFE_CI_DAG_RUNNER_PROFILE_DIR` is set and `--no-profile` is absent. Created
+/// `--perf-dir` nor `$DAGRUN_PROFILE_DIR` is set and `--no-profile` is absent. Created
 /// on demand; runs and sweeps auto-append here so profiling data lands somewhere obvious.
 const DEFAULT_PROFILE_DIR: &str = ".dagrun/profiles";
 
@@ -169,14 +169,20 @@ fn help_text(c: &Palette) -> String {
         commands = c.bold("commands"),
         examples = c.bold("examples"),
         e1 = ex(&format!("{PROG} quickstart")),
-        e2 = ex(&format!("{PROG} box --mem 512M --timeout 30 --cores 2 -- ./probe.sh")),
+        e2 = ex(&format!(
+            "{PROG} box --mem 512M --timeout 30 --cores 2 -- ./probe.sh"
+        )),
         e3 = ex(&format!("{PROG} run --dag dag.json --only build.app")),
-        e6 = ex(&format!("{PROG} plan --dag dag.json --planner critical-path")),
-        e4 = ex(&format!("{PROG} sweep --dag dag.json --step build.app --jobs 1..8")),
+        e6 = ex(&format!(
+            "{PROG} plan --dag dag.json --planner critical-path"
+        )),
+        e4 = ex(&format!(
+            "{PROG} sweep --dag dag.json --step build.app --jobs 1..8"
+        )),
         e5 = ex(&format!("{PROG} ascii --dag dag.json")),
         profiling = c.dim(
             "Profiling data auto-logs to ./.dagrun/profiles/ by default\n \
-             (override with --perf-dir or $SAFE_CI_DAG_RUNNER_PROFILE_DIR; disable with --no-profile)."
+             (override with --perf-dir or $DAGRUN_PROFILE_DIR; disable with --no-profile)."
         ),
     )
 }
@@ -232,7 +238,7 @@ yaml: --dag also accepts .yaml/.yml (isomorphic to JSON; allows comments + multi
         store_dir = k("./.dagrun/profiles/   (created on demand, relative to CWD)"),
         store_note = c.dim(
             "Every run and sweep AUTO-LOGS resource-usage CSVs here; override with --perf-dir or \
-             $SAFE_CI_DAG_RUNNER_PROFILE_DIR, disable with --no-profile. The tool prints where it \
+             $DAGRUN_PROFILE_DIR, disable with --no-profile. The tool prints where it \
              appended (never silent). Consider gitignoring ./.dagrun/."
         ),
         planning = h("Smarter planning: learned estimates + the critical-path planner"),
@@ -365,7 +371,7 @@ fn run_help(c: &Palette) -> String {
             (
                 "--cpu-timeout-multiplier FACTOR",
                 "scale every step's canonical cpu_timeout by FACTOR on THIS platform \
-                 (default 1.0 = no scaling); also $SAFE_CI_DAG_RUNNER_CPU_TIMEOUT_MULTIPLIER",
+                 (default 1.0 = no scaling); also $DAGRUN_CPU_TIMEOUT_MULTIPLIER",
             ),
             ("-v", "stream child output (repeatable)"),
             ("-q, --quiet", "quieter output"),
@@ -1288,14 +1294,14 @@ fn git_sha() -> String {
 /// Env fallback for the outer run budget, so a wrapper that cannot edit the command line (a CI
 /// job template, a systemd unit) can still bound the run.
 fn env_run_timeout() -> Option<i64> {
-    std::env::var("SAFE_CI_DAG_RUNNER_RUN_TIMEOUT")
+    std::env::var("DAGRUN_RUN_TIMEOUT")
         .ok()
         .filter(|v| !v.is_empty())
         .and_then(|v| match v.parse::<i64>() {
             Ok(n) if n > 0 => Some(n),
             _ => {
                 eprintln!(
-                    "{PROG}: SAFE_CI_DAG_RUNNER_RUN_TIMEOUT={v:?} is not a positive integer; \
+                    "{PROG}: DAGRUN_RUN_TIMEOUT={v:?} is not a positive integer; \
                      ignoring"
                 );
                 None
@@ -1450,7 +1456,7 @@ fn resolve_cgroups(
     //
     // OPT-IN, and deliberately so. Enabling containment where it is currently off changes every
     // lane at once; that is an owner decision. Default behaviour below is byte-for-byte what it
-    // was. Set SAFE_CI_DAG_RUNNER_DIRECT_CGROUP=1 to use it.
+    // was. Set DAGRUN_DIRECT_CGROUP=1 to use it.
     if std::env::var(DIRECT_CGROUP_ENV).is_ok_and(|v| v == "1") {
         let mgr = Cgroups::direct();
         if mgr.enabled() {
@@ -1489,7 +1495,7 @@ fn resolve_cgroups(
             ),
             None => eprintln!(
                 "{PROG}: WARNING: no outer run budget is set (--run-timeout / \
-                 SAFE_CI_DAG_RUNNER_RUN_TIMEOUT), so nothing bounds the run as a whole; only \
+                 DAGRUN_RUN_TIMEOUT), so nothing bounds the run as a whole; only \
                  per-step wall timeouts apply."
             ),
         }
@@ -1500,7 +1506,7 @@ fn resolve_cgroups(
     let Some(outer_memory_max) = outer_memory_max_bytes_capped(max_mem_bytes) else {
         eprintln!(
             "{PROG}: ERROR: cannot derive a positive outer MemoryMax from MemAvailable/\
-             $SAFE_CI_OUTER_MEMORY_MAX_BYTES/--max-mem; refusing an unbounded run."
+             $DAGRUN_OUTER_MEMORY_MAX_BYTES/--max-mem; refusing an unbounded run."
         );
         return Err(3);
     };
@@ -1549,7 +1555,7 @@ fn resolve_cgroups(
 /// Resolve the effective profile-store directory and a label for its source (Feature D).
 ///
 /// Precedence: `--no-profile` disables logging (returns `(None, "disabled")`); otherwise an
-/// explicit `--perf-dir` wins; otherwise `$SAFE_CI_DAG_RUNNER_PROFILE_DIR`; otherwise the
+/// explicit `--perf-dir` wins; otherwise `$DAGRUN_PROFILE_DIR`; otherwise the
 /// repo-local default `./.dagrun/profiles/`. Auto-logging is ON by default.
 fn resolve_profile_dir(perf_dir: Option<&str>, no_profile: bool) -> (Option<String>, &'static str) {
     if no_profile {
@@ -2730,7 +2736,7 @@ fn apply_admission(a: &RunArgs) -> Result<Option<crate::admission::MemoryReserva
     // ask would QUEUE behind the first, i.e. the run would wait for itself until the wait ran
     // out.
     //
-    // THE SENTINEL ALONE CANNOT ESTABLISH THAT. `systemd-run --setenv=SAFE_CI_IN_SCOPE=1` sets it
+    // THE SENTINEL ALONE CANNOT ESTABLISH THAT. `systemd-run --setenv=DAGRUN_IN_SCOPE=1` sets it
     // for the whole scope, and every step inherits the runner's environment, so a runner invoked
     // as a STEP of a boxed run reads the same "1" while holding no reservation at all -- and
     // skipping on the flag alone would wave that nested run through with nothing reserved and no

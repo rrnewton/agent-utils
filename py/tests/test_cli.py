@@ -412,9 +412,9 @@ def test_run_profile_prints_table() -> None:
 def test_run_default_profile_store(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # With NEITHER --perf-dir NOR $SAFE_CI_DAG_RUNNER_PROFILE_DIR set, a run auto-logs to the
+    # With NEITHER --perf-dir NOR $DAGRUN_PROFILE_DIR set, a run auto-logs to the
     # repo-local default ./.dagrun/profiles/ (relative to CWD) and says where.
-    monkeypatch.delenv("SAFE_CI_DAG_RUNNER_PROFILE_DIR", raising=False)
+    monkeypatch.delenv("DAGRUN_PROFILE_DIR", raising=False)
     monkeypatch.chdir(tmp_path)
     dag = _demo_path(str(tmp_path))
     rc, _, err = _capture(["run", "--dag", dag, "-q", _ACF])
@@ -428,7 +428,7 @@ def test_run_default_profile_store(
 def test_run_no_profile_writes_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.delenv("SAFE_CI_DAG_RUNNER_PROFILE_DIR", raising=False)
+    monkeypatch.delenv("DAGRUN_PROFILE_DIR", raising=False)
     monkeypatch.chdir(tmp_path)
     dag = _demo_path(str(tmp_path))
     rc, _, err = _capture(["run", "--dag", dag, "--no-profile", "-q", _ACF])

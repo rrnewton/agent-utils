@@ -11,7 +11,7 @@
 # Contract enforced here
 # ----------------------
 #   * DETERMINISTIC + TRACKED default: with no override, ALWAYS the tracked Python entrypoint.
-#   * Rust is opt-in ONLY, via SAFE_CI_DAG_RUNNER_ENGINE=rust. Its tracked launcher asks Cargo to
+#   * Rust is opt-in ONLY, via DAGRUN_ENGINE=rust. Its tracked launcher asks Cargo to
 #     validate the workspace cache and provenance before executing; it never silently falls back.
 #   * LOGS WHICH ENGINE WON on every invocation (one stderr line), so the resolved engine and its
 #     exact path are always visible in logs.
@@ -33,7 +33,7 @@ if [[ "$TOOL" == "engine-resolver" ]]; then
 fi
 
 # Deterministic default: the TRACKED Python entrypoint. Rust is explicit opt-in only.
-ENGINE="${SAFE_CI_DAG_RUNNER_ENGINE:-python}"
+ENGINE="${DAGRUN_ENGINE:-python}"
 
 case "$ENGINE" in
     python|py)
@@ -59,7 +59,7 @@ case "$ENGINE" in
         exec "$TARGET" "$@"
         ;;
     *)
-        echo "[$TOOL] SAFE_CI_DAG_RUNNER_ENGINE='$ENGINE' is invalid (want 'python' or 'rust')" >&2
+        echo "[$TOOL] DAGRUN_ENGINE='$ENGINE' is invalid (want 'python' or 'rust')" >&2
         exit 2
         ;;
 esac

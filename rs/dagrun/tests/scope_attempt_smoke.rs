@@ -9,7 +9,7 @@
 //!
 //! THE POLICY IS UNCHANGED HERE and these cases pin that down: every exit code below is what it
 //! was before. What changed is that the run now says which of the four things happened, and offers
-//! the instrument (`SAFE_CI_FORCE_SCOPE_ATTEMPT=1`) to answer the capability question on a runner
+//! the instrument (`DAGRUN_FORCE_SCOPE_ATTEMPT=1`) to answer the capability question on a runner
 //! population nobody has measured.
 
 use std::path::{Path, PathBuf};
@@ -61,10 +61,10 @@ fn runner_command() -> Command {
     for key in [
         "CI",
         "GITHUB_ACTIONS",
-        "SAFE_CI_FORCE_SCOPE_ATTEMPT",
-        "SAFE_CI_IN_SCOPE",
-        "SAFE_CI_SCOPE_UNIT",
-        "SAFE_CI_DAG_RUNNER_DIRECT_CGROUP",
+        "DAGRUN_FORCE_SCOPE_ATTEMPT",
+        "DAGRUN_IN_SCOPE",
+        "DAGRUN_SCOPE_UNIT",
+        "DAGRUN_DIRECT_CGROUP",
     ] {
         cmd.env_remove(key);
     }
@@ -80,7 +80,7 @@ fn run(fx: &Fixture, envs: &[(&str, &str)], extra: &[&str], hide_session: bool) 
     cmd.args(["run", "--dag", fx.dag().to_str().unwrap(), "--no-profile"])
         .args(extra)
         // Keep the evidence writer out of this test's way; it is covered elsewhere.
-        .env("SAFE_CI_DAG_RUNNER_NO_STEP_LOGS", "1");
+        .env("DAGRUN_NO_STEP_LOGS", "1");
     for (k, v) in envs {
         cmd.env(k, v);
     }
@@ -117,7 +117,7 @@ fn policy_skip_is_named_as_untested_not_as_unavailable() {
         r.text
     );
     assert!(
-        r.text.contains("SAFE_CI_FORCE_SCOPE_ATTEMPT"),
+        r.text.contains("DAGRUN_FORCE_SCOPE_ATTEMPT"),
         "and it must point at the instrument that would answer it:\n{}",
         r.text
     );
@@ -137,7 +137,7 @@ fn a_forced_attempt_that_fails_reports_a_probe_failure_not_a_skip() {
     let fx = Fixture::new("forced_fail");
     let r = run(
         &fx,
-        &[("CI", "1"), ("SAFE_CI_FORCE_SCOPE_ATTEMPT", "1")],
+        &[("CI", "1"), ("DAGRUN_FORCE_SCOPE_ATTEMPT", "1")],
         &[],
         true,
     );
@@ -206,7 +206,7 @@ fn forcing_the_attempt_boxes_where_boxing_is_possible() {
     let fx = Fixture::new("forced_box");
     let r = run(
         &fx,
-        &[("CI", "1"), ("SAFE_CI_FORCE_SCOPE_ATTEMPT", "1")],
+        &[("CI", "1"), ("DAGRUN_FORCE_SCOPE_ATTEMPT", "1")],
         &[],
         false,
     );
@@ -253,7 +253,7 @@ fn the_boxed_path_observes_the_live_pid_in_the_promised_cgroup() {
     );
     // The observation must be bound to the cgroup that was actually arranged.
     assert!(
-        r.text.contains("promised unit safe-ci-") && r.text.contains("/sys/fs/cgroup/"),
+        r.text.contains("promised unit dagrun-") && r.text.contains("/sys/fs/cgroup/"),
         "the proof must name the promised unit and a real cgroup path:\n{}",
         r.text
     );
@@ -266,7 +266,7 @@ fn the_boxed_path_observes_the_live_pid_in_the_promised_cgroup() {
 #[test]
 fn a_forged_in_scope_sentinel_is_refused_not_believed() {
     let fx = Fixture::new("forged");
-    let r = run(&fx, &[("SAFE_CI_IN_SCOPE", "1")], &[], false);
+    let r = run(&fx, &[("DAGRUN_IN_SCOPE", "1")], &[], false);
 
     assert_eq!(
         r.code,
@@ -294,8 +294,8 @@ fn a_sentinel_naming_the_wrong_unit_is_refused_and_names_what_it_found() {
     let r = run(
         &fx,
         &[
-            ("SAFE_CI_IN_SCOPE", "1"),
-            ("SAFE_CI_SCOPE_UNIT", "totally-not-our-unit.scope"),
+            ("DAGRUN_IN_SCOPE", "1"),
+            ("DAGRUN_SCOPE_UNIT", "totally-not-our-unit.scope"),
         ],
         &[],
         false,
@@ -328,7 +328,7 @@ fn a_forged_sentinel_with_the_opt_out_degrades_rather_than_claiming() {
     let fx = Fixture::new("forged_optout");
     let r = run(
         &fx,
-        &[("SAFE_CI_IN_SCOPE", "1")],
+        &[("DAGRUN_IN_SCOPE", "1")],
         &["--allow-cgroup-failure"],
         false,
     );
@@ -365,7 +365,7 @@ fn run_recording(name: &str, envs: &[(&str, &str)], extra: &[&str]) -> (String, 
     let mut cmd = runner_command();
     cmd.args(["run", "--dag", dag.to_str().unwrap(), "--no-profile"])
         .args(extra)
-        .env("SAFE_CI_DAG_RUNNER_LOG_DIR", &ev);
+        .env("DAGRUN_LOG_DIR", &ev);
     for (k, v) in envs {
         cmd.env(k, v);
     }
@@ -404,11 +404,7 @@ fn every_containment_state_reaches_the_banner_and_the_durable_journal() {
 
     // 2) STEPS-CONTAINED-ONLY must be its own state. Recording the direct route as "boxed" would
     //    be the overclaim relocated into an artifact that outlives the run.
-    let (text, line) = run_recording(
-        "direct",
-        &[("CI", "1"), ("SAFE_CI_DAG_RUNNER_DIRECT_CGROUP", "1")],
-        &[],
-    );
+    let (text, line) = run_recording("direct", &[("CI", "1"), ("DAGRUN_DIRECT_CGROUP", "1")], &[]);
     // GATE ON WHETHER THE ROUTE WAS TAKEN, NOT ON THE ANSWER IT GAVE. Keying the skip off the
     // state label means a build that mislabels the direct route as run-boxed simply skips this
     // case and passes — measured: it did. The route announces itself independently of the label,
