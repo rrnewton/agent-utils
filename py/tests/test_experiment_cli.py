@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from safe_ci_dag_runner import StepOutcome
+from dagrun import StepOutcome
 
 from parallel_experiment_runner.cli import _spec_from_args, build_parser, main, parse_seeds
 from parallel_experiment_runner.execute import _classify_outcome

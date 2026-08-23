@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from safe_ci_dag_runner import cgroup
+from dagrun import cgroup
 
 
 def test_scope_drain_waits_past_first_empty_sample_for_late_member() -> None:

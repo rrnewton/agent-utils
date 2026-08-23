@@ -1,4 +1,4 @@
-"""Tests for the safe-ci-dag-runner CLI surface (in-process, stdlib capture)."""
+"""Tests for the dagrun CLI surface (in-process, stdlib capture)."""
 
 from __future__ import annotations
 
@@ -12,8 +12,8 @@ from pathlib import Path
 
 import pytest
 
-from safe_ci_dag_runner import __version__
-from safe_ci_dag_runner.cli import (
+from dagrun import __version__
+from dagrun.cli import (
     CGROUP_SETUP_ENVIRONMENT_ERROR,
     PROG,
     _load_userguide,
@@ -209,7 +209,7 @@ def test_userguide_prints_embedded_guide() -> None:
     assert out == embedded
     # A real, substantial guide (not a stub) with recognizable content.
     assert len(out) > 5000
-    assert "safe-ci-dag-runner" in out
+    assert "dagrun" in out
 
 
 def test_list_and_ascii() -> None:
@@ -413,13 +413,13 @@ def test_run_default_profile_store(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # With NEITHER --perf-dir NOR $SAFE_CI_DAG_RUNNER_PROFILE_DIR set, a run auto-logs to the
-    # repo-local default ./.safe-ci-dag-runner/profiles/ (relative to CWD) and says where.
+    # repo-local default ./.dagrun/profiles/ (relative to CWD) and says where.
     monkeypatch.delenv("SAFE_CI_DAG_RUNNER_PROFILE_DIR", raising=False)
     monkeypatch.chdir(tmp_path)
     dag = _demo_path(str(tmp_path))
     rc, _, err = _capture(["run", "--dag", dag, "-q", _ACF])
     assert rc == 0
-    store = tmp_path / ".safe-ci-dag-runner" / "profiles"
+    store = tmp_path / ".dagrun" / "profiles"
     csvs = list(store.glob("*.csv"))
     assert csvs, "expected the default profile store to be created and written"
     assert "default profile store" in err
@@ -433,7 +433,7 @@ def test_run_no_profile_writes_nothing(
     dag = _demo_path(str(tmp_path))
     rc, _, err = _capture(["run", "--dag", dag, "--no-profile", "-q", _ACF])
     assert rc == 0
-    assert not (tmp_path / ".safe-ci-dag-runner").exists()
+    assert not (tmp_path / ".dagrun").exists()
     assert "profile data appended" not in err
 
 
@@ -483,7 +483,7 @@ def test_sweep_bad_range_exits_2() -> None:
 def test_version_via_module() -> None:
     # argparse --version exits(0); run as a subprocess so it doesn't kill the test process.
     result = subprocess.run(
-        [sys.executable, "-m", "safe_ci_dag_runner", "--version"],
+        [sys.executable, "-m", "dagrun", "--version"],
         capture_output=True,
         text=True,
         check=True,
@@ -502,7 +502,7 @@ def test_run_default_requires_cgroups_or_flag() -> None:
         dag = _demo_path(tmp)
         env = dict(os.environ, CI="1")  # force the boxing re-exec to be skipped
         required = subprocess.run(
-            [sys.executable, "-m", "safe_ci_dag_runner", "run", "--dag", dag, "-q"],
+            [sys.executable, "-m", "dagrun", "run", "--dag", dag, "-q"],
             capture_output=True,
             text=True,
             env=env,
@@ -511,7 +511,7 @@ def test_run_default_requires_cgroups_or_flag() -> None:
         assert "cgroup boxing" in required.stderr.lower()
 
         allowed = subprocess.run(
-            [sys.executable, "-m", "safe_ci_dag_runner", "run", "--dag", dag, "-q",
+            [sys.executable, "-m", "dagrun", "run", "--dag", dag, "-q",
              "--allow-cgroup-failure"],
             capture_output=True,
             text=True,
@@ -534,7 +534,7 @@ def test_unsafe_no_cgroups_deliberately_skips_boxing() -> None:
         # regardless of whether boxing could have been established.
         env = dict(os.environ)
         result = subprocess.run(
-            [sys.executable, "-m", "safe_ci_dag_runner", "run", "--dag", dag, "-q",
+            [sys.executable, "-m", "dagrun", "run", "--dag", dag, "-q",
              "--unsafe-no-cgroups"],
             capture_output=True,
             text=True,
@@ -563,7 +563,7 @@ def test_boxed_run_enforces_cpu_timeout() -> None:
         path = Path(tmp) / "cpu.json"
         path.write_text(dag, encoding="utf-8")
         proc = subprocess.run(
-            [sys.executable, "-m", "safe_ci_dag_runner", "run", "--dag", str(path),
+            [sys.executable, "-m", "dagrun", "run", "--dag", str(path),
              "-q", "--no-profile"],
             capture_output=True,
             text=True,
@@ -611,7 +611,7 @@ def test_default_small_cpu_cap_is_enforced_and_allows_compliant_work() -> None:
         path.write_text(dag, encoding="utf-8")
         env = {k: v for k, v in os.environ.items() if k not in ("CI", "GITHUB_ACTIONS")}
         return subprocess.run(
-            [sys.executable, "-m", "safe_ci_dag_runner", "run", "--dag", str(path),
+            [sys.executable, "-m", "dagrun", "run", "--dag", str(path),
              "-q", "--no-profile"],
             capture_output=True,
             text=True,
@@ -646,15 +646,15 @@ def test_default_small_cpu_cap_is_enforced_and_allows_compliant_work() -> None:
 def test_boxed_reexec_via_symlink_imports_package() -> None:
     # Regression guard for the fleet-wide local-validate breakage: a DEFAULT boxed run invoked
     # through the py/bin symlink (NOT `python -m`, NOT pip-installed) must re-exec a child that
-    # can still import the package. The old code re-exec'd `python -m safe_ci_dag_runner`, whose
-    # fresh child had py/ off sys.path -> `No module named safe_ci_dag_runner`, so every non-CI
+    # can still import the package. The old code re-exec'd `python -m dagrun`, whose
+    # fresh child had py/ off sys.path -> `No module named dagrun`, so every non-CI
     # `run` (i.e. validate.sh) died. The fix re-execs __main__.py by absolute path, which does its
     # own sys.path fixup. Run from a CWD *outside* py/ so an accidental cwd-relative import can't
     # mask the bug. Boxing is environment-dependent, so exit 3 (boxing genuinely unavailable) is a
     # valid LOUD skip; the one thing that must NEVER appear is the import failure.
     import os
 
-    symlink = Path(__file__).resolve().parent.parent / "bin" / "safe-ci-dag-runner"
+    symlink = Path(__file__).resolve().parent.parent / "bin" / "dagrun"
     assert symlink.exists(), f"expected the console symlink at {symlink}"
     dag = (
         '{"steps": [{"group": "cpu", "job": "burn", "desc": "burn",'
@@ -673,7 +673,7 @@ def test_boxed_reexec_via_symlink_imports_package() -> None:
             env=env,
         )
         combined = proc.stdout + proc.stderr
-        assert "No module named safe_ci_dag_runner" not in combined, (
+        assert "No module named dagrun" not in combined, (
             "boxed re-exec child failed to import the package (the regression this guards): "
             f"rc={proc.returncode}\n{combined}"
         )
@@ -705,7 +705,7 @@ def test_cores_flag_refuses_unboxed_soft_affinity() -> None:
 def test_boxed_stdin_dag_survives_scope_reexec() -> None:
     import os
 
-    symlink = Path(__file__).resolve().parent.parent / "bin" / "safe-ci-dag-runner"
+    symlink = Path(__file__).resolve().parent.parent / "bin" / "dagrun"
     dag = (
         '{"steps":[{"group":"stress","job":"singleton","cmd":"sleep 1",'
         '"hint":{"hard_mem_max_bytes":67108864}}]}'
@@ -869,9 +869,9 @@ def test_stress_generation_removes_named_resource_serialization() -> None:
 
 
 def test_stress_generated_graph_has_no_named_resource_scheduling() -> None:
-    from safe_ci_dag_runner.cli import _expand_stress
-    from safe_ci_dag_runner.io import dag_from_json
-    from safe_ci_dag_runner.scheduler import run_dag
+    from dagrun.cli import _expand_stress
+    from dagrun.io import dag_from_json
+    from dagrun.scheduler import run_dag
 
     cfg = dag_from_json(
         '{"resource_caps":{"exclusive":1},"steps":['
@@ -907,8 +907,8 @@ def test_stress_n_must_be_positive() -> None:
 
 def test_expand_stress_replicates_steps_and_rewires_deps() -> None:
     # Unit test of the fan-out: N shards, distinct #NN suffixes, intra-shard deps rewired.
-    from safe_ci_dag_runner.cli import _expand_stress
-    from safe_ci_dag_runner.io import dag_from_json
+    from dagrun.cli import _expand_stress
+    from dagrun.io import dag_from_json
 
     cfg = dag_from_json(
         '{"steps": ['
@@ -936,10 +936,10 @@ def test_expand_stress_gives_each_copy_a_stable_index_in_its_environment() -> No
     # command cannot choose a distinct output path: N copies write one file, the last writer
     # wins, and nothing errors. The `#NN` suffix does not help -- it is part of the job NAME,
     # which the command never sees.
-    from safe_ci_dag_runner.cli import STRESS_COPIES_ENV
-    from safe_ci_dag_runner.cli import STRESS_COPY_ENV
-    from safe_ci_dag_runner.cli import _expand_stress
-    from safe_ci_dag_runner.io import dag_from_json
+    from dagrun.cli import STRESS_COPIES_ENV
+    from dagrun.cli import STRESS_COPY_ENV
+    from dagrun.cli import _expand_stress
+    from dagrun.io import dag_from_json
 
     cfg = dag_from_json(
         '{"steps": [{"group": "demo", "job": "run", "cmd": "true", "env": {"KEEP": "me"}}]}'

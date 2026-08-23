@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 
-from safe_ci_dag_runner.io import (
+from dagrun.io import (
     DagJsonError,
     dag_from_json,
     dag_from_yaml,

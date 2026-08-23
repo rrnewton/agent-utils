@@ -14,8 +14,8 @@ from pathlib import Path
 
 import pytest
 
-from safe_ci_dag_runner import admission
-from safe_ci_dag_runner.admission import (
+from dagrun import admission
+from dagrun.admission import (
     MEM_BUDGET_BYTES_ENV,
     MEM_HEADROOM_BYTES_ENV,
     Verdict,
@@ -334,7 +334,7 @@ def test_run_admission_refuses_a_request_bigger_than_the_host_and_exits_four(
     2 already means "bad usage" and 3 means "cgroup boxing unavailable"; reusing either would
     make "the host is busy, come back" indistinguishable from "this invocation is wrong".
     """
-    from safe_ci_dag_runner import cli
+    from dagrun import cli
 
     monkeypatch.setenv(admission.MEM_LEDGER_ENV, str(_ledger(tmp_path)))
     monkeypatch.setenv(MEM_BUDGET_BYTES_ENV, str(1024 * 1024))
@@ -361,7 +361,7 @@ def test_run_admission_queues_behind_a_live_holder_rather_than_contending(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """The defect in one line: without the ledger this second run would simply start."""
-    from safe_ci_dag_runner import cli
+    from dagrun import cli
 
     ledger = _ledger(tmp_path)
     _decision, held = request_with_limits(
@@ -394,7 +394,7 @@ def test_run_admission_grants_and_the_run_proceeds(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Admission must not become a gate that never opens."""
-    from safe_ci_dag_runner import cli
+    from dagrun import cli
 
     monkeypatch.setenv(admission.MEM_LEDGER_ENV, str(_ledger(tmp_path)))
     monkeypatch.setenv(MEM_BUDGET_BYTES_ENV, str(64 * 1024**3))
@@ -423,7 +423,7 @@ def test_run_admission_without_max_mem_is_refused_rather_than_guessed(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Guessing would reserve the whole host and turn admission into a global mutex."""
-    from safe_ci_dag_runner import cli
+    from dagrun import cli
 
     code = cli.main(
         [
@@ -451,8 +451,8 @@ def test_the_boxing_re_exec_does_not_make_a_run_queue_behind_its_own_reservation
     just fits into, the second ask queues behind the first: the run waits for a holder that is
     itself, and nothing can ever release it.
     """
-    from safe_ci_dag_runner import cgroup as cg
-    from safe_ci_dag_runner import cli
+    from dagrun import cgroup as cg
+    from dagrun import cli
 
     ledger = _ledger(tmp_path)
     gib = 1024**3
@@ -501,8 +501,8 @@ def test_an_inherited_in_scope_sentinel_does_not_wave_an_unreserved_run_through(
     reserved nothing, printed no verdict and exited 0 for a 16 GiB request against a 1 GiB budget.
     The ledger, not the environment, says whether this process is already admitted.
     """
-    from safe_ci_dag_runner import cgroup as cg
-    from safe_ci_dag_runner import cli
+    from dagrun import cgroup as cg
+    from dagrun import cli
 
     ledger = _ledger(tmp_path)
     gib = 1024**3
@@ -585,7 +585,7 @@ def test_a_wait_beyond_the_ceiling_is_refused_rather_than_accepted_and_then_abor
     duration to instant") on the very same command line. A validated input that then panics is
     worse than a rejected one, so both editions reject it, in words that name the bound.
     """
-    from safe_ci_dag_runner import cli
+    from dagrun import cli
 
     gib = 1024**3
     monkeypatch.setenv(admission.MEM_LEDGER_ENV, str(_ledger(tmp_path)))
@@ -637,7 +637,7 @@ def test_a_ledger_this_process_cannot_read_stops_the_run_rather_than_waving_it_t
     silently restore the contention this flag was asked for, and would do it in exactly the
     circumstance where nobody is watching. Exit 4, and name the file.
     """
-    from safe_ci_dag_runner import cli
+    from dagrun import cli
 
     ledger = _ledger(tmp_path)
     ledger.write_text("{not json at all", encoding="utf-8")

@@ -6,7 +6,7 @@ version, license, README, and embedded user guide.
 
 | Crate | Binaries | Purpose |
 |---|---|---|
-| `safe-ci-dag-runner` | `safe-ci-dag-runner`, `cpuset-alloc` | Run and inspect resource-aware CI DAGs; reserve hard-isolated CPU sets for benchmarks. |
+| `dagrun` | `dagrun`, `cpuset-alloc` | Run and inspect resource-aware CI DAGs; reserve hard-isolated CPU sets for benchmarks. |
 | `tick-hub` | `tick-hub` | Evaluate cadenced reminders and health checks in one deterministic tick. |
 | `pr-landing-planner` | `pr-landing-planner` | Produce advisory, conflict-aware pull-request landing plans. |
 | `herdr-run` | `herdr-run`, `herdr-agent` | Run policy-admitted commands and durably message interactive agents through Herdr panes. |
@@ -14,7 +14,7 @@ version, license, README, and embedded user guide.
 Install one published command with Cargo:
 
 ```sh
-cargo install safe-ci-dag-runner
+cargo install dagrun
 cargo install tick-hub
 cargo install pr-landing-planner
 cargo install herdr-run

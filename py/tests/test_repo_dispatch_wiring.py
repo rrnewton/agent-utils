@@ -13,7 +13,7 @@ from types import ModuleType
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RUST_TOOLS = (
-    "safe-ci-dag-runner",
+    "dagrun",
     "cpuset-alloc",
     "tick-hub",
     "pr-landing-planner",
@@ -117,7 +117,7 @@ def test_tracked_rust_launchers_share_the_cargo_runner() -> None:
 def test_dependency_smoke_covers_cpuset_companion() -> None:
     """The companion command gets every dependency-free startup probe."""
     check_deps = _load_check_deps()
-    module = "safe_ci_dag_runner.cpuset_allocator"
+    module = "dagrun.cpuset_allocator"
     assert module in check_deps.ENTRYPOINT_MODULES
 
     py_dir = check_deps._py_dir()

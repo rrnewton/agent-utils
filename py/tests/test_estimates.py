@@ -1,14 +1,14 @@
-"""Tests for the profile-store feedback reader + the planner (safe_ci_dag_runner.estimates)."""
+"""Tests for the profile-store feedback reader + the planner (dagrun.estimates)."""
 
 from __future__ import annotations
 
-from safe_ci_dag_runner import estimates
+from dagrun import estimates
 
 from pathlib import Path
 
 import pytest
 
-from safe_ci_dag_runner import (
+from dagrun import (
     DagConfig,
     InfeasibleAllocationError,
     ResourceHint,
@@ -22,7 +22,7 @@ from safe_ci_dag_runner import (
     plan_to_json,
     plan_to_text,
 )
-from safe_ci_dag_runner.estimates import (
+from dagrun.estimates import (
     Planner,
     StepSpeedup,
     _affinity_width,
@@ -30,7 +30,7 @@ from safe_ci_dag_runner.estimates import (
     _parse_int,
     _robust_median,
 )
-from safe_ci_dag_runner.sizing import jobs_for_budget
+from dagrun.sizing import jobs_for_budget
 
 _HEADER = (
     "timestamp,machine_id,container_class,git_sha,outer_jobs,profile_base_sha,enforcement_kind,"
@@ -112,7 +112,7 @@ def test_robust_median_small_samples_resist_one_slow_outlier() -> None:
 
 
 def test_two_sample_slow_outlier_does_not_invert_speedup(tmp_path: Path) -> None:
-    from safe_ci_dag_runner import load_step_speedups
+    from dagrun import load_step_speedups
 
     # A -j2 width with one clean 5s run and one slow 100s outlier (a single slow CI run) must NOT be
     # read as slower than -j1's 10s. With the min-based small-sample estimator -j2 reads as 5s, so
@@ -379,7 +379,7 @@ def _write_speedup_store(tmp_path: Path, rows: list[str]) -> Path:
 
 
 def test_speedup_knee_stops_at_two_on_rising_cpu(tmp_path: Path) -> None:
-    from safe_ci_dag_runner import load_step_speedups
+    from dagrun import load_step_speedups
 
     # Wall halves 1->2 (10->5) but barely improves 2->4 (5->4.5) while total CPU-s rises
     # (~10.2 -> ~18): both the marginal-gain and the work-conservation signals say stop at -j2.
@@ -407,7 +407,7 @@ def test_speedup_knee_stops_at_two_on_rising_cpu(tmp_path: Path) -> None:
 
 
 def test_speedup_linear_recommends_widest_within_budget(tmp_path: Path) -> None:
-    from safe_ci_dag_runner import load_step_speedups
+    from dagrun import load_step_speedups
 
     # Near-linear scaling with flat total CPU-s: the widest measured width (still within the
     # affinity-16 budget) is recommended.
@@ -424,7 +424,7 @@ def test_speedup_linear_recommends_widest_within_budget(tmp_path: Path) -> None:
 
 
 def test_speedup_single_level_has_no_model(tmp_path: Path) -> None:
-    from safe_ci_dag_runner import load_step_speedups
+    from dagrun import load_step_speedups
 
     # One inner_jobs width is not enough to model a curve.
     store = _write_speedup_store(
@@ -435,7 +435,7 @@ def test_speedup_single_level_has_no_model(tmp_path: Path) -> None:
 
 
 def test_speedup_core_budget_caps_recommendation(tmp_path: Path) -> None:
-    from safe_ci_dag_runner import load_step_speedups
+    from dagrun import load_step_speedups
 
     # Perfect linear scaling to -j4, but a 2-core container budget caps the recommendation at 2.
     store = tmp_path / "cbstore"
@@ -452,7 +452,7 @@ def test_speedup_core_budget_caps_recommendation(tmp_path: Path) -> None:
 
 
 def test_plan_includes_speedup_field(tmp_path: Path) -> None:
-    from safe_ci_dag_runner import load_step_speedups
+    from dagrun import load_step_speedups
 
     store = _write_speedup_store(
         tmp_path,

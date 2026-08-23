@@ -5,8 +5,8 @@ Two defects met here, and the fix is one mechanism.
 #79 derived-enforcement-manifest: the ``capabilities`` manifest used to be a hand-typed JSON
 literal with nothing tying it to the code that enforces the guards it advertises, so it could
 claim enforcement that was not happening. It is now generated from
-:data:`safe_ci_dag_runner.capabilities.ENFORCEMENT_REGISTRY`, and five of its nine keys are
-consulted by :func:`safe_ci_dag_runner.capabilities.is_enforced` at the guard site itself.
+:data:`dagrun.capabilities.ENFORCEMENT_REGISTRY`, and five of its nine keys are
+consulted by :func:`dagrun.capabilities.is_enforced` at the guard site itself.
 
 #75 cpu-timeout-unboxed-fallback: that literal was also one flat object asserting
 ``"cpu_timeout":true``, and that sentence is true only under cgroup boxing. On an uncontained
@@ -37,17 +37,17 @@ from pathlib import Path
 
 import pytest
 
-from safe_ci_dag_runner import DagConfig, Step, run_dag
-from safe_ci_dag_runner.capabilities import (
+from dagrun import DagConfig, Step, run_dag
+from dagrun.capabilities import (
     ENFORCEMENT_REGISTRY,
     Lane,
     enforcement_manifest,
     is_enforced,
     registry_override,
 )
-from safe_ci_dag_runner.cgroup import Cgroups, NoopCgroups
-from safe_ci_dag_runner.model import ResourceHint
-from safe_ci_dag_runner.scheduler import run_dag_limited, uncontained_cpu_budget_warning
+from dagrun.cgroup import Cgroups, NoopCgroups
+from dagrun.model import ResourceHint
+from dagrun.scheduler import run_dag_limited, uncontained_cpu_budget_warning
 
 #: The exact bytes the `capabilities` subcommand promises, and which the Rust engine must
 #: print too. Deliberately a literal: a test that rebuilt this from ENFORCEMENT_REGISTRY
@@ -107,7 +107,7 @@ def test_manifest_is_exactly_the_published_bytes() -> None:
 
 def test_capabilities_subcommand_prints_the_derived_manifest() -> None:
     out = subprocess.run(
-        ["python3", "-m", "safe_ci_dag_runner", "capabilities"],
+        ["python3", "-m", "dagrun", "capabilities"],
         capture_output=True,
         text=True,
         check=True,

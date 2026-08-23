@@ -3,7 +3,7 @@ ZERO optional dependencies installed, and must turn a genuinely-needed-but-missi
 dependency into an ACTIONABLE message instead of a Python traceback.
 
 Motivation: PyYAML is an OPTIONAL dependency of this tree (only the YAML read/write paths need it),
-but it used to be imported at module scope, so `safe-ci-dag-runner -h` crashed with a bare
+but it used to be imported at module scope, so `dagrun -h` crashed with a bare
 ``ModuleNotFoundError: No module named 'yaml'`` on any host without PyYAML. The owner's interim
 policy is to run these Python entrypoints directly, so `-h` crashing is unacceptable.
 
@@ -31,7 +31,7 @@ _BLOCK_YAML_BOOT = (
 )
 
 # The primary ``python -m`` entrypoint for each independently packaged tool.
-ENTRYPOINT_MODULES = ["safe_ci_dag_runner", "tick_hub", "pr_landing_planner"]
+ENTRYPOINT_MODULES = ["dagrun", "tick_hub", "pr_landing_planner"]
 
 # The dependency-free invocations the owner explicitly asked to always work.
 DEPFREE_FLAGS = ["-h", "--help", "--version", ""]
@@ -66,7 +66,7 @@ def test_depfree_invocations_never_touch_optional_deps(module: str, flag: str) -
 
 def test_cpuset_companion_help_starts_without_yaml() -> None:
     """The safe-ci distribution's companion console command is independently startable."""
-    result = _run_blocked("safe_ci_dag_runner.cpuset_allocator", ["--help"])
+    result = _run_blocked("dagrun.cpuset_allocator", ["--help"])
     combined = result.stdout + result.stderr
     assert result.returncode == 0, combined
     assert "Traceback (most recent call last)" not in combined
@@ -76,7 +76,7 @@ def test_cpuset_companion_help_starts_without_yaml() -> None:
 # (module, argv) pairs that genuinely reach a YAML read/write path; each must degrade to a clean,
 # actionable message (exit 2, no traceback) rather than crashing when PyYAML is unavailable.
 YAML_PATH_CASES = [
-    ("safe_ci_dag_runner", ["yaml", "--dag", "{json_dag}"]),  # dag_to_yaml
+    ("dagrun", ["yaml", "--dag", "{json_dag}"]),  # dag_to_yaml
     ("tick_hub", ["yaml", "--config", "{json_cfg}"]),  # config_to_yaml
     ("pr_landing_planner", ["plan", "--fixture", "{yaml_fixture}"]),  # load_fixture_text (YAML)
 ]

@@ -94,7 +94,7 @@ def test_operational_backticks_do_not_leak_nested_terms() -> None:
             1_775_000_000_000,
             "Use `tg --db widget`, `tg --help`, `agents_v17.db`, "
             "`~/.orc/sessions/<session-id>/`, and `~/temp/orc_transcripts/`. "
-            "Keep `safe-ci-dag-runner`, `conversation_state`, `Node.js`, and `ALL`. "
+            "Keep `dagrun`, `conversation_state`, `Node.js`, and `ALL`. "
             "The prose says ALL work is ready. KVM PMU IPC CI.",
         ),
         TermSource(
@@ -106,7 +106,7 @@ def test_operational_backticks_do_not_leak_nested_terms() -> None:
     names = {term.term for term in scan_terminology(sources, "America/New_York")}
 
     assert names.issuperset(
-        {"safe-ci-dag-runner", "conversation_state", "Node.js", "KVM", "PMU", "IPC", "CI"}
+        {"dagrun", "conversation_state", "Node.js", "KVM", "PMU", "IPC", "CI"}
     )
     assert names.isdisjoint(
         {
@@ -140,7 +140,7 @@ def test_explicit_candidate_filter_rejects_literals_and_prose_fragments() -> Non
         (
             TermSource(
                 1_775_000_000_000,
-                "Keep `safe-ci-dag-runner`, `Guest::ppid`, and `Node.js`; reject "
+                "Keep `dagrun`, `Guest::ppid`, and `Node.js`; reject "
                 "`and`, `or`, `true`, `10m`, `4c70658e`, `.env.dbi`, "
                 "`CARGO_BUILD_JOBS=16`, `(hours),`, `check the deploy`, and "
                 "`cells, not among the 70`.",
@@ -150,7 +150,7 @@ def test_explicit_candidate_filter_rejects_literals_and_prose_fragments() -> Non
     )
     names = {term.term for term in terms}
 
-    assert names == {"safe-ci-dag-runner", "Guest::ppid", "Node.js"}
+    assert names == {"dagrun", "Guest::ppid", "Node.js"}
 
 
 def test_term_cap_is_selected_by_eligibility_not_first_mention() -> None:

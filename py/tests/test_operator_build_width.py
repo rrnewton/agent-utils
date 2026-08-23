@@ -17,8 +17,8 @@ from pathlib import Path
 
 import pytest
 
-from safe_ci_dag_runner.cgroup import Cgroups
-from safe_ci_dag_runner.sizing import (
+from dagrun.cgroup import Cgroups
+from dagrun.sizing import (
     BUILD_JOBS_ENV,
     OPERATOR_BUILD_JOBS_ENV,
     choose_build_jobs,
@@ -59,7 +59,7 @@ def test_the_awkward_digit_strings_answer_exactly_as_the_rust_twin_does() -> Non
     # keep aligned.
     assert parse_build_jobs("８") is None
     # Superscript two is isdigit() but not int()-parseable. This raised ValueError, and because
-    # the capture below happens at IMPORT it killed `import safe_ci_dag_runner` outright.
+    # the capture below happens at IMPORT it killed `import dagrun` outright.
     assert parse_build_jobs("8²") is None
     # Arabic-Indic digits: isdigit(), int()-parseable, not ASCII.
     assert parse_build_jobs("٨") is None
@@ -137,7 +137,7 @@ def _captured_in_subprocess(env: dict[str, str]) -> str:
         [
             sys.executable,
             "-c",
-            "from safe_ci_dag_runner.sizing import operator_build_jobs; "
+            "from dagrun.sizing import operator_build_jobs; "
             "print(operator_build_jobs())",
         ],
         env=child,
@@ -157,7 +157,7 @@ def test_the_capture_happens_at_import_from_the_real_environment() -> None:
 
 def test_a_malformed_variable_cannot_take_the_package_down_at_import() -> None:
     # The capture is a module-level statement, so anything it raises is raised by
-    # `import safe_ci_dag_runner` — and then `capabilities`, `--help` and every other subcommand
+    # `import dagrun` — and then `capabilities`, `--help` and every other subcommand
     # die with a traceback because of an environment variable. `_captured_in_subprocess` runs a
     # fresh interpreter with `check=True`, so a raising import fails this test rather than being
     # swallowed.
@@ -186,7 +186,7 @@ def test_the_systemd_free_fallback_still_has_no_caller() -> None:
     rewrite the docstring and the two comments in `sizing.py` that depend on it."""
     import re
 
-    package = Path(__file__).resolve().parents[1] / "safe_ci_dag_runner"
+    package = Path(__file__).resolve().parents[1] / "dagrun"
     call = re.compile(r"(?<![\w.])enter_delegated_scope\s*\(")
     callers = [
         f"{path.name}:{n}"
@@ -220,7 +220,7 @@ def _wrapped_jobs(cmd: str) -> int:
 def test_a_stated_width_reaches_the_step_command(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr("safe_ci_dag_runner.sizing._OPERATOR_BUILD_JOBS", 12)
+    monkeypatch.setattr("dagrun.sizing._OPERATOR_BUILD_JOBS", 12)
     cg = _boxed(tmp_path, cpu_max="28400000 100000", memory_max=str(8 * GIB))
     assert _wrapped_jobs(cg.prepare_command("build.dbi_release", "cargo build")) == 12
 
@@ -231,7 +231,7 @@ def test_with_nothing_stated_the_step_is_still_refined_downward(
     # The leg that must not regress: an unpinned step under a 284-core scope and an 8 GiB cap
     # gets 8, not 284. If operator intent were sniffed from CARGO_BUILD_JOBS this would break
     # in-scope, where the runner has already written that variable.
-    monkeypatch.setattr("safe_ci_dag_runner.sizing._OPERATOR_BUILD_JOBS", None)
+    monkeypatch.setattr("dagrun.sizing._OPERATOR_BUILD_JOBS", None)
     monkeypatch.setenv(BUILD_JOBS_ENV, "284")
     monkeypatch.setenv(OPERATOR_BUILD_JOBS_ENV, "")
     cg = _boxed(tmp_path, cpu_max="28400000 100000", memory_max=str(8 * GIB))

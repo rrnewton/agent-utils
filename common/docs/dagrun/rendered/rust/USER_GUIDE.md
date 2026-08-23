@@ -1,0 +1,741 @@
+# dagrun user guide
+
+`dagrun` models build and test work as a DAG, plans it
+deterministically, and executes ready steps concurrently. Dependencies, memory
+budgets, named resource caps, timeouts, CPU reservations, and Linux containment
+all constrain execution without changing the graph's meaning.
+
+## Installation and library use
+
+```sh
+cargo install dagrun
+```
+
+Rust 1.85 or newer is required. The crate installs both binaries. For library
+use, declare the dependency and import the crate as `dagrun`:
+
+```toml
+[dependencies]
+dagrun = "0.15"
+```
+
+```rust
+use dagrun::{dag_from_yaml, to_ascii};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let dag = dag_from_yaml("steps: []")?;
+    println!("{}", to_ascii(&dag, None));
+    Ok(())
+}
+```
+
+Public modules cover containment, CPU reservations, resource sizing, profile
+summaries, deterministic planning, scheduling, serialization, and
+visualization. The `run_dag` function is the explicit uncontained scheduler;
+`run_dag_boxed` applies a caller-supplied cgroup manager when present. The
+console command establishes and verifies the outer systemd scope. Enforced
+containment requires Linux with cgroup v2 and a delegated systemd user scope.
+`run_dag(..., combined_limit)` and `run_dag_boxed(..., combined_limit)` treat
+that argument as a compatibility combined active-step and per-step-width limit.
+Use `run_dag_limited(..., max_steps, max_cpus, ...)` or a boxed limited variant
+to choose the two values independently. Without an externally established outer
+quota, these helpers do not cap aggregate CPU bandwidth or serialize overlapping
+widths. `cap_config_max_cpus` applies the same per-step cap to runner-controlled
+commands without starting a run; it leaves
+self-managed fixed widths unchanged so the run helpers can refuse an
+over-budget command truthfully.
+The low-level `allocate_widths(...)` helper returns
+`Result<HashMap<_, _>, InfeasibleAllocationError>`; 0.15 makes an over-budget
+self-managed fixed command an explicit error rather than an executable-looking
+width map.
+
+## A first DAG
+
+Each step is identified by a `group.job` tag. `deps` names predecessor tags.
+The optional `hint` object supplies estimates and limits; top-level
+`resource_caps` limits caller-defined scarce resources.
+
+Every resource a step demands must have a cap declared. An UNDECLARED
+resource is refused before any node starts, because it is not the same thing
+as a cap of `0`: undeclared means capacity you forgot to grant, while `0`
+means the step is blocked on purpose. Both would otherwise leave the step
+permanently unready with nothing said, so declare the capacity — or write the
+cap as `0` to say the block is deliberate.
+
+```yaml
+resource_caps:
+  browser: 1
+steps:
+  - group: build
+    job: app
+    desc: compile the application
+    cmd: make build
+    hint:
+      est_duration_s: 30
+      classification: cpu-bound
+      rss_baseline_bytes: 536870912
+  - group: test
+    job: unit
+    cmd: make test
+    deps: [build.app]
+  - group: test
+    job: browser
+    cmd: ./run-browser-tests
+    deps: [build.app]
+    hint:
+      resources: {browser: 1}
+```
+
+JSON and YAML express the same strict schema. File names ending in `.yaml` or
+`.yml` select YAML; other paths select JSON. Use `--dag -` for JSON on standard
+input. Unknown fields, invalid types, duplicate step tags, missing dependencies,
+cycles, and impossible resource demands are rejected before execution.
+
+#### Six top-level keys the document format does not carry (breaking change)
+
+A DAG document is **refused at load** (exit 2) if it sets any of:
+
+    default_step_mem_cap_bytes   default_step_cpu_timeout   cpu_timeout_platform
+    default_step_cpu_count       cpu_timeout_multiplier     known_failures
+
+These name real runner-configuration fields, but the document format has never
+carried them: writing one had **no effect whatsoever**, and nothing said so — a
+cap you thought you had set was silently the default. That is the reader's side
+of the dropped-field bug, so the loader now names the key instead of ignoring
+it. Both language editions refuse exactly the same six.
+
+**This can break a document that loaded before.** Set these at the call site
+(they are caller/platform policy, not properties of the graph — several have
+`--cpu-timeout-multiplier`-style flags or environment variables), or delete
+them: deleting changes nothing, because they were never in effect. A key that
+names *nothing* at all is still tolerated, so forward-compatible additions keep
+loading.
+
+### Fail closed on protected artifact writes
+
+An opt-in `write_domain_policy` turns per-step write declarations into a
+pre-execution requirement. `allowed_domains` is a closed vocabulary;
+`require_explicit: true` requires every step to carry `write_domains` (use `[]`
+when the step writes none of the protected domains). Unknown, duplicate, or
+missing domains stop the whole DAG before the first command starts.
+
+Every non-empty declaration also names its structural guarantee:
+
+- `artifact-producer` creates mutable inputs to a later publisher.
+- `immutable-artifact-barrier` atomically publishes the immutable artifact.
+- `artifact-barrier-dependent` must transitively depend on such a barrier; the
+  runner verifies that graph relationship before execution.
+- `explicitly-isolated` writes a package/path-disjoint output.
+
+```yaml
+write_domain_policy:
+  require_explicit: true
+  allowed_domains: [shared-target, isolated-target]
+steps:
+  - group: build
+    job: publish
+    cmd: ./publish-immutable
+    write_domains: [shared-target]
+    write_domain_guarantee: immutable-artifact-barrier
+  - group: test
+    job: unit
+    cmd: ./run-shared-target-test
+    deps: [build.publish]
+    write_domains: [shared-target]
+    write_domain_guarantee: artifact-barrier-dependent
+  - group: build
+    job: fixture
+    cmd: ./build-fixture-in-private-target
+    write_domains: [isolated-target]
+    write_domain_guarantee: explicitly-isolated
+```
+
+Write domains are not scheduler semaphores. Disjoint writers retain their
+parallelism, and a shared domain is not silently converted into one global
+mutex. External writers remain outside the scheduler; an immutable publication
+barrier shields consumers without pretending those writers were serialized.
+
+## Inspect, convert, and visualize
+
+```sh
+dagrun list --dag pipeline.yaml
+dagrun ascii --dag pipeline.yaml
+dagrun dot --dag pipeline.yaml > pipeline.dot
+dagrun json --dag pipeline.yaml > pipeline.json
+dagrun yaml --dag pipeline.json > pipeline.yaml
+```
+
+`list` is a compact inventory. `ascii` shows dependency layers. `dot` emits
+Graphviz input. `json` emits canonical JSON, while `yaml` emits stable YAML.
+
+## Plan without running
+
+```sh
+dagrun plan --dag pipeline.yaml
+dagrun plan --dag pipeline.yaml --planner critical-path
+dagrun plan --dag pipeline.yaml --format json
+```
+
+The default `greedy-lpt` planner favors the longest ready step. The
+`critical-path` planner favors the largest remaining weighted path. The `cpa`
+planner additionally chooses inner widths from measured speedup curves. Stable
+tag ordering breaks ties, so repeated plans over the same inputs are identical.
+
+By default, past profile samples refine duration and resident-memory estimates.
+Use `--no-profile-feedback` when only authored hints may influence a plan.
+
+### Learning a memory cap from profiles, safely
+
+`run --profile-memory-feedback` is a separate, opt-in path that derives
+`rss_baseline_bytes` from the store's **uncensored** peaks only.
+
+A recorded `peak_bytes` does not on its own say what it measured. A step whose
+peak reached the `memory.max` applied to it, or that the kernel reclaimed,
+throttled or OOM-killed at that ceiling, used everything it was allowed and may
+have wanted more. Treating that number as an observed maximum re-derives the cap
+that produced it and freezes the mistake. So:
+
+- a censored sample is used only as a **floor** — proof demand was at least that
+  large — and can raise an estimate, never lower one;
+- a row recording a step that **failed** — `ok` false, or a non-zero
+  `returncode` such as 137 (SIGKILL, what an OOM kill from an enclosing cgroup
+  looks like) — is censored for the same reason: it says where the step got to
+  before it died, not where it was going;
+- a sample that cannot say (no applied cap recorded, no event counters, no peak)
+  is not evidence, and is counted and reported rather than assumed comfortable;
+- a step needs at least five uncensored samples before its authored hint is
+  replaced at all, and the estimate carries a 20% margin above the 9/10
+  percentile;
+- a step this path **declines** to estimate goes back to the larger of the
+  baseline its author wrote and the floor its recorded peaks prove. Going back
+  to the author's figure matters because the ordinary feedback above has already
+  refined the same hint from the same peaks *without* asking what they were
+  measured under: turning this flag on has to remove that number too, or a
+  decline would quietly mean "use the censoring-blind estimate instead". Keeping
+  the floor matters for the same reason in the other direction: a step whose
+  every run was pinned to a 32 GiB ceiling has proven it needs at least that,
+  and modelling it at the 1 GiB its author guessed would be the same ratchet
+  running the other way. "We do not know the peak" and "we know the peak is at
+  least X" are different answers, and a decline gives the second one whenever
+  the evidence supports it — so a decline can only ever **raise** a step's
+  baseline above what its author wrote, never lower it;
+- `hard_mem_max_bytes` is never rewritten: an explicit hard cap is an
+  instruction, not a guess.
+
+Every step the store knows about gets one line on stderr saying what was decided
+and on what evidence, including the steps that did **not** move — otherwise "the
+cap did not change" and "the store had nothing usable to say" look the same:
+
+```
+dagrun: --profile-memory-feedback: g.build: rss_baseline_bytes=2576980377 [6 uncensored, 0 censored, 0 unprovenanced of 6; 6 uncensored sample(s), 9/10 percentile +20%]
+dagrun: --profile-memory-feedback: g.link: keeping the authored hint [0 uncensored, 6 censored, 0 unprovenanced of 6; every one of 6 recorded peak(s) was censored by its applied cap]
+dagrun: --profile-memory-feedback: g.test: no estimate; rss_baseline_bytes=34359738368, the proven floor [0 uncensored, 6 censored, 0 unprovenanced of 6; every one of 6 recorded peak(s) was censored by its applied cap]
+```
+
+`g.link` and `g.test` were declined on identical evidence; they differ only in
+what their authors wrote. `g.link`'s hint already covers the floor its peaks
+prove, so it is left alone. `g.test`'s does not, so the floor is used and the
+line names the number rather than claiming the authored hint was kept.
+
+The provenance columns this reads are written by the runner itself; a store
+recorded before they existed reads as unprovenanced, which keeps every authored
+hint. Combining the flag with `--no-profile-feedback` (which turns the store
+reader off) derives nothing, and says so.
+
+The estimate is applied after the plan is built, so `--show-plan` prints the
+authored figures and the stderr lines above are the record of what actually
+took effect.
+
+## Run safely
+
+```sh
+dagrun run --dag pipeline.yaml --max-steps 2 --max-cpus 8
+dagrun run --dag pipeline.yaml --max-mem 8G
+dagrun run --dag pipeline.yaml --show-plan --profile
+```
+
+`-s` / `--max-steps` bounds how many DAG nodes may be active. `-j` /
+`--max-cpus` independently sets the **total CPU capacity for the whole run**, in
+core-equivalents, and caps any one runner-controlled step at that width. It does
+not reserve or subtract declared widths as steps start. Thus `-s2 -j8` may run
+two `-j8` steps together: their sixteen workers contend inside the outer
+eight-core-equivalent quota. This oversubscription can help when work stalls or
+parallel phases do not align, and can hurt when both steps are CPU-bound. The default CPU total is
+the effective container/affinity capacity tightened by the shared aggregate
+slice's 90% host budget. An undeclared
+step separately keeps `default_step_cpu_count` (one in the CLI defaults).
+
+**One coupling survives on purpose: an absent `--max-steps` defaults to the
+RESOLVED `--max-cpus`** — the value you typed, not the ambient default. So `-j1`
+alone runs the DAG serially, `-j3` alone permits three-way overlap, and `-j200`
+alone permits two hundred active nodes. If you meant to change bandwidth only,
+say what you meant about overlap too: pass `-s` as well. The hidden 0.13
+`--jobs N` alias resolves to `--max-cpus` first and therefore sets the same
+default. Nothing runs in the other direction: `-s` never changes the CPU budget.
+
+A non-empty effective `jobs_flag` makes the inner width runner-controlled: when
+an authored or profile-derived width exceeds `--max-cpus`, the planner and
+scheduler cap the recommendation, appended command flag, and per-step `cpu.max`
+together. An empty or whitespace-only `jobs_flag` instead
+prevents command rewriting; paired with a positive `preferred_inner_jobs`, it
+declares a self-managed fixed command width. If that declared width
+exceeds the run budget, the run is refused before any DAG step process is
+created because silently throttling (for example) a hardcoded `make -j32`
+inside `--max-cpus 16` would oversubscribe and mislabel its memory/profile data.
+File-backed runs reject before cgroup setup; a stdin DAG may already have
+entered its outer scope before it can be read and validated. A sweep likewise requires a non-empty
+`jobs_flag`, since otherwise changing `sweep --jobs` would not change the guest.
+
+The runner cannot infer hidden concurrency that a command does not declare. An
+arbitrary guest may still create more threads than `--max-cpus`; outer
+`cpu.max` limits their total CPU bandwidth, not their count. Use a controllable
+`jobs_flag`, fix the command's own worker setting, or use `--cores` when fixed
+CPU eligibility is required.
+
+Under boxing the runner also exports a bounded build-worker width to each step
+(never through `MAKEFLAGS`, which would reach determinism-sensitive targets), so
+that a build tool cannot compute a width from the granted quota alone and
+OOM-race the linker. **If you set that variable yourself, your value wins.** A
+quota is a ceiling, not a parallelism instruction, so the derived width applies
+only when you expressed nothing — and in that case it is refined downward per
+step from that step's own cores and memory cap. Either way the run prints one
+line on stderr naming the variable, which value governs, and what the other one
+would have been, so a later OOM is explicable. Your value is read once, in the
+outermost process, and forwarded across the systemd re-exec under the separate
+name `SAFE_CI_OPERATOR_BUILD_JOBS`; the runner therefore never mistakes its own
+scope-wide export for something you asked for.
+
+`--max-mem` is a containment limit as well as a sizing input. Under boxing it becomes the
+outer scope's `MemoryMax`, obeying the same one-way rule as
+`SAFE_CI_OUTER_MEMORY_MAX_BYTES`: it can tighten the derived 90%-of-`MemAvailable`
+boundary, never widen it. The binding ceiling is named on stderr and the live value is read
+back before work starts, so `--max-mem 20G` bounds what the run can actually take from the
+host rather than only what its arithmetic assumed. A `MemoryMax` is a CEILING, not a
+reservation: two such runs on one 32 GiB host are each bounded at 20 GiB, and neither is
+holding 20 GiB — sizing a host for concurrent runs is still the caller's arithmetic. It is
+a whole-run ceiling, not an admission gate either: two steps whose
+caps each fit the budget can still be admitted together when their sum does not, and the
+scope's own `memory.max` is then what stops the run.
+
+`--max-mem` also derives a conservative, model-based `--max-steps` ceiling from the worst-case
+footprint at each step's applied inner width. If an explicit step ceiling is
+also present, the tighter value wins. Hard caps, learned/authored RSS, runtime
+defaults, the outer safety factor, and selected `engine_only` steps all count;
+intentional skips do not. If even one runnable step or the configured footprint
+floor exceeds the budget, the run refuses instead of claiming one step fits.
+CPA reports the same state as `infeasible-memory`. Named resources act as semaphores in
+addition to the step and memory limits. A failed step prevents only dependent work. With
+`--keep-going`, independent ready work continues to launch; without it, the final report names
+every step that was not launched.
+
+Under boxing, the run scope also receives `CPUQuota=<max-cpus>*100%`, and the
+live `cpu.max` value is read back before work starts. This makes `--max-cpus N`
+an N-core-equivalent **CPU-bandwidth** ceiling as well as the scheduler's width
+ceiling for any one step. It is not an instantaneous thread-count or CPU-identity bound: CFS quota
+may briefly run more than N runnable tasks on more than N CPUs and throttle them
+later in the quota period. An unpinned run may also migrate from CPUs A/B to C/D
+without exceeding its long-window budget. Use `--cores K` when exact eligible
+CPU identities are required. The runner does not use `cpu.weight` as a cap.
+
+Migration is deliberately explicit. Before 0.13, `run -j N` meant maximum
+active steps; migrate that old intent to `run -s N`, or use `-s N -j N` when N
+should bound both dimensions. In 0.13, the total-CPU long option was
+`run --jobs N`; replace it with `run --max-cpus N`. The `-j N` shorthand keeps
+its 0.13 total-CPU meaning. A hidden `run --jobs N` compatibility alias remains
+temporarily so existing 0.13 scripts do not break, but it is omitted from help
+and should not be combined with `--max-cpus`; differing simultaneous values are
+rejected. New commands should use `--max-cpus`; the public
+`sweep --jobs RANGE` spelling remains the option for inner widths being measured.
+In 0.15, legal per-step widths no longer consume additive scheduler tokens:
+`--max-steps` governs overlap and several steps may request more than
+`--max-cpus` in aggregate while the boxed outer quota arbitrates their shared
+bandwidth. Library callers that relied on 0.14's width-sum serialization should
+use `max_steps`, named resources, or their own admission policy explicitly.
+
+Per-step wall and CPU timeouts, memory limits, process-tree teardown, and OOM
+attribution are enforced inside nested cgroups when the host supplies cgroup v2
+and a delegated systemd user scope. If that capability is missing, the default
+is to stop with a capability error. `--allow-cgroup-failure` accepts a
+best-effort unboxed fallback with a warning. `--unsafe-no-cgroups` deliberately
+skips containment even when available and should be reserved for reviewed use.
+
+An unboxed run is **uncontained, not degraded**. The CPU-time budget in
+particular is a read of the step cgroup's `cpu.stat`, so with no cgroup it does
+not run at all: a step may burn unbounded CPU against a declared `cpu_timeout`,
+exit 0, and be reported green, bounded only by its wall timeout. Such a run says
+so on stderr, once, naming how many steps carry a budget and the largest of
+them, and `capabilities` reports the two lanes separately so the claim can be
+read rather than assumed.
+
+### A wall budget you did not write is derived, not guessed
+
+A step's `timeout` is a wall-clock ceiling, and wall time is load-dependent: the
+same number means something different on a laptop and on a 300-core host. So it
+is only ever a hang backstop, and it is chosen to sit generously ABOVE the
+CPU-second budget, which is the load-immune guard that should actually fire.
+
+Omitting `timeout` therefore does not mean "unbounded", and it no longer means a
+baked-in 1800 either. The effective bound is resolved, most specific first:
+
+1. the step's own `timeout`, when it declares one;
+2. the document's `default_step_timeout`, when it declares one;
+3. **three times the step's platform-scaled `cpu_timeout`**, when the step
+   declared a CPU budget and that is **larger** than 1800;
+4. otherwise 1800 seconds.
+
+**Rule 3 only ever loosens.** It is floored at 1800, so nothing that ran under
+1800 seconds before runs under less now. Without that floor it silently retimed
+every already-authored step that declared a CPU budget: `{"cmd": "git fetch
+...", "cpu_timeout": 5}` burns about five CPU-seconds and blocks for minutes on
+the network, and a fifteen-second ceiling reaps it and calls it a hang. Wall
+time is unbounded relative to CPU time for anything that blocks, so a
+CPU-derived ceiling is sound only as an upper bound. The case rule 3 is for is
+the other one: a step declaring `cpu_timeout: 900` had a 1800-second wall
+ceiling its own CPU guard could reach — at a 2.5x `cpu_timeout_multiplier` the
+enforced budget is 2250 seconds, above the wall bound — so the wall guard fired
+first and reported a hang where the truth was a slow machine. That step now gets
+2700 seconds.
+
+Rule 3 uses the **declared** CPU budget, not the small default every step
+carries, so a step that declares nothing keeps its 1800-second backstop instead
+of silently dropping to thirty seconds. It tracks the **platform-scaled** budget,
+so raising `cpu_timeout_multiplier` for a slow platform moves the backstop with
+it rather than letting the wall guard start racing the CPU guard there.
+
+One thing to know when upgrading: the `--run-timeout` ordering check below is
+applied to the resolved value, so a graph with a large `cpu_timeout` and a run
+budget between 1800 and the derived ceiling is now **refused before it starts**.
+That refusal is correct — the step really can occupy the run for that long — and
+it is loud, which is the opposite of the silent retiming the floor prevents.
+
+Because omission is now meaningful, an omitted `timeout` is also omitted when the
+DAG is written back out — writing `0` would read as "no wall bound", which is the
+opposite of what it means. The `--run-timeout` ordering check below is applied to
+the resolved value, so a step that never wrote a number is still refused when its
+effective ceiling would reach the run's.
+
+### Bound the whole run, not only its steps
+
+Per-step budgets cannot bound a run: any number of individually-legal steps can
+sum past any ceiling. `--run-timeout SECONDS` adds an outer wall budget for the
+run itself.
+
+```sh
+dagrun run --dag pipeline.yaml --run-timeout 900
+```
+
+On breach the scheduler stops launching, terminates every in-flight step's whole
+process tree, marks those steps aborted with that reason, and **returns** — it
+writes its profile rows and hands back a verdict rather than leaving the process
+to be killed from outside, which would discard the evidence the bound exists to
+capture. `SAFE_CI_DAG_RUNNER_RUN_TIMEOUT` sets the same budget for a wrapper that
+cannot edit the command line.
+
+The bounds are ordered, and the ordering is the point:
+
+| bound | enforced by | on breach |
+| --- | --- | --- |
+| per-step wall / CPU | the runner (CPU budget needs a cgroup) | that step dies and is named |
+| whole-run wall | the runner | in-flight steps cut, rows written, verdict returned |
+| scope `RuntimeMaxSec` | systemd, when boxed | the whole scope dies |
+
+Each level exists to stop the next one from firing. The scope budget is derived
+automatically as the run budget plus the larger of 60 s and a tenth of it, and
+the in-scope process reads the property back off the live unit rather than
+trusting the request; a mismatch is an error unless `--allow-cgroup-failure`.
+
+Because a step allowed to run as long as the whole run could only ever be
+terminated by the outer bound — attributing the overrun to the run instead of to
+the node that caused it — a run whose steps declare a wall budget at least as
+large as `--run-timeout` is **refused before anything starts**, with the
+offending steps named.
+
+Use `capabilities` for the machine-readable enforcement manifest. It has two
+objects, `contained` and `uncontained`, carrying the same key set: the first is
+what a boxed run enforces, the second is what survives when boxing is off.
+
+## Select, parameterize, and stress a step
+
+`--only` runs exactly the named tags, not their dependencies. It is useful for
+profiling an artifact whose prerequisites already exist:
+
+```sh
+dagrun run --dag pipeline.yaml --only test.unit
+```
+
+A command opts into passthrough arguments by including the reserved `{args}`
+token:
+
+```yaml
+- group: test
+  job: unit
+  cmd: pytest {args}
+```
+
+```sh
+dagrun run --dag pipeline.yaml --only test.unit --args='-k retry'
+```
+
+Passing `--args` is rejected unless a selected command declares the token.
+Without `--args`, the token is removed. `--stress N` duplicates the selected
+graph at generation into `N` disconnected components with no edges between
+copies. Each copy retains the original graph's internal dependency edges.
+Named-resource scheduling is removed from the generated copies, so
+`--max-steps` controls how many copied nodes may be active while `--max-cpus`
+caps each copy's requested width and their shared outer CPU bandwidth. The report includes the exact pass ratio
+and the largest number of step child processes measured alive at once. The
+modeled memory footprint must still fit the box. Expansion is also refused when
+it would create more than 100,000 generated DAG nodes/control units, so a tiny
+guest memory hint cannot turn `--stress` into an unbounded host-side allocation.
+
+A singleton DAG can be generated on the fly; no `N`-node file is required:
+
+```sh
+printf '%s\n' '{"steps":[{"group":"stress","job":"singleton","cmd":"sleep 2"}]}' |
+  dagrun run --dag - --stress 100 --max-steps 100 --max-cpus 100 --no-profile
+```
+
+### Repeat runs that write N distinct outputs
+
+Every copy runs the *same* command, so a command that writes a fixed path has
+`N` copies writing one file: the last writer wins, nothing errors, and anyone
+reading the result is looking at one sample wearing the label of `N`. Each copy
+therefore gets two variables in its environment:
+
+| variable | value |
+| --- | --- |
+| `SAFE_CI_DAG_RUNNER_COPY` | this copy's index, zero-padded to the width of `N` (`03` of `10`) |
+| `SAFE_CI_DAG_RUNNER_COPIES` | `N` |
+
+Both are unset when the graph was not multiplied, so a command can tell a single
+run from a copy:
+
+```yaml
+- group: demo
+  job: repeat
+  cmd: ./measure --out out/run-${SAFE_CI_DAG_RUNNER_COPY:-single}.log
+```
+
+```sh
+dagrun run --dag pipeline.yaml --only demo.repeat --stress 10 -j 10
+```
+
+That produces `out/run-01.log` ... `out/run-10.log` from one invocation.
+Repeating a run N times and comparing the results is a common reason to multiply
+a graph, so prefer this to a hand-rolled loop.
+
+> **If you are comparing the runs themselves, keep the identifier out of the
+> program under test.** A process's environment is placed on its initial stack,
+> so a tool that hashes or compares process state sees a per-copy variable as a
+> difference -- and then N copies differ for a reason you introduced rather than
+> one you were measuring. Measured with such a tool: with no extra variable the
+> hash was stable across runs; adding `X=aaaa` changed it, and `X=bbbb` -- the
+> same *length*, different content -- changed it again to a third value, so this
+> is not only an alignment shift.
+>
+> Launch the program under test with whatever it offers for a fixed, minimal
+> environment. Measured on the same tool, doing so made it blind to all of the
+> above, 4 of 4 identical, while the copies still wrote 10 distinct files. The
+> same DAG *without* that isolation produced 10 different results from 10
+> identical runs -- and the runner reported `10/10 passed` either way, so nothing
+> warns you.
+>
+> This applies equally to `SAFE_CI_DAG_RUNNER_STEP`, the ownership nonce the
+> scheduler sets on every step, which contains a pid and a nanosecond timestamp
+> and so differs on every run.
+
+## Profiles, sweeps, and portable summaries
+
+Runs append resource samples to `./.dagrun/profiles/` by default.
+Override the directory with `--perf-dir` or
+`SAFE_CI_DAG_RUNNER_PROFILE_DIR`; disable writes with `--no-profile`. `--profile`
+prints the current run's per-step table.
+
+Measure one step across inner widths with:
+
+```sh
+dagrun sweep --dag pipeline.yaml --step build.app --jobs 1..8
+```
+
+The `summary` command builds, merges, inspects, and plans from bounded portable
+profile summaries. `run --profile-sync BACKEND` can download a shared summary
+before planning and upload merged samples afterward. Run the relevant command
+with `--help` for backend and direction syntax.
+
+## Boxing one command
+
+Boxing is this tool's primary purpose, and a DAG is not required to use it:
+
+```sh
+dagrun box --mem 512M --timeout 30 --cores 2 -- ./probe.sh
+```
+
+`box` builds a one-step DAG in memory and hands it to the ordinary run path, so
+it is exactly equivalent to hand-writing the corresponding singleton-DAG file --
+same containment, same evidence, same exit codes -- and nothing about the run is
+special-cased for it.
+
+`--mem` is applied twice on purpose: as the outer scope's `MemoryMax` and as the
+command's own inner `memory.max`, so a breach is an OOM kill inside the box
+rather than pressure on the host. It is also what the boxed step is MODELLED at,
+so a small ceiling is admitted on its own terms: a DAG file's uncharacterized
+steps are sized against an 8 GiB floor, and measuring `--mem 512M` against that
+floor would refuse every value the flag exists to ask for. `--timeout` is a WALL
+ceiling; the CPU ceiling
+is derived from it as `--timeout x --cores`, because the small ten-second
+per-step CPU floor is a forcing function for an undeclared DAG node and would
+otherwise cut an honest ad-hoc command short for a reason its author never asked
+about.
+
+`box --cores K` is a CPU BANDWIDTH cap (`cpu.max` of K cores, plus an outer
+budget of K), and is deliberately not the same thing as `run --cores K`, which
+is a hard cpuset PIN that fails closed without an exact cgroup cpuset. Boxing one
+command should not require that capability. Aliases `-j` and `--max-cpus` name
+the same knob.
+
+Argv after `--` is shell-quoted element by element, so an argument containing a
+space, a quote or a `$(...)` stays one argument instead of becoming shell syntax.
+
+## Host-wide memory admission
+
+`--max-mem` gates ONE process against a snapshot of the host. It has no notion
+of what other runner invocations have already committed to, so two runs started
+a second apart each see the same headroom and both take it. `run --admission`
+adds the missing shared state:
+
+```sh
+dagrun run --dag dag.json --max-mem 16G --admission
+dagrun run --dag dag.json --max-mem 16G --admission 600   # wait up to 10 min
+```
+
+Admission reserves the run's `--max-mem` against a durable, `flock`-serialized
+ledger every runner on the host shares -- the sibling of the core-reservation
+ledger, with the same `(pid, /proc starttime)` dead-holder reclaim, so a crashed
+run cannot subtract memory forever. It requires `--max-mem`: admission reserves
+a NUMBER, and the only figure available without one describes the whole host.
+
+There are three answers, not two:
+
+| Verdict | Meaning |
+|---|---|
+| GRANT | Reserved and held for the life of the run. |
+| QUEUE | It would fit on a quiet host, so waiting can help. Says how many holders are ahead, and which resource is in the way. |
+| REFUSE | Bigger than the whole-host budget, so waiting can never help. Says the largest number that could be granted. |
+
+A queued run exits 4 by default and prints why; pass `--admission SECONDS` to
+wait instead, up to a ceiling of 86400 (one day) -- a longer wait is refused as
+a usage error rather than accepted and then never honoured. Exit 4 is distinct
+from 2 (bad usage) and 3 (cgroup boxing unavailable) so a retrying scheduler can
+tell "the host is busy, come back" from "this invocation is wrong" without
+parsing prose.
+
+Inside a boxed run the reservation is made ONCE. Boxing re-execs the runner into
+its systemd scope with `execvp`, which keeps the pid and the `/proc` start time,
+so the run finds its OWN record in the ledger and does not ask again -- it would
+otherwise queue behind itself. That skip is granted by the ledger record, not by
+the in-scope environment variable: a runner invoked as a *step* of a boxed run
+inherits the same variable while holding no reservation, and is admitted on its
+own merits like any other run.
+
+A grant needs BOTH `reserved + requested <= whole-host budget` (the condition
+other runners affect) and `requested <= live headroom` (the condition non-runner
+tenants affect -- a ledger cannot see a database that grew). The two are
+reported separately because the remedies differ.
+
+The budget defaults to 85% of `MemTotal` less a flat 8 GiB margin, and that
+margin is capped at one eighth of `MemTotal` so it can never swallow a small
+host's whole budget: held back whole, 8 GiB of an 8 GiB machine would leave a
+budget of zero and refuse every run on that host.
+
+Override the ledger path with `SAFE_CI_MEM_LEDGER`, the aggregate budget with
+`SAFE_CI_ADMISSION_BUDGET_BYTES`, and the live-headroom reading with
+`SAFE_CI_ADMISSION_HEADROOM_BYTES`; an unparseable override is reported and the
+host is measured instead, never silently taken as zero.
+
+A boxed run admits ONCE, before cgroup bring-up: a run that is going to wait
+should not be holding a systemd scope while it waits, and a run that is going to
+be refused should never have created one. Boxing then re-execs the runner into
+that scope, which keeps the pid and the `/proc` start time, so the reservation
+already recorded is still this run's own and is not taken a second time.
+
+## Collision-free CPU reservations
+
+For benchmark isolation, reserve a chosen number of least-busy allowed cores
+and run a complete process tree on them:
+
+```sh
+dagrun pin-run --cores 2 --tag parser-bench -- ./bench-parser
+dagrun run --dag benchmarks.yaml --cores 4
+```
+
+Reservations use a durable cross-process ledger, never choose cores held by a
+concurrent reservation, release on normal or failing exit, and reclaim records
+whose owning process is dead. Enforcement is fail-closed: the exact reserved set
+must become the effective cgroup cpuset. A process-affinity mask is not accepted
+because a descendant can replace it.
+
+No central daemon is required for the current fixed-slice mode: every allocator
+serializes through the shared durable ledger and claims an explicit set of CPU
+IDs. A future service could provide dynamic or fair machine-wide allocation,
+but ordinary `--max-cpus` deliberately remains a shared bandwidth and per-step
+width limit rather than pretending to hand out exclusive moving CPU slices.
+
+The ledger path is `SAFE_CI_CORE_LEDGER` when that variable is set. Otherwise it
+is `$XDG_RUNTIME_DIR/dagrun/core-reservations.json` when the runtime
+directory exists, or
+`<system-temporary-directory>/dagrun-<uid>/core-reservations.json`.
+Serialization uses the private sibling `core-reservations.json.lock`; both
+commands use the same files. A crashed holder is identified by PID plus process
+start time and reclaimed by the next ledger operation, so the state records live
+ownership rather than a permanent allocation. Unsafe, foreign, non-regular, or
+malformed state is refused instead of ignored.
+
+`pin-run` creates a transient `AllowedCPUs` scope and mutation-checks it before
+launch. `run --cores K` changes only the runner's own verified scope, so it fails
+with a capability result when combined with `--allow-cgroup-failure` or
+`--unsafe-no-cgroups`. Reservation exhaustion also fails instead of choosing a
+core held by another process.
+
+The companion command exposes the allocator directly:
+
+```sh
+cpuset-alloc run --cores 2 --tag parser-bench -- ./bench-parser
+cpuset-alloc status
+cpuset-alloc reclaim
+cpuset-alloc selftest
+```
+
+The `--` separator before the wrapped command is required. `selftest` directly
+attempts to move a child onto an excluded CPU and verifies every assigned CPU is
+usable; a missing or inconclusive mutation is a failure, not evidence of a hard
+bound. CPU pinning is intended for controlled measurements, not ordinary CI.
+
+## Command summary
+
+| Command | Purpose |
+|---|---|
+| `run` | Execute a DAG under scheduling and containment constraints. |
+| `box` | Box ONE ad-hoc command with `--mem`/`--timeout`/`--cores`, no DAG file. |
+| `plan` | Show estimates, critical path, widths, and order without running. |
+| `list` / `ascii` / `dot` | Inspect or visualize the graph. |
+| `json` / `yaml` | Validate and convert the DAG. |
+| `sweep` | Measure one step across inner job widths. |
+| `summary` | Build, merge, inspect, or consume portable profile summaries. |
+| `pin-run` | Reserve disjoint cores and run one command tree. |
+| `capabilities` | Print the enforcement-capability manifest. |
+| `quickstart` | Print a runnable introduction. |
+
+All commands support `--help`; the top level supports `--version` and
+`--userguide`.
+
+## Exit behavior
+
+Successful inspection and all-passing runs exit zero. Invalid input or command
+usage is nonzero. A run with a failed step is nonzero. Failure to establish
+required containment has a distinct nonzero capability result. `pin-run` and
+`cpuset-alloc run` return the wrapped command's exit status after releasing the
+reservation; signal termination uses the conventional `128 + signal` status.
+
+## License
+
+MIT

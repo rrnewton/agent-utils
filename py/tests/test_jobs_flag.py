@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from safe_ci_dag_runner import (
+from dagrun import (
     DagConfig,
     ResourceHint,
     Step,

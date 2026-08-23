@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from safe_ci_dag_runner.memory_feedback import (
+from dagrun.memory_feedback import (
     DEFAULT_MARGIN_PCT,
     DEFAULT_MIN_UNCENSORED_SAMPLES,
     Censoring,
@@ -23,7 +23,7 @@ from safe_ci_dag_runner.memory_feedback import (
     memory_admission_from_rows,
     peak_observation_from_row,
 )
-from safe_ci_dag_runner.model import DagConfig, IntentionalSkipReason, ResourceHint, Step
+from dagrun.model import DagConfig, IntentionalSkipReason, ResourceHint, Step
 
 GIB = 1024**3
 
@@ -577,7 +577,7 @@ def _run_cli(args: list[str], env: dict[str, str]) -> tuple[int, str, str]:
     child.update(env)
     child["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
     proc = subprocess.run(
-        [sys.executable, "-m", "safe_ci_dag_runner", *args],
+        [sys.executable, "-m", "dagrun", *args],
         text=True,
         capture_output=True,
         check=False,

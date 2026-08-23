@@ -1,4 +1,4 @@
-# `examples/` — runnable safe-ci-dag-runner DAGs
+# `examples/` — runnable dagrun DAGs
 
 Six small, self-contained DAG files you can run immediately, each demonstrating one core idea.
 Every command is `sleep`/`echo`/pure-shell only, so a whole example finishes in a few seconds and
@@ -14,11 +14,11 @@ either file. See `02-diamond.yaml` for what a literate DAG looks like.
 Run an example with the installed command:
 
 ```sh
-safe-ci-dag-runner run --dag examples/01-linear-chain.json --allow-cgroup-failure
+dagrun run --dag examples/01-linear-chain.json --allow-cgroup-failure
 ```
 
 From a source checkout, run `./setup` first and use
-`./bin/safe-ci-dag-runner` in place of the installed command. The repository's
+`./bin/dagrun` in place of the installed command. The repository's
 behavioral differential runs the same examples against both implementations.
 
 **Why `--allow-cgroup-failure`?** Boxing each step in its own Linux cgroup-v2 sandbox is this
@@ -34,9 +34,9 @@ Before running, it is worth *looking* at each graph — every example works with
 `json`, and `yaml` too:
 
 ```sh
-safe-ci-dag-runner list  --dag examples/02-diamond.json   # one line per step, with class + deps
-safe-ci-dag-runner ascii --dag examples/02-diamond.json   # topological-layer view
-safe-ci-dag-runner dot   --dag examples/02-diamond.json | dot -Tsvg -o dag.svg   # a picture
+dagrun list  --dag examples/02-diamond.json   # one line per step, with class + deps
+dagrun ascii --dag examples/02-diamond.json   # topological-layer view
+dagrun dot   --dag examples/02-diamond.json | dot -Tsvg -o dag.svg   # a picture
 ```
 
 Work through them in order — each adds one concept on top of the previous.
@@ -49,7 +49,7 @@ straight line where each waits for the previous one. Start here to see the basic
 before it, nothing runs in parallel and the wall time is the sum of the steps (~6s).
 
 ```sh
-safe-ci-dag-runner run --dag examples/01-linear-chain.json --allow-cgroup-failure
+dagrun run --dag examples/01-linear-chain.json --allow-cgroup-failure
 ```
 
 ## 2. `02-diamond.json` — a diamond with parallel branches
@@ -62,8 +62,8 @@ carries a larger `est_duration_s`, so when both become ready the runner dispatch
 `skipped`.
 
 ```sh
-safe-ci-dag-runner run --dag examples/02-diamond.json --allow-cgroup-failure
-safe-ci-dag-runner ascii --dag examples/02-diamond.json   # shows the 3 topological layers
+dagrun run --dag examples/02-diamond.json --allow-cgroup-failure
+dagrun ascii --dag examples/02-diamond.json   # shows the 3 topological layers
 ```
 
 This example also ships as **`02-diamond.yaml`** — the same DAG, written literately: inline `#`
@@ -71,8 +71,8 @@ comments and multi-line block-scalar (`|-` / `>-`) descriptions. It loads identi
 `cross/differential.py`), so you can run the YAML edition anywhere the JSON one runs:
 
 ```sh
-safe-ci-dag-runner run  --dag examples/02-diamond.yaml --allow-cgroup-failure
-safe-ci-dag-runner json --dag examples/02-diamond.yaml   # YAML in, canonical JSON out
+dagrun run  --dag examples/02-diamond.yaml --allow-cgroup-failure
+dagrun json --dag examples/02-diamond.yaml   # YAML in, canonical JSON out
 ```
 
 ## 3. `03-scarce-resource-browser.json` — a named scarce resource
@@ -87,7 +87,7 @@ built-in. It can serialize browser end-to-end tests that share fixed ports or a 
 equally cap `"gpu"`, `"db"`, or `"licenses"`.
 
 ```sh
-safe-ci-dag-runner run --dag examples/03-scarce-resource-browser.json --allow-cgroup-failure
+dagrun run --dag examples/03-scarce-resource-browser.json --allow-cgroup-failure
 ```
 
 ## 4. `04-memory-aware.json` — memory hints bound active DAG steps
@@ -98,8 +98,8 @@ baseline. With those hints, `--max-mem` derives the largest `--max-steps` ceilin
 worst-case footprint fits a RAM budget, instead of you hard-coding a number:
 
 ```sh
-safe-ci-dag-runner run --dag examples/04-memory-aware.json --max-mem 4G --allow-cgroup-failure   # -> --max-steps 1 (worst case 4 GiB)
-safe-ci-dag-runner run --dag examples/04-memory-aware.json --max-mem 8G --allow-cgroup-failure   # -> --max-steps 2 (worst case 7 GiB)
+dagrun run --dag examples/04-memory-aware.json --max-mem 4G --allow-cgroup-failure   # -> --max-steps 1 (worst case 4 GiB)
+dagrun run --dag examples/04-memory-aware.json --max-mem 8G --allow-cgroup-failure   # -> --max-steps 2 (worst case 7 GiB)
 ```
 
 A 4 GiB budget only fits one step at a time; 8 GiB fits the two largest that can co-run; a large
@@ -113,7 +113,7 @@ This example also ships as **`04-memory-aware.yaml`** — the same DAG in litera
 comments on each memory hint), loading identically to the JSON:
 
 ```sh
-safe-ci-dag-runner run --dag examples/04-memory-aware.yaml --max-mem 8G --allow-cgroup-failure
+dagrun run --dag examples/04-memory-aware.yaml --max-mem 8G --allow-cgroup-failure
 ```
 
 ## 5. `05-inner-jobs.json` — a step with internal parallelism
@@ -137,10 +137,10 @@ planner recommendation, and child `cpu.max` together.
 
 ```sh
 # This self-managed fixture declares a fixed width of eight, so make the required budget explicit.
-safe-ci-dag-runner run --dag examples/05-inner-jobs.json --max-cpus 8 --allow-cgroup-failure
+dagrun run --dag examples/05-inner-jobs.json --max-cpus 8 --allow-cgroup-failure
 
 # Demonstrate the fail-closed case (exits 2 before the hardcoded -j8 command starts):
-safe-ci-dag-runner run --dag examples/05-inner-jobs.json --max-cpus 4 --allow-cgroup-failure
+dagrun run --dag examples/05-inner-jobs.json --max-cpus 4 --allow-cgroup-failure
 ```
 
 ## 6. `06-step-sweep.json` — profile & experiment with individual steps
@@ -153,24 +153,24 @@ quick downstream steps so `--only` is meaningful.
 
 ```sh
 # Run EXACTLY one step (its dependency build.app is NOT run — inputs assumed present):
-safe-ci-dag-runner run --dag examples/06-step-sweep.json --only test.unit --allow-cgroup-failure
+dagrun run --dag examples/06-step-sweep.json --only test.unit --allow-cgroup-failure
 
 # Run the whole DAG and print a per-step profile table afterwards:
-safe-ci-dag-runner run --dag examples/06-step-sweep.json --profile --allow-cgroup-failure
+dagrun run --dag examples/06-step-sweep.json --profile --allow-cgroup-failure
 
 # Parallel-speedup study of the build step at inner -j1..-j8:
-safe-ci-dag-runner sweep --dag examples/06-step-sweep.json --step build.app --jobs 1..8 --allow-cgroup-failure
+dagrun sweep --dag examples/06-step-sweep.json --step build.app --jobs 1..8 --allow-cgroup-failure
 ```
 
 Every `run` and `sweep` above **auto-logs** resource-usage CSVs to the default profile store,
-`./.safe-ci-dag-runner/profiles/` (relative to your current directory) — you do not need
+`./.dagrun/profiles/` (relative to your current directory) — you do not need
 `--perf-dir`. The tool prints exactly where it appended. Drop `--allow-cgroup-failure` on a Linux
 host with a systemd user session to get real per-step boxing, which also fills in the `rss_hwm`
 (peak memory) column from each step's cgroup. Override the location with `--perf-dir DIR` or
 `$SAFE_CI_DAG_RUNNER_PROFILE_DIR`, or turn logging off with `--no-profile`. Consider gitignoring
-`./.safe-ci-dag-runner/`.
+`./.dagrun/`.
 
 ## See also
 
-- `safe-ci-dag-runner --userguide` — the complete installed reference.
-- `safe-ci-dag-runner quickstart` — the same getting-started tour from the command line.
+- `dagrun --userguide` — the complete installed reference.
+- `dagrun quickstart` — the same getting-started tour from the command line.

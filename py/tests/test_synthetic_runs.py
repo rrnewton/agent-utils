@@ -11,7 +11,7 @@ import io
 import tempfile
 from pathlib import Path
 
-from safe_ci_dag_runner import (
+from dagrun import (
     DagConfig,
     ResourceHint,
     Step,
@@ -19,7 +19,7 @@ from safe_ci_dag_runner import (
     run_dag,
     run_dag_limited,
 )
-from safe_ci_dag_runner.cli import main
+from dagrun.cli import main
 
 
 # --------------------------------------------------------------- synthetic builders

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # TRACKED, deterministic engine resolver for repository-local tool commands.
 #
-# The paired commands (`safe-ci-dag-runner`, `cpuset-alloc`, `tick-hub`,
+# The paired commands (`dagrun`, `cpuset-alloc`, `tick-hub`,
 # `pr-landing-planner`, `herdr-run`, and `herdr-agent`) have tracked Python and Cargo-backed Rust launchers under
 # their respective `*/bin` directories. `agent-team-timeline` and
 # `parallel-experiment-runner` are intentionally Python-only.
@@ -17,7 +17,7 @@
 #     exact path are always visible in logs.
 #
 # The resolved tool name is this script's invocation basename. The tracked links for
-# `safe-ci-dag-runner`, `cpuset-alloc`, `pr-landing-planner`, `tick-hub`, and
+# `dagrun`, `cpuset-alloc`, `pr-landing-planner`, `tick-hub`, and
 # `agent-team-timeline`, `parallel-experiment-runner`, `herdr-run`, and `herdr-agent` all point here.
 set -euo pipefail
 

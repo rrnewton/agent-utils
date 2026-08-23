@@ -7,7 +7,7 @@ else 1800) left every suite in both engines green: a step declaring only a CPU b
 running under 1800 s while the docs and the manifest said otherwise. ``make cross`` cannot see
 that either, because it is a py-vs-rs differential and the defect is symmetric.
 
-This is the Python half of ``rs/safe-ci-dag-runner/tests/wall_backstop_enforcement.rs``, and it
+This is the Python half of ``rs/dagrun/tests/wall_backstop_enforcement.rs``, and it
 pins the chain in two links, because a derived ceiling is floored at ``DEFAULT_STEP_TIMEOUT`` and
 so cannot be waited out inside a test:
 
@@ -27,9 +27,9 @@ import os
 import time
 from pathlib import Path
 
-from safe_ci_dag_runner import DagConfig, Runner, Step
-from safe_ci_dag_runner.attribution import LOG_DIR_ENV
-from safe_ci_dag_runner.cgroup import NoopCgroups
+from dagrun import DagConfig, Runner, Step
+from dagrun.attribution import LOG_DIR_ENV
+from dagrun.cgroup import NoopCgroups
 
 
 def _run(log_dir: Path, step: Step) -> list[dict[str, str]]:

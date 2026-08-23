@@ -1,7 +1,7 @@
 """Command-line entry point for parallel-experiment-runner.
 
 Subcommands:
-  run          run a seed sweep CONTAINED under safe-ci-dag-runner's two-level cgroup scope
+  run          run a seed sweep CONTAINED under dagrun's two-level cgroup scope
   plan-round   resolve + print ONE round's enforced width and lowered DAG (dry, no boxing)
   quickstart   print a self-contained getting-started guide
 
@@ -79,7 +79,7 @@ def _parse_kv(pairs: Sequence[str]) -> dict[str, str]:
 def _spec_from_args(ns: argparse.Namespace) -> "object":
     """Build an ExperimentSpec from a spec file (JSON/YAML) or inline flags."""
     from parallel_experiment_runner.model import ExperimentSpec, HitCondition, WorkerLimits
-    from safe_ci_dag_runner import parse_size
+    from dagrun import parse_size
 
     if isinstance(ns.spec, str) and ns.spec:
         return _spec_from_file(Path(ns.spec))
@@ -179,7 +179,7 @@ def _opt_int(value: object) -> int | None:
 
 def _default_slice(work_dir: Path, ns: argparse.Namespace) -> "object":
     """Build the ResourceSlice for this lane: explicit --slice-* flags, else the whole machine."""
-    from safe_ci_dag_runner import mem_available_bytes, parse_size
+    from dagrun import mem_available_bytes, parse_size
 
     from parallel_experiment_runner.model import ResourceSlice
 
@@ -305,7 +305,7 @@ def _sweep_json(sweep: "object") -> str:
 def _cmd_plan_round(ns: argparse.Namespace) -> int:
     """Resolve ONE round's enforced width and print the lowered DAG — dry, no boxing, for
     inspection and tests. Uses the DECLARED per-worker caps as the per-instance footprint."""
-    from safe_ci_dag_runner import to_ascii
+    from dagrun import to_ascii
 
     from parallel_experiment_runner.calibrate import (
         PerInstance,
@@ -372,7 +372,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=PROG,
         description=(
-            "Run N concurrent seed-sweep workers under safe-ci-dag-runner's cgroup RESOURCE "
+            "Run N concurrent seed-sweep workers under dagrun's cgroup RESOURCE "
             "CONTAINMENT (CPU-time / memory / PID / wall caps)."
         ),
     )
@@ -467,7 +467,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 _QUICKSTART = f"""\
-{PROG} — run N concurrent seed-sweep workers under safe-ci-dag-runner's RESOURCE CONTAINMENT.
+{PROG} — run N concurrent seed-sweep workers under dagrun's RESOURCE CONTAINMENT.
 
 Why: unbounded parallel experiments once saturated the host to ~470 concurrent processes,
 starving the very measurements they existed to produce. This is a resource box, not a

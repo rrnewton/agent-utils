@@ -209,7 +209,7 @@ def self_test() -> int:
         "gent-talk PYTHON is inside the repository mypy run, so it must select the workspace too",
     )
     expect(["rs/tick-hub/src/lib.rs"], {WORKSPACE, CROSS, PACKAGES}, "a workspace crate needs the full chain")
-    expect(["py/safe_ci_dag_runner/sizing.py"], {WORKSPACE, CROSS, PACKAGES}, "python source needs the full chain")
+    expect(["py/dagrun/sizing.py"], {WORKSPACE, CROSS, PACKAGES}, "python source needs the full chain")
     expect(["cross/differential.py"], {CROSS}, "the differential harness needs only itself")
     expect(["common/docs/herdr-run/README.template.md"], {DOCS, PACKAGES}, "embedded docs ship inside packages")
     expect(["AGENTS.md"], set(), "the agent guide is embedded nowhere")

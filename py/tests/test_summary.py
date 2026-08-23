@@ -1,4 +1,4 @@
-"""Tests for the constant-sized, mergeable profile SUMMARY (safe_ci_dag_runner.summary).
+"""Tests for the constant-sized, mergeable profile SUMMARY (dagrun.summary).
 
 Covers the self-review properties that make the summary the "correctness core" of the sync feature:
 bounded size, deterministic + commutative + associative merge, byte-identical serialization
@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import pytest
 
-from safe_ci_dag_runner import summary as S
-from safe_ci_dag_runner.estimates import (
+from dagrun import summary as S
+from dagrun.estimates import (
     bucketize_rows,
     step_samples_from_buckets,
 )

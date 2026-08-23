@@ -26,7 +26,7 @@ def _load_script(name: str) -> ModuleType:
 
 def test_embed_lint_rejects_unknown_placeholders_and_sibling_packages() -> None:
     docs = _load_script("embed_userguides")
-    item = docs.Render("safe-ci-dag-runner", "README", "python", "out/README.md")
+    item = docs.Render("dagrun", "README", "python", "out/README.md")
 
     errors = docs._lint(item, "{{UNKNOWN}}\nRust\ntick-hub\n")
 
@@ -39,14 +39,14 @@ def test_embed_check_reports_both_staleness_and_lint(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     docs = _load_script("embed_userguides")
-    item = docs.Render("safe-ci-dag-runner", "README", "python", "out/README.md")
+    item = docs.Render("dagrun", "README", "python", "out/README.md")
     template = tmp_path / item.template
     fragment = tmp_path / item.fragment
     destination = tmp_path / item.destination
     template.parent.mkdir(parents=True)
     fragment.parent.mkdir(parents=True)
     destination.parent.mkdir(parents=True)
-    template.write_text("# safe-ci-dag-runner\n\n{{DISTRIBUTION}}\n", encoding="utf-8")
+    template.write_text("# dagrun\n\n{{DISTRIBUTION}}\n", encoding="utf-8")
     fragment.write_text("Install this distribution.\n", encoding="utf-8")
     destination.write_text("{{UNKNOWN}}\ntick-hub\n", encoding="utf-8")
     monkeypatch.setattr(docs, "REPO_ROOT", tmp_path)
@@ -65,9 +65,9 @@ def test_embed_prevalidates_every_input_before_writing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     docs = _load_script("embed_userguides")
-    first = docs.Render("safe-ci-dag-runner", "README", "python", "out/README.md")
+    first = docs.Render("dagrun", "README", "python", "out/README.md")
     second = docs.Render(
-        "safe-ci-dag-runner", "USER_GUIDE", "python", "out/USER_GUIDE.md"
+        "dagrun", "USER_GUIDE", "python", "out/USER_GUIDE.md"
     )
     first_template = tmp_path / first.template
     first_fragment = tmp_path / first.fragment
@@ -172,7 +172,7 @@ def test_python_sibling_dependency_requires_a_project_local_exemption() -> None:
         for project in python_check.PROJECTS
         if project.distribution == "parallel-experiment-runner"
     )
-    safe_ci_requirement = {"safe-ci-dag-runner"}
+    safe_ci_requirement = {"dagrun"}
 
     assert not python_check._unexpected_sibling_requirements(
         parallel, safe_ci_requirement
@@ -315,17 +315,17 @@ def test_public_api_docs_are_standalone_without_banning_native_package_terms() -
 
 def test_safe_ci_rust_dependency_snippets_match_the_published_minor_version() -> None:
     manifest = (
-        REPO_ROOT / "rs" / "safe-ci-dag-runner" / "Cargo.toml"
+        REPO_ROOT / "rs" / "dagrun" / "Cargo.toml"
     ).read_text(encoding="utf-8")
     matched = re.search(r'^version = "(\d+\.\d+)\.\d+"$', manifest, re.MULTILINE)
     assert matched is not None
-    dependency = f'safe-ci-dag-runner = "{matched.group(1)}"'
+    dependency = f'dagrun = "{matched.group(1)}"'
     for name in ("README.md", "USER_GUIDE.md"):
         fragment = (
             REPO_ROOT
             / "common"
             / "docs"
-            / "safe-ci-dag-runner"
+            / "dagrun"
             / "fragments"
             / "rust"
             / name

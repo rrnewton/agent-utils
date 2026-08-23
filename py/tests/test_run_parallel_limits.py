@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from safe_ci_dag_runner import (
+from dagrun import (
     DagConfig,
     InfeasibleAllocationError,
     Runner,
@@ -28,9 +28,9 @@ from safe_ci_dag_runner import (
     run_dag_limited,
     schedulable_peak_mem_bytes,
 )
-from safe_ci_dag_runner import cgroup, perflog, profile_enrich
-from safe_ci_dag_runner.cgroup import NoopCgroups
-from safe_ci_dag_runner.cli import (
+from dagrun import cgroup, perflog, profile_enrich
+from dagrun.cgroup import NoopCgroups
+from dagrun.cli import (
     MAX_RUN_CPUS,
     MAX_STRESS_GENERATED_NODES,
     _planning_budgets,
@@ -41,9 +41,9 @@ from safe_ci_dag_runner.cli import (
     build_parser,
     main,
 )
-from safe_ci_dag_runner.estimates import Planner
-from safe_ci_dag_runner.model import IntentionalSkipReason, StepClass
-from safe_ci_dag_runner.sizing import stress_copy_footprint_bytes
+from dagrun.estimates import Planner
+from dagrun.model import IntentionalSkipReason, StepClass
+from dagrun.sizing import stress_copy_footprint_bytes
 
 
 def _run_args(**overrides: object) -> argparse.Namespace:
@@ -127,9 +127,9 @@ def test_stress_guard_sizes_the_cpu_capped_pre_expansion_graph(
         assert all(step.hint.preferred_inner_jobs == 2 for step in sized.steps)
         return RunResult(ok=True, wall_s=0.0)
 
-    monkeypatch.setattr("safe_ci_dag_runner.cli._stress_guard", fake_stress_guard)
-    monkeypatch.setattr("safe_ci_dag_runner.cli._final_stress_guard", fake_final_guard)
-    monkeypatch.setattr("safe_ci_dag_runner.cli.run_dag_limited", fake_run)
+    monkeypatch.setattr("dagrun.cli._stress_guard", fake_stress_guard)
+    monkeypatch.setattr("dagrun.cli._final_stress_guard", fake_final_guard)
+    monkeypatch.setattr("dagrun.cli.run_dag_limited", fake_run)
     assert (
         main(
             [
@@ -304,7 +304,7 @@ def test_hidden_run_jobs_alias_and_conflict() -> None:
 def test_default_max_cpus_takes_tightest_container_affinity_and_shared_slice(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("safe_ci_dag_runner.cli.container_core_budget", lambda: 8)
+    monkeypatch.setattr("dagrun.cli.container_core_budget", lambda: 8)
     monkeypatch.setattr(cgroup, "aggregate_slice_max_cpus", lambda: 6)
     assert _select_max_cpus(_run_args()) == 6
     assert _select_max_cpus(_run_args(max_cpus=10)) == 10
@@ -388,7 +388,7 @@ def test_max_mem_and_explicit_max_steps_use_tighter_ceiling(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cfg = _sleep_cfg(count=1)
-    monkeypatch.setattr("safe_ci_dag_runner.cli.jobs_for_budget", lambda _cfg, _budget: (5, 123))
+    monkeypatch.setattr("dagrun.cli.jobs_for_budget", lambda _cfg, _budget: (5, 123))
     assert _select_max_steps(cfg, _run_args(), 7) == 7
     assert _select_max_steps(cfg, _run_args(max_mem="1G"), 7) == 5
     assert _select_max_steps(cfg, _run_args(max_steps=3, max_mem="1G"), 7) == 3
@@ -399,7 +399,7 @@ def test_nonbinding_max_mem_cannot_loosen_default_max_steps_past_max_cpus(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     cfg = _sleep_cfg(count=1)
-    monkeypatch.setattr("safe_ci_dag_runner.cli.jobs_for_budget", lambda _cfg, _budget: (316, 123))
+    monkeypatch.setattr("dagrun.cli.jobs_for_budget", lambda _cfg, _budget: (316, 123))
 
     assert _select_max_steps(cfg, _run_args(max_mem="1G"), 2) == 2
     evidence = capsys.readouterr().err
@@ -774,7 +774,7 @@ def test_small_default_cap_is_applied_after_run_cpu_job_clamp(
         observed.append(cfg.default_step_cpu_count)
         return RunResult(ok=True, wall_s=0.0)
 
-    monkeypatch.setattr("safe_ci_dag_runner.cli.run_dag_limited", fake_run)
+    monkeypatch.setattr("dagrun.cli.run_dag_limited", fake_run)
     rc = main(
         [
             "run",
@@ -1118,7 +1118,7 @@ def test_sweep_refuses_empty_jobs_flag_before_spawn(
 def test_run_budget_reaches_every_planner_but_memory_remains_cpa_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("safe_ci_dag_runner.cli.container_core_budget", lambda: 12)
+    monkeypatch.setattr("dagrun.cli.container_core_budget", lambda: 12)
     for planner in (Planner.GREEDY_LPT, Planner.CRITICAL_PATH, Planner.CPA):
         core_budget, mem_budget = _planning_budgets(planner, "2G", 16)
         assert core_budget == 16

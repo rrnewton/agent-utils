@@ -7,8 +7,8 @@
 # below.
 #
 # Try:
-#   safe-ci-dag-runner run --dag examples/04-memory-aware.yaml --max-mem 4G --allow-cgroup-failure
-#   safe-ci-dag-runner run --dag examples/04-memory-aware.yaml --max-mem 8G --allow-cgroup-failure
+#   dagrun run --dag examples/04-memory-aware.yaml --max-mem 4G --allow-cgroup-failure
+#   dagrun run --dag examples/04-memory-aware.yaml --max-mem 8G --allow-cgroup-failure
 
 description: |-
   Memory-aware sizing: per-step RSS hints let --max-mem pick the largest --max-steps whose modeled worst-case footprint fits a RAM budget.

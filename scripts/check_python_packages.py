@@ -57,10 +57,10 @@ class Project:
 
 PROJECTS: tuple[Project, ...] = (
     Project(
-        directory="safe_ci_dag_runner",
-        distribution="safe-ci-dag-runner",
-        package="safe_ci_dag_runner",
-        commands=("safe-ci-dag-runner", "cpuset-alloc"),
+        directory="dagrun",
+        distribution="dagrun",
+        package="dagrun",
+        commands=("dagrun", "cpuset-alloc"),
         resources=("README.md", "USER_GUIDE.md", "py.typed"),
         required_dependencies=("pyyaml",),
     ),
@@ -124,8 +124,8 @@ PROJECTS: tuple[Project, ...] = (
             "py.typed",
             "examples/chaos-sweep.json",
         ),
-        required_dependencies=("safe-ci-dag-runner",),
-        sibling_package_exemptions=("safe-ci-dag-runner", "safe_ci_dag_runner"),
+        required_dependencies=("dagrun",),
+        sibling_package_exemptions=("dagrun",),
     ),
     Project(
         directory="herdr_run",

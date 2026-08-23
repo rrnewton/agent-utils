@@ -26,16 +26,16 @@ import time
 
 import pytest
 
-from safe_ci_dag_runner import (
+from dagrun import (
     DagConfig,
     ResourceHint,
     Step,
     run_dag,
     undeclared_resource_demands,
 )
-from safe_ci_dag_runner.cgroup import NoopCgroups
-from safe_ci_dag_runner.model import IntentionalSkipReason
-from safe_ci_dag_runner.scheduler import _cpu_seconds_from_stats
+from dagrun.cgroup import NoopCgroups
+from dagrun.model import IntentionalSkipReason
+from dagrun.scheduler import _cpu_seconds_from_stats
 
 
 def _demanding_step(resource: str = "browser", count: int = 1) -> Step:

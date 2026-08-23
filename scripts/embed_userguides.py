@@ -28,7 +28,7 @@ PLACEHOLDER = "{{DISTRIBUTION}}"
 UNEXPANDED_TEMPLATE = re.compile(r"\{\{|\}\}")
 
 TOOLS: tuple[tuple[str, str, str], ...] = (
-    ("safe-ci-dag-runner", "safe_ci_dag_runner", "safe-ci-dag-runner"),
+    ("dagrun", "dagrun", "dagrun"),
     ("tick-hub", "tick_hub", "tick-hub"),
     ("pr-landing-planner", "pr_landing_planner", "pr-landing-planner"),
     ("herdr-run", "herdr_run", "herdr-run"),

@@ -1,7 +1,7 @@
 """Impure layer: cgroup bring-up, one boxed round, and the calibration-ramp orchestrator.
 
 Containment is NOT reimplemented here — it is the exact two-level cgroup-v2 machinery from
-``safe-ci-dag-runner``, re-branded with an experiment-specific :class:`ScopeNaming` so a sweep's
+``dagrun``, re-branded with an experiment-specific :class:`ScopeNaming` so a sweep's
 scope/slice are named distinctly from a CI run's. That is the whole point: N concurrent seed VMs
 run under the SAME boxing that CI steps do, with real per-worker ``memory.max`` / ``cpu.max`` /
 CPU-second / wall caps and a clean ``cgroup.kill`` on breach.
@@ -16,8 +16,8 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from safe_ci_dag_runner import CgroupManager, RunResult, StepOutcome, run_dag_limited
-from safe_ci_dag_runner.cgroup import ScopeNaming
+from dagrun import CgroupManager, RunResult, StepOutcome, run_dag_limited
+from dagrun.cgroup import ScopeNaming
 
 from parallel_experiment_runner.calibrate import (
     LiveCapacity,
@@ -85,7 +85,7 @@ def resolve_cgroup_manager(allow_failure: bool) -> tuple[CgroupManager | None, i
     DEFAULT: an uncontained sweep is the very failure mode this tool exists to prevent, so it
     happens only with an explicit opt-out.
     """
-    from safe_ci_dag_runner import cgroup as cg
+    from dagrun import cgroup as cg
 
     naming = EXPERIMENT_NAMING
     if os.environ.get(naming.env_in_scope) == "1":
@@ -120,7 +120,7 @@ def resolve_cgroup_manager(allow_failure: bool) -> tuple[CgroupManager | None, i
     # parked in tokio epoll_wait) holding a PID namespace open, NOT a leaked appender thread — and
     # a live hang is exactly what the per-worker cpu-time / wall backstop kills, via a
     # cgroup-subtree cgroup.kill that reclaims the namespace (see
-    # safe_ci_dag_runner.teardown.reap). Containment IS the fix; a next-run reaper is not needed.
+    # dagrun.teardown.reap). Containment IS the fix; a next-run reaper is not needed.
     if allow_failure:
         print(
             f"{PROG}: warning: resource containment not established (--allow-cgroup-failure); "

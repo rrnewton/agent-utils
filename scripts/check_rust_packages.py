@@ -34,10 +34,10 @@ class Crate:
 
 CRATES: tuple[Crate, ...] = (
     Crate(
-        "safe-ci-dag-runner",
-        ("safe-ci-dag-runner", "cpuset-alloc"),
-        "safe_ci_dag_runner",
-        (("safe-ci-dag-runner", "src/embedded_userguide.md"),),
+        "dagrun",
+        ("dagrun", "cpuset-alloc"),
+        "dagrun",
+        (("dagrun", "src/embedded_userguide.md"),),
     ),
     Crate("tick-hub", ("tick-hub",), "tick_hub", (("tick-hub", "src/embedded_userguide.md"),)),
     Crate(

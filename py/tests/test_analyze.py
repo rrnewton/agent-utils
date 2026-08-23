@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import safe_ci_dag_runner
-from safe_ci_dag_runner import analyze, perflog
+import dagrun
+from dagrun import analyze, perflog
 
 
 def test_summarize_remains_library_only_and_filters_ambient_rows(tmp_path: Path) -> None:
@@ -19,7 +19,7 @@ def test_summarize_remains_library_only_and_filters_ambient_rows(tmp_path: Path)
         encoding="utf-8",
     )
 
-    assert safe_ci_dag_runner.summarize is analyze.summarize
+    assert dagrun.summarize is analyze.summarize
     assert not hasattr(analyze, "main")
     assert analyze.summarize([profile]) == [
         {
@@ -38,7 +38,7 @@ def test_summarize_reads_the_column_the_store_actually_writes() -> None:
 
     ``analyze`` keyed on a duration column the profile store has never written, so every group was
     dropped as unparseable and the helper returned nothing at all against a real store. Asserting
-    the constant against :data:`safe_ci_dag_runner.perflog.STEP_PROFILE_COLUMNS` makes that
+    the constant against :data:`dagrun.perflog.STEP_PROFILE_COLUMNS` makes that
     divergence a test failure rather than a silent empty summary.
     """
     assert analyze.COL_DURATION_S in perflog.STEP_PROFILE_COLUMNS

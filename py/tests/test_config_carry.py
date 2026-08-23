@@ -24,7 +24,7 @@ import dataclasses
 
 import pytest
 
-from safe_ci_dag_runner import (
+from dagrun import (
     DAG_CONFIG_FIELDS,
     DagConfig,
     ResourceHint,
@@ -32,8 +32,8 @@ from safe_ci_dag_runner import (
     WriteDomainPolicy,
     dag_config_carry_diff,
 )
-from safe_ci_dag_runner.io import UNCARRIED_CONFIG_KEYS, DagJsonError, dag_from_json, dag_to_json
-from safe_ci_dag_runner.model import _check_dag_config_fields
+from dagrun.io import UNCARRIED_CONFIG_KEYS, DagJsonError, dag_from_json, dag_to_json
+from dagrun.model import _check_dag_config_fields
 
 
 def configured() -> DagConfig:
@@ -109,7 +109,7 @@ def test_with_steps_carries_every_field_the_default_rebuild_drops() -> None:
 
 
 def test_applying_a_plan_carries_the_whole_lane_policy_forward() -> None:
-    from safe_ci_dag_runner.estimates import apply_plan_to_config, build_plan
+    from dagrun.estimates import apply_plan_to_config, build_plan
 
     base = configured()
     cfg = dataclasses.replace(
@@ -130,7 +130,7 @@ def test_applying_a_plan_carries_the_whole_lane_policy_forward() -> None:
 
 
 def test_the_stress_expansion_carries_the_whole_lane_policy_forward() -> None:
-    from safe_ci_dag_runner.cli import _expand_stress
+    from dagrun.cli import _expand_stress
 
     cfg = configured()
     expanded = _expand_stress(cfg, 3)

@@ -1,4 +1,4 @@
-"""Tests for lowering one round onto a safe-ci-dag-runner DagConfig and the workload classifier.
+"""Tests for lowering one round onto a dagrun DagConfig and the workload classifier.
 
 These assert the four hard requirements land on the exact per-step controls the executor enforces:
 each seed becomes one boxed Step whose cpu_timeout / memory.max / cpu.max / wall timeout come from
@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from safe_ci_dag_runner import DagConfig, RunResult
+from dagrun import DagConfig, RunResult
 from parallel_experiment_runner import execute
 from parallel_experiment_runner.model import (
     STATUS_COMMAND_ERROR,

@@ -15,12 +15,12 @@ import io
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
-from safe_ci_dag_runner.cgroup import Cgroups, NoopCgroups, _sanitize
-from safe_ci_dag_runner.cli import main
-from safe_ci_dag_runner.model import DagConfig, ResourceHint, Step
-from safe_ci_dag_runner.perflog import CsvMetricsSink, new_run_id
-from safe_ci_dag_runner.protocols import CgroupManager
-from safe_ci_dag_runner.scheduler import run_dag
+from dagrun.cgroup import Cgroups, NoopCgroups, _sanitize
+from dagrun.cli import main
+from dagrun.model import DagConfig, ResourceHint, Step
+from dagrun.perflog import CsvMetricsSink, new_run_id
+from dagrun.protocols import CgroupManager
+from dagrun.scheduler import run_dag
 
 
 def _step(job: str, cmd: str, *, deps: Sequence[str] = ()) -> Step:

@@ -1,4 +1,4 @@
-"""Tests for safe_ci_dag_runner.io (JSON round-trip + strict parse errors)."""
+"""Tests for dagrun.io (JSON round-trip + strict parse errors)."""
 
 from __future__ import annotations
 
@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from safe_ci_dag_runner.io import DagJsonError, dag_from_json, dag_to_json
-from safe_ci_dag_runner.model import (
+from dagrun.io import DagJsonError, dag_from_json, dag_to_json
+from dagrun.model import (
     DagConfig,
     ResourceHint,
     Step,
@@ -16,7 +16,7 @@ from safe_ci_dag_runner.model import (
     WriteDomainPolicy,
     resolved_wall_timeout,
 )
-from safe_ci_dag_runner.scheduler import run_dag
+from dagrun.scheduler import run_dag
 
 
 #: Multi-line description with quotes, backslashes, a tab, and unicode — proves the JSON string

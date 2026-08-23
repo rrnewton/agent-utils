@@ -9,7 +9,7 @@ Reviews completed from 2026-08-05 through 2026-08-09:
 
 - [tick-hub](tick-hub.md)
 - [packaging and documentation](packaging-and-docs.md)
-- [safe-ci-dag-runner and cpuset-alloc](safe-ci-dag-runner.md)
+- [dagrun and cpuset-alloc](dagrun.md)
 - [pr-landing-planner](pr-landing-planner.md)
 - [herdr-run](herdr-run.md)
 - [herdr-agent](herdr-agent.md)

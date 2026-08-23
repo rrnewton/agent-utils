@@ -6,7 +6,7 @@ own version and documentation, and only the console commands that belong to it.
 
 | Distribution | Import package | Commands | Purpose |
 | --- | --- | --- | --- |
-| `safe-ci-dag-runner` | `safe_ci_dag_runner` | `safe-ci-dag-runner`, `cpuset-alloc` | Run and inspect resource-aware CI DAGs; the companion allocator reserves isolated CPU sets for benchmarks. |
+| `dagrun` | `dagrun` | `dagrun`, `cpuset-alloc` | Run and inspect resource-aware CI DAGs; the companion allocator reserves isolated CPU sets for benchmarks. |
 | `tick-hub` | `tick_hub` | `tick-hub` | Evaluate cadenced reminders and health checks in one deterministic tick. |
 | `pr-landing-planner` | `pr_landing_planner` | `pr-landing-planner` | Produce an advisory, conflict-aware pull-request landing plan. |
 | `agent-team-timeline` | `agent_team_timeline` | `agent-team-timeline` | Build a durable, zoomable local timeline from coordinator and subagent transcripts. |
@@ -16,7 +16,7 @@ own version and documentation, and only the console commands that belong to it.
 Install a tool from its project directory during development:
 
 ```sh
-python3 -m pip install ./py/safe_ci_dag_runner
+python3 -m pip install ./py/dagrun
 python3 -m pip install ./py/tick_hub
 python3 -m pip install ./py/pr_landing_planner
 python3 -m pip install ./py/agent_team_timeline

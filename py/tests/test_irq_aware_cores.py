@@ -18,7 +18,7 @@ import os
 
 import pytest
 
-from safe_ci_dag_runner import cgroup
+from dagrun import cgroup
 
 
 def interrupts_text(rates: dict[int, int], *, ncpu: int, arch_per_cpu: int = 99_000) -> str:
@@ -28,7 +28,7 @@ def interrupts_text(rates: dict[int, int], *, ncpu: int, arch_per_cpu: int = 99_
     parser ever summed them they would swamp the device signal and the ordering
     assertions below would fail. That is what makes the device-rows-only rule
     observable rather than merely documented. Mirrors the Rust fixture in
-    ``rs/safe-ci-dag-runner/src/cgroup.rs``.
+    ``rs/dagrun/src/cgroup.rs``.
     """
     joined = " ".join(f"CPU{index}" for index in range(ncpu))
     device = " ".join(str(rates.get(index, 0)) for index in range(ncpu))

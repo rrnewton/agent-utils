@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from safe_ci_dag_runner.attribution import (
+from dagrun.attribution import (
     DEFAULT_LOG_MAX_BYTES,
     TRUNCATION_MARKER,
     Culprit,

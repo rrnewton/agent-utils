@@ -95,7 +95,7 @@ fmt:
 clean:
 	mkdir -p rs/.agent-utils-locks
 	flock rs/.agent-utils-locks/cache.lock rm -rf -- rs/target
-	rm -f -- rs/bin/safe-ci-dag-runner.provenance rs/bin/cpuset-alloc.provenance \
+	rm -f -- rs/bin/dagrun.provenance rs/bin/cpuset-alloc.provenance \
 		rs/bin/tick-hub.provenance rs/bin/pr-landing-planner.provenance
 	rm -f -- bin
 	find . -name __pycache__  -type d -prune -exec rm -rf {} + 2>/dev/null || true

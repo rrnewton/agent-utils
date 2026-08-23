@@ -16,11 +16,11 @@ import json
 import os
 from pathlib import Path
 
-from safe_ci_dag_runner import DagConfig, Runner, Step
-from safe_ci_dag_runner.attribution import LOG_DIR_ENV
-from safe_ci_dag_runner.cgroup import NoopCgroups
-from safe_ci_dag_runner.model import DEFAULT_SMALL_CPU_TIMEOUT
-from safe_ci_dag_runner.scheduler import _cpu_journal_fields
+from dagrun import DagConfig, Runner, Step
+from dagrun.attribution import LOG_DIR_ENV
+from dagrun.cgroup import NoopCgroups
+from dagrun.model import DEFAULT_SMALL_CPU_TIMEOUT
+from dagrun.scheduler import _cpu_journal_fields
 
 
 class _FullCounters(NoopCgroups):

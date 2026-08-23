@@ -14,7 +14,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from safe_ci_dag_runner import mem_available_bytes
+from dagrun import mem_available_bytes
 
 from parallel_experiment_runner.model import ResourceSlice, WorkerLimits
 

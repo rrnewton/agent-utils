@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import pytest
 
-from safe_ci_dag_runner.model import (
+from dagrun.model import (
     CPU_TIMEOUT_MULTIPLIER_ENV,
     CPU_TIMEOUT_PLATFORM_ENV,
     DEFAULT_CPU_TIMEOUT_MULTIPLIER,

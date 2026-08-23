@@ -10,8 +10,8 @@ import time
 
 import pytest
 
-from safe_ci_dag_runner.cgroup import NoopCgroups
-from safe_ci_dag_runner.model import (
+from dagrun.cgroup import NoopCgroups
+from dagrun.model import (
     DEFAULT_SMALL_CPU_COUNT,
     DEFAULT_SMALL_CPU_TIMEOUT,
     DEFAULT_SMALL_MEM_CAP_BYTES,
@@ -20,8 +20,8 @@ from safe_ci_dag_runner.model import (
     ResourceHint,
     Step,
 )
-from safe_ci_dag_runner.protocols import RunResult
-from safe_ci_dag_runner.scheduler import (
+from dagrun.protocols import RunResult
+from dagrun.scheduler import (
     _ABSENT,
     Runner,
     run_dag,

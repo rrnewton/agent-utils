@@ -13,8 +13,8 @@ schema, CLI, output, error, and state-transition drift.
 
 | Command | Purpose | Python distribution | Rust crate |
 |---|---|---|---|
-| `safe-ci-dag-runner` | Plan, visualize, and execute resource-aware CI DAGs with Linux cgroup containment and profiling. | `safe-ci-dag-runner` | `safe-ci-dag-runner` |
-| `cpuset-alloc` | Reserve disjoint CPU sets and hard-pin benchmark process trees. | Companion command in `safe-ci-dag-runner` | Companion binary in `safe-ci-dag-runner` |
+| `dagrun` | Plan, visualize, and execute resource-aware CI DAGs with Linux cgroup containment and profiling. | `dagrun` | `dagrun` |
+| `cpuset-alloc` | Reserve disjoint CPU sets and hard-pin benchmark process trees. | Companion command in `dagrun` | Companion binary in `dagrun` |
 | `tick-hub` | Evaluate independently cadenced reminders and freshness checks in one deterministic tick. | `tick-hub` | `tick-hub` |
 | `pr-landing-planner` | Produce advisory, conflict- and CI-aware pull-request landing plans. | `pr-landing-planner` | `pr-landing-planner` |
 | `herdr-run` | Run an allowlisted command in a Herdr pane, outside whatever constrains the caller, with audited, byte-preserving results. An agent whose sandbox blocks the network is one such caller. | `herdr-run` | `herdr-run` |
@@ -29,7 +29,7 @@ need this source tree or knowledge of the sibling implementation.
 | Command | Purpose | Python distribution |
 |---|---|---|
 | `agent-team-timeline` | Build durable, zoomable local timelines from coordinator and subagent transcripts. | `agent-team-timeline` |
-| `parallel-experiment-runner` | Run boxed, resource-bounded concurrent seed sweeps through `safe-ci-dag-runner`. | `parallel-experiment-runner` |
+| `parallel-experiment-runner` | Run boxed, resource-bounded concurrent seed sweeps through `dagrun`. | `parallel-experiment-runner` |
 
 These tools are independently installable and follow the same package
 documentation and artifact checks. They are explicit exceptions to the
@@ -84,7 +84,7 @@ make both
 make check
 make test
 python3 -m mypy cross/differential.py
-python3 cross/differential.py --tool safe-ci-dag-runner
+python3 cross/differential.py --tool dagrun
 make cross
 make check-packages
 ```

@@ -18,10 +18,10 @@ import json
 import os
 from pathlib import Path
 
-from safe_ci_dag_runner import DagConfig, Runner, Step
-from safe_ci_dag_runner.attribution import LOG_DIR_ENV
-from safe_ci_dag_runner.cgroup import NoopCgroups
-from safe_ci_dag_runner.scheduler import BudgetUnit
+from dagrun import DagConfig, Runner, Step
+from dagrun.attribution import LOG_DIR_ENV
+from dagrun.cgroup import NoopCgroups
+from dagrun.scheduler import BudgetUnit
 
 #: What the fake cgroup reports the step has burned. Deliberately NOT close to the wall time the
 #: step will have accumulated when the monitor trips (~1 poll interval), so a record that quietly

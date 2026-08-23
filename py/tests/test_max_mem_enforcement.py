@@ -1,6 +1,6 @@
 """``--max-mem`` is a containment limit, not only a sizing input.
 
-``safe-ci-dag-runner run --max-mem 20G`` used to feed one thing: the modelled active-step
+``dagrun run --max-mem 20G`` used to feed one thing: the modelled active-step
 ceiling.  The outer systemd scope was still brought up with 90% of ``MemAvailable``, so on a
 128 GiB host a run that announced a 20 GiB budget could grow to ~115 GiB before anything stopped
 it.  "Two validates with 20 GiB each" was then true of the arithmetic and of nothing on the
@@ -23,8 +23,8 @@ from collections.abc import Sequence
 
 import pytest
 
-from safe_ci_dag_runner import cgroup as cg
-from safe_ci_dag_runner import cli
+from dagrun import cgroup as cg
+from dagrun import cli
 
 
 def test_a_max_mem_spec_becomes_a_positive_byte_ceiling() -> None:

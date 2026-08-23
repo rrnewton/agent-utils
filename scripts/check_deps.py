@@ -20,8 +20,8 @@ from pathlib import Path
 
 # Modules behind every Python console command, including companion commands from a distribution.
 ENTRYPOINT_MODULES = [
-    "safe_ci_dag_runner",
-    "safe_ci_dag_runner.cpuset_allocator",
+    "dagrun",
+    "dagrun.cpuset_allocator",
     "tick_hub",
     "pr_landing_planner",
     "parallel_experiment_runner",

@@ -1,11 +1,11 @@
-"""Tests for safe_ci_dag_runner.sizing (synthetic, deterministic)."""
+"""Tests for dagrun.sizing (synthetic, deterministic)."""
 
 from __future__ import annotations
 
 from unittest.mock import patch
 
-from safe_ci_dag_runner.model import DagConfig, ResourceHint, Step, StepClass
-from safe_ci_dag_runner.sizing import (
+from dagrun.model import DagConfig, ResourceHint, Step, StepClass
+from dagrun.sizing import (
     PER_BUILD_JOB_MEM_BYTES,
     derive_build_jobs,
     jobs_footprint_bytes,
@@ -280,7 +280,7 @@ def test_wide_dag_uses_bounded_conservative_memory_fallback() -> None:
 def test_stress_copy_footprint_sums_declared_and_default_charges() -> None:
     # Per-copy footprint sums each step's cap: a declared hard cap verbatim, an rss_baseline
     # scaled by mem_cap_factor, and an UNDECLARED step charged the SMALL default (1 GiB).
-    from safe_ci_dag_runner.model import DEFAULT_SMALL_MEM_CAP_BYTES, DagConfig, ResourceHint, Step
+    from dagrun.model import DEFAULT_SMALL_MEM_CAP_BYTES, DagConfig, ResourceHint, Step
     cfg = DagConfig(
         steps=(
             Step("g", "hard", "d", "true", hint=ResourceHint(hard_mem_max_bytes=2 * 1024**3)),
@@ -295,7 +295,7 @@ def test_stress_copy_footprint_sums_declared_and_default_charges() -> None:
 
 
 def test_stress_copy_footprint_single_node_is_that_node_cap() -> None:
-    from safe_ci_dag_runner.model import DagConfig, ResourceHint, Step
+    from dagrun.model import DagConfig, ResourceHint, Step
     cfg = DagConfig(
         steps=(Step("dbi", "file_metadata", "d", "true",
                     hint=ResourceHint(hard_mem_max_bytes=3 * 1024**3)),)
@@ -382,7 +382,7 @@ def test_width_one_sizing_skips_closure_on_5000_node_reverse_chain() -> None:
 def test_box_mem_budget_is_min_of_readable_signals() -> None:
     # Use one deterministic snapshot. Comparing the function's MemAvailable read
     # to a later live /proc read races with other processes on the host.
-    import safe_ci_dag_runner.sizing as sizing
+    import dagrun.sizing as sizing
 
     cases = (
         (8 * GIB, 6 * GIB, 6 * GIB),

@@ -8,14 +8,14 @@ not-yet-existent file for reading (a ``FileNotFoundError``).
 
 from __future__ import annotations
 
-from safe_ci_dag_runner import perflog
+from dagrun import perflog
 
 import csv
 import tempfile
 from pathlib import Path
 
-from safe_ci_dag_runner import DagConfig, Step, run_dag, run_dag_limited
-from safe_ci_dag_runner.perflog import (
+from dagrun import DagConfig, Step, run_dag, run_dag_limited
+from dagrun.perflog import (
     CsvMetricsSink,
     append_step_profiles,
     machine_id,

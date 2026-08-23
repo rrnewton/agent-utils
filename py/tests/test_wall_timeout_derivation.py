@@ -26,8 +26,8 @@ import dataclasses
 from parallel_experiment_runner.model import (
     WALL_CPU_BACKSTOP_FACTOR as PER_WALL_CPU_BACKSTOP_FACTOR,
 )
-from safe_ci_dag_runner.io import dag_from_json, dag_to_json
-from safe_ci_dag_runner.model import (
+from dagrun.io import dag_from_json, dag_to_json
+from dagrun.model import (
     DEFAULT_SMALL_CPU_TIMEOUT,
     DEFAULT_STEP_TIMEOUT,
     WALL_CPU_BACKSTOP_FACTOR,
@@ -36,7 +36,7 @@ from safe_ci_dag_runner.model import (
     canonical_cpu_timeout,
     resolved_wall_timeout,
 )
-from safe_ci_dag_runner.scheduler import steps_violating_run_timeout
+from dagrun.scheduler import steps_violating_run_timeout
 
 
 def _step(**kwargs: int) -> Step:

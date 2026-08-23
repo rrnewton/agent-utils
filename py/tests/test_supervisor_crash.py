@@ -14,10 +14,10 @@ from pathlib import Path
 
 import pytest
 
-from safe_ci_dag_runner.attribution import RunEvidence
-from safe_ci_dag_runner.cgroup import NoopCgroups
-from safe_ci_dag_runner.model import DagConfig, ResourceHint, Step
-from safe_ci_dag_runner.scheduler import Runner
+from dagrun.attribution import RunEvidence
+from dagrun.cgroup import NoopCgroups
+from dagrun.model import DagConfig, ResourceHint, Step
+from dagrun.scheduler import Runner
 
 #: Wall budget for one whole in-test run. Every step below is `true` or a 0.1s sleep, so a
 #: healthy run finishes in well under a second; anything approaching this is the wedge.

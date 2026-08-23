@@ -11,9 +11,9 @@ from pathlib import Path
 
 import pytest
 
-from safe_ci_dag_runner import cgroup as cg
-from safe_ci_dag_runner import cli
-from safe_ci_dag_runner.model import DEFAULT_STEP_TIMEOUT
+from dagrun import cgroup as cg
+from dagrun import cli
+from dagrun.model import DEFAULT_STEP_TIMEOUT
 
 
 def _config(argv: list[str], **kwargs: object) -> object:

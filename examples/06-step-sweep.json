@@ -1,5 +1,5 @@
 {
-  "description": "A DAG built to demonstrate the per-step profiling tools: `sweep` (parallel-speedup study), `run --only` (run exactly one step), `run --profile` (per-step table), and the default auto-logging profile store. The `build.app` step is a small CPU-bound workload that ACTUALLY scales with its inner parallelism: it splits a fixed amount of pure-shell work across N parallel workers, where N is the inner-jobs width the runner passes in via the step's jobs_flag. So `sweep --step build.app --jobs 1..8` shows a real speedup curve, and every run/sweep auto-appends resource-usage CSVs to ./.safe-ci-dag-runner/profiles/.",
+  "description": "A DAG built to demonstrate the per-step profiling tools: `sweep` (parallel-speedup study), `run --only` (run exactly one step), `run --profile` (per-step table), and the default auto-logging profile store. The `build.app` step is a small CPU-bound workload that ACTUALLY scales with its inner parallelism: it splits a fixed amount of pure-shell work across N parallel workers, where N is the inner-jobs width the runner passes in via the step's jobs_flag. So `sweep --step build.app --jobs 1..8` shows a real speedup curve, and every run/sweep auto-appends resource-usage CSVs to ./.dagrun/profiles/.",
   "steps": [
     {
       "group": "build",

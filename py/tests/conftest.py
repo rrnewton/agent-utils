@@ -1,6 +1,6 @@
-"""Shared pytest fixtures for the safe-ci-dag-runner Python tests.
+"""Shared pytest fixtures for the dagrun Python tests.
 
-The default auto-logging profile store (Feature D) writes CSVs to ``./.safe-ci-dag-runner/profiles/``
+The default auto-logging profile store (Feature D) writes CSVs to ``./.dagrun/profiles/``
 relative to the CWD whenever a ``run``/``sweep`` executes without ``--perf-dir``/``--no-profile``.
 To keep the test run hermetic (no writes into the repo checkout), an autouse fixture points
 ``$SAFE_CI_DAG_RUNNER_PROFILE_DIR`` at a throwaway temp directory for every test. Tests that
@@ -21,8 +21,8 @@ from pathlib import Path
 
 import pytest
 
-from safe_ci_dag_runner.cli import PROFILE_DIR_ENV
-from safe_ci_dag_runner.sizing import BUILD_JOBS_ENV, OPERATOR_BUILD_JOBS_ENV
+from dagrun.cli import PROFILE_DIR_ENV
+from dagrun.sizing import BUILD_JOBS_ENV, OPERATOR_BUILD_JOBS_ENV
 
 
 @pytest.fixture(autouse=True)
@@ -48,4 +48,4 @@ def _no_ambient_operator_build_width(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     monkeypatch.delenv(BUILD_JOBS_ENV, raising=False)
     monkeypatch.delenv(OPERATOR_BUILD_JOBS_ENV, raising=False)
-    monkeypatch.setattr("safe_ci_dag_runner.sizing._OPERATOR_BUILD_JOBS", None)
+    monkeypatch.setattr("dagrun.sizing._OPERATOR_BUILD_JOBS", None)

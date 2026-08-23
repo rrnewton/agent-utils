@@ -12,14 +12,14 @@ import tracemalloc
 
 import pytest
 
-from safe_ci_dag_runner.attribution import (
+from dagrun.attribution import (
     CAPTURE_MAX_BYTES_ENV,
     DEFAULT_CAPTURE_MAX_BYTES,
     capture_max_bytes,
 )
-from safe_ci_dag_runner.cgroup import NoopCgroups
-from safe_ci_dag_runner.model import DagConfig, Step
-from safe_ci_dag_runner.scheduler import Runner, _BoundedCapture
+from dagrun.cgroup import NoopCgroups
+from dagrun.model import DagConfig, Step
+from dagrun.scheduler import Runner, _BoundedCapture
 
 
 def test_the_ring_never_allocates_more_than_its_ceiling_however_much_is_fed() -> None:
@@ -125,7 +125,7 @@ def test_the_console_line_bound_is_one_mebibyte_stated_as_a_number() -> None:
     test says nothing about the shipped value. Both engines carry a "MUST match" note beside this
     number; this is what turns that note into something that can fail.
     """
-    from safe_ci_dag_runner import scheduler
+    from dagrun import scheduler
 
     assert scheduler._STREAM_LINE_MAX_BYTES == 1048576
 
@@ -214,7 +214,7 @@ def test_the_live_stream_buffer_does_not_grow_without_a_newline(
     BEFORE any newline does, which can only happen if something other than a newline drained the
     buffer.
     """
-    from safe_ci_dag_runner import scheduler
+    from dagrun import scheduler
 
     # A 3 KiB bound keeps the test fast; the production constant is a display bound, not a policy,
     # so overriding it here changes only how quickly the same code path is reached.

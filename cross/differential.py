@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Python-vs-Rust differential tester for safe-ci-dag-runner.
+"""Python-vs-Rust differential tester for dagrun.
 
 Prove the Python and Rust builds produce identical OBSERVABLE behavior. For a set of
 representative and randomized DAG fixtures, this runs BOTH the Python CLI
-(``python3 -m safe_ci_dag_runner``) and a private copy of the executable resolved by the tracked
+(``python3 -m dagrun``) and a private copy of the executable resolved by the tracked
 ``rs/bin`` Cargo launcher and asserts:
 
 * ``list``, ``ascii``, ``dot`` stdout are BYTE-IDENTICAL.
@@ -113,7 +113,7 @@ NOPROF = "--no-profile"
 #: proven separately by :func:`compare_plan_feedback` against a fixed SYNTHETIC store.
 NOFB = "--no-profile-feedback"
 
-#: Feedback identity envs (mirrors safe_ci_dag_runner.estimates): pin the machine id + container
+#: Feedback identity envs (mirrors dagrun.estimates): pin the machine id + container
 #: class so the feedback reader loads a fixed synthetic ``step_profiles_<mid>_<cc>.csv`` regardless
 #: of the host, making the plan/sizing feedback checks deterministic everywhere.
 SYNTH_MACHINE = "cross_synth_machine"
@@ -187,7 +187,7 @@ class Report:
 
 
 def py_command() -> list[str]:
-    return [sys.executable, "-m", "safe_ci_dag_runner"]
+    return [sys.executable, "-m", "dagrun"]
 
 
 _RUST_SNAPSHOTS: list[tempfile.TemporaryDirectory[str]] = []
@@ -1712,7 +1712,7 @@ def compare_capture_ceiling(py: list[str], rs: list[str], rep: Report) -> None:
         # 1492 bytes of "lineN" plus 1492 of "oopsN": the ceiling is over the STEP, so the notice
         # counts both pipes. A per-stream ring says 1492, twice.
         notice = (
-            "[safe-ci-dag-runner] EARLIER OUTPUT DROPPED: this step produced 2984 bytes but "
+            "[dagrun] EARLIER OUTPUT DROPPED: this step produced 2984 bytes but "
             "only the last 300 were kept in memory (raise or lift the ceiling with "
             "SAFE_CI_DAG_RUNNER_CAPTURE_MAX_BYTES; 0 = unlimited). The durable per-step log is "
             "unaffected and still has the rest."
@@ -3581,7 +3581,7 @@ def compare_memory_hardening(py: list[str], rs: list[str], rep: Report) -> None:
             rep.ok("memory:nonbinding-max-mem-keeps-cpu-base")
         elif common_nonbinding and pdetails is not None and pdetails[0] == 1:
             print(
-                "cross[safe-ci-dag-runner]: SKIP strict nonbinding max-mem proof: "
+                "cross[dagrun]: SKIP strict nonbinding max-mem proof: "
                 "host exposes only one online CPU"
             )
             rep.ok("memory:nonbinding-max-mem-one-cpu-capability")
@@ -5467,7 +5467,7 @@ def compare_operator_build_width(py: list[str], rs: list[str], rep: Report) -> N
             label = f"operator-build-width:{leg}"
             if all(_boxing_capability_unavailable(out) for out in outcomes.values()):
                 print(
-                    f"cross[safe-ci-dag-runner]: SKIP boxed build-width differential ({leg}): "
+                    f"cross[dagrun]: SKIP boxed build-width differential ({leg}): "
                     "cgroup-v2 + a working systemd --user scope are unavailable"
                 )
                 rep.ok(f"{label}:capability-unavailable")
@@ -5554,7 +5554,7 @@ def compare_boxed_cpu_bandwidth(py: list[str], rs: list[str], rep: Report) -> No
         unavailable = {name: _boxing_capability_unavailable(out) for name, out in outcomes.items()}
         if all(unavailable.values()):
             print(
-                "cross[safe-ci-dag-runner]: SKIP boxed CPU-bandwidth differential: "
+                "cross[dagrun]: SKIP boxed CPU-bandwidth differential: "
                 "cgroup-v2 + a working systemd --user scope are unavailable"
             )
             rep.ok("boxed-cpu-bandwidth:capability-unavailable")
@@ -5657,8 +5657,8 @@ def compare_pin_run(py: list[str], rs: list[str], rep: Report) -> None:
             rep.bad("pin-run:signal-status", f"py={po}\nrs={ro}")
 
 
-def compare_safe_ci_dag_runner(rand_count: int, seed: int) -> int:
-    tool = "safe-ci-dag-runner"
+def compare_dagrun(rand_count: int, seed: int) -> int:
+    tool = "dagrun"
     py = py_command()
     rs = rs_command(tool)
     rep = Report()
@@ -5728,8 +5728,8 @@ def compare_safe_ci_dag_runner(rand_count: int, seed: int) -> int:
 
 def py_command_for(tool: str) -> list[str]:
     modules = {
-        "safe-ci-dag-runner": "safe_ci_dag_runner",
-        "cpuset-alloc": "safe_ci_dag_runner.cpuset_allocator",
+        "dagrun": "dagrun",
+        "cpuset-alloc": "dagrun.cpuset_allocator",
         "tick-hub": "tick_hub",
         "pr-landing-planner": "pr_landing_planner",
         "herdr-run": "herdr_run",
@@ -7289,9 +7289,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="py-vs-rs differential tester")
     parser.add_argument(
         "--tool",
-        default="safe-ci-dag-runner",
+        default="dagrun",
         choices=(
-            "safe-ci-dag-runner",
+            "dagrun",
             "cpuset-alloc",
             "tick-hub",
             "pr-landing-planner",
@@ -7306,8 +7306,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     tool = str(ns.tool)
     rand_count = int(ns.random)
     seed = int(ns.seed)
-    if tool == "safe-ci-dag-runner":
-        return compare_safe_ci_dag_runner(rand_count, seed)
+    if tool == "dagrun":
+        return compare_dagrun(rand_count, seed)
     if tool == "cpuset-alloc":
         return compare_cpuset_alloc()
     if tool == "tick-hub":
@@ -7319,7 +7319,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if tool == "herdr-agent":
         return compare_herdr_agent(py_command_for(tool), rs_command(tool))
     results = (
-        compare_safe_ci_dag_runner(rand_count, seed),
+        compare_dagrun(rand_count, seed),
         compare_cpuset_alloc(),
         compare_tick_hub(rand_count, seed),
         compare_pr_landing_planner(rand_count, seed),

@@ -1,6 +1,6 @@
 # parallel-experiment-runner — user guide
 
-Run **N concurrent seed-sweep workers under RESOURCE CONTAINMENT**, using `safe-ci-dag-runner`'s
+Run **N concurrent seed-sweep workers under RESOURCE CONTAINMENT**, using `dagrun`'s
 two-level cgroup-v2 scope. A seed sweep is one command template with a `{seed}` placeholder, run
 over a range of seeds — a chaos search, a fuzz sweep, a flaky-repro hunt, a parameter scan.
 
@@ -47,7 +47,7 @@ returns `EAGAIN`) rather than kernel-killing the worker, so the denied-fork coun
 the cpu/wall guard reaps the contained worker. The kill message then names the fork-bomb even
 though the reaping cause was the wall/CPU guard.
 
-It is a thin, additive generalization of `safe-ci-dag-runner`: each seed becomes one contained
+It is a thin, additive generalization of `dagrun`: each seed becomes one contained
 `Step`, and the existing scheduler runs them. There is **no second runner** — the containment,
 teardown, CPU-second budget, and per-step measurement are all the CI runner's, reused.
 
@@ -168,7 +168,7 @@ kernel could not reap the zombies inside it. That is a running process over its 
 is precisely what the per-worker **cpu-time / wall backstop** kills. The requirement that follows is
 about *how* the kill lands: it must reclaim the **namespace**, not just one process. It does — every
 breach (and normal exit) routes through a **cgroup-subtree `cgroup.kill`** (see
-`safe_ci_dag_runner.teardown.reap`) that SIGKILLs *every* member of the worker's cgroup atomically,
+`dagrun.teardown.reap`) that SIGKILLs *every* member of the worker's cgroup atomically,
 including `setsid`/double-fork escapees a process-group kill would miss. When the hung main and all
 its namespace peers die together, the namespace refcount drops to zero and the kernel reaps the
 zombies — so the box does not kill one pid and inherit the orphans. No separate teardown reaper is

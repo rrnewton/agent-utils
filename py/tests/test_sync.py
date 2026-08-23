@@ -1,4 +1,4 @@
-"""Tests for the pluggable profile-summary sync backends (safe_ci_dag_runner.sync).
+"""Tests for the pluggable profile-summary sync backends (dagrun.sync).
 
 The local + git-branch backends are exercised end-to-end offline (the git backend against a local
 bare repo, including the retry-on-conflict read-modify-write). The github-artifacts backend's pure
@@ -11,8 +11,8 @@ from pathlib import Path
 
 import pytest
 
-from safe_ci_dag_runner import summary as S
-from safe_ci_dag_runner import sync
+from dagrun import summary as S
+from dagrun import sync
 
 MID = "m"
 CC = "affinity8_cpu-max-max"

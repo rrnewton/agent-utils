@@ -1,6 +1,6 @@
 """parallel-experiment-runner: run N concurrent seed-sweep workers under RESOURCE CONTAINMENT.
 
-This is a thin, additive generalization of ``safe-ci-dag-runner`` for the seed-sweep shape: a
+This is a thin, additive generalization of ``dagrun`` for the seed-sweep shape: a
 single command template with a ``{seed}`` placeholder, run over a range of seeds, with each worker
 contained by the SAME two-level cgroup-v2 mechanism CI steps use. The threat model is a BUG in our
 OWN code — not an adversary — so this is a *resource box*, not a security sandbox: no seccomp, no
@@ -19,7 +19,7 @@ That distrust is enforced on FOUR independent axes, each mapped to a named failu
 The hard requirements, each realized by a specific piece:
 
 1. CPU-TIME (not wall) budgets -> :attr:`model.WorkerLimits.cpu_timeout_s` lowered onto
-   ``safe_ci_dag_runner.Step.cpu_timeout`` (measured from the cgroup ``cpu.stat``; ``None`` = UNSET,
+   ``dagrun.Step.cpu_timeout`` (measured from the cgroup ``cpu.stat``; ``None`` = UNSET,
    never wall-derived).
 2. DECLARED + ENFORCED concurrency, sized from MEASURED headroom -> :mod:`calibrate` resolves a
    width from the lane, live capacity, and measured per-worker footprint; live CPU capacity is the
@@ -37,7 +37,7 @@ The hard requirements, each realized by a specific piece:
    namespace open so its zombies (which cost zero CPU and zero memory, invisible to a
    cpu-and-memory-only box) were never reaped. A hang is exactly what the per-worker cpu-time /
    wall backstop (guarantee 1) exists to kill, and the kill goes through a cgroup-subtree
-   ``cgroup.kill`` (``safe_ci_dag_runner.teardown.reap``), which SIGKILLs EVERY member of the
+   ``cgroup.kill`` (``dagrun.teardown.reap``), which SIGKILLs EVERY member of the
    step's cgroup at once — so the hung main dies WITH everything in its PID namespace, releasing
    the namespace and letting the kernel reap the zombies, instead of killing one pid and
    inheriting the orphans. Containment is the fix; no separate teardown reaper is required.

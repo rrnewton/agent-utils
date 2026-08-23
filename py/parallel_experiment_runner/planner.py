@@ -1,7 +1,7 @@
-"""Lower one calibrated round onto a ``safe_ci_dag_runner.DagConfig`` (pure) + classify outcomes.
+"""Lower one calibrated round onto a ``dagrun.DagConfig`` (pure) + classify outcomes.
 
-This is where the runner "reuses safe-ci-dag-runner; does NOT write a sibling": each seed becomes
-one :class:`safe_ci_dag_runner.Step`, and every per-worker HARD limit is lowered onto the exact
+This is where the runner "reuses dagrun; does NOT write a sibling": each seed becomes
+one :class:`dagrun.Step`, and every per-worker HARD limit is lowered onto the exact
 per-step control the executor already enforces —
 
 * ``worker_limits.memory_bytes`` -> ``ResourceHint.hard_mem_max_bytes`` (inner ``memory.max``),
@@ -28,7 +28,7 @@ import shlex
 from dataclasses import dataclass
 from pathlib import Path
 
-from safe_ci_dag_runner import DagConfig, ResourceHint, Step
+from dagrun import DagConfig, ResourceHint, Step
 
 from parallel_experiment_runner.model import (
     STATUS_COMMAND_ERROR,

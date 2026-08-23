@@ -16,9 +16,9 @@ TOOL="$(basename "$0")"
 cd "$ROOT"
 
 case "$TOOL" in
-  safe-ci-dag-runner|cpuset-alloc)
-    PACKAGE="safe-ci-dag-runner"
-    PACKAGE_TOOLS=(safe-ci-dag-runner cpuset-alloc)
+  dagrun|cpuset-alloc)
+    PACKAGE="dagrun"
+    PACKAGE_TOOLS=(dagrun cpuset-alloc)
     ;;
   tick-hub)
     PACKAGE="tick-hub"
@@ -222,7 +222,7 @@ while ((attempt <= 3)); do
 
   if [[ "${AGENT_UTILS_RS_ENSURE_ONLY:-}" != "1" ]]; then
     # Publish a named, content-addressed copy outside the deletable Cargo target. The stable name is
-    # required because safe-ci-dag-runner and cpuset-alloc use current_exe() for containment re-exec.
+    # required because dagrun and cpuset-alloc use current_exe() for containment re-exec.
     # Existing snapshots are rehashed and never overwritten when valid.
     SNAPSHOT_DIR="$ROOT/rs/.agent-utils-snapshots/$TOOL/$binary_sha"
     SNAPSHOT="$SNAPSHOT_DIR/$TOOL"
