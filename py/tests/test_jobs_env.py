@@ -81,3 +81,30 @@ def test_a_malformed_name_is_REFUSED_not_ignored():
     refusal, and the operator would debug the wrong thing."""
     with pytest.raises(ValueError, match="not a valid environment variable name"):
         resolve_jobs_env(env={JOBS_ENV_ENV: "not a name"})
+
+
+# --- the planner must ALLOCATE for an env-only step, not pass the raw declaration ------
+
+def test_the_planner_allocates_width_for_an_env_only_step():
+    """REGRESSION. The first version of this feature delivered the env channel at execution
+    time but left `apply_plan_to_config` gating on `jobs_flag` alone, so a step resizable
+    ONLY by env kept its raw `preferred_inner_jobs` instead of the planner's allocated
+    width. It would have handed cargo the declared 32 while the runner believed it had
+    clamped the step -- the exact "declared width that never reached the tool" defect this
+    feature exists to fix, inverted.
+
+    Five sites in estimates.py made that distinction; all now ask
+    `step_width_is_resizable`, which is true for either channel.
+    """
+    from dagrun.estimates import apply_plan_to_config  # noqa: F401  (import must resolve)
+    import inspect
+
+    import dagrun.estimates as est
+
+    src = inspect.getsource(est)
+    # No site may gate width decisions on the flag alone any more.
+    assert "effective_jobs_flag(step, cfg.default_jobs_flag).strip()" not in src, (
+        "a width decision still gates on jobs_flag alone; an env-only step would be "
+        "treated as unresizable and keep its raw declared width"
+    )
+    assert src.count("step_width_is_resizable(") >= 5

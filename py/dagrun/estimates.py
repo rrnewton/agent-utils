@@ -22,6 +22,7 @@ from dagrun.model import (
     Step,
     effective_cpu_count,
     effective_jobs_flag,
+    step_width_is_resizable,
 )
 from dagrun.sizing import (
     _memory_footprint_fits,
@@ -1073,7 +1074,7 @@ def _infeasible_fixed_widths(
             (step.tag, widths[step.tag])
             for step in cfg.steps
             if step.skip_reason is None
-            and not effective_jobs_flag(step, cfg.default_jobs_flag).strip()
+            and not step_width_is_resizable(step, cfg.default_jobs_flag, cfg.default_jobs_env)
             and widths[step.tag] > budget
         )
     )
@@ -1133,7 +1134,7 @@ def _cpa_admissible(
             admissible[tag] = [1]
             wall[tag] = {1: 0.0}
             continue
-        if not effective_jobs_flag(step, cfg.default_jobs_flag).strip():
+        if not step_width_is_resizable(step, cfg.default_jobs_flag, cfg.default_jobs_env):
             # An empty jobs_flag means the command manages its own fixed width. The planner cannot
             # safely act on a learned curve because changing preferred_inner_jobs would not change
             # the guest command. Run entry points refuse this configuration when the declared width
@@ -1397,9 +1398,9 @@ def _build_cpa_plan(
         bounded = _speedup_within_budget(speedup, P)
         if bounded is not None:
             bounded_speedups[tag] = bounded
-        elif tag in by_tag and not effective_jobs_flag(
-            by_tag[tag], cfg.default_jobs_flag
-        ).strip():
+        elif tag in by_tag and not step_width_is_resizable(
+            by_tag[tag], cfg.default_jobs_flag, cfg.default_jobs_env
+        ):
             # A self-managed infeasible step may have measurements only above P. Keep that curve
             # diagnostic and use its exact fixed-width level if present; no allocation is applied.
             bounded_speedups[tag] = speedup
@@ -1479,7 +1480,9 @@ def _build_cpa_plan(
                     widths[tag]
                     if step.skip_reason is None
                     and stop_reason != _CPA_INFEASIBLE_MEMORY
-                    and effective_jobs_flag(step, cfg.default_jobs_flag).strip()
+                    and step_width_is_resizable(
+                        step, cfg.default_jobs_flag, cfg.default_jobs_env
+                    )
                     else None
                 ),
             )
@@ -1600,7 +1603,7 @@ def apply_plan_to_config(cfg: DagConfig, plan: Plan) -> DagConfig:
             else step.hint.rss_baseline_bytes
         )
         inner = step.hint.preferred_inner_jobs
-        if effective_jobs_flag(step, cfg.default_jobs_flag).strip():
+        if step_width_is_resizable(step, cfg.default_jobs_flag, cfg.default_jobs_env):
             inner = (
                 entry.alloc_inner_jobs
                 if entry.alloc_inner_jobs is not None
