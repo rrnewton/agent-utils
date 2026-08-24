@@ -29,6 +29,7 @@ from dagrun.model import (
     WriteDomainGuarantee,
     WriteDomainPolicy,
     write_domain_violations,
+    resolve_jobs_env,
 )
 
 __all__ = [
@@ -506,6 +507,10 @@ def _dag_from_obj(raw: object) -> DagConfig:
         outer_mem_safety_factor=_opt_float(doc, "outer_mem_safety_factor", 1.0),
         default_step_timeout=default_step_timeout,
         default_jobs_flag=_opt_str(doc, "default_jobs_flag", DEFAULT_JOBS_FLAG),
+        # HOST-supplied, never read from the document: which env channel this machine
+        # delivers inner width through. A graph must not be able to set it, because that is
+        # exactly the per-host setting that does not belong in a description of the work.
+        default_jobs_env=_opt_str(doc, "default_jobs_env", resolve_jobs_env()),
         write_domain_policy=policy,
     )
     violations = write_domain_violations(cfg)
@@ -585,6 +590,7 @@ def _dag_to_obj(cfg: DagConfig) -> dict[str, object]:
         "outer_mem_safety_factor": cfg.outer_mem_safety_factor,
         "default_step_timeout": cfg.default_step_timeout,
         "default_jobs_flag": cfg.default_jobs_flag,
+        "default_jobs_env": cfg.default_jobs_env,
         "steps": [_step_to_json(s) for s in cfg.steps],
     }
     if cfg.default_step_timeout == 0:

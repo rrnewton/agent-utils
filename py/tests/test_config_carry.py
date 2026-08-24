@@ -61,6 +61,7 @@ def configured() -> DagConfig:
         outer_mem_safety_factor=1.2,
         default_step_timeout=600,
         default_jobs_flag="--jobs {n}",
+        default_jobs_env="CARGO_BUILD_JOBS",
         default_step_mem_cap_bytes=None,
         default_step_cpu_count=4,
         default_step_cpu_timeout=120,

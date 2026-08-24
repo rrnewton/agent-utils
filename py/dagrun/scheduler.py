@@ -52,6 +52,9 @@ from dagrun.model import (
     step_classification,
     undeclared_resource_demands,
     write_domain_violations,
+    env_with_inner_jobs,
+    step_width_is_resizable,
+    JOBS_ENV_ENV,
 )
 from dagrun.profile_enrich import (
     resolve_effective_inner_jobs,
@@ -309,7 +312,7 @@ def _self_managed_width_violations(
             if step.skip_reason is None
             and (width := step.hint.preferred_inner_jobs) is not None
             and width > budget
-            and not effective_jobs_flag(step, cfg.default_jobs_flag).strip()
+            and not step_width_is_resizable(step, cfg.default_jobs_flag, cfg.default_jobs_env)
         )
     )
 
@@ -324,10 +327,11 @@ def _self_managed_width_error(cfg: DagConfig, max_cpus: int) -> str | None:
         f"{tag} (preferred_inner_jobs={width})" for tag, width in violations
     )
     return (
-        f"--max-cpus {max(1, max_cpus)} cannot lower guest parallelism for step(s) with an empty "
-        f"effective jobs_flag: {detail}; set each step's jobs_flag to the guest's worker-count "
-        "option (or remove the empty override and set default_jobs_flag), reduce "
-        "preferred_inner_jobs, or raise --max-cpus"
+        f"--max-cpus {max(1, max_cpus)} cannot lower guest parallelism for step(s) that offer "
+        f"no width channel: {detail}; this machine must declare one -- set "
+        f"${JOBS_ENV_ENV} to the guest's worker-count ENV VAR (e.g. CARGO_BUILD_JOBS), or set "
+        "the step's jobs_flag to its worker-count OPTION -- or reduce preferred_inner_jobs, or "
+        "raise --max-cpus"
     )
 
 
@@ -1081,6 +1085,9 @@ class Runner:
         # Runner authority wins over a DAG-supplied environment value.
         env[STEP_NONCE_ENV] = nonce
         inner_jobs = preferred_inner_jobs(step)
+        # Deliver the width through this machine's env channel when it has one. Empty overlay
+        # when the host configured none, so behaviour is unchanged where nothing is set.
+        env.update(env_with_inner_jobs(step, self.cfg.default_jobs_env, inner_jobs))
         cpu_count = effective_cpu_count(step, self.cfg.default_step_cpu_count)
         # SMALL default caps for an undeclared step (the forcing function): fall back to the
         # DAG's tight 1-GiB memory.max / 1-core cpu.max / 10-s CPU-time floor when the step
