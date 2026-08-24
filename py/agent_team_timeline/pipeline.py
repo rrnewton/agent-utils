@@ -22,8 +22,10 @@ from agent_team_timeline.archive import (
     as_object,
     as_string,
     canonical_json,
+    canonical_jsonl,
     narrow_json,
     read_json,
+    read_jsonl,
     write_json_if_changed,
     write_text_if_changed,
 )
@@ -47,8 +49,17 @@ from agent_team_timeline.claude import (
     load_claude_team,
     snapshot_claude_lineage,
 )
-from agent_team_timeline.model import Agent, Event, TeamData, ToolCall, source_digest
-from agent_team_timeline.model_io import team_from_json_obj
+from agent_team_timeline.model import (
+    Agent,
+    Event,
+    TaskNote,
+    TeamData,
+    ToolCall,
+    source_digest,
+    task_note_key,
+)
+from agent_team_timeline.model_io import task_note_from_json_obj, team_from_json_obj
+from agent_team_timeline.payloads import merge_payloads, payload_ref, resolve_payloads
 from agent_team_timeline.naming import (
     AgentNameJob,
     AgentNameResult,
@@ -272,6 +283,38 @@ class IngestReport:
     # from the archive itself, not only from whichever terminal happened to be open.
     retired_message_projections: int = 0
     retired_message_projection_bytes: int = 0
+    # Every task note this archive holds for the team, and how many of them this ingest is the
+    # first to have promoted. The second number is the one worth watching: it is large exactly
+    # once, on the ingest that first lifts an existing frozen projection into the model, and
+    # after that it is the count of notes genuinely written upstream since the last run. A run
+    # that reports a large number twice for the same team is reporting a bug -- the merge is not
+    # recognizing what it already has -- which is precisely the failure this counter exists to
+    # make visible in a receipt rather than in a diff nobody reads.
+    task_notes: int = 0
+    newly_promoted_task_notes: int = 0
+    # How many of those notes upstream no longer has, so the archive is their only copy. A standing
+    # inventory rather than a delta, because that is the form of the number anyone acts on: it is
+    # the answer to "what would be gone if this file were", and it is the one thing here that
+    # cannot be recomputed once `source_snapshots/` is deleted.
+    task_notes_upstream_deleted: int = 0
+    # The content-addressed tool text this archive holds for the team, and what this ingest was
+    # the first to store. Reported in the same shape and for the same reason as the task-note
+    # counters above: the "newly" number is large exactly once per team, on the ingest that first
+    # rescues the text `_archive_team` used to delete, and afterwards it is the text produced
+    # since the last run. Two large numbers in a row for one team means the content-addressed
+    # merge is not recognizing what it already has, and a receipt is where that should be visible.
+    tool_payloads: int = 0
+    tool_payload_bytes: int = 0
+    newly_stored_tool_payloads: int = 0
+    newly_stored_tool_payload_bytes: int = 0
+    # What the payload tree was found to be missing. Pruning it is a supported operation, so
+    # neither of these is an error -- but a supported operation that leaves no trace is
+    # indistinguishable from data loss six months later, and the receipt is the only place either
+    # can be seen. `pruned` is shards the previous manifest recorded and this ingest did not find;
+    # `damaged` is shards whose bytes disagreed with their recorded digest and were re-measured,
+    # which a content-addressed union is not supposed to be able to reach at all.
+    pruned_payload_shards: tuple[str, ...] = ()
+    damaged_payload_shards: tuple[str, ...] = ()
 
     def to_json_obj(self) -> dict[str, JsonValue]:
         """Return the ingest report as a JSON-serializable object."""
@@ -295,6 +338,15 @@ class IngestReport:
             "orc_prefix_overrides": overrides,
             "retired_message_projections": self.retired_message_projections,
             "retired_message_projection_bytes": self.retired_message_projection_bytes,
+            "task_notes": self.task_notes,
+            "newly_promoted_task_notes": self.newly_promoted_task_notes,
+            "task_notes_upstream_deleted": self.task_notes_upstream_deleted,
+            "tool_payloads": self.tool_payloads,
+            "tool_payload_bytes": self.tool_payload_bytes,
+            "newly_stored_tool_payloads": self.newly_stored_tool_payloads,
+            "newly_stored_tool_payload_bytes": self.newly_stored_tool_payload_bytes,
+            "pruned_payload_shards": list(self.pruned_payload_shards),
+            "damaged_payload_shards": list(self.damaged_payload_shards),
         }
 
 
@@ -365,7 +417,13 @@ def utc_now() -> str:
 def _write_json_durable(path: Path, value: JsonValue) -> bool:
     """Atomically write JSON and persist the replaced directory entry before returning."""
 
-    changed = write_json_if_changed(path, value)
+    return _write_text_durable(path, canonical_json(value))
+
+
+def _write_text_durable(path: Path, text: str) -> bool:
+    """Atomically write text and persist the replaced directory entry before returning."""
+
+    changed = write_text_if_changed(path, text)
     if not changed:
         return False
     try:
@@ -382,17 +440,54 @@ def _write_json_durable(path: Path, value: JsonValue) -> bool:
     return True
 
 
-def _archive_team(team: TeamData) -> TeamData:
-    """Keep messages verbatim while dropping bulky tool commands and outputs.
+def _archive_team(team: TeamData) -> tuple[TeamData, tuple[str, ...]]:
+    """Detach the bulky tool text into content-addressed payloads; redact the source cwd.
 
-    Tool timing/name/count metadata is sufficient for the requested condensed transcript. The
-    original Codex JSONL remains the authority for command stdout and patch bodies.
+    Returns the team as ``raw/team.json`` will hold it, plus every payload the caller must store
+    before that file is durable.
+
+    **What changed and why.** This function used to say "the original Codex JSONL remains the
+    authority for command stdout and patch bodies", and it meant it: it set ``input_text`` and
+    ``output_text`` to ``None`` and nothing anywhere else kept them. 0 of the 30,921 tool calls in
+    one archived team retained either field. That single line is why 3.59 GB of vendor JSONL under
+    gitignored ``teams/*/source_snapshots/`` cannot be deleted -- not because the archive prefers
+    the vendor format, but because for those two fields the vendor file is the only copy. The text
+    now goes to :mod:`agent_team_timeline.payloads` and the tool call keeps a digest and a byte
+    count, so the model still does not carry the bulk and the archive no longer loses it.
+
+    **The two redactions are deliberate and stay.** ``working_directory`` and any credential
+    embedded in ``repository_url`` are removed rather than relocated, and
+    ``test_ingest_never_persists_cwd_or_repository_credentials`` pins that. They are not the same
+    kind of thing as the tool text: they are *policy* losses, taken knowingly, on content whose
+    value to a timeline is near zero and whose cost when leaked is not. The losslessness audit
+    knows about them by name for exactly that reason -- a declared redaction and a silent drop
+    read identically in a diff, and only one of them is acceptable.
+
+    A payload is emitted for an empty string too. ``""`` and ``None`` are different observations
+    about a tool call -- "it produced nothing" and "we do not know what it produced" -- and this
+    is the layer that used to conflate them.
     """
 
-    tools = tuple(
-        replace(tool, input_text=None, output_text=None)
-        for tool in team.tool_calls
-    )
+    payloads: list[str] = []
+    tools: list[ToolCall] = []
+    for tool in team.tool_calls:
+        input_ref = None
+        output_ref = None
+        if tool.input_text is not None:
+            payloads.append(tool.input_text)
+            input_ref = payload_ref(tool.input_text)
+        if tool.output_text is not None:
+            payloads.append(tool.output_text)
+            output_ref = payload_ref(tool.output_text)
+        tools.append(
+            replace(
+                tool,
+                input_text=None,
+                output_text=None,
+                input_payload=input_ref,
+                output_payload=output_ref,
+            )
+        )
     sources = tuple(
         replace(
             source,
@@ -401,7 +496,57 @@ def _archive_team(team: TeamData) -> TeamData:
         )
         for source in team.sources
     )
-    return replace(team, sources=sources, tool_calls=tools)
+    return replace(team, sources=sources, tool_calls=tuple(tools)), tuple(payloads)
+
+
+def _payload_root(archive: Path, team_slug: str) -> Path:
+    _validate_team_slug(team_slug)
+    return archive / "teams" / team_slug / "payloads"
+
+
+def rehydrate_tool_payloads(archive: Path, team: TeamData) -> TeamData:
+    """Return *team* with every resolvable tool payload put back inline.
+
+    ``load_archived_team`` deliberately does not do this. The whole reason the text lives in a
+    separate tree is that it is the bulk -- 290 MB against a 55 MB ``team.json`` on one measured
+    team -- and every existing caller of the loader wants the graph, not the stdout. Paying that
+    on every build, every query and every summarize pass to serve the handful of callers that want
+    the text would invert the reason the split exists.
+
+    So materialization is explicit, and it is honest about a pruned tree: a reference that does not
+    resolve leaves ``input_text``/``output_text`` as ``None`` and keeps the reference, so the
+    caller can still see the digest and the byte count of what is missing rather than being told
+    the tool produced nothing.
+    """
+
+    refs = [
+        ref
+        for tool in team.tool_calls
+        for ref in (tool.input_payload, tool.output_payload)
+        if ref is not None
+    ]
+    if not refs:
+        return team
+    resolved = resolve_payloads(_payload_root(archive, team.team_slug), refs)
+    return replace(
+        team,
+        tool_calls=tuple(
+            replace(
+                tool,
+                input_text=(
+                    resolved.get(tool.input_payload.sha256)
+                    if tool.input_payload is not None
+                    else tool.input_text
+                ),
+                output_text=(
+                    resolved.get(tool.output_payload.sha256)
+                    if tool.output_payload is not None
+                    else tool.output_text
+                ),
+            )
+            for tool in team.tool_calls
+        ),
+    )
 
 
 def _raw_team_path(archive: Path, team_slug: str) -> Path:
@@ -444,6 +589,98 @@ def _source_manifest_path(archive: Path, team_slug: str) -> Path:
 def _normalized_generation_path(archive: Path, team_slug: str) -> Path:
     _validate_team_slug(team_slug)
     return archive / "teams" / team_slug / "raw" / "normalized-generation.json"
+
+
+def _task_notes_path(archive: Path, team_slug: str) -> Path:
+    _validate_team_slug(team_slug)
+    return archive / "teams" / team_slug / "raw" / "task-notes.jsonl"
+
+
+def _load_promoted_task_notes(archive: Path, team_slug: str) -> tuple[TaskNote, ...]:
+    """Read the task notes this archive already holds, as of before the current ingest.
+
+    Strictly ordered on read, not merely deduplicated. The file is an accumulator that only ever
+    grows, and the one failure mode that would quietly lose content is a writer that emitted the
+    same key twice with different bodies -- a reader that took "the last one wins" would make
+    that unobservable. Requiring the order the writer promises turns it into a refusal instead.
+    """
+
+    path = _task_notes_path(archive, team_slug)
+    notes: list[TaskNote] = []
+    previous_key: tuple[str, int] | None = None
+    for index, record in enumerate(read_jsonl(path)):
+        note = task_note_from_json_obj(record, f"{path}:{index + 1}")
+        key = task_note_key(note)
+        if previous_key is not None and key <= previous_key:
+            raise ValueError(
+                f"{path}:{index + 1}: promoted task notes are not strictly ordered by "
+                "(source_path, note_id)"
+            )
+        previous_key = key
+        notes.append(note)
+    return tuple(notes)
+
+
+def _merge_promoted_task_notes(
+    promoted: Sequence[TaskNote], observed: Sequence[TaskNote], where: str
+) -> tuple[tuple[TaskNote, ...], int]:
+    """Union the already-promoted notes with this ingest's, first promotion winning.
+
+    Three properties, and each one is load-bearing.
+
+    **Union, not replacement.** This is the entire reason the promotion exists. Orc's ``task_notes``
+    table is mutable upstream and rows are genuinely deleted from it: on the archive that prompted
+    this, 74 of the 4,583 notes in one projection had no counterpart left in the live table, among
+    them a "POST-LAND AUTHORITY DRIFT" report and the note recording that an owner authorized
+    landing a pull request over stale dependency edges. Anything that recomputed this file from
+    what is currently observable would delete them. So an observed set that has *lost* a note
+    leaves the promoted record exactly where it is; nothing in this function can shrink the file.
+
+    **First promotion wins, with exactly one exception.** A note already here keeps its stored
+    body and its stored provenance even when today's projection presents it differently. That is
+    the same freeze-first rule ``orc._advance_task_candidate`` applies to the projection itself,
+    and applying it again here is what makes the file byte-stable: without it, one appended note
+    would restamp the provenance of every other record with the new projection generation.
+
+    The exception is ``upstream_present``, which latches from true to false and never back. It is
+    not provenance about where the bytes came from; it is the archive's record of *when it became
+    the last copy*, and freezing it at first promotion would have answered that question only for
+    notes upstream had already deleted before this archive first ran -- the one part of the
+    population that cannot grow. Orc refuses to reuse a note id below its frozen high-water mark,
+    so a deleted note cannot come back and the latch cannot be wrong in the other direction. One
+    such transition rewrites one line of the file, which is a real change and should be visible as
+    one.
+
+    **Divergence in the immutable core is a refusal, not a merge.** ``task_id``, ``content`` and
+    ``created_at`` are the fields Orc never legitimately edits, and the snapshot layer already
+    refuses when they change. If they differ here, the two sides disagree about what a note *is*,
+    and picking either one silently would be choosing which copy of the historical record to
+    believe on the operator's behalf. Enrichment -- title, owner, author -- is not in that set,
+    because it demonstrably does change upstream and the frozen copy is deliberately the older
+    one.
+    """
+
+    merged = {task_note_key(note): note for note in promoted}
+    newly_promoted = 0
+    for note in observed:
+        key = task_note_key(note)
+        prior = merged.get(key)
+        if prior is None:
+            merged[key] = note
+            newly_promoted += 1
+            continue
+        if (prior.task_id, prior.content, prior.created_at) != (
+            note.task_id,
+            note.content,
+            note.created_at,
+        ):
+            raise ValueError(
+                f"{where}: promoted task note {prior.source_path}#{prior.note_id} "
+                "disagrees with the current source about its immutable core"
+            )
+        if prior.upstream_present and not note.upstream_present:
+            merged[key] = replace(prior, upstream_present=False)
+    return tuple(sorted(merged.values(), key=task_note_key)), newly_promoted
 
 
 def _retired_message_projection_root(archive: Path, team_slug: str) -> Path:
@@ -618,9 +855,26 @@ def _record_site_identity(
     return int(_write_json_durable(path, narrow_json(identity.to_json_obj())))
 
 
-def _ensure_source_snapshots_ignored(archive: Path) -> bool:
+def _ensure_bulk_content_ignored(archive: Path) -> bool:
+    """Keep the two trees that hold raw bulk out of version control, and nothing else.
+
+    ``payloads/`` joins ``source_snapshots/`` here rather than living under tracked ``raw/``, and
+    that placement is the whole reason it is safe for the archive to start keeping command stdout
+    and patch bodies at all. Those bytes are the ones most likely to contain an absolute path
+    under someone's home directory or a token that leaked into a log line -- the archive has a
+    test, ``test_ingest_never_persists_cwd_or_repository_credentials``, whose entire subject is
+    that tracked files must not carry that kind of content. Putting the payload tree beside the
+    snapshots preserves that promise exactly: what is tracked is the model and the digests, what
+    is ignored is the bulk. An operator who wants the bulk versioned or replicated can say so
+    themselves; the default cannot make that decision for them.
+    """
+
     path = archive / ".gitignore"
-    required = (f"/{_ARCHIVE_LOCK}", "/teams/*/source_snapshots/")
+    required = (
+        f"/{_ARCHIVE_LOCK}",
+        "/teams/*/source_snapshots/",
+        "/teams/*/payloads/",
+    )
     if path.exists() and not path.is_file():
         raise ValueError(f"archive .gitignore is not a file: {path}")
     existing = path.read_text(encoding="utf-8") if path.is_file() else ""
@@ -815,6 +1069,45 @@ def _write_ingested_team(
     """Write provider-neutral normalized data after a provider snapshot is durable."""
 
     changed = files_changed
+    # The payload tree is written first, and everything the marker commits follows it. Two
+    # orderings had to be reconciled here.
+    #
+    # `team.json` is about to stop carrying the tool text and start carrying a digest that points
+    # at it, so the text has to be durable before the pointer is: an archive holding the pointer
+    # and not the text claims content it does not have. The reverse -- payloads durable, pointers
+    # not yet written -- costs nothing, because a payload nobody references is inert and the next
+    # ingest merges it back into the same place.
+    #
+    # It also has to come before `raw/task-notes.jsonl`, and that is a durability argument rather
+    # than a content one. This merge is the fallible step in the sequence; the writes after it are
+    # not. Everything below is bound by the Orc generation marker, which is written by the caller,
+    # so an exception in the middle leaves a marker that no longer describes the files -- and
+    # `load_archived_team` refuses the team until an ingest completes. That state is recoverable
+    # only if the *next* ingest can get past the same step, so the step most likely to raise
+    # belongs before the first durable write, not between two of them.
+    archived, detached_payloads = _archive_team(team)
+    payload_report = merge_payloads(_payload_root(archive, team_slug), detached_payloads)
+    changed += payload_report.files_changed
+    # Then the task notes, before anything derived from them, because this file -- not the
+    # provider snapshot, and not the frozen projection inside it -- is now the archive's copy of
+    # that text. `teams/*/source_snapshots/` is gitignored, so until this existed the only
+    # version-controlled trace of a note was the message it renders into inside `raw/team.json`,
+    # and that rendering is lossy and window-filtered. See `_merge_promoted_task_notes` for why
+    # the union, rather than a recomputation, is the entire point.
+    notes_path = _task_notes_path(archive, team_slug)
+    promoted, newly_promoted = _merge_promoted_task_notes(
+        _load_promoted_task_notes(archive, team_slug), team.task_notes, str(notes_path)
+    )
+    if promoted:
+        changed += int(
+            _write_text_durable(
+                notes_path,
+                canonical_jsonl(
+                    as_object(narrow_json(note.to_json_obj()), "task note")
+                    for note in promoted
+                ),
+            )
+        )
     artifact_catalog = extract_artifacts(team)
     changed += int(
         _write_json_durable(
@@ -822,7 +1115,6 @@ def _write_ingested_team(
             narrow_json(artifact_catalog.to_json_obj()),
         )
     )
-    archived = _archive_team(team)
     # These identifiers still reach the filesystem even though the per-thread projection that first
     # motivated the check is gone: `summary_data/agents/<thread-id>.json` and
     # `summaries/agents/<thread-id>.md` are both built by interpolating `agent.thread_id`
@@ -832,7 +1124,14 @@ def _write_ingested_team(
         _validate_archive_id(agent.thread_id, "thread id")
     changed += int(
         _write_json_durable(
-            _raw_team_path(archive, team_slug), narrow_json(archived.to_json_obj())
+            _raw_team_path(archive, team_slug),
+            # Written without the task notes, which `raw/task-notes.jsonl` above now holds. They
+            # are already in this file once, as the message text of the events they render into,
+            # and a second verbatim copy would add roughly 70 MB to an archive whose largest
+            # `team.json` is already 220 MB -- for content the loader reattaches from a file it
+            # has to read anyway. `load_archived_team` puts them back, so no consumer of the
+            # model can tell the difference; only the bytes on disk can.
+            narrow_json(replace(archived, task_notes=()).to_json_obj()),
         )
     )
     # Sweep the retired per-thread projection only once the file it was a projection *of* is
@@ -869,8 +1168,19 @@ def _write_ingested_team(
         projects=len(artifact_catalog.projects),
         retired_message_projections=retired_files,
         retired_message_projection_bytes=retired_bytes,
+        task_notes=len(promoted),
+        newly_promoted_task_notes=newly_promoted,
+        task_notes_upstream_deleted=sum(
+            1 for note in promoted if not note.upstream_present
+        ),
+        tool_payloads=payload_report.stored,
+        tool_payload_bytes=payload_report.stored_bytes,
+        newly_stored_tool_payloads=payload_report.newly_stored,
+        newly_stored_tool_payload_bytes=payload_report.newly_stored_bytes,
+        pruned_payload_shards=payload_report.pruned_shards,
+        damaged_payload_shards=payload_report.damaged_shards,
     )
-    return archived, report
+    return replace(archived, task_notes=promoted), report
 
 
 def _normalized_generation_value(
@@ -878,6 +1188,7 @@ def _normalized_generation_value(
 ) -> dict[str, JsonValue]:
     """Describe the complete normalized Orc generation committed by the marker."""
 
+    notes_path = _task_notes_path(archive, team_slug)
     return {
         "schema_version": 1,
         "tool": "agent-team-timeline",
@@ -890,6 +1201,27 @@ def _normalized_generation_value(
         "artifact_catalog_sha256": _file_sha256(
             _artifact_catalog_path(archive, team_slug)
         ),
+        # An Orc team with no task source never writes the file at all, and hashes as the empty
+        # one it would have been -- so "no notes" and "an empty accumulator" are the same
+        # generation, and a torn or truncated write of a file that *is* the last copy of its
+        # content is caught by the marker exactly like a torn `team.json`.
+        "task_notes_sha256": (
+            _file_sha256(notes_path)
+            if notes_path.is_file()
+            else hashlib.sha256(b"").hexdigest()
+        ),
+        # The payload tree is deliberately NOT bound here, and the reason is worth stating because
+        # it looks like an omission. Everything this marker covers is something that can go stale:
+        # `team.json`, the artifact catalog and the task notes are all derived, and a mixed
+        # generation of them is a real and silent failure. A payload cannot be stale. Its name is
+        # its content, references to it either resolve or do not, and the store is a union that
+        # never rewrites a record -- so there is no state in which the tree is *wrong* about what
+        # `team.json` points at, only states in which it is incomplete. Incompleteness is exactly
+        # what the tree is meant to permit: it is gitignored bulk that an operator is invited to
+        # prune, permission or move to cold storage. Binding it here would turn every one of those
+        # into a refusal on the next build and force a re-ingest that recreated the very bytes the
+        # operator had just removed. `payloads.verify_payload_store`, run by the losslessness
+        # audit, is what checks the tree, and it reports a pruned shard as the absence it is.
         "source_digest": source_digest(team),
     }
 
@@ -903,7 +1235,15 @@ def _validate_normalized_generation(
             f"incomplete Orc normalized generation for {team_slug!r}; rerun ingest"
         )
     marker = as_object(read_json(marker_path), str(marker_path))
-    expected_fields = {
+    # Each accepted generation is the previous one plus exactly the digests a later change added,
+    # so the list reads as the history it is. An older marker describes an archive that genuinely
+    # had no task-note file and no payload tree, and it describes that archive completely and
+    # correctly; refusing it would force a full re-ingest of every existing Orc team before any of
+    # them could be built again -- several hours of penalty for additions that changed none of the
+    # bytes the old marker vouches for. The next ingest writes the current field set and the
+    # tolerance stops applying to that team, which is the staged-migration shape
+    # `OrcTaskProjection.from_json_obj` already uses for its own historical field sets.
+    base_fields = {
         "schema_version",
         "tool",
         "normalizer_schema_version",
@@ -913,11 +1253,19 @@ def _validate_normalized_generation(
         "artifact_catalog_sha256",
         "source_digest",
     }
-    if set(marker) != expected_fields:
+    accepted_field_sets = (
+        base_fields,
+        base_fields | {"task_notes_sha256"},
+    )
+    if set(marker) not in accepted_field_sets:
         raise ValueError(
             f"invalid Orc normalized generation marker at {marker_path}"
         )
-    expected = _normalized_generation_value(archive, team_slug, team)
+    expected = {
+        key: value
+        for key, value in _normalized_generation_value(archive, team_slug, team).items()
+        if key in set(marker)
+    }
     if marker != expected:
         raise ValueError(
             f"stale or incomplete Orc normalized generation for {team_slug!r}; "
@@ -938,7 +1286,7 @@ def _ingest_codex_locked(
     """Normalize one complete Codex lineage and write canonical raw JSON."""
 
     _ensure_archive(archive, team_slug, create=True)
-    changed = int(_ensure_source_snapshots_ignored(archive))
+    changed = int(_ensure_bulk_content_ignored(archive))
     manifest_state = _load_source_manifest(
         archive,
         team_slug,
@@ -1056,7 +1404,7 @@ def _ingest_claude_locked(
 
     root_thread_id = session_file.stem
     _ensure_archive(archive, team_slug, create=True)
-    changed = int(_ensure_source_snapshots_ignored(archive))
+    changed = int(_ensure_bulk_content_ignored(archive))
     previous_sources = _load_claude_source_manifest(
         archive, team_slug, root_thread_id, date_window
     )
@@ -1282,7 +1630,7 @@ def _ingest_orc_locked(
     """Snapshot and normalize one Orc coordinator lineage."""
 
     _ensure_archive(archive, team_slug, create=True)
-    changed = int(_ensure_source_snapshots_ignored(archive))
+    changed = int(_ensure_bulk_content_ignored(archive))
     manifest_state = _load_orc_source_manifest(
         archive,
         team_slug,
@@ -1417,7 +1765,13 @@ def load_archived_team(archive: Path, team_slug: str) -> TeamData:
     path = _raw_team_path(archive, team_slug)
     if not path.is_file():
         raise ValueError(f"no ingested team {team_slug!r}; run `agent-team-timeline ingest`")
-    team = team_from_json_obj(read_json(path))
+    # `raw/team.json` and `raw/task-notes.jsonl` are two files holding one model; the split is a
+    # storage decision made in `_write_ingested_team` and stops here. Everything above this line
+    # in the archive and everything below it in the program sees a single `TeamData`.
+    team = replace(
+        team_from_json_obj(read_json(path)),
+        task_notes=_load_promoted_task_notes(archive, team_slug),
+    )
     if team.team_slug != team_slug:
         raise ValueError(
             f"archived team slug {team.team_slug!r} does not match requested {team_slug!r}"
@@ -4435,6 +4789,7 @@ __all__ = [
     "ingest_orc",
     "load_archived_team",
     "record_run",
+    "rehydrate_tool_payloads",
     "source_digest",
     "summarize_archive",
     "utc_now",

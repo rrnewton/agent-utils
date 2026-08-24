@@ -20,9 +20,11 @@ from agent_team_timeline.model import (
     Edge,
     Event,
     SourceSnapshot,
+    TaskNote,
     TeamData,
     ToolCall,
     Turn,
+    task_note_key,
 )
 
 
@@ -6300,6 +6302,54 @@ def _task_records(
     return tuple(events), tuple(turns), tuple(inferred.values())
 
 
+def _promoted_task_notes(
+    source: OrcSourceCopy,
+    source_path: Path,
+    records: Sequence[_FrozenTaskNote],
+) -> tuple[TaskNote, ...]:
+    """Lift one task source's frozen note history into normalized model records.
+
+    This is the whole content of the frozen projection, verbatim and unwindowed. ``_task_records``
+    below renders the same notes into events and drops the ones outside the ingest window, which
+    is right for a timeline and wrong for the last surviving copy of a deleted note -- so the two
+    deliberately disagree, and this one keeps everything.
+
+    ``upstream_present`` costs one query against the snapshotted database and is the only thing
+    here that could not be recovered later. The projection already knows the *number* of frozen
+    notes with no live counterpart and the digest of their ids -- ``missing_note_count`` and
+    ``missing_note_ids_sha256``, computed by ``_task_rewrite_observation`` at snapshot time -- and
+    neither answers "which ones", which is the only form of the question a reader ever has. Once
+    ``source_snapshots/`` is deleted, which is the entire point of promoting these notes, the
+    comparison can never be made again; recording it per note is what turns "1,386 notes are the
+    archive's only copy" from a statistic into something you can open.
+
+    The comparison is against the *snapshot* database, not the live one: the snapshot is the state
+    the frozen records were frozen against, so the two sides of the comparison are contemporaries.
+    ``pipeline._merge_promoted_task_notes`` is what carries the answer forward, and it lets this
+    field -- alone among the provenance -- latch from true to false as upstream deletes rows.
+    """
+
+    projection = source.task_projection
+    live_note_ids = {record.note_id for record in _observed_task_notes(source_path)}
+    return tuple(
+        TaskNote(
+            note_id=record.note_id,
+            source_path=source.source_path,
+            task_source_ordinal=source.task_source_ordinal or 0,
+            task_id=record.task_id,
+            title=record.title,
+            content=record.content,
+            created_at=record.created_at,
+            server_author=record.server_author,
+            task_owner=record.task_owner,
+            upstream_present=record.note_id in live_note_ids,
+            projection_policy=None if projection is None else projection.policy,
+            projection_sha256=None if projection is None else projection.sha256,
+        )
+        for record in records
+    )
+
+
 def _agent_depth(
     thread_id: str, parents: Mapping[str, str | None]
 ) -> int:
@@ -6610,12 +6660,14 @@ def load_orc_team(
         }
 
     task_events: list[Event] = []
+    task_notes: list[TaskNote] = []
     inferred_spawns: list[_Spawn] = []
     for source in task_sources:
         path = _snapshot_path(snapshot_root, source.snapshot_path)
         frozen_records = _bootstrap_frozen_task_projection(
             snapshot_root, source, path
         )
+        task_notes.extend(_promoted_task_notes(source, path, frozen_records))
         task_roots = task_roots_by_path.get(source.source_path, ())
         owner_root = lineage_by_session[source.owner_session_id]
         if task_roots and owner_root not in task_roots:
@@ -6999,6 +7051,7 @@ def load_orc_team(
             sorted(tools, key=lambda item: (item.started_at_ms, item.call_id))
         ),
         edges=tuple(sorted(edges, key=lambda item: (item.timestamp_ms, item.edge_id))),
+        task_notes=tuple(sorted(task_notes, key=task_note_key)),
     )
 
 

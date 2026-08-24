@@ -385,6 +385,7 @@ def test_pipeline_snapshots_claude_and_reuses_unchanged_archive(tmp_path: Path) 
     assert (archive / ".gitignore").read_text(encoding="utf-8").splitlines() == [
         "/.agent-team-timeline.lock",
         "/teams/*/source_snapshots/",
+        "/teams/*/payloads/",
     ]
     manifest = json.loads(
         (

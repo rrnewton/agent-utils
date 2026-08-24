@@ -6,7 +6,7 @@ import hashlib
 import json
 import os
 import tempfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 
 JsonScalar = str | int | float | bool | None
@@ -17,6 +17,56 @@ def canonical_json(value: JsonValue) -> str:
     """Return the archive's stable JSON representation."""
 
     return json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+
+
+def canonical_jsonl(records: Iterable[Mapping[str, JsonValue]]) -> str:
+    """Return one canonical JSON object per line, in the order given.
+
+    The indented whole-file form above is what a human diffs; this one is what a reader can
+    consume a record at a time without materializing the file. Both are sorted-key and
+    ``ensure_ascii=False`` so the same record hashes the same either way, and both end in a
+    newline so appending never merges two records into one line.
+    """
+
+    return "".join(
+        json.dumps(dict(record), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        + "\n"
+        for record in records
+    )
+
+
+def read_jsonl(path: Path) -> list[dict[str, JsonValue]]:
+    """Read a line-delimited JSON record file, treating an absent file as empty.
+
+    Absent means "nothing has written this yet", which every caller here handles by starting
+    from an empty record set; a symlink or a non-regular file means something other than this
+    tool owns the name, and that is refused rather than followed. Empty lines are skipped rather
+    than refused, because a blank line carries no record and rejecting one would turn a harmless
+    stray newline into an unreadable archive. Every line reports its own number, because "invalid
+    JSON" without a line number in a several-hundred-thousand-line record file is not a
+    diagnosis.
+
+    **Split on ``"\\n"``, never with ``str.splitlines()``.** This is the reader for files
+    :func:`canonical_jsonl` wrote, and that writer uses ``ensure_ascii=False``, so U+2028, U+2029
+    and U+0085 -- which JSON does not escape and ``splitlines`` *does* treat as line terminators
+    -- go to disk raw inside a string value. With ``splitlines`` one such character in one note's
+    text turns one physical line into two JSON fragments, and the file becomes permanently
+    unparseable: not a bad read, an archive that can no longer be loaded or re-ingested, poisoned
+    by content the archive itself just wrote. There are no such characters in the corpus today;
+    there is also nothing stopping the next agent message from containing one.
+    """
+
+    if not path.exists():
+        return []
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"line-delimited JSON record file is not a regular file: {path}")
+    result: list[dict[str, JsonValue]] = []
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").split("\n"), 1):
+        if not line:
+            continue
+        value = narrow_json(json.loads(line), f"{path}:{line_number}")
+        result.append(as_object(value, f"{path}:{line_number}"))
+    return result
 
 
 def content_hash(text: str) -> str:

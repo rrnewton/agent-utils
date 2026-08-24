@@ -754,8 +754,12 @@ example-team/
     │   ├── .objects/<prefix>/<sha>.db         # immutable Orc SQLite objects
     │   ├── .projections/<prefix>/<sha>.json   # frozen Orc note provenance
     │   └── .staging/                           # managed, retry-safe Orc candidates
+    ├── payloads/                      # gitignored tool arguments and command output
+    │   ├── <xx>.jsonl                 # content-addressed, sharded by digest prefix
+    │   └── manifest.json              # records, bytes, and each shard's content address
     ├── raw/
     │   ├── team.json
+    │   ├── task-notes.jsonl          # verbatim task notes, one per line; append-only
     │   ├── site-identity.json        # projects, repositories, hosts, archive timezone
     │   ├── source-manifest.json      # versioned path/byte/hash/update provenance
     │   ├── normalized-generation.json # Orc manifest/team/catalog commit marker
@@ -788,6 +792,58 @@ example-team/
 versioned. It is what prevents a future refresh from buying the same summary twice. Run receipts are
 append-only and make the last attempted/completed refresh, model work, cache hits, source size, and
 source digest auditable.
+
+`raw/task-notes.jsonl` is the archive's own copy of every task note the lineage has ever shown it,
+one canonical JSON object per line, sorted and keyed on the note's source database and id. The same
+notes also appear in `team.json` as the messages they render into, but that rendering packs the task
+id and title into a text prefix and omits notes outside the ingest window; this file keeps each
+field separately, keeps every note, and records where the text came from and whether it can still be
+re-read upstream. Task trackers delete notes, and when one is deleted this file is the only copy
+left — so it is append-only by construction. An ingest adds notes it has not seen before and touches
+nothing else, which is why a repeat ingest changes no bytes at all, and it refuses rather than
+merges if a stored note and the live source disagree about a note's task, text, or creation time.
+
+`payloads/` is where a tool call's arguments and its command output now live. Earlier versions kept
+neither: ingest set both fields to `null` and left the vendor log as the only copy, so an archive
+could tell you that a command ran and not what it printed. Each payload is stored once under the
+SHA-256 of its own text, in the shard named by the first byte of that digest, and `team.json` keeps
+only the digest and the byte count. That split is deliberate and worth understanding before you
+decide how to back the directory up. Command output is the biggest and the most sensitive thing an
+archive holds — file contents, absolute paths, whatever a log line happened to include — so it is
+gitignored alongside the source snapshots, while the model that points at it stays small and
+version-controlled. Prune, encrypt or relocate `payloads/` and the archive still says precisely
+which text is missing and how large it was, which is more than it could say before.
+
+Before you delete anything, ask the archive what it would lose:
+
+```bash
+agent-team-timeline audit-losslessness --output ./timelines/example-team
+agent-team-timeline audit-losslessness --output ./timelines/example-team \
+  --team example-team --format json --require-lossless
+```
+
+This re-reads every row of the vendor snapshots and requires each one to fall under a rule that
+says what became of it, then checks that claim: that an event really is recorded at that line, that
+a stored payload really is byte-identical to the output the row carries. A row shape no rule covers
+— a new record type in a newer Codex — exits 1 rather than passing quietly, which is the point of
+running it at all. Rows whose content the archive genuinely does not keep are listed with their
+sizes and the reason; that inventory is what `--require-lossless` refuses on, and it is the check
+to put in front of an actual `rm -rf` of `source_snapshots/`. Only Codex teams are covered today;
+Claude and Orc teams are reported as uncovered by name, and an archive containing one is never
+reported lossless.
+
+The audit is defined against `raw/source-manifest.json`, not against whatever files happen to be in
+the directory, because an audit whose subject is "what survived" cannot detect loss — delete a
+rollout and its rows simply stop being counted, and the report gets *greener* the more you remove.
+A recorded rollout that is gone, shorter than its record, or no longer hashing to it fails the gate.
+
+**Deleting `source_snapshots/` makes the team read-only, permanently.** Reading it afterwards is
+fine and is the promise the audit is about: `team.json`, `raw/task-notes.jsonl` and `payloads/` are
+all that a build, a query or a summary needs. But every ingest path still reads the vendor tree to
+establish append-only continuity with the last run, so the next `ingest` for that team fails: Codex
+reports a missing source snapshot for a rollout its manifest records, and Orc reports a snapshot
+that does not match its manifest. Delete the snapshots for a lineage that is finished, not for one
+that is still running, and understand that the decision is not reversible by re-ingesting.
 
 Ingest first copies every newline-complete rollout in the selected lineage into
 `teams/<team>/source_snapshots/`; all parsing after that point uses these copies rather than the live

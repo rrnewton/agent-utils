@@ -387,6 +387,105 @@ predecessor point to the successor start. It is structural in the site, but it i
 the renderer does not invent a child-to-parent lifetime return or progress messages for the
 successor coordinator.
 
+## Tool payloads are stored, not deferred to the vendor logs
+
+Until this contract existed, ingest deleted the two largest fields in the model. `_archive_team`
+set `input_text` and `output_text` to `null` on every tool call before writing `raw/team.json`, and
+said so: "the original Codex JSONL remains the authority for command stdout and patch bodies."
+That was measurably true — 0 of the 30,921 tool calls in one archived team retained either field —
+and it is the whole reason 3.59 GB of vendor JSONL under gitignored `teams/*/source_snapshots/`
+could not be deleted.
+
+The text now goes to `teams/<slug>/payloads/`, a provider-neutral content-addressed tree written by
+every ingest for every provider:
+
+- `payloads/<xx>.jsonl` — up to 256 shards named by the first byte of the digest. Each line is one
+  canonical JSON object, `{"sha256":…,"text":…}`, sorted by digest within the shard. Because
+  `sha256` sorts before `text` and a digest needs no JSON escaping, the digest of a record occupies
+  a fixed byte range of its line; indexing a shard is a slice per line and parses no JSON. One new
+  payload rewrites one shard, so a repeat ingest changes zero files.
+- `payloads/manifest.json` — records, text bytes, and the content address of every shard.
+
+`raw/team.json` keeps only a reference per field: `{"sha256", "byte_length"}`, emitted only when
+set so every archive written before this stays byte-identical until its next ingest. The byte
+length is load-bearing, not decoration: it is what lets a pruned archive still say exactly what it
+no longer holds, instead of presenting as a tool call that produced nothing.
+
+**The tree is gitignored, beside `source_snapshots/` and not under `raw/`.** That placement is what
+makes storing this content safe at all. Command stdout and patch bodies carry file contents,
+absolute paths under the operator's home directory, and whatever credentials leaked into a log
+line; `test_ingest_never_persists_cwd_or_repository_credentials` pins the promise that tracked
+files do not. The split keeps both properties: the model stays small and tracked, the bulk stays
+large and ignored, and either can be pruned, permissioned, encrypted or moved to cold storage
+without the other noticing. Materialization is explicit — `pipeline.rehydrate_tool_payloads`, never
+`load_archived_team`, which would pay 290 MB on one measured team to serve callers that want the
+graph.
+
+Merging is a union keyed on the digest and can never shrink the tree, for the reason task-note
+promotion cannot: this is the archive's copy. Content addressing makes "first wins" degenerate
+rather than a policy, which is why a payload carries no provenance fields — a task note's identity
+is a mutable upstream row id and its body can change beneath it, while a payload's identity *is*
+its body. Two different payloads under one digest is a refusal.
+
+A shard the manifest records and the tree no longer has is a prune, which is supported, so it is
+dropped from the manifest and reported on the ingest receipt rather than refused: refusing would
+have made the documented operation freeze the team on every subsequent ingest, including the one
+re-observing the very bytes that had been removed. A shard that is *present* but no longer hashes
+to its recorded digest is the state content addressing is not supposed to reach, so before its
+recorded byte count is carried forward it is checked against the bytes, and a disagreement is
+re-measured and reported — otherwise the merge rewrites the manifest over the loss and
+`verify_payload_store` reports the tree clean afterwards. Untouched shards are still not re-hashed;
+that whole-tree pass has a name and a caller of its own.
+
+The tree is deliberately **not** bound into `raw/normalized-generation.json`. That marker exists to
+catch a stale generation, and a payload cannot be stale: its name is its content, a reference
+either resolves or does not, and the store never rewrites a record. What the tree can be is
+incomplete — which is exactly the state prunability means, so binding it would make every prune a
+refusal on the next build and a re-ingest that recreated the removed bytes. `payloads/manifest.json`
+records each shard's content address, and `payloads.verify_payload_store` — run by the losslessness
+audit, never on the read path — is what compares the tree against it and reports a pruned shard as
+the absence it is.
+
+### The losslessness gate
+
+`agent-team-timeline audit-losslessness` re-enumerates each team's vendor rows independently of the
+reader and requires every one to fall under a rule in `losslessness._CODEX_RULES` that says what
+became of it, then checks the rule's claim against `raw/team.json` and the payload tree. It takes
+no lock, calls no model, and writes nothing.
+
+Three outcomes, deliberately distinct:
+
+- **unaccounted** — no rule matched. There is no catch-all rule, so a new Codex record type or a
+  renamed payload type fails on the first audit after it appears rather than being silently absent
+  from every archive built afterwards. Exit 1.
+- **unverified** — a rule matched and its claim was false: no event at the line a rule says one
+  exists at, a payload digest that does not resolve, or stored text that is not byte-identical to
+  the text re-derived from the vendor row. Exit 1.
+- **declared lossy** — a rule matched and its claim is that the content is *not* retained. Not a
+  failure; the inventory. `--require-lossless` turns it into exit 1, and that is the flag an actual
+  deletion should be gated on.
+
+The corpus is defined by `raw/source-manifest.json`, not by what `rglob` finds. An audit whose
+subject is whatever survived on disk cannot detect loss — deleting a rollout removes its rows from
+the enumeration, so the report gets greener the more is removed, and an emptied `source_snapshots/`
+reads as "0 rows in 0 files: vendor snapshots are redundant". Every recorded rollout is therefore
+required to be present and to hash to its recorded digest, which also catches the truncation
+`codex._complete_prefix` would otherwise absorb by silently dropping an incomplete tail.
+
+A rule may not claim more than its check proves, so rules were split until each claim was exactly
+checkable: `response_item/message` by role, `event_msg/item_completed` by item type. The check has
+to be about content wherever the claim is: a rule verified only by "some record cites this line"
+passes on an archive whose every message body has been blanked, so the rules that say a message is
+carried verbatim compare the text and the encrypted content against the vendor row, and the one
+that renders a goal into a line claims only that the objective survives inside it. Dispositions
+distinguish `redacted` — content deliberately not persisted, naming the policy — from `partial` and
+`dropped`, which are content the archive wanted and does not have. Bytes are attributed by whole
+row, exact for `dropped` and an upper bound for `partial`, and the report says so.
+
+**Coverage is Codex only.** Claude and Orc would each need their own row enumeration and rule
+table; the audit reports them as uncovered by name rather than omitting them, and an archive
+containing an uncovered team can be sound but never lossless.
+
 ## Orc snapshot transaction and compatibility contract
 
 Orc ingestion has two identities for every source. The logical identity is its original
@@ -409,11 +508,56 @@ The transaction is deliberately ordered:
 4. Normalize only that validated source set, then durably write the source manifest, artifact
    catalog, provider-neutral team data, and the raw source snapshot.
 5. Write `raw/normalized-generation.json` last. It binds the canonical source-manifest digest,
-   byte digest of `team.json`, artifact-catalog digest, normalizer schema, and semantic source
-   digest. Readers reject a missing or stale marker, so a crash between earlier writes cannot
-   expose a mixed generation.
+   byte digest of `team.json`, artifact-catalog digest, task-note digest, normalizer schema, and
+   semantic source digest. Readers reject a missing or stale marker, so a crash between earlier
+   writes cannot expose a mixed generation. A marker written before task notes were a record
+   family omits the task-note digest and is still accepted, so an existing archive keeps building
+   until its next ingest.
 6. Only after the marker is durable, garbage-collect unreferenced managed objects. A retry removes
    stale managed staging candidates and reconstructs or reuses the generation idempotently.
+
+### Task notes are records, not only messages
+
+A task note reaches the timeline twice, and the two copies answer different questions.
+
+`raw/team.json` holds the *message* it renders into — an `external_message` or
+`inter_agent_message` event whose text is `[<task-id> · <title>]\n\n<content>`, attributed to the
+coordinator or to the synthetic owner thread, and dropped entirely when it falls outside the ingest
+window. That is the reading copy.
+
+`raw/task-notes.jsonl` holds the *record*: one canonical JSON object per line, keyed on
+`(source_path, note_id)` and sorted by it, with the task id, title, content, creation instant,
+server author and task owner as separate fields, plus the provenance of the freeze: the projection
+policy, the content address of the projection generation the note was promoted from, and
+`upstream_present`. Nothing filters it and nothing rewrites it.
+
+The record file exists because Orc's `task_notes` table is mutable upstream and rows are really
+deleted from it — `orc-coord-014-hermit2` has 1,311 of 7,826 frozen notes with no live counterpart
+and `orc-coord-030-hermit3` has 75 of 5,079, so for those 1,386 notes the archive is the only copy
+anywhere. Until this file existed, that content was version-controlled only as the lossy message
+rendering, because the frozen projection that held it lives under gitignored `source_snapshots/`.
+
+`upstream_present` is the per-note answer to *which* ones those are, and it is the only field here
+that cannot be recomputed later. The projection has always carried `missing_note_count` and
+`missing_note_ids_sha256`, but a count and a digest do not name a note, and after
+`source_snapshots/` is deleted — the whole reason for promoting these records — the comparison can
+never be made again.
+
+Promotion is a union and never a recomputation: a note already in the file keeps its stored body
+and its stored provenance, an ingest that no longer observes it changes nothing, and only genuinely
+new notes are appended. That is what makes it idempotent — a repeat ingest promotes zero notes and
+writes zero bytes — and it is also why provenance is accurate: re-deriving it each run would
+restamp every record with the current projection generation, churning tens of megabytes for one
+appended note and asserting something false about the rest. The single exception is
+`upstream_present`, which latches from true to false when upstream deletes a note, because freezing
+it would answer the question correctly only for notes already deleted before this archive first
+ran. Immutable-core divergence between the stored record and the current source is a refusal, not a
+silent merge; enrichment divergence is not, because enrichment legitimately changes upstream and
+the frozen copy is deliberately older.
+
+`TeamData.task_notes` is the single model-level view. `load_archived_team` reattaches the records
+after reading `team.json`, so no consumer of the model needs to know the storage is split; the
+split exists only so the archive does not carry the same tens of megabytes twice.
 
 Modern Orc databases retain a historical `content_blocks` prefix while new records first appear in
 `messages`. Normalization is a stable block-ID union: existing content-block events keep their

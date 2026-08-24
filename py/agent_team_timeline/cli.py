@@ -20,6 +20,10 @@ from agent_team_timeline.glossary_audit import (
     format_glossary_audit,
 )
 from agent_team_timeline.identity import IdentityOverrides, parse_identity_overrides
+from agent_team_timeline.losslessness import (
+    audit_archive_losslessness,
+    format_losslessness_audit,
+)
 from agent_team_timeline.multi_team import build_combined_archive
 from agent_team_timeline.naming import AgentNameError
 from agent_team_timeline.orc import OrcContinuationSpec, OrcParseError
@@ -606,6 +610,42 @@ def _parser() -> argparse.ArgumentParser:
     )
     audit_glossary.set_defaults(handler="audit_glossary")
 
+    audit_lossless = sub.add_parser(
+        "audit-losslessness",
+        help="account for every vendor row against the archive; no lock, no model call",
+        description=(
+            "re-enumerate each team's vendor source snapshots and require every row to fall "
+            "under a declared rule saying what became of it, then check the rule's claim against "
+            "raw/team.json and the payload store. Exits 1 when a row matches no rule or a rule's "
+            "claim is false; exits 0, and reports the remaining inventory, when the archive's "
+            "account of itself holds. Run this before deleting source snapshots"
+        ),
+    )
+    audit_lossless.add_argument(
+        "--output", required=True, help="durable archive directory"
+    )
+    audit_lossless.add_argument(
+        "--team",
+        action="append",
+        default=[],
+        help="team slug to audit; repeat as needed (default: every archive team)",
+    )
+    audit_lossless.add_argument(
+        "--format",
+        choices=("text", "json"),
+        default="text",
+        help="report format (default: %(default)s)",
+    )
+    audit_lossless.add_argument(
+        "--require-lossless",
+        action="store_true",
+        help=(
+            "also exit 1 while any vendor row's content is still absent from the archive; this "
+            "is the check to gate an actual deletion on"
+        ),
+    )
+    audit_lossless.set_defaults(handler="audit_losslessness")
+
     query = sub.add_parser(
         "query", help="navigate a built timeline without starting the website",
         description="navigate a built timeline without starting the website",
@@ -854,6 +894,82 @@ def _print_retired_projections(report: IngestReport) -> None:
         f"{PROG}: {report.team_slug}: removed {report.retired_message_projections} retired "
         f"raw/messages/<thread-id>.json file(s) ({mib:.1f} MiB); the tool no longer writes that "
         "per-thread projection, which nothing read and which raw/team.json still fully describes",
+        file=sys.stderr,
+    )
+
+
+def _print_promoted_task_notes(report: IngestReport) -> None:
+    """Announce newly promoted task notes, on stderr, and say why the archive just grew.
+
+    Silent on the steady state, where the number is the handful of notes written upstream since
+    the last run and the operator learns nothing from being told. Loud exactly once per team, on
+    the ingest that first lifts an existing frozen projection into `raw/task-notes.jsonl`: that
+    run adds tens of megabytes of *tracked* files to a versioned archive, and an operator who
+    finds that in `git status` without having been told deserves better than guessing.
+
+    The wording names what is new rather than what changed, because the content itself is not new
+    -- it was already in the archive, inside gitignored `source_snapshots/`, one deletion away
+    from being gone. That is the sentence worth printing.
+    """
+
+    if report.newly_promoted_task_notes == 0:
+        return
+    print(
+        f"{PROG}: {report.team_slug}: promoted {report.newly_promoted_task_notes} task note(s) "
+        f"into raw/task-notes.jsonl ({report.task_notes} total); the archive now keeps this text "
+        "under version control instead of only inside gitignored source_snapshots/",
+        file=sys.stderr,
+    )
+    # And the number that makes the sentence above worth reading. These notes are gone upstream:
+    # the file just written is the only copy of them anywhere, which is a different claim from
+    # "the archive keeps a copy" and the one an operator should see before deciding what to back
+    # up. It is printed alongside the promotion rather than on its own line every run, because on
+    # the steady state nothing has been promoted and the standing count has not moved.
+    if report.task_notes_upstream_deleted:
+        print(
+            f"{PROG}: {report.team_slug}: {report.task_notes_upstream_deleted} of those notes no "
+            "longer exist in the upstream task table; for those this archive is the only copy",
+            file=sys.stderr,
+        )
+
+
+def _print_stored_payloads(report: IngestReport) -> None:
+    """Announce newly stored tool payloads, on stderr, and say where they went.
+
+    Loud exactly once per team, on the ingest that first rescues the command arguments and stdout
+    that `_archive_team` used to delete outright, because that run grows the operator's archive by
+    a fifth of the size of its vendor snapshots and they should learn it here rather than from
+    `df`. Silent on the steady state, where the number is whatever the agents have run since the
+    last ingest.
+
+    It says the tree is gitignored because that is the first question an operator will have about
+    hundreds of megabytes of command output appearing under `teams/`, and the answer -- the same
+    answer `source_snapshots/` has always had -- is the reason it is safe to keep at all.
+    """
+
+    # Said first and unconditionally, because unlike everything else in this function it is not
+    # news about growth. A shard whose bytes stopped matching the digest recorded for them is a
+    # state a content-addressed union should not be able to reach; the merge re-measured it rather
+    # than refusing, so this line is the only trace that anything was lost. A prune is quieter --
+    # it is a supported operation someone performed on purpose -- but it is still named, because a
+    # supported operation that leaves no record is indistinguishable from data loss later.
+    for shard in report.damaged_payload_shards:
+        print(f"{PROG}: {report.team_slug}: payload store: {shard}", file=sys.stderr)
+    if report.pruned_payload_shards:
+        print(
+            f"{PROG}: {report.team_slug}: {len(report.pruned_payload_shards)} payload shard(s) "
+            "recorded by the previous ingest are no longer in the tree; the manifest no longer "
+            "claims them",
+            file=sys.stderr,
+        )
+    if report.newly_stored_tool_payloads == 0:
+        return
+    mib = report.newly_stored_tool_payload_bytes / (1024 * 1024)
+    print(
+        f"{PROG}: {report.team_slug}: stored {report.newly_stored_tool_payloads} tool payload(s) "
+        f"({mib:.1f} MiB) into gitignored teams/{report.team_slug}/payloads/ "
+        f"({report.tool_payloads} total); the archive now keeps command arguments and output "
+        "instead of discarding them and deferring to the vendor logs",
         file=sys.stderr,
     )
 
@@ -1223,6 +1339,34 @@ def main(argv: Sequence[str] | None = None) -> int:
         except (OSError, ValueError) as error:
             print(f"{PROG}: {error}", file=sys.stderr)
             return 2
+    if handler == "audit_losslessness":
+        try:
+            lossless_report = audit_archive_losslessness(
+                _path(str(ns.output)),
+                _string_list(ns.team, "--team"),
+            )
+            lossless_format = str(ns.format)
+            if lossless_format not in {"text", "json"}:
+                raise ValueError(
+                    f"unsupported losslessness audit format {lossless_format!r}"
+                )
+            print(
+                format_losslessness_audit(
+                    lossless_report, "json" if lossless_format == "json" else "text"
+                ),
+                end="",
+            )
+        except (OSError, ValueError) as error:
+            print(f"{PROG}: {error}", file=sys.stderr)
+            return 2
+        # Exit 1, not 2: this is a finding about the archive, not a failure to run. `make` and CI
+        # both distinguish them, and an operator scripting a deletion behind this command needs
+        # "the gate says no" to be tellable from "the gate could not be evaluated".
+        if not lossless_report.sound:
+            return 1
+        if bool(ns.require_lossless) and not lossless_report.lossless:
+            return 1
+        return 0
     if handler == "ingest_project":
         project_started = utc_now()
         project_command = [PROG, *args]
@@ -1264,6 +1408,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(f"{team.team_slug} ({team.provider}):", end=" ")
                 _print_ingest(team.ingest)
                 _print_retired_projections(team.ingest)
+                _print_promoted_task_notes(team.ingest)
+                _print_stored_payloads(team.ingest)
                 _print_prefix_overrides(team.ingest)
             for failure in project_report.failures:
                 print(f"{PROG}: team {failure.summary}", file=sys.stderr)
@@ -1583,6 +1729,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             _print_ingest(ingest_report)
             _print_retired_projections(ingest_report)
+            _print_promoted_task_notes(ingest_report)
+            _print_stored_payloads(ingest_report)
             _print_prefix_overrides(ingest_report)
         refresh_handlers = ("refresh", "refresh_claude", "refresh_orc")
         if handler == "summarize" or handler in refresh_handlers:

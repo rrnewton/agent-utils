@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,8 +17,9 @@ from agent_team_timeline.archive import (
     as_object,
     as_string,
     canonical_json,
-    narrow_json,
+    canonical_jsonl,
     read_json,
+    read_jsonl,
     write_text_if_changed,
 )
 from agent_team_timeline.model import Event, TeamData, source_digest
@@ -538,28 +538,6 @@ def _record_sort_key(record: dict[str, JsonValue]) -> tuple[int, int, str, str]:
         as_string(record.get("team_slug"), "record.team_slug"),
         as_string(record.get("record_id"), "record.record_id"),
     )
-
-
-def _jsonl(records: Iterable[dict[str, JsonValue]]) -> str:
-    return "".join(
-        json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        + "\n"
-        for record in records
-    )
-
-
-def _load_jsonl(path: Path) -> list[dict[str, JsonValue]]:
-    if not path.exists():
-        return []
-    if path.is_symlink() or not path.is_file():
-        raise ValueError(f"managed transcript export is not a regular file: {path}")
-    result: list[dict[str, JsonValue]] = []
-    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-        if not line:
-            continue
-        value = narrow_json(json.loads(line), f"{path}:{line_number}")
-        result.append(as_object(value, f"{path}:{line_number}"))
-    return result
 
 
 def _prompt_authorship_rule_from_json(
@@ -1173,7 +1151,7 @@ def export_transcripts(
                 "monotonic transcript export cannot omit previously extracted teams: "
                 + ", ".join(omitted)
             )
-    previous_occurrences = _load_jsonl(root / "occurrences.jsonl")
+    previous_occurrences = read_jsonl(root / "occurrences.jsonl")
     configured_rules = (
         tuple(prompt_authorship_rules)
         if prompt_authorship_rules is not None
@@ -1248,10 +1226,10 @@ def export_transcripts(
     messages = sorted([*prompts, *responses], key=_record_sort_key)
 
     texts = {
-        "occurrences.jsonl": _jsonl(occurrences),
-        "prompts.jsonl": _jsonl(prompts),
-        "messages.jsonl": _jsonl(messages),
-        "system-inputs.jsonl": _jsonl(system_inputs),
+        "occurrences.jsonl": canonical_jsonl(occurrences),
+        "prompts.jsonl": canonical_jsonl(prompts),
+        "messages.jsonl": canonical_jsonl(messages),
+        "system-inputs.jsonl": canonical_jsonl(system_inputs),
     }
     rules_text = _rules_text(rules)
     changed = 0

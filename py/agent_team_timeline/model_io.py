@@ -8,7 +8,9 @@ from agent_team_timeline.model import (
     Agent,
     Edge,
     Event,
+    PayloadRef,
     SourceSnapshot,
+    TaskNote,
     TeamData,
     ToolCall,
     Turn,
@@ -61,6 +63,94 @@ def _items(root: Mapping[str, object], key: str) -> list[dict[str, object]]:
         _object(value, f"team.{key}[{index}]")
         for index, value in enumerate(_array(root.get(key), f"team.{key}"))
     ]
+
+
+def _payload_ref(value: object, where: str) -> PayloadRef | None:
+    """Decode a tool call's payload reference, absent in every pre-payload archive.
+
+    Strict about the field set for the same reason ``task_note_from_json_obj`` is: unlike the rest
+    of a tool call, the thing this points at is *not* re-derivable from ``raw/team.json``, and
+    once the vendor snapshots are gone it is not re-derivable at all. An unknown key means the
+    writer recorded something about the payload that this reader would carry forward without
+    understanding, and for a reference into a store that is the archive's only copy, that is worth
+    a refusal rather than a shrug.
+    """
+
+    if value is None:
+        return None
+    item = _object(value, where)
+    if set(item) != {"sha256", "byte_length"}:
+        raise ValueError(f"{where}: invalid payload reference fields: {sorted(item)!r}")
+    byte_length = _integer(item.get("byte_length"), f"{where}.byte_length")
+    if byte_length < 0:
+        raise ValueError(f"{where}.byte_length: expected a non-negative integer")
+    return PayloadRef(
+        sha256=_string(item.get("sha256"), f"{where}.sha256"), byte_length=byte_length
+    )
+
+
+def task_note_from_json_obj(value: object, where: str) -> TaskNote:
+    """Strictly decode one promoted task note.
+
+    Stricter than its neighbours in this module on purpose. The other record families are
+    rewritten wholesale from their source snapshots on every ingest, so a decode that quietly
+    accepted something wrong would be corrected by the next run. A task note is not rewritten:
+    once promoted it is carried forward from this file and nowhere else, so a field this decoder
+    lets through unexamined is a field nothing downstream will ever re-derive. Hence the exact
+    key set -- an unknown key means the writer knew something this reader does not, and merging
+    that record forward would silently drop it.
+    """
+
+    item = _object(value, where)
+    expected = {
+        "note_id",
+        "source_path",
+        "task_source_ordinal",
+        "task_id",
+        "title",
+        "content",
+        "created_at",
+        "server_author",
+        "task_owner",
+        "upstream_present",
+        "projection_policy",
+        "projection_sha256",
+    }
+    if set(item) != expected:
+        missing = sorted(expected - set(item))
+        unknown = sorted(set(item) - expected)
+        raise ValueError(
+            f"{where}: invalid task note fields: missing={missing!r}, unknown={unknown!r}"
+        )
+    upstream_present = item.get("upstream_present")
+    if not isinstance(upstream_present, bool):
+        raise ValueError(f"{where}.upstream_present: expected a boolean")
+    note_id = _integer(item.get("note_id"), f"{where}.note_id")
+    if note_id < 0:
+        raise ValueError(f"{where}.note_id: expected a non-negative integer")
+    ordinal = _integer(item.get("task_source_ordinal"), f"{where}.task_source_ordinal")
+    if ordinal < 0:
+        raise ValueError(f"{where}.task_source_ordinal: expected a non-negative integer")
+    return TaskNote(
+        note_id=note_id,
+        source_path=_string(item.get("source_path"), f"{where}.source_path"),
+        task_source_ordinal=ordinal,
+        task_id=_string(item.get("task_id"), f"{where}.task_id"),
+        title=_string(item.get("title"), f"{where}.title"),
+        content=_string(item.get("content"), f"{where}.content"),
+        created_at=_string(item.get("created_at"), f"{where}.created_at"),
+        server_author=_optional_string(
+            item.get("server_author"), f"{where}.server_author"
+        ),
+        task_owner=_optional_string(item.get("task_owner"), f"{where}.task_owner"),
+        upstream_present=upstream_present,
+        projection_policy=_optional_string(
+            item.get("projection_policy"), f"{where}.projection_policy"
+        ),
+        projection_sha256=_optional_string(
+            item.get("projection_sha256"), f"{where}.projection_sha256"
+        ),
+    )
 
 
 def team_from_json_obj(value: object) -> TeamData:
@@ -183,6 +273,12 @@ def team_from_json_obj(value: object) -> TeamData:
                 output_text=_optional_string(item.get("output_text"), "tool.output_text"),
                 nested_tools=nested,
                 source_line=_integer(item.get("source_line"), "tool.source_line"),
+                input_payload=_payload_ref(
+                    item.get("input_payload"), "tool.input_payload"
+                ),
+                output_payload=_payload_ref(
+                    item.get("output_payload"), "tool.output_payload"
+                ),
             )
         )
     edges = tuple(
@@ -204,6 +300,17 @@ def team_from_json_obj(value: object) -> TeamData:
         )
         for item in _items(root, "edges")
     )
+    # Absent, not empty, in every archive written before task notes became a record family, and
+    # absent again in every archive written after -- the ingest writer keeps them in
+    # `raw/task-notes.jsonl` and reattaches them. Decoding the key when it *is* present keeps
+    # `TeamData.to_json_obj` round-trippable, which the model tests rely on and which a caller
+    # serializing a complete team in memory has every right to expect.
+    task_notes = tuple(
+        task_note_from_json_obj(item, f"team.task_notes[{index}]")
+        for index, item in enumerate(
+            _array(root.get("task_notes", []), "team.task_notes")
+        )
+    )
     return TeamData(
         team_slug=_string(root.get("team_slug"), "team.team_slug"),
         provider=_string(root.get("provider"), "team.provider"),
@@ -215,6 +322,7 @@ def team_from_json_obj(value: object) -> TeamData:
         events=events,
         tool_calls=tuple(tools),
         edges=edges,
+        task_notes=task_notes,
         window_start_ms=_optional_integer(
             root.get("window_start_ms"), "team.window_start_ms"
         ),
@@ -222,4 +330,4 @@ def team_from_json_obj(value: object) -> TeamData:
     )
 
 
-__all__ = ["team_from_json_obj"]
+__all__ = ["task_note_from_json_obj", "team_from_json_obj"]

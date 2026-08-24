@@ -20,8 +20,10 @@ from agent_team_timeline.archive import (
     as_int,
     as_object,
     canonical_json,
+    canonical_jsonl,
     narrow_json,
     read_json,
+    read_jsonl,
     write_json_if_changed,
 )
 from agent_team_timeline.cli import main as timeline_main
@@ -34,6 +36,7 @@ from agent_team_timeline.orc import (
     snapshot_orc_lineage,
 )
 from agent_team_timeline.model import TeamData, source_digest
+from agent_team_timeline.payloads import load_payload_manifest, verify_payload_store
 from agent_team_timeline.phases import build_phases
 from agent_team_timeline.pipeline import (
     build_archive,
@@ -5394,3 +5397,320 @@ def test_orc_ingest_cli_authorizes_a_second_session_only_when_named(
         == 2
     )
     assert "names sessions outside this lineage" in capsys.readouterr().err
+
+
+def _promoted_task_note_records(archive: Path) -> tuple[dict[str, JsonValue], ...]:
+    path = archive / "teams" / "orc-test" / "raw" / "task-notes.jsonl"
+    return tuple(read_jsonl(path))
+
+
+def test_task_notes_are_promoted_into_the_normalized_model(tmp_path: Path) -> None:
+    """The notes become model records with provenance, stored once and not inside team.json."""
+
+    source, _, _ = _fixture(tmp_path)
+    archive = tmp_path / "archive"
+    team, report = ingest_orc(
+        archive, source, ROOT, "orc-test", "America/New_York"
+    )
+    _, projection = _manifest_task_projection(archive)
+    notes_path = archive / "teams" / "orc-test" / "raw" / "task-notes.jsonl"
+    raw_team = as_object(
+        read_json(archive / "teams" / "orc-test" / "raw" / "team.json"),
+        "team.json",
+    )
+
+    assert report.task_notes == 4
+    assert report.newly_promoted_task_notes == 4
+    assert [note.note_id for note in team.task_notes] == [1, 2, 3, 4]
+    assert [note.content for note in team.task_notes] == [
+        "First incarnation finding",
+        "Second incarnation result",
+        "",
+        "Exactly at exclusive end",
+    ]
+    assert {note.source_path for note in team.task_notes} == {".tg/project.db"}
+    assert {note.title for note in team.task_notes} == {"Audit the scheduler"}
+    assert {note.task_owner for note in team.task_notes} == {"worker"}
+    assert {note.upstream_present for note in team.task_notes} == {True}
+    assert {note.projection_policy for note in team.task_notes} == {
+        "frozen-note-history-v3"
+    }
+    assert {note.projection_sha256 for note in team.task_notes} == {
+        projection.get("sha256")
+    }
+    # One storage location, not two: the bytes live in the record file, and `team.json` keeps only
+    # the events they render into.
+    assert len(_promoted_task_note_records(archive)) == 4
+    assert "task_notes" not in raw_team
+    assert notes_path.read_text(encoding="utf-8").count("\n") == 4
+
+
+def test_task_note_deleted_upstream_survives_without_source_snapshots(
+    tmp_path: Path,
+) -> None:
+    """The point of the whole exercise: the archive outlives the row and the snapshot both.
+
+    Note 4 is deleted from the live task table, the way Orc really does delete notes -- 74 of the
+    4,583 in one real projection have no counterpart left upstream. Then `source_snapshots/` is
+    removed outright, standing in for the relocation this promotion is a prerequisite for. What
+    must remain readable afterwards is the note's exact text, from the version-controlled part of
+    the archive alone.
+    """
+
+    source, _, task_db = _fixture(tmp_path)
+    archive = tmp_path / "archive"
+    first, _ = ingest_orc(archive, source, ROOT, "orc-test", "America/New_York")
+    first_generation = {
+        note.note_id: note.projection_sha256 for note in first.task_notes
+    }
+    connection = sqlite3.connect(task_db)
+    try:
+        connection.execute("DELETE FROM task_notes WHERE id = 4")
+        connection.execute(
+            "INSERT INTO task_notes(task_id, content, created_at) VALUES "
+            "('task-a', 'Written after the deletion', '2026-07-22T05:00:00+00:00')"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    second, report = ingest_orc(
+        archive, source, ROOT, "orc-test", "America/New_York"
+    )
+    shutil.rmtree(archive / "teams" / "orc-test" / "source_snapshots")
+    reloaded = load_archived_team(archive, "orc-test")
+    survivor = next(note for note in reloaded.task_notes if note.note_id == 4)
+    appended = next(note for note in reloaded.task_notes if note.note_id == 5)
+
+    assert report.newly_promoted_task_notes == 1
+    assert report.task_notes == 5
+    assert [note.note_id for note in second.task_notes] == [1, 2, 3, 4, 5]
+    assert survivor.content == "Exactly at exclusive end"
+    assert survivor.created_at == "2026-07-22T04:00:00+00:00"
+    assert appended.content == "Written after the deletion"
+    # And the archive says, per note, that it is now the only copy of this one. The first ingest
+    # saw note 4 alive and recorded it as such; the second saw it gone and latched the field over.
+    # This is the fact `OrcTaskProjection.missing_note_count` counts and cannot name, and the only
+    # thing here that stops being computable the moment the snapshots are deleted -- which the
+    # `rmtree` two lines above has already done.
+    assert survivor.upstream_present is False
+    assert report.task_notes_upstream_deleted == 1
+    assert {
+        note.note_id: note.upstream_present
+        for note in reloaded.task_notes
+        if note.note_id != 4
+    } == {1: True, 2: True, 3: True, 5: True}
+    assert appended.upstream_present is True
+    # Provenance is recorded once and never restamped: the four original notes still name the
+    # generation they were promoted from, and only the new note names the current one.
+    assert {
+        note.note_id: note.projection_sha256
+        for note in reloaded.task_notes
+        if note.note_id <= 4
+    } == first_generation
+    assert appended.projection_sha256 not in set(first_generation.values())
+
+
+def test_promoted_task_notes_are_not_reimported_on_a_repeat_ingest(
+    tmp_path: Path,
+) -> None:
+    """An ingest that observes nothing new must promote nothing and rewrite no bytes."""
+
+    source, _, task_db = _fixture(tmp_path)
+    archive = tmp_path / "archive"
+    ingest_orc(archive, source, ROOT, "orc-test", "America/New_York")
+    notes_path = archive / "teams" / "orc-test" / "raw" / "task-notes.jsonl"
+    after_first = notes_path.read_bytes()
+
+    _, repeated = ingest_orc(
+        archive, source, ROOT, "orc-test", "America/New_York"
+    )
+
+    assert repeated.newly_promoted_task_notes == 0
+    assert repeated.task_notes == 4
+    assert repeated.files_changed == 0
+    assert notes_path.read_bytes() == after_first
+
+    _append_task_note(task_db, "One more note")
+    _, extended = ingest_orc(
+        archive, source, ROOT, "orc-test", "America/New_York"
+    )
+
+    assert extended.newly_promoted_task_notes == 1
+    assert extended.task_notes == 5
+    # Append-only in the literal sense: the previously promoted records are byte-identical, so a
+    # version-controlled archive sees a one-line diff rather than a whole-file restamp.
+    assert notes_path.read_bytes().startswith(after_first)
+
+
+def test_promoted_task_note_disagreeing_about_its_core_is_refused(
+    tmp_path: Path,
+) -> None:
+    """Two copies of one note that differ in the fields Orc never edits is a refusal.
+
+    Reachable only when the promoted file and the frozen projection have been made to disagree --
+    the snapshot layer refuses a rewritten note before this ever sees it. That is exactly why the
+    check belongs here too: this file is the copy nothing else can reconstruct, so the one place
+    that must never quietly choose a winner is the merge that carries it forward.
+    """
+
+    source, _, _ = _fixture(tmp_path)
+    archive = tmp_path / "archive"
+    ingest_orc(archive, source, ROOT, "orc-test", "America/New_York")
+    notes_path = archive / "teams" / "orc-test" / "raw" / "task-notes.jsonl"
+    promoted = pipeline_module._load_promoted_task_notes(archive, "orc-test")
+    tampered = tuple(
+        replace(note, content="not what was promoted") if note.note_id == 2 else note
+        for note in promoted
+    )
+    notes_path.write_text(
+        canonical_jsonl(
+            as_object(narrow_json(note.to_json_obj()), "note") for note in tampered
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="disagrees with the current source"):
+        ingest_orc(archive, source, ROOT, "orc-test", "America/New_York")
+
+
+def test_promoted_task_notes_out_of_order_are_refused(tmp_path: Path) -> None:
+    """A duplicated or misordered key would let one record hide another; refuse instead."""
+
+    source, _, _ = _fixture(tmp_path)
+    archive = tmp_path / "archive"
+    ingest_orc(archive, source, ROOT, "orc-test", "America/New_York")
+    notes_path = archive / "teams" / "orc-test" / "raw" / "task-notes.jsonl"
+    promoted = pipeline_module._load_promoted_task_notes(archive, "orc-test")
+    notes_path.write_text(
+        canonical_jsonl(
+            as_object(narrow_json(note.to_json_obj()), "note")
+            for note in reversed(promoted)
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="not strictly ordered"):
+        load_archived_team(archive, "orc-test")
+
+
+def test_orc_ingest_stores_tool_payloads_outside_the_generation_marker(tmp_path: Path) -> None:
+    """The payload tree is provider-neutral, and the Orc marker deliberately does not bind it.
+
+    The marker exists to catch a *stale* generation, and a payload cannot be stale: its name is
+    its content and the store is a union that never rewrites a record. What it can be is
+    incomplete, which is the state the tree is designed to permit -- gitignored bulk an operator
+    may prune, permission or move. Binding it here would turn every one of those into a refusal on
+    the next build. This pins that: the tree can lose a whole shard and the archive still loads.
+    """
+
+    source, _, _ = _fixture(tmp_path)
+    archive = tmp_path / "archive"
+    _, report = ingest_orc(archive, source, ROOT, "orc-test", "America/New_York")
+    payload_root = archive / "teams" / "orc-test" / "payloads"
+
+    assert report.tool_payloads > 0
+    assert report.newly_stored_tool_payloads == report.tool_payloads
+    assert sorted(payload_root.glob("*.jsonl"))
+    assert verify_payload_store(payload_root) == ()
+
+    marker_path = archive / "teams" / "orc-test" / "raw" / "normalized-generation.json"
+    marker = as_object(read_json(marker_path), str(marker_path))
+    assert "payloads_sha256" not in marker
+
+    shutil.rmtree(payload_root)
+    load_archived_team(archive, "orc-test")
+
+
+def test_a_tampered_payload_shard_is_caught_by_verification(tmp_path: Path) -> None:
+    """Nothing checks shard bytes on the read path, so this is where that check lives."""
+
+    source, _, _ = _fixture(tmp_path)
+    archive = tmp_path / "archive"
+    ingest_orc(archive, source, ROOT, "orc-test", "America/New_York")
+    payload_root = archive / "teams" / "orc-test" / "payloads"
+    manifest = load_payload_manifest(payload_root)
+    assert manifest is not None
+    shard = sorted(payload_root.glob("*.jsonl"))[0]
+    shard.write_text("", encoding="utf-8")
+
+    # Still loads, because the model and its digests are intact and the tree is prunable by
+    # design -- at load time an emptied shard is indistinguishable from a pruned one.
+    load_archived_team(archive, "orc-test")
+
+    problems = verify_payload_store(payload_root)
+    assert any("do not match the digest recorded for them" in problem for problem in problems)
+
+
+def test_pre_promotion_generation_marker_still_builds(tmp_path: Path) -> None:
+    """An archive ingested before promotion existed keeps loading until its next ingest."""
+
+    source, _, _ = _fixture(tmp_path)
+    archive = tmp_path / "archive"
+    ingest_orc(archive, source, ROOT, "orc-test", "America/New_York")
+    marker_path = (
+        archive / "teams" / "orc-test" / "raw" / "normalized-generation.json"
+    )
+    marker = as_object(read_json(marker_path), str(marker_path))
+    del marker["task_notes_sha256"]
+    (archive / "teams" / "orc-test" / "raw" / "task-notes.jsonl").unlink()
+    write_json_if_changed(marker_path, narrow_json(marker))
+
+    team = load_archived_team(archive, "orc-test")
+
+    assert team.task_notes == ()
+
+    restored, report = ingest_orc(
+        archive, source, ROOT, "orc-test", "America/New_York"
+    )
+
+    assert report.newly_promoted_task_notes == 4
+    assert len(restored.task_notes) == 4
+    assert "task_notes_sha256" in as_object(
+        read_json(marker_path), str(marker_path)
+    )
+
+
+def test_a_task_note_holding_a_unicode_line_separator_stays_readable(
+    tmp_path: Path,
+) -> None:
+    """`raw/task-notes.jsonl` is the last copy of 1,386 notes; one character must not break it.
+
+    U+2028, U+2029 and U+0085 are line terminators to `str.splitlines` and ordinary characters to
+    JSON, which writes them raw because `canonical_jsonl` uses `ensure_ascii=False`. A reader that
+    split on them turned one record into two fragments, and since `load_archived_team` reads this
+    file on every load, one such note made the team permanently unloadable *and* un-reingestable
+    -- poisoned by content the archive itself had just written.
+    """
+
+    hostile = "line one\u2028line two\u2029ends\u0085here"
+    source, _, task_db = _fixture(tmp_path)
+    archive = tmp_path / "archive"
+    _append_task_note(task_db, hostile)
+    ingest_orc(archive, source, ROOT, "orc-test", "America/New_York")
+
+    reloaded = load_archived_team(archive, "orc-test")
+    survivor = next(note for note in reloaded.task_notes if note.content == hostile)
+
+    assert survivor.content == hostile
+    assert len(_promoted_task_note_records(archive)) == 5
+    # And the file is still the accumulator the next ingest reads, which is where it broke before.
+    _, repeated = ingest_orc(archive, source, ROOT, "orc-test", "America/New_York")
+    assert repeated.newly_promoted_task_notes == 0
+    assert repeated.task_notes == 5
+
+
+def test_the_record_file_primitives_round_trip_every_json_string(tmp_path: Path) -> None:
+    """`canonical_jsonl` and `read_jsonl` are one contract and are tested as one."""
+
+    path = tmp_path / "records.jsonl"
+    records: tuple[dict[str, JsonValue], ...] = (
+        {"text": "plain"},
+        {"text": "sep\u2028para\u2029nel\u0085end"},
+        {"text": "tab\tcarriage\rnewline\nquote\""},
+        {"text": ""},
+    )
+    path.write_text(canonical_jsonl(records), encoding="utf-8")
+
+    assert path.read_text(encoding="utf-8").count("\n") == 4
+    assert tuple(read_jsonl(path)) == records
