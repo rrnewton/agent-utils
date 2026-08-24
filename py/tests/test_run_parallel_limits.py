@@ -693,7 +693,10 @@ def test_overbudget_self_managed_width_refuses_before_spawn(
     assert result.max_concurrent_steps == 0
     assert not marker.exists()
     assert "cannot lower guest parallelism" in capsys.readouterr().err
-    with pytest.raises(ValueError, match="empty effective jobs_flag"):
+    # The condition widened: a step is unresizable when it offers NEITHER a jobs_flag NOR an
+    # env channel. The message must still name the step AND tell the operator which knob to
+    # set, so this asserts both rather than a loose substring.
+    with pytest.raises(ValueError, match="offer no width channel"):
         Runner(cfg, max_steps=1, max_cpus=2, cgroups=NoopCgroups(), verbosity=0)
 
     # An intentional pre-execution skip can never spawn, so its dormant width must not reject the
