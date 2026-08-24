@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import signal
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -77,6 +78,23 @@ CPU_TIMEOUT_PLATFORM_ENV = "DAGRUN_CPU_TIMEOUT_PLATFORM"
 #: Default template for the inner-parallelism (concurrency) flag appended to a step's command
 #: when the step declares ``preferred_inner_jobs``. See :func:`render_jobs_flag`.
 DEFAULT_JOBS_FLAG = "-j"
+
+#: MACHINE-LEVEL name of the environment variable through which this host delivers a step's
+#: inner width, for guests that read their worker count from the environment rather than argv
+#: (cargo's ``CARGO_BUILD_JOBS`` is the motivating case).
+#:
+#: WHY THIS IS A MACHINE KNOB AND NOT A GRAPH FIELD. How many workers a step should use is a
+#: property of the HOST; *which channel* a tool listens on is a property of the toolchain
+#: INSTALLED on that host. Neither is a property of the work, so neither belongs in a DAG. This
+#: mirrors :data:`CPU_TIMEOUT_PLATFORM_ENV`, which already scales a graph-declared budget per
+#: platform without editing the graph.
+#:
+#: It exists because an appended flag cannot reach every guest: a step whose command is a
+#: compound ``A && B`` would have the flag land only on ``B``, and a command ending in ``--``
+#: would pass it through to a program that has no such option. Those steps carry an empty
+#: ``jobs_flag`` today and are consequently unresizable, which makes the runner refuse them on
+#: any host too small for their declared width.
+JOBS_ENV_ENV = "SAFE_CI_DAG_RUNNER_JOBS_ENV"
 
 
 class StepClass(Enum):
@@ -180,6 +198,10 @@ class Step:
     # (the step manages a fixed declared width, which the planner cannot resize). See
     # render_jobs_flag for the template forms.
     jobs_flag: str | None = None
+    # Environment variable through which THIS step's guest accepts its worker count. None
+    # inherits DagConfig.default_jobs_env (normally set from $SAFE_CI_DAG_RUNNER_JOBS_ENV by the
+    # host, not by the graph); "" disables the env channel for this step specifically.
+    jobs_env: str | None = None
     # A typed, pre-execution omission. This is not PASS and is kept separate from
     # dependency-skipped nodes in RunResult. Unknown strings are rejected by the loader.
     skip_reason: IntentionalSkipReason | None = None
@@ -218,6 +240,71 @@ def effective_jobs_flag(step: Step, default_jobs_flag: str) -> str:
     """The jobs-flag template in effect for a step: its own ``jobs_flag`` overrides the
     DagConfig-level default; ``None`` inherits the default."""
     return step.jobs_flag if step.jobs_flag is not None else default_jobs_flag
+
+
+_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def resolve_jobs_env(
+    explicit: str | None = None,
+    env: Mapping[str, str] | None = None,
+) -> str:
+    """Resolve this machine's inner-width ENV channel name.
+
+    Precedence: an explicit caller value wins over $SAFE_CI_DAG_RUNNER_JOBS_ENV, which wins over
+    "" (this machine offers no env channel).
+
+    A MALFORMED NAME IS REFUSED rather than silently ignored, for the same reason
+    :func:`resolve_cpu_timeout_multiplier` refuses one: a typo that quietly disabled the channel
+    would turn every self-managed step back into a hard refusal on a small host, and the operator
+    would see a capacity error rather than the configuration mistake that caused it.
+    """
+    environ = os.environ if env is None else env
+    raw = (explicit if explicit is not None else environ.get(JOBS_ENV_ENV) or "").strip()
+    if not raw:
+        return ""
+    if not _ENV_NAME_RE.match(raw):
+        raise ValueError(
+            f"{JOBS_ENV_ENV}={raw!r} is not a valid environment variable name"
+        )
+    return raw
+
+
+def effective_jobs_env(step: Step, default_jobs_env: str) -> str:
+    """The inner-width ENV channel in effect for a step: its own ``jobs_env`` overrides the
+    DagConfig-level default; ``None`` inherits the default."""
+    return step.jobs_env if step.jobs_env is not None else default_jobs_env
+
+
+def env_with_inner_jobs(
+    step: Step, default_jobs_env: str, inner_jobs: int | None
+) -> dict[str, str]:
+    """The environment overlay carrying a step's inner width, when this machine offers a channel.
+
+    Returns ``{}`` when the step declares no width or no channel is configured, so a host that
+    sets nothing behaves exactly as before. The value is the SAME width the flag path would
+    render, so the two channels cannot disagree.
+    """
+    if inner_jobs is None:
+        return {}
+    name = effective_jobs_env(step, default_jobs_env).strip()
+    if not name:
+        return {}
+    return {name: str(inner_jobs)}
+
+
+def step_width_is_resizable(step: Step, default_jobs_flag: str, default_jobs_env: str) -> bool:
+    """Can the runner actually lower this step's declared inner width?
+
+    True when EITHER channel is available. This is the predicate the capacity refusal keys on:
+    a step that offers neither channel bakes its width into its own command, so clamping its
+    cgroup quota alone would leave the original worker count running inside a smaller box --
+    a slowdown disguised as a limit, which is the outcome the refusal exists to prevent.
+    """
+    return bool(
+        effective_jobs_flag(step, default_jobs_flag).strip()
+        or effective_jobs_env(step, default_jobs_env).strip()
+    )
 
 
 def command_with_inner_jobs(
@@ -487,6 +574,10 @@ class DagConfig:
     default_step_timeout: int = 0
     # Default inner-parallelism flag template for steps that don't set their own `jobs_flag`.
     default_jobs_flag: str = DEFAULT_JOBS_FLAG
+    # Default inner-parallelism ENV channel for steps that don't set their own `jobs_env`.
+    # Normally resolved from $SAFE_CI_DAG_RUNNER_JOBS_ENV (see resolve_jobs_env) so the HOST
+    # declares it, not the graph. Empty means this machine offers no env channel.
+    default_jobs_env: str = ""
     # --- Deliberately SMALL default caps applied to a step that DECLARES NOTHING ---
     # The forcing function (see the module-level DEFAULT_SMALL_* constants): an undeclared step is
     # boxed into a tight floor so it must declare its real needs. These are active by default; the
@@ -548,6 +639,7 @@ DAG_CONFIG_FIELDS: tuple[str, ...] = (
     "outer_mem_safety_factor",
     "default_step_timeout",
     "default_jobs_flag",
+    "default_jobs_env",
     "default_step_mem_cap_bytes",
     "default_step_cpu_count",
     "default_step_cpu_timeout",
@@ -626,6 +718,7 @@ def dag_config_carry_diff(frm: DagConfig, to: DagConfig) -> list[str]:
         ),
         ("default_step_timeout", frm.default_step_timeout, to.default_step_timeout),
         ("default_jobs_flag", frm.default_jobs_flag, to.default_jobs_flag),
+        ("default_jobs_env", frm.default_jobs_env, to.default_jobs_env),
         (
             "default_step_mem_cap_bytes",
             _render_opt_int(frm.default_step_mem_cap_bytes),
