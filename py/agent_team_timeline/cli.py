@@ -730,6 +730,28 @@ def _parser() -> argparse.ArgumentParser:
             help="select human, bot, or all prompt authorship (default: %(default)s)",
         )
         query_transcript.add_argument(
+            "--limit",
+            type=int,
+            default=None,
+            metavar="N",
+            help="return at most N records from the start of the selection",
+        )
+        query_transcript.add_argument(
+            "--tail",
+            type=int,
+            default=None,
+            metavar="N",
+            help="return the last N records of the selection",
+        )
+        query_transcript.add_argument(
+            "--verify",
+            action="store_true",
+            help=(
+                "re-read every consulted projection end to end and reproduce its manifest "
+                "digest, and resolve prompt/response linkage by full scan rather than seek"
+            ),
+        )
+        query_transcript.add_argument(
             "--team", action="append", default=[], help="team slug; repeat as needed"
         )
         query_transcript.add_argument("--start-time", help="inclusive RFC3339 instant")
@@ -1262,7 +1284,13 @@ def _run_query(ns: argparse.Namespace, handler: str) -> int:
             limit=int(ns.limit),
         )
     elif handler in {"query_prompts", "query_messages"}:
-        transcript_query = TranscriptQuery(output)
+        raw_limit: object = ns.limit
+        raw_tail: object = ns.tail
+        if raw_limit is not None and not isinstance(raw_limit, int):
+            raise ValueError("--limit must be an integer")
+        if raw_tail is not None and not isinstance(raw_tail, int):
+            raise ValueError("--tail must be an integer")
+        transcript_query = TranscriptQuery(output, verify=bool(ns.verify))
         raw_range: object = ns.ordinal_range
         ordinal_range = (
             parse_ordinal_range(raw_range) if isinstance(raw_range, str) else None
@@ -1270,11 +1298,19 @@ def _run_query(ns: argparse.Namespace, handler: str) -> int:
         command = "prompts" if handler == "query_prompts" else "messages"
         items = (
             transcript_query.list_prompts(
-                _query_filters(ns), ordinal_range, str(ns.which)
+                _query_filters(ns),
+                ordinal_range,
+                str(ns.which),
+                limit=raw_limit,
+                tail=raw_tail,
             )
             if handler == "query_prompts"
             else transcript_query.list_messages(
-                _query_filters(ns), ordinal_range, str(ns.which)
+                _query_filters(ns),
+                ordinal_range,
+                str(ns.which),
+                limit=raw_limit,
+                tail=raw_tail,
             )
         )
     elif handler == "query_stats":

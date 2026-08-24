@@ -1510,9 +1510,9 @@ def _load_orc_source_manifest(
         return _OrcManifestState((), (), requested_specs)
     obj = as_object(read_json(path), str(path))
     schema_version = as_int(obj.get("schema_version"), f"{path}: schema_version")
-    if schema_version not in (1, 2, 3, 4) or obj.get("provider") != "orc":
+    if schema_version not in (1, 2, 3, 4, 5) or obj.get("provider") != "orc":
         raise OrcParseError(f"invalid Orc source manifest at {path}")
-    if schema_version in (2, 3, 4):
+    if schema_version in (2, 3, 4, 5):
         expected_fields = {
             "schema_version",
             "provider",
@@ -1522,7 +1522,7 @@ def _load_orc_source_manifest(
             "date_window",
             "sources",
         }
-        if schema_version in (3, 4):
+        if schema_version in (3, 4, 5):
             expected_fields.add("continuation_sessions")
         if set(obj) != expected_fields:
             missing = sorted(expected_fields - set(obj))
@@ -1561,15 +1561,15 @@ def _load_orc_source_manifest(
             OrcSourceCopy.from_json_obj(
                 source,
                 f"{path}: sources[{index}]",
-                2 if schema_version in (3, 4) else schema_version,
+                2 if schema_version in (3, 4, 5) else schema_version,
             )
         )
     links: list[OrcContinuationLink] = []
     raw_continuations = obj.get("continuation_sessions")
     if raw_continuations is not None:
-        if schema_version not in (3, 4):
+        if schema_version not in (3, 4, 5):
             raise OrcParseError(
-                f"{path}: continuation_sessions requires manifest schema version 3 or 4"
+                f"{path}: continuation_sessions requires manifest schema version 3, 4 or 5"
             )
         for index, raw_link in enumerate(
             as_array(raw_continuations, f"{path}: continuation_sessions")
@@ -1580,15 +1580,33 @@ def _load_orc_source_manifest(
             has_bounded_fields = (
                 "start_message_id" in link or "start_source_line" in link
             )
+            has_boundary_table = "predecessor_source_table" in link
             if schema_version == 3 and has_bounded_fields:
                 raise OrcParseError(
                     f"{path}: schema-v3 continuation record cannot contain bounded fields"
                 )
-            if schema_version == 4 and not (
+            if schema_version in (3, 4) and has_boundary_table:
+                raise OrcParseError(
+                    f"{path}: schema-v{schema_version} continuation record cannot "
+                    "name a predecessor boundary table"
+                )
+            if schema_version in (4, 5) and not (
                 "start_message_id" in link and "start_source_line" in link
             ):
                 raise OrcParseError(
-                    f"{path}: schema-v4 continuation record lacks bounded fields"
+                    f"{path}: schema-v{schema_version} continuation record lacks "
+                    "bounded fields"
+                )
+            # v5 is the version at which the boundary ordinal stopped being a bare integer whose
+            # table had to be re-derived at read time. The key must be present; its *value* may
+            # still be null, because a boundary whose ordinal resolves identically in both candidate
+            # tables is deliberately left unresolved rather than guessed. Presence is therefore the
+            # only thing worth demanding: it distinguishes "a table-aware writer looked at this
+            # link" from "this link predates the question".
+            if schema_version == 5 and not has_boundary_table:
+                raise OrcParseError(
+                    f"{path}: schema-v5 continuation record lacks its "
+                    "predecessor_source_table field"
                 )
             links.append(
                 OrcContinuationLink.from_json_obj(
@@ -1688,7 +1706,7 @@ def _ingest_orc_locked(
         archive, team, ((), ()), identity_overrides
     )
     source_manifest: dict[str, object] = {
-        "schema_version": 4 if snapshot.continuations else 2,
+        "schema_version": 5 if snapshot.continuations else 2,
         "provider": "orc",
         "root_session_id": root_session_id,
         "source_root": str(source_root.resolve()),
@@ -1787,7 +1805,7 @@ def load_archived_team(archive: Path, team_slug: str) -> TeamData:
         )
         if (
             source_manifest.get("provider") == "orc"
-            and source_manifest.get("schema_version") in (2, 3, 4)
+            and source_manifest.get("schema_version") in (2, 3, 4, 5)
         ):
             _validate_normalized_generation(archive, team_slug, team)
     return team

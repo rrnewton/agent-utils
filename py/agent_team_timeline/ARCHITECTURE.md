@@ -112,6 +112,29 @@ ordinary publication race without unbounded disk growth. Scope narrowing or a te
 disables the grace and purges dereferenced objects immediately so an export cannot retain data
 outside its declared slice.
 
+Builds also project schema 1 into schema 3, the chunked seekable layout, beside the older two.
+`data/timeline-v3.json` is its bootstrap: identity, time range, team records, the codec
+parameters, and a catalogue of every shard with its record count, byte counts, time bounds and
+both digests. Aggregate activity bins are **not** inlined there — they are their own shard — which
+is why the schema-3 bootstrap is 88,239 bytes where the schema-2 bootstrap is 5,702,530. Shards
+are multi-member gzip files of minified JSONL, one record per line, written and indexed by the
+seekable JSONL codec: `data/timeline-v3/timeline/<team>/<UTC-day>.jsonl.gz` for events, phases and
+message edges, `data/timeline-v3/spine/<team>.jsonl.gz` for the records with no single instant
+(team, agents, phase cards, structural edges, rollups, projects, summary files, glossary, project
+overview), and `data/timeline-v3/bins.jsonl.gz` for activity bins across all teams. Each shard has
+a `.index.jsonl` sidecar giving per-member byte offsets, line ranges and time bounds, so a window
+read costs the size of the answer; the spine additionally publishes each record kind's line range
+in the bootstrap, because it has no time axis to seek on. A schema-3 shard exists **once** — there
+is no uncompressed twin — and every line carries `record_kind` plus the sort instant `at_ms`,
+which are the only two fields added to the schema-1 record. Records are filed by their own instant
+rather than duplicated into every day they span; each shard entry publishes `t_end_exclusive`,
+the smallest instant at which nothing in the shard is still live, so a reader rendering `[T0, T1)`
+selects shards by `t0 < T1 and t_end_exclusive > T0`. Everything there is half-open, records
+included: a phase and a bin reach to their own `end_ms`, and an event or edge reaches one
+millisecond past the instant it occupies. Over the whole measured archive schema 3 is 37,963,770
+bytes against 280,971,189 for schema 1 and 1,503,831,881 for schema 2, and adding one day rewrites
+387,547 of those bytes. Nothing reads schema 3 yet; it is published so that something can.
+
 The browser does not infer complete statistics from a partially loaded set of days. It uses the
 global aggregate only for an unfiltered full-range view, computes narrower totals only when every
 overlapping day is resident, and otherwise marks event counts unavailable. Opening an agent
@@ -129,8 +152,15 @@ schema-1 `data/timeline.json` monolith—use `public, no-cache`: browsers may st
 revalidate before reuse. Only a filename containing a complete 64-hex content digest receives a
 one-year immutable policy; phase IDs are stable identities rather than content hashes and therefore
 remain revalidated. The browser uses normal fetch caching, allowing a matching ETag to produce a
-304 response. The built-in handler disables directory listing so generated object and transcript
-filenames cannot be enumerated through the server.
+304 response. Each ETag is computed once per distinct version of a file, keyed by device, inode and
+`mtime`, so a 304 costs a stat rather than a full re-read of the object it declines to send. The
+handler also answers a single `Range` header with `206` and a `Content-Range`, advertising
+`Accept-Ranges: bytes` on every response, which is what lets a reader fetch one gzip member of a
+schema-3 shard at the offset its sidecar index published. Ranges and content coding are never
+combined: a range always addresses the identity representation, because half a gzip stream is not
+half a document. A multi-range request, or a range wider than 16 MiB, is answered with the whole
+representation instead, which is always a legal answer. The built-in handler disables directory
+listing so generated object and transcript filenames cannot be enumerated through the server.
 
 The browser first probes schema 2, then falls back to schema 1 when the bootstrap is absent (or when
 an incomplete schema-2 publication cannot be read). At aggregate zoom it uses bootstrap activity
@@ -645,10 +675,30 @@ last source record, the successor start, and their gap. A bounded successor addi
 source-native message ID and resolved row inside a reused root. Source discovery and normalization
 apply that boundary before summary inputs are formed: inactive pre-boundary descendants and
 unrelated task databases are excluded, retained agent lifetimes are clamped, and task notes shared
-across roots are partitioned at the frozen boundaries. Source-manifest schema 4 records bounded
-links; schemas 2 and 3 remain readable. The Orc normalized-generation schema is versioned
-separately so a binary that changes these normalization rules refuses stale generated data until a
-mechanical reingest repairs it.
+across roots are partitioned at the frozen boundaries. Source-manifest schema 5 records the table
+each boundary ordinal indexes; schema 4 records bounded links; schemas 2 and 3 remain readable. The
+Orc normalized-generation schema is versioned separately so a binary that changes these
+normalization rules refuses stale generated data until a mechanical reingest repairs it.
+
+A frozen boundary is a row ordinal, and an ordinal means nothing without the table it indexes. Orc
+moved its transcript storage from `content_blocks` to an append-only `messages` table, the two
+number their rows independently, and both tables coexist in a migrated database — so re-deriving
+the table at read time from whichever storage layout the database currently presents answers a
+different question than the one the ordinal was recorded against. That produced a refusal —
+"boundary row disappeared" — against wholly intact data, because the recorded ordinal was a
+`content_blocks` rowid far beyond the end of the `messages` table Orc had since added beside it. No
+single global answer can be right either: one measured lineage has two links whose ordinals resolve
+in *different* tables, so whichever table one answer picks, the other link fails.
+
+Schema 5 therefore records `predecessor_source_table` with the ordinal, and each source records
+`provider_schema_version` — Orc's own in-band `schema_version`, which no SQL in this module used to
+read, and whose absence is why storage-layout questions were being answered by guessing from which
+tables happen to exist. A link frozen before schema 5 names no table and is migrated by evidence
+rather than by layout: the ordinal is tried in every candidate table the database has, and only a
+table whose row carries exactly the recorded timestamp can win. Exactly one winner is adopted and
+written back, so the next run is unambiguous. No winner is a real refusal. More than one winner
+confirms the boundary — both readings assert the same thing — but leaves the table unrecorded,
+because a guess written into the manifest would be indistinguishable from an observation.
 
 Schema-v2 manifests and task projections are exact schemas: unknown and missing keys, malformed
 digests, noncanonical projection JSON, duplicate note IDs, unsafe relative paths, symlinked path

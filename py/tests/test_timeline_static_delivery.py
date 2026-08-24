@@ -6,7 +6,11 @@ import threading
 from pathlib import Path
 
 from agent_team_timeline.server import make_server
-from agent_team_timeline.standalone_server import accepts_gzip, cache_control_for_path
+from agent_team_timeline.standalone_server import (
+    accepts_gzip,
+    cache_control_for_path,
+    parse_byte_range,
+)
 from agent_team_timeline.static_assets import (
     deterministic_gzip,
     gzip_sidecar_path,
@@ -185,3 +189,130 @@ def test_only_complete_content_digest_filenames_are_immutable(tmp_path: Path) ->
     assert cache_control_for_path(tmp_path / "phase-0123456789abcdef.json") == (
         "public, no-cache"
     )
+
+
+def test_parse_byte_range_covers_the_forms_a_shard_reader_uses() -> None:
+    """Only what a sidecar-driven reader asks for, and nothing that needs a MIME body."""
+
+    assert parse_byte_range("bytes=0-99", 1_000) == (0, 99)
+    assert parse_byte_range("bytes=100-", 1_000) == (100, 999)
+    # A tail range is how a reader finds the last member with no sidecar to consult.
+    assert parse_byte_range("bytes=-500", 1_000) == (500, 999)
+    assert parse_byte_range("bytes=-5000", 1_000) == (0, 999)
+    # Clamped rather than refused: a client may legitimately not know the length.
+    assert parse_byte_range("bytes=900-99999", 1_000) == (900, 999)
+    # `first >= size` is unsatisfiable and comes back inverted, which is how the caller tells it
+    # apart from "no range here" and answers 416 instead of 200.
+    unsatisfiable = parse_byte_range("bytes=1000-1099", 1_000)
+    assert unsatisfiable is not None and unsatisfiable[1] < unsatisfiable[0]
+    # Everything this server declines to interpret returns None, and a None means 200.
+    for header in ("bytes=0-99,200-299", "items=0-99", "bytes=-", "bytes=abc", "bytes=-0", ""):
+        assert parse_byte_range(header, 1_000) is None
+
+
+def test_server_answers_a_byte_range_without_sending_the_whole_object(
+    tmp_path: Path,
+) -> None:
+    """A schema-3 reader must be able to fetch one member by the offset its sidecar published.
+
+    The archive shipped its own `serve.py` with no range support at all, so the layout designed
+    around byte offsets could not be read by the server published beside it. The assertions are
+    on the status, the `Content-Range` and the body length, because those are what a reader acts
+    on -- and on `Accept-Ranges`, because a capability nothing advertises is a capability nothing
+    uses.
+    """
+
+    payload = bytes(index % 251 for index in range(20_000))
+    (tmp_path / "shard.bin").write_bytes(payload)
+    (tmp_path / "index.html").write_text("ok", encoding="utf-8")
+    server = make_server(tmp_path, port=0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        port = int(server.server_address[1])
+        status, headers, body = _request(port, "GET", "/shard.bin")
+        assert status == 200
+        assert headers["accept-ranges"] == "bytes"
+        etag = headers["etag"]
+
+        status, headers, body = _request(
+            port, "GET", "/shard.bin", {"Range": "bytes=1000-1099"}
+        )
+        assert status == 206
+        assert headers["content-range"] == "bytes 1000-1099/20000"
+        assert headers["content-length"] == "100"
+        assert body == payload[1000:1100]
+
+        status, headers, body = _request(port, "GET", "/shard.bin", {"Range": "bytes=-50"})
+        assert status == 206
+        assert headers["content-range"] == "bytes 19950-19999/20000"
+        assert body == payload[-50:]
+
+        # Unsatisfiable: the client's idea of the file is stale and should be told so.
+        status, headers, body = _request(
+            port, "GET", "/shard.bin", {"Range": "bytes=20000-20099"}
+        )
+        assert status == 416
+        assert headers["content-range"] == "bytes */20000"
+        assert body == b""
+
+        # `If-Range` against the current validator is honoured; against a stale one it is not,
+        # and the whole representation is the only safe answer.
+        status, headers, body = _request(
+            port, "GET", "/shard.bin", {"Range": "bytes=0-9", "If-Range": etag}
+        )
+        assert status == 206
+        assert body == payload[:10]
+        status, headers, body = _request(
+            port,
+            "GET",
+            "/shard.bin",
+            {"Range": "bytes=0-9", "If-Range": '"sha256-' + ("0" * 64) + '"'},
+        )
+        assert status == 200
+        assert body == payload
+
+        # A multi-range request is answered whole rather than with a multipart body.
+        status, headers, body = _request(
+            port, "GET", "/shard.bin", {"Range": "bytes=0-9,20-29"}
+        )
+        assert status == 200
+        assert body == payload
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_a_range_request_is_never_answered_with_a_content_coding(tmp_path: Path) -> None:
+    """Byte offsets address the named file, so negotiation is off when a range is asked for.
+
+    Half a gzip stream is not half a document. Returning a slice of the `.gz` companion under
+    `Content-Encoding: gzip` would hand a client bytes it cannot decode and cannot tell apart
+    from the ones it asked for.
+    """
+
+    identity = b'{"event":"repeated timeline data"}\n' * 2_000
+    target = tmp_path / "data.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(identity)
+    (tmp_path / "index.html").write_text("ok", encoding="utf-8")
+    assert sync_gzip_sidecar(target) is True
+    server = make_server(tmp_path, port=0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        port = int(server.server_address[1])
+        status, headers, body = _request(
+            port,
+            "GET",
+            "/data.json",
+            {"Accept-Encoding": "gzip", "Range": "bytes=0-33"},
+        )
+        assert status == 206
+        assert "content-encoding" not in headers
+        assert body == identity[:34]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)

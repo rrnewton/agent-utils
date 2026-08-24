@@ -126,6 +126,18 @@ _SOURCE_STATE_DETACHED = "detached"
 _SESSION_STATE_SHIFT = 64
 _SESSION_STATE_MASK = (1 << _SESSION_STATE_SHIFT) - 1
 _SESSION_STATE_TAG = 1 << (_SESSION_STATE_SHIFT * 2)
+# The two tables a continuation boundary's row ordinal can ever have indexed, and the identity
+# column each of them numbers rows by. `messages` is the modern append-only transcript and numbers
+# its rows with an explicit `id`; `content_blocks` is the older per-block store whose ordinal is its
+# `rowid`. The ordinal itself is just an integer and says nothing about which of the two it came
+# from, which is exactly the ambiguity `OrcContinuationLink.predecessor_source_table` closes.
+#
+# Order matters only for the message a refusal prints; resolution never picks by position. See
+# `_resolve_continuation_boundary` for why a positional preference would be the wrong rule.
+_CONTINUATION_BOUNDARY_IDENTITY: Mapping[str, str] = {
+    "messages": "id",
+    "content_blocks": "rowid",
+}
 
 
 class OrcParseError(ValueError):
@@ -807,6 +819,20 @@ class OrcSourceCopy:
     # because that field's degradation describes Orc's rewritable conversation projection, and the
     # two events can and do occur together -- one `degradation_reason` string cannot hold both.
     append_prefix_override: OrcAppendPrefixOverride | None = None
+    # What Orc itself says its storage schema is, read from the in-band `schema_version` table of
+    # the snapshotted database and copied here verbatim. `None` means the database has no such
+    # table -- a genuinely older Orc that predates it -- and never means "we did not look".
+    #
+    # This field exists because an audit found that no SQL anywhere in this module selected it: every
+    # decision about Orc's storage layout was being made by duck-typing which tables happened to
+    # exist (`_session_storage_table`), and duck-typing is exactly what fails on a database caught
+    # mid-transition, where the *old* table still holds the rows and the *new* table already exists
+    # but is nearly empty. The recorded version does not by itself decide anything -- the boundary
+    # resolver deliberately uses evidence, not version numbers -- but it is the one fact that lets a
+    # human reading a manifest months later say "this source was schema 3 when we froze it and is
+    # schema 8 now", which is the sentence nobody could write while diagnosing the false positive
+    # that motivated it.
+    provider_schema_version: int | None = None
 
     def to_json_obj(self) -> dict[str, object]:
         """Return this validated source-copy record as a JSON object."""
@@ -844,6 +870,7 @@ class OrcSourceCopy:
                 if self.append_prefix_override is not None
                 else None
             ),
+            "provider_schema_version": self.provider_schema_version,
         }
 
     @classmethod
@@ -891,12 +918,14 @@ class OrcSourceCopy:
             alias_fields = canonical_fields | {
                 "semantic_alias_baseline_path",
             }
-            current_fields = alias_fields | {"append_prefix_override"}
+            override_fields = alias_fields | {"append_prefix_override"}
+            current_fields = override_fields | {"provider_schema_version"}
             if set(raw) not in (
                 legacy_fields,
                 lineage_fields,
                 canonical_fields,
                 alias_fields,
+                override_fields,
                 current_fields,
             ):
                 _require_exact_keys(raw, current_fields, where)
@@ -942,6 +971,7 @@ class OrcSourceCopy:
             source_state = _SOURCE_STATE_LIVE
             task_source_ordinal: int | None = 0 if kind == "task" else None
             append_prefix_override: OrcAppendPrefixOverride | None = None
+            provider_schema_version: int | None = None
         elif manifest_schema_version == 2:
             expected_snapshot_path = _snapshot_object_relative(sha256)
             if snapshot_path != expected_snapshot_path:
@@ -1067,6 +1097,14 @@ class OrcSourceCopy:
                     f"{where}.append_prefix_override.superseded_snapshot_path: the "
                     "pre-rewrite snapshot cannot be the current snapshot"
                 )
+            raw_provider_schema = raw.get("provider_schema_version")
+            provider_schema_version = (
+                None
+                if raw_provider_schema is None
+                else _positive_integer(
+                    raw_provider_schema, f"{where}.provider_schema_version"
+                )
+            )
         else:
             raise OrcParseError(
                 f"{where}: unsupported Orc manifest schema {manifest_schema_version}"
@@ -1142,6 +1180,7 @@ class OrcSourceCopy:
             task_projection=task_projection,
             captured_at=_required_string(raw.get("captured_at"), f"{where}.captured_at"),
             append_prefix_override=append_prefix_override,
+            provider_schema_version=provider_schema_version,
         )
 
 
@@ -1205,6 +1244,15 @@ class OrcContinuationLink:
     start_source_line: int | None
     started_at_ms: int
     gap_ms: int
+    # Which table `predecessor_source_line` is a row ordinal *in*. It belongs beside that field and
+    # is only last because a dataclass wants its defaulted fields last; the default exists so links
+    # frozen before this field was added decode without a migration pass over every archive.
+    #
+    # `None` means the table is not recorded, and that is a live state rather than purely a legacy
+    # one: `_resolve_continuation_boundary` declines to record a table when the ordinal resolves to
+    # the recorded timestamp in more than one candidate table, because writing a guess there would
+    # be indistinguishable from writing a fact.
+    predecessor_source_table: str | None = None
 
     def to_json_obj(self) -> dict[str, object]:
         """Return the exact durable continuation-boundary record."""
@@ -1214,6 +1262,7 @@ class OrcContinuationLink:
             "session_id": self.session_id,
             "predecessor_source_path": self.predecessor_source_path,
             "predecessor_source_line": self.predecessor_source_line,
+            "predecessor_source_table": self.predecessor_source_table,
             "predecessor_at_ms": self.predecessor_at_ms,
             "source_path": self.source_path,
             "start_message_id": self.start_message_id,
@@ -1238,8 +1287,9 @@ class OrcContinuationLink:
             "started_at_ms",
             "gap_ms",
         }
-        current_fields = legacy_fields | {"start_message_id", "start_source_line"}
-        if set(raw) not in (legacy_fields, current_fields):
+        bounded_fields = legacy_fields | {"start_message_id", "start_source_line"}
+        current_fields = bounded_fields | {"predecessor_source_table"}
+        if set(raw) not in (legacy_fields, bounded_fields, current_fields):
             _require_exact_keys(raw, current_fields, where)
         predecessor_session_id = _safe_component(
             _required_string(
@@ -1276,6 +1326,18 @@ class OrcContinuationLink:
             raw.get("predecessor_source_line"),
             f"{where}.predecessor_source_line",
         )
+        predecessor_source_table = _optional_string(
+            raw.get("predecessor_source_table"),
+            f"{where}.predecessor_source_table",
+        )
+        if (
+            predecessor_source_table is not None
+            and predecessor_source_table not in _CONTINUATION_BOUNDARY_IDENTITY
+        ):
+            raise OrcParseError(
+                f"{where}.predecessor_source_table: unsupported Orc boundary table "
+                f"{predecessor_source_table!r}"
+            )
         predecessor_at_ms = _nonnegative_integer(
             raw.get("predecessor_at_ms"), f"{where}.predecessor_at_ms"
         )
@@ -1305,6 +1367,7 @@ class OrcContinuationLink:
             start_source_line=start_source_line,
             started_at_ms=started_at_ms,
             gap_ms=gap_ms,
+            predecessor_source_table=predecessor_source_table,
         )
 
 
@@ -1568,6 +1631,12 @@ def _nonnegative_integer(value: object, where: str) -> int:
 def _integer(value: object, where: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise OrcParseError(f"{where}: expected an integer")
+    return value
+
+
+def _positive_integer(value: object, where: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise OrcParseError(f"{where}: expected a positive integer")
     return value
 
 
@@ -1849,6 +1918,45 @@ def _session_storage_table(
         return "content_blocks"
     raise OrcParseError(
         f"{where}: missing both modern messages and legacy conversation_state"
+    )
+
+
+def _provider_schema_version(path: Path, where: str) -> int | None:
+    """Read what Orc itself says this database's storage schema is.
+
+    Orc keeps a single-row `schema_version` table -- `id = 1`, a positive `version`, and the time it
+    was last migrated. Nothing in this module used to select it, which is how a whole family of bugs
+    got in: every question about storage layout was answered by looking at which tables exist, and
+    that answer is a *current* observation being applied to *historical* records.
+
+    Absent table means ``None`` and nothing else. That is a real, benign state -- Orc predates the
+    table -- and it is the only state that reads as "no version". A table that is present but does
+    not answer `SELECT version WHERE id = 1` is refused rather than recorded as ``None``, because
+    the two would then be indistinguishable and the second one is precisely the signal that Orc's
+    storage has changed shape again. Recording it as absent would reproduce, in the field intended
+    to prevent it, the silent-misread failure that motivated the field. A refusal here is one line
+    to fix once someone reads it; a silent ``None`` is another year of nobody noticing.
+    """
+
+    connection = _read_only(path)
+    try:
+        if "schema_version" not in _table_names(connection, where):
+            return None
+        raw = connection.execute(
+            "SELECT version FROM schema_version WHERE id = 1"
+        ).fetchone()
+    except sqlite3.Error as error:
+        raise OrcParseError(
+            f"{where}: Orc schema_version table is present but unreadable: {error}"
+        ) from error
+    finally:
+        connection.close()
+    if raw is None:
+        raise OrcParseError(
+            f"{where}: Orc schema_version table holds no version row"
+        )
+    return _positive_integer(
+        _row(raw, where)[0], f"{where}: schema_version.version"
     )
 
 
@@ -5138,10 +5246,20 @@ def _publish_staged_objects(
 
 
 def _session_record_timestamp(
-    connection: sqlite3.Connection, source_line: int, where: str
+    connection: sqlite3.Connection, source_line: int, where: str, table: str
 ) -> int | None:
-    table = _session_storage_table(connection, where)
-    identity = "id" if table == "messages" else "rowid"
+    """Read one row's timestamp from *table*, or ``None`` when that ordinal has no row there.
+
+    The table is a parameter rather than something this function decides. It used to decide, by
+    asking `_session_storage_table` which storage layout the database currently presents, and that
+    is precisely the bug this signature exists to make unrepresentable: a stored ordinal was written
+    against whichever table Orc was using *then*, and re-deriving the table *now* silently answers a
+    different question the moment the database has been migrated underneath the recorded link.
+    """
+
+    identity = _CONTINUATION_BOUNDARY_IDENTITY.get(table)
+    if identity is None:
+        raise OrcParseError(f"{where}: unsupported Orc boundary table {table!r}")
     raw = connection.execute(
         f"SELECT created_at_ms FROM {table} WHERE {identity} = ?",
         (source_line,),
@@ -5151,24 +5269,176 @@ def _session_record_timestamp(
     return _integer(_row(raw, where)[0], f"{where}: created_at_ms")
 
 
+def _resolve_continuation_boundary(
+    connection: sqlite3.Connection,
+    link: OrcContinuationLink,
+    index: int,
+    where: str,
+) -> str | None:
+    """Confirm a recorded boundary still holds, and say which table its ordinal indexes.
+
+    A link written since `predecessor_source_table` existed names its own table, so this is a single
+    lookup and any disagreement is real. A link written before it names no table, and the ordinal
+    alone cannot be resolved -- so this refuses to *choose* a table and instead makes the recorded
+    evidence do the choosing: try the ordinal in every candidate table the database actually has and
+    keep the ones whose row carries exactly the recorded `predecessor_at_ms`.
+
+    Three things were considered and rejected for that migration case:
+
+    * **Ask `_session_storage_table` which layout the database presents.** This is the behaviour
+      being fixed. It is not merely imprecise, it is unfixable in principle: one measured lineage
+      spans Orc's storage transition and has two links whose ordinals resolve in *different* tables
+      -- one in `content_blocks`, one in `messages` -- with both tables present in both predecessor
+      databases. Whichever table a single global answer picks, the other link is wrong.
+    * **Prefer one table and fall back to the other.** A preference silently picks a table whenever
+      the ordinal happens to exist in both, and "the row exists" is a far weaker coincidence than it
+      sounds: `content_blocks` and `messages` both start at 1 and both grow monotonically, so small
+      ordinals exist in both essentially always. On the measured lineage, ordinal 1762 exists in both
+      tables of the same database with *different* timestamps -- 1786759893720 in `messages`, which
+      is the recorded one, and 1786432513136 in `content_blocks`, which is nearly four days off.
+      Preference would have taken whichever table it was told to like and reported a false failure or,
+      worse, a false success.
+    * **Refuse the ingest until an operator names the table.** This turns a resolvable, evidence-backed
+      question into an interactive one, on a path an operator reaches only because their data is
+      intact. The evidence is already in the manifest; asking a human to retype it adds a way to be
+      wrong and removes none.
+
+    Exactly one agreeing table is adopted and returned so the next run is unambiguous. Zero agreeing
+    tables is a real refusal: the recorded evidence is nowhere in this database. More than one
+    agreeing table means both readings assert the same thing, so the boundary itself is confirmed --
+    but which table the ordinal *came from* is genuinely undetermined, and this returns ``None``
+    rather than freeze a coin flip into the manifest as though it had been observed.
+
+    **What the adopted table is, and is not, evidence of.** "Exactly one table holds this ordinal at
+    this instant" is a reading of the database in front of us, not a proof of provenance. A
+    predecessor whose true table was compacted -- the ordinal no longer present there -- while the
+    other table happens to carry that instant at that ordinal would be adopted under the other
+    table's name. The alternative rule, refusing whenever provenance cannot be *proved*, refuses
+    every un-tabled link in existence, which is the entire migration population and the exact false
+    refusal this function replaces. What is not weakened either way is the thing the field is used
+    for: `predecessor_at_ms` is confirmed against a real row before anything is adopted, and it is
+    the instant -- not the table -- that the boundary means. `predecessor_source_table` earns its
+    place by making the *next* read a single unambiguous lookup, and the append-prefix digest guard
+    refuses the predecessor mutations that would be needed to reach the compacted state at all.
+    """
+
+    tables = _table_names(connection, where)
+    recorded_table = link.predecessor_source_table
+    if recorded_table is not None:
+        if recorded_table not in tables:
+            raise OrcParseError(
+                f"recorded Orc continuation {index} boundary table "
+                f"{recorded_table!r} is absent from {where}"
+            )
+        observed = _session_record_timestamp(
+            connection, link.predecessor_source_line, where, recorded_table
+        )
+        if observed is None:
+            raise OrcParseError(
+                f"recorded Orc continuation {index} boundary row disappeared from "
+                f"{recorded_table}"
+            )
+        if observed != link.predecessor_at_ms:
+            raise OrcParseError(
+                f"recorded Orc continuation {index} boundary evidence changed"
+            )
+        return recorded_table
+    observations = tuple(
+        (
+            table,
+            _session_record_timestamp(
+                connection, link.predecessor_source_line, where, table
+            ),
+        )
+        for table in _CONTINUATION_BOUNDARY_IDENTITY
+        if table in tables
+    )
+    agreeing = tuple(
+        table
+        for table, observed in observations
+        if observed == link.predecessor_at_ms
+    )
+    if not agreeing:
+        detail = ", ".join(
+            f"{table}={'absent' if observed is None else observed}"
+            for table, observed in observations
+        )
+        raise OrcParseError(
+            f"recorded Orc continuation {index} boundary evidence changed: row "
+            f"{link.predecessor_source_line} was recorded at "
+            f"{link.predecessor_at_ms} ms and the link names no table, but no "
+            f"candidate table in {where} still holds that row "
+            f"({detail or 'no candidate table present'})"
+        )
+    if len(agreeing) > 1:
+        return None
+    return agreeing[0]
+
+
 def _latest_session_record_before(
     connection: sqlite3.Connection, before_ms: int, where: str
-) -> tuple[int, int] | None:
-    table = _session_storage_table(connection, where)
-    identity = "id" if table == "messages" else "rowid"
-    raw = connection.execute(
-        f"SELECT {identity}, created_at_ms FROM {table} "
-        "WHERE created_at_ms > 0 AND created_at_ms < ? "
-        f"ORDER BY created_at_ms DESC, {identity} DESC LIMIT 1",
-        (before_ms,),
-    ).fetchone()
-    if raw is None:
-        return None
-    row = _row(raw, where)
-    return (
-        _integer(row[0], f"{where}: source line"),
-        _integer(row[1], f"{where}: created_at_ms"),
-    )
+) -> tuple[str, int, int] | None:
+    """Return the table, ordinal and timestamp of the last content record before *before_ms*.
+
+    The table travels with the ordinal from the moment the boundary is first derived, because this
+    is the only point in the program where the pairing is known for free. Deriving the ordinal here
+    and re-deriving the table at every later read is what produced a guard that refused intact data.
+
+    **Every candidate table is asked, not the one the database currently looks like.** This used to
+    call `_session_storage_table`, which answers "does a `messages` table exist?" -- and existing is
+    not holding rows. A database caught mid-transition has an empty or nearly-empty `messages`
+    beside a `content_blocks` that still holds the entire transcript, so the single-table question
+    returned `messages`, found nothing before the successor's start, and the caller refused a
+    lineage whose predecessor content was sitting untouched in the other table. The weaker variant
+    is worse because it does not announce itself: `messages` holding *one* early row made the
+    boundary resolve to that row, silently skipping every later record in `content_blocks` and then
+    freezing the wrong pair into the manifest as though it had been observed. Duck-typing the
+    layout is the same mistake `_resolve_continuation_boundary` was written to stop making; there is
+    no reason for the derivation side to keep making it.
+
+    A tie -- two tables whose latest qualifying row shares the maximum instant -- is broken by the
+    declared order in :data:`_CONTINUATION_BOUNDARY_IDENTITY`, and that is *not* the coin flip the
+    resolver refuses to make. The resolver is asked an unobservable historical question ("which
+    table was this recorded ordinal written against?") and declines to guess. This function is
+    asked a present-tense one ("which record is the last one before the successor started?") and
+    both candidates are true answers, observed now, in a table named now. Choosing between two
+    correct observations is a choice; inventing provenance for one is not.
+    """
+
+    tables = _table_names(connection, where)
+    candidates = [name for name in _CONTINUATION_BOUNDARY_IDENTITY if name in tables]
+    if not candidates:
+        # A backstop, not a live path: `_require_tables` refuses a session database missing its
+        # transcript table long before a continuation boundary is derived from it. It is here
+        # anyway because the alternative -- falling out of the loop with `best is None` -- would
+        # report "no predecessor content record before its start" and send a reader looking for a
+        # missing message when what is missing is the schema. The two diagnoses lead to different
+        # places, so they are different refusals even when only one of them can fire today.
+        raise OrcParseError(
+            f"{where}: holds none of the Orc transcript tables "
+            f"({', '.join(_CONTINUATION_BOUNDARY_IDENTITY)})"
+        )
+    best: tuple[str, int, int] | None = None
+    for table in candidates:
+        identity = _CONTINUATION_BOUNDARY_IDENTITY[table]
+        raw = connection.execute(
+            f"SELECT {identity}, created_at_ms FROM {table} "
+            "WHERE created_at_ms > 0 AND created_at_ms < ? "
+            f"ORDER BY created_at_ms DESC, {identity} DESC LIMIT 1",
+            (before_ms,),
+        ).fetchone()
+        if raw is None:
+            continue
+        row = _row(raw, where)
+        candidate = (
+            table,
+            _integer(row[0], f"{where}: source line"),
+            _integer(row[1], f"{where}: created_at_ms"),
+        )
+        # Strictly greater, so the declared order breaks a tie and the first table listed wins.
+        if best is None or candidate[2] > best[2]:
+            best = candidate
+    return best
 
 
 def _continuation_links(
@@ -5226,20 +5496,17 @@ def _continuation_links(
                         f"recorded Orc continuation {index} no longer matches "
                         "its configured sessions"
                     )
-                recorded_at = _session_record_timestamp(
-                    connection,
-                    link.predecessor_source_line,
-                    str(predecessor_path),
+                resolved_table = _resolve_continuation_boundary(
+                    connection, link, index, str(predecessor_path)
                 )
-                if recorded_at is None:
-                    raise OrcParseError(
-                        f"recorded Orc continuation {index} boundary row disappeared"
-                    )
-                if recorded_at != link.predecessor_at_ms:
-                    raise OrcParseError(
-                        f"recorded Orc continuation {index} boundary evidence changed"
-                    )
-                result.append(link)
+                # Adopting the resolved table here is what makes the migration happen exactly once.
+                # The link is otherwise reused byte for byte, so a lineage whose links already name
+                # their tables rewrites nothing and the ingest stays idempotent.
+                result.append(
+                    link
+                    if resolved_table == link.predecessor_source_table
+                    else replace(link, predecessor_source_table=resolved_table)
+                )
                 continue
             boundary = _latest_session_record_before(
                 connection, started_at_ms, str(predecessor_path)
@@ -5249,7 +5516,11 @@ def _continuation_links(
                     f"Orc continuation {successor_id!r} has no predecessor "
                     "content record before its start"
                 )
-            predecessor_source_line, predecessor_at_ms = boundary
+            (
+                predecessor_source_table,
+                predecessor_source_line,
+                predecessor_at_ms,
+            ) = boundary
         except sqlite3.Error as error:
             raise OrcParseError(
                 f"failed to inspect Orc continuation boundary at "
@@ -5268,6 +5539,7 @@ def _continuation_links(
                 session_id=successor_id,
                 predecessor_source_path=predecessor_source_path,
                 predecessor_source_line=predecessor_source_line,
+                predecessor_source_table=predecessor_source_table,
                 predecessor_at_ms=predecessor_at_ms,
                 source_path=successor_source_path,
                 start_message_id=spec.start_message_id,
@@ -5495,6 +5767,12 @@ def snapshot_orc_lineage(
                     task_projection=task_projection,
                     captured_at=effective_captured_at,
                     append_prefix_override=append_prefix_override,
+                    # Read from the staged copy, not the live file: the manifest must describe the
+                    # bytes it points at, and the live database can migrate between the backup and
+                    # this line.
+                    provider_schema_version=_provider_schema_version(
+                        temporary, relative
+                    ),
                 )
             )
 
@@ -6433,8 +6711,14 @@ def _validated_continuation_roots(
         path = _snapshot_path(snapshot_root, predecessor_source.snapshot_path)
         connection = _read_only(path)
         try:
-            recorded_at = _session_record_timestamp(
-                connection, validated.predecessor_source_line, str(path)
+            # Same resolver as the snapshot path, deliberately. This read is against the frozen
+            # snapshot object rather than the live database, so the two can legitimately be at
+            # different Orc storage schemas at the same instant -- which is exactly the situation
+            # in which two independently written "which table is this?" rules would drift apart and
+            # only one of them would be believed. Nothing is adopted here: this path validates, and
+            # the snapshot path is the only writer of `predecessor_source_table`.
+            _resolve_continuation_boundary(
+                connection, validated, index - 1, str(path)
             )
         except sqlite3.Error as error:
             raise OrcParseError(
@@ -6442,10 +6726,6 @@ def _validated_continuation_roots(
             ) from error
         finally:
             connection.close()
-        if recorded_at != validated.predecessor_at_ms:
-            raise OrcParseError(
-                f"Orc continuation {index - 1} boundary evidence changed"
-            )
     return roots
 
 

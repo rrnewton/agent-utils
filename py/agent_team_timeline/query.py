@@ -5,15 +5,18 @@ from __future__ import annotations
 
 import argparse
 import base64
+import gzip
 import hashlib
 import json
 import re
 import sys
-from collections.abc import Iterable, Sequence
+import zlib
+from bisect import bisect_left, bisect_right
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Protocol
+from typing import BinaryIO, Protocol
 
 QUERY_SCHEMA_VERSION = 1
 TIMELINE_SCHEMA_VERSION = 1
@@ -60,7 +63,23 @@ JsonValue = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
 
 
 class TimeWindow(Protocol):
-    """The two interval operations required by query filtering."""
+    """The interval operations query filtering needs, plus the bounds a seek needs.
+
+    ``contains`` and ``overlaps`` are enough to *filter* records one at a time, which is all
+    this protocol used to promise, and it is exactly why every windowed query used to read
+    the whole archive: a predicate can reject a record but it cannot say where to start
+    reading. The bounds are declared here so a window can be turned into a byte offset. They
+    are read-only properties rather than plain attributes so that the frozen dataclasses that
+    implement this protocol satisfy it without being made mutable.
+    """
+
+    @property
+    def start_ms(self) -> int | None:
+        """Inclusive lower bound in epoch milliseconds, or ``None`` for unbounded."""
+
+    @property
+    def end_ms(self) -> int | None:
+        """Exclusive upper bound in epoch milliseconds, or ``None`` for unbounded."""
 
     def contains(self, timestamp_ms: int) -> bool:
         """Return whether a point falls inside this half-open window."""
@@ -287,6 +306,23 @@ class SummaryKindStats:
         }
 
 
+def _check_page(limit: int | None, tail: int | None) -> None:
+    """Validate the two paging flags, and refuse the combination that has no meaning.
+
+    ``--limit`` takes the first N of the selection and ``--tail`` the last N. Together they
+    would have to mean one of two different things -- the first N of the last M, or the last
+    N of the first M -- and a reader cannot tell which from the command line. Refusing is
+    cheaper than picking, and far cheaper than picking silently.
+    """
+
+    if limit is not None and limit < 1:
+        raise ValueError("--limit must be at least 1")
+    if tail is not None and tail < 1:
+        raise ValueError("--tail must be at least 1")
+    if limit is not None and tail is not None:
+        raise ValueError("--limit and --tail select opposite ends; choose one")
+
+
 def parse_ordinal_range(raw: str) -> OrdinalRange:
     """Parse ``N`` or inclusive ``N-M`` prompt ordinals."""
 
@@ -300,26 +336,849 @@ def parse_ordinal_range(raw: str) -> OrdinalRange:
     return OrdinalRange(first, last)
 
 
-def _read_jsonl(path: Path) -> tuple[dict[str, JsonValue], ...]:
-    if path.is_symlink() or not path.is_file():
-        raise ValueError(f"transcript export file is missing or unsafe: {path}")
-    result: list[dict[str, JsonValue]] = []
-    for line_number, line in enumerate(
-        path.read_text(encoding="utf-8").splitlines(), 1
-    ):
-        if not line:
-            continue
-        raw: object = json.loads(line)
-        result.append(
-            as_object(
-                _narrow_json(raw, f"{path}:{line_number}"), f"{path}:{line_number}"
-            )
+# =====================================================================================
+# Reading a slice instead of a file
+# =====================================================================================
+#
+# Everything between here and `TranscriptQuery` exists to make an answer cost the size of
+# the *span the answer lives in* rather than the size of the file. That is deliberately a
+# weaker claim than "the size of the answer", because one shape does not reach it and saying
+# so here is cheaper than a reader discovering it with a stopwatch: `list_messages` can bound
+# where a response scan *starts* (no response precedes the prompt it replies to) and cannot
+# bound where it *ends* (a response may arrive arbitrarily later), so selecting the first few
+# prompts of an archive and asking for their replies still walks the message projection to
+# EOF unless a `--limit`, a `--tail` or a window end stops it. See `list_messages` for why no
+# sound upper bound exists rather than merely not having been written yet.
+#
+# Two physical formats need slicing, and they get two readers rather than one, because they
+# are genuinely different problems:
+#
+# `_ChunkedJsonlReader` reads a schema-3 shard -- a multi-member gzip file with the sidecar
+# index written by `agent_team_timeline.seekable_jsonl`. It is a *reimplementation* of that
+# module's reader, and the duplication is deliberate and load-bearing. This file is copied
+# verbatim into every generated archive as the standalone `./timeline` executable, which is
+# pinned by `test_bundled_query_source_runs_without_the_installed_package`: it runs with no
+# `agent_team_timeline` package on the path, so it may import nothing but the standard
+# library. The alternatives were to make the launcher a multi-file bundle (losing the single
+# executable an archive owner can copy anywhere) or to concatenate modules at render time
+# (a build step whose output nobody reads until it is broken). Instead the copy is pinned by
+# a differential: `test_query_chunk_reader_matches_the_package_reader` asserts that this
+# reader and `seekable_jsonl.SeekableJsonlReader` return the same records *and* read the same
+# number of bytes from the same shard. A comment saying "keep these in sync" would not have
+# survived the first divergence; a failing test will.
+#
+# **No query calls it yet, and that is a gap rather than a design.** Schema 3 is written by
+# `timeline_v3.py` and read by nothing: every list, stats and search path in this file still
+# opens `data/timeline-v2.json` and falls back to `data/timeline.json`. This reader is here so
+# that the shards are not a write-only format and so that its behaviour is pinned before a
+# caller depends on it -- the differential above and the missing-sidecar test in
+# `test_query_read_paths.py` both run today. The wiring is a separate change, because it has to
+# decide what a schema-3 reader does when the bootstrap is absent, which of the three streams
+# each existing question reads, and how a partially published generation is detected; none of
+# those are answered by having a reader. Until then, treat this as tested and unreferenced, and
+# do not read the presence of the code as evidence that the archive is being served from it.
+#
+# `_SeekableJsonlText` reads the *uncompressed* transcript projections under
+# `extracted/transcripts/`. Those have no sidecar and deliberately gain none: adding a
+# chunked `.gz` twin beside them would recreate exactly the duplication schema 3 exists to
+# remove (the archive already carries 2.42 GB of `.json` beside 0.19 GB of `.gz`), and it is
+# unnecessary, because an uncompressed file sorted on its key can be binary-searched in
+# place. The two invariants that makes sound are writer invariants, not lucky properties of
+# today's data: `transcript_export` emits both files through `sorted(..., key=_record_sort_key)`
+# whose first component is `timestamp_ms`, and assigns `ordinal` by `enumerate(prompts, 1)`
+# over that same sorted list, so in `prompts.jsonl` the ordinal is exactly the line number
+# plus one. Both are re-checked at the records a seek actually lands on, so a projection that
+# ever stops honouring them fails loudly instead of silently returning the wrong window.
+
+
+class ArchiveReadError(ValueError):
+    """A managed file this reader cannot navigate.
+
+    A subclass of ``ValueError`` because every caller in this file already funnels
+    ``ValueError`` into the CLI's exit-2 path with the message attached; the distinct class
+    is for the reader that wants to tell "this archive is damaged or stale" apart from "this
+    request was malformed" without matching on prose.
+    """
+
+
+_CHUNK_INDEX_FORMAT = "agent-team-timeline/seekable-jsonl-index"
+_CHUNK_INDEX_VERSION = 1
+_CHUNK_INDEX_CODEC = "gzip"
+_CHUNK_INDEX_SUFFIX = ".index.jsonl"
+
+# Read granularity when a reader is deliberately walking a whole file: large enough that
+# syscall overhead disappears against parsing.
+_SCAN_BLOCK_BYTES = 1 << 18
+
+# Read granularity for a bisect probe, which wants one record and nothing else. Deliberately
+# far smaller than `_SCAN_BLOCK_BYTES`: a bisect over the 105 MB message projection takes
+# about twenty-seven probes, so reading a scan-sized block at each one would turn a seek that
+# should cost a few hundred kilobytes into seven megabytes. The mean transcript record is
+# about 1.6 KB, so 4 KiB answers most probes in one read; a longer record is caught by
+# doubling rather than by a second guess at the right constant, which bounds the wasted read
+# at one record's length however long that record turns out to be.
+_PROBE_BLOCK_BYTES = 1 << 12
+
+# The first backwards read of a tail. Twenty records at the measured mean fit inside it, so
+# the common tail costs one read; the window doubles rather than guessing again.
+_TAIL_BLOCK_BYTES = 1 << 16
+
+_GZIP_WBITS = 16 + zlib.MAX_WBITS
+
+
+@dataclass(frozen=True)
+class _ChunkMember:
+    """One gzip member's extent, in all three coordinate systems the index publishes."""
+
+    c_off: int
+    c_len: int
+    u_off: int
+    u_len: int
+    l0: int
+    n: int
+    t0: int | None
+    t1: int | None
+
+    def overlaps(self, start_ms: int | None, end_ms: int | None) -> bool:
+        """Whether this member can hold a record in the half-open range ``[start, end)``."""
+
+        if self.t0 is None or self.t1 is None:
+            return False
+        if start_ms is not None and self.t1 < start_ms:
+            return False
+        return end_ms is None or self.t0 < end_ms
+
+
+@dataclass(frozen=True)
+class _ChunkIndex:
+    """A parsed sidecar: the header fields a reader acts on, plus the member table."""
+
+    timestamp_key: str
+    timestamps_sorted: bool
+    record_count: int
+    c_size: int
+    u_size: int
+    c_sha256: str
+    u_sha256: str
+    data_file: str
+    members: tuple[_ChunkMember, ...]
+
+
+def _optional_json_int(value: JsonValue, where: str) -> int | None:
+    return None if value is None else as_int(value, where)
+
+
+def _parse_chunk_index(text: str, where: str) -> _ChunkIndex:
+    """Parse a sidecar and check that its member table is contiguous.
+
+    Contiguity is the invariant every read below assumes, so it is checked once here rather
+    than re-derived per read. Split on ``"\\n"`` rather than ``str.splitlines()``: the sidecar
+    is written with ``ensure_ascii=False``, so a ``data_file`` carrying U+2028 -- which JSON
+    does not escape and ``splitlines`` does treat as a terminator -- would be written as one
+    line and read back as two.
+    """
+
+    lines = [line for line in text.split("\n") if line]
+    if not lines:
+        raise ArchiveReadError(f"{where}: index is empty")
+    header = as_object(_narrow_json(json.loads(lines[0]), where), f"{where} header")
+    if as_string(header.get("format"), f"{where} header.format") != _CHUNK_INDEX_FORMAT:
+        raise ArchiveReadError(f"{where}: not a chunked-JSONL index")
+    version = as_int(header.get("version"), f"{where} header.version")
+    if version != _CHUNK_INDEX_VERSION:
+        raise ArchiveReadError(f"{where}: unsupported index version {version}")
+    codec = as_string(header.get("codec"), f"{where} header.codec")
+    if codec != _CHUNK_INDEX_CODEC:
+        raise ArchiveReadError(
+            f"{where}: index describes codec {codec!r}; this reader implements "
+            f"{_CHUNK_INDEX_CODEC!r} only"
         )
-    return tuple(result)
+    members: list[_ChunkMember] = []
+    c_off = 0
+    u_off = 0
+    line_no = 0
+    for offset, raw_line in enumerate(lines[1:]):
+        spot = f"{where} member {offset}"
+        obj = as_object(_narrow_json(json.loads(raw_line), spot), spot)
+        member = _ChunkMember(
+            c_off=as_int(obj.get("c_off"), f"{spot}.c_off"),
+            c_len=as_int(obj.get("c_len"), f"{spot}.c_len"),
+            u_off=as_int(obj.get("u_off"), f"{spot}.u_off"),
+            u_len=as_int(obj.get("u_len"), f"{spot}.u_len"),
+            l0=as_int(obj.get("l0"), f"{spot}.l0"),
+            n=as_int(obj.get("n"), f"{spot}.n"),
+            t0=_optional_json_int(obj.get("t0"), f"{spot}.t0"),
+            t1=_optional_json_int(obj.get("t1"), f"{spot}.t1"),
+        )
+        if member.c_off != c_off or member.u_off != u_off or member.l0 != line_no:
+            raise ArchiveReadError(f"{spot}: not contiguous with the preceding members")
+        if member.c_len <= 0 or member.u_len < 0 or member.n < 0:
+            raise ArchiveReadError(f"{spot}: non-positive extent")
+        members.append(member)
+        c_off += member.c_len
+        u_off += member.u_len
+        line_no += member.n
+    if not members:
+        raise ArchiveReadError(f"{where}: index describes no members")
+    if as_int(header.get("member_count"), f"{where} header.member_count") != len(members):
+        raise ArchiveReadError(f"{where}: header member count disagrees with the table")
+    record_count = as_int(header.get("record_count"), f"{where} header.record_count")
+    c_size = as_int(header.get("c_size"), f"{where} header.c_size")
+    u_size = as_int(header.get("u_size"), f"{where} header.u_size")
+    if record_count != line_no or c_size != c_off or u_size != u_off:
+        raise ArchiveReadError(f"{where}: header totals disagree with the member table")
+    sorted_claim = header.get("timestamps_sorted")
+    if not isinstance(sorted_claim, bool):
+        raise ArchiveReadError(f"{where} header.timestamps_sorted: expected a boolean")
+    return _ChunkIndex(
+        timestamp_key=as_string(
+            header.get("timestamp_key"), f"{where} header.timestamp_key"
+        ),
+        # The header's claim is confirmed against the table rather than trusted. A member
+        # with no timestamps has no position on the axis, and one of those anywhere but the
+        # tail makes the bisect key non-monotonic -- and a binary search over a
+        # non-monotonic sequence does not fail, it silently returns a cursor past real data.
+        timestamps_sorted=sorted_claim and _members_are_bisectable(members),
+        record_count=record_count,
+        c_size=c_size,
+        u_size=u_size,
+        c_sha256=as_string(header.get("c_sha256"), f"{where} header.c_sha256"),
+        u_sha256=as_string(header.get("u_sha256"), f"{where} header.u_sha256"),
+        data_file=as_string(header.get("data_file"), f"{where} header.data_file"),
+        members=tuple(members),
+    )
+
+
+def _members_are_bisectable(members: Sequence[_ChunkMember]) -> bool:
+    """Whether the member table's time bounds are non-decreasing, so a bisect is sound."""
+
+    previous: int | None = None
+    for member in members:
+        if member.t0 is None or member.t1 is None:
+            return False
+        if previous is not None and member.t0 < previous:
+            return False
+        previous = member.t1
+    return True
+
+
+def _split_member(data: bytes, where: str) -> list[bytes]:
+    if not data:
+        return []
+    if not data.endswith(b"\n"):
+        raise ArchiveReadError(f"{where}: member does not end at a line boundary")
+    return data[:-1].split(b"\n")
+
+
+def _decode_record(line: bytes, where: str) -> dict[str, JsonValue]:
+    try:
+        raw: object = json.loads(line.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ArchiveReadError(f"{where}: not a JSON record: {error}") from error
+    return as_object(_narrow_json(raw, where), where)
+
+
+class _ChunkedJsonlReader:
+    """Read a schema-3 shard, touching only the members an answer needs.
+
+    Every method is O(result) in bytes read from the shard when the sidecar is present, and
+    correct-but-O(file) when it is absent -- losing the index costs speed and nothing else.
+    :attr:`data_bytes_read` counts physical reads from the ``.gz`` so that claim can be
+    asserted on rather than timed; :attr:`index_bytes_read` counts the one-time sidecar read
+    separately, because the sidecar is a roughly fixed 0.17% of the shard set and folding it
+    into the same counter would obscure exactly the number under test.
+    """
+
+    def __init__(self, path: Path, *, index_path: Path | None = None) -> None:
+        self.path = path
+        self.data_bytes_read = 0
+        self.index_bytes_read = 0
+        self._index: _ChunkIndex | None = None
+        self._member_starts: tuple[int, ...] = ()
+        self._member_ends: tuple[int, ...] = ()
+        sidecar = (
+            index_path
+            if index_path is not None
+            else path.with_name(path.name + _CHUNK_INDEX_SUFFIX)
+        )
+        if path.is_symlink() or not path.is_file():
+            raise ArchiveReadError(f"archive shard is missing or unsafe: {path}")
+        if sidecar.is_symlink() or not sidecar.is_file():
+            return
+        raw = sidecar.read_bytes()
+        self.index_bytes_read += len(raw)
+        try:
+            index = _parse_chunk_index(raw.decode("utf-8"), str(sidecar))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ArchiveReadError(f"{sidecar}: malformed index: {error}") from error
+        # Three O(1) agreement checks before any read trusts the table. A stale sidecar does
+        # not produce a slow answer, it produces a confidently wrong one -- records
+        # attributed to the wrong timestamps, a tail that returns the middle of the file.
+        if index.data_file != path.name:
+            raise ArchiveReadError(
+                f"{sidecar}: index describes {index.data_file!r}, not {path.name!r}"
+            )
+        size = path.stat().st_size
+        if size != index.c_size:
+            raise ArchiveReadError(
+                f"{sidecar}: index describes {index.c_size} compressed bytes but "
+                f"{path} holds {size}"
+            )
+        self._index = index
+        self._member_starts = tuple(member.l0 for member in index.members)
+        self._member_ends = tuple(
+            member.t1 if member.t1 is not None else -1 for member in index.members
+        )
+
+    @property
+    def has_index(self) -> bool:
+        """Whether a sidecar was found and accepted; false means reads are full scans."""
+
+        return self._index is not None
+
+    @property
+    def index(self) -> _ChunkIndex:
+        """The accepted sidecar, or an error if this reader is scanning without one."""
+
+        if self._index is None:
+            raise ArchiveReadError(f"{self.path}: no index is loaded")
+        return self._index
+
+    @property
+    def record_count(self) -> int:
+        """How many records the shard holds, from the index or from a scan."""
+
+        if self._index is not None:
+            return self._index.record_count
+        return sum(1 for _ in self.iter_records())
+
+    def iter_records(self) -> Iterator[dict[str, JsonValue]]:
+        """Yield every record in file order, whether or not there is an index."""
+
+        if self._index is None:
+            yield from self._scan()
+            return
+        with self.path.open("rb") as handle:
+            for member in self._index.members:
+                for offset, line in enumerate(self._member_lines(handle, member)):
+                    yield _decode_record(line, f"{self.path} line {member.l0 + offset}")
+
+    def read_lines(self, first: int, last: int) -> Iterator[dict[str, JsonValue]]:
+        """Yield records whose 0-based line number is in the half-open ``[first, last)``."""
+
+        if first < 0 or last < first:
+            raise ArchiveReadError(f"invalid line range [{first}, {last})")
+        if first == last:
+            return
+        if self._index is None:
+            for number, record in enumerate(self._scan()):
+                if number >= last:
+                    return
+                if number >= first:
+                    yield record
+            return
+        members = self._index.members
+        # `bisect_right - 1` steps back from "first member starting after `first`" to "the
+        # member `first` is inside"; starts are strictly increasing except for a degenerate
+        # empty member, which the max() guards.
+        cursor = max(bisect_right(self._member_starts, first) - 1, 0)
+        with self.path.open("rb") as handle:
+            for member in members[cursor:]:
+                if member.l0 >= last:
+                    return
+                if member.n == 0:
+                    continue
+                lines = self._member_lines(handle, member)
+                lo = max(first - member.l0, 0)
+                hi = min(last - member.l0, member.n)
+                for offset in range(lo, hi):
+                    yield _decode_record(
+                        lines[offset], f"{self.path} line {member.l0 + offset}"
+                    )
+
+    def read_range(
+        self, start_ms: int | None, end_ms: int | None
+    ) -> Iterator[dict[str, JsonValue]]:
+        """Yield records whose timestamp falls in the half-open ``[start_ms, end_ms)``.
+
+        A record with no timestamp is never selected: a record without a position on the time
+        axis is not "before everything", it is absent from the axis, and returning it would
+        make two adjacent range queries overlap.
+        """
+
+        key = self._index.timestamp_key if self._index is not None else "at_ms"
+        if self._index is None:
+            for record in self._scan():
+                at_ms = record.get(key)
+                if isinstance(at_ms, int) and not isinstance(at_ms, bool):
+                    if _within(at_ms, start_ms, end_ms):
+                        yield record
+            return
+        with self.path.open("rb") as handle:
+            for member in self._candidates(start_ms, end_ms):
+                for offset, line in enumerate(self._member_lines(handle, member)):
+                    where = f"{self.path} line {member.l0 + offset}"
+                    record = _decode_record(line, where)
+                    at_ms = record.get(key)
+                    if not isinstance(at_ms, int) or isinstance(at_ms, bool):
+                        continue
+                    if _within(at_ms, start_ms, end_ms):
+                        yield record
+
+    def tail(self, count: int) -> list[dict[str, JsonValue]]:
+        """Return the last *count* records, opening only the final member(s)."""
+
+        if count <= 0:
+            return []
+        if self._index is None:
+            collected: list[dict[str, JsonValue]] = []
+            for record in self._scan():
+                collected.append(record)
+                if len(collected) > count:
+                    del collected[0]
+            return collected
+        lines: list[bytes] = []
+        first_line = self._index.record_count
+        with self.path.open("rb") as handle:
+            for member in reversed(self._index.members):
+                if member.n == 0:
+                    continue
+                lines = self._member_lines(handle, member) + lines
+                first_line = member.l0
+                if len(lines) >= count:
+                    break
+        wanted = lines[-count:] if count < len(lines) else lines
+        base = first_line + len(lines) - len(wanted)
+        return [
+            _decode_record(line, f"{self.path} line {base + offset}")
+            for offset, line in enumerate(wanted)
+        ]
+
+    def _candidates(
+        self, start_ms: int | None, end_ms: int | None
+    ) -> Iterator[_ChunkMember]:
+        index = self.index
+        if not index.timestamps_sorted:
+            # Linear over the member table, which lives in memory and is four orders of
+            # magnitude smaller than the data. The number under test -- bytes read from the
+            # shard -- is identical to the bisect path; only the table walk is O(members).
+            for member in index.members:
+                if member.overlaps(start_ms, end_ms):
+                    yield member
+            return
+        cursor = 0
+        if start_ms is not None:
+            cursor = bisect_left(self._member_ends, start_ms)
+        for member in index.members[cursor:]:
+            if end_ms is not None and member.t0 is not None and member.t0 >= end_ms:
+                return
+            if member.overlaps(start_ms, end_ms):
+                yield member
+
+    def _member_lines(self, handle: BinaryIO, member: _ChunkMember) -> list[bytes]:
+        handle.seek(member.c_off)
+        raw = handle.read(member.c_len)
+        self.data_bytes_read += len(raw)
+        if len(raw) != member.c_len:
+            raise ArchiveReadError(
+                f"{self.path}: member at {member.c_off} is {len(raw)} bytes, "
+                f"index says {member.c_len}"
+            )
+        try:
+            data = gzip.decompress(raw)
+        except (EOFError, OSError, zlib.error) as error:
+            raise ArchiveReadError(
+                f"{self.path}: member at {member.c_off} did not inflate: {error}"
+            ) from error
+        # Free, because gzip already computed it, and it turns "the sidecar is stale in a way
+        # the size check missed" from a wrong answer into an error at the exact member.
+        if len(data) != member.u_len:
+            raise ArchiveReadError(
+                f"{self.path}: member at {member.c_off} inflates to {len(data)} bytes, "
+                f"index says {member.u_len}"
+            )
+        return _split_member(data, str(self.path))
+
+    def _scan(self) -> Iterator[dict[str, JsonValue]]:
+        """Walk the whole shard when there is no usable sidecar, counting what it costs.
+
+        A member boundary is *not* a line boundary as far as this loop is concerned, and that
+        is the whole subtlety. The read window is a fixed number of **compressed** bytes, so
+        each inflate hands back an arbitrary prefix of the stream, ending mid-record whenever
+        a member happens to compress to more than one window -- which is not exotic: a shard
+        of incompressible payloads reaches 796,663 compressed bytes in a single member at the
+        default ~1 MiB target, three windows' worth. Handing that prefix to
+        :func:`_split_member`, which requires a trailing newline because a *whole member* has
+        one, turned "the sidecar is missing" into "the shard is unreadable" -- the opposite of
+        the guarantee this method exists to provide, and on precisely the path that runs when
+        the index has been lost. Lines are therefore reassembled across both window and member
+        boundaries, and the only place a newline is demanded is the end of the stream.
+        """
+
+        number = 0
+        pending = b""
+        remainder = b""
+        with self.path.open("rb") as handle:
+            engine = zlib.decompressobj(_GZIP_WBITS)
+            while True:
+                if not pending:
+                    pending = handle.read(_SCAN_BLOCK_BYTES)
+                    if not pending:
+                        break
+                    self.data_bytes_read += len(pending)
+                try:
+                    chunk = engine.decompress(pending)
+                except zlib.error as error:
+                    raise ArchiveReadError(
+                        f"{self.path}: not a gzip member: {error}"
+                    ) from error
+                if chunk:
+                    remainder += chunk
+                    cut = remainder.rfind(b"\n")
+                    if cut >= 0:
+                        complete, remainder = remainder[:cut], remainder[cut + 1 :]
+                        for line in complete.split(b"\n"):
+                            yield _decode_record(line, f"{self.path} line {number}")
+                            number += 1
+                if engine.eof:
+                    pending = engine.unused_data
+                    engine = zlib.decompressobj(_GZIP_WBITS)
+                else:
+                    pending = b""
+        if remainder:
+            raise ArchiveReadError(
+                f"{self.path}: shard does not end at a line boundary"
+            )
+
+
+def _within(at_ms: int, start_ms: int | None, end_ms: int | None) -> bool:
+    if start_ms is not None and at_ms < start_ms:
+        return False
+    return end_ms is None or at_ms < end_ms
+
+
+class _SeekableJsonlText:
+    """Binary-search an uncompressed, key-sorted JSONL projection in place.
+
+    The archive's transcript projections are plain `.jsonl` -- that is their integrity
+    contract, digested in `extracted/transcripts/manifest.json` -- and this reads slices of
+    them without a sidecar, an index, or a second copy on disk. A sorted uncompressed file
+    does not need one: the position of a key is recoverable by probing.
+
+    Probing costs ``O(log bytes)`` reads of one record each rather than ``O(1)``, and that is
+    the whole trade. Against the alternative -- publishing a chunked `.gz` twin of every
+    projection -- it saves about 24 MB of duplicated bytes per rebuild on the measured
+    archive and costs roughly twenty-seven extra small reads on a query that would otherwise
+    have read one member. The duplication is the thing schema 3 was built to stop.
+    """
+
+    def __init__(self, path: Path, *, expected_bytes: int | None = None) -> None:
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"transcript export file is missing or unsafe: {path}")
+        self.path = path
+        self.bytes_read = 0
+        self.size = path.stat().st_size
+        # The manifest's byte count is checked at open even when the digest is not, because
+        # it is a stat and it catches the failure the digest check was written for: a
+        # generation that was interrupted, or a file appended to after the manifest was
+        # written. What it cannot catch -- an equal-length rewrite -- is what
+        # :meth:`stream_verified` and ``--verify`` are for.
+        if expected_bytes is not None and expected_bytes != self.size:
+            raise ValueError(
+                f"transcript export generation is incomplete: {path.name} holds "
+                f"{self.size} bytes, the manifest declares {expected_bytes}"
+            )
+
+    def stream_verified(self, expected_sha256: str | None) -> Iterator[bytes]:
+        """Yield every line, reproducing the manifest digest as the bytes go past.
+
+        This is the path a query that genuinely needs the whole file takes, and on it the
+        archive's integrity contract is checked in full and for free -- the digest is folded
+        over bytes already being read. The verification happens at the *end*, so a caller
+        that abandons the iterator early gets no guarantee and no false one either.
+        """
+
+        digest = hashlib.sha256()
+        window = _PROBE_BLOCK_BYTES
+        with self.path.open("rb") as handle:
+            remainder = b""
+            while True:
+                block = handle.read(window)
+                if not block:
+                    break
+                # Ramped for the same reason `iter_from` is: a caller with `--limit 5`
+                # abandons this iterator after the first few records, and reading a
+                # scan-sized block to satisfy it would make the smallest possible request
+                # cost a quarter of a megabyte. A caller who does read to the end reaches
+                # full block size after six reads.
+                window = min(window * 4, _SCAN_BLOCK_BYTES)
+                self.bytes_read += len(block)
+                digest.update(block)
+                remainder += block
+                lines = remainder.split(b"\n")
+                remainder = lines.pop()
+                yield from (line for line in lines if line)
+            if remainder:
+                yield remainder
+        if expected_sha256 is not None and digest.hexdigest() != expected_sha256:
+            raise ValueError(
+                f"transcript export generation is incomplete: {self.path.name}"
+            )
+
+    def iter_from(self, offset: int) -> Iterator[tuple[int, bytes]]:
+        """Yield ``(line start offset, line)`` from *offset*, which must be a line start.
+
+        The read window ramps from a probe-sized block up to a scan-sized one. Both ends
+        matter: a caller taking three records from the middle of a 105 MB file should not pay
+        a quarter of a megabyte to get them, and a caller streaming the rest of the file
+        should not pay a syscall every four kilobytes to do it.
+        """
+
+        window = _PROBE_BLOCK_BYTES
+        with self.path.open("rb") as handle:
+            handle.seek(offset)
+            position = offset
+            remainder = b""
+            while True:
+                block = handle.read(window)
+                if not block:
+                    break
+                window = min(window * 4, _SCAN_BLOCK_BYTES)
+                self.bytes_read += len(block)
+                remainder += block
+                while True:
+                    cut = remainder.find(b"\n")
+                    if cut < 0:
+                        break
+                    line = remainder[:cut]
+                    remainder = remainder[cut + 1 :]
+                    if line:
+                        yield position, line
+                    position += cut + 1
+            if remainder:
+                yield position, remainder
+
+    def backwards(self, end: int | None = None) -> "_BackwardCursor":
+        """Open a resumable backwards read ending at *end*.
+
+        *end* must be a line start -- in practice the offset a :meth:`seek_first` returned --
+        so that "the last twenty records before this instant" is one backwards read from
+        there rather than a forward scan of everything preceding it.
+        """
+
+        return _BackwardCursor(self, end)
+
+    def tail_lines(self, count: int, *, end: int | None = None) -> list[bytes]:
+        """Return the last *count* non-empty lines before *end*, reading backwards."""
+
+        if count <= 0:
+            return []
+        cursor = self.backwards(end)
+        return cursor.extend_to(count)[-count:]
+
+    def seek_first(self, key: str, target: int, where: str) -> int:
+        """Return the offset of the first record whose integer *key* is at least *target*.
+
+        A textbook offset bisect with one wrinkle worth naming: the search space is byte
+        offsets, but only line starts are meaningful, so the probe reads forward from the
+        midpoint to the next line boundary and evaluates *that* record. The predicate
+        "the first record starting at or after this offset has key >= target" is monotone in
+        the offset precisely because the file is sorted, which is why the answer is the
+        smallest offset satisfying it and not merely some offset that does.
+        """
+
+        low = 0
+        high = self.size
+        while low < high:
+            middle = (low + high) // 2
+            probe = self._record_at_or_after(middle, key, where)
+            if probe is None or probe[1] >= target:
+                high = middle
+            else:
+                low = middle + 1
+        aligned = self._record_at_or_after(low, key, where)
+        return self.size if aligned is None else aligned[0]
+
+    def _record_at_or_after(
+        self, offset: int, key: str, where: str
+    ) -> tuple[int, int] | None:
+        """The ``(line start, key)`` of the first record starting at or after *offset*."""
+
+        with self.path.open("rb") as handle:
+            start = offset
+            if offset > 0:
+                handle.seek(offset - 1)
+                probe = handle.read(1)
+                self.bytes_read += len(probe)
+                if probe != b"\n":
+                    skipped = self._advance_past_newline(handle)
+                    if skipped is None:
+                        return None
+                    start = skipped
+            handle.seek(start)
+            line = self._read_line(handle)
+        if not line:
+            return None
+        record = _decode_record(line, f"{where}:{start}")
+        value = record.get(key)
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError(f"{where}:{start}: {key} is not an integer")
+        return start, value
+
+    def _advance_past_newline(self, handle: BinaryIO) -> int | None:
+        position = handle.tell()
+        window = _PROBE_BLOCK_BYTES
+        while True:
+            block = handle.read(window)
+            if not block:
+                return None
+            window = min(window * 2, _SCAN_BLOCK_BYTES)
+            self.bytes_read += len(block)
+            cut = block.find(b"\n")
+            if cut >= 0:
+                return position + cut + 1
+            position += len(block)
+
+    def _read_line(self, handle: BinaryIO) -> bytes:
+        collected = b""
+        window = _PROBE_BLOCK_BYTES
+        while True:
+            block = handle.read(window)
+            if not block:
+                return collected
+            window = min(window * 2, _SCAN_BLOCK_BYTES)
+            self.bytes_read += len(block)
+            cut = block.find(b"\n")
+            if cut >= 0:
+                return collected + block[:cut]
+            collected += block
+
+
+class _BackwardCursor:
+    """A backwards read of a projection that widens without re-reading what it has.
+
+    This exists because the obvious shape does not compose with filtering. "The last twenty
+    records matching a team" cannot be answered by one backwards read of twenty lines, so the
+    caller widens -- and if widening means calling ``tail_lines`` again with a bigger count,
+    round *k* re-reads everything rounds 1..k-1 read. Measured on the 105,453,039-byte message
+    projection, a ``--tail 20`` restricted to a team whose last message sits at index 35,578 of
+    66,114 read 201,412,186 bytes: 1.9 times the file, to return twenty records. With the buffer
+    kept, the same query reads 112,283,226 -- the message projection once and the prompt
+    projection once, since the selection is resolved through both -- and neither byte twice.
+    One pass is the only ceiling worth having on a method whose entire justification is that it
+    does not read the file.
+
+    It is still a full pass in that shape, and no buffer discipline can fix that: the accepted
+    records end at index 35,578, so a backwards walk has to cross the 30,536 rejected ones to
+    reach them. What was removed is the second and third crossing, not the first.
+
+    The window still doubles per round, for the reason it always did: a selection that rejects
+    most of what it sees would otherwise cost one syscall per rejected record. What changed is
+    that the doubling now buys *additional* bytes rather than a larger re-read.
+    """
+
+    def __init__(self, reader: _SeekableJsonlText, end: int | None) -> None:
+        self._reader = reader
+        self._start = reader.size if end is None else max(min(end, reader.size), 0)
+        self._buffer = b""
+        self._window = _TAIL_BLOCK_BYTES
+
+    @property
+    def exhausted(self) -> bool:
+        """Whether the window has reached offset zero and nothing earlier remains."""
+
+        return self._start == 0
+
+    def _widen(self) -> None:
+        start = max(0, self._start - self._window)
+        with self._reader.path.open("rb") as handle:
+            handle.seek(start)
+            block = handle.read(self._start - start)
+        self._reader.bytes_read += len(block)
+        self._buffer = block + self._buffer
+        self._start = start
+        self._window *= 2
+
+    def lines(self) -> list[bytes]:
+        """The complete non-empty lines in the buffer, in file order.
+
+        The earliest element is dropped unless the window has reached offset zero: it may be
+        the tail of a record that begins before the window, and nothing in the buffer can tell
+        it apart from a whole one. Dropping it is conservative rather than lossy -- the next
+        widen brings it back with its beginning attached.
+        """
+
+        collected = [line for line in self._buffer.split(b"\n") if line]
+        if self._start > 0 and collected:
+            collected.pop(0)
+        return collected
+
+    def extend_to(self, wanted: int) -> list[bytes]:
+        """Widen until the buffer holds *wanted* complete lines, or the file runs out."""
+
+        collected = self.lines()
+        while len(collected) < wanted and not self.exhausted:
+            self._widen()
+            collected = self.lines()
+        return collected
+
+
+@dataclass(frozen=True)
+class _ManagedFile:
+    """One manifest-declared transcript projection and everything claimed about it."""
+
+    name: str
+    path: Path
+    sha256: str
+    declared_bytes: int | None
 
 
 class TranscriptQuery:
-    """Validated read-only access to the zero-model transcript projection."""
+    """Validated read-only access to the zero-model transcript projection.
+
+    **What this class stopped doing, and why.** It used to SHA-256 all four managed files in
+    its constructor -- 227,545,190 bytes on the measured archive -- and then materialize two
+    of them with ``read_text().splitlines()``. Every query paid all of it: ``messages --range
+    3978-3980`` read 339,828,416 bytes at 994,996,224 bytes of resident memory and returned
+    nine records, and its cost was byte-identical to ``--range 1`` because the filtering
+    happened after full materialization. Of what it hashed, 115,261,964 bytes -- the
+    occurrence log and the system-input projection -- are consulted by no query at all.
+
+    The same three questions now cost 3,054,373 bytes, 65,536 bytes and zero: the range read
+    seeks to its span, ``--tail 20`` reads one backwards block, and constructing this object
+    reads nothing whatsoever. `test_query_read_paths.py` asserts each of those as a bound on
+    :attr:`bytes_read` rather than as a duration.
+
+    Now nothing is read until a query asks for it, and what a query asks for is a slice.
+
+    **The integrity contract, restated honestly**, because it did change and pretending
+    otherwise would be worse than the change:
+
+    * At open, every managed file is checked for existence, for not being a symlink, and --
+      where the manifest declares one -- for its exact byte count. That is four ``stat``
+      calls and it catches the failure the constructor's digest loop was written to catch: a
+      generation interrupted midway, or a file appended to after the manifest was written.
+      All four, not just the two a query consults: a truncated ``occurrences.jsonl`` says the
+      generation is damaged whether or not this particular question would have read it, and
+      an open that only checked what it intended to read would report a healthy archive while
+      holding the evidence that it is not.
+    * A query that reads a file *end to end* verifies its digest in full, folded over bytes
+      it was reading anyway, so it costs nothing. ``stats`` and an unfiltered ``prompts``
+      still fail closed exactly as before.
+    * A query that reads a *slice* verifies the byte count and the structure of the records
+      it returns, and does not reproduce the whole-file digest -- it never read the whole
+      file. ``verify=True`` (``--verify`` on the command line) restores the complete check on
+      demand, for the reader who wants the old guarantee at the old price.
+    * A manifest written before the per-file ``bytes`` field existed declares no size, so
+      there is nothing to check with a ``stat``; such a file gets the complete digest check on
+      first use instead. Degrading to "no check" there would silently weaken exactly the
+      oldest archives, which is the one direction this change must not go.
+
+    **What a slice read does not promise.** An equal-length rewrite of bytes no query touched
+    is invisible to a size check, and no amount of seeking will see it -- that is what
+    ``--verify`` is for, and why the bullet above says which measurement each path made rather
+    than claiming one guarantee for both.
+    """
 
     _FILES = (
         "occurrences.jsonl",
@@ -328,7 +1187,11 @@ class TranscriptQuery:
         "system-inputs.jsonl",
     )
 
-    def __init__(self, root: Path) -> None:
+    #: The two projections any query actually consults. The other two are declared, checked
+    #: for presence, and never opened -- naming them here is what keeps that deliberate.
+    _CONSULTED = ("prompts.jsonl", "messages.jsonl")
+
+    def __init__(self, root: Path, *, verify: bool = False) -> None:
         self.root = root.resolve()
         self.transcript_root = self.root / "extracted" / "transcripts"
         manifest_path = self.transcript_root / "manifest.json"
@@ -344,23 +1207,98 @@ class TranscriptQuery:
                 f"expected {TRANSCRIPT_EXPORT_SCHEMA_VERSION}"
             )
         files = as_object(manifest.get("files"), "transcript manifest files")
+        self._declared: dict[str, _ManagedFile] = {}
         for name in self._FILES:
             entry = as_object(files.get(name), f"transcript manifest files.{name}")
-            expected = as_string(entry.get("sha256"), f"{name}.sha256")
             path = self.transcript_root / name
             if path.is_symlink() or not path.is_file():
                 raise ValueError(f"transcript export file is missing or unsafe: {path}")
-            actual = hashlib.sha256(path.read_bytes()).hexdigest()
-            if actual != expected:
-                raise ValueError(f"transcript export generation is incomplete: {name}")
-        self.prompts = _read_jsonl(self.transcript_root / "prompts.jsonl")
-        self.messages = _read_jsonl(self.transcript_root / "messages.jsonl")
-        self._prompt_ordinals = {
-            as_string(record.get("record_id"), "prompt.record_id"): as_int(
-                record.get("ordinal"), "prompt.ordinal"
+            declared_bytes = _optional_json_int(entry.get("bytes"), f"{name}.bytes")
+            # The stat happens here, for all four files, and not in `_SeekableJsonlText`.
+            # It used to happen only there, which meant it happened only for the two
+            # projections a query opens -- so a truncated `occurrences.jsonl` was accepted in
+            # silence by an open that had already been told how long the file should be. The
+            # constructor's old digest loop caught that; a size check is the cheap half of
+            # what it caught, and the half that costs a stat is the half worth keeping
+            # unconditional.
+            if declared_bytes is not None:
+                size = path.stat().st_size
+                if size != declared_bytes:
+                    raise ValueError(
+                        f"transcript export generation is incomplete: {name} holds "
+                        f"{size} bytes, the manifest declares {declared_bytes}"
+                    )
+            self._declared[name] = _ManagedFile(
+                name=name,
+                path=path,
+                sha256=as_string(entry.get("sha256"), f"{name}.sha256"),
+                declared_bytes=declared_bytes,
             )
-            for record in self.prompts
-        }
+        self._readers: dict[str, _SeekableJsonlText] = {}
+        self._verified: set[str] = set()
+        # `verify` means "rely on nothing this archive merely promises". It re-digests every
+        # managed projection end to end -- all four, because "the old guarantee at the old
+        # price" is not a guarantee if it silently drops the two files the old constructor
+        # hashed and no query reads -- and it also widens the message read in
+        # :meth:`list_messages` from a seek to a full scan, because those are the two places
+        # a slice read substitutes an invariant for a measurement.
+        self._exhaustive = verify
+        if verify:
+            for name in self._FILES:
+                self._verify_whole(name)
+
+    @property
+    def bytes_read(self) -> int:
+        """Bytes physically read from the transcript projections by this instance.
+
+        Published so the cost of a query can be *asserted* rather than timed. A timing
+        assertion is a flake on a loaded build host; a byte-count assertion is a proof, and
+        it is the only way to keep a future refactor from quietly reintroducing the full
+        materialization this class was rewritten to remove.
+        """
+
+        return sum(reader.bytes_read for reader in self._readers.values())
+
+    def _managed(self, name: str) -> _ManagedFile:
+        declared = self._declared.get(name)
+        if declared is None:
+            raise ValueError(f"{name} is not a managed transcript projection")
+        return declared
+
+    def _reader(self, name: str) -> _SeekableJsonlText:
+        existing = self._readers.get(name)
+        if existing is not None:
+            return existing
+        declared = self._managed(name)
+        reader = _SeekableJsonlText(declared.path, expected_bytes=declared.declared_bytes)
+        self._readers[name] = reader
+        if declared.declared_bytes is None and name not in self._verified:
+            # No declared length to check, so the only guard left is the digest. Pay for it
+            # once, here, rather than answering from bytes nothing has vouched for.
+            self._verify_whole(name)
+        return reader
+
+    def _verify_whole(self, name: str) -> None:
+        declared = self._managed(name)
+        reader = self._readers.get(name)
+        if reader is None:
+            reader = _SeekableJsonlText(
+                declared.path, expected_bytes=declared.declared_bytes
+            )
+            self._readers[name] = reader
+        for _line in reader.stream_verified(declared.sha256):
+            pass
+        self._verified.add(name)
+
+    def _stream(self, name: str) -> Iterator[dict[str, JsonValue]]:
+        """Yield every record in one projection, verifying its digest as the bytes go past."""
+
+        declared = self._managed(name)
+        reader = self._reader(name)
+        expected = None if name in self._verified else declared.sha256
+        for number, line in enumerate(reader.stream_verified(expected)):
+            yield _decode_record(line, f"{declared.path}:{number + 1}")
+        self._verified.add(name)
 
     @staticmethod
     def _selected(record: dict[str, JsonValue], filters: QueryFilters) -> bool:
@@ -389,62 +1327,303 @@ class TranscriptQuery:
             raise ValueError("prompt selection must be human, bot, or all")
         return which == "all" or cls._prompt_class(record) == which
 
+    @staticmethod
+    def _window_bounds(filters: QueryFilters) -> tuple[int | None, int | None]:
+        window = filters.window
+        return (None, None) if window is None else (window.start_ms, window.end_ms)
+
+    def _iter_instant_span(
+        self, name: str, start_ms: int | None, end_ms: int | None
+    ) -> Iterator[dict[str, JsonValue]]:
+        """Yield records with ``start_ms <= timestamp_ms``, stopping at *end_ms*.
+
+        The sortedness the bisect depends on is re-checked across the span actually read.
+        That is the honest amount to check -- it cannot vouch for bytes nobody looked at --
+        and it is enough to turn "the projection stopped being sorted and the seek silently
+        under-returned" into a refusal at the first record out of order.
+        """
+
+        reader = self._reader(name)
+        where = str(self._managed(name).path)
+        offset = (
+            0 if start_ms is None else reader.seek_first("timestamp_ms", start_ms, where)
+        )
+        previous: int | None = None
+        for position, line in reader.iter_from(offset):
+            record = _decode_record(line, f"{where}:{position}")
+            at_ms = as_int(record.get("timestamp_ms"), "transcript record.timestamp_ms")
+            if previous is not None and at_ms < previous:
+                raise ValueError(
+                    f"{where}:{position}: records are not ordered by timestamp_ms, so a "
+                    "seeked read would under-return; rebuild the transcript export"
+                )
+            previous = at_ms
+            if end_ms is not None and at_ms >= end_ms:
+                return
+            yield record
+
+    def _iter_prompts_by_ordinal(
+        self, ordinal_range: OrdinalRange
+    ) -> Iterator[dict[str, JsonValue]]:
+        """Yield the prompts in an inclusive ordinal range, seeking straight to the first.
+
+        ``ordinal`` is bisectable for the same reason ``timestamp_ms`` is: the exporter
+        assigns it with ``enumerate(prompts, 1)`` over the already-sorted projection, so it
+        is the line number plus one. Consecutiveness is asserted across the records returned
+        rather than assumed, because the failure mode of a non-dense ordinal column is a
+        window that quietly omits its middle.
+        """
+
+        reader = self._reader("prompts.jsonl")
+        where = str(self._managed("prompts.jsonl").path)
+        offset = reader.seek_first("ordinal", ordinal_range.first, where)
+        expected: int | None = None
+        for position, line in reader.iter_from(offset):
+            record = _decode_record(line, f"{where}:{position}")
+            ordinal = as_int(record.get("ordinal"), "prompt.ordinal")
+            if ordinal > ordinal_range.last:
+                return
+            if expected is not None and ordinal != expected:
+                raise ValueError(
+                    f"{where}:{position}: prompt ordinals jump from {expected - 1} to "
+                    f"{ordinal}; the projection is not the dense chronological index its "
+                    "manifest declares"
+                )
+            expected = ordinal + 1
+            yield record
+
+    def _tail_matching(
+        self,
+        name: str,
+        count: int,
+        accept: "Callable[[dict[str, JsonValue]], bool]",
+        *,
+        end: int | None = None,
+    ) -> list[dict[str, JsonValue]]:
+        """Return the last *count* accepted records, reading backwards from *end*.
+
+        The filter is applied *during* the backwards walk, so this returns *count* records
+        that match rather than the matches among the last *count* records. The window widens
+        by a factor of four when the records it caught were filtered away, rather than by one
+        record at a time: a selection that rejects most of what it sees would otherwise cost
+        one backwards read per rejected record.
+
+        The widening happens on a :class:`_BackwardCursor` rather than by re-issuing a bigger
+        ``tail_lines``, which is what keeps the total at one pass. Each round decodes only the
+        lines the round actually added -- they are exactly the front of the buffer, because
+        widening only prepends -- so neither the bytes nor the JSON is paid for twice.
+        """
+
+        reader = self._reader(name)
+        where = str(self._managed(name).path)
+        cursor = reader.backwards(end)
+        matched: list[dict[str, JsonValue]] = []
+        decoded = 0
+        wanted = max(count, 1)
+        while True:
+            lines = cursor.extend_to(wanted)
+            fresh = lines[: len(lines) - decoded]
+            decoded = len(lines)
+            matched = [
+                dict(record)
+                for record in (
+                    _decode_record(line, f"{where}: tail record") for line in fresh
+                )
+                if accept(record)
+            ] + matched
+            if len(matched) >= count or cursor.exhausted:
+                return matched[-count:]
+            wanted = max(len(lines), wanted) * 4
+
+    def _prompt_candidates(
+        self, filters: QueryFilters, ordinal_range: OrdinalRange | None
+    ) -> Iterator[dict[str, JsonValue]]:
+        """Yield prompt records from the narrowest span that can hold the answer."""
+
+        if ordinal_range is not None:
+            yield from self._iter_prompts_by_ordinal(ordinal_range)
+            return
+        start_ms, end_ms = self._window_bounds(filters)
+        if start_ms is not None:
+            yield from self._iter_instant_span("prompts.jsonl", start_ms, end_ms)
+            return
+        # No physical narrowing is possible, so this is the end-to-end path -- and being the
+        # end-to-end path, it is the one that verifies the manifest digest.
+        for record in self._stream("prompts.jsonl"):
+            if end_ms is not None and (
+                as_int(record.get("timestamp_ms"), "transcript record.timestamp_ms")
+                >= end_ms
+            ):
+                return
+            yield record
+
     def list_prompts(
         self,
         filters: QueryFilters,
         ordinal_range: OrdinalRange | None,
         which: str = "human",
+        *,
+        limit: int | None = None,
+        tail: int | None = None,
     ) -> list[dict[str, JsonValue]]:
         """Return verbatim authored prompt records in global timestamp order."""
 
+        _check_page(limit, tail)
+
+        def accept(record: dict[str, JsonValue]) -> bool:
+            return self._selected_prompt_authorship(
+                record, which
+            ) and self._selected(record, filters)
+
+        start_ms, end_ms = self._window_bounds(filters)
+        if tail is not None and ordinal_range is None and start_ms is None:
+            end_offset = (
+                None
+                if end_ms is None
+                else self._reader("prompts.jsonl").seek_first(
+                    "timestamp_ms", end_ms, str(self._managed("prompts.jsonl").path)
+                )
+            )
+            return self._tail_matching("prompts.jsonl", tail, accept, end=end_offset)
         result: list[dict[str, JsonValue]] = []
-        for record in self.prompts:
-            ordinal = as_int(record.get("ordinal"), "prompt.ordinal")
-            if ordinal_range is not None and not ordinal_range.contains(ordinal):
+        for record in self._prompt_candidates(filters, ordinal_range):
+            if not accept(record):
                 continue
-            if not self._selected_prompt_authorship(record, which):
-                continue
-            if self._selected(record, filters):
-                result.append(dict(record))
-        return result
+            result.append(dict(record))
+            if limit is not None and len(result) >= limit:
+                break
+        return result[-tail:] if tail is not None else result
 
     def list_messages(
         self,
         filters: QueryFilters,
         ordinal_range: OrdinalRange | None,
         which: str = "human",
+        *,
+        limit: int | None = None,
+        tail: int | None = None,
     ) -> list[dict[str, JsonValue]]:
-        """Return prompts plus mechanically associated coordinator responses."""
+        """Return prompts plus mechanically associated coordinator responses.
 
+        **Where the message read starts, and why that is sound.** A response is emitted only
+        when its ``in_reply_to_prompt_id`` names a selected prompt, so the scan can begin at
+        the earliest selected prompt's instant instead of at byte zero. That rests on one
+        writer invariant: ``transcript_export._response_records`` links a response only to a
+        prompt occurrence at or before the response's own instant, and both projections are
+        sorted on that instant. The narrow gap is a logical prompt with several occurrences
+        whose *representative* occurrence -- the earliest one carrying an authorship
+        classification -- is later than the occurrence a response was actually linked to; on
+        the measured archive that is 0 of 4,043 prompts, but it is not structurally
+        impossible. ``verify=True`` therefore does not merely re-digest: it also abandons this
+        lower bound and resolves linkage by full scan, so the reader who will not rely on an
+        invariant the archive only promises has a way to say so.
+
+        When a time window is set, the lower bound is the window's own start instead, which
+        rests on nothing at all -- a message outside the window is dropped by ``_selected``
+        regardless of what it replies to.
+
+        **There is a lower bound and no upper one, and that asymmetry is structural.** The
+        invariant above is one-sided: a response is linked to a prompt occurrence at or before
+        its own instant, and *nothing* bounds how long after that instant it arrives. So the
+        scan can start late and cannot stop early. Selecting the last few prompts of an
+        archive therefore costs almost nothing -- the lower bound does all the work, and
+        ``--range 3978-3980`` on the measured archive reads 3,054,373 bytes of a 105,453,039
+        byte projection -- while selecting the *first* few costs the whole projection:
+        ``--range 1-3`` reads all of it, because ``lower`` is the first prompt's instant and
+        there is no instant after which a reply to prompt 1 becomes impossible.
+
+        Three ways to bound the top were considered. Stopping at the last selected prompt's
+        instant is wrong by construction, since that is precisely where the replies begin.
+        Stopping once every selected prompt has been seen replied to assumes one reply per
+        prompt, which the projection does not promise. Recording a per-prompt "last reply"
+        offset in the manifest would work and is a change to ``transcript_export``, not to a
+        reader, so it is not smuggled in here. What *is* honoured is the caller's own bound:
+        ``--limit`` stops the scan the moment it has enough, ``--tail`` runs backwards from
+        the end instead, and a window end caps it. An unbounded question over an early
+        selection reads to EOF, and the section comment above says so rather than leaving it
+        to be measured.
+        """
+
+        _check_page(limit, tail)
         selected_prompts = self.list_prompts(filters, ordinal_range, which)
+        if not selected_prompts:
+            return []
         selected_prompt_ids = {
             as_string(record.get("record_id"), "prompt.record_id")
             for record in selected_prompts
         }
-        result: list[dict[str, JsonValue]] = []
-        for record in self.messages:
-            record_type = as_string(record.get("record_type"), "message.record_type")
-            if record_type == "prompt":
-                record_id = as_string(record.get("record_id"), "prompt.record_id")
-                if record_id not in selected_prompt_ids:
-                    continue
-                ordinal: int | None = as_int(record.get("ordinal"), "prompt.ordinal")
-            elif record_type == "response":
+        prompt_ordinals = {
+            as_string(record.get("record_id"), "prompt.record_id"): as_int(
+                record.get("ordinal"), "prompt.ordinal"
+            )
+            for record in selected_prompts
+        }
+        earliest = min(
+            as_int(record.get("timestamp_ms"), "prompt.timestamp_ms")
+            for record in selected_prompts
+        )
+        window_start, window_end = self._window_bounds(filters)
+        if self._exhaustive:
+            lower = window_start
+        elif window_start is not None:
+            lower = max(window_start, earliest)
+        else:
+            lower = earliest
+
+        def accept(record: dict[str, JsonValue]) -> bool:
+            return self._message_ordinal(record, selected_prompt_ids) is not None and (
+                self._selected(record, filters)
+            )
+
+        def project(record: dict[str, JsonValue]) -> dict[str, JsonValue]:
+            item = dict(record)
+            if as_string(record.get("record_type"), "message.record_type") == "response":
                 prompt_id = record.get("in_reply_to_prompt_id")
-                if (
-                    not isinstance(prompt_id, str)
-                    or prompt_id not in selected_prompt_ids
-                ):
-                    continue
-                ordinal = self._prompt_ordinals.get(prompt_id)
-            else:
-                raise ValueError(f"unknown transcript message type {record_type!r}")
-            if self._selected(record, filters):
-                item = dict(record)
-                if record_type == "response":
-                    item["prompt_ordinal"] = ordinal
-                result.append(item)
+                item["prompt_ordinal"] = (
+                    prompt_ordinals.get(prompt_id) if isinstance(prompt_id, str) else None
+                )
+            return item
+
+        if tail is not None:
+            end_offset = (
+                None
+                if window_end is None
+                else self._reader("messages.jsonl").seek_first(
+                    "timestamp_ms", window_end, str(self._managed("messages.jsonl").path)
+                )
+            )
+            return [
+                project(record)
+                for record in self._tail_matching(
+                    "messages.jsonl", tail, accept, end=end_offset
+                )
+            ]
+        result: list[dict[str, JsonValue]] = []
+        for record in self._iter_instant_span("messages.jsonl", lower, window_end):
+            if not accept(record):
+                continue
+            result.append(project(record))
+            if limit is not None and len(result) >= limit:
+                break
         return result
+
+    def _message_ordinal(
+        self, record: dict[str, JsonValue], selected_prompt_ids: set[str]
+    ) -> str | None:
+        """Return the message's record type when it belongs to the selection, else ``None``."""
+
+        record_type = as_string(record.get("record_type"), "message.record_type")
+        if record_type == "prompt":
+            record_id = as_string(record.get("record_id"), "prompt.record_id")
+            return record_type if record_id in selected_prompt_ids else None
+        if record_type == "response":
+            prompt_id = record.get("in_reply_to_prompt_id")
+            return (
+                record_type
+                if isinstance(prompt_id, str) and prompt_id in selected_prompt_ids
+                else None
+            )
+        raise ValueError(f"unknown transcript message type {record_type!r}")
 
     def content_stats(
         self, filters: QueryFilters
@@ -454,7 +1633,7 @@ class TranscriptQuery:
         human_prompt_texts: list[str] = []
         bot_prompt_texts: list[str] = []
         unattributed_prompt_texts: list[str] = []
-        for record in self.prompts:
+        for record in self._stream("prompts.jsonl"):
             if not self._selected(record, filters):
                 continue
             text = as_string(record.get("text"), "prompt.text")
@@ -467,7 +1646,7 @@ class TranscriptQuery:
                 unattributed_prompt_texts.append(text)
         linked_response_texts: list[str] = []
         unlinked_response_texts: list[str] = []
-        for record in self.messages:
+        for record in self._stream("messages.jsonl"):
             if (
                 as_string(record.get("record_type"), "message.record_type")
                 != "response"
@@ -3054,6 +4233,43 @@ def _standalone_add_transcript_filters(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _standalone_add_paging(parser: argparse.ArgumentParser) -> None:
+    """Add the two paging flags and the integrity escape hatch to a transcript command."""
+
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        metavar="N",
+        help="return at most N records from the start of the selection",
+    )
+    parser.add_argument(
+        "--tail",
+        type=int,
+        default=None,
+        metavar="N",
+        help="return the last N records of the selection",
+    )
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help=(
+            "re-read every consulted projection end to end and reproduce its manifest "
+            "digest, and resolve prompt/response linkage by full scan instead of by seek"
+        ),
+    )
+
+
+def _standalone_paging(ns: argparse.Namespace) -> tuple[int | None, int | None]:
+    raw_limit: object = getattr(ns, "limit", None)
+    raw_tail: object = getattr(ns, "tail", None)
+    if raw_limit is not None and not isinstance(raw_limit, int):
+        raise ValueError("--limit must be an integer")
+    if raw_tail is not None and not isinstance(raw_tail, int):
+        raise ValueError("--tail must be an integer")
+    return raw_limit, raw_tail
+
+
 def _standalone_add_common_options(
     parser: argparse.ArgumentParser, default_format: str
 ) -> None:
@@ -3143,6 +4359,7 @@ def _standalone_parser() -> argparse.ArgumentParser:
             "examples:\n"
             "  ./timeline prompts\n"
             "  ./timeline prompts --range 200-300\n"
+            "  ./timeline prompts --tail 20\n"
             "  ./timeline prompts --which all --format jsonl\n"
             "  ./timeline prompts --team orc-coord-014 --format jsonl"
         ),
@@ -3160,6 +4377,7 @@ def _standalone_parser() -> argparse.ArgumentParser:
         default="human",
         help="select human, bot, or all prompt authorship (default: %(default)s)",
     )
+    _standalone_add_paging(prompts)
     _standalone_add_transcript_filters(prompts)
     _standalone_add_common_options(prompts, "text")
 
@@ -3183,6 +4401,7 @@ def _standalone_parser() -> argparse.ArgumentParser:
         default="human",
         help="select human, bot, or all prompt authorship (default: %(default)s)",
     )
+    _standalone_add_paging(messages)
     _standalone_add_transcript_filters(messages)
     _standalone_add_common_options(messages, "text")
 
@@ -3409,7 +4628,9 @@ def _standalone_main(argv: Sequence[str] | None = None) -> int:
                 limit=int(ns.limit),
             )
         elif action in {"prompts", "messages"}:
-            query_transcripts = TranscriptQuery(output)
+            limit, tail = _standalone_paging(ns)
+            _check_page(limit, tail)
+            query_transcripts = TranscriptQuery(output, verify=bool(ns.verify))
             raw_range: object = ns.ordinal_range
             ordinal_range = (
                 parse_ordinal_range(raw_range) if isinstance(raw_range, str) else None
@@ -3417,11 +4638,19 @@ def _standalone_main(argv: Sequence[str] | None = None) -> int:
             command = action
             items = (
                 query_transcripts.list_prompts(
-                    _standalone_filters(ns), ordinal_range, str(ns.which)
+                    _standalone_filters(ns),
+                    ordinal_range,
+                    str(ns.which),
+                    limit=limit,
+                    tail=tail,
                 )
                 if action == "prompts"
                 else query_transcripts.list_messages(
-                    _standalone_filters(ns), ordinal_range, str(ns.which)
+                    _standalone_filters(ns),
+                    ordinal_range,
+                    str(ns.which),
+                    limit=limit,
+                    tail=tail,
                 )
             )
         elif action == "stats":

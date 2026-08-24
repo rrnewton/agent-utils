@@ -37,6 +37,7 @@ from agent_team_timeline.static_assets import (
     write_text_with_gzip_invalidation,
 )
 from agent_team_timeline.timeline_shards import write_timeline_shards
+from agent_team_timeline.timeline_v3 import is_schema_3_path, write_timeline_v3
 from agent_team_timeline.window import DateWindow
 
 
@@ -409,6 +410,12 @@ def _safe_generated_path(raw: str) -> PurePosixPath:
         or any(part in ("", ".", "..") for part in path.parts)
     ):
         raise ValueError(f"unsafe generated path in export manifest: {raw!r}")
+    # Schema 3 before the `.gz` rule below, which reads a trailing `.gz` as the compressed
+    # sidecar of a plain file and recurses on the base. A schema-3 shard has no plain base --
+    # existing once is the point -- so recursing would ask whether a file that is never written
+    # is a legal export path.
+    if is_schema_3_path(raw):
+        return path
     if raw.endswith(".gz"):
         if raw.removesuffix(".gz").endswith(".gz"):
             raise ValueError(f"nested gzip sidecar in export manifest: {raw!r}")
@@ -771,6 +778,17 @@ def _build_combined_archive_locked(
         )
         changed += shard_report.files_changed
         for relative in shard_report.generated_files:
+            _safe_generated_path(relative)
+            generated_files.add(relative)
+        # Schema 3 alongside, never instead of: `query.py` reads the schema-2 bootstrap and
+        # falls back to `data/timeline.json`, so dropping either generation here would break the
+        # export's own tooling. Its paths go into the same manifest as everything else, which is
+        # what makes the caller's existing stale-file removal retire a shard whose day or team
+        # has gone -- schema 3 needs no reachability manifest of its own because its names say
+        # what they are.
+        v3_report = write_timeline_v3(output, timeline)
+        changed += v3_report.files_changed
+        for relative in v3_report.generated_files:
             _safe_generated_path(relative)
             generated_files.add(relative)
         export_manifest = as_object(

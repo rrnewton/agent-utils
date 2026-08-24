@@ -52,15 +52,107 @@ def cache_control_for_path(path: Path) -> str:
     return _IMMUTABLE if _CONTENT_HASHED_NAME.fullmatch(path.name) else _REVALIDATE
 
 
-def _strong_etag(handle: BinaryIO) -> str:
+#: Digests already computed, keyed by identity *and* by the two pieces of metadata that change
+#: when a file is rewritten. A rebuild replaces a file by `os.replace`, which gives it a new inode
+#: and a new mtime, so a stale entry cannot be hit: the key stops matching before the content does.
+_ETAG_CACHE: dict[tuple[str, int, int, int], str] = {}
+_ETAG_CACHE_LOCK = threading.Lock()
+
+#: Bounded because this process outlives any one page load. Small: the entry point, the bootstrap
+#: and every shard a session touches fit easily, and the cost of a miss is one re-read.
+_ETAG_CACHE_LIMIT = 512
+
+#: The largest range this server will answer with a 206. Above it the whole representation is
+#: sent instead, which is a legal answer to any range request -- a server is always permitted to
+#: ignore ``Range``.
+#:
+#: The bound exists because the selected bytes are buffered rather than streamed. Streaming them
+#: would mean interposing a length-limited file object between the open handle and the base
+#: class's copy loop, and every way to spell that in this file's typing contract needs either a
+#: Liskov-violating override of ``copyfile`` or a suppression, and this package has neither
+#: anywhere. Buffering costs one allocation the size of the answer, and the answer this exists to
+#: serve is one gzip member of a schema-3 shard: the codec targets about a mebibyte per member and
+#: the largest ever measured was 796,663 bytes, so the ceiling is more than an order of magnitude
+#: above the case and far below the 246,973,399-byte monolith that made an unbounded buffer worth
+#: worrying about.
+_MAX_RANGE_BYTES = 16 << 20
+
+_RANGE = re.compile(r"^bytes=(\d*)-(\d*)$")
+
+
+def _strong_etag(path: Path, stat_result: os.stat_result) -> str:
+    """The file's SHA-256, computed at most once per distinct version of it.
+
+    The digest is kept, rather than the validator weakened, because a strong validator is the
+    thing that makes a range request safe: a client that fetches member 3 of a shard on Tuesday
+    and member 7 on Wednesday needs to know it is reading one file, and `mtime` alone cannot say
+    so at one-second resolution. What is removed is re-deriving it. Hashing on every request made
+    a 100-byte range over the 246,973,399-byte schema-1 monolith cost a full read before the first
+    byte went out -- and made a 304, whose entire purpose is to send nothing, cost exactly as much
+    as a 200.
+    """
+
+    key = (str(path), stat_result.st_dev, stat_result.st_ino, stat_result.st_mtime_ns)
+    with _ETAG_CACHE_LOCK:
+        cached = _ETAG_CACHE.get(key)
+    if cached is not None:
+        return cached
     digest = hashlib.sha256()
-    while True:
-        chunk = handle.read(1024 * 1024)
-        if not chunk:
-            break
-        digest.update(chunk)
-    handle.seek(0)
-    return '"sha256-' + digest.hexdigest() + '"'
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    etag = '"sha256-' + digest.hexdigest() + '"'
+    with _ETAG_CACHE_LOCK:
+        if len(_ETAG_CACHE) >= _ETAG_CACHE_LIMIT:
+            # Insertion-ordered, so this drops the least recently *added* entry. Not an LRU, and
+            # deliberately not: an LRU here would be more code guarding a cost that is one file
+            # read, on a loopback server for one reader.
+            _ETAG_CACHE.pop(next(iter(_ETAG_CACHE)))
+        _ETAG_CACHE[key] = etag
+    return etag
+
+
+def parse_byte_range(header: str, size: int) -> tuple[int, int] | None:
+    """Resolve one ``Range`` header against a *size*-byte representation.
+
+    Returns the inclusive ``(first, last)`` byte offsets, or ``None`` when the header names no
+    range this server will honour -- in which case the caller sends the whole thing, which is
+    always a correct answer to a range request.
+
+    **Only a single range is honoured.** A comma-separated list would mean a
+    ``multipart/byteranges`` body, and the one client this exists for -- a reader fetching one
+    gzip member of a shard by the offset its sidecar published -- asks for exactly one range and
+    would have to grow a MIME parser to read the reply. Refusing by falling back to 200 is a
+    correct response to a request this cannot improve on, whereas implementing multipart is a
+    second body format to get wrong.
+
+    A suffix range (``bytes=-500``) is honoured, because "the last N bytes" is how a reader
+    recovers a shard's final member when it has no sidecar at all.
+    """
+
+    match = _RANGE.fullmatch(header.strip())
+    if match is None:
+        return None
+    raw_first, raw_last = match.group(1), match.group(2)
+    if not raw_first and not raw_last:
+        return None
+    if not raw_first:
+        length = int(raw_last)
+        if length == 0:
+            return None
+        return (max(size - length, 0), size - 1)
+    first = int(raw_first)
+    if first >= size:
+        # Unsatisfiable, and distinct from unparseable: the caller answers 416 rather than 200,
+        # because a client asking past the end has a stale idea of the file and should be told.
+        return (size, size - 1)
+    last = size - 1 if not raw_last else min(int(raw_last), size - 1)
+    if last < first:
+        return None
+    return (first, last)
 
 
 def _etag_matches(raw_header: str, etag: str) -> bool:
@@ -118,7 +210,18 @@ class TimelineRequestHandler(http.server.SimpleHTTPRequestHandler):
             return super().send_head()
         sidecar_path = source_path.with_name(source_path.name + ".gz")
         vary = sidecar_path.is_file() and not sidecar_path.is_symlink()
-        use_gzip = vary and accepts_gzip(self.headers.get("Accept-Encoding", ""))
+        raw_range = self.headers.get("Range", "")
+        # A range request is served from the identity representation, always. A byte range over
+        # a `.gz` companion would be a range over bytes the client never asked for by name and
+        # cannot decode in isolation -- half a gzip stream is not half a document -- so content
+        # coding and byte ranges are simply not combined here. Nothing is lost for the case this
+        # exists to serve: a schema-3 shard *is* the `.gz`, it has no plain twin, and a range
+        # over it addresses exactly the bytes its sidecar index named.
+        use_gzip = (
+            vary
+            and not raw_range
+            and accepts_gzip(self.headers.get("Accept-Encoding", ""))
+        )
         selected_path = sidecar_path if use_gzip else source_path
         handle: BinaryIO | None = None
         try:
@@ -131,7 +234,7 @@ class TimelineRequestHandler(http.server.SimpleHTTPRequestHandler):
             self.send_error(404, "File not found")
             return None
 
-        etag = _strong_etag(handle)
+        etag = _strong_etag(selected_path, selected_stat)
         if _etag_matches(self.headers.get("If-None-Match", ""), etag):
             handle.close()
             self.send_response(304)
@@ -145,11 +248,49 @@ class TimelineRequestHandler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
             return None
 
-        self.send_response(200)
+        size = selected_stat.st_size
+        # `If-Range` makes a range conditional on the representation being the one the client
+        # already has part of. If it does not match, the correct answer is the whole thing, not a
+        # slice of a different file stitched onto the client's stale prefix.
+        if_range = self.headers.get("If-Range", "")
+        selection = (
+            parse_byte_range(raw_range, size)
+            if raw_range and (not if_range or _etag_matches(if_range, etag))
+            else None
+        )
+        if selection is not None and selection[1] >= selection[0] and (
+            selection[1] - selection[0] + 1 > _MAX_RANGE_BYTES
+        ):
+            selection = None
+        if selection is not None and selection[1] < selection[0]:
+            handle.close()
+            self.send_response(416)
+            self.send_header("Content-Range", f"bytes */{size}")
+            self.send_header("Content-Length", "0")
+            self.send_header("ETag", etag)
+            self.send_header("Accept-Ranges", "bytes")
+            self._send_cache_control(source_path)
+            self.end_headers()
+            return None
+
+        self.send_response(206 if selection is not None else 200)
         self.send_header("Content-Type", self.guess_type(str(source_path)))
-        self.send_header("Content-Length", str(selected_stat.st_size))
+        if selection is None:
+            self.send_header("Content-Length", str(size))
+        else:
+            first, last = selection
+            handle.seek(first)
+            body = handle.read(last - first + 1)
+            handle.close()
+            handle = io.BytesIO(body)
+            self.send_header("Content-Range", f"bytes {first}-{last}/{size}")
+            self.send_header("Content-Length", str(len(body)))
         self.send_header("Last-Modified", formatdate(source_stat.st_mtime, usegmt=True))
         self.send_header("ETag", etag)
+        # Advertised on every response, including the ones with no range, because a client that
+        # cannot see the capability will not use it -- and the schema-3 layout exists precisely
+        # so that a reader can ask for one member instead of a shard.
+        self.send_header("Accept-Ranges", "bytes")
         self._send_cache_control(source_path)
         if vary:
             self.send_header("Vary", "Accept-Encoding")

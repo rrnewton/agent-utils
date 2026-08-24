@@ -5,7 +5,7 @@ import json
 import shutil
 import sqlite3
 import stat
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -50,6 +50,7 @@ from agent_team_timeline.window import apply_date_window, parse_date_window
 ROOT = "11111111-1111-1111-1111-111111111111"
 NESTED = "22222222-2222-2222-2222-222222222222"
 SUCCESSOR = "33333333-3333-3333-3333-333333333333"
+THIRD = "44444444-4444-4444-4444-444444444444"
 
 
 def _ms(value: str) -> int:
@@ -66,6 +67,7 @@ def _session_database(
     blocks: Sequence[tuple[object, ...]],
     created_at: str = "2026-07-20T19:00:00+00:00",
     updated_at: str = "2026-07-22T04:00:00+00:00",
+    schema_version: int | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(path)
@@ -112,6 +114,43 @@ def _session_database(
             "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             blocks,
         )
+        if schema_version is not None:
+            _write_provider_schema_version(connection, schema_version)
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _write_provider_schema_version(
+    connection: sqlite3.Connection, version: int
+) -> None:
+    """Create or update Orc's own in-band schema marker, in Orc's own shape.
+
+    Copied from a real session database rather than invented, including the `CHECK` constraints:
+    the point of recording this value is that it is Orc's statement about its storage, so a fixture
+    that stored it in some more convenient shape would be testing this repository's imagination.
+    """
+
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS schema_version (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            version INTEGER NOT NULL CHECK (version > 0),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        """
+    )
+    connection.execute(
+        "INSERT INTO schema_version(id, version, updated_at) VALUES (1, ?, ?) "
+        "ON CONFLICT(id) DO UPDATE SET version = excluded.version",
+        (version, "2026-07-21 09:00:00"),
+    )
+
+
+def _set_provider_schema_version(path: Path, version: int) -> None:
+    connection = sqlite3.connect(path)
+    try:
+        _write_provider_schema_version(connection, version)
         connection.commit()
     finally:
         connection.close()
@@ -667,6 +706,441 @@ def _continuation_fixture(tmp_path: Path) -> tuple[Path, Path]:
     return source, task_db
 
 
+# The first link's frozen boundary and the moment its successor starts, named once so the tampering
+# cases below can state the exact value they are replacing rather than nudging whatever is there.
+_SPLIT_FIRST_BOUNDARY_MS = _ms("2026-07-21T15:01:00+00:00")
+_SPLIT_SECOND_START_MS = _ms("2026-07-21T16:00:00+00:00")
+
+
+def _boundary_block(
+    block_id: str, session_id: str, at_ms: int, text: str
+) -> tuple[object, ...]:
+    return (
+        block_id,
+        f"{block_id}-message",
+        session_id,
+        0,
+        at_ms,
+        1,
+        "assistant",
+        "text",
+        text,
+        None,
+        None,
+        None,
+        None,
+        "model",
+        None,
+        None,
+        None,
+    )
+
+
+def _status_message(native_id: str, block_id: int, at_ms: int) -> dict[str, object]:
+    return {
+        "id": native_id,
+        "role": "Assistant",
+        "source": None,
+        "created_at_ms": at_ms,
+        "blocks": [{"type": "StatusBlock", "id": block_id, "message": native_id}],
+    }
+
+
+def _split_table_continuation_fixture(tmp_path: Path) -> Path:
+    """Build the one lineage shape that proves a global storage-table answer cannot work.
+
+    Three parentless coordinators, two continuation links, and the two links' boundary ordinals live
+    in *different* tables:
+
+    * The first predecessor is a pre-transition session -- `content_blocks` only, no `messages`
+      table at all -- so its boundary ordinal is a `content_blocks` rowid.
+    * The second predecessor is a post-transition session carrying both tables, so its boundary
+      ordinal is a `messages` id. That ordinal *also* exists as a `content_blocks` rowid in the same
+      database, with a timestamp days away from the recorded one, which is what makes "just prefer
+      one table" indistinguishable from a coin flip.
+
+    Both predecessors are in one lineage and are resolved by one ingest, so any rule that answers
+    "which table?" once per run, however it answers, gets exactly one of the two links wrong. This
+    is not a hypothetical: it is the shape of a measured archive whose ingest refused with
+    "boundary row disappeared" against entirely intact data.
+    """
+
+    source = tmp_path / "split-table-source"
+    first_db = source / ".orc" / "sessions" / ROOT / "session.db"
+    second_db = source / ".orc" / "sessions" / SUCCESSOR / "session.db"
+    third_db = source / ".orc" / "sessions" / THIRD / "session.db"
+    _session_database(
+        first_db,
+        ROOT,
+        parent_id=None,
+        db_name=None,
+        messages=[],
+        blocks=[
+            _boundary_block(
+                "first-opening",
+                ROOT,
+                _ms("2026-07-21T15:00:00+00:00"),
+                "Predecessor opening",
+            ),
+            _boundary_block(
+                "first-final",
+                ROOT,
+                _ms("2026-07-21T15:01:00+00:00"),
+                "Predecessor final status",
+            ),
+        ],
+        created_at="2026-07-21T09:00:00+00:00",
+        updated_at="2026-07-21T15:30:00+00:00",
+        schema_version=3,
+    )
+    # Five content rows and four messages, so the messages ordinal the second link freezes (4) is
+    # also a live content_blocks rowid -- carrying a different timestamp. Without that overlap the
+    # regression would pass for the wrong reason: any rule at all resolves an ordinal that exists in
+    # exactly one table.
+    _session_database(
+        second_db,
+        SUCCESSOR,
+        parent_id=None,
+        db_name=None,
+        messages=[],
+        blocks=[
+            _boundary_block(
+                f"second-block-{index}",
+                SUCCESSOR,
+                _ms("2026-07-21T16:15:00+00:00") + index * 60_000,
+                f"Successor block {index}",
+            )
+            for index in range(1, 6)
+        ],
+        created_at="2026-07-21T16:00:00+00:00",
+        updated_at="2026-07-21T19:30:00+00:00",
+        schema_version=5,
+    )
+    _add_messages(
+        second_db,
+        tuple(
+            (
+                index,
+                SUCCESSOR,
+                at_ms,
+                _status_message(f"second-message-{index}", 100 + index, at_ms),
+            )
+            for index, at_ms in enumerate(
+                (
+                    _ms("2026-07-21T16:20:00+00:00"),
+                    _ms("2026-07-21T17:00:00+00:00"),
+                    _ms("2026-07-21T18:00:00+00:00"),
+                    _ms("2026-07-21T19:00:00+00:00"),
+                ),
+                start=1,
+            )
+        ),
+    )
+    _session_database(
+        third_db,
+        THIRD,
+        parent_id=None,
+        db_name=None,
+        messages=[],
+        blocks=[
+            _boundary_block(
+                "third-opening",
+                THIRD,
+                _ms("2026-07-21T20:15:00+00:00"),
+                "Second successor opening",
+            )
+        ],
+        created_at="2026-07-21T20:00:00+00:00",
+        updated_at="2026-07-21T21:00:00+00:00",
+        schema_version=5,
+    )
+    _index_database(
+        source / ".orc" / "index.db",
+        ((ROOT, None), (SUCCESSOR, None), (THIRD, None)),
+    )
+    return source
+
+
+def _source_manifest(archive: Path) -> dict[str, JsonValue]:
+    path = archive / "teams" / "orc-test" / "raw" / "source-manifest.json"
+    return as_object(read_json(path), str(path))
+
+
+def _manifest_links(archive: Path) -> list[dict[str, object]]:
+    manifest = _source_manifest(archive)
+    return [
+        dict(as_object(raw_link, "continuation"))
+        for raw_link in as_array(manifest["continuation_sessions"], "continuations")
+    ]
+
+
+def _link_int(link: Mapping[str, object], key: str) -> int:
+    return as_int(narrow_json(link[key], key), key)
+
+
+def _write_manifest_links(
+    archive: Path, schema_version: int, links: Sequence[Mapping[str, object]]
+) -> None:
+    """Put a hand-edited continuation record back, at a stated manifest schema version.
+
+    The version is a required argument rather than something inferred from the records, because
+    every use here is deliberately writing a record shape from a *different* generation of the
+    writer than the one that produced the archive, and inferring it would quietly repair the very
+    mismatch the test exists to create.
+    """
+
+    path = archive / "teams" / "orc-test" / "raw" / "source-manifest.json"
+    manifest: dict[str, object] = dict(_source_manifest(archive))
+    manifest["schema_version"] = schema_version
+    manifest["continuation_sessions"] = [dict(link) for link in links]
+    path.write_text(json.dumps(narrow_json(manifest)), encoding="utf-8")
+
+
+def _recorded_boundary_tables(archive: Path) -> list[object]:
+    return [link["predecessor_source_table"] for link in _manifest_links(archive)]
+
+
+def _recorded_provider_schema_versions(archive: Path) -> dict[str, object]:
+    manifest = _source_manifest(archive)
+    return {
+        str(as_object(source, "source")["source_path"]): as_object(
+            source, "source"
+        )["provider_schema_version"]
+        for source in as_array(manifest["sources"], "sources")
+    }
+
+
+def test_two_link_lineage_freezes_each_boundary_table_separately(
+    tmp_path: Path,
+) -> None:
+    source = _split_table_continuation_fixture(tmp_path)
+    archive = tmp_path / "archive"
+
+    _, first = ingest_orc(
+        archive,
+        source,
+        ROOT,
+        "orc-test",
+        "UTC",
+        None,
+        None,
+        (SUCCESSOR, THIRD),
+    )
+    _, second = ingest_orc(archive, source, ROOT, "orc-test", "UTC")
+
+    assert first.sources > 0
+    assert second.files_changed == 0
+    manifest = _source_manifest(archive)
+    assert manifest["schema_version"] == 5
+    # The whole claim in one assertion: two links in one lineage, resolved by one ingest, landing in
+    # two different tables.
+    assert _recorded_boundary_tables(archive) == ["content_blocks", "messages"]
+    links = as_array(manifest["continuation_sessions"], "continuations")
+    assert as_object(links[0], "link")["predecessor_source_line"] == 2
+    assert as_object(links[1], "link")["predecessor_source_line"] == 4
+    assert _recorded_provider_schema_versions(archive) == {
+        f".orc/sessions/{ROOT}/session.db": 3,
+        f".orc/sessions/{SUCCESSOR}/session.db": 5,
+        f".orc/sessions/{THIRD}/session.db": 5,
+    }
+
+
+def test_a_first_ingest_derives_the_boundary_from_evidence_not_from_layout(
+    tmp_path: Path,
+) -> None:
+    """A predecessor caught mid-transition must not lose its boundary to the empty new table.
+
+    This is the *derivation* side of the same defect the resolver fixes on the verification
+    side, and it was left behind once: `_latest_session_record_before` asked
+    `_session_storage_table` which layout the database presents, and that function answers
+    "messages" the moment a `messages` table exists, whether or not it holds anything.
+
+    Two failures follow, and the fixture reproduces both at once. The predecessor's transcript
+    lives entirely in `content_blocks`; a `messages` table exists beside it holding a single row
+    from long before the successor started. Under the old rule the boundary derived to that one
+    early row -- skipping every later `content_blocks` record and freezing the wrong pair into
+    the manifest as an observation -- and with that row removed entirely the derivation found
+    nothing and the ingest refused a lineage whose data is completely intact.
+    """
+
+    source = _split_table_continuation_fixture(tmp_path)
+    first_db = source / ".orc" / "sessions" / ROOT / "session.db"
+    early = _ms("2026-07-21T09:30:00+00:00")
+    _add_messages(
+        first_db,
+        ((1, ROOT, early, _status_message("stray-early-message", 300, early)),),
+    )
+
+    archive = tmp_path / "archive"
+    ingest_orc(
+        archive, source, ROOT, "orc-test", "UTC", None, None, (SUCCESSOR, THIRD)
+    )
+
+    links = _manifest_links(archive)
+    # The real last predecessor record is `content_blocks` rowid 2 at 15:01, not the stray
+    # `messages` row at 09:30.
+    assert links[0]["predecessor_source_table"] == "content_blocks"
+    assert links[0]["predecessor_source_line"] == 2
+    assert _link_int(links[0], "predecessor_at_ms") == _ms(
+        "2026-07-21T15:01:00+00:00"
+    )
+
+
+def test_storage_transition_under_a_frozen_link_is_not_a_disappeared_row(
+    tmp_path: Path,
+) -> None:
+    """Orc migrating a predecessor to dual-table storage must not invalidate its frozen boundary."""
+
+    source = _split_table_continuation_fixture(tmp_path)
+    archive = tmp_path / "archive"
+    ingest_orc(
+        archive, source, ROOT, "orc-test", "UTC", None, None, (SUCCESSOR, THIRD)
+    )
+    first_db = source / ".orc" / "sessions" / ROOT / "session.db"
+
+    # Exactly what Orc's in-place migration does: the pre-transition rows stay in `content_blocks`
+    # and a `messages` table appears alongside them holding only post-transition traffic. The
+    # frozen boundary ordinal (2) is therefore far beyond the new table's single row -- the measured
+    # archive's numbers were 11111 and 906 -- so re-deriving the table from what the database now
+    # looks like reports the row as gone.
+    _add_messages(
+        first_db,
+        (
+            (
+                1,
+                ROOT,
+                _ms("2026-07-21T15:20:00+00:00"),
+                _status_message("first-post-migration", 200, _ms("2026-07-21T15:20:00+00:00")),
+            ),
+        ),
+    )
+    _set_provider_schema_version(first_db, 8)
+
+    _, migrated = ingest_orc(archive, source, ROOT, "orc-test", "UTC")
+
+    assert migrated.files_changed > 0
+    assert _recorded_boundary_tables(archive) == ["content_blocks", "messages"]
+    assert _recorded_provider_schema_versions(archive)[
+        f".orc/sessions/{ROOT}/session.db"
+    ] == 8
+    assert load_archived_team(archive, "orc-test").provider == "orc"
+
+
+def test_table_less_links_are_migrated_by_evidence_not_by_storage_layout(
+    tmp_path: Path,
+) -> None:
+    """A manifest frozen before the table was recorded resolves both links, each in its own table."""
+
+    source = _split_table_continuation_fixture(tmp_path)
+    archive = tmp_path / "archive"
+    ingest_orc(
+        archive, source, ROOT, "orc-test", "UTC", None, None, (SUCCESSOR, THIRD)
+    )
+
+    # Rewind the manifest to the shape a table-less writer produced, so the migration path runs
+    # against the record it actually has to handle rather than a newly written one with a field
+    # blanked out.
+    links = _manifest_links(archive)
+    for link in links:
+        del link["predecessor_source_table"]
+    _write_manifest_links(archive, 4, links)
+
+    _, migrated = ingest_orc(archive, source, ROOT, "orc-test", "UTC")
+    _, repeated = ingest_orc(archive, source, ROOT, "orc-test", "UTC")
+
+    assert migrated.files_changed > 0
+    assert repeated.files_changed == 0
+    assert _source_manifest(archive)["schema_version"] == 5
+    assert _recorded_boundary_tables(archive) == ["content_blocks", "messages"]
+
+
+def test_table_less_link_whose_evidence_is_nowhere_still_refuses(
+    tmp_path: Path,
+) -> None:
+    source = _split_table_continuation_fixture(tmp_path)
+    archive = tmp_path / "archive"
+    ingest_orc(
+        archive, source, ROOT, "orc-test", "UTC", None, None, (SUCCESSOR, THIRD)
+    )
+    links = _manifest_links(archive)
+    for link in links:
+        del link["predecessor_source_table"]
+        link["predecessor_at_ms"] = _link_int(link, "predecessor_at_ms") - 1
+        link["gap_ms"] = _link_int(link, "gap_ms") + 1
+    _write_manifest_links(archive, 4, links)
+
+    with pytest.raises(OrcParseError, match="boundary evidence changed"):
+        ingest_orc(archive, source, ROOT, "orc-test", "UTC")
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected"),
+    (
+        (
+            {
+                "predecessor_at_ms": _SPLIT_FIRST_BOUNDARY_MS - 1,
+                "gap_ms": _SPLIT_SECOND_START_MS - _SPLIT_FIRST_BOUNDARY_MS + 1,
+            },
+            "boundary evidence changed",
+        ),
+        ({"predecessor_source_line": 999}, "boundary row disappeared"),
+        (
+            {"predecessor_source_table": "messages"},
+            "boundary table 'messages' is absent",
+        ),
+    ),
+    ids=("evidence-changed", "row-disappeared", "table-absent"),
+)
+def test_naming_the_boundary_table_narrows_the_guard_without_weakening_it(
+    tmp_path: Path, mutation: dict[str, object], expected: str
+) -> None:
+    """Each way a named boundary can stop being true still refuses, and says which way it was.
+
+    The three failures were one message before the table was recorded, because a table-less link
+    could not tell "the row is gone" from "we are reading the wrong table". Splitting them is the
+    readable half of the fix: an operator who sees `boundary table 'messages' is absent` knows
+    immediately that the manifest and the database disagree about storage layout, which is a very
+    different morning from `boundary row disappeared`.
+    """
+
+    source = _split_table_continuation_fixture(tmp_path)
+    archive = tmp_path / "archive"
+    ingest_orc(
+        archive, source, ROOT, "orc-test", "UTC", None, None, (SUCCESSOR, THIRD)
+    )
+    links = _manifest_links(archive)
+    links[0].update(mutation)
+    _write_manifest_links(archive, 5, links)
+
+    with pytest.raises(OrcParseError, match=expected):
+        ingest_orc(archive, source, ROOT, "orc-test", "UTC")
+
+
+def test_unreadable_provider_schema_marker_refuses_rather_than_reading_as_absent(
+    tmp_path: Path,
+) -> None:
+    source = _split_table_continuation_fixture(tmp_path)
+    third_db = source / ".orc" / "sessions" / THIRD / "session.db"
+    connection = sqlite3.connect(third_db)
+    try:
+        connection.execute("DELETE FROM schema_version")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(OrcParseError, match="holds no version row"):
+        ingest_orc(
+            tmp_path / "archive",
+            source,
+            ROOT,
+            "orc-test",
+            "UTC",
+            None,
+            None,
+            (SUCCESSOR, THIRD),
+        )
+
+
 def test_explicit_orc_continuation_unions_lineages_and_partitions_shared_notes(
     tmp_path: Path,
 ) -> None:
@@ -706,15 +1180,24 @@ def test_explicit_orc_continuation_unions_lineages_and_partitions_shared_notes(
     assert link.predecessor_session_id == ROOT
     assert link.session_id == SUCCESSOR
     assert link.started_at_ms == _ms("2026-07-21T16:00:00+00:00")
+    assert link.predecessor_source_table == "content_blocks"
     assert OrcContinuationLink.from_json_obj(
         link.to_json_obj(), "continuation"
     ) == link
-    legacy_link = link.to_json_obj()
+    # Two earlier record shapes still decode. Each dropped field decodes to `None`, which for the
+    # boundary table means "unrecorded" -- the state the resolver is written to migrate out of --
+    # so the decoded link is the same link minus exactly the facts that shape never carried.
+    bounded_link = link.to_json_obj()
+    del bounded_link["predecessor_source_table"]
+    assert OrcContinuationLink.from_json_obj(
+        bounded_link, "table-less continuation"
+    ) == replace(link, predecessor_source_table=None)
+    legacy_link = dict(bounded_link)
     del legacy_link["start_message_id"]
     del legacy_link["start_source_line"]
     assert OrcContinuationLink.from_json_obj(
         legacy_link, "legacy continuation"
-    ) == link
+    ) == replace(link, predecessor_source_table=None)
 
     team = load_orc_team(
         snapshot,

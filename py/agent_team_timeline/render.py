@@ -47,6 +47,7 @@ from agent_team_timeline.static_assets import (
     write_text_with_gzip_invalidation,
 )
 from agent_team_timeline.timeline_shards import write_timeline_shards
+from agent_team_timeline.timeline_v3 import is_schema_3_path, write_timeline_v3
 from agent_team_timeline.window import DateWindow
 from agent_team_timeline.terminology import (
     GlossaryTerm,
@@ -850,6 +851,13 @@ _PRESENTATION_RETIRED = frozenset({"query.py"})
 
 
 def _safe_presentation_file(relative: str) -> str:
+    # Schema 3 first, because the rule below -- "a trailing `.gz` names the compressed sidecar of
+    # a plain file" -- is a convention of the older generations and schema 3 deliberately breaks
+    # it: its shards ARE `.gz` and have no plain twin, which is the duplication it exists to
+    # remove. Stripping the suffix here would ask whether `…/2026-05-04.jsonl` is a legal
+    # presentation path, and it is not, because it is never written.
+    if is_schema_3_path(relative):
+        return relative
     base = relative.removesuffix(".gz")
     if relative.endswith(".gz") and base.endswith(".gz"):
         raise ValueError(f"nested presentation gzip sidecar: {relative!r}")
@@ -1524,6 +1532,15 @@ def render_archive(
     )
     if shard_report is not None:
         changed += shard_report.files_changed
+    # Schema 3 is published beside schema 1 and schema 2, not instead of them: `query.py` still
+    # reads the schema-2 bootstrap and falls back to `data/timeline.json`, so a build that
+    # emitted only schema 3 would leave the archive unreadable by its own tools. The same flag
+    # governs both projections because they answer the same question -- "is this a real export
+    # or a fixture?" -- and letting them diverge would give a test an archive with one
+    # generation missing and no way to tell which.
+    v3_report = write_timeline_v3(archive, timeline_json) if _write_shards else None
+    if v3_report is not None:
+        changed += v3_report.files_changed
     generated_files = set(_PRESENTATION_COMMON)
     generated_files.update(published_summary_paths)
     generated_files.update(phase_paths.values())
@@ -1536,6 +1553,8 @@ def render_archive(
     )
     if shard_report is not None:
         generated_files.update(shard_report.generated_files)
+    if v3_report is not None:
+        generated_files.update(v3_report.generated_files)
     for relative in sorted(compressible_paths):
         if gzip_sidecar_path(_generated_path(archive, relative)).is_file():
             generated_files.add(relative + ".gz")
