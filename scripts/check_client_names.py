@@ -18,7 +18,7 @@ Two safety properties, both covered by `--self-test`:
   match. An exemption that has outlived its reason is a failure, not a quiet no-op, so the
   allowlist cannot grow into a second place where these names are tolerated.
 * **Ordinary English is not a violation.** The pattern is anchored so that `thermite` and
-  `hermitage` pass while `dev-hermit` and `DeepScryCoder1` do not.
+  `hermitage` pass while `dev-hermit` and `DeepScryFoo` do not.
 
 See `#86 scrub-client-names`.
 
@@ -37,11 +37,11 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-#: The client projects, case-insensitively, so `deepscry-bot`, `DeepScryCoder1` and `dev-hermit`
+#: The client projects, case-insensitively, so `deepscry-bot`, `DeepScryFoo` and `dev-hermit`
 #: are all caught while `thermite` and `hermitage` are not.
 #:
 #: The trailing guard is `[sS]?(?![a-z])` rather than a plain `\b`, because `\b` does not sit
-#: between `y` and `C`: `\bDeepScry\b` misses `DeepScryCoder1` entirely, and a name glued to a
+#: between `y` and `F`: `\bDeepScry\b` misses `DeepScryFoo` entirely, and a name glued to a
 #: CamelCase suffix is exactly how one survived in a test fixture. Refusing only a LOWERCASE
 #: continuation keeps `hermitage` out while still catching a CamelCase or hyphenated compound,
 #: and the optional `s` keeps the plural.
@@ -132,7 +132,7 @@ def self_test() -> int:
     # The pattern is the part that has to be right.
     expect(bool(FORBIDDEN.search("the DeepScry workspace")), "must catch a bare client name")
     expect(bool(FORBIDDEN.search("dev-hermit")), "must catch a name inside a hyphenated identifier")
-    expect(bool(FORBIDDEN.search("DeepScryCoder1")), "must catch a name inside CamelCase")
+    expect(bool(FORBIDDEN.search("DeepScryFoo")), "must catch a name inside CamelCase")
     expect(bool(FORBIDDEN.search("HERMIT")), "must be case-insensitive")
     expect(not FORBIDDEN.search("thermite"), "must not fire on a word merely containing the letters")
     expect(not FORBIDDEN.search("hermitage"), "must not fire on an unrelated English word")

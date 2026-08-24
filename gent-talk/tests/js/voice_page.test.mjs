@@ -4718,8 +4718,8 @@ test("the channel view speaks the operator's clock, not UTC", async () => {
 test("a bot author is labelled as one", async () => {
   const page = newPage();
   await signIn(page);
-  const lines = await showDiscord(page, [message({ author: "acme-bot", author_is_bot: true })]);
-  assert.match(lines[0].text(), /acme-bot \(bot\)/);
+  const lines = await showDiscord(page, [message({ author: "MyDiscordBot", author_is_bot: true })]);
+  assert.match(lines[0].text(), /MyDiscordBot \(bot\)/);
 });
 
 test("the small markdown subset renders, and renders as ELEMENTS the page made itself", async () => {
@@ -7637,9 +7637,9 @@ const whoOf = (page, i) => row(page, i).getAttribute("data-who");
 
 function crowd() {
   return [
-    message({ id: "1000000000000000001", author: "unormal", author_id: "10", author_is_bot: false }),
-    message({ id: "1000000000000000002", author: "AcmeCoder1", author_id: "20", author_is_bot: true }),
-    message({ id: "1000000000000000003", author: "unormal", author_id: "10", author_is_bot: false }),
+    message({ id: "1000000000000000001", author: "alice", author_id: "10", author_is_bot: false }),
+    message({ id: "1000000000000000002", author: "MyDiscordBot", author_id: "20", author_is_bot: true }),
+    message({ id: "1000000000000000003", author: "alice", author_id: "10", author_is_bot: false }),
   ];
 }
 
