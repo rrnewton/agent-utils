@@ -21,7 +21,18 @@ from dagrun.scheduler import Runner
 
 #: Wall budget for one whole in-test run. Every step below is `true` or a 0.1s sleep, so a
 #: healthy run finishes in well under a second; anything approaching this is the wedge.
-_DEADLINE_S = 20.0
+#:
+#: DELIBERATELY GENEROUS, and the reason matters because the obvious instinct is to tighten it.
+#: This bound exists to tell FINITE from INFINITE — a wedged scheduler waits on an outcome that is
+#: never published, so it does not take 30s, it takes forever. It does not exist to tell fast from
+#: slow. A tight bound therefore buys nothing against the failure it guards (a wedge fails either
+#: way, just sooner) while buying a false positive every time the host is busy.
+#:
+#: It was 20.0, and that is exactly what happened: this test passes in 0.33s standalone and 3/3 on
+#: repeat, but failed inside a full `make validate` on a loaded machine — twice, in unrelated work,
+#: on a suite that gates every push. A flaky gate is worse than a slow one, because the cost is
+#: paid by whoever is landing something else and has no reason to suspect this file.
+_DEADLINE_S = 120.0
 
 
 def _step(job: str, cmd: str = "true", **kwargs: object) -> Step:

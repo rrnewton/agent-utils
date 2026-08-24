@@ -302,9 +302,9 @@ class TaskNote:
 
     ``upstream_present`` is the one field here that no later run can reconstruct, and it is the
     reason this record family is worth its bytes. Orc's ``task_notes`` table is mutable and rows
-    are genuinely deleted from it: measured against the archive that prompted this,
-    ``orc-coord-014-hermit2`` has 1,311 of 7,826 frozen notes with no live counterpart and
-    ``orc-coord-030-hermit3`` has 75 of 5,079 -- 1,386 notes for which this file is the only copy
+    are genuinely deleted from it: measured against the archive that prompted this, one Orc team
+    has 1,311 of 7,826 frozen notes with no live counterpart and another has 75 of 5,079 --
+    1,386 notes for which this file is the only copy
     in existence. The projection has always counted them (``OrcTaskProjection.missing_note_count``)
     and hashed their ids, but a count is not an answer to "which ones", and the moment
     ``source_snapshots/`` is deleted -- the entire purpose of the promotion -- nothing can ever
@@ -358,7 +358,7 @@ def task_note_key(note: TaskNote) -> tuple[str, int]:
     """Return the identity a promoted note is merged and ordered on.
 
     The note id is only unique within one task database, and an Orc lineage can carry several --
-    ``orc-coord-030-hermit3`` carries two -- so the source path is part of the identity, not
+    one team in the measured archive carries two -- so the source path is part of the identity, not
     decoration. ``task_source_ordinal`` is deliberately *not* in the key: it is an ordinal
     assigned per ingest and a source that changes ordinal is still the same source.
     """

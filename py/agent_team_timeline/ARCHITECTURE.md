@@ -532,8 +532,9 @@ policy, the content address of the projection generation the note was promoted f
 `upstream_present`. Nothing filters it and nothing rewrites it.
 
 The record file exists because Orc's `task_notes` table is mutable upstream and rows are really
-deleted from it — `orc-coord-014-hermit2` has 1,311 of 7,826 frozen notes with no live counterpart
-and `orc-coord-030-hermit3` has 75 of 5,079, so for those 1,386 notes the archive is the only copy
+deleted from it — in the archive that prompted this, one Orc team has 1,311 of 7,826 frozen notes
+with no live counterpart and another has 75 of 5,079, so for those 1,386 notes the archive is the
+only copy
 anywhere. Until this file existed, that content was version-controlled only as the lossy message
 rendering, because the frozen projection that held it lives under gitignored `source_snapshots/`.
 
