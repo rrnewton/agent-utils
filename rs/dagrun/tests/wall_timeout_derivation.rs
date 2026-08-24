@@ -41,6 +41,7 @@ fn step(timeout: i64, cpu_timeout: i64) -> Step {
         timeout,
         cpu_timeout,
         jobs_flag: None,
+        jobs_env: None,
         skip_reason: None,
         write_domains: None,
         write_domain_guarantee: None,

@@ -1115,7 +1115,7 @@ def test_sweep_refuses_empty_jobs_flag_before_spawn(
     )
     assert rc == 2
     assert not marker.exists()
-    assert "empty effective jobs_flag" in capsys.readouterr().err
+    assert "offers no width channel" in capsys.readouterr().err
 
 
 def test_run_budget_reaches_every_planner_but_memory_remains_cpa_only(

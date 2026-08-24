@@ -9,8 +9,26 @@ waved through.
 
 from __future__ import annotations
 
+import json
+import shlex
+from pathlib import Path
+
 import pytest
 
+from dagrun import (
+    DagConfig,
+    DagJsonError,
+    ResourceHint,
+    Runner,
+    apply_plan_to_config,
+    build_plan,
+    cap_config_max_cpus,
+    dag_from_json,
+    dag_to_json,
+    run_dag_limited,
+)
+from dagrun.cgroup import NoopCgroups
+from dagrun.estimates import Planner
 from dagrun.model import (
     JOBS_ENV_ENV,
     Step,
@@ -20,30 +38,43 @@ from dagrun.model import (
 )
 
 
-def _step(**kw) -> Step:
-    return Step("g", "j", "", "cargo build --workspace && cargo build --bin x", **kw)
+def _step(
+    *,
+    jobs_flag: str | None = None,
+    jobs_env: str | None = None,
+    hint: ResourceHint | None = None,
+) -> Step:
+    return Step(
+        "g",
+        "j",
+        "",
+        "cargo build --workspace && cargo build --bin x",
+        jobs_flag=jobs_flag,
+        jobs_env=jobs_env,
+        hint=hint or ResourceHint(),
+    )
 
 
-def test_host_declares_the_channel_and_the_graph_does_not_have_to():
+def test_host_declares_the_channel_and_the_graph_does_not_have_to() -> None:
     """The motivating case: a compound command that no appended flag can reach."""
     step = _step(jobs_flag="")
     assert env_with_inner_jobs(step, "CARGO_BUILD_JOBS", 4) == {"CARGO_BUILD_JOBS": "4"}
 
 
-def test_no_channel_configured_is_a_no_op():
+def test_no_channel_configured_is_a_no_op() -> None:
     """A host that sets nothing behaves exactly as before this feature existed."""
     assert env_with_inner_jobs(_step(jobs_flag=""), "", 4) == {}
 
 
-def test_no_declared_width_sets_nothing():
+def test_no_declared_width_sets_nothing() -> None:
     assert env_with_inner_jobs(_step(jobs_flag=""), "CARGO_BUILD_JOBS", None) == {}
 
 
-def test_a_step_may_opt_out_of_the_channel_specifically():
+def test_a_step_may_opt_out_of_the_channel_specifically() -> None:
     assert env_with_inner_jobs(_step(jobs_env=""), "CARGO_BUILD_JOBS", 4) == {}
 
 
-def test_step_override_beats_the_machine_default():
+def test_step_override_beats_the_machine_default() -> None:
     assert env_with_inner_jobs(_step(jobs_env="MAKEFLAGS_J"), "CARGO_BUILD_JOBS", 2) == {
         "MAKEFLAGS_J": "2"
     }
@@ -51,32 +82,32 @@ def test_step_override_beats_the_machine_default():
 
 # --- the predicate the refusal keys on -------------------------------------------------
 
-def test_neither_channel_is_still_unresizable():
+def test_neither_channel_is_still_unresizable() -> None:
     """THE LOAD-BEARING CASE. Nothing here may make the refusal stop firing."""
     assert step_width_is_resizable(_step(jobs_flag=""), "-j", "") is False
 
 
-def test_either_channel_alone_makes_it_resizable():
+def test_either_channel_alone_makes_it_resizable() -> None:
     assert step_width_is_resizable(_step(jobs_flag=""), "-j", "CARGO_BUILD_JOBS") is True
     assert step_width_is_resizable(_step(), "-j", "") is True
 
 
-def test_whitespace_is_not_a_channel():
+def test_whitespace_is_not_a_channel() -> None:
     """A blank-looking value must not be mistaken for a usable channel."""
     assert step_width_is_resizable(_step(jobs_flag="  "), "-j", "   ") is False
 
 
 # --- resolution from the host ----------------------------------------------------------
 
-def test_resolves_from_the_host_environment():
+def test_resolves_from_the_host_environment() -> None:
     assert resolve_jobs_env(env={JOBS_ENV_ENV: "CARGO_BUILD_JOBS"}) == "CARGO_BUILD_JOBS"
 
 
-def test_unset_means_no_channel():
+def test_unset_means_no_channel() -> None:
     assert resolve_jobs_env(env={}) == ""
 
 
-def test_a_malformed_name_is_REFUSED_not_ignored():
+def test_a_malformed_name_is_REFUSED_not_ignored() -> None:
     """Silently ignoring a typo would turn every self-managed step back into a hard capacity
     refusal, and the operator would debug the wrong thing."""
     with pytest.raises(ValueError, match="not a valid environment variable name"):
@@ -85,7 +116,7 @@ def test_a_malformed_name_is_REFUSED_not_ignored():
 
 # --- the planner must ALLOCATE for an env-only step, not pass the raw declaration ------
 
-def test_the_planner_allocates_width_for_an_env_only_step():
+def test_the_planner_allocates_width_for_an_env_only_step() -> None:
     """REGRESSION. The first version of this feature delivered the env channel at execution
     time but left `apply_plan_to_config` gating on `jobs_flag` alone, so a step resizable
     ONLY by env kept its raw `preferred_inner_jobs` instead of the planner's allocated
@@ -108,3 +139,222 @@ def test_the_planner_allocates_width_for_an_env_only_step():
         "treated as unresizable and keep its raw declared width"
     )
     assert src.count("step_width_is_resizable(") >= 5
+
+    step = _step(
+        jobs_flag="",
+        hint=ResourceHint(preferred_inner_jobs=4),
+    )
+    cfg = DagConfig(steps=(step,), default_jobs_env="CARGO_BUILD_JOBS")
+    plan = build_plan(cfg, {}, planner=Planner.CPA, core_budget=1)
+    assert plan.entries[0].alloc_inner_jobs == 1
+    assert apply_plan_to_config(cfg, plan).steps[0].hint.preferred_inner_jobs == 1
+
+
+def test_run_budget_caps_an_env_only_step() -> None:
+    step = _step(jobs_flag="", hint=ResourceHint(preferred_inner_jobs=4))
+    cfg = DagConfig(steps=(step,), default_jobs_env="CARGO_BUILD_JOBS")
+    assert cap_config_max_cpus(cfg, 1).steps[0].hint.preferred_inner_jobs == 1
+
+
+def test_programmatic_planner_and_cap_refuse_a_malformed_channel() -> None:
+    malformed_step = _step(jobs_flag="-j", jobs_env="bad=name")
+    with pytest.raises(ValueError, match="not a valid environment variable name"):
+        step_width_is_resizable(malformed_step, "-j", "")
+
+    step = _step(jobs_flag="", hint=ResourceHint(preferred_inner_jobs=4))
+    cfg = DagConfig(steps=(step,), default_jobs_env="bad=name")
+    with pytest.raises(ValueError, match="not a valid environment variable name"):
+        step_width_is_resizable(step, cfg.default_jobs_flag, cfg.default_jobs_env)
+    with pytest.raises(ValueError, match="not a valid environment variable name"):
+        cap_config_max_cpus(cfg, 1)
+    with pytest.raises(ValueError, match="not a valid environment variable name"):
+        build_plan(cfg, {}, planner=Planner.CPA, core_budget=1)
+
+
+# --- interchange and malformed-name refusal -------------------------------------------
+
+def test_jobs_env_fields_round_trip() -> None:
+    doc = {
+        "default_jobs_env": "DEFAULT_JOBS",
+        "steps": [
+            {
+                "group": "g",
+                "job": "j",
+                "cmd": "true",
+                "jobs_env": "STEP_JOBS",
+            }
+        ],
+    }
+    cfg = dag_from_json(json.dumps(doc))
+    assert cfg.default_jobs_env == "DEFAULT_JOBS"
+    assert cfg.steps[0].jobs_env == "STEP_JOBS"
+    assert json.loads(dag_to_json(cfg))["steps"][0]["jobs_env"] == "STEP_JOBS"
+
+
+@pytest.mark.parametrize(
+    "doc,location",
+    [
+        ({"default_jobs_env": "not a name", "steps": []}, "default_jobs_env"),
+        (
+            {
+                "steps": [
+                    {"group": "g", "job": "j", "cmd": "true", "jobs_env": "bad=name"}
+                ]
+            },
+            "steps[0].jobs_env",
+        ),
+    ],
+)
+def test_malformed_document_jobs_env_is_refused(doc: object, location: str) -> None:
+    with pytest.raises(DagJsonError, match=location.replace("[", r"\[").replace("]", r"\]")):
+        dag_from_json(json.dumps(doc))
+
+
+# --- child-observed execution ----------------------------------------------------------
+
+class _BoxedScopeWidth(NoopCgroups):
+    """A deterministic boxed boundary that reproduces the real wrapper's late export."""
+
+    enabled = True
+
+    def prepare_command(
+        self,
+        tag: str,
+        cmd: str,
+        mem_max: int | None = None,
+        cpu_count: int | None = None,
+    ) -> str:
+        del tag, mem_max, cpu_count
+        return f"export CARGO_BUILD_JOBS=8\n{cmd}"
+
+    def cpu_stats(self, tag: str) -> dict[str, int]:
+        del tag
+        return {
+            "usage_usec": 0,
+            "user_usec": 0,
+            "system_usec": 0,
+            "throttled_usec": 0,
+        }
+
+
+class _BoxedReadonlyWidth(_BoxedScopeWidth):
+    """A wrapper that makes an otherwise ordinary channel readonly before the final boundary."""
+
+    def prepare_command(
+        self,
+        tag: str,
+        cmd: str,
+        mem_max: int | None = None,
+        cpu_count: int | None = None,
+    ) -> str:
+        del tag, mem_max, cpu_count
+        return f"readonly CARGO_BUILD_JOBS=8\n{cmd}"
+
+
+def _observed_child_width(
+    tmp_path: Path,
+    *,
+    max_cpus: int,
+    default_jobs_env: str,
+    cgroups: NoopCgroups | None = None,
+) -> str:
+    output = tmp_path / f"width-{max_cpus}-{bool(cgroups)}-{bool(default_jobs_env)}"
+    step = Step(
+        "g",
+        "j",
+        "",
+        f"printf '%s' \"$CARGO_BUILD_JOBS\" > {shlex.quote(str(output))}",
+        env={"CARGO_BUILD_JOBS": "99"},
+        hint=ResourceHint(preferred_inner_jobs=4),
+        jobs_flag="",
+    )
+    cfg = DagConfig(steps=(step,), default_jobs_env=default_jobs_env)
+    result = run_dag_limited(
+        cfg,
+        max_steps=1,
+        max_cpus=max_cpus,
+        cgroups=cgroups,
+        verbosity=0,
+    )
+    assert result.ok
+    return output.read_text(encoding="utf-8")
+
+
+def test_unboxed_child_observes_the_admitted_env_only_width(tmp_path: Path) -> None:
+    assert _observed_child_width(
+        tmp_path, max_cpus=1, default_jobs_env="CARGO_BUILD_JOBS"
+    ) == "1"
+    assert _observed_child_width(
+        tmp_path, max_cpus=8, default_jobs_env="CARGO_BUILD_JOBS"
+    ) == "4"
+
+
+def test_boxed_child_keeps_the_per_step_width_after_the_scope_export(tmp_path: Path) -> None:
+    assert _observed_child_width(
+        tmp_path,
+        max_cpus=1,
+        default_jobs_env="CARGO_BUILD_JOBS",
+        cgroups=_BoxedScopeWidth(),
+    ) == "1"
+
+
+def test_boxed_scope_or_operator_width_is_unchanged_without_a_jobs_env_channel(
+    tmp_path: Path,
+) -> None:
+    assert _observed_child_width(
+        tmp_path,
+        max_cpus=4,
+        default_jobs_env="",
+        cgroups=_BoxedScopeWidth(),
+    ) == "8"
+
+
+@pytest.mark.parametrize(
+    ("jobs_env", "cgroups"),
+    [
+        ("BASHOPTS", None),
+        ("CARGO_BUILD_JOBS", _BoxedReadonlyWidth()),
+    ],
+    ids=("unboxed-bash-readonly", "boxed-wrapper-readonly"),
+)
+def test_unassignable_jobs_env_refuses_before_guest_command(
+    tmp_path: Path,
+    jobs_env: str,
+    cgroups: NoopCgroups | None,
+) -> None:
+    marker = tmp_path / "guest-ran"
+    cfg = DagConfig(
+        steps=(
+            Step(
+                "g",
+                "j",
+                "",
+                f"printf PASS > {shlex.quote(str(marker))}",
+                hint=ResourceHint(preferred_inner_jobs=4),
+                jobs_flag="",
+            ),
+        ),
+        default_jobs_env=jobs_env,
+    )
+    result = run_dag_limited(
+        cfg,
+        max_steps=1,
+        max_cpus=1,
+        cgroups=cgroups,
+        verbosity=0,
+    )
+    assert not result.ok
+    assert result.outcomes[0].returncode == 125
+    assert "did not retain assigned width 1" in result.outcomes[0].summary
+    assert not marker.exists()
+
+
+def test_programmatic_malformed_channel_refuses_before_spawn(tmp_path: Path) -> None:
+    marker = tmp_path / "spawned"
+    cfg = DagConfig(
+        steps=(Step("g", "j", "", f"touch {shlex.quote(str(marker))}"),),
+        default_jobs_env="bad=name",
+    )
+    with pytest.raises(ValueError, match="not a valid environment variable name"):
+        Runner(cfg, max_steps=1, max_cpus=1, cgroups=NoopCgroups(), verbosity=0)
+    assert not marker.exists()

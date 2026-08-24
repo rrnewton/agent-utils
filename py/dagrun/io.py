@@ -112,6 +112,17 @@ def _opt_str_or_none(m: Mapping[str, object], key: str) -> str | None:
     return val
 
 
+def _jobs_env_field(m: Mapping[str, object], key: str, where: str) -> str | None:
+    """Read and validate an optional jobs-env field with its document location attached."""
+    raw = _opt_str_or_none(m, key)
+    if raw is None:
+        return None
+    try:
+        return resolve_jobs_env(raw, env={})
+    except ValueError as exc:
+        raise DagJsonError(f"{where}.{key}: {exc}") from exc
+
+
 def _opt_int_or_none(m: Mapping[str, object], key: str) -> int | None:
     val = m.get(key)
     if val is None:
@@ -481,6 +492,7 @@ def _dag_from_obj(raw: object) -> DagConfig:
                 timeout=_opt_int(sm, "timeout", default_step_timeout),
                 cpu_timeout=_opt_int(sm, "cpu_timeout", 0),
                 jobs_flag=_opt_str_or_none(sm, "jobs_flag"),
+                jobs_env=_jobs_env_field(sm, "jobs_env", where),
                 skip_reason=skip_reason,
                 write_domains=_present_str_list(sm, "write_domains"),
                 write_domain_guarantee=(
@@ -498,6 +510,14 @@ def _dag_from_obj(raw: object) -> DagConfig:
                 f"step {step.tag}: dependency on intentionally skipped node(s) "
                 f"{', '.join(blocked)} is undefined"
             )
+    try:
+        default_jobs_env = resolve_jobs_env(
+            _opt_str(doc, "default_jobs_env", "")
+            if "default_jobs_env" in doc
+            else None
+        )
+    except ValueError as exc:
+        raise DagJsonError(f"<root>.default_jobs_env: {exc}") from exc
     cfg = DagConfig(
         steps=tuple(steps),
         description=_opt_str(doc, "description", ""),
@@ -507,10 +527,10 @@ def _dag_from_obj(raw: object) -> DagConfig:
         outer_mem_safety_factor=_opt_float(doc, "outer_mem_safety_factor", 1.0),
         default_step_timeout=default_step_timeout,
         default_jobs_flag=_opt_str(doc, "default_jobs_flag", DEFAULT_JOBS_FLAG),
-        # HOST-supplied, never read from the document: which env channel this machine
-        # delivers inner width through. A graph must not be able to set it, because that is
-        # exactly the per-host setting that does not belong in a description of the work.
-        default_jobs_env=_opt_str(doc, "default_jobs_env", resolve_jobs_env()),
+        # The host-level default comes from $SAFE_CI_DAG_RUNNER_JOBS_ENV when the document does
+        # not carry an explicit value. Serialization carries the resolved value so a config
+        # round-trip cannot silently lose the channel.
+        default_jobs_env=default_jobs_env,
         write_domain_policy=policy,
     )
     violations = write_domain_violations(cfg)
@@ -561,6 +581,7 @@ def _step_to_json(step: Step) -> dict[str, object]:
         # immediately after `timeout` to match the Rust serializer's key order.
         "cpu_timeout": step.cpu_timeout,
         "jobs_flag": step.jobs_flag,
+        "jobs_env": step.jobs_env,
         "skip_reason": step.skip_reason.value if step.skip_reason is not None else None,
         "hint": _hint_to_json(step.hint),
     }

@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::io::json_str;
-use crate::model::{effective_jobs_flag, DagConfig, ResourceHint, Step};
+use crate::model::{step_width_is_resizable, DagConfig, ResourceHint, Step};
 use crate::perflog::{container_class, machine_id, parse_csv_line};
 use crate::sizing::{
     memory_footprint_fits, outer_mem_footprint_bytes, schedulable_peak_mem_bytes_widths,
@@ -1101,9 +1101,7 @@ fn infeasible_fixed_widths(
         .filter_map(|step| {
             let width = widths[&step.tag()];
             (step.skip_reason.is_none()
-                && effective_jobs_flag(step, &cfg.default_jobs_flag)
-                    .trim()
-                    .is_empty()
+                && !step_width_is_resizable(step, &cfg.default_jobs_flag, &cfg.default_jobs_env)
                 && width > p)
                 .then(|| (step.tag(), width))
         })
@@ -1139,9 +1137,11 @@ fn cpa_admissible(
         match speedups.get(&tag) {
             Some(sp)
                 if !sp.levels.is_empty()
-                    && !effective_jobs_flag(step, &cfg.default_jobs_flag)
-                        .trim()
-                        .is_empty() =>
+                    && step_width_is_resizable(
+                        step,
+                        &cfg.default_jobs_flag,
+                        &cfg.default_jobs_env,
+                    ) =>
             {
                 let knee_ok: Vec<&SpeedupLevel> = sp
                     .levels
@@ -1176,11 +1176,10 @@ fn cpa_admissible(
                 }
             }
             _ => {
-                // No curve, or an empty effective jobs_flag: without a way to rewrite the guest
-                // command CPA cannot vary its worker count and must charge it as a rigid step.
-                let self_managed = effective_jobs_flag(step, &cfg.default_jobs_flag)
-                    .trim()
-                    .is_empty();
+                // No curve, or no effective width channel: without a way to rewrite the guest
+                // width CPA cannot vary its worker count and must charge it as a rigid step.
+                let self_managed =
+                    !step_width_is_resizable(step, &cfg.default_jobs_flag, &cfg.default_jobs_env);
                 // Preserve a self-managed command's declared width even above P so the allocator
                 // can report infeasibility instead of inventing a guest-width rewrite.
                 let declared = step.hint.preferred_inner_jobs.filter(|value| *value > 0);
@@ -1559,14 +1558,12 @@ fn build_cpa_plan(
                 } else {
                     speedups.get(&tag).cloned()
                 },
-                // An empty effective jobs flag opts out of command rewriting. CPA still charges
-                // the fixed width in its model, but must not publish a value that
-                // apply_plan_to_config could misrepresent as an executable guest-width change.
+                // A step with no width channel opts out of guest-width rewriting. CPA still
+                // charges the fixed width in its model, but must not publish a value that
+                // apply_plan_to_config could misrepresent as executable.
                 alloc_inner_jobs: if s.skip_reason.is_some()
                     || infeasible_memory
-                    || effective_jobs_flag(s, &cfg.default_jobs_flag)
-                        .trim()
-                        .is_empty()
+                    || !step_width_is_resizable(s, &cfg.default_jobs_flag, &cfg.default_jobs_env)
                 {
                     None
                 } else {
@@ -1601,6 +1598,7 @@ pub fn build_plan(
     core_budget: Option<i64>,
     mem_budget: Option<i64>,
 ) -> Plan {
+    crate::model::assert_valid_jobs_env_config(cfg);
     let mut resolved: HashMap<String, Resolved> = HashMap::new();
     let mut est: HashMap<String, f64> = HashMap::new();
     for step in &cfg.steps {
@@ -1626,9 +1624,11 @@ pub fn build_plan(
                 }
                 let step = cfg.steps.iter().find(|step| step.tag() == *tag)?;
                 (planner == Planner::Cpa
-                    && effective_jobs_flag(step, &cfg.default_jobs_flag)
-                        .trim()
-                        .is_empty())
+                    && !step_width_is_resizable(
+                        step,
+                        &cfg.default_jobs_flag,
+                        &cfg.default_jobs_env,
+                    ))
                 .then(|| (tag.clone(), speedup.clone()))
             })
             .collect(),
@@ -1717,10 +1717,11 @@ pub fn apply_plan_to_config(cfg: &DagConfig, plan: &Plan) -> DagConfig {
                 } else {
                     step.hint.rss_baseline_bytes
                 };
-                let inner = if effective_jobs_flag(step, &cfg.default_jobs_flag)
-                    .trim()
-                    .is_empty()
-                {
+                let inner = if !step_width_is_resizable(
+                    step,
+                    &cfg.default_jobs_flag,
+                    &cfg.default_jobs_env,
+                ) {
                     step.hint.preferred_inner_jobs
                 } else {
                     entry.alloc_inner_jobs.or(step.hint.preferred_inner_jobs)
@@ -2151,6 +2152,7 @@ mod tests {
             timeout: 1800,
             cpu_timeout: 0,
             jobs_flag: None,
+            jobs_env: None,
             skip_reason: None,
             write_domains: None,
             write_domain_guarantee: None,
@@ -2219,6 +2221,7 @@ mod tests {
             outer_mem_safety_factor: 1.2,
             default_step_timeout: 600,
             default_jobs_flag: "--jobs {n}".to_string(),
+            default_jobs_env: "BUILD_JOBS".to_string(),
             default_step_mem_cap_bytes: None,
             default_step_cpu_count: Some(4),
             default_step_cpu_timeout: 120,
@@ -2591,6 +2594,56 @@ t,m,affinity16_cpu-max-max,a,1,a,u,l,g.managed,cpu-bound,4,2.0,0,True,False,0,10
     }
 
     #[test]
+    fn cpa_allocates_and_applies_width_for_an_env_only_step() {
+        let mut step = mk("g", "env", &[], 8.0);
+        step.hint.preferred_inner_jobs = Some(4);
+        step.jobs_flag = Some(String::new());
+        let cfg = DagConfig {
+            steps: vec![step],
+            default_jobs_env: "CARGO_BUILD_JOBS".to_string(),
+            ..Default::default()
+        };
+        let plan = build_plan(
+            &cfg,
+            &HashMap::new(),
+            Planner::Cpa,
+            DEFAULT_MIN_SAMPLES,
+            &HashMap::new(),
+            Some(1),
+            None,
+        );
+        assert_eq!(plan.entries[0].alloc_inner_jobs, Some(1));
+        assert_eq!(
+            apply_plan_to_config(&cfg, &plan).steps[0]
+                .hint
+                .preferred_inner_jobs,
+            Some(1)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid jobs-env configuration")]
+    fn cpa_refuses_malformed_programmatic_jobs_env_before_publishing_an_allocation() {
+        let mut step = mk("g", "env", &[], 8.0);
+        step.hint.preferred_inner_jobs = Some(4);
+        step.jobs_flag = Some(String::new());
+        let cfg = DagConfig {
+            steps: vec![step],
+            default_jobs_env: "bad=name".to_string(),
+            ..Default::default()
+        };
+        let _ = build_plan(
+            &cfg,
+            &HashMap::new(),
+            Planner::Cpa,
+            DEFAULT_MIN_SAMPLES,
+            &HashMap::new(),
+            Some(1),
+            None,
+        );
+    }
+
+    #[test]
     fn cpa_excludes_intentional_skips_from_cpu_memory_and_curve_allocation() {
         let rows = "\
 t,m,affinity16_cpu-max-max,a,1,a,u,l,g.live,cpu-bound,1,10.0,0,True,False,0,1000,,,10.0,0.0,0.0
@@ -2876,6 +2929,7 @@ t,m,affinity16_cpu-max-max,a,1,a,u,l,m.heavy,cpu-bound,8,5.0,0,True,False,0,1000
             timeout: 1800,
             cpu_timeout: 0,
             jobs_flag: None,
+            jobs_env: None,
             skip_reason: None,
             write_domains: None,
             write_domain_guarantee: None,

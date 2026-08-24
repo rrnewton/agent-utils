@@ -328,6 +328,7 @@ def _env(extra: Mapping[str, str] | None = None) -> dict[str, str]:
     # which is applied after these pops.
     env.pop("CARGO_BUILD_JOBS", None)
     env.pop("DAGRUN_OPERATOR_BUILD_JOBS", None)
+    env.pop("SAFE_CI_DAG_RUNNER_JOBS_ENV", None)
     if extra:
         env.update(extra)
     return env
@@ -606,6 +607,35 @@ def representative_fixtures() -> list[Fixture]:
                         "cmd": 'c() { [ "$*" = "--num-threads 3" ]; }; c',
                         "hint": {"preferred_inner_jobs": 3},
                     }
+                ],
+            },
+        )
+    )
+    fixtures.append(
+        Fixture(
+            "jobs_env_schema",
+            {
+                "default_jobs_env": "CARGO_BUILD_JOBS",
+                "steps": [
+                    {
+                        "group": "g",
+                        "job": "inherit",
+                        "cmd": "true",
+                        "hint": {"preferred_inner_jobs": 1},
+                    },
+                    {
+                        "group": "g",
+                        "job": "override",
+                        "cmd": "true",
+                        "jobs_env": "CUSTOM_BUILD_JOBS",
+                        "hint": {"preferred_inner_jobs": 1},
+                    },
+                    {
+                        "group": "g",
+                        "job": "opt-out",
+                        "cmd": "true",
+                        "jobs_env": "",
+                    },
                 ],
             },
         )
@@ -3899,7 +3929,7 @@ def compare_sweep_errors(py: list[str], rs: list[str], rep: Report) -> None:
         )
         po = run(py, args, {"SELF_MANAGED_MARKER": marker["py"]})
         ro = run(rs, args, {"SELF_MANAGED_MARKER": marker["rs"]})
-        phrase = "empty effective jobs_flag"
+        phrase = "offers no width channel"
         if (
             po.returncode == ro.returncode == 2
             and phrase in po.stderr
@@ -5518,6 +5548,186 @@ def compare_operator_build_width(py: list[str], rs: list[str], rep: Report) -> N
             rep.ok(label)
 
 
+def compare_jobs_env_width(py: list[str], rs: list[str], rep: Report) -> None:
+    """Prove the allocated width reaches the child through an environment channel.
+
+    The narrow leg catches planner/cap bugs (preferred four under a one-core admission must become
+    one), the roomy leg catches implementations that always collapse to one, and the boxed leg
+    catches the late scope-wide ``CARGO_BUILD_JOBS`` export overwriting the step allocation.
+    Refusal cases prove missing or malformed channels fail before spawning the child.
+    """
+
+    with tempfile.TemporaryDirectory(prefix="dagrun-cross-jobs-env-") as td:
+        root = Path(td)
+        dag_path = root / "dag.json"
+        dag_path.write_text(
+            json.dumps(
+                {
+                    "steps": [
+                        {
+                            "group": "g",
+                            "job": "a",
+                            "cmd": 'printf "%s" "$CARGO_BUILD_JOBS" > "$OBSERVED_PATH"',
+                            "jobs_flag": "",
+                            "timeout": 60,
+                            "hint": {"preferred_inner_jobs": 4},
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        def width_leg(label: str, max_cpus: int, expected: str, *, boxed: bool) -> None:
+            outcomes: dict[str, Outcome] = {}
+            observed: dict[str, str | None] = {}
+            for name, command in (("py", py), ("rs", rs)):
+                output = root / f"{label}-{name}.txt"
+                args = [
+                    "run",
+                    "--dag",
+                    str(dag_path),
+                    "-s1",
+                    f"-j{max_cpus}",
+                    "-q",
+                    NOPROF,
+                    NOFB,
+                ]
+                if not boxed:
+                    args.append("--unsafe-no-cgroups")
+                env = {
+                    "SAFE_CI_DAG_RUNNER_JOBS_ENV": "CARGO_BUILD_JOBS",
+                    "OBSERVED_PATH": str(output),
+                    "DAGRUN_NO_STEP_LOGS": "1",
+                }
+                if boxed:
+                    env.update(
+                        {
+                            "DAGRUN_FORCE_SCOPE_ATTEMPT": "1",
+                            "CARGO_BUILD_JOBS": "8",
+                        }
+                    )
+                outcomes[name] = run(command, args, env)
+                observed[name] = output.read_text(encoding="utf-8") if output.exists() else None
+
+            check = f"jobs-env:{label}"
+            if boxed and all(_boxing_capability_unavailable(out) for out in outcomes.values()):
+                print(
+                    "cross[dagrun]: SKIP boxed jobs-env differential: "
+                    "cgroup-v2 + a working systemd --user scope are unavailable"
+                )
+                rep.ok(f"{check}:capability-unavailable")
+            elif (
+                all(out.returncode == 0 for out in outcomes.values())
+                and observed == {"py": expected, "rs": expected}
+            ):
+                rep.ok(check)
+            else:
+                rep.bad(
+                    check,
+                    f"expected child width {expected}; outcomes={outcomes} observed={observed}",
+                )
+
+        width_leg("unboxed-narrow", 1, "1", boxed=False)
+        width_leg("unboxed-roomy", 8, "4", boxed=False)
+        width_leg("boxed-narrow", 1, "1", boxed=True)
+
+        def readonly_leg(label: str, *, boxed: bool) -> None:
+            outcomes: dict[str, Outcome] = {}
+            spawned: dict[str, bool] = {}
+            for name, command in (("py", py), ("rs", rs)):
+                output = root / f"{label}-{name}.txt"
+                args = [
+                    "run",
+                    "--dag",
+                    str(dag_path),
+                    "-s1",
+                    "-j1",
+                    "-q",
+                    NOPROF,
+                    NOFB,
+                ]
+                if not boxed:
+                    args.append("--unsafe-no-cgroups")
+                env = {
+                    "SAFE_CI_DAG_RUNNER_JOBS_ENV": "BASHOPTS",
+                    "OBSERVED_PATH": str(output),
+                    "DAGRUN_NO_STEP_LOGS": "1",
+                }
+                if boxed:
+                    env["DAGRUN_FORCE_SCOPE_ATTEMPT"] = "1"
+                outcomes[name] = run(command, args, env)
+                spawned[name] = output.exists()
+
+            check = f"jobs-env:{label}"
+            if boxed and all(_boxing_capability_unavailable(out) for out in outcomes.values()):
+                print(
+                    "cross[dagrun]: SKIP boxed readonly jobs-env differential: "
+                    "cgroup-v2 + a working systemd --user scope are unavailable"
+                )
+                rep.ok(f"{check}:capability-unavailable")
+                return
+            combined = {name: out.stdout + out.stderr for name, out in outcomes.items()}
+            if (
+                all(out.returncode != 0 for out in outcomes.values())
+                and not any(spawned.values())
+                and all("did not retain assigned width 1" in text for text in combined.values())
+            ):
+                rep.ok(check)
+            else:
+                rep.bad(
+                    check,
+                    "readonly BASHOPTS must fail before the guest command; "
+                    f"outcomes={outcomes} spawned={spawned}",
+                )
+
+        readonly_leg("unboxed-readonly", boxed=False)
+        readonly_leg("boxed-readonly", boxed=True)
+
+        for leg, extra, phrase in (
+            ("missing", {}, "no width channel"),
+            (
+                "malformed",
+                {"SAFE_CI_DAG_RUNNER_JOBS_ENV": "NOT=A=NAME"},
+                "valid environment variable name",
+            ),
+        ):
+            outcomes: dict[str, Outcome] = {}
+            spawned: dict[str, bool] = {}
+            for name, command in (("py", py), ("rs", rs)):
+                output = root / f"{leg}-{name}.txt"
+                env = {"OBSERVED_PATH": str(output), "DAGRUN_NO_STEP_LOGS": "1", **extra}
+                outcomes[name] = run(
+                    command,
+                    (
+                        "run",
+                        "--dag",
+                        str(dag_path),
+                        "-s1",
+                        "-j1",
+                        "--unsafe-no-cgroups",
+                        "-q",
+                        NOPROF,
+                        NOFB,
+                    ),
+                    env,
+                )
+                spawned[name] = output.exists()
+            combined = {name: out.stdout + out.stderr for name, out in outcomes.items()}
+            if (
+                all(out.returncode == 2 for out in outcomes.values())
+                and not any(spawned.values())
+                and all(phrase in text for text in combined.values())
+            ):
+                rep.ok(f"jobs-env:{leg}")
+            else:
+                rep.bad(
+                    f"jobs-env:{leg}",
+                    f"expected pre-spawn refusal containing {phrase!r}; "
+                    f"outcomes={outcomes} spawned={spawned}",
+                )
+
+
 def compare_boxed_cpu_bandwidth(py: list[str], rs: list[str], rep: Report) -> None:
     """Anchor ``-j`` / ``--max-cpus`` to live quota and aggregate CPU counters."""
 
@@ -5702,6 +5912,7 @@ def compare_dagrun(rand_count: int, seed: int) -> int:
     compare_run_parallel_limits(py, rs, rep)
     compare_boxed_cpu_bandwidth(py, rs, rep)
     compare_operator_build_width(py, rs, rep)
+    compare_jobs_env_width(py, rs, rep)
     compare_pin_run(py, rs, rep)
     yaml_paths = yaml_fixture_paths()
     n_fixtures = len(fixtures) + len(examples) + len(yaml_paths)

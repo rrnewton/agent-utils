@@ -67,9 +67,12 @@ spelling of `-j` is `--max-cpus`; migrate the 0.13 `run --jobs` spelling to it.
 A hidden compatibility alias keeps existing 0.13 scripts working but is not
 public run vocabulary; differing simultaneous values conflict and are rejected.
 `sweep --jobs RANGE` remains the width-range option for a per-step speedup
-experiment. A non-empty `jobs_flag` lets the runner rewrite an inner width down
-to `--max-cpus`; an empty or whitespace-only flag prevents rewriting. When paired with a positive
-declared width, that width is self-managed and the run refuses it if it exceeds the total budget.
+experiment. A non-empty `jobs_flag` or `jobs_env` lets the runner rewrite an
+inner width down to `--max-cpus`; `default_jobs_env` supplies the environment
+channel inherited by steps, and `SAFE_CI_DAG_RUNNER_JOBS_ENV` supplies that
+default when the document omits it. Empty effective channels prevent rewriting.
+When paired with a positive declared width, that width is self-managed and the
+run refuses it if it exceeds the total budget.
 
 The current planners do not jointly optimize inner width, co-running load, and
 memory. Greedy-LPT and critical-path choose only dispatch order. CPA chooses

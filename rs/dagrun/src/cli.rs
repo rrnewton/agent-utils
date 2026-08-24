@@ -50,8 +50,8 @@ use crate::memory_feedback::{
     DEFAULT_MIN_UNCENSORED_SAMPLES,
 };
 use crate::model::{
-    effective_jobs_flag, step_classification, DagConfig, ResourceHint, Step, StepOutcome,
-    DEFAULT_STEP_TIMEOUT,
+    step_classification, step_width_is_resizable, DagConfig, ResourceHint, Step, StepOutcome,
+    DEFAULT_STEP_TIMEOUT, JOBS_ENV_ENV,
 };
 use crate::perflog::{append_step_profiles, child_cpu_seconds, PerfWindow};
 use crate::profile_enrich::container_core_budget;
@@ -203,12 +203,14 @@ dagrun --help\n\n\
 {store}\n  {store_dir}\n  {store_note}\n\n\
 {planning}\n  {pl1}\n  {pl2}\n  {pl3}\n  {plan_note}\n\n\
 {schema}  {schema_note}\n  \
-step:   group, job, desc, description, cmd, deps[], env{{}}, timeout, jobs_flag, networkonly, engine_only, hint{{}}\n  \
+step:   group, job, desc, description, cmd, deps[], env{{}}, timeout, jobs_flag, jobs_env, networkonly, engine_only, hint{{}}\n  \
 hint:   resources{{name:int}}, est_duration_s, rss_baseline_bytes, hard_mem_max_bytes,\n          classification(\"cpu-bound\"|\"latency-bound\"|\"light\"), preferred_inner_jobs\n  \
-top:    description, resource_caps{{name:int}}, mem_cap_factor, mem_cap_floor_bytes,\n          outer_mem_safety_factor, default_step_timeout, default_jobs_flag\n  \
+top:    description, resource_caps{{name:int}}, mem_cap_factor, mem_cap_floor_bytes,\n          outer_mem_safety_factor, default_step_timeout, default_jobs_flag, default_jobs_env\n  \
 desc = short label; description = long-form docs (often multi-line, great in YAML)\n  \
 jobs_flag: appended with a step preferred_inner_jobs; \"-j\"->\"-j 4\", \"-j%d\"->\"-j4\", \"--jobs=\"->\"--jobs=4\"\n  \
           empty/whitespace means a fixed self-managed width: it cannot be rewritten or swept\n  \
+jobs_env: environment variable receiving the same admitted width; absent inherits default_jobs_env\n  \
+          (normally resolved from ${JOBS_ENV_ENV})\n  \
 yaml: --dag also accepts .yaml/.yml (isomorphic to JSON; allows comments + multi-line block-scalar descriptions); the `yaml` subcommand emits YAML\n\n\
 {what}\n  \
 - concurrent scheduling honoring deps + resource caps, ordered by the chosen --planner\n  \
@@ -232,7 +234,7 @@ yaml: --dag also accepts .yaml/.yml (isomorphic to JSON; allows comments + multi
         s3 = k(&format!("{PROG} sweep --dag dag.json --step build.app --jobs 1..8  # -j1..-j8 speedup table")),
         studies_note = c.dim(
             "--only drops dependency edges to steps outside the selection (inputs assumed present); \
-             sweep passes each width into the step via its jobs_flag and reports wall/user/sys/rss + speedup."
+             sweep passes each width through the step jobs_flag and/or jobs_env channel and reports wall/user/sys/rss + speedup."
         ),
         store = h("Where profiling data lands (by default)"),
         store_dir = k("./.dagrun/profiles/   (created on demand, relative to CWD)"),
@@ -736,6 +738,7 @@ fn box_config(
             // that fires and the CPU guard stays a backstop.
             cpu_timeout: timeout_s.saturating_mul(cores),
             jobs_flag: None,
+            jobs_env: None,
             skip_reason: None,
             write_domains: None,
             write_domain_guarantee: None,
@@ -2550,14 +2553,11 @@ fn cmd_sweep(a: &SweepArgs, c: &Palette) -> i32 {
         .find(|s| s.tag() == step_tag)
         .expect("tag presence checked above")
         .clone();
-    if effective_jobs_flag(&base, &cfg.default_jobs_flag)
-        .trim()
-        .is_empty()
-    {
+    if !step_width_is_resizable(&base, &cfg.default_jobs_flag, &cfg.default_jobs_env) {
         eprintln!(
-            "{PROG}: sweep: step '{step_tag}' has an empty effective jobs_flag, so --jobs cannot \
-             change guest parallelism; set the step's jobs_flag to the guest's worker-count \
-             option, or remove the empty override and set default_jobs_flag"
+            "{PROG}: sweep: step '{step_tag}' offers no width channel, so --jobs cannot change \
+             guest parallelism; set jobs_flag to the guest's worker-count option or \
+             jobs_env/default_jobs_env to its worker-count environment variable"
         );
         return 2;
     }
