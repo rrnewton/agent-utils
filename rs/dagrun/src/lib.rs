@@ -71,11 +71,13 @@ pub use memory_feedback::{
     DEFAULT_MARGIN_PCT, DEFAULT_MIN_UNCENSORED_SAMPLES,
 };
 pub use model::{
-    command_with_inner_jobs, dag_config_carry_diff, effective_jobs_flag, preferred_inner_jobs,
-    render_jobs_flag, resolved_wall_timeout, step_classification, step_failure_reason,
-    undeclared_resource_demands, write_domain_violations, DagConfig, ResourceHint, RunResult, Step,
-    StepClass, StepOutcome, WriteDomainGuarantee, WriteDomainPolicy, DAG_CONFIG_FIELDS,
-    DEFAULT_JOBS_FLAG, DEFAULT_STEP_TIMEOUT, WALL_CPU_BACKSTOP_FACTOR,
+    command_with_inner_jobs, dag_config_carry_diff, effective_jobs_env, effective_jobs_flag,
+    env_with_inner_jobs, preferred_inner_jobs, render_jobs_flag, resolve_jobs_env,
+    resolved_wall_timeout, step_classification, step_failure_reason, step_width_is_resizable,
+    undeclared_resource_demands, validate_jobs_env_config, write_domain_violations, DagConfig,
+    ResourceHint, RunResult, Step, StepClass, StepOutcome, WriteDomainGuarantee, WriteDomainPolicy,
+    DAG_CONFIG_FIELDS, DEFAULT_JOBS_FLAG, DEFAULT_STEP_TIMEOUT, JOBS_ENV_ENV,
+    WALL_CPU_BACKSTOP_FACTOR,
 };
 pub use perflog::{append_step_profiles, PerfWindow};
 pub use profile_enrich::{

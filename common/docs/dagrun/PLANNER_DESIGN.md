@@ -255,12 +255,13 @@ For each step `i`, define its **admissible width set** `W_i`:
 - If `i` is an intentional pre-execution skip, `W_i = {1}` with zero wall, CPU-area, and memory
   demand. It remains visible in plan output as `est_source=skip` but cannot suppress allocation for
   runnable work.
-- If `i` has an empty/whitespace-only effective `jobs_flag`, its command manages a **fixed** width.
+- If `i` has empty/whitespace-only effective `jobs_flag` **and** `jobs_env` channels, its command
+  manages a **fixed** width.
   The run refuses before process creation when its positive declared `preferred_inner_jobs > P`;
   otherwise `W_i` contains that declared width. With no positive declared width, the configured
   default is only a runner/cgroup cap (not a hidden guest worker count) and may be tightened to
   `P`. CPA never pretends it can
-  resize a command that opted out of flag injection, and `sweep` rejects such a step. Pure CPA
+  resize a command that opted out of both injection channels, and `sweep` rejects such a step. Pure CPA
   planning retains an over-budget fixed width and reports `infeasible-fixed-width`; its modeled
   makespan is infinity and no `alloc_inner_jobs` is published for that self-managed step. If the
   learned curve contains an exact level at the fixed width, its measured wall is used; otherwise
@@ -354,8 +355,8 @@ The allocator outputs `p_i` per step and passes the result to the runner:
 
 1. **Bake executable widths in.** For each feasible runner-controlled step, produce a `DagConfig`
    copy whose `Step.hint.preferred_inner_jobs = p_i` (analogous to `apply_plan_to_config`). This
-   flows through `command_with_inner_jobs` (the flag actually handed to the step) and through
-   `step_mem_cap_for_inner_jobs` (the memory cap). Self-managed steps retain their declared width
+   flows through `command_with_inner_jobs` and/or `env_with_inner_jobs` (the width actually handed
+   to the step) and through `step_mem_cap_for_inner_jobs` (the memory cap). Self-managed steps retain their declared width
    and have `alloc_inner_jobs = null`; intentional skips retain their authored hints when a plan is
    applied.
 2. **Order.** Compute the same order as the critical-path planner, using the *allocated* weights
@@ -365,7 +366,7 @@ The allocator outputs `p_i` per step and passes the result to the runner:
    are met, named resources fit, and fewer than `S = --max-steps` nodes are active. It does **not**
    subtract `p_i` from a shared admission-token pool. Runner-controlled authored widths above `P`
    are still visibly capped before planning and execution, including the command's appended jobs
-   flag and per-step `cpu.max`; a self-managed fixed width above `P` is infeasible and cannot be
+   flag or jobs environment variable and per-step `cpu.max`; a self-managed fixed width above `P` is infeasible and cannot be
    executed. Multiple legal widths may therefore sum above `P`, with the verified outer `cpu.max`
    providing the actual shared-bandwidth boundary.
 

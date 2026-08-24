@@ -26,8 +26,8 @@ use std::fmt;
 use serde_json::Value;
 
 use crate::model::{
-    write_domain_violations, DagConfig, IntentionalSkipReason, ResourceHint, Step, StepClass,
-    WriteDomainGuarantee, WriteDomainPolicy, DEFAULT_JOBS_FLAG,
+    resolve_jobs_env, write_domain_violations, DagConfig, IntentionalSkipReason, ResourceHint,
+    Step, StepClass, WriteDomainGuarantee, WriteDomainPolicy, DEFAULT_JOBS_FLAG,
 };
 
 const DEFAULT_MEM_CAP_FLOOR: i64 = 8 * 1024 * 1024 * 1024;
@@ -506,6 +506,12 @@ pub fn dag_from_value(raw: &Value) -> Result<DagConfig, DagJsonError> {
             timeout: opt_int(sm, "timeout", default_step_timeout)?,
             cpu_timeout: opt_int(sm, "cpu_timeout", 0)?,
             jobs_flag: opt_str_or_none(sm, "jobs_flag")?,
+            jobs_env: match opt_str_or_none(sm, "jobs_env")? {
+                Some(value) => Some(resolve_jobs_env(Some(&value)).map_err(|error| {
+                    err(format!("{where_}.jobs_env: {error}"))
+                })?),
+                None => None,
+            },
             skip_reason: match opt_str_or_none(sm, "skip_reason")? {
                 Some(text) => {
                     Some(IntentionalSkipReason::from_value(&text).ok_or_else(|| {
@@ -554,6 +560,14 @@ pub fn dag_from_value(raw: &Value) -> Result<DagConfig, DagJsonError> {
             )));
         }
     }
+    let default_jobs_env = match doc.get("default_jobs_env") {
+        Some(_) => {
+            let value = opt_str(doc, "default_jobs_env", "")?;
+            resolve_jobs_env(Some(&value))
+        }
+        None => resolve_jobs_env(None),
+    }
+    .map_err(|error| err(format!("<root>.default_jobs_env: {error}")))?;
     let cfg = DagConfig {
         steps,
         description: opt_str(doc, "description", "")?,
@@ -563,6 +577,7 @@ pub fn dag_from_value(raw: &Value) -> Result<DagConfig, DagJsonError> {
         outer_mem_safety_factor: opt_float(doc, "outer_mem_safety_factor", 1.0)?,
         default_step_timeout,
         default_jobs_flag: opt_str(doc, "default_jobs_flag", DEFAULT_JOBS_FLAG)?,
+        default_jobs_env,
         write_domain_policy: policy,
         // SMALL forcing-function default caps for undeclared steps: not parsed from the document
         // (mirrors the Python io parser, which relies on the DagConfig dataclass defaults), so a
@@ -891,6 +906,11 @@ fn emit_step(s: &mut String, step: &Step, base: usize) {
         "\"jobs_flag\": {},\n",
         opt_str_json(step.jobs_flag.as_deref())
     ));
+    s.push_str(&key);
+    s.push_str(&format!(
+        "\"jobs_env\": {},\n",
+        opt_str_json(step.jobs_env.as_deref())
+    ));
     if let Some(reason) = step.skip_reason {
         s.push_str(&key);
         s.push_str(&format!("\"skip_reason\": {},\n", json_str(reason.value())));
@@ -975,6 +995,10 @@ pub fn dag_to_json(cfg: &DagConfig) -> String {
         "  \"default_jobs_flag\": {},\n",
         json_str(&cfg.default_jobs_flag)
     ));
+    s.push_str(&format!(
+        "  \"default_jobs_env\": {},\n",
+        json_str(&cfg.default_jobs_env)
+    ));
     let policy_active = cfg.write_domain_policy.require_explicit
         || !cfg.write_domain_policy.allowed_domains.is_empty();
     if cfg.steps.is_empty() {
@@ -1033,11 +1057,12 @@ mod tests {
     fn roundtrip_is_stable() {
         let doc = r#"{"description": "the whole pipeline", "resource_caps": {"browser": 2},
             "mem_cap_factor": 1.25,
-            "outer_mem_safety_factor": 1.1, "default_jobs_flag": "--jobs=", "steps": [
+            "outer_mem_safety_factor": 1.1, "default_jobs_flag": "--jobs=",
+            "default_jobs_env": "DEFAULT_JOBS", "steps": [
             {"group": "build", "job": "app", "desc": "compile",
              "description": "line 1\nline 2 with \"quotes\" and \\backslash\\ and unicode é☃",
              "cmd": "make build",
-             "jobs_flag": "-j%d",
+             "jobs_flag": "-j%d", "jobs_env": "STEP_JOBS",
              "hint": {"est_duration_s": 90, "rss_baseline_bytes": 5368709120,
                       "classification": "cpu-bound", "preferred_inner_jobs": 8}},
             {"group": "e2e", "job": "smoke", "desc": "browser", "cmd": "make e2e",
@@ -1062,8 +1087,11 @@ mod tests {
         assert_eq!(back.steps[0].hint.classification, StepClass::CpuBound);
         assert_eq!(back.steps[0].hint.rss_baseline_bytes, Some(5368709120));
         assert_eq!(back.steps[0].jobs_flag.as_deref(), Some("-j%d"));
+        assert_eq!(back.steps[0].jobs_env.as_deref(), Some("STEP_JOBS"));
         assert_eq!(back.steps[1].jobs_flag, None);
+        assert_eq!(back.steps[1].jobs_env, None);
         assert_eq!(back.default_jobs_flag, "--jobs=");
+        assert_eq!(back.default_jobs_env, "DEFAULT_JOBS");
         assert_eq!(back.steps[1].hint.resources.get("browser"), Some(&1));
         assert_eq!(back.steps[1].env.get("HEADLESS"), Some(&"1".to_string()));
     }
@@ -1257,6 +1285,29 @@ steps:
         for doc in bad {
             assert!(dag_from_json(doc).is_err(), "expected error for: {doc}");
         }
+    }
+
+    #[test]
+    fn malformed_jobs_env_fields_are_refused_by_location() {
+        let top = dag_from_json(r#"{"default_jobs_env":"not a name","steps":[]}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(top.contains("<root>.default_jobs_env"), "{top}");
+        assert!(
+            top.contains("not a valid environment variable name"),
+            "{top}"
+        );
+
+        let step = dag_from_json(
+            r#"{"steps":[{"group":"g","job":"j","cmd":"true","jobs_env":"bad=name"}]}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(step.contains("steps[0].jobs_env"), "{step}");
+        assert!(
+            step.contains("not a valid environment variable name"),
+            "{step}"
+        );
     }
 
     #[test]

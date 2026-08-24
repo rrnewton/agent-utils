@@ -290,7 +290,7 @@ def resolve_jobs_env(
     raw = (explicit if explicit is not None else environ.get(JOBS_ENV_ENV) or "").strip()
     if not raw:
         return ""
-    if not _ENV_NAME_RE.match(raw):
+    if not _ENV_NAME_RE.fullmatch(raw):
         raise ValueError(
             f"{JOBS_ENV_ENV}={raw!r} is not a valid environment variable name"
         )
@@ -299,8 +299,22 @@ def resolve_jobs_env(
 
 def effective_jobs_env(step: Step, default_jobs_env: str) -> str:
     """The inner-width ENV channel in effect for a step: its own ``jobs_env`` overrides the
-    DagConfig-level default; ``None`` inherits the default."""
-    return step.jobs_env if step.jobs_env is not None else default_jobs_env
+    DagConfig-level default; ``None`` inherits the default.
+
+    The returned name is normalized and validated even for programmatically-built configs. A
+    malformed channel must fail before execution rather than making an env-only step look
+    resizable and then failing (or setting the wrong variable) in a worker thread.
+    """
+    raw = step.jobs_env if step.jobs_env is not None else default_jobs_env
+    return resolve_jobs_env(raw, env={})
+
+
+def validate_jobs_env_config(cfg: DagConfig) -> None:
+    """Validate every configured inner-width ENV channel before any DAG node may spawn."""
+    resolve_jobs_env(cfg.default_jobs_env, env={})
+    for step in cfg.steps:
+        if step.jobs_env is not None:
+            resolve_jobs_env(step.jobs_env, env={})
 
 
 def env_with_inner_jobs(
@@ -328,10 +342,10 @@ def step_width_is_resizable(step: Step, default_jobs_flag: str, default_jobs_env
     cgroup quota alone would leave the original worker count running inside a smaller box --
     a slowdown disguised as a limit, which is the outcome the refusal exists to prevent.
     """
-    return bool(
-        effective_jobs_flag(step, default_jobs_flag).strip()
-        or effective_jobs_env(step, default_jobs_env).strip()
-    )
+    # Resolve the env channel first so a valid jobs flag cannot short-circuit validation of a
+    # malformed programmatic jobs_env value.
+    jobs_env = effective_jobs_env(step, default_jobs_env)
+    return bool(effective_jobs_flag(step, default_jobs_flag).strip() or jobs_env.strip())
 
 
 def command_with_inner_jobs(
@@ -602,8 +616,8 @@ class DagConfig:
     # Default inner-parallelism flag template for steps that don't set their own `jobs_flag`.
     default_jobs_flag: str = DEFAULT_JOBS_FLAG
     # Default inner-parallelism ENV channel for steps that don't set their own `jobs_env`.
-    # Normally resolved from $DAGRUN_JOBS_ENV (see resolve_jobs_env) so the HOST
-    # declares it, not the graph. Empty means this machine offers no env channel.
+    # When omitted by a loaded document, resolved from $SAFE_CI_DAG_RUNNER_JOBS_ENV (see
+    # resolve_jobs_env); callers may also set it explicitly. Empty means no env channel.
     default_jobs_env: str = ""
     # --- Deliberately SMALL default caps applied to a step that DECLARES NOTHING ---
     # The forcing function (see the module-level DEFAULT_SMALL_* constants): an undeclared step is

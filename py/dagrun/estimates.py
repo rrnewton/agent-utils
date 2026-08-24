@@ -21,8 +21,8 @@ from dagrun.model import (
     ResourceHint,
     Step,
     effective_cpu_count,
-    effective_jobs_flag,
     step_width_is_resizable,
+    validate_jobs_env_config,
 )
 from dagrun.sizing import (
     _memory_footprint_fits,
@@ -1521,6 +1521,7 @@ def build_plan(
     fixed width is reported as infeasible instead. ``mem_budget`` (the ``--max-mem`` RAM budget)
     applies only to CPA allocation.
     """
+    validate_jobs_env_config(cfg)
     speedups = speedups or {}
     resolved: dict[str, tuple[float, str, int | None, str, int]] = {}
     est: dict[str, float] = {}

@@ -79,6 +79,7 @@ from dagrun.model import (
     resolve_jobs_env,
     effective_jobs_env,
     env_with_inner_jobs,
+    validate_jobs_env_config,
     preferred_inner_jobs,
     render_jobs_flag,
     resolved_wall_timeout,
@@ -156,6 +157,7 @@ __all__ = [
     "resolve_jobs_env",
     "effective_jobs_env",
     "env_with_inner_jobs",
+    "validate_jobs_env_config",
     "command_with_inner_jobs",
     # containment outcome
     "ScopeAttempt",

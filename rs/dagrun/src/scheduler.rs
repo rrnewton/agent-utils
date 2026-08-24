@@ -46,9 +46,10 @@ use crate::attribution::{
 use crate::cgroup::CgroupManager;
 use crate::model::{
     canonical_cpu_timeout, command_with_inner_jobs, effective_cpu_count, effective_cpu_timeout,
-    effective_jobs_flag, preferred_inner_jobs, resolved_wall_timeout, scale_cpu_timeout,
-    step_classification, undeclared_resource_demands, write_domain_violations, DagConfig,
-    RunResult, Step, StepOutcome,
+    env_with_inner_jobs, preferred_inner_jobs, resolved_wall_timeout, scale_cpu_timeout,
+    step_classification, step_width_is_resizable, undeclared_resource_demands,
+    validate_jobs_env_config, write_domain_violations, DagConfig, RunResult, Step, StepOutcome,
+    JOBS_ENV_ENV,
 };
 use crate::profile_enrich::{resolve_effective_inner_jobs, step_enrichment_columns};
 
@@ -639,10 +640,11 @@ pub fn uncontained_cpu_budget_warning(cfg: &DagConfig) -> Option<String> {
 /// This is intentionally visible: a caller-authored width that the run budget changes must not
 /// look as though it executed unchanged. The top-level undeclared-step cpu.max default is capped
 /// too, even though no jobs flag is appended for an undeclared command.
-/// A declared over-budget width whose effective `jobs_flag` is empty is left unchanged: the runner
-/// cannot rewrite that guest's command, and [`validate_max_cpus_rewrite`] makes execution fail
-/// closed instead of falsely claiming the width was lowered.
+/// A declared over-budget width with neither a jobs flag nor jobs-env channel is left unchanged:
+/// the runner cannot rewrite that guest's width, and [`validate_max_cpus_rewrite`] makes execution
+/// fail closed instead of falsely claiming the width was lowered.
 pub fn cap_config_max_cpus(cfg: &DagConfig, max_cpus: i64) -> DagConfig {
+    crate::model::assert_valid_jobs_env_config(cfg);
     let max_cpus = max_cpus.max(1);
     let mut capped = cfg.clone();
     if let Some(default) = capped
@@ -657,21 +659,19 @@ pub fn cap_config_max_cpus(cfg: &DagConfig, max_cpus: i64) -> DagConfig {
         capped.default_step_cpu_count = Some(max_cpus);
     }
     let default_jobs_flag = capped.default_jobs_flag.clone();
+    let default_jobs_env = capped.default_jobs_env.clone();
     for step in &mut capped.steps {
         if let Some(width) = step
             .hint
             .preferred_inner_jobs
             .filter(|width| *width > max_cpus)
         {
-            if effective_jobs_flag(step, &default_jobs_flag)
-                .trim()
-                .is_empty()
-            {
+            if !step_width_is_resizable(step, &default_jobs_flag, &default_jobs_env) {
                 continue;
             }
             eprintln!(
                 "[scheduler] WARNING: step {} preferred_inner_jobs={width} exceeds the run total \
-                 CPU-core budget --max-cpus {max_cpus}; capping its command width and per-step \
+                 CPU-core budget --max-cpus {max_cpus}; capping its guest width and per-step \
                  cpu.max to {max_cpus}",
                 step.tag()
             );
@@ -683,10 +683,11 @@ pub fn cap_config_max_cpus(cfg: &DagConfig, max_cpus: i64) -> DagConfig {
 
 /// Validate that every declared width above `max_cpus` can be rewritten in the guest command.
 ///
-/// An empty effective `jobs_flag` means the step owns its concurrency internally. Lowering only
-/// its scheduling hint and cgroup quota would leave the original worker count running inside a
-/// smaller CPU box, so callers must refuse before any step starts.
+/// A step with neither width channel owns its concurrency internally. Lowering only its scheduling
+/// hint and cgroup quota would leave the original worker count running inside a smaller CPU box,
+/// so callers must refuse before any step starts.
 pub(crate) fn validate_max_cpus_rewrite(cfg: &DagConfig, max_cpus: i64) -> Result<(), String> {
+    validate_jobs_env_config(cfg)?;
     let max_cpus = max_cpus.max(1);
     let mut bad: Vec<(String, i64)> = cfg
         .steps
@@ -697,9 +698,7 @@ pub(crate) fn validate_max_cpus_rewrite(cfg: &DagConfig, max_cpus: i64) -> Resul
             }
             let width = step.hint.preferred_inner_jobs?;
             (width > max_cpus
-                && effective_jobs_flag(step, &cfg.default_jobs_flag)
-                    .trim()
-                    .is_empty())
+                && !step_width_is_resizable(step, &cfg.default_jobs_flag, &cfg.default_jobs_env))
             .then(|| (step.tag(), width))
         })
         .collect();
@@ -713,10 +712,10 @@ pub(crate) fn validate_max_cpus_rewrite(cfg: &DagConfig, max_cpus: i64) -> Resul
         .collect::<Vec<_>>()
         .join(", ");
     Err(format!(
-        "--max-cpus {max_cpus} cannot lower guest parallelism for step(s) with an empty effective \
-         jobs_flag: {detail}; set each step's jobs_flag to the guest's worker-count option (or \
-         remove the empty override and set default_jobs_flag), reduce preferred_inner_jobs, or \
-         raise --max-cpus"
+        "--max-cpus {max_cpus} cannot lower guest parallelism for step(s) that offer no width \
+         channel: {detail}; this machine must declare one -- set ${JOBS_ENV_ENV} to the guest's \
+         worker-count ENV VAR (e.g. CARGO_BUILD_JOBS), or set the step's jobs_flag to its \
+         worker-count OPTION -- or reduce preferred_inner_jobs, or raise --max-cpus"
     ))
 }
 
@@ -1019,6 +1018,8 @@ struct Runner {
     verbosity: i64,
     /// Default inner-parallelism flag template (e.g. "-j") for steps without their own.
     default_jobs_flag: String,
+    /// Default environment channel for steps that consume their width from an environment variable.
+    default_jobs_env: String,
     /// Per-step cgroup boxing (memory/CPU caps + setsid-proof teardown), or `None` when unboxed.
     cgroups: BoxedCgroups,
     /// Multiplier from a step's measured RSS baseline to its inner memory cap.
@@ -1116,6 +1117,7 @@ impl Runner {
             keep_going,
             verbosity,
             default_jobs_flag: capped.default_jobs_flag.clone(),
+            default_jobs_env: capped.default_jobs_env.clone(),
             cgroups,
             mem_cap_factor: capped.mem_cap_factor,
             default_step_mem_cap_bytes: capped.default_step_mem_cap_bytes,
@@ -1428,6 +1430,7 @@ impl Runner {
                 let keep_going = self.keep_going;
                 let verbosity = self.verbosity;
                 let default_jobs_flag = self.default_jobs_flag.clone();
+                let default_jobs_env = self.default_jobs_env.clone();
                 let cgroups = self.cgroups.clone();
                 let mem_cap_factor = self.mem_cap_factor;
                 let default_step_mem_cap_bytes = self.default_step_mem_cap_bytes;
@@ -1463,6 +1466,7 @@ impl Runner {
                                 keep_going,
                                 verbosity,
                                 default_jobs_flag,
+                                default_jobs_env,
                                 cgroups,
                                 mem_cap_factor,
                                 default_step_mem_cap_bytes,
@@ -1898,6 +1902,7 @@ struct StepCtx {
     keep_going: bool,
     verbosity: i64,
     default_jobs_flag: String,
+    default_jobs_env: String,
     cgroups: BoxedCgroups,
     mem_cap_factor: f64,
     /// SMALL forcing-function defaults for an undeclared step (see `model::DEFAULT_SMALL_*`).
@@ -2134,6 +2139,17 @@ fn capture_termination_evidence(
     culprit
 }
 
+fn checked_jobs_env_export(name: &str, value: &str) -> String {
+    let failure = format!(
+        "dagrun: ERROR: jobs environment variable {name} did not retain assigned width {value}; \
+         refusing guest command"
+    );
+    format!(
+        "if ! export {name}={value} || [ \"${{{name}-}}\" != {value} ]; then\n  \
+         printf '%s\\n' '{failure}' >&2\n  exit 125\nfi\n"
+    )
+}
+
 /// Supervise ONE step: launch (cgroup-boxed when enabled), pump output, enforce the timeout,
 /// reap the whole tree, classify, and record a per-step profile row.
 fn run_step(ctx: StepCtx) {
@@ -2143,6 +2159,7 @@ fn run_step(ctx: StepCtx) {
         keep_going,
         verbosity,
         default_jobs_flag,
+        default_jobs_env,
         cgroups,
         mem_cap_factor,
         default_step_mem_cap_bytes,
@@ -2160,7 +2177,15 @@ fn run_step(ctx: StepCtx) {
     // Append the step's inner-parallelism (concurrency) flag when it declares one. No-op when the
     // step has no preferred_inner_jobs.
     let inner_jobs = preferred_inner_jobs(&step, None);
-    let base_cmd = command_with_inner_jobs(&step, &default_jobs_flag, inner_jobs);
+    let jobs_env = env_with_inner_jobs(&step, &default_jobs_env, inner_jobs);
+    let mut base_cmd = command_with_inner_jobs(&step, &default_jobs_flag, inner_jobs);
+    if let Some((name, value)) = &jobs_env {
+        // The real cgroup wrapper exports its scope/operator CARGO_BUILD_JOBS before executing
+        // `base_cmd`. Re-export the admitted per-step value at the final command boundary so a
+        // configured CARGO_BUILD_JOBS channel cannot be overwritten by that outer default. The
+        // name was validated before any node could spawn and the value is a decimal integer.
+        base_cmd = format!("{}{base_cmd}", checked_jobs_env_export(name, value));
+    }
     // cpu.max core cap. `inner_jobs` (declared width) still keys the command's `-j` flag above;
     // the cgroup core cap falls back to the small default so an undeclared step is 1-core-boxed
     // WITHOUT appending a bogus `-j 1` to a command that may not accept it.
@@ -2227,6 +2252,10 @@ fn run_step(ctx: StepCtx) {
     cmd.arg("-c").arg(&run_cmd);
     for (k, v) in &step.env {
         cmd.env(k, v);
+    }
+    if let Some((name, value)) = &jobs_env {
+        // Runner authority wins over a DAG-supplied value on the same channel.
+        cmd.env(name, value);
     }
     cmd.env(STEP_NONCE_ENV, &nonce);
     // Own process group (pgid == child pid) so teardown can reap the whole tree with a
@@ -3403,6 +3432,7 @@ mod tests {
             timeout: 1800,
             cpu_timeout: 0,
             jobs_flag: None,
+            jobs_env: None,
             skip_reason: None,
             write_domains: None,
             write_domain_guarantee: None,
@@ -4011,6 +4041,8 @@ mod tests {
     struct ProfileCaptureCgroups {
         cpu_counts: Mutex<Vec<Option<i64>>>,
         mem_caps: Mutex<Vec<Option<i64>>>,
+        scope_build_jobs: Option<i64>,
+        readonly_scope_build_jobs: bool,
     }
 
     impl CgroupManager for ProfileCaptureCgroups {
@@ -4027,7 +4059,13 @@ mod tests {
         ) -> String {
             self.cpu_counts.lock().unwrap().push(cpu_count);
             self.mem_caps.lock().unwrap().push(mem_max);
-            cmd.to_string()
+            if self.readonly_scope_build_jobs {
+                return format!("readonly CARGO_BUILD_JOBS=8\n{cmd}");
+            }
+            match self.scope_build_jobs {
+                Some(jobs) => format!("export CARGO_BUILD_JOBS={jobs}\n{cmd}"),
+                None => cmd.to_string(),
+            }
         }
 
         fn kill(&self, _tag: &str) -> bool {
@@ -4578,6 +4616,120 @@ mod tests {
         assert!(res.ok, "expected '-j4' to be appended so the check passes");
     }
 
+    fn jobs_env_output(label: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "dagrun_jobs_env_{}_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test"),
+            label
+        ));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    fn jobs_env_cfg(output: &std::path::Path, default_jobs_env: &str) -> DagConfig {
+        let mut item = step(
+            "g",
+            "env",
+            "printf '%s' \"$CARGO_BUILD_JOBS\" > \"$OBSERVED_PATH\"",
+            &[],
+            0.0,
+            &[],
+        );
+        item.hint.preferred_inner_jobs = Some(4);
+        item.jobs_flag = Some(String::new());
+        item.env
+            .insert("CARGO_BUILD_JOBS".to_string(), "99".to_string());
+        item.env.insert(
+            "OBSERVED_PATH".to_string(),
+            output.to_string_lossy().into_owned(),
+        );
+        DagConfig {
+            steps: vec![item],
+            default_jobs_env: default_jobs_env.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn unboxed_child_observes_the_admitted_env_only_width() {
+        let narrow = jobs_env_output("unboxed_narrow");
+        let cfg = jobs_env_cfg(&narrow, "CARGO_BUILD_JOBS");
+        assert!(run_dag_limited(&cfg, 1, 1, false, 0).ok);
+        assert_eq!(std::fs::read_to_string(&narrow).unwrap(), "1");
+
+        let normal = jobs_env_output("unboxed_normal");
+        let cfg = jobs_env_cfg(&normal, "CARGO_BUILD_JOBS");
+        assert!(run_dag_limited(&cfg, 1, 8, false, 0).ok);
+        assert_eq!(std::fs::read_to_string(&normal).unwrap(), "4");
+        let _ = std::fs::remove_file(narrow);
+        let _ = std::fs::remove_file(normal);
+    }
+
+    #[test]
+    fn boxed_child_keeps_the_per_step_width_after_the_scope_export() {
+        let output = jobs_env_output("boxed_narrow");
+        let cfg = jobs_env_cfg(&output, "CARGO_BUILD_JOBS");
+        let cgroups = Arc::new(ProfileCaptureCgroups {
+            scope_build_jobs: Some(8),
+            ..Default::default()
+        });
+        assert!(run_dag_boxed_limited(&cfg, 1, 1, false, 0, Some(cgroups)).ok);
+        assert_eq!(std::fs::read_to_string(&output).unwrap(), "1");
+        let _ = std::fs::remove_file(output);
+    }
+
+    #[test]
+    fn boxed_scope_or_operator_width_is_unchanged_without_a_jobs_env_channel() {
+        let output = jobs_env_output("boxed_operator");
+        let cfg = jobs_env_cfg(&output, "");
+        let cgroups = Arc::new(ProfileCaptureCgroups {
+            scope_build_jobs: Some(8),
+            ..Default::default()
+        });
+        assert!(run_dag_boxed_limited(&cfg, 1, 4, false, 0, Some(cgroups)).ok);
+        assert_eq!(std::fs::read_to_string(&output).unwrap(), "8");
+        let _ = std::fs::remove_file(output);
+    }
+
+    #[test]
+    fn unboxed_bash_readonly_jobs_env_refuses_before_guest_command() {
+        let output = jobs_env_output("unboxed_readonly");
+        let cfg = jobs_env_cfg(&output, "BASHOPTS");
+        let result = run_dag_limited(&cfg, 1, 1, false, 0);
+        assert!(!result.ok);
+        assert_eq!(result.outcomes[0].returncode, Some(125));
+        assert!(result.outcomes[0]
+            .summary
+            .contains("did not retain assigned width 1"));
+        assert!(!output.exists(), "the guest command must not run");
+    }
+
+    #[test]
+    fn boxed_readonly_jobs_env_refuses_before_guest_command() {
+        let output = jobs_env_output("boxed_readonly");
+        let cfg = jobs_env_cfg(&output, "CARGO_BUILD_JOBS");
+        let cgroups = Arc::new(ProfileCaptureCgroups {
+            readonly_scope_build_jobs: true,
+            ..Default::default()
+        });
+        let result = run_dag_boxed_limited(&cfg, 1, 1, false, 0, Some(cgroups));
+        assert!(!result.ok);
+        assert_eq!(result.outcomes[0].returncode, Some(125));
+        assert!(result.outcomes[0]
+            .summary
+            .contains("did not retain assigned width 1"));
+        assert!(!output.exists(), "the guest command must not run");
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid jobs-env configuration")]
+    fn public_cap_refuses_malformed_programmatic_jobs_env() {
+        let mut cfg = jobs_env_cfg(&jobs_env_output("malformed_cap"), "bad=name");
+        cfg.steps[0].hint.preferred_inner_jobs = Some(4);
+        let _ = cap_config_max_cpus(&cfg, 1);
+    }
+
     #[test]
     fn oversized_width_and_default_cpu_cap_are_clamped_to_max_cpus() {
         let mut item = step(
@@ -4633,10 +4785,11 @@ mod tests {
 
         assert_eq!(
             validate_max_cpus_rewrite(&cfg, 2).unwrap_err(),
-            "--max-cpus 2 cannot lower guest parallelism for step(s) with an empty effective \
-             jobs_flag: g.wide (preferred_inner_jobs=8); set each step's jobs_flag to the guest's \
-             worker-count option (or remove the empty override and set default_jobs_flag), reduce \
-             preferred_inner_jobs, or raise --max-cpus"
+            "--max-cpus 2 cannot lower guest parallelism for step(s) that offer no width channel: \
+             g.wide (preferred_inner_jobs=8); this machine must declare one -- set \
+             $SAFE_CI_DAG_RUNNER_JOBS_ENV to the guest's worker-count ENV VAR (e.g. \
+             CARGO_BUILD_JOBS), or set the step's jobs_flag to its worker-count OPTION -- or \
+             reduce preferred_inner_jobs, or raise --max-cpus"
         );
         let capped = cap_config_max_cpus(&cfg, 2);
         assert_eq!(

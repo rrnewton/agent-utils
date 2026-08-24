@@ -69,12 +69,13 @@ from dagrun.model import (
     DEFAULT_SMALL_CPU_TIMEOUT,
     DEFAULT_SMALL_MEM_CAP_BYTES,
     DEFAULT_STEP_TIMEOUT,
+    JOBS_ENV_ENV,
     DagConfig,
     ResourceHint,
     Step,
-    effective_jobs_flag,
     resolve_cpu_timeout_multiplier,
     step_classification,
+    step_width_is_resizable,
 )
 from dagrun.profile_enrich import container_core_budget
 from dagrun.protocols import CgroupManager, MetricsSink, StepOutcome
@@ -214,7 +215,7 @@ def _quickstart(c: Palette) -> str:
   {k(f'{PROG} sweep --dag dag.json --step build.app --jobs 1..8')}  {c.dim('# run one step at -j1..-j8, print a speedup table')}
   {c.dim('--only drops dependency edges to steps outside the selection (their outputs are')}
   {c.dim('assumed already present); it is for profiling/experimenting on a step in isolation.')}
-  {c.dim('sweep passes each width into the step via its jobs_flag and reports wall/user/sys/rss + speedup.')}
+  {c.dim('sweep passes each width through the step jobs_flag and/or jobs_env channel and reports wall/user/sys/rss + speedup.')}
 
 {h('Where profiling data lands (by default)')}
   {c.dim('Every run and sweep AUTO-LOGS resource-usage CSVs to a repo-local store:')}
@@ -241,11 +242,11 @@ def _quickstart(c: Palette) -> str:
   {c.dim(f'Use {k("--no-profile-feedback")} to ignore the store and plan from the DAG hints only.')}
 
 {h('DAG schema')}  {c.dim('(only group/job/cmd are required per step; everything else has defaults)')}
-  step:   group, job, desc, description, cmd, deps[], env{{}}, timeout, jobs_flag, networkonly, engine_only, hint{{}}
+  step:   group, job, desc, description, cmd, deps[], env{{}}, timeout, jobs_flag, jobs_env, networkonly, engine_only, hint{{}}
   hint:   resources{{name:int}}, est_duration_s, rss_baseline_bytes, hard_mem_max_bytes,
           classification("cpu-bound"|"latency-bound"|"light"), preferred_inner_jobs
   top:    description, resource_caps{{name:int}}, mem_cap_factor, mem_cap_floor_bytes,
-          outer_mem_safety_factor, default_step_timeout, default_jobs_flag
+          outer_mem_safety_factor, default_step_timeout, default_jobs_flag, default_jobs_env
   {c.dim('desc = short label; description = long-form docs (often multi-line, great in YAML).')}
   {c.dim('YAML: --dag also accepts .yaml/.yml (isomorphic to JSON; allows comments + block-scalar')}
   {c.dim('  descriptions). The yaml subcommand emits YAML; json emits canonical JSON.')}
@@ -253,6 +254,8 @@ def _quickstart(c: Palette) -> str:
   {c.dim('jobs_flag: template appended with a step preferred_inner_jobs, e.g. "-j" -> "-j 4",')}
   {c.dim('  "-j%d" -> "-j4", "--jobs=" -> "--jobs=4", "--num-threads" -> "--num-threads 4".')}
   {c.dim('  Empty/whitespace means a fixed self-managed width: it cannot be rewritten or swept.')}
+  {c.dim('jobs_env: environment variable receiving the same admitted width; None inherits')}
+  {c.dim(f'  default_jobs_env, normally resolved from ${JOBS_ENV_ENV}.')}
 
 {h('What you get')}
   - concurrent scheduling honoring deps + resource caps, ordered by the chosen {k('--planner')}
@@ -1777,11 +1780,13 @@ def _cmd_sweep(ns: argparse.Namespace, c: Palette) -> int:
         return 2
     repeat = max(1, int(ns.repeat))
     base_step = by_tag[step_tag]
-    if not effective_jobs_flag(base_step, cfg.default_jobs_flag).strip():
+    if not step_width_is_resizable(
+        base_step, cfg.default_jobs_flag, cfg.default_jobs_env
+    ):
         print(
-            f"{PROG}: sweep: step {step_tag!r} has an empty effective jobs_flag, so --jobs cannot "
-            "change guest parallelism; set the step's jobs_flag to the guest's worker-count "
-            "option, or remove the empty override and set default_jobs_flag",
+            f"{PROG}: sweep: step {step_tag!r} offers no width channel, so --jobs cannot "
+            "change guest parallelism; set jobs_flag to the guest's worker-count option or "
+            "jobs_env/default_jobs_env to its worker-count environment variable",
             file=sys.stderr,
         )
         return 2
