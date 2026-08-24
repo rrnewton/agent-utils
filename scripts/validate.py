@@ -54,10 +54,17 @@ WORKSPACE = "workspace"
 CROSS = "cross"
 PACKAGES = "packages"
 GENT_TALK = "gent-talk"
+HYGIENE = "hygiene"
 
 #: Every group, in the order a full run should execute them: cheapest and most likely to fail
 #: first, so a broken build does not surface only after twenty minutes of packaging.
 GROUPS: dict[str, tuple[Check, ...]] = {
+    # Repo-wide and cheap, so it leads. A client name can be typed into ANY file, including the
+    # prose directories below that map to no other check at all.
+    HYGIENE: (
+        Check("client-names-self-test", ("python3", "scripts/check_client_names.py", "--self-test")),
+        Check("client-names", ("python3", "scripts/check_client_names.py")),
+    ),
     DOCS: (Check("embed-userguides", ("python3", "scripts/embed_userguides.py", "--check")),),
     WORKSPACE: (
         Check("rust-fmt", ("cargo", "fmt", "--all", "--manifest-path", "rs/Cargo.toml", "--", "--check")),
@@ -84,6 +91,10 @@ GROUPS: dict[str, tuple[Check, ...]] = {
 
 ALL_GROUPS: frozenset[str] = frozenset(GROUPS)
 
+#: Groups that run for EVERY change, whatever the paths. A group belongs here only if a change
+#: anywhere could break it -- which for a repo-wide text scan is the literal truth.
+ALWAYS: frozenset[str] = frozenset({HYGIENE})
+
 #: Why a group runs, phrased so the reason survives being read months later.
 WHY: dict[str, str] = {
     DOCS: "a document that is embedded into packaged user guides changed",
@@ -91,6 +102,7 @@ WHY: dict[str, str] = {
     CROSS: "code with a paired cross-language implementation changed",
     PACKAGES: "something that ships inside a distribution changed",
     GENT_TALK: "gent-talk changed (it is outside the Rust workspace and has its own suite)",
+    HYGIENE: "always: a consuming project's name can be typed into any file",
 }
 
 #: Longest prefix wins, so `scripts/embed_userguides.py` beats the bare `scripts/` catch-all.
@@ -111,6 +123,8 @@ PREFIX_RULES: tuple[tuple[str, frozenset[str]], ...] = (
     ("scripts/check_python_packages.py", frozenset({PACKAGES})),
     ("scripts/check_rust_packages.py", frozenset({PACKAGES})),
     ("scripts/validate.py", frozenset()),
+    # Its own group is always-on, so naming it here only stops it reading as unclassified.
+    ("scripts/check_client_names.py", frozenset()),
     # Prose and agent-facing material. Not embedded anywhere, so nothing can go red for it.
     ("ai_docs/", frozenset()),
     ("reviews/", frozenset()),
@@ -131,8 +145,8 @@ def groups_for(paths: list[str]) -> tuple[frozenset[str], dict[str, str]]:
     Returns the groups, and — for the report — the first path that pulled each one in. An
     unrecognised path selects every group, and names itself as the reason.
     """
-    selected: set[str] = set()
-    because: dict[str, str] = {}
+    selected: set[str] = set(ALWAYS)
+    because: dict[str, str] = {group: "always" for group in ALWAYS}
     for path in sorted(paths):
         best: frozenset[str] | None = None
         best_len = -1
@@ -188,8 +202,8 @@ def report(selected: frozenset[str], because: dict[str, str], paths: list[str]) 
             print(f"  RUN   {group:<11} — {WHY[group]} [{because.get(group, '?')}]")
         else:
             print(f"  skip  {group:<11} — nothing changed that it can observe")
-    if not selected:
-        print("  (nothing to run: every changed path is prose or configuration)")
+    if selected <= ALWAYS:
+        print("  (nothing selected by path: every changed path is prose or configuration)")
 
 
 def self_test() -> int:
@@ -197,9 +211,13 @@ def self_test() -> int:
     failures: list[str] = []
 
     def expect(paths: list[str], want: set[str], why: str) -> None:
+        """`want` is what the PATHS select. Always-on groups are added here and checked below."""
         got, _ = groups_for(paths)
-        if set(got) != want:
-            failures.append(f"{why}\n    paths={paths}\n    want={sorted(want)}\n    got ={sorted(got)}")
+        expected = want | ALWAYS
+        if set(got) != expected:
+            failures.append(
+                f"{why}\n    paths={paths}\n    want={sorted(expected)}\n    got ={sorted(got)}"
+            )
 
     expect(["gent-talk/src/ops.rs"], {GENT_TALK}, "a gent-talk change must not drag in the workspace contract")
     expect(["gent-talk/web/voice.js", "gent-talk/README.md"], {GENT_TALK}, "gent-talk docs are still gent-talk")
@@ -222,7 +240,22 @@ def self_test() -> int:
         {GENT_TALK, WORKSPACE, CROSS, PACKAGES},
         "a change spanning two areas is the UNION, never the smaller of the two",
     )
-    expect([], set(), "no changes selects nothing")
+    expect(["scripts/check_client_names.py"], set(), "the hygiene guard needs only its own always-on group")
+    expect([], set(), "no changes selects nothing by path")
+
+    # ALWAYS is the property the table above cannot state, because it folds it in silently.
+    for paths, why in (
+        ([], "no changes at all"),
+        (["ai_docs/note.md"], "a prose path that selects nothing else"),
+        (["AGENTS.md"], "a file mapped to the empty set"),
+        (["rs/tick-hub/src/lib.rs"], "an ordinary source change"),
+    ):
+        got, because = groups_for(paths)
+        if not ALWAYS <= set(got):
+            failures.append(f"an always-on group must run for {why}: got {sorted(got)}")
+        for group in ALWAYS:
+            if group not in because:
+                failures.append(f"an always-on group must state a reason for {why}")
 
     # Every group named by a rule must exist, or the selector silently runs nothing for it.
     for prefix, groups in PREFIX_RULES:
@@ -238,7 +271,7 @@ def self_test() -> int:
     if failures:
         print(f"\n{len(failures)} self-test failure(s)", file=sys.stderr)
         return 1
-    print("validate --self-test: PASSED (15 mapping controls)")
+    print("validate --self-test: PASSED (15 mapping controls, 8 always-on controls)")
     return 0
 
 

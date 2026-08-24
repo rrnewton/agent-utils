@@ -118,6 +118,28 @@ found here as permission to skip one you found there.
 The converse holds too: a stricter policy encountered elsewhere is not a reason
 to start opening pull requests here.
 
+### Never name a consuming project
+
+`agent-utils` is a reusable collection of libraries. Other repositories
+submodule it and use it — they are its **clients**, not its subject. Their names
+do not belong anywhere in this tree, including comments, tests, fixtures, and
+dated records in `ai_docs/` and `reviews/`.
+
+`make validate` enforces this on every change, whatever the paths, via
+`scripts/check_client_names.py`.
+
+When you need to explain *why* code behaves the way it does, describe the
+behaviour rather than naming the client — "the originating validator", "the
+fully-censored case". The reason is the useful part; the name is the part a
+reader cannot resolve. Where a record genuinely needs to distinguish two
+consumers, use neutral labels (`consumer-a`, `consumer-b`) and say in the
+document that they are redactions.
+
+Do not resolve this by rewriting history silently. If you redact a dated record,
+**change any note that claims the record is unmodified** — a provenance note
+that promises "kept as written" beside text you have edited is worse than either
+the name or the edit.
+
 ## Naming: every feature gets a slug
 
 Every issue and pull request names its subject with a **slug**: lowercase

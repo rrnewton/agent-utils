@@ -21,7 +21,7 @@ mypy:
 	python3 scripts/check_no_any.py .
 
 # Lint/typecheck gates (what CI runs).
-check: check-deps mypy check-test-suite-selector check-validate-selector
+check: check-deps mypy check-test-suite-selector check-validate-selector check-client-names
 	@host_target="$$(rustc -vV | sed -n 's/^host: //p')"; \
 	test -n "$$host_target"; \
 	cargo clippy --release --workspace --all-targets --manifest-path rs/Cargo.toml \
@@ -53,6 +53,11 @@ validate-all:
 # The selector must not be able to silently under-run. Offline, no build, no network.
 check-validate-selector:
 	python3 scripts/validate.py --self-test
+
+# agent-utils is reusable; the projects that consume it must not be named anywhere in the tree.
+check-client-names:
+	python3 scripts/check_client_names.py --self-test
+	python3 scripts/check_client_names.py
 
 check-test-suite-selector:
 	@for valid in all python rust; do \
