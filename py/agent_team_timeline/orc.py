@@ -34,6 +34,81 @@ _AUXILIARY_POLICY_NOT_APPLICABLE = "not-applicable"
 _AUXILIARY_DEGRADATION_REASON = (
     "conversation-history-rewritten-stable-spawns-preserved"
 )
+_PREFIX_OVERRIDE_POLICY = "operator-accepted-prefix-rewrite-v1"
+# A different event from _AUXILIARY_DEGRADATION_REASON and therefore a different string. That one
+# records something this code *detected and tolerated* on its own authority, about the rewritable
+# conversation projection. This one records that the durable append prefix -- the thing the archive
+# otherwise treats as immutable -- did not match, and that a human passed an explicit flag saying
+# so anyway. A reader who greps for one must not find the other, because "the tool decided" and "an
+# operator decided" have entirely different follow-up actions.
+_PREFIX_OVERRIDE_DEGRADATION_REASON = (
+    "append-prefix-rewritten-operator-accepted-rows-preserved"
+)
+# The exact column lists the append-prefix digest covers, in digest order. These exist as constants
+# rather than inline SQL so the guard's digest and the diff that explains a mismatch are provably
+# reading the same columns: a diff that omitted a digested column could report "nothing changed"
+# about a refusal, which is worse than no diff at all. `_prefix_query` builds both statements, and
+# `test_prefix_scopes_reproduce_the_guard_digest` pins the agreement.
+_CONTENT_BLOCK_PREFIX_COLUMNS = (
+    "rowid",
+    "id",
+    "message_id",
+    "session_id",
+    "block_index",
+    "created_at_ms",
+    "turn_index",
+    "role",
+    "block_type",
+    "content",
+    "searchable_text",
+    "code_input",
+    "code_output",
+    "code_exit_code",
+    "model",
+    "user_source",
+    "token_count",
+    "extra",
+)
+_MESSAGE_PREFIX_COLUMNS = (
+    "id",
+    "session_id",
+    "role",
+    "created_at_ms",
+    "message_json",
+    "search_text",
+)
+# Caps on the recorded diff. The whole point of the override is that it runs against archives whose
+# guarded prefix is hundreds of megabytes, so every part of the evidence is bounded and every bound
+# is reported as a flag rather than applied silently. Twenty rows is far more than the observed
+# incident needs (one) and still small enough to read in a terminal and to store in every future
+# run receipt for the same source.
+#
+# These caps stayed small on purpose after being reconsidered, and the reason is
+# `superseded_snapshot_path` below: an accepted override no longer garbage-collects the pre-rewrite
+# database, so the recorded diff is a *summary* of an event whose two sides both still exist on
+# disk. A reader who needs more than the summary re-runs the comparison against the retained
+# object, at whatever fidelity they want, without this code having had to guess in advance how much
+# detail would turn out to matter. Raising the caps -- or spilling a complete diff to a
+# sidecar file in the archive, which was the other candidate -- would buy a second, still-frozen,
+# still-lossy rendering of bytes the archive already keeps, and would do it by writing a
+# potentially unbounded file on the one code path that exists to survive pathological inputs. The
+# summary is for the operator standing at the terminal; the object store is the evidence.
+_PREFIX_DIFF_MAX_ROWS = 20
+_PREFIX_DIFF_MAX_KEYS = 8
+_PREFIX_DIFF_EXCERPT_CHARS = 160
+_PREFIX_DIFF_CONTEXT_CHARS = 24
+_PREFIX_DIFF_MAX_JSON_PATHS = 8
+_PREFIX_DIFF_MAX_JSON_DEPTH = 6
+# A second, tighter bound for the *refusal message*. Twenty rows of eighteen excerpted columns is a
+# reasonable thing to store in a receipt and an unreasonable thing to throw at a terminal as one
+# exception string, so the refusal spends a few kilobytes and then says how many rows it did not
+# name. The full bounded evidence is what gets recorded when the override is actually taken.
+_PREFIX_DIFF_MAX_MESSAGE_CHARS = 4000
+# Only attempt the structural JSON diff on values small enough that parsing them twice is cheap.
+# Above this the character-window excerpt still localizes the change; what is lost is only the
+# field *name*, and paying an unbounded parse to recover a name is the wrong trade in a code path
+# that exists to survive pathological inputs.
+_PREFIX_DIFF_MAX_JSON_CHARS = 1_000_000
 _EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 _SNAPSHOT_OBJECT_ROOT = ".objects"
 _TASK_PROJECTION_ROOT = ".projections"
@@ -172,6 +247,355 @@ class OrcAuxiliaryStatus:
             degraded=degraded,
             degradation_reason=degradation_reason,
         )
+
+
+@dataclass(frozen=True)
+class OrcPrefixColumnChange:
+    """One guarded column whose stored value differs from the recorded append prefix.
+
+    ``previous`` and ``observed`` are *excerpts*, not values: a rendered window centred on the first
+    and last character that differ, so a one-field edit inside a megabyte of ``message_json`` reads
+    as ``"token_count":null`` against ``"token_count":445`` instead of two identical truncated
+    prefixes. ``bounded`` says the window is a window; ``json_paths`` names the changed field when
+    both sides parse as JSON, which is the answer an operator actually wants.
+    """
+
+    column: str
+    previous: str
+    observed: str
+    bounded: bool
+    json_paths: tuple[str, ...]
+    json_paths_bounded: bool
+
+    def to_json_obj(self) -> dict[str, object]:
+        """Return this column change as bounded manifest and receipt evidence."""
+
+        return {
+            "column": self.column,
+            "previous": self.previous,
+            "observed": self.observed,
+            "bounded": self.bounded,
+            "json_paths": list(self.json_paths),
+            "json_paths_bounded": self.json_paths_bounded,
+        }
+
+    @classmethod
+    def from_json_obj(
+        cls, raw: Mapping[str, object], where: str
+    ) -> OrcPrefixColumnChange:
+        """Strictly decode one recorded column change."""
+
+        _require_exact_keys(
+            raw,
+            {
+                "column",
+                "previous",
+                "observed",
+                "bounded",
+                "json_paths",
+                "json_paths_bounded",
+            },
+            where,
+        )
+        return cls(
+            column=_required_string(raw.get("column"), f"{where}.column"),
+            previous=_string_value(raw.get("previous"), f"{where}.previous"),
+            observed=_string_value(raw.get("observed"), f"{where}.observed"),
+            bounded=_boolean(raw.get("bounded"), f"{where}.bounded"),
+            json_paths=tuple(
+                _required_string(item, f"{where}.json_paths[{index}]")
+                for index, item in enumerate(
+                    _array(raw.get("json_paths"), f"{where}.json_paths")
+                )
+            ),
+            json_paths_bounded=_boolean(
+                raw.get("json_paths_bounded"), f"{where}.json_paths_bounded"
+            ),
+        )
+
+    def describe(self) -> str:
+        """Return one operator-readable line naming the column, its fields, and the excerpts."""
+
+        fields = ""
+        if self.json_paths:
+            fields = " ." + ", .".join(self.json_paths)
+            if self.json_paths_bounded:
+                fields += ", ..."
+        return f"{self.column}{fields}: {self.previous} -> {self.observed}"
+
+
+@dataclass(frozen=True)
+class OrcPrefixRowChange:
+    """One row at or below the append watermark whose guarded columns were rewritten."""
+
+    table: str
+    row_id: int
+    columns: tuple[OrcPrefixColumnChange, ...]
+
+    def to_json_obj(self) -> dict[str, object]:
+        """Return this row change as bounded manifest and receipt evidence."""
+
+        return {
+            "table": self.table,
+            "row_id": self.row_id,
+            "columns": [column.to_json_obj() for column in self.columns],
+        }
+
+    @classmethod
+    def from_json_obj(
+        cls, raw: Mapping[str, object], where: str
+    ) -> OrcPrefixRowChange:
+        """Strictly decode one recorded row change."""
+
+        _require_exact_keys(raw, {"table", "row_id", "columns"}, where)
+        columns = tuple(
+            OrcPrefixColumnChange.from_json_obj(
+                _mapping(item, f"{where}.columns[{index}]"),
+                f"{where}.columns[{index}]",
+            )
+            for index, item in enumerate(
+                _array(raw.get("columns"), f"{where}.columns")
+            )
+        )
+        if not columns:
+            raise OrcParseError(f"{where}: a recorded row change must name a column")
+        return cls(
+            table=_required_string(raw.get("table"), f"{where}.table"),
+            # Signed, because SQLite rowids legitimately are. Narrowing this to non-negative would
+            # make a real archive undecodable to buy a validation nobody asked for.
+            row_id=_integer(raw.get("row_id"), f"{where}.row_id"),
+            columns=columns,
+        )
+
+    def describe(self) -> str:
+        """Return one operator-readable line naming the row and each changed column."""
+
+        return (
+            f"{self.table} row {self.row_id}: "
+            + "; ".join(column.describe() for column in self.columns)
+        )
+
+
+@dataclass(frozen=True)
+class OrcAppendPrefixOverride:
+    """An operator's recorded decision to re-baseline one source's append-prefix digest.
+
+    This is provenance, not permission: the record is written *after* the fact and is sticky, so an
+    archive that was ever re-baselined says so forever, in the manifest, next to the source it
+    happened to. ``override_count`` accumulates; ``changed_rows`` keeps the most recent event's
+    bounded evidence, because a counter alone cannot tell a later reader whether the accepted change
+    was a metadata backfill or something that should have been refused. Earlier events remain in the
+    run receipts written by the runs that made them.
+
+    ``superseded_snapshot_path`` is what makes any of that checkable rather than merely readable. It
+    names the pre-rewrite database -- the exact object the manifest pointed at before this override
+    re-baselined the digest -- and naming it in the manifest is what keeps it alive: object GC
+    retains everything the manifest still references, so the bytes survive the command that made
+    them unverifiable instead of being reclaimed by it. With both sides on disk the bounded
+    ``changed_rows`` summary stops being the only account of the event; an operator who accepted a
+    rewrite and later regretted it can diff the two databases directly, at full fidelity, with
+    nothing but ``sqlite3``.
+
+    Retention is one deep, per source, and it is reclaimed by the next *accepted* override on that
+    same source, which supersedes this pointer and lets GC take the older object. That is the
+    deliberate choice over keeping every superseded generation: these are whole session databases,
+    an archive is not a backup system, and every reclamation is therefore the direct consequence of
+    a second explicit operator action carrying the same warning as the first -- never of a routine
+    run. Nothing here is load-bearing for a later ingest, so a missing object is tolerated rather
+    than fatal: see :func:`prune_orc_snapshot_objects`.
+
+    A schema-v1 source keeps its snapshot at its own mirrored source path instead of in the managed
+    object store, where GC never reaches it. The pointer then records that path as a plain note
+    saying where the bytes are, and it is the only case in which it is not a content-addressed
+    object name.
+    """
+
+    policy: str
+    source_path: str
+    accepted_at: str
+    override_count: int
+    previous_append_prefix_sha256: str
+    observed_append_prefix_sha256: str
+    superseded_snapshot_path: str
+    superseded_sha256: str
+    changed_row_count: int
+    changed_rows: tuple[OrcPrefixRowChange, ...]
+    changed_rows_bounded: bool
+    degraded: bool
+    degradation_reason: str
+
+    def to_json_obj(self) -> dict[str, object]:
+        """Return the bounded override record stored beside its source."""
+
+        return {
+            "policy": self.policy,
+            "source_path": self.source_path,
+            "accepted_at": self.accepted_at,
+            "override_count": self.override_count,
+            "previous_append_prefix_sha256": self.previous_append_prefix_sha256,
+            "observed_append_prefix_sha256": self.observed_append_prefix_sha256,
+            "superseded_snapshot_path": self.superseded_snapshot_path,
+            "superseded_sha256": self.superseded_sha256,
+            "changed_row_count": self.changed_row_count,
+            "changed_rows": [row.to_json_obj() for row in self.changed_rows],
+            "changed_rows_bounded": self.changed_rows_bounded,
+            "degraded": self.degraded,
+            "degradation_reason": self.degradation_reason,
+        }
+
+    @classmethod
+    def from_json_obj(
+        cls, raw: Mapping[str, object], where: str
+    ) -> OrcAppendPrefixOverride:
+        """Strictly decode one recorded operator override."""
+
+        _require_exact_keys(
+            raw,
+            {
+                "policy",
+                "source_path",
+                "accepted_at",
+                "override_count",
+                "previous_append_prefix_sha256",
+                "observed_append_prefix_sha256",
+                "superseded_snapshot_path",
+                "superseded_sha256",
+                "changed_row_count",
+                "changed_rows",
+                "changed_rows_bounded",
+                "degraded",
+                "degradation_reason",
+            },
+            where,
+        )
+        policy = _required_string(raw.get("policy"), f"{where}.policy")
+        if policy != _PREFIX_OVERRIDE_POLICY:
+            raise OrcParseError(f"{where}.policy: unsupported policy {policy!r}")
+        override_count = _nonnegative_integer(
+            raw.get("override_count"), f"{where}.override_count"
+        )
+        if override_count < 1:
+            raise OrcParseError(
+                f"{where}: a recorded override must have happened at least once"
+            )
+        degraded = _boolean(raw.get("degraded"), f"{where}.degraded")
+        degradation_reason = _required_string(
+            raw.get("degradation_reason"), f"{where}.degradation_reason"
+        )
+        # An override that does not carry its degradation is the failure mode this record exists to
+        # prevent, so it is rejected on read rather than repaired: a manifest claiming a clean
+        # source while holding override evidence is corrupt, not merely stale.
+        if not degraded or degradation_reason != _PREFIX_OVERRIDE_DEGRADATION_REASON:
+            raise OrcParseError(
+                f"{where}: an accepted prefix rewrite must record its degradation"
+            )
+        previous_digest = _sha256_string(
+            raw.get("previous_append_prefix_sha256"),
+            f"{where}.previous_append_prefix_sha256",
+        )
+        observed_digest = _sha256_string(
+            raw.get("observed_append_prefix_sha256"),
+            f"{where}.observed_append_prefix_sha256",
+        )
+        if previous_digest == observed_digest:
+            raise OrcParseError(
+                f"{where}: an accepted prefix rewrite must record two different digests"
+            )
+        # The retained pointer is checked for shape here rather than for existence, and the two are
+        # different promises on purpose. Shape is an archive invariant this code controls, while
+        # existence is a property of a directory an operator can and sometimes must clean up by
+        # hand: refusing to decode an otherwise valid manifest because a piece of evidence was
+        # deleted would make a routine future ingest fail for a reason that has nothing to do with
+        # it.
+        #
+        # The shape rule binds only inside the managed object store, because only there does the
+        # pointer *do* anything -- it is what keeps GC's hands off those bytes, so it must be the
+        # content-addressed name of the digest recorded beside it and cannot be aimed elsewhere.
+        # Outside it the pointer is a note to a human, and it has to stay one: a schema-v1 source
+        # is stored at its own mirrored source path rather than in the object store, GC does not
+        # reach that path at all, and rejecting the honest note would be the only thing standing
+        # between such an archive and a decodable manifest.
+        superseded_sha256 = _sha256_string(
+            raw.get("superseded_sha256"), f"{where}.superseded_sha256"
+        )
+        superseded_snapshot_path = _required_string(
+            raw.get("superseded_snapshot_path"), f"{where}.superseded_snapshot_path"
+        )
+        _safe_relative(superseded_snapshot_path)
+        expected_superseded = _snapshot_object_relative(superseded_sha256)
+        if (
+            superseded_snapshot_path.startswith(f"{_SNAPSHOT_OBJECT_ROOT}/")
+            and superseded_snapshot_path != expected_superseded
+        ):
+            raise OrcParseError(
+                f"{where}.superseded_snapshot_path: expected content-addressed path "
+                f"{expected_superseded!r}"
+            )
+        changed_rows = tuple(
+            OrcPrefixRowChange.from_json_obj(
+                _mapping(item, f"{where}.changed_rows[{index}]"),
+                f"{where}.changed_rows[{index}]",
+            )
+            for index, item in enumerate(
+                _array(raw.get("changed_rows"), f"{where}.changed_rows")
+            )
+        )
+        changed_row_count = _nonnegative_integer(
+            raw.get("changed_row_count"), f"{where}.changed_row_count"
+        )
+        changed_rows_bounded = _boolean(
+            raw.get("changed_rows_bounded"), f"{where}.changed_rows_bounded"
+        )
+        if (
+            changed_row_count < 1
+            or changed_row_count < len(changed_rows)
+            or changed_rows_bounded != (len(changed_rows) < changed_row_count)
+        ):
+            raise OrcParseError(
+                f"{where}: recorded row evidence disagrees with its own row count"
+            )
+        return cls(
+            policy=policy,
+            source_path=_required_string(
+                raw.get("source_path"), f"{where}.source_path"
+            ),
+            accepted_at=_required_string(
+                raw.get("accepted_at"), f"{where}.accepted_at"
+            ),
+            override_count=override_count,
+            previous_append_prefix_sha256=previous_digest,
+            observed_append_prefix_sha256=observed_digest,
+            superseded_snapshot_path=superseded_snapshot_path,
+            superseded_sha256=superseded_sha256,
+            changed_row_count=changed_row_count,
+            changed_rows=changed_rows,
+            changed_rows_bounded=changed_rows_bounded,
+            degraded=degraded,
+            degradation_reason=degradation_reason,
+        )
+
+    def describe(self) -> tuple[str, ...]:
+        """Return the operator-readable report: one headline, then one line per changed row."""
+
+        headline = (
+            f"accepted append-prefix rewrite for {self.source_path}: "
+            f"{self.changed_row_count} row(s) changed at or below the append watermark "
+            f"(override #{self.override_count}, {self.degradation_reason})"
+        )
+        lines = [headline, *(row.describe() for row in self.changed_rows)]
+        if self.changed_rows_bounded:
+            lines.append(
+                f"... {self.changed_row_count - len(self.changed_rows)} further changed "
+                "row(s) not shown"
+            )
+        # Last, because it is the line an operator comes back for hours later: where the bytes this
+        # override stopped trusting actually are. Printing the path is the whole affordance -- the
+        # rows above are a summary, and this is how to check it.
+        lines.append(
+            f"pre-rewrite snapshot retained for comparison: {self.superseded_snapshot_path} "
+            "(reclaimed by the next accepted override on this source)"
+        )
+        return tuple(lines)
 
 
 @dataclass(frozen=True)
@@ -376,6 +800,11 @@ class OrcSourceCopy:
     auxiliary: OrcAuxiliaryStatus
     task_projection: OrcTaskProjection | None
     captured_at: str
+    # Sticky: once an operator has re-baselined this source's append prefix, the archive says so
+    # for the rest of its life, even across later clean ingests. Kept separate from `auxiliary`
+    # because that field's degradation describes Orc's rewritable conversation projection, and the
+    # two events can and do occur together -- one `degradation_reason` string cannot hold both.
+    append_prefix_override: OrcAppendPrefixOverride | None = None
 
     def to_json_obj(self) -> dict[str, object]:
         """Return this validated source-copy record as a JSON object."""
@@ -408,6 +837,11 @@ class OrcSourceCopy:
                 else None
             ),
             "captured_at": self.captured_at,
+            "append_prefix_override": (
+                self.append_prefix_override.to_json_obj()
+                if self.append_prefix_override is not None
+                else None
+            ),
         }
 
     @classmethod
@@ -452,13 +886,15 @@ class OrcSourceCopy:
                 "canonical_semantic_sha256",
                 "canonical_semantic_complete_bytes",
             }
-            current_fields = canonical_fields | {
+            alias_fields = canonical_fields | {
                 "semantic_alias_baseline_path",
             }
+            current_fields = alias_fields | {"append_prefix_override"}
             if set(raw) not in (
                 legacy_fields,
                 lineage_fields,
                 canonical_fields,
+                alias_fields,
                 current_fields,
             ):
                 _require_exact_keys(raw, current_fields, where)
@@ -503,6 +939,7 @@ class OrcSourceCopy:
             semantic_baseline_path: str | None = snapshot_path
             source_state = _SOURCE_STATE_LIVE
             task_source_ordinal: int | None = 0 if kind == "task" else None
+            append_prefix_override: OrcAppendPrefixOverride | None = None
         elif manifest_schema_version == 2:
             expected_snapshot_path = _snapshot_object_relative(sha256)
             if snapshot_path != expected_snapshot_path:
@@ -593,6 +1030,41 @@ class OrcSourceCopy:
                     raw_ordinal, f"{where}.task_source_ordinal"
                 )
             )
+            raw_prefix_override = raw.get("append_prefix_override")
+            append_prefix_override = (
+                None
+                if raw_prefix_override is None
+                else OrcAppendPrefixOverride.from_json_obj(
+                    _mapping(
+                        raw_prefix_override, f"{where}.append_prefix_override"
+                    ),
+                    f"{where}.append_prefix_override",
+                )
+            )
+            # The override names its own source so that it stays readable when a receipt or a bug
+            # report quotes it alone; that makes it forgeable in isolation, so the pairing is
+            # checked here, where both halves are in hand.
+            if (
+                append_prefix_override is not None
+                and append_prefix_override.source_path != source_path
+            ):
+                raise OrcParseError(
+                    f"{where}.append_prefix_override.source_path: recorded override "
+                    f"belongs to {append_prefix_override.source_path!r}"
+                )
+            # A rewrite changes the guarded prefix, so it changes the file, so the superseded object
+            # and the current one cannot be the same object. If they are, the manifest is claiming
+            # to retain a pre-rewrite copy while pointing at the post-rewrite bytes -- retention
+            # that reads as satisfied and holds nothing. Caught here because this is the only place
+            # both paths are in hand.
+            if (
+                append_prefix_override is not None
+                and append_prefix_override.superseded_snapshot_path == snapshot_path
+            ):
+                raise OrcParseError(
+                    f"{where}.append_prefix_override.superseded_snapshot_path: the "
+                    "pre-rewrite snapshot cannot be the current snapshot"
+                )
         else:
             raise OrcParseError(
                 f"{where}: unsupported Orc manifest schema {manifest_schema_version}"
@@ -617,6 +1089,11 @@ class OrcSourceCopy:
                 semantic_identity_mode == _SEMANTIC_IDENTITY_DETERMINISTIC
                 and semantic_baseline_path is not None
             )
+            # Task sources never reach the append-prefix guard: their history is protected by the
+            # frozen-note projection instead, which has its own rewrite policy and its own
+            # degradation reasons. An override recorded against a task source would therefore be
+            # describing a comparison that never happened.
+            or (kind == "task" and append_prefix_override is not None)
         ):
             raise OrcParseError(
                 f"{where}: invalid schema-v2 projections for {kind} source"
@@ -662,6 +1139,7 @@ class OrcSourceCopy:
             auxiliary=auxiliary,
             task_projection=task_projection,
             captured_at=_required_string(raw.get("captured_at"), f"{where}.captured_at"),
+            append_prefix_override=append_prefix_override,
         )
 
 
@@ -835,6 +1313,10 @@ class OrcSnapshotResult:
     sources: tuple[OrcSourceCopy, ...]
     files_changed: int
     continuations: tuple[OrcContinuationLink, ...] = ()
+    # Only the overrides this pass actually accepted, not every override the manifest remembers.
+    # Callers use this to decide whether the *current* run must shout; the sticky record on each
+    # source answers the different question of whether the archive was ever re-baselined.
+    prefix_overrides: tuple[OrcAppendPrefixOverride, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -860,6 +1342,7 @@ class _PreparedCandidate:
     temporary_path: Path
     state: _LogicalState
     previous_state: _LogicalState | None
+    prefix_override: OrcAppendPrefixOverride | None
 
 
 @dataclass(frozen=True)
@@ -891,6 +1374,36 @@ class _LogicalState:
     append_count: int
     append_max_id: int
     append_prefix_sha256: str
+
+
+@dataclass(frozen=True)
+class _SessionGeometry:
+    """Row counts and watermarks for the tables a session's append prefix is digested over."""
+
+    storage_table: str
+    content_count: int
+    content_max_id: int
+    message_count: int
+    message_max_id: int
+
+
+@dataclass(frozen=True)
+class _PrefixScope:
+    """One guarded table, the columns the digest covers in order, and the watermark applied."""
+
+    table: str
+    columns: tuple[str, ...]
+    limit: int
+
+    @property
+    def query(self) -> str:
+        """Return the single statement both the digest and the row diff read rows through."""
+
+        key = self.columns[0]
+        return (
+            f"SELECT {', '.join(self.columns)} FROM {self.table} "
+            f"WHERE {key} <= ? ORDER BY {key}"
+        )
 
 
 @dataclass(frozen=True)
@@ -2916,6 +3429,105 @@ def _validate_source_semantic_identity(
     return identity
 
 
+def _session_geometry(
+    connection: sqlite3.Connection, path: Path, session_state_mode: str | None
+) -> _SessionGeometry:
+    """Measure the tables a session's append prefix is digested over, honouring legacy modes."""
+
+    storage_table = _session_storage_table(connection, str(path))
+    if session_state_mode == "messages-only":
+        if storage_table != "messages":
+            raise OrcParseError(
+                f"{path}: messages-only legacy state lacks messages table"
+            )
+    elif session_state_mode == "content-only":
+        storage_table = "content_blocks"
+    elif session_state_mode is not None:
+        raise OrcParseError(
+            f"unsupported legacy Orc session state mode {session_state_mode!r}"
+        )
+    content_count = 0
+    content_max_id = 0
+    if session_state_mode != "messages-only":
+        content_row = _one(
+            connection,
+            "SELECT COUNT(*), COALESCE(MAX(rowid), 0) FROM content_blocks",
+            str(path),
+        )
+        content_count = _nonnegative_integer(content_row[0], f"{path}: content count")
+        content_max_id = _nonnegative_integer(
+            content_row[1], f"{path}: max content rowid"
+        )
+    message_count = 0
+    message_max_id = 0
+    if storage_table == "messages":
+        message_row = _one(
+            connection,
+            "SELECT COUNT(*), COALESCE(MAX(id), 0) FROM messages",
+            str(path),
+        )
+        message_count = _nonnegative_integer(message_row[0], f"{path}: message count")
+        message_max_id = _nonnegative_integer(
+            message_row[1], f"{path}: max message id"
+        )
+    return _SessionGeometry(
+        storage_table=storage_table,
+        content_count=content_count,
+        content_max_id=content_max_id,
+        message_count=message_count,
+        message_max_id=message_max_id,
+    )
+
+
+def _session_prefix_scopes(
+    geometry: _SessionGeometry,
+    session_state_mode: str | None,
+    prefix_max_id: int | None,
+) -> tuple[tuple[_PrefixScope, ...], bool]:
+    """Return exactly what the append-prefix digest covers, plus whether it is a legacy prefix.
+
+    Both the digest in :func:`_logical_state` and the row diff that explains a mismatch derive
+    their SQL from this one answer, so the two can never disagree about which rows were compared.
+    That matters because the diff is what an operator reads before deciding whether to override a
+    refusal: a diff scoped differently from the digest would be evidence about a different question.
+    """
+
+    if session_state_mode == "messages-only":
+        limit = geometry.message_max_id if prefix_max_id is None else prefix_max_id
+        return ((_PrefixScope("messages", _MESSAGE_PREFIX_COLUMNS, limit),), False)
+    if geometry.storage_table == "messages":
+        if prefix_max_id is None:
+            content_limit = geometry.content_max_id
+            message_limit = geometry.message_max_id
+            legacy_prefix = False
+        elif prefix_max_id & _SESSION_STATE_TAG:
+            packed = prefix_max_id ^ _SESSION_STATE_TAG
+            content_limit = packed >> _SESSION_STATE_SHIFT
+            message_limit = packed & _SESSION_STATE_MASK
+            legacy_prefix = False
+        else:
+            content_limit = prefix_max_id
+            message_limit = 0
+            legacy_prefix = True
+        content_scope = _PrefixScope(
+            "content_blocks", _CONTENT_BLOCK_PREFIX_COLUMNS, content_limit
+        )
+        if legacy_prefix:
+            return ((content_scope,), True)
+        return (
+            (
+                content_scope,
+                _PrefixScope("messages", _MESSAGE_PREFIX_COLUMNS, message_limit),
+            ),
+            False,
+        )
+    limit = geometry.content_max_id if prefix_max_id is None else prefix_max_id
+    return (
+        (_PrefixScope("content_blocks", _CONTENT_BLOCK_PREFIX_COLUMNS, limit),),
+        False,
+    )
+
+
 def _logical_state(
     path: Path,
     kind: str,
@@ -2935,153 +3547,79 @@ def _logical_state(
                 ("session_meta", "content_blocks"),
                 str(path),
             )
-            storage_table = _session_storage_table(connection, str(path))
+            geometry = _session_geometry(connection, path, session_state_mode)
+            scopes, legacy_prefix = _session_prefix_scopes(
+                geometry, session_state_mode, prefix_max_id
+            )
             if session_state_mode == "messages-only":
-                if storage_table != "messages":
-                    raise OrcParseError(
-                        f"{path}: messages-only legacy state lacks messages table"
-                    )
-                count_row = _one(
-                    connection,
-                    "SELECT COUNT(*), COALESCE(MAX(id), 0) FROM messages",
-                    str(path),
-                )
-                append_count = _nonnegative_integer(
-                    count_row[0], f"{path}: message count"
-                )
-                append_max_id = _nonnegative_integer(
-                    count_row[1], f"{path}: max message id"
-                )
-                limit = append_max_id if prefix_max_id is None else prefix_max_id
+                scope = scopes[0]
                 prefix_count, prefix_digest = _query_digest(
-                    connection,
-                    "SELECT id, session_id, role, created_at_ms, message_json, "
-                    "search_text FROM messages WHERE id <= ? ORDER BY id",
-                    (limit,),
+                    connection, scope.query, (scope.limit,)
                 )
                 return _LogicalState(
                     append_count=(
-                        append_count if prefix_max_id is None else prefix_count
+                        geometry.message_count
+                        if prefix_max_id is None
+                        else prefix_count
                     ),
-                    append_max_id=append_max_id,
+                    append_max_id=geometry.message_max_id,
                     append_prefix_sha256=prefix_digest,
                 )
-            if session_state_mode not in (None, "content-only"):
-                raise OrcParseError(
-                    f"unsupported legacy Orc session state mode {session_state_mode!r}"
-                )
-            if session_state_mode == "content-only":
-                storage_table = "content_blocks"
-            if storage_table == "messages":
-                content_row = _one(
-                    connection,
-                    "SELECT COUNT(*), COALESCE(MAX(rowid), 0) FROM content_blocks",
-                    str(path),
-                )
-                message_row = _one(
-                    connection,
-                    "SELECT COUNT(*), COALESCE(MAX(id), 0) FROM messages",
-                    str(path),
-                )
-                content_count = _nonnegative_integer(
-                    content_row[0], f"{path}: content count"
-                )
-                content_max_id = _nonnegative_integer(
-                    content_row[1], f"{path}: max content rowid"
-                )
-                message_count = _nonnegative_integer(
-                    message_row[0], f"{path}: message count"
-                )
-                message_max_id = _nonnegative_integer(
-                    message_row[1], f"{path}: max message id"
-                )
+            if geometry.storage_table == "messages":
                 if (
-                    content_max_id > _SESSION_STATE_MASK
-                    or message_max_id > _SESSION_STATE_MASK
+                    geometry.content_max_id > _SESSION_STATE_MASK
+                    or geometry.message_max_id > _SESSION_STATE_MASK
                 ):
                     raise OrcParseError(f"{path}: session row identity exceeds 64 bits")
-                if prefix_max_id is None:
-                    content_limit = content_max_id
-                    message_limit = message_max_id
-                    legacy_prefix = False
-                elif prefix_max_id & _SESSION_STATE_TAG:
-                    packed = prefix_max_id ^ _SESSION_STATE_TAG
-                    content_limit = packed >> _SESSION_STATE_SHIFT
-                    message_limit = packed & _SESSION_STATE_MASK
-                    legacy_prefix = False
-                else:
-                    content_limit = prefix_max_id
-                    message_limit = 0
-                    legacy_prefix = True
-                content_prefix_count, content_prefix_digest = _query_digest(
-                    connection,
-                    "SELECT rowid, id, message_id, session_id, block_index, "
-                    "created_at_ms, turn_index, role, block_type, content, "
-                    "searchable_text, code_input, code_output, code_exit_code, "
-                    "model, user_source, token_count, extra FROM content_blocks "
-                    "WHERE rowid <= ? ORDER BY rowid",
-                    (content_limit,),
+                packed_max_id = (
+                    _SESSION_STATE_TAG
+                    | (geometry.content_max_id << _SESSION_STATE_SHIFT)
+                    | geometry.message_max_id
                 )
-                message_prefix_count, message_prefix_digest = _query_digest(
-                    connection,
-                    "SELECT id, session_id, role, created_at_ms, message_json, "
-                    "search_text FROM messages WHERE id <= ? ORDER BY id",
-                    (message_limit,),
+                content_scope = scopes[0]
+                content_prefix_count, content_prefix_digest = _query_digest(
+                    connection, content_scope.query, (content_scope.limit,)
                 )
                 if legacy_prefix:
                     return _LogicalState(
                         append_count=content_prefix_count,
-                        append_max_id=(
-                            _SESSION_STATE_TAG
-                            | (content_max_id << _SESSION_STATE_SHIFT)
-                            | message_max_id
-                        ),
+                        append_max_id=packed_max_id,
                         append_prefix_sha256=content_prefix_digest,
                     )
+                message_scope = scopes[1]
+                message_prefix_count, message_prefix_digest = _query_digest(
+                    connection, message_scope.query, (message_scope.limit,)
+                )
                 combined = hashlib.sha256()
                 for value in (
                     "content_blocks",
                     content_prefix_count,
-                    content_limit,
+                    content_scope.limit,
                     content_prefix_digest,
                     "messages",
                     message_prefix_count,
-                    message_limit,
+                    message_scope.limit,
                     message_prefix_digest,
                 ):
                     _update_digest(combined, value)
                 return _LogicalState(
                     append_count=(
-                        content_count + message_count
+                        geometry.content_count + geometry.message_count
                         if prefix_max_id is None
                         else content_prefix_count + message_prefix_count
                     ),
-                    append_max_id=(
-                        _SESSION_STATE_TAG
-                        | (content_max_id << _SESSION_STATE_SHIFT)
-                        | message_max_id
-                    ),
+                    append_max_id=packed_max_id,
                     append_prefix_sha256=combined.hexdigest(),
                 )
-            count_row = _one(
-                connection,
-                "SELECT COUNT(*), COALESCE(MAX(rowid), 0) FROM content_blocks",
-                str(path),
-            )
-            append_count = _nonnegative_integer(count_row[0], f"{path}: content count")
-            append_max_id = _nonnegative_integer(count_row[1], f"{path}: max rowid")
-            limit = append_max_id if prefix_max_id is None else prefix_max_id
+            scope = scopes[0]
             prefix_count, prefix_digest = _query_digest(
-                connection,
-                "SELECT rowid, id, message_id, session_id, block_index, created_at_ms, "
-                "turn_index, role, block_type, content, searchable_text, code_input, "
-                "code_output, code_exit_code, model, user_source, token_count, extra "
-                "FROM content_blocks WHERE rowid <= ? ORDER BY rowid",
-                (limit,),
+                connection, scope.query, (scope.limit,)
             )
             return _LogicalState(
-                append_count=append_count if prefix_max_id is None else prefix_count,
-                append_max_id=append_max_id,
+                append_count=(
+                    geometry.content_count if prefix_max_id is None else prefix_count
+                ),
+                append_max_id=geometry.content_max_id,
                 append_prefix_sha256=prefix_digest,
             )
         if kind == "task":
@@ -3312,7 +3850,22 @@ def _prune_managed_objects(
 def prune_orc_snapshot_objects(
     snapshot_root: Path, retained_sources: Sequence[OrcSourceCopy]
 ) -> int:
-    """Remove unreferenced managed objects after a durable manifest commit."""
+    """Remove unreferenced managed objects after a durable manifest commit.
+
+    Two classes of retention, deliberately not treated alike. Everything a source *needs* -- its
+    own snapshot, a preserved raw-byte semantic baseline, an alias baseline, a frozen task
+    projection -- is retained *and* verified below: missing or wrong-hashed, and this raises,
+    because a later ingest would otherwise compute against bytes that are not the bytes it
+    recorded.
+
+    An accepted append-prefix override's ``superseded_snapshot_path`` is retained without being
+    verified. It is evidence, not an input: nothing downstream reads it, and the override record
+    itself -- both digests, the row count, the bounded rows -- is what a future run validates. So
+    the pointer earns the object protection from GC, which is the entire point of naming it, but a
+    hand-deleted or hand-pruned evidence object must not be able to fail an unrelated ingest six
+    months later. Failing closed on a *need* prevents silent corruption; failing closed on a
+    *keepsake* only strands the archive.
+    """
 
     retained_databases: set[str] = set()
     retained_projections: set[str] = set()
@@ -3323,6 +3876,10 @@ def prune_orc_snapshot_objects(
                 f"refusing Orc object GC for unmanaged snapshot path {source.snapshot_path!r}"
             )
         retained_databases.add(source.snapshot_path)
+        if source.append_prefix_override is not None:
+            retained_databases.add(
+                source.append_prefix_override.superseded_snapshot_path
+            )
         retained_items: tuple[tuple[str, str], ...] = (
             (source.snapshot_path, source.sha256),
         )
@@ -3581,6 +4138,499 @@ def _plan_snapshot_sources(
     )
 
 
+def _prefix_value(value: object) -> tuple[str, str]:
+    """Render one SQLite value as the (kind, body) pair the append-prefix digest distinguishes.
+
+    The kinds mirror :func:`_update_digest`'s type tags exactly, which is the point: the diff must
+    call two values different on precisely the occasions the digest does. Python's ``==`` does not
+    -- ``1 == 1.0`` and ``True == 1`` -- so a diff built on ``==`` alone could report "no rows
+    changed" about a digest that really did move, and an operator would be shown an empty
+    explanation for a real refusal.
+    """
+
+    if value is None:
+        return "null", ""
+    if isinstance(value, bool):
+        return "int", "1" if value else "0"
+    if isinstance(value, int):
+        return "int", str(value)
+    if isinstance(value, float):
+        return "real", value.hex()
+    if isinstance(value, str):
+        return "text", value
+    if isinstance(value, bytes):
+        return "blob", value.hex()
+    # _update_digest raises for anything else, but this function runs while explaining a failure,
+    # and a diff that raises replaces the operator's evidence with a second, less informative error.
+    return "unsupported", type(value).__name__
+
+
+def _prefix_values_equal(previous: object, observed: object) -> bool:
+    """Compare two SQLite values the way the digest does, without rendering either.
+
+    ``type(...) is type(...)`` is the cheap stand-in for the tag comparison in
+    :func:`_prefix_value`: it separates ``1`` from ``1.0`` and ``True`` from ``1``, which plain
+    ``==`` does not, and it costs nothing on the overwhelming majority of rows that are identical.
+    """
+
+    return previous == observed and type(previous) is type(observed)
+
+
+def _prefix_rows_equal(
+    previous: Sequence[object], observed: Sequence[object]
+) -> bool:
+    """Compare two prefix rows the way the digest does, cheaply, without rendering them."""
+
+    if len(previous) != len(observed):
+        return False
+    return all(
+        _prefix_values_equal(left, right) for left, right in zip(previous, observed)
+    )
+
+
+def _prefix_window(body: str, start: int, end: int) -> tuple[str, bool]:
+    """Return a bounded slice of *body* with ellipses marking whatever was cut."""
+
+    start = max(0, min(start, len(body)))
+    end = max(start, min(end, len(body)))
+    if end - start > _PREFIX_DIFF_EXCERPT_CHARS:
+        end = start + _PREFIX_DIFF_EXCERPT_CHARS
+    text = body[start:end]
+    if start > 0:
+        text = "..." + text
+    if end < len(body):
+        text = text + "..."
+    return text, start > 0 or end < len(body)
+
+
+def _prefix_excerpts(
+    previous_body: str, observed_body: str
+) -> tuple[str, str, bool]:
+    """Return matching windows centred on where two bodies first and last disagree.
+
+    Truncating from character zero would be useless here: the incident this exists for is a single
+    field edited nine minutes after capture inside a large ``message_json`` blob, where two
+    head-truncated renderings are byte-identical and say nothing. Anchoring the window on the
+    differing region instead makes the report read as ``"token_count":null`` against
+    ``"token_count":445`` no matter how far into the value the edit sits.
+    """
+
+    shared = min(len(previous_body), len(observed_body))
+    head = 0
+    while head < shared and previous_body[head] == observed_body[head]:
+        head += 1
+    tail = 0
+    while (
+        tail < shared - head
+        and previous_body[len(previous_body) - 1 - tail]
+        == observed_body[len(observed_body) - 1 - tail]
+    ):
+        tail += 1
+    start = head - _PREFIX_DIFF_CONTEXT_CHARS
+    previous_excerpt, previous_bounded = _prefix_window(
+        previous_body,
+        start,
+        len(previous_body) - tail + _PREFIX_DIFF_CONTEXT_CHARS,
+    )
+    observed_excerpt, observed_bounded = _prefix_window(
+        observed_body,
+        start,
+        len(observed_body) - tail + _PREFIX_DIFF_CONTEXT_CHARS,
+    )
+    return previous_excerpt, observed_excerpt, previous_bounded or observed_bounded
+
+
+def _json_object(value: object) -> dict[str, object] | None:
+    if not isinstance(value, dict):
+        return None
+    result: dict[str, object] = {}
+    for key, item in value.items():
+        if not isinstance(key, str):
+            return None
+        result[key] = item
+    return result
+
+
+def _json_array(value: object) -> list[object] | None:
+    if not isinstance(value, list):
+        return None
+    return list(value)
+
+
+def _collect_json_changes(
+    previous: object, observed: object, path: str, depth: int, found: list[str]
+) -> bool:
+    """Append the paths whose values differ; return whether a cap stopped the walk early."""
+
+    if len(found) >= _PREFIX_DIFF_MAX_JSON_PATHS:
+        return True
+    if _prefix_values_equal(previous, observed):
+        return False
+    if depth >= _PREFIX_DIFF_MAX_JSON_DEPTH:
+        found.append(path or ".")
+        return True
+    previous_object = _json_object(previous)
+    observed_object = _json_object(observed)
+    if previous_object is not None and observed_object is not None:
+        bounded = False
+        for key in sorted(set(previous_object) | set(observed_object)):
+            child = f"{path}.{key}" if path else key
+            if key not in previous_object or key not in observed_object:
+                if len(found) >= _PREFIX_DIFF_MAX_JSON_PATHS:
+                    return True
+                found.append(child)
+                continue
+            bounded = (
+                _collect_json_changes(
+                    previous_object[key], observed_object[key], child, depth + 1, found
+                )
+                or bounded
+            )
+        return bounded
+    previous_array = _json_array(previous)
+    observed_array = _json_array(observed)
+    if (
+        previous_array is not None
+        and observed_array is not None
+        and len(previous_array) == len(observed_array)
+    ):
+        bounded = False
+        for index, (left, right) in enumerate(zip(previous_array, observed_array)):
+            bounded = (
+                _collect_json_changes(
+                    left, right, f"{path}[{index}]", depth + 1, found
+                )
+                or bounded
+            )
+        return bounded
+    found.append(path or ".")
+    return False
+
+
+def _json_change_paths(
+    previous_body: str, observed_body: str
+) -> tuple[tuple[str, ...], bool]:
+    """Name the JSON fields that changed inside one text column, or nothing if it is not JSON."""
+
+    if (
+        len(previous_body) > _PREFIX_DIFF_MAX_JSON_CHARS
+        or len(observed_body) > _PREFIX_DIFF_MAX_JSON_CHARS
+    ):
+        return (), False
+    try:
+        previous_value: object = json.loads(previous_body)
+        observed_value: object = json.loads(observed_body)
+    except (json.JSONDecodeError, RecursionError, UnicodeDecodeError, ValueError):
+        return (), False
+    if _json_object(previous_value) is None and _json_array(previous_value) is None:
+        return (), False
+    if _json_object(observed_value) is None and _json_array(observed_value) is None:
+        return (), False
+    found: list[str] = []
+    try:
+        bounded = _collect_json_changes(previous_value, observed_value, "", 0, found)
+    except RecursionError:
+        return (), True
+    return tuple(found), bounded
+
+
+def _prefix_column_change(
+    column: str, previous_value: object, observed_value: object
+) -> OrcPrefixColumnChange:
+    """Describe one changed column as a bounded, self-explaining before/after pair."""
+
+    previous_kind, previous_body = _prefix_value(previous_value)
+    observed_kind, observed_body = _prefix_value(observed_value)
+    json_paths: tuple[str, ...] = ()
+    json_paths_bounded = False
+    if previous_kind == observed_kind:
+        previous_excerpt, observed_excerpt, bounded = _prefix_excerpts(
+            previous_body, observed_body
+        )
+        if previous_kind == "text":
+            json_paths, json_paths_bounded = _json_change_paths(
+                previous_body, observed_body
+            )
+    else:
+        previous_excerpt, previous_bounded = _prefix_window(
+            previous_body, 0, len(previous_body)
+        )
+        observed_excerpt, observed_bounded = _prefix_window(
+            observed_body, 0, len(observed_body)
+        )
+        bounded = previous_bounded or observed_bounded
+    return OrcPrefixColumnChange(
+        column=column,
+        previous=_prefix_display(previous_kind, previous_excerpt),
+        observed=_prefix_display(observed_kind, observed_excerpt),
+        bounded=bounded,
+        json_paths=json_paths,
+        json_paths_bounded=json_paths_bounded,
+    )
+
+
+def _prefix_display(kind: str, excerpt: str) -> str:
+    return "null" if kind == "null" else f"{kind}:{excerpt}"
+
+
+@dataclass(frozen=True)
+class _PrefixDiff:
+    """Bounded evidence about how a live source's append prefix differs from its snapshot."""
+
+    changed_rows: tuple[OrcPrefixRowChange, ...]
+    changed_row_count: int
+    missing_rows: tuple[str, ...]
+    missing_row_count: int
+    added_rows: tuple[str, ...]
+    added_row_count: int
+
+    @property
+    def changed_rows_bounded(self) -> bool:
+        """Return whether more rows changed than the record names."""
+
+        return len(self.changed_rows) < self.changed_row_count
+
+
+def _append_prefix_diff(
+    previous_path: Path, current_path: Path, scopes: Sequence[_PrefixScope]
+) -> _PrefixDiff:
+    """Walk both prefixes in key order and report, boundedly, exactly how they differ.
+
+    Both sides are streamed rather than loaded: the guarded prefix of a real coordinator archive is
+    hundreds of megabytes, and this runs on the failure path of a run that is already slow. Only
+    rows that actually differ are ever rendered, and only the first `_PREFIX_DIFF_MAX_ROWS` of
+    those are kept -- the counts are exact regardless.
+    """
+
+    changed: list[OrcPrefixRowChange] = []
+    changed_count = 0
+    missing: list[str] = []
+    missing_count = 0
+    added: list[str] = []
+    added_count = 0
+    previous_connection = _read_only(previous_path)
+    try:
+        current_connection = _read_only(current_path)
+        try:
+            for scope in scopes:
+                previous_cursor = previous_connection.execute(
+                    scope.query, (scope.limit,)
+                )
+                current_cursor = current_connection.execute(
+                    scope.query, (scope.limit,)
+                )
+                previous_raw = next(previous_cursor, None)
+                current_raw = next(current_cursor, None)
+                where = f"{scope.table} prefix diff"
+                while previous_raw is not None or current_raw is not None:
+                    previous_row = (
+                        None if previous_raw is None else _row(previous_raw, where)
+                    )
+                    current_row = (
+                        None if current_raw is None else _row(current_raw, where)
+                    )
+                    previous_key = (
+                        None
+                        if previous_row is None
+                        else _integer(previous_row[0], f"{where}: key")
+                    )
+                    current_key = (
+                        None
+                        if current_row is None
+                        else _integer(current_row[0], f"{where}: key")
+                    )
+                    if current_key is None or (
+                        previous_key is not None and previous_key < current_key
+                    ):
+                        missing_count += 1
+                        if len(missing) < _PREFIX_DIFF_MAX_KEYS:
+                            missing.append(f"{scope.table} row {previous_key}")
+                        previous_raw = next(previous_cursor, None)
+                        continue
+                    if previous_key is None or current_key < previous_key:
+                        added_count += 1
+                        if len(added) < _PREFIX_DIFF_MAX_KEYS:
+                            added.append(f"{scope.table} row {current_key}")
+                        current_raw = next(current_cursor, None)
+                        continue
+                    if previous_row is not None and current_row is not None:
+                        if not _prefix_rows_equal(previous_row, current_row):
+                            changed_count += 1
+                            if len(changed) < _PREFIX_DIFF_MAX_ROWS:
+                                changed.append(
+                                    OrcPrefixRowChange(
+                                        table=scope.table,
+                                        row_id=previous_key,
+                                        columns=tuple(
+                                            _prefix_column_change(
+                                                name,
+                                                previous_row[index],
+                                                current_row[index],
+                                            )
+                                            for index, name in enumerate(scope.columns)
+                                            if not _prefix_values_equal(
+                                                previous_row[index],
+                                                current_row[index],
+                                            )
+                                        ),
+                                    )
+                                )
+                    previous_raw = next(previous_cursor, None)
+                    current_raw = next(current_cursor, None)
+        finally:
+            current_connection.close()
+    except sqlite3.Error as error:
+        raise OrcParseError(
+            f"failed to compare Orc append prefixes for {current_path}: {error}"
+        ) from error
+    finally:
+        previous_connection.close()
+    return _PrefixDiff(
+        changed_rows=tuple(changed),
+        changed_row_count=changed_count,
+        missing_rows=tuple(missing),
+        missing_row_count=missing_count,
+        added_rows=tuple(added),
+        added_row_count=added_count,
+    )
+
+
+def _prefix_scopes_for(
+    path: Path, session_state_mode: str | None, prefix_max_id: int
+) -> tuple[_PrefixScope, ...]:
+    """Return the scopes the guard digested for *path* at the recorded watermark."""
+
+    connection = _read_only(path)
+    try:
+        geometry = _session_geometry(connection, path, session_state_mode)
+    except sqlite3.Error as error:
+        raise OrcParseError(
+            f"failed to inspect Orc SQLite source {path}: {error}"
+        ) from error
+    finally:
+        connection.close()
+    scopes, _ = _session_prefix_scopes(geometry, session_state_mode, prefix_max_id)
+    return scopes
+
+
+def _resolve_prefix_rewrite(
+    relative: str,
+    kind: str,
+    session_id: str,
+    previous: OrcSourceCopy,
+    previous_state: _LogicalState,
+    observed: _LogicalState,
+    diff: _PrefixDiff,
+    accept_prefix_rewrite: frozenset[str],
+    captured_at: str,
+) -> OrcAppendPrefixOverride:
+    """Refuse a prefix rewrite, or record an operator's explicit acceptance of it.
+
+    Acceptance is scoped to the one session the operator was shown, which is why this takes a set
+    of authorized session ids and not a boolean. A lineage is a tree -- a root coordinator plus
+    every nested session the index reaches -- and the guard runs once per session in it, so a bare
+    boolean would extend one session's diagnosed backfill to every other session in the tree. That
+    is the same argument :func:`agent_team_timeline.project_config._prefix_rewrite_selection` makes
+    one level up for teams, and it bites harder here: the operator is *structurally* incapable of
+    having seen the other sessions, because the first mismatching source raises and ends the run,
+    so a second genuinely rewritten session has never been printed at the moment the flag is
+    passed. Naming the session makes the authorization say only what was actually inspected.
+
+    Refusals therefore arrive one per run rather than all at once, and that is deliberate. Batching
+    them would mean preparing every candidate in the lineage -- a full consistent backup of every
+    session and task database -- on a run that is going to fail anyway, purely to enrich a message.
+    The order is deterministic (sources are visited sorted by path), so the sequence terminates:
+    each re-run surfaces the next rewritten session with its own evidence, and the operator adds
+    one more session id having actually read that session's diff.
+
+    The diff is computed and reported whether or not the override is in play, because the operator
+    has to decide *before* passing the flag and the only alternative would be enabling the override
+    in order to discover what it would accept -- exactly backwards for a safety valve. The extra
+    scan costs a pass over a prefix the run has already digested twice, on a run that is failing
+    anyway.
+
+    For the same reason the refusal states the *price* of the flag it recommends, not just its
+    name. The refusal is where the decision is actually made; a caveat that lives only in the user
+    guide is a caveat the operator reads after acting, if at all. So the message says which snapshot
+    object acceptance supersedes and how long that copy is kept, and it says the recorded diff is a
+    summary by quoting the two caps that apply -- rows kept out of rows changed, and characters per
+    column value. An operator who reads "1 row(s) changed" and nothing else cannot tell that the
+    evidence in exchange is lossy; one who reads "20 of 25" and "160 characters" can.
+
+    Two things the override deliberately does not cover, both raised regardless of the flag. The
+    first is the prefix gaining or losing a row: a row that disappeared is record loss, which is
+    the whole reason the guard exists, and a row that appeared behind the watermark is history
+    inserted after the fact -- a different and more serious event than a metadata backfill. These
+    are reported together rather than in sequence because they arrive together: the count guard
+    above already refuses an unbalanced prefix, so the only way either reaches here is a deletion
+    and an insertion cancelling out. The second is a digest that moved with no row to show for it,
+    which means this code's own evidence disagrees with its own digest; accepting a rewrite nobody
+    can describe would make the recorded override worthless.
+    """
+
+    prefix_error = (
+        f"Orc {kind} existing append prefix was rewritten for {relative}"
+    )
+    if diff.missing_row_count or diff.added_row_count:
+        raise OrcParseError(
+            f"{prefix_error}: the recorded prefix lost {diff.missing_row_count} row(s) "
+            f"({', '.join(diff.missing_rows) or 'none'}) and gained "
+            f"{diff.added_row_count} row(s) "
+            f"({', '.join(diff.added_rows) or 'none'}) below its watermark; accepting a "
+            "prefix rewrite covers changed column values only, never rows appearing or "
+            "disappearing"
+        )
+    if diff.changed_row_count == 0:
+        raise OrcParseError(
+            f"{prefix_error}: the digest moved but no row differs, so the archive cannot "
+            "describe what changed"
+        )
+    if session_id not in accept_prefix_rewrite:
+        described: list[str] = []
+        budget = _PREFIX_DIFF_MAX_MESSAGE_CHARS
+        for row in diff.changed_rows:
+            line = row.describe()
+            if budget - len(line) < 0 and described:
+                break
+            described.append(line)
+            budget -= len(line)
+        remaining = diff.changed_row_count - len(described)
+        evidence = "; ".join(described)
+        if remaining:
+            evidence += f"; ... {remaining} further changed row(s) not shown"
+        raise OrcParseError(
+            f"{prefix_error}: {diff.changed_row_count} row(s) changed at or below the "
+            f"append watermark [{evidence}]; re-run with "
+            f"--accept-orc-prefix-rewrite {session_id} to record this rewrite and "
+            "re-baseline the digest -- that authorizes this one session and no other, so "
+            "another rewritten session in this lineage refuses again with its own evidence "
+            "-- accepting supersedes the pre-rewrite snapshot "
+            f"{previous.snapshot_path} (kept for comparison until the next accepted "
+            "override on this source, then reclaimed) and records only a bounded summary "
+            f"-- at most {_PREFIX_DIFF_MAX_ROWS} of those {diff.changed_row_count} changed "
+            f"row(s), at most {_PREFIX_DIFF_EXCERPT_CHARS} characters per column value"
+        )
+    prior = previous.append_prefix_override
+    return OrcAppendPrefixOverride(
+        policy=_PREFIX_OVERRIDE_POLICY,
+        source_path=relative,
+        accepted_at=captured_at,
+        override_count=1 if prior is None else prior.override_count + 1,
+        previous_append_prefix_sha256=previous_state.append_prefix_sha256,
+        observed_append_prefix_sha256=observed.append_prefix_sha256,
+        # The object the manifest is about to stop pointing at. Recording it *is* retaining it:
+        # object GC keeps what the manifest references, so this assignment is the difference
+        # between an operator having a route back and not having one.
+        superseded_snapshot_path=previous.snapshot_path,
+        superseded_sha256=previous.sha256,
+        changed_row_count=diff.changed_row_count,
+        changed_rows=diff.changed_rows,
+        changed_rows_bounded=diff.changed_rows_bounded,
+        degraded=True,
+        degradation_reason=_PREFIX_OVERRIDE_DEGRADATION_REASON,
+    )
+
+
 def _prepare_snapshot_candidate(
     source_root: Path,
     snapshot_root: Path,
@@ -3588,6 +4638,8 @@ def _prepare_snapshot_candidate(
     previous: OrcSourceCopy | None,
     selected_session_ids: frozenset[str],
     temporary: Path,
+    captured_at: str,
+    accept_prefix_rewrite: frozenset[str],
 ) -> _PreparedCandidate:
     relative = discovered.source_path
     if previous is None:
@@ -3627,6 +4679,7 @@ def _prepare_snapshot_candidate(
     state = _logical_state(temporary, discovered.kind)
     previous_state: _LogicalState | None = None
     previous_session_mode: str | None = None
+    prefix_override: OrcAppendPrefixOverride | None = None
     if previous is not None:
         if previous_path is None:
             raise AssertionError("validated previous snapshot path is missing")
@@ -3709,10 +4762,32 @@ def _prepare_snapshot_candidate(
                 raise OrcParseError(
                     f"Orc {discovered.kind} append prefix lost rows for {relative}"
                 )
+            # Only the *digest* comparison is overridable. The two guards above stay absolute
+            # because both of them mean rows are gone or unaccounted for, and no operator flag in
+            # this tool is allowed to wave through record loss -- the override exists for the
+            # narrow case of an upstream metadata backfill rewriting a column in place.
             if prefix.append_prefix_sha256 != previous_state.append_prefix_sha256:
-                raise OrcParseError(
-                    f"Orc {discovered.kind} existing append prefix was rewritten for "
-                    f"{relative}"
+                prefix_override = _resolve_prefix_rewrite(
+                    relative,
+                    discovered.kind,
+                    # The owner session id, not the directory name parsed out of the path: for a
+                    # session source with a previous record these are the same string (discovery
+                    # refuses a session directory whose database says otherwise), and taking it
+                    # from the manifest keeps the authorization keyed to the identity the archive
+                    # already committed to rather than to a path the operator could rename.
+                    owner_session_id,
+                    previous,
+                    previous_state,
+                    prefix,
+                    _append_prefix_diff(
+                        previous_path,
+                        temporary,
+                        _prefix_scopes_for(
+                            temporary, previous_session_mode, previous.append_max_id
+                        ),
+                    ),
+                    accept_prefix_rewrite,
+                    captured_at,
                 )
     return _PreparedCandidate(
         discovered,
@@ -3723,6 +4798,7 @@ def _prepare_snapshot_candidate(
         temporary,
         state,
         previous_state,
+        prefix_override,
     )
 
 
@@ -4201,6 +5277,41 @@ def _continuation_links(
     return tuple(result)
 
 
+def _accepted_prefix_rewrite_sessions(
+    requested: Sequence[str], lineage_session_ids: frozenset[str]
+) -> frozenset[str]:
+    """Validate the per-session append-prefix override list against this lineage's sessions.
+
+    Every near miss is rejected here, before a single database is copied, rather than quietly
+    authorizing nothing: a repeated id, an id that is not a legal session component at all, and an
+    id for a session outside the lineage this run snapshots. The reasoning is the same one
+    :func:`agent_team_timeline.project_config._prefix_rewrite_selection` records for teams -- an
+    override that looks accepted but had no effect is the worst outcome available to a safety
+    valve, because the operator reads their own command line back and believes it did something.
+
+    A session that *is* in the lineage but turns out to have a clean prefix is deliberately not an
+    error. The operator names a session having read that session's refusal, and between that
+    refusal and the re-run the upstream writer may well have been rolled back, or the flag may be
+    carried across two runs of a lineage where only one of them needed it. Refusing that would
+    punish the honest case; the run receipt records what was *permitted* separately from what
+    actually fired, which is what makes an unused authorization visible.
+    """
+
+    if len(set(requested)) != len(requested):
+        raise OrcParseError(
+            "--accept-orc-prefix-rewrite selection contains duplicate session ids"
+        )
+    for session_id in requested:
+        _safe_component(session_id, "accepted Orc prefix-rewrite session id")
+    unknown = sorted(set(requested) - lineage_session_ids)
+    if unknown:
+        raise OrcParseError(
+            "--accept-orc-prefix-rewrite names sessions outside this lineage: "
+            + ", ".join(unknown)
+        )
+    return frozenset(requested)
+
+
 def snapshot_orc_lineage(
     source_root: Path,
     root_session_id: str,
@@ -4209,8 +5320,17 @@ def snapshot_orc_lineage(
     captured_at: str,
     continuation_specs: Sequence[str | OrcContinuationSpec] = (),
     previous_continuations: Sequence[OrcContinuationLink] = (),
+    accept_prefix_rewrite: Sequence[str] = (),
 ) -> OrcSnapshotResult:
-    """Publish immutable SQLite objects after validating provider-specific monotonicity."""
+    """Publish immutable SQLite objects after validating provider-specific monotonicity.
+
+    ``accept_prefix_rewrite`` is an operator override, empty by default, and it relaxes exactly one
+    check for exactly the sessions it names: a named session whose recorded append prefix digests
+    differently is re-baselined and recorded as degraded instead of refusing the whole lineage. A
+    session the list does not name is untouched by the flag and still refuses. Rows that vanished
+    from or appeared inside the prefix still refuse either way; see :func:`_resolve_prefix_rewrite`
+    for why the authorization is per session rather than per run.
+    """
 
     specs = _continuation_specs(continuation_specs)
     _lineage_roots(root_session_id, tuple(spec.session_id for spec in specs))
@@ -4225,11 +5345,17 @@ def snapshot_orc_lineage(
     previous_by_path = plan.previous_by_path
     selected_session_ids = plan.selected_session_ids
     task_ordinals = plan.task_ordinals
+    # Validated against the discovered lineage, so a mistyped id is caught here rather than being
+    # silently inert; the plan does no writing, so this still happens before anything is staged.
+    accepted_sessions = _accepted_prefix_rewrite_sessions(
+        accept_prefix_rewrite, selected_session_ids
+    )
 
     staged_objects: list[tuple[Path, Path, str]] = []
     result_sources: list[OrcSourceCopy] = []
     temporary_paths: list[Path] = []
     temporary_by_source: dict[str, Path] = {}
+    accepted_overrides: list[OrcAppendPrefixOverride] = []
     try:
         for discovered_source in discovered:
             relative = discovered_source.source_path
@@ -4248,6 +5374,16 @@ def snapshot_orc_lineage(
                 previous,
                 selected_session_ids,
                 temporary,
+                captured_at,
+                accepted_sessions,
+            )
+            if candidate.prefix_override is not None:
+                accepted_overrides.append(candidate.prefix_override)
+            # Sticky across later clean ingests: a source that was ever re-baselined keeps saying
+            # so. Dropping the record the moment the source went back to appending cleanly would
+            # erase exactly the fact a reader needs when the normalized data looks odd later.
+            append_prefix_override = candidate.prefix_override or (
+                previous.append_prefix_override if previous is not None else None
             )
             owner_session_id = candidate.owner_session_id
             previous_target = candidate.previous_path
@@ -4356,6 +5492,7 @@ def snapshot_orc_lineage(
                     auxiliary=auxiliary,
                     task_projection=task_projection,
                     captured_at=effective_captured_at,
+                    append_prefix_override=append_prefix_override,
                 )
             )
 
@@ -4367,6 +5504,7 @@ def snapshot_orc_lineage(
             sources=tuple(result_sources),
             files_changed=changed,
             continuations=continuations,
+            prefix_overrides=tuple(accepted_overrides),
         )
     finally:
         for temporary in temporary_paths:
@@ -5865,9 +7003,12 @@ def load_orc_team(
 
 
 __all__ = [
+    "OrcAppendPrefixOverride",
     "OrcContinuationLink",
     "OrcContinuationSpec",
     "OrcParseError",
+    "OrcPrefixColumnChange",
+    "OrcPrefixRowChange",
     "OrcSnapshotResult",
     "OrcSourceCopy",
     "load_orc_team",

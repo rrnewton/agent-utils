@@ -60,6 +60,7 @@ from agent_team_timeline.query import (
 from agent_team_timeline.server import serve
 from agent_team_timeline.summarize import SummaryError
 from agent_team_timeline.token_usage import TokenUsage
+from agent_team_timeline.transcript_export import TranscriptExportReport
 from agent_team_timeline.window import DateWindow, parse_date_window
 
 PROG = "agent-team-timeline"
@@ -218,6 +219,30 @@ def _add_orc_ingest(parser: argparse.ArgumentParser) -> None:
             "explicit successor coordinator session; use a session id for the whole "
             "session or compact JSON with session_id and start_message_id for a reused "
             "session; repeat in chronological order"
+        ),
+    )
+    # Named for the provider even though `ingest-orc` is already provider-specific, where `orc` is
+    # a redundant word. `ingest-project` ingests all three providers under one subcommand and needs
+    # this same flag there, and a flag that means one thing on one subcommand and is spelled
+    # differently on another is worse than a redundant word on this one.
+    #
+    # Per session, not a blanket switch, and repeatable in the same `action="append"` shape as
+    # `--continuation-session` above and `--team` on `ingest-project`. A lineage is a session tree,
+    # the guard runs once per session in it, and the refusal names exactly one of them -- so a bare
+    # boolean would authorize sessions the operator has structurally never seen, because the run
+    # ends at the first refusal. The refusal prints this flag with the session id already filled
+    # in, so the operator's next command is a copy of what they were just shown.
+    parser.add_argument(
+        "--accept-orc-prefix-rewrite",
+        action="append",
+        default=[],
+        metavar="SESSION",
+        help=(
+            "operator override: accept this one session's recorded append prefix having been "
+            "rewritten in place, re-baselining its digest and marking the source degraded; "
+            "repeat per session; the changed rows and columns are printed and recorded; a "
+            "rewritten session not named here still refuses, and rows that disappeared from or "
+            "appeared inside the prefix are refused for every session"
         ),
     )
     _add_date_window(parser)
@@ -403,6 +428,30 @@ def _parser() -> argparse.ArgumentParser:
         help=(
             "registered team slug to ingest; repeat as needed (default: every team); "
             "transcript extraction still covers every normalized archive team"
+        ),
+    )
+    # Per team *and* per session, not a blanket switch. A project run ingests every registered team
+    # at once and each Orc team is a whole session tree, so a bare boolean would extend one
+    # diagnosed rewrite to every other team in the manifest, and a bare team slug would do the same
+    # thing to every other session under that team. The composite value needs no quoting rule:
+    # neither half can contain a colon, so `TEAM:SESSION` has exactly one parse.
+    #
+    # A flag, not the manifest field every other per-team knob is (`date_window`,
+    # `identity_overrides`, `continuation_sessions`), and that asymmetry is the point: those
+    # describe what a team *is*, and are meant to persist. An accepted rewrite is a one-time
+    # judgement about one diagnosed event, and a manifest field would silently re-authorize it on
+    # every future run -- precisely the standing invitation to launder a real rewrite that
+    # the receipt's `accepted_prefix_rewrite_sessions` exists to make visible.
+    ingest_project_parser.add_argument(
+        "--accept-orc-prefix-rewrite",
+        action="append",
+        default=[],
+        metavar="TEAM:SESSION",
+        help=(
+            "operator override: accept an in-place append-prefix rewrite for this one session of "
+            "this one Orc team, re-baselining its digest and marking the source degraded; repeat "
+            "per session; the slug must be an Orc team this run ingests and the session id is the "
+            "one that team's refusal named"
         ),
     )
     ingest_project_parser.set_defaults(handler="ingest_project")
@@ -748,20 +797,27 @@ def _summary_call(ns: argparse.Namespace) -> SummarizeReport:
     )
 
 
+def _string_list(raw: object, flag: str) -> tuple[str, ...]:
+    """Narrow one repeatable ``action="append"`` value to the strings the callee is typed for.
+
+    argparse hands back ``Any``, and the alternative -- ``tuple(str(item) for item in raw)`` --
+    silences the type checker by *coercing* rather than checking, which turns a namespace this
+    package mis-populates into a plausible-looking argument instead of an error. That matters most
+    for an override flag, where a value the operator did not write is the whole hazard.
+    """
+
+    if not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):
+        raise ValueError(f"{flag} values must be strings")
+    return tuple(item for item in raw if isinstance(item, str))
+
+
 def _identity_overrides(
     ns: argparse.Namespace, command_args: Sequence[str]
 ) -> IdentityOverrides:
-    raw_projects: object = getattr(ns, "project", [])
-    raw_hosts: object = getattr(ns, "source_host", [])
-    if not isinstance(raw_projects, list) or not all(
-        isinstance(item, str) for item in raw_projects
-    ):
-        raise ValueError("--project values must be strings")
-    if not isinstance(raw_hosts, list) or not all(
-        isinstance(item, str) for item in raw_hosts
-    ):
-        raise ValueError("--source-host values must be strings")
-    projects, hosts = parse_identity_overrides(raw_projects, raw_hosts)
+    projects, hosts = parse_identity_overrides(
+        _string_list(getattr(ns, "project", []), "--project"),
+        _string_list(getattr(ns, "source_host", []), "--source-host"),
+    )
     timezone_explicit = any(
         item == "--timezone" or item.startswith("--timezone=")
         for item in command_args
@@ -779,6 +835,72 @@ def _print_ingest(report: IngestReport) -> None:
         f"{report.tool_calls} outer tools, {report.edges} edges from {report.sources} source files "
         f"({report.source_bytes / (1024 * 1024):.1f} MiB); {report.files_changed} archive files changed"
     )
+
+
+def _print_retired_projections(report: IngestReport) -> None:
+    """Announce the one-time sweep of the retired per-thread projection, on stderr.
+
+    Silence would be wrong here: the operator's archive just lost hundreds of megabytes and, if it
+    is versioned, gained a deletion of a few thousand tracked files, and they are entitled to see
+    why before `git status` tells them. Stderr for the same reason the override notice uses it --
+    this is a notice about the archive, not a result of the query, and it has to survive stdout
+    being redirected. It prints once: the next ingest finds nothing to sweep and says nothing.
+    """
+
+    if report.retired_message_projections == 0:
+        return
+    mib = report.retired_message_projection_bytes / (1024 * 1024)
+    print(
+        f"{PROG}: {report.team_slug}: removed {report.retired_message_projections} retired "
+        f"raw/messages/<thread-id>.json file(s) ({mib:.1f} MiB); the tool no longer writes that "
+        "per-thread projection, which nothing read and which raw/team.json still fully describes",
+        file=sys.stderr,
+    )
+
+
+def _print_prefix_overrides(report: IngestReport) -> None:
+    """Report every append-prefix rewrite this ingest accepted, on stderr, in full.
+
+    On stderr because this is a warning about degraded data rather than a result: it must survive
+    the operator redirecting stdout to a file, and it must be impossible to miss in a scheduled
+    run's log. Nothing here is summarized away -- the record is already bounded at the point it is
+    built, so printing all of it costs at most a couple of dozen lines.
+    """
+
+    for override in report.orc_prefix_overrides:
+        for line in override.describe():
+            print(f"{PROG}: {report.team_slug}: {line}", file=sys.stderr)
+
+
+def _print_transcript_partiality(report: TranscriptExportReport) -> None:
+    """Name every team the projection carried and every rule it set aside, on stderr, in full.
+
+    On stderr for the same reason as `_print_prefix_overrides`: this is a warning about degraded
+    output, not a result, so it must survive stdout being redirected to a file and it must be
+    unmissable in a scheduled run's log. One line per team and one per rule, never a count -- the
+    count is already on the stdout summary line, and a count alone is the shape that lets a
+    permanent skip fade into background noise, since "1 team carried" reads the same on the run
+    where it started as on the four hundredth run afterwards. The team slug and the exception are
+    what an operator can act on.
+
+    A traceback is printed whenever one was kept, which is only for exception types the exporter
+    does not classify as data/IO failure -- for those the one-line message is a defect report with
+    the evidence removed, and this is often the only place it survives an unattended overnight run.
+    """
+
+    for skip in report.skipped_teams:
+        print(
+            f"{PROG}: transcripts: team {skip.summary} -- carried forward unchanged from its last "
+            "good extraction; nothing since is projected",
+            file=sys.stderr,
+        )
+        if skip.traceback is not None:
+            print(skip.traceback, end="", file=sys.stderr)
+    for dropped in report.dropped_authorship_rules:
+        print(
+            f"{PROG}: transcripts: prompt authorship rule {dropped.summary} -- not applied",
+            file=sys.stderr,
+        )
 
 
 def _print_summaries(report: SummarizeReport) -> None:
@@ -1108,45 +1230,84 @@ def main(argv: Sequence[str] | None = None) -> int:
         selected_slugs: tuple[str, ...] = ()
         try:
             config = load_project_ingest_config(_path(str(ns.config)))
-            project_team_values: object = ns.team
-            if not isinstance(project_team_values, list) or not all(
-                isinstance(item, str) for item in project_team_values
-            ):
-                raise ValueError("--team values must be strings")
             selected_slugs = tuple(
                 team.slug
-                for team in config.select_teams(tuple(project_team_values))
+                for team in config.select_teams(_string_list(ns.team, "--team"))
             )
-            project_report = ingest_project(config, selected_slugs)
+            project_report = ingest_project(
+                config,
+                selected_slugs,
+                _string_list(
+                    ns.accept_orc_prefix_rewrite, "--accept-orc-prefix-rewrite"
+                ),
+            )
+            project_failure_summary = project_report.failure_summary()
+            # A partial run is recorded as "failed", not as a third status. `run_stats` buckets
+            # anything outside completed/failed as "other", so inventing "partial" would quietly
+            # move these runs out of the failed count that a human actually watches. The structured
+            # detail -- which teams, and why -- lives in the mechanical payload below, where it can
+            # be read without guessing from a status word.
             project_run_path = record_run(
                 config.output,
                 project_command,
                 project_started,
-                "completed",
+                "failed" if project_report.failed else "completed",
                 selected_slugs[0],
                 None,
                 None,
                 None,
+                error=project_failure_summary,
                 team_slugs=selected_slugs,
                 mechanical={"project_ingest": project_report.to_json_obj()},
             )
             for team in project_report.teams:
                 print(f"{team.team_slug} ({team.provider}):", end=" ")
                 _print_ingest(team.ingest)
+                _print_retired_projections(team.ingest)
+                _print_prefix_overrides(team.ingest)
+            for failure in project_report.failures:
+                print(f"{PROG}: team {failure.summary}", file=sys.stderr)
+                if failure.traceback is not None:
+                    print(failure.traceback, end="", file=sys.stderr)
+            print(
+                f"teams: {len(project_report.teams)} succeeded, "
+                f"{len(project_report.failures)} failed"
+            )
             project_transcripts = project_report.transcripts
-            print(
-                f"transcripts: {project_transcripts.prompts} prompts, "
-                f"{project_transcripts.responses} responses, "
-                f"{project_transcripts.system_inputs} system inputs across "
-                f"{project_transcripts.teams} normalized archive teams; "
-                f"{project_transcripts.files_changed} files changed"
-            )
-            print(
-                "JSONL: "
-                f"{config.output / 'extracted' / 'transcripts' / 'prompts.jsonl'}"
-            )
+            if project_transcripts is None:
+                print(
+                    f"{PROG}: transcript extraction failed: "
+                    f"{project_report.transcript_error}",
+                    file=sys.stderr,
+                )
+                # Deliberately no JSONL path here. The file still exists from the last good run,
+                # and naming it after a failed extraction would read as a pointer to fresh output.
+                print("transcripts: not extracted")
+            else:
+                _print_transcript_partiality(project_transcripts)
+                project_skipped_note = (
+                    f" ({len(project_transcripts.skipped_teams)} further team(s) carried "
+                    "forward unread)"
+                    if project_transcripts.skipped_teams
+                    else ""
+                )
+                print(
+                    f"transcripts: {project_transcripts.prompts} prompts, "
+                    f"{project_transcripts.responses} responses, "
+                    f"{project_transcripts.system_inputs} system inputs across "
+                    f"{project_transcripts.teams} normalized archive teams"
+                    f"{project_skipped_note}; "
+                    f"{project_transcripts.files_changed} files changed"
+                )
+                print(
+                    "JSONL: "
+                    f"{config.output / 'extracted' / 'transcripts' / 'prompts.jsonl'}"
+                )
             print("website: not built (run `agent-team-timeline build` separately)")
             print(f"run metadata: {project_run_path}")
+            if project_report.failed:
+                print(f"{PROG}: {project_failure_summary}", file=sys.stderr)
+                return 2
             return 0
         except (
             ClaudeParseError,
@@ -1204,27 +1365,44 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             selected = _transcript_teams(archive, ns.team)
             report = extract_transcripts_archive(archive, selected)
+            partiality = report.partiality_summary()
+            # A partial extraction is recorded as "failed", not as a third status, for the same
+            # reason `ingest-project` does it: `run_stats` buckets anything outside
+            # completed/failed as "other", so inventing "partial" would quietly move these runs
+            # out of the failed count a human actually watches. Which teams, and why, is in the
+            # mechanical payload and on stderr.
             run_path = record_run(
                 archive,
                 command,
                 started,
-                "completed",
+                "failed" if partiality is not None else "completed",
                 selected[0],
                 None,
                 None,
                 None,
+                error=partiality,
                 team_slugs=selected,
                 mechanical={"transcript_extraction": report.to_json_obj()},
             )
+            _print_transcript_partiality(report)
+            skipped_note = (
+                f" ({len(report.skipped_teams)} further team(s) carried forward unread)"
+                if report.skipped_teams
+                else ""
+            )
             print(
                 f"transcripts: {report.prompts} prompts, {report.responses} responses, "
-                f"{report.system_inputs} system inputs across {report.teams} teams; "
+                f"{report.system_inputs} system inputs across {report.teams} teams"
+                f"{skipped_note}; "
                 f"{report.carried_forward} historical records retained, "
                 f"{report.reclassified} source records reclassified, "
                 f"{report.files_changed} files changed"
             )
             print(f"JSONL: {archive / 'extracted' / 'transcripts' / 'prompts.jsonl'}")
             print(f"run metadata: {run_path}")
+            if partiality is not None:
+                print(f"{PROG}: {partiality}", file=sys.stderr)
+                return 2
             return 0
         except (OSError, ValueError) as error:
             if selected:
@@ -1388,6 +1566,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                         _orc_continuation_arg(str(item))
                         for item in ns.continuation_session
                     ),
+                    _string_list(
+                        ns.accept_orc_prefix_rewrite, "--accept-orc-prefix-rewrite"
+                    ),
                 )
             else:
                 _, ingest_report = ingest_codex(
@@ -1401,6 +1582,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     tuple(str(item) for item in ns.continuation_session),
                 )
             _print_ingest(ingest_report)
+            _print_retired_projections(ingest_report)
+            _print_prefix_overrides(ingest_report)
         refresh_handlers = ("refresh", "refresh_claude", "refresh_orc")
         if handler == "summarize" or handler in refresh_handlers:
             summary_report = _summary_call(ns)

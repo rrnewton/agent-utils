@@ -48,12 +48,17 @@ from agent_team_timeline.pipeline import (
     _load_agent_names,
     _root_overview_input,
     _rollup_jobs_for_level,
+    _write_ingested_team,
     build_archive,
+    extract_transcripts_archive,
     load_archived_team,
     record_run,
     summarize_archive,
 )
-from agent_team_timeline.render import prune_retired_query_artifacts
+from agent_team_timeline.render import (
+    _remove_stale_presentation_files,
+    prune_retired_query_artifacts,
+)
 from agent_team_timeline.server import make_server
 from agent_team_timeline.summarize import PLAIN_LANGUAGE_ROLLUP_STYLE, SummaryResult
 from agent_team_timeline.terminology import GlossaryTerm, glossary_term_id
@@ -593,6 +598,229 @@ def test_retired_query_cleanup_preserves_unowned_custom_launcher(
     assert prune_retired_query_artifacts(tmp_path) == 0
     assert custom.read_text(encoding="utf-8") == "print('custom operator helper')\n"
     assert custom_cache.read_bytes() == b"custom cache"
+
+
+def _legacy_message_projection(archived: TeamData) -> dict[str, dict[str, object]]:
+    """Rebuild `raw/messages/<thread-id>.json` exactly as the retired ingest writer produced it.
+
+    Reproduced verbatim rather than described, because every test below turns on whether the
+    archive still holds these five record sets once the writer is gone. Prose could not be checked
+    against `raw/team.json`; this can, and it also lets a legacy directory be seeded with the real
+    payload instead of a placeholder that a lenient sweep would pass by accident.
+    """
+
+    payloads: dict[str, dict[str, object]] = {}
+    for agent in archived.agents:
+        thread_id = agent.thread_id
+        payloads[thread_id] = {
+            "agent": agent.to_json_obj(),
+            "turns": [
+                turn.to_json_obj()
+                for turn in archived.turns
+                if turn.thread_id == thread_id
+            ],
+            "messages": [
+                event.to_json_obj()
+                for event in archived.events
+                if event.thread_id == thread_id
+            ],
+            "tools": [
+                tool.to_json_obj()
+                for tool in archived.tool_calls
+                if tool.thread_id == thread_id
+            ],
+            "edges": [
+                edge.to_json_obj()
+                for edge in archived.edges
+                if edge.from_thread_id == thread_id or edge.to_thread_id == thread_id
+            ],
+        }
+    return payloads
+
+
+def _seed_legacy_message_projection(archive: Path, archived: TeamData) -> tuple[Path, int]:
+    root = archive / "teams" / archived.team_slug / "raw" / "messages"
+    root.mkdir(parents=True, exist_ok=True)
+    written = 0
+    for thread_id, payload in _legacy_message_projection(archived).items():
+        path = root / f"{thread_id}.json"
+        write_json_if_changed(path, narrow_json(payload))
+        written += path.stat().st_size
+    return root, written
+
+
+def test_ingest_no_longer_writes_the_per_thread_message_projection(
+    tmp_path: Path,
+) -> None:
+    team = _team()
+    archived, report = _write_ingested_team(tmp_path, team.team_slug, team, None, 0)
+
+    assert not (tmp_path / "teams" / team.team_slug / "raw" / "messages").exists()
+    assert report.retired_message_projections == 0
+    assert report.retired_message_projection_bytes == 0
+
+    # The removal is a deduplication, not a deletion: rebuilding the retired payload from the
+    # `raw/team.json` that ingest just wrote reproduces it exactly, thread for thread.
+    reloaded = load_archived_team(tmp_path, team.team_slug)
+    projection = _legacy_message_projection(archived)
+    assert set(projection) == {ROOT, CHILD}
+    assert _legacy_message_projection(reloaded) == projection
+
+
+def test_ingest_retires_a_legacy_message_projection_and_reports_what_it_freed(
+    tmp_path: Path,
+) -> None:
+    team = _team()
+    archived, _ = _write_ingested_team(tmp_path, team.team_slug, team, None, 0)
+    root, seeded_bytes = _seed_legacy_message_projection(tmp_path, archived)
+    assert seeded_bytes > 0
+
+    _, report = _write_ingested_team(tmp_path, team.team_slug, team, None, 0)
+
+    assert not root.exists()
+    assert report.retired_message_projections == 2
+    assert report.retired_message_projection_bytes == seeded_bytes
+    assert report.files_changed == 2
+
+    receipt = report.to_json_obj()
+    assert receipt["retired_message_projections"] == 2
+    assert receipt["retired_message_projection_bytes"] == seeded_bytes
+
+    # Sweeping is a one-time event, so the very next ingest must be silent about it rather than
+    # re-reporting a reclamation that already happened.
+    _, again = _write_ingested_team(tmp_path, team.team_slug, team, None, 0)
+    assert again.retired_message_projections == 0
+    assert again.retired_message_projection_bytes == 0
+    assert again.files_changed == 0
+
+
+def test_message_projection_sweep_leaves_every_file_it_did_not_write(
+    tmp_path: Path,
+) -> None:
+    team = _team()
+    archived, _ = _write_ingested_team(tmp_path, team.team_slug, team, None, 0)
+    root, _ = _seed_legacy_message_projection(tmp_path, archived)
+
+    # Four shapes the writer never produced. If the sweep took any of them it would be deleting
+    # somebody else's data on the strength of a directory name.
+    notes = root / "operator-notes.txt"
+    notes.write_text("why this lineage was re-ingested\n", encoding="utf-8")
+    sidecar = root / f"{ROOT}.json.gz"
+    sidecar.write_bytes(b"not a projection")
+    nested = root / "subdirectory"
+    nested.mkdir()
+    (nested / "kept.json").write_text("{}\n", encoding="utf-8")
+    link = root / "elsewhere.json"
+    link.symlink_to(tmp_path / "teams" / team.team_slug / "raw" / "team.json")
+
+    _, report = _write_ingested_team(tmp_path, team.team_slug, team, None, 0)
+
+    assert report.retired_message_projections == 2
+    assert not (root / f"{ROOT}.json").exists()
+    assert not (root / f"{CHILD}.json").exists()
+    # The directory itself survives because it is no longer empty of things that are not ours.
+    assert root.is_dir()
+    assert notes.read_text(encoding="utf-8") == "why this lineage was re-ingested\n"
+    assert sidecar.read_bytes() == b"not a projection"
+    assert (nested / "kept.json").read_text(encoding="utf-8") == "{}\n"
+    assert link.is_symlink()
+    assert (tmp_path / "teams" / team.team_slug / "raw" / "team.json").is_file()
+
+
+def test_message_projection_sweep_takes_every_thread_shaped_name_not_only_this_run_s(
+    tmp_path: Path,
+) -> None:
+    """Pin the deliberate breadth of the predicate, and the price it charges.
+
+    The sweep matches the writer's name *shape*, not the thread ids of the team being ingested.
+    That is what reclaims an orphan left by an earlier, wider ingest -- the retired writer never
+    deleted anything, so narrowing `--team` or the date window stranded projections that no
+    exact-name rule could ever name again, and leaving them would also keep the directory
+    permanently non-empty and therefore unremovable. The same rule necessarily takes a `.json` file
+    an operator put in this ingest-owned directory. Both halves are asserted here so that neither
+    can be changed by accident: the second is a cost that was accepted, not an oversight.
+    """
+
+    team = _team()
+    archived, _ = _write_ingested_team(tmp_path, team.team_slug, team, None, 0)
+    root, seeded_bytes = _seed_legacy_message_projection(tmp_path, archived)
+
+    orphan = root / "01hzzzzzzzzzzzzzzzzzzzzzzz.json"
+    orphan.write_text('{"agent": {}}\n', encoding="utf-8")
+    operator_file = root / "notes.2026.json"
+    operator_file.write_text('{"why": "re-ingested"}\n', encoding="utf-8")
+    expected = seeded_bytes + orphan.stat().st_size + operator_file.stat().st_size
+
+    _, report = _write_ingested_team(tmp_path, team.team_slug, team, None, 0)
+
+    assert not root.exists()
+    assert report.retired_message_projections == 4
+    assert report.retired_message_projection_bytes == expected
+
+
+def test_message_projection_sweep_ignores_a_symlinked_directory(tmp_path: Path) -> None:
+    team = _team()
+    _write_ingested_team(tmp_path, team.team_slug, team, None, 0)
+    # A symlink where the retired directory used to be points the sweep at files that are not in
+    # the archive at all. It must decline rather than follow the name out of the tree.
+    decoy = tmp_path / "decoy"
+    decoy.mkdir()
+    victim = decoy / f"{ROOT}.json"
+    victim.write_text("{}\n", encoding="utf-8")
+    root = tmp_path / "teams" / team.team_slug / "raw" / "messages"
+    root.symlink_to(decoy, target_is_directory=True)
+
+    _, report = _write_ingested_team(tmp_path, team.team_slug, team, None, 0)
+
+    assert report.retired_message_projections == 0
+    assert victim.read_text(encoding="utf-8") == "{}\n"
+    assert root.is_symlink()
+
+
+def test_build_after_retiring_the_message_projection_serves_a_working_archive(
+    tmp_path: Path,
+) -> None:
+    team = _team()
+    archived, _ = _write_ingested_team(tmp_path, team.team_slug, team, None, 0)
+    root, _ = _seed_legacy_message_projection(tmp_path, archived)
+    assert root.is_dir()
+
+    _, report = _write_ingested_team(tmp_path, team.team_slug, team, None, 0)
+    assert report.retired_message_projections == 2
+    assert not root.exists()
+
+    summarize_archive(tmp_path, team.team_slug, "heuristic", "test-model")
+    built = build_archive(tmp_path, team.team_slug)
+
+    assert built["files_changed"] > 0
+    assert not root.exists()
+    assert (tmp_path / "index.html").is_file()
+    timeline = json.loads(
+        (tmp_path / "data" / "timeline.json").read_text(encoding="utf-8")
+    )
+    assert {agent["id"] for agent in timeline["agents"]} == {ROOT, CHILD}
+    for phase in timeline["phases"]:
+        assert (tmp_path / phase["detail_path"]).is_file()
+
+    # The sweep must not leave the presentation inventory believing it still owns something, so a
+    # second build has to be a no-op rather than re-converging on the changed tree.
+    assert build_archive(tmp_path, team.team_slug)["files_changed"] == 0
+
+    # Serve it the way an operator would, and fetch the three files the page cannot start without.
+    server = make_server(tmp_path, port=0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        port = int(server.server_address[1])
+        for relative in ("index.html", "data/timeline.json", "data/timeline-v2.json"):
+            url = f"http://127.0.0.1:{port}/{relative}"
+            with urllib.request.urlopen(url, timeout=5) as response:
+                assert response.status == 200
+                assert response.read()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
 
 
 def test_append_catchup_keeps_completed_historical_overview_stable(
@@ -2476,6 +2704,27 @@ def test_combined_export_stale_cleanup_cannot_delete_raw_team_data(
     assert raw_path.read_text(encoding="utf-8") == "valuable raw transcript\n"
 
 
+def test_presentation_stale_cleanup_cannot_delete_raw_team_data(tmp_path: Path) -> None:
+    """The single-team build sweeper is as structurally blind to `raw/` as the combined one.
+
+    The twin of `test_combined_export_stale_cleanup_cannot_delete_raw_team_data` above, and it
+    exists for the same reason that one does. The retirement of `raw/messages/` argues that a
+    sweep of ingest data belongs in ingest because *both* build sweepers are unable to name a path
+    under `raw/`; only the `multi_team` half of that claim was pinned by a test, which is exactly
+    the half a future refactor is least likely to break silently.
+    """
+
+    raw_relative = "teams/victim/raw/messages/00000000-0000-0000-0000-000000000001.json"
+    raw_path = tmp_path / raw_relative
+    raw_path.parent.mkdir(parents=True)
+    raw_path.write_text("valuable ingest data\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="unrecognized presentation manifest path"):
+        _remove_stale_presentation_files(tmp_path, {raw_relative}, set())
+
+    assert raw_path.read_text(encoding="utf-8") == "valuable ingest data\n"
+
+
 def test_combined_export_stale_cleanup_rejects_symlinked_summary_parent(
     tmp_path: Path,
 ) -> None:
@@ -2862,3 +3111,147 @@ def test_loopback_server_serves_json_with_safe_headers(tmp_path: Path) -> None:
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+def _tear_normalized_generation(archive: Path, team_slug: str) -> None:
+    """Leave a team in the exact state a crash between two ingest writes leaves it in.
+
+    ``_ingest_orc_locked`` writes ``raw/source-manifest.json`` and only afterwards
+    ``raw/normalized-generation.json``. A process killed between those two lines -- an OOM, a
+    scheduler timeout, a host reboot -- leaves a team whose ``raw/team.json`` is perfectly readable
+    and whose generation marker says nothing, which is precisely what
+    ``_validate_normalized_generation`` is there to refuse.
+    """
+
+    write_json_if_changed(
+        archive / "teams" / team_slug / "raw" / "source-manifest.json",
+        narrow_json(
+            {
+                "schema_version": 2,
+                "provider": "orc",
+                "root_session_id": ROOT,
+                "source_root": "/nonexistent/state",
+                "snapshot_root": f"teams/{team_slug}/source_snapshots",
+                "date_window": None,
+                "sources": [],
+            }
+        ),
+    )
+
+
+def test_transcript_extraction_carries_a_torn_team_and_still_projects_the_healthy_one(
+    tmp_path: Path,
+) -> None:
+    """One team torn between its two ingest writes must not withhold the others' new prompts.
+
+    This is the archive-level half of the fix: the failure is produced by real
+    ``load_archived_team`` validation against real files on disk, not by a fake, so it exercises
+    the classification and the skip together.
+    """
+
+    healthy = _team()
+    torn = replace(_team(), team_slug="orc-test", provider="orc")
+    _write_team(tmp_path, healthy)
+    _write_team(tmp_path, torn)
+
+    whole = extract_transcripts_archive(tmp_path)
+    assert whole.teams == 2
+    assert whole.partial is False
+
+    _tear_normalized_generation(tmp_path, "orc-test")
+    grown = replace(
+        healthy,
+        events=(
+            *healthy.events,
+            _event("prompt-2", ROOT, 30_000, "user_prompt", "A brand new question."),
+        ),
+    )
+    _write_team(tmp_path, grown)
+
+    partial = extract_transcripts_archive(tmp_path)
+
+    assert partial.teams == 1
+    assert partial.partial is True
+    assert [skip.team_slug for skip in partial.skipped_teams] == ["orc-test"]
+    assert partial.skipped_teams[0].error_type == "ValueError"
+    assert "incomplete Orc normalized generation" in partial.skipped_teams[0].error
+    # A ValueError is a classified data fault, so no traceback is kept for it.
+    assert partial.skipped_teams[0].traceback is None
+
+    prompts = [
+        json.loads(line)
+        for line in (tmp_path / "extracted" / "transcripts" / "prompts.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    texts = {str(record["text"]) for record in prompts}
+    assert "A brand new question." in texts
+    assert {
+        team for record in prompts for team in record["occurrence_teams"]
+    } == {"codex-test", "orc-test"}
+
+    # Repairing the team needs no extraction-side intervention.
+    write_json_if_changed(
+        tmp_path / "teams" / "orc-test" / "raw" / "source-manifest.json",
+        narrow_json({"schema_version": 1, "provider": "codex", "sources": []}),
+    )
+    assert extract_transcripts_archive(tmp_path).partial is False
+
+
+def test_transcript_extraction_still_fails_when_no_team_can_be_read(
+    tmp_path: Path,
+) -> None:
+    """An archive nobody can read is the one state not to rewrite the corpus in.
+
+    Every record would be carried forward, so the projection would gain nothing, and it would be
+    written while the archive is in a state that no reader can validate. The refusal names every
+    team and every cause, because "no ingested teams found" would send the operator looking for a
+    missing directory rather than a torn one.
+    """
+
+    _write_team(tmp_path, replace(_team(), team_slug="orc-one", provider="orc"))
+    _write_team(tmp_path, replace(_team(), team_slug="orc-two", provider="orc"))
+    extract_transcripts_archive(tmp_path)
+    _tear_normalized_generation(tmp_path, "orc-one")
+    _tear_normalized_generation(tmp_path, "orc-two")
+
+    with pytest.raises(ValueError) as raised:
+        extract_transcripts_archive(tmp_path)
+    message = str(raised.value)
+    assert "no archive team" in message
+    assert "orc-one: ValueError: incomplete Orc normalized generation" in message
+    assert "orc-two: ValueError: incomplete Orc normalized generation" in message
+
+
+def test_extract_transcripts_cli_exits_two_and_names_the_team_it_carried(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A partial projection that exits 0 is a silent data gap in every scheduled caller."""
+
+    _write_team(tmp_path, _team())
+    _write_team(tmp_path, replace(_team(), team_slug="orc-test", provider="orc"))
+    assert timeline_main(("extract-transcripts", "--output", str(tmp_path))) == 0
+    capsys.readouterr()
+
+    _tear_normalized_generation(tmp_path, "orc-test")
+
+    assert timeline_main(("extract-transcripts", "--output", str(tmp_path))) == 2
+    captured = capsys.readouterr()
+    assert "across 1 teams (1 further team(s) carried forward unread)" in captured.out
+    assert "team orc-test: ValueError: incomplete Orc normalized generation" in (
+        captured.err
+    )
+    assert "carried forward unchanged from its last good extraction" in captured.err
+    # The JSONL is still named, because unlike a failed extraction it really was refreshed.
+    assert "JSONL:" in captured.out
+
+    run = json.loads(
+        sorted((tmp_path / "runs").glob("*.json"))[-1].read_text(encoding="utf-8")
+    )
+    assert run["status"] == "failed"
+    assert "1 of 2 archive teams could not be read" in run["error"]
+    extraction = run["mechanical"]["transcript_extraction"]
+    assert extraction["teams"] == 1
+    assert extraction["teams_skipped"] == 1
+    assert extraction["skipped_teams"][0]["team_slug"] == "orc-test"
+    assert extraction["dropped_prompt_authorship_rules"] == []

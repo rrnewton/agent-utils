@@ -236,12 +236,62 @@ the normalized active set to `extracted/transcripts/authorship-rules.json` and r
 and original source classification on every corrected prompt. A config-driven ingest replaces the
 complete active rule set; a later direct `extract-transcripts` reuses it.
 
+A rule belonging to a team the archive has no data for yet — the normal state of a newly registered
+team whose first ingest has not succeeded — is **set aside, not fatal**. It is named on stderr and
+in `dropped_prompt_authorship_rules` in both the run receipt and the transcript manifest, and it
+starts applying by itself as soon as that team ingests. Nothing needs re-running by hand.
+
 This command is entirely mechanical. It snapshots and normalizes the selected registered teams,
 then refreshes `extracted/transcripts/` over **every** normalized team already in the archive so the
 global prompt database remains monotonic. A `--team` filter limits ingestion, not that final global
 projection. Its run receipt binds the exact config-file SHA-256, records zero model calls/tokens,
 and confirms that no website build ran; use `build` or `export` explicitly when presentation files
 should change.
+
+One unreadable team no longer stops the rest. Each configured team is ingested independently: a
+team that fails is reported and skipped, the remaining teams still ingest, and transcript
+extraction still runs — a failed team simply keeps contributing the records it contributed on its
+last good run, because extraction reads the archive's durable normalized snapshots rather than this
+run's results. The failure is never silent. Every failed team is printed to stderr with its
+provider and exact error, the summary line says how many teams succeeded and how many failed, the
+run receipt records `status`, `teams_succeeded`, `teams_failed`, and a `failed_teams` array with
+each team's slug, provider, error type, and message, and the command exits non-zero:
+
+```
+codex-example-014 (codex): ingest: 34 agents, 5182 messages/events, ...
+agent-team-timeline: team orc-example-014 (orc): OrcParseError: Orc session existing append prefix was rewritten for sessions/SESSION_UUID.db
+teams: 2 succeeded, 1 failed
+transcripts: 91422 prompts, 88190 responses, 4310 system inputs across 12 normalized archive teams; 6 files changed
+```
+
+### A team the projection could not read is carried, not fatal
+
+The same isolation holds one level down, inside extraction. A team whose stored snapshot cannot be
+*loaded* — most often one left torn by a crash between two of the ingest's writes, which the
+generation validator then correctly refuses — is skipped rather than ending the projection. It
+keeps contributing everything it contributed on its last good extraction, and its authorship rules
+stay in force; what is missing is only what has happened to it since.
+
+That is stated four times over, because a partial projection that reads as complete is worse than
+an outright failure. The stdout count does not absorb the carried team, every skipped team gets its
+own stderr line, the run receipt gains `skipped_teams` / `teams_skipped`, and
+`extracted/transcripts/manifest.json` records the same for whoever opens the archive later:
+
+```
+agent-team-timeline: transcripts: team orc-example-014: ValueError: incomplete Orc normalized generation for 'orc-example-014'; rerun ingest -- carried forward unchanged from its last good extraction; nothing since is projected
+transcripts: 91422 prompts, 88190 responses, 4310 system inputs across 11 normalized archive teams (1 further team(s) carried forward unread); 6 files changed
+```
+
+Both `ingest-project` and `extract-transcripts` exit 2 when the projection came out partial, even
+if every team they ingested succeeded — extraction covers the whole archive, so a clean ingest
+proves nothing about the projection. Fix the named team and re-run; the projection picks its rows
+up with no other intervention. Extraction fails outright only when **no** team can be read at all,
+and then it names every team and every cause.
+
+Fix the reported team and rerun; ingestion is idempotent, so the healthy teams do no work the
+second time and the repaired team's rows join the projection. If extraction itself fails — which a
+partially-updated archive can still cause — the per-team results are kept and reported anyway, and
+the receipt records `transcript_extraction_error`.
 
 ## End-to-end refresh
 
@@ -401,6 +451,11 @@ Reruns take a monotonic union: a provider-side rewrite or rotation cannot delete
 was already extracted. Prompt ordinals are a convenient current 1-based chronological projection,
 not durable identity; adding newly discovered older history can renumber later prompts. The run
 receipt records zero model calls and zero model tokens.
+
+A team that cannot be loaded is carried forward and reported rather than ending the run, and the
+command exits 2 — see "A team the projection could not read is carried, not fatal" above. Naming a
+team with `--team` still cannot *narrow* the projection: leaving out a team the projection already
+covers is refused, because that is a decision rather than a fault.
 
 ### 3. Summarize — the only token-spending stage
 
@@ -704,8 +759,7 @@ example-team/
     │   ├── site-identity.json        # projects, repositories, hosts, archive timezone
     │   ├── source-manifest.json      # versioned path/byte/hash/update provenance
     │   ├── normalized-generation.json # Orc manifest/team/catalog commit marker
-    │   ├── source-snapshot.json
-    │   └── messages/<thread-id>.json
+    │   └── source-snapshot.json
     ├── summary_data/
     │   ├── artifacts.json             # logical-key/version/model/context catalog
     │   ├── cache/<content-hash>.json
@@ -756,6 +810,34 @@ restricted to the exact paths in that refresh's validated source set; leftover f
 interrupted run are not silently adopted. Snapshot traversal and replacement reject symlinked
 roots, directories, and targets, and durable replacements fsync both file content and its parent
 directory before the transaction proceeds.
+
+### The retired `raw/messages/` directory
+
+Older archives contain `teams/<team>/raw/messages/<thread-id>.json`, one file per agent thread. It
+was a re-serialization of the records already in `raw/team.json`, split by thread, and nothing ever
+read it — not the website, not `./timeline`, not `serve.py`, not any earlier version of any of them.
+It was also large: on one twelve-team archive it was 675,371,783 bytes across 2,932 files — 50.9% of
+everything under `teams/` that is not a gitignored source snapshot, so it roughly doubled the size
+of the version-controlled archive — and every ingest rewrote all of it.
+
+The tool no longer writes it, and the next ingest of a team removes it. That happens once; later
+runs find nothing and say nothing. When it happens you get a line on stderr naming the team, the
+file count, and the megabytes reclaimed, and the same counts land in the run receipt under
+`ingest.retired_message_projections` and `ingest.retired_message_projection_bytes`, so the deletion
+is still explicable months later from the archive alone.
+
+Nothing is lost. Every record in those files is in `raw/team.json`, which is written and flushed
+before the sweep begins, and if your archive is versioned the deleted bytes remain in its history —
+expect a large deletion in `git status` after the first ingest.
+
+The sweep removes regular files directly inside that directory named `<thread-id>.json`, matching
+the *shape* of a thread id rather than only the threads in your current `raw/team.json`. That is
+deliberate: the old writer never cleaned up after itself, so a lineage re-ingested through a
+narrower `--team` selection or date window left orphaned projections behind, and those are the ones
+most worth reclaiming. The cost is that `raw/messages/` is an ingest-owned directory and is swept
+as one — do not keep your own files in it, because anything you leave there named `something.json`
+goes too. A symlink, a subdirectory, a `.gz` sidecar, and any other name are left alone, and
+anything left behind keeps the directory itself in place.
 
 ## Claude source semantics and limitations
 
@@ -810,6 +892,117 @@ prior snapshot. Schema-v2 manifests record bounded message/spawn digests, cumula
 counts, and explicit degraded flags—never the raw conversation payload. Existing schema-v1 archives
 validate their preserved byte baseline and retain their exact raw-byte summary-cache identity until
 a real semantic change moves them to deterministic schema-v2 identity.
+
+### Accepting an in-place append-prefix rewrite
+
+Separately from that conversation projection, the archive holds each session's `content_blocks` and
+`messages` rows to a byte-exact append-only contract at or below the watermark it last recorded.
+That contract is occasionally broken by something harmless: an upstream backfill writing a
+`token_count` into a row captured minutes earlier. No record is lost, but the digest moves and the
+ingest refuses.
+
+The refusal now says exactly what moved—which table, which row, which column, and which JSON field
+inside that column, as a before/after excerpt anchored on the difference rather than truncated from
+the start:
+
+```
+agent-team-timeline: Orc session existing append prefix was rewritten for
+  .orc/sessions/SESSION_UUID/session.db: 1 row(s) changed at or below the append watermark
+  [messages row 878292: message_json .token_count: text:..."token_count":null} ->
+  text:..."token_count":445}]; re-run with --accept-orc-prefix-rewrite SESSION_UUID to
+  record this rewrite and re-baseline the digest -- that authorizes this one session and
+  no other, so another rewritten session in this lineage refuses again with its own
+  evidence -- accepting supersedes the pre-rewrite snapshot .objects/16/1617869e....db
+  (kept for comparison until the next accepted override on this source, then reclaimed)
+  and records only a bounded summary -- at most 20 of those 1 changed row(s), at most
+  160 characters per column value
+```
+
+The second half of that message is the price, stated where the decision is made. Accepting is not
+free and not fully reversible, so the refusal names the snapshot object it will stop trusting and
+admits that the diff kept in exchange is a summary, not a transcript.
+
+Read that first, decide, and only then override — with the session id the refusal printed:
+
+```bash
+agent-team-timeline ingest-orc \
+  --output ../summary/widget --team orc-example-014 \
+  --source-root ../raw/devbig014 --root-session SESSION_UUID \
+  --accept-orc-prefix-rewrite SESSION_UUID
+```
+
+**The flag authorizes one session, not the run.** A lineage is a session tree — a root coordinator
+plus every nested session — and the guard runs once per session in it. If a second session was also
+rewritten, this command refuses again, naming that session and printing *its* diff, and you repeat
+the flag once you have read it:
+
+```bash
+agent-team-timeline ingest-orc ... \
+  --accept-orc-prefix-rewrite SESSION_UUID \
+  --accept-orc-prefix-rewrite NESTED_SESSION_UUID
+```
+
+Two refusals for two rewrites is the intended cost. The alternative is one flag that re-baselines
+sessions you were never shown, because the ingest stops at the first refusal and so can only ever
+print one of them before you decide.
+
+For a project manifest, name the team and the session together as `TEAM:SESSION`, because one
+project run ingests every registered team and each Orc team is a whole session tree — either half
+alone is a blanket switch over the other. A slug that is not registered, is not an Orc team, or is
+not in this run's `--team` selection is rejected before any ingest starts, as is a bare session id
+with no team on it:
+
+```bash
+agent-team-timeline ingest-project --config configs/widget.json \
+  --accept-orc-prefix-rewrite orc-example-014:SESSION_UUID
+```
+
+The session ids you were permitted to re-baseline — whether or not any of them needed it — are
+recorded in the run receipt as `accepted_prefix_rewrite_sessions`, so a flag left switched on in a
+scheduled job is visible rather than indistinguishable from a clean run.
+
+The override is narrow, loud, and permanent in the record:
+
+- **It never covers a lost or added record.** A row that disappeared from the prefix, a row that
+  appeared inside it, and a shrinking history all still refuse, flag or no flag. Only values
+  changing in rows that were already there are accepted, and the new snapshot is a full copy of the
+  current source, so nothing is dropped.
+- **It never covers a session you did not name.** A session id that is not in the discovered
+  lineage is rejected before a single database is copied, so a typo cannot leave you believing an
+  override applied when it authorized nothing.
+- **It re-baselines the record, and re-baselines nothing but the record.** The digest becomes that
+  of the source as it now stands. If the session was still running — as the one this exists for
+  was — then `append_count` and `append_max_id` move by exactly the rows that arrived while you
+  were deciding, and every one of those rows is ingested; the re-baselined digest is then a value
+  equal to neither digest in the override record, which reports the before and after of the span
+  that was actually compared. The source manifest, the frozen task `.projections` pointer, and
+  ownership carry through unchanged, and the next run needs no flag.
+- **It reports itself.** The changed rows and columns are printed to stderr (so they survive
+  redirecting stdout to a log), recorded in the run receipt under `ingest.orc_prefix_overrides`,
+  and stored beside the source in the manifest as `append_prefix_override` with `degraded: true`
+  and the reason `append-prefix-rewritten-operator-accepted-rows-preserved`. That record is sticky
+  and counts up: an archive that was ever re-baselined keeps saying so.
+- **It keeps the bytes it stopped trusting.** The pre-rewrite snapshot object is *not* collected by
+  the run that supersedes it. Its path and digest are recorded as `superseded_snapshot_path` and
+  `superseded_sha256`, printed as the last line of the acceptance report, and honoured by object
+  GC on every later run, so an accepted rewrite always leaves a route back.
+
+Every part of the *report* is bounded—at most 20 rows, windowed value excerpts, at most 8 JSON paths
+per column—and any bound that was applied is flagged rather than hidden. Those caps are a summary of
+an event whose two sides both survive on disk, so more detail is always a `sqlite3` session away:
+
+```bash
+cd ../summary/widget/teams/orc-example-014/source_snapshots
+sqlite3 .objects/16/1617869e....db \
+  "SELECT message_json FROM messages WHERE id = 878292"
+```
+
+Retention is one deep per source, and only another *accepted* override reclaims it: the second
+acceptance supersedes the first's pointer, and the next GC takes the older object. So the bytes are
+never reclaimed by a routine run—only by a second deliberate decision that carries the same warning
+as the first. Copy the archive if you need to keep more than the latest generation. Deleting a
+retained object by hand does not break anything either: it is evidence, not an input, so a later
+ingest still runs and the manifest still records that the rewrite happened.
 
 SQLite backups are staged, integrity-checked, published into an immutable content-addressed object
 store, and fsynced before the manifest is updated. `raw/normalized-generation.json` is written last

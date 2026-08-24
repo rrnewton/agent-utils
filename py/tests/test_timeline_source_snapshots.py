@@ -456,6 +456,87 @@ def test_append_replaces_snapshot_with_longer_complete_prefix(tmp_path: Path) ->
     assert report.source_bytes == len(expected)
 
 
+def test_real_ingest_writes_no_per_thread_message_projection(tmp_path: Path) -> None:
+    _, archive, _ = _first_ingest(tmp_path)
+
+    # Nothing anywhere in the archive, not just under the one team: this is the check that catches
+    # a second writer being added later under a different team root.
+    assert [path for path in archive.rglob("messages") if path.is_dir()] == []
+    raw = archive / "teams" / "codex-test" / "raw"
+    assert sorted(path.name for path in raw.iterdir()) == [
+        "artifacts.json",
+        "site-identity.json",
+        "source-manifest.json",
+        "source-snapshot.json",
+        "team.json",
+    ]
+
+
+def test_real_ingest_retires_a_legacy_projection_and_says_so_on_stderr(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sessions, archive, _ = _first_ingest(tmp_path)
+    legacy = archive / "teams" / "codex-test" / "raw" / "messages"
+    legacy.mkdir()
+    payload = json.dumps({"agent": {}, "turns": [], "messages": []}) + "\n"
+    for thread_id in (ROOT, CHILD):
+        (legacy / f"{thread_id}.json").write_text(payload, encoding="utf-8")
+    freed = 2 * len(payload.encode("utf-8"))
+    capsys.readouterr()
+
+    status = timeline_main(
+        (
+            "ingest",
+            "--sessions-root",
+            str(sessions),
+            "--root-session",
+            ROOT,
+            "--team",
+            "codex-test",
+            "--output",
+            str(archive),
+            "--timezone",
+            "UTC",
+        )
+    )
+
+    assert status == 0
+    assert not legacy.exists()
+    captured = capsys.readouterr()
+    # On stderr, not stdout: a scheduled run redirects stdout, and this is the operator's only
+    # live notice that a few thousand tracked files just left their archive.
+    assert "retired" in captured.err and "raw/messages" in captured.err
+    assert "removed 2 retired" in captured.err
+    assert "raw/messages" not in captured.out
+
+    run_path = sorted((archive / "runs").glob("*.json"))[-1]
+    run = json.loads(run_path.read_text(encoding="utf-8"))
+    assert run["ingest"]["retired_message_projections"] == 2
+    assert run["ingest"]["retired_message_projection_bytes"] == freed
+
+    # Second run: nothing left to sweep, and nothing said about it.
+    capsys.readouterr()
+    assert (
+        timeline_main(
+            (
+                "ingest",
+                "--sessions-root",
+                str(sessions),
+                "--root-session",
+                ROOT,
+                "--team",
+                "codex-test",
+                "--output",
+                str(archive),
+                "--timezone",
+                "UTC",
+            )
+        )
+        == 0
+    )
+    assert "raw/messages" not in capsys.readouterr().err
+
+
 def test_disappeared_source_fails_and_preserves_snapshot(tmp_path: Path) -> None:
     sessions, archive, origin = _first_ingest(tmp_path)
     copied_before = _snapshot(archive).read_bytes()

@@ -8,6 +8,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
+from traceback import format_exception
 from typing import Literal, cast
 
 from agent_team_timeline.archive import (
@@ -136,22 +137,134 @@ class ProjectTeamIngestResult:
 
 
 @dataclass(frozen=True)
+class ProjectTeamIngestFailure:
+    """One configured team whose ingest raised, recorded instead of aborting the run.
+
+    ``error_type`` is the exception class name rather than a category of our own invention: it is
+    what a reader needs to tell an ``OrcParseError`` about one archive's bytes apart from an
+    ``OSError`` about a missing mount, and it costs nothing to keep exact. ``traceback`` is present
+    only for exception types this package does not classify as data/IO failure, because for those
+    the one-line message is a defect report with the evidence removed.
+    """
+
+    team_slug: str
+    provider: Provider
+    error_type: str
+    error: str
+    traceback: str | None = None
+
+    def to_json_obj(self) -> dict[str, JsonValue]:
+        """Return this failure as run-receipt metadata."""
+
+        value: dict[str, JsonValue] = {
+            "team_slug": self.team_slug,
+            "provider": self.provider,
+            "error_type": self.error_type,
+            "error": self.error,
+        }
+        if self.traceback is not None:
+            value["traceback"] = self.traceback
+        return value
+
+    @property
+    def summary(self) -> str:
+        """Return one operator-readable line naming the team, provider, and cause."""
+
+        return f"{self.team_slug} ({self.provider}): {self.error_type}: {self.error}"
+
+
+@dataclass(frozen=True)
 class ProjectIngestReport:
-    """Results of configured team ingests and the global transcript projection."""
+    """Results of configured team ingests and the global transcript projection.
+
+    ``transcripts`` is optional and ``failures`` may be non-empty because a project run reports a
+    partial outcome instead of collapsing into a single exception. Callers must consult
+    :attr:`failed`: reporting a partial run as a success would make the missing team invisible to
+    everything that reads only an exit status.
+    """
 
     config_sha256: str
     teams: tuple[ProjectTeamIngestResult, ...]
-    transcripts: TranscriptExportReport
+    transcripts: TranscriptExportReport | None
+    failures: tuple[ProjectTeamIngestFailure, ...] = ()
+    transcript_error: str | None = None
+    # The ``team:session`` pairs this run was *permitted* to re-baseline, whether or not any of
+    # them needed it. Recorded separately from the overrides that actually fired, because "the
+    # operator left the override switched on in a scheduled job" and "no rewrite happened" look
+    # identical otherwise, and the first of those is a standing invitation to launder a real
+    # rewrite. The session half is kept here rather than reduced to a team list precisely because
+    # the authorization is per session: a receipt saying only "orc-team" would read as a standing
+    # permission over that team's whole session tree, which is the thing the pair exists to deny.
+    accept_prefix_rewrite_sessions: tuple[str, ...] = ()
+
+    @property
+    def failed(self) -> bool:
+        """Return whether any selected team, or the projection itself, did not complete.
+
+        A *partial* projection counts as a failure. It is tempting to call it a success because
+        the file was written and most teams are in it, but the exit status is the only signal an
+        unattended scheduler reads, and "eleven of twelve teams' prompts are current" needs a
+        human exactly as much as "no prompts are current" does. A skipped team is also not
+        self-announcing from the ingest side: it can be skipped by extraction while its own ingest
+        succeeded or was never attempted at all, so ``failures`` being empty proves nothing about
+        the projection.
+        """
+
+        return (
+            bool(self.failures)
+            or self.transcripts is None
+            or self.transcripts.partial
+        )
+
+    def failure_summary(self) -> str | None:
+        """Return one line naming every failure, or ``None`` when the run was clean."""
+
+        if not self.failed:
+            return None
+        parts: list[str] = []
+        if self.failures:
+            selected = len(self.teams) + len(self.failures)
+            parts.append(
+                f"{len(self.failures)} of {selected} teams failed: "
+                + "; ".join(failure.summary for failure in self.failures)
+            )
+        if self.transcript_error is not None:
+            parts.append(f"transcript extraction failed: {self.transcript_error}")
+        if self.transcripts is not None:
+            partiality = self.transcripts.partiality_summary()
+            if partiality is not None:
+                parts.append(f"transcript extraction was partial: {partiality}")
+        return " | ".join(parts)
 
     def to_json_obj(self) -> dict[str, JsonValue]:
-        """Return an explicit zero-model run receipt payload."""
+        """Return an explicit zero-model run receipt payload.
+
+        ``schema_version`` deliberately does not move for the failure fields. It is the *config*
+        manifest version as well as the receipt version, so raising it here would reject every
+        manifest on disk in order to describe a purely additive receipt change. The failure keys
+        are always written -- ``failed_teams`` as an empty list and
+        ``transcript_extraction_error`` as null on a clean run -- so a reader never has to
+        distinguish an absent key from an empty one.
+        """
 
         team_values: list[JsonValue] = [team.to_json_obj() for team in self.teams]
+        failure_values: list[JsonValue] = [
+            failure.to_json_obj() for failure in self.failures
+        ]
+        accepted_values: list[JsonValue] = list(self.accept_prefix_rewrite_sessions)
         return {
             "schema_version": PROJECT_INGEST_SCHEMA_VERSION,
             "config_sha256": self.config_sha256,
+            "status": "failed" if self.failed else "completed",
             "teams": team_values,
-            "transcript_extraction": self.transcripts.to_json_obj(),
+            "teams_succeeded": len(self.teams),
+            "failed_teams": failure_values,
+            "teams_failed": len(self.failures),
+            "transcript_extraction": (
+                None if self.transcripts is None else self.transcripts.to_json_obj()
+            ),
+            "transcript_extraction_error": self.transcript_error,
+            "accepted_prefix_rewrite_sessions": accepted_values,
             "model_calls": 0,
             "model_tokens": 0,
             "website_build_performed": False,
@@ -560,58 +673,225 @@ def load_project_ingest_config(path: Path) -> ProjectIngestConfig:
     return ProjectIngestConfig(config_path, config_sha256, output, teams)
 
 
+def _ingest_team(
+    output: Path, team: ProjectTeamConfig, accept_prefix_rewrite: Sequence[str]
+) -> IngestReport:
+    """Dispatch one configured team to its provider importer."""
+
+    source = team.source
+    if isinstance(source, CodexProjectSource):
+        _, report = ingest_codex(
+            output,
+            source.sessions_root,
+            source.root_session,
+            team.slug,
+            team.timezone,
+            team.date_window,
+            team.identity_overrides,
+            source.continuation_sessions,
+        )
+    elif isinstance(source, ClaudeProjectSource):
+        _, report = ingest_claude(
+            output,
+            source.session_file,
+            team.slug,
+            team.timezone,
+            team.date_window,
+            team.identity_overrides,
+        )
+    else:
+        _, report = ingest_orc(
+            output,
+            source.source_root,
+            source.root_session,
+            team.slug,
+            team.timezone,
+            team.date_window,
+            team.identity_overrides,
+            source.continuation_sessions,
+            accept_prefix_rewrite,
+        )
+    return report
+
+
+def _team_failure(
+    team: ProjectTeamConfig, error: Exception
+) -> ProjectTeamIngestFailure:
+    """Describe one team's raised exception without deciding what the run should do about it."""
+
+    # Every provider parse error subclasses ValueError, and every filesystem fault arrives as
+    # OSError, so this pair is the whole classified failure surface of the importers -- the same
+    # pair the CLI has always treated as "expected, report it and exit 2". Anything else is a defect
+    # in this package rather than a property of one team's logs, so it keeps its traceback: a
+    # KeyError reduced to the single line "'messages'" is unactionable, and this receipt is the only
+    # place the evidence would otherwise survive an unattended overnight run.
+    #
+    # The traceback is formatted from the exception object rather than from format_exc(), so this
+    # function does not silently produce "NoneType: None" if it is ever called outside an active
+    # `except` block.
+    expected = isinstance(error, (OSError, ValueError))
+    return ProjectTeamIngestFailure(
+        team.slug,
+        team.provider,
+        type(error).__name__,
+        str(error),
+        None if expected else "".join(format_exception(error)),
+    )
+
+
+def _prefix_rewrite_selection(
+    selected: Sequence[ProjectTeamConfig], requested: Sequence[str]
+) -> dict[str, frozenset[str]]:
+    """Validate the ``TEAM:SESSION`` append-prefix overrides against the teams this run ingests.
+
+    The override is named per team *and* per session rather than passed as one blanket switch,
+    because both scopes fan out. A project run ingests a dozen teams at once, so a bare boolean
+    would silently extend one team's known, diagnosed metadata backfill to eleven others whose
+    sources nobody had looked at; and each Orc team is a whole session tree, so a per-team boolean
+    would do the identical thing one level down, to sessions the operator has structurally never
+    been shown -- the guard raises on the first mismatching source, so a second rewritten session
+    is never printed before the flag is passed. The pair is the smallest thing that names only what
+    was actually inspected.
+
+    Every kind of near miss is rejected here, before any ingest starts, rather than quietly doing
+    nothing: a value that is not a ``TEAM:SESSION`` pair at all (which is exactly what an operator
+    produces by pasting the bare session id that ``ingest-orc``'s refusal prints), a typo'd slug, a
+    slug for a Codex or Claude team that has no append-prefix guard, and a slug that is registered
+    but excluded from this run's ``--team`` filter. A flag that appears to have been accepted but
+    had no effect is the worst possible outcome for a safety override, because the next person
+    reads the command line and believes it did something.
+
+    The session half is deliberately *not* validated here. Which sessions a lineage contains is not
+    knowable from the manifest -- discovery walks the source root's session index -- so checking it
+    here would mean opening every team's databases before the run, duplicating work the snapshotter
+    does anyway. It is validated inside :func:`agent_team_timeline.orc.snapshot_orc_lineage`
+    against the discovered lineage, before a single database is copied, and that error arrives on
+    the failing team's receipt line where the team slug is already printed.
+    """
+
+    if len(set(requested)) != len(requested):
+        raise ValueError(
+            "--accept-orc-prefix-rewrite selection contains duplicates"
+        )
+    by_slug = {team.slug: team for team in selected}
+    accepted: dict[str, set[str]] = {}
+    malformed: list[str] = []
+    for value in requested:
+        slug, separator, session_id = value.partition(":")
+        # Neither half can itself contain a colon -- team slugs are lowercase alphanumerics and
+        # hyphens, session ids are safe path components -- so one partition is a complete parse and
+        # there is no quoting rule for an operator to get wrong.
+        if not separator or not slug or not session_id:
+            malformed.append(value)
+            continue
+        accepted.setdefault(slug, set()).add(session_id)
+    if malformed:
+        raise ValueError(
+            "--accept-orc-prefix-rewrite takes TEAM:SESSION, naming the one team and the "
+            "one session the refusal showed you; these do not: " + ", ".join(malformed)
+        )
+    unknown = sorted(set(accepted) - set(by_slug))
+    if unknown:
+        raise ValueError(
+            "--accept-orc-prefix-rewrite names teams this run does not ingest: "
+            + ", ".join(unknown)
+        )
+    not_orc = sorted(slug for slug in accepted if by_slug[slug].provider != "orc")
+    if not_orc:
+        raise ValueError(
+            "--accept-orc-prefix-rewrite applies only to orc teams; these are not: "
+            + ", ".join(not_orc)
+        )
+    return {slug: frozenset(sessions) for slug, sessions in accepted.items()}
+
+
 def ingest_project(
-    config: ProjectIngestConfig, requested_teams: Sequence[str] = ()
+    config: ProjectIngestConfig,
+    requested_teams: Sequence[str] = (),
+    accept_prefix_rewrite: Sequence[str] = (),
 ) -> ProjectIngestReport:
     """Ingest selected registered teams, then refresh the global transcript JSONL.
 
     This operation invokes provider importers and transcript extraction only. It cannot invoke a
     summarizer and deliberately does not build or rewrite the website presentation.
+
+    Teams are isolated from one another: a team that raises is recorded as a failure and the run
+    continues with the next one. The provider importers share no mutable state across teams -- each
+    writes only under ``teams/<slug>/`` while holding the archive writer lock -- and a team that
+    fails keeps, byte for byte, the normalized snapshot its last successful ingest wrote.
+
+    ``accept_prefix_rewrite`` holds ``TEAM:SESSION`` pairs naming, individually, the Orc sessions
+    whose append-prefix guard this run may re-baseline; the team half is validated against the
+    selection and raises before any team is touched, and the session half is validated by the
+    snapshotter against the discovered lineage before it copies anything.
+
+    The outcome is returned, never raised, even when every team failed, because the caller needs
+    the whole picture to write one honest receipt. Callers must therefore consult
+    :attr:`ProjectIngestReport.failed` and set their own exit status from it.
     """
 
     selected = config.select_teams(requested_teams)
+    accepted = _prefix_rewrite_selection(selected, accept_prefix_rewrite)
     results: list[ProjectTeamIngestResult] = []
+    failures: list[ProjectTeamIngestFailure] = []
+    # One team must not be able to end the run. With no boundary inside this loop, a single
+    # unreadable source lineage took down eleven healthy teams *and* the transcript extraction
+    # after them, on four consecutive runs of roughly seven minutes each, and the operator's only
+    # evidence was one exception naming the one team that was already known to be broken.
     for team in selected:
-        source = team.source
-        if isinstance(source, CodexProjectSource):
-            _, report = ingest_codex(
-                config.output,
-                source.sessions_root,
-                source.root_session,
-                team.slug,
-                team.timezone,
-                team.date_window,
-                team.identity_overrides,
-                source.continuation_sessions,
+        try:
+            report = _ingest_team(
+                config.output, team, sorted(accepted.get(team.slug, ()))
             )
-        elif isinstance(source, ClaudeProjectSource):
-            _, report = ingest_claude(
-                config.output,
-                source.session_file,
-                team.slug,
-                team.timezone,
-                team.date_window,
-                team.identity_overrides,
-            )
-        else:
-            _, report = ingest_orc(
-                config.output,
-                source.source_root,
-                source.root_session,
-                team.slug,
-                team.timezone,
-                team.date_window,
-                team.identity_overrides,
-                source.continuation_sessions,
-            )
+        except Exception as error:  # Deliberately broad; see _team_failure.
+            # BaseException is deliberately NOT caught: a KeyboardInterrupt or SystemExit means the
+            # operator or the runtime is stopping this process, and continuing on to the next team
+            # would be ignoring that instruction, not being robust to a bad team.
+            failures.append(_team_failure(team, error))
+            continue
         results.append(ProjectTeamIngestResult(team.slug, team.provider, report))
+
     # Always project every normalized team already in the durable archive. The projection is a
     # monotonic global database and therefore cannot safely omit teams merely because this run's
-    # ingest filter selected a subset.
-    transcripts = extract_transcripts_archive(
-        config.output, authorship_rules=config.prompt_authorship_rules
+    # ingest filter selected a subset -- or because a team failed. Extraction reads each team's
+    # durable `teams/<slug>/raw/team.json`, so a team that failed today contributes exactly the
+    # records it contributed on its last good run, and `_monotonic_union` carries forward any
+    # occurrence whose source has since disappeared. Skipping extraction whenever any team failed
+    # would therefore withhold the *successful* teams' new prompts for no safety gain -- and the
+    # same argument applies one level down, inside extraction, to a team whose durable snapshot
+    # cannot be *read*: it is skipped and named there rather than ending the projection.
+    transcripts: TranscriptExportReport | None = None
+    transcript_error: str | None = None
+    try:
+        transcripts = extract_transcripts_archive(
+            config.output, authorship_rules=config.prompt_authorship_rules
+        )
+    except Exception as error:  # Deliberately broad, for the same reason as the team loop.
+        # Extraction is itself isolated per team now -- a team that fails to load is carried
+        # forward and named in `transcripts.skipped_teams`, and a rule pointing at a team the
+        # archive has no data for is set aside and named in
+        # `transcripts.dropped_authorship_rules` -- so the two shapes that used to arrive here as
+        # exceptions no longer do. This stays because the exhaustive claim it would otherwise be
+        # making is not one this function can enforce: everything below the loaded teams (the
+        # monotonic union's own invariants, a corrupt `occurrences.jsonl`, a full disk mid-write)
+        # can still raise, and letting that propagate would discard the per-team results collected
+        # above, which is precisely the "one failure erases eleven successes" shape being removed
+        # here. Record it and let the caller report both.
+        transcript_error = f"{type(error).__name__}: {error}"
+    return ProjectIngestReport(
+        config.config_sha256,
+        tuple(results),
+        transcripts,
+        tuple(failures),
+        transcript_error,
+        tuple(
+            sorted(
+                f"{slug}:{session_id}"
+                for slug, sessions in accepted.items()
+                for session_id in sessions
+            )
+        ),
     )
-    return ProjectIngestReport(config.config_sha256, tuple(results), transcripts)
 
 
 __all__ = [
@@ -623,5 +903,6 @@ __all__ = [
     "ProjectIngestConfig",
     "ProjectIngestReport",
     "ProjectTeamConfig",
+    "ProjectTeamIngestFailure",
     "ProjectTeamIngestResult",
 ]

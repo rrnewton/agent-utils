@@ -215,8 +215,9 @@ def test_orc_pipeline_persists_and_reuses_continuation_manifest_state(
         captured_at: str,
         continuation_specs: Sequence[str | OrcContinuationSpec] = (),
         previous_continuations: Sequence[OrcContinuationLink] = (),
+        accept_prefix_rewrite: Sequence[str] = (),
     ) -> OrcSnapshotResult:
-        del source_root, snapshot_root, captured_at
+        del source_root, snapshot_root, captured_at, accept_prefix_rewrite
         assert root_session_id == ROOT
         snapshot_calls.append(
             (
@@ -283,6 +284,7 @@ def test_orc_pipeline_rejects_resolved_boundary_drift_before_normalization(
         captured_at: str,
         continuation_specs: Sequence[str | OrcContinuationSpec] = (),
         previous_continuations: Sequence[OrcContinuationLink] = (),
+        accept_prefix_rewrite: Sequence[str] = (),
     ) -> OrcSnapshotResult:
         del (
             source_root,
@@ -292,6 +294,7 @@ def test_orc_pipeline_rejects_resolved_boundary_drift_before_normalization(
             captured_at,
             continuation_specs,
             previous_continuations,
+            accept_prefix_rewrite,
         )
         return OrcSnapshotResult((), 0, (_link(),))
 

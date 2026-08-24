@@ -7,6 +7,7 @@ import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from traceback import format_exception
 from typing import Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -128,8 +129,120 @@ class PromptAuthorshipRule:
 
 
 @dataclass(frozen=True)
+class TranscriptTeamSkip:
+    """One archive team the projection carried forward because it could not be re-read.
+
+    A skip is *not* the same thing as a team with nothing new to contribute. The occurrences that
+    team contributed on its last good run are still projected -- ``_monotonic_union`` seeds itself
+    with every record already in ``occurrences.jsonl`` and only replaces the ones the current run
+    re-derives -- but nothing that has happened to that team since is, and the manifest's
+    ``source_generations`` has no entry for it because no current generation was read. That is a
+    materially different artifact from a complete projection, and the difference is invisible in
+    the record counts, so it is named here rather than inferred.
+
+    The fields mirror :class:`~agent_team_timeline.project_config.ProjectTeamIngestFailure` on
+    purpose, and for the same reasons: ``error_type`` is the exception class name because that is
+    what distinguishes one archive's torn bytes from a missing mount, and ``traceback`` is kept
+    only for exception types this package does not classify as data/IO failure, since for those a
+    one-line message is a defect report with the evidence deleted.
+    """
+
+    team_slug: str
+    error_type: str
+    error: str
+    traceback: str | None = None
+
+    @classmethod
+    def from_exception(cls, team_slug: str, error: BaseException) -> TranscriptTeamSkip:
+        """Classify one team's load failure without deciding what the run should do about it."""
+
+        # Formatted from the exception object rather than from format_exc(), so this classifier
+        # does not silently produce "NoneType: None" if it is ever called outside an except block.
+        expected = isinstance(error, (OSError, ValueError))
+        return cls(
+            team_slug,
+            type(error).__name__,
+            str(error),
+            None if expected else "".join(format_exception(error)),
+        )
+
+    def to_json_obj(self) -> dict[str, JsonValue]:
+        """Return the complete skip, traceback included, for a run receipt."""
+
+        value: dict[str, JsonValue] = {
+            "team_slug": self.team_slug,
+            "error_type": self.error_type,
+            "error": self.error,
+        }
+        if self.traceback is not None:
+            value["traceback"] = self.traceback
+        return value
+
+    def to_manifest_obj(self) -> dict[str, JsonValue]:
+        """Return the skip as durable projection metadata, deliberately without the traceback.
+
+        The run receipt is the place a traceback belongs: it is dated, it is one run's evidence,
+        and nothing compares two of them. ``manifest.json`` is neither -- it is rewritten in place
+        every run and its bytes decide ``files_changed`` -- so embedding interpreter line numbers
+        in it would make an unrelated refactor of this module show up as a projection change.
+        """
+
+        return {
+            "team_slug": self.team_slug,
+            "error_type": self.error_type,
+            "error": self.error,
+        }
+
+    @property
+    def summary(self) -> str:
+        """Return one operator-readable line naming the team and why it was carried."""
+
+        return f"{self.team_slug}: {self.error_type}: {self.error}"
+
+
+@dataclass(frozen=True)
+class DroppedAuthorshipRule:
+    """One configured prompt-authorship rule the archive has no team to apply it to.
+
+    Dropped rather than fatal, and the distinction is narrower than it looks. A rule's
+    ``team_slug`` is not typed by a human: the project config nests rules inside their team and
+    :func:`agent_team_timeline.project_config._prompt_authorship_rules` stamps the enclosing
+    team's slug onto each one, so a rule naming an unknown team never means "typo". It means the
+    archive holds no normalized data for a team that is genuinely registered -- overwhelmingly, a
+    new team whose *first* ingest just failed. Refusing the whole extraction over that is the
+    "one broken lineage withholds eleven healthy teams' prompts" failure this projection exists to
+    avoid, so the rule is set aside and reported at the same volume as a skipped team.
+
+    It is reported rather than silently ignored because a rule that appears configured and does
+    nothing is the worst state for an authorship correction: the next reader sees the rule in the
+    config, sees prompts still labelled ``unknown``, and has no way to tell which of the two is
+    wrong.
+    """
+
+    rule_id: str
+    team_slug: str
+
+    def to_json_obj(self) -> dict[str, JsonValue]:
+        """Return the dropped rule as receipt and manifest metadata."""
+
+        return {"rule_id": self.rule_id, "team_slug": self.team_slug}
+
+    @property
+    def summary(self) -> str:
+        """Return one operator-readable line naming the rule and the team it cannot reach."""
+
+        return f"{self.rule_id} (team {self.team_slug} has no normalized data)"
+
+
+@dataclass(frozen=True)
 class TranscriptExportReport:
-    """Counts produced by one mechanical transcript export."""
+    """Counts produced by one mechanical transcript export.
+
+    ``teams`` counts the teams whose *current* normalized data was read. Teams carried forward
+    without being re-read are in ``skipped_teams`` and are deliberately not added to that count:
+    a partial projection reported as "across 12 teams" is exactly the partial-run-that-looks-
+    complete this reporting exists to prevent.
+    """
 
     teams: int
     prompts: int
@@ -138,10 +251,52 @@ class TranscriptExportReport:
     carried_forward: int
     files_changed: int
     reclassified: int = 0
+    skipped_teams: tuple[TranscriptTeamSkip, ...] = ()
+    dropped_authorship_rules: tuple[DroppedAuthorshipRule, ...] = ()
+
+    @property
+    def partial(self) -> bool:
+        """Return whether this projection is missing anything a complete one would have."""
+
+        return bool(self.skipped_teams or self.dropped_authorship_rules)
+
+    def partiality_summary(self) -> str | None:
+        """Return one line naming everything missing, or ``None`` when the projection is whole."""
+
+        if not self.partial:
+            return None
+        parts: list[str] = []
+        if self.skipped_teams:
+            parts.append(
+                f"{len(self.skipped_teams)} of "
+                f"{self.teams + len(self.skipped_teams)} archive teams could not be read "
+                "and were carried forward unchanged: "
+                + "; ".join(skip.summary for skip in self.skipped_teams)
+            )
+        if self.dropped_authorship_rules:
+            parts.append(
+                f"{len(self.dropped_authorship_rules)} prompt authorship rule(s) were not "
+                "applied: "
+                + "; ".join(
+                    rule.summary for rule in self.dropped_authorship_rules
+                )
+            )
+        return " | ".join(parts)
 
     def to_json_obj(self) -> dict[str, JsonValue]:
-        """Return a run-receipt-compatible JSON object."""
+        """Return a run-receipt-compatible JSON object.
 
+        The two partiality arrays are always written, empty on a whole projection, so a reader
+        never has to distinguish an absent key from an empty one -- the same choice
+        ``ProjectIngestReport.to_json_obj`` made for ``failed_teams``.
+        """
+
+        skipped_values: list[JsonValue] = [
+            skip.to_json_obj() for skip in self.skipped_teams
+        ]
+        dropped_values: list[JsonValue] = [
+            rule.to_json_obj() for rule in self.dropped_authorship_rules
+        ]
         return {
             "teams": self.teams,
             "prompts": self.prompts,
@@ -150,6 +305,9 @@ class TranscriptExportReport:
             "carried_forward": self.carried_forward,
             "reclassified": self.reclassified,
             "files_changed": self.files_changed,
+            "skipped_teams": skipped_values,
+            "teams_skipped": len(self.skipped_teams),
+            "dropped_prompt_authorship_rules": dropped_values,
             "model_calls": 0,
             "model_tokens": 0,
         }
@@ -963,12 +1121,21 @@ def export_transcripts(
     archive: Path,
     teams: Iterable[TeamData],
     prompt_authorship_rules: Sequence[PromptAuthorshipRule] | None = None,
+    skipped_teams: Sequence[TranscriptTeamSkip] = (),
 ) -> TranscriptExportReport:
     """Update the archive's append-only coordinator transcript projection.
 
     This function performs no network requests and has no model integration. Existing source
     occurrences are retained when a provider's current snapshot no longer contains them, which
     protects the extracted corpus from provider-side history rewriting or log rotation.
+
+    ``skipped_teams`` names archive teams the caller could not load. They are *represented* in the
+    output -- their occurrences are carried forward and their authorship rules still applied -- but
+    nothing that happened to them since their last good run is, so every artifact this function
+    writes says which teams they were and why. At least one team must still have loaded: a
+    projection assembled entirely from carried-forward records would rewrite the corpus while the
+    archive is in a state nobody could read, which is the one moment not to touch it, and it would
+    also tell the operator nothing they did not already know from the load failures themselves.
     """
 
     ordered_teams = tuple(sorted(teams, key=lambda team: team.team_slug))
@@ -976,6 +1143,16 @@ def export_transcripts(
         raise ValueError("transcript extraction requires at least one ingested team")
     if len({team.team_slug for team in ordered_teams}) != len(ordered_teams):
         raise ValueError("transcript extraction received duplicate team slugs")
+    ordered_skips = tuple(sorted(skipped_teams, key=lambda skip: skip.team_slug))
+    skipped_slugs = {skip.team_slug for skip in ordered_skips}
+    if len(skipped_slugs) != len(ordered_skips):
+        raise ValueError("transcript extraction received duplicate skipped team slugs")
+    loaded_slugs = {team.team_slug for team in ordered_teams}
+    if skipped_slugs & loaded_slugs:
+        raise ValueError(
+            "transcript extraction received a team as both loaded and skipped: "
+            + ", ".join(sorted(skipped_slugs & loaded_slugs))
+        )
     root = archive / "extracted" / "transcripts"
     previous_manifest = _validate_previous_manifest(root)
     if previous_manifest is not None:
@@ -983,20 +1160,49 @@ def export_transcripts(
             as_string(value, "transcript manifest team")
             for value in as_array(previous_manifest.get("teams"), "transcript manifest teams")
         }
-        selected_teams = {team.team_slug for team in ordered_teams}
-        omitted = sorted(previous_teams - selected_teams)
+        # A skipped team is not an omitted team. This guard exists to stop the projection being
+        # silently *narrowed* -- by a `--team` filter, or by a team directory that was deleted --
+        # and both of those are decisions, recoverable only by a human who knows what was dropped.
+        # A team that merely failed to load is still in the archive, still in this manifest's
+        # `teams`, still carried in `occurrences.jsonl`, and named in `skipped_teams`, so nothing
+        # the guard protects is at risk. Refusing it anyway is precisely how one torn team came to
+        # withhold eleven healthy teams' new prompts on every run until someone intervened.
+        omitted = sorted(previous_teams - loaded_slugs - skipped_slugs)
         if omitted:
             raise ValueError(
                 "monotonic transcript export cannot omit previously extracted teams: "
                 + ", ".join(omitted)
             )
+    previous_occurrences = _load_jsonl(root / "occurrences.jsonl")
     configured_rules = (
         tuple(prompt_authorship_rules)
         if prompt_authorship_rules is not None
         else _load_rules(root / _AUTHORSHIP_RULES_FILE)
     )
+    # Rules are validated against every team the projection *represents*, not just the teams read
+    # this run, and the difference is load-bearing rather than lenient. `_apply_authorship_rules`
+    # rebuilds authorship from the source label on every occurrence on every run -- it resets
+    # `author_kind` and drops `authorship_rule_id` before re-matching -- so a rule withdrawn
+    # because its team could not be loaded would not merely fail to classify anything new: it
+    # would *un-classify* that team's carried-forward prompts, silently reverting audited
+    # corrections to `unknown` in a projection that otherwise looks complete. Carrying a team's
+    # records forward is only safe together with carrying its rules forward.
+    projected_teams = (
+        loaded_slugs
+        | skipped_slugs
+        | {
+            as_string(record.get("team_slug"), "old record.team_slug")
+            for record in previous_occurrences
+        }
+    )
+    dropped_authorship_rules = tuple(
+        DroppedAuthorshipRule(rule.rule_id, rule.team_slug)
+        for rule in configured_rules
+        if rule.team_slug not in projected_teams
+    )
     rules = _validate_rules(
-        configured_rules, {team.team_slug for team in ordered_teams}
+        [rule for rule in configured_rules if rule.team_slug in projected_teams],
+        projected_teams,
     )
 
     current_prompts = [
@@ -1013,7 +1219,7 @@ def export_transcripts(
 
     current_occurrences = [*current_prompts, *current_responses, *current_system]
     occurrences, carried, reclassified, migrated_authorship = _monotonic_union(
-        _load_jsonl(root / "occurrences.jsonl"), current_occurrences
+        previous_occurrences, current_occurrences
     )
     rule_counts = _apply_authorship_rules(
         occurrences, rules, migrated_authorship
@@ -1089,13 +1295,30 @@ def export_transcripts(
     rule_count_values: dict[str, JsonValue] = {
         rule_id: count for rule_id, count in rule_counts.items()
     }
+    team_values: list[JsonValue] = list(sorted(loaded_slugs | skipped_slugs))
+    skipped_values: list[JsonValue] = [
+        skip.to_manifest_obj() for skip in ordered_skips
+    ]
+    dropped_rule_values: list[JsonValue] = [
+        rule.to_json_obj() for rule in dropped_authorship_rules
+    ]
     manifest: dict[str, JsonValue] = {
         "schema_version": TRANSCRIPT_EXPORT_SCHEMA_VERSION,
         "kind": "mechanical-coordinator-transcript-export",
         "model_calls": 0,
         "model_tokens": 0,
-        "teams": [team.team_slug for team in ordered_teams],
+        # Every team this projection represents, read or carried -- which is what the next run's
+        # omission guard needs. Listing only the teams read this run would let a skipped team fall
+        # out of the manifest, and a team that has fallen out can afterwards be deleted from the
+        # archive entirely without the guard ever noticing.
+        "teams": team_values,
+        # ...whereas `source_generations` holds only the teams actually read, because a generation
+        # entry asserts a source digest that was computed this run. There is no honest entry to
+        # write for a team nobody could load, and inventing one from the previous manifest would
+        # be a claim about bytes this run never saw.
         "source_generations": source_generations,
+        "skipped_teams": skipped_values,
+        "dropped_prompt_authorship_rules": dropped_rule_values,
         "counts": {
             "prompts": len(prompts),
             "responses": len(responses),
@@ -1104,6 +1327,8 @@ def export_transcripts(
             "carried_forward": carried,
             "reclassified": reclassified,
             "prompt_authorship_rules": len(rules),
+            "teams_read": len(ordered_teams),
+            "teams_skipped": len(ordered_skips),
         },
         "prompt_authorship": {
             "rule_application_counts": rule_count_values,
@@ -1135,12 +1360,16 @@ def export_transcripts(
         carried_forward=carried,
         files_changed=changed,
         reclassified=reclassified,
+        skipped_teams=ordered_skips,
+        dropped_authorship_rules=dropped_authorship_rules,
     )
 
 
 __all__ = [
+    "DroppedAuthorshipRule",
     "PromptAuthorshipRule",
     "TRANSCRIPT_EXPORT_SCHEMA_VERSION",
     "TranscriptExportReport",
+    "TranscriptTeamSkip",
     "export_transcripts",
 ]

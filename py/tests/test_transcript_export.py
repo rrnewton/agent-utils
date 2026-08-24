@@ -15,6 +15,7 @@ from agent_team_timeline.cli import main as timeline_main
 from agent_team_timeline.model import Agent, Event, TeamData
 from agent_team_timeline.transcript_export import (
     PromptAuthorshipRule,
+    TranscriptTeamSkip,
     export_transcripts,
 )
 
@@ -734,3 +735,245 @@ def test_prompt_query_selects_durable_authorship_without_prose_guessing(
         "prompt",
     ]
     assert bot_messages[1]["text"] == "Response linked to the agent prompt"
+
+
+def _skip(team_slug: str, message: str = "torn normalized generation") -> TranscriptTeamSkip:
+    return TranscriptTeamSkip.from_exception(team_slug, ValueError(message))
+
+
+def test_an_unreadable_team_is_carried_forward_and_named_rather_than_stopping_the_rest(
+    tmp_path: Path,
+) -> None:
+    """The reviewer's scenario: one team cannot be loaded, every other team still projects.
+
+    The authorship rule is the part that makes this more than an exception-handling change.
+    ``_apply_authorship_rules`` rebuilds attribution from the *source* label on every occurrence
+    on every run, so dropping the unreadable team's rule along with the team would not merely
+    fail to classify anything new -- it would silently revert an audited correction on records
+    that are still in the projection. Filtering rules to the loaded teams, which is the obvious
+    reading of "filter authorship rules", fails this test on the ``owner_human`` assertion.
+    """
+
+    legacy_prompt = replace(
+        _event("alpha-prompt", "turn-a", 200, "user_prompt", "Legacy", 10),
+        source_native_id="legacy-message",
+        ingress_kind="submitted_web",
+        author_kind="external_or_unknown",
+    )
+    alpha = replace(_team((legacy_prompt,)), provider="orc")
+    beta = replace(
+        _team((_event("beta-prompt", "turn-b", 300, "user_prompt", "First", 1),)),
+        team_slug="beta",
+    )
+    rule = PromptAuthorshipRule(
+        "legacy-owner",
+        "alpha",
+        "submitted_web",
+        "owner_human",
+        "The audited legacy message was submitted by the owner.",
+        source_native_ids=("legacy-message",),
+    )
+    root = tmp_path / "extracted" / "transcripts"
+
+    whole = export_transcripts(tmp_path, (alpha, beta), (rule,))
+    assert whole.teams == 2
+    assert whole.partial is False
+    assert whole.partiality_summary() is None
+
+    # Alpha is now unreadable, and beta has meanwhile received a new prompt.
+    grown_beta = replace(
+        beta,
+        events=(
+            *beta.events,
+            _event("beta-prompt-2", "turn-b2", 400, "user_prompt", "Second", 2),
+        ),
+    )
+    partial = export_transcripts(tmp_path, (grown_beta,), (rule,), (_skip("alpha"),))
+
+    assert partial.teams == 1
+    assert partial.partial is True
+    assert [skip.team_slug for skip in partial.skipped_teams] == ["alpha"]
+    assert partial.skipped_teams[0].error_type == "ValueError"
+    assert partial.skipped_teams[0].error == "torn normalized generation"
+    assert partial.skipped_teams[0].traceback is None
+    assert partial.dropped_authorship_rules == ()
+    summary = partial.partiality_summary()
+    assert summary is not None
+    assert "1 of 2 archive teams could not be read" in summary
+    assert "alpha: ValueError: torn normalized generation" in summary
+
+    prompts = {str(record["text"]): record for record in _jsonl(root / "prompts.jsonl")}
+    # Beta's new prompt is projected -- the headline promise -- and alpha's is still there.
+    assert set(prompts) == {"Legacy", "First", "Second"}
+    assert prompts["Legacy"]["team_slug"] == "alpha"
+    assert prompts["Legacy"]["author_kind"] == "owner_human"
+    assert prompts["Legacy"]["authorship_rule_id"] == "legacy-owner"
+    assert prompts["Second"]["team_slug"] == "beta"
+
+
+def test_a_partial_projection_says_so_in_the_manifest_it_leaves_behind(
+    tmp_path: Path,
+) -> None:
+    """Whoever reads the archive later was not watching the run that wrote it."""
+
+    alpha = _team((_event("alpha-prompt", "turn-a", 200, "user_prompt", "One", 1),))
+    beta = replace(
+        _team((_event("beta-prompt", "turn-b", 300, "user_prompt", "Two", 1),)),
+        team_slug="beta",
+    )
+    root = tmp_path / "extracted" / "transcripts"
+
+    export_transcripts(tmp_path, (alpha, beta))
+    export_transcripts(tmp_path, (beta,), None, (_skip("alpha"),))
+
+    manifest = as_object(
+        narrow_json(json.loads((root / "manifest.json").read_text(encoding="utf-8"))),
+        "manifest",
+    )
+    # `teams` keeps every team the projection represents, so the omission guard can still see
+    # alpha next run; `source_generations` holds only the team whose bytes were actually read.
+    assert manifest["teams"] == ["alpha", "beta"]
+    generations = as_object(
+        narrow_json(json.loads(json.dumps(manifest["source_generations"]))[0]),
+        "generation",
+    )
+    assert generations["team_slug"] == "beta"
+    assert manifest["skipped_teams"] == [
+        {
+            "team_slug": "alpha",
+            "error_type": "ValueError",
+            "error": "torn normalized generation",
+        }
+    ]
+    counts = as_object(manifest["counts"], "counts")
+    assert counts["teams_read"] == 1
+    assert counts["teams_skipped"] == 1
+
+
+def test_a_skipped_team_does_not_open_the_door_to_deleting_a_team_from_the_projection(
+    tmp_path: Path,
+) -> None:
+    """The omission guard is relaxed for skips and for nothing else."""
+
+    alpha = _team((_event("alpha-prompt", "turn-a", 200, "user_prompt", "One", 1),))
+    beta = replace(
+        _team((_event("beta-prompt", "turn-b", 300, "user_prompt", "Two", 1),)),
+        team_slug="beta",
+    )
+    export_transcripts(tmp_path, (alpha, beta))
+
+    with pytest.raises(ValueError, match="cannot omit previously extracted teams: alpha"):
+        export_transcripts(tmp_path, (beta,))
+
+    # Naming it as a skip is what makes it legal, and it stays legal on the run after that.
+    export_transcripts(tmp_path, (beta,), None, (_skip("alpha"),))
+    export_transcripts(tmp_path, (beta,), None, (_skip("alpha"),))
+    with pytest.raises(ValueError, match="cannot omit previously extracted teams: alpha"):
+        export_transcripts(tmp_path, (beta,))
+
+
+def test_a_rule_for_a_team_the_archive_has_no_data_for_is_set_aside_not_fatal(
+    tmp_path: Path,
+) -> None:
+    """Route (a): a newly registered team whose very first ingest failed.
+
+    Its configured rules point at a slug the archive has never heard of. That used to raise
+    ``prompt authorship rule ... selects unknown team`` and take the whole projection down with
+    it, every run, until a human fixed the new team.
+    """
+
+    alpha = _team((_event("alpha-prompt", "turn-a", 200, "user_prompt", "One", 1),))
+    reachable = PromptAuthorshipRule(
+        "alpha-owner",
+        "alpha",
+        "typed",
+        "owner_human",
+        "Audited: alpha's typed ingress is the owner.",
+    )
+    orphan = PromptAuthorshipRule(
+        "newcomer-owner",
+        "newcomer",
+        "submitted_web",
+        "owner_human",
+        "Audited: the new team's web ingress is the owner.",
+    )
+
+    report = export_transcripts(tmp_path, (alpha,), (reachable, orphan))
+
+    assert report.prompts == 1
+    assert report.partial is True
+    assert report.skipped_teams == ()
+    assert [rule.rule_id for rule in report.dropped_authorship_rules] == [
+        "newcomer-owner"
+    ]
+    assert report.dropped_authorship_rules[0].team_slug == "newcomer"
+    summary = report.partiality_summary()
+    assert summary is not None
+    assert "1 prompt authorship rule(s) were not applied" in summary
+    assert "newcomer-owner (team newcomer has no normalized data)" in summary
+
+    root = tmp_path / "extracted" / "transcripts"
+    persisted = as_object(
+        narrow_json(
+            json.loads((root / "authorship-rules.json").read_text(encoding="utf-8"))
+        ),
+        "rules",
+    )
+    rules_json = json.loads(json.dumps(persisted["rules"]))
+    assert [rule["rule_id"] for rule in rules_json] == ["alpha-owner"]
+
+    # Once the newcomer finally ingests, its rule is live again with no operator action.
+    newcomer_prompt = replace(
+        _event("newcomer-prompt", "turn-n", 400, "user_prompt", "Hello", 1),
+        ingress_kind="submitted_web",
+        author_kind="external_or_unknown",
+    )
+    healed = export_transcripts(
+        tmp_path,
+        (alpha, replace(_team((newcomer_prompt,)), team_slug="newcomer")),
+        (reachable, orphan),
+    )
+    assert healed.partial is False
+    prompts = {str(record["text"]): record for record in _jsonl(root / "prompts.jsonl")}
+    assert prompts["Hello"]["author_kind"] == "owner_human"
+    assert prompts["Hello"]["authorship_rule_id"] == "newcomer-owner"
+
+
+def test_an_unclassified_load_failure_keeps_its_traceback_off_the_durable_manifest(
+    tmp_path: Path,
+) -> None:
+    """The evidence goes to the receipt; the manifest keeps bytes that do not churn."""
+
+    skip = TranscriptTeamSkip.from_exception("alpha", KeyError("messages"))
+    assert skip.error_type == "KeyError"
+    assert skip.traceback is not None
+    assert "KeyError" in skip.traceback
+    assert skip.to_json_obj()["traceback"] == skip.traceback
+    assert "traceback" not in skip.to_manifest_obj()
+
+    beta = replace(
+        _team((_event("beta-prompt", "turn-b", 300, "user_prompt", "Two", 1),)),
+        team_slug="beta",
+    )
+    export_transcripts(tmp_path, (beta,), None, (skip,))
+    manifest = as_object(
+        narrow_json(
+            json.loads(
+                (tmp_path / "extracted" / "transcripts" / "manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+        ),
+        "manifest",
+    )
+    assert manifest["skipped_teams"] == [
+        {"team_slug": "alpha", "error_type": "KeyError", "error": "'messages'"}
+    ]
+
+
+def test_export_still_refuses_a_team_offered_as_both_loaded_and_skipped(
+    tmp_path: Path,
+) -> None:
+    alpha = _team((_event("alpha-prompt", "turn-a", 200, "user_prompt", "One", 1),))
+    with pytest.raises(ValueError, match="both loaded and skipped: alpha"):
+        export_transcripts(tmp_path, (alpha,), None, (_skip("alpha"),))

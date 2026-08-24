@@ -67,6 +67,7 @@ from agent_team_timeline.identity import (
     site_identity_from_json_obj,
 )
 from agent_team_timeline.orc import (
+    OrcAppendPrefixOverride,
     OrcContinuationLink,
     OrcContinuationSpec,
     OrcParseError,
@@ -141,6 +142,7 @@ if TYPE_CHECKING:
     from agent_team_timeline.transcript_export import (
         PromptAuthorshipRule,
         TranscriptExportReport,
+        TranscriptTeamSkip,
     )
 
 
@@ -257,10 +259,27 @@ class IngestReport:
     files_changed: int
     artifacts: int = 0
     projects: int = 0
+    # Append-prefix rewrites an operator explicitly accepted *during this ingest*. Empty for every
+    # provider but Orc, and empty for Orc unless the override flag was passed and fired. It rides
+    # on the ingest report because that is what lands in the run receipt, and an override that
+    # existed only as a line of terminal output would be unauditable the moment the terminal
+    # scrolled.
+    orc_prefix_overrides: tuple[OrcAppendPrefixOverride, ...] = ()
+    # One-time reclamation of the retired `raw/messages/<thread-id>.json` projection, counted only
+    # on the ingest that actually swept it and zero on every ingest afterwards. It is recorded in
+    # the run receipt for the same reason the override above is: a several-hundred-megabyte
+    # deletion inside an operator's version-controlled archive should be explicable months later
+    # from the archive itself, not only from whichever terminal happened to be open.
+    retired_message_projections: int = 0
+    retired_message_projection_bytes: int = 0
 
     def to_json_obj(self) -> dict[str, JsonValue]:
         """Return the ingest report as a JSON-serializable object."""
 
+        overrides: list[JsonValue] = [
+            narrow_json(override.to_json_obj())
+            for override in self.orc_prefix_overrides
+        ]
         return {
             "team_slug": self.team_slug,
             "source_digest": self.source_digest,
@@ -273,6 +292,9 @@ class IngestReport:
             "files_changed": self.files_changed,
             "artifacts": self.artifacts,
             "projects": self.projects,
+            "orc_prefix_overrides": overrides,
+            "retired_message_projections": self.retired_message_projections,
+            "retired_message_projection_bytes": self.retired_message_projection_bytes,
         }
 
 
@@ -422,6 +444,98 @@ def _source_manifest_path(archive: Path, team_slug: str) -> Path:
 def _normalized_generation_path(archive: Path, team_slug: str) -> Path:
     _validate_team_slug(team_slug)
     return archive / "teams" / team_slug / "raw" / "normalized-generation.json"
+
+
+def _retired_message_projection_root(archive: Path, team_slug: str) -> Path:
+    _validate_team_slug(team_slug)
+    return archive / "teams" / team_slug / "raw" / "messages"
+
+
+def _retire_message_projections(archive: Path, team_slug: str) -> tuple[int, int]:
+    """Remove the retired per-thread projection of ``raw/team.json``; report files and bytes.
+
+    ``teams/<slug>/raw/messages/<thread-id>.json`` was written by every ingest from this tool's
+    first commit and read by nothing, ever. There is no reader in this package, in its tests, in
+    the browser bundle, in the standalone ``timeline`` CLI, ``serve.py`` or ``run_stats.py``
+    shipped into each archive, nor in any revision of any of those: the only path join naming that
+    directory in the entire repository history was the writer. Each file was a pure per-thread
+    partition of ``raw/team.json`` -- the same agent, turn, event, tool-call and edge records,
+    re-serialized once per thread -- so it carried no information the archive does not still hold
+    and can be recomputed from ``raw/team.json`` at any time. On the twelve-team archive that
+    prompted this it was 675,371,783 bytes across 2,932 files -- 50.9% of everything under
+    ``teams/`` that is not a gitignored source snapshot, so it roughly doubled the size of the
+    version-controlled archive -- and every ingest rewrote all of it.
+
+    **Why remove it rather than leave it.** An archive is meant to be version-controlled, and
+    ``raw/messages/`` is not in the generated ``.gitignore``, so every one of those files is
+    tracked. A tracked file the tool has stopped maintaining is worse than an absent one: it keeps
+    being cloned, it keeps being diffed, and it reads as current when it is frozen. That is the
+    same judgement ``render.prune_retired_query_artifacts`` already made for the retired generated
+    ``query.py`` launcher, and this reuses its discipline rather than inventing a second one.
+
+    **Why at ingest rather than at build.** ``raw/`` is the ingest namespace. The build sweepers --
+    ``render._safe_presentation_file`` and ``multi_team._safe_generated_path`` -- cannot even name
+    a path under ``raw/``; they raise, and a test pins that refusal precisely so a presentation bug
+    can never delete ingest data. Retiring from build would mean punching a hole in the guard whose
+    whole job is to protect this directory. Ingest already creates, writes and fsyncs it, so the
+    retirement belongs exactly where the writer was. A separate ``gc`` command was the other
+    option and was rejected: it is a second mechanism for something the repository already has an
+    idiom for, and it reclaims nothing for an operator who never learns it exists.
+
+    **Why this is safe for an old archive read by an old reader.** No reader ever existed, in any
+    version, so there is no older reader to break; the content remains derivable from
+    ``raw/team.json``, which is written and fsynced immediately before this runs and is never
+    removed; and in a versioned archive the deleted bytes stay in history.
+
+    **What the sweep deletes, stated exactly.** Regular files directly inside the directory whose
+    names have the *shape* the writer used -- ``<archive-id>.json``, the same identifier grammar
+    ``_validate_archive_id`` enforces on a thread id -- and nothing else. It deliberately does not
+    narrow that to the thread ids of the team being ingested right now, which are in hand at the
+    only call site. The old writer never deleted anything it had written, so a lineage re-ingested
+    under a narrower ``--team`` selection or date window left projections behind for threads the
+    current ``raw/team.json`` no longer mentions. Those orphans are the oldest and least
+    recoverable bytes in the directory, an exact-name sweep would strand them permanently, and
+    because they would then keep the directory non-empty forever it could never be removed either
+    -- so the narrower rule fails at the one job this function has. The price is real and is not
+    hidden: a file of your own directly inside this directory named ``<something>.json`` is swept
+    with the rest. That is the bargain every other path under ``raw/`` already makes -- ``raw/`` is
+    the ingest namespace, not a place to keep notes -- and it is the one respect in which this
+    sweep is broader than ``render.prune_retired_query_artifacts``, which can afford byte equality
+    because its retired artifact had exactly one possible content. A per-thread projection does
+    not: its bytes depend on the thread, so there is no fixed content to compare against.
+
+    A symlink, a subdirectory, a ``.gz`` sidecar and any name outside the grammar are left
+    untouched, and any one of them left behind leaves the directory itself in place.
+
+    The sweep needs no durability barrier of its own, unlike the writes around it: it is
+    idempotent, so a crash that loses the unlinks costs one repeat on the next ingest.
+    """
+
+    root = _retired_message_projection_root(archive, team_slug)
+    if root.is_symlink() or not root.is_dir():
+        return 0, 0
+    files = 0
+    freed = 0
+    foreign = False
+    for entry in sorted(root.iterdir()):
+        name = entry.name
+        stem = name.removesuffix(".json")
+        # `_ARCHIVE_ID` is the identifier grammar, not the current team's thread ids: see the
+        # docstring for why matching the writer's name *shape* is deliberate and what it costs.
+        if (
+            name == stem
+            or entry.is_symlink()
+            or not entry.is_file()
+            or _ARCHIVE_ID.fullmatch(stem) is None
+        ):
+            foreign = True
+            continue
+        freed += entry.stat().st_size
+        entry.unlink()
+        files += 1
+    if not foreign:
+        root.rmdir()
+    return files, freed
 
 
 def _file_sha256(path: Path) -> str:
@@ -709,6 +823,10 @@ def _write_ingested_team(
         )
     )
     archived = _archive_team(team)
+    # These identifiers still reach the filesystem even though the per-thread projection that first
+    # motivated the check is gone: `summary_data/agents/<thread-id>.json` and
+    # `summaries/agents/<thread-id>.md` are both built by interpolating `agent.thread_id`
+    # directly, with no guard of their own. Do not remove this loop with the writer below it.
     _validate_archive_id(archived.root_thread_id, "root thread id")
     for agent in archived.agents:
         _validate_archive_id(agent.thread_id, "thread id")
@@ -717,42 +835,10 @@ def _write_ingested_team(
             _raw_team_path(archive, team_slug), narrow_json(archived.to_json_obj())
         )
     )
-    by_thread = {agent.thread_id: agent for agent in archived.agents}
-    for thread_id, agent in by_thread.items():
-        obj: dict[str, object] = {
-            "agent": agent.to_json_obj(),
-            "turns": [
-                turn.to_json_obj()
-                for turn in archived.turns
-                if turn.thread_id == thread_id
-            ],
-            "messages": [
-                event.to_json_obj()
-                for event in archived.events
-                if event.thread_id == thread_id
-            ],
-            "tools": [
-                tool.to_json_obj()
-                for tool in archived.tool_calls
-                if tool.thread_id == thread_id
-            ],
-            "edges": [
-                edge.to_json_obj()
-                for edge in archived.edges
-                if edge.from_thread_id == thread_id or edge.to_thread_id == thread_id
-            ],
-        }
-        changed += int(
-            _write_json_durable(
-                archive
-                / "teams"
-                / team_slug
-                / "raw"
-                / "messages"
-                / f"{thread_id}.json",
-                narrow_json(obj),
-            )
-        )
+    # Sweep the retired per-thread projection only once the file it was a projection *of* is
+    # durable, so no instant exists in which the archive holds neither.
+    retired_files, retired_bytes = _retire_message_projections(archive, team_slug)
+    changed += retired_files
     digest = source_digest(team)
     snapshot: dict[str, object] = {
         "provider": team.provider,
@@ -781,6 +867,8 @@ def _write_ingested_team(
         files_changed=changed,
         artifacts=len(artifact_catalog.artifacts),
         projects=len(artifact_catalog.projects),
+        retired_message_projections=retired_files,
+        retired_message_projection_bytes=retired_bytes,
     )
     return archived, report
 
@@ -1189,6 +1277,7 @@ def _ingest_orc_locked(
     date_window: DateWindow | None,
     identity_overrides: IdentityOverrides | None,
     continuation_specs: Sequence[str | OrcContinuationSpec],
+    accept_prefix_rewrite: Sequence[str],
 ) -> tuple[TeamData, IngestReport]:
     """Snapshot and normalize one Orc coordinator lineage."""
 
@@ -1211,6 +1300,7 @@ def _ingest_orc_locked(
         utc_now(),
         manifest_state.continuation_specs,
         manifest_state.continuation_links,
+        accept_prefix_rewrite,
     )
     changed += snapshot.files_changed
     resolved_specs = tuple(
@@ -1281,6 +1371,7 @@ def _ingest_orc_locked(
     return archived, replace(
         report,
         files_changed=report.files_changed + marker_changed + gc_changed,
+        orc_prefix_overrides=snapshot.prefix_overrides,
     )
 
 
@@ -1293,8 +1384,17 @@ def ingest_orc(
     date_window: DateWindow | None = None,
     identity_overrides: IdentityOverrides | None = None,
     continuation_specs: Sequence[str | OrcContinuationSpec] = (),
+    accept_prefix_rewrite: Sequence[str] = (),
 ) -> tuple[TeamData, IngestReport]:
-    """Snapshot and normalize one Orc lineage as a serialized raw-data transaction."""
+    """Snapshot and normalize one Orc lineage as a serialized raw-data transaction.
+
+    ``accept_prefix_rewrite`` is empty by default and stays empty unless an operator names sessions
+    on the command line. When a *named* session's recorded append prefix has been rewritten in
+    place, the digest is re-baselined, the change is described row by row and column by column in
+    ``IngestReport.orc_prefix_overrides`` and in the source manifest, and the source is marked
+    degraded. Nothing is deleted and no row is skipped on that path. A rewritten session the list
+    does not name still refuses the whole ingest, because the operator has not been shown it yet.
+    """
 
     with _archive_writer_lock(archive):
         return _ingest_orc_locked(
@@ -1306,6 +1406,7 @@ def ingest_orc(
             date_window,
             identity_overrides,
             continuation_specs,
+            accept_prefix_rewrite,
         )
 
 
@@ -1348,9 +1449,25 @@ def extract_transcripts_archive(
     An empty selection means every team with normalized raw data in this archive. The archive
     writer lock makes the multi-file JSONL generation serial with provider ingestion and site
     builds; no summarizer or model adapter is reachable from this operation.
+
+    A team that cannot be loaded is skipped and reported rather than ending the extraction. Loading
+    is per team and reads only ``teams/<slug>/``, so one team's torn or unreadable state says
+    nothing about the others -- and the projection is a monotonic union seeded with everything
+    already in ``occurrences.jsonl``, so a skipped team keeps contributing exactly what it
+    contributed on its last good run. Raising instead, as this did, meant a single team caught
+    between its source manifest and its normalized-generation marker withheld every *other* team's
+    new prompts on every run until a human intervened. The returned report names the skipped teams
+    and their causes; callers must consult :attr:`TranscriptExportReport.partial` and report it,
+    because a partial projection that reads as complete is worse than the failure it replaced.
+
+    All of them failing is still fatal: see :func:`export_transcripts` for why an archive nobody
+    can read is the one state not to rewrite the corpus in.
     """
 
-    from agent_team_timeline.transcript_export import export_transcripts
+    from agent_team_timeline.transcript_export import (
+        TranscriptTeamSkip as _TranscriptTeamSkip,
+        export_transcripts,
+    )
 
     with _archive_writer_lock(archive):
         selected = tuple(team_slugs)
@@ -1369,8 +1486,22 @@ def extract_transcripts_archive(
             raise ValueError(f"no ingested teams found in {archive}")
         if len(set(selected)) != len(selected):
             raise ValueError("transcript extraction team selection contains duplicates")
-        teams = tuple(load_archived_team(archive, team_slug) for team_slug in selected)
-        return export_transcripts(archive, teams, authorship_rules)
+        teams: list[TeamData] = []
+        skipped: list[TranscriptTeamSkip] = []
+        for team_slug in selected:
+            try:
+                teams.append(load_archived_team(archive, team_slug))
+            except Exception as error:  # Deliberately broad; see TranscriptTeamSkip.from_exception.
+                # BaseException is deliberately NOT caught: a KeyboardInterrupt or SystemExit is the
+                # operator or the runtime stopping this process, and carrying on to the next team
+                # would be ignoring that, not being robust to one bad team.
+                skipped.append(_TranscriptTeamSkip.from_exception(team_slug, error))
+        if not teams:
+            raise ValueError(
+                f"no archive team in {archive} could be loaded for transcript extraction: "
+                + "; ".join(skip.summary for skip in skipped)
+            )
+        return export_transcripts(archive, teams, authorship_rules, skipped)
 
 
 def load_artifact_catalog(

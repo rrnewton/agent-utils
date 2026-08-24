@@ -24,6 +24,7 @@ from agent_team_timeline.archive import (
     read_json,
     write_json_if_changed,
 )
+from agent_team_timeline.cli import main as timeline_main
 from agent_team_timeline.orc import (
     OrcContinuationLink,
     OrcContinuationSpec,
@@ -4066,3 +4067,1330 @@ def test_orc_pipeline_allows_narrowing_but_rejects_widening_ingest_window(
             "orc-test",
             "America/New_York",
         )
+
+
+# --- operator override for an in-place append-prefix rewrite -----------------------------------
+#
+# The incident these cover: an upstream backfill wrote "token_count" into one already-captured
+# `messages` row about nine minutes after capture. The append-prefix guard is byte-exact over 18
+# content_blocks columns and 6 messages columns, so it refused the whole lineage -- correctly, on
+# the evidence it had, and uselessly, because it could not say which row or column moved.
+
+
+def _override_prefix(parent_id: str | None) -> str:
+    return "ov" if parent_id is None else "nested-ov"
+
+
+def _override_block(prefix: str, session_id: str, index: int) -> tuple[object, ...]:
+    """Return one `content_blocks` row of an override fixture session."""
+
+    return (
+        f"{prefix}-block-{index}",
+        f"{prefix}-message-{index}",
+        session_id,
+        0,
+        _ms("2026-08-15T10:00:00+00:00") + index * 1000,
+        1,
+        "user" if index % 2 == 0 else "assistant",
+        "text",
+        f"Recorded line {index}",
+        None,
+        None,
+        None,
+        None,
+        None if index % 2 == 0 else "model",
+        None,
+        None,
+        None,
+    )
+
+
+def _override_message(
+    prefix: str, session_id: str, row_id: int, offset: int
+) -> tuple[int, str, int, dict[str, object]]:
+    """Return one `messages` row of an override fixture session."""
+
+    created_at_ms = _ms("2026-08-15T10:00:00+00:00") + offset
+    return (
+        row_id,
+        session_id,
+        created_at_ms,
+        {
+            "id": f"{prefix}-native-{row_id}",
+            "role": "User" if row_id == 1 else "Assistant",
+            "source": None,
+            "created_at_ms": created_at_ms,
+            "blocks": [{"type": "AgentBlock", "id": 90 + row_id, "agent_id": "worker"}],
+            "token_count": None,
+        },
+    )
+
+
+def _override_session(
+    path: Path,
+    session_id: str,
+    *,
+    parent_id: str | None,
+    db_name: str | None,
+    content_blocks: int,
+) -> None:
+    """Write one modern Orc session (dual content_blocks/messages storage) at *path*.
+
+    Message ids deliberately skip 3 and 4. That gap is not decoration: it is the only way to test
+    a row *appearing* inside an already-recorded prefix, because a straight insert past the
+    watermark is caught earlier by the row-count guard instead.
+
+    The rows come from :func:`_override_block` and :func:`_override_message` rather than being
+    written inline, because :func:`_receive_live_traffic` has to append rows this fixture would
+    have produced itself had capture happened a minute later. Two generators would eventually
+    diverge in some column nobody is looking at, and the append-prefix digest covers every column.
+    """
+
+    prefix = _override_prefix(parent_id)
+    _session_database(
+        path,
+        session_id,
+        parent_id=parent_id,
+        db_name=db_name,
+        messages=[],
+        blocks=[
+            _override_block(prefix, session_id, index) for index in range(content_blocks)
+        ],
+        created_at="2026-08-15T09:00:00+00:00",
+        updated_at="2026-08-15T11:00:00+00:00",
+    )
+    _add_messages(
+        path,
+        tuple(
+            _override_message(prefix, session_id, row_id, offset)
+            for row_id, offset in ((1, 0), (2, 1000), (5, 5000))
+        ),
+    )
+
+
+def _receive_live_traffic(
+    path: Path,
+    session_id: str,
+    *,
+    block_indices: Sequence[int],
+    messages: Sequence[tuple[int, int]],
+    updated_at: str,
+) -> None:
+    """Append rows to a session that is still running, the way Orc itself would.
+
+    This is the half of the incident every other override fixture leaves out. The observed
+    backfill landed on the *watermark row* of a session that was still receiving messages, about
+    nine minutes after capture -- so by the time the operator re-ran the ingest, the database had
+    both the rewritten row and rows that simply had not existed before. A fixture frozen between
+    the two runs makes the re-baselined digest and the append count come out unchanged, which is
+    an artifact of the fixture and not a property of the feature.
+
+    `session_meta.updated_at` moves forward with the rows because a real session's does, and the
+    meta-extension guard reads it: leaving it behind would test appending against a session that
+    claims not to have changed.
+    """
+
+    prefix = _override_prefix(_session_parent_id(path))
+    connection = sqlite3.connect(path)
+    try:
+        connection.executemany(
+            "INSERT INTO content_blocks VALUES "
+            "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            tuple(_override_block(prefix, session_id, index) for index in block_indices),
+        )
+        connection.executemany(
+            "INSERT INTO messages(id, session_id, role, created_at_ms, message_json, "
+            "search_text) VALUES (?, ?, ?, ?, ?, NULL)",
+            tuple(
+                (
+                    row_id,
+                    row_session_id,
+                    str(message["role"]).lower(),
+                    timestamp_ms,
+                    json.dumps(message, separators=(",", ":")),
+                )
+                for row_id, row_session_id, timestamp_ms, message in (
+                    _override_message(prefix, session_id, row_id, offset)
+                    for row_id, offset in messages
+                )
+            ),
+        )
+        connection.execute(
+            "UPDATE session_meta SET updated_at = ? WHERE id = ?",
+            (updated_at, session_id),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _session_parent_id(path: Path) -> str | None:
+    connection = sqlite3.connect(path)
+    try:
+        row = connection.execute("SELECT parent_id FROM session_meta").fetchone()
+    finally:
+        connection.close()
+    parent_id = row[0]
+    return None if parent_id is None else str(parent_id)
+
+
+def _override_fixture(
+    tmp_path: Path, *, content_blocks: int = 2
+) -> tuple[Path, Path, Path]:
+    """Build a single-session override source plus its task database."""
+
+    source = tmp_path / "override-source"
+    root_db = source / ".orc" / "sessions" / ROOT / "session.db"
+    _override_session(
+        root_db, ROOT, parent_id=None, db_name="project", content_blocks=content_blocks
+    )
+    _task_database(source / ".tg" / "project.db")
+    _index_database(source / ".orc" / "index.db", ((ROOT, None),))
+    return source, root_db, tmp_path / "override-snapshot"
+
+
+def _nested_override_fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
+    """Build the two-session lineage the override's scope is actually about.
+
+    A single-session fixture cannot see the failure this exists to pin, because with one session
+    "authorize the run" and "authorize the session" are the same statement. The shape is the one
+    the rest of this suite already uses for a lineage -- a root coordinator plus one nested session
+    reached through the index -- so the guard runs twice over sources that fail independently.
+    """
+
+    source = tmp_path / "nested-override-source"
+    root_db = source / ".orc" / "sessions" / ROOT / "session.db"
+    nested_db = source / ".orc" / "sessions" / NESTED / "session.db"
+    _override_session(
+        root_db, ROOT, parent_id=None, db_name="project", content_blocks=2
+    )
+    _override_session(
+        nested_db, NESTED, parent_id=ROOT, db_name=None, content_blocks=2
+    )
+    _task_database(source / ".tg" / "project.db")
+    _index_database(
+        source / ".orc" / "index.db", ((ROOT, None), (NESTED, ROOT))
+    )
+    return source, root_db, nested_db, tmp_path / "nested-override-snapshot"
+
+
+def _backfill_token_count(path: Path, message_id: int, token_count: int) -> None:
+    """Reproduce the observed upstream edit: one JSON field, in place, after capture."""
+
+    connection = sqlite3.connect(path)
+    try:
+        raw = connection.execute(
+            "SELECT message_json FROM messages WHERE id = ?", (message_id,)
+        ).fetchone()[0]
+        message = json.loads(str(raw))
+        message["token_count"] = token_count
+        connection.execute(
+            "UPDATE messages SET message_json = ? WHERE id = ?",
+            (json.dumps(message, separators=(",", ":")), message_id),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _override_snapshot_objects(snapshot_root: Path) -> tuple[str, ...]:
+    root = snapshot_root / ".objects"
+    if not root.is_dir():
+        return ()
+    return tuple(sorted(path.name for path in root.glob("[0-9a-f][0-9a-f]/*.db")))
+
+
+def _session_source(sources: Sequence[OrcSourceCopy]) -> OrcSourceCopy:
+    return next(item for item in sources if item.kind == "session")
+
+
+def _task_source(sources: Sequence[OrcSourceCopy]) -> OrcSourceCopy:
+    return next(item for item in sources if item.kind == "task")
+
+
+def test_prefix_scopes_reproduce_the_guard_digest(tmp_path: Path) -> None:
+    """Pin the diff and the digest to one definition of "the prefix"."""
+
+    source, _, snapshot = _override_fixture(tmp_path)
+    first = snapshot_orc_lineage(source, ROOT, snapshot, (), "first")
+    session = _session_source(first.sources)
+    database = _snapshot_database(snapshot, session)
+
+    connection = orc_module._read_only(database)
+    try:
+        geometry = orc_module._session_geometry(connection, database, None)
+        scopes, legacy = orc_module._session_prefix_scopes(geometry, None, None)
+        digests = [
+            orc_module._query_digest(connection, scope.query, (scope.limit,))
+            for scope in scopes
+        ]
+    finally:
+        connection.close()
+
+    assert not legacy
+    assert [scope.table for scope in scopes] == ["content_blocks", "messages"]
+    combined = hashlib.sha256()
+    for value in (
+        "content_blocks",
+        digests[0][0],
+        scopes[0].limit,
+        digests[0][1],
+        "messages",
+        digests[1][0],
+        scopes[1].limit,
+        digests[1][1],
+    ):
+        orc_module._update_digest(combined, value)
+    assert combined.hexdigest() == session.append_prefix_sha256
+    assert digests[0][0] + digests[1][0] == session.append_count
+
+
+def test_append_prefix_rewrite_is_refused_by_default_and_names_row_column_and_field(
+    tmp_path: Path,
+) -> None:
+    source, root_db, snapshot = _override_fixture(tmp_path)
+    first = snapshot_orc_lineage(source, ROOT, snapshot, (), "first")
+    before_objects = _override_snapshot_objects(snapshot)
+    _backfill_token_count(root_db, 2, 445)
+
+    with pytest.raises(OrcParseError) as raised:
+        snapshot_orc_lineage(source, ROOT, snapshot, first.sources, "second")
+
+    message = str(raised.value)
+    assert "Orc session existing append prefix was rewritten for" in message
+    assert "1 row(s) changed" in message
+    assert "messages row 2" in message
+    assert "message_json .token_count" in message
+    assert '"token_count":null' in message
+    assert '"token_count":445' in message
+    # The recommended command is complete: the flag with the session id it authorizes, so the
+    # operator cannot accidentally re-baseline anything else by following the instruction.
+    assert f"--accept-orc-prefix-rewrite {ROOT} " in message
+    assert "authorizes this one session and no other" in message
+    # The refusal is where the operator decides, so the refusal -- not the user guide -- has to
+    # state what accepting costs: which object stops being the baseline, how long it is kept, and
+    # that the diff kept in exchange is a bounded summary, with the two numbers that bound it.
+    session = _session_source(first.sources)
+    assert f"supersedes the pre-rewrite snapshot {session.snapshot_path}" in message
+    assert "until the next accepted override on this source, then reclaimed" in message
+    assert "at most 20 of those 1 changed row(s)" in message
+    assert "at most 160 characters per column value" in message
+    # Refusing is still the default, and refusing still publishes nothing.
+    assert _override_snapshot_objects(snapshot) == before_objects
+
+
+def _prefix_digest_at(
+    snapshot_root: Path, source: OrcSourceCopy, watermark: int | None
+) -> str:
+    """Re-digest a published session snapshot at *watermark*, or in full when it is ``None``.
+
+    Two different digests share the name "append prefix sha256" and the difference only becomes
+    visible on a live session, which is exactly why it is worth naming here. The manifest's
+    `append_prefix_sha256` covers everything the source held at capture; an override's
+    `observed_append_prefix_sha256` covers only the rows at or below the *previous* watermark,
+    because that is the span the guard compared and the span the operator was shown a diff of.
+    """
+
+    return orc_module._logical_state(
+        _snapshot_database(snapshot_root, source),
+        "session",
+        prefix_max_id=watermark,
+    ).append_prefix_sha256
+
+
+def _recorded_lines(team: TeamData) -> set[str]:
+    """Return just the session transcript lines of an override fixture team.
+
+    The fixture's task database contributes events too, and they are irrelevant to whether an
+    appended `content_blocks` row was ingested -- comparing whole event sets would drag them into
+    an assertion about session traffic and make the failure unreadable.
+    """
+
+    return {
+        event.text
+        for event in team.events
+        if event.text is not None and event.text.startswith("Recorded line ")
+    }
+
+
+def _unpack_session_watermark(append_max_id: int) -> tuple[int, int]:
+    """Return the (content rowid, message id) watermarks packed into a modern append_max_id."""
+
+    assert append_max_id & orc_module._SESSION_STATE_TAG
+    packed = append_max_id ^ orc_module._SESSION_STATE_TAG
+    return (
+        packed >> orc_module._SESSION_STATE_SHIFT,
+        packed & orc_module._SESSION_STATE_MASK,
+    )
+
+
+def test_accepted_prefix_rewrite_on_a_live_session_rebaselines_and_keeps_every_record(
+    tmp_path: Path,
+) -> None:
+    """The production shape: the rewrite lands on a session that is still receiving messages.
+
+    This is what actually happened. Orc backfilled `token_count` from null to 445 on the *watermark
+    row* about nine minutes after capture, and in those nine minutes the session went on running,
+    so the re-ingest saw a rewritten row and four rows that had not existed at capture. The frozen
+    sibling below holds the database still between the two runs, and holding it still quietly makes
+    three unrelated things come out equal -- the re-baselined digest equals the digest the override
+    recorded, the append count does not move, and neither does the watermark. All three are
+    artifacts of the fixture. On a live session all three legitimately differ, for reasons that
+    have nothing to do with the rewrite, so a suite that only ever pinned the equalities was
+    pinning the fixture rather than the feature.
+
+    What has to be true instead is stated below in the terms that survive traffic: no record is
+    lost, the rows that arrived are ingested, the rewrite is recorded against the span it was
+    diagnosed on, and the re-baseline describes the database as it now is -- which the next
+    unflagged run is the real proof of, since a re-baseline that described the frozen past would
+    refuse immediately.
+    """
+
+    source, root_db, snapshot = _override_fixture(tmp_path)
+    first = snapshot_orc_lineage(source, ROOT, snapshot, (), "first")
+    before = load_orc_team(snapshot, ROOT, "override", "UTC", first.sources)
+    session_before = _session_source(first.sources)
+    assert _unpack_session_watermark(session_before.append_max_id) == (2, 5)
+
+    # Nine minutes pass. One already-captured row is backfilled in place, and the session keeps
+    # doing what a live session does: two more content blocks, two more messages, past the
+    # watermark. Both edits are present in the same re-ingest, because that is how the operator
+    # met them.
+    _backfill_token_count(root_db, 2, 445)
+    _receive_live_traffic(
+        root_db,
+        ROOT,
+        block_indices=(2, 3),
+        messages=((6, 6000), (7, 7000)),
+        updated_at="2026-08-15T11:20:00+00:00",
+    )
+
+    second = snapshot_orc_lineage(
+        source,
+        ROOT,
+        snapshot,
+        first.sources,
+        "second",
+        accept_prefix_rewrite=(ROOT,),
+    )
+
+    # The override still describes the one row that was rewritten, and only it. Appended rows are
+    # not "changes" -- they are past the watermark, outside the span the guard digests at all --
+    # so traffic must not inflate the evidence an operator is asked to judge.
+    assert len(second.prefix_overrides) == 1
+    override = second.prefix_overrides[0]
+    assert override.changed_row_count == 1
+    assert override.changed_rows_bounded is False
+    row = override.changed_rows[0]
+    assert (row.table, row.row_id) == ("messages", 2)
+    assert [column.column for column in row.columns] == ["message_json"]
+    assert '"token_count":null' in row.columns[0].previous
+    assert '"token_count":445' in row.columns[0].observed
+
+    session_after = _session_source(second.sources)
+    # The two digests the override pairs are both taken at the *old* watermark, one on each side.
+    # That pairing is what makes the record checkable against the snapshot it superseded, and it
+    # is unaffected by anything that arrived afterwards.
+    assert override.previous_append_prefix_sha256 == session_before.append_prefix_sha256
+    assert override.previous_append_prefix_sha256 == _prefix_digest_at(
+        snapshot, session_before, None
+    )
+    assert override.observed_append_prefix_sha256 == _prefix_digest_at(
+        snapshot, session_after, session_before.append_max_id
+    )
+    assert override.observed_append_prefix_sha256 != session_before.append_prefix_sha256
+    assert override.superseded_snapshot_path == session_before.snapshot_path
+    assert override.superseded_sha256 == session_before.sha256
+
+    # The re-baseline, by contrast, is taken over everything the source now holds -- so on a live
+    # session it is a third distinct digest, equal to neither side of the override. The frozen
+    # fixture's `session_after.append_prefix_sha256 == override.observed_append_prefix_sha256` is
+    # true there only because "the old watermark" and "everything" name the same rows when nothing
+    # arrived; asserting it as a general property would forbid the source from having grown.
+    assert session_after.append_prefix_sha256 == _prefix_digest_at(
+        snapshot, session_after, None
+    )
+    assert session_after.append_prefix_sha256 != override.observed_append_prefix_sha256
+    assert session_after.append_prefix_sha256 != override.previous_append_prefix_sha256
+
+    # Likewise the count and the watermark: they move by exactly the traffic, and by nothing else.
+    # An override that silently dropped the appended rows would leave both frozen, which is what
+    # the frozen fixture cannot distinguish from correct behaviour.
+    assert session_after.append_count == session_before.append_count + 4
+    assert _unpack_session_watermark(session_after.append_max_id) == (4, 7)
+    assert session_after.owner_session_id == session_before.owner_session_id
+    assert session_after.append_prefix_override == override
+
+    after = load_orc_team(snapshot, ROOT, "override", "UTC", second.sources)
+    # No record is lost: everything ingested before the rewrite is still there, byte for byte. The
+    # backfilled column is metadata the timeline does not project, so not one event is disturbed
+    # by it -- which is the entire reason this rewrite was acceptable to accept.
+    before_events = {event.event_id: event for event in before.events}
+    after_events = {event.event_id: event for event in after.events}
+    assert before_events.keys() <= after_events.keys()
+    assert all(after_events[key] == event for key, event in before_events.items())
+    # ...and the rows that arrived after capture were ingested rather than being cut off at the
+    # re-baselined watermark.
+    assert _recorded_lines(before) == {"Recorded line 0", "Recorded line 1"}
+    assert _recorded_lines(after) == {
+        "Recorded line 0",
+        "Recorded line 1",
+        "Recorded line 2",
+        "Recorded line 3",
+    }
+
+    # The proof that the re-baseline describes the database as it now is: the next run needs no
+    # flag. A digest re-baselined to the pre-traffic prefix would refuse here instead.
+    third = snapshot_orc_lineage(source, ROOT, snapshot, second.sources, "third")
+    assert third.prefix_overrides == ()
+    # And the record stays sticky across that clean run -- the archive says it was re-baselined
+    # once, forever, even though the run that observed it did nothing unusual.
+    assert _session_source(third.sources).append_prefix_override == override
+
+    # Traffic keeps arriving after the accepted run, and is still ordinary appending.
+    _receive_live_traffic(
+        root_db,
+        ROOT,
+        block_indices=(4,),
+        messages=((8, 8000),),
+        updated_at="2026-08-15T11:40:00+00:00",
+    )
+    fourth = snapshot_orc_lineage(source, ROOT, snapshot, third.sources, "fourth")
+    assert fourth.prefix_overrides == ()
+    session_fourth = _session_source(fourth.sources)
+    assert session_fourth.append_count == session_after.append_count + 2
+    assert _unpack_session_watermark(session_fourth.append_max_id) == (5, 8)
+    assert session_fourth.append_prefix_override == override
+
+
+def test_accepted_prefix_rewrite_rebaselines_and_discards_no_records(
+    tmp_path: Path,
+) -> None:
+    """The degenerate shape: nothing arrives between capture and re-ingest.
+
+    Kept because it isolates what the rewrite alone does -- with no traffic in the way, the
+    semantic cache key, the task projection and the whole normalized team must come out identical,
+    and any difference is attributable to the override and nothing else. It is the *weaker* test of
+    the two, though, and the equalities it can state are read in the light of
+    :func:`test_accepted_prefix_rewrite_on_a_live_session_rebaselines_and_keeps_every_record`,
+    which is the shape the incident actually had.
+    """
+
+    source, root_db, snapshot = _override_fixture(tmp_path)
+    first = snapshot_orc_lineage(source, ROOT, snapshot, (), "first")
+    before = load_orc_team(snapshot, ROOT, "override", "UTC", first.sources)
+    before_task = _task_source(first.sources)
+    _backfill_token_count(root_db, 2, 445)
+
+    second = snapshot_orc_lineage(
+        source,
+        ROOT,
+        snapshot,
+        first.sources,
+        "second",
+        accept_prefix_rewrite=(ROOT,),
+    )
+
+    assert len(second.prefix_overrides) == 1
+    override = second.prefix_overrides[0]
+    assert override.degraded is True
+    assert (
+        override.degradation_reason
+        == "append-prefix-rewritten-operator-accepted-rows-preserved"
+    )
+    assert override.policy == "operator-accepted-prefix-rewrite-v1"
+    assert override.override_count == 1
+    assert override.source_path == _session_source(first.sources).source_path
+    assert override.changed_row_count == 1
+    assert override.changed_rows_bounded is False
+    row = override.changed_rows[0]
+    assert (row.table, row.row_id) == ("messages", 2)
+    assert [column.column for column in row.columns] == ["message_json"]
+    assert row.columns[0].json_paths == ("token_count",)
+    assert row.columns[0].json_paths_bounded is False
+    assert '"token_count":null' in row.columns[0].previous
+    assert '"token_count":445' in row.columns[0].observed
+
+    session_before = _session_source(first.sources)
+    session_after = _session_source(second.sources)
+    # Re-baselined, and only re-baselined: the digest moves to what was actually observed and
+    # nothing else about the record is rewritten or dropped.
+    assert override.previous_append_prefix_sha256 == session_before.append_prefix_sha256
+    assert override.observed_append_prefix_sha256 != session_before.append_prefix_sha256
+    # Stated the way it stays true once rows start arriving. The override's observed digest covers
+    # the span at or below the *previous* watermark -- the span the guard compared -- while the
+    # manifest's covers everything the source now holds. Here those are the same rows, so the
+    # tempting `session_after.append_prefix_sha256 == override.observed_append_prefix_sha256`
+    # passes; it passes only because this fixture is frozen, and it would forbid the source from
+    # having grown. The live-session test above pins the general form.
+    assert session_after.append_prefix_sha256 == _prefix_digest_at(
+        snapshot, session_after, None
+    )
+    assert override.observed_append_prefix_sha256 == _prefix_digest_at(
+        snapshot, session_after, session_before.append_max_id
+    )
+    # No traffic, so -- and only so -- the count and the watermark are also unmoved. These two are
+    # a statement about this fixture, not about accepting a rewrite.
+    assert session_after.append_count == session_before.append_count
+    assert session_after.append_max_id == session_before.append_max_id
+    assert session_after.owner_session_id == session_before.owner_session_id
+    assert session_after.append_prefix_override == override
+    # Both degradations are recorded, separately, because both really happened: rewriting
+    # message_json also moves Orc's conversation projection, and one `degradation_reason` string
+    # could not have held the two events at once.
+    assert session_after.auxiliary.degraded is True
+    assert (
+        session_after.auxiliary.degradation_reason
+        == "conversation-history-rewritten-stable-spawns-preserved"
+    )
+    assert (
+        session_after.auxiliary.degradation_reason
+        != override.degradation_reason
+    )
+    # The paid-summary cache key survives, because nothing normalized changed.
+    assert session_after.semantic_sha256 == session_before.semantic_sha256
+    # The unrelated task source keeps its .projections pointer untouched.
+    after_task = _task_source(second.sources)
+    assert after_task.task_projection == before_task.task_projection
+    assert (
+        snapshot / Path(str(before_task.task_projection and before_task.task_projection.path))
+    ).is_file()
+
+    after = load_orc_team(snapshot, ROOT, "override", "UTC", second.sources)
+    assert _semantic_team(after) == _semantic_team(before)
+
+    # Having re-baselined, the next run needs no override at all.
+    third = snapshot_orc_lineage(source, ROOT, snapshot, second.sources, "third")
+    assert third.prefix_overrides == ()
+
+
+def test_accepting_one_session_does_not_authorize_another_in_the_same_lineage(
+    tmp_path: Path,
+) -> None:
+    """The scope defect, reproduced: one acceptance must not re-baseline a whole session tree.
+
+    Before this the flag was a single boolean threaded to every discovered source, so one
+    invocation re-baselined every rewritten session in the lineage at once -- the same
+    blanket-switch failure the team-level flag was already designed against, one level down. What
+    made it invisible is reproduced here too: the guard raises on the first mismatching source, so
+    the operator was only ever shown the *root* session's diff before passing the flag. The nested
+    session was authorized having never been printed.
+    """
+
+    source, root_db, nested_db, snapshot = _nested_override_fixture(tmp_path)
+    first = snapshot_orc_lineage(source, ROOT, snapshot, (), "first")
+    before_objects = _override_snapshot_objects(snapshot)
+    _backfill_token_count(root_db, 2, 445)
+    _backfill_token_count(nested_db, 2, 445)
+
+    # What the operator actually sees with no flag: the root session, and only the root session.
+    with pytest.raises(OrcParseError) as unflagged:
+        snapshot_orc_lineage(source, ROOT, snapshot, first.sources, "second")
+    assert f"sessions/{ROOT}/session.db" in str(unflagged.value)
+    assert NESTED not in str(unflagged.value)
+
+    # Acting on exactly that: the refusal named the root session, so the root session is what gets
+    # authorized -- and the nested session, which nobody has looked at, still refuses with its own
+    # evidence rather than being swept along.
+    with pytest.raises(OrcParseError) as raised:
+        snapshot_orc_lineage(
+            source,
+            ROOT,
+            snapshot,
+            first.sources,
+            "second",
+            accept_prefix_rewrite=(ROOT,),
+        )
+    message = str(raised.value)
+    assert f"sessions/{NESTED}/session.db" in message
+    assert "messages row 2" in message
+    assert f"--accept-orc-prefix-rewrite {NESTED} " in message
+    # Refused means refused for the whole lineage: the run that would have quietly re-baselined
+    # both publishes nothing at all.
+    assert _override_snapshot_objects(snapshot) == before_objects
+
+    accepted = snapshot_orc_lineage(
+        source,
+        ROOT,
+        snapshot,
+        first.sources,
+        "third",
+        accept_prefix_rewrite=(ROOT, NESTED),
+    )
+
+    assert sorted(
+        override.source_path for override in accepted.prefix_overrides
+    ) == [
+        f".orc/sessions/{ROOT}/session.db",
+        f".orc/sessions/{NESTED}/session.db",
+    ]
+
+
+def test_authorizing_one_session_leaves_an_unrewritten_sibling_unmarked(
+    tmp_path: Path,
+) -> None:
+    """An acceptance is a statement about one session, so no other source may acquire the mark."""
+
+    source, root_db, _, snapshot = _nested_override_fixture(tmp_path)
+    first = snapshot_orc_lineage(source, ROOT, snapshot, (), "first")
+    _backfill_token_count(root_db, 2, 445)
+
+    second = snapshot_orc_lineage(
+        source,
+        ROOT,
+        snapshot,
+        first.sources,
+        "second",
+        accept_prefix_rewrite=(ROOT, NESTED),
+    )
+
+    # Both were authorized; only the one that was actually rewritten is recorded as degraded. An
+    # authorization is permission, never an assertion that something happened.
+    assert [override.source_path for override in second.prefix_overrides] == [
+        f".orc/sessions/{ROOT}/session.db"
+    ]
+    nested = next(
+        item
+        for item in second.sources
+        if item.owner_session_id == NESTED and item.kind == "session"
+    )
+    assert nested.append_prefix_override is None
+
+
+def test_an_accepted_session_id_outside_the_lineage_is_refused_up_front(
+    tmp_path: Path,
+) -> None:
+    """A safety override that silently authorizes nothing is the worst outcome available to it."""
+
+    source, root_db, _, snapshot = _nested_override_fixture(tmp_path)
+    first = snapshot_orc_lineage(source, ROOT, snapshot, (), "first")
+    before_objects = _override_snapshot_objects(snapshot)
+    _backfill_token_count(root_db, 2, 445)
+
+    stranger = "33333333-3333-3333-3333-333333333333"
+    with pytest.raises(OrcParseError) as raised:
+        snapshot_orc_lineage(
+            source,
+            ROOT,
+            snapshot,
+            first.sources,
+            "second",
+            accept_prefix_rewrite=(ROOT, stranger),
+        )
+    assert "names sessions outside this lineage" in str(raised.value)
+    assert stranger in str(raised.value)
+    # Raised from the plan, before any database was copied, so a typo costs nothing and -- more to
+    # the point -- cannot half-apply by re-baselining the sessions that did match.
+    assert _override_snapshot_objects(snapshot) == before_objects
+
+    with pytest.raises(OrcParseError, match="duplicate session ids"):
+        snapshot_orc_lineage(
+            source,
+            ROOT,
+            snapshot,
+            first.sources,
+            "second",
+            accept_prefix_rewrite=(ROOT, ROOT),
+        )
+
+
+def test_accepted_prefix_rewrite_retains_the_pre_rewrite_snapshot(
+    tmp_path: Path,
+) -> None:
+    """The reviewer's scenario, end to end: accepting must not GC the bytes it stopped trusting.
+
+    Before this, the accepting run pruned the previous object in the same call that re-baselined
+    the digest, so an operator who read the refusal, judged it benign, and was wrong had no route
+    back -- only a 20-row, 160-character-per-column summary. This drives the real `ingest_orc`
+    entry point rather than `snapshot_orc_lineage`, because the GC that destroyed the object runs
+    in the pipeline, after the manifest commits, and never ran in the unit-level fixture at all.
+
+    The session keeps receiving messages across the rewrite, matching the incident: retention has
+    to hold while the source is growing, which is the only state it is ever exercised in. A frozen
+    source would also hide the manifest round trip that matters here -- the recorded override is
+    decoded on the next run against a `append_count` and watermark that have since moved.
+    """
+
+    source, root_db, _ = _override_fixture(tmp_path)
+    archive = tmp_path / "archive"
+    ingest_orc(archive, source, ROOT, "orc-test", "UTC")
+    snapshot_root = archive / "teams" / "orc-test" / "source_snapshots"
+    manifest_path = archive / "teams" / "orc-test" / "raw" / "source-manifest.json"
+    pre_rewrite = _manifest_snapshot_database(archive, "session")
+    pre_rewrite_sha256 = orc_module._sha256_file(pre_rewrite)
+    _backfill_token_count(root_db, 2, 445)
+    _receive_live_traffic(
+        root_db,
+        ROOT,
+        block_indices=(2,),
+        messages=((6, 6000),),
+        updated_at="2026-08-15T11:20:00+00:00",
+    )
+
+    _, report = ingest_orc(
+        archive, source, ROOT, "orc-test", "UTC", accept_prefix_rewrite=(ROOT,)
+    )
+
+    override = report.orc_prefix_overrides[0]
+    assert override.superseded_sha256 == pre_rewrite_sha256
+    assert (
+        override.superseded_snapshot_path
+        == pre_rewrite.relative_to(snapshot_root).as_posix()
+    )
+    # The object GC ran in this same call and left the superseded bytes alone.
+    assert pre_rewrite.is_file()
+    assert orc_module._sha256_file(pre_rewrite) == pre_rewrite_sha256
+    current = _manifest_snapshot_database(archive, "session")
+    assert current != pre_rewrite
+    assert current.is_file()
+
+    # Not merely present: still the pre-rewrite content, so the accepted diff is checkable at full
+    # fidelity against the object the archive now points at.
+    def _token_count(path: Path) -> object:
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            raw = connection.execute(
+                "SELECT message_json FROM messages WHERE id = 2"
+            ).fetchone()[0]
+        finally:
+            connection.close()
+        return json.loads(str(raw))["token_count"]
+
+    assert _token_count(pre_rewrite) is None
+    assert _token_count(current) == 445
+
+    stored = as_object(
+        as_object(
+            next(
+                item
+                for item in as_array(
+                    as_object(
+                        read_json(manifest_path), str(manifest_path)
+                    ).get("sources"),
+                    "sources",
+                )
+                if as_object(item, "source").get("kind") == "session"
+            ),
+            "source",
+        ).get("append_prefix_override"),
+        "override",
+    )
+    assert stored.get("superseded_sha256") == pre_rewrite_sha256
+
+    # Sticky retention: a later ordinary ingest still names the object, so routine runs cannot
+    # quietly reclaim what the override run deliberately kept -- including the routine ingests that
+    # keep happening because the session is still producing rows, which is what "later" means for a
+    # live session and which publish a new current object each time.
+    _receive_live_traffic(
+        root_db,
+        ROOT,
+        block_indices=(3,),
+        messages=((7, 7000),),
+        updated_at="2026-08-15T11:40:00+00:00",
+    )
+    ingest_orc(archive, source, ROOT, "orc-test", "UTC")
+    assert pre_rewrite.is_file()
+    assert orc_module._sha256_file(pre_rewrite) == pre_rewrite_sha256
+    assert _manifest_snapshot_database(archive, "session") not in (pre_rewrite, current)
+
+
+def test_a_schema_v1_source_records_where_its_pre_rewrite_bytes_actually_are(
+    tmp_path: Path,
+) -> None:
+    """A v1 snapshot lives outside the object store, so the pointer is a note, not a GC anchor.
+
+    The retention pointer is normally a content-addressed object name, and that shape is enforced
+    on read so a manifest cannot aim object retention somewhere else. A schema-v1 source is stored
+    at its own mirrored source path instead, which GC never scans; recording that path honestly is
+    the only way the override stays decodable *and* still tells a human where the bytes are.
+    """
+
+    source, root_db, _ = _override_fixture(tmp_path)
+    archive = tmp_path / "archive"
+    ingest_orc(archive, source, ROOT, "orc-test", "UTC")
+    manifest_path = archive / "teams" / "orc-test" / "raw" / "source-manifest.json"
+    _downgrade_orc_manifest_to_v1(manifest_path)
+    snapshot_root = archive / "teams" / "orc-test" / "source_snapshots"
+    mirrored = snapshot_root / ".orc" / "sessions" / ROOT / "session.db"
+    assert mirrored.is_file()
+    _backfill_token_count(root_db, 2, 445)
+
+    _, report = ingest_orc(
+        archive, source, ROOT, "orc-test", "UTC", accept_prefix_rewrite=(ROOT,)
+    )
+
+    override = report.orc_prefix_overrides[0]
+    assert override.superseded_snapshot_path == f".orc/sessions/{ROOT}/session.db"
+    assert not override.superseded_snapshot_path.startswith(".objects/")
+    assert mirrored.is_file()
+    assert orc_module._sha256_file(mirrored) == override.superseded_sha256
+
+    # The whole point of tolerating the shape: the migrated schema-2 manifest still decodes, so a
+    # v1 archive that took an override is not quietly bricked on its next ordinary run.
+    _, again = ingest_orc(archive, source, ROOT, "orc-test", "UTC")
+    assert again.orc_prefix_overrides == ()
+
+
+def test_a_second_accepted_override_reclaims_the_first_retained_snapshot(
+    tmp_path: Path,
+) -> None:
+    """Retention is one deep and only another explicit acceptance collects it."""
+
+    source, root_db, _ = _override_fixture(tmp_path)
+    archive = tmp_path / "archive"
+    ingest_orc(archive, source, ROOT, "orc-test", "UTC")
+    first_pre_rewrite = _manifest_snapshot_database(archive, "session")
+    _backfill_token_count(root_db, 2, 445)
+    ingest_orc(archive, source, ROOT, "orc-test", "UTC", accept_prefix_rewrite=(ROOT,))
+    second_pre_rewrite = _manifest_snapshot_database(archive, "session")
+    assert first_pre_rewrite.is_file()
+
+    _backfill_token_count(root_db, 1, 17)
+    _, report = ingest_orc(
+        archive, source, ROOT, "orc-test", "UTC", accept_prefix_rewrite=(ROOT,)
+    )
+
+    override = report.orc_prefix_overrides[0]
+    assert override.override_count == 2
+    assert (
+        override.superseded_sha256 == orc_module._sha256_file(second_pre_rewrite)
+    )
+    assert second_pre_rewrite.is_file()
+    # The first override's copy is gone, reclaimed by a second deliberate acceptance rather than
+    # by any routine run -- which is the documented retention policy, not an accident.
+    assert not first_pre_rewrite.exists()
+
+
+def test_a_hand_deleted_retained_snapshot_does_not_break_a_later_ingest(
+    tmp_path: Path,
+) -> None:
+    """Retention is evidence, not an input, so losing it must not fail an unrelated run."""
+
+    source, root_db, _ = _override_fixture(tmp_path)
+    archive = tmp_path / "archive"
+    ingest_orc(archive, source, ROOT, "orc-test", "UTC")
+    pre_rewrite = _manifest_snapshot_database(archive, "session")
+    _backfill_token_count(root_db, 2, 445)
+    ingest_orc(archive, source, ROOT, "orc-test", "UTC", accept_prefix_rewrite=(ROOT,))
+
+    pre_rewrite.unlink()
+
+    _, report = ingest_orc(archive, source, ROOT, "orc-test", "UTC")
+    assert report.orc_prefix_overrides == ()
+    # The fact of the override survives its evidence: the manifest still records that this source
+    # was re-baselined, which is the part a later reader must not be able to lose.
+    manifest_path = archive / "teams" / "orc-test" / "raw" / "source-manifest.json"
+    manifest = as_object(read_json(manifest_path), str(manifest_path))
+    session = next(
+        as_object(item, "source")
+        for item in as_array(manifest.get("sources"), "sources")
+        if as_object(item, "source").get("kind") == "session"
+    )
+    stored = as_object(session.get("append_prefix_override"), "override")
+    assert stored.get("override_count") == 1
+    assert not pre_rewrite.exists()
+
+
+def test_accepted_prefix_rewrite_is_sticky_and_counts_repeat_events(
+    tmp_path: Path,
+) -> None:
+    source, root_db, snapshot = _override_fixture(tmp_path)
+    first = snapshot_orc_lineage(source, ROOT, snapshot, (), "first")
+    _backfill_token_count(root_db, 2, 445)
+    second = snapshot_orc_lineage(
+        source, ROOT, snapshot, first.sources, "second", accept_prefix_rewrite=(ROOT,)
+    )
+
+    clean = snapshot_orc_lineage(source, ROOT, snapshot, second.sources, "clean")
+
+    # No new event, but the archive still says it happened.
+    assert clean.prefix_overrides == ()
+    carried = _session_source(clean.sources).append_prefix_override
+    assert carried is not None
+    assert carried.override_count == 1
+    assert carried.accepted_at == "second"
+
+    _backfill_token_count(root_db, 1, 17)
+    fourth = snapshot_orc_lineage(
+        source, ROOT, snapshot, clean.sources, "fourth", accept_prefix_rewrite=(ROOT,)
+    )
+
+    assert len(fourth.prefix_overrides) == 1
+    assert fourth.prefix_overrides[0].override_count == 2
+    assert fourth.prefix_overrides[0].accepted_at == "fourth"
+    assert fourth.prefix_overrides[0].changed_rows[0].row_id == 1
+
+
+def test_accepted_prefix_rewrite_never_covers_rows_appearing_or_disappearing(
+    tmp_path: Path,
+) -> None:
+    source, root_db, snapshot = _override_fixture(tmp_path)
+    first = snapshot_orc_lineage(source, ROOT, snapshot, (), "first")
+
+    # One content block deleted and one message inserted into the id gap: the totals cancel, so
+    # the row-count guard is satisfied and only the digest notices.
+    connection = sqlite3.connect(root_db)
+    try:
+        connection.execute("DELETE FROM content_blocks WHERE id = 'ov-block-0'")
+        connection.execute(
+            "INSERT INTO messages(id, session_id, role, created_at_ms, message_json, "
+            "search_text) VALUES (3, ?, 'assistant', ?, ?, NULL)",
+            (
+                ROOT,
+                _ms("2026-08-15T10:00:03+00:00"),
+                json.dumps(
+                    {
+                        "id": "ov-native-3",
+                        "role": "Assistant",
+                        "source": None,
+                        "created_at_ms": _ms("2026-08-15T10:00:03+00:00"),
+                        "blocks": [
+                            {"type": "AgentBlock", "id": 93, "agent_id": "worker"}
+                        ],
+                        "token_count": None,
+                    },
+                    separators=(",", ":"),
+                ),
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    for accept in ((), (ROOT,)):
+        with pytest.raises(OrcParseError) as raised:
+            snapshot_orc_lineage(
+                source,
+                ROOT,
+                snapshot,
+                first.sources,
+                "second",
+                accept_prefix_rewrite=accept,
+            )
+        message = str(raised.value)
+        assert "lost 1 row(s) (content_blocks row 1)" in message
+        assert "gained 1 row(s) (messages row 3)" in message
+        assert "never rows appearing or disappearing" in message
+
+
+def test_accepted_prefix_rewrite_bounds_a_large_diff(tmp_path: Path) -> None:
+    source, root_db, snapshot = _override_fixture(tmp_path, content_blocks=30)
+    first = snapshot_orc_lineage(source, ROOT, snapshot, (), "first")
+
+    connection = sqlite3.connect(root_db)
+    try:
+        connection.execute(
+            "UPDATE content_blocks SET searchable_text = ? WHERE rowid <= 25",
+            ("x" * 5000,),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(OrcParseError) as raised:
+        snapshot_orc_lineage(source, ROOT, snapshot, first.sources, "refused")
+
+    # The refusal is bounded more tightly than the record: 20 rows of excerpted columns belong in a
+    # receipt, not in one exception string thrown at a terminal.
+    refusal = str(raised.value)
+    assert "25 row(s) changed" in refusal
+    assert "further changed row(s) not shown" in refusal
+    assert len(refusal) < 6000
+
+    second = snapshot_orc_lineage(
+        source, ROOT, snapshot, first.sources, "second", accept_prefix_rewrite=(ROOT,)
+    )
+
+    override = second.prefix_overrides[0]
+    assert override.changed_row_count == 25
+    assert len(override.changed_rows) == 20
+    assert override.changed_rows_bounded is True
+    column = override.changed_rows[0].columns[0]
+    assert column.column == "searchable_text"
+    assert column.bounded is True
+    assert len(column.observed) < 300
+    lines = override.describe()
+    assert "5 further changed row(s) not shown" in lines[-2]
+    # The caps are a summary, not the record: the report's last word is where the unabridged
+    # pre-rewrite bytes are, so the 5 unnamed rows remain recoverable by hand.
+    assert lines[-1] == (
+        "pre-rewrite snapshot retained for comparison: "
+        f"{override.superseded_snapshot_path} (reclaimed by the next accepted override "
+        "on this source)"
+    )
+    assert (snapshot / override.superseded_snapshot_path).is_file()
+
+
+def test_accepted_prefix_rewrite_round_trips_through_the_source_manifest(
+    tmp_path: Path,
+) -> None:
+    source, root_db, _ = _override_fixture(tmp_path)
+    archive = tmp_path / "archive"
+    _, clean_report = ingest_orc(archive, source, ROOT, "orc-test", "UTC")
+    assert clean_report.orc_prefix_overrides == ()
+    _backfill_token_count(root_db, 2, 445)
+
+    with pytest.raises(OrcParseError, match="existing append prefix was rewritten"):
+        ingest_orc(archive, source, ROOT, "orc-test", "UTC")
+
+    _, report = ingest_orc(
+        archive, source, ROOT, "orc-test", "UTC", accept_prefix_rewrite=(ROOT,)
+    )
+
+    assert len(report.orc_prefix_overrides) == 1
+    recorded = as_array(
+        as_object(report.to_json_obj(), "report").get("orc_prefix_overrides"),
+        "report.orc_prefix_overrides",
+    )
+    assert len(recorded) == 1
+    manifest_path = archive / "teams" / "orc-test" / "raw" / "source-manifest.json"
+    manifest = as_object(read_json(manifest_path), str(manifest_path))
+    session = next(
+        as_object(item, "source")
+        for item in as_array(manifest.get("sources"), "sources")
+        if as_object(item, "source").get("kind") == "session"
+    )
+    stored = as_object(session.get("append_prefix_override"), "override")
+    assert stored.get("degraded") is True
+    assert (
+        stored.get("degradation_reason")
+        == "append-prefix-rewritten-operator-accepted-rows-preserved"
+    )
+    assert stored.get("changed_row_count") == 1
+    task = next(
+        as_object(item, "source")
+        for item in as_array(manifest.get("sources"), "sources")
+        if as_object(item, "source").get("kind") == "task"
+    )
+    assert task.get("append_prefix_override") is None
+
+    # The manifest decodes on the next run, which is the only proof that matters for a sticky
+    # record: an override that could not be read back would fail every future ingest.
+    _, again = ingest_orc(archive, source, ROOT, "orc-test", "UTC")
+    assert again.orc_prefix_overrides == ()
+    reread = as_object(read_json(manifest_path), str(manifest_path))
+    reread_session = next(
+        as_object(item, "source")
+        for item in as_array(reread.get("sources"), "sources")
+        if as_object(item, "source").get("kind") == "session"
+    )
+    assert reread_session.get("append_prefix_override") == stored
+
+
+@pytest.mark.parametrize(
+    ("mutation", "match"),
+    (
+        ({"degraded": False}, "must record its degradation"),
+        (
+            {"degradation_reason": "conversation-history-rewritten-stable-spawns-preserved"},
+            "must record its degradation",
+        ),
+        ({"override_count": 0}, "must have happened at least once"),
+        ({"policy": "something-else"}, "unsupported policy"),
+        ({"changed_row_count": 9}, "disagrees with its own row count"),
+        ({"source_path": "elsewhere.db"}, "belongs to"),
+        # A retention pointer that is not the managed content-addressed name of the digest beside
+        # it would aim object GC at an arbitrary path, so the two are checked against each other
+        # rather than trusted.
+        (
+            {"superseded_snapshot_path": ".objects/aa/aa.db"},
+            "expected content-addressed path",
+        ),
+        ({"superseded_sha256": "0" * 64}, "expected content-addressed path"),
+    ),
+)
+def test_forged_prefix_override_records_are_rejected(
+    tmp_path: Path, mutation: dict[str, JsonValue], match: str
+) -> None:
+    source, root_db, _ = _override_fixture(tmp_path)
+    archive = tmp_path / "archive"
+    ingest_orc(archive, source, ROOT, "orc-test", "UTC")
+    _backfill_token_count(root_db, 2, 445)
+    ingest_orc(archive, source, ROOT, "orc-test", "UTC", accept_prefix_rewrite=(ROOT,))
+    manifest_path = archive / "teams" / "orc-test" / "raw" / "source-manifest.json"
+    manifest = as_object(read_json(manifest_path), str(manifest_path))
+    sources = as_array(manifest.get("sources"), "sources")
+    for index, item in enumerate(sources):
+        entry = as_object(item, "source")
+        if entry.get("kind") != "session":
+            continue
+        override = as_object(entry.get("append_prefix_override"), "override")
+        override.update(mutation)
+        entry["append_prefix_override"] = override
+        sources[index] = entry
+    manifest["sources"] = sources
+    write_json_if_changed(manifest_path, narrow_json(manifest))
+
+    with pytest.raises(OrcParseError, match=match):
+        ingest_orc(archive, source, ROOT, "orc-test", "UTC")
+
+
+def test_a_retention_pointer_aimed_at_the_current_snapshot_is_rejected(
+    tmp_path: Path,
+) -> None:
+    """Retention that names the post-rewrite object reads as satisfied and holds nothing."""
+
+    source, root_db, _ = _override_fixture(tmp_path)
+    archive = tmp_path / "archive"
+    ingest_orc(archive, source, ROOT, "orc-test", "UTC")
+    _backfill_token_count(root_db, 2, 445)
+    ingest_orc(archive, source, ROOT, "orc-test", "UTC", accept_prefix_rewrite=(ROOT,))
+    manifest_path = archive / "teams" / "orc-test" / "raw" / "source-manifest.json"
+    manifest = as_object(read_json(manifest_path), str(manifest_path))
+    sources = as_array(manifest.get("sources"), "sources")
+    for index, item in enumerate(sources):
+        entry = as_object(item, "source")
+        if entry.get("kind") != "session":
+            continue
+        override = as_object(entry.get("append_prefix_override"), "override")
+        override["superseded_snapshot_path"] = entry.get("snapshot_path")
+        override["superseded_sha256"] = entry.get("sha256")
+        entry["append_prefix_override"] = override
+        sources[index] = entry
+    manifest["sources"] = sources
+    write_json_if_changed(manifest_path, narrow_json(manifest))
+
+    with pytest.raises(
+        OrcParseError, match="pre-rewrite snapshot cannot be the current snapshot"
+    ):
+        ingest_orc(archive, source, ROOT, "orc-test", "UTC")
+
+
+def test_orc_ingest_cli_refuses_then_records_an_accepted_prefix_rewrite(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source, root_db, _ = _override_fixture(tmp_path)
+    archive = tmp_path / "cli-archive"
+    command = [
+        "ingest-orc",
+        "--output",
+        str(archive),
+        "--team",
+        "orc-test",
+        "--source-root",
+        str(source),
+        "--root-session",
+        ROOT,
+        "--timezone",
+        "UTC",
+    ]
+    assert timeline_main(command) == 0
+    capsys.readouterr()
+    _backfill_token_count(root_db, 2, 445)
+
+    assert timeline_main(command) == 2
+    refused = capsys.readouterr()
+    assert "existing append prefix was rewritten" in refused.err
+    assert "messages row 2" in refused.err
+    assert "--accept-orc-prefix-rewrite" in refused.err
+    # The cost of the flag reaches the terminal the operator is standing at, not only the guide.
+    assert "supersedes the pre-rewrite snapshot .objects/" in refused.err
+    assert "at most 160 characters per column value" in refused.err
+
+    # Copied out of the refusal verbatim: the message names the flag *and* the session, so the
+    # operator's next command is what they were just shown rather than a reconstruction.
+    assert f"--accept-orc-prefix-rewrite {ROOT}" in refused.err
+    assert timeline_main([*command, "--accept-orc-prefix-rewrite", ROOT]) == 0
+    accepted = capsys.readouterr()
+    # Loud, on stderr, so it survives the operator redirecting stdout to a log file.
+    assert "accepted append-prefix rewrite" in accepted.err
+    assert "append-prefix-rewritten-operator-accepted-rows-preserved" in accepted.err
+    assert "messages row 2: message_json .token_count" in accepted.err
+    assert "pre-rewrite snapshot retained for comparison: .objects/" in accepted.err
+    assert "accepted append-prefix rewrite" not in accepted.out
+
+    runs = sorted((archive / "runs").glob("*.json"))
+    latest = as_object(read_json(runs[-1]), str(runs[-1]))
+    assert latest.get("status") == "completed"
+    assert "--accept-orc-prefix-rewrite" in as_array(
+        latest.get("command"), "command"
+    )
+    overrides = as_array(
+        as_object(latest.get("ingest"), "ingest").get("orc_prefix_overrides"),
+        "orc_prefix_overrides",
+    )
+    assert len(overrides) == 1
+    recorded = as_object(overrides[0], "override")
+    assert (
+        recorded.get("degradation_reason")
+        == "append-prefix-rewritten-operator-accepted-rows-preserved"
+    )
+    row = as_object(
+        as_array(recorded.get("changed_rows"), "changed_rows")[0], "row"
+    )
+    assert row.get("table") == "messages"
+    assert row.get("row_id") == 2
+    column = as_object(as_array(row.get("columns"), "columns")[0], "column")
+    assert column.get("column") == "message_json"
+    assert as_array(column.get("json_paths"), "json_paths") == ["token_count"]
+
+
+def test_orc_ingest_cli_authorizes_a_second_session_only_when_named(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The whole operator loop on a real lineage: one refusal, one flag, then the next one.
+
+    Two rewritten sessions cost two round trips, on purpose. Each refusal prints one session's
+    evidence and the exact repeat of the flag that authorizes it, so the operator arrives at a
+    two-session acceptance having read two diffs -- which is the property a single boolean, or a
+    single flag that happened to cover the lineage, could not give.
+    """
+
+    source, root_db, nested_db, _ = _nested_override_fixture(tmp_path)
+    archive = tmp_path / "nested-cli-archive"
+    command = [
+        "ingest-orc",
+        "--output",
+        str(archive),
+        "--team",
+        "orc-test",
+        "--source-root",
+        str(source),
+        "--root-session",
+        ROOT,
+        "--timezone",
+        "UTC",
+    ]
+    assert timeline_main(command) == 0
+    capsys.readouterr()
+    _backfill_token_count(root_db, 2, 445)
+    _backfill_token_count(nested_db, 2, 445)
+
+    assert timeline_main(command) == 2
+    first = capsys.readouterr().err
+    assert f"--accept-orc-prefix-rewrite {ROOT}" in first
+    assert NESTED not in first
+
+    # The obvious next command -- and it is still refused, because the nested session's rewrite
+    # has not been shown to anyone yet.
+    assert timeline_main([*command, "--accept-orc-prefix-rewrite", ROOT]) == 2
+    second = capsys.readouterr().err
+    assert f"sessions/{NESTED}/session.db" in second
+    assert f"--accept-orc-prefix-rewrite {NESTED}" in second
+
+    assert (
+        timeline_main(
+            [
+                *command,
+                "--accept-orc-prefix-rewrite",
+                ROOT,
+                "--accept-orc-prefix-rewrite",
+                NESTED,
+            ]
+        )
+        == 0
+    )
+    accepted = capsys.readouterr().err
+    assert accepted.count("accepted append-prefix rewrite") == 2
+    assert f"sessions/{ROOT}/session.db" in accepted
+    assert f"sessions/{NESTED}/session.db" in accepted
+
+    # A mistyped id is rejected up front rather than being silently inert, and the archive the
+    # previous command left behind is still clean afterwards.
+    assert (
+        timeline_main(
+            [*command, "--accept-orc-prefix-rewrite", "not-a-session-in-this-lineage"]
+        )
+        == 2
+    )
+    assert "names sessions outside this lineage" in capsys.readouterr().err

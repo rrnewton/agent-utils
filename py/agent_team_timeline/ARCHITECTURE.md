@@ -246,10 +246,21 @@ Some legacy transports did not persist a sender at all. A registered team may th
 strict `prompt_authorship_rules` matching its slug, ingress kind, optional half-open RFC3339
 interval, and optional exact native message IDs. Rules can only refine `unknown` or
 `external_or_unknown` source labels; they cannot overwrite intrinsic provider attribution.
-Overlapping rules and unknown teams fail the extraction. The exporter preserves the source label,
-rule ID, and human-written audit reason on each corrected record and persists the normalized rule
-set as `extracted/transcripts/authorship-rules.json`. A direct later `extract-transcripts` reuses
-that set; a subsequent registered-project ingest replaces it with the config's complete rule set.
+Overlapping rules fail the extraction. The exporter preserves the source label, rule ID, and
+human-written audit reason on each corrected record and persists the normalized rule set as
+`extracted/transcripts/authorship-rules.json`. A direct later `extract-transcripts` reuses that
+set; a subsequent registered-project ingest replaces it with the config's complete rule set.
+
+A rule naming a team the archive holds no normalized data for does **not** fail the extraction. It
+is set aside, listed in the report, in `manifest.json` as `dropped_prompt_authorship_rules`, and on
+stderr, and it becomes live again with no operator action the moment that team ingests. A rule's
+team slug is stamped from the enclosing team by the config parser rather than typed, so an unknown
+team never means "typo" — it means a registered team whose first ingest has not yet succeeded, and
+failing every other team's projection over that is the outage this projection exists to avoid. The
+scope rules are applied against every team the projection *represents*, not only the teams read
+this run: authorship is rebuilt from the source label on every occurrence on every run, so a rule
+withdrawn while its team's records are still carried would silently revert audited corrections to
+`unknown`.
 
 ### Registered project ingestion contract
 
@@ -270,12 +281,51 @@ slugs are unique and provider-neutral; identity values pass through the same URL
 IANA-timezone validators as individual ingest commands. Optional per-team prompt-authorship rules
 are part of the exact versioned config and its receipt digest; they never inspect message text.
 
-Configured teams run in file order through the existing provider snapshot transactions. Successful
-earlier teams and their provider source manifests remain durable if a later provider fails; the
-top-level receipt marks the configured run failed, and a rerun resumes idempotently. Only after all
-selected ingests succeed does the command invoke global transcript extraction. Extraction always
-selects every normalized archive team, even when `--team` limited this run's provider refresh,
-because the monotonic prompt projection cannot omit previously exported teams.
+Configured teams run in file order through the existing provider snapshot transactions, and each
+team is isolated from the others. A team that raises is recorded as a failure and the run continues
+with the next team: the importers share no mutable state across teams, each writes only under
+`teams/<slug>/` while holding the archive writer lock, and a failed ingest leaves that team's
+previously normalized snapshot byte-identical. Transcript extraction then runs, because it is
+defined over the archive's normalized teams rather than over this run's successes — a team that
+failed today contributes exactly the records it contributed on its last good run, and the monotonic
+union carries forward any occurrence whose source has since disappeared. Withholding the projection
+because one lineage is unreadable would hide the *other* teams' new prompts to no purpose.
+Extraction always selects every normalized archive team, even when `--team` limited this run's
+provider refresh, because the monotonic prompt projection cannot omit previously exported teams.
+
+Extraction is isolated per team by the same argument, one level down. A team whose durable snapshot
+cannot be *read* — the classic case is a crash between the source-manifest write and the
+normalized-generation marker, which leaves a team the generation validator correctly refuses — is
+skipped and named, not raised. Its occurrences are carried forward by the monotonic union and its
+authorship rules stay in force, so the projection still represents it; what is missing is anything
+that happened to it since its last good run, and that is exactly what the report says. Extraction
+therefore stops only when **no** team can be read, because a corpus rewritten entirely from carried
+records gains nothing and would be written while the archive is in a state no reader can validate.
+
+Skipping is reported at four places, because a partial projection that reads as complete is worse
+than the hard failure it replaces: the stdout count says `across N teams (M further team(s) carried
+forward unread)` rather than inflating `N`; each skipped team and each dropped rule gets its own
+stderr line naming the slug and the cause; the run receipt carries `skipped_teams`,
+`teams_skipped`, and `dropped_prompt_authorship_rules`; and `extracted/transcripts/manifest.json`
+records the same, so whoever reads the archive months later — who was not watching the run — can
+see it. The manifest's `teams` lists every team the projection represents, read or carried, which
+is what keeps the next run's omission guard able to see a skipped team; `source_generations`
+lists only the teams actually read, because a generation entry asserts a digest computed this run.
+Both `extract-transcripts` and `ingest-project` exit 2 on a partial projection.
+
+Partial outcomes are loud, structured, and non-zero. The mechanical receipt records `status`,
+`teams_succeeded`, `teams_failed`, and a `failed_teams` array carrying each failed team's slug,
+provider, exception type, and message — plus a traceback when the exception was not one of the
+classified data/IO types, since a bare one-line message from an unclassified defect is
+unactionable. Each failure is also printed to stderr, the summary line states how many teams
+succeeded and how many failed, the run is recorded as `failed`, and the command exits 2. A rerun
+resumes idempotently and, once the broken lineage is fixed, the projection picks its rows up. A
+partial *projection* counts as a failure for the same reason: extraction runs over the whole
+archive rather than this run's selection, so `failed_teams` being empty is no evidence at all that
+the projection is whole, and an exit status derived from it alone would report the run as clean.
+Whatever remains that no per-team isolation can prevent — a corrupt `occurrences.jsonl`, a
+violated union invariant, a full disk mid-write — is recorded as `transcript_extraction_error`
+rather than raised, so a partial run still reports which teams did succeed.
 
 The command has no path to summary backends and records `model_calls: 0`, `model_tokens: 0`, and
 `website_build_performed: false` in its mechanical receipt, together with the exact config-file
@@ -357,7 +407,7 @@ The transaction is deliberately ordered:
 3. Hard-link validated staged files into immutable content-addressed stores and fsync the files and
    containing directories. An orphan object from an interrupted attempt is harmless and reusable.
 4. Normalize only that validated source set, then durably write the source manifest, artifact
-   catalog, provider-neutral team data, and related raw projections.
+   catalog, provider-neutral team data, and the raw source snapshot.
 5. Write `raw/normalized-generation.json` last. It binds the canonical source-manifest digest,
    byte digest of `team.json`, artifact-catalog digest, normalizer schema, and semantic source
    digest. Readers reject a missing or stale marker, so a crash between earlier writes cannot
@@ -370,6 +420,80 @@ Modern Orc databases retain a historical `content_blocks` prefix while new recor
 canonical IDs, exact overlaps are deduplicated, and modern-only blocks extend the transcript. The
 append guard and semantic source identity cover both tables. This is essential because either table
 can otherwise change normalized text without changing the other table's digest.
+
+### Accepting an in-place append-prefix rewrite
+
+The append guard is byte-exact over 18 named `content_blocks` columns and 6 named `messages`
+columns at or below the recorded watermark, so an upstream metadata backfill — a `token_count`
+written into an already-captured row minutes after capture — refuses the whole lineage even though
+no record was touched. `--accept-orc-prefix-rewrite` is the recorded way past exactly that, on
+`ingest-orc`, `refresh-orc`, and on `ingest-project`. It is empty by default and changes nothing
+about the default path.
+
+**The unit of authorization is one session.** The flag is repeatable and takes a session id
+(`TEAM:SESSION` on `ingest-project`, where the team is also ambiguous), and it is validated against
+the discovered lineage before any database is copied. That granularity is the point rather than a
+convenience: a lineage is a session tree, the guard runs once per session in it, and the guard
+raises on the *first* mismatching source — so at the moment the operator decides, exactly one
+session's diff has been printed. A run-level switch would therefore re-baseline sessions that are
+structurally impossible to have inspected, which is the same failure the per-team scope on
+`ingest-project` already exists to prevent, one level down. Two rewritten sessions cost two
+refusals and two flags, each read before it is granted.
+
+The guard's three checks are not equally overridable. `append history shrank` and `append prefix
+lost rows` stay absolute, because both mean rows are gone or unaccounted for. Only the digest
+comparison is overridable, and only for rows that were already there: if the diff finds a row
+missing from or newly present inside the prefix, ingestion refuses with or without the flag, and so
+does a digest that moved with no row to show for it.
+
+Whenever the digests disagree — flag or no flag — both prefixes are streamed in key order and
+compared with the digest's own type rules, and the refusal or the acceptance names the changed rows,
+the changed columns, and, when the column holds JSON, the changed fields. The operator therefore
+decides whether to override *after* seeing what the override would accept. Every part of that
+evidence is bounded and every bound is reported as a flag rather than applied silently: at most 20
+rows, character windows anchored on the differing region rather than truncated from the start, and
+at most 8 JSON paths per column.
+
+An accepted rewrite re-baselines the source's recorded state to the database as it now stands, and
+changes nothing else. It is worth being exact about what "as it now stands" covers, because the
+shape this exists for is a session that is *still running*: the observed backfill landed on the
+watermark row about nine minutes after capture, and in those nine minutes more messages arrived. So
+`append_count` and `append_max_id` move by exactly the rows that arrived, and `append_prefix_sha256`
+becomes the digest of everything the source now holds — a third value, equal to neither digest in
+the override record, which pairs the before and after taken at the *previous* watermark because
+that is the span the guard compared and the operator was shown a diff of. Ownership, the source
+manifest, and the `.projections` pointer carry through, and the new snapshot object is a full copy
+of the current source, so no record is dropped. On a session that happens to be idle those two
+numbers and the pairing coincide, but that is a property of the session, not a guarantee of the
+override. The event is recorded as an `append_prefix_override` beside the source, with
+`degraded: true` and the reason `append-prefix-rewritten-operator-accepted-rows-preserved`. That is
+deliberately *not* the auxiliary reason `conversation-history-rewritten-stable-spawns-preserved`:
+that one records something this code tolerated on its own authority about Orc's rewritable
+conversation projection, this one records that a human overrode a refusal about the durable append
+prefix, and the two frequently occur together on the same source. The record is sticky and counts
+up, so an archive that was ever re-baselined says so afterwards, and the same evidence lands in the
+run receipt under `ingest.orc_prefix_overrides`.
+
+The pre-rewrite snapshot object survives the run that supersedes it. Accepting an override records
+`superseded_snapshot_path` and `superseded_sha256` beside the source, and object GC retains
+everything the manifest references, so the accepting run cannot collect the bytes it just made
+unverifiable. That is why the bounded diff stays bounded: it is a summary of an event whose two
+databases both remain on disk and can be compared at any fidelity afterwards, which is a better
+guarantee than either a larger cap or a second frozen rendering spilled to a sidecar file.
+
+Retention is one deep per source and is reclaimed only by the next *accepted* override on that same
+source, which supersedes the pointer and lets GC take the older object. These are whole session
+databases and an archive is not a backup system, so every reclamation is the direct consequence of
+a second explicit operator decision rather than of a routine run. The pointer is retained but not
+verified: unlike a semantic baseline or a task projection, nothing later reads it, so a
+hand-deleted evidence object is tolerated instead of failing an unrelated future ingest. The
+override record itself — both digests, the row count, the bounded rows — remains, and remains
+validated, either way.
+
+Because acceptance is irreversible in that narrow sense, the refusal states the price rather than
+leaving it to the user guide: it names the object that acceptance supersedes, says how long that
+copy is kept, and quotes the two caps that bound the diff kept in exchange — rows recorded out of
+rows changed, and characters per column value.
 
 Orc continuations are explicit-only and ordered. A whole-root successor freezes the predecessor's
 last source record, the successor start, and their gap. A bounded successor additionally freezes a
@@ -672,6 +796,51 @@ spends tokens.
   proven to remain an unchanged subset. Task-note deletion is retained as a tombstone in the
   cumulative frozen projection; immutable overlap, new-ID high-water, and SQLite sequence guards
   still fail closed on mutation, reuse, or rollback.
+- An operator may accept an in-place rewrite of an Orc session's append prefix, and only that: the
+  flag is explicit, per invocation and per team, and it never covers a row leaving or entering the
+  prefix. Acceptance re-baselines the digest, keeps every record, names the changed rows and
+  columns in both the terminal and the run receipt, and marks the source degraded permanently. The
+  refusal that recommends the flag discloses its price, and the run that accepts it retains the
+  superseded snapshot object rather than collecting it, so the summary it records is never the only
+  surviving account of the change.
+- A durable artifact is retired only when it holds nothing the archive does not still hold, and it
+  is then removed rather than left to rot, in the namespace that wrote it. Ingest removes
+  `teams/<slug>/raw/messages/<thread-id>.json`, a per-thread re-serialization of `raw/team.json`
+  that no version of any reader ever opened; the sweep runs after `raw/team.json` is durable, takes
+  every regular file directly inside that ingest-owned directory whose name has the writer's shape
+  — `<archive-id>.json`, including orphans from an earlier wider ingest and, deliberately, anything
+  else left there under that name — leaves a symlink, a subdirectory and every other name alone
+  along with the directory containing them, and reports the reclaimed file and byte counts in the
+  run receipt.
+  The build sweepers cannot do this job: they are structurally unable to name a path under `raw/`,
+  which is what stops a presentation bug from deleting ingest data.
+
+### Retiring a durable artifact
+
+Retirement is a removal, not an abandonment, and it happens in three places at once: the writer
+goes, the namespace that owned the writer sweeps what it wrote, and the layout documentation stops
+listing the path. The tempting alternative — delete the writer and leave the bytes for someone
+else, or for a garbage-collection command nobody runs — is the worst of the available options. An
+archive is meant to be version controlled, so a file the tool has stopped maintaining keeps being
+cloned and diffed while reading as current.
+
+The precondition is evidentiary, not aesthetic: retirement requires showing that no reader exists
+*and* that nothing is lost. `render.prune_retired_query_artifacts` establishes the first by byte
+equality with the generated launcher, and refuses to touch a file it cannot recognize. The
+`raw/messages/` sweep establishes the first by the absence of any path join naming that directory
+anywhere in this repository's history, and the second by the projection being recomputable from
+`raw/team.json`, which sits beside it and is written first. Both follow the same discipline: never
+a symlink, never outside the namespace that wrote the artifact, and idempotent, so an interrupted
+sweep costs one repeat rather than a torn archive.
+
+The two differ in how tightly they can recognize their own output, and the difference is forced,
+not stylistic. The retired launcher had exactly one possible content, so byte equality is available
+and is used. A per-thread projection's bytes depend on the thread, so there is nothing fixed to
+compare against, and the strongest exact rule available — the thread ids in the current
+`raw/team.json` — is not merely weaker but wrong: it would strand the orphans an earlier wider
+ingest left behind, and by keeping the directory non-empty forever it would prevent the removal it
+exists to perform. The sweep therefore matches the writer's name shape inside a directory that
+belongs to ingest, and the guide says so rather than promising an exactness the code does not have.
 
 ## Required time/backfill behavior
 
