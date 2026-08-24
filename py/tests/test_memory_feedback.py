@@ -284,7 +284,7 @@ def test_the_estimate_never_falls_below_the_largest_uncensored_peak() -> None:
 
 
 def test_every_peak_censored_keeps_the_static_hint_and_says_so() -> None:
-    """This is the DeepScry case: a step whose whole history sits on its own ceiling."""
+    """This is the fully-censored case: a step whose whole history sits on its own ceiling."""
     rows = [_row(peak=str(8 * GIB), cap=str(8 * GIB)) for _ in range(30)]
 
     admission = memory_admission_from_rows(rows)["g.build"]
@@ -361,7 +361,7 @@ def test_only_a_profile_backed_admission_replaces_the_authored_hint() -> None:
 
 
 def test_a_declined_step_is_restored_to_the_baseline_its_author_wrote() -> None:
-    """The DeepScry case at the seam where it actually bites.
+    """The fully-censored case at the seam where it actually bites.
 
     By the time this runs, the ordinary censoring-BLIND plan feedback has already replaced the
     authored 42949672960 B hint with 8589934592 B — the very censored peak this module refuses to

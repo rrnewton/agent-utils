@@ -1,13 +1,16 @@
 # Parallel Experiment Runner Design
 
-> **Provenance.** This is a dated investigation record, kept as written. It was produced
-> against a private downstream workspace, so names of repositories, hosts and services
-> outside this one appear below and cannot be resolved from here. They are left in place
-> deliberately: rewriting a record to look tidier destroys the evidence it exists to be.
-> Nothing here describes `agent-utils` itself. See `#67 standalone-repo`.
+> **Provenance.** This is a dated investigation record. It was produced against a private
+> downstream workspace, so it refers to repositories, hosts and services outside this one
+> that cannot be resolved from here. Projects that consume `agent-utils` appear under
+> neutral labels — `consumer-a`, `consumer-b` — and those are REDACTIONS, not real names:
+> `agent-utils` is a reusable library and has to read standalone, without naming whoever
+> happens to use it. **The measurements, dates and findings are unchanged**; only names
+> were replaced. Nothing here describes `agent-utils` itself.
+> See `#86 scrub-client-names` and `#67 standalone-repo`.
 >
-> This record was written before the tool was renamed to `dagrun`; only the name has been
-> updated, and nothing else about the record has changed.
+> This record was written before the tool was renamed to `dagrun`. That rename and the
+> consumer-name redaction described above are the only changes made to it.
 
 **Date:** 2026-07-29
 **Status:** proposed; implementation waits for owner review
@@ -16,13 +19,13 @@
 
 ## 1. Problem and scope
 
-Hermit chaos experiments search a seed space by running many independent guest
-executions. A single Hermit container remains sequential internally, but a host
-with 158 physical cores can explore many seeds concurrently. Existing sweeps
-have been ad hoc and sequential; some also streamed enough trace/build output to
-overwhelm agents. Simply launching dozens of QEMU or Hermit processes is unsafe:
-memory and disk footprints vary, host load changes, and an interrupted process
-can leave descendants behind.
+Deterministic-execution chaos experiments search a seed space by running many
+independent guest executions. A single such container remains sequential
+internally, but a host with 158 physical cores can explore many seeds
+concurrently. Existing sweeps have been ad hoc and sequential; some also streamed
+enough trace/build output to overwhelm agents. Simply launching dozens of QEMU or
+container processes is unsafe: memory and disk footprints vary, host load changes,
+and an interrupted process can leave descendants behind.
 
 The proposed runner turns a seed search into a sequence of dynamically generated
 `dagrun` rounds. It does not introduce a second scheduler or a second
@@ -30,7 +33,7 @@ isolation/reaping implementation. `dagrun` remains the executor and supplies its
 existing two-level cgroup containment, per-step profiling, process-group capture,
 eager teardown, and profile store.
 
-The first release targets Linux/cgroup-v2 and Hermit `--chaos`/QEMU-style
+The first release targets Linux/cgroup-v2 and `--chaos`/QEMU-style
 workers, while keeping the experiment API generic enough for backend builds,
 CI shards, fuzzers, and other independent parameter sweeps.
 
@@ -93,7 +96,7 @@ coordinator:
 ```python
 spec = ExperimentSpec(
     name="btrfs-chunk-recover",
-    command=("hermit", "run", "--chaos", "--seed", "{seed}", "--", "./case"),
+    command=("consumer-a", "run", "--chaos", "--seed", "{seed}", "--", "./case"),
     profile_key=ProfileKey(...),
     worker_limits=WorkerLimits(cpu_cores=1, memory_bytes=4 << 30, disk_bytes=8 << 30),
     hit=HitCondition(regex="BUG:|panic|Segmentation fault"),
@@ -148,11 +151,11 @@ wall-time history.
 
 ### 4.1 Canonical key inputs
 
-For QEMU/Hermit runs, an automatic key should hash a canonical identity record:
+For QEMU/container runs, an automatic key should hash a canonical identity record:
 
 - tool and profile-schema versions;
-- Hermit executable content SHA-256 and backend;
-- Hermit determinism/chaos flags other than the seed;
+- container executable content SHA-256 and backend;
+- determinism/chaos flags other than the seed;
 - guest command template with the seed replaced by `{seed}`;
 - VM kernel, root image, snapshot, and target-artifact content IDs;
 - vCPU count, guest-memory size, disk/overlay class, and accelerator;
@@ -302,7 +305,7 @@ must never use broad `pkill`, process-name matching, or host-wide cleanup.
 An earlier draft of this section proposed a *next-run-cleans-previous* reaper on
 the theory that abandonment (an agent recycle, the 120-second tool cap, a detached
 run outliving its launcher) strands leaked `tracing-appender` threads that pin a
-scope. **Reproduction (hermit-ci) refuted that theory**, so the reaper was removed:
+scope. **Reproduction (consumer-a CI) refuted that theory**, so the reaper was removed:
 
 - Five abandonment scenarios — SIGKILL the launcher mid-run, launcher-then-guest
   kill, `--verify` kill mid-Run-1, and six staggered kills — each stranded **zero**
@@ -322,7 +325,7 @@ What survives the refutation, and is a cleaner justification for the box:
    its cause) — so a box validating only cpu and memory would still report *perfect
    health*. Only a `pids.max` cap catches this.
 2. **The real cause is a live hang the box already kills.** The zombies were held
-   open by a **live, hung** `hermit run --strict --verify` — its main parked in
+   open by a **live, hung** `consumer-a run --strict --verify` — its main parked in
    tokio `epoll_wait`, guest not progressing — keeping a PID namespace alive. A hang
    is exactly what the per-worker **cpu-time / wall backstop** (§7, guarantee 1)
    exists to kill.

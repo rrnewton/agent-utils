@@ -1,10 +1,13 @@
 # Work-output artifacts and site identity
 
-> **Provenance.** This is a dated investigation record, kept as written. It was produced
-> against a private downstream workspace, so names of repositories, hosts and services
-> outside this one appear below and cannot be resolved from here. They are left in place
-> deliberately: rewriting a record to look tidier destroys the evidence it exists to be.
-> Nothing here describes `agent-utils` itself. See `#67 standalone-repo`.
+> **Provenance.** This is a dated investigation record. It was produced against a private
+> downstream workspace, so it refers to repositories, hosts and services outside this one
+> that cannot be resolved from here. Projects that consume `agent-utils` appear under
+> neutral labels — `consumer-a`, `consumer-b` — and those are REDACTIONS, not real names:
+> `agent-utils` is a reusable library and has to read standalone, without naming whoever
+> happens to use it. **The measurements, dates and findings are unchanged**; only names
+> were replaced. Nothing here describes `agent-utils` itself.
+> See `#86 scrub-client-names` and `#67 standalone-repo`.
 
 ## Decision
 
@@ -245,7 +248,7 @@ Build site identity from the same project/host catalogs. Rank the primary projec
 An explicit setting always wins, especially for a superproject with active
 submodules. Keep all contributing projects and source hosts even when one is
 primary. Render one project and one host as, for example,
-`Agent Timeline: dev-hermit, devbig014`, with the project name linked. Render
+`Agent Timeline: dev-consumer-a, devbig014`, with the project name linked. Render
 `multi-repo` or `multi-host` when necessary and expose the complete, evidenced list
 in a tooltip/menu. A project may have several teams and hosts; a team may touch
 several projects. Do not encode either relationship as a single field on `TeamData`.

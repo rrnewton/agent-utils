@@ -380,7 +380,7 @@ class _NoopCgroupManager:
 
     :attr:`enabled` is ``False`` and every method is a no-op, so a step runs unwrapped and
     teardown falls back to the process-group kill in :func:`dagrun.teardown.reap`
-    — observationally identical to DeepScry's "no cgroups" path.
+    — observationally identical to the originating pipeline's "no cgroups" path.
     """
 
     enabled: bool = False
@@ -1121,7 +1121,7 @@ class Runner:
         run_cmd = self.cgroups.prepare_command(
             step.tag, base_cmd, mem_max=mem_max, cpu_count=cpu_count
         )
-        # Parallel-speedup ENRICHMENT capture (only under real cgroup boxing, matching DeepScry).
+        # Parallel-speedup ENRICHMENT capture (only under real cgroup boxing, as in the original).
         # prepare_command has already created the step's child cgroup, so cpu.pressure is readable;
         # bracket the step with two host-load snapshots so contention can be attributed later.
         boxed = self.cgroups.enabled
@@ -1451,7 +1451,7 @@ class Runner:
                 row[f"cpu.{key}"] = value
         # Rich parallel-speedup enrichment columns (effective_cores, throttled_s, contention, PSI).
         # Only under real boxing; an un-boxed run leaves them blank (the writer fills them from the
-        # STEP_PROFILE_COLUMNS schema), matching DeepScry's "blank when unavailable" posture.
+        # STEP_PROFILE_COLUMNS schema), matching the originating "blank when unavailable" posture.
         if boxed:
             row.update(
                 step_enrichment_columns(

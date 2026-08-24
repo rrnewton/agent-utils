@@ -179,7 +179,7 @@ connect it, open voice mode, and ask the agent to call one of its tools. **That 
 first thing done on this project**, ahead of any design work.
 
 Known limits even if it works: voice mode is a chat, not a monitor — there is no push, so he must
-initiate ("catch me up on the deepscry channel"). For a driver that is arguably correct behaviour.
+initiate ("catch me up on the acme channel"). For a driver that is arguably correct behaviour.
 Messages would be posted by the bot identity the MCP server authenticates as, not by his own account.
 
 ## ElevenLabs Agents plus a phone number

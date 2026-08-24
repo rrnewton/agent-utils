@@ -1,10 +1,13 @@
 # dagrun profile feedback and modeling audit
 
-> **Provenance.** This is a dated investigation record, kept as written. It was produced
-> against a private downstream workspace, so names of repositories, hosts and services
-> outside this one appear below and cannot be resolved from here. They are left in place
-> deliberately: rewriting a record to look tidier destroys the evidence it exists to be.
-> Nothing here describes `agent-utils` itself. See `#67 standalone-repo`.
+> **Provenance.** This is a dated investigation record. It was produced against a private
+> downstream workspace, so it refers to repositories, hosts and services outside this one
+> that cannot be resolved from here. Projects that consume `agent-utils` appear under
+> neutral labels — `consumer-a`, `consumer-b` — and those are REDACTIONS, not real names:
+> `agent-utils` is a reusable library and has to read standalone, without naming whoever
+> happens to use it. **The measurements, dates and findings are unchanged**; only names
+> were replaced. Nothing here describes `agent-utils` itself.
+> See `#86 scrub-client-names` and `#67 standalone-repo`.
 >
 > This record was written before the tool was renamed to `dagrun`. The rename was applied
 > throughout: not only the tool's name but the identifiers that carry it — environment
@@ -18,9 +21,9 @@ Date: 2026-08-17
 Audit bases:
 
 - `agent-utils` `12d5b41a8e01207ea1bb5c8b929732ecf1945d2f`
-- Hermit `rrnewton/hermit:main` `770b95c505fa2794e2937b9245bb72b5f10ec340`
-- Hermit's pinned `agent-utils` submodule `b4951000ceccb08b16b1aab1f4cf303a4ca84172`
-- DeepScry `origin/integration` `a4e5b7090150ee9ad7832a038cce36e5c415cd87` and
+- Consumer A `consumer-a:main` `770b95c505fa2794e2937b9245bb72b5f10ec340`
+- Consumer A's pinned `agent-utils` submodule `b4951000ceccb08b16b1aab1f4cf303a4ca84172`
+- Consumer B `origin/integration` `a4e5b7090150ee9ad7832a038cce36e5c415cd87` and
   `origin/main` `50660ef8b2b339c7c04af9a8dee162e3c597c239` (same relevant path; both pin
   `agent-utils` `cb1ea2e5f0eb79481f3eff93942699ed7e99adfb`)
 
@@ -62,7 +65,7 @@ The end-to-end feedback story is much less reliable than the collector:
 - The portable summary used by `--profile-sync` has a severe sampling defect that can invert the
   majority distribution and produce a catastrophically wrong model.
 
-Hermit is not currently using learned profiles in its important automated paths:
+Consumer A is not currently using learned profiles in its important automated paths:
 
 - `scripts/validate.rs` invokes the scheduler library directly, so it never runs the CLI's profile
   reader or planner. It forwards newly collected rows for diagnostics only.
@@ -71,16 +74,16 @@ Hermit is not currently using learned profiles in its important automated paths:
 - Every step in current `portable.json` has an explicit hard memory cap, so learned RSS would not
   alter the per-step cap or memory-aware concurrency even if the feedback store were restored.
 
-The practical Hermit verdict is therefore: a historical local store was demonstrably found and
+The practical Consumer A verdict is therefore: a historical local store was demonstrably found and
 selected by the `plan` command, but there is no paired run evidence proving those values changed
 execution. Current CI and `validate.rs` treat profiles as output evidence, not input to the next
-plan. Hermit's current memory decisions are authored, not profile-derived.
+plan. Consumer A's current memory decisions are authored, not profile-derived.
 
-DeepScry is in the same operational state for a different reason. Its validator feeds authored
+Consumer B is in the same operational state for a different reason. Its validator feeds authored
 hints directly into the `dagrun` library scheduler and records the resulting measurements into a
-separate DeepScry CSV schema. It has accumulated 1,820 local per-step rows, but there is no loader
+separate Consumer B CSV schema. It has accumulated 1,820 local per-step rows, but there is no loader
 or plan-application path, and the field names are incompatible with what `dagrun`'s feedback reader
-expects. DeepScry therefore collects useful diagnostics but does not use models it has learned.
+expects. Consumer B therefore collects useful diagnostics but does not use models it has learned.
 
 ## Intended data flow
 
@@ -279,11 +282,11 @@ assign widths across the whole DAG under a core and optional memory budget.
 | Caller selects `--planner cpa` | A speedup curve is display-only, not an allocator input. |
 | Ephemeral CI restores/syncs history | Uploaded current-run CSVs are diagnostics only. |
 
-## Hermit consumer audit
+## Consumer A audit
 
 ### Current automated paths
 
-The current Hermit `main` audit used commit `770b95c505fa2794e2937b9245bb72b5f10ec340`.
+The current Consumer A `main` audit used commit `770b95c505fa2794e2937b9245bb72b5f10ec340`.
 
 1. `ci/run-dag.sh` forwards runner arguments. With no explicit path, a repeated local invocation can
    read and write the checkout-local default store.
@@ -303,20 +306,20 @@ The current Hermit `main` audit used commit `770b95c505fa2794e2937b9245bb72b5f10
 6. `scripts/validate.rs` calls `run_dag_boxed_deadline` directly. That API schedules the supplied
    config; it does not load CSVs, build a feedback plan, or apply one. `forward_step_profiles`
    appends the result rows for upload, but there is no corresponding reader in that path.
-7. At the audited Hermit commit, all 51 portable DAG steps have both
+7. At the audited Consumer A commit, all 51 portable DAG steps have both
    `rss_baseline_bytes` and `hard_mem_max_bytes`; all nine privileged DAG steps also carry explicit
    hard caps. Learned RSS therefore cannot replace their enforced or modeled memory values.
 
 ### Positive local control
 
-A historical Hermit worktree contained a 53-row local profile store. Running its `plan` command
+A historical Consumer A worktree contained a 53-row local profile store. Running its `plan` command
 against that store produced 46 plan entries, all with `est_source=store` and `rss_source=store`.
 Most had one sample and four had two; none had a multi-width speedup model. This proves only that
 the local reader found and selected those rows (question 2), because `plan` does not apply or execute
 the result. It does not prove a real run changed scheduling or enforcement (question 3). That
-worktree was stale and is not evidence that current Hermit CI closes the feedback loop.
+worktree was stale and is not evidence that current Consumer A CI closes the feedback loop.
 
-### Hermit verdict
+### Consumer A verdict
 
 | Path | Collects | Reuses learned history | Learned memory changes behavior |
 | --- | --- | --- | --- |
@@ -327,19 +330,19 @@ worktree was stale and is not evidence that current Hermit CI closes the feedbac
 | Manual full-DAG workflow | Yes, ephemeral | No | No |
 | `scripts/validate.rs` library scheduler | Yes, when explicitly forwarded | No | No |
 
-Hermit currently has profile collection and artifact retention, but not an automated
+Consumer A currently has profile collection and artifact retention, but not an automated
 profile-feedback deployment.
 
-## DeepScry consumer audit
+## Consumer B audit
 
-The latest DeepScry `origin/integration` and `origin/main` use the same relevant validation path
+The latest Consumer B `origin/integration` and `origin/main` use the same relevant validation path
 and both pin an older `agent-utils` revision from before the current feedback planner:
 
 1. `scripts/validate.py` builds `DagConfig` values from authored `STEP_DURATION_HINT`,
    `PER_STEP_RSS_BASELINE`, `PER_STEP_MEMORY_MAX`, and scheduling-profile tables.
 2. It invokes `run_dag(..., metrics=None)` directly. That scheduler API does not discover a profile
    store, build a feedback plan, or apply estimates.
-3. After execution it translates `dagrun`'s compact rows into DeepScry's own `validate_perf`
+3. After execution it translates `dagrun`'s compact rows into Consumer B's own `validate_perf`
    schema. The historical fields are named `duration_s` and `memory_peak_bytes`, while `dagrun`'s
    reader expects `elapsed_s` and `peak_bytes` in a `step_profiles_<identity>.csv` store of its
    own shape.
@@ -347,7 +350,7 @@ and both pin an older `agent-utils` revision from before the current feedback pl
    machine/container files. Search of the validation path found analysis and append code but no
    `dagrun` estimate loader, and no `build_plan` or `apply_plan_to_config` call.
 
-DeepScry is therefore not using profile-derived duration, memory, speedup, or scheduling decisions.
+Consumer B is therefore not using profile-derived duration, memory, speedup, or scheduling decisions.
 Its rows remain valuable for offline analysis, but they are not a feedback store.
 
 ## Test and review strength
@@ -373,11 +376,11 @@ properties more than deployment closure and model validity.
 
 ## Adversarial review findings
 
-An independent agent reviewed this report against the stated `agent-utils` commit, latest Hermit
-`origin/main`, and latest DeepScry integration/main paths under the explicit no-goalpost-moving
+An independent agent reviewed this report against the stated `agent-utils` commit, latest Consumer A
+`origin/main`, and latest Consumer B integration/main paths under the explicit no-goalpost-moving
 rule. The review caused material corrections rather than a lowered bar: it removed a false
-Python/Rust core-budget-divergence claim contaminated by uncommitted work; narrowed the Hermit
-positive control from "applied" to "selected by plan"; added DeepScry's pinned pre-feedback
+Python/Rust core-budget-divergence claim contaminated by uncommitted work; narrowed the Consumer A
+positive control from "applied" to "selected by plan"; added Consumer B's pinned pre-feedback
 revision and missing verdict evidence; corrected hard-cap sizing, identity overrides, sync overlap,
 workflow coverage, and default-width profile recording; marked the concurrent 0.13 plan-application
 fix as outside the pinned audit base; and rejected a source-label count as proof that execution
@@ -436,7 +439,7 @@ call is never reached for a hard-cap-only step. An undeclared step receiving the
 after subset selection has placed one in the runnable config; that flag is selection metadata, not
 a zero-memory promise. Consequently `--max-mem` and CPA can admit concurrency that ignores real
 enforced caps. The separate stress helper does charge hard caps and runtime defaults, but it shares
-the erroneous `engine_only` exclusion. Hermit happens not to trigger the baseline half because its
+the erroneous `engine_only` exclusion. Consumer A happens not to trigger the baseline half because its
 hard-capped steps also carry RSS baselines.
 
 Version 0.15.0 includes every runnable non-skipped step, using hard caps, learned/authored RSS, or
@@ -668,12 +671,12 @@ start.
 16. Keep scalar duration/RSS models width-specific, or define and test a principled projection from
    width-specific measurements to the width being planned.
 
-### Close the Hermit loop deliberately
+### Close the Consumer A loop deliberately
 
-17. Choose a persistent feedback mechanism for Hermit CI: the atomic git-branch summary backend or
+17. Choose a persistent feedback mechanism for Consumer A CI: the atomic git-branch summary backend or
     a workflow cache/artifact protocol that downloads before planning and uploads after execution.
 18. Run the memory-producing lanes boxed. An unboxed artifact cannot supply learned peak memory.
-19. Decide whether Hermit's explicit hard caps are policy ceilings or generated estimates. If they
+19. Decide whether Consumer A's explicit hard caps are policy ceilings or generated estimates. If they
     remain authoritative, do not claim learned memory drives the run; use profiles to propose and
     review cap changes instead.
 20. Retain the actual run-emitted receipt from recommendation 13, including a digest of the plan
@@ -685,13 +688,13 @@ start.
     store, and prove a deliberately different learned estimate changes the second plan while a
     changed command identity refuses the stale sample.
 
-### Close the DeepScry loop deliberately
+### Close the Consumer B loop deliberately
 
 22. Either emit `dagrun`'s exact profile schema into a configured feedback store and apply a plan
-    before `run_dag`, or add an explicit, tested adapter for new DeepScry rows. The legacy schema
+    before `run_dag`, or add an explicit, tested adapter for new Consumer B rows. The legacy schema
     omits success, return-code, timeout, CPU-timeout, and OOM evidence, so its ambiguous historical
     rows must remain diagnostics-only unless independently classified; merely renaming
     `duration_s`/`memory_peak_bytes` would train on failures, because `dagrun` accepts a missing
     verdict cell. Do not relabel the CSV as feedback without proving the second run changes.
-23. Preserve DeepScry's authored hard limits as policy ceilings and keep learned estimates separate,
+23. Preserve Consumer B's authored hard limits as policy ceilings and keep learned estimates separate,
     so adopting feedback cannot silently weaken resource containment.

@@ -1,10 +1,13 @@
 # Summary backend comparison experiments
 
-> **Provenance.** This is a dated investigation record, kept as written. It was produced
-> against a private downstream workspace, so names of repositories, hosts and services
-> outside this one appear below and cannot be resolved from here. They are left in place
-> deliberately: rewriting a record to look tidier destroys the evidence it exists to be.
-> Nothing here describes `agent-utils` itself. See `#67 standalone-repo`.
+> **Provenance.** This is a dated investigation record. It was produced against a private
+> downstream workspace, so it refers to repositories, hosts and services outside this one
+> that cannot be resolved from here. Projects that consume `agent-utils` appear under
+> neutral labels — `consumer-a`, `consumer-b` — and those are REDACTIONS, not real names:
+> `agent-utils` is a reusable library and has to read standalone, without naming whoever
+> happens to use it. **The measurements, dates and findings are unchanged**; only names
+> were replaced. Nothing here describes `agent-utils` itself.
+> See `#86 scrub-client-names` and `#67 standalone-repo`.
 
 ## 2026-08-05 controlled experiment
 
@@ -24,7 +27,7 @@ run that never reached generation:
   spend.
 - The Orc total of **2,704,708 successful tokens** (or **2,774,129 all-in**) is
   a different workload, not another model result. It must not be placed in a
-  model-comparison cost chart beside the Codex-Hermit run.
+  model-comparison cost chart beside the Codex/Consumer A run.
 
 The exact controlled inputs and results are retained under `~/temp/` for
 inspection. The archive format and normal workflow are described in the
@@ -33,7 +36,7 @@ inspection. The archive format and normal workflow are described in the
 ### Controlled workload
 
 The immutable source archive was
-`~/temp/codex-hermit-timeline-benchmark-source`. Its digest was:
+`~/temp/codex-consumer-a-timeline-benchmark-source`. Its digest was:
 
 ```text
 bcaa65af434f9d2bff148a6b6a92b46336e2465ca55f7ef696575cb36ee34b20
@@ -81,9 +84,9 @@ total a second time.
 
 | Attempt | Artifact directory |
 |---|---|
-| Deterministic heuristic | `~/temp/07_codex-hermit-controlled-heuristic` |
-| Luna (incomplete) | `~/temp/codex-hermit-timeline-luna` |
-| Sol control | `~/temp/04_codex-hermit-controlled-sol` |
+| Deterministic heuristic | `~/temp/07_codex-consumer-a-controlled-heuristic` |
+| Luna (incomplete) | `~/temp/codex-consumer-a-timeline-luna` |
+| Sol control | `~/temp/04_codex-consumer-a-controlled-sol` |
 
 | Attempt | Completed receipts | Failed receipts | Successful artifact total | Failed-call overhead | All recorded spend | Result |
 |---|---:|---:|---:|---:|---:|---|
@@ -118,7 +121,7 @@ batches, zero newly spent tokens, and a subsequent build changed zero files.
 
 ### Plain-language feature extension
 
-`~/temp/05_codex-hermit-sol-feature-complete` was copied from the controlled
+`~/temp/05_codex-consumer-a-sol-feature-complete` was copied from the controlled
 Sol output and then updated by a later pipeline revision. It uses the same
 source digest and model, but it is **not another model arm** and is not strictly
 comparable to the controlled run: the technical rollup prompt changed and five
@@ -160,7 +163,7 @@ superiority, because no other model produced the same plain-language jobs.
 
 ### Why the Orc number is separate
 
-The Orc artifact is `~/temp/06_orc-hermit-day1-sol`. It summarizes a
+The Orc artifact is `~/temp/06_orc-consumer-a-day1-sol`. It summarizes a
 different provider snapshot and date window with different transcript density,
 lineage, prompts, and pipeline features. Its imported backing data contained
 1,413 agent incarnations, 42,761 events, and 24,593 outer tool calls; the
@@ -177,7 +180,7 @@ plain-language rollups: 245 logical jobs in all. Its source digest was
 Therefore, 2,704,708 is the cost behind successful Orc artifacts and 2,774,129
 is its all-in cost. Neither number says whether Sol is cheaper or more expensive
 than another model: there is no second model on the same Orc input, and this is
-not the controlled Codex-Hermit workload.
+not the controlled Codex/Consumer A workload.
 
 ### Evidence and audit method
 
@@ -253,7 +256,7 @@ Every arm copied and ingested the same source snapshot:
 
 The root session was `019fcfe7-0f68-7301-8aab-c2f90a7026c7`. The display
 timezone was `America/New_York`; the declared primary project and host were
-`dev-hermit` and `devbig014`.
+`dev-consumer-a` and `devbig014`.
 
 | Attempt | Artifact directory |
 |---|---|

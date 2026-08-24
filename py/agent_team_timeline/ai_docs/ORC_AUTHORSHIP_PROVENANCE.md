@@ -1,10 +1,13 @@
 # Orc authorship provenance
 
-> **Provenance.** This is a dated investigation record, kept as written. It was produced
-> against a private downstream workspace, so names of repositories, hosts and services
-> outside this one appear below and cannot be resolved from here. They are left in place
-> deliberately: rewriting a record to look tidier destroys the evidence it exists to be.
-> Nothing here describes `agent-utils` itself. See `#67 standalone-repo`.
+> **Provenance.** This is a dated investigation record. It was produced against a private
+> downstream workspace, so it refers to repositories, hosts and services outside this one
+> that cannot be resolved from here. Projects that consume `agent-utils` appear under
+> neutral labels — `consumer-a`, `consumer-b` — and those are REDACTIONS, not real names:
+> `agent-utils` is a reusable library and has to read standalone, without naming whoever
+> happens to use it. **The measurements, dates and findings are unchanged**; only names
+> were replaced. Nothing here describes `agent-utils` itself.
+> See `#86 scrub-client-names` and `#67 standalone-repo`.
 
 ## Finding
 
@@ -39,7 +42,7 @@ name a sender.
 
 Cross-provider evidence does. Codex session
 `019fe949-ce0c-7c81-bd47-57db7ce7d4b5` invoked
-`scripts/orc-hermit-msg.py` at `09:18:18.882Z` with bytes exactly equal to the
+`scripts/orc-consumer-a-msg.py` at `09:18:18.882Z` with bytes exactly equal to the
 Orc block. The delivery completed at `09:18:22.240Z` with an API-accepted HTTP
 200 receipt. The Orc block followed 25.609 seconds later.
 
@@ -71,7 +74,7 @@ the Orc block followed 15.043 seconds later.
 - SHA-256: `37a5a253bf0870c21e7669eeb2acda952b3100a3b0b7915feafd2b776406a124`
 - Equality: byte-for-byte
 
-The message calls itself `hermit-gate`, but the durable proof is that this
+The message calls itself `consumer-a-gate`, but the durable proof is that this
 Claude provider session sent it. Coordinator-assigned names may be reused, and
 self-labels are not identity credentials.
 

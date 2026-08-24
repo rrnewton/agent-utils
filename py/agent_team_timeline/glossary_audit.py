@@ -45,7 +45,7 @@ _ENV_ASSIGNMENT = re.compile(r"[A-Z][A-Z0-9_]{2,}=")
 _METHOD_OR_CALL = re.compile(r"(?:::|\(\)|\([^)]*\))")
 _ERRNO_NAME = re.compile(r"E[A-Z0-9_]{3,}")
 _TEAM_OR_RECYCLED_AGENT = re.compile(
-    r"(?:(?:claude|codex|orc)-coord(?:-[0-9]+)?|(?:agent|hermit)-[0-9]+|"
+    r"(?:(?:claude|codex|orc)-coord(?:-[0-9]+)?|agent-[0-9]+|"
     r"goal-[a-z0-9-]+)",
     re.IGNORECASE,
 )
@@ -376,7 +376,7 @@ def _mechanical_rejection_reason(
         or "=" in clean
     ):
         return "code-or-configuration-literal"
-    if folded.startswith(("sudo ", "with-proxy ", "hermit ")):
+    if folded.startswith(("sudo ", "with-proxy ")):
         return "operational-command"
     if _OPERATIONAL_DEFINITION.search(definition[:240]):
         return "operational-command-or-label"

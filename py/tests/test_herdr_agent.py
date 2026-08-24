@@ -91,7 +91,7 @@ class FakeAgentHerdr:
         self.index = 0
         self.runs: list[str] = []
         self.waits: list[tuple[str, str, int]] = []
-        self.workspace = "deepscry"
+        self.workspace = "acme"
         self.cwd = "/work/mtg"
         self.session = "session-1"
         self.read_text = "agent transcript\n"
@@ -136,7 +136,7 @@ def client(fake: FakeAgentHerdr) -> HerdrClient:
 def target(**changes: str) -> Target:
     values = {
         "pane_id": "w1:p1", "session_agent": "codex", "session_value": "session-1",
-        "expected_agent": "codex", "expected_workspace": "deepscry", "expected_cwd": "/work/mtg",
+        "expected_agent": "codex", "expected_workspace": "acme", "expected_cwd": "/work/mtg",
     }
     values.update(changes)
     return Target(**values)

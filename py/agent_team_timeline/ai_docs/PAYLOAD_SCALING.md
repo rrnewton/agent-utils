@@ -1,12 +1,15 @@
 # Timeline payload scaling
 
-> **Provenance.** This is a dated investigation record, kept as written. It was produced
-> against a private downstream workspace, so names of repositories, hosts and services
-> outside this one appear below and cannot be resolved from here. They are left in place
-> deliberately: rewriting a record to look tidier destroys the evidence it exists to be.
-> Nothing here describes `agent-utils` itself. See `#67 standalone-repo`.
+> **Provenance.** This is a dated investigation record. It was produced against a private
+> downstream workspace, so it refers to repositories, hosts and services outside this one
+> that cannot be resolved from here. Projects that consume `agent-utils` appear under
+> neutral labels — `consumer-a`, `consumer-b` — and those are REDACTIONS, not real names:
+> `agent-utils` is a reusable library and has to read standalone, without naming whoever
+> happens to use it. **The measurements, dates and findings are unchanged**; only names
+> were replaced. Nothing here describes `agent-utils` itself.
+> See `#86 scrub-client-names` and `#67 standalone-repo`.
 
-## Measured Hermit baseline
+## Measured Consumer A baseline
 
 The 2026-08-12 full-corpus audit measured the generated schema-1 `data/timeline.json` at
 196,704,084 bytes. Deterministic gzip level 6 reduced the same bytes to 27,043,927 bytes: 13.7% of
@@ -50,12 +53,12 @@ The loader now selects schema 2 when its bootstrap is present and falls back to 
 schema-1 monolith otherwise. This preserves exported archives and basic static-server deployment
 while allowing a multi-week view to start from identity, lifetime, and aggregate data rather than
 tens or hundreds of megabytes of transcript detail. Real-corpus measurements for the implemented
-projection should be refreshed whenever the Hermit corpus or schema changes; do not substitute the
+projection should be refreshed whenever the Consumer A corpus or schema changes; do not substitute the
 earlier prototype decomposition for current generated-file measurements.
 
-## Implemented Hermit measurement (2026-08-12)
+## Implemented Consumer A measurement (2026-08-12)
 
-The zero-provider projection of the 196,704,084-byte Hermit schema-1 corpus produced a 31,763-byte
+The zero-provider projection of the 196,704,084-byte Consumer A schema-1 corpus produced a 31,763-byte
 gzip bootstrap, a 941,723-byte gzip global lifetime/structural-edge object, and 24 UTC detail-day
 objects totaling 25,896,120 bytes gzip. Day objects ranged from 46,402 bytes to 4,185,274 bytes
 gzip, with a 766,772-byte median. Generation took 10.47 seconds and peaked at 1,217,636 KiB RSS;
@@ -73,7 +76,7 @@ full reports and a separately serveable package are under
 
 ## Outer-zoom interaction measurement (2026-08-12)
 
-The 23-day, seven-team Hermit archive was measured again after combining coordinator and worker
+The 23-day, seven-team Consumer A archive was measured again after combining coordinator and worker
 activity, selecting bins by an eight-pixel minimum, retaining aggregate mode through five minutes
 per pixel, and skipping invisible lifetime packing. At the fitted 1440×900 view, resolution changed
 from hourly to daily, rendered activity blocks fell from 1,509 to 49, and SVG nodes fell from 3,054
@@ -85,4 +88,4 @@ The end-to-end initial transfer changed from 197,021,654 bytes to 1,140,452 byte
 heap from 216,223,692 bytes to 12,233,132 bytes. Those two gains include the schema-2 lazy-delivery
 work above and must not be attributed solely to the outer-zoom rendering changes. The exact before
 and after reports are `qa/full-site-before-summary.json` and
-`qa/full-site-after-ui-fixes.json` in the durable Hermit export.
+`qa/full-site-after-ui-fixes.json` in the durable Consumer A export.

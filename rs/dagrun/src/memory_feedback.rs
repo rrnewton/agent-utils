@@ -938,7 +938,7 @@ mod tests {
 
     #[test]
     fn every_peak_censored_keeps_the_static_hint_and_says_so() {
-        // The DeepScry case: a step whose whole history sits on its own ceiling.
+        // The fully-censored case: a step whose whole history sits on its own ceiling.
         let rows: Vec<_> = (0..30)
             .map(|_| row(&[("peak_bytes", "8589934592")]))
             .collect();
@@ -1078,7 +1078,7 @@ mod tests {
 
     #[test]
     fn a_declined_step_is_restored_to_the_baseline_its_author_wrote() {
-        // The DeepScry case, at the seam where it actually bites. By the time this runs, the
+        // The fully-censored case, at the seam where it actually bites. By the time this runs, the
         // ordinary censoring-BLIND plan feedback has already replaced the authored 40 GiB hint
         // with 8589934592 B — the very censored peak this module refuses to learn from. Declining
         // has to UNDO that, or turning the flag on leaves the unsafe number in place under the

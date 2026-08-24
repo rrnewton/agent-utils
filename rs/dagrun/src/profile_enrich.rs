@@ -4,7 +4,7 @@
 // profile-row columns the parallel-speedup model reads back (Rust port of
 // `py/dagrun/profile_enrich.py`).
 //
-// The column NAMES mirror DeepScry's `scripts/validate_perflog.py` `STEP_PROFILE_COLUMNS`
+// The column NAMES mirror the originating `scripts/validate_perflog.py` `STEP_PROFILE_COLUMNS`
 // (`effective_cores`, `quota_utilization_pct`, `throttled_s`, `external_cpu_s`/`external_cores`,
 // `co_tenants_*`, `ambient_bucket`, `load*`, host/step PSI), so a later schema unification is a
 // RENAME, not a redesign. Everything is best-effort and captured UNDER cgroup boxing; an

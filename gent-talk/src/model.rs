@@ -208,7 +208,7 @@ pub fn sort_oldest_first(messages: &mut [Message]) {
 pub struct ChannelInfo {
     /// Snowflake of the channel.
     pub id: ChannelId,
-    /// Human label used in speech and in the web app ("deepscry lead team").
+    /// Human label used in speech and in the web app ("acme lead team").
     ///
     /// This one comes from the operator's CONFIGURATION file and cannot be changed at runtime.
     /// What a person actually hears is [`ChannelInfo::display_name`], because `#39 channel-alias`

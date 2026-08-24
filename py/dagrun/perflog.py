@@ -72,7 +72,7 @@ CSV_COLUMNS = [
 #: :func:`_step_profile_fieldnames`), so they are captured without being hard-coded here.
 #: Rich parallel-speedup enrichment columns, appended to STEP_PROFILE_COLUMNS. Captured UNDER
 #: cgroup boxing on Linux and left BLANK when unavailable (an un-boxed run / missing /proc file),
-#: exactly like DeepScry's writer. The NAMES mirror DeepScry's ``validate_perflog``
+#: exactly like the originating writer. The NAMES mirror the originating ``validate_perflog``
 #: STEP_PROFILE_COLUMNS so a later schema unification is a rename, not a redesign. Produced by
 #: :func:`dagrun.profile_enrich.step_enrichment_columns`.
 ENRICHMENT_COLUMNS = [
@@ -314,9 +314,9 @@ def _proc_stat_busy_jiffies() -> int | None:
 def _ensure_dir(output_dir: str | Path) -> Path | None:
     """Create ``output_dir`` on demand and return it, or warn + return ``None`` on failure.
 
-    Unlike the DeepScry original (which required a pre-existing opt-in directory two levels
-    up from the checkout), the directory is explicit and created eagerly; an inability to
-    create it is a visible warning, never a silent skip."""
+    Unlike the originating implementation (which required a pre-existing opt-in directory
+    two levels up from the checkout), the directory is explicit and created eagerly; an
+    inability to create it is a visible warning, never a silent skip."""
     path = Path(output_dir)
     try:
         path.mkdir(parents=True, exist_ok=True)

@@ -198,7 +198,7 @@ an observed result rather than a harness-level side effect.
 ## Profile-feedback audit
 
 The independently reviewed [profile feedback and modeling audit](../ai_docs/dagrun-profile-feedback-audit.md)
-separates collection, model selection, and execution impact. It confirms that Hermit and DeepScry
+separates collection, model selection, and execution impact. It confirms that Consumer A and Consumer B
 currently collect profile evidence without closing the automated feedback loop, and records the
 portable-summary sampling blocker, provenance gaps, memory-model mismatches, and consumer-specific
 evidence without treating a source label as proof that runtime behavior changed.

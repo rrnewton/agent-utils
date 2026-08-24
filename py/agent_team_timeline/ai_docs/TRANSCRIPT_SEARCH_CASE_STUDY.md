@@ -1,12 +1,15 @@
 # Transcript search case study: backend maturity
 
-> **Provenance.** This is a dated investigation record, kept as written. It was produced
-> against a private downstream workspace, so names of repositories, hosts and services
-> outside this one appear below and cannot be resolved from here. They are left in place
-> deliberately: rewriting a record to look tidier destroys the evidence it exists to be.
-> Nothing here describes `agent-utils` itself. See `#67 standalone-repo`.
+> **Provenance.** This is a dated investigation record. It was produced against a private
+> downstream workspace, so it refers to repositories, hosts and services outside this one
+> that cannot be resolved from here. Projects that consume `agent-utils` appear under
+> neutral labels — `consumer-a`, `consumer-b` — and those are REDACTIONS, not real names:
+> `agent-utils` is a reusable library and has to read standalone, without naming whoever
+> happens to use it. **The measurements, dates and findings are unchanged**; only names
+> were replaced. Nothing here describes `agent-utils` itself.
+> See `#86 scrub-client-names` and `#67 standalone-repo`.
 
-The Hermit archive provides a concrete acceptance test for transcript search: find where agents
+The Consumer A archive provides a concrete acceptance test for transcript search: find where agents
 defined backend maturity grade B3 and identify which backend measurements justified that label.
 This is a zero-model, post-ingestion task; search must operate on verbatim normalized messages.
 
@@ -34,8 +37,8 @@ This is a zero-model, post-ingestion task; search must operate on verbatim norma
   `message:orc-coord-014::orc-note-4fb50e87-22179` later invalidates an earlier DBI B3 figure:
   DBI matched only 4/84 of its own detlog ordinals across two runs, so a quoted 130/152 (85.5%)
   result was not comparable until its dimension and normalization were explained.
-- `orc-coord-030-hermit3`, 2026-08-13 01:49:36Z,
-  `message:orc-coord-030-hermit3::orc-note-4fb50e87-s1-713` calls LiteInst B3 rather than B4
+- `orc-coord-030-consumer-a3`, 2026-08-13 01:49:36Z,
+  `message:orc-coord-030-consumer-a3::orc-note-4fb50e87-s1-713` calls LiteInst B3 rather than B4
   after `/bin/echo` and `/bin/true` passed canonical L2 while `/bin/cat /dev/null` still failed on
   virtual-time differences.
 
@@ -92,7 +95,7 @@ and classifies the linked prompt author as an agent.
 
 ## Scale observation
 
-The final seven-team Hermit website used for this audit has 246,155 search records in 53 team/day
+The final seven-team Consumer A website used for this audit has 246,155 search records in 53 team/day
 objects: 119,733 textual events and 126,422 condensed tool records. The text objects occupy 333.96
 MB as identity JSON and 50.50 MB at gzip-6. The 53 relationship sidecars add 9.51 MB identity or
 1.13 MB at gzip-6. The 3.87 MB bootstrap is 2.14 MB compressed, including about 2.93 million base64

@@ -47,7 +47,7 @@ _QUIET_PSI_AVG10: Final = 5.0
 _QUIET_CO_TENANTS: Final = 2
 
 # Fallback USER_HZ when ``os.sysconf("SC_CLK_TCK")`` is unavailable, matching the
-# DeepScry original's ``os.sysconf(...) or 100``.
+# originating implementation's ``os.sysconf(...) or 100``.
 _DEFAULT_CLK_TCK: Final = 100
 
 #: The three-level ambient-load verdict, by string value (the value is the parity key).

@@ -2024,7 +2024,7 @@ def _resolve_cgroup_manager(
     unavailable. The deliberate opt-out is logged loudly (the reason is a reviewable audit signal),
     and takes precedence over ``allow_failure`` when both are set.
 
-    Flow (mirrors DeepScry's validate cgroup bring-up):
+    Flow (mirrors the originating validator's cgroup bring-up):
 
     * Already inside the managed scope (``DAGRUN_IN_SCOPE=1``): construct :class:`Cgroups`. If
       per-step containment came up, install the scope teardown handler and box. If it did not,

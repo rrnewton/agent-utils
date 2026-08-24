@@ -611,7 +611,7 @@ def _proc_cwd(pid: int) -> str | None:
 def _cmdline_targets_cwd(cmd: str, pid: int, cwd: str) -> bool:
     """Does a process belong to ``cwd``? By its command line OR its actual ``/proc`` cwd.
 
-    DeepScry matches the working directory as a substring of the command line
+    The originating implementation matches the working directory as a substring of the command line
     (``current_dir in cmd``); we additionally check the real ``/proc/<pid>/cwd`` so a
     process launched with a relative path (whose cwd never appears in ``argv``) is still
     correctly attributed — the same robustness the scope reaper already relied on.

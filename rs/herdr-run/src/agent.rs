@@ -1520,7 +1520,7 @@ mod tests {
                     tab_id: "w1:t1".to_owned(),
                     workspace_id: "w1".to_owned(),
                 }],
-                workspace_label: "deepscry".to_owned(),
+                workspace_label: "acme".to_owned(),
                 state: Mutex::new(FakeState {
                     infos,
                     states: states.iter().map(|state| (*state).to_owned()).collect(),
@@ -1711,7 +1711,7 @@ mod tests {
             session_agent: Some("codex".to_owned()),
             session_value: Some("session-1".to_owned()),
             expected_agent: Some("codex".to_owned()),
-            expected_workspace: Some("deepscry".to_owned()),
+            expected_workspace: Some("acme".to_owned()),
             expected_cwd: Some(PathBuf::from("/work/mtg")),
         }
     }
