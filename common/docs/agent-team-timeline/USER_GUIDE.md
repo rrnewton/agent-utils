@@ -419,6 +419,12 @@ summary cache inputs stay unchanged; common per-session event, turn, and tool ID
 sessions are namespaced. The browser shows one structural continuation edge rather than pretending
 that the new coordinator was a spawned worker.
 
+Every ingest first copies the vendor logs it is about to parse into a snapshot store *outside*
+`--output`, defaulting to `<output>.sources/`. Those copies are ingest input rather than published
+output and are usually the largest thing here; see
+[Where the source snapshots live](#where-the-source-snapshots-live) for the `--snapshot-root` flag
+and for how an existing archive moves them.
+
 Use `ingest-claude --session-file FILE` for a Claude lineage. Like Codex ingestion, it is offline and
 does not invoke a model.
 
@@ -746,14 +752,11 @@ example-team/
 │   ├── messages.jsonl               # prompts plus mechanically linked responses
 │   └── system-inputs.jsonl          # retained scheduled/synthetic coordinator inputs
 ├── data/
-│   ├── timeline.json[.gz]           # identity file plus optional deterministic sidecar
+│   ├── timeline-v2.json[.gz]        # browser bootstrap; objects/ holds its immutable shards
+│   ├── timeline-v3.json             # `./timeline`'s bootstrap; shards under timeline-v3/
 │   └── details/<phase-id>.json[.gz]
+├── snapshot-root.json               # where this archive keeps its vendor source snapshots
 └── teams/example-team/
-    ├── source_snapshots/             # gitignored validated source copies
-    │   ├── 2026/08/04/rollout-....jsonl       # Codex/Claude
-    │   ├── .objects/<prefix>/<sha>.db         # immutable Orc SQLite objects
-    │   ├── .projections/<prefix>/<sha>.json   # frozen Orc note provenance
-    │   └── .staging/                           # managed, retry-safe Orc candidates
     ├── payloads/                      # gitignored tool arguments and command output
     │   ├── <xx>.jsonl                 # content-addressed, sharded by digest prefix
     │   └── manifest.json              # records, bytes, and each shard's content address
@@ -845,9 +848,9 @@ reports a missing source snapshot for a rollout its manifest records, and Orc re
 that does not match its manifest. Delete the snapshots for a lineage that is finished, not for one
 that is still running, and understand that the decision is not reversible by re-ingesting.
 
-Ingest first copies every newline-complete rollout in the selected lineage into
-`teams/<team>/source_snapshots/`; all parsing after that point uses these copies rather than the live
-Codex files. The generated root `.gitignore` excludes the potentially large copies, while
+Ingest first copies every newline-complete rollout in the selected lineage into the snapshot
+store described in [Where the source snapshots live](#where-the-source-snapshots-live); all parsing
+after that point uses these copies rather than the live Codex files, while
 `raw/source-manifest.json` remains versionable and records each original path, copied byte count,
 SHA-256 digest, line count, and last snapshot update. Reruns permit only exact reuse, an append to an
 existing prefix, or a newly discovered child rollout. A disappeared file, shorter complete prefix,
@@ -866,6 +869,74 @@ restricted to the exact paths in that refresh's validated source set; leftover f
 interrupted run are not silently adopted. Snapshot traversal and replacement reject symlinked
 roots, directories, and targets, and durable replacements fsync both file content and its parent
 directory before the transaction proceeds.
+
+### Where the source snapshots live
+
+The vendor copies are ingest **input**, not published output. They are typically the largest thing
+an archive touches — on one measured archive, 995 files and 6,524,876,923 bytes against a
+9,662,206,589-byte archive, 67.5% of it — and nothing a reader, a query or the website ever opens.
+So they are kept outside `--output`:
+
+    /path/to/summary/widget            <- --output: published, served, cloned
+    /path/to/summary/widget.sources/   <- the snapshot store
+    /path/to/summary/widget.sources/<team-slug>/...
+
+Set it with `--snapshot-root DIR` on any ingest or refresh command, or with a top-level
+`"snapshot_root"` in a project config. It names the *store*, not one team's directory: teams are
+slug-named subdirectories inside it, so an archive with twelve teams sets it once. The archive
+records the choice in `snapshot-root.json` at its root, so later runs do not need the flag —
+without that record, forgetting the flag once would silently start a second store beside the
+first, and both would look valid.
+
+The store keeps a `.gitignore` containing `/*`, which ignores every entry including itself, so a
+store that lands inside a repository is invisible to `git status` rather than being offered as
+several gigabytes of additions.
+
+**An existing archive is not moved by a build.** If `teams/<team>/source_snapshots/` is populated,
+every ingest keeps using it exactly as before, indefinitely, with no flag. Moving it is something
+you ask for:
+
+```bash
+agent-team-timeline migrate-snapshots --output ./timelines/example-team
+agent-team-timeline migrate-snapshots --output ./timelines/example-team --move
+```
+
+The first prints what would move, from where, to where, how many files and bytes, and anything it
+refuses to touch. The second does it — a rename per team when the store is on the same filesystem,
+which the default sibling always is. It refuses rather than merging into an occupied target, and it
+refuses a cross-filesystem move unless you add `--copy`, because that path is a copy-verify-delete:
+interruptible, and the bytes exist twice while it runs.
+
+The layout is recorded *before* the first byte moves, so an interrupted migration is resumable on
+both paths: the next ingest recognises the half-moved state by name and refuses for the teams
+still inside the archive — the ones already moved keep ingesting normally — and re-running
+`migrate-snapshots --move` finishes it. That holds for `--copy` too, because the copy assembles
+each team under `<store>/.migrating/<team>` and publishes it with a rename, so a target directory
+never exists in a half-written state and an interruption leaves nothing to disentangle: re-running
+discards the scratch copy and starts that team again. `agent-team-timeline inspect` prints the
+current layout under `source_snapshots`, including `store_root`.
+
+Two things the resolver refuses rather than guessing at, both of which used to end badly:
+
+- **`--snapshot-root` while any team's snapshots are still inside the archive.** One archive has
+  one layout, so the flag is refused for a *new* team as well, naming the directories that are
+  still in the old place. Accepting it would have split the archive across two layouts and then
+  recorded the new one archive-wide, after which every already-ingested team refuses.
+- **A recorded store that is not there.** If the archive and its store were renamed together, the
+  sibling `<output>.sources` is adopted — it carries a marker saying which archive it belongs to,
+  so that is a reading and not a guess. Otherwise the run stops and says so, rather than creating
+  an empty store and losing sight of the snapshots that exist somewhere else. Renaming the archive
+  directory alone is fine and always was; the store's marker is updated to the new name.
+
+**Nothing under the snapshot root is reachable over HTTP.** For a migrated archive that is true by
+construction — the files are not under the served root. For an archive that has not been migrated,
+`make serve` refuses any path with a `source_snapshots` component with a 404, so the bytes are not
+fetchable even while they are still physically inside the tree. (An archive built by an older tool
+carries that tool's `serve.py`; rebuild it to pick up the refusal.)
+
+Back the store up with the archive if you want incremental ingest to keep working. Without it the
+archive still reads, queries, summarizes and builds — see the paragraph above on what deleting the
+snapshots costs — but the next ingest for that team cannot establish append-only continuity.
 
 ### The retired `raw/messages/` directory
 
@@ -894,6 +965,70 @@ most worth reclaiming. The cost is that `raw/messages/` is an ingest-owned direc
 as one — do not keep your own files in it, because anything you leave there named `something.json`
 goes too. A symlink, a subdirectory, a `.gz` sidecar, and any other name are left alone, and
 anything left behind keeps the directory itself in place.
+
+### The retired schema-1 monolith, and `gc`
+
+`data/timeline.json` was the whole presentation timeline in one JSON document — 246,973,399
+bytes, plus a 33,997,790-byte gzip twin, on one twelve-team archive. A published build no longer
+writes it. Both readers had already retired it: `./timeline` prefers the schema-3 shards, then
+the schema-2 objects, and opens the monolith only if neither is there, and the website loads
+`data/timeline-v2.json` and falls back to the monolith only when that load fails. Every build
+writes both of the generations in front of it, so nothing an up-to-date tool produces needs it.
+
+**A rebuild does not delete the copy you already have.** Not writing a file and deleting it are
+separate decisions, and only the first one belongs to a build you ran for another reason. The
+monolith is recorded in `data/export.json` under `retired_files` and left exactly where it is, so
+an older `./timeline` or a browser holding a cached `app.js` still finds what it looks for.
+
+Reclaiming it is `gc`, and `gc` defaults to telling you rather than doing anything:
+
+```bash
+agent-team-timeline gc --output .            # dry run: every category, by bytes
+agent-team-timeline gc --output . --delete   # move the reclaimable ones to the trash
+agent-team-timeline gc --output . --empty-trash   # the irreversible pass
+```
+
+The dry run classifies every file in the archive as live, reclaimable or held, and prints the
+reason for each category even when it is empty — a zero that does not explain itself is not an
+answer. Nothing is ever reclaimed because "the last build did not write it": a file goes only
+when a named superseding artifact is present *and complete* — schema 3's completeness is judged
+by the same five-clause rule the reader uses before it will answer a question — or when a
+manifest authoritative over its directory disowns it.
+
+`--delete` moves files into `.agent-team-timeline-trash/<generation>/files/`, mirroring their
+archive paths, and writes a `receipt.json` beside them saying what went and why. The receipt is
+written before the first file moves and rewritten after the last one, gaining `"complete": true`,
+so a sweep that fails partway still leaves a list of what may be in the trash rather than an
+unexplained directory. Putting it back is one copy from the archive root:
+
+```bash
+cp -a .agent-team-timeline-trash/<generation>/files/. ./
+```
+
+`--empty-trash` is a separate invocation, and asking for both at once is refused. That is the
+whole design: this archive costs hours of model time to rebuild, so the first destructive
+operation is reversible and the second one is a decision you have to type out on purpose.
+
+Three things `gc` reports and deliberately never touches.
+
+The schema-2 objects listed as `retained_objects` are the previous generation's, kept alive for
+one more generation so that a browser which already loaded the previous bootstrap can still fetch
+what it names; the next build that supersedes them reclaims them.
+
+`teams/*/source_snapshots/`, usually the largest thing in the archive, is vendor input rather than
+published output and has a purpose-built gate of its own: run `audit-losslessness
+--require-lossless` and act on that. To get those bytes out of the published tree without deleting
+anything, run `migrate-snapshots` instead; after that this category is empty, because `gc`
+classifies the directory it was given and there is nothing of the kind left in it.
+
+And **schema-3 shards the bootstrap does not name**, which are reported and never swept. Absence
+from the catalogue cannot distinguish a retired team's leftover shard from a live team's shard
+that an interrupted build published before it got to its bootstrap — the answer depends only on
+which of the two is newer, and nothing on disk says. The publisher settles it instead: a build
+clears `data/timeline-v3/` of everything outside its own plan once its bootstrap is written, so a
+completed build always leaves this category empty. If it is *not* empty, a build was interrupted;
+the archive is meanwhile reading through the slower generation behind schema 3, and the fix is to
+re-run the build, which clears the residue. `gc` says exactly that in the category's reason.
 
 ## Claude source semantics and limitations
 
@@ -1048,10 +1183,14 @@ per column—and any bound that was applied is flagged rather than hidden. Those
 an event whose two sides both survive on disk, so more detail is always a `sqlite3` session away:
 
 ```bash
-cd ../summary/widget/teams/orc-example-014/source_snapshots
+cd ../summary/widget.sources/orc-example-014
 sqlite3 .objects/16/1617869e....db \
   "SELECT message_json FROM messages WHERE id = 878292"
 ```
+
+That path is the snapshot store, which for an archive that has not been through
+`migrate-snapshots` is still `../summary/widget/teams/orc-example-014/source_snapshots` instead.
+`agent-team-timeline inspect` prints the one this archive uses, as `source_snapshots.store_root`.
 
 Retention is one deep per source, and only another *accepted* override reclaims it: the second
 acceptance supersedes the first's pointer, and the next GC takes the older object. So the bytes are
@@ -1199,9 +1338,17 @@ that generated alias without changing the internal `agent_team_timeline.query` i
 
 ```bash
 agent-team-timeline inspect --output ./timelines/example-team
+agent-team-timeline gc --output ./timelines/example-team
 ```
 
-This prints track/phase/edge/event/rollup counts and the current manifest.
+`inspect` prints track/phase/edge/event/rollup counts and the current manifest. It reads them out
+of the schema-3 catalogue when the archive has one, which is why it is now instant: on one
+twelve-team archive the old whole-monolith parse cost 2.4 seconds and 1.44 GiB resident for six
+integers the 89 KB bootstrap already publishes.
+
+`gc` accounts for disk rather than records: every file classified as live, reclaimable or held,
+with bytes and a reason per category. It changes nothing without `--delete`; see "The retired
+schema-1 monolith, and `gc`" above for what it will and will not reclaim.
 
 Common errors:
 

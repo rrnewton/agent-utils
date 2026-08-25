@@ -74,8 +74,11 @@ The generated identity files remain ordinary static-site files. The bundled serv
 selects deterministic gzip-6 companions for large browser assets and uses ETags so reloads can
 reuse validated responses; another basic static server can still serve the identity files.
 Modern generated sites start from `data/timeline-v2.json` and fetch immutable UTC-day detail
-objects only as their time ranges become visible. `data/timeline.json` remains present for older
-browsers and compatibility queries. Full transcript search uses separate content-addressed UTC-day
+objects only as their time ranges become visible, while `./timeline` reads the smaller schema-3
+shards under `data/timeline-v3/`. A published build no longer writes the schema-1 monolith
+`data/timeline.json`: both readers reached it only as a fallback behind those two, and it was a
+quarter of a gigabyte. A copy an older build left behind is left where it is rather than deleted
+by a rebuild; `agent-team-timeline gc` reports it and, when asked, reclaims it. Full transcript search uses separate content-addressed UTC-day
 objects, so it is independent of phase chunking and includes final messages that fall exactly at an
 agent lifetime boundary. Search objects contain verbatim message text plus condensed one-line tool
 records; they never contain raw tool inputs or outputs. A false-positive-only trigram filter in the

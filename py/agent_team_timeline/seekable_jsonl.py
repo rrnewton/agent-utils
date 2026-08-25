@@ -784,6 +784,7 @@ class SeekableJsonlReader:
         index_path: Path | None = None,
         use_index: bool = True,
         timestamp_key: str | None = None,
+        cache_members: bool = False,
     ) -> None:
         self._path = path
         self._index_path = index_path if index_path is not None else index_path_for(path)
@@ -804,6 +805,15 @@ class SeekableJsonlReader:
             DEFAULT_TIMESTAMP_KEY if timestamp_key is None else timestamp_key
         )
         self._handle: BinaryIO | None = None
+        # Off by default, because the general case is a reader used once over a file far larger
+        # than memory, and a cache there would turn a streaming read into an out-of-memory error.
+        # A caller opts in when it will ask several questions of one file whose answers live in
+        # overlapping members -- reading three separate line ranges out of the same member, say.
+        # Without it each question re-inflates the member and `data_bytes_read` honestly reports
+        # the repetition; with it the counter reports what a reader that keeps what it has already
+        # paid for actually costs. `query._ChunkedJsonlReader`, the standalone copy of this class,
+        # carries the same option under the same name, and it is used there for exactly that case.
+        self._members: dict[int, bytes] | None = {} if cache_members else None
         if use_index and self._index_path.is_file():
             raw_sidecar = self._index_path.read_bytes()
             self._index_bytes_read += len(raw_sidecar)
@@ -1101,7 +1111,13 @@ class SeekableJsonlReader:
         return raw
 
     def _member_bytes(self, entry: ChunkIndexEntry) -> bytes:
-        return self._inflate(self._raw_member(entry), entry)
+        if self._members is None:
+            return self._inflate(self._raw_member(entry), entry)
+        cached = self._members.get(entry.c_off)
+        if cached is None:
+            cached = self._inflate(self._raw_member(entry), entry)
+            self._members[entry.c_off] = cached
+        return cached
 
     def _inflate(self, raw: bytes, entry: ChunkIndexEntry) -> bytes:
         try:

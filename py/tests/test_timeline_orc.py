@@ -45,6 +45,8 @@ from agent_team_timeline.pipeline import (
     summarize_archive,
 )
 from agent_team_timeline.window import apply_date_window, parse_date_window
+from tests.timeline_snapshots import snapshot_root
+from tests.timeline_projection import schema_1_timeline_text
 
 
 ROOT = "11111111-1111-1111-1111-111111111111"
@@ -273,11 +275,11 @@ def _manifest_snapshot_database(archive: Path, kind: str) -> Path:
     relative = source.get("snapshot_path")
     if not isinstance(relative, str):
         raise AssertionError("test fixture snapshot path is not a string")
-    return archive / "teams" / "orc-test" / "source_snapshots" / relative
+    return snapshot_root(archive, "orc-test") / relative
 
 
 def _managed_snapshot_objects(archive: Path) -> tuple[Path, ...]:
-    root = archive / "teams" / "orc-test" / "source_snapshots" / ".objects"
+    root = snapshot_root(archive, "orc-test") / ".objects"
     if not root.is_dir():
         return ()
     return tuple(
@@ -290,7 +292,7 @@ def _managed_snapshot_objects(archive: Path) -> tuple[Path, ...]:
 
 
 def _managed_task_projections(archive: Path) -> tuple[Path, ...]:
-    root = archive / "teams" / "orc-test" / "source_snapshots" / ".projections"
+    root = snapshot_root(archive, "orc-test") / ".projections"
     if not root.is_dir():
         return ()
     return tuple(
@@ -318,7 +320,7 @@ def _manifest_task_projection(archive: Path) -> tuple[Path, dict[str, JsonValue]
     relative = projection.get("path")
     if not isinstance(relative, str):
         raise AssertionError("test fixture projection path is not a string")
-    path = archive / "teams" / "orc-test" / "source_snapshots" / relative
+    path = snapshot_root(archive, "orc-test") / relative
     return path, projection
 
 
@@ -3712,7 +3714,8 @@ def test_duplicate_agent_block_identity_is_rejected(tmp_path: Path) -> None:
 
 def _downgrade_orc_manifest_to_v1(path: Path) -> tuple[OrcSourceCopy, ...]:
     root = as_object(read_json(path), str(path))
-    snapshot_root = path.parent.parent / "source_snapshots"
+    archive = path.parent.parent.parent.parent
+    snapshots = snapshot_root(archive, path.parent.parent.name)
     legacy_sources: list[JsonValue] = []
     object_paths: set[Path] = set()
     for index, raw_source in enumerate(
@@ -3743,8 +3746,8 @@ def _downgrade_orc_manifest_to_v1(path: Path) -> tuple[OrcSourceCopy, ...]:
         snapshot_path = legacy_source.get("snapshot_path")
         if not isinstance(source_path, str) or not isinstance(snapshot_path, str):
             raise AssertionError("test fixture source paths are not strings")
-        object_path = snapshot_root.joinpath(*Path(snapshot_path).parts)
-        legacy_path = snapshot_root.joinpath(*Path(source_path).parts)
+        object_path = snapshots.joinpath(*Path(snapshot_path).parts)
+        legacy_path = snapshots.joinpath(*Path(source_path).parts)
         legacy_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(object_path, legacy_path)
         if legacy_source.get("kind") == "task":
@@ -3837,9 +3840,9 @@ def test_v1_unchanged_migration_preserves_semantics_digest_and_summary_cache(
         archive / "teams" / "orc-test" / "raw" / "source-manifest.json"
     )
     legacy_sources = _downgrade_orc_manifest_to_v1(manifest_path)
-    snapshot_root = archive / "teams" / "orc-test" / "source_snapshots"
+    snapshots = snapshot_root(archive, "orc-test")
     legacy_team = load_orc_team(
-        snapshot_root, ROOT, "orc-test", "America/New_York", legacy_sources
+        snapshots, ROOT, "orc-test", "America/New_York", legacy_sources
     )
     before = replace(initial, sources=legacy_team.sources)
     raw_team_path = archive / "teams" / "orc-test" / "raw" / "team.json"
@@ -4099,7 +4102,7 @@ def test_noncanonical_task_projection_fails_closed(tmp_path: Path) -> None:
     sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
     relative = f".projections/{sha256[:2]}/{sha256}.json"
     replacement = (
-        archive / "teams" / "orc-test" / "source_snapshots" / relative
+        snapshot_root(archive, "orc-test") / relative
     )
     replacement.parent.mkdir(parents=True, exist_ok=True)
     replacement.write_text(text, encoding="utf-8")
@@ -4169,14 +4172,7 @@ def test_managed_object_gc_rejects_symlinks(tmp_path: Path) -> None:
     source, _, _ = _fixture(tmp_path)
     archive = tmp_path / "archive"
     ingest_orc(archive, source, ROOT, "orc-test", "America/New_York")
-    prefix = (
-        archive
-        / "teams"
-        / "orc-test"
-        / "source_snapshots"
-        / ".objects"
-        / "ff"
-    )
+    prefix = snapshot_root(archive, "orc-test") / ".objects" / "ff"
     prefix.mkdir()
     unsafe = prefix / ("f" * 64 + ".db")
     unsafe.symlink_to(tmp_path / "outside.db")
@@ -4408,7 +4404,7 @@ def test_stale_managed_staging_candidate_is_pruned(tmp_path: Path) -> None:
     source, _, _ = _fixture(tmp_path)
     archive = tmp_path / "archive"
     ingest_orc(archive, source, ROOT, "orc-test", "America/New_York")
-    staging = archive / "teams" / "orc-test" / "source_snapshots" / ".staging"
+    staging = snapshot_root(archive, "orc-test") / ".staging"
     stale = staging / "orc-123-0123456789abcdef.db"
     stale_wal = staging / "orc-123-0123456789abcdef.db-wal"
     stale_shm = staging / "orc-123-0123456789abcdef.db-shm"
@@ -4436,7 +4432,7 @@ def test_unsafe_staging_entry_is_rejected(
     source, _, _ = _fixture(tmp_path)
     archive = tmp_path / "archive"
     ingest_orc(archive, source, ROOT, "orc-test", "America/New_York")
-    staging = archive / "teams" / "orc-test" / "source_snapshots" / ".staging"
+    staging = snapshot_root(archive, "orc-test") / ".staging"
     unsafe = staging / "unsafe"
     if unsafe_kind == "symlink":
         unsafe.symlink_to(tmp_path / "outside")
@@ -4473,9 +4469,7 @@ def test_orc_pipeline_builds_one_day_archive_idempotently(tmp_path: Path) -> Non
     )
     summaries = summarize_archive(archive, "orc-test", "heuristic", "fixture")
     built = build_archive(archive, "orc-test")
-    timeline = json.loads(
-        (archive / "data" / "timeline.json").read_text(encoding="utf-8")
-    )
+    timeline = json.loads(schema_1_timeline_text(archive))
 
     assert team.provider == "orc"
     assert first.sources == 3
@@ -5300,7 +5294,7 @@ def test_accepted_prefix_rewrite_retains_the_pre_rewrite_snapshot(
     source, root_db, _ = _override_fixture(tmp_path)
     archive = tmp_path / "archive"
     ingest_orc(archive, source, ROOT, "orc-test", "UTC")
-    snapshot_root = archive / "teams" / "orc-test" / "source_snapshots"
+    snapshots = snapshot_root(archive, "orc-test")
     manifest_path = archive / "teams" / "orc-test" / "raw" / "source-manifest.json"
     pre_rewrite = _manifest_snapshot_database(archive, "session")
     pre_rewrite_sha256 = orc_module._sha256_file(pre_rewrite)
@@ -5321,7 +5315,7 @@ def test_accepted_prefix_rewrite_retains_the_pre_rewrite_snapshot(
     assert override.superseded_sha256 == pre_rewrite_sha256
     assert (
         override.superseded_snapshot_path
-        == pre_rewrite.relative_to(snapshot_root).as_posix()
+        == pre_rewrite.relative_to(snapshots).as_posix()
     )
     # The object GC ran in this same call and left the superseded bytes alone.
     assert pre_rewrite.is_file()
@@ -5396,8 +5390,8 @@ def test_a_schema_v1_source_records_where_its_pre_rewrite_bytes_actually_are(
     ingest_orc(archive, source, ROOT, "orc-test", "UTC")
     manifest_path = archive / "teams" / "orc-test" / "raw" / "source-manifest.json"
     _downgrade_orc_manifest_to_v1(manifest_path)
-    snapshot_root = archive / "teams" / "orc-test" / "source_snapshots"
-    mirrored = snapshot_root / ".orc" / "sessions" / ROOT / "session.db"
+    snapshots = snapshot_root(archive, "orc-test")
+    mirrored = snapshots / ".orc" / "sessions" / ROOT / "session.db"
     assert mirrored.is_file()
     _backfill_token_count(root_db, 2, 445)
 
@@ -5960,7 +5954,7 @@ def test_task_note_deleted_upstream_survives_without_source_snapshots(
     second, report = ingest_orc(
         archive, source, ROOT, "orc-test", "America/New_York"
     )
-    shutil.rmtree(archive / "teams" / "orc-test" / "source_snapshots")
+    shutil.rmtree(snapshot_root(archive, "orc-test"))
     reloaded = load_archived_team(archive, "orc-test")
     survivor = next(note for note in reloaded.task_notes if note.note_id == 4)
     appended = next(note for note in reloaded.task_notes if note.note_id == 5)

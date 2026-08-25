@@ -14,6 +14,7 @@ from agent_team_timeline.model_io import team_from_json_obj
 from agent_team_timeline.phases import build_phases
 from agent_team_timeline.pipeline import build_archive, summarize_archive
 from agent_team_timeline.window import apply_date_window, parse_date_window
+from tests.timeline_projection import schema_1_timeline_text
 
 
 ROOT = "root-thread"
@@ -261,9 +262,7 @@ def test_built_site_uses_exact_window_and_only_selected_agents(tmp_path: Path) -
 
     report = summarize_archive(tmp_path, team.team_slug, "heuristic", "test-model")
     built = build_archive(tmp_path, team.team_slug)
-    timeline = json.loads(
-        (tmp_path / "data" / "timeline.json").read_text(encoding="utf-8")
-    )
+    timeline = json.loads(schema_1_timeline_text(tmp_path))
 
     assert report.agent_names == 1
     assert built["agents"] == 1
@@ -361,9 +360,7 @@ def test_built_site_keeps_silent_agent_whose_lifetime_overlaps_window(
 
     report = summarize_archive(tmp_path, team.team_slug, "heuristic", "test-model")
     built = build_archive(tmp_path, team.team_slug)
-    timeline = json.loads(
-        (tmp_path / "data" / "timeline.json").read_text(encoding="utf-8")
-    )
+    timeline = json.loads(schema_1_timeline_text(tmp_path))
 
     assert report.agent_names == 3
     assert built["agents"] == 3

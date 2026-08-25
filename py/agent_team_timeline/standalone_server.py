@@ -79,6 +79,26 @@ _MAX_RANGE_BYTES = 16 << 20
 
 _RANGE = re.compile(r"^bytes=(\d*)-(\d*)$")
 
+#: Path components this server will not serve from, at any depth, under any name.
+#:
+#: `source_snapshots` is the vendor material ingestion reads -- 6,524,876,923 bytes across 995
+#: files on the measured archive, 67.5% of everything under the root. A new archive keeps it
+#: outside the served tree entirely, in the store beside the archive, so for those this rule
+#: never fires. It exists for the archive nobody has migrated yet, where the bytes are still
+#: physically inside `--output` and are therefore fetchable by anyone who can guess a filename.
+#:
+#: A refusal by *component name*, anywhere beneath the root, rather than by matching the exact
+#: `teams/<slug>/source_snapshots/` shape. This file is copied verbatim into every archive and has
+#: no notion of teams, and the loose rule is the safe direction to be wrong in: the only thing it
+#: can over-refuse is a file the archive has no reason to contain, while the strict rule would
+#: under-refuse the moment somebody copied or symlinked a store somewhere unexpected.
+#:
+#: Note what this does *not* claim to be. It is a serving policy, not a security boundary: the
+#: files are still on the operator's disk with their ordinary permissions, and the server is
+#: loopback-only. The claim is narrower and is the one that was asked for -- nothing under the
+#: snapshot root is reachable over HTTP.
+_UNSERVABLE_COMPONENTS = frozenset({"source_snapshots"})
+
 
 def _strong_etag(path: Path, stat_result: os.stat_result) -> str:
     """The file's SHA-256, computed at most once per distinct version of it.
@@ -189,6 +209,16 @@ class TimelineRequestHandler(http.server.SimpleHTTPRequestHandler):
         self.send_header("Cache-Control", cache_control_for_path(source_path))
         self._cache_control_sent = True
 
+    def _is_unservable(self, path: Path) -> bool:
+        """Whether *path* lies in a tree this server refuses to publish.
+
+        Checked on the path `translate_path` produced, after its own normalization, so a request
+        spelled with `%2e%2e`, doubled slashes or percent-encoded components is judged by where it
+        actually lands rather than by how it was written.
+        """
+
+        return any(part in _UNSERVABLE_COMPONENTS for part in path.parts)
+
     def _selected_source_path(self) -> Path | None:
         source_path = Path(self.translate_path(self.path))
         if not source_path.is_dir():
@@ -205,6 +235,16 @@ class TimelineRequestHandler(http.server.SimpleHTTPRequestHandler):
     def send_head(self) -> BinaryIO | None:
         """Open the selected representation and emit content-negotiated headers."""
 
+        # First, before the file is opened, before content negotiation, and before the base class
+        # can be reached: a refusal that ran later could be bypassed by any request shape that
+        # falls through to `super().send_head()`.
+        #
+        # 404 rather than 403, matching `list_directory` directly above, which has answered 404
+        # for a real directory since it was written. The reason is the same: this server's error
+        # responses should not be a discovery oracle. "Forbidden" tells a client the path exists.
+        if self._is_unservable(Path(self.translate_path(self.path))):
+            self.send_error(404, "File not found")
+            return None
         source_path = self._selected_source_path()
         if source_path is None or not source_path.is_file() or source_path.is_symlink():
             return super().send_head()

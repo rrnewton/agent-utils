@@ -25,6 +25,7 @@ from agent_team_timeline.pipeline import ingest_codex
 from agent_team_timeline.phases import build_phases
 from agent_team_timeline.pipeline import _phase_jobs
 from agent_team_timeline.summarize import _input_hash
+from tests.timeline_snapshots import snapshot_root
 
 
 ROOT = "root-thread"
@@ -362,10 +363,7 @@ def _origin(sessions: Path) -> Path:
 
 def _snapshot(archive: Path) -> Path:
     return (
-        archive
-        / "teams"
-        / "codex-test"
-        / "source_snapshots"
+        snapshot_root(archive, "codex-test")
         / "2026"
         / "08"
         / "05"
@@ -405,7 +403,7 @@ def test_ingest_copies_complete_lines_then_parses_the_backup(tmp_path: Path) -> 
 
     # The normalized parser has everything it needs in the copy, independent of the live root.
     parsed = load_codex_team(
-        archive / "teams" / "codex-test" / "source_snapshots",
+        snapshot_root(archive, "codex-test"),
         ROOT,
         "codex-test",
         "UTC",
@@ -1039,14 +1037,7 @@ def test_continuation_source_truncation_fails_without_replacing_archive(
 
 def test_orphan_snapshot_is_excluded_from_manifest_bound_parse(tmp_path: Path) -> None:
     sessions, archive, _ = _first_ingest(tmp_path)
-    orphan = (
-        archive
-        / "teams"
-        / "codex-test"
-        / "source_snapshots"
-        / "orphan"
-        / "rollout-child.jsonl"
-    )
+    orphan = snapshot_root(archive, "codex-test") / "orphan" / "rollout-child.jsonl"
     orphan.parent.mkdir(parents=True)
     orphan.write_bytes(_child_bytes())
 
@@ -1071,15 +1062,15 @@ def test_snapshot_directory_symlink_escape_is_rejected(
     (archive / ".agent-team-timeline.json").write_text(
         '{"schema_version":1,"tool":"agent-team-timeline"}\n', encoding="utf-8"
     )
-    snapshot_root = archive / "teams" / "codex-test" / "source_snapshots"
+    snapshots = snapshot_root(archive, "codex-test")
     outside = tmp_path / "outside"
     outside.mkdir()
     if symlink_level == "root":
-        snapshot_root.parent.mkdir(parents=True)
-        snapshot_root.symlink_to(outside, target_is_directory=True)
+        snapshots.parent.mkdir(parents=True)
+        snapshots.symlink_to(outside, target_is_directory=True)
     else:
-        snapshot_root.mkdir(parents=True)
-        (snapshot_root / "2026").symlink_to(outside, target_is_directory=True)
+        snapshots.mkdir(parents=True)
+        (snapshots / "2026").symlink_to(outside, target_is_directory=True)
 
     with pytest.raises(CodexParseError, match="symlink or non-directory"):
         ingest_codex(archive, sessions, ROOT, "codex-test", "UTC")
@@ -1135,7 +1126,7 @@ def test_retry_recovers_copy_that_advanced_before_manifest(tmp_path: Path) -> No
     copied_only = snapshot_codex_lineage(
         sessions,
         ROOT,
-        archive / "teams" / "codex-test" / "source_snapshots",
+        snapshot_root(archive, "codex-test"),
         _manifest_sources(archive),
         "2026-08-05T12:00:00Z",
     )

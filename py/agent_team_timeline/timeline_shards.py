@@ -426,13 +426,29 @@ def _phase_intervals(record: dict[str, JsonValue], where: str) -> list[tuple[int
     return intervals
 
 
-def _activity_bounds(
+def activity_bounds(
     timeline: dict[str, JsonValue],
 ) -> tuple[
     dict[str, tuple[int, int]],
     dict[str, tuple[int, int]],
     tuple[tuple[int, int], ...],
 ]:
+    """The zoom bounds for every phase, agent and rollup, from a schema-1 timeline.
+
+    Returned as ``(by phase id, by agent id, by rollup position)``. The first two are keyed
+    because a phase or an agent has a stable identifier and the caller has it in hand; rollups
+    are positional in ``timeline.rollups`` order because a rollup's identity is the triple
+    ``(team, kind, start_ms)`` and threading that through here would put a reference format --
+    which belongs to the reader -- inside the arithmetic.
+
+    Public, rather than private to schema 2, because schema 3 publishes the same numbers and
+    they must be the *same* numbers: two implementations of "the smallest interval containing
+    this record's actual work" would be two answers to one question, and the one the browser
+    happened to load would decide where it zoomed. :mod:`agent_team_timeline.timeline_v3` calls
+    this and republishes the result; `test_timeline_v3.py` asserts the two generations agree
+    record for record.
+    """
+
     phase_intervals: dict[str, list[tuple[int, int]]] = {}
     agent_intervals: dict[str, list[tuple[int, int]]] = {}
     global_intervals: list[tuple[int, int]] = []
@@ -755,8 +771,16 @@ def write_timeline_shards(
 ) -> TimelineShardReport:
     """Publish schema-2 objects and then atomically publish their stable bootstrap.
 
-    The caller continues to own ``data/timeline.json``.  Keeping that schema-1 file makes both old
-    browsers and the archive-local query CLI valid throughout the migration.
+    This generation is the one the **website** reads. `static/app.js` loads
+    ``data/timeline-v2.json`` and fetches these immutable objects as their time ranges become
+    visible; it has no schema-3 mode, because reading multi-member gzip over HTTP Range in the
+    browser does not exist yet. So schema 2 keeps being written even though `query.py` now
+    prefers schema 3 -- retiring the only format the graphical surface can open would retire the
+    surface.
+
+    Schema 1 is a different case and was retired: `render.retired_schema_1_files` records the two
+    fallback paths that used to reach ``data/timeline.json`` and why a published build no longer
+    produces it.
     """
 
     if as_int(raw_timeline.get("schema_version"), "timeline.schema_version") != 1:
@@ -767,7 +791,7 @@ def write_timeline_shards(
     timeline = as_object(narrow_json(raw_timeline), "timeline")
     current_scope = _shard_scope(timeline, "timeline")
     previous_objects = _previous_objects(output)
-    phase_bounds, agent_bounds, rollup_bounds = _activity_bounds(timeline)
+    phase_bounds, agent_bounds, rollup_bounds = activity_bounds(timeline)
     days = _detail_days(timeline, phase_bounds)
     generated_files: set[str] = {SCHEMA_2_BOOTSTRAP_PATH}
     changed = 0

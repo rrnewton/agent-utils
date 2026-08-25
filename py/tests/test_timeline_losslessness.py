@@ -35,6 +35,7 @@ from agent_team_timeline.pipeline import (
     load_archived_team,
     rehydrate_tool_payloads,
 )
+from tests.timeline_snapshots import snapshot_root
 
 ROOT = "root-thread"
 CHILD = "child-thread"
@@ -225,6 +226,10 @@ def test_payload_tree_is_gitignored_and_tracked_files_stay_clean(tmp_path: Path)
         "/.agent-team-timeline.lock",
         "/teams/*/source_snapshots/",
         "/teams/*/payloads/",
+        # Local recovery state, like the lock: `gc --delete` renames what it reclaims into here
+        # rather than unlinking it, and a quarter-gigabyte of reclaimed files must not turn up
+        # as a proposed addition to the operator's next commit.
+        "/.agent-team-timeline-trash/",
     ]
     tracked = "\n".join(
         path.read_text(encoding="utf-8")
@@ -646,7 +651,7 @@ def test_absent_snapshots_are_reported_as_nothing_left_to_compare(tmp_path: Path
     """After the deletion this gate exists to authorize, the gate has no opinion left to give."""
 
     archive = _ingest(tmp_path)
-    shutil.rmtree(archive / "teams" / "codex-test" / "source_snapshots")
+    shutil.rmtree(snapshot_root(archive, "codex-test"))
 
     report = audit_codex_losslessness(archive, "codex-test")
 
@@ -869,7 +874,7 @@ def test_a_deleted_vendor_snapshot_fails_the_gate_rather_than_shrinking_the_corp
     """Deletion must not be self-ratifying: the manifest, not `rglob`, defines the corpus."""
 
     archive = _ingest(tmp_path, child=True)
-    snapshots = archive / "teams" / "codex-test" / "source_snapshots"
+    snapshots = snapshot_root(archive, "codex-test")
     intact = audit_codex_losslessness(archive, "codex-test")
     assert intact.vendor_files == 2 and intact.source_problems == ()
 
@@ -901,10 +906,7 @@ def test_a_truncated_vendor_snapshot_is_caught_by_its_recorded_digest(
 
     archive = _ingest(tmp_path)
     rollout = (
-        archive
-        / "teams"
-        / "codex-test"
-        / "source_snapshots"
+        snapshot_root(archive, "codex-test")
         / "2026"
         / "08"
         / "05"

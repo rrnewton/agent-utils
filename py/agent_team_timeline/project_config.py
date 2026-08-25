@@ -88,6 +88,11 @@ class ProjectIngestConfig:
     config_path: Path
     config_sha256: str
     output: Path
+    #: Where the vendor source snapshots go, or ``None`` to let the archive's recorded layout --
+    #: and, for a brand-new archive, ``<output>.sources`` -- decide. Optional rather than required
+    #: because the default is the answer almost every project wants, and a manifest that had to
+    #: state it would make every existing manifest invalid for no gain.
+    snapshot_root: Path | None
     teams: tuple[ProjectTeamConfig, ...]
 
     @property
@@ -355,6 +360,23 @@ def _relative_output(config_path: Path, raw: str) -> Path:
     return (config_path.parent / candidate).resolve()
 
 
+def _snapshot_root(config_path: Path, raw: str) -> Path:
+    """Resolve the snapshot store, allowing an absolute path where ``output`` does not.
+
+    ``output`` is required to be relative because the archive is the artifact and a manifest that
+    hardcoded where somebody's artifact lives could not be shared. The snapshot store is the
+    opposite kind of thing: it is machine-local bulk, and the reason an operator overrides its
+    location at all is usually that the artifact and the bulk belong on *different filesystems* --
+    a small versioned tree on the laptop's disk, six gigabytes of vendor logs on the big one. A
+    rule that forced that to be spelled as `../../../../mnt/big/sources` would be pedantry.
+    """
+
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        candidate = config_path.parent / candidate
+    return candidate.resolve()
+
+
 def _source_path(config_path: Path, raw: str) -> Path:
     candidate = Path(raw).expanduser()
     if not candidate.is_absolute():
@@ -610,7 +632,9 @@ def load_project_ingest_config(path: Path) -> ProjectIngestConfig:
         root,
         str(config_path),
         frozenset({"schema_version", "output", "teams"}),
-        frozenset({"timezone", "projects", "source_hosts", "window"}),
+        frozenset(
+            {"timezone", "projects", "source_hosts", "window", "snapshot_root"}
+        ),
     )
     schema_version = as_int(root.get("schema_version"), str(config_path) + ".schema_version")
     if schema_version != PROJECT_INGEST_SCHEMA_VERSION:
@@ -621,6 +645,14 @@ def load_project_ingest_config(path: Path) -> ProjectIngestConfig:
     output = _relative_output(
         config_path,
         _required_string(root.get("output"), str(config_path) + ".output"),
+    )
+    snapshot_root = (
+        _snapshot_root(
+            config_path,
+            _required_string(root["snapshot_root"], str(config_path) + ".snapshot_root"),
+        )
+        if "snapshot_root" in root
+        else None
     )
     timezone = (
         _required_string(root["timezone"], str(config_path) + ".timezone")
@@ -670,11 +702,16 @@ def load_project_ingest_config(path: Path) -> ProjectIngestConfig:
             f"{config_path}.teams: duplicate prompt authorship rule ids are not allowed"
         )
     config_sha256 = hashlib.sha256(config_bytes).hexdigest()
-    return ProjectIngestConfig(config_path, config_sha256, output, teams)
+    return ProjectIngestConfig(
+        config_path, config_sha256, output, snapshot_root, teams
+    )
 
 
 def _ingest_team(
-    output: Path, team: ProjectTeamConfig, accept_prefix_rewrite: Sequence[str]
+    output: Path,
+    team: ProjectTeamConfig,
+    accept_prefix_rewrite: Sequence[str],
+    snapshot_root: Path | None,
 ) -> IngestReport:
     """Dispatch one configured team to its provider importer."""
 
@@ -689,6 +726,7 @@ def _ingest_team(
             team.date_window,
             team.identity_overrides,
             source.continuation_sessions,
+            snapshot_root,
         )
     elif isinstance(source, ClaudeProjectSource):
         _, report = ingest_claude(
@@ -698,6 +736,7 @@ def _ingest_team(
             team.timezone,
             team.date_window,
             team.identity_overrides,
+            snapshot_root,
         )
     else:
         _, report = ingest_orc(
@@ -710,6 +749,7 @@ def _ingest_team(
             team.identity_overrides,
             source.continuation_sessions,
             accept_prefix_rewrite,
+            snapshot_root,
         )
     return report
 
@@ -817,8 +857,9 @@ def ingest_project(
 
     Teams are isolated from one another: a team that raises is recorded as a failure and the run
     continues with the next one. The provider importers share no mutable state across teams -- each
-    writes only under ``teams/<slug>/`` while holding the archive writer lock -- and a team that
-    fails keeps, byte for byte, the normalized snapshot its last successful ingest wrote.
+    writes only under ``teams/<slug>/`` and under its own slug-named directory in the snapshot
+    store, while holding the archive writer lock -- and a team that fails keeps, byte for byte,
+    the normalized snapshot its last successful ingest wrote.
 
     ``accept_prefix_rewrite`` holds ``TEAM:SESSION`` pairs naming, individually, the Orc sessions
     whose append-prefix guard this run may re-baseline; the team half is validated against the
@@ -841,7 +882,10 @@ def ingest_project(
     for team in selected:
         try:
             report = _ingest_team(
-                config.output, team, sorted(accepted.get(team.slug, ()))
+                config.output,
+                team,
+                sorted(accepted.get(team.slug, ())),
+                config.snapshot_root,
             )
         except Exception as error:  # Deliberately broad; see _team_failure.
             # BaseException is deliberately NOT caught: a KeyboardInterrupt or SystemExit means the

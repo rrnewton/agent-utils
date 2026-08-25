@@ -1097,7 +1097,7 @@ def audit_codex_losslessness(archive: Path, team_slug: str) -> LosslessnessRepor
     generation, which is exactly what a read-only audit of a moving archive should do.
     """
 
-    from agent_team_timeline.pipeline import load_archived_team
+    from agent_team_timeline.pipeline import load_archived_team, snapshot_root_for
 
     team_root = archive / "teams" / team_slug
     manifest_path = team_root / "raw" / "source-manifest.json"
@@ -1111,7 +1111,12 @@ def audit_codex_losslessness(archive: Path, team_slug: str) -> LosslessnessRepor
             provider,
             f"no rule table exists for provider {provider!r}; only codex is covered",
         )
-    snapshot_root = team_root / "source_snapshots"
+    # Resolved rather than assumed: the vendor snapshots may be inside the archive, where an
+    # older tool put them, or in the store beside it, where `migrate-snapshots` puts them. This
+    # audit is the gate any future *deletion* of that tree has to pass, so an audit that could
+    # only see one of the two locations would report a relocated archive as "already absent,
+    # nothing to compare" -- a green result whose meaning is the opposite of green.
+    snapshot_root = snapshot_root_for(archive, team_slug)
     if not snapshot_root.is_dir():
         return _skipped(
             team_slug,

@@ -25,6 +25,8 @@ from agent_team_timeline.pipeline import (
     load_artifact_catalog,
     summarize_archive,
 )
+from agent_team_timeline.snapshot_store import resolve_snapshot_root
+from tests.timeline_projection import schema_1_timeline_text
 
 
 ROOT = "00000000-0000-0000-0000-000000000001"
@@ -407,7 +409,10 @@ def test_ingest_writes_catalog_before_redacting_tool_payloads(tmp_path: Path) ->
         )
     )
 
-    archived, report = _write_ingested_team(tmp_path, team.team_slug, team, None, 0)
+    archived, report = _write_ingested_team(
+        tmp_path, team.team_slug, team, None, 0,
+        resolve_snapshot_root(tmp_path, team.team_slug),
+    )
 
     assert archived.tool_calls[0].input_text is None
     assert archived.tool_calls[0].output_text is None
@@ -435,7 +440,10 @@ def test_build_associates_catalog_with_phase_agent_and_rollups(tmp_path: Path) -
             ),
         )
     )
-    _, report = _write_ingested_team(tmp_path, team.team_slug, team, None, 0)
+    _, report = _write_ingested_team(
+        tmp_path, team.team_slug, team, None, 0,
+        resolve_snapshot_root(tmp_path, team.team_slug),
+    )
     assert report.artifacts >= 2
     summarize_archive(tmp_path, team.team_slug, "heuristic", "test-model")
 
@@ -452,9 +460,7 @@ def test_build_associates_catalog_with_phase_agent_and_rollups(tmp_path: Path) -
         and item["external_id"] == "56"
     )
     artifact_id = pull["artifact_id"]
-    timeline = json.loads(
-        (tmp_path / "data" / "timeline.json").read_text(encoding="utf-8")
-    )
+    timeline = json.loads(schema_1_timeline_text(tmp_path))
     assert timeline["artifact_catalog_path"] == "data/artifacts.json"
     assert [project["url"] for project in timeline["projects"]] == [REPOSITORY]
     phase = next(
@@ -497,7 +503,12 @@ def test_ingest_never_persists_cwd_or_repository_credentials(tmp_path: Path) -> 
     unsafe_team = replace(team, sources=(unsafe_source,))
 
     archived, _ = _write_ingested_team(
-        tmp_path, unsafe_team.team_slug, unsafe_team, None, 0
+        tmp_path,
+        unsafe_team.team_slug,
+        unsafe_team,
+        None,
+        0,
+        resolve_snapshot_root(tmp_path, unsafe_team.team_slug),
     )
 
     assert archived.sources[0].working_directory is None

@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 
 from agent_team_timeline import __version__
 from agent_team_timeline.archive import (
+    ARCHIVE_MARKER_FILE,
     JsonValue,
     as_array,
     as_int,
@@ -26,7 +27,10 @@ from agent_team_timeline.archive import (
     narrow_json,
     read_json,
     read_jsonl,
+    validate_team_slug,
+    write_json_durable,
     write_json_if_changed,
+    write_text_durable,
     write_text_if_changed,
 )
 from agent_team_timeline.artifacts import (
@@ -102,6 +106,13 @@ from agent_team_timeline.phases import (
     phase_agent_ids,
 )
 from agent_team_timeline.render import render_archive
+from agent_team_timeline.snapshot_store import (
+    SnapshotLocation,
+    ensure_snapshot_store,
+    read_pointer,
+    resolve_snapshot_root,
+    write_pointer,
+)
 from agent_team_timeline.summarize import (
     GLOSSARY_DEFINITION_STYLE,
     PLAIN_LANGUAGE_ROLLUP_STYLE,
@@ -157,10 +168,18 @@ if TYPE_CHECKING:
     )
 
 
-_TEAM_SLUG = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 _ARCHIVE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
-_ARCHIVE_MARKER = ".agent-team-timeline.json"
+_ARCHIVE_MARKER = ARCHIVE_MARKER_FILE
 _ARCHIVE_LOCK = ".agent-team-timeline.lock"
+
+#: The third archive control name, beside the marker and the lock: where
+#: :mod:`agent_team_timeline.archive_gc` puts what it reclaims, so that the first destructive
+#: pass is a rename rather than an unlink. Declared here rather than there because
+#: `_ensure_bulk_content_ignored` has to name it and `archive_gc` imports *this* module for the
+#: writer lock -- putting it the other way round would be a cycle, and duplicating the string
+#: would let the ignore rule and the directory drift apart in exactly the case that matters,
+#: which is the one where an operator is about to commit.
+ARCHIVE_TRASH_ROOT = ".agent-team-timeline-trash"
 _PROJECT_OVERVIEW_SCHEMA_VERSION = 3
 _GLOSSARY_SCHEMA_VERSION = 3
 _ORC_NORMALIZER_SCHEMA_VERSION = 3
@@ -168,11 +187,11 @@ _OVERVIEW_CONTEXT_CHARS = 48_000
 _TERM_EVIDENCE_LIMIT = 6
 
 
-def _validate_team_slug(team_slug: str) -> None:
-    if len(team_slug) > 64 or _TEAM_SLUG.fullmatch(team_slug) is None:
-        raise ValueError(
-            "team slug must be 1-64 lowercase letters/digits separated by single hyphens"
-        )
+#: The slug grammar moved to :mod:`agent_team_timeline.archive` when the snapshot store started
+#: naming a directory after a slug *outside* the archive: three modules now depend on the same
+#: rule, and the furthest one from the archive is the one where a slug that is not a slug becomes
+#: a path traversal. This alias keeps the call sites here unchanged.
+_validate_team_slug = validate_team_slug
 
 
 def _validate_archive_id(value: str, label: str) -> None:
@@ -181,8 +200,14 @@ def _validate_archive_id(value: str, label: str) -> None:
 
 
 @contextmanager
-def _archive_writer_lock(archive: Path) -> Iterator[None]:
-    """Serialize raw archive transactions across processes using Linux ``flock``."""
+def archive_writer_lock(archive: Path) -> Iterator[None]:
+    """Serialize raw archive transactions across processes using Linux ``flock``.
+
+    Public because reclaiming disk is a writer too. :mod:`agent_team_timeline.archive_gc` takes
+    this same lock for both its dry run and its sweep -- the dry run because a report computed
+    beside a running build names files the build is in the middle of replacing, and a report
+    that cannot be trusted is worse than one that waited.
+    """
 
     if archive.exists() and not archive.is_dir():
         raise ValueError(f"archive output is not a directory: {archive}")
@@ -216,7 +241,7 @@ def _archive_writer_locks(*archives: Path) -> Iterator[None]:
     }
     with ExitStack() as stack:
         for key in sorted(ordered):
-            stack.enter_context(_archive_writer_lock(ordered[key]))
+            stack.enter_context(archive_writer_lock(ordered[key]))
         yield
 
 
@@ -315,6 +340,22 @@ class IngestReport:
     # which a content-addressed union is not supposed to be able to reach at all.
     pruned_payload_shards: tuple[str, ...] = ()
     damaged_payload_shards: tuple[str, ...] = ()
+    # Where this ingest put the vendor snapshots, and whether it is the run that decided. The
+    # location is in the receipt because it is the one thing about a build that is now *outside*
+    # the directory the operator named: a run given `--output X` that writes several gigabytes to
+    # a sibling of `X` owes the record an explicit statement of where, and "read the code and
+    # recompute the default" is not one. `snapshot_root_established` is true only on the run that
+    # first records a layout for the archive, which is the run whose stderr says so out loud.
+    #
+    # Archive-relative, like the source manifest's copy and for the same two reasons. A receipt
+    # under `runs/` is inside the served, version-controllable tree, and the receipts this archive
+    # already writes record relative paths -- an absolute one here would be the first home
+    # directory published in that file. It is also the encoding that stays true when the pair is
+    # moved. The CLI resolves it against the archive before printing, because on a terminal the
+    # useful form is the one you can paste into `du`.
+    snapshot_root: str = ""
+    snapshot_root_layout: str = ""
+    snapshot_root_established: bool = False
 
     def to_json_obj(self) -> dict[str, JsonValue]:
         """Return the ingest report as a JSON-serializable object."""
@@ -347,6 +388,9 @@ class IngestReport:
             "newly_stored_tool_payload_bytes": self.newly_stored_tool_payload_bytes,
             "pruned_payload_shards": list(self.pruned_payload_shards),
             "damaged_payload_shards": list(self.damaged_payload_shards),
+            "snapshot_root": self.snapshot_root,
+            "snapshot_root_layout": self.snapshot_root_layout,
+            "snapshot_root_established": self.snapshot_root_established,
         }
 
 
@@ -414,30 +458,11 @@ def utc_now() -> str:
     return datetime.now(tz=timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _write_json_durable(path: Path, value: JsonValue) -> bool:
-    """Atomically write JSON and persist the replaced directory entry before returning."""
-
-    return _write_text_durable(path, canonical_json(value))
-
-
-def _write_text_durable(path: Path, text: str) -> bool:
-    """Atomically write text and persist the replaced directory entry before returning."""
-
-    changed = write_text_if_changed(path, text)
-    if not changed:
-        return False
-    try:
-        parent_fd = os.open(
-            path.parent,
-            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
-        )
-    except OSError as exc:
-        raise OSError(f"cannot open parent directory for durable JSON write {path}: {exc}") from exc
-    try:
-        os.fsync(parent_fd)
-    finally:
-        os.close(parent_fd)
-    return True
+#: Both moved to :mod:`agent_team_timeline.archive`, unchanged, when the snapshot store needed the
+#: same durability for the pointer file it writes at the archive root. These aliases keep the
+#: several dozen call sites in this module reading as they did.
+_write_json_durable = write_json_durable
+_write_text_durable = write_text_durable
 
 
 def _archive_team(team: TeamData) -> tuple[TeamData, tuple[str, ...]]:
@@ -576,9 +601,35 @@ def _summary_projection_missing(path: Path) -> bool:
     return False
 
 
-def _source_snapshot_root(archive: Path, team_slug: str) -> Path:
-    _validate_team_slug(team_slug)
-    return archive / "teams" / team_slug / "source_snapshots"
+def _source_snapshot_location(
+    archive: Path, team_slug: str, requested: Path | None
+) -> SnapshotLocation:
+    """Decide where this team's vendor snapshots live, and make sure the directory exists.
+
+    The one place in ingestion that knows about the location at all. Everything downstream --
+    every provider snapshotter, every loader, every digest recorded in the source manifest -- is
+    addressed relative to the root this returns, which is the property that made moving 6.5 GB out
+    of the published tree a change to one function rather than to three providers.
+
+    Resolution never moves anything; see :mod:`agent_team_timeline.snapshot_store` for the four
+    branches and the two refusals. What this adds is the side effect resolution deliberately does
+    not have: creating the store, its marker, and the ``.gitignore`` that keeps a multi-gigabyte
+    tree out of somebody's ``git status``.
+    """
+
+    location = resolve_snapshot_root(archive, team_slug, requested)
+    ensure_snapshot_store(location)
+    return location
+
+
+def snapshot_root_for(archive: Path, team_slug: str) -> Path:
+    """Return one team's snapshot root without creating anything.
+
+    Public for the read-only callers -- the losslessness audit and the garbage collector -- which
+    need the same answer ingestion gets and must not bring a store into existence to get it.
+    """
+
+    return resolve_snapshot_root(archive, team_slug).root
 
 
 def _source_manifest_path(archive: Path, team_slug: str) -> Path:
@@ -867,6 +918,12 @@ def _ensure_bulk_content_ignored(archive: Path) -> bool:
     snapshots preserves that promise exactly: what is tracked is the model and the digests, what
     is ignored is the bulk. An operator who wants the bulk versioned or replicated can say so
     themselves; the default cannot make that decision for them.
+
+    ``/teams/*/source_snapshots/`` stays here even though a new archive no longer puts anything
+    there. It is the rule that keeps an *unmigrated* archive working exactly as it did, and it
+    costs one line. The relocated store cannot be covered from this file at all -- it is outside
+    the archive -- so it ignores itself instead; see
+    :data:`agent_team_timeline.snapshot_store.STORE_GITIGNORE_FILE`.
     """
 
     path = archive / ".gitignore"
@@ -874,6 +931,11 @@ def _ensure_bulk_content_ignored(archive: Path) -> bool:
         f"/{_ARCHIVE_LOCK}",
         "/teams/*/source_snapshots/",
         "/teams/*/payloads/",
+        # The `gc` trash. Ignored for the same reason the lock is -- it is local recovery state,
+        # not content -- and ignored *before* it can exist, so that an operator who runs `gc
+        # --delete` on a tracked archive does not find a quarter-gigabyte of deleted files
+        # proposed as an addition to their next commit.
+        f"/{ARCHIVE_TRASH_ROOT}/",
     )
     if path.exists() and not path.is_file():
         raise ValueError(f"archive .gitignore is not a file: {path}")
@@ -1065,6 +1127,7 @@ def _write_ingested_team(
     team: TeamData,
     date_window: DateWindow | None,
     files_changed: int,
+    location: SnapshotLocation,
 ) -> tuple[TeamData, IngestReport]:
     """Write provider-neutral normalized data after a provider snapshot is durable."""
 
@@ -1154,6 +1217,14 @@ def _write_ingested_team(
             narrow_json(snapshot),
         )
     )
+    # Recorded last, after everything it describes is durable, and recorded even when it merely
+    # restates the default. An archive that only *derived* its layout would answer "where are my
+    # snapshots?" by recomputing today's default -- so the day the default changes, or the day an
+    # operator passes `--snapshot-root` once and forgets it the next time, the archive would
+    # quietly start a second tree beside the first. Neither tree is invalid on its own, which is
+    # exactly why the filesystem cannot report the mistake and the archive has to.
+    pointer_established = read_pointer(archive) is None
+    changed += int(write_pointer(archive, location))
     report = IngestReport(
         team_slug=team_slug,
         source_digest=digest,
@@ -1179,6 +1250,9 @@ def _write_ingested_team(
         newly_stored_tool_payload_bytes=payload_report.newly_stored_bytes,
         pruned_payload_shards=payload_report.pruned_shards,
         damaged_payload_shards=payload_report.damaged_shards,
+        snapshot_root=location.archive_relative,
+        snapshot_root_layout=location.layout,
+        snapshot_root_established=pointer_established,
     )
     return replace(archived, task_notes=promoted), report
 
@@ -1282,6 +1356,7 @@ def _ingest_codex_locked(
     date_window: DateWindow | None,
     identity_overrides: IdentityOverrides | None,
     continuation_thread_ids: Sequence[str],
+    requested_snapshot_root: Path | None,
 ) -> tuple[TeamData, IngestReport]:
     """Normalize one complete Codex lineage and write canonical raw JSON."""
 
@@ -1294,7 +1369,8 @@ def _ingest_codex_locked(
         date_window,
         continuation_thread_ids,
     )
-    snapshot_root = _source_snapshot_root(archive, team_slug)
+    location = _source_snapshot_location(archive, team_slug, requested_snapshot_root)
+    snapshot_root = location.root
     source_copies = (
         snapshot_codex_lineage(
             sessions_root,
@@ -1351,7 +1427,7 @@ def _ingest_codex_locked(
         "provider": "codex",
         "root_thread_id": root_thread_id,
         "source_root": str(sessions_root.resolve()),
-        "snapshot_root": f"teams/{team_slug}/source_snapshots",
+        "snapshot_root": location.archive_relative,
         "date_window": date_window.to_json_obj() if date_window is not None else None,
         "sources": [source.to_json_obj() for source in source_copies.sources],
     }
@@ -1364,7 +1440,9 @@ def _ingest_codex_locked(
             _source_manifest_path(archive, team_slug), narrow_json(source_manifest)
         )
     )
-    return _write_ingested_team(archive, team_slug, team, date_window, changed)
+    return _write_ingested_team(
+        archive, team_slug, team, date_window, changed, location
+    )
 
 
 def ingest_codex(
@@ -1376,10 +1454,16 @@ def ingest_codex(
     date_window: DateWindow | None = None,
     identity_overrides: IdentityOverrides | None = None,
     continuation_thread_ids: Sequence[str] = (),
+    snapshot_root: Path | None = None,
 ) -> tuple[TeamData, IngestReport]:
-    """Snapshot and normalize one Codex lineage as one serialized raw-data transaction."""
+    """Snapshot and normalize one Codex lineage as one serialized raw-data transaction.
 
-    with _archive_writer_lock(archive):
+    ``snapshot_root`` names the *store*, not this team's directory inside it -- the team is one
+    slug-named subdirectory, so one setting serves an archive with twelve teams. Omitted, the
+    archive's recorded layout decides, and a brand-new archive gets ``<archive>.sources``.
+    """
+
+    with archive_writer_lock(archive):
         return _ingest_codex_locked(
             archive,
             sessions_root,
@@ -1389,6 +1473,7 @@ def ingest_codex(
             date_window,
             identity_overrides,
             continuation_thread_ids,
+            snapshot_root,
         )
 
 
@@ -1399,6 +1484,7 @@ def _ingest_claude_locked(
     display_timezone: str,
     date_window: DateWindow | None,
     identity_overrides: IdentityOverrides | None,
+    requested_snapshot_root: Path | None,
 ) -> tuple[TeamData, IngestReport]:
     """Snapshot and normalize one Claude coordinator lineage."""
 
@@ -1408,7 +1494,8 @@ def _ingest_claude_locked(
     previous_sources = _load_claude_source_manifest(
         archive, team_slug, root_thread_id, date_window
     )
-    snapshot_root = _source_snapshot_root(archive, team_slug)
+    location = _source_snapshot_location(archive, team_slug, requested_snapshot_root)
+    snapshot_root = location.root
     source_copies = snapshot_claude_lineage(
         session_file,
         snapshot_root,
@@ -1442,7 +1529,7 @@ def _ingest_claude_locked(
         "root_thread_id": root_thread_id,
         "source_root": str(session_file.parent.resolve()),
         "root_session_file": str(session_file.resolve()),
-        "snapshot_root": f"teams/{team_slug}/source_snapshots",
+        "snapshot_root": location.archive_relative,
         "date_window": date_window.to_json_obj() if date_window is not None else None,
         "sources": [source.to_json_obj() for source in source_copies.sources],
     }
@@ -1451,7 +1538,9 @@ def _ingest_claude_locked(
             _source_manifest_path(archive, team_slug), narrow_json(source_manifest)
         )
     )
-    return _write_ingested_team(archive, team_slug, team, date_window, changed)
+    return _write_ingested_team(
+        archive, team_slug, team, date_window, changed, location
+    )
 
 
 def ingest_claude(
@@ -1461,10 +1550,11 @@ def ingest_claude(
     display_timezone: str,
     date_window: DateWindow | None = None,
     identity_overrides: IdentityOverrides | None = None,
+    snapshot_root: Path | None = None,
 ) -> tuple[TeamData, IngestReport]:
     """Snapshot and normalize one Claude lineage as one serialized transaction."""
 
-    with _archive_writer_lock(archive):
+    with archive_writer_lock(archive):
         return _ingest_claude_locked(
             archive,
             session_file,
@@ -1472,6 +1562,7 @@ def ingest_claude(
             display_timezone,
             date_window,
             identity_overrides,
+            snapshot_root,
         )
 
 
@@ -1536,13 +1627,33 @@ def _load_orc_source_manifest(
         )
         if not Path(recorded_source_root).is_absolute():
             raise OrcParseError(f"{path}: source_root must be absolute")
-        expected_snapshot_root = f"teams/{team_slug}/source_snapshots"
+        # Recorded, shape-checked, and deliberately *not* compared against where this run is
+        # about to write.
+        #
+        # It used to be compared, against the single hardcoded `teams/<slug>/source_snapshots`,
+        # and that check stopped being expressible the moment the store became configurable and
+        # relocatable: after a migration the manifest still says where the bytes were at the last
+        # ingest, which is the honest thing for it to say and is no longer where they are. Making
+        # `migrate-snapshots` rewrite the manifest instead was rejected -- `raw/source-manifest.json`
+        # is bound by digest into `raw/normalized-generation.json`, so touching it would leave
+        # every reader refusing the archive as a mixed generation until someone re-ingested, which
+        # is a much worse outcome than a stale descriptive field.
+        #
+        # Nothing is lost, because the string equality was only ever a proxy for the question that
+        # matters -- "are the previous snapshots this manifest names actually here?" -- and that
+        # question is answered properly, per object and by SHA-256, in `_prepare_snapshot_candidate`
+        # a few frames down. A relocated tree whose contents are wrong fails there, on the bytes,
+        # rather than here, on a path.
+        #
+        # The shape check stays: relative, non-empty. An absolute path in a tracked, HTTP-served
+        # file would publish somebody's home directory, and a manifest that recorded one would keep
+        # being wrong every time the archive moved.
         recorded_snapshot_root = as_string(
             obj.get("snapshot_root"), f"{path}: snapshot_root"
         )
-        if recorded_snapshot_root != expected_snapshot_root:
+        if not recorded_snapshot_root or Path(recorded_snapshot_root).is_absolute():
             raise OrcParseError(
-                f"{path}: snapshot_root must be {expected_snapshot_root!r}"
+                f"{path}: snapshot_root must be a non-empty path relative to the archive"
             )
     recorded_root = as_string(obj.get("root_session_id"), f"{path}: root_session_id")
     if recorded_root != root_session_id:
@@ -1644,6 +1755,7 @@ def _ingest_orc_locked(
     identity_overrides: IdentityOverrides | None,
     continuation_specs: Sequence[str | OrcContinuationSpec],
     accept_prefix_rewrite: Sequence[str],
+    requested_snapshot_root: Path | None,
 ) -> tuple[TeamData, IngestReport]:
     """Snapshot and normalize one Orc coordinator lineage."""
 
@@ -1656,7 +1768,8 @@ def _ingest_orc_locked(
         date_window,
         continuation_specs,
     )
-    snapshot_root = _source_snapshot_root(archive, team_slug)
+    location = _source_snapshot_location(archive, team_slug, requested_snapshot_root)
+    snapshot_root = location.root
     changed += prune_orc_staging(snapshot_root)
     snapshot = snapshot_orc_lineage(
         source_root,
@@ -1710,7 +1823,7 @@ def _ingest_orc_locked(
         "provider": "orc",
         "root_session_id": root_session_id,
         "source_root": str(source_root.resolve()),
-        "snapshot_root": f"teams/{team_slug}/source_snapshots",
+        "snapshot_root": location.archive_relative,
         "date_window": date_window.to_json_obj() if date_window is not None else None,
         "sources": [source.to_json_obj() for source in snapshot.sources],
     }
@@ -1725,7 +1838,7 @@ def _ingest_orc_locked(
         )
     )
     archived, report = _write_ingested_team(
-        archive, team_slug, team, date_window, changed
+        archive, team_slug, team, date_window, changed, location
     )
     marker_changed = int(
         _write_json_durable(
@@ -1751,6 +1864,7 @@ def ingest_orc(
     identity_overrides: IdentityOverrides | None = None,
     continuation_specs: Sequence[str | OrcContinuationSpec] = (),
     accept_prefix_rewrite: Sequence[str] = (),
+    snapshot_root: Path | None = None,
 ) -> tuple[TeamData, IngestReport]:
     """Snapshot and normalize one Orc lineage as a serialized raw-data transaction.
 
@@ -1762,7 +1876,7 @@ def ingest_orc(
     does not name still refuses the whole ingest, because the operator has not been shown it yet.
     """
 
-    with _archive_writer_lock(archive):
+    with archive_writer_lock(archive):
         return _ingest_orc_locked(
             archive,
             source_root,
@@ -1773,6 +1887,7 @@ def ingest_orc(
             identity_overrides,
             continuation_specs,
             accept_prefix_rewrite,
+            snapshot_root,
         )
 
 
@@ -1841,7 +1956,7 @@ def extract_transcripts_archive(
         export_transcripts,
     )
 
-    with _archive_writer_lock(archive):
+    with archive_writer_lock(archive):
         selected = tuple(team_slugs)
         if not selected:
             teams_root = archive / "teams"
@@ -3797,7 +3912,7 @@ def summarize_archive(
 ) -> SummarizeReport:
     """Fill structured summaries/names while serializing token-spending cache misses."""
 
-    with _archive_writer_lock(archive):
+    with archive_writer_lock(archive):
         return _summarize_archive_locked(
             archive,
             team_slug,
@@ -4482,7 +4597,7 @@ def _build_archive_locked(
     rollup_kinds: tuple[str, ...] = DEFAULT_ROLLUP_KINDS,
     output: Path | None = None,
     _precompress: bool = True,
-    _write_shards: bool = True,
+    _published: bool = True,
 ) -> dict[str, int]:
     """Regenerate Markdown/HTML/JSON exclusively from cached structured data."""
 
@@ -4645,7 +4760,7 @@ def _build_archive_locked(
         artifact_catalog,
         site_identity,
         _precompress=_precompress,
-        _write_shards=_write_shards,
+        _published=_published,
         _export_window=display_window,
     )
 
@@ -4659,7 +4774,7 @@ def build_archive(
     rollup_kinds: tuple[str, ...] = DEFAULT_ROLLUP_KINDS,
     output: Path | None = None,
     _precompress: bool = True,
-    _write_shards: bool = True,
+    _published: bool = True,
 ) -> dict[str, int]:
     """Regenerate one site while serializing its source snapshot and output files."""
 
@@ -4673,7 +4788,7 @@ def build_archive(
             rollup_kinds=rollup_kinds,
             output=output,
             _precompress=_precompress,
-            _write_shards=_write_shards,
+            _published=_published,
         )
 
 

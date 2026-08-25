@@ -29,11 +29,31 @@ sidecar index. The three consequences are the three defects above, each removed 
 * **A bootstrap that fits in one packet's worth of parsing.** Activity bins are a shard, not an
   inline field; see "Where the activity bins went" below.
 
-Nothing here reads schema 3. This module is the write path, and it deliberately runs *alongside*
-schema 1 and schema 2 rather than replacing them: `query.py` still reads `data/timeline-v2.json`
-with a fallback to `data/timeline.json`, and a build that emitted only schema 3 would break the
-archive it is supposed to improve. Deleting the older generations is a later change with its own
-evidence to gather.
+This module is the write path. What reads it is `query._SchemaThreeArchive`, which every list,
+show, search and stats surface now goes through when a *complete* schema-3 generation is present
+-- see that class for the completeness rule and for why a partial publication falls back rather
+than being read.
+
+**Schema 2 is still written beside it; schema 1 is not.** The two generations were retired at
+different times because their readers retired them at different times. `query.py` reaches schema
+1 only when neither of the newer bootstraps is present, and `static/app.js` reaches it only when
+its schema-2 load throws -- so a published build stopped writing the 280,971,189-byte monolith,
+and `render.retired_schema_1_files` says why not writing it and deleting it had to be separate
+decisions. Schema 2 stays because the website has no schema-3 mode at all: a browser reading
+schema 3 needs multi-member gzip over HTTP Range in JavaScript, which does not exist yet, and
+retiring the format the only graphical surface reads would be retiring the surface. Reclaiming
+what an older build already wrote belongs to :mod:`agent_team_timeline.archive_gc`, not to a
+build.
+
+Schema 3 replaces the presentation *timeline*. It does not replace the transcript search corpus,
+which is still schema 2's content-addressed day shards with their trigram blooms, so a transcript
+search reads phases and agents from a schema-3 spine and messages from schema 2 -- the one
+operation that touches both generations, and the one place the reader checks that they describe
+the same source.
+
+The one thing schema 3 publishes that schema 1 does not is the zoom bounds; see
+:data:`_ACTIVITY_BOUNDS_KIND` for why they are published rather than recomputed on read, and what
+the 324,624 bytes buy.
 
 Sharding axis: (team, UTC day)
 ------------------------------
@@ -57,7 +77,7 @@ would correctly report all 12 files as changed. With day shards, yesterday is by
 the rebuild touches only today.
 
 Measured, by building the archive with its final UTC day removed and then adding that day back:
-**387,547 bytes rewritten across 7 files**, of a 37,963,770-byte schema-3 generation -- 1.02%.
+**387,547 bytes rewritten across 7 files**, of a 38,288,394-byte schema-3 generation -- 1.01%.
 The seven are that team's shard for that day, that team's spine, the bins shard, their three
 sidecars, and the bootstrap. The same day landing in a one-file-per-team layout would have
 rewritten 5,335,449 bytes, 13.8 times as much, and in the schema-1 monolith it rewrites all
@@ -166,14 +186,14 @@ Three streams
 -------------
 ``timeline``  ``data/timeline-v3/timeline/<team>/<YYYY-MM-DD>.jsonl.gz``
     Events, phases and non-structural edges: everything with a position on the time axis and
-    enough volume to be worth seeking into. 97% of schema 3's bytes.
+    enough volume to be worth seeking into. 93% of schema 3's bytes.
 
 ``spine``  ``data/timeline-v3/spine/<team>.jsonl.gz``
     The per-team records that have no single instant, or that a reader needs *all* of before it
     can draw anything: the team record, agents, phase cards, structural edges
     (`spawn`/`continuation`/`result` -- the spawn tree is a graph, and fetching it a day at a
-    time to draw it whole is the wrong shape), rollups, projects, summary files, glossary terms
-    and the project overview.
+    time to draw it whole is the wrong shape), rollups, projects, summary files, glossary terms,
+    the project overview, and the derived zoom bounds of :data:`_ACTIVITY_BOUNDS_KIND`.
 
     **The spine deliberately carries no `at_ms`.** Its shards are addressed by *line range*, not
     by time: records are grouped by kind in :data:`_SPINE_KIND_ORDER` and the bootstrap publishes
@@ -186,8 +206,11 @@ Three streams
     `start_ms`/`end_ms`; there are 2,555 agents in the whole archive, so a reader filters them in
     memory.
 
-    One file per team rather than one file per (team, kind): 8 kinds times 12 teams is 96 mostly
-    tiny files, each with its own sidecar, and the line-range door already exists.
+    One file per team rather than one file per (team, kind): 10 kinds times 12 teams is 120
+    mostly tiny files, each with its own sidecar, and the line-range door already exists.
+
+    This is the stream every command-line question is answered from, and it is 2,412,120 bytes
+    of a 38,288,394-byte generation. Its shards are the only ones `query.py` opens.
 
 ``bins``  ``data/timeline-v3/bins.jsonl.gz``
     Activity bins, all teams, sorted by `(at_ms, ...)` and therefore bisectable.
@@ -232,6 +255,27 @@ already own that job for every other generated path. One fewer file, one fewer i
 Publication order is unchanged and load-bearing: every shard and every sidecar exists before the
 bootstrap that names them is written.
 
+**The writer owns the directory, and empties it of everything it did not just write.** After the
+bootstrap is published, :func:`write_timeline_v3` removes every shard-shaped file under
+``data/timeline-v3/`` outside its own plan, and `rmdir`s what that empties. Handing the job to the
+caller's manifest-driven removal alone is not enough, and the gap is not hypothetical: that
+removal reaps `previous - current` out of ``data/export.json``, which is written *after* this
+function returns, so shards published by a build that died before its own bootstrap are in no
+manifest's `previous` and no manifest's `current`. Nothing would ever name them again.
+
+That leftover matters far beyond the disk it occupies, because absence from the catalogue is not
+by itself evidence of death: a shard the catalogue does not name is a *retired team's* shard if
+the bootstrap beside it is newer, and a *live team's* shard if the bootstrap is older, and the two
+are indistinguishable from the outside. A sweeper that guessed would eventually guess "retired"
+about the better half of a rebuild. Making the publisher clear its own tree removes the ambiguity
+at the only point where it is not a guess -- here, where the plan is known -- and lets both the
+reader (rule 5 of :class:`agent_team_timeline.query._SchemaThreeArchive`) and
+:mod:`agent_team_timeline.archive_gc` treat any leftover as one unambiguous fact: a build was
+interrupted, and the remedy is to run one.
+
+Only files matching the two shapes this module emits are removed, and never through a symlink, so
+"owns the directory" means the output it produces and not whatever an operator put beside it.
+
 What it costs, measured
 -----------------------
 Three write paths over the same schema-1 input -- one team's records sliced out of the archive and
@@ -248,13 +292,22 @@ That is **7.4%** of schema 1 and **7.1%** of schema 2 on the mid-sized team; 16.
 the largest, where a third of the bytes are message bodies that were always going to dominate.
 Against the two older generations together, schema 3 is 3.6% and 7.9%.
 
-Over the whole archive schema 3 is 37,963,770 bytes in 171 files -- 72 timeline shards, 12 spine
-shards, one bins shard, their sidecars, and an **88,239-byte bootstrap against schema 2's
-5,702,530**. The sidecars are 65,976 bytes of that, 0.17%, which is the number the phrase "a
-roughly fixed fraction of the shard set" refers to wherever it appears. Against the generations it
-sits beside: schema 1 is 280,971,189 bytes in 2 files and schema 2 is 1,503,831,881 in 661, so
-schema 3 is **13.5% of schema 1, 2.5% of schema 2, and 2.1% of the two together** -- 1.79 GB of
-the same 463,423 records against 38 MB.
+Over the whole archive schema 3 is 38,288,394 bytes in 171 files -- 72 timeline shards totalling
+35,655,306 compressed bytes, 12 spine shards totalling 2,412,120, one 65,384-byte bins shard,
+their sidecars, and an **89,298-byte bootstrap against schema 2's 5,702,530**. The sidecars are
+66,286 bytes of that, 0.17%, which is the number the phrase "a roughly fixed fraction of the shard
+set" refers to wherever it appears. Against the generations it sits beside: schema 1 is
+280,971,189 bytes in 2 files and schema 2 is 1,503,831,881 in 661, so schema 3 is **13.6% of
+schema 1, 2.5% of schema 2, and 2.1% of the two together** -- 1.79 GB against 38 MB.
+
+478,007 records, of which 463,423 are the schema-1 timeline re-encoded and 14,584 are the derived
+zoom bounds. Those cost 324,624 bytes, 0.85% of the generation, and they are 0.02% of what schema
+1 and schema 2 occupy between them; the recomputation they replace would have read tens of
+megabytes of the timeline stream per zoom.
+
+That the timeline stream is 93% of the generation is the number the read path turns on: no
+question `query.py` asks opens it. Every list, show, search and stats answer comes out of the
+2,412,120-byte spine, and a one-team answer out of one team's share of it.
 
 Determinism
 -----------
@@ -270,6 +323,7 @@ replaces a file only when its bytes differ, so an unchanged rebuild churns nothi
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -293,6 +347,7 @@ from agent_team_timeline.seekable_jsonl import (
     write_seekable_jsonl_lines,
 )
 from agent_team_timeline.static_assets import GZIP_COMPRESSION_LEVEL
+from agent_team_timeline.timeline_shards import activity_bounds
 
 
 SCHEMA_3_VERSION = 3
@@ -319,22 +374,9 @@ _STRUCTURAL_EDGE_KINDS = frozenset({"spawn", "continuation", "result"})
 #: The subset of a phase a card needs: schema 2's nine card fields, plus ``team`` because a
 #: schema-3 spine shard is per-team and the record has to say which one it belongs to.
 #:
-#: It is *not* the whole of what schema 2 puts on a card, and the difference is worth stating
-#: rather than leaving to be discovered. Schema 2 attaches ``activity_start_ms`` and
-#: ``activity_end_ms`` to every phase card, every agent and every rollup -- 14,584 records on the
-#: measured archive -- and schema 3 carries them nowhere. They are *derived*, not schema-1 data:
-#: `timeline_shards._minimum_activity_range` computes them by scanning the events and edges that
-#: fall inside each interval, and schema 3's envelope is "the schema-1 record plus exactly two
-#: keys", which is what makes the losslessness differential a comparison and not a subtraction.
-#: Recomputing them here would mean either duplicating that scan or threading schema 2's result
-#: through two callers that presently share nothing.
-#:
-#: The cost is real and is not hidden: the browser's `zoomToActivityRange` uses the recorded
-#: bounds when it has them and otherwise scans the whole in-memory timeline, and a schema-3
-#: reader has neither. A reader of schema 3 can derive the bounds from the timeline shards it
-#: already fetches -- the events and edges are right there, sorted -- so the feature is
-#: reachable, but it is reachable by work this module has not done. Wiring it is a change with
-#: its own evidence to gather, and until then this comment is the record that it is missing.
+#: Schema 2 also attaches ``activity_start_ms``/``activity_end_ms`` to every card, and schema 3
+#: does *not* put them here. It publishes them, but as their own spine kind -- see
+#: :data:`_ACTIVITY_BOUNDS_KIND`.
 _PHASE_CARD_FIELDS = frozenset(
     {
         "id",
@@ -350,10 +392,38 @@ _PHASE_CARD_FIELDS = frozenset(
     }
 )
 
+#: The zoom bounds, published rather than derived on read.
+#:
+#: ``zoomToActivityRange`` wants the smallest interval that actually contains a phase's,
+#: an agent's or a rollup's work, so that "zoom to agent lifetime" on an agent that was idle
+#: for six of its seven hours frames the hour rather than the seven. Schema 2 attaches those
+#: two numbers to 14,584 records -- 2,555 agents, 130 rollups, 11,899 phase cards -- and the
+#: first draft of schema 3 carried them nowhere, on the ground that they are *derived* and the
+#: envelope is "the schema-1 record plus exactly two keys".
+#:
+#: **They are published.** The alternative -- recompute them when a reader asks -- was weighed
+#: and refused, and the reason is that the recomputation is the exact scan the bounds exist to
+#: avoid. :func:`timeline_shards.activity_bounds` derives them from every phase's ``states``
+#: array and every event and edge instant belonging to the agent; a reader answering "zoom to
+#: this agent's lifetime" would therefore have to read every timeline shard the agent's
+#: lifetime intersects -- for a long-lived agent, that is its team's entire stream, which is
+#: 93% of schema 3's bytes. Publishing 14,584 small records to avoid re-reading tens of
+#: megabytes is not a close call, and it is the trade schema 2 already made.
+#:
+#: The envelope is nonetheless intact, because these are **not** schema-1 records with two
+#: extra keys: they are a derived kind of their own, like ``phase_card``, keyed by the
+#: archive's stable reference. An ``agent`` line in a spine shard is still its schema-1 record
+#: byte for byte, so the losslessness differential stays a comparison rather than a
+#: subtraction, and a reader that does not zoom never reads this kind -- it is last in
+#: :data:`_SPINE_KIND_ORDER` precisely so that it falls outside the member a first frame
+#: inflates.
+_ACTIVITY_BOUNDS_KIND = "activity_bounds"
+
 #: Spine kinds in the order they are laid down, and therefore the order of their line ranges.
 #: Declared rather than sorted so the records a first frame needs -- the team, its agents, the
 #: phase cards behind the navigation strip -- land in the first member, which is the only member
-#: a reader that wants them has to inflate.
+#: a reader that wants them has to inflate, and so that the kind only a zoom interaction needs
+#: lands after them.
 _SPINE_KIND_ORDER: tuple[str, ...] = (
     "team",
     "agent",
@@ -364,6 +434,7 @@ _SPINE_KIND_ORDER: tuple[str, ...] = (
     "summary_file",
     "glossary_term",
     "project_overview",
+    _ACTIVITY_BOUNDS_KIND,
 )
 
 #: The field each spine kind is ordered by within its group. Every sort below tiebreaks on the
@@ -380,6 +451,7 @@ _SPINE_SORT_FIELD: Mapping[str, str] = {
     "summary_file": "path",
     "glossary_term": "id",
     "project_overview": "team",
+    _ACTIVITY_BOUNDS_KIND: "ref",
 }
 
 #: Schema-1 top-level keys copied into the bootstrap as-is.
@@ -516,6 +588,12 @@ class TimelineV3Report:
     compressed_bytes: int
     uncompressed_bytes: int
     index_bytes: int
+    #: Shard-shaped files found under the schema-3 root and outside this build's plan, removed
+    #: after the bootstrap was published. Reported separately from ``files_changed`` rather than
+    #: only folded into it, because a non-zero value here is a *finding*: on a healthy archive
+    #: every build leaves the tree equal to its catalogue, so anything removed is the residue of
+    #: a build that did not finish.
+    removed_files: tuple[str, ...] = ()
 
     @property
     def total_bytes(self) -> int:
@@ -564,6 +642,49 @@ class _Line:
         """Order within one kind's group in a spine shard."""
 
         return (self.key, self.line)
+
+
+def _local_identifier(team: str, identifier: str) -> str:
+    """Strip the ``<team>::`` prefix the combined export puts on every identifier.
+
+    The single-team render leaves identifiers bare and the combined export qualifies them, so
+    a reference built from the raw identifier would name the same agent two ways depending on
+    which renderer produced the archive. Stripping the prefix makes the reference the same
+    string in both, which is the whole reason it is called stable.
+    """
+
+    prefix = f"{team}::"
+    return identifier[len(prefix) :] if identifier.startswith(prefix) else identifier
+
+
+def agent_reference(team: str, identifier: str) -> str:
+    """The archive's stable reference for one agent."""
+
+    return f"agent:{team}::{_local_identifier(team, identifier)}"
+
+
+def phase_reference(team: str, identifier: str) -> str:
+    """The archive's stable reference for one work phase."""
+
+    return f"phase:{team}::{_local_identifier(team, identifier)}"
+
+
+def rollup_reference(team: str, kind: str, start_ms: int) -> str:
+    """The archive's stable reference for one calendar rollup.
+
+    A rollup has no identifier of its own, so the triple that identifies it is the reference.
+    """
+
+    return f"rollup:{team}::{kind}::{start_ms}"
+
+
+# The three functions above are a second implementation of `query.agent_ref`, `query.phase_ref`
+# and `query.rollup_ref`. The duplication is deliberate and cannot be removed by importing:
+# `query.py` is copied verbatim into every generated archive as the `./timeline` executable and
+# may import nothing outside the standard library, so the reader cannot import the writer. It is
+# also not left to a comment to enforce -- `test_timeline_v3.py` builds a timeline, computes both
+# forms for every agent, phase and rollup in it, and asserts they are the same string, because a
+# comment does not fail.
 
 
 def utc_day_start(timestamp_ms: int) -> int:
@@ -631,6 +752,26 @@ def is_schema_3_path(relative: str) -> bool:
     # three, and a fourth must be added here deliberately rather than admitted by a wildcard.
     depths: Mapping[str, int] = {"bins.jsonl.gz": 1, "spine": 2, "timeline": 3}
     return depths.get(tail[0]) == len(tail)
+
+
+def is_schema_3_shard_name(name: str) -> bool:
+    """Whether a bare file name is one of the two shapes this module publishes.
+
+    Deliberately looser than :func:`is_schema_3_path`, and the looseness is the point. This is
+    the predicate that decides what :func:`_remove_unplanned` clears out of the schema-3 root and
+    -- restated, because that module imports nothing from this package -- what the reader counts
+    when it checks that the tree holds nothing the catalogue omits. Those two must agree, and
+    they must agree in the safe direction: a file the reader notices and the writer will not
+    clear is a generation that declines forever and that rebuilding cannot repair.
+
+    Matching a *name* rather than a *path* is what guarantees the agreement, since it removes
+    every question of depth and component grammar on which two implementations could differ. The
+    cost is that a ``.jsonl.gz`` an operator parked inside ``data/timeline-v3/`` would be removed
+    by the next build. That directory is machine-owned -- its name, its layout and its contents
+    are all decided here -- so the trade is a hypothetical against a real cliff.
+    """
+
+    return name.endswith(".jsonl.gz") or name.endswith(".jsonl.gz" + INDEX_SUFFIX)
 
 
 def _safe_slug(slug: str, where: str) -> str:
@@ -748,6 +889,43 @@ def _output_path(output: Path, relative: str, *, make_parents: bool) -> Path:
             f"schema-3 output path escapes the archive: {relative!r}"
         ) from error
     return candidate
+
+
+def _remove_unplanned(output: Path, published: frozenset[str]) -> tuple[str, ...]:
+    """Remove shard-shaped files under the schema-3 root that *published* does not name.
+
+    Called only after the bootstrap is on disk, so that an interruption during this pass leaves a
+    complete generation with some residue beside it -- the harmless direction -- rather than a
+    catalogue that names a file this pass has already unlinked.
+
+    ``unlink`` rather than a move into `gc`'s trash, because this is not a decision an operator
+    made and there is nothing here to reverse: the removed file is derived output that this same
+    call has just re-derived, and the shard that replaced it is on disk before the first unlink.
+    Directories emptied by the pass are removed innermost-first, since a retired team's day
+    directory is otherwise a permanent empty marker for a team that no longer exists.
+    """
+
+    root = output / SCHEMA_3_ROOT
+    if root.is_symlink() or not root.is_dir():
+        return ()
+    removed: list[str] = []
+    for directory, subdirectories, names in os.walk(root, topdown=False, followlinks=False):
+        here = Path(directory)
+        if here.is_symlink():
+            continue
+        for name in sorted(names):
+            if not is_schema_3_shard_name(name):
+                continue
+            path = here / name
+            relative = path.relative_to(output).as_posix()
+            if relative in published or path.is_symlink() or not path.is_file():
+                continue
+            path.unlink()
+            removed.append(relative)
+        del subdirectories
+        if here != root and not any(here.iterdir()):
+            here.rmdir()
+    return tuple(sorted(removed))
 
 
 @dataclass(frozen=True)
@@ -927,7 +1105,94 @@ def _spine_lines(
         where = "timeline.project_overview"
         record = as_object(singular, where)
         place(_team_of(record, sole_team, where), "project_overview", record, where)
+
+    # The zoom bounds, last, so that the member a first frame inflates does not carry them.
+    # Every subject is walked in its own collection's order because that is the order
+    # `activity_bounds` keys its rollup answer by; the two loops over `rollups` therefore have
+    # to agree, and they do because both enumerate `_collection(timeline, "rollups")`.
+    #
+    # This is a second pass over the events and edges in the same build, because
+    # `write_timeline_shards` already ran one for schema 2. Calling the same function twice is
+    # the deliberate choice: caching the result across the two writers would couple them through
+    # a shared object whose lifetime neither owns, and the alternative -- deriving schema 3's
+    # bounds independently -- is the one thing that must not happen, since two derivations are
+    # two answers to "where should this zoom". Measured at 5.1 seconds on the archive's 487,796
+    # timeline instants -- 379,006 events and both endpoints of 54,395 edges -- against 16.6 for
+    # the projection as a whole.
+    phase_bounds, agent_bounds, rollup_bounds = activity_bounds(dict(timeline))
+    for index, record in enumerate(_collection(timeline, "agents")):
+        where = f"timeline.agents[{index}]"
+        team = _team_of(record, sole_team, where)
+        identifier = as_string(record.get("id"), f"{where}.id")
+        place(
+            team,
+            _ACTIVITY_BOUNDS_KIND,
+            _bounds_record(
+                agent_reference(team, identifier),
+                agent_bounds.get(identifier, _own_interval(record, where)),
+            ),
+            where,
+        )
+    for index, record in enumerate(_collection(timeline, "phases")):
+        where = f"timeline.phases[{index}]"
+        team = _team_of(record, sole_team, where)
+        identifier = as_string(record.get("id"), f"{where}.id")
+        place(
+            team,
+            _ACTIVITY_BOUNDS_KIND,
+            _bounds_record(
+                phase_reference(team, identifier),
+                phase_bounds.get(identifier, _own_interval(record, where)),
+            ),
+            where,
+        )
+    rollups = _collection(timeline, "rollups")
+    if len(rollup_bounds) != len(rollups):
+        raise TimelineV3Error(
+            "timeline.rollups: activity bounds do not line up with the rollups they describe"
+        )
+    for index, record in enumerate(rollups):
+        where = f"timeline.rollups[{index}]"
+        team = _team_of(record, sole_team, where)
+        place(
+            team,
+            _ACTIVITY_BOUNDS_KIND,
+            _bounds_record(
+                rollup_reference(
+                    team,
+                    as_string(record.get("kind"), f"{where}.kind"),
+                    _field_int(record, "start_ms", where),
+                ),
+                rollup_bounds[index],
+            ),
+            where,
+        )
     return buckets
+
+
+def _own_interval(record: Mapping[str, JsonValue], where: str) -> tuple[int, int]:
+    """The record's declared interval, which is what an unbounded subject falls back to.
+
+    Schema 2 uses exactly this fallback -- `_global_object` and `_phase_index_object` both pass
+    ``(start_ms, end_ms)`` as the default of their ``bounds.get`` -- so schema 3 must too, or
+    the two generations would disagree about the one record for which no activity was found.
+    """
+
+    return _field_int(record, "start_ms", where), _field_int(record, "end_ms", where)
+
+
+def _bounds_record(reference: str, bounds: tuple[int, int]) -> dict[str, JsonValue]:
+    """One zoom-bounds line: which record it is about, and the interval to frame.
+
+    No ``team`` field: the shard is per-team and the reference already names the team, so a
+    third copy of it would be 14,584 repetitions of something the reader already knows.
+    """
+
+    return {
+        "ref": reference,
+        "activity_start_ms": bounds[0],
+        "activity_end_ms": bounds[1],
+    }
 
 
 def _ordered_spine(
@@ -978,9 +1243,10 @@ def write_timeline_v3(
 ) -> TimelineV3Report:
     """Publish the schema-3 shards, then the bootstrap that names them.
 
-    *output* is the archive root; every path this writes is relative to it. The caller keeps
-    owning ``data/timeline.json`` and ``data/timeline-v2.json``: schema 3 is published beside
-    them, not instead of them, until something reads it.
+    *output* is the archive root; every path this writes is relative to it. ``data/timeline-v2``
+    remains the caller's, and is still published beside this, because the website reads it and
+    has no schema-3 mode; ``data/timeline.json`` is no longer written by a published build at
+    all. See the module docstring for why those two retirements are not the same event.
 
     **Every refusal is raised before the first byte is written.** The projection is built whole
     -- buckets, ordering, per-team validation, spine layout -- and only then published. The
@@ -1104,6 +1370,13 @@ def write_timeline_v3(
     generated: list[str] = [SCHEMA_3_BOOTSTRAP_PATH]
     for shard in shards:
         generated.extend(shard.generated_files)
+    removed = _remove_unplanned(
+        output,
+        frozenset(
+            relative for relative in generated if relative != SCHEMA_3_BOOTSTRAP_PATH
+        ),
+    )
+    changed += len(removed)
     index_bytes = sum(
         _output_path(output, shard.index_relative_path, make_parents=False).stat().st_size
         for shard in shards
@@ -1118,6 +1391,7 @@ def write_timeline_v3(
         compressed_bytes=sum(shard.write.index.c_size for shard in shards),
         uncompressed_bytes=sum(shard.write.index.u_size for shard in shards),
         index_bytes=index_bytes,
+        removed_files=removed,
     )
 
 
@@ -1188,6 +1462,7 @@ __all__ = [
     "SCHEMA_3_VERSION",
     "ShardReport",
     "is_schema_3_path",
+    "is_schema_3_shard_name",
     "TimelineV3Error",
     "TimelineV3Report",
     "write_timeline_v3",

@@ -12,6 +12,7 @@ from pathlib import Path
 
 from agent_team_timeline import __version__
 from agent_team_timeline.archive import as_array, as_object, read_json
+from agent_team_timeline.archive_gc import collect, format_gc_report
 from agent_team_timeline.claude import ClaudeParseError
 from agent_team_timeline.codex import CodexParseError
 from agent_team_timeline.github_enrich import PullMetadataReport, enrich_pull_request_metadata
@@ -30,6 +31,7 @@ from agent_team_timeline.orc import OrcContinuationSpec, OrcParseError
 from agent_team_timeline.pipeline import (
     IngestReport,
     SummarizeReport,
+    archive_writer_lock,
     build_archive,
     extract_transcripts_archive,
     ingest_claude,
@@ -60,8 +62,15 @@ from agent_team_timeline.query import (
     format_search_results,
     format_stats,
     parse_ordinal_range,
+    schema_3_completeness,
+    schema_3_record_counts,
 )
 from agent_team_timeline.server import serve
+from agent_team_timeline.snapshot_store import (
+    format_migration_report,
+    migrate_snapshots,
+    pointer_summary,
+)
 from agent_team_timeline.summarize import SummaryError
 from agent_team_timeline.token_usage import TokenUsage
 from agent_team_timeline.transcript_export import TranscriptExportReport
@@ -130,6 +139,30 @@ def _add_archive(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--team", required=True, help="stable team slug, for example example-team")
 
 
+def _add_snapshot_root(parser: argparse.ArgumentParser) -> None:
+    """Offer the store location on every command that can create one.
+
+    Named `--snapshot-root` rather than `--snapshot-dir` because it is the root of a store holding
+    every team, not one team's directory: the team is a slug-named subdirectory inside it, so an
+    archive with twelve teams sets this once. Offered on the ingest and refresh commands and not
+    on `build`, `query` or `serve`, because those never create a store -- they read the layout the
+    archive already recorded, and a flag they would have to ignore is worse than no flag.
+    """
+
+    parser.add_argument(
+        "--snapshot-root",
+        dest="snapshot_root",
+        default=None,
+        metavar="DIR",
+        help=(
+            "where to keep the vendor source snapshots, which are ingest input rather than "
+            "published output and are the largest thing here (default: <output>.sources, a "
+            "sibling of the archive; an archive that already keeps them inside itself keeps "
+            "doing so until `migrate-snapshots` is run)"
+        ),
+    )
+
+
 def _add_date_window(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--timezone",
@@ -178,6 +211,7 @@ def _add_site_identity(parser: argparse.ArgumentParser) -> None:
 
 def _add_ingest(parser: argparse.ArgumentParser) -> None:
     _add_archive(parser)
+    _add_snapshot_root(parser)
     parser.add_argument(
         "--sessions-root", default="~/.codex/sessions", help="Codex rollout tree (default: %(default)s)"
     )
@@ -197,6 +231,7 @@ def _add_ingest(parser: argparse.ArgumentParser) -> None:
 
 def _add_claude_ingest(parser: argparse.ArgumentParser) -> None:
     _add_archive(parser)
+    _add_snapshot_root(parser)
     parser.add_argument(
         "--session-file",
         required=True,
@@ -208,6 +243,7 @@ def _add_claude_ingest(parser: argparse.ArgumentParser) -> None:
 
 def _add_orc_ingest(parser: argparse.ArgumentParser) -> None:
     _add_archive(parser)
+    _add_snapshot_root(parser)
     parser.add_argument(
         "--source-root",
         required=True,
@@ -579,6 +615,81 @@ def _parser() -> argparse.ArgumentParser:
     inspect.add_argument("--output", required=True)
     inspect.set_defaults(handler="inspect")
 
+    collect_garbage = sub.add_parser(
+        "gc",
+        help="report what a built archive no longer produces; delete only when asked",
+        description=(
+            "classify every file in a built archive as live, reclaimable or held, and print the "
+            "bytes for each category. Reclaims nothing unless --delete is given, and even then "
+            "moves files into .agent-team-timeline-trash/ rather than unlinking them, so a "
+            "mistake costs a copy back instead of an eight-hour rebuild. Emptying that trash is "
+            "a separate --empty-trash pass. Nothing is ever reclaimed on the strength of 'the "
+            "last build did not write it': a file goes only when a named superseding artifact "
+            "is present and complete, or when a manifest authoritative over its directory "
+            "disowns it"
+        ),
+    )
+    collect_garbage.add_argument(
+        "--output", required=True, help="built archive directory"
+    )
+    collect_garbage.add_argument(
+        "--delete",
+        action="store_true",
+        help="move every reclaimable file into the archive's trash directory",
+    )
+    collect_garbage.add_argument(
+        "--empty-trash",
+        action="store_true",
+        dest="empty_trash",
+        help="permanently delete the trash directory; this is the irreversible pass",
+    )
+    collect_garbage.add_argument(
+        "--format",
+        choices=("text", "json"),
+        default="text",
+        help="report format (default: %(default)s)",
+    )
+    collect_garbage.set_defaults(handler="gc")
+
+    migrate_snapshots_parser = sub.add_parser(
+        "migrate-snapshots",
+        help="move an archive's vendor source snapshots out of the published tree",
+        description=(
+            "relocate teams/<slug>/source_snapshots/ into a store outside --output. The "
+            "snapshots are ingest input, not published output: they are typically two thirds of "
+            "an archive's bytes, they are reachable over HTTP from `make serve`, and the tool "
+            "has always gitignored them. Nothing moves unless --move is given; without it this "
+            "prints what would move, from where, to where, and what it refuses to touch. The "
+            "move is a rename when the store is on the same filesystem, which it is by default, "
+            "and the archive records the new layout before the first byte moves so that an "
+            "interrupted run is resumable rather than ambiguous"
+        ),
+    )
+    migrate_snapshots_parser.add_argument(
+        "--output", required=True, help="built or ingested archive directory"
+    )
+    _add_snapshot_root(migrate_snapshots_parser)
+    migrate_snapshots_parser.add_argument(
+        "--move",
+        action="store_true",
+        help="actually relocate the snapshots; without this the command only reports",
+    )
+    migrate_snapshots_parser.add_argument(
+        "--copy",
+        action="store_true",
+        help=(
+            "permit a copy-verify-delete when the store is on a different filesystem; unlike a "
+            "rename this is interruptible and the bytes exist twice while it runs"
+        ),
+    )
+    migrate_snapshots_parser.add_argument(
+        "--format",
+        choices=("text", "json"),
+        default="text",
+        help="report format (default: %(default)s)",
+    )
+    migrate_snapshots_parser.set_defaults(handler="migrate_snapshots")
+
     audit_glossary = sub.add_parser(
         "audit-glossary",
         help="audit retired glossary candidates without publishing links",
@@ -920,6 +1031,44 @@ def _print_retired_projections(report: IngestReport) -> None:
     )
 
 
+def _print_snapshot_root(report: IngestReport, archive: Path) -> None:
+    """Say where the vendor snapshots went, exactly once per archive, on stderr.
+
+    This is the only thing the tool writes outside `--output`, and an operator who typed
+    `--output X` is entitled to be told the first time several gigabytes start accumulating
+    somewhere that is not `X`. Said once -- on the run that records the layout -- and silent
+    afterwards, for the same reason the task-note and payload announcements are: a line printed
+    on every run is a line nobody reads on the run that matters.
+
+    An archive that keeps its snapshots in the old in-archive place gets a different sentence,
+    naming the command that changes that. It is not a warning and not a deprecation: the old
+    layout keeps working indefinitely, and the only thing wrong with it is the thing the operator
+    can now choose to fix.
+    """
+
+    if not report.snapshot_root_established:
+        return
+    # Resolved for display. The report keeps the archive-relative form so that the receipt it
+    # lands in stays free of absolute paths; a terminal wants the opposite.
+    where = (archive / report.snapshot_root).resolve()
+    if report.snapshot_root_layout == "in-archive-legacy":
+        print(
+            f"{PROG}: {report.team_slug}: this archive keeps its vendor source snapshots inside "
+            f"itself, at {where}; they are ingest input rather than published output, and they "
+            "are reachable over HTTP from `make serve` until they are moved. "
+            f"`{PROG} migrate-snapshots --output {archive}` says what moving them would do",
+            file=sys.stderr,
+        )
+        return
+    print(
+        f"{PROG}: {report.team_slug}: vendor source snapshots are being kept in {where}, outside "
+        "the published archive, because they are ingest input and are usually the largest thing "
+        "here. The archive records the location; back it up with the archive if you want "
+        "incremental ingest to keep working",
+        file=sys.stderr,
+    )
+
+
 def _print_promoted_task_notes(report: IngestReport) -> None:
     """Announce newly promoted task notes, on stderr, and say why the archive just grew.
 
@@ -1143,15 +1292,31 @@ def _export_selection(
     return window, kinds, timezone_name
 
 
-def _inspect(archive: Path) -> int:
+def _inspect_counts(archive: Path) -> dict[str, int]:
+    """The six collection sizes, from the cheapest generation that can state them.
+
+    Schema 3 publishes all six in its 89,298-byte bootstrap, so a complete generation answers
+    without opening a shard. Before this, the only implementation parsed ``data/timeline.json``
+    -- 246,973,399 bytes at 1.44 GiB resident on the measured archive -- to print six integers,
+    which is also why a published build no longer writing that file could not simply have left
+    this alone.
+
+    The schema-1 branch is kept, and kept second, for the archives that still only have it: one
+    written before schema 3 existed, or the combined export's per-team intermediate. It is a
+    fallback in the same sense the reader's is, and it disappears when those archives do.
+    """
+
+    counts = schema_3_record_counts(archive)
+    if counts is not None:
+        return counts
     timeline_path = archive / "data" / "timeline.json"
-    manifest_path = archive / "manifest.json"
     if not timeline_path.is_file():
-        raise ValueError(f"no built timeline at {timeline_path}")
+        _complete, declined = schema_3_completeness(archive)
+        raise ValueError(
+            f"no built timeline in {archive}: {declined}, and no {timeline_path}"
+        )
     timeline = as_object(read_json(timeline_path), str(timeline_path))
-    manifest = as_object(read_json(manifest_path), str(manifest_path)) if manifest_path.is_file() else {}
-    result = {
-        "archive": str(archive.resolve()),
+    return {
         "agents": len(as_array(timeline.get("agents"), "timeline.agents")),
         "phases": len(as_array(timeline.get("phases"), "timeline.phases")),
         "edges": len(as_array(timeline.get("edges"), "timeline.edges")),
@@ -1160,9 +1325,56 @@ def _inspect(archive: Path) -> int:
         "summary_files": len(
             as_array(timeline.get("summary_files"), "timeline.summary_files")
         ),
-        "manifest": manifest,
     }
+
+
+def _inspect(archive: Path) -> int:
+    manifest_path = archive / "manifest.json"
+    manifest = as_object(read_json(manifest_path), str(manifest_path)) if manifest_path.is_file() else {}
+    result: dict[str, object] = dict(_inspect_counts(archive))
+    result["archive"] = str(archive.resolve())
+    result["manifest"] = manifest
+    # Cheap -- one small JSON read plus a walk of whatever is still inside the archive, which for
+    # a migrated archive is nothing -- and it is the answer to the first question anyone asks
+    # after noticing that an 8.8 GB archive is now 2.9 GB.
+    result["source_snapshots"] = pointer_summary(archive)
     print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def _migrate_snapshots(
+    archive: Path,
+    requested: Path | None,
+    *,
+    move: bool,
+    copy_across_devices: bool,
+    report_format: str,
+) -> int:
+    """Report or perform the relocation, under the archive writer lock in both cases.
+
+    The dry run takes the lock too. It is the same argument `gc` makes: the report is the input to
+    a human's decision about several gigabytes, and one computed while a build was moving files
+    underneath it would describe an archive that never existed.
+    """
+
+    if report_format not in {"text", "json"}:
+        raise ValueError(f"unsupported migrate-snapshots report format {report_format!r}")
+    if copy_across_devices and not move:
+        # Not an error the operator can act on any other way: --copy authorizes a destructive,
+        # interruptible path, and a dry run performs no path at all. Refusing is how the flag
+        # stops meaning "I meant to move" without ever having moved.
+        raise ValueError("--copy has no effect without --move; add --move or drop --copy")
+    with archive_writer_lock(archive):
+        result = migrate_snapshots(
+            archive,
+            requested,
+            move=move,
+            copy_across_devices=copy_across_devices,
+        )
+    if report_format == "json":
+        print(json.dumps(result.to_json_obj(), indent=2, sort_keys=True))
+    else:
+        print(format_migration_report(result, moved=move), end="")
     return 0
 
 
@@ -1350,6 +1562,38 @@ def main(argv: Sequence[str] | None = None) -> int:
         except (OSError, ValueError) as error:
             print(f"{PROG}: {error}", file=sys.stderr)
             return 2
+    if handler == "gc":
+        try:
+            gc_format = str(ns.format)
+            if gc_format not in {"text", "json"}:
+                raise ValueError(f"unsupported gc report format {gc_format!r}")
+            print(
+                format_gc_report(
+                    collect(
+                        _path(str(ns.output)),
+                        delete=bool(ns.delete),
+                        empty_trash=bool(ns.empty_trash),
+                    ),
+                    gc_format,
+                ),
+                end="",
+            )
+            return 0
+        except (OSError, ValueError) as error:
+            print(f"{PROG}: {error}", file=sys.stderr)
+            return 2
+    if handler == "migrate_snapshots":
+        try:
+            return _migrate_snapshots(
+                _path(str(ns.output)),
+                _path(str(ns.snapshot_root)) if ns.snapshot_root is not None else None,
+                move=bool(ns.move),
+                copy_across_devices=bool(ns.copy),
+                report_format=str(ns.format),
+            )
+        except (OSError, ValueError) as error:
+            print(f"{PROG}: {error}", file=sys.stderr)
+            return 2
     if handler == "audit_glossary":
         try:
             glossary_team_values: object = ns.team
@@ -1443,6 +1687,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             for team in project_report.teams:
                 print(f"{team.team_slug} ({team.provider}):", end=" ")
                 _print_ingest(team.ingest)
+                _print_snapshot_root(team.ingest, config.output)
                 _print_retired_projections(team.ingest)
                 _print_promoted_task_notes(team.ingest)
                 _print_stored_payloads(team.ingest)
@@ -1726,6 +1971,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ),
                 end_time=str(ns.end_time) if ns.end_time is not None else None,
             )
+            requested_snapshot_root = (
+                _path(str(ns.snapshot_root)) if ns.snapshot_root is not None else None
+            )
             if handler in ("ingest_claude", "refresh_claude"):
                 _, ingest_report = ingest_claude(
                     archive,
@@ -1734,6 +1982,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     str(ns.timezone),
                     date_window,
                     identity_overrides,
+                    requested_snapshot_root,
                 )
             elif handler in ("ingest_orc", "refresh_orc"):
                 _, ingest_report = ingest_orc(
@@ -1751,6 +2000,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     _string_list(
                         ns.accept_orc_prefix_rewrite, "--accept-orc-prefix-rewrite"
                     ),
+                    requested_snapshot_root,
                 )
             else:
                 _, ingest_report = ingest_codex(
@@ -1762,8 +2012,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     date_window,
                     identity_overrides,
                     tuple(str(item) for item in ns.continuation_session),
+                    requested_snapshot_root,
                 )
             _print_ingest(ingest_report)
+            _print_snapshot_root(ingest_report, archive)
             _print_retired_projections(ingest_report)
             _print_promoted_task_notes(ingest_report)
             _print_stored_payloads(ingest_report)

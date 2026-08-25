@@ -59,10 +59,17 @@ from agent_team_timeline.render import (
     _remove_stale_presentation_files,
     prune_retired_query_artifacts,
 )
+from agent_team_timeline.query import (
+    SCHEMA_3_BOOTSTRAP_PATH,
+    QueryFilters,
+    TimelineQuery,
+)
 from agent_team_timeline.server import make_server
 from agent_team_timeline.summarize import PLAIN_LANGUAGE_ROLLUP_STYLE, SummaryResult
 from agent_team_timeline.terminology import GlossaryTerm, glossary_term_id
 from agent_team_timeline.window import DateWindow
+from agent_team_timeline.snapshot_store import resolve_snapshot_root
+from tests.timeline_projection import schema_1_timeline_text
 
 
 ROOT = "00000000-0000-0000-0000-000000000001"
@@ -323,9 +330,14 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
     assert (tmp_path / "run_stats.py").stat().st_mode & 0o111
     assert (tmp_path / "timeline").stat().st_mode & 0o111
     assert not (tmp_path / "query.py").exists()
-    timeline_gzip = tmp_path / "data" / "timeline.json.gz"
-    assert gzip.decompress(timeline_gzip.read_bytes()) == (
-        tmp_path / "data" / "timeline.json"
+    # The schema-1 monolith is not written any more, and neither is its gzip twin. Both readers
+    # reached it only behind the two generations this build does write, and it was the single
+    # largest file in the archive.
+    assert not (tmp_path / "data" / "timeline.json").exists()
+    assert not (tmp_path / "data" / "timeline.json.gz").exists()
+    timeline_v2_gzip = tmp_path / "data" / "timeline-v2.json.gz"
+    assert gzip.decompress(timeline_v2_gzip.read_bytes()) == (
+        tmp_path / "data" / "timeline-v2.json"
     ).read_bytes()
     schema_2_bootstrap = json.loads(
         (tmp_path / "data" / "timeline-v2.json").read_text(encoding="utf-8")
@@ -354,7 +366,7 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
     assert "./timeline agents --team TEAM --format jsonl" in generated_readme
     assert "./timeline show phase:TEAM::PHASE_ID --transcript" in generated_readme
     assert "data/export.json" in generated_readme
-    timeline = json.loads((tmp_path / "data" / "timeline.json").read_text(encoding="utf-8"))
+    timeline = json.loads(schema_1_timeline_text(tmp_path))
     assert len(timeline["agents"]) == 2
     child_track = next(agent for agent in timeline["agents"] if agent["id"] == CHILD)
     assert child_track["short_name"] == "Release receipt audit"
@@ -653,7 +665,10 @@ def test_ingest_no_longer_writes_the_per_thread_message_projection(
     tmp_path: Path,
 ) -> None:
     team = _team()
-    archived, report = _write_ingested_team(tmp_path, team.team_slug, team, None, 0)
+    archived, report = _write_ingested_team(
+        tmp_path, team.team_slug, team, None, 0,
+        resolve_snapshot_root(tmp_path, team.team_slug),
+    )
 
     assert not (tmp_path / "teams" / team.team_slug / "raw" / "messages").exists()
     assert report.retired_message_projections == 0
@@ -671,11 +686,17 @@ def test_ingest_retires_a_legacy_message_projection_and_reports_what_it_freed(
     tmp_path: Path,
 ) -> None:
     team = _team()
-    archived, _ = _write_ingested_team(tmp_path, team.team_slug, team, None, 0)
+    archived, _ = _write_ingested_team(
+        tmp_path, team.team_slug, team, None, 0,
+        resolve_snapshot_root(tmp_path, team.team_slug),
+    )
     root, seeded_bytes = _seed_legacy_message_projection(tmp_path, archived)
     assert seeded_bytes > 0
 
-    _, report = _write_ingested_team(tmp_path, team.team_slug, team, None, 0)
+    _, report = _write_ingested_team(
+        tmp_path, team.team_slug, team, None, 0,
+        resolve_snapshot_root(tmp_path, team.team_slug),
+    )
 
     assert not root.exists()
     assert report.retired_message_projections == 2
@@ -688,7 +709,10 @@ def test_ingest_retires_a_legacy_message_projection_and_reports_what_it_freed(
 
     # Sweeping is a one-time event, so the very next ingest must be silent about it rather than
     # re-reporting a reclamation that already happened.
-    _, again = _write_ingested_team(tmp_path, team.team_slug, team, None, 0)
+    _, again = _write_ingested_team(
+        tmp_path, team.team_slug, team, None, 0,
+        resolve_snapshot_root(tmp_path, team.team_slug),
+    )
     assert again.retired_message_projections == 0
     assert again.retired_message_projection_bytes == 0
     assert again.files_changed == 0
@@ -698,7 +722,10 @@ def test_message_projection_sweep_leaves_every_file_it_did_not_write(
     tmp_path: Path,
 ) -> None:
     team = _team()
-    archived, _ = _write_ingested_team(tmp_path, team.team_slug, team, None, 0)
+    archived, _ = _write_ingested_team(
+        tmp_path, team.team_slug, team, None, 0,
+        resolve_snapshot_root(tmp_path, team.team_slug),
+    )
     root, _ = _seed_legacy_message_projection(tmp_path, archived)
 
     # Four shapes the writer never produced. If the sweep took any of them it would be deleting
@@ -713,7 +740,10 @@ def test_message_projection_sweep_leaves_every_file_it_did_not_write(
     link = root / "elsewhere.json"
     link.symlink_to(tmp_path / "teams" / team.team_slug / "raw" / "team.json")
 
-    _, report = _write_ingested_team(tmp_path, team.team_slug, team, None, 0)
+    _, report = _write_ingested_team(
+        tmp_path, team.team_slug, team, None, 0,
+        resolve_snapshot_root(tmp_path, team.team_slug),
+    )
 
     assert report.retired_message_projections == 2
     assert not (root / f"{ROOT}.json").exists()
@@ -742,7 +772,10 @@ def test_message_projection_sweep_takes_every_thread_shaped_name_not_only_this_r
     """
 
     team = _team()
-    archived, _ = _write_ingested_team(tmp_path, team.team_slug, team, None, 0)
+    archived, _ = _write_ingested_team(
+        tmp_path, team.team_slug, team, None, 0,
+        resolve_snapshot_root(tmp_path, team.team_slug),
+    )
     root, seeded_bytes = _seed_legacy_message_projection(tmp_path, archived)
 
     orphan = root / "01hzzzzzzzzzzzzzzzzzzzzzzz.json"
@@ -751,7 +784,10 @@ def test_message_projection_sweep_takes_every_thread_shaped_name_not_only_this_r
     operator_file.write_text('{"why": "re-ingested"}\n', encoding="utf-8")
     expected = seeded_bytes + orphan.stat().st_size + operator_file.stat().st_size
 
-    _, report = _write_ingested_team(tmp_path, team.team_slug, team, None, 0)
+    _, report = _write_ingested_team(
+        tmp_path, team.team_slug, team, None, 0,
+        resolve_snapshot_root(tmp_path, team.team_slug),
+    )
 
     assert not root.exists()
     assert report.retired_message_projections == 4
@@ -760,7 +796,10 @@ def test_message_projection_sweep_takes_every_thread_shaped_name_not_only_this_r
 
 def test_message_projection_sweep_ignores_a_symlinked_directory(tmp_path: Path) -> None:
     team = _team()
-    _write_ingested_team(tmp_path, team.team_slug, team, None, 0)
+    _write_ingested_team(
+        tmp_path, team.team_slug, team, None, 0,
+        resolve_snapshot_root(tmp_path, team.team_slug),
+    )
     # A symlink where the retired directory used to be points the sweep at files that are not in
     # the archive at all. It must decline rather than follow the name out of the tree.
     decoy = tmp_path / "decoy"
@@ -770,7 +809,10 @@ def test_message_projection_sweep_ignores_a_symlinked_directory(tmp_path: Path) 
     root = tmp_path / "teams" / team.team_slug / "raw" / "messages"
     root.symlink_to(decoy, target_is_directory=True)
 
-    _, report = _write_ingested_team(tmp_path, team.team_slug, team, None, 0)
+    _, report = _write_ingested_team(
+        tmp_path, team.team_slug, team, None, 0,
+        resolve_snapshot_root(tmp_path, team.team_slug),
+    )
 
     assert report.retired_message_projections == 0
     assert victim.read_text(encoding="utf-8") == "{}\n"
@@ -781,11 +823,17 @@ def test_build_after_retiring_the_message_projection_serves_a_working_archive(
     tmp_path: Path,
 ) -> None:
     team = _team()
-    archived, _ = _write_ingested_team(tmp_path, team.team_slug, team, None, 0)
+    archived, _ = _write_ingested_team(
+        tmp_path, team.team_slug, team, None, 0,
+        resolve_snapshot_root(tmp_path, team.team_slug),
+    )
     root, _ = _seed_legacy_message_projection(tmp_path, archived)
     assert root.is_dir()
 
-    _, report = _write_ingested_team(tmp_path, team.team_slug, team, None, 0)
+    _, report = _write_ingested_team(
+        tmp_path, team.team_slug, team, None, 0,
+        resolve_snapshot_root(tmp_path, team.team_slug),
+    )
     assert report.retired_message_projections == 2
     assert not root.exists()
 
@@ -795,9 +843,7 @@ def test_build_after_retiring_the_message_projection_serves_a_working_archive(
     assert built["files_changed"] > 0
     assert not root.exists()
     assert (tmp_path / "index.html").is_file()
-    timeline = json.loads(
-        (tmp_path / "data" / "timeline.json").read_text(encoding="utf-8")
-    )
+    timeline = json.loads(schema_1_timeline_text(tmp_path))
     assert {agent["id"] for agent in timeline["agents"]} == {ROOT, CHILD}
     for phase in timeline["phases"]:
         assert (tmp_path / phase["detail_path"]).is_file()
@@ -812,7 +858,7 @@ def test_build_after_retiring_the_message_projection_serves_a_working_archive(
     thread.start()
     try:
         port = int(server.server_address[1])
-        for relative in ("index.html", "data/timeline.json", "data/timeline-v2.json"):
+        for relative in ("index.html", "data/timeline-v2.json", "data/timeline-v3.json"):
             url = f"http://127.0.0.1:{port}/{relative}"
             with urllib.request.urlopen(url, timeout=5) as response:
                 assert response.status == 200
@@ -1097,9 +1143,7 @@ def test_build_embeds_standalone_site_identity(tmp_path: Path) -> None:
     summarize_archive(tmp_path, team.team_slug, "heuristic", "test-model")
     build_archive(tmp_path, team.team_slug)
 
-    timeline = json.loads(
-        (tmp_path / "data" / "timeline.json").read_text(encoding="utf-8")
-    )
+    timeline = json.loads(schema_1_timeline_text(tmp_path))
     assert timeline["display_timezone"] == "America/New_York"
     assert timeline["display_timezone_source"] == "explicit"
     assert timeline["teams"] == [
@@ -1191,7 +1235,7 @@ def test_reused_subagent_gets_one_structural_lifetime_result(tmp_path: Path) -> 
     _write_team(tmp_path, updated)
     summarize_archive(tmp_path, updated.team_slug, "heuristic", "test-model")
     build_archive(tmp_path, updated.team_slug)
-    timeline = json.loads((tmp_path / "data" / "timeline.json").read_text(encoding="utf-8"))
+    timeline = json.loads(schema_1_timeline_text(tmp_path))
     result_edges = [edge for edge in timeline["edges"] if edge["kind"] == "result"]
     assert len(result_edges) == 1
     lifetime_result = result_edges[0]
@@ -1277,7 +1321,7 @@ def test_explicit_coordinator_continuation_is_structural_without_fake_join(
     summarize_archive(tmp_path, updated.team_slug, "heuristic", "test-model")
     build_archive(tmp_path, updated.team_slug)
 
-    timeline = json.loads((tmp_path / "data" / "timeline.json").read_text(encoding="utf-8"))
+    timeline = json.loads(schema_1_timeline_text(tmp_path))
     edges = {edge["id"]: edge for edge in timeline["edges"]}
     rendered = edges[f"codex-continuation-{CONTINUATION}"]
     assert rendered["kind"] == "continuation"
@@ -1305,7 +1349,7 @@ def test_only_ended_agent_lifetimes_get_a_structural_join(
     summarize_archive(tmp_path, updated.team_slug, "heuristic", "test-model")
     build_archive(tmp_path, updated.team_slug)
 
-    timeline = json.loads((tmp_path / "data" / "timeline.json").read_text(encoding="utf-8"))
+    timeline = json.loads(schema_1_timeline_text(tmp_path))
     result_edges = [edge for edge in timeline["edges"] if edge["kind"] == "result"]
     assert len(result_edges) == expected_results
     if expected_results:
@@ -1415,7 +1459,7 @@ def test_resumed_nested_agent_joins_parent_while_turn_results_reach_initiators(
     summarize_archive(tmp_path, updated.team_slug, "heuristic", "test-model")
     build_archive(tmp_path, updated.team_slug)
 
-    timeline = json.loads((tmp_path / "data" / "timeline.json").read_text(encoding="utf-8"))
+    timeline = json.loads(schema_1_timeline_text(tmp_path))
     result_edges = {
         edge["id"]: edge["target_id"]
         for edge in timeline["edges"]
@@ -1820,9 +1864,7 @@ def test_summary_window_can_backfill_one_hour_without_other_rollup_levels(
     assert first_export["files_changed"] > 0
     assert second_export["files_changed"] == 0
     assert (export / ".agent-team-timeline.json").is_file()
-    timeline = json.loads(
-        (export / "data" / "timeline.json").read_text(encoding="utf-8")
-    )
+    timeline = json.loads(schema_1_timeline_text(export))
     assert {item["kind"] for item in timeline["rollups"]} == {"hourly"}
     assert all(
         START <= phase["start_ms"] < START + 20_000
@@ -1912,9 +1954,7 @@ def test_build_without_summary_cache_uses_presentation_only_fallbacks(
     assert first["files_changed"] > 0
     assert second["files_changed"] == 0
     assert not source_summary_root.exists()
-    timeline = json.loads(
-        (output / "data" / "timeline.json").read_text(encoding="utf-8")
-    )
+    timeline = json.loads(schema_1_timeline_text(output))
     assert timeline["phases"]
     assert {phase["phrase"] for phase in timeline["phases"]} == {
         "Summary unavailable"
@@ -1990,9 +2030,7 @@ def test_build_preserves_available_phase_summaries_in_patchy_archive(
     (summary_root / "artifacts.json").unlink()
 
     build_archive(tmp_path, team.team_slug, output=output)
-    timeline = json.loads(
-        (output / "data" / "timeline.json").read_text(encoding="utf-8")
-    )
+    timeline = json.loads(schema_1_timeline_text(output))
     phrases = {phase["id"]: phase["phrase"] for phase in timeline["phases"]}
     availability = {
         phase["id"]: phase["summary_available"] for phase in timeline["phases"]
@@ -2061,9 +2099,7 @@ def test_build_invalidates_backfilled_phase_and_dependent_summaries(
         rollup_kinds=("daily",),
         output=output,
     )
-    timeline = json.loads(
-        (output / "data" / "timeline.json").read_text(encoding="utf-8")
-    )
+    timeline = json.loads(schema_1_timeline_text(output))
     child_phase = next(
         phase for phase in timeline["phases"] if phase["agent_id"] == CHILD
     )
@@ -2088,9 +2124,7 @@ def test_build_invalidates_backfilled_phase_and_dependent_summaries(
         rollup_kinds=("daily",),
         output=output,
     )
-    catalog_only = json.loads(
-        (output / "data" / "timeline.json").read_text(encoding="utf-8")
-    )
+    catalog_only = json.loads(schema_1_timeline_text(output))
     assert next(
         phase
         for phase in catalog_only["phases"]
@@ -2115,9 +2149,7 @@ def test_build_invalidates_backfilled_phase_and_dependent_summaries(
         rollup_kinds=("daily",),
         output=output,
     )
-    refreshed = json.loads(
-        (output / "data" / "timeline.json").read_text(encoding="utf-8")
-    )
+    refreshed = json.loads(schema_1_timeline_text(output))
     assert next(
         phase for phase in refreshed["phases"] if phase["agent_id"] == CHILD
     )["summary_available"] is True
@@ -2140,9 +2172,7 @@ def test_build_recovers_compatible_paid_name_from_catalog(tmp_path: Path) -> Non
 
     output = tmp_path / "catalog-recovery-site"
     build_archive(tmp_path, team.team_slug, output=output)
-    timeline = json.loads(
-        (output / "data" / "timeline.json").read_text(encoding="utf-8")
-    )
+    timeline = json.loads(schema_1_timeline_text(output))
     child = next(agent for agent in timeline["agents"] if agent["id"] == CHILD)
     assert child["short_name"] == expected_name["short_name"]
     assert child["lifetime_summary"] == expected_name["lifetime_summary"]
@@ -2173,9 +2203,7 @@ def test_build_does_not_recover_future_catalog_knowledge_into_slice(
         rollup_kinds=("hourly",),
         output=output,
     )
-    timeline = json.loads(
-        (output / "data" / "timeline.json").read_text(encoding="utf-8")
-    )
+    timeline = json.loads(schema_1_timeline_text(output))
     child = next(agent for agent in timeline["agents"] if agent["id"] == CHILD)
     assert "no cached hindsight name" in child["naming_rationale"]
     assert all(
@@ -2284,9 +2312,7 @@ def test_build_does_not_render_stale_partial_rollup_as_complete(
         rollup_kinds=("hourly",),
         output=output,
     )
-    timeline = json.loads(
-        (output / "data" / "timeline.json").read_text(encoding="utf-8")
-    )
+    timeline = json.loads(schema_1_timeline_text(output))
     assert len(timeline["rollups"]) == 1
     assert timeline["rollups"][0]["summary_available"] is False
     assert timeline["rollups"][0]["technical_path"] == ""
@@ -2323,9 +2349,7 @@ def test_build_suppresses_stale_out_of_window_overview_source(tmp_path: Path) ->
         display_window=window,
         output=output,
     )
-    timeline = json.loads(
-        (output / "data" / "timeline.json").read_text(encoding="utf-8")
-    )
+    timeline = json.loads(schema_1_timeline_text(output))
     assert timeline["project_overview"]["summary_available"] is False
     assert "Summary unavailable" in timeline["project_overview"]["text"]
 
@@ -2470,9 +2494,7 @@ def test_combined_export_namespaces_teams_and_is_byte_idempotent(
     assert first["teams"] == 2
     assert first["files_changed"] > 0
     assert second["files_changed"] == 0
-    timeline = json.loads(
-        (output / "data" / "timeline.json").read_text(encoding="utf-8")
-    )
+    timeline = json.loads(schema_1_timeline_text(output))
     assert timeline["range"] == {"start_ms": START, "end_ms": START + 20_000}
     assert [team["slug"] for team in timeline["teams"]] == [
         "claude-test",
@@ -2550,15 +2572,18 @@ def test_combined_export_namespaces_teams_and_is_byte_idempotent(
     )
     assert export_manifest["teams"] == ["claude-test", first_team.team_slug]
     assert "query.py" not in export_manifest["generated_files"]
-    assert "data/timeline.json.gz" in export_manifest["generated_files"]
+    assert "data/timeline.json" not in export_manifest["generated_files"]
+    assert "data/timeline.json.gz" not in export_manifest["generated_files"]
+    assert export_manifest["retired_files"] == []
     assert "data/timeline-v2.json" in export_manifest["generated_files"]
+    assert "data/timeline-v3.json" in export_manifest["generated_files"]
     assert any(
         value.startswith("data/timeline-v2/objects/") and value.endswith(".json")
         for value in export_manifest["generated_files"]
     )
     assert "app.js.gz" in export_manifest["generated_files"]
-    assert gzip.decompress((output / "data" / "timeline.json.gz").read_bytes()) == (
-        output / "data" / "timeline.json"
+    assert gzip.decompress((output / "data" / "timeline-v2.json.gz").read_bytes()) == (
+        output / "data" / "timeline-v2.json"
     ).read_bytes()
     artifact_catalog = json.loads(
         (output / "data" / "artifacts.json").read_text(encoding="utf-8")
@@ -2653,9 +2678,7 @@ def test_combined_export_builds_two_zero_summary_teams(tmp_path: Path) -> None:
         not (tmp_path / "teams" / team.team_slug / "summary_data").exists()
         for team in (codex_team, claude_team)
     )
-    timeline = json.loads(
-        (output / "data" / "timeline.json").read_text(encoding="utf-8")
-    )
+    timeline = json.loads(schema_1_timeline_text(output))
     assert {item["slug"] for item in timeline["teams"]} == {
         codex_team.team_slug,
         claude_team.team_slug,
@@ -2825,9 +2848,7 @@ def test_agent_name_v1_projection_degrades_without_lifetime_summary(
     assert loaded.lifetime_summary is None
 
     build_archive(tmp_path, team.team_slug)
-    timeline = json.loads(
-        (tmp_path / "data" / "timeline.json").read_text(encoding="utf-8")
-    )
+    timeline = json.loads(schema_1_timeline_text(tmp_path))
     child_track = next(agent for agent in timeline["agents"] if agent["id"] == CHILD)
     assert child_track["short_name"] == "Release receipt audit"
     assert child_track["summary_available"] is False
@@ -3010,9 +3031,7 @@ def test_build_ignores_retired_glossary_schema(tmp_path: Path) -> None:
 
     build_archive(tmp_path, team.team_slug)
 
-    timeline = json.loads(
-        (tmp_path / "data" / "timeline.json").read_text(encoding="utf-8")
-    )
+    timeline = json.loads(schema_1_timeline_text(tmp_path))
     assert timeline["glossary"] == []
     assert glossary_path.read_bytes() == before
 
@@ -3059,9 +3078,7 @@ def test_build_excludes_legacy_glossary_without_mutating_immutable_data(
 
     build_archive(tmp_path, team.team_slug)
 
-    timeline = json.loads(
-        (tmp_path / "data" / "timeline.json").read_text(encoding="utf-8")
-    )
+    timeline = json.loads(schema_1_timeline_text(tmp_path))
     assert timeline["glossary"] == []
     assert not stale_week.exists()
     assert user_notes.read_text(encoding="utf-8") == "# user-owned notes\n"
@@ -3255,3 +3272,68 @@ def test_extract_transcripts_cli_exits_two_and_names_the_team_it_carried(
     assert extraction["teams_skipped"] == 1
     assert extraction["skipped_teams"][0]["team_slug"] == "orc-test"
     assert extraction["dropped_prompt_authorship_rules"] == []
+
+
+def test_a_real_build_is_read_through_schema_three(tmp_path: Path) -> None:
+    """The end-to-end the fixture tests cannot reach: a build, then a query over it.
+
+    Everything else that exercises the schema-3 read path constructs the three generations by
+    calling the writers directly, which proves the reader and the writer agree and proves
+    nothing about the *renderer*. Two things only a real build produces are checked here.
+
+    The first is the single-team case. `render` does not stamp a ``team`` field on every record
+    -- there is only one team, and schema 1 does not carry it -- so a spine record can arrive
+    without one, and a reader that assumed the field would raise on the very archive shape most
+    installations have.
+
+    The second is that the completeness rule accepts what the build actually writes. The rule is
+    a conjunction of four clauses about files and byte counts, and it is easy to write one that
+    is correct about corruption and wrong about a healthy archive; the symptom would be a silent
+    permanent fallback to schema 2, with every byte-count claim in
+    `test_query_schema_3.py` still passing.
+    """
+
+    team = _team()
+    _write_team(tmp_path, team)
+    summarize_archive(tmp_path, team.team_slug, "heuristic", "test-model")
+    build_archive(tmp_path, team.team_slug)
+
+    query = TimelineQuery(tmp_path)
+    assert query.schema_3_declined == ""
+    agents = query.list_records("agents", QueryFilters())
+    assert agents
+    assert all(record["team"] == team.team_slug for record in agents)
+
+    # And the answers are the schema-2 answers. Hiding the schema-3 entry point is the whole
+    # difference between the two readings, so the comparison is over one tree, not two builds.
+    (tmp_path / SCHEMA_3_BOOTSTRAP_PATH).rename(tmp_path / "hidden-timeline-v3.json")
+    fallback = TimelineQuery(tmp_path)
+    assert fallback.schema_3_declined == "no schema-3 bootstrap"
+    assert fallback.list_records("agents", QueryFilters()) == agents
+    assert fallback.list_records("phases", QueryFilters()) == query.list_records(
+        "phases", QueryFilters()
+    )
+    assert fallback.show(str(agents[0]["ref"])) == query.show(str(agents[0]["ref"]))
+    assert query.bytes_read < fallback.bytes_read
+
+    # And so is schema 1, the last fallback. A single-team export puts no `team` field on a
+    # phase, a rollup or a summary file, and every reference in the query surface is
+    # team-qualified, so this is the reading that used to raise `expected a string` from the
+    # middle of the loader on the archive shape most exports have.
+    #
+    # A published build no longer writes the monolith, so it is produced here the one way the
+    # tool still produces one -- the combiner's unpublished render -- and dropped into the tree.
+    # Reading it back is what keeps this a comparison between three generations of the *same*
+    # build rather than between two builds.
+    intermediate = tmp_path.parent / "intermediate"
+    build_archive(tmp_path, team.team_slug, output=intermediate, _published=False)
+    (tmp_path / "data" / "timeline.json").write_bytes(
+        (intermediate / "data" / "timeline.json").read_bytes()
+    )
+    (tmp_path / "data" / "timeline-v2.json").rename(tmp_path / "hidden-timeline-v2.json")
+    oldest = TimelineQuery(tmp_path)
+    assert oldest.list_records("agents", QueryFilters()) == agents
+    assert oldest.list_records("rollups", QueryFilters()) == query.list_records(
+        "rollups", QueryFilters()
+    )
+    assert oldest.activity_bins(QueryFilters()) == query.activity_bins(QueryFilters())

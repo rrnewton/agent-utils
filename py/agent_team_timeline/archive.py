@@ -5,12 +5,21 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import tempfile
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 
 JsonScalar = str | int | float | bool | None
 JsonValue = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
+
+#: What makes a directory an archive this tool manages, rather than a directory that happens to
+#: hold some JSON. It lives here, in the module every other one imports, because three unrelated
+#: places now need the same answer -- the pipeline writes it, `gc` refuses to sweep a directory
+#: without it, and the snapshot store asks whether the archive a store claims still exists -- and
+#: the import graph gives them no other common home: `pipeline` imports `snapshot_store`, so the
+#: name could not simply live in the one that writes it.
+ARCHIVE_MARKER_FILE = ".agent-team-timeline.json"
 
 
 def canonical_json(value: JsonValue) -> str:
@@ -107,6 +116,56 @@ def write_json_if_changed(path: Path, value: JsonValue) -> bool:
     """Write deterministic JSON through :func:`write_text_if_changed`."""
 
     return write_text_if_changed(path, canonical_json(value))
+
+
+def write_text_durable(path: Path, text: str) -> bool:
+    """Atomically write text and persist the replaced directory entry before returning.
+
+    ``write_text_if_changed`` fsyncs the file's *contents* and then renames, which is enough for
+    the bytes but not for the name: after a crash the directory entry can still point at the old
+    inode. Every caller that writes a file another run will later treat as authoritative wants
+    both, so the parent fsync lives here rather than being restated at each call site.
+    """
+
+    changed = write_text_if_changed(path, text)
+    if not changed:
+        return False
+    try:
+        parent_fd = os.open(
+            path.parent,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+    except OSError as exc:
+        raise OSError(f"cannot open parent directory for durable write {path}: {exc}") from exc
+    try:
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+    return True
+
+
+def write_json_durable(path: Path, value: JsonValue) -> bool:
+    """Atomically write JSON and persist the replaced directory entry before returning."""
+
+    return write_text_durable(path, canonical_json(value))
+
+
+#: The archive's team-slug grammar. It lives here, beside the other primitives every layer shares,
+#: because three modules now need it -- ingestion, which creates the directory; the snapshot store,
+#: which names a directory after it outside the archive; and the migration that moves one to the
+#: other. Restating the pattern in each would let them drift, and the one that drifts furthest is
+#: the one furthest from the archive, which is exactly the one where a slug that is not a slug
+#: turns into a path traversal.
+_TEAM_SLUG = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+
+
+def validate_team_slug(team_slug: str) -> None:
+    """Refuse anything that is not a bare, filesystem-safe team slug."""
+
+    if len(team_slug) > 64 or _TEAM_SLUG.fullmatch(team_slug) is None:
+        raise ValueError(
+            "team slug must be 1-64 lowercase letters/digits separated by single hyphens"
+        )
 
 
 def read_json(path: Path) -> JsonValue:

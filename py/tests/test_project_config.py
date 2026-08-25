@@ -315,6 +315,7 @@ def test_orc_cli_dispatches_ordered_continuation_sessions(
         identity_overrides: IdentityOverrides | None = None,
         continuation_specs: Sequence[str | OrcContinuationSpec] = (),
         accept_prefix_rewrite: Sequence[str] = (),
+        snapshot_root: Path | None = None,
     ) -> tuple[TeamData, IngestReport]:
         normalized = tuple(_orc_spec(spec) for spec in continuation_specs)
         received.append(
@@ -367,6 +368,7 @@ def test_project_ingest_dispatches_all_providers_then_extracts_all(
         date_window: DateWindow | None = None,
         identity_overrides: IdentityOverrides | None = None,
         continuation_thread_ids: Sequence[str] = (),
+        snapshot_root: Path | None = None,
     ) -> tuple[TeamData, IngestReport]:
         calls.append(
             (
@@ -388,6 +390,7 @@ def test_project_ingest_dispatches_all_providers_then_extracts_all(
         display_timezone: str,
         date_window: DateWindow | None = None,
         identity_overrides: IdentityOverrides | None = None,
+        snapshot_root: Path | None = None,
     ) -> tuple[TeamData, IngestReport]:
         calls.append(
             (
@@ -410,6 +413,7 @@ def test_project_ingest_dispatches_all_providers_then_extracts_all(
         identity_overrides: IdentityOverrides | None = None,
         continuation_specs: Sequence[str | OrcContinuationSpec] = (),
         accept_prefix_rewrite: Sequence[str] = (),
+        snapshot_root: Path | None = None,
     ) -> tuple[TeamData, IngestReport]:
         normalized = tuple(_orc_spec(spec) for spec in continuation_specs)
         calls.append(
@@ -499,6 +503,7 @@ def _install_isolation_fakes(
         date_window: DateWindow | None = None,
         identity_overrides: IdentityOverrides | None = None,
         continuation_thread_ids: Sequence[str] = (),
+        snapshot_root: Path | None = None,
     ) -> tuple[TeamData, IngestReport]:
         return cast(TeamData, object()), fail_or_report(team_slug)
 
@@ -509,6 +514,7 @@ def _install_isolation_fakes(
         display_timezone: str,
         date_window: DateWindow | None = None,
         identity_overrides: IdentityOverrides | None = None,
+        snapshot_root: Path | None = None,
     ) -> tuple[TeamData, IngestReport]:
         return cast(TeamData, object()), fail_or_report(team_slug)
 
@@ -522,6 +528,7 @@ def _install_isolation_fakes(
         identity_overrides: IdentityOverrides | None = None,
         continuation_specs: Sequence[str | OrcContinuationSpec] = (),
         accept_prefix_rewrite: Sequence[str] = (),
+        snapshot_root: Path | None = None,
     ) -> tuple[TeamData, IngestReport]:
         return cast(TeamData, object()), fail_or_report(team_slug)
 
@@ -1077,6 +1084,7 @@ def _install_prefix_rewrite_probe(
         date_window: DateWindow | None = None,
         identity_overrides: IdentityOverrides | None = None,
         continuation_thread_ids: Sequence[str] = (),
+        snapshot_root: Path | None = None,
     ) -> tuple[TeamData, IngestReport]:
         return cast(TeamData, object()), _report(team_slug)
 
@@ -1087,6 +1095,7 @@ def _install_prefix_rewrite_probe(
         display_timezone: str,
         date_window: DateWindow | None = None,
         identity_overrides: IdentityOverrides | None = None,
+        snapshot_root: Path | None = None,
     ) -> tuple[TeamData, IngestReport]:
         return cast(TeamData, object()), _report(team_slug)
 
@@ -1100,6 +1109,7 @@ def _install_prefix_rewrite_probe(
         identity_overrides: IdentityOverrides | None = None,
         continuation_specs: Sequence[str | OrcContinuationSpec] = (),
         accept_prefix_rewrite: Sequence[str] = (),
+        snapshot_root: Path | None = None,
     ) -> tuple[TeamData, IngestReport]:
         granted[team_slug] = tuple(accept_prefix_rewrite)
         return cast(TeamData, object()), _report(team_slug)

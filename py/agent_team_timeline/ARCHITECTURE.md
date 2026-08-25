@@ -7,9 +7,11 @@ selection rule changes.
 ## Durable project and export layout
 
 A durable archive is a directory such as `~/agent_logs_archive/summary/<project>`. One archive may contain
-multiple teams under `teams/<team-slug>/`; source snapshots remain ignored, while normalized data,
-expensive summary artifacts, model-usage receipts, and deterministic presentation files can be
-version controlled. A typical archive combines the registered Codex, Claude, and Orc
+multiple teams under `teams/<team-slug>/`; normalized data, expensive summary artifacts,
+model-usage receipts, and deterministic presentation files can be version controlled. The vendor
+source snapshots are not in the archive at all — they are ingest input, they are the bulk, and
+they live in a separate store beside it; see "The source snapshots are not part of the artifact"
+below. A typical archive combines the registered Codex, Claude, and Orc
 coordinator sessions from all source hosts; team registration lives outside the package in the
 archive project's `projects/<project>.json` configuration rather than in application code.
 
@@ -82,7 +84,7 @@ of the performance contract and are covered by browser tests.
 
 ### Static delivery and schema compatibility
 
-Website builds keep timeline schema 1 and every uncompressed identity file intact. They also create
+Website builds keep every uncompressed identity file intact. They also create
 byte-idempotent gzip-6 sidecars for browser-facing JSON, JavaScript, CSS, HTML, and rendered
 Markdown files of at least 1 KiB. The gzip header has no source filename and a zero timestamp, so a
 content-identical rebuild does not change the sidecar or its mtime. Website exports inventory
@@ -112,16 +114,17 @@ ordinary publication race without unbounded disk growth. Scope narrowing or a te
 disables the grace and purges dereferenced objects immediately so an export cannot retain data
 outside its declared slice.
 
-Builds also project schema 1 into schema 3, the chunked seekable layout, beside the older two.
+Builds also project schema 1 into schema 3, the chunked seekable layout, beside schema 2.
 `data/timeline-v3.json` is its bootstrap: identity, time range, team records, the codec
 parameters, and a catalogue of every shard with its record count, byte counts, time bounds and
 both digests. Aggregate activity bins are **not** inlined there — they are their own shard — which
-is why the schema-3 bootstrap is 88,239 bytes where the schema-2 bootstrap is 5,702,530. Shards
+is why the schema-3 bootstrap is 89,298 bytes where the schema-2 bootstrap is 5,702,530. Shards
 are multi-member gzip files of minified JSONL, one record per line, written and indexed by the
 seekable JSONL codec: `data/timeline-v3/timeline/<team>/<UTC-day>.jsonl.gz` for events, phases and
 message edges, `data/timeline-v3/spine/<team>.jsonl.gz` for the records with no single instant
 (team, agents, phase cards, structural edges, rollups, projects, summary files, glossary, project
-overview), and `data/timeline-v3/bins.jsonl.gz` for activity bins across all teams. Each shard has
+overview, and the derived zoom bounds), and `data/timeline-v3/bins.jsonl.gz` for activity bins
+across all teams. Each shard has
 a `.index.jsonl` sidecar giving per-member byte offsets, line ranges and time bounds, so a window
 read costs the size of the answer; the spine additionally publishes each record kind's line range
 in the bootstrap, because it has no time axis to seek on. A schema-3 shard exists **once** — there
@@ -131,9 +134,103 @@ rather than duplicated into every day they span; each shard entry publishes `t_e
 the smallest instant at which nothing in the shard is still live, so a reader rendering `[T0, T1)`
 selects shards by `t0 < T1 and t_end_exclusive > T0`. Everything there is half-open, records
 included: a phase and a bin reach to their own `end_ms`, and an event or edge reaches one
-millisecond past the instant it occupies. Over the whole measured archive schema 3 is 37,963,770
+millisecond past the instant it occupies. Over the whole measured archive schema 3 is 38,288,394
 bytes against 280,971,189 for schema 1 and 1,503,831,881 for schema 2, and adding one day rewrites
-387,547 of those bytes. Nothing reads schema 3 yet; it is published so that something can.
+387,547 of those bytes.
+
+### Retiring a format generation, and `gc`
+
+A published build writes schema 2 and schema 3 and **not** the schema-1 monolith. The two older
+generations were retired at different times because their readers retired them at different
+times: `./timeline` reaches `data/timeline.json` only when neither newer bootstrap is present,
+and the website reaches it only when its schema-2 load throws, but the website has no schema-3
+mode at all, so schema 2 stays and schema 1 goes. On the measured archive that is 280,971,189
+bytes — 246,973,399 plus a 33,997,790-byte twin — no longer written on every build. Schema 1
+remains the *intermediate* format the combined export merges: `multi_team` renders each team into
+a temporary directory with `_published=False`, reads `data/timeline.json` back out of it, and
+publishes only the merged schema 2 and schema 3.
+
+Not writing a file and deleting it are separate decisions. A rebuild over an archive that already
+has the monolith leaves it exactly where it is and records it in `data/export.json` under
+`retired_files`; the presentation sweep, which otherwise reaps `previous - current`, is told to
+skip it. That keeps an archive written by an older tool readable by an older reader, and it keeps
+a quarter-gigabyte irreversible unlink from happening as a side effect of a build run for another
+reason.
+
+The deletion is `agent-team-timeline gc`, which defaults to a dry run and classifies every file
+in the archive as live, reclaimable or held, with the reason printed per category even when the
+category is empty. It is a third user of the archive's existing mark-and-sweep idiom rather than
+a second idiom, and it inherits both of the existing users' refusals: nothing is reclaimed on the
+strength of "the last build did not write it", only when a named superseding artifact is present
+**and complete** — schema 3's completeness judged by the same five-clause rule the reader applies
+— or when a manifest authoritative over a directory disowns the file. Two categories are
+reclaimable: the schema-1 monolith, and schema-2 objects in neither `current_objects` nor
+`retained_objects`. Four are reported and never reclaimed: `retained_objects` (the previous
+generation's, kept one generation so a reader holding the previous bootstrap can still fetch what
+it names), shards under `data/timeline-v3/` the bootstrap does not name,
+`teams/*/source_snapshots/` (vendor input, gated by `audit-losslessness --require-lossless`, and
+empty on an archive `migrate-snapshots` has moved), and the trash itself.
+
+The schema-3 orphans are the one category that changed side. Absence from the catalogue does not
+say whether a shard is a retired team's or a live team's — publication is shards, then bootstrap,
+with no atomicity across the set, so a build that dies in between leaves the *previous* bootstrap
+in place, self-consistent, with the new team's shards beside it unnamed. Sweeping there deletes
+the better half of a rebuild and, in the same pass, declares the monolith superseded. So the
+publisher owns the directory instead: `write_timeline_v3` removes everything under
+`data/timeline-v3/` outside its own plan once its bootstrap is on disk, and the reader's fifth
+clause declines a generation whose tree holds a shard-shaped file the catalogue omits. A non-empty
+orphan set therefore has exactly one meaning — a build was interrupted — and the remedy is to run
+one.
+
+Both the dry run and the sweep take the archive writer lock, the dry run included, because the
+report is the input to a human's decision and a listing computed beside a running build names
+files the build is halfway through replacing. `--delete` moves files into
+`.agent-team-timeline-trash/<generation>/files/`, mirroring their archive paths, and writes a
+`receipt.json` naming every file, its category and the reason — written before the first move as
+intent and rewritten afterwards with `complete: true`, so that a sweep which fails partway still
+leaves a record of what may be in the trash; restoring is one `cp -a` from the
+archive root. `--empty-trash` is a separate invocation and asking for both at once is refused,
+because the first pass is reversible and the second is not. The trash directory is in the
+archive's generated `.gitignore` before it can exist.
+
+`inspect` no longer parses the monolith to print six integers: schema 3's catalogue publishes a
+per-record-kind count for every shard, so the same six numbers come out of the 89,298-byte
+bootstrap. Measured on the archive's data, 1,480.3 MiB resident and 2.447 s became 71.9 MiB and
+0.011 s, with identical counts.
+
+The zoom bounds — the smallest interval that contains an agent's, a phase's or a rollup's actual
+work, which is what "zoom to agent lifetime" frames — are a spine record kind of their own, keyed
+by the archive's stable reference. Schema 2 attaches them to 14,584 records; schema 3 publishes
+the same numbers, from the same derivation, without putting a field on any record that came out of
+the timeline. They cost 324,624 bytes, 0.85% of the generation. They are published rather than
+recomputed on read because the recomputation scans every phase state run and every event and edge
+instant belonging to the subject, which for a long-lived agent means its team's entire timeline
+stream — the 93% of schema 3 that the read path otherwise never opens.
+
+Schema 3 is the read path. Every archive-local CLI surface — `teams`, `agents`, `phases`,
+`rollups`, `list`, `show`, `search`, `stats` — reads `data/timeline-v3.json` and the spine shards
+it names when a **complete** schema-3 generation is present, and falls back to schema 2 and then
+schema 1 when it is not. Complete means: the bootstrap is a regular file declaring schema 3; its
+codec block names a container, timestamp key, record-kind key and index suffix this reader
+implements; every shard it names resolves inside `data/timeline-v3/`, is a regular file of exactly
+the published `c_bytes`, and has a sidecar beside it; and the set of teams with spine shards equals
+the set of teams the bootstrap inlines. Those checks are one parse of an 89 KB file and two `stat`
+calls per shard, so they run before every query. The published `c_sha256`/`u_sha256` are **not**
+verified on the read path — that would mean reading all 38 MB to answer a question that costs
+300 KB — so a same-length substitution of a shard's contents is the documented limit, narrowed but
+not closed by the sidecar agreement checks the reader makes when it opens a shard. Whether schema 3
+and schema 2 describe the same source generation is checked where the two are used together:
+transcript search reads its corpus from schema 2, and a `source_digest` mismatch is refused there
+rather than at open, where it would cost the 5,702,530-byte schema-2 bootstrap that schema 3 exists
+to stop reading.
+
+Measured on the same archive, in bytes read from disk to answer one question including opening the
+archive: `list agents --team <one>` costs 284,952 against schema 2's 25,692,901; `show` of one
+reference 342,601 against 25,692,901; `stats --team <one>` 342,601 against 25,692,901; `stats`
+over every team 2,483,652 against 25,745,677; `search --scope summaries` over every team 2,483,652
+against 25,745,677. Opening the archive and asking nothing costs 89,298 bytes against 25,692,901.
+Transcript search is the exception and stays close to schema 2's cost, because its corpus is
+schema 2's.
 
 The browser does not infer complete statistics from a partially loaded set of days. It uses the
 global aggregate only for an unfiltered full-range view, computes narrower totals only when every
@@ -163,7 +260,9 @@ representation instead, which is always a legal answer. The built-in handler dis
 listing so generated object and transcript filenames cannot be enumerated through the server.
 
 The browser first probes schema 2, then falls back to schema 1 when the bootstrap is absent (or when
-an incomplete schema-2 publication cannot be read). At aggregate zoom it uses bootstrap activity
+an incomplete schema-2 publication cannot be read). That fallback is now only reachable in an
+archive an older tool wrote, because a published build no longer emits the monolith; it is kept
+because such archives exist, not because a new one produces the state it handles. At aggregate zoom it uses bootstrap activity
 bins without loading a detail day. Detail zoom loads only UTC-day objects intersecting the visible
 range plus a one-hour-or-eight-percent buffer. Lifetime zoom uses the global lifetimes and
 structural edges without loading detail days. A `Map<URL, Promise>` retains each object request,
@@ -185,8 +284,8 @@ request-generation guard prevents a stale search from replacing newer results.
 
 This delivery layer is additive. Opening the archive through another static server still serves
 the identity files correctly, while older generated sites without sidecars or schema 2 remain
-valid. The schema-1 monolith remains available for compatibility, but schema-2 startup avoids its
-whole-file transfer, parsing, and object-graph cost. Measurements and remaining work are recorded
+valid. The schema-1 monolith remains readable where an older build left one, but it is no longer
+written, and schema-2 startup avoids its whole-file transfer, parsing, and object-graph cost. Measurements and remaining work are recorded
 in `ai_docs/PAYLOAD_SCALING.md`.
 
 ### Read-only query boundary
@@ -384,6 +483,69 @@ browser and archive-local CLI use the same catalog Bloom algorithm only as a fal
 prefilter, then apply the same ASCII-case-insensitive/non-ASCII-exact matching contract to full
 record text. JSON responses use query schema version 1, JSONL emits one record per line, and
 Markdown is presentation-only.
+
+## The source snapshots are not part of the artifact
+
+Every provider snapshots the vendor logs it is about to parse, and the copies are the largest
+thing the tool touches: **995 files and 6,524,876,923 bytes of a 9,662,206,589-byte archive,
+67.5%**, on the archive these numbers were measured against. Nothing that reads the archive reads
+them — not a query, not a build, not the website — and the generated `.gitignore` has excluded
+them since the tree existed, so the tool had already decided they were input rather than output
+and had simply left them physically inside `--output`, where they were also reachable over HTTP.
+
+They live outside it now, in a store defaulting to `<output>.sources/` with one slug-named
+directory per team. The sibling is chosen for the migration rather than for taste: it is on the
+same filesystem as the archive in every layout anyone has, so relocating an existing tree is
+`os.replace` per team — atomic, instant, and impossible to half-finish inside one team — where a
+state directory under `$XDG_STATE_HOME` would be same-filesystem only by luck and, in the unlucky
+case, a 6.5 GB interruptible copy handed to an operator as a default.
+
+`--snapshot-root DIR` on any ingest or refresh, or `"snapshot_root"` in a project config, chooses
+another. The archive records the outcome in `snapshot-root.json` at its root rather than
+re-deriving it, because a run that re-derived would guess today's default: an operator who passed
+the flag once and forgot it next time would start a second store, and neither store is invalid on
+its own, so nothing but the archive can report the mistake. Resolution is: the flag, else the
+recorded pointer, else a populated `teams/<slug>/source_snapshots/`, else the default.
+
+**A build never relocates anything.** An archive in the old layout keeps using it indefinitely,
+with no flag; `migrate-snapshots` is the deliberate command, dry-run by default. It records the
+new layout *before* the first byte moves, so a crash leaves a state resolution recognises by name
+as an interrupted migration and refuses to build on, and re-running the command finishes it. The
+other ordering would leave a crashed run looking like a team that had never been ingested, which
+is the one misreading indistinguishable from a correct reading.
+
+Re-running really does finish it, on both paths. The rename path is atomic per team, so a team is
+either moved or not. The `--copy` path assembles each team under `<store>/.migrating/<team>` and
+publishes it with a same-device rename, so an interrupted copy leaves scratch under a name no team
+slug can take rather than a half tree at the team's own path — which is what previously wedged the
+archive between two commands that pointed at each other, with the plausible way out being to
+delete the only copy of the vendor logs.
+
+Two resolution refusals exist because one archive has one layout and because the pointer is a
+name-relative reference. `--snapshot-root` is refused whenever *any* team's snapshots are still
+inside the archive, not merely this team's: accepting it for a new team split the archive across
+two layouts and then recorded the new one archive-wide, after which every already-ingested team
+refused. And a recorded store that is not on disk is not created from the pointer alone — if the
+archive and its store were renamed together the sibling `<output>.sources` is adopted, because its
+marker says which archive it belongs to; otherwise, when snapshots have been copied for this
+archive before, the run stops instead of fabricating an empty store outside `--output` and failing
+several layers later against a directory it had just made. Renaming the archive alone is fine: a
+store marker naming a path where no archive is any more is a rename, not the two-archive collision
+the marker was written to catch.
+
+Three things still read the tree, which is why this is a relocation and not a deletion: the
+append-only guards (Orc's opens the previous content-addressed database, verifies it against its
+recorded digest, and recomputes logical state from it), the frozen task-note projections, and the
+losslessness audit that gates any eventual deletion. `audit-losslessness` therefore resolves the
+root the same way ingestion does; an audit that could only look inside the archive would report a
+relocated archive as "already absent, nothing to compare", a green result meaning the opposite of
+green.
+
+`serve.py` refuses any request path with a `source_snapshots` component with a 404, at any depth.
+For a migrated archive that changes nothing — the files are not under the served root — and it is
+written for the archives that have not migrated, where the bytes are still physically inside the
+served tree. It is a serving policy rather than a security boundary; the claim it makes is exactly
+the one that was asked for.
 
 ## Codex snapshot and continuation contract
 

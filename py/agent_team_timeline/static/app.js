@@ -3422,14 +3422,23 @@
         activityRange ? activityRange.end_ms : bounds.end_ms
       );
     }
+    // The recorded-bounds fast path is chosen by whether the bounds are *there*, not by which
+    // generation the page loaded. It used to require `schemaMode === "schema2"`, which was true
+    // of the only generation that published them and became wrong the moment a second one did:
+    // schema 3 publishes the same two numbers, derived by the same function, as a spine record
+    // keyed by stable reference. A guard on the schema name would have made a correct record
+    // unusable because of where it came from.
     var recordedStart = number(bounds && bounds.activity_start_ms, NaN);
     var recordedEnd = number(bounds && bounds.activity_end_ms, NaN);
-    if (app.schemaMode === "schema2" && Number.isFinite(recordedStart) &&
-        Number.isFinite(recordedEnd) && recordedEnd > recordedStart) {
+    if (Number.isFinite(recordedStart) && Number.isFinite(recordedEnd) &&
+        recordedEnd > recordedStart) {
       zoomToRange(recordedStart, recordedEnd);
       return;
     }
-    if (app.schemaMode !== "schema2") {
+    // No recorded bounds: derive them from what is in memory. Under schema 1 that is the whole
+    // timeline and the answer is immediate; under a sharded generation the events and edges of
+    // the interval have to be fetched first, which is what the request below does.
+    if (app.schemaMode === "schema1") {
       finishZoom();
       return;
     }

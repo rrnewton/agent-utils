@@ -729,6 +729,10 @@ def archive_readme(
         "has run.\n"
         "- `teams/` contains per-team normalized inputs, cached summaries, and published "
         "Markdown summaries.\n"
+        "- `snapshot-root.json`, when present, records where this archive keeps the vendor "
+        "source snapshots ingestion reads. They are input rather than output and are usually the "
+        "largest thing involved, so they are kept outside this directory and are not served; "
+        "back that store up alongside this archive if you intend to keep ingesting into it.\n"
         "- `qa/`, when present, contains human- or automation-produced validation evidence.\n"
         "- `.agent-team-timeline.json` marks this as a managed archive, "
         "`.agent-team-timeline.lock` serializes writers, and `.gitignore` identifies local-only "
@@ -931,6 +935,55 @@ def _remove_stale_presentation_files(
     return changed
 
 
+#: The schema-1 monolith. Retired as an *output* -- see :func:`retired_schema_1_files` -- but
+#: still the intermediate format the combined export merges, so the name stays a constant rather
+#: than becoming a literal in two places that could drift apart.
+SCHEMA_1_TIMELINE_PATH = "data/timeline.json"
+
+
+def retired_schema_1_files(archive: Path, current: set[str]) -> frozenset[str]:
+    """The schema-1 files an older build left behind, which this build must **not** delete.
+
+    A published export stopped writing ``data/timeline.json`` and its ``.gz`` twin -- 280,971,189
+    bytes on the measured archive, of which the plain file alone is 246,973,399 -- because both
+    readers reach schema 1 only as a fallback. ``./timeline`` prefers schema 3, then schema 2,
+    and opens the monolith only when neither is present; `static/app.js` loads
+    ``data/timeline-v2.json`` and falls back to the monolith only when that load throws. Every
+    published build writes both of the generations in front of it, so nothing reaches past them
+    in an archive this tool has touched.
+
+    **Not writing it and deleting it are different decisions, and this function is the seam.**
+    Left to itself, `_remove_stale_presentation_files` would delete the monolith the instant a
+    newer tool rebuilt an older archive: it reaps ``previous - current``, the monolith is in
+    every older manifest's ``previous``, and it is in no new build's ``current``. That is a
+    quarter-gigabyte irreversible unlink performed as a side effect of a build the operator asked
+    for a different reason, and it is the exact shape of surprise the archive's own stale-file
+    rules are careful about elsewhere -- `_finish_object_generation` holds a retained set for one
+    generation rather than trusting a single narrowed build, and `prune_retired_query_artifacts`
+    refuses to remove a launcher whose bytes it does not recognise.
+
+    So the monolith is *retired*, not reaped: this build declines to rewrite it, records it in
+    the export manifest's ``retired_files``, and leaves the bytes alone. Two things then remain
+    true that would not be otherwise. An archive written by an older tool stays readable by an
+    older reader -- an ``./timeline`` copy from before schema 2 existed, or a browser holding a
+    cached ``app.js``, still finds what it looks for. And the deletion becomes something an
+    operator asks for, with `gc`, which reports it by size first, moves it to a trash directory
+    rather than unlinking it, and requires a second command to make that permanent.
+
+    *current* is the set this build did write, so that a mode which still writes schema 1 -- the
+    combiner's intermediate -- never reports its own live output as retired.
+    """
+
+    retired: set[str] = set()
+    for relative in (SCHEMA_1_TIMELINE_PATH, SCHEMA_1_TIMELINE_PATH + ".gz"):
+        if relative in current:
+            continue
+        path = archive / Path(relative)
+        if path.is_file() and not path.is_symlink():
+            retired.add(relative)
+    return frozenset(retired)
+
+
 def prune_retired_query_artifacts(
     archive: Path,
     *,
@@ -997,10 +1050,24 @@ def render_archive(
     site_identity: SiteIdentity,
     *,
     _precompress: bool = True,
-    _write_shards: bool = True,
+    _published: bool = True,
     _export_window: DateWindow | None = None,
 ) -> dict[str, int]:
-    """Regenerate all presentation files without invoking a summary backend."""
+    """Regenerate all presentation files without invoking a summary backend.
+
+    ``_published`` distinguishes the two things this function is asked to produce, which used to
+    be distinguished by a flag called ``_write_shards`` that said only half of it. A **published**
+    render is an archive a human or a browser opens: it gets schema 2 and schema 3 and no
+    schema-1 monolith. An **unpublished** render is the combined export's per-team intermediate,
+    written into a temporary directory that `multi_team` reads back and deletes; it gets the
+    schema-1 monolith and nothing else, because schema 1 is the format the combiner merges and
+    the two shard generations would be built twice -- once per team here, once over the merged
+    timeline there -- and thrown away.
+
+    The flag has to be one flag rather than two. Letting "writes shards" and "writes the
+    monolith" diverge would allow an archive with neither, which is an export no reader can
+    open and no test can name.
+    """
 
     previous_presentation_files = _previous_presentation_files(archive)
     changed = 0
@@ -1513,10 +1580,14 @@ def render_archive(
     timeline_json = narrow_json(timeline)
     if not isinstance(timeline_json, dict):
         raise AssertionError("timeline projection must be an object")
-    changed += _write_compressible_json(
-        _generated_path(archive, "data/timeline.json"), timeline_json
-    )
-    compressible_paths.add("data/timeline.json")
+    if not _published:
+        # The combiner's intermediate. Schema 1 is written here and only here, because it is
+        # this function's *output format* in that mode -- `multi_team` reads it straight back
+        # out of the temporary directory -- rather than an artefact anybody keeps.
+        changed += _write_compressible_json(
+            _generated_path(archive, SCHEMA_1_TIMELINE_PATH), timeline_json
+        )
+        compressible_paths.add(SCHEMA_1_TIMELINE_PATH)
     if _precompress:
         for relative in sorted(compressible_paths):
             changed += int(sync_gzip_sidecar(_generated_path(archive, relative)))
@@ -1527,30 +1598,20 @@ def render_archive(
             search_records=search_records,
             precompress=_precompress,
         )
-        if _write_shards
+        if _published
         else None
     )
     if shard_report is not None:
         changed += shard_report.files_changed
-    # Schema 3 is published beside schema 1 and schema 2, not instead of them: `query.py` still
-    # reads the schema-2 bootstrap and falls back to `data/timeline.json`, so a build that
-    # emitted only schema 3 would leave the archive unreadable by its own tools. The same flag
-    # governs both projections because they answer the same question -- "is this a real export
-    # or a fixture?" -- and letting them diverge would give a test an archive with one
-    # generation missing and no way to tell which.
-    v3_report = write_timeline_v3(archive, timeline_json) if _write_shards else None
+    v3_report = write_timeline_v3(archive, timeline_json) if _published else None
     if v3_report is not None:
         changed += v3_report.files_changed
     generated_files = set(_PRESENTATION_COMMON)
     generated_files.update(published_summary_paths)
     generated_files.update(phase_paths.values())
-    generated_files.update(
-        {
-            _PRESENTATION_MANIFEST,
-            "data/timeline.json",
-            "data/artifacts.json",
-        }
-    )
+    generated_files.update({_PRESENTATION_MANIFEST, "data/artifacts.json"})
+    if not _published:
+        generated_files.add(SCHEMA_1_TIMELINE_PATH)
     if shard_report is not None:
         generated_files.update(shard_report.generated_files)
     if v3_report is not None:
@@ -1558,11 +1619,14 @@ def render_archive(
     for relative in sorted(compressible_paths):
         if gzip_sidecar_path(_generated_path(archive, relative)).is_file():
             generated_files.add(relative + ".gz")
-    for relative in generated_files:
+    retired_files = (
+        retired_schema_1_files(archive, generated_files) if _published else frozenset()
+    )
+    for relative in generated_files | retired_files:
         _safe_presentation_file(relative)
     retired_query_was_managed = "query.py" in previous_presentation_files
     changed += _remove_stale_presentation_files(
-        archive, previous_presentation_files, generated_files
+        archive, previous_presentation_files - retired_files, generated_files
     )
     changed += prune_retired_query_artifacts(
         archive,
@@ -1583,6 +1647,7 @@ def render_archive(
         ),
         "source_digest": timeline_json["source_digest"],
         "generated_files": generated_values,
+        "retired_files": [value for value in sorted(retired_files)],
     }
     changed += int(
         write_text_if_changed(

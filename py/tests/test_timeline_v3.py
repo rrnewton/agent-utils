@@ -45,13 +45,24 @@ from agent_team_timeline.archive import (
     as_string,
     read_json,
 )
+from agent_team_timeline.query import (
+    agent_ref,
+    is_schema_3_shard_name as query_is_schema_3_shard_name,
+    phase_ref,
+    rollup_ref,
+)
 from agent_team_timeline.seekable_jsonl import SeekableJsonlReader, index_path_for
+from agent_team_timeline.timeline_shards import activity_bounds
 from agent_team_timeline.timeline_v3 import (
+    agent_reference,
+    phase_reference,
+    rollup_reference,
     SCHEMA_3_BINS_PATH,
     SCHEMA_3_BOOTSTRAP_PATH,
     SCHEMA_3_RECORD_KIND_KEY,
     SCHEMA_3_ROOT,
     SCHEMA_3_TIMESTAMP_KEY,
+    is_schema_3_shard_name,
     TimelineV3Error,
     utc_day_start,
     write_timeline_v3,
@@ -78,7 +89,14 @@ def _phase(team: str, start_ms: int, end_ms: int, ident: str) -> dict[str, JsonV
         "summary_available": True,
         "detail_path": f"data/details/{team}/phase-{ident}.json",
         "stats": {"events": 3},
-        "states": ["running"],
+        # Real state objects, not a bare label. The activity bounds are derived from these --
+        # an ``idle`` run contributes nothing -- so a fixture with placeholder states would let
+        # the bounds be anything at all and still pass.
+        "states": [
+            {"kind": "idle", "start_ms": start_ms, "end_ms": start_ms + 600_000},
+            {"kind": "active", "start_ms": start_ms + 600_000, "end_ms": start_ms + 900_000},
+            {"kind": "idle", "start_ms": start_ms + 900_000, "end_ms": end_ms},
+        ],
         "artifact_ids": [],
         "output_artifact_ids": [],
         "team": team,
@@ -306,9 +324,12 @@ def test_every_schema_one_record_survives_the_round_trip(tmp_path: Path) -> None
     }
     for kind, bodies in expected.items():
         assert recovered[kind] == bodies, kind
-    # `phase_card` is a projection of `phases`, not a collection of its own, so it is the one
-    # recovered kind with no schema-1 counterpart. Every other kind must be accounted for above.
-    assert set(recovered) - set(expected) == {"phase_card"}
+    # `phase_card` and `activity_bounds` are projections of `phases`, `agents` and `rollups`,
+    # not collections of their own, so they are the two recovered kinds with no schema-1
+    # counterpart. Every other kind must be accounted for above, and the fact that these two
+    # are *derived* is exactly what keeps every line above byte-identical to schema 1: neither
+    # adds a field to a record that came out of the timeline.
+    assert set(recovered) - set(expected) == {"phase_card", "activity_bounds"}
 
 
 def test_phase_cards_are_a_subset_of_their_phases(tmp_path: Path) -> None:
@@ -373,6 +394,60 @@ def test_activity_bins_are_a_shard_and_not_inlined_in_the_bootstrap(tmp_path: Pa
     assert len(entries) == 1
     assert entries[0]["path"] == SCHEMA_3_BINS_PATH
     assert entries[0]["records"] == len(_records(timeline, "activity_bins"))
+
+
+def test_a_build_clears_the_root_of_everything_outside_its_own_plan(tmp_path: Path) -> None:
+    """The publisher owns ``data/timeline-v3/``, so nothing else has to guess about it.
+
+    The two files planted here are what a build that died before writing its bootstrap leaves
+    behind, and they are indistinguishable on disk from what a retired team leaves behind. No
+    reader and no sweeper can tell those apart; only the build can, because only the build knows
+    what it just published. So it removes them here, and empties the directory that held them --
+    which is what lets the reader treat a leftover as an interrupted build and `gc` refuse to
+    sweep one.
+    """
+
+    timeline = _timeline()
+    write_timeline_v3(tmp_path, timeline)
+    stray_dir = tmp_path / SCHEMA_3_ROOT / "timeline" / "retired-team"
+    stray_dir.mkdir(parents=True)
+    (stray_dir / "2026-05-04.jsonl.gz").write_bytes(b"\x1f\x8b" + b"0" * 32)
+    (stray_dir / "2026-05-04.jsonl.gz.index.jsonl").write_text("{}\n", encoding="utf-8")
+    # Not shard-shaped, so not this module's to remove.
+    note = tmp_path / SCHEMA_3_ROOT / "NOTES.txt"
+    note.write_text("left by an operator\n", encoding="utf-8")
+
+    report = write_timeline_v3(tmp_path, timeline)
+
+    assert report.removed_files == (
+        f"{SCHEMA_3_ROOT}/timeline/retired-team/2026-05-04.jsonl.gz",
+        f"{SCHEMA_3_ROOT}/timeline/retired-team/2026-05-04.jsonl.gz.index.jsonl",
+    )
+    assert report.files_changed == 2
+    assert not stray_dir.exists()
+    assert note.is_file()
+    # Idempotent: with nothing left to remove the next build changes nothing at all.
+    assert write_timeline_v3(tmp_path, timeline).removed_files == ()
+
+
+def test_the_reader_and_the_writer_agree_on_what_a_shard_is_called(tmp_path: Path) -> None:
+    """`query.py` ships standalone and cannot import this module, so the predicate is written
+    twice. They must agree, and in particular the reader must not recognise a shape the writer
+    declines to remove -- that combination is a generation that declines forever and that no
+    rebuild can repair."""
+
+    del tmp_path
+    for name in (
+        "2026-05-04.jsonl.gz",
+        "2026-05-04.jsonl.gz.index.jsonl",
+        "team-a.jsonl.gz",
+        "bins.jsonl.gz",
+        "NOTES.txt",
+        "timeline.json",
+        ".index.jsonl",
+        "",
+    ):
+        assert is_schema_3_shard_name(name) is query_is_schema_3_shard_name(name), name
 
 
 def test_two_builds_over_identical_input_produce_identical_bytes(tmp_path: Path) -> None:
@@ -713,3 +788,131 @@ def test_the_report_names_every_file_it_wrote(tmp_path: Path) -> None:
     }
     assert set(report.generated_files) == on_disk
     assert report.total_bytes == sum((tmp_path / name).stat().st_size for name in on_disk)
+
+
+# ---------------------------------------------------------------------------------------
+# The zoom bounds
+# ---------------------------------------------------------------------------------------
+
+
+def _bounds_by_ref(output: Path) -> dict[str, tuple[int, int]]:
+    table: dict[str, tuple[int, int]] = {}
+    for record in _all_records(output):
+        if record[SCHEMA_3_RECORD_KIND_KEY] != "activity_bounds":
+            continue
+        reference = as_string(record["ref"], "activity bounds ref")
+        table[reference] = (
+            as_int(record["activity_start_ms"], "activity_start_ms"),
+            as_int(record["activity_end_ms"], "activity_end_ms"),
+        )
+    return table
+
+
+def test_the_published_bounds_are_the_numbers_schema_two_publishes(
+    tmp_path: Path,
+) -> None:
+    """The differential that keeps two generations from disagreeing about where to zoom.
+
+    Schema 2 attaches these to every agent, phase card and rollup; schema 3 publishes them as
+    a spine kind of their own. The two must be the *same* numbers, or "zoom to agent lifetime"
+    would frame a different window depending on which generation the browser happened to load,
+    and nothing would report that as an error. Both sides come from
+    `timeline_shards.activity_bounds`, and this is the assertion that keeps it that way.
+    """
+
+    timeline = _timeline()
+    write_timeline_v3(tmp_path, timeline)
+    published = _bounds_by_ref(tmp_path)
+
+    phase_bounds, agent_bounds, rollup_bounds = activity_bounds(timeline)
+    expected: dict[str, tuple[int, int]] = {}
+    for record in _records(timeline, "agents"):
+        team = as_string(record["team"], "agent.team")
+        identifier = as_string(record["id"], "agent.id")
+        expected[agent_reference(team, identifier)] = agent_bounds[identifier]
+    for record in _records(timeline, "phases"):
+        team = as_string(record["team"], "phase.team")
+        identifier = as_string(record["id"], "phase.id")
+        expected[phase_reference(team, identifier)] = phase_bounds[identifier]
+    for index, record in enumerate(_records(timeline, "rollups")):
+        team = as_string(record["team"], "rollup.team")
+        expected[
+            rollup_reference(
+                team,
+                as_string(record["kind"], "rollup.kind"),
+                as_int(record["start_ms"], "rollup.start_ms"),
+            )
+        ] = rollup_bounds[index]
+
+    assert published == expected
+    assert len(published) == (
+        len(_records(timeline, "agents"))
+        + len(_records(timeline, "phases"))
+        + len(_records(timeline, "rollups"))
+    )
+
+
+def test_the_bounds_are_narrower_than_the_records_they_describe(tmp_path: Path) -> None:
+    """Otherwise there would be nothing to publish: the record already carries its interval."""
+
+    timeline = _timeline()
+    write_timeline_v3(tmp_path, timeline)
+    published = _bounds_by_ref(tmp_path)
+    narrower = 0
+    for record in _records(timeline, "phases"):
+        team = as_string(record["team"], "phase.team")
+        reference = phase_reference(team, as_string(record["id"], "phase.id"))
+        start, end = published[reference]
+        assert as_int(record["start_ms"], "start") <= start < end
+        assert end <= as_int(record["end_ms"], "end")
+        if end - start < as_int(record["end_ms"], "end") - as_int(record["start_ms"], "start"):
+            narrower += 1
+    assert narrower == len(_records(timeline, "phases"))
+
+
+def test_the_bounds_are_the_last_thing_in_a_spine_shard(tmp_path: Path) -> None:
+    """A reader that never zooms must never pay for them.
+
+    The line ranges are what make that true, and their *order* is what makes the ranges cheap:
+    the kind a first frame needs is at line 0 and the kind only an interaction needs is at the
+    end, so the two fall in different gzip members as soon as a shard has more than one.
+    """
+
+    write_timeline_v3(tmp_path, _timeline())
+    for entry in _shard_entries(tmp_path, "spine"):
+        ranges = entry["line_ranges"]
+        assert isinstance(ranges, dict)
+        bounds = ranges["activity_bounds"]
+        assert isinstance(bounds, list)
+        first = as_int(bounds[0], "activity_bounds first")
+        for kind, span in ranges.items():
+            assert isinstance(span, list)
+            if kind != "activity_bounds":
+                assert as_int(span[0], f"{kind} first") < first
+        assert first + as_int(bounds[1], "activity_bounds count") == as_int(
+            entry["records"], "records"
+        )
+
+
+def test_the_writers_references_are_the_readers_references(tmp_path: Path) -> None:
+    """The duplication `timeline_v3` documents, pinned rather than promised.
+
+    `query.py` is copied verbatim into every archive as the `./timeline` executable and may
+    import nothing but the standard library, so the reader cannot import the writer's reference
+    builders. What it can do is fail when they disagree.
+    """
+
+    timeline = _timeline()
+    for record in _records(timeline, "agents"):
+        team = as_string(record["team"], "agent.team")
+        assert agent_reference(team, as_string(record["id"], "agent.id")) == agent_ref(record)
+    for record in _records(timeline, "phases"):
+        team = as_string(record["team"], "phase.team")
+        assert phase_reference(team, as_string(record["id"], "phase.id")) == phase_ref(record)
+    for record in _records(timeline, "rollups"):
+        team = as_string(record["team"], "rollup.team")
+        assert rollup_reference(
+            team,
+            as_string(record["kind"], "rollup.kind"),
+            as_int(record["start_ms"], "rollup.start_ms"),
+        ) == rollup_ref(record)

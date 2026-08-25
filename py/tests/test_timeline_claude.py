@@ -23,6 +23,8 @@ from agent_team_timeline.pipeline import (
     summarize_archive,
 )
 from agent_team_timeline.window import parse_date_window
+from tests.timeline_snapshots import snapshot_root
+from tests.timeline_projection import schema_1_timeline_text
 
 
 SESSION_ID = "11111111-1111-4111-8111-111111111111"
@@ -386,6 +388,7 @@ def test_pipeline_snapshots_claude_and_reuses_unchanged_archive(tmp_path: Path) 
         "/.agent-team-timeline.lock",
         "/teams/*/source_snapshots/",
         "/teams/*/payloads/",
+        "/.agent-team-timeline-trash/",
     ]
     manifest = json.loads(
         (
@@ -399,18 +402,10 @@ def test_pipeline_snapshots_claude_and_reuses_unchanged_archive(tmp_path: Path) 
     assert manifest["provider"] == "claude"
     assert manifest["root_thread_id"] == SESSION_ID
     assert manifest["date_window"]["start_date"] == "2026-01-02"
-    assert (
-        archive
-        / "teams"
-        / "claude-fixture"
-        / "source_snapshots"
-        / f"{SESSION_ID}.jsonl"
-    ).is_file()
+    assert (snapshot_root(archive, "claude-fixture") / f"{SESSION_ID}.jsonl").is_file()
     summarize_archive(archive, "claude-fixture", "heuristic", "fixture")
     build_archive(archive, "claude-fixture")
-    timeline = json.loads(
-        (archive / "data" / "timeline.json").read_text(encoding="utf-8")
-    )
+    timeline = json.loads(schema_1_timeline_text(archive))
     result_edges = [edge for edge in timeline["edges"] if edge["kind"] == "result"]
     assert {
         (edge["source_id"], edge["target_id"])

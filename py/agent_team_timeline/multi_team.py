@@ -29,7 +29,11 @@ from agent_team_timeline.pipeline import (
 )
 from agent_team_timeline.model import TeamData
 from agent_team_timeline.periods import DEFAULT_ROLLUP_KINDS
-from agent_team_timeline.render import archive_readme, prune_retired_query_artifacts
+from agent_team_timeline.render import (
+    archive_readme,
+    prune_retired_query_artifacts,
+    retired_schema_1_files,
+)
 from agent_team_timeline.search_index import build_search_records
 from agent_team_timeline.static_assets import (
     gzip_sidecar_path,
@@ -550,7 +554,7 @@ def _build_combined_archive_locked(
                 rollup_kinds=rollup_kinds,
                 output=team_root,
                 _precompress=False,
-                _write_shards=False,
+                _published=False,
             )
             timeline_path = team_root / "data" / "timeline.json"
             artifacts_path = team_root / "data" / "artifacts.json"
@@ -587,7 +591,6 @@ def _build_combined_archive_locked(
             {
                 "README.md",
                 _EXPORT_MANIFEST,
-                "data/timeline.json",
                 "data/artifacts.json",
             }
         )
@@ -712,10 +715,12 @@ def _build_combined_archive_locked(
             ),
             "combined artifact catalog",
         )
-        changed += _write_compressible_json(
-            _output_path(output, "data/timeline.json"), timeline
-        )
-        compressible_files.add("data/timeline.json")
+        # No `data/timeline.json` here. The merged monolith was 243,001,813 bytes plus a
+        # 33,562,114-byte twin on the measured archive, and every reader of a combined export
+        # reaches schema 1 only after schema 3 and schema 2 have both failed -- both of which
+        # this function writes, a few lines below, before it names anything. See
+        # `render.retired_schema_1_files` for why an older one already on disk is left where it
+        # is rather than swept.
         changed += _write_compressible_json(
             _output_path(output, "data/artifacts.json"), artifact_catalog
         )
@@ -780,17 +785,19 @@ def _build_combined_archive_locked(
         for relative in shard_report.generated_files:
             _safe_generated_path(relative)
             generated_files.add(relative)
-        # Schema 3 alongside, never instead of: `query.py` reads the schema-2 bootstrap and
-        # falls back to `data/timeline.json`, so dropping either generation here would break the
-        # export's own tooling. Its paths go into the same manifest as everything else, which is
-        # what makes the caller's existing stale-file removal retire a shard whose day or team
-        # has gone -- schema 3 needs no reachability manifest of its own because its names say
-        # what they are.
+        # Schema 3 alongside schema 2, which is what the website reads: dropping either would
+        # break a surface. Its paths go into the same manifest as everything else, which is what
+        # makes the caller's existing stale-file removal retire a shard whose day or team has
+        # gone -- schema 3 needs no reachability manifest of its own because its names say what
+        # they are.
         v3_report = write_timeline_v3(output, timeline)
         changed += v3_report.files_changed
         for relative in v3_report.generated_files:
             _safe_generated_path(relative)
             generated_files.add(relative)
+        retired_files = retired_schema_1_files(output, generated_files)
+        for relative in retired_files:
+            _safe_generated_path(relative)
         export_manifest = as_object(
             narrow_json(
                 {
@@ -806,12 +813,15 @@ def _build_combined_archive_locked(
                     "rollup_kinds": list(rollup_kinds),
                     "source_digest": timeline["source_digest"],
                     "generated_files": sorted(generated_files),
+                    "retired_files": sorted(retired_files),
                 }
             ),
             "combined export manifest",
         )
         retired_query_was_managed = "query.py" in previous_files
-        changed += _remove_stale_files(output, previous_files, generated_files)
+        changed += _remove_stale_files(
+            output, previous_files - set(retired_files), generated_files
+        )
         changed += prune_retired_query_artifacts(
             output,
             manifest_owned=retired_query_was_managed,

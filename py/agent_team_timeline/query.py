@@ -8,6 +8,7 @@ import base64
 import gzip
 import hashlib
 import json
+import os
 import re
 import sys
 import zlib
@@ -367,16 +368,10 @@ def parse_ordinal_range(raw: str) -> OrdinalRange:
 # number of bytes from the same shard. A comment saying "keep these in sync" would not have
 # survived the first divergence; a failing test will.
 #
-# **No query calls it yet, and that is a gap rather than a design.** Schema 3 is written by
-# `timeline_v3.py` and read by nothing: every list, stats and search path in this file still
-# opens `data/timeline-v2.json` and falls back to `data/timeline.json`. This reader is here so
-# that the shards are not a write-only format and so that its behaviour is pinned before a
-# caller depends on it -- the differential above and the missing-sidecar test in
-# `test_query_read_paths.py` both run today. The wiring is a separate change, because it has to
-# decide what a schema-3 reader does when the bootstrap is absent, which of the three streams
-# each existing question reads, and how a partially published generation is detected; none of
-# those are answered by having a reader. Until then, treat this as tested and unreferenced, and
-# do not read the presence of the code as evidence that the archive is being served from it.
+# `_SchemaThreeArchive`, below it, is what calls it: every list, show, search and stats path in
+# this file now reads `data/timeline-v3.json` and its spine shards when a complete schema-3
+# generation is present, and falls back to schema 2 and then schema 1 when it is not. See that
+# class for the completeness rule and for which stream answers which question.
 #
 # `_SeekableJsonlText` reads the *uncompressed* transcript projections under
 # `extracted/transcripts/`. Those have no sidecar and deliberately gain none: adding a
@@ -589,13 +584,27 @@ class _ChunkedJsonlReader:
     into the same counter would obscure exactly the number under test.
     """
 
-    def __init__(self, path: Path, *, index_path: Path | None = None) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        index_path: Path | None = None,
+        cache_members: bool = False,
+    ) -> None:
         self.path = path
         self.data_bytes_read = 0
         self.index_bytes_read = 0
         self._index: _ChunkIndex | None = None
         self._member_starts: tuple[int, ...] = ()
         self._member_ends: tuple[int, ...] = ()
+        # Off by default, because the general case is a reader used once over a shard far larger
+        # than memory. A caller opts in when it will ask several questions of one shard whose
+        # answers live in overlapping members -- a schema-3 spine, where the agents, the phase
+        # cards and the rollups of one team are three line ranges inside the same ~1 MiB member.
+        # Without it, "the agents, then the phase cards, then the rollups" inflates that member
+        # three times and `data_bytes_read` honestly reports three times the bytes; with it, the
+        # counter reports what a reader that keeps what it has already paid for actually costs.
+        self._members: dict[int, list[bytes]] | None = {} if cache_members else None
         sidecar = (
             index_path
             if index_path is not None
@@ -776,6 +785,16 @@ class _ChunkedJsonlReader:
                 yield member
 
     def _member_lines(self, handle: BinaryIO, member: _ChunkMember) -> list[bytes]:
+        if self._members is not None:
+            cached = self._members.get(member.c_off)
+            if cached is not None:
+                return cached
+            lines = self._read_member_lines(handle, member)
+            self._members[member.c_off] = lines
+            return lines
+        return self._read_member_lines(handle, member)
+
+    def _read_member_lines(self, handle: BinaryIO, member: _ChunkMember) -> list[bytes]:
         handle.seek(member.c_off)
         raw = handle.read(member.c_len)
         self.data_bytes_read += len(raw)
@@ -855,6 +874,656 @@ def _within(at_ms: int, start_ms: int | None, end_ms: int | None) -> bool:
     if start_ms is not None and at_ms < start_ms:
         return False
     return end_ms is None or at_ms < end_ms
+
+
+SCHEMA_3_BOOTSTRAP_PATH = "data/timeline-v3.json"
+_SCHEMA_3_ROOT = "data/timeline-v3"
+_SCHEMA_3_KIND = "timeline-v3-bootstrap"
+_SCHEMA_3_VERSION = 3
+_SCHEMA_3_CONTAINER = "multi-member-gzip"
+_SCHEMA_3_TIMESTAMP_KEY = "at_ms"
+_SCHEMA_3_RECORD_KIND_KEY = "record_kind"
+_SCHEMA_3_STREAMS = ("timeline", "spine", "bins")
+
+#: Which spine kind answers a question about each stable-reference kind. ``phase`` is the
+#: outlier and deliberately so: a schema-3 spine carries the phase *card*, the same nine fields
+#: schema 2's phase index publishes, not the full phase with its state runs and transcript
+#: pointer. Every phase question this file asks -- list, search, summary coverage, the
+#: ``detail_path`` `show` follows -- is answerable from the card, and the full phase stays in
+#: the timeline stream where it is one record among 379,006 events rather than something a
+#: listing has to walk past.
+_SCHEMA_3_SPINE_KIND_FOR: dict[str, str] = {
+    "agent": "agent",
+    "phase": "phase_card",
+    "rollup": "rollup",
+}
+
+#: The derived spine kind carrying ``activity_start_ms``/``activity_end_ms``, keyed by the same
+#: stable reference `show` takes.
+_SCHEMA_3_BOUNDS_KIND = "activity_bounds"
+
+#: Schema 1 names its collections in the plural and its references in the singular. Both spellings
+#: are load-bearing -- ``timeline.agents`` is a field name, ``agent:`` is a reference prefix -- so
+#: the mapping is written down once here rather than reconstructed by trimming an ``s``.
+_SINGULAR: dict[str, str] = {"agents": "agent", "phases": "phase", "rollups": "rollup"}
+
+
+class SchemaThreeDeclined(ValueError):
+    """A schema-3 generation this reader will not read, with the reason it will not.
+
+    Raised inside :meth:`_SchemaThreeArchive.open` and caught there: the caller gets ``None``
+    and a sentence, not an exception, because "schema 3 is not usable" must always fall back to
+    schema 2 rather than fail the query. The class exists so the refusals can be written as
+    ordinary early returns instead of as a chain of nested conditionals, and so a test can
+    match the sentence.
+    """
+
+
+@dataclass(frozen=True)
+class _ShardEntry:
+    """One catalog entry from the schema-3 bootstrap.
+
+    ``line_ranges`` is empty for a time-addressed shard and ``t0``/``t1`` are ``None`` for a
+    spine shard; a schema-3 stream is addressed one way or the other and never both.
+    """
+
+    stream: str
+    team: str | None
+    day: str | None
+    path: str
+    index_path: str
+    records: int
+    c_bytes: int
+    t0: int | None
+    t1: int | None
+    t_end_exclusive: int | None
+    line_ranges: dict[str, tuple[int, int]]
+
+
+def _schema_3_line_ranges(raw: JsonValue, where: str) -> dict[str, tuple[int, int]]:
+    if raw is None:
+        return {}
+    ranges: dict[str, tuple[int, int]] = {}
+    for kind, value in as_object(raw, where).items():
+        pair = as_array(value, f"{where}.{kind}")
+        if len(pair) != 2:
+            raise SchemaThreeDeclined(f"{where}.{kind}: expected [first, count]")
+        first = as_int(pair[0], f"{where}.{kind}[0]")
+        count = as_int(pair[1], f"{where}.{kind}[1]")
+        if first < 0 or count < 0:
+            raise SchemaThreeDeclined(f"{where}.{kind}: negative line range")
+        ranges[kind] = (first, count)
+    return ranges
+
+
+def _schema_3_shard(raw: JsonValue, stream: str, where: str) -> _ShardEntry:
+    entry = as_object(raw, where)
+    team = entry.get("team")
+    day = entry.get("day")
+    return _ShardEntry(
+        stream=stream,
+        team=None if team is None else as_string(team, where + ".team"),
+        day=None if day is None else as_string(day, where + ".day"),
+        path=as_string(entry.get("path"), where + ".path"),
+        index_path=as_string(entry.get("index_path"), where + ".index_path"),
+        records=as_int(entry.get("records"), where + ".records"),
+        c_bytes=as_int(entry.get("c_bytes"), where + ".c_bytes"),
+        t0=_optional_json_int(entry.get("t0"), where + ".t0"),
+        t1=_optional_json_int(entry.get("t1"), where + ".t1"),
+        t_end_exclusive=_optional_json_int(
+            entry.get("t_end_exclusive"), where + ".t_end_exclusive"
+        ),
+        line_ranges=_schema_3_line_ranges(entry.get("line_ranges"), where + ".line_ranges"),
+    )
+
+
+class _SchemaThreeArchive:
+    """The schema-3 generation, opened lazily and read a line range at a time.
+
+    What each question reads
+    ------------------------
+    Only the **spine** stream. Every question this file asks about the presentation timeline --
+    which teams, which agents, which phases, which rollups, which project overviews, what a
+    reference resolves to, how much summary text exists -- is answered from
+    ``data/timeline-v3/spine/<team>.jsonl.gz``, and from one *line range* inside it rather than
+    from the whole shard: the bootstrap publishes each kind's ``[first, count]``, so "the
+    agents of one team" is a :meth:`_ChunkedJsonlReader.read_lines` call that inflates only the
+    members those lines fall in. The **timeline** stream -- events, edges and full phases, 93%
+    of schema 3's bytes -- is opened by none of them, and the **bins** stream only by
+    :meth:`activity_bins`.
+
+    That is not an oversight, it is the measurement: schema 2 answers the same questions from a
+    ``global`` object and a ``phase_index`` object that together cost 25,692,901 bytes to open
+    on the measured archive, unconditionally, before the first question is asked, because both
+    are single JSON documents that must be parsed whole. The same questions against schema 3
+    cost the 89,298-byte bootstrap plus the members the answer actually lives in.
+
+    Completeness, and why it is checked this way
+    --------------------------------------------
+    :meth:`open` returns ``None`` and a reason rather than raising, because reading a *partial*
+    schema-3 generation as if it were whole is worse than not reading it at all: a listing that
+    silently omits a team is indistinguishable from a team that did no work. The rule is:
+
+    1. ``data/timeline-v3.json`` is a regular file (not a symlink), parses, and declares
+       ``schema_version == 3`` and ``kind == "timeline-v3-bootstrap"``.
+    2. Its ``codec`` block names a container, timestamp key, record-kind key and index suffix
+       this reader implements. A future writer that changes any of them gets a fallback, not a
+       misreading.
+    3. It names all three streams, and every shard entry in them resolves to a path inside
+       ``data/timeline-v3/``, is a regular file, is **exactly** ``c_bytes`` long, and has a
+       sidecar beside it that is also a regular file.
+    4. The set of teams named by spine shards equals the set of team slugs the bootstrap
+       inlines. Every team gets a spine shard from the writer -- it always emits at least the
+       ``team`` record -- so an inequality here is a generation that lost a shard.
+    5. The converse of 3: every shard-shaped file **on disk** under ``data/timeline-v3/`` is
+       named by the catalogue. Nothing published there is unaccounted for.
+
+    Rules 1-5 cost one parse of an 89 KB file, one walk of a machine-owned directory tree, and
+    two ``stat`` calls per shard (342 on the measured archive), which is why they can run before
+    every query rather than behind a flag.
+
+    They rest on the writer's publication order, which is load-bearing and stated in
+    :mod:`agent_team_timeline.timeline_v3`: every shard and sidecar is written before the
+    bootstrap that names them, and the bootstrap is replaced atomically. So the bootstrap
+    existing implies the shards existed when it was written, and rules 3 and 4 catch the cases
+    that fact does not cover -- a rebuild interrupted after rewriting a shard and before
+    rewriting the bootstrap, a copy that stopped halfway, a shard deleted since.
+
+    **Rule 5 is there because rules 1-4 cannot see a shard the bootstrap does not mention, and
+    that is the direction of partial publication that loses a team.** Publication is
+    shards-then-bootstrap with no atomicity across the set, so a build that adds a team and dies
+    between the last spine shard and the bootstrap leaves the *previous* generation's bootstrap
+    in place: every file it names is present at its declared length, rule 4 compares two sets
+    that both come out of that same bootstrap, and the new team's shards sit on disk unread. The
+    reader would answer from the older catalogue and omit a team the archive plainly has -- and
+    `data/timeline-v2.json`, written earlier in the same build, would list it, so the website and
+    ``./timeline`` would disagree about how many teams exist. Rule 5 turns that into a fallback
+    to schema 2, which is the generation that does have the team.
+
+    Only *shard-shaped* names count -- ``*.jsonl.gz`` and ``*.jsonl.gz.index.jsonl``, the two
+    file shapes the writer emits. A stray note or an editor's scratch file under the root is
+    ignored rather than costing the archive its fast read path, and a symlink is skipped for the
+    same reason it is skipped everywhere else here: the bootstrap decides what this process
+    opens, not the tree. The writer removes its own strays (see
+    :func:`agent_team_timeline.timeline_v3.write_timeline_v3`), so on an archive built by a
+    completed run rule 5 has nothing to find; when it does find something, a rebuild is the
+    remedy and `gc` says so rather than sweeping it.
+
+    **The honest limit is a rewrite that preserves length.** The bootstrap also publishes
+    ``c_sha256`` and ``u_sha256`` per shard, and neither is checked here, because checking them
+    means reading all 38,288,394 bytes to answer a question that costs 300 KB -- which is the
+    entire property schema 3 exists to provide. The three cheap agreement checks
+    :class:`_ChunkedJsonlReader` already makes on every shard it opens (the sidecar names this
+    file, the sidecar's ``c_size`` equals the file's length, and each member inflates to exactly
+    the length the sidecar claims) narrow the gap further, and turn a stale sidecar into an
+    error at the exact member rather than a confident wrong answer. What remains uncaught is a
+    same-length substitution, which is the same limit the transcript projections' size check
+    has, and `test_query_read_paths.py` pins it there rather than letting a docstring overstate
+    it.
+
+    **The cross-generation check is deferred, not skipped.** Whether schema 3 and schema 2
+    describe the same source generation is only answerable by reading schema 2's bootstrap --
+    5,702,530 bytes on the measured archive, sixty-five times the size of schema 3's, and
+    exactly the file schema 3 exists to stop opening. So it is checked at the one place the two
+    generations are used *together*: transcript search reads schema 2's corpus while the phases
+    and agents around it come from schema 3, so :meth:`TimelineQuery._search_bootstrap` refuses
+    a ``source_digest`` mismatch at the moment it opens that corpus -- where the schema-2
+    bootstrap is being read anyway and the comparison is free.
+    """
+
+    def __init__(
+        self,
+        root: Path,
+        bootstrap: dict[str, JsonValue],
+        bootstrap_bytes: int,
+        shards: Sequence[_ShardEntry],
+    ) -> None:
+        self.root = root
+        self.bootstrap = bootstrap
+        self._bootstrap_bytes = bootstrap_bytes
+        self._spine: dict[str, _ShardEntry] = {
+            entry.team: entry
+            for entry in shards
+            if entry.stream == "spine" and entry.team is not None
+        }
+        self._bins: tuple[_ShardEntry, ...] = tuple(
+            entry for entry in shards if entry.stream == "bins"
+        )
+        self.teams: tuple[str, ...] = tuple(sorted(self._spine))
+        self._readers: dict[str, _ChunkedJsonlReader] = {}
+        self._groups: dict[tuple[str, str], tuple[dict[str, JsonValue], ...]] = {}
+        self._refs: dict[tuple[str, str], dict[str, dict[str, JsonValue]]] = {}
+
+    @classmethod
+    def open(cls, root: Path) -> tuple["_SchemaThreeArchive | None", str]:
+        """Accept a complete schema-3 generation, or say in one sentence why not."""
+
+        try:
+            return cls._open(root), ""
+        except SchemaThreeDeclined as error:
+            return None, str(error)
+        except (OSError, ValueError) as error:
+            # A malformed bootstrap is a declined generation, not a failed query: the archive
+            # still has schema 2 and schema 1, and refusing to answer at all would make schema
+            # 3 a liability rather than an optimisation.
+            return None, f"schema-3 bootstrap is unreadable: {error}"
+
+    @classmethod
+    def _open(cls, root: Path) -> "_SchemaThreeArchive":
+        path = root / SCHEMA_3_BOOTSTRAP_PATH
+        if path.is_symlink() or not path.is_file():
+            raise SchemaThreeDeclined("no schema-3 bootstrap")
+        encoded = path.read_bytes()
+        bootstrap = as_object(
+            _narrow_json(json.loads(encoded.decode("utf-8")), str(path)), str(path)
+        )
+        version = bootstrap.get("schema_version")
+        if version != _SCHEMA_3_VERSION or bootstrap.get("kind") != _SCHEMA_3_KIND:
+            raise SchemaThreeDeclined(
+                f"{SCHEMA_3_BOOTSTRAP_PATH} is not a schema-3 bootstrap"
+            )
+        cls._check_codec(bootstrap)
+        shards = cls._catalog(root, bootstrap)
+        declared = cls._declared_team_slugs(bootstrap)
+        published = {entry.team for entry in shards if entry.stream == "spine"}
+        if declared != published:
+            missing = sorted(slug for slug in declared if slug not in published)
+            extra = sorted(slug for slug in published if slug is not None and slug not in declared)
+            raise SchemaThreeDeclined(
+                "schema-3 spine shards do not cover the published teams "
+                f"(missing {missing}, unexpected {extra})"
+            )
+        cls._check_nothing_unnamed(root, shards)
+        return cls(root, bootstrap, len(encoded), shards)
+
+    @staticmethod
+    def _check_codec(bootstrap: dict[str, JsonValue]) -> None:
+        codec = as_object(bootstrap.get("codec"), "timeline-v3.codec")
+        expected: tuple[tuple[str, str], ...] = (
+            ("container", _SCHEMA_3_CONTAINER),
+            ("timestamp_key", _SCHEMA_3_TIMESTAMP_KEY),
+            ("record_kind_key", _SCHEMA_3_RECORD_KIND_KEY),
+            ("index_suffix", _CHUNK_INDEX_SUFFIX),
+        )
+        for key, value in expected:
+            found = codec.get(key)
+            if found != value:
+                raise SchemaThreeDeclined(
+                    f"timeline-v3.codec.{key} is {found!r}; this reader implements {value!r}"
+                )
+
+    @staticmethod
+    def _declared_team_slugs(bootstrap: dict[str, JsonValue]) -> set[str]:
+        slugs: set[str] = set()
+        for index, raw in enumerate(as_array(bootstrap.get("teams"), "timeline-v3.teams")):
+            team = as_object(raw, f"timeline-v3.teams[{index}]")
+            slugs.add(as_string(team.get("slug"), f"timeline-v3.teams[{index}].slug"))
+        if not slugs:
+            raise SchemaThreeDeclined("timeline-v3.teams: must name at least one team")
+        return slugs
+
+    @classmethod
+    def _catalog(
+        cls, root: Path, bootstrap: dict[str, JsonValue]
+    ) -> tuple[_ShardEntry, ...]:
+        streams = as_object(bootstrap.get("streams"), "timeline-v3.streams")
+        missing = [name for name in _SCHEMA_3_STREAMS if name not in streams]
+        if missing:
+            raise SchemaThreeDeclined(f"timeline-v3.streams is missing {missing}")
+        shards: list[_ShardEntry] = []
+        seen: set[str] = set()
+        for stream in _SCHEMA_3_STREAMS:
+            where = f"timeline-v3.streams.{stream}"
+            section = as_object(streams[stream], where)
+            for index, raw in enumerate(as_array(section.get("shards"), where + ".shards")):
+                entry = _schema_3_shard(raw, stream, f"{where}.shards[{index}]")
+                if entry.path in seen:
+                    raise SchemaThreeDeclined(f"duplicate schema-3 shard {entry.path!r}")
+                seen.add(entry.path)
+                cls._check_present(root, entry)
+                shards.append(entry)
+        return tuple(shards)
+
+    @staticmethod
+    def _check_present(root: Path, entry: _ShardEntry) -> None:
+        for relative, label in ((entry.path, "shard"), (entry.index_path, "sidecar")):
+            if not relative.startswith(_SCHEMA_3_ROOT + "/"):
+                raise SchemaThreeDeclined(
+                    f"schema-3 {label} path is outside {_SCHEMA_3_ROOT}/: {relative!r}"
+                )
+            path = _schema_3_file(root, relative)
+            if path is None:
+                raise SchemaThreeDeclined(f"schema-3 {label} is missing: {relative}")
+        size = _schema_3_size(root, entry.path)
+        if size != entry.c_bytes:
+            raise SchemaThreeDeclined(
+                f"schema-3 shard {entry.path} is {size} bytes; the bootstrap says "
+                f"{entry.c_bytes} -- the generation is partly published"
+            )
+
+    @staticmethod
+    def _check_nothing_unnamed(root: Path, shards: Sequence[_ShardEntry]) -> None:
+        """Rule 5: no shard-shaped file under the root is missing from the catalogue.
+
+        Run *after* :meth:`_check_present`, so that damage visible from the catalogue keeps its
+        own more specific sentence and this one is left to report the case only the tree can
+        see. The listing is capped at three names because the interesting fact is the direction
+        of the disagreement, not the inventory; the whole inventory is what `gc` prints.
+        """
+
+        named: set[str] = set()
+        for entry in shards:
+            named.add(entry.path)
+            named.add(entry.index_path)
+        stray = sorted(relative for relative in _schema_3_tree(root) if relative not in named)
+        if not stray:
+            return
+        shown = ", ".join(stray[:3]) + (", ..." if len(stray) > 3 else "")
+        raise SchemaThreeDeclined(
+            f"{len(stray)} schema-3 file(s) on disk are named by no entry in "
+            f"{SCHEMA_3_BOOTSTRAP_PATH} ({shown}) -- a build published shards and did not reach "
+            "its bootstrap, so this catalogue is older than the tree it describes"
+        )
+
+    # -- reading -------------------------------------------------------------------------
+
+    @property
+    def bytes_read(self) -> int:
+        """Bootstrap, sidecars and shard members physically read so far.
+
+        Recomputed from the open readers rather than accumulated, so it cannot double-count a
+        member a memoised group returned without reading.
+        """
+
+        return self._bootstrap_bytes + sum(
+            reader.data_bytes_read + reader.index_bytes_read
+            for reader in self._readers.values()
+        )
+
+    @property
+    def opened_shards(self) -> tuple[str, ...]:
+        """Which shards have been opened, so a test can assert on the set and not only the size.
+
+        A byte count says an answer was cheap; this says *which* files it came out of, which is
+        the claim that actually matters -- that a listing never opens the timeline stream, and
+        that a one-team question never opens another team's spine. A count can be small for the
+        wrong reason; a path set cannot.
+        """
+
+        return tuple(sorted(self._readers))
+
+    def header(self) -> dict[str, JsonValue]:
+        """The schema-1-shaped top of the timeline: everything the bootstrap inlines.
+
+        ``schema_version`` is reported as 1 for the same reason
+        :meth:`TimelineQuery._load_schema_2_timeline` reports it as 1 -- the value describes the
+        *shape the caller sees*, which is schema 1's, not the generation it was assembled from.
+        """
+
+        header: dict[str, JsonValue] = {"schema_version": TIMELINE_SCHEMA_VERSION}
+        for field in (
+            "generated_at",
+            "source_digest",
+            "display_timezone",
+            "display_timezone_source",
+            "range",
+            "stats",
+            "artifact_catalog_path",
+            "glossary_path",
+            "teams",
+        ):
+            if field in self.bootstrap:
+                header[field] = self.bootstrap[field]
+        return header
+
+    def _reader(self, relative: str, *, cache_members: bool = False) -> _ChunkedJsonlReader:
+        reader = self._readers.get(relative)
+        if reader is None:
+            path = _schema_3_file(self.root, relative)
+            if path is None:
+                raise ArchiveReadError(f"schema-3 shard vanished: {relative}")
+            reader = _ChunkedJsonlReader(path, cache_members=cache_members)
+            self._readers[relative] = reader
+        return reader
+
+    def teams_in_scope(self, teams: Sequence[str]) -> tuple[str, ...]:
+        """The published teams a filter selects, in shard order.
+
+        An unknown slug in the filter selects nothing rather than raising: that is what the
+        in-memory paths do -- ``_selected_team`` simply never matches -- and a seeking read must
+        not turn a filter that used to return an empty list into an error.
+        """
+
+        if not teams:
+            return self.teams
+        wanted = frozenset(teams)
+        return tuple(team for team in self.teams if team in wanted)
+
+    def spine(self, kind: str, teams: Sequence[str] = ()) -> list[dict[str, JsonValue]]:
+        """Every record of one spine kind, for the selected teams and no others."""
+
+        records: list[dict[str, JsonValue]] = []
+        for team in self.teams_in_scope(teams):
+            records.extend(self._group(kind, team))
+        return records
+
+    def _group(self, kind: str, team: str) -> tuple[dict[str, JsonValue], ...]:
+        """One kind's line range in one team's spine, read once and remembered.
+
+        Memoised because the question is asked repeatedly for the same team -- ``list teams``
+        derives each team's range from its agents, and every transcript-search record is
+        validated against its agent -- and re-reading a member per question would make the
+        counter this class is judged by report the same bytes many times over, which would be
+        an honest count of a dishonest read.
+        """
+
+        memo = self._groups.get((kind, team))
+        if memo is not None:
+            return memo
+        entry = self._spine.get(team)
+        span = None if entry is None else entry.line_ranges.get(kind)
+        if entry is None or span is None:
+            self._groups[(kind, team)] = ()
+            return ()
+        first, count = span
+        # Members are cached for a spine shard and for nothing else. A team's agents, phase
+        # cards, structural edges and rollups are four line ranges inside the same member, and
+        # `summary_stats` asks for three of them in a row -- without the cache that member is
+        # inflated three times, and the archive-wide `stats` cost measured 5,803,943 bytes
+        # against 2,257,791 with it. The bound is the spine, 2,088,865 compressed bytes across
+        # twelve teams, and only the members actually touched; the timeline stream, which is 93%
+        # of schema 3 and the one a cache could not hold, is never opened by this class.
+        reader = self._reader(entry.path, cache_members=True)
+        records = tuple(
+            self._unwrap(record, kind, team, entry.path)
+            for record in reader.read_lines(first, first + count)
+        )
+        self._groups[(kind, team)] = records
+        return records
+
+    @staticmethod
+    def _unwrap(
+        record: dict[str, JsonValue], kind: str, team: str, where: str
+    ) -> dict[str, JsonValue]:
+        """Turn a schema-3 line back into the schema-1 record the rest of this file expects.
+
+        The envelope key is removed rather than passed through, because `show` returns the
+        record as it found it and a ``record_kind`` leaking into the output would make the
+        answer depend on which generation served it.
+
+        ``team`` is stamped when the record does not carry it. The single-team render does not
+        put a ``team`` field on its records -- there is only one, and schema 1 does not carry it
+        -- and the writer's `_team_of` falls back to the sole team for exactly that case. The
+        shard *is* the team, so this is the same fallback read from the other side, and it is
+        strictly better informed than the writer's: it works for a multi-team archive too. A
+        record that names a *different* team than the shard it sits in is corruption and says so.
+        """
+
+        found = record.pop(_SCHEMA_3_RECORD_KIND_KEY, None)
+        if found != kind:
+            raise ArchiveReadError(
+                f"{where}: expected a {kind!r} record, found {found!r}"
+            )
+        declared = record.get("team")
+        if declared is None:
+            record["team"] = team
+        elif declared != team:
+            raise ArchiveReadError(
+                f"{where}: record names team {declared!r} in {team!r}'s spine shard"
+            )
+        return record
+
+    def bounds(self, team: str) -> dict[str, tuple[int, int]]:
+        """The zoom bounds published for one team, keyed by stable reference."""
+
+        table: dict[str, tuple[int, int]] = {}
+        for record in self._group(_SCHEMA_3_BOUNDS_KIND, team):
+            where = f"{team} activity bounds"
+            reference = as_string(record.get("ref"), where + ".ref")
+            table[reference] = (
+                as_int(record.get("activity_start_ms"), where + ".activity_start_ms"),
+                as_int(record.get("activity_end_ms"), where + ".activity_end_ms"),
+            )
+        return table
+
+    def refs(
+        self, kind: str, team: str, reference_of: Callable[[dict[str, JsonValue]], str]
+    ) -> dict[str, dict[str, JsonValue]]:
+        """One team's records of one reference kind, indexed by reference and zoom-bounded.
+
+        The bounds are merged here and nowhere else. `show` is the only surface that returns a
+        record as it found it, so it is the only one whose answer changes if they are absent --
+        and it asks about one reference in one team, so merging costs that team's bounds range
+        and not the archive's.
+        """
+
+        memo = self._refs.get((kind, team))
+        if memo is not None:
+            return memo
+        table: dict[str, dict[str, JsonValue]] = {}
+        bounds = self.bounds(team)
+        for record in self._group(_SCHEMA_3_SPINE_KIND_FOR[kind], team):
+            reference = reference_of(record)
+            if reference in table:
+                raise ValueError(f"duplicate stable reference {reference!r}")
+            merged = dict(record)
+            pair = bounds.get(reference)
+            if pair is not None:
+                merged["activity_start_ms"], merged["activity_end_ms"] = pair
+            table[reference] = merged
+        self._refs[(kind, team)] = table
+        return table
+
+    def activity_bins(
+        self, start_ms: int | None, end_ms: int | None
+    ) -> list[dict[str, JsonValue]]:
+        """The pre-aggregated activity bins overlapping a half-open window.
+
+        The one time-addressed read in this class, and the reason
+        :meth:`_ChunkedJsonlReader.read_range` exists on the reader rather than only in its
+        tests. No command-line surface consumes the bins today -- schema 2 validated them at
+        open and no query has ever asked for one -- but they are the collection a windowed
+        reader can actually seek into, and publishing the door here is what lets a caller
+        (an overview chart, a future ``bins`` listing) get them without loading the archive.
+        """
+
+        records: list[dict[str, JsonValue]] = []
+        for entry in self._bins:
+            reader = self._reader(entry.path)
+            for record in reader.read_range(start_ms, end_ms):
+                record.pop(_SCHEMA_3_RECORD_KIND_KEY, None)
+                # Both envelope keys come off, not just the classifying one. A bin's schema-1
+                # record has no ``at_ms``; the writer adds it as the sort key, and leaving it
+                # on would make a schema-3 bin a different record from a schema-2 bin -- which
+                # is the one thing this read path is not allowed to be.
+                record.pop(_SCHEMA_3_TIMESTAMP_KEY, None)
+                records.append(record)
+        return records
+
+
+def _schema_3_file(root: Path, relative: str) -> Path | None:
+    """Resolve an archive-relative schema-3 path, or ``None`` if it is missing or unsafe.
+
+    Symlinks are refused in both directions -- a symlinked component and a symlinked leaf --
+    because the bootstrap is data and the shard paths in it decide what this process opens.
+    """
+
+    pure = PurePosixPath(relative)
+    if pure.is_absolute() or any(part in {"", ".", ".."} for part in pure.parts):
+        return None
+    cursor = root
+    for part in pure.parts:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            return None
+    return cursor if cursor.is_file() else None
+
+
+def _schema_3_size(root: Path, relative: str) -> int:
+    path = _schema_3_file(root, relative)
+    return -1 if path is None else path.stat().st_size
+
+
+#: The two file shapes the schema-3 writer publishes. Restated here rather than imported for the
+#: reason every other schema-3 constant in this file is restated: this module ships as a
+#: self-contained launcher inside the archive and imports nothing from the package. The writer
+#: holds the same predicate under the same name, and the pair is load-bearing in one direction --
+#: a reader that recognised a shape the writer does not remove would decline a generation that
+#: rebuilding cannot repair -- so `test_timeline_v3.py` asserts the two agree.
+_SCHEMA_3_SHARD_SUFFIX = ".jsonl.gz"
+_SCHEMA_3_SIDECAR_SUFFIX = _SCHEMA_3_SHARD_SUFFIX + _CHUNK_INDEX_SUFFIX
+
+
+def is_schema_3_shard_name(name: str) -> bool:
+    """Whether *name* is a file the schema-3 writer would have produced."""
+
+    return name.endswith(_SCHEMA_3_SHARD_SUFFIX) or name.endswith(_SCHEMA_3_SIDECAR_SUFFIX)
+
+
+def _schema_3_tree(root: Path) -> frozenset[str]:
+    """Every shard-shaped regular file under ``data/timeline-v3/``, archive-relative.
+
+    Symlinks -- to a directory or to a file -- are neither descended nor reported. That matches
+    :func:`_schema_3_file`, which refuses to *open* through one, and it keeps this set to files
+    the writer could have written and could remove again.
+
+    Written on :func:`os.scandir`, and on plain strings, because this runs before every query.
+    Both choices were measured on a 720-file tree the size of the measured archive's schema-3
+    generation, and both are larger than they look. ``scandir`` carries the entry type in the
+    directory read itself, so the walk costs one ``getdents`` per directory and no ``stat`` at
+    all, where the ``os.walk`` form has to ask ``Path.is_symlink`` and ``Path.is_file`` per name.
+    And building the archive-relative name by slicing rather than by
+    ``Path(...).relative_to(root).as_posix()`` is worth **23 ms of the 24**: pathlib dominated
+    the whole function. Together, 27.3 ms became 0.6 ms. Twenty-seven milliseconds on the way to
+    an answer whose entire point is that it costs 300 KB would have been the largest single item
+    on the read path.
+    """
+
+    start = root / _SCHEMA_3_ROOT
+    if start.is_symlink() or not start.is_dir():
+        return frozenset()
+    found: set[str] = set()
+    trim = len(str(start))
+    pending = [str(start)]
+    while pending:
+        try:
+            with os.scandir(pending.pop()) as entries:
+                for entry in entries:
+                    if entry.is_symlink():
+                        continue
+                    if entry.is_dir(follow_symlinks=False):
+                        pending.append(entry.path)
+                    elif entry.is_file(follow_symlinks=False) and is_schema_3_shard_name(
+                        entry.name
+                    ):
+                        found.add(
+                            _SCHEMA_3_ROOT + entry.path[trim:].replace(os.sep, "/")
+                        )
+        except OSError:
+            # A directory that vanished or cannot be read is not evidence of an unnamed shard,
+            # and the catalogue check has already established that everything named is present.
+            continue
+    return frozenset(found)
 
 
 class _SeekableJsonlText:
@@ -1681,6 +2350,35 @@ def _team(record: dict[str, JsonValue], where: str) -> str:
     return as_string(record.get("team"), f"{where}.team")
 
 
+def _stamp_sole_team(records: Sequence[dict[str, JsonValue]], slug: str | None) -> None:
+    """Give records their team when the archive has exactly one and they do not say so.
+
+    The single-team renderer does not put a ``team`` field on a phase, a rollup or a summary
+    file: there is one team, and schema 1 does not carry the field. Every reference and every
+    listing in this file is team-qualified, so without this the archive shape *most* archives
+    have could not be read at all -- ``./timeline rollups`` on a single-team export raised
+    ``expected a string`` from the middle of the schema-2 loader, and ``./timeline phases``
+    raised the same from schema 1. That was true before schema 3 existed and is fixed here
+    rather than left, because "schema 1 and schema 2 remain readable" is the contract schema 3
+    is allowed to be added under, and a contract nothing checks is a contract that has already
+    lapsed.
+
+    The writer's `timeline_v3._team_of` makes exactly this inference on the way out, and a
+    schema-3 spine shard makes it structurally -- the shard *is* the team. This is the same
+    rule, applied to the two generations that have nowhere else to get it from.
+
+    Stamped in place. The dictionaries belong to the parsed timeline, nothing else reads those
+    collections out of it, and copying them would double the resident size of a 247 MB schema-1
+    document to add one short string per record.
+    """
+
+    if slug is None:
+        return
+    for record in records:
+        if record.get("team") is None:
+            record["team"] = slug
+
+
 def _local_identifier(team: str, identifier: str) -> str:
     prefix = f"{team}::"
     return identifier[len(prefix) :] if identifier.startswith(prefix) else identifier
@@ -1715,6 +2413,16 @@ def rollup_ref(record: dict[str, JsonValue], where: str = "rollup") -> str:
     kind = as_string(record.get("kind"), f"{where}.kind")
     start_ms = as_int(record.get("start_ms"), f"{where}.start_ms")
     return f"rollup:{team}::{kind}::{start_ms}"
+
+
+#: How to build the reference for each record kind that has one. A table rather than an
+#: ``if`` chain because both the whole-archive index and the schema-3 seek need exactly this
+#: dispatch, and two copies of it would be two chances to disagree about what a reference is.
+_REFERENCE_OF: dict[str, Callable[[dict[str, JsonValue]], str]] = {
+    "agent": agent_ref,
+    "phase": phase_ref,
+    "rollup": rollup_ref,
+}
 
 
 def _timestamp(timestamp_ms: int) -> str:
@@ -1958,35 +2666,120 @@ def _copy_fields(
     return {key: record[key] for key in keys if key in record}
 
 
+def _sorted_refs(references: Iterable[str]) -> list[JsonValue]:
+    """A sorted list of stable references, typed as the JSON it becomes."""
+
+    return [reference for reference in sorted(references)]
+
+
+def schema_3_completeness(root: Path) -> tuple[bool, str]:
+    """Whether *root* holds a schema-3 generation complete enough to read, and why not if not.
+
+    The same five-clause rule :class:`_SchemaThreeArchive` applies before it will answer a
+    question, published as a plain predicate so a *writer* can ask it too. The caller that
+    needs it is :mod:`agent_team_timeline.archive_gc`: "may the schema-1 monolith be reclaimed"
+    is exactly "is there a complete newer generation that answers the same questions", and the
+    only defensible way to answer that is to run the reader's own acceptance rule rather than a
+    second, looser one that could say yes where the reader says no.
+
+    Returning a reason rather than a bare bool is what makes a refusal actionable: a dry run
+    that says "held: no schema-3 bootstrap" tells an operator to rebuild, and one that says
+    "held: shard X is 40 bytes short" tells them the last build was interrupted.
+    """
+
+    archive, declined = _SchemaThreeArchive.open(root)
+    return archive is not None, declined
+
+
+#: How ``inspect``'s six counts are assembled from the shard catalogue. The left-hand names are
+#: schema-1 collection names because that is what the command has always printed; the right-hand
+#: pairs are ``(stream, record kind)`` as the bootstrap publishes them. ``edges`` is two entries
+#: because schema 3 splits them: the spawn tree lives in the spine and everything else is
+#: time-addressed, and schema 1 counted the union.
+_SCHEMA_3_COUNT_SOURCES: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
+    ("agents", (("spine", "agent"),)),
+    ("phases", (("timeline", "phase"),)),
+    ("edges", (("timeline", "edge"), ("spine", "structural_edge"))),
+    ("events", (("timeline", "event"),)),
+    ("rollups", (("spine", "rollup"),)),
+    ("summary_files", (("spine", "summary_file"),)),
+)
+
+
+def schema_3_record_counts(root: Path) -> dict[str, int] | None:
+    """How many records of each schema-1 collection a complete schema-3 generation holds.
+
+    ``None`` when there is no complete generation to count, so a caller can fall back.
+
+    This exists because ``inspect`` printed six integers and paid 246,973,399 bytes and 1.44 GiB
+    of resident memory for them, by parsing the schema-1 monolith whole. Every one of the six is
+    already published in the 89,298-byte bootstrap -- a timeline shard's catalogue entry carries
+    ``counts`` per record kind and a spine shard's carries ``line_ranges``, whose second element
+    is a count -- so the answer is a sum over a list the reader already validated.
+
+    The counts are read off the *catalogue* rather than by opening shards, which is the whole
+    point: no shard is inflated, and in particular the timeline stream, 93% of the generation,
+    stays shut. That the catalogue's numbers are the shards' numbers is not taken on trust
+    either; it is what :meth:`_SchemaThreeArchive._check_present` establishes for the bytes and
+    what `test_timeline_v3.py` establishes for the records.
+    """
+
+    archive, _declined = _SchemaThreeArchive.open(root)
+    if archive is None:
+        return None
+    tallies: dict[tuple[str, str], int] = {}
+    streams = as_object(archive.bootstrap.get("streams"), "timeline-v3.streams")
+    for stream, raw_section in streams.items():
+        where = f"timeline-v3.streams.{stream}"
+        section = as_object(raw_section, where)
+        for index, raw in enumerate(as_array(section.get("shards"), where + ".shards")):
+            entry = as_object(raw, f"{where}.shards[{index}]")
+            counts = entry.get("counts")
+            if counts is not None:
+                for kind, value in as_object(counts, f"{where}.shards[{index}].counts").items():
+                    key = (stream, kind)
+                    tallies[key] = tallies.get(key, 0) + as_int(
+                        value, f"{where}.shards[{index}].counts.{kind}"
+                    )
+            for kind, span in _schema_3_line_ranges(
+                entry.get("line_ranges"), f"{where}.shards[{index}].line_ranges"
+            ).items():
+                key = (stream, kind)
+                tallies[key] = tallies.get(key, 0) + span[1]
+    return {
+        name: sum(tallies.get(source, 0) for source in sources)
+        for name, sources in _SCHEMA_3_COUNT_SOURCES
+    }
+
+
 class TimelineQuery:
-    """Validated, read-only view of a built single- or multi-team timeline."""
+    """Validated, read-only view of a built single- or multi-team timeline.
+
+    Three generations answer the same questions and this class prefers the cheapest complete
+    one: schema 3's shards, then schema 2's content-addressed objects, then schema 1's
+    monolith. The older two are **not** dead code -- an archive built before schema 3 existed
+    must keep working, and that compatibility is the contract, not a leftover.
+
+    Under schema 3 nothing is read at construction beyond the 89 KB bootstrap, and every
+    collection below is a property that reads the line range it needs when it is first asked
+    for. Under schemas 2 and 1 the whole projection is in memory before the first question,
+    because those formats offer nothing smaller to read. :attr:`bytes_read` reports what it
+    cost either way, which is how the difference is asserted rather than described.
+    """
 
     def __init__(self, root: Path) -> None:
         self.root = root.resolve()
+        self._bytes_read = 0
         self._timeline_v2_bootstrap: dict[str, JsonValue] | None = None
-        bootstrap_path = self.root / "data" / "timeline-v2.json"
-        if bootstrap_path.is_file():
-            bootstrap = as_object(read_json(bootstrap_path), str(bootstrap_path))
-            bootstrap_schema = as_int(
-                bootstrap.get("schema_version"), "timeline-v2.schema_version"
-            )
-            predates_phase_index = (
-                bootstrap_schema == 2
-                and bootstrap.get("kind") == "timeline-bootstrap"
-                and "phase_index" not in bootstrap
-            )
-            if predates_phase_index:
-                self.timeline = self._load_schema_1_timeline()
-            else:
-                self.timeline, self._timeline_v2_bootstrap = (
-                    self._load_schema_2_timeline(bootstrap_path, bootstrap)
-                )
+        self._schema_3: _SchemaThreeArchive | None = None
+        #: Empty when schema 3 was used; otherwise one sentence saying why it was not. Read by
+        #: the tests that pin the completeness rule, and by anyone asking why a rebuilt archive
+        #: is still being served from schema 2.
+        self._schema_3, self.schema_3_declined = _SchemaThreeArchive.open(self.root)
+        if self._schema_3 is not None:
+            self.timeline = self._schema_3.header()
         else:
-            if bootstrap_path.exists():
-                raise ValueError(
-                    f"timeline schema-2 bootstrap is not a regular file: {bootstrap_path}"
-                )
-            self.timeline = self._load_schema_1_timeline()
+            self.timeline = self._load_older_generation()
         schema_version = as_int(
             self.timeline.get("schema_version"), "timeline.schema_version"
         )
@@ -1996,30 +2789,219 @@ class TimelineQuery:
                 f"expected {TIMELINE_SCHEMA_VERSION}"
             )
         self.teams = _record_array(self.timeline, "teams")
-        self.agents = _record_array(self.timeline, "agents")
-        self.phases = _record_array(self.timeline, "phases")
-        self.rollups = _record_array(self.timeline, "rollups")
-        self._entries = self._build_index()
-        phase_intervals: dict[tuple[str, str], list[tuple[int, int, str]]] = {}
-        for index, phase in enumerate(self.phases):
-            where = f"timeline.phases[{index}]"
-            team = _team(phase, where)
-            agent_id = _local_identifier(
-                team, as_string(phase.get("agent_id"), where + ".agent_id")
-            )
-            start_ms, end_ms = _interval(phase, where)
-            phase_intervals.setdefault((team, agent_id), []).append(
-                (start_ms, end_ms, phase_ref(phase, where))
-            )
-        self._search_phase_intervals = {
-            key: tuple(sorted(values)) for key, values in phase_intervals.items()
-        }
+        #: The one team's slug when the archive has exactly one, otherwise ``None``. See
+        #: :func:`_stamp_sole_team` for what depends on it.
+        self._sole_team = (
+            as_string(self.teams[0].get("slug"), "timeline.teams[0].slug")
+            if len(self.teams) == 1
+            else None
+        )
+        self._collections: dict[str, tuple[dict[str, JsonValue], ...]] = {}
+        self._entries: dict[str, _IndexEntry] | None = None
+        self._phase_intervals: dict[tuple[str, str], tuple[tuple[int, int, str], ...]] | None = (
+            None
+        )
+
+    # -- opening ---------------------------------------------------------------------------
+
+    def _load_older_generation(self) -> dict[str, JsonValue]:
+        """Schema 2 if it is present and current, otherwise schema 1."""
+
+        bootstrap_path = self.root / "data" / "timeline-v2.json"
+        if not bootstrap_path.is_file():
+            if bootstrap_path.exists():
+                raise ValueError(
+                    f"timeline schema-2 bootstrap is not a regular file: {bootstrap_path}"
+                )
+            return self._load_schema_1_timeline()
+        bootstrap = as_object(self._read_json(bootstrap_path), str(bootstrap_path))
+        bootstrap_schema = as_int(
+            bootstrap.get("schema_version"), "timeline-v2.schema_version"
+        )
+        predates_phase_index = (
+            bootstrap_schema == 2
+            and bootstrap.get("kind") == "timeline-bootstrap"
+            and "phase_index" not in bootstrap
+        )
+        if predates_phase_index:
+            return self._load_schema_1_timeline()
+        timeline, self._timeline_v2_bootstrap = self._load_schema_2_timeline(
+            bootstrap_path, bootstrap
+        )
+        return timeline
 
     def _load_schema_1_timeline(self) -> dict[str, JsonValue]:
         timeline_path = self.root / "data" / "timeline.json"
         if not timeline_path.is_file():
             raise ValueError(f"no built timeline at {timeline_path}")
-        return as_object(read_json(timeline_path), str(timeline_path))
+        return as_object(self._read_json(timeline_path), str(timeline_path))
+
+    # -- accounting ------------------------------------------------------------------------
+
+    @property
+    def bytes_read(self) -> int:
+        """Every byte this query has pulled off disk, including the generation it opened with.
+
+        A byte count and not a clock, for the reason `test_query_read_paths.py` gives about the
+        transcript projections: the claim under test is "an answer costs the span it lives in",
+        and a stopwatch on a build host measures the host.
+        """
+
+        schema_3 = 0 if self._schema_3 is None else self._schema_3.bytes_read
+        return self._bytes_read + schema_3
+
+    def _read_bytes(self, path: Path) -> bytes:
+        encoded = path.read_bytes()
+        self._bytes_read += len(encoded)
+        return encoded
+
+    def _read_json(self, path: Path) -> JsonValue:
+        return _narrow_json(
+            json.loads(self._read_bytes(path).decode("utf-8")), str(path)
+        )
+
+    def _read_markdown(self, path: Path) -> str:
+        return self._read_bytes(path).decode("utf-8")
+
+    @property
+    def opened_shards(self) -> tuple[str, ...]:
+        """The schema-3 shards this query has opened; empty under schemas 1 and 2."""
+
+        return () if self._schema_3 is None else self._schema_3.opened_shards
+
+    # -- the one place two generations meet ------------------------------------------------
+
+    def _search_bootstrap(self) -> dict[str, JsonValue]:
+        """The schema-2 bootstrap, which is where the transcript search corpus lives.
+
+        Schema 3 replaces the *presentation timeline*; it does not replace the search corpus,
+        which is still a set of schema-2 content-addressed day shards with trigram blooms. So a
+        transcript search under schema 3 reads phases and agents from the spine and messages
+        from schema 2, and that is the only operation in this file that touches both.
+
+        It is therefore the place the cross-generation check belongs. Verifying at open that
+        schema 3 and schema 2 describe the same ``source_digest`` would mean parsing schema 2's
+        5,702,530-byte bootstrap before answering a question schema 3 answers in 300 KB -- the
+        cost schema 3 exists to remove, paid to guard a mismatch that only matters here.
+        Deferring it costs nothing: the file is being read anyway, and the comparison is a
+        string.
+
+        The mismatch is a refusal rather than a fallback. Two generations of one archive
+        disagreeing about their source is not something a reader can paper over by picking one:
+        the phases would come from one build and the messages from another, and the linkage
+        between them -- which phase a message falls inside -- would be silently wrong.
+        """
+
+        if self._timeline_v2_bootstrap is None:
+            bootstrap_path = self.root / "data" / "timeline-v2.json"
+            if not bootstrap_path.is_file():
+                raise ValueError(
+                    "this archive has no transcript search corpus; rebuild the website"
+                )
+            bootstrap = as_object(
+                self._read_json(bootstrap_path), str(bootstrap_path)
+            )
+            if (
+                as_int(bootstrap.get("schema_version"), "timeline-v2.schema_version") != 2
+                or bootstrap.get("kind") != "timeline-bootstrap"
+            ):
+                raise ValueError(
+                    f"unsupported timeline schema-2 bootstrap at {bootstrap_path}"
+                )
+            ours = self.timeline.get("source_digest")
+            theirs = bootstrap.get("source_digest")
+            if ours is not None and theirs is not None and ours != theirs:
+                raise ValueError(
+                    "the transcript search corpus belongs to a different source generation "
+                    f"({theirs!r}) than the timeline being read ({ours!r}); rebuild the website"
+                )
+            self._timeline_v2_bootstrap = bootstrap
+        if self._timeline_v2_bootstrap.get("search") is None:
+            raise ValueError(
+                "this archive has no transcript search corpus; rebuild the website"
+            )
+        return self._timeline_v2_bootstrap
+
+    # -- collections -----------------------------------------------------------------------
+
+    def _collection(self, name: str) -> tuple[dict[str, JsonValue], ...]:
+        """One top-level collection, read from whichever generation is open.
+
+        Under schema 3 this is the seek: the spine kind's published line range, for every team,
+        read once and remembered. Under schemas 1 and 2 the records are already in
+        ``self.timeline`` and this is a lookup.
+        """
+
+        cached = self._collections.get(name)
+        if cached is not None:
+            return cached
+        if self._schema_3 is None:
+            records = _record_array(self.timeline, name)
+            _stamp_sole_team(records, self._sole_team)
+        else:
+            # A schema-3 spine shard is per team, so `_SchemaThreeArchive._unwrap` has already
+            # stamped every record from the path it read it out of -- better informed than the
+            # sole-team inference, and correct for a multi-team archive too.
+            records = tuple(
+                self._schema_3.spine(_SCHEMA_3_SPINE_KIND_FOR[_SINGULAR[name]])
+            )
+        self._collections[name] = records
+        return records
+
+    def _scoped(
+        self, name: str, filters: QueryFilters
+    ) -> tuple[dict[str, JsonValue], ...]:
+        """One collection restricted to the teams a filter selects.
+
+        The restriction is pushed down to the shard under schema 3 -- a ``--team`` listing
+        opens one spine and no others -- and applied afterwards under schemas 1 and 2, where
+        the records are in memory and there is nothing to push down to. Callers still filter by
+        team themselves; this narrows what they have to walk, it does not replace the check.
+        """
+
+        if self._schema_3 is None or not filters.teams:
+            return self._collection(name)
+        return tuple(
+            self._schema_3.spine(
+                _SCHEMA_3_SPINE_KIND_FOR[_SINGULAR[name]], filters.teams
+            )
+        )
+
+    def _for_team(self, name: str, team: str) -> tuple[dict[str, JsonValue], ...]:
+        """One collection restricted to a single named team."""
+
+        if self._schema_3 is None:
+            return tuple(
+                record
+                for record in self._collection(name)
+                if _team(record, _SINGULAR[name]) == team
+            )
+        return tuple(
+            self._schema_3.spine(_SCHEMA_3_SPINE_KIND_FOR[_SINGULAR[name]], (team,))
+        )
+
+    @property
+    def agents(self) -> tuple[dict[str, JsonValue], ...]:
+        """Every agent in the archive."""
+
+        return self._collection("agents")
+
+    @property
+    def phases(self) -> tuple[dict[str, JsonValue], ...]:
+        """Every work phase in the archive.
+
+        Under schema 3 these are the phase *cards* -- the same nine fields schema 2's phase
+        index publishes -- rather than the full phase records schema 1 holds. Nothing in this
+        file reads a phase field outside the card.
+        """
+
+        return self._collection("phases")
+
+    @property
+    def rollups(self) -> tuple[dict[str, JsonValue], ...]:
+        """Every calendar rollup in the archive."""
+
+        return self._collection("rollups")
 
     def _content_addressed_object(
         self, raw_reference: JsonValue, where: str
@@ -2035,7 +3017,7 @@ class TimelineQuery:
                 f"{where}.url: expected content-addressed path {expected_relative!r}"
             )
         path, _pure = self._safe_file(relative)
-        encoded = path.read_bytes()
+        encoded = self._read_bytes(path)
         if hashlib.sha256(encoded).hexdigest() != digest:
             raise ValueError(f"{where}: object digest mismatch for {relative}")
         raw_bytes = reference.get("bytes")
@@ -2139,7 +3121,13 @@ class TimelineQuery:
                 as_array(global_record.get("agents"), global_relative + ".agents")
             )
         )
+        # The sole-team inference has to happen before the validation below rather than after
+        # it: a single-team export's rollups, project overviews and phases carry no ``team`` at
+        # all, and every one of these loops reads the field. Applied to the *global object's*
+        # own collections, which is what the returned timeline is assembled from.
+        sole = next(iter(team_slugs)) if len(team_slugs) == 1 else None
         agent_teams: dict[str, str] = {}
+        _stamp_sole_team(agents, sole)
         for index, agent in enumerate(agents):
             where = f"{global_relative}.agents[{index}]"
             identifier = as_string(agent.get("id"), where + ".id")
@@ -2166,6 +3154,7 @@ class TimelineQuery:
                 as_array(raw_values, f"{global_relative}.{key}")
             ):
                 record = as_object(raw, f"{global_relative}.{key}[{index}]")
+                _stamp_sole_team((record,), sole)
                 team = _team(record, f"{global_relative}.{key}[{index}]")
                 if team not in team_slugs:
                     raise ValueError(
@@ -2229,6 +3218,7 @@ class TimelineQuery:
             as_array(bootstrap.get("activity_bins"), "timeline-v2.activity_bins")
         ):
             activity_bin = as_object(raw_bin, f"timeline-v2.activity_bins[{index}]")
+            _stamp_sole_team((activity_bin,), sole)
             team = _team(activity_bin, f"timeline-v2.activity_bins[{index}]")
             if team not in team_slugs:
                 raise ValueError(
@@ -2270,7 +3260,14 @@ class TimelineQuery:
         )
         return timeline, bootstrap
 
-    def _project_overviews(self) -> tuple[dict[str, JsonValue], ...]:
+    def _project_overviews(
+        self, teams: Sequence[str] = ()
+    ) -> tuple[dict[str, JsonValue], ...]:
+        if self._schema_3 is not None:
+            # One spine kind whichever renderer produced the archive: the writer folds the
+            # single-team ``project_overview`` object and the combined export's labelled list
+            # into the same kind, so the reader never has to know which it opened.
+            return tuple(self._schema_3.spine("project_overview", teams))
         plural = self.timeline.get("project_overviews")
         if plural is not None:
             return tuple(
@@ -2298,6 +3295,63 @@ class TimelineQuery:
             content=TextTotals.from_texts(texts),
         )
 
+    def activity_bins(self, filters: QueryFilters) -> list[dict[str, JsonValue]]:
+        """The pre-aggregated activity bins overlapping the filter's window.
+
+        The only collection in the archive that a windowed read can *seek* into rather than
+        scan: bins are one time-sorted shard in schema 3, so a caller asking for one day reads
+        the members that day falls in. Every other collection this class serves -- agents,
+        phase cards, rollups -- is addressed by line range, because it has no honest position
+        on the time axis (an agent alive across the whole archive has one ``start_ms``, which is
+        outside almost every window a reader will ask about) and a range read over it would
+        appear to work and quietly under-return.
+
+        No command-line subcommand consumes this today; schema 2 validated the bins at open and
+        no query has ever asked for one. It is published because the bins are what an overview
+        chart draws, and the point of schema 3 is that drawing that chart should not require
+        loading the archive.
+        """
+
+        start_ms = None if filters.window is None else filters.window.start_ms
+        end_ms = None if filters.window is None else filters.window.end_ms
+        if self._schema_3 is not None:
+            records = self._schema_3.activity_bins(start_ms, end_ms)
+        else:
+            records = [
+                as_object(raw, f"timeline.activity_bins[{index}]")
+                for index, raw in enumerate(
+                    as_array(
+                        self.timeline.get("activity_bins") or [], "timeline.activity_bins"
+                    )
+                )
+            ]
+            _stamp_sole_team(records, self._sole_team)
+            records = [
+                record
+                for record in records
+                if _within(
+                    as_int(record.get("start_ms"), "activity_bin.start_ms"),
+                    start_ms,
+                    end_ms,
+                )
+            ]
+        selected = [
+            record
+            for record in records
+            if self._selected_team(_team(record, "activity_bin"), filters)
+        ]
+        # Sorted, and totally: schema 3 reads the bins in instant order because that is how the
+        # shard is written, and schemas 1 and 2 hand them back in the order the renderer emitted
+        # them. Neither order is the archive's, so the answer states one. The tiebreaker is the
+        # encoded record, the same total order the writer sorts shards by.
+        selected.sort(
+            key=lambda record: (
+                as_int(record.get("start_ms"), "activity_bin.start_ms"),
+                canonical_json(record),
+            )
+        )
+        return selected
+
     def summary_stats(self, filters: QueryFilters) -> dict[str, SummaryKindStats]:
         """Count available and unavailable summaries in the presentation projection."""
 
@@ -2306,7 +3360,7 @@ class TimelineQuery:
         # Project overviews describe a whole team and have no honest time interval. Exclude
         # them from time-sliced statistics instead of pretending they belong to every window.
         if filters.window is None:
-            for record in self._project_overviews():
+            for record in self._project_overviews(filters.teams):
                 team = _team(record, "project_overview")
                 if not self._selected_team(team, filters):
                     continue
@@ -2319,7 +3373,7 @@ class TimelineQuery:
 
         agent_texts: list[str] = []
         agent_unavailable = 0
-        for record in self.agents:
+        for record in self._scoped("agents", filters):
             team = _team(record, "agent")
             if not self._selected_team(team, filters):
                 continue
@@ -2334,7 +3388,7 @@ class TimelineQuery:
 
         phase_texts: list[str] = []
         phase_unavailable = 0
-        for record in self.phases:
+        for record in self._scoped("phases", filters):
             team = _team(record, "phase")
             if not self._selected_team(team, filters):
                 continue
@@ -2351,7 +3405,7 @@ class TimelineQuery:
         technical_unavailable = 0
         plain_texts: list[str] = []
         plain_unavailable = 0
-        for record in self.rollups:
+        for record in self._scoped("rollups", filters):
             team = _team(record, "rollup")
             kind = as_string(record.get("kind"), "rollup.kind")
             reference = rollup_ref(record)
@@ -2366,7 +3420,7 @@ class TimelineQuery:
                     record.get("technical_path"), "rollup.technical_path"
                 )
                 technical_texts.append(
-                    self._rollup_file(relative, team).read_text(encoding="utf-8")
+                    self._read_markdown(self._rollup_file(relative, team))
                 )
             else:
                 technical_unavailable += 1
@@ -2376,7 +3430,7 @@ class TimelineQuery:
                     "rollup.plain_language_path",
                 )
                 plain_texts.append(
-                    self._rollup_file(relative, team).read_text(encoding="utf-8")
+                    self._read_markdown(self._rollup_file(relative, team))
                 )
             else:
                 plain_unavailable += 1
@@ -2395,44 +3449,64 @@ class TimelineQuery:
             ),
         }
 
-    def _build_index(self) -> dict[str, _IndexEntry]:
-        entries: dict[str, _IndexEntry] = {}
-        for index, record in enumerate(self.teams):
-            slug = as_string(record.get("slug"), f"timeline.teams[{index}].slug")
-            self._add_entry(entries, team_ref(slug), "team", record)
-        for index, record in enumerate(self.agents):
-            self._add_entry(
-                entries,
-                agent_ref(record, f"timeline.agents[{index}]"),
-                "agent",
-                record,
-            )
-        for index, record in enumerate(self.phases):
-            self._add_entry(
-                entries,
-                phase_ref(record, f"timeline.phases[{index}]"),
-                "phase",
-                record,
-            )
-        for index, record in enumerate(self.rollups):
-            self._add_entry(
-                entries,
-                rollup_ref(record, f"timeline.rollups[{index}]"),
-                "rollup",
-                record,
-            )
-        return entries
+    def lookup(self, reference: str) -> _IndexEntry | None:
+        """Resolve one stable reference, reading as little as the generation allows.
 
-    @staticmethod
-    def _add_entry(
-        entries: dict[str, _IndexEntry],
-        reference: str,
-        kind: str,
-        record: dict[str, JsonValue],
-    ) -> None:
-        if reference in entries:
-            raise ValueError(f"duplicate stable reference {reference!r}")
-        entries[reference] = _IndexEntry(kind, record)
+        Under schemas 1 and 2 this is a dictionary built over everything, once, because
+        everything is already in memory. Under schema 3 it is a **seek**: a reference carries
+        the team it belongs to -- ``agent:<team>::<id>``, ``phase:<team>::<id>``,
+        ``rollup:<team>::<kind>::<start_ms>`` -- so only that team's spine is opened, and only
+        the line range of the one kind the prefix names. Resolving a reference in a twelve-team
+        archive therefore costs one team's records rather than 14,584.
+
+        A malformed or unknown reference returns ``None`` rather than raising, because two
+        callers want different words for it: `show` says "unknown stable reference" and
+        ``--agent`` says "must be an agent:... reference".
+        """
+
+        kind, separator, remainder = reference.partition(":")
+        if not separator:
+            return None
+        if kind == "team":
+            for index, record in enumerate(self.teams):
+                slug = as_string(record.get("slug"), f"timeline.teams[{index}].slug")
+                if slug == remainder:
+                    return _IndexEntry("team", record)
+            return None
+        if kind not in _SCHEMA_3_SPINE_KIND_FOR:
+            return None
+        if self._schema_3 is None:
+            return self._index().get(reference)
+        team, team_separator, _ = remainder.partition("::")
+        if not team_separator:
+            return None
+        found = self._schema_3.refs(kind, team, _REFERENCE_OF[kind]).get(reference)
+        return None if found is None else _IndexEntry(kind, found)
+
+    def _index(self) -> dict[str, _IndexEntry]:
+        """The whole-archive reference index, for the generations that have no other door.
+
+        Built on first use rather than at construction, which moves one check with it: two
+        records sharing a stable reference used to be refused when the archive was opened and is
+        now refused the first time a reference is resolved. That is a deliberate trade -- the
+        check cost a full walk of every agent, phase and rollup on every `stats` invocation that
+        would never resolve a reference -- and it is narrower than it looks, because schema 2's
+        loader refuses a duplicate agent identifier on its own path, and schema 3's writer
+        refuses a duplicate team slug before it publishes anything.
+        """
+
+        if self._entries is not None:
+            return self._entries
+        entries: dict[str, _IndexEntry] = {}
+        for name, kind in _SINGULAR.items():
+            reference_of = _REFERENCE_OF[kind]
+            for record in self._collection(name):
+                reference = reference_of(record)
+                if reference in entries:
+                    raise ValueError(f"duplicate stable reference {reference!r}")
+                entries[reference] = _IndexEntry(kind, record)
+        self._entries = entries
+        return entries
 
     def _selected_team(self, team: str, filters: QueryFilters) -> bool:
         return not filters.teams or team in filters.teams
@@ -2440,7 +3514,7 @@ class TimelineQuery:
     def _validated_agent_filter(self, filters: QueryFilters) -> str | None:
         if filters.agent_ref is None:
             return None
-        entry = self._entries.get(filters.agent_ref)
+        entry = self.lookup(filters.agent_ref)
         if entry is None:
             raise ValueError(f"unknown stable reference {filters.agent_ref!r}")
         if entry.kind != "agent":
@@ -2474,14 +3548,12 @@ class TimelineQuery:
     def _team_range(self, slug: str) -> tuple[int, int] | None:
         intervals = [
             _interval(record, f"agent {agent_ref(record)}")
-            for record in self.agents
-            if _team(record, "agent") == slug
+            for record in self._for_team("agents", slug)
         ]
         if not intervals:
             intervals = [
                 _interval(record, f"rollup {rollup_ref(record)}")
-                for record in self.rollups
-                if _team(record, "rollup") == slug
+                for record in self._for_team("rollups", slug)
             ]
         if not intervals:
             return None
@@ -2516,7 +3588,7 @@ class TimelineQuery:
         self, filters: QueryFilters, selected_agent: str | None
     ) -> list[dict[str, JsonValue]]:
         results: list[dict[str, JsonValue]] = []
-        for index, record in enumerate(self.agents):
+        for index, record in enumerate(self._scoped("agents", filters)):
             where = f"timeline.agents[{index}]"
             reference = agent_ref(record, where)
             team = _team(record, where)
@@ -2558,7 +3630,7 @@ class TimelineQuery:
         self, filters: QueryFilters, selected_agent: str | None
     ) -> list[dict[str, JsonValue]]:
         results: list[dict[str, JsonValue]] = []
-        for index, record in enumerate(self.phases):
+        for index, record in enumerate(self._scoped("phases", filters)):
             where = f"timeline.phases[{index}]"
             team = _team(record, where)
             current_agent = self._agent_reference_for_id(
@@ -2590,7 +3662,7 @@ class TimelineQuery:
 
     def _list_rollups(self, filters: QueryFilters) -> list[dict[str, JsonValue]]:
         results: list[dict[str, JsonValue]] = []
-        for index, record in enumerate(self.rollups):
+        for index, record in enumerate(self._scoped("rollups", filters)):
             where = f"timeline.rollups[{index}]"
             team = _team(record, where)
             kind = as_string(record.get("kind"), f"{where}.kind")
@@ -2675,11 +3747,7 @@ class TimelineQuery:
     ) -> Iterable[dict[str, JsonValue]]:
         """Yield validated records while retaining at most one decoded day shard."""
 
-        bootstrap = self._timeline_v2_bootstrap
-        if bootstrap is None:
-            raise ValueError(
-                "this archive has no transcript search corpus; rebuild the website"
-            )
+        bootstrap = self._search_bootstrap()
         timeline_teams = sorted(
             as_string(team.get("slug"), "timeline team.slug") for team in self.teams
         )
@@ -2812,7 +3880,7 @@ class TimelineQuery:
                     raise ValueError(
                         f"transcript search record agent identity mismatch: {reference}"
                     )
-                agent_entry = self._entries.get(agent_reference)
+                agent_entry = self.lookup(agent_reference)
                 if agent_entry is None or agent_entry.kind != "agent":
                     raise ValueError(
                         f"transcript search record has unknown agent {agent_reference!r}"
@@ -2903,9 +3971,7 @@ class TimelineQuery:
     ) -> _SearchLinkContext:
         """Read compact linkage shards while retaining only candidate relationships."""
 
-        bootstrap = self._timeline_v2_bootstrap
-        if bootstrap is None:
-            raise ValueError("missing timeline schema-2 bootstrap")
+        bootstrap = self._search_bootstrap()
         source_digest = as_string(
             bootstrap.get("source_digest"), "timeline-v2.source_digest"
         )
@@ -3030,7 +4096,7 @@ class TimelineQuery:
                     raise ValueError(
                         f"transcript search linkage agent belongs to another team: {reference}"
                     )
-                agent_entry = self._entries.get(agent_reference)
+                agent_entry = self.lookup(agent_reference)
                 if agent_entry is None or agent_entry.kind != "agent":
                     raise ValueError(
                         f"transcript search linkage response has unknown agent {agent_reference!r}"
@@ -3069,9 +4135,7 @@ class TimelineQuery:
 
         if not candidate_prompt_refs and not needed_prompt_refs:
             return _SearchLinkContext({}, {})
-        bootstrap = self._timeline_v2_bootstrap
-        if bootstrap is None:
-            raise ValueError("missing timeline schema-2 bootstrap")
+        bootstrap = self._search_bootstrap()
         search = as_object(bootstrap.get("search"), "timeline-v2.search")
         shards = as_array(search.get("shards"), "timeline-v2.search.shards")
         if shards and all(
@@ -3092,6 +4156,35 @@ class TimelineQuery:
             needed_prompt_refs,
         )
 
+    def _search_phase_intervals(
+        self,
+    ) -> dict[tuple[str, str], tuple[tuple[int, int, str], ...]]:
+        """Phase intervals per ``(team, agent)``, built the first time a search asks.
+
+        Built lazily rather than in the constructor, which is where it used to live: a
+        transcript search is the only caller, and paying for the whole phase collection to open
+        an archive made every `list` and `stats` invocation carry the cost of a feature it does
+        not use.
+        """
+
+        if self._phase_intervals is not None:
+            return self._phase_intervals
+        intervals: dict[tuple[str, str], list[tuple[int, int, str]]] = {}
+        for index, phase in enumerate(self.phases):
+            where = f"timeline.phases[{index}]"
+            team = _team(phase, where)
+            agent_id = _local_identifier(
+                team, as_string(phase.get("agent_id"), where + ".agent_id")
+            )
+            start_ms, end_ms = _interval(phase, where)
+            intervals.setdefault((team, agent_id), []).append(
+                (start_ms, end_ms, phase_ref(phase, where))
+            )
+        self._phase_intervals = {
+            key: tuple(sorted(values)) for key, values in intervals.items()
+        }
+        return self._phase_intervals
+
     def _phase_reference_for_search_record(
         self, record: dict[str, JsonValue]
     ) -> str | None:
@@ -3099,7 +4192,7 @@ class TimelineQuery:
         agent_id = as_string(record.get("agent_id"), "search record.agent_id")
         at_ms = as_int(record.get("at_ms"), "search record.at_ms")
         candidates: list[tuple[int, str]] = []
-        for start_ms, end_ms, reference in self._search_phase_intervals.get(
+        for start_ms, end_ms, reference in self._search_phase_intervals().get(
             (team, _local_identifier(team, agent_id)), ()
         ):
             if start_ms <= at_ms < end_ms:
@@ -3157,7 +4250,7 @@ class TimelineQuery:
     def show(self, reference: str, *, transcript: bool = False) -> dict[str, JsonValue]:
         """Resolve one stable reference and include useful relationship links."""
 
-        entry = self._entries.get(reference)
+        entry = self.lookup(reference)
         if entry is None:
             if reference.startswith(("message:", "tool:")):
                 return self._show_search_record(reference)
@@ -3179,14 +4272,16 @@ class TimelineQuery:
         self, result: dict[str, JsonValue], record: dict[str, JsonValue]
     ) -> None:
         slug = as_string(record.get("slug"), "team.slug")
-        result["agent_refs"] = [
-            agent_ref(agent) for agent in self.agents if _team(agent, "agent") == slug
-        ]
-        result["rollup_refs"] = [
-            rollup_ref(rollup)
-            for rollup in self.rollups
-            if _team(rollup, "rollup") == slug
-        ]
+        # Sorted, so the answer is a property of the archive rather than of the generation that
+        # served it. Schema 2 hands these back in the order the renderer emitted them and a
+        # schema-3 spine hands them back in identifier order, and a `show` whose output depends
+        # on which file happened to be on disk is a `show` nobody can diff across a rebuild.
+        result["agent_refs"] = _sorted_refs(
+            agent_ref(agent) for agent in self._for_team("agents", slug)
+        )
+        result["rollup_refs"] = _sorted_refs(
+            rollup_ref(rollup) for rollup in self._for_team("rollups", slug)
+        )
         interval = self._team_range(slug)
         if interval is not None:
             result["start_ms"], result["end_ms"] = interval
@@ -3206,27 +4301,25 @@ class TimelineQuery:
                 team, as_string(parent, "agent.parent_id")
             )
         )
-        result["child_refs"] = [
+        result["child_refs"] = _sorted_refs(
             agent_ref(candidate)
-            for candidate in self.agents
-            if _team(candidate, "agent") == team
-            and isinstance(candidate.get("parent_id"), str)
+            for candidate in self._for_team("agents", team)
+            if isinstance(candidate.get("parent_id"), str)
             and self._same_agent_identifier(
                 team,
                 as_string(candidate.get("parent_id"), "agent.parent_id"),
                 identifier,
             )
-        ]
-        result["phase_refs"] = [
+        )
+        result["phase_refs"] = _sorted_refs(
             phase_ref(phase)
-            for phase in self.phases
-            if _team(phase, "phase") == team
-            and self._same_agent_identifier(
+            for phase in self._for_team("phases", team)
+            if self._same_agent_identifier(
                 team,
                 as_string(phase.get("agent_id"), "phase.agent_id"),
                 identifier,
             )
-        ]
+        )
         _with_times(result, record, "agent")
 
     def _expand_phase(
@@ -3239,7 +4332,7 @@ class TimelineQuery:
         identifier = as_string(record.get("agent_id"), "phase.agent_id")
         result["agent_ref"] = self._agent_reference_for_id(team, identifier)
         relative = as_string(record.get("detail_path"), "phase.detail_path")
-        detail = as_object(read_json(self._detail_file(relative)), relative)
+        detail = as_object(self._read_json(self._detail_file(relative)), relative)
         result["detail"] = (
             detail
             if transcript
@@ -3255,16 +4348,16 @@ class TimelineQuery:
             technical_path = as_string(
                 record.get("technical_path"), "rollup.technical_path"
             )
-            result["technical_markdown"] = self._rollup_file(
-                technical_path, team
-            ).read_text(encoding="utf-8")
+            result["technical_markdown"] = self._read_markdown(
+                self._rollup_file(technical_path, team)
+            )
         if _summary_available(record, "plain_language_summary_available"):
             plain_path = as_string(
                 record.get("plain_language_path"), "rollup.plain_language_path"
             )
-            result["plain_language_markdown"] = self._rollup_file(
-                plain_path, team
-            ).read_text(encoding="utf-8")
+            result["plain_language_markdown"] = self._read_markdown(
+                self._rollup_file(plain_path, team)
+            )
         _with_times(result, record, "rollup")
 
     def search(
@@ -3553,7 +4646,7 @@ class TimelineQuery:
         case_sensitive: bool,
     ) -> list[dict[str, JsonValue]]:
         results: list[dict[str, JsonValue]] = []
-        for record in self.agents:
+        for record in self._scoped("agents", filters):
             team = _team(record, "agent")
             reference = agent_ref(record)
             if not self._selected_team(team, filters):
@@ -3584,7 +4677,7 @@ class TimelineQuery:
                         text=text,
                         start_ms=start_ms,
                     )
-        for record in self.phases:
+        for record in self._scoped("phases", filters):
             team = _team(record, "phase")
             current_agent = self._agent_reference_for_id(
                 team, as_string(record.get("agent_id"), "phase.agent_id")
@@ -3621,7 +4714,7 @@ class TimelineQuery:
         self, needle: str, filters: QueryFilters, case_sensitive: bool
     ) -> list[dict[str, JsonValue]]:
         results: list[dict[str, JsonValue]] = []
-        for record in self.rollups:
+        for record in self._scoped("rollups", filters):
             team = _team(record, "rollup")
             kind = as_string(record.get("kind"), "rollup.kind")
             reference = rollup_ref(record)
@@ -3654,7 +4747,7 @@ class TimelineQuery:
                     )
                 )
             for field, relative in fields:
-                text = self._rollup_file(relative, team).read_text(encoding="utf-8")
+                text = self._read_markdown(self._rollup_file(relative, team))
                 self._match(
                     results,
                     needle=needle,
@@ -3676,7 +4769,7 @@ class TimelineQuery:
         case_sensitive: bool,
     ) -> list[dict[str, JsonValue]]:
         results: list[dict[str, JsonValue]] = []
-        for record in self.phases:
+        for record in self._scoped("phases", filters):
             team = _team(record, "phase")
             current_agent = self._agent_reference_for_id(
                 team, as_string(record.get("agent_id"), "phase.agent_id")
@@ -3689,7 +4782,7 @@ class TimelineQuery:
             if not _overlaps(record, reference, filters.window):
                 continue
             relative = as_string(record.get("detail_path"), "phase.detail_path")
-            detail = as_object(read_json(self._detail_file(relative)), relative)
+            detail = as_object(self._read_json(self._detail_file(relative)), relative)
             transcript = as_array(detail.get("transcript"), f"{relative}.transcript")
             for index, raw_message in enumerate(transcript):
                 message = as_object(raw_message, f"{relative}.transcript[{index}]")
@@ -4691,6 +5784,8 @@ __all__ = [
     "parse_ordinal_range",
     "query_envelope",
     "rollup_ref",
+    "schema_3_completeness",
+    "schema_3_record_counts",
     "team_ref",
 ]
 
