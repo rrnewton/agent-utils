@@ -31,7 +31,7 @@ from tests.timeline_projection import schema_1_timeline_text
 
 ROOT = "00000000-0000-0000-0000-000000000001"
 START = 1_775_000_000_000
-REPOSITORY = "https://github.com/rrnewton/example"
+REPOSITORY = "https://github.com/example-org/example"
 
 
 def _tool(
@@ -139,18 +139,18 @@ def test_extracts_confirmed_commit_push_and_pull_request_without_duplicates() ->
         "push",
         2_000,
         "with-proxy git push origin HEAD:refs/heads/topic",
-        "To https://github.com/rrnewton/example.git\n   1111111..abc1234  HEAD -> topic",
+        "To https://github.com/example-org/example.git\n   1111111..abc1234  HEAD -> topic",
     )
     pull = _tool(
         "pr",
         3_000,
-        "with-proxy gh pr create -R rrnewton/example --title Fix --body body",
-        "https://github.com/rrnewton/example/pull/42\nexit_code=0",
+        "with-proxy gh pr create -R example-org/example --title Fix --body body",
+        "https://github.com/example-org/example/pull/42\nexit_code=0",
     )
     mention = _event(
         "mention",
         4_000,
-        "The output is https://github.com/rrnewton/example/pull/42.",
+        "The output is https://github.com/example-org/example/pull/42.",
     )
 
     catalog = extract_artifacts(_team(events=(mention,), tools=(commit, push, pull)))
@@ -207,13 +207,13 @@ def test_artifact_range_index_preserves_half_open_output_and_dedupe_semantics() 
         "push",
         2_000,
         "git push origin HEAD:refs/heads/topic",
-        "To https://github.com/rrnewton/example.git\n"
+        "To https://github.com/example-org/example.git\n"
         "   1111111..abc1234  HEAD -> topic",
     )
     reference = _event(
         "reference",
         3_000,
-        "Review https://github.com/rrnewton/example/commit/abc1234.",
+        "Review https://github.com/example-org/example/commit/abc1234.",
     )
     catalog = extract_artifacts(_team(events=(reference,), tools=(commit, push)))
     artifact = next(item for item in catalog.artifacts if item.kind is ArtifactKind.COMMIT)
@@ -249,13 +249,13 @@ def test_policy_search_and_failed_commands_never_claim_outputs() -> None:
         1_000,
         "rg -n 'git commit|git push|gh pr create' docs",
         "example: [main deadbee] Not an executed commit\n"
-        "https://github.com/rrnewton/example/pull/7",
+        "https://github.com/example-org/example/pull/7",
     )
     failed_create = _tool(
         "failed-pr",
         2_000,
-        "with-proxy gh pr create -R rrnewton/example --title Nope --body Nope",
-        "https://github.com/rrnewton/example/pull/8\nfatal: authentication failed\nexit=128",
+        "with-proxy gh pr create -R example-org/example --title Nope --body Nope",
+        "https://github.com/example-org/example/pull/8\nfatal: authentication failed\nexit=128",
     )
     commit = _tool(
         "commit",
@@ -298,7 +298,7 @@ def test_multiline_quoted_pr_body_keeps_true_command_boundary() -> None:
     create = _tool(
         "multiline-pr",
         1_000,
-        "with-proxy gh pr create -R rrnewton/example --title Fix "
+        "with-proxy gh pr create -R example-org/example --title Fix "
         "--body 'Summary\nThe prose says git commit and git push, but executes neither.'",
         REPOSITORY + "/pull/13",
     )
@@ -403,7 +403,7 @@ def test_ingest_writes_catalog_before_redacting_tool_payloads(tmp_path: Path) ->
             _tool(
                 "pr",
                 1_000,
-                "with-proxy gh pr create -R rrnewton/example --title Fix --body body",
+                "with-proxy gh pr create -R example-org/example --title Fix --body body",
                 REPOSITORY + "/pull/55",
             ),
         )
@@ -435,7 +435,7 @@ def test_build_associates_catalog_with_phase_agent_and_rollups(tmp_path: Path) -
             _tool(
                 "pr",
                 10_000,
-                "with-proxy gh pr create -R rrnewton/example --title Fix --body body",
+                "with-proxy gh pr create -R example-org/example --title Fix --body body",
                 REPOSITORY + "/pull/56",
             ),
         )
@@ -498,7 +498,7 @@ def test_ingest_never_persists_cwd_or_repository_credentials(tmp_path: Path) -> 
     unsafe_source = replace(
         team.sources[0],
         working_directory="/home/private/customer/project",
-        repository_url="https://alice:supersecret@github.com/rrnewton/example.git",
+        repository_url="https://alice:supersecret@github.com/example-org/example.git",
     )
     unsafe_team = replace(team, sources=(unsafe_source,))
 

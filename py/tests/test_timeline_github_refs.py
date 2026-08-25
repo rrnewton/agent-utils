@@ -25,7 +25,7 @@ def test_explicit_pull_url_produces_canonical_link_metadata() -> None:
 
 
 def test_explicit_pull_url_uses_base_pr_url_before_files_suffix() -> None:
-    text = "Inspect https://github.com/rrnewton/dev-widget/pull/42/files."
+    text = "Inspect https://github.com/example-org/dev-widget/pull/42/files."
 
     (reference,) = find_pull_request_references(text)
 
@@ -34,24 +34,24 @@ def test_explicit_pull_url_uses_base_pr_url_before_files_suffix() -> None:
 
 
 def test_qualified_owner_repository_reference_needs_no_context() -> None:
-    text = "Follow up in rrnewton/dev-widget#1087, then report back."
+    text = "Follow up in example-org/dev-widget#1087, then report back."
 
     (reference,) = find_pull_request_references(text)
 
     assert reference.kind is PullRequestReferenceKind.QUALIFIED
-    assert reference.text == "rrnewton/dev-widget#1087"
-    assert reference.link.repository == GitHubRepository("rrnewton", "dev-widget")
-    assert reference.link.url == "https://github.com/rrnewton/dev-widget/pull/1087"
+    assert reference.text == "example-org/dev-widget#1087"
+    assert reference.link.repository == GitHubRepository("example-org", "dev-widget")
+    assert reference.link.url == "https://github.com/example-org/dev-widget/pull/1087"
 
 
 def test_pr_number_uses_explicit_string_repository_context() -> None:
     text = "PR #38 fixes the scheduling regression."
 
-    (reference,) = find_pull_request_references(text, "rrnewton/dev-widget")
+    (reference,) = find_pull_request_references(text, "example-org/dev-widget")
 
     assert reference.kind is PullRequestReferenceKind.REPOSITORY_CONTEXT
     assert reference.text == "PR #38"
-    assert reference.link.repository.slug == "rrnewton/dev-widget"
+    assert reference.link.repository.slug == "example-org/dev-widget"
     assert reference.link.number == 38
 
 
@@ -71,7 +71,7 @@ def test_pr_number_without_repository_context_remains_plain_text() -> None:
 def test_naked_number_remains_plain_text_even_with_repository_context() -> None:
     text = "Compare #38 with issue #7 and milestone #4."
 
-    assert find_pull_request_references(text, "rrnewton/dev-widget") == ()
+    assert find_pull_request_references(text, "example-org/dev-widget") == ()
 
 
 def test_unrelated_urls_and_github_issues_are_not_pull_requests() -> None:

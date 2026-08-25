@@ -1588,7 +1588,7 @@ test("the header identifies the project, execution host, and archive timezone", 
   await expect(heading).toHaveText("Agent Timeline: dev-widget, devbig014");
   await expect(heading.getByRole("link", { name: "dev-widget" })).toHaveAttribute(
     "href",
-    "https://github.com/rrnewton/dev-widget"
+    "https://github.com/example-org/dev-widget"
   );
   await expect(heading.getByRole("link", { name: "dev-widget" })).toHaveAttribute(
     "rel",
@@ -2038,7 +2038,7 @@ test("full-transcript role filters support user-only, none, and all", async func
     "transcript entries do not expose normalized data-role values yet"
   );
   expect(await entries.count()).toBe(5);
-  const pullRequest = page.locator('.pr-reference[href="https://github.com/rrnewton/dev-widget/pull/38"]');
+  const pullRequest = page.locator('.pr-reference[href="https://github.com/example-org/dev-widget/pull/38"]');
   await expect(pullRequest).toHaveAttribute("title", "Repair malformed-input handling");
 
   await filters.getByRole("button", { name: /user only/i }).click();
@@ -2238,11 +2238,11 @@ test("artifact outputs and references stay distinct across phase, rollup, and ag
   const pullRequest = outputs.locator('[data-artifact-id="artifact-pr38"] .artifact-primary-link');
   await expect(pullRequest).toHaveAttribute(
     "href",
-    "https://github.com/rrnewton/dev-widget/pull/38"
+    "https://github.com/example-org/dev-widget/pull/38"
   );
   await expect(pullRequest).toHaveAttribute("target", "_blank");
   await expect(pullRequest).toHaveAttribute("rel", "noopener noreferrer");
-  await expect(outputs.locator(".artifact-project-link")).toHaveText("rrnewton/dev-widget");
+  await expect(outputs.locator(".artifact-project-link")).toHaveText("example-org/dev-widget");
 
   const unsafeCard = references.locator('[data-artifact-id="artifact-unsafe-link"]');
   await expect(unsafeCard.locator("a.artifact-primary-link")).toHaveCount(0);

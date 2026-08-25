@@ -2310,7 +2310,7 @@ def test_classifies_orc_inputs_from_user_source_and_extra(tmp_path: Path) -> Non
                 }
             ),
             None,
-            json.dumps({"sender_display_name": "Ryan Newton"}),
+            json.dumps({"sender_display_name": "Alice Doe"}),
         ),
         (
             "gchat-other",

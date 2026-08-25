@@ -14,12 +14,12 @@ from agent_team_timeline.identity import (
 
 
 def test_repository_remotes_become_safe_browser_urls() -> None:
-    assert canonical_repository_url("git@github.com:rrnewton/dev-widget.git") == (
-        "https://github.com/rrnewton/dev-widget"
+    assert canonical_repository_url("git@github.com:example-org/dev-widget.git") == (
+        "https://github.com/example-org/dev-widget"
     )
     assert canonical_repository_url(
-        "https://GitHub.com/rrnewton/agent-utils.git?token=secret#fragment"
-    ) == "https://github.com/rrnewton/agent-utils"
+        "https://GitHub.com/example-org/agent-utils.git?token=secret#fragment"
+    ) == "https://github.com/example-org/agent-utils"
 
 
 def test_structured_codex_metadata_infers_projects_without_prompt_scanning() -> None:
@@ -28,13 +28,13 @@ def test_structured_codex_metadata_infers_projects_without_prompt_scanning() -> 
             {
                 "cwd": "/home/newton/work/dev-widget",
                 "git": {
-                    "repository_url": "https://github.com/rrnewton/dev-widget.git"
+                    "repository_url": "https://github.com/example-org/dev-widget.git"
                 },
             },
             {
                 "cwd": "/home/newton/work/agent-utils",
                 "git": {
-                    "repository_url": "git@github.com:rrnewton/agent-utils.git"
+                    "repository_url": "git@github.com:example-org/agent-utils.git"
                 },
                 "hostname": "devbig014.example.com",
             },
@@ -56,7 +56,7 @@ def test_identity_merge_accumulates_distinct_projects_and_hosts() -> None:
         (
             ProjectIdentity(
                 "dev-widget",
-                "https://github.com/rrnewton/dev-widget",
+                "https://github.com/example-org/dev-widget",
                 True,
                 "session_metadata",
             ),
@@ -68,7 +68,7 @@ def test_identity_merge_accumulates_distinct_projects_and_hosts() -> None:
     inferred = (
         ProjectIdentity(
             "agent-utils",
-            "https://github.com/rrnewton/agent-utils",
+            "https://github.com/example-org/agent-utils",
             True,
             "session_metadata",
         ),
@@ -107,7 +107,7 @@ def test_site_identity_json_round_trip() -> None:
         (
             ProjectIdentity(
                 "dev-widget",
-                "https://github.com/rrnewton/dev-widget",
+                "https://github.com/example-org/dev-widget",
                 True,
                 "explicit",
             ),

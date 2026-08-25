@@ -571,7 +571,7 @@ mod tests {
             "channel_id": "123",
             "content": "first",
             "timestamp": "2026-08-18T12:00:00.000000+00:00",
-            "author": { "id": "400000000000000004", "username": "rrnewton", "global_name": "Ryan", "bot": false }
+            "author": { "id": "400000000000000004", "username": "alice", "global_name": "Alice Doe", "bot": false }
           }
         ])
     }
@@ -596,7 +596,7 @@ mod tests {
             "channel_id": "123",
             "content": "asking you",
             "timestamp": "2026-08-18T12:00:00.000000+00:00",
-            "author": { "id": "4", "username": "rrnewton", "global_name": "Ryan", "bot": false }
+            "author": { "id": "4", "username": "alice", "global_name": "Alice Doe", "bot": false }
           }
         ]);
         let messages = parse_message_list(&payload).expect("parses");
@@ -634,7 +634,10 @@ mod tests {
         let messages = parse_message_list(&sample_payload()).expect("parses");
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].content, "first");
-        assert_eq!(messages[0].author, "Ryan", "global_name wins over username");
+        assert_eq!(
+            messages[0].author, "Alice Doe",
+            "global_name wins over username"
+        );
         assert!(!messages[0].author_is_bot);
         assert_eq!(messages[1].content, "second");
         assert_eq!(

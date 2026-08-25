@@ -899,7 +899,7 @@ async fn every_rendered_message_carries_its_authors_snowflake() {
     let channel = ChannelId(WRITE_CHANNEL.to_owned());
     harness
         .discord
-        .seed(&channel, "rrnewton", "who is watching the mac runner");
+        .seed(&channel, "alice", "who is watching the mac runner");
     // A BOT author, on purpose: addressing another coding agent by mention is a thing the owner
     // legitimately wants, and a payload that carried ids only for humans would fail here.
     harness.discord.seed(
@@ -909,7 +909,7 @@ async fn every_rendered_message_carries_its_authors_snowflake() {
     );
     let human = harness
         .discord
-        .author_id("rrnewton")
+        .author_id("alice")
         .expect("the fake assigned the human an id");
     let bot = harness
         .discord
@@ -928,7 +928,7 @@ async fn every_rendered_message_carries_its_authors_snowflake() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let messages = payload["messages"].as_array().expect("array");
-    assert_eq!(messages[0]["author"], "rrnewton");
+    assert_eq!(messages[0]["author"], "alice");
     assert_eq!(messages[0]["author_id"], human.as_str());
     assert_eq!(messages[1]["author"], "coder-bot");
     assert_eq!(

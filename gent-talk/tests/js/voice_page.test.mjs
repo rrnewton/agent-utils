@@ -1051,7 +1051,7 @@ function newPage(store = new Map(), script = SCRIPT) {
         posted: {
           id: "9000000000000000001",
           channel_id: CHANNEL.id,
-          author: "rrnewton",
+          author: "alice",
           author_id: "1000000000000000009",
           author_is_bot: false,
           timestamp: "2026-08-19T20:40:00.000Z",
@@ -4667,11 +4667,11 @@ test("every raw message shows its author and its message id", async () => {
   const page = newPage();
   await signIn(page);
 
-  const lines = await showDiscord(page, [message({ id: "999888777666555444", author: "rrnewton", author_is_bot: false })]);
+  const lines = await showDiscord(page, [message({ id: "999888777666555444", author: "alice", author_is_bot: false })]);
 
   assert.equal(lines.length, 1);
   const text = lines[0].text();
-  assert.match(text, /rrnewton/);
+  assert.match(text, /alice/);
   assert.match(text, /999888777666555444/, "the message id is what makes this view worth having");
   assert.match(text, /2026-08-19 04:31/);
   // `#62 message-count-accuracy`, carried across from web/app.js. The fixture sends no `complete`,
@@ -7687,7 +7687,7 @@ test("REPLYING TEACHES THE PAGE WHICH ACCOUNT IS ITS OWN, AND THAT ACCOUNT IS 'M
   const again = newPage(store);
   await signIn(again);
   await showDiscord(again, [
-    message({ id: "1000000000000000050", author: "Ryan Voice Bot", author_id: "1000000000000000009", author_is_bot: true }),
+    message({ id: "1000000000000000050", author: "My Voice Bot", author_id: "1000000000000000009", author_is_bot: true }),
   ]);
   assert.equal(
     whoOf(again, 0),

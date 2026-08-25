@@ -290,13 +290,13 @@ const timeline = {
     projects: [
       {
         label: "dev-widget",
-        repository_url: "https://github.com/rrnewton/dev-widget",
+        repository_url: "https://github.com/example-org/dev-widget",
         primary: true,
         source: "session_metadata"
       },
       {
         label: "agent-utils",
-        repository_url: "https://github.com/rrnewton/agent-utils",
+        repository_url: "https://github.com/example-org/agent-utils",
         primary: false,
         source: "session_metadata"
       },
@@ -391,7 +391,7 @@ const timeline = {
   ]
 };
 
-const pullUrl = "https://github.com/rrnewton/dev-widget/pull/38";
+const pullUrl = "https://github.com/example-org/dev-widget/pull/38";
 const pullText = "I will trace the malformed-input path for " + pullUrl + ".";
 
 const phaseADetail = {
@@ -423,7 +423,7 @@ const phaseADetail = {
         end: pullText.indexOf(pullUrl) + pullUrl.length,
         text: pullUrl,
         kind: "explicit_url",
-        repository: "rrnewton/dev-widget",
+        repository: "example-org/dev-widget",
         number: 38,
         url: pullUrl,
         title: "Repair malformed-input handling"
@@ -472,11 +472,11 @@ const artifactCatalog = {
       kind: "pull_request",
       locator: pullUrl,
       url: pullUrl,
-      label: "rrnewton/dev-widget PR #38",
+      label: "example-org/dev-widget PR #38",
       title: "Repair malformed-input handling",
       external_id: "38",
-      project_url: "https://github.com/rrnewton/dev-widget",
-      project_slug: "rrnewton/dev-widget",
+      project_url: "https://github.com/example-org/dev-widget",
+      project_slug: "example-org/dev-widget",
       producer_thread_id: "agent-a",
       produced_at_ms: BASE_MS + 12 * minute,
       evidence: [
@@ -499,13 +499,13 @@ const artifactCatalog = {
     {
       artifact_id: REFERENCE_ARTIFACT_ID,
       kind: "issue",
-      locator: "https://github.com/rrnewton/dev-widget/issues/41",
-      url: "https://github.com/rrnewton/dev-widget/issues/41",
-      label: "rrnewton/dev-widget issue #41",
+      locator: "https://github.com/example-org/dev-widget/issues/41",
+      url: "https://github.com/example-org/dev-widget/issues/41",
+      label: "example-org/dev-widget issue #41",
       title: "Harden malformed-input diagnostics",
       external_id: "41",
-      project_url: "https://github.com/rrnewton/dev-widget",
-      project_slug: "rrnewton/dev-widget",
+      project_url: "https://github.com/example-org/dev-widget",
+      project_slug: "example-org/dev-widget",
       producer_thread_id: null,
       produced_at_ms: null,
       evidence: [
@@ -520,7 +520,7 @@ const artifactCatalog = {
           relation: "referenced",
           action: "mentioned",
           confidence: "high",
-          matched_text: "https://github.com/rrnewton/dev-widget/issues/41",
+          matched_text: "https://github.com/example-org/dev-widget/issues/41",
           extractor: "work-artifacts-v1"
         }
       ]
@@ -559,8 +559,8 @@ const artifactCatalog = {
     {
       project_id: "project-dev-widget",
       host: "github.com",
-      slug: "rrnewton/dev-widget",
-      url: "https://github.com/rrnewton/dev-widget",
+      slug: "example-org/dev-widget",
+      url: "https://github.com/example-org/dev-widget",
       evidence_ids: ["evidence-pr38-produced"]
     }
   ]

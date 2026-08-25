@@ -1157,7 +1157,7 @@ def test_build_embeds_standalone_site_identity(tmp_path: Path) -> None:
         (
             ProjectIdentity(
                 "dev-widget",
-                "https://github.com/rrnewton/dev-widget",
+                "https://github.com/example-org/dev-widget",
                 True,
                 "session_metadata",
             ),
@@ -1189,7 +1189,7 @@ def test_build_embeds_standalone_site_identity(tmp_path: Path) -> None:
 
 def test_phase_details_emit_conservative_pull_request_link_spans(tmp_path: Path) -> None:
     team = _team(
-        "Reviewed https://github.com/rrnewton/dev-widget/pull/38 and "
+        "Reviewed https://github.com/example-org/dev-widget/pull/38 and "
         "sched-ext/scx#3668; naked #7 is ambiguous."
     )
     _write_team(tmp_path, team)
@@ -1208,7 +1208,7 @@ def test_phase_details_emit_conservative_pull_request_link_spans(tmp_path: Path)
     )
     references = entry["pull_requests"]
     assert [reference["repository"] for reference in references] == [
-        "rrnewton/dev-widget",
+        "example-org/dev-widget",
         "sched-ext/scx",
     ]
     assert [reference["number"] for reference in references] == [38, 3668]
@@ -1219,15 +1219,15 @@ def test_phase_details_emit_conservative_pull_request_link_spans(tmp_path: Path)
     assert all(reference["text"] != "#7" for reference in references)
 
     pull = PullRequestMetadata(
-        key=PullRequestKey("rrnewton/dev-widget", 38),
+        key=PullRequestKey("example-org/dev-widget", 38),
         title="Repair archive refresh",
         state="closed",
         draft=False,
         merged_at="2026-08-05T10:00:00Z",
         body_excerpt="Makes refresh append-safe.",
         base_ref="main",
-        head_label="rrnewton:archive-refresh",
-        author="rrnewton",
+        head_label="example-org:archive-refresh",
+        author="alice",
         updated_at="2026-08-05T10:00:00Z",
         etag='W/"pull-38"',
         fetched_at="2026-08-05T11:00:00Z",

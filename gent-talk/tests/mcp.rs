@@ -955,7 +955,7 @@ async fn every_tool_result_carries_a_usable_mention_and_a_reply_built_from_it_pi
     let channel = ChannelId(WRITE_CHANNEL.to_owned());
     harness
         .discord
-        .seed(&channel, "rrnewton", "who has the mac runner");
+        .seed(&channel, "alice", "who has the mac runner");
     harness.discord.seed(
         &channel,
         "coder-bot",

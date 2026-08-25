@@ -55,7 +55,7 @@ def _manifest(output: str = "../summary/widget") -> dict[str, object]:
         "projects": [
             {
                 "label": "dev-widget",
-                "repository_url": "https://github.com/rrnewton/dev-widget.git",
+                "repository_url": "https://github.com/example-org/dev-widget.git",
             }
         ],
         "source_hosts": ["shared.example.com"],
@@ -166,7 +166,7 @@ def test_load_project_config_resolves_paths_and_provider_schema(tmp_path: Path) 
     assert codex.date_window is not None
     assert codex.date_window.start_date == "2026-08-01"
     assert codex.identity_overrides.projects[0].repository_url == (
-        "https://github.com/rrnewton/dev-widget"
+        "https://github.com/example-org/dev-widget"
     )
     assert codex.identity_overrides.hosts[0].hostname == "codex.example.com"
     assert isinstance(claude.source, ClaudeProjectSource)

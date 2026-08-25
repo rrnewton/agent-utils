@@ -228,7 +228,7 @@ function newPage(
     entries: [
       {
         id: "9000000000000000001",
-        author: "rrnewton",
+        author: "alice",
         timestamp: "2026-08-19T20:40:00.000Z",
         spoken_time: "2026-08-19 13:40 PDT",
         summary: "the arm64 job never reported",
@@ -238,7 +238,7 @@ function newPage(
       {
         id: "9000000000000000001",
         channel_id: CHANNEL.id,
-        author: "rrnewton",
+        author: "alice",
         author_is_bot: false,
         timestamp: "2026-08-19T20:40:00.000Z",
         spoken_time: "2026-08-19 13:40 PDT",
