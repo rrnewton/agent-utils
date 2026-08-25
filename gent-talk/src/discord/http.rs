@@ -4,10 +4,16 @@
 //! payload maps onto [`Message`] — are pure functions below, and they are unit-tested. The async
 //! wrapper around them is deliberately thin, because it is the only part that cannot be tested
 //! without a live token.
+//!
+//! The one piece of judgment that used to live in that thin wrapper — what to do about a **429** —
+//! has been moved out into [`super::ratelimit`], which is transport-agnostic and is exercised both
+//! by its own tests and by [`super::fake::FakeDiscord`]. What remains here is reading the headers
+//! off a reqwest response and handing them over.
 
 use async_trait::async_trait;
 use serde_json::json;
 
+use super::ratelimit::{parse_rate_limit, Attempt, Headers, RateLimiter};
 use super::{DiscordClient, DiscordError};
 use crate::config::{DiscordConfig, Secret};
 use crate::model::{ChannelId, Message, MessageId, UserId};
@@ -246,12 +252,39 @@ pub fn parse_message_list(value: &serde_json::Value) -> Result<Vec<Message>, Dis
     Ok(messages)
 }
 
+/// Copy the headers this client reads out of a reqwest response.
+///
+/// Only the rate-limit family, and only when the value is valid ASCII — nothing else here has any
+/// use for a header, and copying the whole map would put an `Authorization` echo or a cookie into
+/// a struct that ends up in a log line.
+fn rate_limit_headers(headers: &reqwest::header::HeaderMap) -> Headers {
+    const READ: [&str; 6] = [
+        "retry-after",
+        "x-ratelimit-bucket",
+        "x-ratelimit-global",
+        "x-ratelimit-remaining",
+        "x-ratelimit-reset-after",
+        "x-ratelimit-scope",
+    ];
+    let mut out = Headers::new();
+    for name in READ {
+        if let Some(value) = headers.get(name).and_then(|value| value.to_str().ok()) {
+            out = out.with(name, value);
+        }
+    }
+    out
+}
+
 /// A live Discord client.
 #[derive(Debug)]
 pub struct HttpDiscordClient {
     client: reqwest::Client,
     api_base: String,
     authorization: String,
+    /// Discord's rate limits, obeyed. Shared by every request this client makes, which is what
+    /// lets one channel's 429 stop the *next* request on that channel before it is sent, and a
+    /// global 429 stop all of them. See [`super::ratelimit`].
+    limiter: RateLimiter,
 }
 
 impl HttpDiscordClient {
@@ -274,42 +307,69 @@ impl HttpDiscordClient {
             client,
             api_base: config.api_base.clone(),
             authorization: authorization_header(&config.bot_token),
+            limiter: RateLimiter::new(),
         })
     }
 
+    /// The rate-limit state this client shares across every request.
+    #[must_use]
+    pub fn limiter(&self) -> &RateLimiter {
+        &self.limiter
+    }
+
+    /// Send a prepared request, obeying Discord's rate limits within a bounded budget.
+    ///
+    /// The retry lives here rather than in the caller because the bucket state has to be shared:
+    /// a per-caller retry would have every route rediscovering the same closed window one rejected
+    /// request at a time.
     async fn send(&self, request: PreparedRequest) -> Result<serde_json::Value, DiscordError> {
         let method = match request.method {
             "GET" => reqwest::Method::GET,
             "POST" => reqwest::Method::POST,
             other => return Err(DiscordError::Refused(format!("unsupported method {other}"))),
         };
-        let mut builder = self
-            .client
-            .request(method, &request.url)
-            .header(reqwest::header::AUTHORIZATION, &self.authorization);
-        if let Some(body) = request.body {
-            builder = builder.json(&body);
-        }
-        let response = builder
-            .send()
+        let url = &request.url;
+        let body = request.body.as_ref();
+        self.limiter
+            .run(request.method, url, || async {
+                let mut builder = self
+                    .client
+                    .request(method.clone(), url)
+                    .header(reqwest::header::AUTHORIZATION, &self.authorization);
+                if let Some(body) = body {
+                    builder = builder.json(body);
+                }
+                let response = builder
+                    .send()
+                    .await
+                    .map_err(|e| DiscordError::Transport(e.to_string()))?;
+                let status = response.status();
+                let headers = rate_limit_headers(response.headers());
+                let text = response
+                    .text()
+                    .await
+                    .map_err(|e| DiscordError::Transport(e.to_string()))?;
+                // Before the generic failure path: a 429 is an instruction to wait, not an error
+                // to report. Surfacing it as one is what used to turn a transient burst into an
+                // HTTP 502 for whoever asked the question.
+                if let Some(limit) = parse_rate_limit(status.as_u16(), &headers, &text) {
+                    return Ok(Attempt::Limited(limit));
+                }
+                if !status.is_success() {
+                    // Truncate: a Discord error body is short, but an intermediary's error page is
+                    // not, and this string ends up in a log.
+                    let mut body = text;
+                    body.truncate(500);
+                    return Err(DiscordError::Status {
+                        status: status.as_u16(),
+                        body,
+                    });
+                }
+                let value: serde_json::Value =
+                    serde_json::from_str(&text).map_err(|e| DiscordError::Shape(e.to_string()))?;
+                Ok(Attempt::Done(value, headers))
+            })
             .await
-            .map_err(|e| DiscordError::Transport(e.to_string()))?;
-        let status = response.status();
-        let text = response
-            .text()
-            .await
-            .map_err(|e| DiscordError::Transport(e.to_string()))?;
-        if !status.is_success() {
-            // Truncate: a Discord error body is short, but an intermediary's error page is not,
-            // and this string ends up in a log.
-            let mut body = text;
-            body.truncate(500);
-            return Err(DiscordError::Status {
-                status: status.as_u16(),
-                body,
-            });
-        }
-        serde_json::from_str(&text).map_err(|e| DiscordError::Shape(e.to_string()))
     }
 }
 
@@ -347,6 +407,36 @@ mod tests {
 
     fn channel() -> ChannelId {
         ChannelId("123".to_owned())
+    }
+
+    #[test]
+    fn only_the_rate_limit_headers_are_copied_off_a_response() {
+        // Two properties at once. The rate-limit family must survive, or the client cannot obey a
+        // limit it was told about; and nothing else may, because this struct is what a WARN line
+        // prints and a response can carry a `set-cookie` or an authorization echo.
+        let mut raw = reqwest::header::HeaderMap::new();
+        raw.insert("retry-after", "1".parse().expect("ascii"));
+        raw.insert("X-RateLimit-Bucket", "abcd".parse().expect("ascii"));
+        raw.insert("x-ratelimit-remaining", "0".parse().expect("ascii"));
+        raw.insert("x-ratelimit-reset-after", "1.25".parse().expect("ascii"));
+        raw.insert("x-ratelimit-scope", "user".parse().expect("ascii"));
+        raw.insert("set-cookie", "session=secret".parse().expect("ascii"));
+        raw.insert("authorization", "Bot abc".parse().expect("ascii"));
+
+        let headers = rate_limit_headers(&raw);
+        assert_eq!(headers.get("Retry-After"), Some("1"));
+        assert_eq!(headers.get("x-ratelimit-bucket"), Some("abcd"));
+        assert_eq!(
+            super::super::ratelimit::exhausted_for(&headers),
+            Some(std::time::Duration::from_millis(1250)),
+            "the bucket accounting has to survive the copy, or nothing can be preempted"
+        );
+        assert_eq!(headers.get("set-cookie"), None);
+        assert_eq!(
+            headers.get("authorization"),
+            None,
+            "a header struct that ends up in a log must not carry a credential"
+        );
     }
 
     #[test]

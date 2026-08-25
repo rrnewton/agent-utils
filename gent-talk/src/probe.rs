@@ -193,8 +193,9 @@ impl Diagnosis {
                  re-check the invite."
             }
             Self::RateLimited => {
-                "Wait and restart. If it recurs immediately, something else is sharing this bot \
-                 token and burning its rate limit."
+                "Wait and restart. The client already waited the time Discord asked for and the \
+                 limit did not clear inside its budget, so something else is very likely sharing \
+                 this bot token and burning its rate limit."
             }
             Self::UnexpectedStatus { .. } => {
                 "Read the status and body above. A 5xx is Discord's own outage and a restart in a \
@@ -337,6 +338,9 @@ fn classify(error: &DiscordError) -> Diagnosis {
         DiscordError::Transport(detail) => Diagnosis::Unreachable(detail.clone()),
         DiscordError::Shape(detail) => Diagnosis::Unintelligible(detail.clone()),
         DiscordError::Refused(detail) => Diagnosis::Refused(detail.clone()),
+        // The client already waited this out and could not clear it, so the probe learned nothing
+        // about readability — exactly what a bare 429 used to mean here, and still does.
+        DiscordError::RateLimited(_) => Diagnosis::RateLimited,
         DiscordError::Status { status, body } => match (*status, discord_error_code(body)) {
             (401, _) => Diagnosis::InvalidToken,
             (_, Some(DISCORD_MISSING_ACCESS)) => Diagnosis::NoAccess,

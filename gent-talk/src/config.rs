@@ -242,10 +242,13 @@ pub struct DiscordConfig {
     pub max_count_scan: u32,
     /// How often each configured channel is polled for messages nobody asked for. `0` is OFF.
     ///
-    /// **Off by default.** Every tick is one Discord request per channel against a rate limit this
-    /// server does not handle — no `Retry-After`, and a 429 surfaces as HTTP 502 — so turning it
-    /// on is a decision an operator makes with that in front of them, not a thing that happens
-    /// because they upgraded. Refused below [`crate::live::MIN_POLL_SECONDS`].
+    /// **Off by default.** Every tick is one Discord request per channel against a shared rate
+    /// limit. The client now obeys `Retry-After` within a bounded budget
+    /// ([`crate::discord::ratelimit`]), so a burst is waited out rather than surfaced as a gateway
+    /// error — but waiting is not extra quota, and a poll that runs whether or not anybody is
+    /// listening spends the same quota the questions do. Turning it on is a decision an operator
+    /// makes with that in front of them, not a thing that happens because they upgraded. Refused
+    /// below [`crate::live::MIN_POLL_SECONDS`].
     pub live_poll_seconds: u64,
 }
 
@@ -561,8 +564,8 @@ impl Config {
                 field: "discord.live_poll_seconds".to_owned(),
                 detail: format!(
                     "{live_poll_seconds} is below the {} second floor. Every tick is one Discord \
-                     request per channel against a rate limit this server does not handle; use 0 \
-                     to turn live ingestion off.",
+                     request per channel against a shared rate limit, and obeying Retry-After \
+                     buys time, not quota; use 0 to turn live ingestion off.",
                     crate::live::MIN_POLL_SECONDS
                 ),
             });

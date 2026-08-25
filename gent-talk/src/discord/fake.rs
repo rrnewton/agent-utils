@@ -14,12 +14,26 @@
 //! been seeded or explicitly registered, and a fetch or post aimed at any other id answers the way
 //! Discord answers for a channel a bot cannot see — HTTP 404, `Unknown Channel`, code 10003. That
 //! is what makes [`crate::probe`] a real check when it runs against this fake.
+//!
+//! # It must be able to say "not so fast"
+//!
+//! For the same reason it can 404, it can **429**. [`FakeDiscord::rate_limit_next`] queues
+//! Discord's own rate-limit answer — the JSON body with `retry_after` in fractional seconds and a
+//! `global` flag — and [`FakeDiscord::set_bucket`] makes its successful answers carry Discord's
+//! `X-RateLimit-*` accounting. Both go through the SAME [`super::ratelimit::RateLimiter`] the live
+//! client uses, so a test written here exercises production's waiting, its bucket bookkeeping and
+//! its loud exhaustion rather than a second implementation of them.
+//!
+//! What it is not is evidence about live Discord. The header names and the body shape are from the
+//! documentation; the first real 429 will be the first real 429.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use async_trait::async_trait;
 
+use super::ratelimit::{Attempt, Headers, RateLimit, RateLimiter, RetryPolicy};
 use super::{DiscordClient, DiscordError};
 use crate::config::DEFAULT_DISCORD_API_BASE;
 use crate::model::{sort_oldest_first, ChannelId, Message, MessageId, UserId};
@@ -39,6 +53,8 @@ pub struct PostedMessage {
 #[derive(Debug, Default)]
 pub struct FakeDiscord {
     state: Mutex<State>,
+    /// The real rate-limit engine, not a stand-in for it. See the module documentation.
+    limiter: RateLimiter,
 }
 
 #[derive(Debug, Default)]
@@ -53,6 +69,11 @@ struct State {
     /// mentioned the wrong person.
     authors: BTreeMap<String, UserId>,
     fail_with: Option<String>,
+    /// Queued rate-limit answers. Each one is spent by the next request that is actually SENT, so
+    /// a request the limiter held back does not consume one.
+    rate_limits: VecDeque<RateLimit>,
+    /// The `X-RateLimit-*` accounting successful answers carry, when a test asked for any.
+    bucket_headers: Headers,
 }
 
 impl FakeDiscord {
@@ -60,6 +81,54 @@ impl FakeDiscord {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// An empty fake whose rate-limit budget is `policy` rather than production's.
+    ///
+    /// Tests that need EXHAUSTION reachable use this; everything else takes the real bounds, so
+    /// the ordinary suite is measuring the ordinary policy.
+    #[must_use]
+    pub fn with_retry_policy(policy: RetryPolicy) -> Self {
+        Self {
+            state: Mutex::new(State::default()),
+            limiter: RateLimiter::with_policy(policy),
+        }
+    }
+
+    /// The rate-limit engine this fake shares with the live client.
+    #[must_use]
+    pub fn limiter(&self) -> &RateLimiter {
+        &self.limiter
+    }
+
+    /// Answer the next `count` requests with Discord's own 429, asking for `retry_after`.
+    ///
+    /// `global` picks which kind: a per-route bucket limit, or the whole-token one that stops
+    /// every channel at once. Queued rather than sticky, so a test can say "rate-limited twice,
+    /// then fine" and watch the retry actually clear it.
+    pub fn rate_limit_next(&self, count: usize, retry_after: Duration, global: bool) {
+        let mut state = self.lock();
+        for _ in 0..count {
+            state.rate_limits.push_back(RateLimit {
+                retry_after,
+                global,
+                bucket: None,
+                scope: Some(if global { "global" } else { "user" }.to_owned()),
+            });
+        }
+    }
+
+    /// Make successful answers carry Discord's bucket accounting.
+    ///
+    /// `remaining: 0` is Discord saying the next request on this bucket is going to be rejected;
+    /// the limiter is expected to wait `reset_after` out rather than spend it.
+    pub fn set_bucket(&self, remaining: u64, reset_after: Duration) {
+        self.lock().bucket_headers = Headers::new()
+            .with("x-ratelimit-remaining", &remaining.to_string())
+            .with(
+                "x-ratelimit-reset-after",
+                &format!("{:.3}", reset_after.as_secs_f64()),
+            );
     }
 
     /// Declare that this fake has `channel`, without putting anything in it.
@@ -228,6 +297,16 @@ impl FakeDiscord {
         self.lock().fail_with.take().map(DiscordError::Transport)
     }
 
+    /// The rate-limit answer this request gets, if one is queued for it.
+    fn take_rate_limit(&self) -> Option<RateLimit> {
+        self.lock().rate_limits.pop_front()
+    }
+
+    /// The headers a successful answer carries.
+    fn success_headers(&self) -> Headers {
+        self.lock().bucket_headers.clone()
+    }
+
     /// Discord's own answer for a channel this bot cannot see, byte for byte in shape, so that
     /// [`crate::probe`] classifies it through exactly the code path a live 404 takes.
     fn unknown_channel(&self, channel: &ChannelId) -> Option<DiscordError> {
@@ -250,46 +329,60 @@ impl DiscordClient for FakeDiscord {
         before: Option<&MessageId>,
         after: Option<&MessageId>,
     ) -> Result<Vec<Message>, DiscordError> {
-        self.lock().fetches += 1;
-        if let Some(failure) = self.take_failure() {
-            return Err(failure);
-        }
         // Share the real client's refusal, so a caller cannot get away here with a request
-        // Discord would not define.
-        let _ = super::http::page_request(DEFAULT_DISCORD_API_BASE, channel, limit, before, after)?;
-        if let Some(unknown) = self.unknown_channel(channel) {
-            return Err(unknown);
-        }
-        let cursor = |id: Option<&MessageId>| id.and_then(MessageId::numeric);
-        let (before, after) = (cursor(before), cursor(after));
-        let state = self.lock();
-        let mut messages: Vec<Message> = state
-            .messages
-            .iter()
-            .filter(|m| &m.channel_id == channel)
-            .filter(|m| {
-                let Some(id) = m.id.numeric() else {
-                    // An unparseable id cannot be placed relative to a cursor, so it is only ever
-                    // returned by an uncursored fetch. Guessing would fabricate an ordering.
-                    return before.is_none() && after.is_none();
-                };
-                before.is_none_or(|b| id < b) && after.is_none_or(|a| id > a)
+        // Discord would not define. OUTSIDE the retry loop: a request this server refuses to
+        // build was never going to be sent, so it neither spends an attempt nor counts as a fetch.
+        let request =
+            super::http::page_request(DEFAULT_DISCORD_API_BASE, channel, limit, before, after)?;
+        self.limiter
+            .run(request.method, &request.url, || async {
+                // Everything below here is ONE SENT REQUEST, which is what makes `fetch_count`
+                // able to prove that a preempted request really was not sent.
+                self.lock().fetches += 1;
+                if let Some(limit) = self.take_rate_limit() {
+                    return Ok(Attempt::Limited(limit));
+                }
+                if let Some(failure) = self.take_failure() {
+                    return Err(failure);
+                }
+                if let Some(unknown) = self.unknown_channel(channel) {
+                    return Err(unknown);
+                }
+                let cursor = |id: Option<&MessageId>| id.and_then(MessageId::numeric);
+                let (before, after) = (cursor(before), cursor(after));
+                let state = self.lock();
+                let mut messages: Vec<Message> = state
+                    .messages
+                    .iter()
+                    .filter(|m| &m.channel_id == channel)
+                    .filter(|m| {
+                        let Some(id) = m.id.numeric() else {
+                            // An unparseable id cannot be placed relative to a cursor, so it is
+                            // only ever returned by an uncursored fetch. Guessing would fabricate
+                            // an ordering.
+                            return before.is_none() && after.is_none();
+                        };
+                        before.is_none_or(|b| id < b) && after.is_none_or(|a| id > a)
+                    })
+                    .cloned()
+                    .collect();
+                drop(state);
+                sort_oldest_first(&mut messages);
+                let limit = usize::from(limit.clamp(1, super::http::DISCORD_MAX_LIMIT));
+                if messages.len() > limit {
+                    if after.is_some() {
+                        // `after` walks FORWARD: Discord answers with the OLDEST messages
+                        // following the cursor, not the newest ones. Taking the newest here would
+                        // make a forward walk skip everything in between and still look correct
+                        // in a test.
+                        messages.truncate(limit);
+                    } else {
+                        messages.drain(..messages.len() - limit);
+                    }
+                }
+                Ok(Attempt::Done(messages, self.success_headers()))
             })
-            .cloned()
-            .collect();
-        sort_oldest_first(&mut messages);
-        let limit = usize::from(limit.clamp(1, super::http::DISCORD_MAX_LIMIT));
-        if messages.len() > limit {
-            if after.is_some() {
-                // `after` walks FORWARD: Discord answers with the OLDEST messages following the
-                // cursor, not the newest ones. Taking the newest here would make a forward walk
-                // skip everything in between and still look correct in a test.
-                messages.truncate(limit);
-            } else {
-                messages.drain(..messages.len() - limit);
-            }
-        }
-        Ok(messages)
+            .await
     }
 
     async fn post_message(
@@ -298,37 +391,47 @@ impl DiscordClient for FakeDiscord {
         content: &str,
         reply_to: Option<&MessageId>,
     ) -> Result<Message, DiscordError> {
-        if let Some(failure) = self.take_failure() {
-            return Err(failure);
-        }
         // Share the real client's validation so a test cannot pass on input Discord would reject.
         // Validation first, then existence, because Discord also rejects an empty body before it
         // ever looks the channel up.
-        let _ = super::http::post_request(DEFAULT_DISCORD_API_BASE, channel, content, reply_to)?;
-        if let Some(unknown) = self.unknown_channel(channel) {
-            return Err(unknown);
-        }
-        // Through `seed_reply` when this really is a reply, so the fake's own channel ends up in
-        // the shape Discord's would: the pointer on the ANSWERING message. Without this, posting a
-        // reply here produced a loose message and the parent never showed as answered — which is
-        // exactly the behaviour the inbox view is built on, so the fake would have been unable to
-        // exercise the one loop that matters.
-        let id = match reply_to {
-            Some(parent) => self.seed_reply(channel, "gent-talk", content, parent),
-            None => self.seed(channel, "gent-talk", content),
-        };
-        self.lock().posted.push(PostedMessage {
-            channel: channel.clone(),
-            content: content.to_owned(),
-            reply_to: reply_to.cloned(),
-        });
-        let state = self.lock();
-        state
-            .messages
-            .iter()
-            .find(|m| m.id == id)
-            .cloned()
-            .ok_or_else(|| DiscordError::Shape("posted message vanished".to_owned()))
+        let request =
+            super::http::post_request(DEFAULT_DISCORD_API_BASE, channel, content, reply_to)?;
+        self.limiter
+            .run(request.method, &request.url, || async {
+                if let Some(limit) = self.take_rate_limit() {
+                    return Ok(Attempt::Limited(limit));
+                }
+                if let Some(failure) = self.take_failure() {
+                    return Err(failure);
+                }
+                if let Some(unknown) = self.unknown_channel(channel) {
+                    return Err(unknown);
+                }
+                // Through `seed_reply` when this really is a reply, so the fake's own channel ends
+                // up in the shape Discord's would: the pointer on the ANSWERING message. Without
+                // this, posting a reply here produced a loose message and the parent never showed
+                // as answered — which is exactly the behaviour the inbox view is built on, so the
+                // fake would have been unable to exercise the one loop that matters.
+                let id = match reply_to {
+                    Some(parent) => self.seed_reply(channel, "gent-talk", content, parent),
+                    None => self.seed(channel, "gent-talk", content),
+                };
+                self.lock().posted.push(PostedMessage {
+                    channel: channel.clone(),
+                    content: content.to_owned(),
+                    reply_to: reply_to.cloned(),
+                });
+                let state = self.lock();
+                let message = state
+                    .messages
+                    .iter()
+                    .find(|m| m.id == id)
+                    .cloned()
+                    .ok_or_else(|| DiscordError::Shape("posted message vanished".to_owned()))?;
+                drop(state);
+                Ok(Attempt::Done(message, self.success_headers()))
+            })
+            .await
     }
 }
 
@@ -539,6 +642,171 @@ mod tests {
                 message.author_id
             );
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_429_is_waited_out_and_the_read_succeeds_instead_of_failing() {
+        // The gap this closes. Before, a 429 came back as `DiscordError::Status { status: 429 }`
+        // and the API layer turned it into HTTP 502 — a question that would have been answered
+        // half a second later instead failed.
+        let fake = FakeDiscord::new();
+        fake.seed(&channel(), "a", "hello");
+        fake.rate_limit_next(2, Duration::from_millis(750), false);
+        let started = tokio::time::Instant::now();
+        let messages = fake
+            .fetch_recent(&channel(), 10)
+            .await
+            .expect("a rate limit that clears must not surface as a failure");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_millis(1500),
+            "it must have waited the 750ms Discord asked for, twice"
+        );
+        assert_eq!(fake.fetch_count(), 3, "one original and two retries");
+        assert_eq!(fake.limiter().stats().retries, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_posted_reply_survives_a_rate_limit_too() {
+        let fake = FakeDiscord::new();
+        let target = fake.seed(&channel(), "a", "question");
+        fake.rate_limit_next(1, Duration::from_millis(400), false);
+        let posted = fake
+            .post_message(&channel(), "answer", Some(&target))
+            .await
+            .expect("the retry posts it");
+        assert_eq!(posted.content, "answer");
+        assert_eq!(
+            fake.posted().len(),
+            1,
+            "a retried post must be posted ONCE, not once per attempt"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_exhausted_retry_budget_fails_loudly_and_names_the_rate_limit() {
+        // The budget must not be a way of failing quietly: a caller that cannot tell quota from
+        // an outage cannot do anything sensible about either.
+        let fake = FakeDiscord::with_retry_policy(RetryPolicy {
+            max_attempts: 2,
+            max_total_wait: Duration::from_secs(30),
+        });
+        fake.seed(&channel(), "a", "hello");
+        fake.rate_limit_next(5, Duration::from_millis(300), false);
+        let error = fake
+            .fetch_recent(&channel(), 10)
+            .await
+            .expect_err("a limit that never clears must not read as an empty channel");
+        assert_eq!(fake.fetch_count(), 2, "bounded: two attempts, then stop");
+        let message = error.to_string();
+        assert!(
+            message.contains("RATE LIMIT"),
+            "the reason must name the rate limit: {message}"
+        );
+        match error {
+            DiscordError::RateLimited(detail) => {
+                assert_eq!(detail.attempts, 2);
+                assert!(!detail.global);
+                assert_eq!(detail.retry_after, Duration::from_millis(300));
+            }
+            other => panic!("expected a rate limit, got {other:?}"),
+        }
+    }
+
+    /// A fake that never retries, so a rejection LEAVES its window standing for the next caller.
+    fn no_retries() -> FakeDiscord {
+        FakeDiscord::with_retry_policy(RetryPolicy {
+            max_attempts: 1,
+            max_total_wait: Duration::from_secs(30),
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_global_limit_holds_back_a_channel_that_never_saw_it() {
+        // Discord's global limit is on the TOKEN. Filing it under the channel that observed it
+        // would let the very next channel spend a request walking into the identical wall.
+        let other = ChannelId("c2".to_owned());
+        let fake = no_retries();
+        fake.seed(&channel(), "a", "one");
+        fake.seed(&other, "a", "two");
+
+        fake.rate_limit_next(1, Duration::from_secs(5), true);
+        fake.fetch_recent(&channel(), 10)
+            .await
+            .expect_err("one attempt, so this one gives up");
+        let spent = fake.fetch_count();
+
+        let started = tokio::time::Instant::now();
+        fake.fetch_recent(&other, 10)
+            .await
+            .expect("the other channel reads once the global window passes");
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(5),
+            "a GLOBAL limit is the whole token: every channel waits behind it"
+        );
+        assert_eq!(
+            fake.fetch_count(),
+            spent + 1,
+            "and the doomed request was held rather than sent and rejected"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_per_route_limit_holds_back_only_its_own_channel() {
+        // The contrast that makes the test above mean something: treating every 429 as global
+        // would stall the whole server on one busy channel.
+        let other = ChannelId("c2".to_owned());
+        let fake = no_retries();
+        fake.seed(&channel(), "a", "one");
+        fake.seed(&other, "a", "two");
+
+        fake.rate_limit_next(1, Duration::from_secs(5), false);
+        fake.fetch_recent(&channel(), 10)
+            .await
+            .expect_err("one attempt, so this one gives up");
+
+        let started = tokio::time::Instant::now();
+        fake.fetch_recent(&other, 10)
+            .await
+            .expect("a different channel is a different bucket");
+        assert_eq!(
+            started.elapsed(),
+            Duration::ZERO,
+            "one channel's bucket must not stall every other channel"
+        );
+
+        // ...and the channel that WAS limited is held back rather than sent again.
+        let held = tokio::time::Instant::now();
+        fake.fetch_recent(&channel(), 10)
+            .await
+            .expect("reads once its own window passes");
+        assert_eq!(held.elapsed(), Duration::from_secs(5));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_empty_bucket_is_waited_out_rather_than_spent_on_a_certain_rejection() {
+        let fake = FakeDiscord::new();
+        fake.seed(&channel(), "a", "hello");
+        // Discord's accounting on a SUCCESSFUL answer: no requests left, refilling in two seconds.
+        fake.set_bucket(0, Duration::from_secs(2));
+        fake.fetch_recent(&channel(), 10).await.expect("reads");
+        let after_first = fake.fetch_count();
+
+        let started = tokio::time::Instant::now();
+        fake.fetch_recent(&channel(), 10).await.expect("reads");
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(2),
+            "the next request was known to be doomed and must be held, not sent"
+        );
+        assert_eq!(
+            fake.fetch_count(),
+            after_first + 1,
+            "held back, then sent exactly once"
+        );
+        assert_eq!(fake.limiter().stats().preempted, 1);
     }
 
     #[tokio::test]

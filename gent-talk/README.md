@@ -207,7 +207,7 @@ not just the HTTP status, decide which message you get:
 | 403, code `50001` (Missing Access) | The bot **cannot see this channel at all**: either it is not in the server, or it has no `View Channel` there | Re-run the OAuth2 invite for the right server; then, for a private channel, add the bot or its role in **Edit Channel → Permissions**. Discord does not distinguish these two, so the message names both. |
 | 403, code `50013` (Missing Permissions) | The bot **can** see the channel but may not read its history | Grant **Read Message History** on that channel. The invite is fine; this is a per-channel override. |
 | 404, code `10003` (Unknown Channel) | Wrong snowflake, or a channel this bot was never invited to | Re-copy the id (Developer Mode → right-click → Copy Channel ID); if the id is right, re-check the invite. |
-| 429 | Rate-limited, so readability was **not** established | Wait and restart. |
+| 429 that did not clear | Rate-limited beyond the client's own retry budget, so readability was **not** established | Wait and restart. The client already waited the time Discord asked for; if it did not clear, something else is very likely sharing this bot token. See "Discord rate limits". |
 | no response | The process cannot reach `discord.com` | Check egress: DNS, outbound HTTPS, proxy. |
 | success, but every message has **blank content** | Almost certainly **Message Content Intent** is off | Turn it on (Developer Portal → Bot → Privileged Gateway Intents) and restart. |
 
@@ -238,6 +238,46 @@ Note that `--fake-discord` does **not** skip the probe, and the in-memory Discor
 pass: it knows which channels it actually has, and answers anything else with Discord's own
 404 / `Unknown Channel`. If the fake said yes to every channel, the probe would pass against it
 unconditionally and the tests would prove nothing about the real client.
+
+## Discord rate limits
+
+Discord answers an over-quota request with **HTTP 429** and says precisely how long to wait: a
+JSON body carrying `retry_after` in **fractional seconds** and a `global` flag, a rounded
+`Retry-After` header, and the `X-RateLimit-*` family. This client reads that and obeys it. The
+whole of it is `src/discord/ratelimit.rs`, and it is shared by the live HTTP client and by the
+in-memory fake, so the engine the tests exercise is the engine production takes.
+
+**A 429 is no longer a caller's problem.** It is waited out and the request retried, so a question
+asked during a burst is answered a fraction of a second later instead of failing.
+
+**The waiting is bounded, twice**: at most four attempts and at most thirty seconds of total
+waiting per request, whichever comes first. A wait longer than the remaining budget is refused
+*before* it is taken — parking a caller for a minute and then failing anyway is the worst of both.
+
+**Running out is loud.** The budget is not a way of failing quietly: it produces
+`DiscordError::RateLimited`, whose message names the rate limit, the route, how many attempts were
+made, how long was actually spent waiting and what Discord still wants. It is never turned into an
+empty channel or a generic upstream error.
+
+**Global and per-route are different things and are kept apart.** A per-route 429 shuts one
+bucket; a `global` one shuts the whole bot token, and every channel waits behind it. Filing a
+global limit under the channel that happened to observe it would let the next channel spend a
+request walking into the identical wall a millisecond later.
+
+**A request that is certain to be rejected is not sent.** A 429, or a *successful* response whose
+`X-RateLimit-Remaining` is `0`, closes that bucket until it resets; the next request on it waits
+rather than being spent. Where Discord's `X-RateLimit-Bucket` says two routes share one bucket,
+they share one gate.
+
+**The poll loop's backoff and this are one mechanism at two scales, not two mechanisms.** The
+client's wait is the inner, precise one Discord asked for; only a limit it could not clear reaches
+`src/live.rs`, and that loop's per-channel doubling then waits *at least* as long as Discord's
+outstanding request. The outer wait can be longer than Discord asked for, never shorter.
+
+**All of this is tested against the in-memory fake, and only against the fake.** The fake can
+return Discord's 429 with a `Retry-After` and can carry the bucket headers on a success, and the
+tests measure the waits on a paused clock. The header names, the body field and the rounding
+behaviour come from Discord's published documentation; none of it has met live Discord.
 
 ## Checking a deployment
 
@@ -754,8 +794,8 @@ Three rules in the loop are correctness, not tuning:
   and an agent simply missing lines. Walking forward cannot lose them.
 
 **And a bound on catching up, because "read until caught up, whatever it costs" is a request storm
-against a rate limit this server does not handle.** One tick walks at most four pages per channel
-— 200 messages at the default — and stops. Nothing is skipped: the cursor only ever moves past
+against a shared rate limit — and obeying `Retry-After` buys time, not quota.** One tick walks at
+most four pages per channel — 200 messages at the default — and stops. Nothing is skipped: the cursor only ever moves past
 what was actually published, so the next tick continues where this one stopped. Being stopped by
 that ceiling is logged **once**, at WARN, on the way into it, and the recovery is logged too;
 delivery is running late and that is worth seeing, but it is lateness, not loss.
@@ -764,6 +804,14 @@ delivery is running late and that is worth seeing, but it is lateness, not loss.
 that measures how long the loop actually waited against a healthy control. It has to be measured,
 because deleting the line that applies the backoff changes nothing else observable: the loop still
 fetches, still publishes, still recovers, still logs.
+
+**And when the failure is a rate limit, the backoff does not undercut it.** A 429 during a tick is
+first waited out by the client itself (see "Discord rate limits"); what reaches this loop is a
+limit that did not clear inside that budget, still carrying Discord's outstanding `retry_after`.
+The loop waits the larger of its own doubling and that number, so the two are one mechanism at two
+scales rather than two rival opinions about when to come back. That is measured too: after a
+single failure the doubling alone says twenty seconds, which is not long enough for a limit that
+asked for forty-five.
 
 ### Decision two: the PAGE keeps the ElevenLabs conversation socket
 
@@ -2138,6 +2186,7 @@ src/auth.rs           bearer tokens, read vs write scope
 src/access.rs         the access log: what one line says, and what it must never say
 src/model.rs          Message/Channel types, snowflake ordering
 src/discord/          the DiscordClient trait, the live HTTP client, the in-memory fake
+src/discord/ratelimit.rs  Retry-After, the X-RateLimit-* buckets, and the bounded wait-and-retry
 src/summary.rs        extractive digest lines
 src/retrieval.rs      semantic random access, behind the Ranker trait
 src/untrusted.rs      the data-not-instructions boundary
@@ -2177,20 +2226,25 @@ Beyond the security list above:
   cache key and otherwise unused, and **no page requests a summary**. `#49 cached-summaries` is
   therefore the server half of that issue and not the whole of it: the seam, the key, the
   invalidation, the bounds and the sweep are done; the thing a person would see is not.
-* No caching of channel content: every question is a fresh Discord fetch, and Discord's rate
-  limits are not handled. The summary cache is the one exception and it is a cache of DERIVED
-  text, bounded and purgeable — see "Durable state".
-* No `Retry-After` handling; a 429 from Discord surfaces as HTTP 502. **Live push makes this
-  matter more than it used to**: with `discord.live_poll_seconds` set, this server spends one
-  Discord request per channel per interval whether or not anybody is listening, on top of every
-  question asked. That is why the setting defaults to OFF, why an interval under five seconds is
-  refused outright rather than clamped, and why a channel whose read fails backs off (doubling, up
-  to sixteen intervals) instead of retrying at the same rate. It is still not `Retry-After`
-  handling, and a 429 during a poll tick is a WARN line and a backoff, not a queued retry.
-* **Live push has never run against live Discord either, and neither has the poller.** The seeding
-  rule, the cursor, the failure path and the SSE framing are all tested against the in-memory
-  fake; the first real deployment with an interval set will be the first time the poll loop meets
-  Discord's rate limiter.
+* No caching of channel content: every question is a fresh Discord fetch. Obeying `Retry-After`
+  does not change that — it buys time, not quota, so a poll interval still spends one request per
+  channel whether or not anybody is listening. That is why `discord.live_poll_seconds` still
+  defaults to OFF and why an interval under five seconds is still refused outright rather than
+  clamped. The summary cache is the one exception and it is a cache of DERIVED text, bounded and
+  purgeable — see "Durable state".
+* **`Retry-After` is handled; the status code and the absence of a queue are what is left.** A 429
+  is parsed (body `retry_after` in fractional seconds, the `global` flag, and the `X-RateLimit-*`
+  headers), waited out and retried, bounded at four attempts and thirty seconds; a bucket known to
+  be empty is not spent; a global limit stops every channel rather than one. See "Discord rate
+  limits". Two things are deliberately NOT done: **the exhausted case still reaches an API caller
+  as HTTP 502**, not as a 429 with a `Retry-After` of its own, because the error-to-status mapping
+  in `src/http/api.rs` was left alone; and **there is no queue** — a request that runs out of
+  budget is over, not deferred to be sent later.
+* **Live push has never run against live Discord either, and neither has the poller, and neither
+  has the rate-limit handling.** The seeding rule, the cursor, the failure path, the SSE framing
+  and every wait described under "Discord rate limits" are tested against the in-memory fake on a
+  paused clock; the first real deployment with an interval set will be the first time any of it
+  meets Discord's rate limiter.
 * **Whether the vendor honours a replayed transcript is UNVERIFIED.** `#46 conversation-replay`
   is complete on this side — the budget, the fencing, the four honesty states and the transport
   switch are all tested — but no billed run has yet confirmed that ElevenLabs puts the payload in

@@ -41,11 +41,16 @@
 //! ## What polling costs, stated plainly
 //!
 //! It multiplies this server's Discord request volume by one request per channel per interval,
-//! forever, whether or not anybody is listening. The README's Known gaps already record that
-//! Discord's rate limits are NOT handled here and that a 429 surfaces to the caller as HTTP 502.
-//! So ingestion is **off unless configured** (`discord.live_poll_seconds`, default 0), the
-//! interval has a floor the configuration refuses to go below, and a failing channel backs off
-//! rather than hammering — see [`backoff`].
+//! forever, whether or not anybody is listening. A 429 is no longer simply passed on: the client
+//! obeys Discord's `Retry-After` within a bounded budget, and only a limit it could not clear
+//! reaches this loop — see [`crate::discord::ratelimit`]. That makes a tick cheaper to get wrong,
+//! not free. So ingestion is still **off unless configured** (`discord.live_poll_seconds`, default
+//! 0), the interval still has a floor the configuration refuses to go below, and a failing channel
+//! still backs off rather than hammering — see [`backoff`].
+//!
+//! The two waits nest rather than compete: the client's is the inner, precise one Discord asked
+//! for, and [`backoff`] is the outer one, which never waits LESS than Discord's outstanding
+//! request. There is one notion of "slow down" here, applied at two scales.
 //!
 //! **The backoff is not decoration, and it is not left to be read.** [`poll_loop`] sleeping longer
 //! after a failure is pinned by a test that measures the loop's own elapsed time against a healthy
@@ -600,7 +605,17 @@ async fn poll_loop(
                         );
                     }
                     *failed = failed.saturating_add(1);
-                    wait = wait.max(backoff(interval, *failed, max_backoff));
+                    // Two slow-downs would be one too many, so they NEST: the client has already
+                    // waited out whatever `Retry-After` it could afford (see
+                    // `crate::discord::ratelimit`), and what reaches here is a limit that did not
+                    // clear. Taking the larger of Discord's own outstanding request and this
+                    // loop's doubling means the outer wait can be longer than Discord asked for
+                    // but never shorter — which is the one direction that would keep hammering a
+                    // limiter that has already said no.
+                    let asked_for = error.retry_after().unwrap_or_default();
+                    wait = wait
+                        .max(backoff(interval, *failed, max_backoff))
+                        .max(asked_for);
                 }
             }
         }
@@ -870,6 +885,56 @@ mod tests {
         assert!(
             bad.fetch_count() >= 3,
             "and it must still be RETRIED — backing off is not giving up"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_rate_limit_the_client_could_not_clear_slows_this_loop_by_what_discord_asked_for() {
+        // The seam that keeps this loop's backoff and the client's `Retry-After` from being two
+        // rival notions of "slow down". The client waits out what it can afford; what arrives
+        // here is a limit it could NOT clear, still carrying Discord's outstanding request. This
+        // loop must not come back sooner than that — its own doubling says 20s after one failure,
+        // and 20s is less than Discord asked for.
+        //
+        // Coming back early is not merely impolite. The client refuses to SEND before the window
+        // opens, so an early tick does not become a request; it becomes a tick that accomplishes
+        // nothing and fails again, and the channel stays dark until some later tick happens to
+        // land after the window. Waiting the time Discord actually named is what makes the very
+        // next tick the one that recovers.
+        let interval = Duration::from_secs(10);
+        assert_eq!(
+            backoff(interval, 1, interval * MAX_BACKOFF_INTERVALS),
+            Duration::from_secs(20),
+            "the doubling backoff alone would come back well before Discord is ready"
+        );
+
+        let channel = ChannelId("3333".to_owned());
+        // One attempt and almost no waiting budget, so the 429 surfaces here with its wait intact
+        // rather than being slept out inside the client. This is the shape of a real long limit:
+        // longer than any one caller should be held for.
+        let fake = Arc::new(FakeDiscord::with_retry_policy(
+            crate::discord::ratelimit::RetryPolicy {
+                max_attempts: 1,
+                max_total_wait: Duration::from_secs(1),
+            },
+        ));
+        fake.register_channel(&channel);
+        fake.seed(&channel, "codex", "said before anyone was listening");
+        fake.rate_limit_next(1, Duration::from_secs(45), false);
+
+        let hub = LiveHub::new();
+        let elapsed = elapsed_over(fake.as_ref(), &hub, &channel, interval, 2).await;
+        assert_eq!(
+            elapsed,
+            Duration::from_secs(45),
+            "the loop came back before Discord said it could: the two waits are fighting rather \
+             than nesting"
+        );
+        assert_eq!(
+            fake.fetch_count(),
+            2,
+            "and the tick after the wait must actually READ — a loop that wakes early is held by \
+             the client and recovers nothing"
         );
     }
 
