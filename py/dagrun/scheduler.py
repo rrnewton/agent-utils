@@ -570,7 +570,10 @@ class Runner:
         self.aborted: set[str] = set()  # tags killed by eager-exit (labelled ABORTED, not FAIL)
         self.step_profile_rows: list[Mapping[str, object]] = []
         self.failed = False  # a genuine (non-aborted) step failed
-        self.stop = False  # stop scheduling new steps after a failure
+        # Global eager-exit remains the compatibility default for a failed step without a family.
+        self.stop = False
+        # Families whose own failure has stopped their remaining work. Other families keep going.
+        self.failed_families: set[str] = set()
         self.wall = 0.0
         # OUTER wall budget for the WHOLE run (None = unbounded). Independent of every per-step
         # budget, and that independence is the point: no combination of individually-legal steps
@@ -662,26 +665,44 @@ class Runner:
         self.cores_used -= self._step_width(step)
         return True
 
-    def _trip_fail_fast(self) -> None:
-        """Record the run as failed and, unless ``keep_going``, cut every in-flight peer short.
+    def _trip_fail_fast(self, failed_tag: str) -> None:
+        """Record a failure and cut the matching fail-fast scope short.
 
         Caller holds :attr:`lock`. Shared by the ordinary step-failure path, the spawn-failure
         path and the supervisor-crash paths so all three cancel peers identically.
+
+        A step without ``fail_fast_family`` preserves the existing global eager-exit. A step
+        with one cancels only peers in that family. Dependency closure separately prevents every
+        true dependent from running, so unrelated families can finish without weakening the
+        failed family's eager-exit.
         """
         self.failed = True
         if self.keep_going:
             return
-        self.stop = True
+        failed_family = self.steps[failed_tag].fail_fast_family
+        if failed_family is None:
+            self.stop = True
+        else:
+            self.failed_families.add(failed_family)
         # A node that exists to EXPLAIN this failure is spared. Reaping it destroys the only
         # account of why the run failed, which is the opposite of what eager-exit is for: the
         # point is to stop paying for work that cannot matter, and the diagnosis is the one piece
-        # of remaining work that matters most. Everything else is still cut short.
+        # of remaining work that matters most. Everything else in the matching scope is cut short.
         failed = self._genuinely_failed()
-        spared = {tag for tag in self.running if self._exempt_from_eager_exit(tag, failed)}
+        candidates = {
+            tag
+            for tag in self.running
+            if self.stop or self.steps[tag].fail_fast_family in self.failed_families
+        }
+        spared = {
+            tag for tag in candidates if self._exempt_from_eager_exit(tag, failed)
+        }
         others = [
-            (tag, proc) for tag, proc in self.running_procs.items() if tag not in spared
+            (tag, proc)
+            for tag, proc in self.running_procs.items()
+            if tag in candidates and tag not in spared
         ]
-        for other in self.running:
+        for other in candidates:
             if other in spared:
                 continue
             self.aborted.add(other)  # its thread will label itself ABORTED
@@ -715,6 +736,13 @@ class Runner:
         """
         step = self.steps.get(tag)
         return step is not None and step.explains_a_failure_in(failed)
+
+    def _blocked_by_fail_fast(self, tag: str) -> bool:
+        """Whether global or family-scoped eager-exit blocks ``tag`` from starting."""
+        if self.stop:
+            return True
+        family = self.steps[tag].fail_fast_family
+        return family is not None and family in self.failed_families
 
     def _skipped(self) -> set[str]:
         """Tags whose deps FAILED (transitively) so they must never run.
@@ -948,10 +976,14 @@ class Runner:
                 # is not enough -- the measured case had the diagnostic still QUEUED when its
                 # subject failed, so it was never launched at all and the run reported the
                 # symptom with no account of the cause.
-                failed_now = self._genuinely_failed() if self.stop else set()
+                failed_now = (
+                    self._genuinely_failed()
+                    if self.stop or self.failed_families
+                    else set()
+                )
 
                 def _startable_after_stop(tag: str) -> bool:
-                    if not self.stop:
+                    if not self._blocked_by_fail_fast(tag):
                         return True
                     return self._exempt_from_eager_exit(tag, failed_now)
 
@@ -969,18 +1001,28 @@ class Runner:
                 pending_diagnostics = [
                     tag
                     for tag in self.order
-                    if self.stop
+                    if self._blocked_by_fail_fast(tag)
                     and _pending(tag)
                     and _startable_after_stop(tag)
                     and self._deps_known(self.steps[tag])
                     and self._deps_ok(self.steps[tag])
+                ]
+                blocked_by_family = [
+                    tag
+                    for tag in self.order
+                    if _pending(tag)
+                    and self._blocked_by_fail_fast(tag)
+                    and not _startable_after_stop(tag)
                 ]
                 if (
                     not self.running
                     and not pending_diagnostics
                     and (
                         self.stop
-                        or len(self.done) + len(skipped) + len(self.intentional_skips)
+                        or len(self.done)
+                        + len(skipped)
+                        + len(self.intentional_skips)
+                        + len(blocked_by_family)
                         >= len(self.steps)
                     )
                 ):
@@ -1024,7 +1066,10 @@ class Runner:
                     # `resource_avail`, so the counts read below are stable rather than merely
                     # sampled, and `resource_avail` has returned to the configured caps.
                     accounted = (
-                        len(self.done) + len(skipped) + len(self.intentional_skips)
+                        len(self.done)
+                        + len(skipped)
+                        + len(self.intentional_skips)
+                        + len(blocked_by_family)
                     )
                     remaining = max(0, len(self.steps) - accounted)
                     if not launchable and not self.running and remaining > 0:
@@ -1034,6 +1079,7 @@ class Runner:
                             if tag not in self.done
                             and tag not in skipped
                             and tag not in self.intentional_skip_tags
+                            and tag not in blocked_by_family
                         )
                         print(
                             f"[scheduler] REFUSED: terminal starve -- {remaining} step(s) can "
@@ -1100,7 +1146,7 @@ class Runner:
                 aborted=False,
                 pids_events=0,
             )
-            self._trip_fail_fast()
+            self._trip_fail_fast(step.tag)
         if self.evidence is not None:
             self.evidence.record(
                 "supervisor_crash",
@@ -1289,7 +1335,7 @@ class Runner:
             with self.lock:
                 self._retire(step)
                 self.done[step.tag] = outcome
-                self._trip_fail_fast()
+                self._trip_fail_fast(step.tag)
             self._emit(f"[{step.tag}] ✗ FAIL   {step.desc} ({summary})")
             return
         with self.lock:
@@ -1641,7 +1687,7 @@ class Runner:
                 # len(steps), which every step now reaches. The ``stop`` clause exists precisely
                 # for the eager-exit case, where deps-succeeded steps are neither launched nor
                 # skipped and the loop would otherwise spin forever.
-                self._trip_fail_fast()
+                self._trip_fail_fast(step.tag)
 
         # Emit terminal status OUTSIDE the lock (_emit re-acquires it).
         if outcome.aborted and self.run_timed_out:

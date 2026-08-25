@@ -544,6 +544,9 @@ def _dag_from_obj(raw: object) -> DagConfig:
             raise DagJsonError(
                 f"{where}.skip_reason: unknown value {skip_text!r}"
             ) from exc
+        fail_fast_family = _opt_str_or_none(sm, "fail_fast_family")
+        if fail_fast_family is not None and not fail_fast_family.strip():
+            raise DagJsonError(f"{where}.fail_fast_family: must be non-empty")
         steps.append(
             Step(
                 group=_req_str(sm, "group", where),
@@ -562,6 +565,7 @@ def _dag_from_obj(raw: object) -> DagConfig:
                 jobs_env=_jobs_env_field(sm, "jobs_env", where),
                 skip_reason=skip_reason,
                 explains=_opt_str_list(sm, "explains"),
+                fail_fast_family=fail_fast_family,
                 write_domains=_present_str_list(sm, "write_domains"),
                 write_domain_guarantee=(
                     None
@@ -665,6 +669,8 @@ def _step_to_json(step: Step) -> dict[str, object]:
     # existing DAG or the cross-build byte-comparison that pins the two editions together.
     if step.explains:
         obj["explains"] = list(step.explains)
+    if step.fail_fast_family is not None:
+        obj["fail_fast_family"] = step.fail_fast_family
     if step.write_domains is not None:
         obj["write_domains"] = list(step.write_domains)
     if step.write_domain_guarantee is not None:

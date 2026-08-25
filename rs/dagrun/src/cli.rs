@@ -743,6 +743,7 @@ fn box_config(
             write_domains: None,
             write_domain_guarantee: None,
             explains: Vec::new(),
+            fail_fast_family: None,
         }],
         // cpu.max for the boxed command. Set on the CONFIG rather than as preferred_inner_jobs,
         // because the latter appends a `-j K` flag to the command -- correct for a build, wrong

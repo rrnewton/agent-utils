@@ -108,6 +108,28 @@ def test_cpu_timeout_roundtrip_and_conditional_emit() -> None:
     assert dag_to_json(dag_from_json(out)) == out
 
 
+def test_fail_fast_family_roundtrip_and_rejects_empty() -> None:
+    doc = (
+        "{\"steps\": ["
+        "{\"group\":\"g\",\"job\":\"scoped\",\"cmd\":\"true\","
+        "\"fail_fast_family\":\"family-a\"},"
+        "{\"group\":\"g\",\"job\":\"global\",\"cmd\":\"true\"}]}"
+    )
+    cfg = dag_from_json(doc)
+    assert cfg.steps[0].fail_fast_family == "family-a"
+    assert cfg.steps[1].fail_fast_family is None
+
+    encoded = dag_to_json(cfg)
+    assert encoded.count("\"fail_fast_family\"") == 1
+    assert dag_to_json(dag_from_json(encoded)) == encoded
+
+    with pytest.raises(DagJsonError, match="fail_fast_family: must be non-empty"):
+        dag_from_json(
+            "{\"steps\":[{\"group\":\"g\",\"job\":\"j\",\"cmd\":\"true\","
+            "\"fail_fast_family\":\"   \"}]}"
+        )
+
+
 def test_default_step_timeout_applied() -> None:
     # A step that omits `timeout` inherits the document-level default_step_timeout; a step
     # with its own timeout keeps it; and the config records the document default.

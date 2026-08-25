@@ -491,6 +491,13 @@ pub fn dag_from_value(raw: &Value) -> Result<DagConfig, DagJsonError> {
     for (i, entry) in steps_raw.iter().enumerate() {
         let where_ = format!("steps[{i}]");
         let sm = as_obj(entry, &where_)?;
+        let fail_fast_family = opt_str_or_none(sm, "fail_fast_family")?;
+        if fail_fast_family
+            .as_ref()
+            .is_some_and(|family| family.trim().is_empty())
+        {
+            return Err(err(format!("{where_}.fail_fast_family: must be non-empty")));
+        }
         steps.push(Step {
             group: req_str(sm, "group", &where_)?,
             job: req_str(sm, "job", &where_)?,
@@ -536,6 +543,7 @@ pub fn dag_from_value(raw: &Value) -> Result<DagConfig, DagJsonError> {
                 }
             },
             explains: opt_str_list(sm, "explains")?,
+            fail_fast_family,
         });
     }
     refuse_unusable_explains(&steps)?;
@@ -921,8 +929,9 @@ fn emit_step(s: &mut String, step: &Step, base: usize) {
     // because the two editions are pinned together by a byte-identical JSON comparison. A graph
     // that does not use the relationship keeps a byte-identical document.
     let has_explains = !step.explains.is_empty();
+    let has_fail_fast_family = step.fail_fast_family.is_some();
     let has_write_domains = step.write_domains.is_some() || step.write_domain_guarantee.is_some();
-    if has_explains || has_write_domains {
+    if has_explains || has_fail_fast_family || has_write_domains {
         s.push_str(",\n");
     } else {
         s.push('\n');
@@ -931,6 +940,15 @@ fn emit_step(s: &mut String, step: &Step, base: usize) {
         s.push_str(&key);
         s.push_str("\"explains\": ");
         emit_str_list(s, &step.explains, base + 2);
+        if has_fail_fast_family || has_write_domains {
+            s.push_str(",\n");
+        } else {
+            s.push('\n');
+        }
+    }
+    if let Some(family) = &step.fail_fast_family {
+        s.push_str(&key);
+        s.push_str(&format!("\"fail_fast_family\": {}", json_str(family)));
         if has_write_domains {
             s.push_str(",\n");
         } else {
@@ -1181,6 +1199,32 @@ steps:
         assert!(cfg.resource_caps.is_empty());
         assert_eq!(cfg.mem_cap_factor, 1.25);
         assert_eq!(cfg.default_jobs_flag, "-j");
+    }
+
+    #[test]
+    fn fail_fast_family_roundtrips_and_rejects_empty() {
+        let doc = r#"{"steps":[
+            {"group":"g","job":"scoped","cmd":"true",
+             "fail_fast_family":"family-a"},
+            {"group":"g","job":"global","cmd":"true"}]}"#;
+        let cfg = dag_from_json(doc).unwrap();
+        assert_eq!(cfg.steps[0].fail_fast_family.as_deref(), Some("family-a"));
+        assert_eq!(cfg.steps[1].fail_fast_family, None);
+
+        let encoded = dag_to_json(&cfg);
+        assert_eq!(encoded.matches("\"fail_fast_family\"").count(), 1);
+        assert_eq!(dag_to_json(&dag_from_json(&encoded).unwrap()), encoded);
+
+        let error = dag_from_json(
+            r#"{"steps":[{"group":"g","job":"j","cmd":"true",
+                "fail_fast_family":"   "}]}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("fail_fast_family: must be non-empty"),
+            "{error}"
+        );
     }
 
     #[test]

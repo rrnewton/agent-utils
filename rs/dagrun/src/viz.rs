@@ -286,6 +286,7 @@ mod tests {
             write_domains: None,
             write_domain_guarantee: None,
             explains: Vec::new(),
+            fail_fast_family: None,
         };
         let mut caps = BTreeMap::new();
         caps.insert("browser".to_string(), 1);
@@ -357,6 +358,7 @@ mod tests {
             write_domains: None,
             write_domain_guarantee: None,
             explains: Vec::new(),
+            fail_fast_family: None,
         };
         let cfg = DagConfig {
             steps: vec![
@@ -399,6 +401,7 @@ mod tests {
             write_domains: None,
             write_domain_guarantee: None,
             explains: Vec::new(),
+            fail_fast_family: None,
         };
         let cfg = DagConfig {
             steps: vec![

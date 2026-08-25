@@ -752,6 +752,7 @@ mod tests {
             write_domains: None,
             write_domain_guarantee: None,
             explains: Vec::new(),
+            fail_fast_family: None,
         }
     }
 
@@ -932,6 +933,7 @@ mod tests {
             write_domains: None,
             write_domain_guarantee: None,
             explains: Vec::new(),
+            fail_fast_family: None,
         };
         assert_eq!(step_mem_cap_bytes(&s, 1.25, None), Some(9 * GIB));
     }

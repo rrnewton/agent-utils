@@ -189,6 +189,10 @@ struct Shared {
     /// eager-cancel path can consult it without holding the step map. Empty for every ordinary
     /// step; only diagnostics appear with a non-empty list.
     explains_index: HashMap<String, Vec<String>>,
+    /// tag -> its declared fail-fast family. Missing tags preserve global eager-exit.
+    fail_fast_family_index: HashMap<String, String>,
+    /// Families whose own failure has stopped their remaining work.
+    failed_families: HashSet<String>,
     /// The WHOLE RUN exceeded its outer wall budget and cut its in-flight steps short.
     run_timed_out: bool,
     /// Child processes currently alive, and the largest count observed during this run.
@@ -813,39 +817,58 @@ fn is_exempt_from_eager_exit(
         .is_some_and(|explains| explains.iter().any(|t| failed.contains(t)))
 }
 
-/// Record the run as failed and, unless `keep_going`, cut every in-flight peer short.
+/// Whether global or family-scoped eager-exit blocks `tag` from starting.
+fn blocked_by_fail_fast(sh: &Shared, tag: &str) -> bool {
+    sh.stop
+        || sh
+            .fail_fast_family_index
+            .get(tag)
+            .is_some_and(|family| sh.failed_families.contains(family))
+}
+
+/// Record the run as failed and cut the matching fail-fast scope short.
 ///
 /// Shared by the ordinary step-failure path, the spawn-failure path and the supervisor-panic
-/// paths so all three cancel peers identically.
-fn trip_fail_fast(sh: &mut Shared, cgroups: &BoxedCgroups, keep_going: bool) {
+/// paths so all three cancel peers identically. A step without a family preserves the existing
+/// global eager-exit; a step with one cancels only peers in that family. Dependency closure
+/// separately excludes true dependents, while unrelated families continue.
+fn trip_fail_fast(sh: &mut Shared, cgroups: &BoxedCgroups, keep_going: bool, failed_tag: &str) {
     sh.failed = true;
     if keep_going {
         return;
     }
-    sh.stop = true;
+    match sh.fail_fast_family_index.get(failed_tag).cloned() {
+        Some(family) => {
+            sh.failed_families.insert(family);
+        }
+        None => sh.stop = true,
+    }
     // A node that exists to EXPLAIN this failure is spared. Reaping it destroys the only account
     // of why the run failed, which is the opposite of what eager-exit is for: the point is to
     // stop paying for work that cannot matter, and the diagnosis is the one piece of remaining
-    // work that matters most. Everything else is still cut short.
+    // work that matters most. Everything else in the matching scope is cut short.
     let failed = genuinely_failed(sh);
-    let spared: std::collections::HashSet<String> = sh
+    let candidates: HashSet<String> = sh
         .running
+        .iter()
+        .filter(|tag| blocked_by_fail_fast(sh, tag))
+        .cloned()
+        .collect();
+    let spared: HashSet<String> = candidates
         .iter()
         .filter(|tag| is_exempt_from_eager_exit(sh, tag, &failed))
         .cloned()
         .collect();
-    let admitted: Vec<String> = sh.running.iter().cloned().collect();
-    for other in admitted {
-        if spared.contains(&other) {
-            continue;
+    for other in &candidates {
+        if !spared.contains(other) {
+            sh.aborted.insert(other.clone());
         }
-        sh.aborted.insert(other);
     }
     let others: Vec<(String, u32, Option<String>)> = sh
         .running_pids
         .iter()
-        .filter(|(k, _)| !spared.contains(*k))
-        .map(|(k, v)| (k.clone(), *v, sh.running_nonces.get(k).cloned()))
+        .filter(|(tag, _)| candidates.contains(*tag) && !spared.contains(*tag))
+        .map(|(tag, pid)| (tag.clone(), *pid, sh.running_nonces.get(tag).cloned()))
         .collect();
     reap_many(cgroups, &others);
 }
@@ -897,7 +920,7 @@ fn publish_supervisor_failure(
                 aborted: false,
             },
         );
-        trip_fail_fast(&mut sh, cgroups, keep_going);
+        trip_fail_fast(&mut sh, cgroups, keep_going, &tag);
     }
     if let Some(e) = evidence {
         // THE REASON IS THE RECORD. The whole point of the reason string is that it NAMES the
@@ -1109,6 +1132,14 @@ impl Runner {
             .iter()
             .map(|(tag, step)| (tag.clone(), step.explains.clone()))
             .collect();
+        let fail_fast_family_index: HashMap<String, String> = steps
+            .iter()
+            .filter_map(|(tag, step)| {
+                step.fail_fast_family
+                    .as_ref()
+                    .map(|family| (tag.clone(), family.clone()))
+            })
+            .collect();
         Runner {
             steps: Arc::new(steps),
             order,
@@ -1139,6 +1170,8 @@ impl Runner {
                 step_profile_rows: Vec::new(),
                 running_nonces: HashMap::new(),
                 explains_index,
+                fail_fast_family_index,
+                failed_families: HashSet::new(),
                 run_timed_out: false,
                 active_processes: 0,
                 max_concurrent_steps: 0,
@@ -1310,32 +1343,50 @@ impl Runner {
                 // is not enough -- the measured case had the diagnostic still QUEUED when its
                 // subject failed, so it was never launched at all and the run reported the
                 // symptom with no account of the cause.
-                let failed_now = if sh.stop {
+                let failed_now = if sh.stop || !sh.failed_families.is_empty() {
                     genuinely_failed(&sh)
                 } else {
                     std::collections::HashSet::new()
                 };
                 let startable_after_stop = |sh: &Shared, tag: &str| -> bool {
-                    !sh.stop || is_exempt_from_eager_exit(sh, tag, &failed_now)
+                    !blocked_by_fail_fast(sh, tag)
+                        || is_exempt_from_eager_exit(sh, tag, &failed_now)
                 };
                 // Do not end the run while a permitted diagnostic is still waiting to start.
                 // Terminates: the set is finite, each member runs at most once, and a member
                 // whose deps can never be satisfied is excluded here rather than waited on.
-                let pending_diagnostics = sh.stop
-                    && self.order.iter().any(|tag| {
+                let pending_diagnostics = self.order.iter().any(|tag| {
+                    blocked_by_fail_fast(&sh, tag)
+                        && !sh.done.contains_key(tag)
+                        && !sh.running.contains(tag)
+                        && !skipped.contains(tag)
+                        && self.steps[tag].skip_reason.is_none()
+                        && startable_after_stop(&sh, tag)
+                        && deps_known(&sh, &self.steps[tag])
+                        && deps_ok(&sh, &self.steps[tag])
+                });
+                let blocked_by_family: HashSet<String> = self
+                    .order
+                    .iter()
+                    .filter(|tag| {
+                        let tag = *tag;
                         let step = &self.steps[tag];
                         !sh.done.contains_key(tag)
                             && !sh.running.contains(tag)
                             && !skipped.contains(tag)
                             && step.skip_reason.is_none()
-                            && startable_after_stop(&sh, tag)
-                            && deps_known(&sh, step)
-                            && deps_ok(&sh, step)
-                    });
+                            && blocked_by_fail_fast(&sh, tag)
+                            && !startable_after_stop(&sh, tag)
+                    })
+                    .cloned()
+                    .collect();
                 if sh.running.is_empty()
                     && !pending_diagnostics
                     && (sh.stop
-                        || sh.done.len() + skipped.len() + self.intentional_skips.len()
+                        || sh.done.len()
+                            + skipped.len()
+                            + self.intentional_skips.len()
+                            + blocked_by_family.len()
                             >= self.steps.len())
                 {
                     break;
@@ -1383,7 +1434,10 @@ impl Runner {
                     // be mutating `sh.done` or `sh.resource_avail`, so the counts read below are
                     // stable rather than merely sampled, and `resource_avail` has returned to the
                     // configured caps.
-                    let accounted = sh.done.len() + skipped.len() + self.intentional_skips.len();
+                    let accounted = sh.done.len()
+                        + skipped.len()
+                        + self.intentional_skips.len()
+                        + blocked_by_family.len();
                     let remaining = self.steps.len().saturating_sub(accounted);
                     if launchable.is_empty() && sh.running.is_empty() && remaining > 0 {
                         let mut stuck: Vec<String> = self
@@ -1393,6 +1447,7 @@ impl Runner {
                                 !sh.done.contains_key(*t)
                                     && !skipped.contains(*t)
                                     && self.steps[*t].skip_reason.is_none()
+                                    && !blocked_by_family.contains(*t)
                             })
                             .cloned()
                             .collect();
@@ -2303,7 +2358,7 @@ fn run_step(ctx: StepCtx) {
                 None,
             );
             sh.done.insert(tag.clone(), outcome);
-            trip_fail_fast(&mut sh, &cgroups, keep_going);
+            trip_fail_fast(&mut sh, &cgroups, keep_going, &tag);
             drop(sh);
             emit(&format!(
                 "[{tag}] \u{2717} FAIL   {} (spawn failed: {e})",
@@ -2841,7 +2896,7 @@ fn run_step(ctx: StepCtx) {
             // step still running so a fast failure does not wait for a slow in-flight build.
             // keep_going records the failure but leaves scheduling open: independent ready steps
             // continue, while dependency-failure closure skips only true dependents.
-            trip_fail_fast(&mut sh, &cgroups, keep_going);
+            trip_fail_fast(&mut sh, &cgroups, keep_going, &tag);
         }
         (was_aborted, cut_by_run_budget, reason)
     };
@@ -3437,6 +3492,7 @@ mod tests {
             write_domains: None,
             write_domain_guarantee: None,
             explains: Vec::new(),
+            fail_fast_family: None,
         }
     }
 
@@ -3870,6 +3926,63 @@ mod tests {
         );
         assert_eq!(res.skipped, vec!["g.dependent"]);
         assert_eq!(res.not_launched, vec!["g.independent"]);
+    }
+
+    #[test]
+    fn scoped_eager_exit_cancels_its_family_and_completes_an_independent_family() {
+        let mut fail = step("family", "fail", "sleep 0.2; exit 1", &[], 100.0, &[]);
+        let mut peer = step("family", "peer", "sleep 5", &[], 90.0, &[]);
+        let mut independent = step("independent", "ok", "sleep 0.5; true", &[], 80.0, &[]);
+        let mut dependent = step("family", "dependent", "true", &["family.fail"], 70.0, &[]);
+        fail.fail_fast_family = Some("family-a".to_string());
+        peer.fail_fast_family = Some("family-a".to_string());
+        dependent.fail_fast_family = Some("family-a".to_string());
+        independent.fail_fast_family = Some("family-b".to_string());
+        let cfg = DagConfig {
+            steps: vec![fail, peer, independent, dependent],
+            ..Default::default()
+        };
+
+        let res = run_dag(&cfg, 3, false, 0);
+        let outcomes: HashMap<String, StepOutcome> = res
+            .outcomes
+            .iter()
+            .map(|outcome| (outcome.tag.clone(), outcome.clone()))
+            .collect();
+
+        assert!(!res.ok);
+        assert!(!outcomes["family.fail"].ok);
+        assert!(!outcomes["family.fail"].aborted);
+        assert!(outcomes["family.peer"].aborted);
+        assert_eq!(res.skipped, vec!["family.dependent"]);
+        assert!(outcomes["independent.ok"].ok);
+        assert!(!outcomes["independent.ok"].aborted);
+    }
+
+    #[test]
+    fn scoped_eager_exit_does_not_launch_a_queued_family_peer() {
+        let mut fail = step("family", "fail", "exit 1", &[], 100.0, &[]);
+        let mut peer = step("family", "queued", "true", &[], 90.0, &[]);
+        let mut independent = step("independent", "ok", "true", &[], 80.0, &[]);
+        fail.fail_fast_family = Some("family-a".to_string());
+        peer.fail_fast_family = Some("family-a".to_string());
+        independent.fail_fast_family = Some("family-b".to_string());
+        let cfg = DagConfig {
+            steps: vec![fail, peer, independent],
+            ..Default::default()
+        };
+
+        let res = run_dag(&cfg, 1, false, 0);
+        let outcomes: HashMap<String, StepOutcome> = res
+            .outcomes
+            .iter()
+            .map(|outcome| (outcome.tag.clone(), outcome.clone()))
+            .collect();
+
+        assert!(!res.ok);
+        assert!(outcomes["independent.ok"].ok);
+        assert!(!outcomes.contains_key("family.queued"));
+        assert_eq!(res.not_launched, vec!["family.queued"]);
     }
 
     #[test]

@@ -233,6 +233,46 @@ def test_fail_fast_reports_independent_step_as_not_launched() -> None:
     assert res.not_launched == ("g.independent",)
 
 
+def test_scoped_eager_exit_cancels_its_family_and_completes_an_independent_family() -> None:
+    fail = _step("family", "fail", "sleep 0.2; exit 1", est=100.0)
+    peer = _step("family", "peer", "sleep 5", est=90.0)
+    independent = _step("independent", "ok", "sleep 0.5; true", est=80.0)
+    dependent = _step("family", "dependent", "true", deps=[fail.tag], est=70.0)
+    fail.fail_fast_family = "family-a"
+    peer.fail_fast_family = "family-a"
+    dependent.fail_fast_family = "family-a"
+    independent.fail_fast_family = "family-b"
+    cfg = DagConfig(steps=(fail, peer, independent, dependent))
+
+    res = run_dag(cfg, jobs=3, keep_going=False, verbosity=0)
+    outcomes = {outcome.tag: outcome for outcome in res.outcomes}
+
+    assert not res.ok
+    assert outcomes[fail.tag].ok is False and outcomes[fail.tag].aborted is False
+    assert outcomes[peer.tag].aborted is True, "the failed family must still be cancelled"
+    assert res.skipped == (dependent.tag,), "a true dependent must remain dependency-skipped"
+    assert outcomes[independent.tag].ok is True
+    assert outcomes[independent.tag].aborted is False, "an independent family must complete"
+
+
+def test_scoped_eager_exit_does_not_launch_a_queued_family_peer() -> None:
+    fail = _step("family", "fail", "exit 1", est=100.0)
+    peer = _step("family", "queued", "true", est=90.0)
+    independent = _step("independent", "ok", "true", est=80.0)
+    fail.fail_fast_family = "family-a"
+    peer.fail_fast_family = "family-a"
+    independent.fail_fast_family = "family-b"
+    cfg = DagConfig(steps=(fail, peer, independent))
+
+    res = run_dag(cfg, jobs=1, keep_going=False, verbosity=0)
+    outcomes = {outcome.tag: outcome for outcome in res.outcomes}
+
+    assert not res.ok
+    assert outcomes[independent.tag].ok is True
+    assert peer.tag not in outcomes
+    assert res.not_launched == (peer.tag,)
+
+
 def test_keep_going_launches_independent_step_after_failure() -> None:
     cfg = DagConfig(
         steps=(

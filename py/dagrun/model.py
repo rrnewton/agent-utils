@@ -228,6 +228,11 @@ class Step:
     # :meth:`Step.explains_a_failure_in`. A declared explainer is still cancelled normally when
     # something it does not explain fails.
     explains: list[str] = field(default_factory=list)
+    # Steps carrying the same non-empty value form one fail-fast family. A failure cancels only
+    # running and queued peers in that family; true dependents remain excluded by the ordinary
+    # dependency closure, while independent families continue. None preserves the existing
+    # global eager-exit behavior, so existing graphs do not silently become keep-going runs.
+    fail_fast_family: str | None = None
 
     def explains_a_failure_in(self, failed: Container[str]) -> bool:
         """Whether this step is exempt from eager-exit given the set of tags that FAILED.

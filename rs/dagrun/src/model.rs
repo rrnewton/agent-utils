@@ -275,6 +275,13 @@ pub struct Step {
     /// cycle), and lets the exemption be CONDITIONAL -- see [`Step::explains_a_failure_in`].
     /// Both editions of this crate must accept and enforce this field identically.
     pub explains: Vec<String>,
+    /// Non-empty name of the fail-fast family this step belongs to.
+    ///
+    /// A failure cancels running and queued peers in the same family. True dependents are still
+    /// excluded by dependency closure, while independent families continue. `None` preserves the
+    /// existing global eager-exit behavior so an existing graph cannot silently become a
+    /// keep-going run merely because the runner learned this field.
+    pub fail_fast_family: Option<String>,
 }
 
 impl Step {
@@ -1291,6 +1298,7 @@ mod tests {
             write_domains: None,
             write_domain_guarantee: None,
             explains: Vec::new(),
+            fail_fast_family: None,
         };
         assert_eq!(step_classification(&step), StepClass::LatencyBound);
     }
@@ -1315,6 +1323,7 @@ mod tests {
             write_domains: None,
             write_domain_guarantee: None,
             explains: Vec::new(),
+            fail_fast_family: None,
         }
     }
 
@@ -1520,6 +1529,7 @@ mod cpu_timeout_multiplier_tests {
             write_domains: None,
             write_domain_guarantee: None,
             explains: Vec::new(),
+            fail_fast_family: None,
         }
     }
 
@@ -1689,6 +1699,7 @@ mod carry_tests {
             write_domains: None,
             write_domain_guarantee: None,
             explains: Vec::new(),
+            fail_fast_family: None,
         }
     }
 
