@@ -35,6 +35,68 @@ when a **named superseding artefact is present and complete**, checked by the re
 acceptance rule, or when a manifest that is authoritative over a directory says the file is in
 neither its current nor its retained set.
 
+Retiring a whole generation needs one thing more
+------------------------------------------------
+A superseding artefact says the archive can still be read without the old generation. It does not
+say the old generation has *stopped being produced*, and for a format that is still written those
+are different: reclaiming this build's own output is churn, and the operator who runs `gc` after
+every build would pay for it every time. The schema-1 monolith did not have to ask, because it
+was already unwritten when it was given a category. Schema 2 does, because it is 1.4 GB and it is
+still the website's only format.
+
+The answer cannot come from the archive. Objects are content addressed and the bootstrap goes
+through `write_text_if_changed`, so a build that republishes an identical schema 2 moves no mtime
+at all -- on a measured archive the newest schema-2 object was thirteen hours *older* than the
+schema-3 bootstrap while that same build's `data/export.json` named all 661 schema-2 files as its
+own output. So the answer comes from the code: `timeline_shards.SCHEMA_2_IS_PUBLISHED`, which
+`timeline_shards.write_timeline_shards` enforces by refusing to run while it is false. "No build
+did" is an observation and this module refuses to act on one; "no build can" is a property, and
+that is what a category worth 1.4 GB is gated on. See :func:`_schema_2_retirement_refusal`.
+
+…and one thing schema 3 does not supersede at all
+-------------------------------------------------
+"Schema 3 replaces schema 2" is true of the *presentation timeline* and false of the archive.
+``query.TimelineQuery._search_bootstrap`` says so in as many words: the transcript search corpus
+is still a set of schema-2 content-addressed day shards with trigram blooms, catalogued in the
+``search`` section of ``data/timeline-v2.json``, and a search under schema 3 reads phases and
+agents from the spine and *messages from schema 2*. It is the one operation in the reader that
+touches both generations, and it has no schema-3 successor to be superseded by.
+
+That is 500.5 MiB of the 1,434.2 MiB this module can see in the generation on a measured archive
+-- 35% -- and it is not a duplicate copy of anything. Reclaiming it does not make the archive
+slower, it deletes `timeline search` and `timeline show` outright, against a schema-3 generation
+that is perfectly complete. So the retirement of the *format* and the retirement of the *corpus*
+are two facts, the archive states the second one itself -- the bootstrap either carries a
+``search`` section or it does not -- and :func:`_schema_2_search_corpus_category` holds exactly
+what that section names, forever, until a build stops naming it. The whole-generation category is
+therefore the generation *minus* the corpus, which is the only split that satisfies this module's
+own rule: reclaim what a named successor covers, and nothing else.
+
+Two more questions the retirement has to ask
+--------------------------------------------
+`query.schema_3_completeness` is the reader's acceptance rule and it is entirely
+*intra-generation*: all five clauses compare the schema-3 bootstrap against itself and against
+its own tree. It cannot see that the generation beside it is **newer**, and one exists --
+`render.render_archive` publishes schema 2 and then schema 3, so a build killed in between leaves
+a new schema 2 next to an untouched old schema 3, self-consistent and a team short. Reclaiming
+on completeness alone would then take the newer generation and keep the older one, which is the
+one outcome worse than reclaiming nothing. The reader already treats that mismatch as a refusal
+where it can see it -- ``_search_bootstrap`` compares ``source_digest`` across the two bootstraps
+and declines rather than papering over it -- so :func:`_cross_generation_refusal` makes the same
+comparison *before* the sweep, because the reader only makes it when somebody searches and by
+then the bytes are gone. See :func:`_cross_generation_refusal` for why this is asked of schema 2
+and not of the monolith.
+
+The other question is the browser. `gc` reclaims without rebuilding -- that is the point of it --
+but the archive carries its **own copy** of ``app.js``, written by the build that made it, and
+`gc` does not rewrite it. A copy from before the flip has no schema-3 mode at all: it loads
+``data/timeline-v2.json`` as its timeline and falls back to ``data/timeline.json``, and this pass
+offers both. So the graphical surface would go silently, at the moment the operator was told they
+were reclaiming a superseded copy. :func:`_website_refusal` asks the positive question instead --
+does this archive's own ``app.js`` name the schema-3 bootstrap -- and holds the generation until a
+build has put one there. That is the same shape as every other precondition here: a named
+successor has to be *present*, not merely conceivable.
+
 The rejected design: sweeping everything ``data/export.json`` does not name
 -------------------------------------------------------------------------
 The export manifest is a complete positive inventory of one build's presentation output, so
@@ -86,7 +148,15 @@ What `gc` will not touch, and why
   names. Reclaiming them would collapse that grace period to zero at exactly the moment it is
   being used, since the operator most likely to run `gc` is the one who has just rebuilt and is
   looking at what the rebuild left behind -- which is when a browser tab from before the rebuild
-  is still open. The next build supersedes them and they go on their own.
+  is still open. The next build supersedes them and they go on their own. That reasoning holds
+  only while something still *writes* schema 2; when the format itself is retired the grace
+  period has nobody left to protect, and the whole generation moves into one category. See
+  :func:`_schema_2_categories`.
+* **The transcript search corpus.** The schema-2 bootstrap and the day shards and linkage
+  sidecars its ``search`` section names -- 500.5 MiB and 144 objects on the measured archive.
+  Reported at full size, never reclaimed, and *not* reclaimed even once the schema-2 presentation
+  format is retired, because retiring a format does not give this corpus a successor. See
+  :func:`_schema_2_search_corpus_category`.
 * **Schema-3 shards the bootstrap does not name.** Reported, never reclaimed. Absence from the
   catalogue does not say whether the shard is a retired team's or a live team's: the answer turns
   entirely on whether the bootstrap beside it is newer or older than the shard, which nothing on
@@ -139,7 +209,11 @@ from agent_team_timeline.archive import (
 )
 from agent_team_timeline.pipeline import ARCHIVE_TRASH_ROOT, archive_writer_lock
 from agent_team_timeline.query import schema_3_completeness
-from agent_team_timeline.timeline_shards import SCHEMA_2_BOOTSTRAP_PATH
+from agent_team_timeline.timeline_shards import (
+    SCHEMA_2_BOOTSTRAP_PATH,
+    SCHEMA_2_ROOT,
+    schema_2_is_published,
+)
 from agent_team_timeline.timeline_v3 import SCHEMA_3_BOOTSTRAP_PATH, SCHEMA_3_ROOT
 
 #: Where a swept file goes. Dot-prefixed and at the archive root, beside the marker and the lock,
@@ -159,7 +233,14 @@ _SCHEMA_2_OBJECT_ROOT = "data/timeline-v2/objects"
 _SCHEMA_2_MANIFEST = "data/timeline-v2/manifest.json"
 _SOURCE_SNAPSHOT_DIRECTORY = "source_snapshots"
 _OBJECT_NAME = re.compile(r"[0-9a-f]{64}\.json(?:\.gz)?")
+_OBJECT_DIGEST = re.compile(r"[0-9a-f]{64}")
 _GENERATION_STAMP = "%Y%m%dT%H%M%SZ"
+
+#: The archive's own copy of the browser bundle. Named here rather than imported from `render`
+#: because what this module needs is not "the file a build writes" but "the file a *past* build
+#: left in this archive", and those are the same path and deliberately not the same claim -- see
+#: :func:`_website_refusal`.
+_WEBSITE_APP = "app.js"
 
 
 class ArchiveGcError(ValueError):
@@ -387,6 +468,14 @@ def _schema_1_category(root: Path) -> GcCategory:
     the failure the fallback exists to absorb. So both must be present, and schema 3's presence
     is judged by :func:`query.schema_3_completeness` -- the reader's own five-clause rule, not a
     looser restatement of it that could say yes where the reader says no.
+
+    The second condition is a statement about the *website*, not about schema 2, and it lapses
+    the day the website stops reading schema 2 -- which is exactly what
+    :data:`timeline_shards.SCHEMA_2_IS_PUBLISHED` going false records, since the flip is only
+    legal alongside a browser that reads schema 3. Keeping the condition past that point would
+    hold the monolith for a reader that no longer exists, and would print a reason whose first
+    clause was false, which is the failure mode this whole change is about: a refusal nobody can
+    act on because its premise has quietly expired.
     """
 
     files = _files_with_sizes(root, (_SCHEMA_1_TIMELINE, _SCHEMA_1_TIMELINE + ".gz"))
@@ -398,7 +487,7 @@ def _schema_1_category(root: Path) -> GcCategory:
             f"held: no complete schema-3 generation supersedes it ({declined})",
             files,
         )
-    if _size_of(root, SCHEMA_2_BOOTSTRAP_PATH) is None:
+    if schema_2_is_published() and _size_of(root, SCHEMA_2_BOOTSTRAP_PATH) is None:
         return GcCategory(
             "schema-1-monolith",
             False,
@@ -406,11 +495,16 @@ def _schema_1_category(root: Path) -> GcCategory:
             f"{SCHEMA_2_BOOTSTRAP_PATH} is absent",
             files,
         )
+    beside = (
+        f" beside {SCHEMA_2_BOOTSTRAP_PATH}"
+        if _size_of(root, SCHEMA_2_BOOTSTRAP_PATH) is not None
+        else ""
+    )
     return GcCategory(
         "schema-1-monolith",
         True,
-        f"superseded by a complete {SCHEMA_3_BOOTSTRAP_PATH} beside "
-        f"{SCHEMA_2_BOOTSTRAP_PATH}; no build writes it any more",
+        f"superseded by a complete {SCHEMA_3_BOOTSTRAP_PATH}{beside}; no build writes it any "
+        "more",
         files,
     )
 
@@ -452,15 +546,459 @@ def _schema_2_manifest_sets(root: Path) -> tuple[frozenset[str], frozenset[str]]
     return current, retained
 
 
-def _schema_2_categories(root: Path) -> tuple[GcCategory, GcCategory]:
-    """Split the object store into what the manifest disowns and what it deliberately holds.
+#: Named in the reasons below rather than paraphrased, because an operator looking at 1.4 GB held
+#: by a constant is entitled to know which constant, and because the string is what a future
+#: reader greps for when they want to know what makes this category fire.
+_SCHEMA_2_CAPABILITY = "timeline_shards.SCHEMA_2_IS_PUBLISHED"
 
-    The manifest's accounting is exact today -- on the measured archive 353 current plus 305
-    retained is 658, which is every one of the 334 ``.json`` and 324 ``.gz`` files on disk, with
-    no orphan and nothing missing -- and this function is written so that reading it that way
-    keeps the property rather than replacing it. The orphan set is *derived* as
-    ``on disk - current - retained``, so if it is ever non-empty that is a real finding about a
-    crashed build, not an artefact of `gc` counting differently.
+
+def _bootstrap(
+    root: Path, relative: str, version: int, kind: str
+) -> dict[str, JsonValue] | None:
+    """One generation's bootstrap, or ``None`` when this reader cannot vouch for it.
+
+    ``None`` collapses "absent" and "unreadable", which every caller here then has to separate
+    for itself, and that is on purpose: the two mean opposite things to a collector. An absent
+    bootstrap is a generation that is not there, and a generation that is not there holds
+    nothing; an unreadable one is a generation whose contents cannot be enumerated, and a
+    collector that treated it as empty would classify every file it names as unclaimed. So the
+    narrowing is done here and the interpretation is done at each call site, in the open.
+    """
+
+    path = root / relative
+    if path.is_symlink() or not path.is_file():
+        return None
+    try:
+        document = as_object(read_json(path), str(path))
+    except (OSError, ValueError):
+        return None
+    if document.get("schema_version") != version or document.get("kind") != kind:
+        return None
+    return document
+
+
+def _schema_2_search_paths(root: Path) -> frozenset[str] | None:
+    """Every schema-2 file the transcript search corpus is made of, or ``None`` if unknowable.
+
+    An empty set is a real answer and means "this archive has no transcript search corpus": either
+    there is no schema-2 bootstrap at all, or the one there is carries no ``search`` section --
+    which is what an archive predating transcript search looks like, and what an archive built
+    after the corpus finds a schema-3 home will look like. ``None`` is the other answer, "there is
+    a bootstrap and it cannot be parsed", and the caller turns that into a refusal rather than
+    into an empty set, because a corpus whose members cannot be listed is a corpus whose members
+    cannot be protected.
+
+    The set is taken from the catalogue rather than from the shape of the filenames, because the
+    two halves of the generation are stored in the same content-addressed directory and are
+    indistinguishable on disk: ``data/timeline-v2/objects/<sha256>.json`` is a day of transcript
+    or a page of presentation depending only on which section of the bootstrap points at it.
+    Names cannot answer that. The catalogue can, exactly, and it is the same list
+    ``query._iter_search_records`` walks -- ``search.shards[].sha256`` for the day shard and
+    ``search.shards[].linkage.sha256`` for the prompt/response sidecar
+    ``query._search_link_context_from_sidecars`` reads.
+
+    The ``.gz`` twin of each object is included even though the reader only ever opens the plain
+    ``.json`` -- the digest is over the uncompressed bytes -- because the twin is what a browser
+    fetches, and leaving the compressed half of a held corpus behind to be swept would keep the
+    corpus readable by exactly one of its two readers.
+    """
+
+    path = root / SCHEMA_2_BOOTSTRAP_PATH
+    if path.is_symlink() or not path.is_file():
+        return frozenset()
+    bootstrap = _bootstrap(root, SCHEMA_2_BOOTSTRAP_PATH, 2, "timeline-bootstrap")
+    if bootstrap is None:
+        return None
+    raw_search = bootstrap.get("search")
+    if raw_search is None:
+        return frozenset()
+    named: set[str] = {SCHEMA_2_BOOTSTRAP_PATH, SCHEMA_2_BOOTSTRAP_PATH + ".gz"}
+    try:
+        search = as_object(raw_search, "timeline-v2.search")
+        for index, raw_shard in enumerate(
+            as_array(search.get("shards"), "timeline-v2.search.shards")
+        ):
+            where = f"timeline-v2.search.shards[{index}]"
+            shard = as_object(raw_shard, where)
+            references = [(shard, where)]
+            raw_linkage = shard.get("linkage")
+            if raw_linkage is not None:
+                references.append((as_object(raw_linkage, where + ".linkage"), where + ".linkage"))
+            for reference, source in references:
+                digest = as_string(reference.get("sha256"), source + ".sha256")
+                if _OBJECT_DIGEST.fullmatch(digest) is None:
+                    return None
+                named.add(f"{_SCHEMA_2_OBJECT_ROOT}/{digest}.json")
+                named.add(f"{_SCHEMA_2_OBJECT_ROOT}/{digest}.json.gz")
+    except ValueError:
+        return None
+    return frozenset(named)
+
+
+def _cross_generation_refusal(root: Path) -> str | None:
+    """Whether the schema-3 generation describes the *same build* as the schema 2 beside it.
+
+    `query.schema_3_completeness` cannot answer this and is not defective for not answering it:
+    all five of its clauses are about one generation's internal agreement -- the bootstrap parses,
+    the codec is one this reader implements, the spine covers the declared teams, every named
+    shard is present at its declared length, and nothing on disk is unnamed. A generation can
+    satisfy every one of those and still be **older than the generation it is being used to
+    retire**, and one specific accident produces exactly that: `render.render_archive` writes
+    schema 2 and then schema 3, in that order, with no atomicity across the pair, so a build that
+    dies in between -- OOM, ENOSPC, a validation error inside `write_timeline_v3` -- leaves a new
+    schema 2 next to the previous build's schema 3, untouched and perfectly self-consistent. The
+    writer's lock is released by process death, so nothing stops `gc` running next.
+
+    Reclaiming there would take the newer generation and keep the older one. On a three-team
+    export whose schema 3 is a build behind, that is a team whose presentation data exists in no
+    readable generation at all -- and the pass would say ``superseded``, because from inside
+    schema 3 everything is in order.
+
+    ``source_digest`` settles it, and this is not a new rule invented for a collector: it is the
+    reader's, from ``query.TimelineQuery._search_bootstrap``, which refuses outright when the two
+    generations disagree because "the phases would come from one build and the messages from
+    another". The reader makes that comparison lazily -- only when something searches -- which is
+    correct for a reader and useless here, because by the time anybody searches `gc` has already
+    moved the bytes. So the same comparison is made eagerly, once, before the sweep.
+
+    **Asked of schema 2 and not of the schema-1 monolith**, deliberately. The monolith is not
+    written by a published build at all, so it cannot be the newest generation in an archive; the
+    worst it can be is stale, and a stale fallback behind two live generations loses nothing when
+    it goes. Schema 2 is written by *every* build, which is what makes "it might be newer than
+    schema 3" a state an archive can actually be in.
+    """
+
+    schema_3 = _bootstrap(root, SCHEMA_3_BOOTSTRAP_PATH, 3, "timeline-v3-bootstrap")
+    schema_2 = _bootstrap(root, SCHEMA_2_BOOTSTRAP_PATH, 2, "timeline-bootstrap")
+    if schema_3 is None or schema_2 is None:
+        return None
+    theirs = schema_3.get("source_digest")
+    ours = schema_2.get("source_digest")
+    if theirs is None or ours is None or theirs == ours:
+        return None
+    return (
+        f"held: {SCHEMA_3_BOOTSTRAP_PATH} and {SCHEMA_2_BOOTSTRAP_PATH} describe different "
+        f"builds -- source_digest {theirs!r} against {ours!r} -- so the schema-3 generation is "
+        "not a successor to this schema 2, it is a bystander from another one. Publication is "
+        "schema 2 and then schema 3, so a build that died between them leaves exactly this: a "
+        "complete, self-consistent schema 3 that is a build behind, and reclaiming on its "
+        "strength would take the newer generation and keep the older. The reader refuses the "
+        "same mismatch when a transcript search makes it look at both. Re-run the build; it "
+        "republishes schema 3 against this source and the two agree again"
+    )
+
+
+def _website_refusal(root: Path) -> str | None:
+    """Whether this archive's own browser bundle has anywhere to go once schema 2 is reclaimed.
+
+    A subtle asymmetry, and the one thing about `gc` that a tool release cannot fix on its own.
+    Every other precondition here is about the *tool*: flip a constant, ship a reader, and every
+    archive in the world is ready at once. The website is not shipped, it is **copied** -- a build
+    writes ``app.js`` into the archive it builds, and that copy then stays exactly as it was until
+    another build overwrites it. `gc` does not rewrite it and should not: rewriting published
+    assets is a build's job, and a collector that started editing JavaScript would be doing
+    something nobody could audit from a receipt.
+
+    So an archive built before the flip carries a bundle with no schema-3 mode -- it loads
+    ``data/timeline-v2.json`` and falls back to ``data/timeline.json`` -- and this pass offers
+    both of those. Sweeping without rebuilding, which is the whole convenience `gc` sells, would
+    leave the operator an ``index.html`` that fails its first fetch, falls through to a file that
+    is also in the trash, and shows an error. Silently, hours later, in somebody else's session.
+
+    The test is the *positive* one: does this archive's ``app.js`` name the schema-3 bootstrap.
+    Asking the negative -- "does it still mention ``data/timeline-v2.json``" -- would be wrong
+    rather than merely fragile, because a post-flip bundle still fetches that file: it is the
+    transcript search catalogue, which the flip does not retire. Presence of the schema-3 URL is
+    the thing that actually distinguishes a bundle that can read this archive without schema 2's
+    presentation objects from one that cannot.
+
+    An archive with no ``app.js`` gets no refusal. There is no graphical surface there to protect,
+    and inventing one would hold bytes on behalf of a reader that does not exist -- the failure
+    mode :func:`_schema_1_category` describes for the fallback condition it lets lapse.
+    """
+
+    path = root / _WEBSITE_APP
+    if path.is_symlink() or not path.is_file():
+        return None
+    try:
+        source = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    if SCHEMA_3_BOOTSTRAP_PATH in source:
+        return None
+    return (
+        f"held: this archive's own {_WEBSITE_APP} has no schema-3 mode -- it does not mention "
+        f"{SCHEMA_3_BOOTSTRAP_PATH} -- so it still loads {SCHEMA_2_BOOTSTRAP_PATH} as its "
+        f"timeline and falls back to {_SCHEMA_1_TIMELINE}, and this pass offers both. A build "
+        f"copies {_WEBSITE_APP} into the archive and `gc` does not rewrite it, so a newer tool "
+        "is not enough on its own: re-run the build against this archive, which costs no tokens "
+        "and republishes the bundle, and the generation becomes collectable"
+    )
+
+
+def _schema_2_generation_files(root: Path) -> tuple[GcFile, ...]:
+    """Every file the schema-2 generation owns: the bootstrap, its gzip twin, and its whole tree.
+
+    The tree is taken wholesale rather than filtered to object-shaped names, which departs from
+    :func:`_schema_2_categories`' orphan rule deliberately. ``data/timeline-v2/`` belongs to one
+    format generation and to nothing else -- no other writer puts anything there and no reader
+    looks there for anything else -- so once that generation is retired an unrecognised file
+    inside it is residue of the same dead format, and skipping it would leave the directory
+    standing for no reason anybody could later reconstruct. This set is only ever reached with
+    the retirement preconditions already satisfied, and reclaiming is a rename into
+    ``.agent-team-timeline-trash/``, so the price of being wrong about a stray is one copy back.
+
+    "Wholesale" is about *recognising* names, not about fate: :func:`_schema_2_categories`
+    subtracts the transcript search corpus from whatever this returns, in both worlds, because
+    those objects live in this tree without belonging to the format that is being retired.
+    """
+
+    return _files_with_sizes(
+        root,
+        (
+            SCHEMA_2_BOOTSTRAP_PATH,
+            SCHEMA_2_BOOTSTRAP_PATH + ".gz",
+            *(relative for relative, _size in _walk_files(root, SCHEMA_2_ROOT)),
+        ),
+    )
+
+
+def _schema_2_retirement_refusal(root: Path) -> str | None:
+    """Why the schema-2 generation may not go yet, or ``None`` when it may.
+
+    Four preconditions, and they answer four different questions. **Is there anything left to
+    read the archive with**, which is the same question the schema-1 monolith asks and is answered
+    the same way -- by `query.schema_3_completeness`, the reader's own five-clause acceptance
+    rule, called rather than restated so that `gc` can never say yes where the reader says no.
+    **Will anything write this generation again**, which the monolith never had to ask, because
+    when the monolith was retired the tool had already stopped emitting it and schema 2 was there
+    to catch both readers. **Is that schema 3 a successor to this schema 2 or a bystander from
+    another build**, which completeness structurally cannot see -- :func:`_cross_generation_refusal`.
+    And **does the browser in this archive know about schema 3** -- :func:`_website_refusal`,
+    the one precondition a tool release cannot satisfy on an operator's behalf.
+
+    They are checked in that order because that is the order in which they stop being worth
+    printing: an operator whose tool still writes schema 2 does not need to hear about their
+    ``app.js``, and one whose schema 3 is a shard short does not need to hear about digests.
+
+    The second question is answered from the *code* -- :data:`timeline_shards.SCHEMA_2_IS_PUBLISHED`
+    via :func:`timeline_shards.schema_2_is_published` -- and never from the archive, because every
+    archive-side signal for it is either wrong or circular:
+
+    * **Modification times lie, and this tool is why.** Schema-2 objects are content addressed and
+      the bootstrap goes through `write_text_if_changed`, so a build that republishes an identical
+      schema 2 writes no byte and moves no mtime. A measured archive showed its newest schema-2
+      object thirteen hours older than its schema-3 bootstrap while the most recent build's
+      ``data/export.json`` named all 661 schema-2 files as its own ``generated_files`` and both
+      bootstraps carried the same ``source_digest`` and ``generated_at``. An mtime rule would have
+      released 1.4 GB that the next build would have written straight back -- and worse, it would
+      have been the "the last build did not write it" inference this whole module refuses.
+    * **The export manifest is the opposite mistake.** It does name the generation, exactly, and
+      that is why it cannot be the gate: the manifest of an archive built before the retirement
+      names schema 2 forever, so requiring its silence would hold the bytes until a rebuild that
+      the operator is trying to avoid, and requiring its *presence* to hold would be the mtime
+      rule with more steps. It is corroboration for a human -- the measured archive above -- not a
+      precondition.
+
+    So the writer declares it, once, in the place a future edit has to go through anyway, and
+    :func:`timeline_shards.write_timeline_shards` refuses to run while the declaration says
+    retired. That is the property mtimes cannot have: not "no build did", but "no build can".
+    """
+
+    if schema_2_is_published():
+        return (
+            f"held: this build still writes schema 2 -- {_SCHEMA_2_CAPABILITY} is True, and "
+            "write_timeline_shards refuses to run while it is False -- so every byte reclaimed "
+            "here would be written again by the next build, which is churn rather than "
+            "collection. The website is why that constant is still True: static/app.js loads "
+            f"{SCHEMA_2_BOOTSTRAP_PATH} and has no schema-3 mode, so retiring the format today "
+            "would retire the graphical surface. Nothing an operator can do to this archive "
+            "changes this line; a release of the tool does"
+        )
+    complete, declined = schema_3_completeness(root)
+    if not complete:
+        return f"held: no complete schema-3 generation supersedes it ({declined})"
+    mismatch = _cross_generation_refusal(root)
+    if mismatch is not None:
+        return mismatch
+    return _website_refusal(root)
+
+
+def _holds_raw_turns(root: Path) -> bool:
+    """Whether the material a rebuild reads is in *this* directory.
+
+    The distinction is ingest archive against combined export, and it is not cosmetic: both carry
+    ``.agent-team-timeline.json`` and both are things `gc` runs on, but only the first can be
+    rebuilt from itself. Asked as "is there a ``teams/<slug>/raw/``" rather than by looking for a
+    marker that says which kind of archive this is, because no such marker exists and inventing
+    one to answer a sentence in a reason string would be the tail wagging the dog -- the question
+    the sentence is actually making a promise about is literally "are the raw turns here".
+    """
+
+    teams = root / "teams"
+    if not teams.is_dir() or teams.is_symlink():
+        return False
+    for team in teams.iterdir():
+        raw = team / "raw"
+        if raw.is_dir() and not raw.is_symlink():
+            return True
+    return False
+
+
+def _schema_2_reclaim_reason(root: Path) -> str:
+    """The reclaim reason, which is mostly a warning, and is a warning on purpose.
+
+    This category removes the **last fallback**. The reader tries schema 3, then schema 2, then
+    ``data/timeline.json``; the monolith is already retired as output and is offered for
+    collection by :func:`_schema_1_category` under conditions that are satisfied whenever these
+    are, so one ``--delete`` can take the whole chain below schema 3 in a single pass. After that
+    a schema-3 generation the reader *declines* is not a slow archive, it is an unreadable one --
+    and clause 5 declines a whole generation over one shard-shaped file under
+    ``data/timeline-v3/`` that the catalogue does not name, which is the exact residue an
+    interrupted build leaves.
+
+    That is recoverable, and **how** recoverable depends on which archive this is, which is why
+    the sentence is computed rather than written. An ingest archive holds ``teams/*/raw`` and a
+    rebuild there costs no tokens and reads material that is right here. A **combined export**
+    does not: `multi_team.build_combined_archive` writes ``teams/<slug>/summaries/`` and no
+    ``raw/`` at all, while carrying the archive marker, so `gc --output <export>` runs on it
+    perfectly happily -- and an export is the archive most likely to be collected, being the one
+    an operator keeps and serves. Promising that operator a local rebuild would be false at the
+    exact moment they are deciding something that ``--empty-trash`` makes permanent, so the reason
+    says instead where the raw turns actually are: in the ingest archive this was built from,
+    which may be on another machine, or may itself have been collected.
+
+    The alternative considered was a doc note plus a shorter reason; it was rejected because the
+    dry run is the only artefact an operator is guaranteed to read before typing ``--delete``.
+    """
+
+    monolith_gone = _size_of(root, _SCHEMA_1_TIMELINE) is None
+    chain = (
+        f"{_SCHEMA_1_TIMELINE} is already gone, so schema 3 becomes the only generation this "
+        "archive has"
+        if monolith_gone
+        else f"{_SCHEMA_1_TIMELINE} is still on disk, but the schema-1-monolith category above "
+        "offers it under conditions these already satisfy, so one --delete takes both and "
+        "schema 3 becomes the only generation this archive has"
+    )
+    rebuild = (
+        "the way back is a rebuild, which costs no tokens and reads the teams/*/raw beside it"
+        if _holds_raw_turns(root)
+        else "the way back is a rebuild, and it cannot be run here: this archive has no "
+        "teams/*/raw, which is what a combined export looks like -- the raw turns are in the "
+        "ingest archive it was built from, wherever that is"
+    )
+    return (
+        f"superseded by a complete {SCHEMA_3_BOOTSTRAP_PATH} beside {SCHEMA_2_BOOTSTRAP_PATH}; "
+        f"no build writes it any more ({_SCHEMA_2_CAPABILITY} is False, and "
+        "write_timeline_shards refuses to run while it is). This is the presentation half of the "
+        "generation only: the transcript search corpus lives in the same tree, schema 3 does not "
+        "replace it, and it is held by schema-2-search-corpus. WARNING, read before --delete: "
+        f"this removes the last fallback. {chain}. A schema-3 generation the reader declines then "
+        "leaves the archive unreadable rather than slow, and it declines the whole generation "
+        f"over a single shard-shaped file under {SCHEMA_3_ROOT}/ that the catalogue does not "
+        f"name -- exactly what an interrupted build leaves behind. Then {rebuild}; the way back "
+        f"from a mistake in the next ten minutes is {TRASH_ROOT}/, until `gc --empty-trash`"
+    )
+
+
+def _schema_2_search_corpus_category(
+    root: Path, named: frozenset[str] | None, unknowable: str
+) -> GcCategory:
+    """The half of the schema-2 generation that schema 3 does not supersede. Never reclaimed.
+
+    Everything else `gc` offers is a *copy* of something a newer artefact also has: the monolith
+    against schema 2, the schema-2 presentation objects against schema 3. This is not. The
+    transcript search corpus has exactly one implementation in this codebase -- content-addressed
+    day shards with trigram blooms, catalogued in ``search`` in the schema-2 bootstrap -- and
+    ``query.TimelineQuery._search_bootstrap`` reaches into it from *under schema 3*, which is the
+    plainest possible statement that schema 3 did not replace it. Reclaiming it would not slow
+    anything down, it would delete `timeline search` and `timeline show` from an archive whose
+    schema 3 is in perfect order, and the pass would have said "superseded" while doing it.
+
+    So this category is held unconditionally: not "held until schema 3 is complete", which it
+    already is, and not "held while the format is published", which is the gate the presentation
+    half sits behind. There is no condition to state, because the successor does not exist yet.
+    The day it does, the build that publishes it stops naming these objects in ``search`` and this
+    category empties itself -- which is why the membership is read out of the catalogue on every
+    run rather than pinned to a constant. The rejected alternative was to gate the whole
+    generation on the corpus, refusing all 1.4 GB until search is ported; it was rejected because
+    two thirds of those bytes genuinely *are* superseded, and holding a superseded copy on account
+    of an unrelated tenant of the same directory is the mirror image of the mistake this exists to
+    prevent.
+    """
+
+    if named is None:
+        return GcCategory("schema-2-search-corpus", False, unknowable, ())
+    if not named:
+        return GcCategory(
+            "schema-2-search-corpus",
+            False,
+            f"nothing to hold: {SCHEMA_2_BOOTSTRAP_PATH} names no transcript search corpus, so "
+            "there is nothing here that schema 3 has not superseded",
+            (),
+        )
+    files = _files_with_sizes(root, named)
+    objects = sum(
+        1 for item in files if item.relative_path.startswith(_SCHEMA_2_OBJECT_ROOT + "/")
+    )
+    return GcCategory(
+        "schema-2-search-corpus",
+        False,
+        f"held: not superseded by anything. {SCHEMA_2_BOOTSTRAP_PATH} and the "
+        f"{objects} content-addressed day shards and linkage sidecars its `search` section "
+        f"names under {_SCHEMA_2_OBJECT_ROOT}/ are the transcript search corpus, and schema 3 "
+        "does not implement one -- query.TimelineQuery._search_bootstrap reads this generation "
+        "even when schema 3 answers everything else, which is what `timeline search` and "
+        "`timeline show` run on. Reclaiming these would remove a capability rather than a "
+        "duplicate. They go when a build stops naming them, not when a format is retired",
+        files,
+    )
+
+
+def _schema_2_categories(
+    root: Path,
+) -> tuple[GcCategory, GcCategory, GcCategory, GcCategory]:
+    """The whole schema-2 generation, split four ways that never overlap.
+
+    ``(superseded, search, orphans, retained)``. The four are computed together, and *partition*
+    the generation -- every schema-2 file appears in exactly one of them -- because they are the
+    only categories in this module that describe the same bytes from two angles, and a file listed
+    twice would be counted twice in ``held_bytes`` and, far worse, moved twice by a sweep: the
+    second `os.replace` would fail on a file that is no longer there and abort the pass with a
+    traceback. So the partition is structural rather than remembered. ``superseded`` is the
+    generation *minus* whatever the other three claim.
+
+    The search corpus is subtracted **in both worlds**, and it is the only one of the three that
+    is. Reachability and the grace period are properties of a live format and stop meaning
+    anything once it is retired; being unsuperseded is not, and it is the state the corpus is in
+    either way. Taking it out of ``superseded`` while the generation is live changes no byte's
+    fate -- everything there is held regardless -- and it makes the report say the true thing a
+    year early: of the 1,434.2 MiB in this tree on the measured archive, 500.5 MiB is a capability
+    with no successor and 933.7 MiB is a copy of something schema 3 already has.
+
+    Which way the rest of the split falls depends on :func:`_schema_2_retirement_refusal`.
+
+    **While the generation is live**, reachability is the only thing that can retire a file
+    inside it, and the existing two categories do that job unchanged. The manifest's accounting
+    is exact today -- on the measured archive 353 current plus 305 retained is 658, which is
+    every one of the 334 ``.json`` and 324 ``.gz`` files on disk, with no orphan and nothing
+    missing, and all 283 search objects are inside ``current_objects``, so the corpus never
+    overlaps either of them -- and the orphan set is *derived* as ``on disk - current -
+    retained``, so a non-empty one is a real finding about a crashed build rather than an artefact
+    of `gc` counting differently. ``superseded`` then holds the remainder -- the manifest and the
+    70 current objects that are not the corpus -- and holds it with the reason it cannot go. That
+    remainder used to be reported by nobody: an operator asking where 1.4 GB went was shown 305
+    retained objects and left to discover the rest themselves. A category that exists to explain a
+    refusal has to name the bytes it is refusing.
+
+    **Once it is retired**, the reachability split stops meaning anything and the presentation
+    half moves into one category. ``retained`` in particular has no residual claim: its grace
+    period exists so a browser holding the previous bootstrap can still fetch what that bootstrap
+    names, and the precondition for retirement is that no browser reads this format at all. Both
+    are reported as empty with a reason pointing at the category that took them, rather than
+    dropped, because this module's rule is that a category keeps its reason even when it has no
+    files.
     """
 
     on_disk = {
@@ -468,33 +1006,87 @@ def _schema_2_categories(root: Path) -> tuple[GcCategory, GcCategory]:
         for relative, size in _walk_files(root, _SCHEMA_2_OBJECT_ROOT)
         if _OBJECT_NAME.fullmatch(PurePosixPath(relative).name) is not None
     }
-    sets = _schema_2_manifest_sets(root)
-    if sets is None:
+    generation = _schema_2_generation_files(root)
+    search_paths = _schema_2_search_paths(root)
+    unknowable = (
+        f"held: {SCHEMA_2_BOOTSTRAP_PATH} is present and cannot be parsed, so the objects the "
+        "transcript search corpus needs cannot be told apart from the presentation objects "
+        "schema 3 supersedes -- they share one content-addressed directory and only the "
+        "catalogue distinguishes them. Nothing in this generation is offered until it reads"
+    )
+    refusal = _schema_2_retirement_refusal(root)
+    if refusal is None and search_paths is None:
+        refusal = unknowable
+    search = _schema_2_search_corpus_category(root, search_paths, unknowable)
+    held_by_search = {item.relative_path for item in search.files}
+    generation = tuple(
+        item for item in generation if item.relative_path not in held_by_search
+    )
+    on_disk = {
+        relative: size
+        for relative, size in on_disk.items()
+        if relative not in held_by_search
+    }
+    if refusal is None and not generation:
+        # An archive built after the retirement has no schema 2 to retire, and one already swept
+        # has nothing but the corpus left. Saying so beats printing the reclaim reason -- which is
+        # mostly a warning about losing the last fallback -- against zero files, where it would
+        # frighten an operator about a decision they are not being offered.
+        refusal = (
+            "nothing to collect: the presentation half of this generation is gone and what "
+            f"remains under {SCHEMA_2_ROOT}/ is the transcript search corpus, held above"
+            if held_by_search
+            else f"nothing to collect: this archive has no {SCHEMA_2_BOOTSTRAP_PATH} and no "
+            f"{SCHEMA_2_ROOT}/ tree"
+        )
+    if refusal is None:
+        subsumed = (
+            "subsumed by superseded-schema-2: the presentation half of the generation is being "
+            "reclaimed in this pass, so which of its objects the manifest still names decides "
+            "nothing"
+        )
         return (
             GcCategory(
-                "schema-2-orphan-objects",
-                False,
-                f"held: {_SCHEMA_2_MANIFEST} is absent or unrecognised, so nothing on disk can "
-                "be shown to be unreachable",
-                (),
+                "superseded-schema-2", True, _schema_2_reclaim_reason(root), generation
             ),
+            search,
+            GcCategory("schema-2-orphan-objects", False, subsumed, ()),
             GcCategory(
                 "schema-2-retained-objects",
                 False,
-                f"held: {_SCHEMA_2_MANIFEST} is absent or unrecognised",
+                "subsumed by superseded-schema-2: the grace period keeps these fetchable for a "
+                "browser that already loaded the previous bootstrap, and no browser reads this "
+                "format any more -- which is the precondition the whole generation went on",
                 (),
             ),
         )
-    current, retained = sets
-    orphans = sorted(set(on_disk) - current - retained)
-    return (
-        GcCategory(
+    sets = _schema_2_manifest_sets(root)
+    if sets is None:
+        orphans = GcCategory(
+            "schema-2-orphan-objects",
+            False,
+            f"held: {_SCHEMA_2_MANIFEST} is absent or unrecognised, so nothing on disk can "
+            "be shown to be unreachable",
+            (),
+        )
+        retained_category = GcCategory(
+            "schema-2-retained-objects",
+            False,
+            f"held: {_SCHEMA_2_MANIFEST} is absent or unrecognised",
+            (),
+        )
+    else:
+        current, retained = sets
+        orphans = GcCategory(
             "schema-2-orphan-objects",
             True,
             f"named by neither current_objects nor retained_objects in {_SCHEMA_2_MANIFEST}",
-            tuple(GcFile(relative, on_disk[relative]) for relative in orphans),
-        ),
-        GcCategory(
+            tuple(
+                GcFile(relative, on_disk[relative])
+                for relative in sorted(set(on_disk) - current - retained)
+            ),
+        )
+        retained_category = GcCategory(
             "schema-2-retained-objects",
             False,
             "held: the previous generation's objects, kept alive one more generation so a "
@@ -505,7 +1097,20 @@ def _schema_2_categories(root: Path) -> tuple[GcCategory, GcCategory]:
                 for relative in sorted(retained)
                 if relative in on_disk
             ),
+        )
+    claimed = {item.relative_path for item in orphans.files} | {
+        item.relative_path for item in retained_category.files
+    }
+    return (
+        GcCategory(
+            "superseded-schema-2",
+            False,
+            refusal,
+            tuple(item for item in generation if item.relative_path not in claimed),
         ),
+        search,
+        orphans,
+        retained_category,
     )
 
 
@@ -518,15 +1123,10 @@ def _schema_3_named_paths(root: Path) -> frozenset[str] | None:
     reconstruct it would couple a sweep to a reader's field layout.
     """
 
-    path = root / SCHEMA_3_BOOTSTRAP_PATH
-    if path.is_symlink() or not path.is_file():
+    bootstrap = _bootstrap(root, SCHEMA_3_BOOTSTRAP_PATH, 3, "timeline-v3-bootstrap")
+    if bootstrap is None:
         return None
     try:
-        bootstrap = as_object(read_json(path), str(path))
-        if bootstrap.get("schema_version") != 3 or (
-            bootstrap.get("kind") != "timeline-v3-bootstrap"
-        ):
-            return None
         named: set[str] = {SCHEMA_3_BOOTSTRAP_PATH}
         streams = as_object(bootstrap.get("streams"), "timeline-v3.streams")
         for stream, raw_section in sorted(streams.items()):
@@ -707,9 +1307,13 @@ def plan_collection(root: Path) -> GcReport:
     for _relative, size in _walk_files(root, ""):
         total_bytes += size
         total_files += 1
-    orphan_objects, retained_objects = _schema_2_categories(root)
+    superseded_schema_2, search_corpus, orphan_objects, retained_objects = (
+        _schema_2_categories(root)
+    )
     categories = (
         _schema_1_category(root),
+        superseded_schema_2,
+        search_corpus,
         orphan_objects,
         _schema_3_category(root),
         retained_objects,

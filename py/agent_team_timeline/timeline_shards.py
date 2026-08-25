@@ -34,6 +34,7 @@ from agent_team_timeline.static_assets import (
 
 
 SCHEMA_2_BOOTSTRAP_PATH = "data/timeline-v2.json"
+SCHEMA_2_ROOT = "data/timeline-v2"
 _OBJECT_ROOT = "data/timeline-v2/objects"
 _OBJECT_MANIFEST_PATH = "data/timeline-v2/manifest.json"
 _DAY_MS = 24 * 60 * 60 * 1000
@@ -50,6 +51,75 @@ _BOOTSTRAP_FIELDS = frozenset(
         "activity_bins",
     }
 )
+
+#: Whether this tool still publishes the schema-2 generation at all.
+#:
+#: A **capability of the writer**, not an observation of an archive, and that distinction is the
+#: whole reason it exists. `archive_gc` needs to answer "will anything ever write these 1.4 GB
+#: again", and the tempting evidence -- no schema-2 file has changed since the schema-3 bootstrap
+#: was written -- is worthless here, for a reason this module causes. Objects are content
+#: addressed and the bootstrap goes through `write_text_if_changed`, so a build that publishes an
+#: unchanged schema 2 touches nothing and leaves every mtime where the previous build left it. A
+#: measured archive shows exactly that trap: its newest schema-2 object was thirteen hours older
+#: than its schema-3 bootstrap while its `data/export.json`, written by the most recent build,
+#: named all 661 schema-2 files in ``generated_files`` and both bootstraps carried the same
+#: ``source_digest`` and the same ``generated_at``. The mtimes said "retired"; the build said
+#: "mine". This constant is what the build says, in a form a collector can read.
+#:
+#: It is enforced rather than promised. :func:`write_timeline_shards` raises while it is ``False``,
+#: so the constant cannot be flipped as a one-line lie that leaves the writer running: the flip
+#: fails every build and every test until the call sites in `render` and `multi_team` go with it.
+#: `tests/test_timeline_archive_gc.py` adds the other direction, requiring the bundled
+#: `static/app.js` to name ``data/timeline-v3.json`` once this is ``False``, because the website is
+#: the reason schema 2 is still written -- see :func:`write_timeline_shards` -- and a flip that
+#: left the browser with no schema-3 mode would retire the graphical surface by accident.
+#:
+#: **What this constant does and does not say.** It says the *presentation* generation is retired.
+#: It says nothing about the transcript search corpus, which is also schema 2 -- day shards with
+#: trigram blooms, catalogued in the bootstrap's ``search`` section -- and which schema 3 does not
+#: implement: `query.TimelineQuery._search_bootstrap` reaches into it from under a complete schema
+#: 3, and says so in its first paragraph. Flipping this does not retire that, and `archive_gc`
+#: enforces the distinction rather than trusting this note: its ``schema-2-search-corpus`` category
+#: holds whatever the ``search`` section names, in both worlds, so the corpus survives the day the
+#: format dies and leaves only when a build stops publishing it.
+#:
+#: **The checklist for the day this becomes ``False``**, all of it in one commit, because each
+#: item alone is a regression:
+#:
+#: 1. `static/app.js` reads schema 3, so the browser has something left to open. Note that it must
+#:    go on fetching ``data/timeline-v2.json`` for search; the flip is not a licence to stop.
+#: 2. The two call sites -- `render._render_team` and `multi_team.build_combined_archive` --
+#:    stop calling :func:`write_timeline_shards` for the presentation timeline, and something goes
+#:    on publishing the ``search`` section and its objects, because that is a capability rather
+#:    than a copy and this flip does not supersede it.
+#: 3. `render.retired_schema_1_files` grows the schema-2 presentation paths, exactly as it holds
+#:    the schema-1 monolith today. Without that, the first build after the flip finds those files
+#:    in the previous manifest and in no current one and `_remove_stale_presentation_files`
+#:    **unlinks them outright** -- destroyed as a side effect of a build, outside the trash, which
+#:    is precisely the surprise that function exists to prevent.
+#:
+#: Only then does `gc`'s ``superseded-schema-2`` category start offering the bytes, and even then
+#: only against an archive whose schema-3 generation passes the reader's own completeness rule,
+#: agrees with schema 2's ``source_digest``, and whose *own copy* of ``app.js`` -- written into it
+#: by the build that made it, and never rewritten by `gc` -- already knows where schema 3 lives.
+#: That last one is per archive rather than per release: a tool upgrade does not reach into an
+#: archive somebody built last month, so those archives need one rebuild before they can be
+#: collected.
+SCHEMA_2_IS_PUBLISHED: bool = True
+
+
+def schema_2_is_published() -> bool:
+    """Whether a build of this tool still emits schema 2, published as a predicate.
+
+    A function rather than a re-exported constant so that the answer is read at the moment it is
+    asked. An importer that bound the name once would keep the value it imported, which would make
+    the collector's precondition depend on module import order and would make the retired world
+    untestable without reloading modules. The same shape as `query.schema_3_completeness`: the
+    reader publishes its acceptance rule as a callable so a writer and a collector can ask it
+    instead of restating it.
+    """
+
+    return SCHEMA_2_IS_PUBLISHED
 
 
 @dataclass(frozen=True)
@@ -781,8 +851,22 @@ def write_timeline_shards(
     Schema 1 is a different case and was retired: `render.retired_schema_1_files` records the two
     fallback paths that used to reach ``data/timeline.json`` and why a published build no longer
     produces it.
+
+    The refusal below is what makes :data:`SCHEMA_2_IS_PUBLISHED` worth anything to a collector.
+    `archive_gc` will hand 1.4 GB to the trash on the strength of that constant, so the constant
+    has to be a fact about the writer rather than a comment about it: while it is ``False`` this
+    function cannot run, and therefore no build can quietly keep writing the generation `gc` was
+    told is retired.
     """
 
+    if not SCHEMA_2_IS_PUBLISHED:
+        raise ValueError(
+            "SCHEMA_2_IS_PUBLISHED is False, so this build must not publish schema 2: "
+            "archive_gc offers the whole generation for collection on the strength of that "
+            "constant, and a writer that kept running beside it would recreate what an operator "
+            "had just reclaimed. Remove the call rather than the check -- see the checklist on "
+            "SCHEMA_2_IS_PUBLISHED, whose third item is the one that costs data"
+        )
     if as_int(raw_timeline.get("schema_version"), "timeline.schema_version") != 1:
         raise ValueError("schema-2 sharding requires a schema-1 source timeline")
     bootstrap_path = _safe_output_path(output, SCHEMA_2_BOOTSTRAP_PATH)
@@ -987,6 +1071,9 @@ def write_timeline_shards(
 
 __all__ = [
     "SCHEMA_2_BOOTSTRAP_PATH",
+    "SCHEMA_2_IS_PUBLISHED",
+    "SCHEMA_2_ROOT",
     "TimelineShardReport",
+    "schema_2_is_published",
     "write_timeline_shards",
 ]

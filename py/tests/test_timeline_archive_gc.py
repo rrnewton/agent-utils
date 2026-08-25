@@ -20,7 +20,17 @@ and require the archive to read the same as before.
 *The accounting silently stops adding up.* The schema-2 manifest's current/retained split is
 exact today, and the orphan set is derived as ``on disk - current - retained`` rather than
 counted separately, so a test that plants one unreferenced object and one retained object has
-to see exactly one of them reclaimed.
+to see exactly one of them reclaimed. The schema-2 categories now partition the generation
+rather than describing overlapping parts of it, so that is asserted directly: no file in two
+categories, and the three of them together equal what is on disk.
+
+*A whole generation is released while something still writes it.* ``superseded-schema-2`` is
+gated on a second precondition the monolith never needed -- a writer that has been *retired in
+code*, `timeline_shards.SCHEMA_2_IS_PUBLISHED`, rather than a writer that merely did not run
+recently. The tests hold that constant and the writer together from both sides: with it true the
+1.4 GB is held and the reason says which constant holds it, with it false the writer refuses to
+run at all, and either way the bundled `static/app.js` has to agree with it -- a browser fetching
+a format nobody publishes is how a flip would retire the graphical surface by accident.
 
 Named `test_timeline_*` because the packaged workflow runs `pytest tests/test_timeline_*.py`;
 a file outside that glob would run only under `make validate`.
@@ -34,10 +44,12 @@ import shutil
 import subprocess
 import sys
 import time
+from importlib.resources import files
 from pathlib import Path
 
 import pytest
 
+from agent_team_timeline.archive import ARCHIVE_MARKER_FILE
 from agent_team_timeline.archive_gc import (
     ArchiveGcError,
     TRASH_ROOT,
@@ -53,9 +65,19 @@ from agent_team_timeline.pipeline import (
     build_archive,
     summarize_archive,
 )
-from agent_team_timeline.query import QueryFilters, TimelineQuery
+from agent_team_timeline.query import (
+    QueryFilters,
+    SearchResults,
+    TimelineQuery,
+    schema_3_completeness,
+)
 from agent_team_timeline.render import SCHEMA_1_TIMELINE_PATH
-from agent_team_timeline.timeline_shards import SCHEMA_2_BOOTSTRAP_PATH
+from agent_team_timeline.timeline_shards import (
+    SCHEMA_2_BOOTSTRAP_PATH,
+    SCHEMA_2_IS_PUBLISHED,
+    SCHEMA_2_ROOT,
+    write_timeline_shards,
+)
 from agent_team_timeline.timeline_v3 import SCHEMA_3_BOOTSTRAP_PATH, SCHEMA_3_ROOT
 from tests.test_timeline_pipeline import _team, _write_team
 from tests.timeline_projection import schema_1_timeline_text
@@ -64,6 +86,21 @@ from tests.timeline_projection import schema_1_timeline_text
 _OBJECT_ROOT = "data/timeline-v2/objects"
 _V2_MANIFEST = "data/timeline-v2/manifest.json"
 _EXPORT_MANIFEST = "data/export.json"
+
+
+def _retire_schema_2(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Put the process in the world where the tool has stopped publishing schema 2.
+
+    Patched on the module that owns the constant rather than on `archive_gc`, because that is the
+    coupling under test: `timeline_shards.schema_2_is_published` reads the global when it is
+    called, so one patch moves the collector's precondition *and* the writer's refusal together.
+    A test that could move one without the other would be able to assert a state the release can
+    never be in.
+    """
+
+    monkeypatch.setattr(
+        "agent_team_timeline.timeline_shards.SCHEMA_2_IS_PUBLISHED", False
+    )
 
 
 def _built(archive: Path) -> str:
@@ -81,11 +118,59 @@ def _categories(archive: Path) -> dict[str, tuple[bool, int]]:
     return {item.name: (item.reclaimable, item.count) for item in report.categories}
 
 
-def _answers(archive: Path) -> tuple[object, object]:
+def _answers(archive: Path) -> tuple[object, object, object]:
+    """Everything a sweep must leave answerable, which is not only what schema 3 answers.
+
+    The first two questions come out of the schema-3 spine, and an oracle made of those alone is
+    structurally unable to notice that a pass destroyed something schema 3 does not implement --
+    it would report "the archive still reads" about an archive that had just lost a whole
+    command. A transcript search is the third question for exactly that reason: it is the one
+    operation in `query.TimelineQuery` that reaches into schema 2 from under schema 3, so it is
+    the only one whose survival says anything about the schema-2 tree.
+    """
+
     query = TimelineQuery(archive)
     return (
         query.list_records("agents", QueryFilters()),
         query.list_records("phases", QueryFilters()),
+        _search(archive).total_matches,
+    )
+
+
+def _search(archive: Path) -> SearchResults:
+    """One transcript search, with every knob at the value the CLI defaults to."""
+
+    return TimelineQuery(archive).search_v2(
+        "the",
+        corpus="all-transcript",
+        filters=QueryFilters(),
+        case_sensitive=False,
+        match_mode="smart",
+        sort="relevance",
+        prompt_author="any",
+        linkage="any",
+        roles=(),
+        offset=0,
+        limit=20,
+    )
+
+
+def _publish_a_schema_three_website(archive: Path) -> None:
+    """Give this archive the browser bundle a post-flip build would have written into it.
+
+    `gc` refuses to reclaim the schema-2 presentation objects while the archive's own ``app.js``
+    has no schema-3 mode, and the flip cannot be simulated by monkeypatching a constant the way
+    the writer's retirement can: the bundle is *copied into* the archive by the build that made
+    it, so the pre-flip state is a fact about this directory rather than about the process. The
+    marker is the URL, because that is what :func:`archive_gc._website_refusal` looks for and
+    what a real schema-3 bundle would necessarily contain.
+    """
+
+    app = archive / "app.js"
+    app.write_text(
+        app.read_text(encoding="utf-8")
+        + f'\n// a schema-3 aware bundle fetches "{SCHEMA_3_BOOTSTRAP_PATH}".\n',
+        encoding="utf-8",
     )
 
 
@@ -260,6 +345,8 @@ def test_a_dry_run_touches_nothing_and_explains_every_category(tmp_path: Path) -
     ) == before
     assert {item.name for item in report.categories} == {
         "schema-1-monolith",
+        "superseded-schema-2",
+        "schema-2-search-corpus",
         "schema-2-orphan-objects",
         "schema-2-retained-objects",
         "schema-3-orphan-shards",
@@ -507,6 +594,456 @@ def test_an_unreadable_v2_manifest_holds_every_object(tmp_path: Path) -> None:
     assert orphans.count == 0
     collect(tmp_path, delete=True)
     assert sorted((tmp_path / _OBJECT_ROOT).iterdir()) == before
+
+
+# -- retiring the schema-2 generation itself -------------------------------------------------
+
+
+def test_the_whole_schema_two_generation_is_held_while_the_writer_still_emits_it(
+    tmp_path: Path,
+) -> None:
+    """The precondition the monolith never needed, and the state every archive is in today.
+
+    Schema 3 is complete here and the archive is perfectly readable without schema 2, so the
+    superseding half of the gate is satisfied and the 1.4 GB is *still* held -- because the tool
+    writes this generation on every build, and reclaiming a build's own output is churn dressed
+    up as collection. The reason has to name the constant rather than describe it: an operator
+    looking at the largest held number in the report is entitled to know exactly what would have
+    to change, and "the writer still emits it" without a symbol is not something anyone can act
+    on.
+    """
+
+    _built(tmp_path)
+    assert SCHEMA_2_IS_PUBLISHED
+
+    report = plan_collection(tmp_path)
+    superseded = report.category("superseded-schema-2")
+
+    assert not superseded.reclaimable
+    assert "timeline_shards.SCHEMA_2_IS_PUBLISHED is True" in superseded.reason
+    assert "static/app.js" in superseded.reason
+    # The manifest is in it, and so are the objects the manifest still names that are not the
+    # search corpus -- the ones no category reported before this one existed. The bootstrap is
+    # not: it is the search catalogue, so schema-2-search-corpus claims it in both worlds.
+    paths = {item.relative_path for item in superseded.files}
+    assert _V2_MANIFEST in paths
+    assert any(value.startswith(_OBJECT_ROOT) for value in paths)
+    assert SCHEMA_2_BOOTSTRAP_PATH not in paths
+    assert SCHEMA_2_BOOTSTRAP_PATH in {
+        item.relative_path
+        for item in report.category("schema-2-search-corpus").files
+    }
+    assert superseded.bytes > 0
+
+    collect(tmp_path, delete=True)
+    assert (tmp_path / SCHEMA_2_BOOTSTRAP_PATH).is_file()
+    assert (tmp_path / _V2_MANIFEST).is_file()
+
+
+@pytest.mark.parametrize("retired", (False, True))
+def test_the_four_schema_two_categories_partition_the_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, retired: bool
+) -> None:
+    """No file in two categories, and nothing in the generation in none of them.
+
+    Overlap here is not a reporting blemish. A file listed in a reclaimable category twice is
+    moved twice, and the second `os.replace` raises on a path that is no longer there, so a
+    sweep would abort partway with a traceback. The property is asserted against the filesystem
+    rather than against the sum of the parts, so a category that quietly stopped listing
+    something fails here rather than in an operator's byte count.
+
+    Asserted in **both** worlds, because the retirement is where a partition is easiest to lose:
+    the live branch subtracts three sets from the generation and the retired branch subtracts one,
+    and the one it keeps subtracting -- the search corpus -- is the one whose absence would be a
+    deletion rather than a miscount.
+    """
+
+    _built(tmp_path)
+    planted = f"{_OBJECT_ROOT}/{'c' * 64}.json"
+    (tmp_path / planted).write_text('{"unreferenced": true}', encoding="utf-8")
+    if retired:
+        _publish_a_schema_three_website(tmp_path)
+        _retire_schema_2(monkeypatch)
+
+    report = plan_collection(tmp_path)
+    listings = [
+        [item.relative_path for item in report.category(name).files]
+        for name in (
+            "superseded-schema-2",
+            "schema-2-search-corpus",
+            "schema-2-orphan-objects",
+            "schema-2-retained-objects",
+        )
+    ]
+    flat = [value for listing in listings for value in listing]
+    assert len(flat) == len(set(flat))
+
+    on_disk = {
+        path.relative_to(tmp_path).as_posix()
+        for path in (tmp_path / SCHEMA_2_ROOT).rglob("*")
+        if path.is_file()
+    }
+    on_disk.update(
+        value
+        for value in (SCHEMA_2_BOOTSTRAP_PATH, SCHEMA_2_BOOTSTRAP_PATH + ".gz")
+        if (tmp_path / value).is_file()
+    )
+    assert set(flat) == on_disk
+    assert planted in set(flat)
+
+
+def test_a_retired_schema_two_goes_presentation_first_and_the_archive_still_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The day the writer stops: the superseded half goes, the unsuperseded half stays.
+
+    The current/retained split is not preserved through the retirement, and that is the point of
+    subsuming rather than extending. The grace period exists for a browser holding the previous
+    bootstrap, and the precondition for retiring the format is that no browser reads it -- so
+    holding 305 objects for a reader that cannot exist would be hoarding with a citation. The
+    two subsumed categories keep their reasons and lose their files, because a zero that does not
+    explain itself is not an answer.
+
+    What is *not* subsumed is the transcript search corpus, and the oracle is what proves it:
+    ``_answers`` asks a search as well as the two spine questions, so an archive that came
+    through this sweep with `timeline search` broken fails here rather than being reported as
+    "still reads". The bootstrap survives for the same reason the objects do -- it is the search
+    catalogue, not only the schema-2 timeline header.
+    """
+
+    _built(tmp_path)
+    before = _answers(tmp_path)
+    _publish_a_schema_three_website(tmp_path)
+    _retire_schema_2(monkeypatch)
+
+    report = plan_collection(tmp_path)
+    superseded = report.category("superseded-schema-2")
+    corpus = report.category("schema-2-search-corpus")
+    assert superseded.reclaimable
+    assert superseded.count > 3
+    assert not corpus.reclaimable
+    assert corpus.count > 0
+    assert report.category("schema-2-orphan-objects").count == 0
+    assert report.category("schema-2-retained-objects").count == 0
+    for name in ("schema-2-orphan-objects", "schema-2-retained-objects"):
+        assert "subsumed by superseded-schema-2" in report.category(name).reason
+
+    swept = collect(tmp_path, delete=True)
+
+    assert (tmp_path / SCHEMA_2_BOOTSTRAP_PATH).is_file()
+    assert not (tmp_path / _V2_MANIFEST).exists()
+    assert {item.relative_path for item in swept.moved} & {
+        item.relative_path for item in corpus.files
+    } == set()
+    # The archive still answers all three questions: two out of schema 3, one out of what is
+    # left of schema 2.
+    assert _answers(tmp_path) == before
+
+    payload = tmp_path / str(swept.trash_generation) / "files"
+    shutil.copytree(payload, tmp_path, dirs_exist_ok=True)
+    assert (tmp_path / _V2_MANIFEST).is_file()
+    assert _answers(tmp_path) == before
+
+    # A second run against an archive that has nothing but the corpus left says so plainly,
+    # rather than repeating a warning about a decision nobody is being offered.
+    collect(tmp_path, delete=True)
+    absent = plan_collection(tmp_path).category("superseded-schema-2")
+    assert not absent.reclaimable
+    assert absent.count == 0
+    assert "nothing to collect" in absent.reason
+    assert "transcript search corpus, held above" in absent.reason
+    assert _answers(tmp_path) == before
+
+
+def test_the_reclaim_reason_warns_that_it_removes_the_last_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The warning is part of the category, not part of a document.
+
+    Removing schema 2 removes the last thing behind schema 3, and clause 5 declines a whole
+    schema-3 generation over one shard-shaped file the catalogue does not name -- so after this
+    sweep an interrupted build is the difference between a slow archive and an unreadable one.
+    That is recoverable by a rebuild and it is still a change of failure mode, so it is said in
+    the dry run, which is the one artefact an operator is guaranteed to read before typing
+    `--delete`. The monolith's own availability in the same pass is said too, because one
+    `--delete` takes both and no reason that omitted that would be describing what happens.
+    """
+
+    _built(tmp_path)
+    (tmp_path / SCHEMA_1_TIMELINE_PATH).write_text("{}", encoding="utf-8")
+    _publish_a_schema_three_website(tmp_path)
+    _retire_schema_2(monkeypatch)
+
+    report = plan_collection(tmp_path)
+    reason = report.category("superseded-schema-2").reason
+    assert "WARNING" in reason
+    assert "last fallback" in reason
+    assert SCHEMA_1_TIMELINE_PATH in reason
+    assert "one --delete takes both" in reason
+    assert report.category("schema-1-monolith").reclaimable
+    assert reason in format_gc_report(report, "text")
+    # An ingest archive can be rebuilt from what is beside it, and the reason says so only when
+    # that is true here -- see the export case below.
+    assert "reads the teams/*/raw beside it" in reason
+
+    # With the monolith already gone -- the state a migrated archive is actually in -- the same
+    # reason says the sharper thing rather than the same thing.
+    (tmp_path / SCHEMA_1_TIMELINE_PATH).unlink()
+    sharper = plan_collection(tmp_path).category("superseded-schema-2").reason
+    assert "is already gone" in sharper
+
+
+def test_a_retired_schema_two_is_still_held_without_a_complete_schema_three(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both halves of the gate, not either: a retired writer is not a readable archive.
+
+    This is the dangerous combination, and the one an operator can create by accident. The tool
+    has stopped writing schema 2, so nothing will replace it -- and the generation in front of it
+    is a shard short, so the reader will not answer from it. Reclaiming here leaves an archive
+    that cannot be read at all, which is exactly the outcome the completeness clause exists to
+    prevent, and it has to be judged by the reader's own rule rather than by a restatement.
+    """
+
+    _built(tmp_path)
+    _retire_schema_2(monkeypatch)
+    shard = next((tmp_path / SCHEMA_3_ROOT).rglob("*.jsonl.gz"))
+    shard.write_bytes(shard.read_bytes()[:-8])
+
+    superseded = plan_collection(tmp_path).category("superseded-schema-2")
+    assert not superseded.reclaimable
+    assert "no complete schema-3 generation supersedes it" in superseded.reason
+
+    collect(tmp_path, delete=True)
+    assert (tmp_path / SCHEMA_2_BOOTSTRAP_PATH).is_file()
+    assert TimelineQuery(tmp_path).list_records("agents", QueryFilters())
+
+
+def test_the_writer_cannot_run_once_the_constant_says_it_is_retired(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """What makes the constant evidence rather than a comment.
+
+    `gc` hands 1.4 GB to the trash on the strength of one boolean, so the boolean has to be a
+    fact about the writer. It is: while it is false the writer refuses, so the flip cannot be a
+    one-line edit that leaves builds quietly republishing the generation an operator has just
+    reclaimed -- it fails every build until the call sites go with it. The `build_archive` half
+    is the one that matters, because it is the call site rather than the function that would be
+    forgotten.
+    """
+
+    slug = _built(tmp_path)
+    _retire_schema_2(monkeypatch)
+
+    with pytest.raises(ValueError, match="SCHEMA_2_IS_PUBLISHED is False"):
+        write_timeline_shards(tmp_path, {"schema_version": 1})
+    with pytest.raises(ValueError, match="SCHEMA_2_IS_PUBLISHED is False"):
+        build_archive(tmp_path, slug)
+
+
+def test_the_constant_and_the_website_cannot_drift_apart(tmp_path: Path) -> None:
+    """The other direction of the flip, which no build would catch.
+
+    The website is the reason schema 2 is still written, so retiring the format while
+    `static/app.js` has no schema-3 mode would retire the graphical surface -- and it would do it
+    silently, because the browser's failure is a fetch that 404s in someone else's session hours
+    later, not a build that stops. Asserted against the bundled asset, which is what a build
+    copies into an archive.
+
+    Deliberately **one-directional**, and the direction that is missing is the interesting one.
+    An earlier form of this test asserted the biconditional -- schema-2's URL appears in the
+    bundle if and only if the constant is true -- and that is wrong, not merely strict: the
+    schema-2 bootstrap is also the transcript search catalogue, which the flip does not retire,
+    so a correct post-flip bundle goes on fetching ``data/timeline-v2.json`` to search with. The
+    claim that survives is the one about the *timeline*: after the flip the bundle must know
+    where the new one lives, which is the same fact `archive_gc._website_refusal` asks each
+    archive's own copy of the bundle.
+    """
+
+    app = (files("agent_team_timeline") / "static" / "app.js").read_text(encoding="utf-8")
+
+    if SCHEMA_2_IS_PUBLISHED:
+        assert SCHEMA_2_BOOTSTRAP_PATH in app
+    if not SCHEMA_2_IS_PUBLISHED:
+        assert SCHEMA_3_BOOTSTRAP_PATH in app
+
+
+def test_the_transcript_search_corpus_is_never_offered_in_either_world(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The half of schema 2 that schema 3 did not replace, and the only test that can see it.
+
+    "Superseded" is a claim about a *successor*, and the transcript search corpus has none: it is
+    schema-2 day shards with trigram blooms, catalogued in the bootstrap's ``search`` section,
+    and ``query.TimelineQuery._search_bootstrap`` reaches into them from under a complete schema
+    3. Reclaiming them would not slow the archive down, it would delete `timeline search` and
+    `timeline show` while the report said "superseded".
+
+    Membership is asserted against the catalogue rather than against filenames, because the two
+    halves share one content-addressed directory and are indistinguishable by name -- which is
+    exactly why nothing before this category could tell them apart.
+    """
+
+    _built(tmp_path)
+    bootstrap = json.loads(
+        (tmp_path / SCHEMA_2_BOOTSTRAP_PATH).read_text(encoding="utf-8")
+    )
+    named = {
+        f"{_OBJECT_ROOT}/{digest}.json"
+        for shard in bootstrap["search"]["shards"]
+        for digest in (shard["sha256"], (shard.get("linkage") or {}).get("sha256"))
+        if digest
+    }
+    assert named
+
+    for retired in (False, True):
+        if retired:
+            _publish_a_schema_three_website(tmp_path)
+            _retire_schema_2(monkeypatch)
+        corpus = plan_collection(tmp_path).category("schema-2-search-corpus")
+        assert not corpus.reclaimable
+        assert "not superseded by anything" in corpus.reason
+        assert SCHEMA_2_BOOTSTRAP_PATH in {item.relative_path for item in corpus.files}
+        assert named <= {item.relative_path for item in corpus.files}
+
+    before = _search(tmp_path).total_matches
+    assert before > 0
+    collect(tmp_path, delete=True)
+    for relative in sorted(named):
+        assert (tmp_path / relative).is_file()
+    assert _search(tmp_path).total_matches == before
+
+
+def test_a_schema_three_from_another_build_supersedes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The interruption completeness structurally cannot see, and the team it would have cost.
+
+    All five completeness clauses are intra-generation, so a schema 3 that is a whole build
+    behind passes every one of them. Publication is schema 2 and then schema 3, and the writer's
+    lock dies with the process, so the state below is one OOM away: three teams in schema 2, two
+    in a schema 3 that is otherwise perfect. Reclaiming on completeness alone takes the newer
+    generation and keeps the older one, and the team in neither is gone from every readable
+    generation at once.
+
+    ``source_digest`` is what separates them, and it is not a rule invented here -- the reader
+    refuses the same mismatch in `_search_bootstrap` when a search makes it look at both
+    generations. `gc` has to ask before the sweep, because the reader only asks after it.
+    """
+
+    archive = tmp_path / "archive"
+    output = tmp_path / "export"
+    slugs: list[str] = []
+    for index, slug in enumerate(("team-one", "team-two", "team-three")):
+        team = _team(f"Team {index} narrative.")
+        team = team.__class__(**{**team.__dict__, "team_slug": slug})
+        _write_team(archive, team)
+        summarize_archive(archive, slug, "heuristic", "test-model")
+        slugs.append(slug)
+
+    build_combined_archive(archive, tuple(slugs[:2]), output=output, display_timezone="UTC")
+    stale_tree = tmp_path / "stale-v3"
+    shutil.copytree(output / SCHEMA_3_ROOT, stale_tree)
+    stale_bootstrap = (output / SCHEMA_3_BOOTSTRAP_PATH).read_bytes()
+
+    build_combined_archive(archive, tuple(slugs), output=output, display_timezone="UTC")
+    shutil.rmtree(output / SCHEMA_3_ROOT)
+    shutil.copytree(stale_tree, output / SCHEMA_3_ROOT)
+    (output / SCHEMA_3_BOOTSTRAP_PATH).write_bytes(stale_bootstrap)
+    _publish_a_schema_three_website(output)
+    _retire_schema_2(monkeypatch)
+
+    # The state is exactly the dangerous one: the reader accepts schema 3, and schema 3 is a
+    # team short of the schema 2 beside it.
+    assert schema_3_completeness(output) == (True, "")
+    assert len(TimelineQuery(output).teams) == 2
+    assert len(json.loads((output / SCHEMA_2_BOOTSTRAP_PATH).read_text("utf-8"))["teams"]) == 3
+
+    superseded = plan_collection(output).category("superseded-schema-2")
+    assert not superseded.reclaimable
+    assert "describe different builds" in superseded.reason
+
+    collect(output, delete=True)
+    assert (output / SCHEMA_2_BOOTSTRAP_PATH).is_file()
+    assert (output / _V2_MANIFEST).is_file()
+
+    # And the remedy is the build, which republishes schema 3 against this source. It cannot be
+    # run in the retired world -- the writer refuses -- so the agreement is restored the way the
+    # release will: by the constant going back to what a shipping build would have.
+    monkeypatch.undo()
+    build_combined_archive(archive, tuple(slugs), output=output, display_timezone="UTC")
+    assert len(TimelineQuery(output).teams) == 3
+    _publish_a_schema_three_website(output)
+    _retire_schema_2(monkeypatch)
+    assert plan_collection(output).category("superseded-schema-2").reclaimable
+
+
+def test_an_archive_whose_own_website_predates_schema_three_holds_the_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one precondition a tool release cannot satisfy on an operator's behalf.
+
+    Every other gate here is about the tool: ship a reader and every archive is ready at once.
+    ``app.js`` is different, because a build *copies* it into the archive and `gc` does not
+    rewrite it -- so an archive built before the flip carries a bundle that loads
+    ``data/timeline-v2.json`` and falls back to ``data/timeline.json``, and this pass offers
+    both. Sweeping without rebuilding is the convenience `gc` sells, and here it would spend that
+    convenience on blanking the graphical surface silently, hours later, in somebody else's
+    session.
+
+    So the refusal is the positive question -- does this archive's bundle name the schema-3
+    bootstrap -- and it clears the moment a build has put one there.
+    """
+
+    _built(tmp_path)
+    _retire_schema_2(monkeypatch)
+    app = (tmp_path / "app.js").read_text(encoding="utf-8")
+    assert SCHEMA_2_BOOTSTRAP_PATH in app
+    assert SCHEMA_3_BOOTSTRAP_PATH not in app
+
+    held = plan_collection(tmp_path).category("superseded-schema-2")
+    assert not held.reclaimable
+    assert "has no schema-3 mode" in held.reason
+    collect(tmp_path, delete=True)
+    assert (tmp_path / _V2_MANIFEST).is_file()
+
+    _publish_a_schema_three_website(tmp_path)
+    assert plan_collection(tmp_path).category("superseded-schema-2").reclaimable
+
+
+def test_an_export_is_told_that_its_rebuild_is_somewhere_else(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The recovery promise has to be true of the archive it is printed against.
+
+    "The way back is a rebuild, which costs no tokens and reads teams/*/raw" is true of an ingest
+    archive and false of a combined export: `build_combined_archive` writes
+    ``teams/<slug>/summaries/`` and no ``raw/``, while writing the marker that makes `gc` willing
+    to run there -- and an export is the archive most likely to be collected, being the one an
+    operator keeps and serves. Told the wrong thing, they accept an irreversible-after-empty-trash
+    decision on a recovery that is on another machine or already gone.
+    """
+
+    archive = tmp_path / "archive"
+    output = tmp_path / "export"
+    slugs: list[str] = []
+    for index, slug in enumerate(("team-one", "team-two")):
+        team = _team(f"Team {index} narrative.")
+        team = team.__class__(**{**team.__dict__, "team_slug": slug})
+        _write_team(archive, team)
+        summarize_archive(archive, slug, "heuristic", "test-model")
+        slugs.append(slug)
+    build_combined_archive(archive, tuple(slugs), output=output, display_timezone="UTC")
+    assert (output / ARCHIVE_MARKER_FILE).is_file()
+    assert not any((output / "teams" / slug / "raw").exists() for slug in slugs)
+
+    _publish_a_schema_three_website(output)
+    _retire_schema_2(monkeypatch)
+    reason = plan_collection(output).category("superseded-schema-2").reason
+
+    assert "it cannot be run here" in reason
+    assert "the ingest archive it was built from" in reason
+    assert "reads the teams/*/raw beside it" not in reason
 
 
 def test_source_snapshots_are_measured_and_never_touched(tmp_path: Path) -> None:

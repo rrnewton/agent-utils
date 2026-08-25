@@ -1009,11 +1009,84 @@ cp -a .agent-team-timeline-trash/<generation>/files/. ./
 whole design: this archive costs hours of model time to rebuild, so the first destructive
 operation is reversible and the second one is a decision you have to type out on purpose.
 
-Three things `gc` reports and deliberately never touches.
+### The schema-2 generation, and the last fallback
+
+`data/timeline-v2/` is the other whole generation an archive carries, and it is the big one: on a
+measured archive, 1,434.2 MiB in 658 objects beside a 5.4 MiB bootstrap, against 37 MiB for all of
+schema 3. `gc` splits it in two and only ever offers one of the halves.
+
+The half it does not offer is `schema-2-search-corpus` — 509.1 MiB of it, 35% — and the reason is
+that schema 3 never replaced it. **Transcript search is still schema 2.** The corpus is a set of
+content-addressed day shards with trigram blooms, catalogued in the `search` section of
+`data/timeline-v2.json`, and `timeline search` and `timeline show` read it out of there even on an
+archive whose schema 3 is perfect. Reclaiming it would not make anything slower, it would delete
+those two commands. So `gc` holds the bootstrap and every object that section names, in every
+world, including the one where the presentation format is retired — that flip is about the
+timeline, not about search — and stops holding them only when a build stops naming them.
+
+The half it does offer is `superseded-schema-2`, the presentation objects and the manifest, and it
+holds those under **four** preconditions rather than the monolith's one.
+
+The first is the same: a `data/timeline-v3.json` that passes the reader's own five-clause
+completeness rule. The second is that **this tool no longer writes schema 2 at all** — and that is
+read out of the code, from `timeline_shards.SCHEMA_2_IS_PUBLISHED`, never out of the archive.
+Modification times cannot answer it and will actively mislead you: schema-2 objects are content
+addressed and the bootstrap is only rewritten when its bytes change, so a build that republishes an
+identical schema 2 touches nothing. On the measured archive the newest schema-2 object was thirteen
+hours *older* than the schema-3 bootstrap while that same build's `data/export.json` listed all 661
+schema-2 files as its own output. "The last build did not write it" is not evidence, here or
+anywhere else in `gc`; "no build can write it" is, and the writer enforces it by refusing to run
+while that constant is false.
+
+Today the constant is true, because the website is the reason schema 2 exists: `static/app.js`
+loads `data/timeline-v2.json` and has no schema-3 mode, so retiring the format would retire the
+graphical surface. So `gc` holds those bytes and says which constant holds them. Nothing you can do
+to an archive changes that line; a release of this tool does.
+
+The third and fourth can be satisfied and unsatisfied by an ordinary accident, so they are worth
+knowing about before you meet one.
+
+The third is that the schema 3 in front of schema 2 has to be a **successor to it** rather than a
+bystander from another build. Completeness cannot tell the difference: all five of its clauses
+compare schema 3 against itself. A build publishes schema 2 and then schema 3, so one that dies in
+between — OOM, a full disk — leaves a new schema 2 beside an untouched old schema 3 that is
+flawless and a team short. `gc` compares the two `source_digest` values, which is the same
+comparison the reader refuses on when a search makes it open both generations, and holds
+everything if they disagree. The remedy is to re-run the build.
+
+The fourth is your own copy of `app.js`. A build *copies* the browser bundle into the archive it
+builds; `gc` does not rewrite it, and should not. So an archive built before the flip carries a
+bundle with no schema-3 mode, and sweeping without rebuilding — the whole convenience `gc` sells —
+would leave `index.html` fetching a file that is now in the trash and falling back to another one
+that is also in the trash. `gc` therefore asks whether your archive's `app.js` mentions
+`data/timeline-v3.json` and holds the generation until it does. One rebuild fixes it, per archive:
+a tool upgrade cannot reach into an archive you built last month.
+
+**When all four are satisfied, read the reason before you type `--delete`.** Reclaiming schema 2's
+presentation half removes the last fallback. The reader tries schema 3, then schema 2, then
+`data/timeline.json`, and the monolith is offered for collection under conditions that are already
+satisfied whenever these are — so one `--delete` can take everything below schema 3 in a single
+pass. After that, a schema-3 generation the reader *declines* is not a slow archive but an
+unreadable one, and it declines a whole generation over a single shard-shaped file under
+`data/timeline-v3/` that the catalogue does not name, which is exactly what an interrupted build
+leaves behind. The way back in the next ten minutes is the trash, until `gc --empty-trash`; after
+that it is a rebuild, and **check where that rebuild would have to run**. An ingest archive holds
+`teams/*/raw` and rebuilds from itself for no tokens. A combined export does not — it carries
+`teams/<slug>/summaries/` and nothing else — so its raw turns are back in the ingest archive it
+came from, which may be on another machine. `gc` reads the difference off the archive and says
+which case you are in, in the reason itself.
+
+Four things `gc` reports and deliberately never touches.
+
+The transcript search corpus, above: `data/timeline-v2.json` and the objects its `search` section
+names. It is the one category held for a reason that no release can change, because it is not a
+duplicate of anything — the successor does not exist yet.
 
 The schema-2 objects listed as `retained_objects` are the previous generation's, kept alive for
 one more generation so that a browser which already loaded the previous bootstrap can still fetch
-what it names; the next build that supersedes them reclaims them.
+what it names; the next build that supersedes them reclaims them. That grace lapses with the format
+itself: once nothing writes schema 2, no browser is holding a bootstrap to protect, and these stop
+being a category of their own and go with the rest of the presentation half.
 
 `teams/*/source_snapshots/`, usually the largest thing in the archive, is vendor input rather than
 published output and has a purpose-built gate of its own: run `audit-losslessness

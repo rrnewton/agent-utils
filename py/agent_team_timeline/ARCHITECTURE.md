@@ -164,12 +164,58 @@ a second idiom, and it inherits both of the existing users' refusals: nothing is
 strength of "the last build did not write it", only when a named superseding artifact is present
 **and complete** — schema 3's completeness judged by the same five-clause rule the reader applies
 — or when a manifest authoritative over a directory disowns the file. Two categories are
-reclaimable: the schema-1 monolith, and schema-2 objects in neither `current_objects` nor
-`retained_objects`. Four are reported and never reclaimed: `retained_objects` (the previous
-generation's, kept one generation so a reader holding the previous bootstrap can still fetch what
-it names), shards under `data/timeline-v3/` the bootstrap does not name,
+reclaimable today: the schema-1 monolith, and schema-2 objects in neither `current_objects` nor
+`retained_objects`. Six are reported and never reclaimed: the schema-2 presentation generation
+(below), the transcript search corpus (below, and never reclaimable at all), `retained_objects`
+(the previous generation's, kept one generation so a reader holding the previous bootstrap can
+still fetch what it names), shards under `data/timeline-v3/` the bootstrap does not name,
 `teams/*/source_snapshots/` (vendor input, gated by `audit-losslessness --require-lossless`, and
 empty on an archive `migrate-snapshots` has moved), and the trash itself.
+
+`data/timeline-v2/` is 1,434.2 MiB on the measured archive, an order of magnitude more than
+anything else `gc` can see, and it is **two things in one directory**. Schema 3 replaced the
+presentation timeline; it did not replace the transcript search corpus, which is still schema-2
+content-addressed day shards with trigram blooms catalogued in the bootstrap's `search` section —
+`query.TimelineQuery._search_bootstrap` opens that generation from under a complete schema 3 and
+says so in its first paragraph. The two halves are indistinguishable on disk, sharing one
+content-addressed directory, so only the catalogue can separate them; `schema-2-search-corpus`
+does, and holds 509.1 MiB of the total in every world, including the retired one. A flip that
+retires the presentation format supersedes nothing here, and reclaiming an unsuperseded capability
+because a neighbouring tenant of the same directory got a successor would be the same class of
+mistake as reclaiming on "the last build did not write it".
+
+`superseded-schema-2` is the other half — 925.1 MiB — and it takes three preconditions the
+monolith never needed. **Is it still produced**: a superseding artifact says the archive can be
+*read* without the old generation, not that the old generation stopped being written, and
+reclaiming output the next build rewrites is churn. That cannot be answered from the archive:
+objects are content addressed and the bootstrap goes through `write_text_if_changed`, so a build
+republishing an identical schema 2 moves no mtime — on the measured archive the newest schema-2
+object was thirteen hours older than the schema-3 bootstrap while the same build's
+`data/export.json` named all 661 schema-2 files as its own output. So it comes from the code,
+`timeline_shards.SCHEMA_2_IS_PUBLISHED`, which `write_timeline_shards` enforces by refusing to run
+while it is false: the difference between "no build did" and "no build can". **Is that schema 3 a
+successor**: completeness is entirely intra-generation, so a schema 3 a whole build behind passes
+all five clauses, and publication order is schema 2 then schema 3, which makes "new schema 2 beside
+old, flawless schema 3" one interrupted build away — the `source_digest` comparison the reader
+already refuses on in `_search_bootstrap` is made here eagerly, before the sweep, because the
+reader only makes it after one. **Does this archive's browser know about schema 3**: `app.js` is
+copied into an archive by the build that made it and `gc` does not rewrite it, so a pre-flip copy
+would be left fetching a bootstrap this pass just moved, with the fallback moved too; the refusal
+asks for the positive signal (the bundle names `data/timeline-v3.json`) and clears after one
+rebuild, per archive rather than per release.
+
+When all of them hold, the current/retained/orphan split is subsumed into the one reclaimable
+category, because the grace period protects a browser holding the previous bootstrap and the
+flip's own precondition is that no browser reads the format for its timeline. The reason string
+carries the warning, because this removes the last fallback: the chain is schema 3, then schema 2,
+then the monolith, and the monolith is reclaimable under conditions these already satisfy, so one
+`--delete` can leave schema 3 alone at the bottom, where a generation the reader declines is an
+unreadable archive rather than a slow one. Reversible from the trash, and recoverable by a rebuild
+— but *where* that rebuild can run is computed rather than asserted, because an ingest archive
+holds `teams/*/raw` and a combined export holds only `teams/<slug>/summaries/`, and an export is
+the archive most likely to be collected. Saying "rebuild from `teams/*/raw`" to an operator who has
+none would be a false promise at the one moment they are accepting an irreversible-after-`--empty-trash`
+decision.
 
 The schema-3 orphans are the one category that changed side. Absence from the catalogue does not
 say whether a shard is a retired team's or a live team's — publication is shards, then bootstrap,
