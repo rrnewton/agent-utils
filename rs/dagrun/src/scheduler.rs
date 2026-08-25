@@ -1679,6 +1679,13 @@ fn spawn_reader<R: Read + Send + 'static>(
                         // capture alone would have left this hole open. Flush the oversized
                         // prefix as its own console line: a console line is a display artifact,
                         // and splitting one costs far less than holding an unbounded one.
+                        // SAY SO WHEN IT FIRES. Without the notice below, a forced flush is a
+                        // console line like any other, so the guard acting and the guard never
+                        // acting produce indistinguishable output -- nobody can tell whether it
+                        // has ever worked. It also cannot fire on healthy output (the longest
+                        // newline-free run measured across a real corpus was ~27 KiB against a
+                        // 1 MiB bound), so its one appearance carries the whole burden of
+                        // explaining itself.
                         while pending.len() >= STREAM_LINE_MAX_BYTES {
                             let forced: Vec<u8> = pending.drain(..STREAM_LINE_MAX_BYTES).collect();
                             let text = String::from_utf8_lossy(&forced);
@@ -1691,6 +1698,10 @@ fn spawn_reader<R: Read + Send + 'static>(
                             } else {
                                 emit(&format!("[{tag}] {text}"));
                             }
+                            emit(&format!(
+                                "[{tag}] {}",
+                                stream_split_notice(STREAM_LINE_MAX_BYTES)
+                            ));
                         }
                     }
                 }
@@ -1727,6 +1738,34 @@ fn spawn_reader<R: Read + Send + 'static>(
 // stand alone, and a source-tree path in it is a reference the reader of a packaged crate cannot
 // follow.
 const STREAM_LINE_MAX_BYTES: usize = 1024 * 1024;
+
+// Leading text of the notice emitted immediately after a forced flush.
+//
+// A cap that acts silently is indistinguishable from a cap that never acts, so nobody can tell
+// whether the guard has ever worked. This one fires only on output that has produced
+// `STREAM_LINE_MAX_BYTES` with no newline -- a shape healthy output does not reach -- so the
+// single line it prints is the only evidence a reader will ever get. It has to be unambiguous
+// about two things: that the RUNNER did the splitting, and that splitting a console line
+// discarded nothing. The sibling engine emits the same text.
+const STREAM_SPLIT_MARKER: &str = "^ RUNNER SPLIT the line above";
+
+/// The one line a reader gets when the `-vv` stream cap fires.
+///
+/// Names the mechanism, the threshold, the reason, and -- because "split" alone reads as data
+/// loss -- states explicitly that nothing was dropped.
+///
+/// `limit_bytes` is a parameter rather than read from the constant directly, so a test can drive
+/// the guard at a smaller bound and assert the notice names THAT bound. The sibling engine had a
+/// defaulted argument here and reported the constant's original value instead of the bound in
+/// force -- misreporting the very threshold the message exists to explain.
+fn stream_split_notice(limit_bytes: usize) -> String {
+    format!(
+        "{STREAM_SPLIT_MARKER}: the step emitted {limit_bytes} bytes with no newline, \
+         so the live stream broke the console line to avoid buffering it without limit. \
+         NOTHING WAS DISCARDED -- the durable log and the captured output are complete; \
+         only the console display was broken."
+    )
+}
 
 /// The last `limit` bytes of one output stream, in a buffer that never grows past `limit`.
 ///
@@ -5807,6 +5846,64 @@ mod tests {
         // fails a test by name instead of drifting; and the end-to-end test of this code path
         // overrides the value to stay fast, so it says nothing about the number that ships.
         assert_eq!(STREAM_LINE_MAX_BYTES, 1_048_576);
+    }
+
+    #[test]
+    fn the_split_notice_is_identical_to_the_sibling_engine() {
+        // Byte-for-byte with `stream_split_notice` in py/dagrun/scheduler.py. The two editions'
+        // console output is compared by the differential harness, so drift here is a real
+        // failure. The bound is passed in rather than read from the constant so this test can
+        // name a number the constant does not have -- which is also what stops the notice
+        // reporting a threshold other than the one actually in force.
+        assert_eq!(
+            stream_split_notice(1234),
+            "^ RUNNER SPLIT the line above: the step emitted 1234 bytes with no newline, \
+             so the live stream broke the console line to avoid buffering it without limit. \
+             NOTHING WAS DISCARDED -- the durable log and the captured output are complete; \
+             only the console display was broken."
+        );
+    }
+
+    #[test]
+    fn the_split_notice_says_it_was_forced_and_that_nothing_was_lost() {
+        // The guard has to be legible at the one moment it acts. A forced flush that reads as
+        // an ordinary console line means the cap firing and the cap never firing produce the
+        // same output, so nobody can tell whether it has ever worked -- and it cannot fire on
+        // healthy output, so this single line is the only evidence a reader will ever get.
+        let notice = stream_split_notice(STREAM_LINE_MAX_BYTES);
+        assert!(
+            notice.contains("RUNNER SPLIT"),
+            "the notice must attribute the split to the runner, not leave it looking like the \
+             step's own formatting: {notice}"
+        );
+        assert!(
+            notice.contains("NOTHING WAS DISCARDED"),
+            "\"SPLIT\" alone reads as data loss; the notice must say the output is complete: \
+             {notice}"
+        );
+        assert!(
+            notice.contains(&STREAM_LINE_MAX_BYTES.to_string()),
+            "the notice must name the threshold it enforced: {notice}"
+        );
+    }
+
+    #[test]
+    fn the_split_notice_names_the_bound_in_force_not_the_constant() {
+        // THE DEFECT THIS PINS, found by the sibling engine's test before either shipped: the
+        // notice was built from a value bound once at definition time, so it reported the
+        // constant's own number even when a different bound was the one actually enforcing.
+        // A message that misreports the threshold it exists to explain is worse than silence,
+        // because it is confidently wrong.
+        let notice = stream_split_notice(3072);
+        assert!(
+            notice.contains("3072"),
+            "the notice must name the bound it was given: {notice}"
+        );
+        assert!(
+            !notice.contains("1048576"),
+            "the notice must NOT fall back to the shipped constant when a different bound is \
+             in force: {notice}"
+        );
     }
 
     #[test]

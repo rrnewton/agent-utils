@@ -261,3 +261,94 @@ def test_the_live_stream_buffer_does_not_grow_without_a_newline(
     assert widest <= len("[g.gusher] ") + 3072 + 8192, (
         f"widest streamed piece was {widest} bytes; the live buffer is not being trimmed"
     )
+
+
+def test_a_forced_split_says_it_was_forced_and_that_nothing_was_lost(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The guard has to be legible at the one moment it acts.
+
+    A forced flush that looks like an ordinary console line means the cap firing and the cap
+    never firing produce the SAME output, so nobody can tell whether the guard has ever worked.
+    The bound also cannot fire on healthy output -- the longest newline-free run measured over a
+    real corpus was about 27 KiB against a 1 MiB bound -- so the notice is the only evidence a
+    reader will ever get that it acted.
+
+    Two things are asserted because either alone is misleading: that the notice appears at all,
+    and that it says nothing was discarded. "SPLIT" on its own reads as data loss.
+    """
+    from dagrun import scheduler
+
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(scheduler, "_STREAM_LINE_MAX_BYTES", 3072)
+    try:
+        gusher = Step(
+            "g",
+            "gusher",
+            "",
+            "printf 'y%.0s' $(seq 1 30000); sleep 0.4; echo; exit 1",
+        )
+        runner = Runner(
+            DagConfig(steps=(gusher,)),
+            max_steps=1,
+            max_cpus=1,
+            cgroups=NoopCgroups(),
+            verbosity=2,
+        )
+        runner.run()
+    finally:
+        monkey.undo()
+
+    lines = capsys.readouterr().out.splitlines()
+    detail_at = next(
+        (i for i, line in enumerate(lines) if line.endswith("----- detail -----")),
+        len(lines),
+    )
+    notices = [
+        line
+        for line in lines[:detail_at]
+        if scheduler._STREAM_SPLIT_MARKER in line
+    ]
+    assert notices, (
+        "the cap fired but said nothing: a forced flush is indistinguishable from an "
+        "ordinary console line, so a reader cannot tell the guard acted"
+    )
+    joined = " ".join(notices)
+    assert "NOTHING WAS DISCARDED" in joined, (
+        "the notice must state that splitting a console line dropped no output; 'SPLIT' "
+        "alone reads as data loss"
+    )
+    assert "3072" in joined, "the notice must name the threshold it enforced"
+
+
+def test_ordinary_output_produces_no_split_notice(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The negative control, without which the assertion above proves nothing.
+
+    If the notice were emitted unconditionally it would satisfy the test above while carrying no
+    information. Newline-delimited output of the same total size must produce none.
+    """
+    from dagrun import scheduler
+
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(scheduler, "_STREAM_LINE_MAX_BYTES", 3072)
+    try:
+        tidy = Step("g", "tidy", "", "for i in $(seq 1 400); do printf 'y%.0s' $(seq 1 70); echo; done")
+        runner = Runner(
+            DagConfig(steps=(tidy,)),
+            max_steps=1,
+            max_cpus=1,
+            cgroups=NoopCgroups(),
+            verbosity=2,
+        )
+        runner.run()
+    finally:
+        monkey.undo()
+
+    out = capsys.readouterr().out
+    assert "[g.tidy] y" in out, "the control must actually stream output"
+    assert scheduler._STREAM_SPLIT_MARKER not in out, (
+        "newline-delimited output must not trip the split notice; a notice that always "
+        "appears distinguishes nothing"
+    )

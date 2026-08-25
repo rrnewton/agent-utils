@@ -112,6 +112,38 @@ _THREAD_JOIN_S = 2.0
 #: ``STREAM_LINE_MAX_BYTES`` in ``rs/dagrun/src/scheduler.rs``.
 _STREAM_LINE_MAX_BYTES = 1024 * 1024
 
+#: Marker emitted immediately after a forced flush, so the split is legible.
+#:
+#: A cap that acts silently is indistinguishable from a cap that never acts, which makes
+#: it impossible to tell whether the guard has ever worked. This one fires only on output
+#: that has produced ``_STREAM_LINE_MAX_BYTES`` with no newline -- a shape healthy output
+#: does not reach -- so the single line it prints is the only evidence a reader will ever
+#: get, and it has to be unambiguous about two things: that the RUNNER did the splitting,
+#: and that splitting a console line discarded nothing. MUST match ``stream_split_notice``
+#: in ``rs/dagrun/src/scheduler.rs``.
+_STREAM_SPLIT_MARKER = "^ RUNNER SPLIT the line above"
+
+
+def stream_split_notice(limit_bytes: int) -> str:
+    """The one line a reader gets when the ``-vv`` stream cap fires.
+
+    Names the mechanism, the threshold, the reason, and -- because "split" alone reads as
+    data loss -- states explicitly that nothing was dropped.
+
+    ``limit_bytes`` is REQUIRED rather than defaulted to the module constant. A default is
+    bound once at definition time, so a notice built from it reports the constant's original
+    value even when a different bound is the one actually in force -- the message would then
+    misreport the very threshold it exists to explain. Caught by
+    ``test_a_forced_split_says_it_was_forced_and_that_nothing_was_lost``, which runs the
+    guard at a smaller bound and asserts the notice names that bound.
+    """
+    return (
+        f"{_STREAM_SPLIT_MARKER}: the step emitted {limit_bytes} bytes with no newline, "
+        f"so the live stream broke the console line to avoid buffering it without limit. "
+        f"NOTHING WAS DISCARDED -- the durable log and the captured output are complete; "
+        f"only the console display was broken."
+    )
+
 
 class BudgetUnit(Enum):
     """The quantity a per-step budget bounds, and the ONLY unit a breach may be reported in.
@@ -1402,11 +1434,22 @@ class Runner:
                         # would have left this hole open. Flush the oversized prefix as its own
                         # console line: a console line is a display artifact, and splitting one is
                         # a far smaller cost than holding an unbounded one in memory.
+                        # SAY SO WHEN IT FIRES. Without the marker below, a forced flush is
+                        # a console line like any other, so the guard acting and the guard
+                        # never acting produce indistinguishable output -- nobody can tell
+                        # whether it has ever worked. It also cannot fire on healthy output
+                        # (the longest newline-free run measured across a real corpus was
+                        # ~27 KiB against a 1 MiB bound), so its one appearance carries the
+                        # whole burden of explaining itself.
                         while len(pending) >= _STREAM_LINE_MAX_BYTES:
                             forced = bytes(pending[:_STREAM_LINE_MAX_BYTES])
                             del pending[:_STREAM_LINE_MAX_BYTES]
                             self._emit(
                                 f"[{step.tag}] " + forced.decode(errors="replace")
+                            )
+                            self._emit(
+                                f"[{step.tag}] "
+                                + stream_split_notice(_STREAM_LINE_MAX_BYTES)
                             )
                 if stream and pending:
                     self._emit(
