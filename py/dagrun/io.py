@@ -596,7 +596,7 @@ def _dag_from_obj(raw: object) -> DagConfig:
         outer_mem_safety_factor=_opt_float(doc, "outer_mem_safety_factor", 1.0),
         default_step_timeout=default_step_timeout,
         default_jobs_flag=_opt_str(doc, "default_jobs_flag", DEFAULT_JOBS_FLAG),
-        # The host-level default comes from $SAFE_CI_DAG_RUNNER_JOBS_ENV when the document does
+        # The host-level default comes from $DAGRUN_JOBS_ENV when the document does
         # not carry an explicit value. Serialization carries the resolved value so a config
         # round-trip cannot silently lose the channel.
         default_jobs_env=default_jobs_env,

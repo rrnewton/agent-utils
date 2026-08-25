@@ -616,7 +616,7 @@ class DagConfig:
     # Default inner-parallelism flag template for steps that don't set their own `jobs_flag`.
     default_jobs_flag: str = DEFAULT_JOBS_FLAG
     # Default inner-parallelism ENV channel for steps that don't set their own `jobs_env`.
-    # When omitted by a loaded document, resolved from $SAFE_CI_DAG_RUNNER_JOBS_ENV (see
+    # When omitted by a loaded document, resolved from $DAGRUN_JOBS_ENV (see
     # resolve_jobs_env); callers may also set it explicitly. Empty means no env channel.
     default_jobs_env: str = ""
     # --- Deliberately SMALL default caps applied to a step that DECLARES NOTHING ---
