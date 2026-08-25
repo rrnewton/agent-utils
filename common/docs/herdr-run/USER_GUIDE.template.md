@@ -90,8 +90,8 @@ herdr-run userguide                # this document
 | Option | Effect |
 | --- | --- |
 | `--config PATH` | Use an explicit configuration file instead of the discovered one. Refused by `init`, `quickstart`, and `userguide`, which read no configuration file at all. |
-| `--agent NAME` | The agent this invocation speaks for; names its tab. Otherwise `$HERDR_RUN_AGENT`, `$DG_AGENT_NAME`, or `$ORC_AGENT_NAME`. |
-| `--json` | Emit machine-readable output where the subcommand has one. |
+| `--agent NAME` | The agent this invocation speaks for; names its tab. Otherwise `$HERDR_RUN_AGENT`, `$DG_AGENT_NAME`, or `$ORC_AGENT_NAME`. Refused by `check`, `init`, `reap`, `quickstart`, and `userguide`, which name no tab. |
+| `--json` | Emit machine-readable output where the subcommand has one. Refused by `net-doctor`, `quickstart`, and `userguide`, whose only output is prose. `config`, `target`, and `reap` print JSON with or without it. |
 | `--version` | Print the version and exit. |
 
 **`run` options** only mean something to `run`, and go **after** it:
@@ -112,7 +112,11 @@ as an unrecognized argument. Run `herdr-run <subcommand> --help` for one subcomm
 neither level's help documents the other's. An option at the right level that the chosen subcommand
 still cannot observe is refused too: `herdr-run --config P init` reads as an instruction to write
 `P` and would in fact write `./.herdr-run.yaml`, so it fails and says so rather than doing
-something else quietly.
+something else quietly. All three globals work that way — each is refused by exactly the
+subcommands that cannot observe it, with a message saying why, and each of those subcommands says
+so in its own `--help`. Being told at the flag is the point: a `--json` accepted by a subcommand
+that only prints prose would be discovered at the parse of the output, where it looks like corrupt
+data rather than a request that was never going to be honoured.
 
 ```
 herdr-run --agent release-agent run --timeout 60 'with-proxy git ls-remote origin main'

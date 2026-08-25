@@ -168,6 +168,102 @@ def test_a_refused_config_before_init_writes_nothing(
     assert os.listdir(root) == []
 
 
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--agent", "a", "check", "git status"],
+        ["--agent=a", "check", "git status"],
+        ["--agent", "a", "init"],
+        ["--agent", "a", "reap"],
+        ["--agent", "a", "quickstart"],
+        ["--agent", "a", "userguide"],
+    ],
+)
+def test_agent_is_refused_by_the_subcommands_that_name_no_tab(
+    argv: list[str],
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: object,
+) -> None:
+    """`--agent NAME` is an instruction too: it says who this invocation speaks for.
+
+    The one thing that does is name a tab, so a subcommand that resolves no tab has nothing to do
+    with it. It used to be accepted and dropped, which reads as agreement.
+
+    Run from a scratch directory, because a regression here means `init` really runs.
+    """
+    monkeypatch.chdir(str(tmp_path))
+    assert main(argv) == 2
+    captured = capsys.readouterr()
+    assert "argument --agent:" in captured.err, captured.err
+    assert "names no tab" in captured.err, captured.err
+    assert captured.out == ""
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--json", "net-doctor"],
+        ["--json", "quickstart"],
+        ["--json", "userguide"],
+    ],
+)
+def test_json_is_refused_by_the_subcommands_with_no_machine_readable_output(
+    argv: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--json` asks for machine-readable output, and prose is not a machine-readable answer.
+
+    A caller who is refused finds out at the flag; a caller who is humoured finds out at the parse
+    of the output, where the failure looks like corrupt data instead of a bad request.
+    """
+    assert main(argv) == 2
+    captured = capsys.readouterr()
+    assert "argument --json:" in captured.err, captured.err
+    assert "has no machine-readable output" in captured.err, captured.err
+    assert captured.out == ""
+
+
+def test_every_blind_subcommand_says_so_in_its_own_help() -> None:
+    """A refusal a caller can only discover by tripping over it is a trap, and a note on a
+    subcommand that accepts the option is a lie. Help and behaviour are pinned to each other.
+    """
+    for name, _summary in SUBCOMMANDS:
+        help_ = subcommand_help_text(name)
+        for table, note, label in (
+            (cli_module._CONFIG_BLIND, cli_module._CONFIG_BLIND_NOTE, "--config"),
+            (cli_module._AGENT_BLIND, cli_module._AGENT_BLIND_NOTE, "--agent"),
+            (cli_module._JSON_BLIND, cli_module._JSON_BLIND_NOTE, "--json"),
+        ):
+            assert (note in help_) == (name in table), f"{name}: {label}"
+
+
+def test_the_globals_the_subcommands_can_observe_are_still_accepted(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The refusals must be exactly as wide as the blindness, and no wider.
+
+    Parsing is all that is asserted: a subcommand that got past the parse observed its globals, and
+    running it for real here would need a Herdr server.
+    """
+    for argv in (
+        ["--agent", "a", "run", "git status"],
+        ["--agent", "a", "status"],
+        ["--agent", "a", "config"],
+        ["--agent", "a", "target"],
+        ["--agent", "a", "net-doctor"],
+        # Four subcommands change what they print for `--json`; three print JSON either way.
+        ["--json", "run", "git status"],
+        ["--json", "check", "git status"],
+        ["--json", "status"],
+        ["--json", "init"],
+        ["--json", "config"],
+        ["--json", "target"],
+        ["--json", "reap"],
+    ):
+        cli_module._parse(argv)
+        capsys.readouterr()
+
+
 def test_the_subcommands_own_parse_still_wins_over_the_config_refusal(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

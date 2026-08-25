@@ -82,6 +82,36 @@ _CONFIG_BLIND: dict[str, str] = {
     "userguide": "it prints a packaged document",
 }
 
+#: Subcommands that name no tab, and the reason each one does not.
+#:
+#: ``--agent NAME`` says which agent this invocation speaks for, and the one thing that does is name
+#: the tab the work happens in. A subcommand that resolves no tab therefore cannot observe it, and a
+#: caller who wrote it was saying "do this as NAME" -- an instruction, not a decoration. It is
+#: refused for the same reason ``--config`` is.
+_AGENT_BLIND: dict[str, str] = {
+    "check": "it answers a policy question about a command and touches no pane",
+    "init": "it writes a configuration file and touches no pane",
+    "reap": "it reports on the whole workspace, not on one agent's tab",
+    "quickstart": "it prints a packaged document",
+    "userguide": "it prints a packaged document",
+}
+
+#: Subcommands with no machine-readable output, and the reason each one has none.
+#:
+#: ``--json`` promises machine-readable output *where a subcommand has it*. Where one does not, the
+#: promise cannot be kept: the flag is accepted, prose comes out, and the caller finds out at the
+#: parse of the output rather than at the flag -- which is the worst place to find out, because the
+#: failure looks like corrupt data rather than a rejected request.
+#:
+#: ``config``, ``target``, and ``reap`` are deliberately absent. They print JSON with or without the
+#: flag, so a caller who asks them for machine-readable output gets exactly that; the flag is
+#: redundant there, not disregarded.
+_JSON_BLIND: dict[str, str] = {
+    "net-doctor": "it prints a human diagnosis and a verdict, in prose",
+    "quickstart": "it prints a packaged document",
+    "userguide": "it prints a packaged document",
+}
+
 
 class _UsageError(Exception):
     """A command line this surface cannot accept, carrying the message to print."""
@@ -259,6 +289,23 @@ def _config_blind_error(subcommand: str) -> str:
             f"\n  cd DIRECTORY && herdr-run {subcommand}"
         )
     return message + "\nDrop --config."
+
+
+def _agent_blind_error(subcommand: str) -> str:
+    """Describe ``--agent`` offered to a subcommand that names no tab."""
+    return (
+        f"argument --agent: '{subcommand}' names no tab; {_AGENT_BLIND[subcommand]}."
+        "\nDrop --agent."
+    )
+
+
+def _json_blind_error(subcommand: str) -> str:
+    """Describe ``--json`` offered to a subcommand with no machine-readable output."""
+    return (
+        f"argument --json: '{subcommand}' has no machine-readable output; "
+        f"{_JSON_BLIND[subcommand]}."
+        "\nDrop --json."
+    )
 
 
 def _misplaced_global(name: str) -> str:
@@ -453,9 +500,15 @@ def _parse(raw: Sequence[str]) -> _Invocation:
         raise _EarlyExit()
     invocation = _parse_subcommand(chosen, raw[index:], globals_)
     # After the subcommand's own parse, so that `--config P init --help` still prints init's help
-    # and `--config P init --nonsense` still names the option it could not accept.
+    # and `--config P init --nonsense` still names the option it could not accept. Checked in the
+    # order the global option block lists them, so a command line that offers two blind globals at
+    # once reports the first of them and both editions report the same one.
     if globals_.config is not None and chosen in _CONFIG_BLIND:
         raise _UsageError(_config_blind_error(chosen))
+    if globals_.agent is not None and chosen in _AGENT_BLIND:
+        raise _UsageError(_agent_blind_error(chosen))
+    if globals_.json and chosen in _JSON_BLIND:
+        raise _UsageError(_json_blind_error(chosen))
     return invocation
 
 
@@ -531,8 +584,6 @@ _SUBCOMMAND_HELP: dict[str, str] = {
         "\noptions:\n"
         "  -h, --help            show this help message and exit\n"
         "  --force               overwrite an existing configuration file\n"
-        "\nThis command reads no configuration file, so the global --config option is\n"
-        "refused here rather than accepted and ignored.\n"
     ),
     "status": (
         "usage: herdr-run [GLOBAL OPTIONS] status\n"
@@ -581,8 +632,6 @@ _SUBCOMMAND_HELP: dict[str, str] = {
         "knowing before running anything real.\n"
         "\noptions:\n"
         "  -h, --help            show this help message and exit\n"
-        "\nThis command reads no configuration file, so the global --config option is\n"
-        "refused here rather than accepted and ignored.\n"
     ),
     "userguide": (
         "usage: herdr-run [GLOBAL OPTIONS] userguide\n"
@@ -590,15 +639,41 @@ _SUBCOMMAND_HELP: dict[str, str] = {
         "the pane cap, and the trust model.\n"
         "\noptions:\n"
         "  -h, --help            show this help message and exit\n"
-        "\nThis command reads no configuration file, so the global --config option is\n"
-        "refused here rather than accepted and ignored.\n"
     ),
 }
+
+#: Said by every subcommand ``_CONFIG_BLIND`` names, so the refusal is never a surprise.
+_CONFIG_BLIND_NOTE = (
+    "\nThis command reads no configuration file, so the global --config option is\n"
+    "refused here rather than accepted and ignored.\n"
+)
+
+#: Said by every subcommand ``_AGENT_BLIND`` names.
+_AGENT_BLIND_NOTE = (
+    "\nThis command names no tab, so the global --agent option is refused here rather\n"
+    "than accepted and ignored.\n"
+)
+
+#: Said by every subcommand ``_JSON_BLIND`` names.
+_JSON_BLIND_NOTE = (
+    "\nThis command has no machine-readable output, so the global --json option is\n"
+    "refused here rather than accepted and ignored.\n"
+)
 
 
 def subcommand_help_text(name: str) -> str:
     """Build one subcommand's help so it can be asserted on as text, not only printed."""
-    return _SUBCOMMAND_HELP.get(name, f"usage: herdr-run [GLOBAL OPTIONS] {name}\n")
+    text = _SUBCOMMAND_HELP.get(name, f"usage: herdr-run [GLOBAL OPTIONS] {name}\n")
+    # Derived from the very tables the refusals are decided by, rather than written out again per
+    # subcommand, so a subcommand cannot come to refuse a global option without saying so here.
+    # Listed in the order the global option block lists them.
+    if name in _CONFIG_BLIND:
+        text += _CONFIG_BLIND_NOTE
+    if name in _AGENT_BLIND:
+        text += _AGENT_BLIND_NOTE
+    if name in _JSON_BLIND:
+        text += _JSON_BLIND_NOTE
+    return text
 
 
 def _print_help() -> None:

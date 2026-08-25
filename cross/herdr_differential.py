@@ -401,7 +401,7 @@ def _help_surface(harness: Harness, report: Report, case: PairCase) -> None:
 def _levels(harness: Harness, report: Report, case: PairCase) -> None:
     """An option offered at the wrong level must be refused, identically, by both editions."""
 
-    misplaced = (
+    misplaced: tuple[tuple[str, tuple[str, ...]], ...] = (
         ("global-cwd", ("--cwd", "/tmp", "run", "git status")),
         ("global-timeout", ("--timeout", "5", "run", "git status")),
         ("global-wait-ready", ("--wait-ready", "5", "run", "git status")),
@@ -420,10 +420,46 @@ def _levels(harness: Harness, report: Report, case: PairCase) -> None:
         ("config-blind-init-force", ("--config", "x.yaml", "init", "--force")),
         ("config-blind-quickstart", ("--config", "x.yaml", "quickstart")),
         ("config-blind-userguide", ("--config", "x.yaml", "userguide")),
+        # `--agent NAME` says who this invocation speaks for, and the one thing that does is name
+        # a tab. These five resolve no tab, so accepting it would be accepting an instruction and
+        # then doing nothing about it.
+        ("agent-blind-check", ("--agent", "a", "check", "git status")),
+        ("agent-blind-check-inline", ("--agent=a", "check", "git status")),
+        ("agent-blind-init", ("--agent", "a", "init")),
+        ("agent-blind-reap", ("--agent", "a", "reap")),
+        ("agent-blind-quickstart", ("--agent", "a", "quickstart")),
+        ("agent-blind-userguide", ("--agent", "a", "userguide")),
+        # `--json` promises machine-readable output where a subcommand has it; these three have
+        # only prose to give, so a caller who was humoured would fail at the parse of the output
+        # rather than at the flag.
+        ("json-blind-net-doctor", ("--json", "net-doctor")),
+        ("json-blind-quickstart", ("--json", "quickstart")),
+        ("json-blind-userguide", ("--json", "userguide")),
     )
     for label, args in misplaced:
         python, rust = harness.invoke(case, args)
         report.exact(f"levels/{label}", python, rust, expected_rc=2)
+
+    # Two blind globals at once must produce ONE refusal, and the same one in both editions.
+    # `report.exact` already pins the agreement; naming --config pins which of the two it is, so
+    # the editions cannot agree by both drifting to the other.
+    python, rust = harness.invoke(case, ("--config", "x.yaml", "--agent", "a", "init"))
+    report.exact("levels/two-blind-globals-give-one-refusal", python, rust, expected_rc=2)
+    report.require(
+        "levels/two-blind-globals-report-the-first",
+        "argument --config:" in python.stderr and "argument --agent:" not in python.stderr,
+        f"a --config/--agent pair did not report --config alone: {_describe(python)}",
+    )
+
+    # The globals a subcommand CAN observe stay accepted: the refusals are exactly as wide as the
+    # blindness. `check` is the one that both refuses a global and accepts another.
+    for label, args in (
+        ("agent-sighted-run", ("--agent", "a", "run", "--dry-run", "git status")),
+        ("json-sighted-check", ("--json", "check", "git status")),
+        ("json-sighted-config", ("--json", "config")),
+    ):
+        python, rust = harness.invoke(case, args)
+        report.exact(f"levels/{label}", python, rust, expected_rc=0)
 
     # The subcommand's own parse still wins, so `--help` and a bad local option are unaffected.
     python, rust = harness.invoke(case, ("--config", "x.yaml", "init", "--help"))
@@ -434,6 +470,13 @@ def _levels(harness: Harness, report: Report, case: PairCase) -> None:
         "levels/config-blind-init-names-local-option-first",
         "--nonsense" in python.stderr,
         f"the local option error was replaced by the --config refusal: {_describe(python)}",
+    )
+    python, rust = harness.invoke(case, ("--agent", "a", "quickstart", "--nonsense"))
+    report.exact("levels/agent-blind-names-local-option", python, rust, expected_rc=2)
+    report.require(
+        "levels/agent-blind-names-local-option-first",
+        "--nonsense" in python.stderr,
+        f"the local option error was replaced by the --agent refusal: {_describe(python)}",
     )
 
 
@@ -1161,6 +1204,19 @@ def _init(harness: Harness, report: Report) -> None:
         not (refused.python_root / ".herdr-run.yaml").exists()
         and not (refused.rust_root / ".herdr-run.yaml").exists(),
         "a refused '--config PATH init' still wrote a configuration file",
+    )
+
+    # `--agent NAME init` is refused for the same reason and must be just as total: `init` names no
+    # tab, so the name has nowhere to go, and a refusal that still wrote the file would be worse
+    # than accepting the flag.
+    refused = harness.case("init-agent-refused")
+    python, rust = harness.invoke(refused, ("--agent", "a", "init"))
+    report.exact("init/agent-is-refused", python, rust, expected_rc=2)
+    report.require(
+        "init/agent-refusal-writes-nothing",
+        not (refused.python_root / ".herdr-run.yaml").exists()
+        and not (refused.rust_root / ".herdr-run.yaml").exists(),
+        "a refused '--agent NAME init' still wrote a configuration file",
     )
 
     case = harness.case("init")

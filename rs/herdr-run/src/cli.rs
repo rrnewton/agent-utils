@@ -321,10 +321,22 @@ where
         None => return Ok(ParseResult::Exit(0)),
     };
     // After the subcommand's own parse, so that `--config P init --help` still prints init's help
-    // and `--config P init --nonsense` still names the option it could not accept.
+    // and `--config P init --nonsense` still names the option it could not accept. Checked in the
+    // order the global option block lists them, so a command line that offers two blind globals at
+    // once reports the first of them and both editions report the same one.
     if globals.config.is_some() {
         if let Some(reason) = config_blind_reason(subcommand.name) {
             return Err(config_blind_error(subcommand.name, reason));
+        }
+    }
+    if globals.agent.is_some() {
+        if let Some(reason) = agent_blind_reason(subcommand.name) {
+            return Err(agent_blind_error(subcommand.name, reason));
+        }
+    }
+    if globals.json {
+        if let Some(reason) = json_blind_reason(subcommand.name) {
+            return Err(json_blind_error(subcommand.name, reason));
         }
     }
     Ok(ParseResult::Invocation(Box::new(Invocation {
@@ -530,6 +542,53 @@ fn config_blind_error(subcommand: &str, reason: &str) -> String {
         );
     }
     format!("{message}\nDrop --config.")
+}
+
+/// Why a subcommand names no tab, or `None` when it names one.
+///
+/// `--agent NAME` says which agent this invocation speaks for, and the one thing that does is name
+/// the tab the work happens in. A subcommand that resolves no tab therefore cannot observe it, and
+/// a caller who wrote it was saying "do this as NAME" — an instruction, not a decoration. It is
+/// refused for the same reason `--config` is: accepting an instruction and then disregarding it is
+/// the defect this surface exists to remove.
+fn agent_blind_reason(subcommand: &str) -> Option<&'static str> {
+    match subcommand {
+        "check" => Some("it answers a policy question about a command and touches no pane"),
+        "init" => Some("it writes a configuration file and touches no pane"),
+        "reap" => Some("it reports on the whole workspace, not on one agent's tab"),
+        "quickstart" | "userguide" => Some("it prints a packaged document"),
+        _ => None,
+    }
+}
+
+/// Describe `--agent` offered to a subcommand that names no tab.
+fn agent_blind_error(subcommand: &str, reason: &str) -> String {
+    format!("argument --agent: '{subcommand}' names no tab; {reason}.\nDrop --agent.")
+}
+
+/// Why a subcommand has no machine-readable output, or `None` when it has one.
+///
+/// `--json` promises machine-readable output *where a subcommand has it*. Where one does not, the
+/// promise cannot be kept: the flag is accepted, prose comes out, and the caller finds out at the
+/// parse of the output rather than at the flag — which is the worst place to find out, because the
+/// failure looks like malformed data rather than a rejected request.
+///
+/// `config`, `target`, and `reap` are deliberately NOT here. They print JSON with or without the
+/// flag, so a caller who asks them for machine-readable output gets exactly that; the flag is
+/// redundant there, not disregarded.
+fn json_blind_reason(subcommand: &str) -> Option<&'static str> {
+    match subcommand {
+        "net-doctor" => Some("it prints a human diagnosis and a verdict, in prose"),
+        "quickstart" | "userguide" => Some("it prints a packaged document"),
+        _ => None,
+    }
+}
+
+/// Describe `--json` offered to a subcommand with no machine-readable output.
+fn json_blind_error(subcommand: &str, reason: &str) -> String {
+    format!(
+        "argument --json: '{subcommand}' has no machine-readable output; {reason}.\nDrop --json."
+    )
 }
 
 /// Describe an option that appeared before the subcommand but belongs to one of them.
@@ -1252,6 +1311,12 @@ fn print_help() {
 /// Said by every subcommand that `config_blind_reason` names, so the refusal is never a surprise.
 const CONFIG_BLIND_NOTE: &str = "\nThis command reads no configuration file, so the global --config option is\nrefused here rather than accepted and ignored.\n";
 
+/// Said by every subcommand that `agent_blind_reason` names.
+const AGENT_BLIND_NOTE: &str = "\nThis command names no tab, so the global --agent option is refused here rather\nthan accepted and ignored.\n";
+
+/// Said by every subcommand that `json_blind_reason` names.
+const JSON_BLIND_NOTE: &str = "\nThis command has no machine-readable output, so the global --json option is\nrefused here rather than accepted and ignored.\n";
+
 /// Build one subcommand's help so it can be asserted on as text, not only printed.
 fn subcommand_help_text(name: &str) -> String {
     let mut text = String::new();
@@ -1275,7 +1340,6 @@ fn subcommand_help_text(name: &str) -> String {
             text.push_str("usage: herdr-run [GLOBAL OPTIONS] init [OPTIONS]\n");
             text.push_str("\nWrite an annotated .herdr-run.yaml into the current directory, the way 'git init'\nwrites into the current directory. Every knob is present and set to the value in\nforce today, so adopting the file changes nothing until you edit it. Refuses to\noverwrite an existing configuration.\n");
             text.push_str("\noptions:\n  -h, --help            show this help message and exit\n  --force               overwrite an existing configuration file\n");
-            text.push_str(CONFIG_BLIND_NOTE);
         }
         "status" => {
             text.push_str("usage: herdr-run [GLOBAL OPTIONS] status\n");
@@ -1306,15 +1370,25 @@ fn subcommand_help_text(name: &str) -> String {
             text.push_str("usage: herdr-run [GLOBAL OPTIONS] quickstart\n");
             text.push_str("\nPrint the one-screen introduction: what this command is for, the four commands\nworth trying first, the shape of the command line, and the five things worth\nknowing before running anything real.\n");
             text.push_str("\noptions:\n  -h, --help            show this help message and exit\n");
-            text.push_str(CONFIG_BLIND_NOTE);
         }
         "userguide" => {
             text.push_str("usage: herdr-run [GLOBAL OPTIONS] userguide\n");
             text.push_str("\nPrint the complete reference: configuration, exit codes, readiness, retention,\nthe pane cap, and the trust model.\n");
             text.push_str("\noptions:\n  -h, --help            show this help message and exit\n");
-            text.push_str(CONFIG_BLIND_NOTE);
         }
         other => text.push_str(&format!("usage: herdr-run [GLOBAL OPTIONS] {other}\n")),
+    }
+    // Derived from the very tables the refusals are decided by, rather than written out again per
+    // subcommand, so a subcommand cannot come to refuse a global option without saying so here.
+    // Listed in the order the global option block lists them.
+    if config_blind_reason(name).is_some() {
+        text.push_str(CONFIG_BLIND_NOTE);
+    }
+    if agent_blind_reason(name).is_some() {
+        text.push_str(AGENT_BLIND_NOTE);
+    }
+    if json_blind_reason(name).is_some() {
+        text.push_str(JSON_BLIND_NOTE);
     }
     text
 }
@@ -1462,6 +1536,109 @@ mod tests {
         for subcommand in ["status", "config", "reap", "net-doctor", "target"] {
             parse_args(&["--config", "x.yaml", subcommand])
                 .unwrap_or_else(|error| panic!("{subcommand}: {error}"));
+        }
+    }
+
+    /// `--agent NAME` is an instruction too: it says who this invocation speaks for.
+    ///
+    /// The only thing that does is name a tab, so a subcommand that resolves no tab has nothing to
+    /// do with it. It used to be accepted and dropped, which reads as agreement.
+    #[test]
+    fn agent_is_refused_by_the_subcommands_that_name_no_tab() {
+        for arguments in [
+            vec!["--agent", "a", "check", "git status"],
+            vec!["--agent=a", "check", "git status"],
+            vec!["--agent", "a", "init"],
+            vec!["--agent", "a", "reap"],
+            vec!["--agent", "a", "quickstart"],
+            vec!["--agent", "a", "userguide"],
+        ] {
+            let error = parse_args(&arguments).expect_err(&arguments.join(" "));
+            assert!(
+                error.contains("argument --agent:") && error.contains("names no tab"),
+                "{arguments:?}: {error}"
+            );
+        }
+
+        // The subcommands that DO name a tab are untouched.
+        for arguments in [
+            vec!["--agent", "a", "run", "git status"],
+            vec!["--agent", "a", "status"],
+            vec!["--agent", "a", "config"],
+            vec!["--agent", "a", "target"],
+            vec!["--agent", "a", "net-doctor"],
+        ] {
+            parse_args(&arguments)
+                .unwrap_or_else(|error| panic!("{}: {error}", arguments.join(" ")));
+        }
+    }
+
+    /// `--json` asks for machine-readable output, and prose is not a machine-readable answer.
+    ///
+    /// A caller who is refused finds out at the flag; a caller who is humoured finds out at the
+    /// parse of the output, where the failure looks like corrupt data instead of a bad request.
+    #[test]
+    fn json_is_refused_by_the_subcommands_with_no_machine_readable_output() {
+        for arguments in [
+            vec!["--json", "net-doctor"],
+            vec!["--json", "quickstart"],
+            vec!["--json", "userguide"],
+        ] {
+            let error = parse_args(&arguments).expect_err(&arguments.join(" "));
+            assert!(
+                error.contains("argument --json:")
+                    && error.contains("has no machine-readable output"),
+                "{arguments:?}: {error}"
+            );
+        }
+
+        // Four subcommands change what they print for `--json`, and three print JSON either way.
+        // Neither group may refuse it.
+        for arguments in [
+            vec!["--json", "run", "git status"],
+            vec!["--json", "check", "git status"],
+            vec!["--json", "status"],
+            vec!["--json", "init"],
+            vec!["--json", "config"],
+            vec!["--json", "target"],
+            vec!["--json", "reap"],
+        ] {
+            parse_args(&arguments)
+                .unwrap_or_else(|error| panic!("{}: {error}", arguments.join(" ")));
+        }
+    }
+
+    /// Every refusal must be announced in the help of the subcommand that makes it, and nowhere
+    /// else. A refusal a caller can only discover by tripping over it is a trap, and a note on a
+    /// subcommand that accepts the option is a lie.
+    #[test]
+    fn every_blind_subcommand_says_so_in_its_own_help() {
+        for subcommand in SUBCOMMANDS {
+            let help = subcommand_help_text(subcommand.name);
+            for (blind, note, label) in [
+                (
+                    config_blind_reason(subcommand.name).is_some(),
+                    CONFIG_BLIND_NOTE,
+                    "--config",
+                ),
+                (
+                    agent_blind_reason(subcommand.name).is_some(),
+                    AGENT_BLIND_NOTE,
+                    "--agent",
+                ),
+                (
+                    json_blind_reason(subcommand.name).is_some(),
+                    JSON_BLIND_NOTE,
+                    "--json",
+                ),
+            ] {
+                assert_eq!(
+                    help.contains(note),
+                    blind,
+                    "{}: help and the {label} refusal disagree",
+                    subcommand.name
+                );
+            }
         }
     }
 
