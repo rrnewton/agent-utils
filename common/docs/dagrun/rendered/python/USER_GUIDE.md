@@ -273,7 +273,7 @@ runner-controlled: when an authored or profile-derived width exceeds
 width, and per-step `cpu.max` together. `jobs_flag` appends the width to the
 command; `jobs_env` sets the named environment variable. At the DAG level,
 `default_jobs_env` is inherited by steps; when that field is absent,
-`SAFE_CI_DAG_RUNNER_JOBS_ENV` supplies the host-specific default. A step-level
+`DAGRUN_JOBS_ENV` supplies the host-specific default. A step-level
 value overrides the default, `null` inherits it, and `""` opts that step out.
 Names must be valid shell environment-variable identifiers or the DAG is
 refused before a child starts. Some syntactically valid names are nevertheless

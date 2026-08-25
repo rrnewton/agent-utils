@@ -328,6 +328,8 @@ def _env(extra: Mapping[str, str] | None = None) -> dict[str, str]:
     # which is applied after these pops.
     env.pop("CARGO_BUILD_JOBS", None)
     env.pop("DAGRUN_OPERATOR_BUILD_JOBS", None)
+    env.pop("DAGRUN_JOBS_ENV", None)
+    # The retired spelling must not make a differential case accidentally pass.
     env.pop("SAFE_CI_DAG_RUNNER_JOBS_ENV", None)
     if extra:
         env.update(extra)
@@ -5596,7 +5598,7 @@ def compare_jobs_env_width(py: list[str], rs: list[str], rep: Report) -> None:
                 if not boxed:
                     args.append("--unsafe-no-cgroups")
                 env = {
-                    "SAFE_CI_DAG_RUNNER_JOBS_ENV": "CARGO_BUILD_JOBS",
+                    "DAGRUN_JOBS_ENV": "CARGO_BUILD_JOBS",
                     "OBSERVED_PATH": str(output),
                     "DAGRUN_NO_STEP_LOGS": "1",
                 }
@@ -5650,7 +5652,7 @@ def compare_jobs_env_width(py: list[str], rs: list[str], rep: Report) -> None:
                 if not boxed:
                     args.append("--unsafe-no-cgroups")
                 env = {
-                    "SAFE_CI_DAG_RUNNER_JOBS_ENV": "BASHOPTS",
+                    "DAGRUN_JOBS_ENV": "BASHOPTS",
                     "OBSERVED_PATH": str(output),
                     "DAGRUN_NO_STEP_LOGS": "1",
                 }
@@ -5688,8 +5690,13 @@ def compare_jobs_env_width(py: list[str], rs: list[str], rep: Report) -> None:
             ("missing", {}, "no width channel"),
             (
                 "malformed",
-                {"SAFE_CI_DAG_RUNNER_JOBS_ENV": "NOT=A=NAME"},
+                {"DAGRUN_JOBS_ENV": "NOT=A=NAME"},
                 "valid environment variable name",
+            ),
+            (
+                "retired-name-ignored",
+                {"SAFE_CI_DAG_RUNNER_JOBS_ENV": "CARGO_BUILD_JOBS"},
+                "no width channel",
             ),
         ):
             outcomes: dict[str, Outcome] = {}

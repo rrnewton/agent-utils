@@ -120,8 +120,7 @@ fn refuse_unusable_explains(steps: &[Step]) -> Result<(), DagJsonError> {
             colour.insert(tag, Colour::Grey);
             path.push(tag);
             stack.push((tag, true));
-            let mut targets: Vec<&str> =
-                by_tag[tag].explains.iter().map(|s| s.as_str()).collect();
+            let mut targets: Vec<&str> = by_tag[tag].explains.iter().map(|s| s.as_str()).collect();
             targets.sort_unstable();
             for target in targets {
                 if colour.get(target) != Some(&Colour::Black) {
@@ -922,8 +921,7 @@ fn emit_step(s: &mut String, step: &Step, base: usize) {
     // because the two editions are pinned together by a byte-identical JSON comparison. A graph
     // that does not use the relationship keeps a byte-identical document.
     let has_explains = !step.explains.is_empty();
-    let has_write_domains =
-        step.write_domains.is_some() || step.write_domain_guarantee.is_some();
+    let has_write_domains = step.write_domains.is_some() || step.write_domain_guarantee.is_some();
     if has_explains || has_write_domains {
         s.push_str(",\n");
     } else {

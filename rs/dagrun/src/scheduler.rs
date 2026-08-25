@@ -4787,7 +4787,7 @@ mod tests {
             validate_max_cpus_rewrite(&cfg, 2).unwrap_err(),
             "--max-cpus 2 cannot lower guest parallelism for step(s) that offer no width channel: \
              g.wide (preferred_inner_jobs=8); this machine must declare one -- set \
-             $SAFE_CI_DAG_RUNNER_JOBS_ENV to the guest's worker-count ENV VAR (e.g. \
+             $DAGRUN_JOBS_ENV to the guest's worker-count ENV VAR (e.g. \
              CARGO_BUILD_JOBS), or set the step's jobs_flag to its worker-count OPTION -- or \
              reduce preferred_inner_jobs, or raise --max-cpus"
         );

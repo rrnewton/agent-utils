@@ -37,7 +37,7 @@ pub const DEFAULT_JOBS_FLAG: &str = "-j";
 
 /// Machine-level name of the environment variable through which the runner delivers a step's
 /// admitted inner width. Cargo's `CARGO_BUILD_JOBS` is the motivating channel.
-pub const JOBS_ENV_ENV: &str = "SAFE_CI_DAG_RUNNER_JOBS_ENV";
+pub const JOBS_ENV_ENV: &str = "DAGRUN_JOBS_ENV";
 
 // Deliberately SMALL default caps for a step that DECLARES NOTHING — the "forcing function".
 // An undeclared step is boxed into a tight 1-core / 1-GiB / 10-s-CPU floor, so a real step

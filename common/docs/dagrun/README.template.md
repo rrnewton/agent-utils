@@ -69,7 +69,7 @@ public run vocabulary; differing simultaneous values conflict and are rejected.
 `sweep --jobs RANGE` remains the width-range option for a per-step speedup
 experiment. A non-empty `jobs_flag` or `jobs_env` lets the runner rewrite an
 inner width down to `--max-cpus`; `default_jobs_env` supplies the environment
-channel inherited by steps, and `SAFE_CI_DAG_RUNNER_JOBS_ENV` supplies that
+channel inherited by steps, and `DAGRUN_JOBS_ENV` supplies that
 default when the document omits it. Empty effective channels prevent rewriting.
 When paired with a positive declared width, that width is self-managed and the
 run refuses it if it exceeds the total budget.
