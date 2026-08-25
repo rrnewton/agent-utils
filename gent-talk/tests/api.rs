@@ -1766,6 +1766,64 @@ async fn a_read_token_may_look_at_the_to_do_list_and_may_not_change_it() {
 }
 
 #[tokio::test]
+async fn the_channel_read_says_which_of_its_messages_are_archived() {
+    // `#50 todo-view`. The To do filter REMOVES archived messages; the ordinary channel view greys
+    // them and leaves them where they are. It can only do that if the read says which they are,
+    // and until this field existed it did not — so archiving a message changed nothing visible in
+    // the view the reader is normally looking at, and the gesture read as broken.
+    let (harness, _store, ids) = todo_harness();
+
+    // Nothing archived yet: the field is present and empty rather than absent, so a client never
+    // has to tell "no archive" apart from "an older server that does not report one".
+    let (status, payload) = call(
+        &harness,
+        "GET",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/page"),
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    assert_eq!(payload["dismissed"], serde_json::json!([]));
+
+    let (status, payload) = call(
+        &harness,
+        "POST",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/dismiss"),
+        Some(WRITE_TOKEN),
+        Some(serde_json::json!({ "messages": [ids[0]] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+
+    for route in ["page", "messages"] {
+        let (status, payload) = call(
+            &harness,
+            "GET",
+            &format!("/api/v1/channels/{WRITE_CHANNEL}/{route}"),
+            Some(READ_TOKEN),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{route}: {payload}");
+        // STILL THERE. The message is reported, and reported as archived -- the read does not
+        // filter it out, because filtering is what `/todo` is for.
+        let messages = payload["messages"].as_array().expect("messages");
+        assert!(
+            messages
+                .iter()
+                .any(|m| m["id"] == serde_json::json!(ids[0])),
+            "{route} dropped an archived message instead of flagging it"
+        );
+        assert_eq!(
+            payload["dismissed"],
+            serde_json::json!([ids[0]]),
+            "{route} does not say which of its messages are archived"
+        );
+    }
+}
+
+#[tokio::test]
 async fn every_to_do_answer_says_that_this_read_state_is_not_discords() {
     // Said once, plainly, on every answer — including the LISTING, not only the mutations. The
     // alternative is that the owner discovers it from a divergence: a badge in the Discord app

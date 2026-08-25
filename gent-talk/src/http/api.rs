@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::auth::{self, AuthError, Scope};
 use crate::discord::DiscordError;
 use crate::elevenlabs::{SignedUrl, SignedUrlError};
-use crate::model::{ChannelInfo, Message};
+use crate::model::{ChannelInfo, Message, MessageId};
 use crate::ops::{self, OpError};
 use crate::retrieval::Resolution;
 use crate::state::AppState;
@@ -353,6 +353,11 @@ pub struct MessagesResponse {
     /// A client may show a message count only when this is true. Discord gives no message count
     /// for a guild text channel, so a full window means "at least this many" and nothing more.
     pub complete: bool,
+    /// Which of `messages` the reader has ARCHIVED, so the view can dim them.
+    ///
+    /// The ordinary channel view shows archived rows greyed rather than hidden -- hiding is what
+    /// the To do filter is for -- and it can only do that if the payload says which they are.
+    pub dismissed: Vec<MessageId>,
     /// Standing reminder that the content is third-party text.
     pub untrusted_content_notice: &'static str,
 }
@@ -366,10 +371,12 @@ pub async fn messages(
 ) -> Result<Json<MessagesResponse>, ApiError> {
     require(&headers, &state, Scope::Read)?;
     let window = ops::messages(&state, &channel_id, query.limit).await?;
+    let dismissed = ops::dismissed_within(&state, &window.channel.id, &window.messages).await?;
     Ok(Json(MessagesResponse {
         complete: window.is_whole_channel(),
         channel: window.channel,
         messages: window.messages,
+        dismissed,
         untrusted_content_notice: untrusted::NOTICE,
     }))
 }
@@ -404,6 +411,11 @@ pub struct PageResponse {
     pub next_before: Option<String>,
     /// Hand this back as `since` to take the next step of a range walk.
     pub next_since: Option<String>,
+    /// Which of `messages` the reader has ARCHIVED, so the view can dim them.
+    ///
+    /// The ordinary channel view shows archived rows greyed rather than hidden -- hiding is what
+    /// the To do filter is for -- and it can only do that if the payload says which they are.
+    pub dismissed: Vec<MessageId>,
     /// Standing reminder that the content is third-party text.
     pub untrusted_content_notice: &'static str,
 }
@@ -427,10 +439,12 @@ pub async fn page(
         },
     )
     .await?;
+    let dismissed = ops::dismissed_within(&state, &step.channel.id, &step.messages).await?;
     Ok(Json(PageResponse {
         returned: step.returned(),
         channel: step.channel,
         messages: step.messages,
+        dismissed,
         limit: step.limit,
         has_more: step.has_more,
         next_before: step.next_before.map(|id| id.0),

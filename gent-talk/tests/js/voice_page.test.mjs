@@ -951,7 +951,17 @@ function newPage(store = new Map(), script = SCRIPT) {
      * that does not say is UNKNOWN, and the page must not read silence as "you have the lot".
      * A paging test replaces this with something that answers a `before` cursor.
      */
-    channelPage: async () => json(200, { channel: page.channels[0], messages: page.messages }),
+    // `#50 todo-view`. The dismissal overlay is reported on the CHANNEL read too, not only on
+    // `/todo`: the channel view GREYS archived rows rather than hiding them, and cannot know which
+    // they are otherwise. Same little store `/todo` filters on, so the two cannot disagree.
+    channelPage: async () =>
+      json(200, {
+        channel: page.channels[0],
+        messages: page.messages,
+        dismissed: page.messages
+          .map((m) => String(m.id))
+          .filter((id) => page.dealtWith.has(id)),
+      }),
     // `#48 transcript-storage`. The fixture is a real little store rather than a canned answer:
     // a POSTed turn lands in `storedTurns` and a later GET returns it, so "the page recorded the
     // turn" and "the page can read its own record back" are the same fact here as on the server.
@@ -5753,10 +5763,14 @@ test("the to-do controls exist only where they mean something", async () => {
 
   const rows = await showDiscord(page, backlog(2));
   assert.ok(doneButton(rows[0]), "a channel row has no way to say it has been dealt with");
+  // It used to be HIDDEN here, on the reasoning that pressing it outside the filter would appear
+  // to do nothing. That reasoning expired when the channel view started greying archived rows:
+  // pressing it now has a visible effect exactly where the reader is looking, and hiding it would
+  // leave the swipe as the only way in.
   assert.equal(
     doneButton(rows[0]).hidden,
-    true,
-    "Done is on screen outside the mode, where pressing it would appear to do nothing"
+    false,
+    "the channel view hides the only way to archive that a keyboard can reach"
   );
 
   await turnTodoOn(page);
@@ -7386,7 +7400,10 @@ test("the reply screen shows the message being answered, in full, with its id", 
 const row = (page, i) => page.el("discord-log").children[i];
 const archiveButton = (li) =>
   li.descendants().find((node) => node.className === "archive-button");
-const rowState = (page, i) => ({ replied: row(page, i).getAttribute("data-replied") });
+const rowState = (page, i) => ({
+  replied: row(page, i).getAttribute("data-replied"),
+  archived: row(page, i).getAttribute("data-archived"),
+});
 
 /** Two messages where the second answers the first, as Discord records a reply. */
 function conversation() {
@@ -7406,11 +7423,13 @@ test("A MESSAGE SOMEBODY HAS ANSWERED IS DIMMED; AN UNANSWERED ONE IS NOT", asyn
   await signIn(page);
   await showDiscord(page, conversation());
 
-  assert.deepStrictEqual(rowState(page, 0), { replied: "true" });
+  // Both axes named, because they are independent: being ANSWERED is derived from what happens to
+  // be loaded, being ARCHIVED is the reader's own declaration, and neither implies the other.
+  assert.deepStrictEqual(rowState(page, 0), { replied: "true", archived: "false" });
   // The ANSWER is not itself answered. Discord marks only the answering message, so a naive
   // implementation that set the flag on whichever row carried a pointer would dim this one.
-  assert.deepStrictEqual(rowState(page, 1), { replied: "false" });
-  assert.deepStrictEqual(rowState(page, 2), { replied: "false" });
+  assert.deepStrictEqual(rowState(page, 1), { replied: "false", archived: "false" });
+  assert.deepStrictEqual(rowState(page, 2), { replied: "false", archived: "false" });
 
   // And it is DRAWN, not merely recorded in an attribute.
   const dimmed = cssBlock('#discord-log li.discord-message[data-replied="true"]');
@@ -7446,6 +7465,103 @@ test("the replied state is re-derived over the WHOLE list, not decided when a ro
   );
 });
 
+// `#50 todo-view`. THE DEFAULT STATE OF THE CHANNEL VIEW, and the half that was missing.
+//
+// The owner's report: archiving appeared to do nothing. It was doing something — the dismissal was
+// recorded on the server and the To do filter honoured it — but the channel view said NOTHING about
+// it, so a swipe on the default view produced no visible change at all. These pin the pair: greyed
+// here, hidden only behind the filter, and a way back on the row itself.
+
+test("AN ARCHIVED MESSAGE IS GREYED WHERE IT STANDS, NOT REMOVED FROM THE CHANNEL VIEW", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [
+    message({ id: "1000000000000000001", content: "first" }),
+    message({ id: "1000000000000000002", content: "second" }),
+  ]);
+
+  assert.equal(rowState(page, 0).archived, "false", "a fresh row is already archived");
+  await doneButton(row(page, 0)).click();
+  await page.settle();
+
+  assert.equal(
+    page.el("discord-log").children.length,
+    2,
+    "archiving REMOVED the row; the channel view greys, it does not hide — that is the filter's job"
+  );
+  assert.equal(rowState(page, 0).archived, "true", "the archived row was not greyed");
+  assert.equal(rowState(page, 1).archived, "false", "archiving one row greyed another");
+
+  // And it is DRAWN, not merely recorded in an attribute.
+  const greyed = cssBlock('#discord-log li.discord-message[data-archived="true"]');
+  assert.match(greyed, /opacity/, "an archived row is not dimmed at all");
+  // Desaturated as well as dimmer. A `me` or `coder` row keeps its speaker tint when it is merely
+  // ANSWERED, so opacity alone cannot tell the reader which of the two states they are looking at.
+  assert.match(
+    greyed,
+    /grayscale/,
+    "an archived row keeps its speaker colour, so it reads as merely answered"
+  );
+});
+
+test("the archived row offers the way back, and taking it restores the row in place", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [message({ id: "1000000000000000001", content: "first" })]);
+
+  await doneButton(row(page, 0)).click();
+  await page.settle();
+  assert.equal(
+    doneButton(row(page, 0)).text(),
+    "Unarchive",
+    "an archived row still offers to archive itself again"
+  );
+
+  await doneButton(row(page, 0)).click();
+  await page.settle();
+  assert.equal(rowState(page, 0).archived, "false", "unarchiving did not bring the row back");
+  assert.equal(doneButton(row(page, 0)).text(), "Done", "the control did not go back to Done");
+  assert.deepEqual(
+    page.restoreCalls,
+    [{ messages: ["1000000000000000001"] }],
+    "the way back did not post the restoration to the server"
+  );
+});
+
+test("the row's own control is reachable in the CHANNEL view, not only behind the filter", async () => {
+  // It used to be hidden outside the To do filter, from a time when an archived row was never on
+  // screen here. Now that it is, hiding its only keyboard-reachable control would leave the swipe
+  // as the sole way in — and a gesture must never be the only way to reach an act.
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [message({ id: "1000000000000000001" })]);
+
+  assert.equal(
+    doneButton(row(page, 0)).hidden,
+    false,
+    "the channel view hides the only control a keyboard can reach"
+  );
+});
+
+test("the archive survives the poll that rebuilds the list", async () => {
+  // The set is the SERVER's answer, re-read with every page. A browser-local set would be lost the
+  // moment the list was replaced, and the row would silently un-grey itself under the reader.
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [message({ id: "1000000000000000001" })]);
+  await doneButton(row(page, 0)).click();
+  await page.settle();
+
+  await page.el("refresh-discord").click();
+  await page.settle();
+
+  assert.equal(
+    rowState(page, 0).archived,
+    "true",
+    "a re-read of the channel forgot what had been archived"
+  );
+});
+
 test("THE SWIPE DRIVES THE SAME DISMISSAL THE DONE BUTTON DOES, NOT A SECOND ONE", () => {
   // `#50 todo-view` deferred the gesture layer on one condition: the acts must exist first, each
   // reachable by a control a keyboard can also get to, so a gesture is a SECOND way in and never
@@ -7455,8 +7571,15 @@ test("THE SWIPE DRIVES THE SAME DISMISSAL THE DONE BUTTON DOES, NOT A SECOND ONE
   // So there is exactly one notion of "dealt with", it is the server's, and the swipe posts to it.
   assert.match(
     SCRIPT_CODE,
-    /function swipeable\([\s\S]*?dismissMessages\(/,
-    "the swipe does not go through the same dismissal the Done button uses"
+    /function swipeable\([\s\S]*?toggleArchived\(/,
+    "the swipe does not go through the same act the row's button uses"
+  );
+  // ...and that shared act is the SERVER's, both ways. The swipe archives an ordinary row and puts
+  // an archived one back, so the gesture is its own undo on the row in front of the reader.
+  assert.match(
+    SCRIPT_CODE,
+    /async function toggleArchived\([\s\S]*?restoreMessages\([\s\S]*?dismissMessages\(/,
+    "the shared act does not reach both the dismissal and the restoration"
   );
   // And no second, browser-local one is left behind. `#84 reply-aware-dismissal` arrived with an archive kept
   // in localStorage and a filter of its own; two controls that both mean "show me what is left" is

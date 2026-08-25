@@ -12,7 +12,7 @@
 //! the scope each one needs is stated in its documentation and enforced by its only callers.
 
 use crate::discord::DiscordError;
-use crate::model::{ChannelInfo, Message, MessageId};
+use crate::model::{ChannelId, ChannelInfo, Message, MessageId};
 use crate::retrieval::{self, Resolution};
 use crate::state::AppState;
 use crate::summary::{self, DigestEntry, DEFAULT_SUMMARY_CHARS};
@@ -823,6 +823,32 @@ pub async fn todo(
         window: total,
         complete,
     })
+}
+
+/// Which of `messages` the reader has archived.
+///
+/// Intersected with the window rather than returned whole: the store holds every dismissal the
+/// channel has ever had, and a client only ever needs to grey the rows it is showing. Sending the
+/// lot would grow without bound and say nothing the page could use.
+///
+/// `#50 todo-view`. The To do filter REMOVES these; the ordinary channel view dims them, and until
+/// this existed it could not, because nothing in the messages payload said which ones they were.
+///
+/// # Errors
+///
+/// [`OpError`] when the store cannot be read.
+pub async fn dismissed_within(
+    state: &AppState,
+    channel: &ChannelId,
+    messages: &[Message],
+) -> Result<Vec<MessageId>, OpError> {
+    let present: std::collections::HashSet<&str> =
+        messages.iter().map(|message| message.id.as_str()).collect();
+    let dismissed = state.store.dismissals(channel).await?;
+    Ok(dismissed
+        .into_iter()
+        .filter(|id| present.contains(id.as_str()))
+        .collect())
 }
 
 /// What one dismissal or one restoration did.

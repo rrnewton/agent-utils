@@ -185,7 +185,7 @@
                   contributed instead is the two things `#50` listed as its own follow-ups — the
                   swipe, and the derived "replied" signal.
                 -->
-                <button id="todo-filter" type="button" aria-pressed="false">To do</button>
+                <button id="todo-filter" type="button" aria-pressed="false">Hide archived</button>
               </div>
               <!--
                 `#63 status-line-placement`. The channel's own summary — how much is loaded, and
@@ -714,10 +714,16 @@
                 channel itself — Discord records a reply only on the answering message — so it can
                 only see answers that are <strong>loaded</strong>: a reply further back than you have
                 walked is invisible, and a message can be dimmed later than it should have been,
-                never earlier. <strong>Archive</strong> is your own judgement, stored in this
-                browser; swipe a row on a touch screen, or use the button on any device. The
-                <strong>Inbox</strong> toggle hides everything archived, which is what turns the
-                channel from a log into a queue.
+                never earlier.
+              </p>
+              <p class="hint">
+                <strong>Archive</strong> is your own judgement, and it is recorded on the
+                <strong>server</strong> — so it survives a different browser, a different device and
+                a cleared cache. Swipe a row on a touch screen, or use the row's button on any
+                device; swiping an archived row puts it back. By default an archived row stays
+                where it is, <strong>greyed and drained of colour</strong>, so you can see what you
+                have dealt with and change your mind. <strong>Hide archived</strong> takes them out
+                of the list entirely, which is what turns the channel from a log into a queue.
               </p>
             </article>
 

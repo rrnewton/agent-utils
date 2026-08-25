@@ -3281,6 +3281,27 @@ function noteAuthor(id, name, isBot) {
  *
  * Deciding either per row at construction time would be right only until the next thing happened.
  */
+/**
+ * The row's own archive control, found by walking the row rather than by selector.
+ *
+ * A row is a small tree this file built itself — a meta line and a body — so a walk is exact and
+ * costs nothing. It is also the only lookup here that does not go through `el`, and going through
+ * `children` keeps it to the same handful of DOM operations the rest of this page uses.
+ */
+function doneButtonOf(row) {
+  const stack = [...(row.children || [])];
+  while (stack.length > 0) {
+    const node = stack.pop();
+    if (node.className === "done-button") {
+      return node;
+    }
+    if (node.children) {
+      stack.push(...node.children);
+    }
+  }
+  return null;
+}
+
 function renderChannelRows() {
   const list = el("discord-log");
   const rows = [...list.children];
@@ -3320,6 +3341,24 @@ function renderChannelRows() {
         row.getAttribute("data-author-bot") === "true"
       )
     );
+    // GREYS, never hides, and that is the whole distinction between this and the To do filter.
+    // Being archived is DECLARED by the reader, so unlike `data-replied` it is not evidence that
+    // might be incomplete — but a channel view that removed the row would leave the reader no way
+    // to see what they had archived, and no way to change their mind about it.
+    const isArchived = archivedIds.has(id);
+    row.setAttribute("data-archived", isArchived ? "true" : "false");
+    // The row's own way back, labelled for what it will DO rather than for what the row is. In the
+    // To do filter an archived row is never on screen, so this only ever reads "Done" there.
+    const done = doneButtonOf(row);
+    if (done) {
+      done.textContent = isArchived ? "Unarchive" : "Done";
+      done.setAttribute(
+        "title",
+        isArchived
+          ? "Put this back in the list. This does not change anything in Discord."
+          : "Mark as dealt with here. This does not change anything in Discord."
+      );
+    }
   }
 }
 
@@ -3394,7 +3433,11 @@ function swipeable(li, id) {
       // recorded on the server, with `#50`'s undo behind it. That is what makes this gesture safe
       // enough to be a gesture — a swipe that did something only this browser remembered, with no
       // way back, would be the worst control on the page.
-      guardQuietly(() => dismissMessages({ messages: [id] }))();
+      //
+      // A swipe on an ALREADY archived row puts it back, so the gesture is its own undo on the row
+      // the reader is looking at. Symmetric deliberately: a gesture that only ever went one way
+      // would make the greyed rows a trap.
+      guardQuietly(() => toggleArchived(id))();
     }
   };
 
@@ -3471,19 +3514,20 @@ function discordNode(message) {
   // `#50 todo-view`. The non-gestural way to say "dealt with", and the one a keyboard can reach.
   // On EVERY channel row rather than only on rows built while the mode is on: the mode is a
   // filter over the same list, and a control that exists in one rendering and not another is a
-  // second code path waiting to disagree with the first. It is HIDDEN outside the mode.
+  // second code path waiting to disagree with the first.
   const done = document.createElement("button");
   done.className = "done-button";
   done.setAttribute("type", "button");
   done.setAttribute("title", "Mark as dealt with here. This does not change anything in Discord.");
   done.textContent = "Done";
-  // Hidden OUTSIDE the mode rather than absent, and decided once, here, at construction. Every
-  // path that changes the mode re-reads the channel, so every row is built with the answer already
-  // known — a second pass over the existing rows to correct them would be a branch nothing ever
-  // takes, which is worse than no branch at all.
-  done.hidden = !todoMode;
+  // VISIBLE IN BOTH MODES. It used to be hidden outside the To do filter, from a time when the
+  // channel view said nothing at all about the archive: there was no archived row on screen, so
+  // there was nothing to act on. The channel view greys archived rows now, so the row in front of
+  // the reader is exactly the row that may need putting back — and hiding its only
+  // keyboard-reachable control would leave the swipe as the sole way in, which is the one thing
+  // this section refuses to do. `renderChannelRows` decides which of the two acts it offers.
   done.addEventListener("click", () =>
-    guardQuietly(() => dismissMessages({ messages: [String(message.id)] }))()
+    guardQuietly(() => toggleArchived(String(message.id)))()
   );
   meta.append(done);
   // `#84 reply-aware-dismissal`. THE SWIPE `#50` deferred, and it drives the same act the Done button does
@@ -3636,6 +3680,9 @@ function applyNewestPage(payload) {
       ? [...list.children].filter((li) => snowflakeOlder(li.getAttribute("data-id"), oldest))
       : [];
   list.replaceChildren(...kept, ...messages.map(discordNode));
+  // The archive BEFORE the derivation that reads it. `kept` rows were already on screen and their
+  // ids are still in the set from the read that brought them, so a reset here would un-grey them.
+  noteArchived(payload, kept.length === 0);
   // AFTER the rows exist: every row's replied state and speaker are facts about the list as it now
   // stands rather than about the page that just arrived.
   renderChannelRows();
@@ -3680,6 +3727,9 @@ async function loadOlder() {
     olderFetchInFlight = false;
     // Prepending is a mutation ABOVE the viewport, which is the one case browser scroll anchoring
     // does not handle. Same helper as the fold control, deliberately.
+    // Additive: this step PREPENDS, so the rows already on screen keep the archive they arrived
+    // with and these older ones bring their own.
+    noteArchived(payload, false);
     preservingScroll(() => {
       list.replaceChildren(...arriving, ...list.children);
       // Inside the anchored mutation with everything else that changes height. A step back can
@@ -4064,6 +4114,35 @@ async function loadDiscord(options) {
 let todoMode = false;
 
 /**
+ * Which LOADED messages the reader has archived, as the server reported them.
+ *
+ * Held here rather than read off the rows because it is the server's answer, not a fact about the
+ * DOM: a row is greyed BECAUSE it is in this set, and the set survives the list being rebuilt by a
+ * poll. The ordinary channel view dims these; the To do filter never shows them at all, so in that
+ * mode this stays empty and nothing consults it.
+ *
+ * Only ever the ids in the window on screen — see `ops::dismissed_within`. The store holds every
+ * dismissal the channel ever had, and sending the lot would grow without bound.
+ */
+let archivedIds = new Set();
+
+/**
+ * Take down what a page said about which of its messages are archived.
+ *
+ * `replace` for the newest page, which REPLACES the list; additive for a step back, which prepends
+ * to it. Getting that backwards would either forget the archive on every poll or accumulate ids
+ * for rows that are no longer anywhere.
+ */
+function noteArchived(payload, replace) {
+  if (replace) {
+    archivedIds = new Set();
+  }
+  for (const id of payload.dismissed || []) {
+    archivedIds.add(String(id));
+  }
+}
+
+/**
  * The exact set the last dismissal cleared, so the undo restores that and nothing else.
  *
  * Not a count and not "the last N": by the time the reader presses undo, N may name a different
@@ -4244,21 +4323,83 @@ function appendChannelRow(message) {
   renderTodoControls();
 }
 
-/** Mark messages as dealt with, remember the exact set, and re-read. */
+/**
+ * Archive or unarchive ONE row, whichever it is asking for.
+ *
+ * Both the swipe and the row's button come through here, so the two cannot drift into two notions
+ * of what the gesture means.
+ */
+async function toggleArchived(id) {
+  if (archivedIds.has(String(id))) {
+    await restoreMessages([String(id)]);
+  } else {
+    await dismissMessages({ messages: [String(id)] });
+  }
+}
+
+/**
+ * What an archive or an unarchive does to the list, which is NOT the same in the two modes.
+ *
+ * In the To do filter the row genuinely leaves, so the list has to be re-read. In the channel view
+ * it stays and merely changes colour, so re-deriving the rows already on screen is the whole of
+ * it — and doing that instead of a re-read is why a swipe greys the row instantly rather than
+ * after a round trip to Discord.
+ */
+async function refreshAfterInboxChange() {
+  if (todoMode) {
+    // `ownAct`: rows LEAVING because the reader said so is not something arriving, and the re-read
+    // must not answer their own tap with an offer to jump to a bottom nothing turned up at.
+    await loadTodo({ keepPosition: true, ownAct: true });
+  } else {
+    renderChannelRows();
+  }
+}
+
+/** Mark messages as dealt with, remember the exact set, and settle the list. */
 async function dismissMessages(body) {
   const channel = el("discord-channel").value;
   const payload = await api(`/api/v1/channels/${encodeURIComponent(channel)}/dismiss`, {
     method: "POST",
     body,
   });
-  lastDismissal = { channel, messages: payload.messages || [] };
-  // `ownAct`: rows LEAVING because the reader said so is not something arriving, and the re-read
-  // must not answer their own tap with an offer to jump to a bottom nothing turned up at.
-  await loadTodo({ keepPosition: true, ownAct: true });
+  lastDismissal = { channel, messages: (payload.messages || []).map(String) };
+  for (const id of lastDismissal.messages) {
+    archivedIds.add(id);
+  }
+  await refreshAfterInboxChange();
   const count = lastDismissal.messages.length;
   setStatus(
     `${count} message${count === 1 ? "" : "s"} marked as dealt with here — not in Discord.`
   );
+  renderTodoControls();
+}
+
+/**
+ * Put named messages back, one row at a time.
+ *
+ * The undo chip is a different act and keeps its own path: it restores the exact set the LAST
+ * dismissal cleared. This one is the reader changing their mind about a single row they can see,
+ * so it also takes that row out of the pending undo — otherwise the chip would go on offering to
+ * put back a message that is already back, and "exactly what the last dismissal cleared" would
+ * stop being true of it.
+ */
+async function restoreMessages(ids) {
+  const channel = el("discord-channel").value;
+  const payload = await api(`/api/v1/channels/${encodeURIComponent(channel)}/restore`, {
+    method: "POST",
+    body: { messages: ids.map(String) },
+  });
+  const restored = (payload.messages || []).map(String);
+  for (const id of restored) {
+    archivedIds.delete(id);
+  }
+  if (lastDismissal !== null) {
+    const left = lastDismissal.messages.filter((id) => !restored.includes(id));
+    lastDismissal = left.length === 0 ? null : { ...lastDismissal, messages: left };
+  }
+  await refreshAfterInboxChange();
+  const count = restored.length;
+  setStatus(`${count} message${count === 1 ? "" : "s"} back in the list.`);
   renderTodoControls();
 }
 
