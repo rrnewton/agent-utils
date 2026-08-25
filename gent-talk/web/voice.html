@@ -465,6 +465,27 @@
 
             <section class="settings-group">
               <div class="group-head">
+                <h2>Text size</h2>
+              </div>
+              <!--
+                MESSAGE TEXT ONLY, not the whole interface. A reader asking for more words on a
+                phone screen is not asking for a bigger Reply button, and scaling the row would
+                scale its controls with it. Percent rather than points: it multiplies whatever the
+                stylesheet's own size is, so the two lists stay in proportion.
+              -->
+              <input
+                id="msg-scale"
+                type="range"
+                min="80"
+                max="150"
+                step="5"
+                aria-label="message text size, percent"
+              />
+              <p id="msg-scale-state" class="hint" aria-live="polite"></p>
+            </section>
+
+            <section class="settings-group">
+              <div class="group-head">
                 <h2>Reading width</h2>
                 <button class="help-link" id="help-link-reading-width" type="button" data-help="reading-width" aria-label="About the reading width" title="What this does">?</button>
               </div>

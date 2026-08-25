@@ -632,6 +632,16 @@ class FakeElement {
     this.children = [...kids];
   }
 
+  /** Detach one child. The details sheet a press-and-hold opens is closed by removing it. */
+  removeChild(kid) {
+    const at = this.children.indexOf(kid);
+    if (at >= 0) {
+      this.children.splice(at, 1);
+      kid.parentNode = null;
+    }
+    return kid;
+  }
+
   scrollIntoView() {
     this.scrolledIntoView += 1;
   }
@@ -1636,6 +1646,18 @@ const TUNING_BANDS = {
     "how far a row must be dragged for the archive to happen. Too short and a scroll that started " +
     "slightly sideways files a message away without being asked; too long and the gesture cannot " +
     "be completed on a narrow phone at all"],
+  MIN_MSG_SCALE: [50, 100,
+    "the smallest message text the reader may choose. Much under eighty per cent and the words " +
+    "stop being readable at arm's length on a phone, which is the device this view is for"],
+  MAX_MSG_SCALE: [110, 300,
+    "the largest. Past about half again, a row's own controls no longer line up with the words " +
+    "they belong to and one message fills the screen"],
+  DEFAULT_MSG_SCALE: [80, 150,
+    "what an unconfigured reader gets, and it has to be a size that is actually offered"],
+  HOLD_MS: [250, 1500,
+    "how long a finger rests before the row shows who sent it and when. Below about a quarter of " +
+    "a second an ordinary tap becomes a hold and the message stops folding; past a second and a " +
+    "half the reader has concluded the gesture does not exist and lifted their finger"],
 };
 test("every number this page is tuned by stays inside a band that says what would be wrong", () => {
   for (const [name, [low, high, why]] of Object.entries(TUNING_BANDS)) {
@@ -4671,9 +4693,10 @@ function message(overrides) {
   };
 }
 
-test("every raw message shows its author and its message id", async () => {
-  // The entire value of this view: the agent has described messages that did not exist, and the
-  // operator needs to be able to point at a real one — or show that there is none.
+test("a raw message row spends its width on the MESSAGE, and holds the rest behind a press", async () => {
+  // The entire value of this view is still that the operator can point at a real message — or
+  // show that there is none — so the id has to remain REACHABLE. It does not have to be printed
+  // on every row of a 393-pixel screen, which is what it was.
   const page = newPage();
   await signIn(page);
 
@@ -4681,9 +4704,15 @@ test("every raw message shows its author and its message id", async () => {
 
   assert.equal(lines.length, 1);
   const text = lines[0].text();
-  assert.match(text, /alice/);
-  assert.match(text, /999888777666555444/, "the message id is what makes this view worth having");
-  assert.match(text, /2026-08-19 04:31/);
+  assert.match(text, /alice/, "a third party is not named, and colour cannot say which one it is");
+  assert.doesNotMatch(
+    text,
+    /999888777666555444/,
+    "the row still prints a nineteen-digit id nobody reads"
+  );
+  // A short local clock, and NOT the raw ISO stamp.
+  assert.match(text, /\d{1,2}:\d{2}/, "the row does not say when the message was sent");
+  assert.doesNotMatch(text, /2026-08-19T04:31/, "the row printed the raw ISO timestamp");
   // `#62 message-count-accuracy`, carried across from web/app.js. The fixture sends no `complete`,
   // which is exactly the ordinary case: the fetch window is not a channel total, so no digit.
   assert.match(channelSummaryText(page), /lead team — the most recent messages/);
@@ -4713,16 +4742,117 @@ test("the channel view counts only when the count is the CHANNEL'S, and pluraliz
   assert.equal(page.el("channel-summary").children.length, 1);
 });
 
-test("the channel view speaks the operator's clock, not UTC", async () => {
+const HOLD_MS = 450;
+const hold = async (page, li) => {
+  await li.dispatch("pointerdown", { pointerId: 1, pointerType: "touch", clientX: 10, clientY: 10 });
+  // The harness drives the clock, so the hold is walked past its deadline rather than waited out.
+  assert.equal(page.expireTimers(HOLD_MS), 1, "no hold timer was armed by the press");
+  await page.settle();
+};
+
+test("PRESS AND HOLD is where the author, the full time and the id went", async () => {
   const page = newPage();
   await signIn(page);
-  // `#52 operator-timezone`: the server converts once and hands back a finished string. The page
-  // must prefer it, or the phone and the voice agent disagree about when something was said.
+  const lines = await showDiscord(page, [
+    message({ id: "999888777666555444", author: "alice", author_is_bot: false }),
+  ]);
+
+  await hold(page, lines[0]);
+  const text = lines[0].text();
+  assert.match(text, /999888777666555444/, "the id is not reachable at all any more");
+  assert.match(text, /alice/, "the details do not say who sent it");
+  assert.match(text, /2026/, "the details do not carry a full date");
+
+  // The same gesture closes it, so the row does not accumulate a sheet per press.
+  await hold(page, lines[0]);
+  assert.doesNotMatch(lines[0].text(), /999888777666555444/, "a second hold did not close it");
+});
+
+test("tapping the message folds it, and tapping a control does not", async () => {
+  const page = newPage();
+  await signIn(page);
+  const long = "x".repeat(4000);
+  const lines = await showDiscord(page, [message({ id: "1000000000000000001", content: long })]);
+  const li = lines[0];
+  assert.equal(li.getAttribute("data-collapsed"), "true", "a long message did not start folded");
+
+  await li.dispatch("click", {});
+  assert.equal(li.getAttribute("data-collapsed"), "false", "tapping the message did not open it");
+
+  await li.dispatch("click", {});
+  assert.equal(li.getAttribute("data-collapsed"), "true", "tapping again did not close it");
+
+  // A tap meant for the Reply or Done button is not also a fold.
+  const before = li.getAttribute("data-collapsed");
+  await doneButton(li).click();
+  await page.settle();
+  assert.equal(
+    row(page, 0).getAttribute("data-collapsed"),
+    before,
+    "pressing a control in the row also folded the row"
+  );
+});
+
+test("the fold control stays reachable by keyboard even though the row no longer prints it", async () => {
+  // The page's standing rule: a gesture is a second way in, never the only one. The control is
+  // clipped rather than removed, because `display: none` would take it out of the tab order.
+  const page = newPage();
+  await signIn(page);
+  const lines = await showDiscord(page, [message({ content: "y".repeat(4000) })]);
+  const fold = lines[0].descendants().find((node) => node.className === "fold");
+  assert.ok(fold, "the fold control was deleted, so a keyboard cannot fold a message");
+  assert.notEqual(fold.hidden, true, "the fold control is hidden, so it cannot be tabbed to");
+
+  const clipped = cssBlock("#discord-log .fold");
+  assert.match(clipped, /clip-path/, "the control is not clipped, so it is printed on the row");
+  assert.doesNotMatch(clipped, /display:\s*none/, "display:none would remove it from the tab order");
+});
+
+test("the reader can resize MESSAGE text, and it survives a reload", async () => {
+  const page = newPage();
+  await signIn(page);
+  await page.el("msg-scale").dispatch("input", {});
+
+  page.el("msg-scale").value = "130";
+  await page.el("msg-scale").dispatch("input", {});
+  assert.equal(page.documentElement.style.getPropertyValue("--msg-scale"), "1.3");
+  assert.equal(page.storage.get("gent-talk.voice.msg-scale"), "130", "the size was not kept");
+
+  // Out of range is CLAMPED, not refused: a stored value from another build must not brick the view.
+  page.el("msg-scale").value = "900";
+  await page.el("msg-scale").dispatch("input", {});
+  assert.equal(page.documentElement.style.getPropertyValue("--msg-scale"), "1.5");
+
+  // It scales the MESSAGE, not the row: a bigger Reply button is not what was asked for.
+  assert.match(
+    CSS,
+    /#discord-log \.body[\s\S]{0,80}--msg-scale/,
+    "the type scale does not reach the message body"
+  );
+});
+
+test("the channel spends its width on words, not on insets", async () => {
+  // 15% of a 393-pixel phone, on every row, bought what the speaker COLOUR now buys.
+  const mine = cssBlock('#discord-log li.discord-message[data-who="me"]');
+  assert.match(mine, /--speaker-inset/, "the phone rule still hard-codes a percentage inset");
+  assert.doesNotMatch(mine, /margin-left:\s*15%/, "the 15% inset survived");
+});
+
+test("the channel view shows the READER's clock, not the server's and not UTC", async () => {
+  const page = newPage();
+  await signIn(page);
+  // `#52 operator-timezone` had the server convert once, into `server.timezone`, and the page
+  // print whatever it was handed. That is right for the VOICE AGENT, which has to speak a time and
+  // cannot ask a browser. It is wrong for a phone: `server.timezone` defaults to UTC, so an
+  // operator who never configured one reads every message in UTC while holding a device that
+  // knows its own zone. The browser's zone is not a guess.
   const lines = await showDiscord(page, [
     message({ timestamp: "2026-08-19T04:31:00.000Z", spoken_time: "2026-08-18 21:31 PDT" }),
   ]);
-  assert.match(lines[0].text(), /2026-08-18 21:31 PDT/);
-  assert.doesNotMatch(lines[0].text(), /04:31/, "the page rendered the raw UTC stamp instead");
+  const text = lines[0].text();
+  assert.doesNotMatch(text, /PDT/, "the page is still printing the SERVER's configured zone");
+  assert.doesNotMatch(text, /2026-08-19T04:31/, "the page rendered the raw ISO stamp");
+  assert.match(text, /\d{1,2}:\d{2}/, "no clock reached the row at all");
 });
 
 test("a bot author is labelled as one", async () => {
@@ -9540,7 +9670,8 @@ test("a message arriving on the stream is rendered with its id, without a refres
   assert.equal(arrived.getAttribute("data-id"), "200");
   assert.match(arrived.text(), /the runner came back/);
   assert.match(arrived.text(), /claude-integ/, "a live row carries its author like a fetched one");
-  assert.match(arrived.text(), /id 200/, "and its id — the whole point of this view");
+  // The id identifies the row without being printed on it, exactly as on a fetched row.
+  assert.doesNotMatch(arrived.text(), /id 200/, "a live row still prints the id the fetch dropped");
 });
 
 test("a replayed message the page already shows renders once, not twice", async () => {

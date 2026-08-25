@@ -25,6 +25,17 @@
      so it is not read as a lighter or darker version of either principal. */
   --third: #3a3325;
   --third-edge: #5b5039;
+  /*
+   * How far a message is pushed off its own side of the list.
+   *
+   * It was 15% of the pane, which on a 393px phone is nearly sixty pixels of nothing on every
+   * single row -- and it bought what the COLOUR now buys, twice over. A small fixed hint keeps the
+   * asymmetry that says which side of the conversation a message is on while giving the text back
+   * the width. Bounded in `rem`, not `%`, so a wider window spends the extra on words.
+   */
+  --speaker-inset: 1.5rem;
+  /* The reader's own type size for message text. Settings drives it; see `--msg-scale`. */
+  --msg-scale: 1;
   --dock: #191c22;
   --ok: #5bd98a;
   --idle: #6b7484;
@@ -492,13 +503,13 @@ body {
 #discord-log li.discord-message[data-who="me"] {
   background: var(--mine);
   border-color: var(--mine-edge);
-  margin-left: 15%;
+  margin-left: var(--speaker-inset);
   border-bottom-right-radius: 0.15rem;
 }
 
 #discord-log li.discord-message[data-who="coder"] {
   background: var(--theirs);
-  margin-right: 15%;
+  margin-right: var(--speaker-inset);
   border-bottom-left-radius: 0.15rem;
 }
 
@@ -517,8 +528,7 @@ body {
 #discord-log li.discord-message[data-who="bot"] {
   background: var(--third);
   border-color: var(--third-edge);
-  margin-right: 7%;
-  margin-left: 7%;
+  margin-inline: calc(var(--speaker-inset) / 2);
 }
 
 /* The percentage insets are proportionate in a capped column and absurd across a full-width one,
@@ -1158,12 +1168,69 @@ body {
   row-gap: 0.15rem;
 }
 
-/* The message id is the point of this view: it is what lets the operator say "that message does
-   not exist". Monospaced so a snowflake can be read digit by digit. */
+/* The message id is what lets the operator say "that message does not exist", so it is still
+   reachable — by PRESS AND HOLD, in the details sheet, rather than by spending a line of every
+   row on a nineteen-digit number nobody reads. Monospaced there, so a snowflake can be read digit
+   by digit. */
 .msg-id {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 0.72rem;
   overflow-wrap: anywhere;
+}
+
+/*
+ * MESSAGE TEXT IS THE POINT OF THIS VIEW, so it is the thing the reader may resize.
+ *
+ * On the body and the summary rather than on the row, deliberately: scaling the whole row would
+ * scale the metadata and the controls with it, and the reader asking for more words on screen is
+ * not asking for a bigger Reply button. The base is a little under the old 0.95rem, because the
+ * owner asked for slightly denser by default and the width reclaimed above pays for it.
+ */
+#discord-log .body,
+#discord-log .summary-text {
+  font-size: calc(0.88rem * var(--msg-scale));
+}
+
+/*
+ * THE FOLD CONTROL IS NOT PRINTED ON THE ROW ANY MORE. Tapping the message toggles it.
+ *
+ * Kept in the DOM and kept focusable rather than deleted, because a tap is a pointer gesture and
+ * this page's rule is that a gesture is never the only way in: somebody arriving by keyboard tabs
+ * to this and it appears. `clip` rather than `display: none` is what keeps it in the tab order at
+ * all -- a hidden button is not focusable, and would have removed the keyboard path entirely.
+ */
+#discord-log .fold {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+#discord-log .fold:focus-visible {
+  position: static;
+  width: auto;
+  height: auto;
+  overflow: visible;
+  clip-path: none;
+}
+
+/*
+ * The summary's label used to take a COLUMN.
+ *
+ * `.summary` is a flex row and `.summary-mark` is `flex: 0 0 auto`, so on a phone the word
+ * SUMMARY held a fixed strip at the left and the summary itself was squeezed into whatever was
+ * left -- a few characters per line. The mark belongs ABOVE the text, not beside it.
+ */
+.summary {
+  display: block;
+}
+
+.summary-mark {
+  display: block;
+  margin-bottom: 0.1rem;
 }
 
 /* ---------------------------------------------------------------------------- the dock ----- */
@@ -1800,7 +1867,7 @@ textarea {
      two speakers directly above — same numbers, because they are the same two people and a reader
      switching views must not see the column change shape under them. */
   #discord-log li.discord-message[data-who="me"] {
-    margin-left: min(15%, 6rem);
+    margin-left: min(15%, 6rem); /* a desk has the room a phone does not */
   }
 
   #discord-log li.discord-message[data-who="coder"] {

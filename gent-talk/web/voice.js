@@ -26,6 +26,7 @@
 const TOKEN_KEY = "gent-talk.token"; // shared with the main app on purpose.
 const MIC_SETTINGS_KEY = "gent-talk.voice.mic";
 const WIDTH_KEY = "gent-talk.voice.width";
+const MSG_SCALE_KEY = "gent-talk.voice.msg-scale";
 
 const el = (id) => document.getElementById(id);
 
@@ -2030,6 +2031,53 @@ function renderControlBar() {
 // The unit is CHARACTERS, not pixels. What makes a line hard to read is how many characters are on
 // it, so that is what the reader is choosing and what gets stored.
 
+/**
+ * The reader's own type size for message text, as a PERCENTAGE of the stylesheet's own.
+ *
+ * Bounded rather than free: under about eighty per cent the text stops being readable at arm's
+ * length on a phone, and over about a hundred and fifty the fold control and the row's own
+ * controls no longer line up with the words they belong to.
+ */
+const MIN_MSG_SCALE = 80;
+const MAX_MSG_SCALE = 150;
+const DEFAULT_MSG_SCALE = 100;
+
+const clampMsgScale = (value) => {
+  const n = Math.round(Number(value));
+  if (!Number.isFinite(n)) {
+    return DEFAULT_MSG_SCALE;
+  }
+  return Math.min(MAX_MSG_SCALE, Math.max(MIN_MSG_SCALE, n));
+};
+
+/** Put a type size on the page, and return the one actually applied, which is the clamped one. */
+function applyMsgScale(value) {
+  const pct = clampMsgScale(value);
+  document.documentElement.style.setProperty("--msg-scale", String(pct / 100));
+  el("msg-scale").value = String(pct);
+  return pct;
+}
+
+/** Store it, and READ IT BACK: private browsing accepts `setItem` and keeps nothing. */
+function persistMsgScale(pct) {
+  const encoded = String(pct);
+  try {
+    localStorage.setItem(MSG_SCALE_KEY, encoded);
+  } catch (_error) {
+    return false;
+  }
+  return localStorage.getItem(MSG_SCALE_KEY) === encoded;
+}
+
+/** Apply a new size and say, in Settings, whether it will survive a reload. */
+function msgScaleChanged(value) {
+  const pct = applyMsgScale(value);
+  el("msg-scale-state").textContent = persistMsgScale(pct)
+    ? `Saved — message text at ${pct}% of its usual size.`
+    : "This browser refused to store the text size, so it will be forgotten when you reload " +
+      `(private browsing does this). Message text is at ${pct}% until then.`;
+}
+
 const MIN_READING_CH = 45;
 const MAX_READING_CH = 120;
 const DEFAULT_READING_CH = 72;
@@ -2056,6 +2104,12 @@ function clampReadingWidth(value) {
     return DEFAULT_READING_CH;
   }
   return Math.min(MAX_READING_CH, Math.max(MIN_READING_CH, Math.round(ch)));
+}
+
+/** What was stored, clamped. A missing or corrupt entry is the default, never an error. */
+function storedMsgScale() {
+  const stored = localStorage.getItem(MSG_SCALE_KEY);
+  return clampMsgScale(stored === null ? DEFAULT_MSG_SCALE : stored);
 }
 
 /** What was stored, clamped. A missing or corrupt entry is the default, never an error. */
@@ -3288,11 +3342,11 @@ function noteAuthor(id, name, isBot) {
  * costs nothing. It is also the only lookup here that does not go through `el`, and going through
  * `children` keeps it to the same handful of DOM operations the rest of this page uses.
  */
-function doneButtonOf(row) {
+function childByClass(row, className) {
   const stack = [...(row.children || [])];
   while (stack.length > 0) {
     const node = stack.pop();
-    if (node.className === "done-button") {
+    if (node.className === className) {
       return node;
     }
     if (node.children) {
@@ -3301,6 +3355,8 @@ function doneButtonOf(row) {
   }
   return null;
 }
+
+const doneButtonOf = (row) => childByClass(row, "done-button");
 
 function renderChannelRows() {
   const list = el("discord-log");
@@ -3349,6 +3405,14 @@ function renderChannelRows() {
     row.setAttribute("data-archived", isArchived ? "true" : "false");
     // The row's own way back, labelled for what it will DO rather than for what the row is. In the
     // To do filter an archived row is never on screen, so this only ever reads "Done" there.
+    // WHO, printed only where the colour cannot say it. `me` and `coder` are drawn as the
+    // transcript's two speakers, so their names are a line of chrome restating what the row's own
+    // colour already said. A third party is one of many and has to be named.
+    const who = row.getAttribute("data-who");
+    const author = childByClass(row, "msg-author");
+    if (author) {
+      author.hidden = who === "me" || who === "coder";
+    }
     const done = doneButtonOf(row);
     if (done) {
       done.textContent = isArchived ? "Unarchive" : "Done";
@@ -3371,16 +3435,97 @@ function renderChannelRows() {
  * the way in on a desktop, and it is present on every device, so nothing is reachable only by
  * gesture.
  */
+/**
+ * What the row stopped printing, shown on the row that was asked about.
+ *
+ * Inline rather than a dialog: the reader is holding a finger on one row of a list, and a modal
+ * would take the list away to answer a question about it. Toggled, so the same gesture closes it.
+ *
+ * `textContent` throughout — an author name and a channel's own timestamp are third-party text,
+ * and this is the one place they are shown in full.
+ */
+function toggleMessageDetails(li, message) {
+  const open = childByClass(li, "msg-details");
+  if (open) {
+    li.removeChild(open);
+    return;
+  }
+  const details = document.createElement("div");
+  details.className = "msg-details";
+  const who = document.createElement("div");
+  who.textContent = message.author_is_bot
+    ? `${message.author} (bot)`
+    : String(message.author || "");
+  const when = document.createElement("div");
+  when.textContent = fullLocalTime(message);
+  const id = document.createElement("div");
+  id.className = "msg-id";
+  id.textContent = `id ${message.id}`;
+  details.append(who, when, id);
+  li.append(details);
+}
+
+/**
+ * Tapping the message folds or unfolds it.
+ *
+ * The owner's report: the fold control was a small target on a line already carrying four other
+ * things, and the message beside it is enormous. So the message IS the control.
+ *
+ * It drives the fold BUTTON rather than the fold state, so there is exactly one path that folds a
+ * row — the button keeps its scroll anchoring and its `aria-expanded`, and a keyboard user who
+ * tabs to it gets the same act the tap performs.
+ */
+function tapToFold(li, fold) {
+  li.addEventListener("click", (event) => {
+    if (suppressNextRowClick) {
+      suppressNextRowClick = false;
+      return;
+    }
+    // Never steal a tap meant for a control, a link, or a selection the reader is making.
+    const target = event && event.target;
+    if (target && typeof target.closest === "function" && target.closest("button, a, input")) {
+      return;
+    }
+    const selection = typeof getSelection === "function" ? getSelection() : null;
+    if (selection && String(selection) !== "") {
+      return;
+    }
+    fold.click();
+  });
+}
+
 const SWIPE_START_PX = 12;
 const SWIPE_COMMIT_PX = 90;
+/** How long a finger has to rest before the row offers its details. */
+const HOLD_MS = 450;
 
-function swipeable(li, id) {
+/**
+ * A gesture that ENDED in an act must not also be read as a tap.
+ *
+ * A swipe and a press-and-hold both finish with a `pointerup`, and a browser follows that with a
+ * `click` — which the row also listens for, to fold. One flag rather than one per row: only one
+ * gesture is in flight at a time, and a per-row flag would have to be cleaned up on a list the
+ * poll rebuilds underneath it.
+ */
+let suppressNextRowClick = false;
+
+function swipeable(li, message) {
+  const id = String(message.id);
   let startX = 0;
   let startY = 0;
   let dragging = false;
   let active = false;
 
+  let holdTimer = null;
+  const cancelHold = () => {
+    if (holdTimer !== null) {
+      clearTimeout(holdTimer);
+      holdTimer = null;
+    }
+  };
+
   const reset = () => {
+    cancelHold();
     li.style.transform = "";
     li.style.transition = "";
     dragging = false;
@@ -3395,6 +3540,15 @@ function swipeable(li, id) {
     startX = event.clientX;
     startY = event.clientY;
     li.style.transition = "none";
+    // PRESS AND HOLD, on the same pointer stream as the swipe so the two cannot both fire. The
+    // row prints neither the author nor the message id any more; this is where they went.
+    cancelHold();
+    holdTimer = setTimeout(() => {
+      holdTimer = null;
+      reset();
+      suppressNextRowClick = true;
+      toggleMessageDetails(li, message);
+    }, HOLD_MS);
   });
 
   li.addEventListener("pointermove", (event) => {
@@ -3403,6 +3557,10 @@ function swipeable(li, id) {
     }
     const dx = event.clientX - startX;
     const dy = event.clientY - startY;
+    // Any real travel means this is a swipe or a scroll, not a hold.
+    if (Math.abs(dx) >= SWIPE_START_PX || Math.abs(dy) >= SWIPE_START_PX) {
+      cancelHold();
+    }
     // The axis is decided ONCE, on the first movement that is big enough to have a direction, and
     // then held. Re-deciding per event turns a diagonal flick into a row that judders sideways
     // while the list scrolls under it.
@@ -3429,6 +3587,9 @@ function swipeable(li, id) {
     const committed = Math.abs(dx) >= SWIPE_COMMIT_PX;
     reset();
     if (committed) {
+      suppressNextRowClick = true;
+    }
+    if (committed) {
       // THE SAME ACT the Done button performs, not a second notion of "dealt with": one dismissal,
       // recorded on the server, with `#50`'s undo behind it. That is what makes this gesture safe
       // enough to be a gesture — a swipe that did something only this browser remembered, with no
@@ -3443,6 +3604,55 @@ function swipeable(li, id) {
 
   li.addEventListener("pointerup", finish);
   li.addEventListener("pointercancel", reset);
+}
+
+/**
+ * The clock the READER is standing in, not the one the server was configured with.
+ *
+ * `#52 operator-timezone` had the server convert once, into `server.timezone`, and the page simply
+ * printed what it was handed. That is right for the voice agent — it has to SPEAK a time and
+ * cannot ask a browser — and wrong for a phone: `server.timezone` defaults to UTC, so an operator
+ * who never set it reads every message in UTC while holding a device that knows perfectly well
+ * what time it is. The browser's own zone is not a guess; it is the answer.
+ *
+ * `spoken_time` stays as the fallback for a message with no parseable timestamp, so a server that
+ * sends only the spoken form still shows something rather than nothing.
+ */
+function messageDate(message) {
+  const raw = String(message.timestamp || "");
+  if (!raw) {
+    return null;
+  }
+  const at = new Date(raw);
+  return Number.isNaN(at.getTime()) ? null : at;
+}
+
+/** `13:40` — the hour and minute, which is all a row has room for. */
+function shortLocalTime(message) {
+  const at = messageDate(message);
+  if (at === null) {
+    return String(message.spoken_time || "");
+  }
+  return at.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+/** The whole truth, for the details sheet: date, time and zone, all local. */
+function fullLocalTime(message) {
+  const at = messageDate(message);
+  if (at === null) {
+    return String(message.spoken_time || "unknown");
+  }
+  // Explicit components, NOT `dateStyle`/`timeStyle`. ECMA-402 forbids combining those with an
+  // individual field such as `timeZoneName`, and a browser answers that with a TypeError rather
+  // than by ignoring the option — so the sheet would have thrown instead of opening.
+  return at.toLocaleString([], {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    timeZoneName: "short",
+  });
 }
 
 function discordNode(message) {
@@ -3474,16 +3684,14 @@ function discordNode(message) {
   // An author name is channel data too, and a display name can be anything at all.
   author.textContent = message.author_is_bot ? `${message.author} (bot)` : String(message.author);
   const stamp = document.createElement("span");
-  // `#52 operator-timezone`. The server converts once, into the operator's configured zone, and
-  // hands back a string that is already correct — so prefer it. The ISO slice is the fallback for
-  // a server too old to send `spoken_time`, and it is UTC-as-Discord-reported-it. This page and
-  // web/app.js must not disagree about what time a message was posted.
-  stamp.textContent =
-    message.spoken_time || String(message.timestamp || "").replace("T", " ").slice(0, 16);
-  const id = document.createElement("span");
-  id.className = "msg-id";
-  id.textContent = `id ${message.id}`;
-  meta.append(author, stamp, id);
+  stamp.className = "msg-time";
+  stamp.textContent = shortLocalTime(message);
+  // THE MESSAGE ID IS NOT PRINTED ON THE ROW. It is a nineteen-digit number that no reader reads,
+  // on every row, on a screen 393 pixels wide. It is still the thing that lets the operator say
+  // "that message does not exist", so it moved to the details sheet a press-and-hold opens — see
+  // `showMessageDetails`.
+  author.className = "msg-author";
+  meta.append(author, stamp);
   const body = document.createElement("div");
   body.className = "body";
   renderMarkdownInto(body, message.content);
@@ -3493,7 +3701,10 @@ function discordNode(message) {
   // is the message id, which is what `#49 cached-summaries` keys a summary under — the transcript
   // has none to give, so it gets no summary line and the two lists still share one definition of
   // "long enough to fold".
-  foldable(li, meta, body, message.content, String(message.id));
+  const fold = foldable(li, meta, body, message.content, String(message.id));
+  if (fold) {
+    tapToFold(li, fold);
+  }
   // `#51 reply-view`. Every raw message can be answered, and the affordance is on the row rather
   // than in a menu — Discord's own idiom, and the thing that makes a reply a REPLY rather than a
   // loose message.
@@ -3534,7 +3745,7 @@ function discordNode(message) {
   // rather than a second notion of "dealt with": one dismissal, recorded on the server, reachable
   // by gesture OR by a control a keyboard can get to. That ordering was `#50`'s condition for the
   // gesture layer and it still holds — the gesture is a second way in, never the only one.
-  swipeable(li, String(message.id));
+  swipeable(li, message);
   return li;
 }
 
@@ -5553,7 +5764,9 @@ el("resume-toggle").addEventListener("change", () => {
 // unconditionally: on a phone the stylesheet never consults the value, so there is nothing to
 // branch on here and no second definition of "is this a desktop" to drift.
 applyReadingWidth(storedReadingWidth());
+applyMsgScale(storedMsgScale());
 el("reading-width").addEventListener("input", () => readingWidthChanged(el("reading-width").value));
+el("msg-scale").addEventListener("input", () => msgScaleChanged(el("msg-scale").value));
 el("width-grip").addEventListener("pointerdown", onGripDown);
 el("width-grip").addEventListener("pointermove", onGripMove);
 el("width-grip").addEventListener("pointerup", onGripUp);
