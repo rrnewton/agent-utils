@@ -70,6 +70,7 @@ from agent_team_timeline.terminology import GlossaryTerm, glossary_term_id
 from agent_team_timeline.window import DateWindow
 from agent_team_timeline.snapshot_store import resolve_snapshot_root
 from tests.timeline_projection import schema_1_timeline_text
+from tests.timeline_legacy_generations import write_legacy_schema_2
 
 
 ROOT = "00000000-0000-0000-0000-000000000001"
@@ -335,22 +336,26 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
     # largest file in the archive.
     assert not (tmp_path / "data" / "timeline.json").exists()
     assert not (tmp_path / "data" / "timeline.json.gz").exists()
-    timeline_v2_gzip = tmp_path / "data" / "timeline-v2.json.gz"
-    assert gzip.decompress(timeline_v2_gzip.read_bytes()) == (
-        tmp_path / "data" / "timeline-v2.json"
-    ).read_bytes()
-    schema_2_bootstrap = json.loads(
-        (tmp_path / "data" / "timeline-v2.json").read_text(encoding="utf-8")
+    # Nor is the schema-2 presentation generation, since the website reads schema 3. One
+    # generation is written; two more are still *readable*, for archives an older tool built.
+    assert not (tmp_path / "data" / "timeline-v2.json").exists()
+    assert not (tmp_path / "data" / "timeline-v2").exists()
+    schema_3_bootstrap = json.loads(
+        (tmp_path / "data" / "timeline-v3.json").read_text(encoding="utf-8")
     )
-    assert schema_2_bootstrap["schema_version"] == 2
-    assert schema_2_bootstrap["kind"] == "timeline-bootstrap"
-    assert schema_2_bootstrap["detail_shards"]
-    schema_2_objects = [schema_2_bootstrap["global"], *schema_2_bootstrap["detail_shards"]]
-    assert all(
-        (tmp_path / value["url"]).name == value["sha256"] + ".json"
-        for value in schema_2_objects
-    )
-    assert all((tmp_path / value["url"]).is_file() for value in schema_2_objects)
+    assert schema_3_bootstrap["schema_version"] == 3
+    assert schema_3_bootstrap["kind"] == "timeline-v3-bootstrap"
+    assert schema_3_bootstrap["streams"]["timeline"]["shards"]
+    schema_3_shards = [
+        shard
+        for stream in schema_3_bootstrap["streams"].values()
+        for shard in stream["shards"]
+    ]
+    assert all((tmp_path / shard["path"]).is_file() for shard in schema_3_shards)
+    assert all((tmp_path / shard["index_path"]).is_file() for shard in schema_3_shards)
+    # No plain twin and no `.gz` twin: a schema-3 shard is stored compressed and served as stored,
+    # which is the duplication the generation exists to remove.
+    assert not any((tmp_path / (shard["path"] + ".gz")).exists() for shard in schema_3_shards)
     assert gzip.decompress((tmp_path / "app.js.gz").read_bytes()) == (
         tmp_path / "app.js"
     ).read_bytes()
@@ -394,10 +399,10 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
     assert timeline["stats"]["events"] == len(timeline["events"])
     assert timeline["stats"]["active_agents"] == len(timeline["agents"])
     assert timeline["stats"]["external_messages"] == 0
-    schema_2_global = json.loads(
-        (tmp_path / schema_2_bootstrap["global"]["url"]).read_text(encoding="utf-8")
-    )
-    assert schema_2_global["stats"] == timeline["stats"]
+    # The same totals reach the browser's entry point, which is now the schema-3 bootstrap: it
+    # inlines `stats` for the reason it inlines `teams`, because a frame cannot be drawn without
+    # them and a second round trip would be spent on nothing.
+    assert schema_3_bootstrap["stats"] == timeline["stats"]
     assert any(edge["kind"] == "spawn" for edge in timeline["edges"])
     result_edges = [edge for edge in timeline["edges"] if edge["kind"] == "result"]
     assert len(result_edges) == 1
@@ -852,17 +857,42 @@ def test_build_after_retiring_the_message_projection_serves_a_working_archive(
     # second build has to be a no-op rather than re-converging on the changed tree.
     assert build_archive(tmp_path, team.team_slug)["files_changed"] == 0
 
-    # Serve it the way an operator would, and fetch the three files the page cannot start without.
+    # Serve it the way an operator would, and fetch the two files the page cannot start without.
+    schema_3_bootstrap = json.loads(
+        (tmp_path / "data" / "timeline-v3.json").read_text(encoding="utf-8")
+    )
     server = make_server(tmp_path, port=0)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
         port = int(server.server_address[1])
-        for relative in ("index.html", "data/timeline-v2.json", "data/timeline-v3.json"):
+        for relative in ("index.html", "data/timeline-v3.json"):
             url = f"http://127.0.0.1:{port}/{relative}"
             with urllib.request.urlopen(url, timeout=5) as response:
                 assert response.status == 200
                 assert response.read()
+        # And one gzip member of one shard, by the byte range its sidecar published, which is how
+        # the page reads every shard. `Accept-Ranges` and the 206 are the server half of the split
+        # `static/app.js` depends on; nothing else in this suite fetches a range from the real
+        # server against a real build.
+        shard = schema_3_bootstrap["streams"]["spine"]["shards"][0]
+        index_lines = (tmp_path / shard["index_path"]).read_text(
+            encoding="utf-8"
+        ).strip().split("\n")
+        member = json.loads(index_lines[1])
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{port}/{shard['path']}",
+            headers={"Range": f"bytes=0-{member['c_len'] - 1}"},
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            assert response.status == 206
+            assert response.headers["Accept-Ranges"] == "bytes"
+            assert response.headers["Content-Range"] == (
+                f"bytes 0-{member['c_len'] - 1}/{shard['c_bytes']}"
+            )
+            body = response.read()
+        assert len(body) == member["c_len"]
+        assert len(gzip.decompress(body)) == member["u_len"]
     finally:
         server.shutdown()
         server.server_close()
@@ -2575,16 +2605,16 @@ def test_combined_export_namespaces_teams_and_is_byte_idempotent(
     assert "data/timeline.json" not in export_manifest["generated_files"]
     assert "data/timeline.json.gz" not in export_manifest["generated_files"]
     assert export_manifest["retired_files"] == []
-    assert "data/timeline-v2.json" in export_manifest["generated_files"]
+    assert "data/timeline-v2.json" not in export_manifest["generated_files"]
     assert "data/timeline-v3.json" in export_manifest["generated_files"]
+    assert not any(
+        value.startswith("data/timeline-v2/") for value in export_manifest["generated_files"]
+    )
     assert any(
-        value.startswith("data/timeline-v2/objects/") and value.endswith(".json")
+        value.startswith("data/timeline-v3/") and value.endswith(".jsonl.gz")
         for value in export_manifest["generated_files"]
     )
     assert "app.js.gz" in export_manifest["generated_files"]
-    assert gzip.decompress((output / "data" / "timeline-v2.json.gz").read_bytes()) == (
-        output / "data" / "timeline-v2.json"
-    ).read_bytes()
     artifact_catalog = json.loads(
         (output / "data" / "artifacts.json").read_text(encoding="utf-8")
     )
@@ -3304,8 +3334,11 @@ def test_a_real_build_is_read_through_schema_three(tmp_path: Path) -> None:
     assert agents
     assert all(record["team"] == team.team_slug for record in agents)
 
-    # And the answers are the schema-2 answers. Hiding the schema-3 entry point is the whole
-    # difference between the two readings, so the comparison is over one tree, not two builds.
+    # And the answers are the schema-2 answers. A build no longer writes schema 2, so the middle
+    # generation is produced here the way the archives that still contain one were produced -- by
+    # the writer that made them, over this build's own records. Hiding the schema-3 entry point is
+    # then the whole difference between the two readings, so the comparison is over one tree.
+    write_legacy_schema_2(tmp_path)
     (tmp_path / SCHEMA_3_BOOTSTRAP_PATH).rename(tmp_path / "hidden-timeline-v3.json")
     fallback = TimelineQuery(tmp_path)
     assert fallback.schema_3_declined == "no schema-3 bootstrap"

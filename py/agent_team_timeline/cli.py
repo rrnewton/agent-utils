@@ -1295,7 +1295,7 @@ def _export_selection(
 def _inspect_counts(archive: Path) -> dict[str, int]:
     """The six collection sizes, from the cheapest generation that can state them.
 
-    Schema 3 publishes all six in its 89,298-byte bootstrap, so a complete generation answers
+    Schema 3 publishes all six in its 168,703-byte bootstrap, so a complete generation answers
     without opening a shard. Before this, the only implementation parsed ``data/timeline.json``
     -- 246,973,399 bytes at 1.44 GiB resident on the measured archive -- to print six integers,
     which is also why a published build no longer writing that file could not simply have left

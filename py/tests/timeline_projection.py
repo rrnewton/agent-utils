@@ -75,8 +75,21 @@ _SORT_FIELD: dict[str, str] = {
     "activity_bins": "start_ms",
 }
 
-#: Kinds that exist in schema 3 and in no schema-1 collection.
-_DERIVED_KINDS = frozenset({"phase_card", "activity_bounds"})
+#: Kinds that exist in schema 3 and in no schema-1 collection. The four search kinds are here for
+#: the same reason ``phase_card`` is: the transcript search corpus is a *projection* of the events
+#: and tool calls, built by `search_index.build_search_records` rather than carried in
+#: ``data/timeline.json``, so reconstructing schema 1 from schema 3 must walk past it rather than
+#: try to place it in a collection that has never existed.
+_DERIVED_KINDS = frozenset(
+    {
+        "phase_card",
+        "activity_bounds",
+        "search_record",
+        "search_bloom",
+        "search_prompt",
+        "search_response",
+    }
+)
 
 
 def schema_1_timeline_text(archive: Path) -> str:

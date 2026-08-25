@@ -53,24 +53,30 @@ own output. So the answer comes from the code: `timeline_shards.SCHEMA_2_IS_PUBL
 did" is an observation and this module refuses to act on one; "no build can" is a property, and
 that is what a category worth 1.4 GB is gated on. See :func:`_schema_2_retirement_refusal`.
 
-…and one thing schema 3 does not supersede at all
+…and one thing that had no successor until it did
 -------------------------------------------------
-"Schema 3 replaces schema 2" is true of the *presentation timeline* and false of the archive.
-``query.TimelineQuery._search_bootstrap`` says so in as many words: the transcript search corpus
-is still a set of schema-2 content-addressed day shards with trigram blooms, catalogued in the
-``search`` section of ``data/timeline-v2.json``, and a search under schema 3 reads phases and
-agents from the spine and *messages from schema 2*. It is the one operation in the reader that
-touches both generations, and it has no schema-3 successor to be superseded by.
+"Schema 3 replaces schema 2" used to be true of the *presentation timeline* and false of the
+archive: the transcript search corpus was a set of schema-2 content-addressed day shards with
+trigram blooms, catalogued in the ``search`` section of ``data/timeline-v2.json``, and a search
+under schema 3 read phases and agents from the spine and *messages from schema 2*. That is 500.5
+MiB of the 1,434.2 MiB this module sees in the generation on the measured archive -- 35% -- and it
+was not a duplicate copy of anything, so reclaiming it would not have made the archive slower, it
+would have deleted `timeline search` and `timeline show` outright.
 
-That is 500.5 MiB of the 1,434.2 MiB this module can see in the generation on a measured archive
--- 35% -- and it is not a duplicate copy of anything. Reclaiming it does not make the archive
-slower, it deletes `timeline search` and `timeline show` outright, against a schema-3 generation
-that is perfectly complete. So the retirement of the *format* and the retirement of the *corpus*
-are two facts, the archive states the second one itself -- the bootstrap either carries a
-``search`` section or it does not -- and :func:`_schema_2_search_corpus_category` holds exactly
-what that section names, forever, until a build stops naming it. The whole-generation category is
-therefore the generation *minus* the corpus, which is the only split that satisfies this module's
-own rule: reclaim what a named successor covers, and nothing else.
+Schema 3 now publishes a corpus of its own: the ``search``, ``search_bloom`` and ``search_links``
+streams of `timeline_v3`, read by ``query.TimelineQuery._iter_search_records``, which opens
+``data/timeline-v2.json`` only for an archive built before they existed. So the corpus finally has
+the thing every other category here requires -- a *named, present* successor -- and
+:func:`_schema_2_search_corpus_category` asks the archive whether it has one instead of holding
+unconditionally.
+
+The two facts stay separate, which is the part worth keeping. Retiring the *format* and superseding
+the *corpus* are still different events with different evidence: the format is retired by a
+constant in the writer (:data:`timeline_shards.SCHEMA_2_IS_PUBLISHED`) and the corpus is superseded
+by shards this archive can be seen to hold. An archive can be in either state without the other --
+the common one today is a schema 3 that carries the corpus while the format is still published for
+the website -- and in that state the corpus bytes join the whole-generation category and are held
+there with the format's own reason, rather than being held twice under two.
 
 Two more questions the retirement has to ask
 --------------------------------------------
@@ -152,11 +158,13 @@ What `gc` will not touch, and why
   only while something still *writes* schema 2; when the format itself is retired the grace
   period has nobody left to protect, and the whole generation moves into one category. See
   :func:`_schema_2_categories`.
-* **The transcript search corpus.** The schema-2 bootstrap and the day shards and linkage
-  sidecars its ``search`` section names -- 500.5 MiB and 144 objects on the measured archive.
-  Reported at full size, never reclaimed, and *not* reclaimed even once the schema-2 presentation
-  format is retired, because retiring a format does not give this corpus a successor. See
-  :func:`_schema_2_search_corpus_category`.
+* **The transcript search corpus, when this archive's schema 3 does not carry one.** The
+  schema-2 bootstrap and the day shards and linkage sidecars its ``search`` section names -- 500.5
+  MiB and 144 objects on the measured archive. Held at full size while it is the only copy, and
+  held *even once the schema-2 presentation format is retired*, because retiring a format does not
+  by itself give a corpus a successor. An archive whose schema 3 publishes the ``search`` streams
+  has one, and there these bytes stop being a capability and become a duplicate like everything
+  else in the generation. See :func:`_schema_2_search_corpus_category`.
 * **Schema-3 shards the bootstrap does not name.** Reported, never reclaimed. Absence from the
   catalogue does not say whether the shard is a retired team's or a live team's: the answer turns
   entirely on whether the bootstrap beside it is newer or older than the shard, which nothing on
@@ -461,21 +469,30 @@ def _schema_1_category(root: Path) -> GcCategory:
 
     Two conditions, not one, because the archive has two readers and they retired schema 1 at
     different times. ``./timeline`` reads schema 3 first and schema 2 second and reaches schema 1
-    only when neither is present, so schema 3 alone would satisfy it. The **website** has no
-    schema-3 mode at all: `static/app.js` loads `data/timeline-v2.json` and falls back to
-    `data/timeline.json` when that load throws. Reclaiming the monolith while schema 2 was
-    missing would therefore leave the browser with nothing to fall back *to*, which is precisely
-    the failure the fallback exists to absorb. So both must be present, and schema 3's presence
-    is judged by :func:`query.schema_3_completeness` -- the reader's own five-clause rule, not a
+    only when neither is present, so schema 3 alone would satisfy it. The **website** is the
+    second reader, and the one that needs asking about, because a build *copies* `app.js` into
+    the archive: a bundle written before schema 3 existed loads `data/timeline-v2.json` and falls
+    back to `data/timeline.json` when that load throws, and it will go on doing so forever, since
+    no tool release reaches back into an archive somebody built last month. Schema 3's presence is
+    judged by :func:`query.schema_3_completeness` -- the reader's own five-clause rule, not a
     looser restatement of it that could say yes where the reader says no.
 
-    The second condition is a statement about the *website*, not about schema 2, and it lapses
-    the day the website stops reading schema 2 -- which is exactly what
-    :data:`timeline_shards.SCHEMA_2_IS_PUBLISHED` going false records, since the flip is only
-    legal alongside a browser that reads schema 3. Keeping the condition past that point would
-    hold the monolith for a reader that no longer exists, and would print a reason whose first
-    clause was false, which is the failure mode this whole change is about: a refusal nobody can
-    act on because its premise has quietly expired.
+    **The second condition is asked of this archive, not of this release**, and that is a change
+    from how it was first written. It used to read ``schema_2_is_published() and the bootstrap is
+    absent``, on the reasoning that the flip is only legal beside a browser that reads schema 3,
+    so the condition could lapse with the constant. That reasoning is true about the *tool* and
+    false about a *directory*: the constant is now ``False`` and there are still archives on disk
+    whose own bundle has never heard of schema 3, and for one of those with no schema 2 beside it
+    the monolith is the last thing its graphical surface can open. Reclaiming it there blanks the
+    page -- silently, hours later, in somebody else's session, which is the failure mode
+    :func:`_website_refusal` exists to prevent and which does not become acceptable because a
+    different file was being deleted.
+
+    So the question is the same per-archive one, asked with the same function: does *this*
+    archive's bundle name the schema-3 bootstrap. If it does, the monolith has no reader left and
+    goes. If it does not, it goes anyway as long as schema 2 is there to catch that bundle -- and
+    is held only when neither is. The remedy is the one `_website_refusal` names: rebuild, which
+    costs no tokens and republishes the bundle.
     """
 
     files = _files_with_sizes(root, (_SCHEMA_1_TIMELINE, _SCHEMA_1_TIMELINE + ".gz"))
@@ -487,12 +504,16 @@ def _schema_1_category(root: Path) -> GcCategory:
             f"held: no complete schema-3 generation supersedes it ({declined})",
             files,
         )
-    if schema_2_is_published() and _size_of(root, SCHEMA_2_BOOTSTRAP_PATH) is None:
+    if (
+        _website_refusal(root) is not None
+        and _size_of(root, SCHEMA_2_BOOTSTRAP_PATH) is None
+    ):
         return GcCategory(
             "schema-1-monolith",
             False,
-            "held: the website reads schema 2 and falls back to schema 1, and "
-            f"{SCHEMA_2_BOOTSTRAP_PATH} is absent",
+            f"held: this archive's own {_WEBSITE_APP} has no schema-3 mode, so it reads schema 2 "
+            f"and falls back to schema 1, and {SCHEMA_2_BOOTSTRAP_PATH} is absent. Re-run the "
+            "build against this archive, which republishes the bundle",
             files,
         )
     beside = (
@@ -810,10 +831,13 @@ def _schema_2_retirement_refusal(root: Path) -> str | None:
             f"held: this build still writes schema 2 -- {_SCHEMA_2_CAPABILITY} is True, and "
             "write_timeline_shards refuses to run while it is False -- so every byte reclaimed "
             "here would be written again by the next build, which is churn rather than "
-            "collection. The website is why that constant is still True: static/app.js loads "
-            f"{SCHEMA_2_BOOTSTRAP_PATH} and has no schema-3 mode, so retiring the format today "
-            "would retire the graphical surface. Nothing an operator can do to this archive "
-            "changes this line; a release of the tool does"
+            "collection. The website used to be why that constant was True, and is not any "
+            f"more: static/app.js reads {SCHEMA_3_BOOTSTRAP_PATH} and the schema-3 transcript "
+            "search streams, and keeps schema 2 only as a fallback for an archive an older tool "
+            "built. So a tree reaching this line is one that has turned the constant back on -- "
+            "a released build sets it False -- and the reason to look for is in that tree's own "
+            "timeline_shards.py, not here. Nothing an operator can do to this archive changes "
+            "this line; a release of the tool does"
         )
     complete, declined = schema_3_completeness(root)
     if not complete:
@@ -891,9 +915,10 @@ def _schema_2_reclaim_reason(root: Path) -> str:
     return (
         f"superseded by a complete {SCHEMA_3_BOOTSTRAP_PATH} beside {SCHEMA_2_BOOTSTRAP_PATH}; "
         f"no build writes it any more ({_SCHEMA_2_CAPABILITY} is False, and "
-        "write_timeline_shards refuses to run while it is). This is the presentation half of the "
-        "generation only: the transcript search corpus lives in the same tree, schema 3 does not "
-        "replace it, and it is held by schema-2-search-corpus. WARNING, read before --delete: "
+        "write_timeline_shards refuses to run while it is). Whether this includes the transcript "
+        "search corpus that shares the tree depends on whether the schema 3 here publishes one; "
+        "schema-2-search-corpus says which, and subtracts itself from this category when it does "
+        "not. WARNING, read before --delete: "
         f"this removes the last fallback. {chain}. A schema-3 generation the reader declines then "
         "leaves the archive unreadable rather than slow, and it declines the whole generation "
         f"over a single shard-shaped file under {SCHEMA_3_ROOT}/ that the catalogue does not "
@@ -902,28 +927,80 @@ def _schema_2_reclaim_reason(root: Path) -> str:
     )
 
 
+def _schema_3_search_corpus(root: Path) -> tuple[int, int] | None:
+    """``(shards, teams)`` of this archive's schema-3 transcript search corpus, or ``None``.
+
+    ``None`` means there is no corpus here to supersede the schema-2 one -- no schema-3 bootstrap,
+    an unparsable one, or one written before the ``search`` streams existed. The distinction that
+    matters is not "can this tool write a corpus" but "does *this archive* hold one", the same
+    per-archive question :func:`_website_refusal` asks about ``app.js`` and for the same reason: a
+    tool upgrade does not reach into an archive somebody built last month, and the bytes being
+    offered are that archive's.
+
+    Read out of the catalogue rather than by walking ``data/timeline-v3/search/``, because the
+    catalogue is what the reader acts on: `query._SchemaThreeArchive` will not open a shard the
+    bootstrap does not name, so a shard on disk and absent from the bootstrap is not a corpus, it
+    is residue. The stricter half of the question -- is the whole generation complete, is it the
+    *same build* as this schema 2 -- is already asked, unchanged, by
+    :func:`_schema_2_retirement_refusal` and :func:`_cross_generation_refusal` before any of these
+    bytes can move. This function only has to answer whether the successor exists.
+    """
+
+    bootstrap = _bootstrap(root, SCHEMA_3_BOOTSTRAP_PATH, 3, "timeline-v3-bootstrap")
+    if bootstrap is None:
+        return None
+    try:
+        streams = as_object(bootstrap.get("streams"), "timeline-v3.streams")
+        raw_search = streams.get("search")
+        if raw_search is None:
+            return None
+        section = as_object(raw_search, "timeline-v3.streams.search")
+        shards = as_array(section.get("shards"), "timeline-v3.streams.search.shards")
+        teams = {
+            as_object(raw, f"timeline-v3.streams.search.shards[{index}]").get("team")
+            for index, raw in enumerate(shards)
+        }
+    except ValueError:
+        return None
+    if not shards:
+        return None
+    return len(shards), len(teams)
+
+
 def _schema_2_search_corpus_category(
-    root: Path, named: frozenset[str] | None, unknowable: str
+    root: Path, named: frozenset[str] | None, unknowable: str, successor: tuple[int, int] | None
 ) -> GcCategory:
-    """The half of the schema-2 generation that schema 3 does not supersede. Never reclaimed.
+    """The half of the schema-2 generation whose successor arrived last, held until it did.
 
     Everything else `gc` offers is a *copy* of something a newer artefact also has: the monolith
-    against schema 2, the schema-2 presentation objects against schema 3. This is not. The
-    transcript search corpus has exactly one implementation in this codebase -- content-addressed
-    day shards with trigram blooms, catalogued in ``search`` in the schema-2 bootstrap -- and
-    ``query.TimelineQuery._search_bootstrap`` reaches into it from *under schema 3*, which is the
-    plainest possible statement that schema 3 did not replace it. Reclaiming it would not slow
-    anything down, it would delete `timeline search` and `timeline show` from an archive whose
-    schema 3 is in perfect order, and the pass would have said "superseded" while doing it.
+    against schema 2, the schema-2 presentation objects against schema 3. For most of this
+    module's life the transcript search corpus was not, and this category existed to say so: it
+    had exactly one implementation -- content-addressed day shards with trigram blooms, catalogued
+    in ``search`` in the schema-2 bootstrap -- and the reader reached into it from *under schema
+    3*. Reclaiming it would not have slowed anything down, it would have deleted `timeline search`
+    and `timeline show` from an archive whose schema 3 was in perfect order, and the pass would
+    have said "superseded" while doing it.
 
-    So this category is held unconditionally: not "held until schema 3 is complete", which it
-    already is, and not "held while the format is published", which is the gate the presentation
-    half sits behind. There is no condition to state, because the successor does not exist yet.
-    The day it does, the build that publishes it stops naming these objects in ``search`` and this
-    category empties itself -- which is why the membership is read out of the catalogue on every
-    run rather than pinned to a constant. The rejected alternative was to gate the whole
-    generation on the corpus, refusing all 1.4 GB until search is ported; it was rejected because
-    two thirds of those bytes genuinely *are* superseded, and holding a superseded copy on account
+    Schema 3 now publishes a corpus, so the condition this category always implied can finally be
+    written down, and it is written as a question about **this archive** rather than about this
+    tool: does the schema-3 bootstrap here name ``search`` shards. When it does, these bytes are a
+    duplicate like every other byte in the generation, they stop being subtracted from
+    ``superseded-schema-2``, and they are held or offered by whatever that category decides --
+    which today still holds them, because the format is still published for the website. When it
+    does not, the old reason stands unchanged and unconditionally.
+
+    Deciding it per archive rather than by a constant in the writer is the whole point. The two
+    facts are genuinely independent: a build can carry the schema-3 corpus while an archive on
+    disk predates it, which is the state every existing archive is in until it is rebuilt once, and
+    an archive in that state must keep its only copy no matter what version of the tool is asking.
+    The rejected alternative -- gate on `timeline_v3` being *able* to write a corpus, the way the
+    format's retirement gates on :data:`timeline_shards.SCHEMA_2_IS_PUBLISHED` -- is exactly the
+    mistake :func:`_website_refusal` was written to avoid, and it would offer 500.5 MiB of the only
+    copy an unrebuilt archive has.
+
+    The other rejected alternative, from before there was a successor at all, was to gate the whole
+    generation on the corpus and refuse all 1.4 GB until search was ported. It was rejected because
+    two thirds of those bytes genuinely *were* superseded, and holding a superseded copy on account
     of an unrelated tenant of the same directory is the mirror image of the mistake this exists to
     prevent.
     """
@@ -938,6 +1015,20 @@ def _schema_2_search_corpus_category(
             "there is nothing here that schema 3 has not superseded",
             (),
         )
+    if successor is not None:
+        shards, teams = successor
+        return GcCategory(
+            "schema-2-search-corpus",
+            False,
+            f"nothing to hold: {SCHEMA_3_BOOTSTRAP_PATH} publishes a transcript search corpus of "
+            f"its own -- {shards} search shard(s) across {teams} team(s), with the trigram "
+            "prefilter and the prompt/response sidecar beside them -- and "
+            "query.TimelineQuery._iter_search_records reads it, opening "
+            f"{SCHEMA_2_BOOTSTRAP_PATH} only for an archive that has no such streams. These "
+            "objects are therefore a duplicate like the rest of the generation and are accounted "
+            "for by superseded-schema-2, under whatever condition that category is subject to",
+            (),
+        )
     files = _files_with_sizes(root, named)
     objects = sum(
         1 for item in files if item.relative_path.startswith(_SCHEMA_2_OBJECT_ROOT + "/")
@@ -945,13 +1036,15 @@ def _schema_2_search_corpus_category(
     return GcCategory(
         "schema-2-search-corpus",
         False,
-        f"held: not superseded by anything. {SCHEMA_2_BOOTSTRAP_PATH} and the "
+        f"held: not superseded in this archive. {SCHEMA_2_BOOTSTRAP_PATH} and the "
         f"{objects} content-addressed day shards and linkage sidecars its `search` section "
-        f"names under {_SCHEMA_2_OBJECT_ROOT}/ are the transcript search corpus, and schema 3 "
-        "does not implement one -- query.TimelineQuery._search_bootstrap reads this generation "
-        "even when schema 3 answers everything else, which is what `timeline search` and "
-        "`timeline show` run on. Reclaiming these would remove a capability rather than a "
-        "duplicate. They go when a build stops naming them, not when a format is retired",
+        f"names under {_SCHEMA_2_OBJECT_ROOT}/ are the transcript search corpus, and the "
+        f"{SCHEMA_3_BOOTSTRAP_PATH} here publishes no `search` stream to replace them -- so "
+        "query.TimelineQuery._iter_search_records reads this generation even when schema 3 "
+        "answers everything else, which is what `timeline search` and `timeline show` run on. "
+        "Reclaiming these would remove a capability rather than a duplicate. A rebuild against "
+        "this archive publishes the schema-3 corpus and costs no tokens; then they are offered "
+        "with the rest of the generation",
         files,
     )
 
@@ -969,13 +1062,19 @@ def _schema_2_categories(
     traceback. So the partition is structural rather than remembered. ``superseded`` is the
     generation *minus* whatever the other three claim.
 
-    The search corpus is subtracted **in both worlds**, and it is the only one of the three that
-    is. Reachability and the grace period are properties of a live format and stop meaning
-    anything once it is retired; being unsuperseded is not, and it is the state the corpus is in
-    either way. Taking it out of ``superseded`` while the generation is live changes no byte's
-    fate -- everything there is held regardless -- and it makes the report say the true thing a
-    year early: of the 1,434.2 MiB in this tree on the measured archive, 500.5 MiB is a capability
-    with no successor and 933.7 MiB is a copy of something schema 3 already has.
+    The search corpus is subtracted **in both worlds when it is subtracted at all**, and it is the
+    only one of the three that is. Reachability and the grace period are properties of a live
+    format and stop meaning anything once it is retired; being unsuperseded is not, and an archive
+    whose schema 3 carries no ``search`` stream is in that state whether or not the format is
+    retired. Taking it out of ``superseded`` while the generation is live changes no byte's fate --
+    everything there is held regardless -- and it makes the report say the true thing early: of the
+    1,434.2 MiB in this tree on the measured archive, 500.5 MiB was a capability with no successor
+    and 933.7 MiB a copy of something schema 3 already had.
+
+    Once an archive is rebuilt with the schema-3 search streams the subtraction stops, and it stops
+    in both worlds too, for the symmetric reason: the corpus is then a duplicate, and a duplicate
+    reported in a category whose name says "not superseded" would be the report lying in the
+    direction that costs an operator disk rather than data.
 
     Which way the rest of the split falls depends on :func:`_schema_2_retirement_refusal`.
 
@@ -1017,7 +1116,9 @@ def _schema_2_categories(
     refusal = _schema_2_retirement_refusal(root)
     if refusal is None and search_paths is None:
         refusal = unknowable
-    search = _schema_2_search_corpus_category(root, search_paths, unknowable)
+    search = _schema_2_search_corpus_category(
+        root, search_paths, unknowable, _schema_3_search_corpus(root)
+    )
     held_by_search = {item.relative_path for item in search.files}
     generation = tuple(
         item for item in generation if item.relative_path not in held_by_search

@@ -393,8 +393,29 @@ Do not open `index.html` directly with `file://`; browsers block its JSON fetch.
 Python's built-in loopback HTTP server and exposes nothing on the network. Builds retain each
 ordinary identity file and add deterministic gzip-6 companions for browser-facing files of at
 least 1 KiB. The bundled server negotiates those companions, emits representation-specific strong
-ETags, and lets the browser revalidate mutable files. Copying the archive to a generic static
-server remains compatible; it can ignore the `.gz` companions and serve the identity files.
+ETags, and lets the browser revalidate mutable files.
+
+It also answers a single `Range` header with a `206`, and that is now load-bearing rather than a
+nicety: the page reads the timeline out of `data/timeline-v3/`, one gzip member of one shard at a
+time, at the byte offsets that shard's `.index.jsonl` sidecar published. A first paint downloads
+the 169 KB bootstrap and two line ranges out of each team's spine — everything except the phase
+cards and the zoom bounds, which are fetched when you open an agent lifetime or zoom to one. On a
+twelve-team archive that is **2,155,957 bytes against the previous format's 4,502,381**, in 34
+requests against 2. The parse is the same either way; what halves is the transfer, and the extra
+requests are the price of asking for parts of files instead of whole ones. Copying the archive to a generic static
+server remains compatible — it can ignore the `.gz` companions and serve the identity files, and
+byte ranges are something every static server already does. A server that ignores `Range` entirely
+is still correct: the page detects the whole-file answer and slices the member out of it, which
+costs bandwidth and nothing else.
+
+Transcript search in the browser follows the *corpus*, which is not always the same generation as
+the timeline. An archive built after the schema-3 timeline and before the schema-3 search streams
+has its corpus in `data/timeline-v2.json` and nowhere else; the page reads it from there, exactly
+as `agent-team-timeline search` does, and says so in the line under the title. It refuses instead
+of falling back when the two bootstraps disagree about their `source_digest` — that is two
+different builds, and answering phases out of one and messages out of the other would show
+messages inside phases they never occurred in. A rebuild moves the corpus into schema 3 and the
+note goes away.
 
 ## Separate stages
 
@@ -752,8 +773,9 @@ example-team/
 │   ├── messages.jsonl               # prompts plus mechanically linked responses
 │   └── system-inputs.jsonl          # retained scheduled/synthetic coordinator inputs
 ├── data/
-│   ├── timeline-v2.json[.gz]        # browser bootstrap; objects/ holds its immutable shards
-│   ├── timeline-v3.json             # `./timeline`'s bootstrap; shards under timeline-v3/
+│   ├── timeline-v3.json             # the only bootstrap a build writes; shards under timeline-v3/
+│   │                                #   read by `./timeline` and by the browser alike
+│   │                                #   timeline-v3/search{,-bloom,-links}/ is transcript search
 │   └── details/<phase-id>.json[.gz]
 ├── snapshot-root.json               # where this archive keeps its vendor source snapshots
 └── teams/example-team/
@@ -969,18 +991,26 @@ anything left behind keeps the directory itself in place.
 ### The retired schema-1 monolith, and `gc`
 
 `data/timeline.json` was the whole presentation timeline in one JSON document — 246,973,399
-bytes, plus a 33,997,790-byte gzip twin, on one twelve-team archive. A published build no longer
-writes it. Both readers had already retired it: `./timeline` prefers the schema-3 shards, then
-the schema-2 objects, and opens the monolith only if neither is there, and the website loads
-`data/timeline-v2.json` and falls back to the monolith only when that load fails. Every build
-writes both of the generations in front of it, so nothing an up-to-date tool produces needs it.
+bytes, plus a 33,997,790-byte gzip twin, on one twelve-team archive. `data/timeline-v2/` was the
+generation after it, 1,503,831,881 bytes across 661 content-addressed objects. **A published build
+now writes neither.** Both readers reach them only as fallbacks: `./timeline` and the browser both
+try schema 3 first, then schema 2, then the monolith, and every build writes a complete schema 3,
+so nothing an up-to-date tool produces needs either of them.
 
-**A rebuild does not delete the copy you already have.** Not writing a file and deleting it are
-separate decisions, and only the first one belongs to a build you ran for another reason. The
-monolith is recorded in `data/export.json` under `retired_files` and left exactly where it is, so
-an older `./timeline` or a browser holding a cached `app.js` still finds what it looks for.
+**A rebuild does not delete the copies you already have.** Not writing a file and deleting it are
+separate decisions, and only the first one belongs to a build you ran for another reason. Both
+older generations are recorded in `data/export.json` under `retired_files` and left exactly where
+they are, so an older `./timeline`, or the archive's own older `app.js`, still finds what it looks
+for. That last one is not hypothetical: the browser bundle is *copied into* the archive by the
+build that made it, so an archive you built before this change has a bundle that has never heard of
+schema 3, and it will keep that bundle until you rebuild.
 
-Reclaiming it is `gc`, and `gc` defaults to telling you rather than doing anything:
+That is also the second condition on reclaiming the monolith itself, alongside a complete
+`data/timeline-v3.json`: if your archive's own `app.js` has no schema-3 mode **and** there is no
+`data/timeline-v2.json` beside it, `data/timeline.json` is the last thing that bundle can open, and
+`gc` holds it. Rebuild and it goes.
+
+Reclaiming either is `gc`, and `gc` defaults to telling you rather than doing anything:
 
 ```bash
 agent-team-timeline gc --output .            # dry run: every category, by bytes
@@ -1015,17 +1045,25 @@ operation is reversible and the second one is a decision you have to type out on
 measured archive, 1,434.2 MiB in 658 objects beside a 5.4 MiB bootstrap, against 37 MiB for all of
 schema 3. `gc` splits it in two and only ever offers one of the halves.
 
-The half it does not offer is `schema-2-search-corpus` — 509.1 MiB of it, 35% — and the reason is
-that schema 3 never replaced it. **Transcript search is still schema 2.** The corpus is a set of
-content-addressed day shards with trigram blooms, catalogued in the `search` section of
-`data/timeline-v2.json`, and `timeline search` and `timeline show` read it out of there even on an
-archive whose schema 3 is perfect. Reclaiming it would not make anything slower, it would delete
-those two commands. So `gc` holds the bootstrap and every object that section names, in every
-world, including the one where the presentation format is retired — that flip is about the
-timeline, not about search — and stops holding them only when a build stops naming them.
+The half it may not offer is `schema-2-search-corpus` — 509.1 MiB of it, 35%. The corpus is a set
+of content-addressed day shards with trigram blooms, catalogued in the `search` section of
+`data/timeline-v2.json`, and for a long time it was the *only* copy: `timeline search` and
+`timeline show` read it out of there even on an archive whose schema 3 was perfect. Reclaiming it
+then would not have made anything slower, it would have deleted those two commands.
+
+Schema 3 now publishes a corpus of its own, in three more streams — the records under
+`data/timeline-v3/search/`, the trigram prefilter under `search-bloom/`, the prompt/response
+relationships under `search-links/` — and on the measured archive that is 67.0 MiB against 509.1,
+answering the same queries with byte-identical results while reading 6.4 times fewer bytes. So the
+question `gc` asks is **about your archive, not about your tool**: does the `data/timeline-v3.json`
+here name `search` shards. If it does, these objects are a duplicate like everything else in the
+generation and go with it. If it does not — which is every archive built before the streams
+existed — they are held, in every world including the one where the presentation format is
+retired, because that flip is about the timeline and not about search. One rebuild, which costs no
+tokens, is what moves an archive from the second case to the first.
 
 The half it does offer is `superseded-schema-2`, the presentation objects and the manifest, and it
-holds those under **four** preconditions rather than the monolith's one.
+holds those under **four** preconditions rather than the monolith's two.
 
 The first is the same: a `data/timeline-v3.json` that passes the reader's own five-clause
 completeness rule. The second is that **this tool no longer writes schema 2 at all** — and that is
@@ -1038,10 +1076,11 @@ schema-2 files as its own output. "The last build did not write it" is not evide
 anywhere else in `gc`; "no build can write it" is, and the writer enforces it by refusing to run
 while that constant is false.
 
-Today the constant is true, because the website is the reason schema 2 exists: `static/app.js`
-loads `data/timeline-v2.json` and has no schema-3 mode, so retiring the format would retire the
-graphical surface. So `gc` holds those bytes and says which constant holds them. Nothing you can do
-to an archive changes that line; a release of this tool does.
+**That constant is now false**, so this precondition is satisfied for every archive. It was true
+for a long time because the website was the reason schema 2 existed: `static/app.js` loaded
+`data/timeline-v2.json` and had no schema-3 mode, so retiring the format would have retired the
+graphical surface. The bundle now loads `data/timeline-v3.json` and reads its shards a gzip member
+at a time over HTTP Range, which is what let the writer stop.
 
 The third and fourth can be satisfied and unsatisfied by an ordinary accident, so they are worth
 knowing about before you meet one.
@@ -1054,13 +1093,14 @@ flawless and a team short. `gc` compares the two `source_digest` values, which i
 comparison the reader refuses on when a search makes it open both generations, and holds
 everything if they disagree. The remedy is to re-run the build.
 
-The fourth is your own copy of `app.js`. A build *copies* the browser bundle into the archive it
-builds; `gc` does not rewrite it, and should not. So an archive built before the flip carries a
-bundle with no schema-3 mode, and sweeping without rebuilding — the whole convenience `gc` sells —
-would leave `index.html` fetching a file that is now in the trash and falling back to another one
-that is also in the trash. `gc` therefore asks whether your archive's `app.js` mentions
-`data/timeline-v3.json` and holds the generation until it does. One rebuild fixes it, per archive:
-a tool upgrade cannot reach into an archive you built last month.
+The fourth is your own copy of `app.js`, and it is the one that will actually stop you. A build
+*copies* the browser bundle into the archive it builds; `gc` does not rewrite it, and should not.
+So an archive built before this change carries a bundle with no schema-3 mode, and sweeping without
+rebuilding — the whole convenience `gc` sells — would leave `index.html` fetching a file that is now
+in the trash and falling back to another one that is also in the trash. `gc` therefore asks whether
+your archive's `app.js` mentions `data/timeline-v3.json` and holds the generation until it does.
+One rebuild fixes it, per archive: a tool upgrade cannot reach into an archive you built last month,
+which is exactly why this gate is per archive and permanent rather than a step in a migration.
 
 **When all four are satisfied, read the reason before you type `--delete`.** Reclaiming schema 2's
 presentation half removes the last fallback. The reader tries schema 3, then schema 2, then
@@ -1078,9 +1118,10 @@ which case you are in, in the reason itself.
 
 Four things `gc` reports and deliberately never touches.
 
-The transcript search corpus, above: `data/timeline-v2.json` and the objects its `search` section
-names. It is the one category held for a reason that no release can change, because it is not a
-duplicate of anything — the successor does not exist yet.
+The transcript search corpus, above, in an archive whose own `data/timeline-v3.json` publishes no
+`search` streams: the schema-2 bootstrap and the objects its `search` section names. It is held for
+a reason no release can change on your behalf, because the successor has to be *in this archive*
+and only a rebuild puts it there — the same shape as the `app.js` precondition below.
 
 The schema-2 objects listed as `retained_objects` are the previous generation's, kept alive for
 one more generation so that a browser which already loaded the previous bootstrap can still fetch
@@ -1396,8 +1437,11 @@ day objects; short or non-ASCII terms never reject an object on their own. Match
 ASCII-case-insensitive and non-ASCII-exact so it stays byte-for-byte compatible with that filter.
 Compact linkage sidecars preserve prompt excerpts and linked-response counts across UTC-day
 boundaries even when the prompt's text shard does not match the query. The website loads the full
-linked messages on demand, verifies current content-addressed object bytes before parsing them,
-debounces normal typing, and bounds concurrent shard requests.
+linked messages on demand, debounces normal typing, and bounds concurrent shard requests. On a
+schema-3 archive it reads the same corpus out of `data/timeline-v3/search{,-bloom,-links}/`, and
+the trigram filter is fetched **only when the query has a term a trigram can be built from** — so a
+two-byte query such as `B3` transfers no filter data at all, where the older layout carried every
+filter in the bootstrap and then used none of them.
 
 The older `--scope summaries|transcripts|all` form remains available for compatibility with phase
 summary/detail search. Search-v2-only flags require `--in`; they are rejected rather than silently
@@ -1417,7 +1461,7 @@ agent-team-timeline gc --output ./timelines/example-team
 `inspect` prints track/phase/edge/event/rollup counts and the current manifest. It reads them out
 of the schema-3 catalogue when the archive has one, which is why it is now instant: on one
 twelve-team archive the old whole-monolith parse cost 2.4 seconds and 1.44 GiB resident for six
-integers the 89 KB bootstrap already publishes.
+integers the 169 KB bootstrap already publishes.
 
 `gc` accounts for disk rather than records: every file classified as live, reclaimable or held,
 with bytes and a reason per category. It changes nothing without `--delete`; see "The retired

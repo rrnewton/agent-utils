@@ -95,8 +95,9 @@ so the server can fall back to the new uncompressed bytes rather than pair them 
 bytes. All artifact catalogs, phase details, summaries, and their refreshed sidecars are complete
 before a schema-2 bootstrap publishes objects that refer to them.
 
-Builds additionally project schema 1 into the backwards-compatible schema-2 browser layout.
-`data/timeline-v2.json` is the stable bootstrap: it carries site/team identity, the complete time
+Schema 2 is the generation before it, no longer written by any build and still read by both
+readers when an archive an older tool produced is opened. `data/timeline-v2.json` is its stable
+bootstrap: it carries site/team identity, the complete time
 range, aggregate activity bins, content-addressed global and phase-index references, and a UTC-day
 detail catalog. The lightweight phase index supplies complete lifetime phase cards without their
 state arrays. The immutable global object carries agent lifetimes, precomputed activity bounds,
@@ -106,7 +107,7 @@ intersecting phases (including their states), events, and detailed message edges
 detailed edge crossing midnight appears in both day objects; the browser deduplicates it by stable
 ID. Object basenames are their complete SHA-256 digest, and their gzip sidecars are generated
 before the bootstrap atomically publishes those URLs. Schema 1 remains the archive-local CLI
-projection and the browser fallback for older exports.
+projection and the last fallback for older exports.
 `data/timeline-v2/manifest.json` inventories the current and immediately preceding distinct object
 generation. Identical rebuilds preserve that preceding generation without file churn; a later
 changed generation collects objects retired for two generations. This bounded grace covers the
@@ -114,17 +115,24 @@ ordinary publication race without unbounded disk growth. Scope narrowing or a te
 disables the grace and purges dereferenced objects immediately so an export cannot retain data
 outside its declared slice.
 
-Builds also project schema 1 into schema 3, the chunked seekable layout, beside schema 2.
+Builds project schema 1 into schema 3, the chunked seekable layout, and into nothing else.
 `data/timeline-v3.json` is its bootstrap: identity, time range, team records, the codec
 parameters, and a catalogue of every shard with its record count, byte counts, time bounds and
-both digests. Aggregate activity bins are **not** inlined there — they are their own shard — which
-is why the schema-3 bootstrap is 89,298 bytes where the schema-2 bootstrap is 5,702,530. Shards
+both digests. Aggregate activity bins are **not** inlined there — they are their own shard — and neither are the
+transcript search prefilters, which is why the schema-3 bootstrap is 168,703 bytes where the
+schema-2 bootstrap is 5,702,530. Shards
 are multi-member gzip files of minified JSONL, one record per line, written and indexed by the
 seekable JSONL codec: `data/timeline-v3/timeline/<team>/<UTC-day>.jsonl.gz` for events, phases and
 message edges, `data/timeline-v3/spine/<team>.jsonl.gz` for the records with no single instant
 (team, agents, phase cards, structural edges, rollups, projects, summary files, glossary, project
 overview, and the derived zoom bounds), and `data/timeline-v3/bins.jsonl.gz` for activity bins
-across all teams. Each shard has
+across all teams. Three further streams carry the transcript search corpus when a build has one:
+`data/timeline-v3/search/<team>/<UTC-day>.jsonl.gz` for the records, one shard per team of
+`data/timeline-v3/search-bloom/` for the trigram prefilter, and one per team of
+`data/timeline-v3/search-links/` for the prompt/response relationships. On the measured archive
+that corpus is 67.0 MiB in 192 files against schema 2's 509.1 MiB in 290, and a search reads
+6.4 times fewer bytes for a byte-identical answer; `timeline_v3`'s module docstring records the
+design, the rejected alternatives and every figure. Each shard has
 a `.index.jsonl` sidecar giving per-member byte offsets, line ranges and time bounds, so a window
 read costs the size of the answer; the spine additionally publishes each record kind's line range
 in the bootstrap, because it has no time axis to seek on. A schema-3 shard exists **once** — there
@@ -138,24 +146,46 @@ millisecond past the instant it occupies. Over the whole measured archive schema
 bytes against 280,971,189 for schema 1 and 1,503,831,881 for schema 2, and adding one day rewrites
 387,547 of those bytes.
 
+**The generation that answers a transcript search is chosen separately from the generation that
+draws the timeline, in both readers.** The three search streams arrived after the schema-3
+timeline did, so an archive built between those two moments has a schema-3 timeline beside a
+schema-2 corpus and nothing else — and both readers use it: `query.TimelineQuery._search_bootstrap`
+opens `data/timeline-v2.json` for exactly that archive, and `static/app.js` does the same through
+`app.searchCorpusMode`, which is `"schema3"`, `"schema2"` or `"none"` independently of
+`app.schemaMode`. Both refuse rather than fall back when the two generations disagree about their
+`source_digest`: that is two different builds, and answering phases out of one and messages out of
+the other would place messages inside phases they never occurred in. The page says which of the
+three happened in its meta line, because "this archive predates the schema-3 search corpus" is a
+fact about the archive that only the page can see. The corpus is also all-or-nothing **per team**
+and not only per stream in both readers — a build that died between two teams leaves all three
+sections non-empty and one team's relationships missing, and a search over that team would then
+render every linked reply as unlinked, which is an ordinary-looking answer rather than an error.
+
 ### Retiring a format generation, and `gc`
 
-A published build writes schema 2 and schema 3 and **not** the schema-1 monolith. The two older
-generations were retired at different times because their readers retired them at different
-times: `./timeline` reaches `data/timeline.json` only when neither newer bootstrap is present,
-and the website reaches it only when its schema-2 load throws, but the website has no schema-3
-mode at all, so schema 2 stays and schema 1 goes. On the measured archive that is 280,971,189
-bytes — 246,973,399 plus a 33,997,790-byte twin — no longer written on every build. Schema 1
-remains the *intermediate* format the combined export merges: `multi_team` renders each team into
-a temporary directory with `_published=False`, reads `data/timeline.json` back out of it, and
-publishes only the merged schema 2 and schema 3.
+**A published build writes schema 3 and nothing else.** Both older generations are retired as
+outputs, and they were retired one at a time because their readers retired them one at a time.
+`./timeline` reaches `data/timeline.json` only when neither newer bootstrap is present, and the
+website used to reach it only when its schema-2 load threw — so schema 1 went first, 280,971,189
+bytes on the measured archive (246,973,399 plus a 33,997,790-byte twin). Schema 2 stayed for one
+reason only: the website had no schema-3 mode, and retiring the only format the graphical surface
+could open would have retired the surface. `static/app.js` now loads `data/timeline-v3.json` and
+reads its shards one gzip member at a time over HTTP Range, so `timeline_shards.SCHEMA_2_IS_PUBLISHED`
+is `False`, `write_timeline_shards` refuses to run, and both call sites are gone. That is a further
+1,503,831,881 bytes across 661 files no longer written on every build, of which 509.1 MiB was a
+second copy of the transcript search corpus schema 3 now carries. Schema 1 remains the
+*intermediate* format the combined export merges: `multi_team` renders each team into a temporary
+directory with `_published=False`, reads `data/timeline.json` back out of it, and publishes only
+the merged schema 3.
 
 Not writing a file and deleting it are separate decisions. A rebuild over an archive that already
-has the monolith leaves it exactly where it is and records it in `data/export.json` under
-`retired_files`; the presentation sweep, which otherwise reaps `previous - current`, is told to
-skip it. That keeps an archive written by an older tool readable by an older reader, and it keeps
-a quarter-gigabyte irreversible unlink from happening as a side effect of a build run for another
-reason.
+has either older generation leaves both exactly where they are and records them in
+`data/export.json` under `retired_files`; the presentation sweep, which otherwise reaps
+`previous - current`, is told to skip them. That keeps an archive written by an older tool readable
+by an older reader — including its own copy of `app.js`, which no tool release can update — and it
+keeps 1.8 GB of irreversible unlink from happening as a side effect of a build run for another
+reason. `render.retired_generation_files` is the seam, and it is named for two generations because
+it now holds two.
 
 The deletion is `agent-team-timeline gc`, which defaults to a dry run and classifies every file
 in the archive as live, reclaimable or held, with the reason printed per category even when the
@@ -163,26 +193,31 @@ category is empty. It is a third user of the archive's existing mark-and-sweep i
 a second idiom, and it inherits both of the existing users' refusals: nothing is reclaimed on the
 strength of "the last build did not write it", only when a named superseding artifact is present
 **and complete** — schema 3's completeness judged by the same five-clause rule the reader applies
-— or when a manifest authoritative over a directory disowns the file. Two categories are
-reclaimable today: the schema-1 monolith, and schema-2 objects in neither `current_objects` nor
-`retained_objects`. Six are reported and never reclaimed: the schema-2 presentation generation
-(below), the transcript search corpus (below, and never reclaimable at all), `retained_objects`
+— or when a manifest authoritative over a directory disowns the file. Three categories are
+reclaimable on a rebuilt archive: the schema-1 monolith, the schema-2 presentation generation
+(below), and schema-2 objects in neither `current_objects` nor `retained_objects`. The rest are
+reported and never reclaimed: the transcript search corpus in archives whose schema 3 has none
+(below), `retained_objects`
 (the previous generation's, kept one generation so a reader holding the previous bootstrap can
 still fetch what it names), shards under `data/timeline-v3/` the bootstrap does not name,
 `teams/*/source_snapshots/` (vendor input, gated by `audit-losslessness --require-lossless`, and
 empty on an archive `migrate-snapshots` has moved), and the trash itself.
 
 `data/timeline-v2/` is 1,434.2 MiB on the measured archive, an order of magnitude more than
-anything else `gc` can see, and it is **two things in one directory**. Schema 3 replaced the
-presentation timeline; it did not replace the transcript search corpus, which is still schema-2
-content-addressed day shards with trigram blooms catalogued in the bootstrap's `search` section —
-`query.TimelineQuery._search_bootstrap` opens that generation from under a complete schema 3 and
-says so in its first paragraph. The two halves are indistinguishable on disk, sharing one
+anything else `gc` can see, and it is **two things in one directory**: the presentation timeline
+schema 3 replaced first, and the transcript search corpus — content-addressed day shards with
+trigram blooms catalogued in the bootstrap's `search` section — which schema 3 replaced second,
+with its own `search` streams. The two halves are indistinguishable on disk, sharing one
 content-addressed directory, so only the catalogue can separate them; `schema-2-search-corpus`
-does, and holds 509.1 MiB of the total in every world, including the retired one. A flip that
-retires the presentation format supersedes nothing here, and reclaiming an unsuperseded capability
-because a neighbouring tenant of the same directory got a successor would be the same class of
-mistake as reclaiming on "the last build did not write it".
+does, and holds 509.1 MiB of the total for as long as it is that archive's only copy.
+
+Whether it still is, is asked **per archive** rather than per release, exactly as the `app.js`
+precondition is: a tool that can write the corpus does not put one into an archive built last
+month, so `gc` looks for `search` shards in the schema-3 bootstrap sitting beside this schema 2.
+Where it finds them, the corpus is a duplicate like the rest of the generation and is accounted
+for by `superseded-schema-2`; where it does not, holding it is the same rule as everywhere else
+here — reclaim what a named, present successor covers, and nothing else. One rebuild, which costs
+no tokens, moves an archive from the second state to the first.
 
 `superseded-schema-2` is the other half — 925.1 MiB — and it takes three preconditions the
 monolith never needed. **Is it still produced**: a superseding artifact says the archive can be
@@ -193,7 +228,8 @@ republishing an identical schema 2 moves no mtime — on the measured archive th
 object was thirteen hours older than the schema-3 bootstrap while the same build's
 `data/export.json` named all 661 schema-2 files as its own output. So it comes from the code,
 `timeline_shards.SCHEMA_2_IS_PUBLISHED`, which `write_timeline_shards` enforces by refusing to run
-while it is false: the difference between "no build did" and "no build can". **Is that schema 3 a
+while it is false: the difference between "no build did" and "no build can". It is now `False`,
+so this precondition holds for every archive and the remaining two decide each case. **Is that schema 3 a
 successor**: completeness is entirely intra-generation, so a schema 3 a whole build behind passes
 all five clauses, and publication order is schema 2 then schema 3, which makes "new schema 2 beside
 old, flawless schema 3" one interrupted build away — the `source_digest` comparison the reader
@@ -240,8 +276,7 @@ because the first pass is reversible and the second is not. The trash directory 
 archive's generated `.gitignore` before it can exist.
 
 `inspect` no longer parses the monolith to print six integers: schema 3's catalogue publishes a
-per-record-kind count for every shard, so the same six numbers come out of the 89,298-byte
-bootstrap. Measured on the archive's data, 1,480.3 MiB resident and 2.447 s became 71.9 MiB and
+per-record-kind count for every shard, so the same six numbers come out of the bootstrap alone. Measured on the archive's data, 1,480.3 MiB resident and 2.447 s became 71.9 MiB and
 0.011 s, with identical counts.
 
 The zoom bounds — the smallest interval that contains an agent's, a phase's or a rollup's actual
@@ -260,8 +295,9 @@ schema 1 when it is not. Complete means: the bootstrap is a regular file declari
 codec block names a container, timestamp key, record-kind key and index suffix this reader
 implements; every shard it names resolves inside `data/timeline-v3/`, is a regular file of exactly
 the published `c_bytes`, and has a sidecar beside it; and the set of teams with spine shards equals
-the set of teams the bootstrap inlines. Those checks are one parse of an 89 KB file and two `stat`
-calls per shard, so they run before every query. The published `c_sha256`/`u_sha256` are **not**
+the set of teams the bootstrap inlines. Those checks are one parse of the 168,703-byte bootstrap
+and two `stat` calls per shard — 181 shards, so 362 calls, on the measured archive — so they run
+before every query. The published `c_sha256`/`u_sha256` are **not**
 verified on the read path — that would mean reading all 38 MB to answer a question that costs
 300 KB — so a same-length substitution of a shard's contents is the documented limit, narrowed but
 not closed by the sidecar agreement checks the reader makes when it opens a shard. Whether schema 3
@@ -274,9 +310,10 @@ Measured on the same archive, in bytes read from disk to answer one question inc
 archive: `list agents --team <one>` costs 284,952 against schema 2's 25,692,901; `show` of one
 reference 342,601 against 25,692,901; `stats --team <one>` 342,601 against 25,692,901; `stats`
 over every team 2,483,652 against 25,745,677; `search --scope summaries` over every team 2,483,652
-against 25,745,677. Opening the archive and asking nothing costs 89,298 bytes against 25,692,901.
-Transcript search is the exception and stays close to schema 2's cost, because its corpus is
-schema 2's.
+against 25,745,677. Opening the archive and asking nothing costs the bootstrap — 89,298 bytes
+before the search streams and 168,703 after — against 25,692,901. Transcript search used to be the
+exception, because its corpus was schema 2's; on an archive carrying the schema-3 corpus it reads
+about 72 MB against schema 2's 464 MB for the same result page.
 
 The browser does not infer complete statistics from a partially loaded set of days. It uses the
 global aggregate only for an unfiltered full-range view, computes narrower totals only when every
@@ -305,34 +342,76 @@ half a document. A multi-range request, or a range wider than 16 MiB, is answere
 representation instead, which is always a legal answer. The built-in handler disables directory
 listing so generated object and transcript filenames cannot be enumerated through the server.
 
-The browser first probes schema 2, then falls back to schema 1 when the bootstrap is absent (or when
-an incomplete schema-2 publication cannot be read). That fallback is now only reachable in an
-archive an older tool wrote, because a published build no longer emits the monolith; it is kept
-because such archives exist, not because a new one produces the state it handles. At aggregate zoom it uses bootstrap activity
-bins without loading a detail day. Detail zoom loads only UTC-day objects intersecting the visible
-range plus a one-hour-or-eight-percent buffer. Lifetime zoom uses the global lifetimes and
-structural edges without loading detail days. A `Map<URL, Promise>` retains each object request,
-and a second range visit never refetches or reapplies it. Full transcript search does not scan phase
-detail objects. The bootstrap instead catalogs content-addressed `(team, UTC day)` search objects
-whose records come directly from normalized events and condensed tool calls. The browser validates
-each object's team, range, record count, record identities, roles, and known agents before merging
-it. Current objects carry identity byte counts and are SHA-256 verified before JSON parsing. This
-keeps search complete outside the viewport and makes inclusion independent of phase segmentation.
-Each catalog entry also carries a deterministic Bloom filter over whitespace-compacted UTF-8 byte
-trigrams after ASCII-only case folding. Exact search uses that same portable ASCII-only case-folding
-contract; non-ASCII characters remain exact. Smart-query terms are tested independently; non-ASCII
-or shorter-than-three-byte terms never reject an object, so a query with no eligible term scans all
-selected objects. The filter may fetch an extra object but can never authorize a match or omit one
-from a correctly built catalog. Compact content-addressed linkage sidecars preserve prompt excerpts
-and response counts independently of text-shard selection, so a response after midnight still opens
-its previous-day prompt. Normal typing is debounced, shard fetches have bounded concurrency, and a
-request-generation guard prevents a stale search from replacing newer results.
+**The browser probes schema 3 first, then schema 2, then schema 1**, and announces in the meta line
+which generation it fell back from and why. Both directions of the mismatch are real: an archive
+built before schema 3 ships a bundle that has never heard of it, and this bundle is opened against
+archives nobody has rebuilt, because a build copies `app.js` into the archive it builds.
 
-This delivery layer is additive. Opening the archive through another static server still serves
-the identity files correctly, while older generated sites without sidecars or schema 2 remain
-valid. The schema-1 monolith remains readable where an older build left one, but it is no longer
-written, and schema-2 startup avoids its whole-file transfer, parsing, and object-graph cost. Measurements and remaining work are recorded
-in `ai_docs/PAYLOAD_SCALING.md`.
+A schema-3 first paint fetches `data/timeline-v3.json` and then, in one parallel round, two
+published *line ranges* out of each team's spine shard and the single bins shard. The spine lays
+its kinds down in a declared order and the two the frame does not need are the two largest, so the
+paint is `[0, l0(phase_card))` and `[l0(structural_edge), l0(activity_bounds))` — a page that never
+opens an agent lifetime never inflates the cards, and one that never zooms never inflates the
+bounds. Measured on the twelve-team archive through its own `serve.py`:
+
+| | transferred | JSON parsed | requests |
+|---|---|---|---|
+| schema 2 | 4,502,381 | 16,060,900 | 2 |
+| schema 3 | 2,155,957 | 16,135,089 | 34 |
+
+**2.09× fewer bytes, the same parse, and twenty more round trips.** All three are the trade this
+layout makes and none of them is hidden: the parse does not improve because both generations
+materialise the same records to draw the same frame, and the requests are the cost of seeking —
+one bootstrap, thirteen sidecars totalling 8,218 bytes, and twenty member reads, issued in
+parallel. What moves is transfer, because a schema-3 shard is stored compressed with no plain twin
+and is served as it is stored. The two deferred kinds cost 340,835 bytes (phase cards, on the first
+lifetime open) and 78,228 (zoom bounds, on the first zoom) against schema 2's 826,578-byte,
+9,632,001-parsed phase-index object and zoom bounds it had already paid for inline.
+
+Every shard read is a `Range` request for exactly one gzip member, whose compressed offset, line
+range and time bounds the `.index.jsonl` sidecar published. A member is itself a complete gzip
+stream, so what arrives is never multi-member and `DecompressionStream("gzip")` inflates it
+natively; the server does the seeking, which is what the format was chosen for. A dynamic
+`serve.py` endpoint that returned decoded JSON was considered and refused, because it would stop
+the archive being a directory of static files, would put a second implementation of the member
+table into a file frozen into every archive at build time, and would send *more* bytes. The ETag of
+the first range response is remembered and sent back as `If-Range` on every later one, so a rebuild
+under an open page is refused rather than spliced. Nothing is believed before it is checked against
+the bootstrap: the sidecar's digests, sizes and counts must equal the catalogue entry's, the member
+table must be contiguous and cover them, each 206's total must equal the catalogue's `c_bytes`, and
+each member must inflate to exactly its published length and line count.
+
+Detail zoom loads only shards intersecting the visible range plus a one-hour-or-eight-percent
+buffer, by the published `t0 < T1 and t_end_exclusive > T0` rule, and filters within the member
+because a member is the smallest thing the format can seek to. Aggregate zoom uses the bins shard
+without loading a detail day. Lifetime zoom uses the spine's agents and structural edges. The
+spine's `phase_card` kind *is* schema 2's phase index — the same nine fields, no state arrays — so
+opening an agent lifetime costs no fetch at all, where schema 2 fetched a separate object. Zoom
+bounds are fetched per team on the first zoom, by line range, and looked up by the archive's stable
+reference. A `Map<key, Promise>` retains each sidecar and each member, and a second visit to a
+range never refetches or reinflates it.
+
+Transcript search reads the three schema-3 search streams. The prefilter is its own per-team stream
+rather than an inlined bootstrap field, and it is fetched **only when the query has a term a
+trigram can be built from** — so a two-byte query reads no Bloom data at all, where schema 2 parsed
+4,527,592 base64 characters out of the bootstrap and then skipped every filter. Selection happens
+after the filters are in hand, so a shard the filter rules out is never fetched. The relationship
+sidecar is one shard per team with a published line range per kind, so a response after midnight
+still opens its previous-day prompt without reopening a pruned text shard. Exact search uses the
+same portable ASCII-only case-folding contract the filter does; non-ASCII characters remain exact,
+and a non-ASCII or shorter-than-three-byte term never rejects a shard. Normal typing is debounced,
+fetches have bounded concurrency, and a request-generation guard prevents a stale search from
+replacing newer results.
+
+The schema-2 path is unchanged and still validates what it always did: each object's team, range,
+record count, record identities, roles and known agents, with identity byte counts and a SHA-256
+verified before JSON parsing.
+
+This delivery layer is additive. Opening the archive through another static server still serves the
+identity files correctly — schema 3 needs only `Range`, which every static server implements — and
+older generated sites without sidecars or schema 2 remain valid. The schema-1 monolith and the
+schema-2 generation remain readable where an older build left them, but neither is written.
+Measurements and remaining work are recorded in `ai_docs/PAYLOAD_SCALING.md`.
 
 ### Read-only query boundary
 

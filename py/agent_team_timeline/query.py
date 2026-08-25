@@ -885,6 +885,24 @@ _SCHEMA_3_TIMESTAMP_KEY = "at_ms"
 _SCHEMA_3_RECORD_KIND_KEY = "record_kind"
 _SCHEMA_3_STREAMS = ("timeline", "spine", "bins")
 
+#: The three streams that carry the transcript search corpus. Optional, and all-or-nothing: an
+#: archive built before the corpus moved into schema 3 names none of them and gets the schema-2
+#: corpus, while one that names some but not all is a generation this reader declines rather than
+#: half-reads -- a corpus without its prefilter would silently over-read, and one without its
+#: relationship sidecar would answer with linkage it cannot see, which is a wrong answer rather
+#: than a slow one.
+_SCHEMA_3_SEARCH_STREAMS = ("search", "search_bloom", "search_links")
+
+_SCHEMA_3_SEARCH_KIND = "search_record"
+_SCHEMA_3_BLOOM_KIND = "search_bloom"
+_SCHEMA_3_PROMPT_LINK_KIND = "search_prompt"
+_SCHEMA_3_RESPONSE_LINK_KIND = "search_response"
+
+#: One UTC day, in milliseconds. A ``search`` shard's window is the day its catalogue entry names,
+#: derived rather than published: the entry already carries ``day``, and a second copy of the same
+#: interval is a second thing that can disagree with the records inside it.
+_DAY_MS = 24 * 60 * 60 * 1000
+
 #: Which spine kind answers a question about each stable-reference kind. ``phase`` is the
 #: outlier and deliberately so: a schema-3 spine carries the phase *card*, the same nine fields
 #: schema 2's phase index publishes, not the full phase with its state runs and transcript
@@ -996,7 +1014,10 @@ class _SchemaThreeArchive:
     ``global`` object and a ``phase_index`` object that together cost 25,692,901 bytes to open
     on the measured archive, unconditionally, before the first question is asked, because both
     are single JSON documents that must be parsed whole. The same questions against schema 3
-    cost the 89,298-byte bootstrap plus the members the answer actually lives in.
+    cost the 168,703-byte bootstrap plus the members the answer actually lives in. (89,298 of
+    those bytes were the bootstrap before the search streams; the other 79,405 are their 96
+    catalogue entries, and none of it is Bloom data -- schema 2 inlined 4.5 MB of that into the
+    file every command reads.)
 
     Completeness, and why it is checked this way
     --------------------------------------------
@@ -1018,9 +1039,10 @@ class _SchemaThreeArchive:
     5. The converse of 3: every shard-shaped file **on disk** under ``data/timeline-v3/`` is
        named by the catalogue. Nothing published there is unaccounted for.
 
-    Rules 1-5 cost one parse of an 89 KB file, one walk of a machine-owned directory tree, and
-    two ``stat`` calls per shard (342 on the measured archive), which is why they can run before
-    every query rather than behind a flag.
+    Rules 1-5 cost one parse of the bootstrap -- 168,703 bytes -- one walk of a machine-owned
+    directory tree, and two ``stat`` calls per shard: 181 shards on the measured archive once it
+    carries the search streams, so 362 calls, against 85 shards and 170 calls before them. That
+    is why they can run before every query rather than behind a flag.
 
     They rest on the writer's publication order, which is load-bearing and stated in
     :mod:`agent_team_timeline.timeline_v3`: every shard and sidecar is written before the
@@ -1065,10 +1087,18 @@ class _SchemaThreeArchive:
     describe the same source generation is only answerable by reading schema 2's bootstrap --
     5,702,530 bytes on the measured archive, sixty-five times the size of schema 3's, and
     exactly the file schema 3 exists to stop opening. So it is checked at the one place the two
-    generations are used *together*: transcript search reads schema 2's corpus while the phases
-    and agents around it come from schema 3, so :meth:`TimelineQuery._search_bootstrap` refuses
-    a ``source_digest`` mismatch at the moment it opens that corpus -- where the schema-2
-    bootstrap is being read anyway and the comparison is free.
+    generations are used *together*: an archive whose schema 3 predates the ``search`` streams
+    answers a transcript search out of schema 2's corpus while the phases and agents around it
+    come from schema 3, so :meth:`TimelineQuery._search_bootstrap` refuses a ``source_digest``
+    mismatch at the moment it opens that corpus -- where the schema-2 bootstrap is being read
+    anyway and the comparison is free. On an archive whose schema 3 *does* carry the corpus there
+    is nothing left to check: both halves come from this bootstrap.
+
+    **What the search streams add.** Three optional streams -- ``search``, ``search_bloom`` and
+    ``search_links`` -- carry the transcript search corpus when the build published one. They are
+    the only streams this class reads besides the spine, and they are read only by a search: see
+    :meth:`search_shards`, :meth:`search_blooms` and :meth:`search_links`, and
+    `timeline_v3`'s module docstring for why they are three rather than one.
     """
 
     def __init__(
@@ -1089,6 +1119,30 @@ class _SchemaThreeArchive:
         self._bins: tuple[_ShardEntry, ...] = tuple(
             entry for entry in shards if entry.stream == "bins"
         )
+        self._search: tuple[_ShardEntry, ...] = tuple(
+            entry
+            for entry in shards
+            if entry.stream == "search" and entry.team is not None and entry.day is not None
+        )
+        self._search_bloom: dict[str, _ShardEntry] = {
+            entry.team: entry
+            for entry in shards
+            if entry.stream == "search_bloom" and entry.team is not None
+        }
+        #: Which ``search`` shard paths each team owns, so a prefilter record can be checked
+        #: against the shard it claims to describe rather than merely against the shard it was
+        #: read out of. See :meth:`search_blooms` for what a missing check would cost.
+        self._search_paths_by_team: dict[str, frozenset[str]] = {
+            team: frozenset(
+                entry.path for entry in self._search if entry.team == team
+            )
+            for team in {entry.team for entry in self._search if entry.team is not None}
+        }
+        self._search_links: dict[str, _ShardEntry] = {
+            entry.team: entry
+            for entry in shards
+            if entry.stream == "search_links" and entry.team is not None
+        }
         self.teams: tuple[str, ...] = tuple(sorted(self._spine))
         self._readers: dict[str, _ChunkedJsonlReader] = {}
         self._groups: dict[tuple[str, str], tuple[dict[str, JsonValue], ...]] = {}
@@ -1133,8 +1187,44 @@ class _SchemaThreeArchive:
                 "schema-3 spine shards do not cover the published teams "
                 f"(missing {missing}, unexpected {extra})"
             )
+        cls._check_search_corpus(shards)
         cls._check_nothing_unnamed(root, shards)
         return cls(root, bootstrap, len(encoded), shards)
+
+    @staticmethod
+    def _check_search_corpus(shards: Sequence[_ShardEntry]) -> None:
+        """Every team with a ``search`` shard has a prefilter shard and a linkage shard.
+
+        The stream-level all-or-nothing rule in :meth:`_catalog` says the *format* is whole; this
+        says the *corpus* is. They are different failures: a build that died between two teams
+        leaves all three sections present and one team's relationships missing, and a search over
+        that team would then report every linked response as unlinked -- a wrong answer that
+        nothing downstream can detect, because "this prompt had no replies" is a perfectly
+        ordinary result.
+        """
+
+        for entry in shards:
+            if entry.stream not in _SCHEMA_3_SEARCH_STREAMS:
+                continue
+            # Addressed by team, and the ``search`` stream by day as well. Checked rather than
+            # assumed because an entry missing either would be dropped by the per-stream tables
+            # below and its records would simply never be searched -- the corpus would be short
+            # by a shard and nothing would say so.
+            if entry.team is None or (entry.stream == "search" and entry.day is None):
+                raise SchemaThreeDeclined(
+                    f"transcript search shard {entry.path} does not name the team and day it "
+                    "is addressed by"
+                )
+        teams = {entry.team for entry in shards if entry.stream == "search"}
+        if not teams:
+            return
+        for stream in ("search_bloom", "search_links"):
+            published = {entry.team for entry in shards if entry.stream == stream}
+            missing = sorted(team for team in teams - published if team is not None)
+            if missing:
+                raise SchemaThreeDeclined(
+                    f"the transcript search corpus has no {stream} shard for {missing}"
+                )
 
     @staticmethod
     def _check_codec(bootstrap: dict[str, JsonValue]) -> None:
@@ -1170,9 +1260,16 @@ class _SchemaThreeArchive:
         missing = [name for name in _SCHEMA_3_STREAMS if name not in streams]
         if missing:
             raise SchemaThreeDeclined(f"timeline-v3.streams is missing {missing}")
+        present = [name for name in _SCHEMA_3_SEARCH_STREAMS if name in streams]
+        if present and len(present) != len(_SCHEMA_3_SEARCH_STREAMS):
+            raise SchemaThreeDeclined(
+                "timeline-v3.streams carries part of the transcript search corpus "
+                f"({present}) and not the rest; a corpus without its prefilter or its "
+                "relationship sidecar answers searches wrongly rather than slowly"
+            )
         shards: list[_ShardEntry] = []
         seen: set[str] = set()
-        for stream in _SCHEMA_3_STREAMS:
+        for stream in (*_SCHEMA_3_STREAMS, *present):
             where = f"timeline-v3.streams.{stream}"
             section = as_object(streams[stream], where)
             for index, raw in enumerate(as_array(section.get("shards"), where + ".shards")):
@@ -1439,6 +1536,125 @@ class _SchemaThreeArchive:
                 record.pop(_SCHEMA_3_TIMESTAMP_KEY, None)
                 records.append(record)
         return records
+
+    # -- the transcript search corpus --------------------------------------------------------
+
+    @property
+    def has_search_corpus(self) -> bool:
+        """Whether this generation carries the corpus, or search must fall back to schema 2."""
+
+        return bool(self._search)
+
+    def search_shards(self) -> tuple[_ShardEntry, ...]:
+        """Every ``search`` shard, in catalogue order: ``(team, UTC day)``, sorted."""
+
+        return self._search
+
+    def search_blooms(self, teams: Sequence[str]) -> dict[str, JsonValue]:
+        """The prefilter for each selected team's shards, keyed by the shard's own path.
+
+        Keyed by path rather than by ``(team, day)`` because that is the join a caller actually
+        makes -- it holds a shard entry and wants to know whether to open it -- and because the
+        path is the one identifier the writer guarantees unique across the stream.
+
+        Read only when a query has a term a trigram filter can act on; a two-byte query never
+        calls this at all. That is the whole reason the filters are a stream instead of bootstrap
+        fields: schema 2 parsed 4,527,592 base64 characters out of its bootstrap before every
+        command, search or not, and then skipped every one of them for exactly this query.
+
+        **The named path is checked against the naming team, not merely parsed.** Keying by path
+        is what makes one team's shard reachable from another team's file, and that is the one
+        way this stream can be worse than schema 2's, where each filter is inlined on the very
+        catalogue entry it belongs to and cannot be addressed anywhere else. If ``A``'s prefilter
+        shard carried a record whose ``shard`` named ``B``'s day, the loop below would overwrite
+        ``B``'s own filter with ``A``'s -- and a Bloom filter's only wrong answer is a *false
+        miss*, so `_bloom_might_match` would report a definite miss and the day would be skipped
+        whole. Every record in it would then be silently absent from the result, with no error
+        and no diagnostic: the exact shape of wrong answer this reader refuses elsewhere.
+
+        The writer derives the path from the bucket it is filtering, so nothing produces this
+        today. It is checked anyway because :meth:`_check_completeness` deliberately does not
+        verify ``c_sha256``/``u_sha256`` -- see this class's docstring for why -- and a
+        length-preserving corruption is precisely what that leaves uncaught. The check costs a
+        set membership against a catalogue this reader has already validated.
+        """
+
+        blooms: dict[str, JsonValue] = {}
+        for team in self.teams_in_scope(teams):
+            entry = self._search_bloom.get(team)
+            if entry is None:
+                continue
+            owned = self._search_paths_by_team.get(team, frozenset())
+            reader = self._reader(entry.path)
+            for record in reader.iter_records():
+                where = f"{entry.path} bloom"
+                self._unwrap(record, _SCHEMA_3_BLOOM_KIND, team, where)
+                shard = as_string(record.get("shard"), where + ".shard")
+                if shard not in owned:
+                    raise ArchiveReadError(
+                        f"{where}: prefilter names {shard!r}, which is not a search shard of "
+                        f"team {team!r}"
+                    )
+                blooms[shard] = record.get("bloom")
+        return blooms
+
+    def iter_search_shard(self, entry: _ShardEntry) -> Iterator[dict[str, JsonValue]]:
+        """Yield one ``search`` shard's records, one member at a time.
+
+        The shard is read whole rather than through :meth:`_ChunkedJsonlReader.read_range`, even
+        though it is time-addressed and a window filter is usually in play, because a shard *is* a
+        UTC day: a caller that has already decided to open it wants nearly all of it, and the
+        record-level window filter the caller applies anyway is exact where a member's ``t0``/
+        ``t1`` is only conservative. The seek stays available for a caller that wants a slice of a
+        day; nothing asks for one today.
+        """
+
+        team = entry.team
+        if team is None:
+            raise ArchiveReadError(f"schema-3 search shard names no team: {entry.path}")
+        reader = self._reader(entry.path)
+        # The catalogue's count against the sidecar's, before a single record is yielded. Schema 2
+        # makes the same comparison in the same place and for the same reason: a caller that has
+        # already begun consuming records cannot un-yield them when the shard turns out to be
+        # short, and a short shard is what a half-written generation looks like.
+        if reader.record_count != entry.records:
+            raise ValueError(
+                f"transcript search shard count mismatch: {entry.path} holds "
+                f"{reader.record_count} records, the bootstrap says {entry.records}"
+            )
+        for record in reader.iter_records():
+            yield self._unwrap(record, _SCHEMA_3_SEARCH_KIND, team, entry.path)
+
+    def search_links(
+        self, team: str, *, prompts: bool, responses: bool
+    ) -> tuple[list[dict[str, JsonValue]], list[dict[str, JsonValue]]]:
+        """One team's relationship sidecar, reading only the halves the caller asked for.
+
+        The two line ranges are what make that possible, and they pay off in both directions: a
+        search whose matches are all responses needs prompt excerpts and no response edges, and
+        one whose matches are all prompts needs the edges to count replies and no excerpts. Asking
+        for neither reads nothing, which is what a search with no linked candidates does.
+        """
+
+        entry = self._search_links.get(team)
+        if entry is None:
+            return [], []
+        wanted = {_SCHEMA_3_PROMPT_LINK_KIND: prompts, _SCHEMA_3_RESPONSE_LINK_KIND: responses}
+        found: dict[str, list[dict[str, JsonValue]]] = {
+            _SCHEMA_3_PROMPT_LINK_KIND: [],
+            _SCHEMA_3_RESPONSE_LINK_KIND: [],
+        }
+        for kind, asked in wanted.items():
+            span = entry.line_ranges.get(kind)
+            if not asked or span is None:
+                continue
+            first, count = span
+            reader = self._reader(entry.path, cache_members=True)
+            found[kind] = [
+                self._unwrap(record, kind, team, entry.path)
+                for record in reader.read_lines(first, first + count)
+            ]
+        return found[_SCHEMA_3_PROMPT_LINK_KIND], found[_SCHEMA_3_RESPONSE_LINK_KIND]
 
 
 def _schema_3_file(root: Path, relative: str) -> Path | None:
@@ -2640,6 +2856,32 @@ def _bloom_might_match(raw: JsonValue, terms: tuple[str, ...], where: str) -> bo
     return True
 
 
+def _bloom_can_prune(term: str) -> bool:
+    """Whether a trigram filter could ever reject a shard on account of this term.
+
+    The mirror of the two ``continue``s inside :func:`_bloom_might_match`: a term with a non-ASCII
+    code point is skipped because the portable filter normalizes ASCII only, and one shorter than
+    three bytes has no trigram to look up. A query all of whose terms are skipped cannot prune
+    anything, so under schema 3 -- where the filters are a stream rather than bootstrap fields --
+    it does not read them. Stated as its own predicate rather than inlined so that the condition
+    for *fetching* the filters is textually the condition for *using* them.
+    """
+
+    compact = _compact_text(term)
+    return compact.isascii() and len(_ascii_lower_utf8(compact)) >= 3
+
+
+def _day_bounds(day: str, where: str) -> tuple[int, int]:
+    """The half-open UTC interval a ``YYYY-MM-DD`` shard label names."""
+
+    try:
+        midnight = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except ValueError as error:
+        raise ValueError(f"{where}: not a UTC day label: {day!r}") from error
+    start_ms = int(midnight.timestamp() * 1000)
+    return start_ms, start_ms + _DAY_MS
+
+
 def _search_excerpt(match: _TextMatch) -> dict[str, JsonValue]:
     first = min(start for start, _ in match.ranges)
     start = max(0, first - 120)
@@ -2713,7 +2955,7 @@ def schema_3_record_counts(root: Path) -> dict[str, int] | None:
 
     This exists because ``inspect`` printed six integers and paid 246,973,399 bytes and 1.44 GiB
     of resident memory for them, by parsing the schema-1 monolith whole. Every one of the six is
-    already published in the 89,298-byte bootstrap -- a timeline shard's catalogue entry carries
+    already published in the 168,703-byte bootstrap -- a timeline shard's catalogue entry carries
     ``counts`` per record kind and a spine shard's carries ``line_ranges``, whose second element
     is a count -- so the answer is a sum over a list the reader already validated.
 
@@ -2760,7 +3002,7 @@ class TimelineQuery:
     monolith. The older two are **not** dead code -- an archive built before schema 3 existed
     must keep working, and that compatibility is the contract, not a leftover.
 
-    Under schema 3 nothing is read at construction beyond the 89 KB bootstrap, and every
+    Under schema 3 nothing is read at construction beyond the 168,703-byte bootstrap, and every
     collection below is a property that reads the line range it needs when it is first asked
     for. Under schemas 2 and 1 the whole projection is in memory before the first question,
     because those formats offer nothing smaller to read. :attr:`bytes_read` reports what it
@@ -2872,14 +3114,18 @@ class TimelineQuery:
     # -- the one place two generations meet ------------------------------------------------
 
     def _search_bootstrap(self) -> dict[str, JsonValue]:
-        """The schema-2 bootstrap, which is where the transcript search corpus lives.
+        """The schema-2 bootstrap, which is where an older archive's search corpus lives.
 
-        Schema 3 replaces the *presentation timeline*; it does not replace the search corpus,
-        which is still a set of schema-2 content-addressed day shards with trigram blooms. So a
-        transcript search under schema 3 reads phases and agents from the spine and messages
-        from schema 2, and that is the only operation in this file that touches both.
+        Schema 3 now publishes a corpus of its own -- the ``search``, ``search_bloom`` and
+        ``search_links`` streams -- and :meth:`_iter_search_records` prefers it. This path is what
+        an archive built before those streams gets: its schema 3 answers phases and agents from
+        the spine and its messages still come from schema 2, and that is the only operation in
+        this file that touches both generations. It is reached less and less as archives are
+        rebuilt, and it is not dead: the compatibility is the contract.
 
-        It is therefore the place the cross-generation check belongs. Verifying at open that
+        It is therefore still the place the cross-generation check belongs -- and only here,
+        because a schema-3 corpus makes the question moot: the messages and the phases then come
+        out of the same bootstrap and cannot disagree about their source. Verifying at open that
         schema 3 and schema 2 describe the same ``source_digest`` would mean parsing schema 2's
         5,702,530-byte bootstrap before answering a question schema 3 answers in 300 KB -- the
         cost schema 3 exists to remove, paid to guard a mismatch that only matters here.
@@ -3745,7 +3991,84 @@ class TimelineQuery:
         *,
         bloom_terms: tuple[str, ...] = (),
     ) -> Iterable[dict[str, JsonValue]]:
-        """Yield validated records while retaining at most one decoded day shard."""
+        """Yield validated records while retaining at most one decoded day shard.
+
+        Two generations can answer this and the newer one is preferred, exactly as everywhere else
+        in this class -- but here the fallback is not a slower path to the same file, it is a
+        different file. A schema-3 generation that carries the ``search`` streams answers out of
+        its own bootstrap and never opens ``data/timeline-v2.json``; one built before those streams
+        existed has no corpus of its own, and the schema-2 objects are still the only copy.
+
+        The records the two paths yield are the same records, field for field, because the
+        schema-3 line *is* the schema-2 record plus the envelope key the reader strips. That is
+        what lets both go through one validator below, and it is what
+        `test_timeline_v3_search.py` asserts query by query rather than by inspection.
+        """
+
+        if self._schema_3 is not None and self._schema_3.has_search_corpus:
+            yield from self._iter_search_records_v3(
+                self._schema_3, filters, bloom_terms
+            )
+            return
+        yield from self._iter_search_records_v2(filters, bloom_terms)
+
+    def _iter_search_records_v3(
+        self,
+        archive: "_SchemaThreeArchive",
+        filters: QueryFilters | None,
+        bloom_terms: tuple[str, ...],
+    ) -> Iterator[dict[str, JsonValue]]:
+        """Walk the schema-3 ``search`` stream, shard by shard, pruning before opening."""
+
+        timeline_teams = frozenset(
+            as_string(team.get("slug"), "timeline team.slug") for team in self.teams
+        )
+        teams = () if filters is None else filters.teams
+        # The prefilter is fetched only when at least one term can produce a trigram. A query
+        # like the case study's `B3` -- two bytes -- cannot, so `_bloom_might_match` would accept
+        # every shard and reading the filters would be pure cost. Schema 2 could not make this
+        # choice: its filters arrive inside a bootstrap every command parses regardless.
+        blooms = (
+            archive.search_blooms(teams)
+            if any(_bloom_can_prune(term) for term in bloom_terms)
+            else {}
+        )
+        seen: set[str] = set()
+        for entry in archive.search_shards():
+            where = f"timeline-v3.streams.search {entry.path}"
+            shard_team = entry.team
+            if shard_team is None or entry.day is None:
+                raise ValueError(f"invalid transcript search shard scope at {where}")
+            if shard_team not in timeline_teams:
+                raise ValueError(f"invalid transcript search shard scope at {where}")
+            shard_start, shard_end = _day_bounds(entry.day, where)
+            if filters is not None:
+                if filters.teams and shard_team not in filters.teams:
+                    continue
+                if filters.window is not None and not filters.window.overlaps(
+                    shard_start, shard_end
+                ):
+                    continue
+            if blooms and not _bloom_might_match(
+                blooms.get(entry.path), bloom_terms, where + ".bloom"
+            ):
+                continue
+            for index, record in enumerate(archive.iter_search_shard(entry)):
+                yield self._validated_search_record(
+                    record,
+                    f"{entry.path}.records[{index}]",
+                    shard_team,
+                    shard_start,
+                    shard_end,
+                    seen,
+                )
+
+    def _iter_search_records_v2(
+        self,
+        filters: QueryFilters | None,
+        bloom_terms: tuple[str, ...],
+    ) -> Iterator[dict[str, JsonValue]]:
+        """Walk schema 2's content-addressed day shards, for an archive with no schema-3 corpus."""
 
         bootstrap = self._search_bootstrap()
         timeline_teams = sorted(
@@ -3820,104 +4143,86 @@ class TimelineQuery:
             ):
                 raise ValueError(f"transcript search shard count mismatch: {relative}")
             for record_index, raw_record in enumerate(raw_records):
-                record = as_object(raw_record, f"{relative}.records[{record_index}]")
-                reference = as_string(
-                    record.get("ref"), f"{relative}.records[{record_index}].ref"
+                yield self._validated_search_record(
+                    as_object(raw_record, f"{relative}.records[{record_index}]"),
+                    f"{relative}.records[{record_index}]",
+                    shard_team,
+                    shard_start,
+                    shard_end,
+                    seen,
                 )
-                if (
-                    as_int(
-                        record.get("schema_version"),
-                        f"{relative}.records[{record_index}].schema_version",
-                    )
-                    != 1
-                ):
-                    raise ValueError(
-                        f"unsupported transcript search record: {reference}"
-                    )
-                record_team = as_string(
-                    record.get("team"), f"{relative}.records[{record_index}].team"
-                )
-                at_ms = as_int(
-                    record.get("at_ms"), f"{relative}.records[{record_index}].at_ms"
-                )
-                if record_team != shard_team or not shard_start <= at_ms < shard_end:
-                    raise ValueError(
-                        f"transcript search record escapes shard: {reference}"
-                    )
-                message_prefix = f"message:{record_team}::"
-                tool_prefix = f"tool:{record_team}::"
-                if not reference.startswith((message_prefix, tool_prefix)):
-                    raise ValueError(
-                        f"invalid transcript search reference {reference!r}"
-                    )
-                record_type = as_string(
-                    record.get("record_type"),
-                    f"{relative}.records[{record_index}].record_type",
-                )
-                event_identifier = as_string(
-                    record.get("event_id"),
-                    f"{relative}.records[{record_index}].event_id",
-                )
-                expected_reference = (
-                    tool_prefix if record_type == "tool" else message_prefix
-                ) + event_identifier
-                if reference != expected_reference:
-                    raise ValueError(
-                        f"transcript search reference kind mismatch: {reference}"
-                    )
-                agent_reference = as_string(
-                    record.get("agent_ref"),
-                    f"{relative}.records[{record_index}].agent_ref",
-                )
-                agent_identifier = as_string(
-                    record.get("agent_id"),
-                    f"{relative}.records[{record_index}].agent_id",
-                )
-                if (
-                    self._agent_reference_for_id(record_team, agent_identifier)
-                    != agent_reference
-                ):
-                    raise ValueError(
-                        f"transcript search record agent identity mismatch: {reference}"
-                    )
-                agent_entry = self.lookup(agent_reference)
-                if agent_entry is None or agent_entry.kind != "agent":
-                    raise ValueError(
-                        f"transcript search record has unknown agent {agent_reference!r}"
-                    )
-                if _team(agent_entry.record, "search record agent") != record_team:
-                    raise ValueError(
-                        f"transcript search record agent belongs to another team: {reference}"
-                    )
-                prompt_reference = record.get("prompt_ref")
-                if prompt_reference is not None and not as_string(
-                    prompt_reference,
-                    f"{relative}.records[{record_index}].prompt_ref",
-                ).startswith(message_prefix):
-                    raise ValueError(
-                        f"transcript search prompt reference belongs to another team: {reference}"
-                    )
-                prompt_in_scope = record.get("prompt_in_scope")
-                if prompt_in_scope is not None and not isinstance(
-                    prompt_in_scope, bool
-                ):
-                    raise ValueError(
-                        f"{relative}.records[{record_index}].prompt_in_scope: expected a boolean"
-                    )
-                role = as_string(
-                    record.get("role"), f"{relative}.records[{record_index}].role"
-                )
-                if role not in SEARCH_ROLES:
-                    raise ValueError(f"unsupported transcript search role {role!r}")
-                as_string(
-                    record.get("text"), f"{relative}.records[{record_index}].text"
-                )
-                if reference in seen:
-                    raise ValueError(
-                        f"duplicate transcript search reference {reference!r}"
-                    )
-                seen.add(reference)
-                yield record
+
+    def _validated_search_record(
+        self,
+        record: dict[str, JsonValue],
+        where: str,
+        shard_team: str,
+        shard_start: int,
+        shard_end: int,
+        seen: set[str],
+    ) -> dict[str, JsonValue]:
+        """Check one transcript search record against everything else the archive says.
+
+        Shared by both generations rather than written twice, and that is the point: these
+        refusals are the contract a search result rests on -- that a reference names the record it
+        is attached to, that the agent it is attributed to exists in the same team, that a
+        ``prompt_ref`` does not cross a team boundary -- and a second copy for the newer format
+        would be a second chance for the two to disagree about what a valid corpus is. The
+        schema-3 record is the schema-2 record plus one envelope key the reader has already
+        stripped, so there is nothing left for a separate validator to say.
+        """
+
+        reference = as_string(record.get("ref"), f"{where}.ref")
+        if as_int(record.get("schema_version"), f"{where}.schema_version") != 1:
+            raise ValueError(f"unsupported transcript search record: {reference}")
+        record_team = as_string(record.get("team"), f"{where}.team")
+        at_ms = as_int(record.get("at_ms"), f"{where}.at_ms")
+        if record_team != shard_team or not shard_start <= at_ms < shard_end:
+            raise ValueError(f"transcript search record escapes shard: {reference}")
+        message_prefix = f"message:{record_team}::"
+        tool_prefix = f"tool:{record_team}::"
+        if not reference.startswith((message_prefix, tool_prefix)):
+            raise ValueError(f"invalid transcript search reference {reference!r}")
+        record_type = as_string(record.get("record_type"), f"{where}.record_type")
+        event_identifier = as_string(record.get("event_id"), f"{where}.event_id")
+        expected_reference = (
+            tool_prefix if record_type == "tool" else message_prefix
+        ) + event_identifier
+        if reference != expected_reference:
+            raise ValueError(f"transcript search reference kind mismatch: {reference}")
+        agent_reference = as_string(record.get("agent_ref"), f"{where}.agent_ref")
+        agent_identifier = as_string(record.get("agent_id"), f"{where}.agent_id")
+        if self._agent_reference_for_id(record_team, agent_identifier) != agent_reference:
+            raise ValueError(
+                f"transcript search record agent identity mismatch: {reference}"
+            )
+        agent_entry = self.lookup(agent_reference)
+        if agent_entry is None or agent_entry.kind != "agent":
+            raise ValueError(
+                f"transcript search record has unknown agent {agent_reference!r}"
+            )
+        if _team(agent_entry.record, "search record agent") != record_team:
+            raise ValueError(
+                f"transcript search record agent belongs to another team: {reference}"
+            )
+        prompt_reference = record.get("prompt_ref")
+        if prompt_reference is not None and not as_string(
+            prompt_reference, f"{where}.prompt_ref"
+        ).startswith(message_prefix):
+            raise ValueError(
+                f"transcript search prompt reference belongs to another team: {reference}"
+            )
+        prompt_in_scope = record.get("prompt_in_scope")
+        if prompt_in_scope is not None and not isinstance(prompt_in_scope, bool):
+            raise ValueError(f"{where}.prompt_in_scope: expected a boolean")
+        role = as_string(record.get("role"), f"{where}.role")
+        if role not in SEARCH_ROLES:
+            raise ValueError(f"unsupported transcript search role {role!r}")
+        as_string(record.get("text"), f"{where}.text")
+        if reference in seen:
+            raise ValueError(f"duplicate transcript search reference {reference!r}")
+        seen.add(reference)
+        return record
 
     def _search_link_context_from_records(
         self,
@@ -4124,6 +4429,120 @@ class TimelineQuery:
                 )
         return _SearchLinkContext(prompt_excerpts, response_counts)
 
+    def _search_link_context_from_streams(
+        self,
+        archive: "_SchemaThreeArchive",
+        filters: QueryFilters,
+        selected_agent: str | None,
+        candidate_prompt_refs: frozenset[str],
+        needed_prompt_refs: frozenset[str],
+    ) -> _SearchLinkContext:
+        """Resolve relationships from the schema-3 ``search_links`` stream.
+
+        The same answer as :meth:`_search_link_context_from_sidecars` computed from the same
+        fields, and deliberately the same refusals, with two differences that come from the
+        substrate rather than from a change of mind.
+
+        First, only the halves the caller needs are read: excerpts are fetched only when some
+        matched record cites a prompt, and edges only when some matched record *is* a prompt whose
+        replies have to be counted. Schema 2 reads both, because a content-addressed object is
+        indivisible; a line range is not.
+
+        Second, a response's instant is checked against the days the ``search`` stream actually
+        publishes for that team rather than against the one day a per-day sidecar would have been
+        cut to. That is the same check -- "this edge belongs to a shard of this corpus" -- restated
+        for a per-team file, and it is why the day set is built here rather than assumed.
+        """
+
+        prompt_excerpts: dict[str, str] = {}
+        response_counts: dict[str, int] = {}
+        seen_prompts: set[str] = set()
+        seen_responses: set[str] = set()
+        days_by_team: dict[str, set[int]] = {}
+        for entry in archive.search_shards():
+            if entry.team is None or entry.day is None:
+                continue
+            start_ms, _end_ms = _day_bounds(
+                entry.day, f"timeline-v3.streams.search {entry.path}"
+            )
+            days_by_team.setdefault(entry.team, set()).add(start_ms)
+        for team in archive.teams_in_scope(filters.teams):
+            prompts, responses = archive.search_links(
+                team,
+                prompts=bool(needed_prompt_refs),
+                responses=bool(candidate_prompt_refs),
+            )
+            where = f"timeline-v3.streams.search_links {team}"
+            message_prefix = f"message:{team}::"
+            agent_prefix = f"agent:{team}::"
+            days = days_by_team.get(team, set())
+            for index, prompt in enumerate(prompts):
+                reference = as_string(prompt.get("ref"), f"{where}.prompts[{index}].ref")
+                if not reference.startswith(message_prefix):
+                    raise ValueError(
+                        f"transcript search linkage prompt belongs to another team: {reference}"
+                    )
+                excerpt = as_string(
+                    prompt.get("excerpt"), f"{where}.prompts[{index}].excerpt"
+                )
+                if reference not in needed_prompt_refs:
+                    continue
+                if reference in seen_prompts:
+                    raise ValueError(
+                        f"duplicate transcript search linkage prompt {reference!r}"
+                    )
+                seen_prompts.add(reference)
+                prompt_excerpts[reference] = excerpt
+            for index, response in enumerate(responses):
+                spot = f"{where}.responses[{index}]"
+                reference = as_string(response.get("ref"), spot + ".ref")
+                if not reference.startswith(message_prefix):
+                    raise ValueError(
+                        f"transcript search linkage response belongs to another team: {reference}"
+                    )
+                prompt_reference = as_string(
+                    response.get("prompt_ref"), spot + ".prompt_ref"
+                )
+                if not prompt_reference.startswith(message_prefix):
+                    raise ValueError(
+                        f"transcript search linkage prompt belongs to another team: {reference}"
+                    )
+                at_ms = as_int(response.get("at_ms"), spot + ".at_ms")
+                if at_ms - (at_ms % _DAY_MS) not in days:
+                    raise ValueError(
+                        f"transcript search linkage response escapes shard: {reference}"
+                    )
+                agent_reference = as_string(response.get("agent_ref"), spot + ".agent_ref")
+                if not agent_reference.startswith(agent_prefix):
+                    raise ValueError(
+                        f"transcript search linkage agent belongs to another team: {reference}"
+                    )
+                agent_entry = self.lookup(agent_reference)
+                if agent_entry is None or agent_entry.kind != "agent":
+                    raise ValueError(
+                        f"transcript search linkage response has unknown agent "
+                        f"{agent_reference!r}"
+                    )
+                if _team(agent_entry.record, "search linkage response agent") != team:
+                    raise ValueError(
+                        f"transcript search linkage agent belongs to another team: {reference}"
+                    )
+                if prompt_reference not in candidate_prompt_refs:
+                    continue
+                if filters.window is not None and not filters.window.contains(at_ms):
+                    continue
+                if selected_agent is not None and agent_reference != selected_agent:
+                    continue
+                if reference in seen_responses:
+                    raise ValueError(
+                        f"duplicate transcript search linkage response {reference!r}"
+                    )
+                seen_responses.add(reference)
+                response_counts[prompt_reference] = (
+                    response_counts.get(prompt_reference, 0) + 1
+                )
+        return _SearchLinkContext(prompt_excerpts, response_counts)
+
     def _search_link_context(
         self,
         filters: QueryFilters,
@@ -4135,6 +4554,14 @@ class TimelineQuery:
 
         if not candidate_prompt_refs and not needed_prompt_refs:
             return _SearchLinkContext({}, {})
+        if self._schema_3 is not None and self._schema_3.has_search_corpus:
+            return self._search_link_context_from_streams(
+                self._schema_3,
+                filters,
+                selected_agent,
+                candidate_prompt_refs,
+                needed_prompt_refs,
+            )
         bootstrap = self._search_bootstrap()
         search = as_object(bootstrap.get("search"), "timeline-v2.search")
         shards = as_array(search.get("shards"), "timeline-v2.search.shards")

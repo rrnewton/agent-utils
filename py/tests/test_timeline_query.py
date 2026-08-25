@@ -30,6 +30,7 @@ from agent_team_timeline.search_bloom import (
     compact_search_text,
 )
 from agent_team_timeline.timeline_shards import write_timeline_shards
+from tests.timeline_legacy_generations import schema_2_writer_enabled
 
 
 START = 1_786_068_000_000
@@ -241,11 +242,15 @@ def _site(tmp_path: Path) -> Path:
             "content_fidelity": "verbatim",
         },
     ]
-    write_timeline_shards(
-        root,
-        as_object(narrow_json(timeline), "timeline"),
-        search_records=search_records,
-    )
+    # An archive an older tool wrote: schema 2 and nothing else. That is the whole point of this
+    # fixture -- `query.py` still reads this generation, for archives nobody has rebuilt, and the
+    # only honest way to produce one is to ask the writer that produced them.
+    with schema_2_writer_enabled():
+        write_timeline_shards(
+            root,
+            as_object(narrow_json(timeline), "timeline"),
+            search_records=search_records,
+        )
     return root
 
 
@@ -871,7 +876,8 @@ def test_search_v2_keeps_cross_day_prompt_linkage_when_text_shards_are_pruned(
             prompt_author_kind="owner_human",
         ),
     ]
-    write_timeline_shards(root, timeline, search_records=records)
+    with schema_2_writer_enabled():
+        write_timeline_shards(root, timeline, search_records=records)
 
     assert (
         timeline_main(

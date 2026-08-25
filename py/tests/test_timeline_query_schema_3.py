@@ -42,6 +42,7 @@ from agent_team_timeline.query import (
     TimelineQuery,
 )
 from agent_team_timeline.timeline_shards import write_timeline_shards
+from tests.timeline_legacy_generations import schema_2_writer_enabled
 from agent_team_timeline.timeline_v3 import SCHEMA_3_ROOT, write_timeline_v3
 
 
@@ -308,7 +309,11 @@ def _publish(root: Path) -> dict[str, JsonValue]:
             markdown = root / relative
             markdown.parent.mkdir(parents=True, exist_ok=True)
             markdown.write_text(f"# {relative}\n\nthe deadline moved.\n", encoding="utf-8")
-    write_timeline_shards(root, timeline, search_records=[])
+    # Schema 2 beside schema 3, which is the shape this suite compares across: an archive an
+    # older tool wrote and a newer one rebuilt. A build no longer produces the schema-2 half, so
+    # the writer is enabled for exactly the call that makes it.
+    with schema_2_writer_enabled():
+        write_timeline_shards(root, timeline, search_records=[])
     write_timeline_v3(root, timeline, target_chunk_bytes=CHUNK)
     return timeline
 

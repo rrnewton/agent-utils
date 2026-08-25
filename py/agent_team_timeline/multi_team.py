@@ -32,7 +32,7 @@ from agent_team_timeline.periods import DEFAULT_ROLLUP_KINDS
 from agent_team_timeline.render import (
     archive_readme,
     prune_retired_query_artifacts,
-    retired_schema_1_files,
+    retired_generation_files,
 )
 from agent_team_timeline.search_index import build_search_records
 from agent_team_timeline.static_assets import (
@@ -40,7 +40,6 @@ from agent_team_timeline.static_assets import (
     sync_gzip_sidecar,
     write_text_with_gzip_invalidation,
 )
-from agent_team_timeline.timeline_shards import write_timeline_shards
 from agent_team_timeline.timeline_v3 import is_schema_3_path, write_timeline_v3
 from agent_team_timeline.window import DateWindow
 
@@ -719,7 +718,7 @@ def _build_combined_archive_locked(
         # 33,562,114-byte twin on the measured archive, and every reader of a combined export
         # reaches schema 1 only after schema 3 and schema 2 have both failed -- both of which
         # this function writes, a few lines below, before it names anything. See
-        # `render.retired_schema_1_files` for why an older one already on disk is left where it
+        # `render.retired_generation_files` for why an older one already on disk is left where it
         # is rather than swept.
         changed += _write_compressible_json(
             _output_path(output, "data/artifacts.json"), artifact_catalog
@@ -778,24 +777,19 @@ def _build_combined_archive_locked(
                 _safe_generated_path(sidecar_relative)
                 generated_files.add(sidecar_relative)
 
-        shard_report = write_timeline_shards(
-            output, timeline, search_records=search_records
-        )
-        changed += shard_report.files_changed
-        for relative in shard_report.generated_files:
-            _safe_generated_path(relative)
-            generated_files.add(relative)
-        # Schema 3 alongside schema 2, which is what the website reads: dropping either would
-        # break a surface. Its paths go into the same manifest as everything else, which is what
-        # makes the caller's existing stale-file removal retire a shard whose day or team has
+        # Schema 3, and only schema 3. `write_timeline_shards` used to run here first, and
+        # stopped the day `static/app.js` learned to read schema 3 -- item 2 of the checklist on
+        # `timeline_shards.SCHEMA_2_IS_PUBLISHED`, the other half of which is the call site in
+        # `render._render_team`. Its paths go into the same manifest as everything else, which is
+        # what makes the caller's existing stale-file removal retire a shard whose day or team has
         # gone -- schema 3 needs no reachability manifest of its own because its names say what
         # they are.
-        v3_report = write_timeline_v3(output, timeline)
+        v3_report = write_timeline_v3(output, timeline, search_records=search_records)
         changed += v3_report.files_changed
         for relative in v3_report.generated_files:
             _safe_generated_path(relative)
             generated_files.add(relative)
-        retired_files = retired_schema_1_files(output, generated_files)
+        retired_files = retired_generation_files(output, generated_files)
         for relative in retired_files:
             _safe_generated_path(relative)
         export_manifest = as_object(
@@ -844,15 +838,16 @@ def _build_combined_archive_locked(
         "summary_files": len(merged["summary_files"]),
         "artifacts": len(merged["artifacts"]),
         "projects": len(merged["projects"]),
-        "detail_shards": shard_report.detail_shards,
+        # Repointed at schema 3 with their names unchanged; see the same six keys in
+        # `render._render_team` for what each one now means and why the two transfer figures are
+        # equal to the two byte figures.
+        "detail_shards": v3_report.timeline_shards,
         "search_records": len(search_records),
-        "search_shards": shard_report.search_shards,
-        "bootstrap_bytes": shard_report.bootstrap_bytes,
-        "bootstrap_transfer_bytes": (
-            shard_report.bootstrap_gzip_bytes or shard_report.bootstrap_bytes
-        ),
-        "shard_object_bytes": shard_report.object_bytes,
-        "shard_transfer_bytes": shard_report.object_gzip_bytes,
+        "search_shards": v3_report.search_shards,
+        "bootstrap_bytes": v3_report.bootstrap_bytes,
+        "bootstrap_transfer_bytes": v3_report.bootstrap_bytes,
+        "shard_object_bytes": v3_report.compressed_bytes + v3_report.index_bytes,
+        "shard_transfer_bytes": v3_report.compressed_bytes + v3_report.index_bytes,
     }
 
 

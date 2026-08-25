@@ -30,6 +30,14 @@ code should expose:
 - `[data-testid="transcript-role-filters"]`, and transcript cards with a normalized
   `data-role` (`user`, `assistant`, `agent`, `tool`, `system`, or `other`).
 
+The fixture serves no `data/timeline-v3.json`, so this suite now exercises the bundle's
+**fallback** path: the page probes schema 3, gets a clean 404, and loads the mocked schema-2
+bootstrap without annotating the meta line. That is the state an archive built by an older tool is
+in, and it is worth having covered by something that drives a real browser. Schema 3's own read
+path is covered by `../test_timeline_v3_ui.js` and by `tests/test_timeline_v3_website.py`, which
+serves a real build through the archive's own `serve.py` so the byte ranges are answered by the
+server that ships with the archive.
+
 The fixture intentionally has four agents: one coordinator, two overlapping agents,
 and a third agent whose lifetime starts exactly when the first ends. That makes the
 packed-lane assertion cover both overlap and half-open lifetime reuse. Its spawn,

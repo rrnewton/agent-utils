@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from importlib.resources import files
@@ -46,7 +47,10 @@ from agent_team_timeline.static_assets import (
     sync_gzip_sidecar,
     write_text_with_gzip_invalidation,
 )
-from agent_team_timeline.timeline_shards import write_timeline_shards
+from agent_team_timeline.timeline_shards import (
+    SCHEMA_2_BOOTSTRAP_PATH,
+    schema_2_is_published,
+)
 from agent_team_timeline.timeline_v3 import is_schema_3_path, write_timeline_v3
 from agent_team_timeline.window import DateWindow
 from agent_team_timeline.terminology import (
@@ -935,40 +939,85 @@ def _remove_stale_presentation_files(
     return changed
 
 
-#: The schema-1 monolith. Retired as an *output* -- see :func:`retired_schema_1_files` -- but
+#: The schema-1 monolith. Retired as an *output* -- see :func:`retired_generation_files` -- but
 #: still the intermediate format the combined export merges, so the name stays a constant rather
 #: than becoming a literal in two places that could drift apart.
 SCHEMA_1_TIMELINE_PATH = "data/timeline.json"
 
+#: The schema-2 presentation generation, retired the day `timeline_shards.SCHEMA_2_IS_PUBLISHED`
+#: became ``False``. Two entries and a whole tree: the bootstrap, its gzip twin, and everything
+#: under ``data/timeline-v2/`` -- the content-addressed objects, their gzip twins, and the
+#: reachability manifest that names them.
+#:
+#: Taken wholesale rather than by object-name shape, matching `archive_gc._schema_2_generation_files`
+#: and for the same reason it gives: that directory belongs to one format generation and to nothing
+#: else. The two enumerations are deliberately not shared -- `archive_gc` imports nothing from
+#: `render` and `render` imports nothing from `archive_gc`, because the collector must be able to
+#: reason about an archive a *different* build produced -- so `test_timeline_archive_gc.py` asserts
+#: they agree on a real archive instead.
+SCHEMA_2_PRESENTATION_ROOT = "data/timeline-v2"
 
-def retired_schema_1_files(archive: Path, current: set[str]) -> frozenset[str]:
-    """The schema-1 files an older build left behind, which this build must **not** delete.
 
-    A published export stopped writing ``data/timeline.json`` and its ``.gz`` twin -- 280,971,189
-    bytes on the measured archive, of which the plain file alone is 246,973,399 -- because both
-    readers reach schema 1 only as a fallback. ``./timeline`` prefers schema 3, then schema 2,
-    and opens the monolith only when neither is present; `static/app.js` loads
-    ``data/timeline-v2.json`` and falls back to the monolith only when that load throws. Every
-    published build writes both of the generations in front of it, so nothing reaches past them
-    in an archive this tool has touched.
+def _schema_2_presentation_files(archive: Path) -> set[str]:
+    """Every schema-2 presentation path physically present under *archive*."""
+
+    found: set[str] = set()
+    for relative in (SCHEMA_2_BOOTSTRAP_PATH, SCHEMA_2_BOOTSTRAP_PATH + ".gz"):
+        path = archive / Path(relative)
+        if path.is_file() and not path.is_symlink():
+            found.add(relative)
+    root = archive / Path(SCHEMA_2_PRESENTATION_ROOT)
+    if not root.is_dir() or root.is_symlink():
+        return found
+    # `os.walk` with `followlinks=False`, and symlinked files skipped, so "the generation's tree"
+    # never means "wherever a link in it points". The same care `_safe_output_path` takes on the
+    # writing side, for the same reason: this set decides what a build declines to delete, and a
+    # path that leaves the archive is one it cannot make any promise about.
+    for directory, _subdirectories, names in os.walk(root, followlinks=False):
+        for name in names:
+            path = Path(directory) / name
+            if path.is_symlink() or not path.is_file():
+                continue
+            found.add(path.relative_to(archive).as_posix())
+    return found
+
+
+def retired_generation_files(archive: Path, current: set[str]) -> frozenset[str]:
+    """The files of a retired generation that an older build left behind, and this build must
+    **not** delete.
+
+    Two generations are in this set now. A published export stopped writing ``data/timeline.json``
+    and its ``.gz`` twin -- 280,971,189 bytes on the measured archive, of which the plain file
+    alone is 246,973,399 -- and it has now stopped writing the schema-2 presentation generation as
+    well, 1,503,831,881 bytes across 661 files, because `static/app.js` reads schema 3 and nothing
+    is left that needs the older one. ``./timeline`` prefers schema 3, then schema 2, and opens the
+    monolith only when neither is present; the browser bundle does the same, in the same order.
 
     **Not writing it and deleting it are different decisions, and this function is the seam.**
-    Left to itself, `_remove_stale_presentation_files` would delete the monolith the instant a
-    newer tool rebuilt an older archive: it reaps ``previous - current``, the monolith is in
-    every older manifest's ``previous``, and it is in no new build's ``current``. That is a
-    quarter-gigabyte irreversible unlink performed as a side effect of a build the operator asked
-    for a different reason, and it is the exact shape of surprise the archive's own stale-file
-    rules are careful about elsewhere -- `_finish_object_generation` holds a retained set for one
-    generation rather than trusting a single narrowed build, and `prune_retired_query_artifacts`
-    refuses to remove a launcher whose bytes it does not recognise.
+    Left to itself, `_remove_stale_presentation_files` would delete both generations the instant a
+    newer tool rebuilt an older archive: it reaps ``previous - current``, they are in every older
+    manifest's ``previous``, and they are in no new build's ``current``. That is 1.8 GB of
+    irreversible unlink performed as a side effect of a build the operator asked for a different
+    reason, and it is the exact shape of surprise the archive's own stale-file rules are careful
+    about elsewhere -- `_finish_object_generation` held a retained set for one generation rather
+    than trusting a single narrowed build, and `prune_retired_query_artifacts` refuses to remove a
+    launcher whose bytes it does not recognise.
 
-    So the monolith is *retired*, not reaped: this build declines to rewrite it, records it in
-    the export manifest's ``retired_files``, and leaves the bytes alone. Two things then remain
+    So a retired generation is *retired*, not reaped: this build declines to rewrite it, records it
+    in the export manifest's ``retired_files``, and leaves the bytes alone. Two things then remain
     true that would not be otherwise. An archive written by an older tool stays readable by an
-    older reader -- an ``./timeline`` copy from before schema 2 existed, or a browser holding a
-    cached ``app.js``, still finds what it looks for. And the deletion becomes something an
-    operator asks for, with `gc`, which reports it by size first, moves it to a trash directory
-    rather than unlinking it, and requires a second command to make that permanent.
+    older reader -- an ``./timeline`` copy from before schema 3 existed, or a browser holding a
+    cached ``app.js`` that has never heard of it, still finds what it looks for. And the deletion
+    becomes something an operator asks for, with `gc`, which reports it by size first, moves it to
+    a trash directory rather than unlinking it, and requires a second command to make that
+    permanent.
+
+    The schema-2 case is *why* that grace matters more than it did for the monolith, and the reason
+    is `archive_gc._website_refusal`: a bundle is copied into the archive it was built with, so an
+    archive built before this flip carries an ``app.js`` with no schema-3 mode. Deleting its
+    schema-2 objects during an unrelated build would break the only surface that archive has, hours
+    later, in somebody else's session. `gc` refuses to collect them until a rebuild has replaced
+    the bundle -- and a rebuild is exactly the operation that reaches this function.
 
     *current* is the set this build did write, so that a mode which still writes schema 1 -- the
     combiner's intermediate -- never reports its own live output as retired.
@@ -981,6 +1030,8 @@ def retired_schema_1_files(archive: Path, current: set[str]) -> frozenset[str]:
         path = archive / Path(relative)
         if path.is_file() and not path.is_symlink():
             retired.add(relative)
+    if not schema_2_is_published():
+        retired.update(_schema_2_presentation_files(archive) - current)
     return frozenset(retired)
 
 
@@ -1591,19 +1642,15 @@ def render_archive(
     if _precompress:
         for relative in sorted(compressible_paths):
             changed += int(sync_gzip_sidecar(_generated_path(archive, relative)))
-    shard_report = (
-        write_timeline_shards(
-            archive,
-            timeline_json,
-            search_records=search_records,
-            precompress=_precompress,
-        )
+    # Schema 3 and nothing else. `write_timeline_shards` used to run here too, and stopped the
+    # day `static/app.js` learned to read schema 3 -- item 2 of the checklist on
+    # `timeline_shards.SCHEMA_2_IS_PUBLISHED`. The search records go to the generation that
+    # survives, which is why the corpus is not lost with the presentation half.
+    v3_report = (
+        write_timeline_v3(archive, timeline_json, search_records=search_records)
         if _published
         else None
     )
-    if shard_report is not None:
-        changed += shard_report.files_changed
-    v3_report = write_timeline_v3(archive, timeline_json) if _published else None
     if v3_report is not None:
         changed += v3_report.files_changed
     generated_files = set(_PRESENTATION_COMMON)
@@ -1612,15 +1659,13 @@ def render_archive(
     generated_files.update({_PRESENTATION_MANIFEST, "data/artifacts.json"})
     if not _published:
         generated_files.add(SCHEMA_1_TIMELINE_PATH)
-    if shard_report is not None:
-        generated_files.update(shard_report.generated_files)
     if v3_report is not None:
         generated_files.update(v3_report.generated_files)
     for relative in sorted(compressible_paths):
         if gzip_sidecar_path(_generated_path(archive, relative)).is_file():
             generated_files.add(relative + ".gz")
     retired_files = (
-        retired_schema_1_files(archive, generated_files) if _published else frozenset()
+        retired_generation_files(archive, generated_files) if _published else frozenset()
     )
     for relative in generated_files | retired_files:
         _safe_presentation_file(relative)
@@ -1665,18 +1710,28 @@ def render_archive(
         "summary_files": len(summary_files),
         "artifacts": len(artifact_catalog.artifacts),
         "projects": len(artifact_catalog.projects),
-        "detail_shards": shard_report.detail_shards if shard_report is not None else 0,
+        # These six kept their names and changed the generation they describe, because what an
+        # operator reads them for -- how many pieces is my timeline in, how big is the file a
+        # browser must have before it can draw -- is unchanged. `shard_transfer_bytes` now equals
+        # `shard_object_bytes` and that is the headline rather than a rounding error: a schema-3
+        # shard is stored compressed and served as it is stored, so there is no second copy and no
+        # gap between what is on the disk and what goes over the wire. `bootstrap_transfer_bytes`
+        # equals `bootstrap_bytes` for the opposite reason -- the entry point has no gzip twin at
+        # all -- and is 168,703 against schema 2's 5,702,530 on the measured archive. (It was
+        # 89,298 before the three transcript search streams added their 96 catalogue entries; see
+        # the "The search streams" section of `timeline_v3` for that 1.9x and why it was paid.)
+        "detail_shards": v3_report.timeline_shards if v3_report is not None else 0,
         "search_records": len(search_records),
-        "search_shards": shard_report.search_shards if shard_report is not None else 0,
-        "bootstrap_bytes": shard_report.bootstrap_bytes if shard_report is not None else 0,
+        "search_shards": v3_report.search_shards if v3_report is not None else 0,
+        "bootstrap_bytes": v3_report.bootstrap_bytes if v3_report is not None else 0,
         "bootstrap_transfer_bytes": (
-            (shard_report.bootstrap_gzip_bytes or shard_report.bootstrap_bytes)
-            if shard_report is not None
-            else 0
+            v3_report.bootstrap_bytes if v3_report is not None else 0
         ),
-        "shard_object_bytes": shard_report.object_bytes if shard_report is not None else 0,
+        "shard_object_bytes": (
+            v3_report.compressed_bytes + v3_report.index_bytes if v3_report is not None else 0
+        ),
         "shard_transfer_bytes": (
-            shard_report.object_gzip_bytes if shard_report is not None else 0
+            v3_report.compressed_bytes + v3_report.index_bytes if v3_report is not None else 0
         ),
     }
 

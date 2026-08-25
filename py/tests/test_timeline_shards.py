@@ -1,7 +1,22 @@
+"""The schema-2 projection, which no build performs any more.
+
+`timeline_shards.SCHEMA_2_IS_PUBLISHED` is ``False`` and :func:`write_timeline_shards` refuses to
+run while it is. The writer survives its own retirement for one reason: `query.py` and
+`static/app.js` both still *read* schema 2, for archives an older tool built, and a reader whose
+input cannot be produced cannot be tested. That makes this file the description of what those
+archives contain -- so it is kept, whole, rather than reduced to a test of the refusal.
+
+The refusal itself is asserted once, at the bottom, and every other test here runs inside
+:func:`schema_2_writer_enabled`. The autouse fixture is deliberate and deliberately module-scoped
+in effect: enabling the writer globally would let a *build* test silently produce a generation this
+tool no longer emits, which is the one mistake the constant exists to prevent.
+"""
+
 from __future__ import annotations
 
 import gzip
 import hashlib
+from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -18,6 +33,16 @@ from agent_team_timeline.timeline_shards import (
     SCHEMA_2_BOOTSTRAP_PATH,
     write_timeline_shards,
 )
+
+from tests.timeline_legacy_generations import schema_2_writer_enabled
+
+
+@pytest.fixture(autouse=True)
+def _legacy_writer() -> Iterator[None]:
+    """Every test in this file is about the retired writer, so every test may run it."""
+
+    with schema_2_writer_enabled():
+        yield
 
 
 def _ms(value: str) -> int:
@@ -453,3 +478,26 @@ def test_schema_2_projection_rejects_symlinked_bootstrap_files(
         write_timeline_shards(tmp_path, _timeline())
 
     assert victim.read_text(encoding="utf-8") == "preserve me\n"
+
+
+def test_the_writer_refuses_to_run_for_a_build(tmp_path: Path) -> None:
+    """The refusal, with the fixture's licence explicitly withdrawn.
+
+    This is the enforcement `archive_gc` leans on when it offers a whole 1.4 GB generation to the
+    trash. A constant that merely *said* the writer had stopped would be a comment; this makes it a
+    fact, and makes the flip impossible to land as a one-line lie that left the writer running.
+    """
+
+    import agent_team_timeline.timeline_shards as module
+
+    # The autouse fixture above has lifted the constant for this test as for every other, so it is
+    # put back here -- which is also the only way to reach the branch a build would reach. What the
+    # *default* is is asserted where it belongs, beside the collector that depends on it, in
+    # `test_timeline_archive_gc.py`.
+    module.SCHEMA_2_IS_PUBLISHED = False
+    try:
+        with pytest.raises(ValueError, match="must not publish schema 2"):
+            write_timeline_shards(tmp_path, _timeline())
+    finally:
+        module.SCHEMA_2_IS_PUBLISHED = True
+    assert not (tmp_path / SCHEMA_2_BOOTSTRAP_PATH).exists()

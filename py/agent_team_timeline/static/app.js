@@ -3,6 +3,33 @@
 
   var DATA_URL = "data/timeline.json";
   var SCHEMA_2_URL = "data/timeline-v2.json";
+  var SCHEMA_3_URL = "data/timeline-v3.json";
+  // The sidecar's own header constants, restated here rather than discovered, so a shard written
+  // by a future codec is *declined* instead of misread. `seekable_jsonl` publishes both in every
+  // index header and the bootstrap's `codec` block repeats the container; a reader that accepted
+  // whatever it found would inflate zstd members as gzip and report the truncation as damage.
+  var SCHEMA_3_INDEX_FORMAT = "agent-team-timeline/seekable-jsonl-index";
+  var SCHEMA_3_INDEX_VERSION = 1;
+  var SCHEMA_3_INDEX_SUFFIX = ".index.jsonl";
+  var SCHEMA_3_ROOT = "data/timeline-v3/";
+  // How many member fetches are in flight at once, **across the page** and not per shard read.
+  // The same bound, and the same reason, as SEARCH_LOAD_CONCURRENCY: a first paint asks for one
+  // member from each of a dozen spine shards and a browser that opened all of them at once would
+  // queue them behind each other anyway.
+  //
+  // It has to be global to be that bound at all. `readShardRecords` bounds the members of *one*
+  // shard, and a first paint calls it once per spine shard inside a single `Promise.all` -- so on
+  // the twelve-team archive the per-call bound alone permits 78 concurrent fetches, and
+  // `requestSearchCorpus` maps over the whole 72-entry shard catalogue with no bound above it at
+  // all. The per-origin cap the browser imposes hid that, but a constant whose comment states an
+  // invariant the code does not have is what a later change gets sized against, so the invariant
+  // is enforced instead: `schema3MemberSlot` below is the one gate every member fetch passes.
+  var SCHEMA_3_MEMBER_CONCURRENCY = 6;
+  var SCHEMA_3_DAY_MS = 24 * 60 * 60 * 1000;
+  // The one `schema3Schema2SearchFallback` outcome that is not worth a line in the meta: an
+  // archive exported with no transcript search corpus at all has nothing surprising to report,
+  // and every other outcome does. Named rather than compared as a literal in two places.
+  var SCHEMA_2_CORPUS_ABSENT = "no schema-2 corpus beside it";
   var SVG_NS = "http://www.w3.org/2000/svg";
   var ROW_HEIGHT = 54;
   var PHASE_TOP = 7;
@@ -155,6 +182,18 @@
     searchRequestGeneration: 0,
     transcriptSearchState: "legacy",
     transcriptSearchError: "",
+    //: Which generation the *transcript search corpus* is being read out of, which is not always
+    //: the generation the timeline is being read out of. Schema 3 carried no corpus until the
+    //: `search`/`search_bloom`/`search_links` streams existed, so an archive built between those
+    //: two moments has a schema-3 timeline beside a schema-2 corpus -- and the page reads both,
+    //: for the same reason `query.TimelineQuery._search_bootstrap` does. Three states rather
+    //: than a boolean, because "there is no corpus at all" is a third answer and the search
+    //: dispatch has to tell it from the other two.
+    searchCorpusMode: "none",
+    //: Empty, or one sentence saying why a schema-3 archive's search is coming from schema 2 --
+    //: or why it is coming from nowhere. Shown in the meta line, because "this archive predates
+    //: the schema-3 search corpus" is a fact about the archive that only the page can see.
+    searchCorpusNote: "",
     transcriptSearchResults: [],
     transcriptSearchTotal: 0,
     transcriptMatchedAgentIds: new Set(),
@@ -185,7 +224,31 @@
     phaseIndexReference: null,
     phaseIndexPromise: null,
     phaseIndexByAgent: new Map(),
-    detailErrorActive: false
+    phaseIndexReady: false,
+    detailErrorActive: false,
+    //: Schema 3 only. Sidecar indexes, keyed by their own URL, and inflated members, keyed by
+    //: `<shard path>#<compressed offset>`. Both are promise caches for the same reason
+    //: `resourcePromises` is one: two panes asking for the same day must produce one fetch, and
+    //: a member is immutable for the lifetime of a page load because the ETag check below
+    //: refuses to stitch two versions of a shard together.
+    shardIndexPromises: new Map(),
+    memberPromises: new Map(),
+    //: The ETag of each schema-3 shard, learned from the first range response and sent back as
+    //: `If-Range` on every later one. See `fetchShardMember`.
+    shardEtags: new Map(),
+    //: Schema 3's zoom bounds, which are a spine kind of their own rather than fields on the
+    //: agent, phase card and rollup records -- so they are fetched on the first zoom, not at
+    //: first paint, and land here keyed by the archive's stable reference.
+    activityBoundsByRef: new Map(),
+    activityBoundsPromises: new Map(),
+    phaseCardPromises: new Map(),
+    //: The three per-team schema-3 shards a reader addresses by team rather than by day: the
+    //: spine, the search prefilter and the relationship sidecar.
+    spineByTeam: new Map(),
+    searchBloomByTeam: new Map(),
+    searchLinksByTeam: new Map(),
+    searchBloomPromises: new Map(),
+    searchLinkPromises: new Map()
   };
 
   var timelineCore = window.AgentTimelineCore;
@@ -1056,9 +1119,11 @@
     dom.card.dataset.transcriptSearchState = app.transcriptSearchState;
     dom.card.dataset.loadedSearchShardCount = String(app.loadedSearchShardUrls.size);
     dom.card.dataset.transcriptSearchResultCount = String(app.transcriptSearchTotal);
-    dom.card.dataset.phaseIndexState = app.phaseIndexReference
-      ? (app.phaseIndexPromise ? "requested" : "unloaded")
-      : "legacy";
+    dom.card.dataset.phaseIndexState = app.phaseIndexReady
+      ? "ready"
+      : (app.phaseIndexReference || schema3Enabled()
+        ? (app.phaseIndexPromise || app.phaseCardPromises.size ? "requested" : "unloaded")
+        : "legacy");
   }
 
   function initializeData(raw) {
@@ -1331,6 +1396,9 @@
   }
 
   function loadDetailShard(catalogEntry) {
+    if (schema3Enabled()) {
+      return loadSchema3DetailShard(catalogEntry);
+    }
     var url = immutableTimelineObjectUrl(catalogEntry, "detail shard");
     if (!app.detailPromises.has(url)) {
       var request = fetchContentAddressedJson(catalogEntry, "detail shard").then(function (raw) {
@@ -1362,7 +1430,7 @@
   function requestDetailShards(shards) {
     var started = false;
     var promises = shards.map(function (shard) {
-      var url = immutableTimelineObjectUrl(shard, "detail shard");
+      var url = shardKey(shard, "detail shard");
       if (!app.detailPromises.has(url)) {
         started = true;
       }
@@ -1385,7 +1453,7 @@
   }
 
   function requestVisibleDetails() {
-    if (app.schemaMode !== "schema2" || app.renderLod !== "detail") {
+    if (!shardedMode() || app.renderLod !== "detail") {
       return;
     }
     var request = requestDetailShards(
@@ -1395,7 +1463,7 @@
   }
 
   function requestSearchCorpus() {
-    if (app.schemaMode !== "schema2") {
+    if (!shardedMode()) {
       return;
     }
     app.searchShardState = "loading";
@@ -1561,7 +1629,7 @@
   }
 
   function searchShardMightMatch(shard, query) {
-    var url = immutableTimelineObjectUrl(shard, "transcript search shard");
+    var url = shardKey(shard, "transcript search shard");
     var filterValue = app.searchBloomByUrl.get(url);
     if (!filterValue) {
       return true;
@@ -1662,6 +1730,9 @@
   }
 
   function loadTranscriptSearchShard(catalogEntry) {
+    if (app.searchCorpusMode === "schema3") {
+      return loadSchema3SearchShard(catalogEntry);
+    }
     var url = immutableTimelineObjectUrl(catalogEntry, "transcript search shard");
     return fetchContentAddressedJson(
       catalogEntry,
@@ -1813,8 +1884,22 @@
     });
   }
 
+  //: Load the prefilter for the teams in scope, but only when the query has a term a trigram can
+  //: be built from.
+  //:
+  //: This is the whole difference the prefilter's move out of the bootstrap bought. Under schema 2
+  //: the filters arrived whether or not they could be used; here `B3` -- the case study's own
+  //: acceptance query, two bytes, ineligible for a trigram -- reads no Bloom data at all, and a
+  //: `--team`-narrowed search reads one team's filters instead of the archive's.
+  function prepareTranscriptSearchPrefilter() {
+    if (app.searchCorpusMode !== "schema3" || !queryCanUseBloom(app.query)) {
+      return Promise.resolve([]);
+    }
+    return Promise.all(schema3SearchTeams().map(ensureSearchBlooms));
+  }
+
   function requestTranscriptSearchCorpus() {
-    if (app.schemaMode !== "schema2" || !app.searchCatalog.length) {
+    if (!shardedMode() || !app.searchCatalog.length) {
       app.transcriptSearchState = "unavailable";
       app.transcriptSearchError = "This export does not contain transcript search shards.";
       updateShardDiagnostics();
@@ -1826,13 +1911,47 @@
     updateShardDiagnostics();
     renderTranscriptSearchResults();
     var generation = app.searchRequestGeneration;
+    return prepareTranscriptSearchPrefilter().then(function () {
+      if (generation !== app.searchRequestGeneration) {
+        return [];
+      }
+      return requestTranscriptSearchShards(generation);
+    }).catch(reportTranscriptSearchFailure(generation));
+  }
+
+  //: One failure handler for both steps of a search, so a prefilter that could not be fetched and
+  //: a shard that could not be parsed leave the page in the same state and say so the same way.
+  function reportTranscriptSearchFailure(generation) {
+    return function (error) {
+      if (generation !== app.searchRequestGeneration) {
+        return [];
+      }
+      if (app.transcriptSearchState !== "error") {
+        app.transcriptSearchState = "error";
+        app.transcriptSearchError = errorMessage(error);
+        updateShardDiagnostics();
+        renderTranscriptSearchResults();
+      }
+      throw error;
+    };
+  }
+
+  function requestTranscriptSearchShards(generation) {
+    // Selected *after* the prefilter is in hand, which is the point of the two-step: a shard the
+    // filter rules out is never fetched, and under schema 3 the filter itself is a fetch.
     var textShards = transcriptSearchShards();
-    var linkageShards = app.searchCatalog.filter(function (shard) {
-      return !app.selectedTeam || text(shard.team) === app.selectedTeam;
-    });
+    var linkage = app.searchCorpusMode === "schema3"
+      ? loadSearchItemsBounded(schema3SearchTeams(), ensureSearchLinks, generation)
+      : loadSearchItemsBounded(
+          app.searchCatalog.filter(function (shard) {
+            return !app.selectedTeam || text(shard.team) === app.selectedTeam;
+          }),
+          loadTranscriptSearchLinkage,
+          generation
+        );
     return Promise.all([
       loadSearchItemsBounded(textShards, loadTranscriptSearchShard, generation),
-      loadSearchItemsBounded(linkageShards, loadTranscriptSearchLinkage, generation)
+      linkage
     ]).then(function (values) {
       if (generation !== app.searchRequestGeneration) {
         return values;
@@ -1841,16 +1960,7 @@
       updateShardDiagnostics();
       updateTranscriptSearch();
       return values;
-    }).catch(function (error) {
-      if (generation !== app.searchRequestGeneration) {
-        return [];
-      }
-      app.transcriptSearchState = "error";
-      app.transcriptSearchError = error instanceof Error ? error.message : String(error);
-      updateShardDiagnostics();
-      renderTranscriptSearchResults();
-      throw error;
-    });
+    }).catch(reportTranscriptSearchFailure(generation));
   }
 
   function transcriptRecordMatchesScope(record) {
@@ -2129,10 +2239,17 @@
     renderTranscriptSearchResults();
     zoomToRange(at - SEARCH_JUMP_SPAN_MS / 2, at + SEARCH_JUMP_SPAN_MS / 2);
     selectSearchRecordLocation(record);
-    if (app.schemaMode !== "schema2") {
+    if (!shardedMode()) {
       return;
     }
+    var recordTeam = text(record.team);
     var exactShards = app.shardCatalog.filter(function (shard) {
+      // Schema 3 shards a day per team, so the record's own team narrows twelve fetches to one.
+      // Schema 2's day objects hold every team and carry no `team` field, which is why this is a
+      // condition on the shard rather than an unconditional filter.
+      if (schema3Enabled() && recordTeam && text(shard.team) !== recordTeam) {
+        return false;
+      }
       return number(shard.start_ms, Infinity) <= at &&
         number(shard.end_ms, -Infinity) > at;
     });
@@ -2155,7 +2272,7 @@
   }
 
   function ensureSearchContext(record, request) {
-    if (app.schemaMode !== "schema2") {
+    if (!shardedMode()) {
       return Promise.resolve([]);
     }
     var team = text(record.team);
@@ -2169,9 +2286,15 @@
     var teamShards = app.searchCatalog.filter(function (shard) {
       return text(shard.team) === team;
     });
-    var hasLinkage = teamShards.length > 0 && teamShards.every(function (shard) {
-      return shard.linkage && typeof shard.linkage === "object";
-    });
+    // Schema 3 publishes one relationship sidecar per *team*, so the question "is there linkage
+    // for this team" is asked of that stream and not of every day's catalogue entry -- which
+    // carries no `linkage` reference at all and would otherwise answer "no" and drag the team's
+    // whole text corpus back in.
+    var hasLinkage = app.searchCorpusMode === "schema3"
+      ? app.searchLinksByTeam.has(team)
+      : teamShards.length > 0 && teamShards.every(function (shard) {
+        return shard.linkage && typeof shard.linkage === "object";
+      });
     var needed = [];
     if (!hasLinkage) {
       needed = teamShards;
@@ -2198,7 +2321,7 @@
         if (!shard) {
           return;
         }
-        var url = immutableTimelineObjectUrl(shard, "transcript search shard");
+        var url = shardKey(shard, "transcript search shard");
         if (!seen.has(url)) {
           seen.add(url);
           needed.push(shard);
@@ -2337,6 +2460,22 @@
   }
 
   function loadPhaseIndex() {
+    if (schema3Enabled()) {
+      // Schema 3 has no phase-index object. The cards are the spine's `phase_card` kind -- the
+      // same nine fields, one record per phase, no `states` array -- read by line range from every
+      // team's spine the first time anything asks. One round of ranges rather than a
+      // content-addressed object, and nothing at all for a session that never opens a lifetime.
+      if (app.phaseIndexReady) {
+        return Promise.resolve(app.phaseIndexByAgent);
+      }
+      return Promise.all(
+        Array.from(app.spineByTeam.keys()).map(ensurePhaseCards)
+      ).then(function () {
+        app.phaseIndexReady = true;
+        updateShardDiagnostics();
+        return app.phaseIndexByAgent;
+      });
+    }
     if (!app.phaseIndexReference) {
       return Promise.resolve(null);
     }
@@ -3410,6 +3549,28 @@
   }
 
   function zoomToActivityRange(bounds, scope) {
+    // Schema 3 keeps the zoom bounds out of the records and out of the first paint -- they are a
+    // spine kind of their own, laid down last, 324,624 bytes across the archive. A page that
+    // never zooms never reads them; a page that does reads one team's, once, and then this
+    // function behaves exactly as it does under schema 2, because the record it consults is the
+    // same record derived by the same function.
+    if (schema3Enabled() && !hasField(bounds || {}, "activity_start_ms")) {
+      var reference = activityBoundsRef(bounds, scope);
+      ensureActivityBounds(boundsTeam(bounds)).then(function () {
+        var recorded = app.activityBoundsByRef.get(reference);
+        zoomWithActivityBounds(
+          recorded ? Object.assign({}, bounds, recorded) : bounds,
+          scope
+        );
+      }, function () {
+        zoomWithActivityBounds(bounds, scope);
+      });
+      return;
+    }
+    zoomWithActivityBounds(bounds, scope);
+  }
+
+  function zoomWithActivityBounds(bounds, scope) {
     function finishZoom() {
       var activityRange = timelineCore.activityRangeWithin(
         bounds,
@@ -4556,15 +4717,13 @@
   }
 
   function detailCoverageComplete(start, end) {
-    if (app.schemaMode !== "schema2") {
+    if (!shardedMode()) {
       return true;
     }
     return app.shardCatalog.every(function (shard) {
       var overlaps = number(shard.start_ms, Infinity) < end &&
         number(shard.end_ms, -Infinity) > start;
-      return !overlaps || app.loadedShardUrls.has(
-        immutableTimelineObjectUrl(shard, "detail shard")
-      );
+      return !overlaps || app.loadedShardUrls.has(shardKey(shard, "detail shard"));
     });
   }
 
@@ -5891,8 +6050,8 @@
   }
 
   async function renderAgentLifetimePhases(container, agent, request) {
-    if (app.schemaMode === "schema2") {
-      if (app.phaseIndexReference) {
+    if (shardedMode()) {
+      if (app.phaseIndexReference || schema3Enabled()) {
         if (!app.phaseIndexPromise) {
           showLoading(container, "Loading agent work phases…");
         }
@@ -6271,10 +6430,14 @@
   }
 
   function showLoadError(error) {
-    var message = error instanceof Error ? error.message : String(error);
+    // Names the *newest* entry point rather than the oldest. `loadTimeline` tries schema 3, then
+    // schema 2, then schema 1, and reaches here only when all three failed -- so quoting
+    // `data/timeline.json`, which a current build does not even write, sent every reader looking
+    // for a file whose absence was never the problem.
     dom.meta.textContent = "Timeline could not be loaded";
     dom.loadError.textContent =
-      "Could not load " + DATA_URL + ": " + message +
+      "Could not load " + SCHEMA_3_URL + " or the generations behind it: " +
+      errorMessage(error) +
       ". Serve the generated site over HTTP so its data files are available.";
     dom.loadError.hidden = false;
   }
@@ -6355,6 +6518,1450 @@
     return app.resourcePromises.get(url);
   }
 
+  // =====================================================================================
+  // Schema 3: one small bootstrap, and shards read a gzip member at a time over HTTP Range
+  // =====================================================================================
+  //
+  // What this reads, and what it costs
+  // ----------------------------------
+  // A schema-2 first paint downloads `data/timeline-v2.json` and the content-addressed
+  // `timeline-global` object it names: on the measured archive that is 3,289,110 + 1,213,271 =
+  // 4,502,381 transferred bytes, which the browser then parses as 5,702,530 + 10,358,370 =
+  // 16,060,900 bytes of JSON before it can draw anything. Most of the bootstrap is not structure
+  // at all -- it is 2,059 pre-aggregated activity bins and, once a build has a transcript search
+  // corpus, 4,527,592 base64 characters of Bloom filter, inlined into the one file that gates the
+  // first frame.
+  //
+  // A schema-3 first paint downloads `data/timeline-v3.json` (89,298 bytes, or 168,703 with the
+  // search streams) and then, in one parallel round, two published *line ranges* out of each
+  // team's spine shard, plus the single activity-bins shard. Nothing else. Measured against the
+  // same twelve-team archive, over the archive's own `serve.py`:
+  //
+  //     schema 2   4,502,381 bytes transferred    16,060,900 bytes of JSON parsed    2 requests
+  //     schema 3   2,155,957 bytes transferred    16,135,089 bytes of JSON parsed   34 requests
+  //
+  // **2.09 times fewer bytes on the wire, and the same parse.** The parse figure is recorded
+  // rather than rounded away because it does not improve: both generations have to materialise
+  // roughly the same records to draw the same frame, and minifying them does not change how many
+  // there are. What moves is transfer, and what moves it is that a schema-3 shard is stored
+  // compressed with no plain twin and is served as it is stored.
+  //
+  // The 34 requests against 2 are the honest cost of seeking: one bootstrap, thirteen sidecars
+  // totalling 8,218 bytes, and twenty member reads. On a loopback server that is free; on a
+  // high-latency link it is twenty round trips that schema 2 did not make, which is the trade this
+  // layout takes deliberately and the reason the reads are issued in parallel.
+  //
+  // Two spine kinds are *not* in that paint, and both are read later, by line range:
+  //
+  //     phase cards      340,835 bytes   on the first agent-lifetime open
+  //     zoom bounds       78,228 bytes   on the first zoom
+  //
+  // Schema 2 defers the cards too, into a separate `timeline-phase-index` object, and that object
+  // costs 826,578 bytes compressed and 9,632,001 parsed -- so the deferred half is 2.4 times
+  // cheaper on the wire and 3.1 times cheaper to parse. Its zoom bounds are not deferred at all:
+  // they are fields on records the first paint already had, which is why they cost schema 2
+  // nothing extra here and are already counted in its 16,060,900.
+  //
+  // Where the seek happens, and why the browser does not decode multi-member gzip
+  // ------------------------------------------------------------------------------
+  // A schema-3 shard is a *concatenation* of independent gzip members, and its `.index.jsonl`
+  // sidecar publishes, per member, the compressed byte range, the uncompressed byte range, the
+  // line range, and the instant range. So "give me the records for this day" and "give me lines
+  // [0, 682)" are both answered by: read the sidecar (a few hundred bytes of plain JSONL), pick
+  // the members, and ask the server for exactly their bytes with a `Range` header.
+  //
+  // The server does the seeking. `serve.py` -- which is `standalone_server.py`, copied verbatim
+  // into the archive -- answers a single byte range with a 206, honours `If-Range`, and answers
+  // 416 for a range past the end. Each member is *itself* a complete, ordinary gzip stream, so
+  // what comes back over the wire is never multi-member: it is one stream that
+  // `DecompressionStream("gzip")` inflates natively. That split is the whole reason the format is
+  // multi-member rather than one big deflate, and it is why nothing here ships a JavaScript
+  // inflater.
+  //
+  // A server that ignores `Range` is still correct, and that is a property rather than an
+  // accident: ignoring a range is a legal answer, `fetchShardMember` detects the whole-file reply
+  // and slices the member out of it, and the archive therefore stays readable from a bucket, a
+  // CDN or `python3 -m http.server`. It costs bandwidth and nothing else.
+  //
+  // **The rejected alternative was a dynamic endpoint in `serve.py`** -- `GET /-/v3/records?...`,
+  // with the server reading the sidecar, inflating the members and handing back JSON, so the
+  // browser would decode no gzip at all. It is refused for three reasons. The archive would stop
+  // being a directory of static files: today `python3 -m http.server`, a bucket, a CDN or a
+  // read-only mount all serve it, and every one of those would have started returning 404 for the
+  // timeline. The sidecar's member table and its contiguity invariant would then have a second
+  // implementation, in Python, in a file that is copied into archives and therefore frozen at
+  // build time -- so a reader fix would need a rebuild of every archive rather than a page reload.
+  // And it buys nothing measurable: the inflate is the same inflate, moved across the socket, and
+  // the bytes on the wire go *up*, because JSON is what gzip was compressing.
+  //
+  // What is checked before a record is believed
+  // -------------------------------------------
+  // Schema 2 verifies a whole object against a SHA-256 in its name. A range read cannot do that
+  // without defeating its own purpose, so the integrity story is assembled from parts that a
+  // partial read can actually check, and all of them are checks against the *bootstrap*, which is
+  // the file the page trusted first:
+  //
+  //   * the sidecar header's `c_size`, `u_size`, `c_sha256`, `u_sha256`, `record_count` and
+  //     `member_count` must equal the catalogue entry's -- so a sidecar from another generation
+  //     is rejected before a single byte of data is fetched;
+  //   * the member table must be contiguous and must cover exactly `c_size`/`u_size`/
+  //     `record_count`, the same invariant `seekable_jsonl.ChunkIndex._parse` enforces;
+  //   * every 206 must report a total that equals `c_size`, so a shard that grew or shrank under
+  //     the reader is caught on the first range rather than the last;
+  //   * the ETag of the first response is remembered and sent as `If-Range` on every later one,
+  //     so the server itself refuses to stitch two versions of a shard together; and
+  //   * each inflated member must decode to exactly `u_len` bytes and exactly `n` lines. gzip's
+  //     own CRC-32 and length trailer come free with the inflate.
+  //
+  // Together those say: these bytes are the bytes this bootstrap described. What they do not say
+  // is that the bootstrap is the one the archive's builder wrote -- neither does schema 2, whose
+  // digests are also read out of the file being validated.
+
+  function schema3Enabled() {
+    return app.schemaMode === "schema3";
+  }
+
+  //: Everything schema 3 installs, put back the way an older generation expects to find it.
+  //:
+  //: Called by both older loaders rather than only by the fallback path, because a *partial*
+  //: schema-3 load is the case that matters: `loadSchema3` throws after it has already set
+  //: `spineByTeam` or `phaseIndexReady`, and `loadSchema2` then runs against a page carrying half
+  //: of a generation it does not read. The member and sidecar caches are keyed by immutable
+  //: paths, so they are correct to keep -- but they are dropped anyway, because nothing is going
+  //: to ask for them and a reader that cannot say why a cache is still there has a leak.
+  function resetSchema3State() {
+    app.phaseIndexReady = false;
+    app.phaseCardPromises.clear();
+    app.spineByTeam = new Map();
+    app.searchBloomByTeam = new Map();
+    app.searchLinksByTeam = new Map();
+    app.shardIndexPromises.clear();
+    app.memberPromises.clear();
+    app.shardEtags.clear();
+    app.activityBoundsByRef.clear();
+    app.activityBoundsPromises.clear();
+    app.searchBloomPromises.clear();
+    app.searchLinkPromises.clear();
+  }
+
+  //: Whether the loaded generation answers detail from shards rather than holding everything in
+  //: memory. Schema 2 and schema 3 both do; schema 1 does not. Written as a predicate because the
+  //: guards that used to say `schemaMode !== "schema2"` were asking this question and not that
+  //: one, and each of them became wrong the moment a second sharded generation existed.
+  function shardedMode() {
+    return app.schemaMode === "schema2" || app.schemaMode === "schema3";
+  }
+
+  //: The identity of a shard inside `loadedShardUrls`, `detailPromises` and friends. Schema 2
+  //: names a shard by a content-addressed URL it also validates; schema 3 names it by a path that
+  //: says what it is. One accessor rather than two branches at every call site, and it keeps the
+  //: schema-2 URL validation exactly where it was.
+  function shardKey(entry, where) {
+    if (entry && typeof entry === "object" && typeof entry.path === "string") {
+      return entry.path;
+    }
+    return immutableTimelineObjectUrl(entry, where);
+  }
+
+  function schema3SafeRelativePath(value, where) {
+    var relative = text(value);
+    if (relative.indexOf(SCHEMA_3_ROOT) !== 0 || relative.indexOf("..") >= 0 ||
+        relative.indexOf("//") >= 0 || /[?#]/.test(relative)) {
+      throw new Error(where + " must be a path under " + SCHEMA_3_ROOT + ".");
+    }
+    return relative;
+  }
+
+  function schema3Integer(value, where, minimum) {
+    var parsed = number(value, NaN);
+    if (!Number.isSafeInteger(parsed) || parsed < minimum) {
+      throw new Error(where + " must be an integer of at least " + minimum + ".");
+    }
+    return parsed;
+  }
+
+  //: One catalogue entry, narrowed and given the two field names the rest of the application
+  //: already speaks. `start_ms`/`end_ms` are not invented: they are `t0` and `t_end_exclusive`,
+  //: which is exactly the pair the bootstrap tells a reader to compare a window against
+  //: (`t0 < T1 and t_end_exclusive > T0`), and it is the same comparison `detailShardsForRange`
+  //: has always made against schema 2. Renaming here rather than branching there keeps one
+  //: selection rule in the application instead of one per generation.
+  function schema3ShardEntry(raw, stream, where) {
+    if (!raw || typeof raw !== "object") {
+      throw new Error(where + " must be an object.");
+    }
+    if (text(raw.stream) !== stream) {
+      throw new Error(where + " belongs to stream " + text(raw.stream) + ".");
+    }
+    var path = schema3SafeRelativePath(raw.path, where + ".path");
+    var indexPath = schema3SafeRelativePath(raw.index_path, where + ".index_path");
+    if (indexPath !== path + SCHEMA_3_INDEX_SUFFIX) {
+      throw new Error(where + ".index_path must be its shard plus " + SCHEMA_3_INDEX_SUFFIX + ".");
+    }
+    var lineRanges = new Map();
+    if (hasField(raw, "line_ranges")) {
+      var ranges = raw.line_ranges && typeof raw.line_ranges === "object" ? raw.line_ranges : null;
+      if (!ranges) {
+        throw new Error(where + ".line_ranges must be an object.");
+      }
+      Object.keys(ranges).forEach(function (kind) {
+        var pair = ranges[kind];
+        if (!Array.isArray(pair) || pair.length !== 2) {
+          throw new Error(where + ".line_ranges." + kind + " must be [first, count].");
+        }
+        lineRanges.set(kind, {
+          first: schema3Integer(pair[0], where + ".line_ranges." + kind + "[0]", 0),
+          count: schema3Integer(pair[1], where + ".line_ranges." + kind + "[1]", 0)
+        });
+      });
+    }
+    var t0 = Number.isFinite(raw.t0) ? Number(raw.t0) : null;
+    var reach = Number.isFinite(raw.t_end_exclusive) ? Number(raw.t_end_exclusive) : null;
+    return {
+      stream: stream,
+      team: typeof raw.team === "string" ? raw.team : null,
+      day: typeof raw.day === "string" ? raw.day : null,
+      path: path,
+      index_path: indexPath,
+      records: schema3Integer(raw.records, where + ".records", 0),
+      members: schema3Integer(raw.members, where + ".members", 0),
+      c_bytes: schema3Integer(raw.c_bytes, where + ".c_bytes", 0),
+      u_bytes: schema3Integer(raw.u_bytes, where + ".u_bytes", 0),
+      c_sha256: text(raw.c_sha256),
+      u_sha256: text(raw.u_sha256),
+      timestamps_sorted: raw.timestamps_sorted === true,
+      start_ms: t0,
+      end_ms: reach,
+      line_ranges: lineRanges
+    };
+  }
+
+  function schema3Stream(bootstrap, name, required) {
+    var streams = bootstrap && typeof bootstrap.streams === "object" && bootstrap.streams
+      ? bootstrap.streams
+      : null;
+    if (!streams) {
+      throw new Error("Schema-3 bootstrap has no streams.");
+    }
+    var stream = streams[name] && typeof streams[name] === "object" ? streams[name] : null;
+    if (!stream) {
+      if (required) {
+        throw new Error("Schema-3 bootstrap does not publish the " + name + " stream.");
+      }
+      return [];
+    }
+    var seen = new Set();
+    return array(stream.shards).map(function (raw, index) {
+      var entry = schema3ShardEntry(raw, name, "Schema-3 " + name + " shard " + index);
+      if (seen.has(entry.path)) {
+        throw new Error("Schema-3 " + name + " stream names " + entry.path + " twice.");
+      }
+      seen.add(entry.path);
+      return entry;
+    });
+  }
+
+  // -- the sidecar ------------------------------------------------------------------------
+
+  //: Parse one `.index.jsonl` sidecar: a header line, then one line per member.
+  //:
+  //: Split on "\n" rather than with `String.prototype.split(/\r?\n/)` or any line-terminator
+  //: regex, for the reason `ChunkIndex._parse` gives about `str.splitlines()`: the sidecar is
+  //: written with `ensure_ascii=False`, so a `data_file` carrying U+2028 or U+0085 is one line on
+  //: disk and would become two under a reader with a looser idea of what ends a line.
+  function parseChunkIndex(source, entry) {
+    var where = entry.index_path;
+    var lines = text(source).split("\n").filter(function (line) { return line !== ""; });
+    if (!lines.length) {
+      throw new Error(where + " is empty.");
+    }
+    var header;
+    try {
+      header = JSON.parse(lines[0]);
+    } catch (_error) {
+      throw new Error(where + " header is not JSON.");
+    }
+    if (!header || typeof header !== "object" ||
+        text(header.format) !== SCHEMA_3_INDEX_FORMAT ||
+        number(header.version, NaN) !== SCHEMA_3_INDEX_VERSION) {
+      throw new Error(where + " is not a version-1 " + SCHEMA_3_INDEX_FORMAT + ".");
+    }
+    if (text(header.codec) !== "gzip") {
+      throw new Error(where + " uses codec " + text(header.codec) + ", which this page cannot read.");
+    }
+    // Bind the sidecar to the catalogue before any data byte is requested. Every one of these is
+    // a fact the bootstrap already stated, so a mismatch means the two files came from different
+    // builds -- and a stale sidecar does not give a slow answer, it gives a confident wrong one.
+    if (number(header.c_size, NaN) !== entry.c_bytes ||
+        number(header.u_size, NaN) !== entry.u_bytes ||
+        number(header.record_count, NaN) !== entry.records ||
+        number(header.member_count, NaN) !== entry.members ||
+        text(header.c_sha256) !== entry.c_sha256 ||
+        text(header.u_sha256) !== entry.u_sha256) {
+      throw new Error(where + " describes a different generation than " + SCHEMA_3_URL + ".");
+    }
+    if (lines.length - 1 !== entry.members) {
+      throw new Error(where + " lists " + (lines.length - 1) + " members, expected " + entry.members + ".");
+    }
+    var members = [];
+    var compressed = 0;
+    var uncompressed = 0;
+    var line = 0;
+    for (var index = 1; index < lines.length; index += 1) {
+      var raw;
+      try {
+        raw = JSON.parse(lines[index]);
+      } catch (_error) {
+        throw new Error(where + " member " + (index - 1) + " is not JSON.");
+      }
+      if (!raw || typeof raw !== "object") {
+        throw new Error(where + " member " + (index - 1) + " is not an object.");
+      }
+      var member = {
+        c_off: schema3Integer(raw.c_off, where + " member " + (index - 1) + ".c_off", 0),
+        c_len: schema3Integer(raw.c_len, where + " member " + (index - 1) + ".c_len", 1),
+        u_off: schema3Integer(raw.u_off, where + " member " + (index - 1) + ".u_off", 0),
+        u_len: schema3Integer(raw.u_len, where + " member " + (index - 1) + ".u_len", 0),
+        l0: schema3Integer(raw.l0, where + " member " + (index - 1) + ".l0", 0),
+        n: schema3Integer(raw.n, where + " member " + (index - 1) + ".n", 0),
+        t0: Number.isFinite(raw.t0) ? Number(raw.t0) : null,
+        t1: Number.isFinite(raw.t1) ? Number(raw.t1) : null
+      };
+      // Contiguity, checked once here rather than at every read that assumes it.
+      if (member.c_off !== compressed || member.u_off !== uncompressed || member.l0 !== line) {
+        throw new Error(where + " member " + (index - 1) + " is not contiguous.");
+      }
+      compressed += member.c_len;
+      uncompressed += member.u_len;
+      line += member.n;
+      members.push(member);
+    }
+    if (compressed !== entry.c_bytes || uncompressed !== entry.u_bytes || line !== entry.records) {
+      throw new Error(where + " member table does not cover its own header totals.");
+    }
+    return { header: header, members: members };
+  }
+
+  function loadChunkIndex(entry) {
+    var url = entry.index_path;
+    if (!app.shardIndexPromises.has(url)) {
+      var request = (async function () {
+        var response = await fetch(url, { credentials: "same-origin" });
+        if (!response.ok) {
+          var error = new Error("HTTP " + response.status + " for " + url);
+          error.httpStatus = response.status;
+          throw error;
+        }
+        return parseChunkIndex(await response.text(), entry);
+      }());
+      var cached = request.catch(function (error) {
+        if (app.shardIndexPromises.get(url) === cached) {
+          app.shardIndexPromises.delete(url);
+        }
+        throw error;
+      });
+      app.shardIndexPromises.set(url, cached);
+    }
+    return app.shardIndexPromises.get(url);
+  }
+
+  // -- member selection -------------------------------------------------------------------
+
+  //: Members that can hold a record in the half-open window `[start, end)`.
+  //:
+  //: A member with no timestamped record (`t0 === null`) can never be selected by time, which is
+  //: `ChunkIndexEntry.overlaps` restated: it is not "no constraint", it is "no record here has a
+  //: position on the time axis". A `null` bound on the *query* side is open in that direction.
+  function membersForTimeRange(members, start, end) {
+    return members.filter(function (member) {
+      if (member.t0 === null || member.t1 === null) {
+        return false;
+      }
+      if (Number.isFinite(start) && member.t1 < start) {
+        return false;
+      }
+      if (Number.isFinite(end) && member.t0 >= end) {
+        return false;
+      }
+      return true;
+    });
+  }
+
+  //: Members holding any line of `[first, first + count)`.
+  function membersForLineRange(members, first, count) {
+    if (count <= 0) {
+      return [];
+    }
+    return members.filter(function (member) {
+      return member.l0 < first + count && member.l0 + member.n > first;
+    });
+  }
+
+  // -- reading one member -----------------------------------------------------------------
+
+  //: Inflate one gzip member. Every fetched range is exactly one member, and a member is a
+  //: complete gzip stream, so this never meets the concatenated case a `DecompressionStream`
+  //: refuses -- which is the property the range read is here to produce.
+  async function inflateGzipMember(buffer, where) {
+    if (typeof DecompressionStream !== "function") {
+      throw new Error(
+        "This browser cannot inflate gzip (" + where + "). Schema 3 needs DecompressionStream."
+      );
+    }
+    var stream = new Blob([buffer]).stream().pipeThrough(new DecompressionStream("gzip"));
+    return await new Response(stream).arrayBuffer();
+  }
+
+  function parseContentRangeTotal(header, where) {
+    var match = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(text(header).trim());
+    if (!match) {
+      throw new Error(where + " answered 206 with an unreadable Content-Range.");
+    }
+    return {
+      first: Number(match[1]),
+      last: Number(match[2]),
+      total: Number(match[3])
+    };
+  }
+
+  //: The page-wide gate on member fetches, and the whole of what makes SCHEMA_3_MEMBER_CONCURRENCY
+  //: a page-wide bound.
+  //:
+  //: Deliberately wrapped around the *leaf* -- one member's request -- and around nothing else.
+  //: A gate that also held sidecar fetches could deadlock: `readShardRecords` awaits the sidecar
+  //: before it asks for a member, so six member fetches waiting on a seventh shard's sidecar,
+  //: which is itself queued behind them, would never resolve. Member fetches wait for nothing
+  //: that waits for a slot, so the queue below always drains.
+  var schema3MemberSlots = { active: 0, waiting: [] };
+
+  function schema3MemberSlot(run) {
+    function release() {
+      var next = schema3MemberSlots.waiting.shift();
+      if (next) {
+        next();
+      } else {
+        schema3MemberSlots.active -= 1;
+      }
+    }
+    function start() {
+      var settled;
+      try {
+        settled = Promise.resolve(run());
+      } catch (error) {
+        release();
+        return Promise.reject(error);
+      }
+      return settled.then(function (value) {
+        release();
+        return value;
+      }, function (error) {
+        release();
+        throw error;
+      });
+    }
+    if (schema3MemberSlots.active < SCHEMA_3_MEMBER_CONCURRENCY) {
+      schema3MemberSlots.active += 1;
+      return start();
+    }
+    return new Promise(function (resolve, reject) {
+      schema3MemberSlots.waiting.push(function () {
+        start().then(resolve, reject);
+      });
+    });
+  }
+
+  //: Fetch, inflate and parse one member, once per page load.
+  //:
+  //: The `If-Range` on every request after the first is the point of remembering the ETag: a
+  //: rebuild while the page is open replaces the shard, and a reader that spliced member 7 of the
+  //: new file onto member 3 of the old one would produce records that never coexisted. The server
+  //: answers a mismatched `If-Range` with the whole representation, which this detects and turns
+  //: into a refusal rather than silently accepting a different generation's bytes.
+  function fetchShardMember(entry, member) {
+    var key = entry.path + "#" + member.c_off;
+    if (!app.memberPromises.has(key)) {
+      var request = schema3MemberSlot(async function () {
+        var last = member.c_off + member.c_len - 1;
+        var headers = { Range: "bytes=" + member.c_off + "-" + last };
+        var known = app.shardEtags.get(entry.path);
+        if (known) {
+          headers["If-Range"] = known;
+        }
+        var response = await fetch(entry.path, {
+          credentials: "same-origin",
+          headers: headers
+        });
+        if (response.status === 416) {
+          throw new Error(
+            entry.path + " is shorter than " + SCHEMA_3_URL + " says; rebuild or reload."
+          );
+        }
+        if (!response.ok) {
+          var error = new Error("HTTP " + response.status + " for " + entry.path);
+          error.httpStatus = response.status;
+          throw error;
+        }
+        var etag = text(response.headers.get("ETag"));
+        var buffer = await response.arrayBuffer();
+        if (response.status === 206) {
+          var range = parseContentRangeTotal(
+            response.headers.get("Content-Range"),
+            entry.path
+          );
+          if (range.total !== entry.c_bytes || range.first !== member.c_off ||
+              range.last !== last) {
+            throw new Error(
+              entry.path + " served bytes " + range.first + "-" + range.last + "/" +
+                range.total + ", not the member " + SCHEMA_3_URL + " described."
+            );
+          }
+        } else {
+          // A 200 to a range request is always legal -- a server may ignore `Range` -- so the
+          // whole file is a correct answer and the member is sliced out of it here. What is not
+          // acceptable is a 200 that arrived because `If-Range` did *not* match, which is the
+          // one case where the bytes belong to a different version of the shard.
+          if (known && etag && etag !== known) {
+            throw new Error(
+              entry.path + " changed while it was being read; reload the page."
+            );
+          }
+          if (buffer.byteLength !== entry.c_bytes) {
+            throw new Error(
+              entry.path + " is " + buffer.byteLength + " bytes, not the " + entry.c_bytes +
+                " " + SCHEMA_3_URL + " described."
+            );
+          }
+          buffer = buffer.slice(member.c_off, member.c_off + member.c_len);
+        }
+        if (etag && !app.shardEtags.has(entry.path)) {
+          app.shardEtags.set(entry.path, etag);
+        }
+        var inflated = await inflateGzipMember(buffer, entry.path);
+        if (inflated.byteLength !== member.u_len) {
+          throw new Error(
+            entry.path + " member at " + member.c_off + " inflated to " + inflated.byteLength +
+              " bytes, expected " + member.u_len + "."
+          );
+        }
+        var body = new TextDecoder("utf-8", { fatal: true }).decode(inflated);
+        var lines = body.split("\n");
+        if (lines.length && lines[lines.length - 1] === "") {
+          lines.pop();
+        }
+        if (lines.length !== member.n) {
+          throw new Error(
+            entry.path + " member at " + member.c_off + " holds " + lines.length +
+              " lines, expected " + member.n + "."
+          );
+        }
+        return lines.map(function (line, offset) {
+          var record;
+          try {
+            record = JSON.parse(line);
+          } catch (_error) {
+            throw new Error(entry.path + " line " + (member.l0 + offset) + " is not JSON.");
+          }
+          if (!record || typeof record !== "object" || Array.isArray(record)) {
+            throw new Error(entry.path + " line " + (member.l0 + offset) + " is not an object.");
+          }
+          return record;
+        });
+      });
+      var cached = request.catch(function (error) {
+        if (app.memberPromises.get(key) === cached) {
+          app.memberPromises.delete(key);
+        }
+        throw error;
+      });
+      app.memberPromises.set(key, cached);
+    }
+    return app.memberPromises.get(key);
+  }
+
+  //: Run *jobs* with a bounded number in flight, preserving their order in the result.
+  async function boundedAll(jobs, limit) {
+    var results = new Array(jobs.length);
+    var next = 0;
+    async function worker() {
+      while (next < jobs.length) {
+        var index = next;
+        next += 1;
+        results[index] = await jobs[index]();
+      }
+    }
+    var workers = [];
+    for (var slot = 0; slot < Math.min(limit, jobs.length); slot += 1) {
+      workers.push(worker());
+    }
+    await Promise.all(workers);
+    return results;
+  }
+
+  //: Every record of *entry* that a selector admits, in shard order.
+  //:
+  //: `selector` is either `{ start_ms, end_ms }` (time-addressed streams) or
+  //: `{ first, count }` (line-addressed ones: the spine and the relationship sidecar). Both first
+  //: choose members and then filter *within* them, because a member is the smallest unit the
+  //: format can seek to and a day boundary does not fall on one.
+  async function readShardRecords(entry, selector) {
+    var index = await loadChunkIndex(entry);
+    var byLine = hasField(selector, "first");
+    var members = byLine
+      ? membersForLineRange(index.members, selector.first, selector.count)
+      : membersForTimeRange(index.members, selector.start_ms, selector.end_ms);
+    var pages = await boundedAll(
+      members.map(function (member) {
+        return function () {
+          return fetchShardMember(entry, member).then(function (records) {
+            return { member: member, records: records };
+          });
+        };
+      }),
+      SCHEMA_3_MEMBER_CONCURRENCY
+    );
+    var selected = [];
+    pages.forEach(function (page) {
+      page.records.forEach(function (record, offset) {
+        if (byLine) {
+          var line = page.member.l0 + offset;
+          if (line < selector.first || line >= selector.first + selector.count) {
+            return;
+          }
+        } else {
+          var at = number(record.at_ms, NaN);
+          if (!Number.isFinite(at) ||
+              (Number.isFinite(selector.start_ms) && at < selector.start_ms) ||
+              (Number.isFinite(selector.end_ms) && at >= selector.end_ms)) {
+            return;
+          }
+        }
+        selected.push(record);
+      });
+    });
+    return selected;
+  }
+
+  //: The whole of one line-addressed kind, or an empty list when the shard does not carry it.
+  function readShardKind(entry, kind) {
+    var range = entry.line_ranges.get(kind);
+    if (!range || !range.count) {
+      return Promise.resolve([]);
+    }
+    return readShardRecords(entry, { first: range.first, count: range.count });
+  }
+
+  function schema3RecordsOfKind(records, kind) {
+    return records.filter(function (record) {
+      return text(record.record_kind) === kind;
+    });
+  }
+
+  //: Strip the one key the schema-3 envelope adds, so that what reaches the rest of the page is
+  //: the schema-1 record it always was. `at_ms` is deliberately *not* stripped: an event carried
+  //: it in schema 1 and the writer asserts the two agree, and a phase or edge that gained one is
+  //: carrying a field no renderer reads.
+  function schema3Payload(record) {
+    var copy = {};
+    Object.keys(record).forEach(function (key) {
+      if (key !== "record_kind") {
+        copy[key] = record[key];
+      }
+    });
+    return copy;
+  }
+
+  // -- the spine, which is the first paint --------------------------------------------------
+
+  //: The line ranges a first paint needs from one spine shard, and the two kinds it skips.
+  //:
+  //: The spine lays its kinds down in a declared order, and the two the first frame does *not*
+  //: need are the two largest: `activity_bounds` is last, and `phase_card` sits in the middle. So
+  //: this is `[0, l0(phase_card))` and `[l0(structural_edge), l0(activity_bounds))` -- two
+  //: contiguous ranges with a hole between them, each of which is a run of members and therefore
+  //: one `Range` request per member.
+  //:
+  //: Measured on the twelve-team archive, against reading the whole prefix up to the zoom bounds:
+  //: **2,333,892 compressed bytes down to 1,993,057, and 18,275,931 bytes of JSON to parse down to
+  //: 15,129,075.** The hole is worth a second range because it is 14% of the transfer and 17% of
+  //: the parse, and because it is what makes the first paint strictly cheaper than schema 2's on
+  //: *both* axes rather than only on transfer -- schema 2 defers its phase cards too, into the
+  //: separate `timeline-phase-index` object, so a schema 3 that loaded them eagerly would have
+  //: been comparing two different amounts of work.
+  //:
+  //: Skipping `phase_card` is safe for exactly the reason schema 2's arrangement is: no renderer
+  //: reads a card at load. `app.data.phases` is empty under both generations, the full phases
+  //: arrive from the day shards as the view asks for them, and the cards have one consumer --
+  //: `loadPhaseIndex`, behind the agent-lifetime modal -- which is asynchronous already and shows
+  //: a loading state. `ensurePhaseCards` is that fetch.
+  //:
+  //: Asking for the eight leading kinds separately, rather than as runs, would name the same lines
+  //: in eight calls; asking for the whole shard would drag the archive's 324,624 bytes of zoom
+  //: bounds across for a page that may never zoom.
+  function spineFirstPaintRanges(entry) {
+    var bounds = entry.line_ranges.get("activity_bounds");
+    var end = bounds ? bounds.first : entry.records;
+    var cards = entry.line_ranges.get("phase_card");
+    if (!cards || !cards.count) {
+      return [{ first: 0, count: end }];
+    }
+    var after = cards.first + cards.count;
+    var ranges = [{ first: 0, count: cards.first }];
+    if (end > after) {
+      ranges.push({ first: after, count: end - after });
+    }
+    return ranges.filter(function (range) { return range.count > 0; });
+  }
+
+  //: The phase cards of one team, fetched the first time something wants the phase index.
+  function ensurePhaseCards(team) {
+    var entry = app.spineByTeam.get(team);
+    if (!schema3Enabled() || !entry) {
+      return Promise.resolve(null);
+    }
+    if (!app.phaseCardPromises.has(team)) {
+      var request = readShardKind(entry, "phase_card").then(function (records) {
+        records.map(schema3Payload).forEach(installPhaseCard);
+        sortPhaseIndex();
+        return records;
+      });
+      var cached = request.catch(function (error) {
+        if (app.phaseCardPromises.get(team) === cached) {
+          app.phaseCardPromises.delete(team);
+        }
+        throw error;
+      });
+      app.phaseCardPromises.set(team, cached);
+    }
+    return app.phaseCardPromises.get(team);
+  }
+
+  function installPhaseCard(card) {
+    var agentId = text(card.agent_id);
+    if (!agentId) {
+      throw new Error("Schema-3 phase card has no agent.");
+    }
+    if (!app.phaseIndexByAgent.has(agentId)) {
+      app.phaseIndexByAgent.set(agentId, []);
+    }
+    app.phaseIndexByAgent.get(agentId).push(card);
+  }
+
+  function sortPhaseIndex() {
+    app.phaseIndexByAgent.forEach(function (cards) {
+      cards.sort(function (left, right) {
+        return number(left.start_ms, 0) - number(right.start_ms, 0) ||
+          text(left.id).localeCompare(text(right.id));
+      });
+    });
+  }
+
+  function schema3InstallSpine(team, records, sink) {
+    records.forEach(function (record) {
+      var kind = text(record.record_kind);
+      var payload = schema3Payload(record);
+      if (kind === "team") {
+        return;
+      }
+      if (kind === "agent") {
+        sink.agents.push(payload);
+      } else if (kind === "phase_card") {
+        // Only reachable on a shard whose cards happened to share a member with a kind the frame
+        // does need; `spineFirstPaintRanges` does not ask for them. Kept rather than refused
+        // because a member is the unit of transfer, so over-reading is normal and dropping the
+        // records would mean fetching them again.
+        sink.phaseCards.push(payload);
+      } else if (kind === "structural_edge") {
+        sink.edges.push(payload);
+      } else if (kind === "rollup") {
+        sink.rollups.push(payload);
+      } else if (kind === "project") {
+        sink.projects.push(payload);
+      } else if (kind === "summary_file") {
+        sink.summary_files.push(payload);
+      } else if (kind === "glossary_term") {
+        sink.glossary.push(payload);
+      } else if (kind === "project_overview") {
+        sink.project_overviews.push(payload);
+      } else if (kind !== "activity_bounds") {
+        throw new Error(
+          "Schema-3 spine shard for " + team + " carries an unknown record kind " + kind + "."
+        );
+      }
+    });
+  }
+
+  // -- the zoom bounds, fetched on the first zoom and not before ----------------------------
+
+  function schema3LocalIdentifier(team, identifier) {
+    var prefix = team + "::";
+    return identifier.indexOf(prefix) === 0 ? identifier.slice(prefix.length) : identifier;
+  }
+
+  //: The stable reference an `activity_bounds` record is keyed by, for the three subjects the
+  //: context menus can zoom to. The scope is what says which of the three this is: a phase scope
+  //: carries `phase_id`, an agent scope carries only `agent_id`, and a rollup passes none --
+  //: which is exactly how `zoomToActivityRange`'s callers already distinguish them, so nothing
+  //: here has to guess from the shape of the record.
+  //: Which team a presentation record belongs to, falling back to the sole published team.
+  //:
+  //: **A single-team render does not stamp `team` on anything but its agents.** There is only
+  //: one team, schema 1 does not carry the field, and `render.py` adds it to agents and not to
+  //: phases or rollups -- which is exactly why the schema-3 writer's `_team_of` has a
+  //: `sole_team` fallback, and why `query._SchemaThreeArchive._unwrap` has the same fallback
+  //: read from the other side. This is the third copy of that one rule, and it has to exist:
+  //: without it every `activity_bounds` reference computed for a phase or a rollup on a
+  //: single-team archive comes out empty, no published bound is ever found, and "Zoom to work
+  //: phase" silently degrades to fetching every day shard the subject overlaps -- for a monthly
+  //: rollup, the whole archive -- to recompute two numbers that are sitting in the spine.
+  //: Schema 2 never showed this because it carried the bounds inline on the record itself.
+  function boundsTeam(bounds) {
+    var declared = text(bounds && bounds.team);
+    if (declared) {
+      return declared;
+    }
+    return app.spineByTeam.size === 1
+      ? app.spineByTeam.keys().next().value
+      : "";
+  }
+
+  function activityBoundsRef(bounds, scope) {
+    var team = boundsTeam(bounds);
+    if (!team) {
+      return "";
+    }
+    if (scope && text(scope.phase_id)) {
+      return "phase:" + team + "::" + schema3LocalIdentifier(team, text(bounds.id));
+    }
+    if (scope && text(scope.agent_id) && text(bounds.id)) {
+      return "agent:" + team + "::" + schema3LocalIdentifier(team, text(bounds.id));
+    }
+    var kind = text(bounds && bounds.kind);
+    var start = number(bounds && bounds.start_ms, NaN);
+    if (!kind || !Number.isFinite(start)) {
+      return "";
+    }
+    return "rollup:" + team + "::" + kind + "::" + start;
+  }
+
+  function ensureActivityBounds(team) {
+    var entry = app.spineByTeam.get(team);
+    if (!schema3Enabled() || !entry) {
+      return Promise.resolve(null);
+    }
+    if (!app.activityBoundsPromises.has(team)) {
+      var request = readShardKind(entry, "activity_bounds").then(function (records) {
+        records.forEach(function (record) {
+          var reference = text(record.ref);
+          var start = number(record.activity_start_ms, NaN);
+          var end = number(record.activity_end_ms, NaN);
+          if (!reference || !Number.isFinite(start) || !Number.isFinite(end)) {
+            throw new Error("Schema-3 activity bounds for " + team + " are incomplete.");
+          }
+          app.activityBoundsByRef.set(reference, {
+            activity_start_ms: start,
+            activity_end_ms: end
+          });
+        });
+        return records;
+      });
+      var cached = request.catch(function (error) {
+        if (app.activityBoundsPromises.get(team) === cached) {
+          app.activityBoundsPromises.delete(team);
+        }
+        throw error;
+      });
+      app.activityBoundsPromises.set(team, cached);
+    }
+    return app.activityBoundsPromises.get(team);
+  }
+
+  // -- detail shards ------------------------------------------------------------------------
+
+  //: Merge one schema-3 timeline shard. The records are the schema-1 events, phases and
+  //: non-structural edges of one team's UTC day, so once the envelope key is dropped they are
+  //: exactly what `mergeDetailShard` already knows how to install -- which is why this hands them
+  //: to that function rather than growing a second merge with its own deduplication rules.
+  function loadSchema3DetailShard(entry) {
+    var key = entry.path;
+    if (!app.detailPromises.has(key)) {
+      var request = readShardRecords(entry, { start_ms: NaN, end_ms: NaN }).then(
+        function (records) {
+          var shard = {
+            schema_version: 2,
+            kind: "timeline-detail-day",
+            phases: [],
+            edges: [],
+            events: []
+          };
+          records.forEach(function (record) {
+            var kind = text(record.record_kind);
+            var payload = schema3Payload(record);
+            if (kind === "phase") {
+              shard.phases.push(payload);
+            } else if (kind === "edge") {
+              shard.edges.push(payload);
+            } else if (kind === "event") {
+              shard.events.push(payload);
+            } else {
+              throw new Error(entry.path + " carries an unknown record kind " + kind + ".");
+            }
+          });
+          mergeDetailShard(shard, key);
+          return shard;
+        }
+      );
+      var cached = request.catch(function (error) {
+        if (app.detailPromises.get(key) === cached) {
+          app.detailPromises.delete(key);
+        }
+        throw error;
+      });
+      app.detailPromises.set(key, cached);
+    }
+    return app.detailPromises.get(key);
+  }
+
+  // -- the transcript search corpus ----------------------------------------------------------
+
+  function schema3DayRange(entry, where) {
+    var match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(text(entry.day));
+    if (!match) {
+      throw new Error(where + " is not addressed by a UTC day.");
+    }
+    var start = Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
+    return { start_ms: start, end_ms: start + SCHEMA_3_DAY_MS };
+  }
+
+  //: The catalogue the search UI already speaks, projected from the schema-3 `search` stream.
+  //: `counts.records` and `start_ms`/`end_ms` are the two fields `validateTranscriptSearchShard`
+  //: and `searchShardAt` read, and giving them the same names is what lets one search
+  //: implementation serve both generations.
+  function schema3SearchCatalog(shards) {
+    return shards.map(function (entry) {
+      var range = schema3DayRange(entry, entry.path);
+      return Object.assign({}, entry, {
+        start_ms: range.start_ms,
+        end_ms: range.end_ms,
+        counts: { records: entry.records }
+      });
+    }).sort(function (left, right) {
+      return text(left.team).localeCompare(text(right.team)) ||
+        left.start_ms - right.start_ms;
+    });
+  }
+
+  //: Load one team's prefilter, and only when a query has a term a trigram can be built from.
+  //:
+  //: This is the decision schema 2 could not make. Its blooms are inlined in the bootstrap, so
+  //: every command paid 4,527,592 base64 characters whether or not it searched, and a two-byte
+  //: query -- which cannot use a trigram filter at all -- paid for all of them and then skipped
+  //: every filter. Here the filters are a stream, so `B3` reads none of it.
+  //:
+  //: The path a record names is checked against *this team's own* search shards, not merely
+  //: parsed. Keying by path is what makes another team's shard addressable from here, and a
+  //: Bloom filter's only wrong answer is a false miss -- so one team's filter installed under
+  //: another team's path would make `searchShardMightMatch` skip that whole day and drop every
+  //: record in it from the result, with nothing to say so. Schema 2 could not express this,
+  //: because its filters are inlined on the catalogue entry they belong to. `query.py`'s
+  //: `_SchemaThreeArchive.search_blooms` makes the same check on the same records.
+  function ensureSearchBlooms(team) {
+    var entry = app.searchBloomByTeam.get(team);
+    if (!entry) {
+      return Promise.resolve(null);
+    }
+    var owned = new Set();
+    app.searchCatalog.forEach(function (shard) {
+      if (text(shard.team) === team && text(shard.path)) {
+        owned.add(text(shard.path));
+      }
+    });
+    if (!app.searchBloomPromises.has(team)) {
+      var request = readShardRecords(entry, { start_ms: NaN, end_ms: NaN }).then(
+        function (records) {
+          records.forEach(function (record) {
+            var shard = text(record.shard);
+            if (!shard || text(record.team) !== team) {
+              throw new Error(entry.path + " has a prefilter record for another team.");
+            }
+            if (!owned.has(shard)) {
+              throw new Error(
+                entry.path + " has a prefilter for " + shard +
+                  ", which is not a search shard of " + team + "."
+              );
+            }
+            app.searchBloomByUrl.set(
+              shard,
+              decodeTrigramBloom(record.bloom, "transcript search prefilter " + shard)
+            );
+          });
+          return records;
+        }
+      );
+      var cached = request.catch(function (error) {
+        if (app.searchBloomPromises.get(team) === cached) {
+          app.searchBloomPromises.delete(team);
+        }
+        throw error;
+      });
+      app.searchBloomPromises.set(team, cached);
+    }
+    return app.searchBloomPromises.get(team);
+  }
+
+  //: Whether the query can be pruned with at all, which is what decides whether the prefilter is
+  //: worth a fetch. `queryTermBloomEligible` is the same test the filter itself applies.
+  function queryCanUseBloom(query) {
+    return searchQueryParts(query).some(function (part) {
+      return queryTermBloomEligible(part.value);
+    });
+  }
+
+  function schema3SearchTeams() {
+    var teams = [];
+    app.searchCatalog.forEach(function (shard) {
+      var team = text(shard.team);
+      if (team && teams.indexOf(team) < 0 &&
+          (!app.selectedTeam || team === app.selectedTeam)) {
+        teams.push(team);
+      }
+    });
+    return teams;
+  }
+
+  //: One team's relationship sidecar: prompt excerpts, then response->prompt edges, each a
+  //: published line range. A search that matched no prompt reads only the response half.
+  function ensureSearchLinks(team) {
+    var entry = app.searchLinksByTeam.get(team);
+    if (!entry) {
+      return Promise.resolve(null);
+    }
+    if (!app.searchLinkPromises.has(team)) {
+      var request = Promise.all([
+        readShardKind(entry, "search_prompt"),
+        readShardKind(entry, "search_response")
+      ]).then(function (halves) {
+        var messagePrefix = "message:" + team + "::";
+        var agentPrefix = "agent:" + team + "::";
+        halves[0].forEach(function (record) {
+          var reference = text(record.ref);
+          if (reference.indexOf(messagePrefix) !== 0 || typeof record.excerpt !== "string") {
+            throw new Error(entry.path + " has an invalid prompt excerpt.");
+          }
+          app.searchLinkPromptRefs.add(reference);
+          app.searchPromptExcerpts.set(reference, record.excerpt);
+        });
+        halves[1].forEach(function (record) {
+          var reference = text(record.ref);
+          var promptReference = text(record.prompt_ref);
+          var at = number(record.at_ms, NaN);
+          if (reference.indexOf(messagePrefix) !== 0 ||
+              promptReference.indexOf(messagePrefix) !== 0 ||
+              text(record.agent_ref).indexOf(agentPrefix) !== 0 ||
+              !Number.isFinite(at)) {
+            throw new Error(entry.path + " has an invalid response link.");
+          }
+          app.searchLinkResponseRefs.add(reference);
+          if (!app.searchResponsesByPrompt.has(promptReference)) {
+            app.searchResponsesByPrompt.set(promptReference, []);
+          }
+          app.searchResponsesByPrompt.get(promptReference).push(schema3Payload(record));
+        });
+        app.searchResponsesByPrompt.forEach(function (responses) {
+          responses.sort(function (left, right) {
+            return number(left.at_ms, 0) - number(right.at_ms, 0) ||
+              text(left.ref).localeCompare(text(right.ref));
+          });
+        });
+        app.loadedSearchLinkUrls.add(entry.path);
+        return halves;
+      });
+      var cached = request.catch(function (error) {
+        if (app.searchLinkPromises.get(team) === cached) {
+          app.searchLinkPromises.delete(team);
+        }
+        throw error;
+      });
+      app.searchLinkPromises.set(team, cached);
+    }
+    return app.searchLinkPromises.get(team);
+  }
+
+  function loadSchema3SearchShard(entry) {
+    var key = entry.path;
+    if (app.loadedSearchShardUrls.has(key)) {
+      return Promise.resolve(null);
+    }
+    return readShardRecords(entry, { start_ms: NaN, end_ms: NaN }).then(function (records) {
+      var payloads = records.map(schema3Payload);
+      var shard = {
+        schema_version: 1,
+        kind: "timeline-search-day",
+        team: entry.team,
+        range: { start_ms: entry.start_ms, end_ms: entry.end_ms },
+        records: payloads
+      };
+      // No `source_digest` on the fabricated envelope. Schema 2 puts one on every object and
+      // `validateSchema2ObjectSourceDigest` binds it to the generation; copying the page's own
+      // digest onto a record that never carried one would be a check against itself. Schema 3's
+      // equivalent binding is stronger and has already run by here: the sidecar's digests and
+      // sizes were matched against the bootstrap before the first byte of this shard was fetched.
+      mergeTranscriptSearchShard(shard, entry, key);
+      return shard;
+    });
+  }
+
+  // -- loading the generation ------------------------------------------------------------------
+
+  async function loadSchema3() {
+    var bootstrap;
+    try {
+      bootstrap = await fetchJsonCached(SCHEMA_3_URL);
+    } catch (error) {
+      if (error && error.httpStatus === 404) {
+        return false;
+      }
+      throw error;
+    }
+    if (!bootstrap || typeof bootstrap !== "object" ||
+        number(bootstrap.schema_version, NaN) !== 3 ||
+        text(bootstrap.kind) !== "timeline-v3-bootstrap") {
+      throw new Error("Unsupported schema-3 timeline bootstrap.");
+    }
+    var codec = bootstrap.codec && typeof bootstrap.codec === "object" ? bootstrap.codec : null;
+    if (!codec || text(codec.container) !== "multi-member-gzip" ||
+        text(codec.timestamp_key) !== "at_ms" ||
+        text(codec.record_kind_key) !== "record_kind" ||
+        text(codec.index_suffix) !== SCHEMA_3_INDEX_SUFFIX) {
+      throw new Error("Schema-3 bootstrap declares a codec this page cannot read.");
+    }
+    if (typeof DecompressionStream !== "function") {
+      // Declined rather than attempted, so `loadTimeline` falls through to schema 2 with a
+      // reason a reader can act on instead of a stack trace from the first member.
+      throw new Error("This browser has no DecompressionStream; schema 3 cannot be read.");
+    }
+    var teamSlugs = new Set();
+    array(bootstrap.teams).forEach(function (team) {
+      var slug = text(team && team.slug);
+      if (!slug || teamSlugs.has(slug)) {
+        throw new Error("Schema-3 timeline bootstrap has an invalid or duplicate team.");
+      }
+      teamSlugs.add(slug);
+    });
+    if (!teamSlugs.size) {
+      throw new Error("Schema-3 timeline bootstrap does not identify a team.");
+    }
+    var range = bootstrap.range && typeof bootstrap.range === "object" ? bootstrap.range : null;
+    var rangeStart = number(range && range.start_ms, NaN);
+    var rangeEnd = number(range && range.end_ms, NaN);
+    if (!Number.isFinite(rangeStart) || !Number.isFinite(rangeEnd) || rangeEnd <= rangeStart) {
+      throw new Error("Schema-3 timeline bootstrap has an invalid range.");
+    }
+
+    var timelineShards = schema3Stream(bootstrap, "timeline", true);
+    var spineShards = schema3Stream(bootstrap, "spine", true);
+    var binsShards = schema3Stream(bootstrap, "bins", true);
+    var searchShards = schema3Stream(bootstrap, "search", false);
+    var bloomShards = schema3Stream(bootstrap, "search_bloom", false);
+    var linkShards = schema3Stream(bootstrap, "search_links", false);
+    // All three streams or none, *and* all three for every team that has a `search` shard.
+    //
+    // Two checks rather than one, because they catch two different half-publications and the
+    // first does not imply the second. The stream rule says the *format* is whole: a corpus
+    // with no prefilter would silently over-read, and one with no relationships would answer
+    // with linkage it cannot see. The per-team rule says the *corpus* is whole: a build that
+    // died between two teams leaves all three sections non-empty and one team's relationships
+    // missing, and a search over that team would then render every linked response as unlinked
+    // and every matched prompt with no excerpt and no reply count -- an ordinary-looking answer
+    // that nothing downstream can detect. `query._SchemaThreeArchive._check_search_corpus` is
+    // the same pair of rules on the same catalogue, and the two readers have to agree: a
+    // generation the CLI declines and the page accepts is a generation on which the two
+    // surfaces answer the same question differently.
+    var searchStreamCount = (searchShards.length ? 1 : 0) + (bloomShards.length ? 1 : 0) +
+      (linkShards.length ? 1 : 0);
+    if (searchStreamCount !== 0 && searchStreamCount !== 3) {
+      throw new Error("Schema-3 bootstrap publishes a partial transcript search corpus.");
+    }
+    [
+      { stream: "search_bloom", shards: bloomShards },
+      { stream: "search_links", shards: linkShards }
+    ].forEach(function (side) {
+      var published = new Set(side.shards.map(function (entry) { return entry.team; }));
+      searchShards.forEach(function (entry) {
+        if (!published.has(entry.team)) {
+          throw new Error(
+            "The transcript search corpus has no " + side.stream + " shard for " + entry.team +
+              "."
+          );
+        }
+      });
+    });
+    spineShards.forEach(function (entry) {
+      if (!entry.team || !teamSlugs.has(entry.team)) {
+        throw new Error("Schema-3 spine shard " + entry.path + " names an unpublished team.");
+      }
+    });
+    timelineShards.forEach(function (entry) {
+      if (!entry.team || !teamSlugs.has(entry.team)) {
+        throw new Error("Schema-3 timeline shard " + entry.path + " names an unpublished team.");
+      }
+      if (entry.start_ms === null || entry.end_ms === null) {
+        throw new Error("Schema-3 timeline shard " + entry.path + " publishes no time range.");
+      }
+    });
+
+    app.spineByTeam = new Map(spineShards.map(function (entry) {
+      return [entry.team, entry];
+    }));
+    app.searchBloomByTeam = new Map(bloomShards.map(function (entry) {
+      return [entry.team, entry];
+    }));
+    app.searchLinksByTeam = new Map(linkShards.map(function (entry) {
+      return [entry.team, entry];
+    }));
+
+    // One parallel round: every team's spine prefix, and the single bins shard.
+    //
+    // The bins go with the spine rather than after it. `timeline_v3` moved them out of the
+    // bootstrap because they grow as days x teams x resolutions and a bootstrap whose size is set
+    // by its largest pre-aggregation is not a bootstrap -- that argument is about what gates the
+    // *first* fetch, not about deferring a second one. They are 65,384 bytes, they are the
+    // aggregate chart, and fetching them beside the spine costs no extra round trip while
+    // deferring them would paint an empty chart and then move it under the reader.
+    var sink = {
+      agents: [],
+      phaseCards: [],
+      edges: [],
+      rollups: [],
+      projects: [],
+      summary_files: [],
+      glossary: [],
+      project_overviews: []
+    };
+    var loaded = await Promise.all([
+      Promise.all(spineShards.map(function (entry) {
+        return Promise.all(
+          spineFirstPaintRanges(entry).map(function (range) {
+            return readShardRecords(entry, range);
+          })
+        ).then(function (pages) {
+          return {
+            team: entry.team,
+            records: pages.reduce(function (all, page) { return all.concat(page); }, [])
+          };
+        });
+      })),
+      binsShards.length
+        ? readShardRecords(binsShards[0], { start_ms: NaN, end_ms: NaN })
+        : Promise.resolve([])
+    ]);
+    loaded[0].forEach(function (shard) {
+      schema3InstallSpine(shard.team, shard.records, sink);
+    });
+
+    app.schemaMode = "schema3";
+    app.shardCatalog = timelineShards.slice().sort(function (left, right) {
+      return left.start_ms - right.start_ms ||
+        text(left.team).localeCompare(text(right.team));
+    });
+    app.searchCatalog = schema3SearchCatalog(searchShards);
+    app.searchBloomByUrl = new Map();
+    app.detailPromises.clear();
+    app.loadedShardUrls.clear();
+    app.loadedSearchShardUrls.clear();
+    app.loadedSearchLinkUrls.clear();
+    app.searchRecords = [];
+    app.searchRecordsByRef.clear();
+    app.searchPromptExcerpts.clear();
+    app.searchResponsesByPrompt.clear();
+    app.searchLinkPromptRefs.clear();
+    app.searchLinkResponseRefs.clear();
+    app.activityBoundsByRef.clear();
+    app.activityBoundsPromises.clear();
+    app.searchBloomPromises.clear();
+    app.searchLinkPromises.clear();
+    app.searchShardState = app.shardCatalog.length ? "unloaded" : "ready";
+    app.searchCorpusMode = app.searchCatalog.length ? "schema3" : "none";
+    app.searchCorpusNote = "";
+    if (app.searchCorpusMode === "none") {
+      var declined = await schema3Schema2SearchFallback(bootstrap);
+      // Three outcomes, two of which the reader is told about. "There is no corpus anywhere" is
+      // the ordinary state of an archive exported without one and says nothing worth a line;
+      // "the corpus came from the older generation" and "there is a corpus and it was refused"
+      // are both surprises, and the second is the one an operator has to act on.
+      if (!declined) {
+        app.searchCorpusNote =
+          "transcript search from schema 2 (this archive predates the schema-3 corpus)";
+      } else if (declined !== SCHEMA_2_CORPUS_ABSENT) {
+        app.searchCorpusNote = "transcript search unavailable (" + declined + ")";
+      }
+    }
+    app.transcriptSearchState = app.searchCatalog.length ? "unloaded" : "unavailable";
+    app.transcriptSearchError = app.searchCatalog.length
+      ? ""
+      : "This export does not contain transcript search shards.";
+
+    // The spine's `phase_card` kind *is* schema 2's phase index: the same nine fields, one record
+    // per phase, no `states` array. So it is installed the same way and the modal that used to
+    // fetch a separate content-addressed object now finds it already in hand -- one fewer object
+    // in the archive and one fewer round trip on the first agent-lifetime open.
+    app.phaseIndexReference = null;
+    app.phaseIndexPromise = null;
+    app.phaseIndexByAgent = new Map();
+    app.phaseCardPromises.clear();
+    // Not "ready": the cards are a line range this paint deliberately skipped, and `loadPhaseIndex`
+    // fetches them. Any card that arrived anyway -- because it shared a member with a kind the
+    // frame did need -- is installed here so it is not fetched twice.
+    app.phaseIndexReady = false;
+    sink.phaseCards.forEach(installPhaseCard);
+    sortPhaseIndex();
+
+    var merged = {
+      schema_version: 3,
+      generated_at: bootstrap.generated_at,
+      source_digest: bootstrap.source_digest,
+      display_timezone: bootstrap.display_timezone,
+      display_timezone_source: bootstrap.display_timezone_source,
+      range: bootstrap.range,
+      stats: bootstrap.stats,
+      artifact_catalog_path: bootstrap.artifact_catalog_path,
+      glossary_path: bootstrap.glossary_path,
+      teams: bootstrap.teams,
+      activity_bins: loaded[1].map(schema3Payload),
+      agents: sink.agents,
+      rollups: sink.rollups,
+      projects: sink.projects,
+      summary_files: sink.summary_files,
+      glossary: sink.glossary,
+      edges: sink.edges,
+      // Empty for the same reason schema 2 empties them: the full records live in the day shards
+      // and arrive as the view asks for them. The cards are in `phaseIndexByAgent` above.
+      phases: [],
+      events: []
+    };
+    if (sink.project_overviews.length === 1) {
+      merged.project_overview = sink.project_overviews[0];
+    }
+    if (sink.project_overviews.length) {
+      merged.project_overviews = sink.project_overviews;
+    }
+    initializeData(merged);
+    return true;
+  }
+
+  //: The transcript search corpus a schema-2 bootstrap publishes: the day-shard catalogue and the
+  //: Bloom filters inlined beside it, keyed by the content-addressed URL the page will fetch.
+  //:
+  //: Factored out of `loadSchema2` because it now has a second caller. An archive built after the
+  //: schema-3 *timeline* and before the schema-3 *search streams* has a corpus here and nowhere
+  //: else, and `loadSchema3` reads it rather than declaring search unavailable -- see
+  //: `schema3Schema2SearchFallback`. One implementation rather than two, because the two callers
+  //: must agree about which shards exist and what their filters say; a second parser would be a
+  //: second answer to that question.
+  function schema2SearchCatalog(bootstrap) {
+    var blooms = new Map();
+    var config = bootstrap && bootstrap.search && typeof bootstrap.search === "object"
+      ? bootstrap.search
+      : null;
+    if (!config || text(config.strategy) !== "transcript-message-shards") {
+      return { catalog: [], blooms: blooms };
+    }
+    if (number(config.schema_version, NaN) !== 1) {
+      throw new Error("Unsupported transcript search catalog schema.");
+    }
+    var seen = new Set();
+    var catalog = array(config.shards).slice();
+    catalog.forEach(function (shard) {
+      var url = immutableTimelineObjectUrl(shard, "transcript search shard");
+      var team = text(shard.team);
+      var start = number(shard.start_ms, NaN);
+      var end = number(shard.end_ms, NaN);
+      var recordCount = transcriptSearchRecordCount(shard);
+      if (!team || !Number.isFinite(start) || !Number.isFinite(end) || end <= start ||
+          !Number.isFinite(recordCount) || seen.has(url)) {
+        throw new Error("Invalid or duplicate transcript search shard catalog entry.");
+      }
+      if (hasField(shard, "linkage")) {
+        var linkage = shard.linkage && typeof shard.linkage === "object"
+          ? shard.linkage
+          : null;
+        var linkageCounts = linkage && linkage.counts &&
+          typeof linkage.counts === "object" ? linkage.counts : null;
+        immutableTimelineObjectUrl(linkage, "transcript search linkage shard");
+        if (!Number.isSafeInteger(number(linkageCounts && linkageCounts.prompts, NaN)) ||
+            number(linkageCounts && linkageCounts.prompts, NaN) < 0 ||
+            !Number.isSafeInteger(number(linkageCounts && linkageCounts.responses, NaN)) ||
+            number(linkageCounts && linkageCounts.responses, NaN) < 0) {
+          throw new Error("Invalid transcript search linkage catalog entry.");
+        }
+      }
+      if (hasField(shard, "trigram_bloom")) {
+        blooms.set(
+          url,
+          decodeTrigramBloom(
+            shard.trigram_bloom,
+            "transcript search shard " + team + " " + text(shard.day, url) + ".trigram_bloom"
+          )
+        );
+      }
+      seen.add(url);
+    });
+    catalog.sort(function (left, right) {
+      return text(left.team).localeCompare(text(right.team)) ||
+        number(left.start_ms, 0) - number(right.start_ms, 0);
+    });
+    return { catalog: catalog, blooms: blooms };
+  }
+
+  //: The corpus a schema-3 archive that predates the search streams still has: schema 2's.
+  //:
+  //: **This is a capability, not a courtesy.** The bundle is *copied into the archive it builds*,
+  //: so the two halves of an archive move independently: a build that publishes a schema-3
+  //: timeline without the search streams -- because it predates them, or because it died between
+  //: copying the bundle and publishing them -- leaves a tree whose `data/timeline-v2.json` lists
+  //: a full corpus that this page would otherwise refuse to look at, while `./timeline search` on
+  //: the same directory answers from it happily. A graphical surface that silently loses a
+  //: capability the command line still has, and says "this export does not contain transcript
+  //: search shards" about an export that plainly does, is worse than one that is a generation
+  //: behind: the message is false and there is nothing for the reader to act on.
+  //:
+  //: `query.TimelineQuery._search_bootstrap` is the same fallback on the same file, including its
+  //: refusal: two generations of one archive that disagree about `source_digest` describe two
+  //: different builds, and answering phases out of one and messages out of the other would put
+  //: messages inside phases they never occurred in. That is a refusal there and a refusal here.
+  //: The rest of the binding is already in place and needs nothing new --
+  //: `validateSchema2ObjectSourceDigest` checks every fetched object against `app.data`'s digest,
+  //: which under schema 3 *is* the schema-3 bootstrap's.
+  //:
+  //: Returns the reason it could not be used, or "" when it was.
+  async function schema3Schema2SearchFallback(bootstrap) {
+    var older;
+    try {
+      older = await fetchJsonCached(SCHEMA_2_URL);
+    } catch (error) {
+      if (error && error.httpStatus === 404) {
+        return SCHEMA_2_CORPUS_ABSENT;
+      }
+      return errorMessage(error);
+    }
+    if (!older || typeof older !== "object" || number(older.schema_version, NaN) !== 2 ||
+        text(older.kind) !== "timeline-bootstrap") {
+      return "the schema-2 bootstrap beside it is unreadable";
+    }
+    var ours = text(bootstrap.source_digest);
+    var theirs = text(older.source_digest);
+    if (ours && theirs && ours !== theirs) {
+      return "the schema-2 corpus beside it belongs to a different source generation";
+    }
+    var corpus = schema2SearchCatalog(older);
+    if (!corpus.catalog.length) {
+      return SCHEMA_2_CORPUS_ABSENT;
+    }
+    app.searchCatalog = corpus.catalog;
+    app.searchBloomByUrl = corpus.blooms;
+    app.searchCorpusMode = "schema2";
+    return "";
+  }
+
   async function loadSchema2() {
     var bootstrap;
     try {
@@ -6399,58 +8006,9 @@
     catalog.sort(function (left, right) {
       return number(left.start_ms, 0) - number(right.start_ms, 0);
     });
-    var searchCatalog = [];
-    var searchBloomByUrl = new Map();
-    var searchConfig = bootstrap.search && typeof bootstrap.search === "object"
-      ? bootstrap.search
-      : null;
-    if (searchConfig && text(searchConfig.strategy) === "transcript-message-shards") {
-      if (number(searchConfig.schema_version, NaN) !== 1) {
-        throw new Error("Unsupported transcript search catalog schema.");
-      }
-      var searchUrls = new Set();
-      searchCatalog = array(searchConfig.shards).slice();
-      searchCatalog.forEach(function (shard) {
-        var url = immutableTimelineObjectUrl(shard, "transcript search shard");
-        var team = text(shard.team);
-        var start = number(shard.start_ms, NaN);
-        var end = number(shard.end_ms, NaN);
-        var recordCount = transcriptSearchRecordCount(shard);
-        if (!team || !Number.isFinite(start) || !Number.isFinite(end) || end <= start ||
-            !Number.isFinite(recordCount) || searchUrls.has(url)) {
-          throw new Error("Invalid or duplicate transcript search shard catalog entry.");
-        }
-        if (hasField(shard, "linkage")) {
-          var linkage = shard.linkage && typeof shard.linkage === "object"
-            ? shard.linkage
-            : null;
-          var linkageCounts = linkage && linkage.counts &&
-            typeof linkage.counts === "object" ? linkage.counts : null;
-          immutableTimelineObjectUrl(linkage, "transcript search linkage shard");
-          if (!Number.isSafeInteger(number(linkageCounts && linkageCounts.prompts, NaN)) ||
-              number(linkageCounts && linkageCounts.prompts, NaN) < 0 ||
-              !Number.isSafeInteger(number(linkageCounts && linkageCounts.responses, NaN)) ||
-              number(linkageCounts && linkageCounts.responses, NaN) < 0) {
-            throw new Error("Invalid transcript search linkage catalog entry.");
-          }
-        }
-        if (hasField(shard, "trigram_bloom")) {
-          searchBloomByUrl.set(
-            url,
-            decodeTrigramBloom(
-              shard.trigram_bloom,
-              "transcript search shard " + team + " " + text(shard.day, url) +
-                ".trigram_bloom"
-            )
-          );
-        }
-        searchUrls.add(url);
-      });
-      searchCatalog.sort(function (left, right) {
-        return text(left.team).localeCompare(text(right.team)) ||
-          number(left.start_ms, 0) - number(right.start_ms, 0);
-      });
-    }
+    var schema2Corpus = schema2SearchCatalog(bootstrap);
+    var searchCatalog = schema2Corpus.catalog;
+    var searchBloomByUrl = schema2Corpus.blooms;
     app.schemaMode = "schema2";
     app.shardCatalog = catalog;
     app.searchCatalog = searchCatalog;
@@ -6466,6 +8024,8 @@
     app.searchLinkPromptRefs.clear();
     app.searchLinkResponseRefs.clear();
     app.searchShardState = catalog.length ? "unloaded" : "ready";
+    app.searchCorpusMode = searchCatalog.length ? "schema2" : "none";
+    app.searchCorpusNote = "";
     app.transcriptSearchState = searchCatalog.length ? "unloaded" : "unavailable";
     app.transcriptSearchError = searchCatalog.length
       ? ""
@@ -6473,6 +8033,7 @@
     app.phaseIndexReference = bootstrap.phase_index || null;
     app.phaseIndexPromise = null;
     app.phaseIndexByAgent.clear();
+    resetSchema3State();
     var merged = Object.assign({}, globalData, {
       schema_version: 2,
       generated_at: bootstrap.generated_at,
@@ -6505,30 +8066,64 @@
     app.searchLinkPromptRefs.clear();
     app.searchLinkResponseRefs.clear();
     app.searchShardState = "legacy";
+    app.searchCorpusMode = "none";
+    app.searchCorpusNote = "";
     app.transcriptSearchState = "unavailable";
     app.transcriptSearchError = "Transcript search requires a schema-2 export.";
     app.phaseIndexReference = null;
     app.phaseIndexPromise = null;
     app.phaseIndexByAgent.clear();
+    resetSchema3State();
     initializeData(await fetchJsonCached(DATA_URL));
   }
 
+  //: Newest generation first, each falling back to the one behind it.
+  //:
+  //: **Both directions of the mismatch are real, and neither is hypothetical.** A bundle is
+  //: *copied* into the archive it was built with, so an archive built before schema 3 ships an
+  //: `app.js` that has never heard of it -- which is exactly what `archive_gc._website_refusal`
+  //: holds the schema-2 generation for. The converse happens whenever this bundle is opened
+  //: against an older archive: a rebuild of one archive does not rebuild the others, and a
+  //: reader that assumed the newest format would show an error on a tree that is perfectly
+  //: readable. So both paths stay, and the fallback is announced in the meta line rather than
+  //: swallowed, because "this archive is a generation behind" is a fact about the archive that
+  //: only the page can see.
   async function loadTimeline() {
     try {
+      var schema3Error = null;
+      try {
+        if (await loadSchema3()) {
+          if (app.searchCorpusNote) {
+            dom.meta.textContent += " · " + app.searchCorpusNote;
+          }
+          return;
+        }
+      } catch (error) {
+        schema3Error = error;
+      }
       var schema2Error = null;
       try {
         if (await loadSchema2()) {
+          if (schema3Error) {
+            dom.meta.textContent += " · schema 3 fallback (" +
+              errorMessage(schema3Error) + ")";
+            dom.card.dataset.timelineSchemaMode = "schema2-fallback";
+          }
           return;
         }
       } catch (error) {
         schema2Error = error;
       }
       await loadSchema1();
+      var reasons = [];
+      if (schema3Error) {
+        reasons.push("schema 3 fallback (" + errorMessage(schema3Error) + ")");
+      }
       if (schema2Error) {
-        var message = schema2Error instanceof Error
-          ? schema2Error.message
-          : String(schema2Error);
-        dom.meta.textContent += " · schema 2 fallback (" + message + ")";
+        reasons.push("schema 2 fallback (" + errorMessage(schema2Error) + ")");
+      }
+      if (reasons.length) {
+        dom.meta.textContent += " · " + reasons.join(" · ");
         dom.card.dataset.timelineSchemaMode = "schema1-fallback";
       }
     } catch (error) {
@@ -6536,14 +8131,24 @@
     }
   }
 
+  function errorMessage(error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+
   function transcriptSearchNeedsLoad() {
     var missingText = transcriptSearchShards().some(function (shard) {
-      return !app.loadedSearchShardUrls.has(
-        immutableTimelineObjectUrl(shard, "transcript search shard")
-      );
+      return !app.loadedSearchShardUrls.has(shardKey(shard, "transcript search shard"));
     });
     if (missingText) {
       return true;
+    }
+    if (app.searchCorpusMode === "schema3") {
+      // The relationship sidecar is one shard per team rather than one per day, so "have I got
+      // the linkage" is asked of the teams in scope and not of every catalogue entry.
+      return schema3SearchTeams().some(function (team) {
+        var entry = app.searchLinksByTeam.get(team);
+        return Boolean(entry) && !app.loadedSearchLinkUrls.has(entry.path);
+      });
     }
     return app.searchCatalog.some(function (shard) {
       if (app.selectedTeam && text(shard.team) !== app.selectedTeam) {
@@ -6569,18 +8174,18 @@
       app.transcriptMatchedAgentIds.clear();
       app.activeSearchRef = "";
       renderTranscriptSearchResults();
-      if (app.schemaMode === "schema2" && app.searchShardState !== "ready" &&
+      if (shardedMode() && app.searchShardState !== "ready" &&
           app.searchShardState !== "loading") {
         requestSearchCorpus();
       }
       scheduleRender();
       return;
     }
-    if (app.schemaMode !== "schema2" || !app.searchCatalog.length) {
+    if (!shardedMode() || !app.searchCatalog.length) {
       app.transcriptSearchState = "unavailable";
-      app.transcriptSearchError = app.schemaMode === "schema2"
+      app.transcriptSearchError = shardedMode()
         ? "This export does not contain transcript search shards."
-        : "Transcript search requires a schema-2 export.";
+        : "Transcript search requires a sharded export.";
       updateShardDiagnostics();
       renderTranscriptSearchResults();
       scheduleRender();

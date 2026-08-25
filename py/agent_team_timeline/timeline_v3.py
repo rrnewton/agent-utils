@@ -34,22 +34,32 @@ show, search and stats surface now goes through when a *complete* schema-3 gener
 -- see that class for the completeness rule and for why a partial publication falls back rather
 than being read.
 
-**Schema 2 is still written beside it; schema 1 is not.** The two generations were retired at
-different times because their readers retired them at different times. `query.py` reaches schema
-1 only when neither of the newer bootstraps is present, and `static/app.js` reaches it only when
-its schema-2 load throws -- so a published build stopped writing the 280,971,189-byte monolith,
-and `render.retired_schema_1_files` says why not writing it and deleting it had to be separate
-decisions. Schema 2 stays because the website has no schema-3 mode at all: a browser reading
-schema 3 needs multi-member gzip over HTTP Range in JavaScript, which does not exist yet, and
-retiring the format the only graphical surface reads would be retiring the surface. Reclaiming
-what an older build already wrote belongs to :mod:`agent_team_timeline.archive_gc`, not to a
-build.
+**Neither older generation is written any more, and both are still read.** They were retired at
+different times because their readers retired them at different times, and the second retirement
+is recent enough to be worth stating plainly: schema 2 stayed long after `query.py` had moved on,
+because `static/app.js` had no schema-3 mode and retiring the only format the graphical surface
+could open would have retired the surface. It has one now. The bundle loads the bootstrap below
+and pulls one gzip member of a shard at a time over HTTP Range, through the ``serve.py`` the
+archive ships -- so the server seeks and the browser never meets a multi-member stream. See the
+"Schema 3" block in ``static/app.js`` for that split and for the dynamic endpoint that was
+refused, and `timeline_shards.SCHEMA_2_IS_PUBLISHED` for the checklist the flip had to satisfy.
 
-Schema 3 replaces the presentation *timeline*. It does not replace the transcript search corpus,
-which is still schema 2's content-addressed day shards with their trigram blooms, so a transcript
-search reads phases and agents from a schema-3 spine and messages from schema 2 -- the one
-operation that touches both generations, and the one place the reader checks that they describe
-the same source.
+Both readers still *open* the older generations, in the order schema 3, schema 2, schema 1, and
+they have to: a build copies the bundle into the archive it builds, so an archive from last month
+ships a bundle that has never heard of schema 3, and a reader from this month meets archives from
+last month. `render.retired_generation_files` says why declining to write a generation and
+deleting one had to be separate decisions, and reclaiming what an older build already wrote
+belongs to :mod:`agent_team_timeline.archive_gc`, not to a build.
+
+Schema 3 replaces the presentation *timeline* **and, since the search streams below, the
+transcript search corpus too**. Until then a transcript search read phases and agents from a
+schema-3 spine and messages from schema 2's content-addressed day shards -- the one operation
+that touched both generations, and the one place the reader had to check that they described the
+same source. Now that check has nothing left to compare: the messages come out of the same
+bootstrap as the phases. See "The search streams" below for the whole design, and
+`query.TimelineQuery._iter_search_records` for the reader that no longer opens
+``data/timeline-v2.json`` when these streams are present. The website reads the same three
+streams, which is what let the schema-2 generation stop being written at all.
 
 The one thing schema 3 publishes that schema 1 does not is the zoom bounds; see
 :data:`_ACTIVITY_BOUNDS_KIND` for why they are published rather than recomputed on read, and what
@@ -215,6 +225,160 @@ Three streams
 ``bins``  ``data/timeline-v3/bins.jsonl.gz``
     Activity bins, all teams, sorted by `(at_ms, ...)` and therefore bisectable.
 
+Three more, for search
+----------------------
+``search``  ``data/timeline-v3/search/<team>/<YYYY-MM-DD>.jsonl.gz``
+    The transcript search records: one per textual event and one condensed line per tool run,
+    exactly the records :func:`agent_team_timeline.search_index.build_search_records` produces.
+
+``search_bloom``  ``data/timeline-v3/search-bloom/<team>.jsonl.gz``
+    One record per ``search`` shard, carrying that shard's trigram Bloom filter. The prefilter.
+
+``search_links``  ``data/timeline-v3/search-links/<team>.jsonl.gz``
+    The relationship sidecar: prompt excerpts and response->prompt edges, grouped by kind with
+    published line ranges like the spine.
+
+These three exist only when the build has search records to publish; an archive without them
+carries the original three streams and nothing else, and the reader falls back to schema 2's
+corpus for exactly that case.
+
+The search streams: what was kept, and what was decided again
+-------------------------------------------------------------
+The prior corpus is described in `ai_docs/TRANSCRIPT_SEARCH_CASE_STUDY.md`, which is a dated
+investigation record with its own measurements: on a seven-team website, 246,155 records in 53
+team/day objects, 333.96 MB of identity JSON, a 3.87 MB bootstrap holding about 2.93 million
+base64 characters of Bloom data, and a broad query that selected 50 of those 53 shards. On the
+larger archive measured here the same shape is 313,839 records in 72 team/day objects: 422.4 MiB
+of text objects, 13.0 MiB of linkage sidecars, 4,527,592 base64 characters of Bloom in a
+5,702,530-byte bootstrap, and 509.1 MiB once the ``.gz`` twin of every object is counted.
+
+That design was right, and every part of it is kept: the ``(team, UTC day)`` axis, the
+definite-miss prefilter, the compact relationship sidecars, and the record shape down to the
+field. What changed is the substrate underneath it, and three decisions had to be made again
+against it.
+
+**1. A stream, not a parallel structure.** The corpus becomes three schema-3 streams rather than
+staying content-addressed objects beside them. The axis is not a coincidence to be exploited --
+schema 3 chose ``(team, UTC day)`` *because* the corpus had already chosen it (see "Sharding
+axis" above) -- so this is the two halves finally sharing one scheme, one reader, one stale-file
+rule and one `gc` category. Staying parallel was considered and refused on three counts, none of
+them aesthetic: content-addressed names force the ``data/timeline-v2/manifest.json`` reachability
+file that schema 3 deliberately does not have (see "Stale shards" below); the objects are
+pretty-printed with a ``.gz`` twin, which is 17% of the bytes buying nothing plus a full second
+copy, and removing exactly that duplication is why schema 3 exists; and a reader would keep two
+seek implementations for one sharding axis, which is how the two drift.
+
+Folding the records into the existing ``timeline`` stream instead -- one more ``record_kind`` on
+the day shard that already holds that day's events -- was the closer call, and it is refused for
+the number this whole layout turns on: the timeline stream is 93% of schema 3's bytes and
+`query.py` opens it for nothing. A search would then have to inflate members packed with phases,
+edges and full event records to reach message text, and every day-render would drag the condensed
+tool corpus. The two collections are also not the same records: a search record is a *derived*
+projection -- parent/child route classification, prompt linkage, the child-attributed agent, the
+condensed one-line tool text, the placeholder that stands in for an encrypted body -- and the
+half of it that is tool runs does not appear in the timeline stream at all.
+
+**2. The prefilter moved out of the bootstrap and became skippable.** Schema 2 inlines every
+shard's Bloom filter into ``data/timeline-v2.json``: 4,527,592 base64 characters, which is most of
+why that file is 5,702,530 bytes. Schema 3's bootstrap is 168,703 bytes -- 89,298 of it before
+these streams existed -- and the entire point of that number is that a first frame, a `list`, a
+`stats` and a `show` all cost one parse of it. Inlining the blooms would multiply it by twenty-six
+and charge every one of those commands for a prefilter only `search` can use, so it is refused
+outright.
+
+The prefilter is nonetheless **kept**, against the case study's own evidence that it often cannot
+prune: "common project terms such as KVM, DBI, and ptrace occur on nearly every active day", and
+the acceptance query selected 50 of 53 shards. That is the argument for not paying for it *up
+front*; it is not an argument for deleting it, because the same page records the other side --
+"a rare definite-miss query selected eight shards and completed in about three seconds" against
+about ten for the common one. A filter that is useless for the top hundred terms of a project and
+decisive for everything else is worth having, as long as nothing but a search pays for it.
+
+So it is its own stream, one shard per team, read only when a query actually has a term the
+filter can act on. Two consequences fall out that schema 2 could not have:
+
+* A query whose only term is shorter than a trigram -- ``B3``, the case study's own acceptance
+  query -- reads **no** Bloom data at all, where schema 2 parsed all 4.5 MB of it out of the
+  bootstrap and then skipped every filter. Same result, none of the cost.
+* A ``--team`` search reads one team's filters instead of the archive's.
+
+The two rejected placements are worth naming. *Per-shard headers in the seekable sidecar* cannot
+work: to prune a shard you must not open it, and a shard's sidecar is only read when it is. *One
+global bloom shard* (the shape ``bins`` uses) works and is simpler by one axis, but it makes a
+one-team search read twelve teams' filters, so the team axis is kept. Putting the filters inside
+the ``search_links`` shard -- collapsing three new streams into two -- was also measured rather
+than dismissed: a team's filters are about 375 KB and its links about 1.1 MiB, so they would share
+the first ~1 MiB member and reading the filters alone would inflate roughly 625 KB per team of
+relationships nobody has asked for yet. Two files keep the prefilter's cost equal to the
+prefilter, which is the property that makes "was it worth it" a question anybody can answer.
+
+**3. The relationship sidecars keep their semantics, and change only their shape.** The case
+study earns these: Codex records a child's return on the *receiving parent's* rollout, so the
+author of a response is not the thread the record sits on; and a sliced export can hold a response
+whose ``prompt_ref`` names a prompt outside the exported range, which ``prompt_in_scope`` records
+so a client shows "unavailable" instead of treating it as corruption. Both live in the record
+itself, which is copied verbatim -- ``prompt_ref``, ``prompt_at_ms``, ``prompt_author_kind`` and
+``prompt_in_scope`` are not derived again here and are not dropped.
+
+The sidecar exists for a separate reason the case study also earns: after the prefilter has pruned
+a text shard, a matched record may still need the excerpt of a prompt that lived in the pruned
+shard -- "text-shard pruning could hide a previous-day prompt or later-day response". So the
+prompt excerpts and the response->prompt edges are published apart from the text, and read whole
+for the selected teams. Because they are read whole and never pruned, per-day sharding buys
+nothing and costs a file and a sidecar per day; they are **one shard per team**, laid out like the
+spine -- ``search_prompt`` then ``search_response``, each with a published ``[l0, n)`` -- so a
+search that matched no prompt reads only the response range and one that needs no excerpt reads
+only the prompt range. The write-amplification argument that cuts the timeline stream at the day
+does not reach here: a team's whole linkage is about 1.1 MiB against the 5,335,449 bytes that
+argument was made about.
+
+What the search streams cost, measured
+--------------------------------------
+Built from the measured archive's own 313,839 search records -- the same records, through the same
+`search_index.build_search_records` output that schema 2 was written from, so the two rows below
+describe one corpus in two formats and not two corpora::
+
+    schema 2   509.1 MiB   290 files   456,602,389 bytes of pretty-printed objects
+                                       + 68,198,724 of `.gz` twins
+                                       + a 5,702,530-byte bootstrap (and its 3,289,110-byte twin)
+    schema 3    67.0 MiB   192 files    65,424,198 compressed (398,200,779 uncompressed)
+                                       +  3,196,750 prefilter
+                                       +  1,550,719 relationships
+                                       +     94,015 of sidecars
+
+**13.2% of schema 2**, and the three parts are worth reading separately. The text is 65,424,198
+bytes against 456,602,389 + 68,198,724 -- minified, gzipped once, with no plain twin, which is the
+same three changes schema 3 made to the presentation timeline and the same reason each. The
+relationships are 1,550,719 against 13.0 MiB of identity JSON. The prefilter is 3,196,750 bytes,
+and it barely compresses at all, because base64 of Bloom bits is close to incompressible -- 4.5 MB
+of it in schema 2's bootstrap became 3.2 MB in a stream nothing but a search opens.
+
+The bootstrap goes from **89,298 bytes to 168,703**, and that is the price every other command
+pays: 96 more catalogue entries, +79,405 bytes, 1.9x. It is the number to watch if the corpus ever
+gains a fourth stream, and it is 1.5% of what schema 2's bootstrap cost the same commands.
+
+Against the whole schema-3 generation the corpus is now the larger half: 70,265,682 bytes of
+search beside 38,132,810 of presentation timeline. That is not a regression, it is where the bytes
+always were -- the same corpus was 509.1 MiB of the 1,434.2 MiB schema-2 tree.
+
+**Reading it: 6.4 times fewer bytes, and about the same wall clock.** Six queries run against the
+measured archive through both generations returned byte-identical result pages, at::
+
+    query                      schema 2                    schema 3
+    backend maturity B3        464,540,111 B / 12.6 s       72,691,268 B / 13.2 s
+    B3                         464,678,069 B / 12.2 s       69,514,861 B / 12.7 s
+    KVM                        464,390,410 B / 14.9 s       72,670,442 B / 15.1 s
+    ptrace strict-verify       463,423,554 B / 12.5 s       72,531,066 B / 13.2 s
+    detlog ordinals            460,313,751 B / 12.4 s       72,176,207 B / 13.0 s
+    a term nothing contains     73,251,093 B /  1.9 s       14,675,471 B /  1.9 s
+
+The wall clock is recorded because leaving it out would be a claim by omission. It does not
+improve, and on a warm page cache it is very slightly worse: both generations spend nearly all of
+their time in `json.loads` over the same ~400 MB of records, and schema 3 adds an inflate that
+schema 2 did not pay because it served the plain twin. What moves is the I/O, by 6.4x, which is
+the number that decides a cold cache, a network mount and a browser -- and the disk, by 7.6x,
+which is the number that decides whether the schema-2 generation can be reclaimed at all.
+
 Where the activity bins went, and why the bootstrap is small
 ------------------------------------------------------------
 Schema 2's bootstrap is 5,702,530 bytes, and it is that size because `activity_bins` is inlined:
@@ -292,9 +456,12 @@ That is **7.4%** of schema 1 and **7.1%** of schema 2 on the mid-sized team; 16.
 the largest, where a third of the bytes are message bodies that were always going to dominate.
 Against the two older generations together, schema 3 is 3.6% and 7.9%.
 
-Over the whole archive schema 3 is 38,288,394 bytes in 171 files -- 72 timeline shards totalling
-35,655,306 compressed bytes, 12 spine shards totalling 2,412,120, one 65,384-byte bins shard,
-their sidecars, and an **89,298-byte bootstrap against schema 2's 5,702,530**. The sidecars are
+Over the whole archive schema 3's *presentation* half is 38,288,394 bytes in 171 files -- 72
+timeline shards totalling 35,655,306 compressed bytes, 12 spine shards totalling 2,412,120, one
+65,384-byte bins shard, their sidecars, and the bootstrap, measured at 89,298 bytes here because
+the search streams did not exist yet; they take it to 168,703 and add 192 files of their own, and
+"The search streams" above accounts for both. Against schema 2's 5,702,530-byte bootstrap either
+number is a rounding error. The sidecars are
 66,286 bytes of that, 0.17%, which is the number the phrase "a roughly fixed fraction of the shard
 set" refers to wherever it appears. Against the generations it sits beside: schema 1 is
 280,971,189 bytes in 2 files and schema 2 is 1,503,831,881 in 661, so schema 3 is **13.6% of
@@ -340,6 +507,7 @@ from agent_team_timeline.archive import (
     narrow_json,
     write_text_if_changed,
 )
+from agent_team_timeline.search_bloom import build_trigram_bloom, compact_search_text
 from agent_team_timeline.seekable_jsonl import (
     DEFAULT_TARGET_CHUNK_BYTES,
     INDEX_SUFFIX,
@@ -356,6 +524,39 @@ SCHEMA_3_ROOT = "data/timeline-v3"
 SCHEMA_3_TIMELINE_ROOT = f"{SCHEMA_3_ROOT}/timeline"
 SCHEMA_3_SPINE_ROOT = f"{SCHEMA_3_ROOT}/spine"
 SCHEMA_3_BINS_PATH = f"{SCHEMA_3_ROOT}/bins.jsonl.gz"
+SCHEMA_3_SEARCH_ROOT = f"{SCHEMA_3_ROOT}/search"
+SCHEMA_3_SEARCH_BLOOM_ROOT = f"{SCHEMA_3_ROOT}/search-bloom"
+SCHEMA_3_SEARCH_LINKS_ROOT = f"{SCHEMA_3_ROOT}/search-links"
+
+#: The three streams a build publishes only when it has a transcript search corpus to publish.
+#: Named as a set because the reader's rule is all-or-nothing -- see the ``search_links`` note in
+#: the module docstring: a corpus with no prefilter would silently over-read and a corpus with no
+#: relationships would silently answer with the wrong linkage, so a generation that carries one of
+#: the three and not the others is refused rather than half-read.
+SCHEMA_3_SEARCH_STREAMS: tuple[str, ...] = ("search", "search_bloom", "search_links")
+
+#: How many characters of a prompt the relationship sidecar carries. The same 320 schema 2 uses,
+#: restated rather than imported because the two writers must agree exactly: the differential in
+#: `test_timeline_v3_search.py` compares the ``prompt_excerpt`` a search returns from either
+#: generation, and a different truncation would be a different answer.
+_SEARCH_EXCERPT_CHARACTERS = 320
+
+#: Record kinds of the three search streams. ``search_record`` is the corpus itself; the other
+#: three are the catalogue and the sidecar.
+_SEARCH_RECORD_KIND = "search_record"
+_SEARCH_BLOOM_KIND = "search_bloom"
+_SEARCH_PROMPT_KIND = "search_prompt"
+_SEARCH_RESPONSE_KIND = "search_response"
+
+#: Which record types are prompts and which are responses, in the sense the sidecar means. The
+#: same two sets `timeline_shards._search_linkage` uses; see :func:`_search_links_lines`.
+_SEARCH_PROMPT_TYPES = frozenset({"prompt", "inter_agent_prompt"})
+_SEARCH_RESPONSE_TYPES = frozenset({"response", "inter_agent_response"})
+
+#: The order the linkage kinds are laid down in, and therefore the order of their line ranges.
+_SEARCH_LINK_KIND_ORDER: tuple[str, ...] = (_SEARCH_PROMPT_KIND, _SEARCH_RESPONSE_KIND)
+
+_DAY_MS = 24 * 60 * 60 * 1000
 
 #: The sidecar's ``timestamp_key`` and the sort key of every time-addressed stream. Named for the
 #: field schema-1 events already carry, so an event's line is unchanged by the envelope.
@@ -588,6 +789,12 @@ class TimelineV3Report:
     compressed_bytes: int
     uncompressed_bytes: int
     index_bytes: int
+    #: The transcript search corpus, reported apart from the totals because it is the half of
+    #: schema 3 that replaces a whole schema-2 generation of its own and the comparison an
+    #: operator wants is against *that*, not against the presentation timeline beside it.
+    search_shards: int = 0
+    search_records: int = 0
+    search_bytes: int = 0
     #: Shard-shaped files found under the schema-3 root and outside this build's plan, removed
     #: after the bootstrap was published. Reported separately from ``files_changed`` rather than
     #: only folded into it, because a non-zero value here is a *finding*: on a healthy archive
@@ -642,6 +849,20 @@ class _Line:
         """Order within one kind's group in a spine shard."""
 
         return (self.key, self.line)
+
+    def search_order(self) -> tuple[int, str, bytes]:
+        """Order within a ``search`` shard: instant, then the record's stable reference.
+
+        Not :meth:`time_order`, and the difference is the tiebreak. A timeline shard interleaves
+        three record kinds with no shared identifier, so it can only fall back to the encoded
+        bytes; every search record carries a unique ``ref``, and schema 2 sorts its day objects by
+        ``(at_ms, ref)``. Matching that exactly is what lets the differential compare the two
+        corpora as sequences rather than as sets -- an ordering difference that changes no answer
+        is still an ordering difference a reviewer then has to reason about. The encoded line stays
+        as the final component so the order is total whatever the data does.
+        """
+
+        return (self.at_ms if self.at_ms is not None else 0, self.key, self.line)
 
 
 def _local_identifier(team: str, identifier: str) -> str:
@@ -748,9 +969,17 @@ def is_schema_3_path(relative: str) -> bool:
         stem = part.removesuffix(".jsonl.gz")
         if not stem or stem[0] == "." or not set(stem) <= _SLUG_CHARACTERS:
             return False
-    # One shape per stream, keyed by the component that names the stream. Schema 3 has exactly
-    # three, and a fourth must be added here deliberately rather than admitted by a wildcard.
-    depths: Mapping[str, int] = {"bins.jsonl.gz": 1, "spine": 2, "timeline": 3}
+    # One shape per stream, keyed by the component that names the stream. Each new stream is
+    # added here deliberately rather than admitted by a wildcard, which is what keeps this tight
+    # enough to do a directory listing's job.
+    depths: Mapping[str, int] = {
+        "bins.jsonl.gz": 1,
+        "spine": 2,
+        "search-bloom": 2,
+        "search-links": 2,
+        "timeline": 3,
+        "search": 3,
+    }
     return depths.get(tail[0]) == len(tail)
 
 
@@ -1235,10 +1464,186 @@ def _bins_lines(timeline: Mapping[str, JsonValue], sole_team: str | None) -> lis
     return lines
 
 
+@dataclass(frozen=True)
+class _SearchPlan:
+    """The three search streams, bucketed but not yet ordered or written.
+
+    Built in one pass over the records, because the alternative -- three passes, one per stream --
+    would walk 422 MiB of message text three times to produce three views of it, and every field
+    each view needs is on the record the first pass already has in hand.
+    """
+
+    records: dict[tuple[str, int], list[_Line]]
+    texts: dict[tuple[str, int], list[str]]
+    links: dict[str, dict[str, list[_Line]]]
+
+
+def _search_string(record: Mapping[str, JsonValue], field: str, where: str) -> str:
+    return as_string(record.get(field), f"{where}.{field}")
+
+
+def _search_lines(
+    search_records: Sequence[Mapping[str, JsonValue]], known_slugs: frozenset[str]
+) -> _SearchPlan:
+    """Bucket the corpus by ``(team, UTC day)`` and derive its relationship sidecar.
+
+    Three refusals. The first, a duplicate ``ref``, is schema 2's too -- it would make one record
+    shadow another under a stable reference the archive promises is unique, and ``show`` would
+    return whichever the reader met last. The other two are new here and are new *because of the
+    layout*: schema 2 names its objects by digest, so a record's team and instant decide only
+    which object it is grouped into, while a schema-3 shard puts both in the path. A record naming
+    a team the timeline does not publish would land under a directory no catalogue entry could
+    describe, and one with no ``at_ms`` has no day to be filed under at all.
+
+    All three are raised here, in the plan, rather than at the shard that discovers them, for the
+    reason :func:`write_timeline_v3` gives: a refusal after the first shard is written leaves
+    orphans no manifest can name.
+    """
+
+    plan = _SearchPlan({}, {}, {})
+    seen: set[str] = set()
+    for index, record in enumerate(search_records):
+        where = f"search_records[{index}]"
+        reference = _search_string(record, "ref", where)
+        if reference in seen:
+            raise TimelineV3Error(f"{where}: duplicate search record reference {reference!r}")
+        seen.add(reference)
+        team = _search_string(record, "team", where)
+        if team not in known_slugs:
+            raise TimelineV3Error(
+                f"{where}: search record names team {team!r}, absent from teams[]"
+            )
+        at_ms = _field_int(record, "at_ms", where)
+        text = _search_string(record, "text", where)
+        bucket = (team, utc_day_start(at_ms))
+        plan.records.setdefault(bucket, []).append(
+            # `at_ms + 1` for the same reason an event uses it: a search record is a point, and a
+            # point's half-open reach ends one millisecond later.
+            _Line(
+                at_ms,
+                _SEARCH_RECORD_KIND,
+                reference,
+                _encode(_envelope(record, _SEARCH_RECORD_KIND, at_ms, where)),
+                at_ms + 1,
+            )
+        )
+        plan.texts.setdefault(bucket, []).append(text)
+
+        record_type = _search_string(record, "record_type", where)
+        by_kind = plan.links.setdefault(team, {})
+        if record_type in _SEARCH_PROMPT_TYPES:
+            by_kind.setdefault(_SEARCH_PROMPT_KIND, []).append(
+                _link_line(
+                    _SEARCH_PROMPT_KIND,
+                    reference,
+                    {
+                        "ref": reference,
+                        "excerpt": compact_search_text(text)[:_SEARCH_EXCERPT_CHARACTERS],
+                    },
+                    where,
+                )
+            )
+        if record_type not in _SEARCH_RESPONSE_TYPES:
+            continue
+        raw_prompt = record.get("prompt_ref")
+        if raw_prompt is None:
+            continue
+        prompt_reference = as_string(raw_prompt, f"{where}.prompt_ref")
+        if prompt_reference == reference:
+            continue
+        by_kind.setdefault(_SEARCH_RESPONSE_KIND, []).append(
+            _link_line(
+                _SEARCH_RESPONSE_KIND,
+                reference,
+                {
+                    "ref": reference,
+                    "prompt_ref": prompt_reference,
+                    "at_ms": at_ms,
+                    "agent_ref": _search_string(record, "agent_ref", where),
+                },
+                where,
+            )
+        )
+    return plan
+
+
+def _link_line(
+    kind: str, key: str, record: Mapping[str, JsonValue], where: str
+) -> _Line:
+    """One relationship-sidecar line: line-addressed, so it carries no schema-3 instant.
+
+    A response link *does* carry its own ``at_ms`` -- the reader needs it to apply a window
+    filter without reopening the text shard -- but that is the record's own field, copied from
+    schema 2, and not the stream's sort key. Handing it to :func:`_envelope` as the instant would
+    make the sidecar look time-addressed to a reader, and it is not: it is grouped by kind and
+    addressed by line range, exactly like the spine, and for the same reason the spine gives.
+    """
+
+    return _Line(None, kind, key, _encode(_envelope(record, kind, None, where)), None)
+
+
+def _search_bloom_lines(
+    plan: _SearchPlan, relative_of: Mapping[tuple[str, int], str]
+) -> dict[str, list[_Line]]:
+    """One prefilter record per published ``search`` shard, bucketed by team.
+
+    The filter itself is :func:`search_bloom.build_trigram_bloom`, called with the same texts in
+    the same normalization schema 2 calls it with, so the two generations prune the same shards
+    for the same query. That is not a convenience: the case study's Unicode trap -- "Unicode case
+    equivalences did not match the ASCII Bloom normalization" -- was fixed once, in that module,
+    by making the filter and the exact matcher agree on ASCII-only case folding. A second
+    implementation here would be a second chance to get it wrong.
+    """
+
+    lines: dict[str, list[_Line]] = {}
+    for bucket in sorted(plan.records):
+        team, day_start = bucket
+        bloom = build_trigram_bloom(plan.texts[bucket])
+        record: dict[str, JsonValue] = {
+            "team": team,
+            "day": utc_day_label(day_start),
+            "shard": relative_of[bucket],
+            "records": len(plan.records[bucket]),
+            "bloom": bloom.catalog_obj(),
+        }
+        where = f"search bloom {team} {record['day']}"
+        lines.setdefault(team, []).append(
+            _Line(
+                day_start,
+                _SEARCH_BLOOM_KIND,
+                "",
+                _encode(_envelope(record, _SEARCH_BLOOM_KIND, day_start, where)),
+                day_start + _DAY_MS,
+            )
+        )
+    return lines
+
+
+def _ordered_links(
+    by_kind: Mapping[str, list[_Line]], where: str
+) -> tuple[list[_Line], dict[str, tuple[int, int]]]:
+    """Lay one team's linkage out kind by kind, and report each kind's line range."""
+
+    ordered: list[_Line] = []
+    ranges: dict[str, tuple[int, int]] = {}
+    unknown = sorted(set(by_kind) - set(_SEARCH_LINK_KIND_ORDER))
+    if unknown:
+        raise TimelineV3Error(f"{where}: unclassified linkage kinds {unknown}")
+    for kind in _SEARCH_LINK_KIND_ORDER:
+        group = by_kind.get(kind)
+        if not group:
+            continue
+        group.sort(key=_Line.kind_order)
+        ranges[kind] = (len(ordered), len(group))
+        ordered.extend(group)
+    return ordered, ranges
+
+
 def write_timeline_v3(
     output: Path,
     raw_timeline: Mapping[str, JsonValue],
     *,
+    search_records: Sequence[Mapping[str, JsonValue]] = (),
     target_chunk_bytes: int = DEFAULT_TARGET_CHUNK_BYTES,
 ) -> TimelineV3Report:
     """Publish the schema-3 shards, then the bootstrap that names them.
@@ -1247,6 +1652,14 @@ def write_timeline_v3(
     remains the caller's, and is still published beside this, because the website reads it and
     has no schema-3 mode; ``data/timeline.json`` is no longer written by a published build at
     all. See the module docstring for why those two retirements are not the same event.
+
+    *search_records* is the transcript search corpus, the same sequence the caller hands
+    :func:`timeline_shards.write_timeline_shards`. Passing it publishes the three search streams;
+    omitting it publishes the three original streams and nothing else, and a reader then answers
+    a transcript search out of schema 2. It is a keyword argument rather than another field of
+    the timeline because it is *not* part of the schema-1 timeline: it is derived from the team's
+    events and tool calls by :func:`search_index.build_search_records`, and folding it into the
+    projection's input would make the "unclassified schema-1 field" refusal below meaningless.
 
     **Every refusal is raised before the first byte is written.** The projection is built whole
     -- buckets, ordering, per-team validation, spine layout -- and only then published. The
@@ -1330,6 +1743,62 @@ def write_timeline_v3(
         )
     )
 
+    # The three search streams, planned last and only when there is a corpus. A build with no
+    # search records publishes the original three streams and nothing else, which is what every
+    # archive built before this looks like and what the reader falls back to schema 2 for.
+    search_plan = _search_lines(search_records, known_slugs)
+    search_paths: dict[tuple[str, int], str] = {}
+    for bucket in sorted(search_plan.records):
+        team, day_start = bucket
+        day = utc_day_label(day_start)
+        lines = search_plan.records[bucket]
+        lines.sort(key=_Line.search_order)
+        relative = f"{SCHEMA_3_SEARCH_ROOT}/{team}/{day}.jsonl.gz"
+        search_paths[bucket] = relative
+        planned.append(
+            _PlannedShard(
+                relative_path=relative,
+                stream="search",
+                team=team,
+                day=day,
+                lines=lines,
+                line_ranges=_NO_LINE_RANGES,
+            )
+        )
+    if search_plan.records:
+        bloom_lines = _search_bloom_lines(search_plan, search_paths)
+        for team in sorted(bloom_lines):
+            lines = bloom_lines[team]
+            lines.sort(key=_Line.time_order)
+            planned.append(
+                _PlannedShard(
+                    relative_path=f"{SCHEMA_3_SEARCH_BLOOM_ROOT}/{team}.jsonl.gz",
+                    stream="search_bloom",
+                    team=team,
+                    day=None,
+                    lines=lines,
+                    line_ranges=_NO_LINE_RANGES,
+                )
+            )
+        # A links shard per team that has *search records*, not per team that happens to have a
+        # relationship: a team whose whole corpus is unlinked tool runs still gets an empty shard,
+        # so the reader's "every search team has all three streams" rule holds without a special
+        # case for the archive that has no prompts yet.
+        for team in sorted({team for team, _day in search_plan.records}):
+            ordered, ranges = _ordered_links(
+                search_plan.links.get(team, {}), f"search links {team}"
+            )
+            planned.append(
+                _PlannedShard(
+                    relative_path=f"{SCHEMA_3_SEARCH_LINKS_ROOT}/{team}.jsonl.gz",
+                    stream="search_links",
+                    team=team,
+                    day=None,
+                    lines=ordered,
+                    line_ranges=ranges,
+                )
+            )
+
     # Path safety is filesystem state rather than projection state, but it fails in exactly
     # the same way -- halfway through publication, with orphans behind it -- so it is checked
     # in the same pre-pass. `make_parents=False` because a refusal must not leave directories
@@ -1386,6 +1855,15 @@ def write_timeline_v3(
         generated_files=tuple(sorted(generated)),
         timeline_shards=sum(1 for shard in shards if shard.stream == "timeline"),
         spine_shards=sum(1 for shard in shards if shard.stream == "spine"),
+        search_shards=sum(1 for shard in shards if shard.stream == "search"),
+        search_records=sum(
+            shard.write.record_count for shard in shards if shard.stream == "search"
+        ),
+        search_bytes=sum(
+            shard.write.index.c_size
+            for shard in shards
+            if shard.stream in SCHEMA_3_SEARCH_STREAMS
+        ),
         record_count=record_count,
         bootstrap_bytes=len(bootstrap_text.encode("utf-8")),
         compressed_bytes=sum(shard.write.index.c_size for shard in shards),
@@ -1425,7 +1903,12 @@ def _bootstrap(
         "index_suffix": INDEX_SUFFIX,
     }
     root["teams"] = [dict(team) for team in teams]
-    by_stream: dict[str, list[JsonValue]] = {"timeline": [], "spine": [], "bins": []}
+    by_stream: dict[str, list[JsonValue]] = {
+        "timeline": [],
+        "spine": [],
+        "bins": [],
+        **{stream: [] for stream in SCHEMA_3_SEARCH_STREAMS},
+    }
     for shard in shards:
         by_stream[shard.stream].append(shard.catalog_obj())
     root["streams"] = {
@@ -1448,6 +1931,31 @@ def _bootstrap(
             "shards": by_stream["bins"],
         },
     }
+    if by_stream["search"]:
+        # Published only when there is a corpus, so that an archive without one names exactly the
+        # three streams every reader before this understood. A reader that meets these sections
+        # and does not implement them declines schema 3 and falls back, which is a slow archive;
+        # a reader that met a *partial* set and read it anyway would be a wrong one.
+        streams = as_object(root["streams"], "timeline-v3.streams")
+        streams["search"] = {
+            "addressing": "per-team-utc-day",
+            "sort": "at_ms, record_kind, encoded line",
+            "record_kinds": [_SEARCH_RECORD_KIND],
+            "shards": by_stream["search"],
+        }
+        streams["search_bloom"] = {
+            "addressing": "per-team-time-range",
+            "sort": "at_ms, record_kind, encoded line",
+            "record_kinds": [_SEARCH_BLOOM_KIND],
+            "shards": by_stream["search_bloom"],
+        }
+        streams["search_links"] = {
+            "addressing": "per-team-line-range",
+            "sort": "record_kind in declared order, then the record's reference",
+            "record_kinds": list(_SEARCH_LINK_KIND_ORDER),
+            "shards": by_stream["search_links"],
+        }
+        root["streams"] = streams
     return root
 
 
@@ -1456,6 +1964,10 @@ __all__ = [
     "SCHEMA_3_BOOTSTRAP_PATH",
     "SCHEMA_3_RECORD_KIND_KEY",
     "SCHEMA_3_ROOT",
+    "SCHEMA_3_SEARCH_BLOOM_ROOT",
+    "SCHEMA_3_SEARCH_LINKS_ROOT",
+    "SCHEMA_3_SEARCH_ROOT",
+    "SCHEMA_3_SEARCH_STREAMS",
     "SCHEMA_3_SPINE_ROOT",
     "SCHEMA_3_TIMELINE_ROOT",
     "SCHEMA_3_TIMESTAMP_KEY",

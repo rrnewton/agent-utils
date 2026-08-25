@@ -52,7 +52,7 @@ _BOOTSTRAP_FIELDS = frozenset(
     }
 )
 
-#: Whether this tool still publishes the schema-2 generation at all.
+#: Whether this tool still publishes the schema-2 generation at all. **It does not.**
 #:
 #: A **capability of the writer**, not an observation of an archive, and that distinction is the
 #: whole reason it exists. `archive_gc` needs to answer "will anything ever write these 1.4 GB
@@ -67,45 +67,67 @@ _BOOTSTRAP_FIELDS = frozenset(
 #: "mine". This constant is what the build says, in a form a collector can read.
 #:
 #: It is enforced rather than promised. :func:`write_timeline_shards` raises while it is ``False``,
-#: so the constant cannot be flipped as a one-line lie that leaves the writer running: the flip
-#: fails every build and every test until the call sites in `render` and `multi_team` go with it.
+#: so the constant could not be flipped as a one-line lie that left the writer running: the flip
+#: failed every build until the call sites in `render` and `multi_team` went with it.
 #: `tests/test_timeline_archive_gc.py` adds the other direction, requiring the bundled
-#: `static/app.js` to name ``data/timeline-v3.json`` once this is ``False``, because the website is
-#: the reason schema 2 is still written -- see :func:`write_timeline_shards` -- and a flip that
-#: left the browser with no schema-3 mode would retire the graphical surface by accident.
+#: `static/app.js` to name ``data/timeline-v3.json`` while this is ``False``, because the website
+#: was the reason schema 2 was still written and a flip that left the browser with no schema-3
+#: mode would have retired the graphical surface by accident.
+#:
+#: **Why the writer is still here.** Nothing calls it and nothing may: the guard above is the
+#: enforcement `archive_gc` leans on when it offers a whole generation to the trash, and deleting
+#: the function would delete the guard and leave that offer resting on a comment. What the writer
+#: is *for* now is the other side of the same retirement -- `query.py` still reads schema 2, for
+#: the archives an older tool built, and a reader with no way to produce its input is a reader
+#: nobody can test. So the legacy-reader suites monkeypatch this constant back to ``True`` around
+#: a fixture build, which is honest about what they are doing (asking the writer for an archive an
+#: older tool would have written) in a way that a second, test-only projection would not be.
 #:
 #: **What this constant does and does not say.** It says the *presentation* generation is retired.
 #: It says nothing about the transcript search corpus, which is also schema 2 -- day shards with
-#: trigram blooms, catalogued in the bootstrap's ``search`` section -- and which schema 3 does not
-#: implement: `query.TimelineQuery._search_bootstrap` reaches into it from under a complete schema
-#: 3, and says so in its first paragraph. Flipping this does not retire that, and `archive_gc`
-#: enforces the distinction rather than trusting this note: its ``schema-2-search-corpus`` category
-#: holds whatever the ``search`` section names, in both worlds, so the corpus survives the day the
-#: format dies and leaves only when a build stops publishing it.
+#: trigram blooms, catalogued in the bootstrap's ``search`` section. That distinction was written
+#: here when schema 3 had no corpus of its own; it now has one -- the ``search``, ``search_bloom``
+#: and ``search_links`` streams of `timeline_v3` -- and both readers prefer it:
+#: `query.TimelineQuery._iter_search_records` and, since the flip, `static/app.js`. The
+#: distinction survives the change and is still not this constant's to make: `archive_gc` decides
+#: it **per archive**, by asking whether the schema 3 sitting beside a given schema 2 publishes
+#: ``search`` shards, because a tool that can write a corpus does not put one into an archive
+#: somebody built last month. Its ``schema-2-search-corpus`` category holds the objects while they
+#: are that archive's only copy and releases them once they are not, whatever this constant says.
 #:
-#: **The checklist for the day this becomes ``False``**, all of it in one commit, because each
-#: item alone is a regression:
+#: **The checklist that had to be satisfied to get here**, and what satisfied each item. It is
+#: kept rather than deleted because it is the argument, not a to-do list: anything that proposes
+#: to undo one of these is proposing to reopen the case it closed.
 #:
-#: 1. `static/app.js` reads schema 3, so the browser has something left to open. Note that it must
-#:    go on fetching ``data/timeline-v2.json`` for search; the flip is not a licence to stop.
-#: 2. The two call sites -- `render._render_team` and `multi_team.build_combined_archive` --
-#:    stop calling :func:`write_timeline_shards` for the presentation timeline, and something goes
-#:    on publishing the ``search`` section and its objects, because that is a capability rather
-#:    than a copy and this flip does not supersede it.
-#: 3. `render.retired_schema_1_files` grows the schema-2 presentation paths, exactly as it holds
-#:    the schema-1 monolith today. Without that, the first build after the flip finds those files
-#:    in the previous manifest and in no current one and `_remove_stale_presentation_files`
-#:    **unlinks them outright** -- destroyed as a side effect of a build, outside the trash, which
-#:    is precisely the surprise that function exists to prevent.
+#: 1. *`static/app.js` reads schema 3, so the browser has something left to open.* **Done.** The
+#:    bundle loads ``data/timeline-v3.json`` and reads the shards a gzip member at a time over HTTP
+#:    Range through the archive's own ``serve.py``; see the "Schema 3" block in that file for the
+#:    split and for the dynamic-endpoint alternative that was refused. The condition attached to
+#:    this item -- that it may stop fetching ``data/timeline-v2.json`` only once it reads the
+#:    schema-3 search streams too -- is met by the same change: it reads ``search``,
+#:    ``search_bloom`` and ``search_links``, and falls back to schema 2 only when a bootstrap is
+#:    absent or refuses, which is how an older archive stays readable.
+#: 2. *The two call sites stop calling :func:`write_timeline_shards`.* **Done**, in
+#:    `render._render_team` and `multi_team.build_combined_archive`. Both pass their search records
+#:    to :func:`timeline_v3.write_timeline_v3` instead, so the corpus goes on being published by
+#:    the generation that survives.
+#: 3. *The retired-file seam grows the schema-2 presentation paths.* **Done**, in
+#:    `render.retired_generation_files`, which is what the schema-1 function was renamed to when it
+#:    stopped being about one generation. Without it the first build after the flip would find
+#:    those files in the previous manifest and in no current one and
+#:    `_remove_stale_presentation_files` would **unlink them outright** -- destroyed as a side
+#:    effect of a build, outside the trash, which is precisely the surprise that function exists to
+#:    prevent.
 #:
-#: Only then does `gc`'s ``superseded-schema-2`` category start offering the bytes, and even then
+#: Only now does `gc`'s ``superseded-schema-2`` category start offering the bytes, and even then
 #: only against an archive whose schema-3 generation passes the reader's own completeness rule,
 #: agrees with schema 2's ``source_digest``, and whose *own copy* of ``app.js`` -- written into it
 #: by the build that made it, and never rewritten by `gc` -- already knows where schema 3 lives.
 #: That last one is per archive rather than per release: a tool upgrade does not reach into an
 #: archive somebody built last month, so those archives need one rebuild before they can be
-#: collected.
-SCHEMA_2_IS_PUBLISHED: bool = True
+#: collected. That is not a leftover of the transition; it is permanent, because the bundle is
+#: copied and not shipped.
+SCHEMA_2_IS_PUBLISHED: bool = False
 
 
 def schema_2_is_published() -> bool:
@@ -839,24 +861,35 @@ def write_timeline_shards(
     search_records: Sequence[dict[str, JsonValue]] = (),
     precompress: bool = True,
 ) -> TimelineShardReport:
-    """Publish schema-2 objects and then atomically publish their stable bootstrap.
+    """Publish schema-2 objects and then atomically publish their stable bootstrap. **Retired.**
 
-    This generation is the one the **website** reads. `static/app.js` loads
-    ``data/timeline-v2.json`` and fetches these immutable objects as their time ranges become
-    visible; it has no schema-3 mode, because reading multi-member gzip over HTTP Range in the
-    browser does not exist yet. So schema 2 keeps being written even though `query.py` now
-    prefers schema 3 -- retiring the only format the graphical surface can open would retire the
-    surface.
+    No build calls this. It is refused below while :data:`SCHEMA_2_IS_PUBLISHED` is ``False``, and
+    that constant is ``False``.
 
-    Schema 1 is a different case and was retired: `render.retired_schema_1_files` records the two
-    fallback paths that used to reach ``data/timeline.json`` and why a published build no longer
-    produces it.
+    The reason it was still running long after `query.py` had moved on was the **website**:
+    `static/app.js` loaded ``data/timeline-v2.json`` and fetched these immutable objects as their
+    time ranges became visible, and it had no schema-3 mode, so retiring the only format the
+    graphical surface could open would have retired the surface. That is no longer true. The bundle
+    reads the schema-3 bootstrap and pulls one gzip member of a shard at a time over HTTP Range
+    through the archive's own ``serve.py``; it reads the schema-3 transcript search streams too;
+    and it keeps this generation only as a *fallback*, for an archive an older tool built.
+
+    Which is why the function survives its own retirement. `query.py` also still reads schema 2 for
+    those archives, and a reader with no way to produce its input cannot be tested -- so the suites
+    that cover that reading path monkeypatch the constant back to ``True`` around a fixture build.
+    That is the writer's whole remaining job, and it is a better one than a second projection
+    written only for tests, which would be free to drift away from what real archives contain.
+
+    Schema 1 was retired the same way, one generation earlier:
+    `render.retired_generation_files` records the fallback paths that used to reach
+    ``data/timeline.json``, why a published build no longer produces it, and why not writing a
+    generation and deleting it have to be separate decisions.
 
     The refusal below is what makes :data:`SCHEMA_2_IS_PUBLISHED` worth anything to a collector.
-    `archive_gc` will hand 1.4 GB to the trash on the strength of that constant, so the constant
-    has to be a fact about the writer rather than a comment about it: while it is ``False`` this
-    function cannot run, and therefore no build can quietly keep writing the generation `gc` was
-    told is retired.
+    `archive_gc` hands 1.4 GB to the trash on the strength of that constant, so the constant has to
+    be a fact about the writer rather than a comment about it: while it is ``False`` this function
+    cannot run, and therefore no build can quietly keep writing the generation `gc` was told is
+    retired.
     """
 
     if not SCHEMA_2_IS_PUBLISHED:
@@ -865,7 +898,8 @@ def write_timeline_shards(
             "archive_gc offers the whole generation for collection on the strength of that "
             "constant, and a writer that kept running beside it would recreate what an operator "
             "had just reclaimed. Remove the call rather than the check -- see the checklist on "
-            "SCHEMA_2_IS_PUBLISHED, whose third item is the one that costs data"
+            "SCHEMA_2_IS_PUBLISHED, whose third item is the one that costs data. A test that "
+            "needs an archive an older tool would have written monkeypatches the constant"
         )
     if as_int(raw_timeline.get("schema_version"), "timeline.schema_version") != 1:
         raise ValueError("schema-2 sharding requires a schema-1 source timeline")
