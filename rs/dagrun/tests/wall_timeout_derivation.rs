@@ -44,6 +44,7 @@ fn step(timeout: i64, cpu_timeout: i64) -> Step {
         skip_reason: None,
         write_domains: None,
         write_domain_guarantee: None,
+        explains: Vec::new(),
     }
 }
 

@@ -147,6 +147,70 @@ def test_dep_failure_skips_dependents() -> None:
     assert not r.ok and "g.b" in r.skipped
 
 
+def test_explains_survives_eager_exit_while_a_plain_peer_is_still_aborted() -> None:
+    """The exemption works AND eager-exit still works, asserted in one run.
+
+    Both halves matter. Proving only that the diagnostic survives would be satisfied just as
+    well by a change that disabled eager-exit altogether, and nothing in the passing case would
+    reveal it -- so the plain peer is in the same DAG, under the same failure, and must still be
+    aborted.
+    """
+    cfg = DagConfig(
+        steps=(
+            Step("g", "subject", "", "sleep 0.2; false"),
+            Step("g", "diag", "", "sleep 3", explains=["g.subject"]),
+            Step("g", "plain", "", "sleep 3"),
+        )
+    )
+    r = run_dag(cfg, jobs=3, verbosity=0)
+    outs = {o.tag: o for o in r.outcomes}
+    assert not r.ok
+    # the diagnostic ran to completion rather than being reaped
+    assert outs["g.diag"].aborted is False
+    assert outs["g.diag"].ok is True
+    # and the peer that explains nothing was cancelled exactly as before
+    assert outs["g.plain"].aborted is True
+
+
+def test_explains_launches_a_diagnostic_that_had_not_started_yet() -> None:
+    """The measured case: the diagnostic was still QUEUED when its subject failed.
+
+    Sparing an already-running diagnostic is not sufficient. With one worker the diagnostic
+    cannot have started before the subject fails, so this fails unless eager-exit also permits
+    it to LAUNCH afterwards.
+    """
+    cfg = DagConfig(
+        steps=(
+            Step("g", "subject", "", "false"),
+            Step("g", "diag", "", "true", explains=["g.subject"]),
+        )
+    )
+    r = run_dag(cfg, jobs=1, verbosity=0)
+    outs = {o.tag: o for o in r.outcomes}
+    assert not r.ok
+    assert "g.diag" in outs, "the diagnostic was never launched"
+    assert outs["g.diag"].ok is True and outs["g.diag"].aborted is False
+
+
+def test_explains_does_not_protect_against_an_unrelated_failure() -> None:
+    """The narrowing that stops `explains` becoming a blanket opt-out.
+
+    A step declaring `explains` is not immortal. When something it does NOT explain fails, it is
+    reaped like any other peer.
+    """
+    cfg = DagConfig(
+        steps=(
+            Step("g", "unrelated", "", "sleep 0.2; false"),
+            Step("g", "subject", "", "sleep 3"),
+            Step("g", "diag", "", "sleep 3", explains=["g.subject"]),
+        )
+    )
+    r = run_dag(cfg, jobs=3, verbosity=0)
+    outs = {o.tag: o for o in r.outcomes}
+    assert not r.ok
+    assert outs["g.diag"].aborted is True, "explains must not shield against an unrelated failure"
+
+
 def test_eager_exit_aborts_inflight() -> None:
     cfg = DagConfig(steps=(Step("g", "fast", "", "sleep 0.2; false"), Step("g", "slow", "", "sleep 5")))
     r = run_dag(cfg, jobs=2, verbosity=0)

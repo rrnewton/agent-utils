@@ -2154,6 +2154,7 @@ mod tests {
             skip_reason: None,
             write_domains: None,
             write_domain_guarantee: None,
+            explains: Vec::new(),
         }
     }
 
@@ -2879,6 +2880,7 @@ t,m,affinity16_cpu-max-max,a,1,a,u,l,m.heavy,cpu-bound,8,5.0,0,True,False,0,1000
             skip_reason: None,
             write_domains: None,
             write_domain_guarantee: None,
+            explains: Vec::new(),
         };
         let cfg = DagConfig {
             steps: vec![mk("m", "prep", &[], 2.0), heavy],

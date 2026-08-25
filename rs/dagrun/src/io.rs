@@ -44,6 +44,95 @@ impl fmt::Display for DagJsonError {
 
 impl std::error::Error for DagJsonError {}
 
+/// Refuse an `explains` declaration that cannot mean what it says.
+///
+/// `explains` buys a step an exemption from eager-exit cancellation, so a declaration that is
+/// quietly wrong is worse than one that is missing: the step looks protected in the document and
+/// is reaped anyway, or protects itself for a reason nobody can audit.
+///
+/// UNKNOWN TAG names a node that does not exist, so the exemption can never trigger -- the
+/// misspelling case, silent without a check. SELF-REFERENCE would let any step opt itself out of
+/// cancellation with one self-naming line, which is the blanket opt-out this relationship exists
+/// to avoid. A CYCLE (A explains B explains A, directly or through a chain) makes each member
+/// shield the next, so the whole cycle becomes uncancellable and eager-exit silently stops
+/// applying to it, with every individual line still looking reasonable.
+///
+/// The two editions of this crate must refuse the same documents.
+fn refuse_unusable_explains(steps: &[Step]) -> Result<(), DagJsonError> {
+    let by_tag: std::collections::BTreeMap<String, &Step> =
+        steps.iter().map(|s| (s.tag(), s)).collect();
+    let mut problems: std::collections::BTreeSet<String> = Default::default();
+    for step in steps {
+        let tag = step.tag();
+        for target in &step.explains {
+            if *target == tag {
+                problems.insert(format!(
+                    "step {tag}: explains itself; a step cannot diagnose its own failure"
+                ));
+            } else if !by_tag.contains_key(target) {
+                problems.insert(format!("step {tag}: explains unknown node '{target}'"));
+            }
+        }
+    }
+    if !problems.is_empty() {
+        let joined: Vec<String> = problems.into_iter().collect();
+        return Err(err(joined.join("; ")));
+    }
+
+    // Iterative three-colour DFS over the explains relation, so a deep chain cannot blow the
+    // stack and turn a validation error into a crash.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Colour {
+        White,
+        Grey,
+        Black,
+    }
+    let mut colour: std::collections::BTreeMap<&str, Colour> =
+        by_tag.keys().map(|k| (k.as_str(), Colour::White)).collect();
+    for root in by_tag.keys() {
+        if colour[root.as_str()] != Colour::White {
+            continue;
+        }
+        let mut stack: Vec<(&str, bool)> = vec![(root.as_str(), false)];
+        let mut path: Vec<&str> = Vec::new();
+        while let Some((tag, leaving)) = stack.pop() {
+            if leaving {
+                colour.insert(tag, Colour::Black);
+                path.pop();
+                continue;
+            }
+            match colour[tag] {
+                Colour::Black => continue,
+                Colour::Grey => {
+                    let start = path.iter().position(|t| *t == tag).unwrap_or(0);
+                    let mut cycle: Vec<&str> = path[start..].to_vec();
+                    cycle.push(tag);
+                    return Err(err(format!(
+                        "explains cycle: {}. Each step in the cycle would exempt the next from \
+                         eager-exit, so the whole cycle becomes uncancellable and eager-exit \
+                         silently stops applying to it. `explains` must describe a one-way \
+                         'diagnoses' relation.",
+                        cycle.join(" -> ")
+                    )));
+                }
+                Colour::White => {}
+            }
+            colour.insert(tag, Colour::Grey);
+            path.push(tag);
+            stack.push((tag, true));
+            let mut targets: Vec<&str> =
+                by_tag[tag].explains.iter().map(|s| s.as_str()).collect();
+            targets.sort_unstable();
+            for target in targets {
+                if colour.get(target) != Some(&Colour::Black) {
+                    stack.push((target, false));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn err(msg: impl Into<String>) -> DagJsonError {
     DagJsonError(msg.into())
 }
@@ -441,8 +530,10 @@ pub fn dag_from_value(raw: &Value) -> Result<DagConfig, DagJsonError> {
                     )))
                 }
             },
+            explains: opt_str_list(sm, "explains")?,
         });
     }
+    refuse_unusable_explains(&steps)?;
     let intentional: std::collections::BTreeSet<String> = steps
         .iter()
         .filter(|step| step.skip_reason.is_some())
@@ -807,10 +898,26 @@ fn emit_step(s: &mut String, step: &Step, base: usize) {
     s.push_str(&key);
     s.push_str("\"hint\": ");
     emit_hint(s, &step.hint, base + 2);
-    if step.write_domains.is_some() || step.write_domain_guarantee.is_some() {
+    // `explains` is emitted only when declared, and in the same position as Python's serializer,
+    // because the two editions are pinned together by a byte-identical JSON comparison. A graph
+    // that does not use the relationship keeps a byte-identical document.
+    let has_explains = !step.explains.is_empty();
+    let has_write_domains =
+        step.write_domains.is_some() || step.write_domain_guarantee.is_some();
+    if has_explains || has_write_domains {
         s.push_str(",\n");
     } else {
         s.push('\n');
+    }
+    if has_explains {
+        s.push_str(&key);
+        s.push_str("\"explains\": ");
+        emit_str_list(s, &step.explains, base + 2);
+        if has_write_domains {
+            s.push_str(",\n");
+        } else {
+            s.push('\n');
+        }
     }
     if let Some(domains) = &step.write_domains {
         s.push_str(&key);

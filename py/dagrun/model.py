@@ -10,7 +10,7 @@ import math
 import os
 import re
 import signal
-from collections.abc import Mapping, Sequence
+from collections.abc import Container, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from dataclasses import fields as dataclass_fields
 from enum import Enum
@@ -211,6 +211,33 @@ class Step:
     # WriteDomainPolicy refuses the former before any node starts.
     write_domains: list[str] | None = None
     write_domain_guarantee: WriteDomainGuarantee | None = None
+    # Tags ("group.job") whose FAILURE this step exists to explain.
+    #
+    # WHY THIS IS A RELATIONSHIP AND NOT A BOOLEAN. A diagnostic node -- one whose only job is
+    # to name the cause of another node's failure -- is BY CONSTRUCTION scheduled alongside
+    # something that fails, so eager-exit cancels it precisely when it was about to be useful.
+    # Observed in a consuming graph: a test node failed a few seconds before its companion
+    # ABI-comparison node, the companion was never launched, and the run reported the opaque
+    # symptom while the node that would have named the missing symbol produced nothing.
+    #
+    # The obvious fix is a per-node "never cancel me" flag, and that is the wrong shape: anything
+    # could set it, nothing would say why, and eager-exit would erode into an opt-out. Declaring
+    # WHAT a node explains keeps the intent visible in the document, makes it CHECKABLE (the
+    # loader refuses a tag that does not exist, a self-reference, and a cycle), and -- most
+    # importantly -- lets the exemption be CONDITIONAL rather than blanket: see
+    # :meth:`Step.explains_a_failure_in`. A declared explainer is still cancelled normally when
+    # something it does not explain fails.
+    explains: list[str] = field(default_factory=list)
+
+    def explains_a_failure_in(self, failed: Container[str]) -> bool:
+        """Whether this step is exempt from eager-exit given the set of tags that FAILED.
+
+        The exemption is deliberately narrow. Declaring ``explains`` does not make a step
+        immortal; it only protects the step when one of the specific nodes it claims to explain
+        has actually failed. A diagnostic that explains nothing about THIS failure is reaped like
+        any other peer, so eager-exit keeps doing its job everywhere else.
+        """
+        return any(tag in failed for tag in self.explains)
 
     @property
     def tag(self) -> str:

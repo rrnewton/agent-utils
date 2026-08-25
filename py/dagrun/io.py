@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import math
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, NoReturn
 
 if TYPE_CHECKING:
@@ -436,6 +436,73 @@ def _refuse_uncarried_config_keys(doc: Mapping[str, object]) -> None:
     )
 
 
+def _refuse_unusable_explains(steps: Sequence[Step]) -> None:
+    """Refuse an ``explains`` declaration that cannot mean what it says.
+
+    ``explains`` buys a step an exemption from eager-exit cancellation, so a declaration that is
+    quietly wrong is worse than one that is missing: the step looks protected in the document and
+    is reaped anyway, or protects itself for a reason nobody can audit. Each refusal below is a
+    way that can happen.
+
+    UNKNOWN TAG -- names a node that does not exist, so the exemption can never trigger. This is
+    the misspelling case, and it is silent without a check: the field parses, the step schedules
+    normally, and the protection simply never applies.
+
+    SELF-REFERENCE -- a step cannot explain its own failure. Permitting it would let any step opt
+    itself out of cancellation with a single self-naming line, which is precisely the blanket
+    opt-out this relationship exists to avoid.
+
+    CYCLE -- A explains B and B explains A (directly or through a chain). Each would then shield
+    the other, so the pair becomes mutually uncancellable and eager-exit silently stops applying
+    to it. Nothing reports that; the run just gets slower and the pact is invisible in the
+    document because each individual line looks reasonable. Refusing cycles keeps the relation a
+    strict "diagnoses" hierarchy, which is the only reading under which the exemption is bounded.
+    """
+    by_tag = {step.tag: step for step in steps}
+    problems: list[str] = []
+    for step in steps:
+        for target in step.explains:
+            if target == step.tag:
+                problems.append(f"step {step.tag}: explains itself; a step cannot diagnose its own failure")
+            elif target not in by_tag:
+                problems.append(f"step {step.tag}: explains unknown node {target!r}")
+    if problems:
+        raise DagJsonError("; ".join(sorted(set(problems))))
+
+    # Iterative three-colour DFS over the explains relation. Iterative rather than recursive to
+    # match how this repository walks graphs elsewhere, so a deep chain cannot hit the recursion
+    # limit and turn a validation error into a crash.
+    WHITE, GREY, BLACK = 0, 1, 2
+    colour = {tag: WHITE for tag in by_tag}
+    for root in sorted(by_tag):
+        if colour[root] != WHITE:
+            continue
+        stack: list[tuple[str, bool]] = [(root, False)]
+        path: list[str] = []
+        while stack:
+            tag, leaving = stack.pop()
+            if leaving:
+                colour[tag] = BLACK
+                path.pop()
+                continue
+            if colour[tag] == BLACK:
+                continue
+            if colour[tag] == GREY:
+                cycle = path[path.index(tag):] + [tag]
+                raise DagJsonError(
+                    "explains cycle: " + " -> ".join(cycle) + ". Each step in the cycle would "
+                    "exempt the next from eager-exit, so the whole cycle becomes uncancellable "
+                    "and eager-exit silently stops applying to it. `explains` must describe a "
+                    "one-way 'diagnoses' relation."
+                )
+            colour[tag] = GREY
+            path.append(tag)
+            stack.append((tag, True))
+            for target in sorted(by_tag[tag].explains):
+                if colour.get(target) != BLACK:
+                    stack.append((target, False))
+
+
 def _dag_from_obj(raw: object) -> DagConfig:
     """Build a :class:`DagConfig` from an already-parsed JSON/YAML object.
 
@@ -482,6 +549,7 @@ def _dag_from_obj(raw: object) -> DagConfig:
                 cpu_timeout=_opt_int(sm, "cpu_timeout", 0),
                 jobs_flag=_opt_str_or_none(sm, "jobs_flag"),
                 skip_reason=skip_reason,
+                explains=_opt_str_list(sm, "explains"),
                 write_domains=_present_str_list(sm, "write_domains"),
                 write_domain_guarantee=(
                     None
@@ -498,6 +566,7 @@ def _dag_from_obj(raw: object) -> DagConfig:
                 f"step {step.tag}: dependency on intentionally skipped node(s) "
                 f"{', '.join(blocked)} is undefined"
             )
+    _refuse_unusable_explains(steps)
     cfg = DagConfig(
         steps=tuple(steps),
         description=_opt_str(doc, "description", ""),
@@ -570,6 +639,11 @@ def _step_to_json(step: Step) -> dict[str, object]:
         del obj["cpu_timeout"]
     if step.skip_reason is None:
         del obj["skip_reason"]
+    # Emitted only when declared, like write_domains below: a graph that does not use the
+    # relationship keeps a byte-identical document, so adding the field cannot churn every
+    # existing DAG or the cross-build byte-comparison that pins the two editions together.
+    if step.explains:
+        obj["explains"] = list(step.explains)
     if step.write_domains is not None:
         obj["write_domains"] = list(step.write_domains)
     if step.write_domain_guarantee is not None:

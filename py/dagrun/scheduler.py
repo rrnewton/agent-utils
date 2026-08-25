@@ -667,8 +667,18 @@ class Runner:
         if self.keep_going:
             return
         self.stop = True
-        others = list(self.running_procs.items())
+        # A node that exists to EXPLAIN this failure is spared. Reaping it destroys the only
+        # account of why the run failed, which is the opposite of what eager-exit is for: the
+        # point is to stop paying for work that cannot matter, and the diagnosis is the one piece
+        # of remaining work that matters most. Everything else is still cut short.
+        failed = self._genuinely_failed()
+        spared = {tag for tag in self.running if self._exempt_from_eager_exit(tag, failed)}
+        others = [
+            (tag, proc) for tag, proc in self.running_procs.items() if tag not in spared
+        ]
         for other in self.running:
+            if other in spared:
+                continue
             self.aborted.add(other)  # its thread will label itself ABORTED
         reap_many(
             tuple(
@@ -677,6 +687,29 @@ class Runner:
             ),
             self.cgroups,
         )
+
+    def _genuinely_failed(self) -> set[str]:
+        """Tags whose own run FAILED, excluding steps that were merely cancelled.
+
+        An aborted step is not evidence of anything, so it must not trigger a diagnostic's
+        exemption; only a real failure does. Caller holds :attr:`lock`.
+        """
+        return {
+            tag
+            for tag, outcome in self.done.items()
+            if not outcome.ok and not outcome.aborted
+        }
+
+    def _exempt_from_eager_exit(self, tag: str, failed: set[str]) -> bool:
+        """Whether ``tag`` is a diagnostic for one of the failures in ``failed``.
+
+        This is the ONLY thing that survives eager-exit, and it is deliberately conditional: a
+        step declaring ``explains`` is reaped like any other peer unless one of the specific
+        nodes it names has genuinely failed. So the exemption cannot be used as a blanket
+        opt-out -- a step that explains nothing about THIS failure gets no protection from it.
+        """
+        step = self.steps.get(tag)
+        return step is not None and step.explains_a_failure_in(failed)
 
     def _skipped(self) -> set[str]:
         """Tags whose deps FAILED (transitively) so they must never run.
@@ -905,14 +938,50 @@ class Runner:
                         self.cgroups,
                     )
                 skipped = self._skipped()
-                if not self.running and (
-                    self.stop
-                    or len(self.done) + len(skipped) + len(self.intentional_skips)
-                    >= len(self.steps)
+                # After eager-exit has tripped, ONE class of step may still start: a diagnostic
+                # for a failure that has actually happened. Sparing an already-running diagnostic
+                # is not enough -- the measured case had the diagnostic still QUEUED when its
+                # subject failed, so it was never launched at all and the run reported the
+                # symptom with no account of the cause.
+                failed_now = self._genuinely_failed() if self.stop else set()
+
+                def _startable_after_stop(tag: str) -> bool:
+                    if not self.stop:
+                        return True
+                    return self._exempt_from_eager_exit(tag, failed_now)
+
+                def _pending(tag: str) -> bool:
+                    return (
+                        tag not in self.done
+                        and tag not in self.running
+                        and tag not in skipped
+                        and tag not in self.intentional_skip_tags
+                    )
+
+                # Do not end the run while a permitted diagnostic is still waiting to start.
+                # Terminates: the set is finite, each member runs at most once, and a member
+                # whose deps can never be satisfied is excluded here rather than waited on.
+                pending_diagnostics = [
+                    tag
+                    for tag in self.order
+                    if self.stop
+                    and _pending(tag)
+                    and _startable_after_stop(tag)
+                    and self._deps_known(self.steps[tag])
+                    and self._deps_ok(self.steps[tag])
+                ]
+                if (
+                    not self.running
+                    and not pending_diagnostics
+                    and (
+                        self.stop
+                        or len(self.done) + len(skipped) + len(self.intentional_skips)
+                        >= len(self.steps)
+                    )
                 ):
                     break
                 launchable: list[Step] = []
-                if not self.stop:
+                if True:
                     for tag in self.order:
                         if (
                             tag in self.done
@@ -920,6 +989,8 @@ class Runner:
                             or tag in skipped
                             or tag in self.intentional_skip_tags
                         ):
+                            continue
+                        if not _startable_after_stop(tag):
                             continue
                         step = self.steps[tag]
                         if not self._deps_known(step):

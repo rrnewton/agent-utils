@@ -10,6 +10,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::HashSet;
 
 /// Wall-clock backstop (seconds) for a step that declares NO wall budget AND no CPU budget to
 /// derive one from. Wall time is LOAD-DEPENDENT, so it is only a defence-in-depth hang backstop;
@@ -253,12 +254,36 @@ pub struct Step {
     pub write_domains: Option<Vec<String>>,
     /// Structural guarantee used for non-empty write-domain declarations.
     pub write_domain_guarantee: Option<WriteDomainGuarantee>,
+    /// Tags (`"group.job"`) whose FAILURE this step exists to explain.
+    ///
+    /// A diagnostic node -- one whose only job is to name the cause of another node's failure --
+    /// is by construction scheduled alongside something that fails, so eager-exit cancels it
+    /// precisely when it was about to be useful. Observed in a consuming graph: a test node
+    /// failed seconds before its companion ABI-comparison node, the companion was never launched,
+    /// and the run reported the opaque symptom while the node that would have named the missing
+    /// symbol produced nothing.
+    ///
+    /// Declaring the RELATIONSHIP rather than a "never cancel me" boolean keeps the intent
+    /// visible, makes it checkable (the loader refuses an unknown tag, a self-reference and a
+    /// cycle), and lets the exemption be CONDITIONAL -- see [`Step::explains_a_failure_in`].
+    /// Both editions of this crate must accept and enforce this field identically.
+    pub explains: Vec<String>,
 }
 
 impl Step {
     /// The step's unique tag, `"group.job"`.
     pub fn tag(&self) -> String {
         format!("{}.{}", self.group, self.job)
+    }
+
+    /// Whether this step is exempt from eager-exit given the set of tags that genuinely FAILED.
+    ///
+    /// Deliberately narrow: declaring `explains` does not make a step immortal, it only protects
+    /// the step when one of the specific nodes it claims to explain has actually failed. A
+    /// diagnostic that explains nothing about THIS failure is reaped like any other peer, so
+    /// eager-exit keeps doing its job everywhere else.
+    pub fn explains_a_failure_in(&self, failed: &HashSet<String>) -> bool {
+        self.explains.iter().any(|tag| failed.contains(tag))
     }
 }
 
@@ -1155,6 +1180,7 @@ mod tests {
             skip_reason: None,
             write_domains: None,
             write_domain_guarantee: None,
+            explains: Vec::new(),
         };
         assert_eq!(step_classification(&step), StepClass::LatencyBound);
     }
@@ -1177,6 +1203,7 @@ mod tests {
             skip_reason: None,
             write_domains: None,
             write_domain_guarantee: None,
+            explains: Vec::new(),
         }
     }
 
@@ -1336,6 +1363,7 @@ mod cpu_timeout_multiplier_tests {
             skip_reason: None,
             write_domains: None,
             write_domain_guarantee: None,
+            explains: Vec::new(),
         }
     }
 
@@ -1503,6 +1531,7 @@ mod carry_tests {
             skip_reason: None,
             write_domains: None,
             write_domain_guarantee: None,
+            explains: Vec::new(),
         }
     }
 

@@ -750,6 +750,7 @@ mod tests {
             skip_reason: None,
             write_domains: None,
             write_domain_guarantee: None,
+            explains: Vec::new(),
         }
     }
 
@@ -928,6 +929,7 @@ mod tests {
             skip_reason: None,
             write_domains: None,
             write_domain_guarantee: None,
+            explains: Vec::new(),
         };
         assert_eq!(step_mem_cap_bytes(&s, 1.25, None), Some(9 * GIB));
     }

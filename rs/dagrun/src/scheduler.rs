@@ -184,6 +184,10 @@ struct Shared {
     /// Per-step ownership nonce, so the eager-cancel path can terminate another step's escapees
     /// as thoroughly as that step's own supervisor would (see [`kill_by_nonce`]).
     running_nonces: HashMap<String, String>,
+    /// tag -> the tags whose failure that step exists to explain, copied from the graph so the
+    /// eager-cancel path can consult it without holding the step map. Empty for every ordinary
+    /// step; only diagnostics appear with a non-empty list.
+    explains_index: HashMap<String, Vec<String>>,
     /// The WHOLE RUN exceeded its outer wall budget and cut its in-flight steps short.
     run_timed_out: bool,
     /// Child processes currently alive, and the largest count observed during this run.
@@ -782,6 +786,34 @@ fn retire(sh: &mut Shared, step: &Step) -> bool {
     true
 }
 
+/// Tags whose own run FAILED, excluding steps that were merely cancelled.
+///
+/// An aborted step is not evidence of anything, so it must not trigger a diagnostic's exemption;
+/// only a real failure does. Mirrored by the sibling edition's scheduler.
+fn genuinely_failed(sh: &Shared) -> std::collections::HashSet<String> {
+    sh.done
+        .iter()
+        .filter(|(_, outcome)| !outcome.ok && !outcome.aborted)
+        .map(|(tag, _)| tag.clone())
+        .collect()
+}
+
+/// Whether `tag` is a diagnostic for one of the failures in `failed`.
+///
+/// The ONLY thing that survives eager-exit, and deliberately conditional: a step declaring
+/// `explains` is reaped like any other peer unless one of the specific nodes it names has
+/// genuinely failed, so the exemption cannot be used as a blanket opt-out. Mirrored by the
+/// sibling edition's scheduler.
+fn is_exempt_from_eager_exit(
+    sh: &Shared,
+    tag: &str,
+    failed: &std::collections::HashSet<String>,
+) -> bool {
+    sh.explains_index
+        .get(tag)
+        .is_some_and(|explains| explains.iter().any(|t| failed.contains(t)))
+}
+
 /// Record the run as failed and, unless `keep_going`, cut every in-flight peer short.
 ///
 /// Shared by the ordinary step-failure path, the spawn-failure path and the supervisor-panic
@@ -792,13 +824,28 @@ fn trip_fail_fast(sh: &mut Shared, cgroups: &BoxedCgroups, keep_going: bool) {
         return;
     }
     sh.stop = true;
+    // A node that exists to EXPLAIN this failure is spared. Reaping it destroys the only account
+    // of why the run failed, which is the opposite of what eager-exit is for: the point is to
+    // stop paying for work that cannot matter, and the diagnosis is the one piece of remaining
+    // work that matters most. Everything else is still cut short.
+    let failed = genuinely_failed(sh);
+    let spared: std::collections::HashSet<String> = sh
+        .running
+        .iter()
+        .filter(|tag| is_exempt_from_eager_exit(sh, tag, &failed))
+        .cloned()
+        .collect();
     let admitted: Vec<String> = sh.running.iter().cloned().collect();
     for other in admitted {
+        if spared.contains(&other) {
+            continue;
+        }
         sh.aborted.insert(other);
     }
     let others: Vec<(String, u32, Option<String>)> = sh
         .running_pids
         .iter()
+        .filter(|(k, _)| !spared.contains(*k))
         .map(|(k, v)| (k.clone(), *v, sh.running_nonces.get(k).cloned()))
         .collect();
     reap_many(cgroups, &others);
@@ -1055,6 +1102,12 @@ impl Runner {
             .iter()
             .filter_map(|step| step.skip_reason.map(|reason| (step.tag(), reason)))
             .collect();
+        // Built before `steps` is moved into the Arc; the eager-cancel path consults this rather
+        // than the step map, which it cannot reach while holding only `Shared`.
+        let explains_index: HashMap<String, Vec<String>> = steps
+            .iter()
+            .map(|(tag, step)| (tag.clone(), step.explains.clone()))
+            .collect();
         Runner {
             steps: Arc::new(steps),
             order,
@@ -1083,6 +1136,7 @@ impl Runner {
                 stop: false,
                 step_profile_rows: Vec::new(),
                 running_nonces: HashMap::new(),
+                explains_index,
                 run_timed_out: false,
                 active_processes: 0,
                 max_concurrent_steps: 0,
@@ -1249,14 +1303,42 @@ impl Runner {
                     }
                 }
                 let skipped = self.skipped(&sh);
+                // After eager-exit has tripped, ONE class of step may still start: a diagnostic
+                // for a failure that has actually happened. Sparing an already-running diagnostic
+                // is not enough -- the measured case had the diagnostic still QUEUED when its
+                // subject failed, so it was never launched at all and the run reported the
+                // symptom with no account of the cause.
+                let failed_now = if sh.stop {
+                    genuinely_failed(&sh)
+                } else {
+                    std::collections::HashSet::new()
+                };
+                let startable_after_stop = |sh: &Shared, tag: &str| -> bool {
+                    !sh.stop || is_exempt_from_eager_exit(sh, tag, &failed_now)
+                };
+                // Do not end the run while a permitted diagnostic is still waiting to start.
+                // Terminates: the set is finite, each member runs at most once, and a member
+                // whose deps can never be satisfied is excluded here rather than waited on.
+                let pending_diagnostics = sh.stop
+                    && self.order.iter().any(|tag| {
+                        let step = &self.steps[tag];
+                        !sh.done.contains_key(tag)
+                            && !sh.running.contains(tag)
+                            && !skipped.contains(tag)
+                            && step.skip_reason.is_none()
+                            && startable_after_stop(&sh, tag)
+                            && deps_known(&sh, step)
+                            && deps_ok(&sh, step)
+                    });
                 if sh.running.is_empty()
+                    && !pending_diagnostics
                     && (sh.stop
                         || sh.done.len() + skipped.len() + self.intentional_skips.len()
                             >= self.steps.len())
                 {
                     break;
                 }
-                if !sh.stop {
+                {
                     for tag in &self.order {
                         let step = self.steps[tag].clone();
                         if sh.done.contains_key(tag)
@@ -1264,6 +1346,9 @@ impl Runner {
                             || skipped.contains(tag)
                             || step.skip_reason.is_some()
                         {
+                            continue;
+                        }
+                        if !startable_after_stop(&sh, tag) {
                             continue;
                         }
                         if !deps_known(&sh, &step) {
@@ -3321,6 +3406,7 @@ mod tests {
             skip_reason: None,
             write_domains: None,
             write_domain_guarantee: None,
+            explains: Vec::new(),
         }
     }
 

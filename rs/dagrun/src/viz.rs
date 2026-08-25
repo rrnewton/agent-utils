@@ -284,6 +284,7 @@ mod tests {
             skip_reason: None,
             write_domains: None,
             write_domain_guarantee: None,
+            explains: Vec::new(),
         };
         let mut caps = BTreeMap::new();
         caps.insert("browser".to_string(), 1);
@@ -353,6 +354,7 @@ mod tests {
             skip_reason: None,
             write_domains: None,
             write_domain_guarantee: None,
+            explains: Vec::new(),
         };
         let cfg = DagConfig {
             steps: vec![
@@ -393,6 +395,7 @@ mod tests {
             skip_reason: None,
             write_domains: None,
             write_domain_guarantee: None,
+            explains: Vec::new(),
         };
         let cfg = DagConfig {
             steps: vec![
