@@ -94,7 +94,7 @@ DEFAULT_JOBS_FLAG = "-j"
 #: would pass it through to a program that has no such option. Those steps carry an empty
 #: ``jobs_flag`` today and are consequently unresizable, which makes the runner refuse them on
 #: any host too small for their declared width.
-JOBS_ENV_ENV = "SAFE_CI_DAG_RUNNER_JOBS_ENV"
+JOBS_ENV_ENV = "DAGRUN_JOBS_ENV"
 
 
 class StepClass(Enum):
@@ -199,7 +199,7 @@ class Step:
     # render_jobs_flag for the template forms.
     jobs_flag: str | None = None
     # Environment variable through which THIS step's guest accepts its worker count. None
-    # inherits DagConfig.default_jobs_env (normally set from $SAFE_CI_DAG_RUNNER_JOBS_ENV by the
+    # inherits DagConfig.default_jobs_env (normally set from $DAGRUN_JOBS_ENV by the
     # host, not by the graph); "" disables the env channel for this step specifically.
     jobs_env: str | None = None
     # A typed, pre-execution omission. This is not PASS and is kept separate from
@@ -251,7 +251,7 @@ def resolve_jobs_env(
 ) -> str:
     """Resolve this machine's inner-width ENV channel name.
 
-    Precedence: an explicit caller value wins over $SAFE_CI_DAG_RUNNER_JOBS_ENV, which wins over
+    Precedence: an explicit caller value wins over $DAGRUN_JOBS_ENV, which wins over
     "" (this machine offers no env channel).
 
     A MALFORMED NAME IS REFUSED rather than silently ignored, for the same reason
@@ -575,7 +575,7 @@ class DagConfig:
     # Default inner-parallelism flag template for steps that don't set their own `jobs_flag`.
     default_jobs_flag: str = DEFAULT_JOBS_FLAG
     # Default inner-parallelism ENV channel for steps that don't set their own `jobs_env`.
-    # Normally resolved from $SAFE_CI_DAG_RUNNER_JOBS_ENV (see resolve_jobs_env) so the HOST
+    # Normally resolved from $DAGRUN_JOBS_ENV (see resolve_jobs_env) so the HOST
     # declares it, not the graph. Empty means this machine offers no env channel.
     default_jobs_env: str = ""
     # --- Deliberately SMALL default caps applied to a step that DECLARES NOTHING ---
