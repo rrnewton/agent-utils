@@ -1359,7 +1359,7 @@ fn resolve_cgroups(
         // allow_failure when both are set.
         eprintln!(
             "{PROG}: WARNING: DELIBERATELY UNBOXED via --unsafe-no-cgroups: per-step \
-             memory/CPU/pids caps are NOT enforced. This is an explicit, reviewable opt-out of \
+             memory/CPU-bandwidth/pids caps are NOT enforced; the per-step CPU-time budget uses only a best-effort procfs process-group floor. This is an explicit, reviewable opt-out of \
              cgroup resource boxing (not a capability fallback)."
         );
         return Ok(None);
@@ -1486,7 +1486,7 @@ fn resolve_cgroups(
     if allow_failure {
         eprintln!(
             "{PROG}: warning: cgroup boxing not established (--allow-cgroup-failure); running \
-             UNBOXED (process-group teardown only, no per-step memory/CPU caps)."
+             UNBOXED (process-group teardown, no per-step memory/CPU-bandwidth caps, and only a best-effort procfs CPU-time floor)."
         );
         // SAY WHICH BOUNDS SURVIVE THE FALLBACK, because "unboxed" has been read as "unbounded"
         // and that reading is how a run reached an external job kill. Per-step WALL budgets and
@@ -1495,8 +1495,9 @@ fn resolve_cgroups(
         match run_timeout_s {
             Some(secs) => eprintln!(
                 "{PROG}: unboxed run is STILL wall-bounded: per-step wall timeouts apply and the \
-                 whole run is cut at {secs}s. Per-step CPU-time budgets and the scope-level \
-                 RuntimeMaxSec backstop are NOT enforced without cgroups."
+                 whole run is cut at {secs}s. Per-step CPU-time budgets use a best-effort \
+                 procfs process-group floor; the scope-level RuntimeMaxSec backstop is NOT \
+                 enforced without cgroups."
             ),
             None => eprintln!(
                 "{PROG}: WARNING: no outer run budget is set (--run-timeout / \

@@ -375,13 +375,13 @@ is to stop with a capability error. `--allow-cgroup-failure` accepts a
 best-effort unboxed fallback with a warning. `--unsafe-no-cgroups` deliberately
 skips containment even when available and should be reserved for reviewed use.
 
-An unboxed run is **uncontained, not degraded**. The CPU-time budget in
-particular is a read of the step cgroup's `cpu.stat`, so with no cgroup it does
-not run at all: a step may burn unbounded CPU against a declared `cpu_timeout`,
-exit 0, and be reported green, bounded only by its wall timeout. Such a run says
-so on stderr, once, naming how many steps carry a budget and the largest of
-them, and `capabilities` reports the two lanes separately so the claim can be
-read rather than assumed.
+An unboxed run is **uncontained, not equivalent to boxed execution**. Exact CPU-time
+accounting still requires the step cgroup's `cpu.stat`. Without it, the runner attempts a
+best-effort procfs process-group lower bound: ordinary over-budget trees are reaped, but a process
+that changes process group/session and CPU from exited descendants before their parent reaps them
+can escape the measurement. The `capabilities` contract therefore remains
+`uncontained.cpu_timeout=false`; stderr names the weaker fallback once per run instead of implying
+cgroup-equivalent enforcement.
 
 ### A wall budget you did not write is derived, not guessed
 

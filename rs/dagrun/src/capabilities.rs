@@ -10,8 +10,9 @@
 //! So the manifest is generated here instead. [`ENFORCEMENT_REGISTRY`] is the single declaration;
 //! [`enforcement_manifest`] serializes it key-sorted, compact and with lowercase booleans, so the
 //! two editions agree BY CONSTRUCTION rather than because two people kept two literals in step;
-//! and [`is_enforced`] is consulted at the guard site itself, so flipping one `enforced` flag
-//! moves the advertisement AND the behaviour together.
+//! and [`is_enforced`] is consulted by the contractual guard. The uncontained `cpu_timeout`
+//! fallback is the explicit exception: it may attempt a lower-bound intervention while the
+//! published contract remains false because it cannot provide cgroup-equivalent coverage.
 //!
 //! THE MANIFEST IS PER LANE, BECAUSE ENFORCEMENT IS. Most of these guards are implemented by
 //! reading or writing a cgroup, and a run that could not get one (`--allow-cgroup-failure`,
@@ -22,18 +23,19 @@
 //! reported green while the manifest said the budget held. Each [`Capability`] therefore carries
 //! TWO flags, `contained` and `uncontained`, and [`is_enforced`] takes the [`Lane`] the run is
 //! actually on. The lane is not a comment about the guard site; it is the argument the guard site
-//! passes, so the uncontained column is load-bearing in exactly the way the contained one is.
+//! passes. The best-effort uncontained CPU fallback is deliberately outside that Boolean guarantee.
 //!
 //! [`is_enforced`] panics on an unknown key. A guard site that misspells its capability therefore
 //! fails loudly at the moment it runs, rather than reading as "not enforced" and silently
 //! switching the guard off — which is the exact failure this module exists to prevent.
 //!
-//! WHICH KEYS ACTUALLY GATE SOMETHING. Four of the nine are consulted at the code that enforces
-//! them in THIS engine, and their flags are load-bearing:
+//! WHICH KEYS ACTUALLY GATE SOMETHING. Four of the nine are directly load-bearing on both lanes.
+//! `cpu_timeout` is load-bearing for exact contained enforcement while an explicitly
+//! non-contractual procfs fallback may still act on the uncontained lane:
 //!
 //! | key             | guard site that consults `is_enforced`                              |
 //! |-----------------|---------------------------------------------------------------------|
-//! | `cpu_timeout`   | the scheduler's 1 Hz `cpu.stat` monitor, which reaps over budget     |
+//! | `cpu_timeout`   | exact cgroup `cpu.stat`; uncontained fallback is non-contractual       |
 //! | `wall_timeout`  | the scheduler's per-step wait deadline                               |
 //! | `oom_detection` | the post-step `memory.events` `oom_kill` read                        |
 //! | `memory_max`    | the per-step inner `memory.max` write in the cgroup manager          |
@@ -113,8 +115,8 @@ impl Capability {
 /// sites listed in the module docs consult it. The boxed smoke tests in each build anchor the
 /// `contained` column to real behaviour wherever a cgroup-v2 + systemd --user scope exists; in the
 /// `uncontained` column only `run_timeout`, `wall_timeout` and `write_domains` survive, because
-/// the first two are scheduler-side wall bounds and the third is a pre-execution declaration
-/// check, none of which need a cgroup.
+/// those are guaranteed. A best-effort procfs CPU floor may also act, but remains outside
+/// the Boolean contract because it misses process-group escapees.
 pub const ENFORCEMENT_REGISTRY: &[Capability] = &[
     Capability {
         key: "cpu_affinity",

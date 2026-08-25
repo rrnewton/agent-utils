@@ -8,11 +8,10 @@ claim enforcement that was not happening. It is now generated from
 :data:`dagrun.capabilities.ENFORCEMENT_REGISTRY`, and five of its nine keys are
 consulted by :func:`dagrun.capabilities.is_enforced` at the guard site itself.
 
-#75 cpu-timeout-unboxed-fallback: that literal was also one flat object asserting
-``"cpu_timeout":true``, and that sentence is true only under cgroup boxing. On an uncontained
-lane -- ``--allow-cgroup-failure``, ``--unsafe-no-cgroups``, or a library call with no manager
--- the CPU guard reads ``cpu.stat`` zero times, so a step may burn unbounded CPU against a
-declared budget, exit 0, and be reported green while the manifest says the budget was enforced.
+#75 cpu-timeout-unboxed-fallback: exact CPU-time enforcement remains a cgroup-only guarantee.
+The uncontained lane now attempts a best-effort procfs process-group lower bound, but it can miss
+processes that leave the group and CPU from exited descendants before their parent reaps them.
+The manifest therefore stays false while the scheduler names and tests the weaker attempt.
 
 So each registry entry carries one flag PER LANE, ``is_enforced`` takes the lane the run is on,
 and the manifest publishes both columns. What is pinned here:
@@ -21,10 +20,9 @@ and the manifest publishes both columns. What is pinned here:
   matter what the registry said, and a test parametrised over the constant it protects asserts
   nothing;
 * each lane's table, likewise written out by hand;
-* the behaviour: flip one flag and BOTH the advertisement and the observed guard move, on each
-  lane independently; and
-* an uncontained run says out loud which guard it is not running, so the degradation is legible
-  at the console and not only in a manifest nobody printed.
+* the contractual behaviour: flipping a flag moves the advertised exact guard; the uncontained
+  CPU fallback is explicitly outside that Boolean guarantee; and
+* an uncontained run says out loud that its attempted CPU bound is a lower-quality fallback.
 """
 
 from __future__ import annotations
@@ -78,7 +76,7 @@ _UNCONTAINED = {
     # `--cores` REFUSES on this lane rather than degrading, so the guard is not in force here.
     "cpu_affinity": False,
     "cpu_bandwidth": False,
-    # THE BUG THIS FILE EXISTS FOR: no cgroup, no cpu.stat, no CPU-time enforcement.
+    # No cgroup-equivalent guarantee; the procfs lower bound remains non-contractual.
     "cpu_timeout": False,
     "memory_max": False,
     "oom_detection": False,
@@ -340,19 +338,8 @@ class _BurningCgroups(NoopCgroups):
         return {"usage_usec": 10_000_000, "user_usec": 10_000_000, "system_usec": 0}
 
 
-class _UnboxedBurningCgroups(_BurningCgroups):
-    """The same readings on the UNCONTAINED lane, which is the lane #75 is about.
-
-    A real uncontained run has no counter at all, so this manager is deliberately more
-    generous than reality: it hands the monitor a live over-budget reading and dares it to
-    act on one. Nothing may reap, because the lane advertises no CPU-time guard.
-    """
-
-    enabled = False
-
-
-def test_cpu_budget_reaping_follows_the_cpu_timeout_capability_flag() -> None:
-    # Wall timeout is generous: the only thing that can cut this step is the CPU-time guard.
+def test_cpu_budget_reaping_follows_the_contained_capability_flag() -> None:
+    """The exact cgroup guard remains coupled to its advertised contained flag."""
     cfg = _one_step_dag("sleep 4", timeout=60, cpu_timeout=1)
 
     assert _manifest()["contained"]["cpu_timeout"] is True
@@ -363,44 +350,23 @@ def test_cpu_budget_reaping_follows_the_cpu_timeout_capability_flag() -> None:
     assert "CPU-TIMEOUT" in enforced.outcomes[0].reason
 
     with registry_override("cpu_timeout", False):
-        assert '"cpu_timeout":true' not in enforcement_manifest()
+        assert _manifest()["contained"]["cpu_timeout"] is False
         unenforced = run_dag_limited(
             cfg, max_steps=1, max_cpus=1, cgroups=_BurningCgroups(), verbosity=0
         )
     assert unenforced.ok, (
-        "the step was still reaped over its CPU budget although cpu_timeout is declared "
-        "unenforced; the manifest and the monitor can disagree"
+        "the step was still reaped over its CPU budget although the exact contained guard is "
+        "declared unenforced; the manifest and its contractual guard can disagree"
     )
 
 
-def test_an_uncontained_run_does_not_reap_over_a_budget_it_never_advertised() -> None:
-    """#75, as behaviour rather than prose: the UNCONTAINED column reaches the guard site.
-
-    The manifest says ``uncontained.cpu_timeout`` is false, so a step on that lane must not be
-    cut even when the monitor is handed an over-budget reading. Flipping only the uncontained
-    column must then cut it -- if the guard site ignored its lane argument, one of these two
-    assertions is false whichever way it guessed.
-    """
-    cfg = _one_step_dag("sleep 4", timeout=60, cpu_timeout=1)
-
-    unboxed = run_dag_limited(
-        cfg, max_steps=1, max_cpus=1, cgroups=_UnboxedBurningCgroups(), verbosity=0
-    )
-    assert unboxed.ok, (
-        "an UNCONTAINED run reaped over a CPU budget its own manifest says it does not "
-        f"enforce: {unboxed.outcomes[0].reason}"
-    )
-
+def test_uncontained_cpu_timeout_contract_remains_false() -> None:
+    """The best-effort procfs attempt is not promoted to a cgroup-equivalent guarantee."""
+    assert _manifest()["uncontained"]["cpu_timeout"] is False
+    assert is_enforced("cpu_timeout", Lane.UNCONTAINED) is False
     with registry_override("cpu_timeout", True, lane=Lane.UNCONTAINED):
         assert _manifest()["uncontained"]["cpu_timeout"] is True
-        flipped = run_dag_limited(
-            cfg, max_steps=1, max_cpus=1, cgroups=_UnboxedBurningCgroups(), verbosity=0
-        )
-    assert not flipped.ok
-    assert "CPU-TIMEOUT" in flipped.outcomes[0].reason, (
-        "the uncontained column was flipped on but the guard site did not follow it, so that "
-        "column advertises something no code reads"
-    )
+        assert is_enforced("cpu_timeout", Lane.UNCONTAINED) is True
 
 
 # --------------------------------------------------------------------------------------------
@@ -417,18 +383,18 @@ def test_a_live_budget_produces_a_notice_that_counts_it_and_names_the_largest() 
     notice = uncontained_cpu_budget_warning(cfg)
     assert notice is not None
     assert "UNCONTAINED run" in notice
-    assert "NOT enforced" in notice
-    assert "2 step(s) carry one" in notice
+    assert "best-effort procfs" in notice
+    assert "will police 2 step(s)" in notice
     assert "largest 7s" in notice
 
 
-def test_the_default_budget_counts_because_it_is_equally_unenforced() -> None:
+def test_the_default_budget_counts_for_the_best_effort_floor() -> None:
     # A step that declares nothing still gets `default_step_cpu_timeout`, and that budget is
-    # just as absent on this lane as a declared one. Silence here would under-report the gap.
+    # policed by the same best-effort floor as a declared one. Silence would hide the attempt.
     cfg = DagConfig(steps=(Step("g", "j", "declares nothing", "true"),))
     notice = uncontained_cpu_budget_warning(cfg)
     assert notice is not None
-    assert "1 step(s) carry one" in notice
+    assert "will police 1 step(s)" in notice
     assert "largest 10s" in notice
 
 
@@ -448,7 +414,7 @@ def test_the_platform_multiplier_is_applied_before_the_notice_quotes_a_number() 
     assert "largest 10s" in notice
 
 
-def test_an_uncontained_run_says_the_cpu_budget_is_unenforced(
+def test_an_uncontained_run_names_the_best_effort_cpu_floor(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     cfg = DagConfig(steps=(dataclasses.replace(_step(7), cmd="true"),))
@@ -456,7 +422,7 @@ def test_an_uncontained_run_says_the_cpu_budget_is_unenforced(
     assert result.ok
     message = capsys.readouterr().err
     assert "UNCONTAINED run" in message
-    assert "the per-step CPU-time budget is NOT enforced" in message
+    assert "best-effort procfs process-group CPU floor" in message
     assert "largest 7s" in message
 
 

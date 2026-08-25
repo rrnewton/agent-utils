@@ -29,6 +29,7 @@ pub mod io;
 pub mod memory_feedback;
 pub mod model;
 pub mod perflog;
+pub mod proccpu;
 pub mod profile_enrich;
 pub mod reservation;
 pub mod scheduler;

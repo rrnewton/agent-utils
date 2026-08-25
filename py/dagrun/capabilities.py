@@ -11,8 +11,8 @@ the guard sites inside its own engine.
 So the manifest is generated here instead. :data:`ENFORCEMENT_REGISTRY` is the single
 declaration; :func:`enforcement_manifest` serializes it key-sorted, compact and with
 lowercase booleans, so the two editions agree BY CONSTRUCTION rather than because two
-people kept two literals in step; and :func:`is_enforced` is consulted at the guard site
-itself, so flipping one flag moves the advertisement AND the behaviour together.
+people kept two literals in step; and :func:`is_enforced` is consulted by the contractual
+guards. The uncontained CPU-time fallback is the explicit exception described below.
 
 THE MANIFEST IS PER LANE, BECAUSE ENFORCEMENT IS. Most of these guards are implemented by
 reading or writing a cgroup, and a run that could not get one (``--allow-cgroup-failure``,
@@ -23,21 +23,22 @@ run was advertised guards it was not getting: a step declaring ``cpu_timeout: 3`
 burn 60 CPU-seconds and be reported green while the manifest said the budget held. Each
 :class:`Capability` therefore carries TWO flags, ``contained`` and ``uncontained``, and
 :func:`is_enforced` takes the :class:`Lane` the run is actually on. The lane is not a
-comment about the guard site; it is the argument the guard site passes, so the uncontained
-column is load-bearing in exactly the way the contained one is.
+comment about the guard site; it is the argument the contractual guard site passes.
+The best-effort uncontained CPU fallback is deliberately outside that Boolean guarantee.
 
 :func:`is_enforced` raises on an unknown key. A guard site that misspells its capability
 therefore fails loudly at the moment it runs, rather than reading as "not enforced" and
 silently switching the guard off -- which is the exact failure this module exists to
 prevent.
 
-WHICH KEYS ACTUALLY GATE SOMETHING. Five of the nine are consulted at the code that
-enforces them, and their flags are load-bearing on both lanes:
+WHICH KEYS ACTUALLY GATE SOMETHING. Five of the nine participate in guard code. Four
+have load-bearing flags on both lanes; ``cpu_timeout`` gates the exact cgroup guard while
+the non-contractual uncontained fallback remains active despite its deliberately false flag:
 
     ==============  ================================================================
     key             guard site that consults ``is_enforced``
     ==============  ================================================================
-    cpu_timeout     the scheduler's 1 Hz ``cpu.stat`` monitor, which reaps over budget
+    cpu_timeout     exact cgroup ``cpu.stat`` guard; uncontained fallback is non-contractual
     wall_timeout    the scheduler's per-step wait deadline
     oom_detection   the post-step ``memory.events`` ``oom_kill`` read
     memory_max      the per-step inner ``memory.max`` write in the cgroup manager
@@ -107,8 +108,8 @@ class Capability:
 #: the guard sites listed in the module docstring consult it. The boxed smoke tests in each
 #: build anchor the ``contained`` column to real behaviour wherever a cgroup-v2 + systemd
 #: --user scope exists; in the ``uncontained`` column only ``run_timeout``, ``wall_timeout``
-#: and ``write_domains`` survive, because the first two are scheduler-side wall bounds and
-#: the third is a pre-execution declaration check, none of which need a cgroup.
+#: and ``write_domains`` are guaranteed. A best-effort procfs CPU floor may also act, but
+#: remains outside the Boolean contract because it misses process-group escapees.
 ENFORCEMENT_REGISTRY: tuple[Capability, ...] = (
     Capability(
         key="cpu_affinity",

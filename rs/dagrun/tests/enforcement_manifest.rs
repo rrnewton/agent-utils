@@ -1,10 +1,9 @@
 //! The capability manifest must describe the lane the run is actually on.
 //!
-//! The manifest used to be one flat object asserting `"cpu_timeout":true`. That sentence is true
-//! only under cgroup boxing. On an uncontained lane — `--allow-cgroup-failure`,
-//! `--unsafe-no-cgroups`, or a library call with no manager — the CPU guard reads `cpu.stat` zero
-//! times, so a step may burn unbounded CPU against a declared budget, exit 0, and be reported
-//! green while the manifest says the budget was enforced.
+//! Exact CPU-time enforcement remains a cgroup-only guarantee. The uncontained lane now attempts
+//! a best-effort procfs process-group lower bound, but it can miss processes that leave the group
+//! and CPU from exited descendants before their parent reaps them. The manifest therefore stays
+//! false while the scheduler names and tests the weaker attempt.
 //!
 //! The manifest is no longer a literal at all: it is generated from
 //! `capabilities::ENFORCEMENT_REGISTRY`, whose entries carry one flag per lane. That is what makes
@@ -38,7 +37,7 @@ const UNCONTAINED: &[(&str, bool)] = &[
     // `--cores` REFUSES on this lane rather than degrading, so the guard is not in force here.
     ("cpu_affinity", false),
     ("cpu_bandwidth", false),
-    // THE BUG THIS FILE EXISTS FOR: no cgroup, no cpu.stat, no CPU-time enforcement.
+    // No cgroup-equivalent guarantee; the procfs lower bound remains non-contractual.
     ("cpu_timeout", false),
     ("memory_max", false),
     ("oom_detection", false),

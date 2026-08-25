@@ -1021,3 +1021,121 @@ def test_args_composes_with_only_and_stress() -> None:
         assert rc == 0, err
         assert "dbi.file_metadata: 5/5 passed" in out
         assert "build.app" not in out
+
+
+def test_unboxed_run_enforces_a_lower_bound_and_exposes_its_escape() -> None:
+    # THE REGRESSION THIS FILE DID NOT HAVE. `test_boxed_run_enforces_cpu_timeout` above only
+    # anchors the BOXED path. Unboxed, `CgroupManager.cpu_stats` returns None and the scheduler's
+    # guard used to be skipped entirely, so every `cpu_timeout` was inert on exactly the lane that
+    # matters most: any caller passing --allow-cgroup-failure, which an originating CI wrapper does
+    # unconditionally under GITHUB_ACTIONS/CI. Measured before the procfs fallback existed, the
+    # spinner below burned 60 CPU-seconds against a 3-second budget and exited GREEN.
+    #
+    # Unlike the boxed test this one can NEVER skip: it deliberately runs with boxing off, so it
+    # is a real guard on every machine including boxing-less CI.
+    #
+    # Four brackets, run as separate invocations where needed so eager-exit cannot abort a
+    # control: one breach, two concurrent breaches, an idle step, and a setsid escapee.
+    # The sleeper is the discriminator, not decoration: it runs 6.7x its budget in WALL terms, so
+    # a wall timeout mislabelled as a CPU timeout would kill it. Only a real CPU bound lets it
+    # through, and only the breach proves the bound is enforced at all. Assert both or neither.
+    import os
+
+    spin = (
+        '{"steps": [{"group": "cpu", "job": "burn", "desc": "burn CPU past budget",'
+        ' "cmd": "python3 -c \\"import time\\nt=time.time()\\nwhile time.time()-t<60: pass\\"",'
+        ' "cpu_timeout": 3, "timeout": 300}]}'
+    )
+    sleeper = (
+        '{"steps": [{"group": "cpu", "job": "idle", "desc": "sleep well past the budget",'
+        ' "cmd": "sleep 20", "cpu_timeout": 3, "timeout": 300}]}'
+    )
+    burn_command = "python3 -c 'import time\nt=time.time()\nwhile time.time()-t<60: pass'"
+    multi = json.dumps(
+        {
+            "steps": [
+                {
+                    "group": "cpu",
+                    "job": job,
+                    "cmd": burn_command,
+                    "cpu_timeout": 3,
+                    "timeout": 300,
+                }
+                for job in ("burn-a", "burn-b")
+            ]
+        }
+    )
+    escapee = json.dumps(
+        {
+            "steps": [
+                {
+                    "group": "cpu",
+                    "job": "escape",
+                    "desc": "leave the measured group",
+                    "cmd": (
+                        "setsid --wait python3 -c 'import time\n"
+                        "t=time.time()\nwhile time.time()-t<4: pass'"
+                    ),
+                    "cpu_timeout": 1,
+                    "timeout": 30,
+                }
+            ]
+        }
+    )
+    env = dict(os.environ)
+    # Force the unboxed path the same way a CI lane does.
+    env["GITHUB_ACTIONS"] = "1"
+    env["CI"] = "1"
+
+    def _run(dag_text: str, name: str) -> subprocess.CompletedProcess[str]:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / f"{name}.json"
+            path.write_text(dag_text, encoding="utf-8")
+            return subprocess.run(
+                [sys.executable, "-m", "dagrun", "run", "--dag", str(path),
+                 "--allow-cgroup-failure", "--keep-going", "--max-steps", "2", "-q",
+                 "--no-profile"],
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+
+    breach = _run(spin, "burn")
+    breach_out = breach.stdout + breach.stderr
+    assert "running UNBOXED" in breach_out, (
+        "this test is only meaningful with boxing OFF; if the run was boxed it is exercising the "
+        f"cgroup path and proves nothing about the fallback:\n{breach_out}"
+    )
+    assert breach.returncode == 1, (
+        "an UNBOXED step that burns 20x its CPU budget must FAIL; exit 0 here is the original "
+        f"defect (declared budget, no enforcement). got {breach.returncode}\n{breach_out}"
+    )
+    assert "CPU-TIMEOUT >3s cpu" in breach_out, (
+        f"expected the CPU budget to fire, not the (300s) wall timeout:\n{breach_out}"
+    )
+    assert "PROCFS SUBTREE" in breach_out, (
+        "an unboxed breach must NAME the degraded accounting that produced it, so a reader can "
+        f"weigh its known blind spots:\n{breach_out}"
+    )
+
+    parallel = _run(multi, "multi")
+    parallel_out = parallel.stdout + parallel.stderr
+    assert parallel.returncode == 1, parallel_out
+    assert parallel_out.count("CPU-TIMEOUT >3s cpu") == 2, parallel_out
+    assert parallel_out.count("PROCFS SUBTREE") == 2, parallel_out
+
+    idle = _run(sleeper, "idle")
+    idle_out = idle.stdout + idle.stderr
+    assert idle.returncode == 0, (
+        "a step that sleeps 20s on a 3s CPU budget burns ~no CPU and must SURVIVE. Killing it "
+        "would mean the guard is measuring WALL time while calling itself a CPU timeout — the "
+        f"exact confusion this bound exists to avoid. got {idle.returncode}\n{idle_out}"
+    )
+
+    escaped = _run(escapee, "escape")
+    escaped_out = escaped.stdout + escaped.stderr
+    assert escaped.returncode == 0, (
+        "the procfs process-group floor unexpectedly claimed cgroup-equivalent coverage; a "
+        f"setsid escape must remain visible as the reason capabilities stays false:\n{escaped_out}"
+    )
+    assert "CPU-TIMEOUT" not in escaped_out, escaped_out

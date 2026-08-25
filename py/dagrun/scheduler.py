@@ -57,6 +57,11 @@ from dagrun.model import (
     JOBS_ENV_ENV,
     validate_jobs_env_config,
 )
+from dagrun.proccpu import (
+    CPU_SOURCE_CGROUP,
+    CPU_SOURCE_PROCFS,
+    subtree_cpu_seconds,
+)
 from dagrun.profile_enrich import (
     resolve_effective_inner_jobs,
     step_enrichment_columns,
@@ -228,11 +233,10 @@ def _psi_reading(pressure: Mapping[str, float] | None) -> PsiReading | None:
 def uncontained_cpu_budget_warning(cfg: DagConfig) -> str | None:
     """The one line an UNCONTAINED run owes its operator about per-step CPU-time budgets.
 
-    The CPU guard is implemented by reading the step cgroup's ``cpu.stat``. With no cgroup there
-    is no counter, so the budget is not merely approximate — it does not run at all, and a step
-    that burns unbounded CPU against a declared 3-second budget exits 0 and is reported green.
-    That silence is the defect: ``--allow-cgroup-failure`` is an explicit choice, but nothing said
-    which guards the choice gave up, and the capability manifest asserted the opposite.
+    Without a cgroup, the exact ``cpu.stat`` counter is unavailable. The runner instead samples
+    a best-effort procfs process-group floor. It can reap an ordinary over-budget process tree,
+    but it misses processes that leave the group and CPU from exited descendants until reaped.
+    The warning must name that weaker guarantee rather than equate it with cgroup accounting.
 
     Returns ``None`` when no step carries a live budget, so a graph that has genuinely disabled
     the guard everywhere is not nagged about a bound it never asked for.
@@ -250,9 +254,10 @@ def uncontained_cpu_budget_warning(cfg: DagConfig) -> str | None:
     if not live:
         return None
     return (
-        "UNCONTAINED run: cpu.stat is unreadable without a cgroup, so the per-step CPU-time "
-        f"budget is NOT enforced; {len(live)} step(s) carry one (largest {max(live)}s) and are "
-        "bounded only by their wall timeout. `capabilities` says which guards hold on this lane."
+        "UNCONTAINED run: exact cgroup cpu.stat accounting is unavailable; a best-effort "
+        f"procfs process-group CPU floor will police {len(live)} step(s) (largest {max(live)}s), "
+        "but it can miss processes that leave the group and not-yet-reaped exits. "
+        "`capabilities` cannot express that quality difference."
     )
 
 
@@ -1280,9 +1285,9 @@ class Runner:
         # bracket the step with two host-load snapshots so contention can be attributed later.
         boxed = self.cgroups.enabled
         # WHICH LANE THIS STEP IS ON. Every guard below asks the capability registry about
-        # THIS lane rather than about the engine in the abstract, so the `uncontained` column
-        # of the published manifest is load-bearing in exactly the way the `contained` one
-        # is: an unboxed run that advertises no CPU-time enforcement does not perform any.
+        # THIS lane rather than about the engine in the abstract. The one deliberate exception
+        # is the uncontained CPU-time fallback: it is attempted as a lower bound while the
+        # manifest stays false because it cannot promise cgroup-equivalent enforcement.
         lane = Lane.CONTAINED if boxed else Lane.UNCONTAINED
         # Profile the width the step ACTUALLY ran under. An undeclared boxed command intentionally
         # gets no jobs flag but is constrained by the default per-step cpu.max, so it belongs in
@@ -1433,12 +1438,11 @@ class Runner:
         def _monitor_body() -> None:
             # Poll the step's cgroup descendant-thread count for a per-step peak (metrics
             # only; a noop/disabled manager returns None and this stays a cheap no-op).
-            # When the step declares a CPU-time budget, this same 1 Hz loop also enforces
-            # it from the cgroup's cpu.stat usage_usec (user+system). CPU time is immune to
-            # machine load, so this guard can be far tighter than the wall `timeout` without
-            # flaking; the wall timeout stays as a backstop for a step that blocks/hangs
-            # while burning no CPU. Enforcement is best-effort at the poll granularity
-            # (_MONITOR_INTERVAL_S), and inert when cgroup boxing is off (cpu_stats is None).
+            # When the step declares a CPU-time budget, this same 1 Hz loop measures
+            # user+system CPU. The exact cgroup counter remains primary. Uncontained runs
+            # get a best-effort procfs process-group floor instead of silently doing nothing.
+            # The contractual capability remains false for uncontained runs; the warning names
+            # this lower-bound attempt without promoting it to cgroup-equivalent enforcement.
             nonlocal thread_peak, cpu_timed_out, termination_culprit
             # One-shot, so an unmeasurable budget is stated once per step, not once per tick.
             unmeasurable_warned = False
@@ -1446,46 +1450,65 @@ class Runner:
                 count = self.cgroups.thread_count(step.tag)
                 if count is not None:
                     thread_peak = count if thread_peak is None else max(thread_peak, count)
-                # The `cpu_timeout` guard the `capabilities` manifest advertises IS this
-                # branch, so it asks the registry that publishes the claim (capabilities.py).
-                # An engine that stops reaping here stops advertising it, in the same edit.
-                # On the UNCONTAINED lane the registry says false and the branch is skipped
-                # outright: there is no cpu.stat to read, which is the whole of #75.
-                if cpu_budget > 0 and not cpu_timed_out and is_enforced("cpu_timeout", lane):
-                    cs = self.cgroups.cpu_stats(step.tag)
-                    if cs is not None:
-                        # ABSENT IS NOT ZERO: see :func:`_cpu_seconds_from_stats`. Say so once
-                        # and leave the budget explicitly unenforced rather than reading a
-                        # missing counter as "has consumed none".
-                        measured = _cpu_seconds_from_stats(cs)
-                        if measured is None:
-                            if not unmeasurable_warned:
-                                unmeasurable_warned = True
-                                _warn(
-                                    f"step {step.tag!r}: cgroup cpu.stat has no 'usage_usec', so "
-                                    f"the {cpu_budget}s CPU-time budget CANNOT be enforced for "
-                                    "this step; only the wall timeout still applies."
-                                )
-                            continue
-                        cpu_used_s = measured
-                        if cpu_used_s >= cpu_budget:
-                            # Over CPU budget: reap the whole group now. The main thread's
-                            # proc.wait() then returns normally (no wall TimeoutExpired).
-                            cpu_timed_out = True
-                            termination_culprit = self._capture_termination_evidence(
-                                sink=sink,
-                                step=step,
-                                proc=proc,
-                                nonce=nonce,
-                                event="cpu_timeout",
-                                unit=BudgetUnit.CPU_SECONDS,
-                                limit_s=cpu_budget,
-                                # The very reading the comparison above was made on.
-                                measured_s=cpu_used_s,
-                                wall_elapsed_s=time.time() - start,
+                if (
+                    cpu_budget > 0
+                    and not cpu_timed_out
+                    and (lane is Lane.UNCONTAINED or is_enforced("cpu_timeout", lane))
+                ):
+                    if boxed:
+                        cs = self.cgroups.cpu_stats(step.tag)
+                        measured = None if cs is None else _cpu_seconds_from_stats(cs)
+                        source = CPU_SOURCE_CGROUP
+                    else:
+                        measured = subtree_cpu_seconds(proc.pid)
+                        source = CPU_SOURCE_PROCFS
+
+                    # ABSENT IS NOT ZERO. Say so once rather than leaving a configured
+                    # budget silently inert.
+                    if measured is None:
+                        if not unmeasurable_warned:
+                            unmeasurable_warned = True
+                            mechanism = (
+                                "cgroup cpu.stat usage_usec"
+                                if source == CPU_SOURCE_CGROUP
+                                else "procfs process-group CPU accounting"
                             )
-                            reap(proc, self.cgroups, step.tag, nonce=nonce)
-                            return
+                            _warn(
+                                f"step {step.tag!r}: {mechanism} is unavailable, so the "
+                                f"{cpu_budget}s CPU-time budget CANNOT be enforced for this "
+                                "step; only the wall timeout still applies."
+                            )
+                        continue
+
+                    cpu_used_s = measured
+                    if cpu_used_s < cpu_budget:
+                        continue
+
+                    # Over CPU budget: reap the whole group now. The main thread's
+                    # proc.wait() then returns normally (no wall TimeoutExpired).
+                    cpu_timed_out = True
+                    if source == CPU_SOURCE_PROCFS:
+                        _warn(
+                            f"step {step.tag!r} exceeded its CPU budget "
+                            f"({cpu_used_s:.1f}s observed >= {cpu_budget}s) measured by "
+                            "PROCFS SUBTREE accounting because cgroup boxing is not "
+                            "established; this misses processes that leave the group and "
+                            "not-yet-reaped exits, so it is a floor on true CPU use."
+                        )
+                    termination_culprit = self._capture_termination_evidence(
+                        sink=sink,
+                        step=step,
+                        proc=proc,
+                        nonce=nonce,
+                        event="cpu_timeout",
+                        unit=BudgetUnit.CPU_SECONDS,
+                        limit_s=cpu_budget,
+                        # The very reading the comparison above was made on.
+                        measured_s=cpu_used_s,
+                        wall_elapsed_s=time.time() - start,
+                    )
+                    reap(proc, self.cgroups, step.tag, nonce=nonce)
+                    return
 
         reader = threading.Thread(target=_pump, daemon=True)
         monitor = threading.Thread(target=_monitor, daemon=True)

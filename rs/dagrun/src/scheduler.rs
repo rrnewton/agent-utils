@@ -51,6 +51,7 @@ use crate::model::{
     validate_jobs_env_config, write_domain_violations, DagConfig, RunResult, Step, StepOutcome,
     JOBS_ENV_ENV,
 };
+use crate::proccpu::{subtree_cpu_seconds, CPU_SOURCE_CGROUP, CPU_SOURCE_PROCFS};
 use crate::profile_enrich::{resolve_effective_inner_jobs, step_enrichment_columns};
 
 /// A per-step measurement row (column -> value), matching the perflog step-profile schema.
@@ -609,11 +610,10 @@ fn ungrantable_resources(
 
 /// The one line an UNCONTAINED run owes its operator about per-step CPU-time budgets.
 ///
-/// The CPU guard is implemented by reading the step cgroup's `cpu.stat`. With no cgroup there is
-/// no counter, so the budget is not merely approximate — it does not run at all, and a step that
-/// burns unbounded CPU against a declared 3-second budget exits 0 and is reported green. That
-/// silence is the defect: `--allow-cgroup-failure` is an explicit choice, but nothing said which
-/// guards the choice gave up, and the capability manifest asserted the opposite.
+/// Without a cgroup, the exact `cpu.stat` counter is unavailable. The runner instead samples a
+/// best-effort procfs process-group floor. It can reap an ordinary over-budget process tree, but
+/// it misses processes that leave the group and CPU from exited descendants until reaped. The
+/// warning must name that weaker guarantee rather than equate it with cgroup accounting.
 ///
 /// Returns `None` when no step carries a live budget, so a graph that has genuinely disabled the
 /// guard everywhere is not nagged about a bound it never asked for.
@@ -632,9 +632,10 @@ pub fn uncontained_cpu_budget_warning(cfg: &DagConfig) -> Option<String> {
         .collect();
     let largest = live.iter().copied().max()?;
     Some(format!(
-        "UNCONTAINED run: cpu.stat is unreadable without a cgroup, so the per-step CPU-time \
-         budget is NOT enforced; {} step(s) carry one (largest {largest}s) and are bounded only \
-         by their wall timeout. `capabilities` says which guards hold on this lane.",
+        "UNCONTAINED run: exact cgroup cpu.stat accounting is unavailable; a best-effort \
+         procfs process-group CPU floor will police {} step(s) (largest {largest}s), but it can \
+         miss processes that leave the group and not-yet-reaped exits. `capabilities` cannot \
+         express that quality difference.",
         live.len()
     ))
 }
@@ -2277,9 +2278,9 @@ fn run_step(ctx: StepCtx) {
     // bracket the step with two host-load snapshots so contention can be attributed later.
     let boxed = matches!(&cgroups, Some(cg) if cg.enabled());
     // WHICH LANE THIS STEP IS ON. Every guard below asks the capability registry about THIS lane
-    // rather than about the engine in the abstract, so the `uncontained` column of the published
-    // manifest is load-bearing in exactly the way the `contained` one is: an unboxed run that
-    // advertises no CPU-time enforcement does not perform any.
+    // rather than about the engine in the abstract. The one deliberate exception is the
+    // uncontained CPU-time fallback: it is attempted as a lower bound while the manifest stays
+    // false because it cannot promise cgroup-equivalent enforcement.
     let lane = crate::capabilities::Lane::of_boxed(boxed);
     // Profile the width the step ACTUALLY ran under. An undeclared boxed command intentionally
     // gets no jobs flag but is constrained by the default per-step cpu.max, so it belongs in that
@@ -2487,16 +2488,17 @@ fn run_step(ctx: StepCtx) {
         })
     };
 
-    // Poll the step's cgroup once per MONITOR_INTERVAL for two purposes: (1) a per-step peak
-    // descendant-thread count (metrics only), and (2) CPU-time budget enforcement. Only when
-    // boxing is enabled (both readings are meaningless otherwise), so the un-boxed path adds no
-    // extra thread. The poll is interruptible (checks the stop flag every 50ms), so joining it at
-    // step end returns promptly.
+    // Poll once per MONITOR_INTERVAL for two purposes: (1) a per-step peak descendant-thread
+    // count when cgroup boxing exists, and (2) CPU-time budget enforcement. The exact cgroup
+    // counter remains primary. Uncontained runs get a best-effort procfs process-group floor.
+    // The contractual capability remains false for uncontained runs; the warning names this
+    // lower-bound attempt without promoting it to cgroup-equivalent enforcement. The poll is
+    // interruptible, so joining it at step end returns promptly.
     let monitor_stop = Arc::new(AtomicBool::new(false));
     let thread_peak = Arc::new(Mutex::new(None::<i64>));
     let cpu_exceeded = Arc::new(AtomicBool::new(false));
     let termination_culprit = Arc::new(Mutex::new(None::<Culprit>));
-    let monitor: Option<thread::JoinHandle<()>> = if boxed {
+    let monitor: Option<thread::JoinHandle<()>> = if boxed || cpu_budget > 0 {
         let stop = Arc::clone(&monitor_stop);
         let peak = Arc::clone(&thread_peak);
         let cpu_flag = Arc::clone(&cpu_exceeded);
@@ -2533,62 +2535,75 @@ fn run_step(ctx: StepCtx) {
                             let mut p = peak.lock().unwrap();
                             *p = Some(p.map_or(n, |cur| cur.max(n)));
                         }
-                        // CPU-time budget: a load-invariant per-step ceiling on consumed user+system
-                        // CPU (cgroup cpu.stat usage_usec), mirroring the Python runner exactly. Reap
-                        // the whole tree once when over budget, then exit the monitor.
-                        // The `cpu_timeout` guard the `capabilities` manifest advertises IS this
-                        // branch, so it asks the registry that publishes the claim
-                        // (`crate::capabilities`). An engine that stops reaping here stops
-                        // advertising it, in the same edit. This thread only exists on the boxed
-                        // lane (see the `if boxed` above), so the lane it asks about is CONTAINED;
-                        // the uncontained answer is that there is no cpu.stat to read, which is
-                        // the whole of #75.
-                        if cpu_timeout > 0
-                            && !cpu_flag.load(Ordering::Relaxed)
-                            && crate::capabilities::is_enforced("cpu_timeout", mlane)
-                        {
-                            if let Some(cs) = c.cpu_stats(&t) {
-                                // ABSENT IS NOT ZERO: see `cpu_seconds_from_stats`. Say so once and
-                                // leave the budget explicitly unenforced rather than reading a
-                                // missing counter as "has consumed none".
-                                let Some(cpu_used_s) = cpu_seconds_from_stats(&cs) else {
-                                    if !unmeasurable_warned {
-                                        unmeasurable_warned = true;
-                                        eprintln!(
-                                        "[scheduler] \u{26a0} step {t:?}: cgroup cpu.stat has no \
-                                         'usage_usec', so the {cpu_timeout}s CPU-time budget \
-                                         CANNOT be enforced for this step; only the wall timeout \
-                                         still applies."
-                                    );
-                                    }
-                                    continue;
-                                };
-                                if cpu_used_s >= cpu_timeout as f64 {
-                                    cpu_flag.store(true, Ordering::Relaxed);
-                                    let culprit = capture_termination_evidence(
-                                        &mevidence,
-                                        &msink,
-                                        &t,
-                                        mpid,
-                                        &mnonce,
-                                        TerminationBoundary {
-                                            event: "cpu_timeout",
-                                            unit: BudgetUnit::CpuSeconds,
-                                            limit_s: cpu_timeout,
-                                            // The very reading the comparison above was made on.
-                                            measured_s: cpu_used_s,
-                                            wall_elapsed_s: mstart.elapsed().as_secs_f64(),
-                                        },
-                                    );
-                                    if let Ok(mut slot) = mculprit.lock() {
-                                        *slot = Some(culprit);
-                                    }
-                                    reap(&cg, &t, mpid, Some(&mnonce));
-                                    return;
-                                }
-                            }
-                        }
                     }
+                    if cpu_timeout <= 0
+                        || cpu_flag.load(Ordering::Relaxed)
+                        || (boxed && !crate::capabilities::is_enforced("cpu_timeout", mlane))
+                    {
+                        continue;
+                    }
+
+                    let (measured, source) = if boxed {
+                        (
+                            cg.as_ref()
+                                .and_then(|c| c.cpu_stats(&t))
+                                .and_then(|stats| cpu_seconds_from_stats(&stats)),
+                            CPU_SOURCE_CGROUP,
+                        )
+                    } else {
+                        (subtree_cpu_seconds(mpid), CPU_SOURCE_PROCFS)
+                    };
+
+                    let Some(cpu_used_s) = measured else {
+                        if !unmeasurable_warned {
+                            unmeasurable_warned = true;
+                            let mechanism = if source == CPU_SOURCE_CGROUP {
+                                "cgroup cpu.stat usage_usec"
+                            } else {
+                                "procfs process-group CPU accounting"
+                            };
+                            eprintln!(
+                                "[scheduler] \u{26a0} step {t:?}: {mechanism} is unavailable, \
+                                 so the {cpu_timeout}s CPU-time budget CANNOT be enforced for \
+                                 this step; only the wall timeout still applies."
+                            );
+                        }
+                        continue;
+                    };
+                    if cpu_used_s < cpu_timeout as f64 {
+                        continue;
+                    }
+
+                    cpu_flag.store(true, Ordering::Relaxed);
+                    if source == CPU_SOURCE_PROCFS {
+                        eprintln!(
+                            "[scheduler] \u{26a0} step {t:?} exceeded its CPU budget \
+                             ({cpu_used_s:.1}s observed >= {cpu_timeout}s) measured by PROCFS \
+                             SUBTREE accounting because cgroup boxing is not established; this \
+                             misses processes that leave the group and not-yet-reaped exits, so \
+                             it is a floor on true CPU use."
+                        );
+                    }
+                    let culprit = capture_termination_evidence(
+                        &mevidence,
+                        &msink,
+                        &t,
+                        mpid,
+                        &mnonce,
+                        TerminationBoundary {
+                            event: "cpu_timeout",
+                            unit: BudgetUnit::CpuSeconds,
+                            limit_s: cpu_timeout,
+                            // The very reading the comparison above was made on.
+                            measured_s: cpu_used_s,
+                            wall_elapsed_s: mstart.elapsed().as_secs_f64(),
+                        },
+                    );
+                    if let Ok(mut slot) = mculprit.lock() {
+                        *slot = Some(culprit);
+                    }
+                    reap(&cg, &t, mpid, Some(&mnonce));
+                    return;
                 }
             }));
             if let Err(payload) = body {
@@ -3498,10 +3513,9 @@ mod tests {
 
     // ------------------------------------------------- the uncontained CPU-budget notice
     //
-    // A declared `cpu_timeout` is enforced by reading the step cgroup's `cpu.stat`. Without a
-    // cgroup there is no counter and the guard never runs, so the run owes its operator a line
-    // saying so. Both directions are asserted: a graph that switched the guard off on purpose
-    // must NOT be nagged, or the line becomes noise nobody reads.
+    // A declared `cpu_timeout` uses exact cgroup accounting when boxed and a best-effort procfs
+    // process-group floor when uncontained, so the run owes its operator a line naming the
+    // degraded guarantee. A graph that switched the guard off everywhere must NOT be nagged.
 
     fn cpu_budget_step(group: &str, job: &str, cpu_timeout: i64) -> Step {
         let mut s = step(group, job, "true", &[], 0.0, &[]);
@@ -3517,21 +3531,21 @@ mod tests {
         };
         let notice = uncontained_cpu_budget_warning(&cfg).expect("a live budget must be named");
         assert!(notice.contains("UNCONTAINED run"), "{notice}");
-        assert!(notice.contains("NOT enforced"), "{notice}");
-        assert!(notice.contains("2 step(s) carry one"), "{notice}");
+        assert!(notice.contains("best-effort procfs"), "{notice}");
+        assert!(notice.contains("will police 2 step(s)"), "{notice}");
         assert!(notice.contains("largest 7s"), "{notice}");
     }
 
     #[test]
-    fn the_default_budget_counts_because_it_is_equally_unenforced() {
+    fn the_default_budget_counts_for_the_best_effort_floor() {
         // A step that declares nothing still gets `default_step_cpu_timeout`, and that budget is
-        // just as absent on this lane as a declared one.
+        // policed by the same best-effort floor as a declared one.
         let cfg = DagConfig {
             steps: vec![cpu_budget_step("g", "a", 0)],
             ..Default::default()
         };
         let notice = uncontained_cpu_budget_warning(&cfg).expect("the default budget counts");
-        assert!(notice.contains("1 step(s) carry one"), "{notice}");
+        assert!(notice.contains("will police 1 step(s)"), "{notice}");
         assert!(notice.contains("largest 10s"), "{notice}");
     }
 

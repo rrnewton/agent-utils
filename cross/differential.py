@@ -1150,27 +1150,12 @@ def compare_uncarried_config_keys(py: list[str], rs: list[str], rep: Report) -> 
 
 
 def compare_uncontained_cpu_budget_notice(py: list[str], rs: list[str], rep: Report) -> None:
-    """Both builds must SAY, identically, that an uncontained run does not enforce cpu_timeout.
+    """Both builds must describe the same best-effort uncontained CPU-time fallback.
 
-    The CPU-time guard is a read of the step cgroup's ``cpu.stat``. Under
-    ``--allow-cgroup-failure`` there is no cgroup, so the guard never runs: a step can burn
-    unbounded CPU against a declared budget, exit 0, and be reported green. That was silent, and
-    the ``capabilities`` manifest asserted the opposite.
-
-    The manifest half of the fix is already covered — ``capabilities`` is byte-identical across
-    engines and now carries a ``uncontained`` lane with ``"cpu_timeout":false``. This is the
-    behavioural half: the notice has to reach the operator's console on the very lane the
-    differential itself runs on, and it has to be the SAME sentence in both builds, because a
-    warning present in one engine and missing from the other is exactly the historical
-    ``cpu_timeout`` divergence wearing a different hat.
-
-    The "a graph that disabled the guard is owed no notice" direction is NOT checked here, and
-    deliberately: ``default_step_cpu_timeout`` is an uncarried document key in both builds, so no
-    DAG file reachable from the CLI can zero the default and there is nothing for this mechanism
-    to drive. That leg is pinned in-engine instead
-    (``a_graph_with_the_guard_switched_off_everywhere_is_not_nagged``, both suites). What this
-    mechanism CAN see, and does check, is that the notice fires once per RUN rather than once per
-    step or once per monitor tick.
+    The capability manifest remains ``uncontained.cpu_timeout=false`` because procfs
+    process-group accounting is only a lower bound, not a cgroup-equivalent guarantee. The
+    scheduler nevertheless attempts that weaker guard. This check pins the operator-facing
+    disclosure, its Python/Rust parity, and its once-per-run cardinality.
     """
     with tempfile.TemporaryDirectory() as tmp:
         live = os.path.join(tmp, "live.json")
@@ -1182,19 +1167,19 @@ def compare_uncontained_cpu_budget_notice(py: list[str], rs: list[str], rep: Rep
         po = run(py, ("run", "--dag", live, ACF))
         ro = run(rs, ("run", "--dag", live, ACF))
         label = "uncontained-cpu-budget-notice"
-        phrase = "the per-step CPU-time budget is NOT enforced"
+        phrase = "best-effort procfs process-group CPU floor"
         py_lines = [ln for ln in po.stderr.splitlines() if phrase in ln]
         rs_lines = [ln for ln in ro.stderr.splitlines() if phrase in ln]
         if not py_lines or not rs_lines:
             rep.bad(
                 label,
-                "an UNCONTAINED run must name the guard it is not running; "
+                "an UNCONTAINED run must name the weaker CPU-time fallback; "
                 f"py={py_lines!r} rs={rs_lines!r}",
             )
         elif py_lines != rs_lines:
             rep.bad(label, f"notice differs: py={py_lines!r} rs={rs_lines!r}")
         elif "largest 7s" not in py_lines[0]:
-            rep.bad(label, f"the notice must quote the budget it gave up: {py_lines[0]!r}")
+            rep.bad(label, f"the notice must quote the budget policed by the fallback: {py_lines[0]!r}")
         else:
             rep.ok(label)
 
