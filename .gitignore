@@ -69,3 +69,17 @@ gent-talk/cloudflared.deb
 # Agent worktrees created for parallel work. Never tracked: they are checkouts of
 # this same repository, and committing one would nest the repo inside itself.
 /.claude/
+
+# A test fixture that is a real cargo project, so running its own suite leaves a
+# build tree inside the repository. `/rs/target/` above does not cover it: this is
+# a NESTED target dir belonging to the fixture, not to the workspace, and the
+# workspace pattern is anchored. Left untracked it is merely noise; the reason it
+# is named here is that `git add rs/` sweeps 63 artifact files into a commit,
+# which is exactly what happened once.
+/rs/safe-ci-dag-runner/tests/fixtures/*/target/
+
+# Per-run profiling CSVs the runner appends beside its own sources.
+/rs/safe-ci-dag-runner/.safe-ci-dag-runner/
+
+# The same profiling directory, at the repo root when the runner is invoked from here.
+/.safe-ci-dag-runner/
