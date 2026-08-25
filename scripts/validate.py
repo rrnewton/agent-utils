@@ -61,9 +61,19 @@ HYGIENE = "hygiene"
 GROUPS: dict[str, tuple[Check, ...]] = {
     # Repo-wide and cheap, so it leads. A client name can be typed into ANY file, including the
     # prose directories below that map to no other check at all.
+    #
+    # The documented-defaults guard is here rather than under DOCS or WORKSPACE because it spans
+    # both: it compares a number in `common/docs/` against a constant in `rs/` and `py/`, and
+    # EITHER side changing alone is the drift it exists to catch. Putting it in one group would
+    # leave the other edit unchecked, which is the shape of the bug it guards.
     HYGIENE: (
         Check("client-names-self-test", ("python3", "scripts/check_client_names.py", "--self-test")),
         Check("client-names", ("python3", "scripts/check_client_names.py")),
+        Check(
+            "documented-defaults-self-test",
+            ("python3", "scripts/check_documented_defaults.py", "--self-test"),
+        ),
+        Check("documented-defaults", ("python3", "scripts/check_documented_defaults.py")),
     ),
     DOCS: (Check("embed-userguides", ("python3", "scripts/embed_userguides.py", "--check")),),
     WORKSPACE: (
@@ -102,7 +112,10 @@ WHY: dict[str, str] = {
     CROSS: "code with a paired cross-language implementation changed",
     PACKAGES: "something that ships inside a distribution changed",
     GENT_TALK: "gent-talk changed (it is outside the Rust workspace and has its own suite)",
-    HYGIENE: "always: a consuming project's name can be typed into any file",
+    HYGIENE: (
+        "always: a consuming project's name can be typed into any file, and a documented default"
+        " can be broken from either the prose or the code side"
+    ),
 }
 
 #: Longest prefix wins, so `scripts/embed_userguides.py` beats the bare `scripts/` catch-all.
@@ -123,8 +136,9 @@ PREFIX_RULES: tuple[tuple[str, frozenset[str]], ...] = (
     ("scripts/check_python_packages.py", frozenset({PACKAGES})),
     ("scripts/check_rust_packages.py", frozenset({PACKAGES})),
     ("scripts/validate.py", frozenset()),
-    # Its own group is always-on, so naming it here only stops it reading as unclassified.
+    # Their own group is always-on, so naming them here only stops them reading as unclassified.
     ("scripts/check_client_names.py", frozenset()),
+    ("scripts/check_documented_defaults.py", frozenset()),
     # Prose and agent-facing material. Not embedded anywhere, so nothing can go red for it.
     ("ai_docs/", frozenset()),
     ("reviews/", frozenset()),
@@ -241,6 +255,11 @@ def self_test() -> int:
         "a change spanning two areas is the UNION, never the smaller of the two",
     )
     expect(["scripts/check_client_names.py"], set(), "the hygiene guard needs only its own always-on group")
+    expect(
+        ["scripts/check_documented_defaults.py"],
+        set(),
+        "the documented-defaults guard needs only its own always-on group",
+    )
     expect([], set(), "no changes selects nothing by path")
 
     # ALWAYS is the property the table above cannot state, because it folds it in silently.
@@ -271,7 +290,7 @@ def self_test() -> int:
     if failures:
         print(f"\n{len(failures)} self-test failure(s)", file=sys.stderr)
         return 1
-    print("validate --self-test: PASSED (15 mapping controls, 8 always-on controls)")
+    print("validate --self-test: PASSED (16 mapping controls, 8 always-on controls)")
     return 0
 
 

@@ -21,7 +21,8 @@ mypy:
 	python3 scripts/check_no_any.py .
 
 # Lint/typecheck gates (what CI runs).
-check: check-deps mypy check-test-suite-selector check-validate-selector check-client-names
+check: check-deps mypy check-test-suite-selector check-validate-selector check-client-names \
+	check-documented-defaults
 	@host_target="$$(rustc -vV | sed -n 's/^host: //p')"; \
 	test -n "$$host_target"; \
 	cargo clippy --release --workspace --all-targets --manifest-path rs/Cargo.toml \
@@ -58,6 +59,12 @@ check-validate-selector:
 check-client-names:
 	python3 scripts/check_client_names.py --self-test
 	python3 scripts/check_client_names.py
+
+# A number a guide states as a default is a promise about the code. Compare the two artifacts:
+# the value PARSED OUT OF THE PROSE against the constant, never a sentence formatted from it.
+check-documented-defaults:
+	python3 scripts/check_documented_defaults.py --self-test
+	python3 scripts/check_documented_defaults.py
 
 check-test-suite-selector:
 	@for valid in all python rust; do \
