@@ -392,9 +392,18 @@ pub async fn speak(
     require(&headers, &state, Scope::Read)?;
     let (_channel, message) =
         ops::message_by_id(&state, &channel_id, &message_id, query.limit).await?;
+    // WHAT IS SENT IS NOT THE RAW MESSAGE. Markdown, hashes, snowflakes and ISO timestamps are all
+    // noise when spoken — the voice said "asterisk asterisk deploy asterisk asterisk" and spelled
+    // out nineteen-digit ids. `speakable::for_speech` is deterministic and costs nothing; see it
+    // for why this is code rather than a prompt.
+    let said = crate::speakable::for_speech(
+        &message.content,
+        jiff::Timestamp::now().as_millisecond(),
+        &state.config.timezone,
+    );
     let spoken = state
         .speech
-        .speak(&state.config.elevenlabs, &message.content, query.speed)
+        .speak(&state.config.elevenlabs, &said, query.speed)
         .await?;
     Ok((
         [

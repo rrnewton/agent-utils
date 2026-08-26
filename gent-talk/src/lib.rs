@@ -49,6 +49,7 @@ pub mod ops;
 pub mod probe;
 pub mod replay;
 pub mod retrieval;
+pub mod speakable;
 pub mod state;
 pub mod store;
 pub mod summarize;

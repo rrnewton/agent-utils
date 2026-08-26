@@ -37,6 +37,16 @@ impl Zone {
     pub fn name(&self) -> &str {
         &self.name
     }
+
+    /// Put an instant into this zone.
+    ///
+    /// An accessor rather than a public `tz` field: a caller that could reach the `TimeZone` could
+    /// also keep one, and a zone outliving the configuration it was resolved from is how two parts
+    /// of a server come to disagree about what time it is.
+    #[must_use]
+    pub fn at(&self, instant: jiff::Timestamp) -> jiff::Zoned {
+        instant.to_zoned(self.tz.clone())
+    }
 }
 
 /// Resolve an IANA zone name such as `America/New_York` or `UTC`.

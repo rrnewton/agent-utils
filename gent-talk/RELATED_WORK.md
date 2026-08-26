@@ -306,6 +306,91 @@ Offered because the research contradicts parts of it, not to relitigate settled 
    in Happy's design is the single place where a bespoke component would add something the
    off-the-shelf compositions lack.
 
+## Making markdown pronounceable
+
+Added 2026-08-24, when read-aloud was found saying "asterisk asterisk deploy asterisk asterisk",
+spelling out nineteen-digit snowflakes, and reading ISO timestamps character by character.
+
+**Sourcing caveat, stated first.** This host's egress proxy refuses the pages below to this agent's
+identity, so none of them was fetched. What follows is a survey from established knowledge with
+pointers for a reader who *can* open them; no wording is quoted, and no claim here should be
+treated as verified. Search surfaced the URLs; nothing read them.
+
+### Screen readers are the closest prior art, and they solved the table problem first
+
+NVDA, JAWS and VoiceOver have spent two decades on exactly this question: how to speak a document
+whose structure is visual. Their answer for tabular data is not to read the table — it is to
+**announce its shape and let the listener decide**, in the form "table with N columns and M rows",
+after which the user may step through it or skip it entirely.
+
+That is the idiom `speakable::describe_tables` implements, and arriving at it independently is
+weak evidence it is right; the accessibility literature is much stronger evidence. The one thing
+this bridge does that a screen reader cannot is **decide for the listener**, because there is no
+way to step into a table through a phone speaker in a car. So it also offers the first column's
+keys when those read as words — the part that says what the table is *about*.
+
+Worth reading against our choices:
+
+- NVDA user guide, table navigation and reporting: <https://download.nvaccess.org/releases/2024.4beta2/documentation/userGuide.html>
+- PowerMapper's cross-reader table comparison: <https://www.powermapper.com/tests/screen-readers/tables/>
+- How screen readers get from DOM to speech: <https://testparty.ai/blog/how-screen-readers-parse-dom>
+
+### Text normalization is a named field, and this is a small instance of it
+
+Turning written text into speakable text is **text normalization** (TN) — expanding numbers,
+dates, currency, abbreviations and symbols into the words a speaker would actually say. It is the
+front half of every production TTS pipeline, classically as hand-written grammars (Google's
+Kestrel, built on finite-state transducers) and latterly with neural models, which introduced the
+failure this module is careful to avoid: a learned normalizer will occasionally produce a
+*confidently wrong* reading of a number, where a rule produces a clumsy one.
+
+Sproat and Jaitly's "RNN Approaches to Text Normalization: A Challenge" is the standard reference
+for why that trade matters. Our transformations are all deterministic and none of them calls
+anything, which was the owner's explicit requirement — no extra tokens — and is also the safer
+half of that trade.
+
+- Azure's *display text formatting* is the same machinery pointed the other way (inverse text
+  normalization, speech → written form): <https://learn.microsoft.com/en-us/azure/ai-services/speech-service/display-text-format>
+
+### SSML is the alternative we did not take
+
+The standards answer to "say this differently" is **SSML**: wrap the text in markup and let the
+engine decide, with `<say-as interpret-as="date">`, `<sub alias="…">` for substitutions, and
+`<break>` for pacing. It is more expressive than rewriting the string and it keeps the original
+text intact.
+
+We rewrite anyway, for three reasons worth recording:
+
+1. **Support is uneven.** SSML coverage differs per vendor and per voice, and a tag a vendor
+   ignores fails silently — the listener hears the raw thing, which is the bug being fixed.
+2. **Half our transformations have no tag.** There is no `<say-as>` for "this forty-character hex
+   string is the same one you heard a sentence ago". Placeholder naming is a semantic decision, not
+   a pronunciation hint.
+3. **It would couple us to one vendor's dialect** at exactly the layer we keep swappable
+   (`SpeechProvider`).
+
+If a future backend has strong SSML, dates and numbers could move to `<say-as>` while placeholders
+stay here. That would be a genuine improvement and it is not a rewrite.
+
+### Read-it-later products face the same problem and mostly punt
+
+Speechify, Pocket's read-aloud, and ElevenLabs' own Reader all take arbitrary web or markdown
+content to speech. Publicly they say little about preprocessing, and the observable behaviour of
+several is that code blocks and tables are read verbatim or dropped wholesale with no announcement
+— which is the failure mode on either side of what this module tries to do: reading noise, or
+silently removing content the listener was told to look at. Our thresholds exist to sit between
+them: a snippet of three lines or fewer is spoken, because at that length it *is* the message; a
+longer one is named with its language and size, because the listener should know what they are
+choosing not to hear.
+
+### What is unmet
+
+No open-source library found does markdown-to-speakable with **stable within-document placeholders**
+— the property that makes "hash code A" useful, because it lets a listener tell "the same commit"
+from "a different commit" without hearing either. Ordinary markdown strippers (`remark-strip-markdown`,
+`pandoc -t plain`) remove syntax and leave the hash. That gap is why this is code here rather than
+a dependency.
+
 ## Sources
 
 - [slopus/happy](https://github.com/slopus/happy) — voice architecture, paid-voice, and

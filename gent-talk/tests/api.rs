@@ -1938,6 +1938,55 @@ async fn with_neither_a_voice_nor_an_agent_the_refusal_names_both_ways_to_fix_it
 }
 
 #[tokio::test]
+async fn what_is_read_aloud_is_the_speakable_text_and_not_the_raw_markdown() {
+    // The reported bug: the voice said "asterisk asterisk deploy asterisk asterisk", spelled out
+    // nineteen-digit snowflakes and read ISO timestamps character by character.
+    //
+    // `speakable` has its own unit tests, and they are not enough on their own: they prove the
+    // FUNCTION works while saying nothing about whether the route calls it. Reverting the route to
+    // send `message.content` left every one of them green. This is the seam.
+    let (harness, _store, _ids) = todo_harness();
+    let channel = ChannelId(WRITE_CHANNEL.to_owned());
+    let id = harness
+        .discord
+        .seed(
+            &channel,
+            "codex-eng",
+            "the **deploy** is done at 1000000000000000009",
+        )
+        .0;
+
+    let (status, _headers, _body) = call_bytes(
+        &harness,
+        "POST",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/messages/{id}/speak"),
+        Some(READ_TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let spoken = harness.voice().spoken();
+    assert_eq!(spoken.len(), 1, "{spoken:?}");
+    let said = &spoken[0];
+    assert!(
+        !said.contains("**"),
+        "the vendor was sent raw markdown: {said}"
+    );
+    assert!(
+        !said.contains("1000000000000000009"),
+        "the vendor was asked to spell out a snowflake: {said}"
+    );
+    assert!(
+        said.contains("large number"),
+        "the identifier lost its placeholder entirely: {said}"
+    );
+    assert!(
+        said.contains("deploy"),
+        "the words themselves went missing: {said}"
+    );
+}
+
+#[tokio::test]
 async fn reading_aloud_needs_read_scope() {
     let (harness, _store, ids) = todo_harness();
     let (status, payload) = call(
