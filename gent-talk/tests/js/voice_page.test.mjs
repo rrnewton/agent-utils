@@ -5738,6 +5738,96 @@ test("the kept place draws a line across the list, not only an edge on one row",
   assert.doesNotMatch(rule, /-100vw/, "a viewport-wide line brings a horizontal scrollbar with it");
 });
 
+// --- YOUR PLACE NEVER MOVES ------------------------------------------------------------------
+//
+// The owner's principle, and the reason these are one block: "almost every message client loses my
+// place in the scrollback if I send a new message". Working through a backlog is like working
+// through email — replying to one says nothing about being finished with the next forty.
+//
+// So every path that CAN move the scroll is pinned here, including the ones that were already
+// right. An audit that only tests the bug it found leaves the other paths free to acquire it.
+
+const parkMidway = (page) => {
+  const area = page.el("scroll-area");
+  area.scrollTop = Math.round((area.scrollHeight - area.clientHeight) * 0.5);
+  return area.scrollTop;
+};
+
+test("SWITCHING VIEWS AND COMING BACK KEEPS YOUR PLACE", async () => {
+  // The one path that was genuinely broken. Both panes share one scroll container, so leaving a
+  // view loses its position unless somebody writes it down — and nobody did: every switch called
+  // `scrollToNewest`. A glance at the transcript cost a reader forty messages of scrolling.
+  const page = newPage();
+  await signIn(page);
+  const area = await walkedBackChannel(page);
+  const parked = parkMidway(page);
+
+  await page.el("view-switch").click();
+  await page.settle();
+  await page.el("view-switch").click();
+  await page.settle();
+
+  assert.equal(area.scrollTop, parked, "coming back to the channel lost the reader's place");
+});
+
+test("...but a FIRST entry still lands on the newest message", async () => {
+  // The reasoning the unconditional jump was built on was sound for a first entry and wrong for
+  // every one after it. Arriving at the TOP of a long channel means scrolling past everything
+  // already read to reach what you opened it for.
+  //
+  // A PLAIN first entry, not `walkedBackChannel`: that helper scrolls on its own, so removing the
+  // jump entirely left the earlier version of this test green — it was asserting the helper's
+  // behaviour rather than the page's.
+  const page = newPage();
+  await signIn(page);
+  const area = page.el("scroll-area");
+  area.scrollTop = 0;
+  await showDiscord(page, tallChannel());
+
+  assert.ok(area.scrollHeight > area.clientHeight, "the fixture cannot scroll, so this proves nothing");
+  assert.ok(atBottomOf(area), "a first entry did not land on the newest message");
+});
+
+test("a message ARRIVING does not move a reader who is elsewhere", async () => {
+  const page = newPage();
+  // A TALL channel: with one message there is nothing to scroll, "parked" is the bottom, and the
+  // test would pass by accident while proving nothing.
+  const stream = await withLiveChannel(page, tallChannel());
+  const area = page.el("scroll-area");
+  const parked = parkMidway(page);
+  assert.ok(parked > 0, "the fixture is not tall enough to have a place to lose");
+
+  await deliver(page, stream, sseMessage(message({ id: "200", content: "new" })));
+
+  assert.equal(area.scrollTop, parked, "an arriving message dragged the reader to the bottom");
+  // ...and it says something arrived, because silently leaving them put is the other half of it.
+  assert.equal(page.el("jump-newest").hidden, false, "nothing said a message had arrived");
+});
+
+test("the POLL does not move a reader who is elsewhere", async () => {
+  const page = newPage();
+  await signIn(page);
+  const area = await walkedBackChannel(page);
+  const parked = parkMidway(page);
+
+  await reReadChannel(page);
+
+  assert.equal(area.scrollTop, parked, "the 45-second poll moved the reader");
+});
+
+test("SENDING A REPLY does not move you — the whole complaint, pinned", async () => {
+  const page = newPage();
+  await signIn(page);
+  const area = await walkedBackChannel(page);
+  const parked = parkMidway(page);
+
+  await page.el("reply-text").setValue("restarted it");
+  await page.el("reply-send").click();
+  await page.settle();
+
+  assert.equal(area.scrollTop, parked, "replying threw away the reader's place in the backlog");
+});
+
 test("the channel spends its width on words, not on insets", async () => {
   // 15% of a 393-pixel phone, on every row, bought what the speaker COLOUR now buys.
   const mine = cssBlock('#discord-log li.discord-message[data-who="me"]');

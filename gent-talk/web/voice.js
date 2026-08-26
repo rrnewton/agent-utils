@@ -288,7 +288,31 @@ let currentView = "voice";
  * Deliberately touches NOTHING in `session`. Switching views during a call must not disturb the
  * call: no socket close, no track stop, no re-acquire, no change to the mute state.
  */
+/**
+ * Where the reader was in each view, so switching does not throw it away.
+ *
+ * Both panes share ONE scroll container, so leaving a view loses its position unless somebody
+ * writes it down. Nobody did: every switch called `scrollToNewest`, which meant glancing at the
+ * transcript and coming back put a reader who was forty messages into a backlog at the bottom
+ * again, with no way to find where they had been.
+ *
+ * `null` means "never been here", which is the only case where landing on the newest message is
+ * right — arriving at the TOP of a long channel is the failure the unconditional jump was
+ * originally protecting against, and that reasoning was sound for a FIRST entry and wrong for
+ * every one after it.
+ */
+const viewScroll = { voice: null, discord: null };
+
+/** Whether the last `showView` put the reader back rather than taking them to the newest. */
+let viewRestored = false;
+
 function showView(name) {
+  // Written down BEFORE the panes swap, because after that the scroll position belongs to
+  // whichever pane is now up and says nothing about where the reader was.
+  const leaving = currentView;
+  if (leaving && leaving !== name) {
+    viewScroll[leaving] = el("scroll-area").scrollTop;
+  }
   currentView = name;
   el("pane-voice").hidden = name !== "voice";
   el("pane-discord").hidden = name !== "discord";
@@ -296,15 +320,28 @@ function showView(name) {
   el("view-switch").setAttribute("aria-checked", discord ? "true" : "false");
   el("view-switch-label").textContent = discord ? "Discord" : "Voice";
   // Both panes share ONE scroll container, so a switch swaps the content out from under a
-  // scrollTop that belonged to the other pane. Landing anywhere but the newest message is
-  // wrong for both views, and it is badly wrong for Discord: arriving at the TOP of a long
-  // channel means scrolling past everything already read to reach the thing you opened it
-  // for. Doing this here rather than in loadDiscord() is deliberate — the load only runs on
-  // the FIRST switch, so a fix that lived there would leave every later switch at the top.
-  scrollToNewest();
-  // Entering a view lands on its newest message, so any offer to jump there has been taken.
-  // Leaving the flag set would show a chip pointing at where the reader already is.
-  jumpNewestWanted[name] = false;
+  // scrollTop that belonged to the other pane. On a FIRST entry, landing on the newest message is
+  // right and landing at the top is badly wrong: arriving at the top of a long channel means
+  // scrolling past everything already read to reach the thing you opened it for.
+  //
+  // On every entry AFTER that, it is the reader's place, and throwing it away is the same defect
+  // one level up. A glance at the transcript and back should not cost forty messages of scrolling.
+  const held = viewScroll[name];
+  const returning = typeof held === "number";
+  if (returning) {
+    el("scroll-area").scrollTop = held;
+  } else {
+    scrollToNewest();
+  }
+  // Only when the reader really was taken to the newest message. Clearing it on a RETURN would
+  // hide a chip that is pointing at something they have not seen.
+  if (!returning) {
+    jumpNewestWanted[name] = false;
+  }
+  // Told to the caller, because restoring the position here is only half of it: entering the
+  // channel also RE-READS it, and a read that does not know it is a return settles to the newest
+  // message and undoes this immediately. See the view-switch handler.
+  viewRestored = returning;
   // The chips belong to the list you are looking at, and you are now looking at a different one.
   renderScrollTools();
   // Leaving the channel takes the reading with it: audio that goes on playing over the transcript
@@ -6549,8 +6586,12 @@ el("view-switch").addEventListener("click", () => {
   // Deliberately NOT guarded on the log being empty. That guard is what made the view stale:
   // after the first load it never fetched again, so switching back showed you the channel as it
   // had been, with nothing on screen admitting it.
+  // KEEP THE POSITION when this entry was a return. `loadDiscord` with no options settles to the
+  // newest message, which would undo the restore `showView` just performed — the two halves have
+  // to agree or the fix is invisible.
+  const returning = viewRestored;
   guardQuietly(async () => {
-    await loadDiscord();
+    await loadDiscord(returning ? { keepPosition: true } : undefined);
     if (currentView === "discord") {
       scheduleDiscordPoll();
     }
