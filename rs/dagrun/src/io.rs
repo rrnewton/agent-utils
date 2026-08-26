@@ -146,7 +146,7 @@ fn err(msg: impl Into<String>) -> DagJsonError {
 /// `cmds`, `timeouts`, `env_vars`, `description` vs `desc`. Silently ignored, the instruction is
 /// simply not carried out and the document still says it was: the step runs with no timeout, no
 /// dependency, no environment, and nothing anywhere reports it.
-const STEP_KEYS: [&str; 19] = [
+const STEP_KEYS: [&str; 21] = [
     "cmd",
     "cpu_timeout",
     "deps",
@@ -166,6 +166,19 @@ const STEP_KEYS: [&str; 19] = [
     "timeout",
     "write_domain_guarantee",
     "write_domains",
+    // ⚠️ DECLARED HERE, CONSUMED DOWNSTREAM, NOT BY dagrun. Both are read by
+    // hermit's planner (hermit/scripts/lib/validate_plan.rs):
+    // `requires_host_capability` at :648, driving the HOST-INAPPLICABLE decision
+    // that stops a node claiming a pass on a machine that cannot run it, and
+    // `manifest` at :382. dagrun ignores both by design.
+    //
+    // Listed because this schema is CLOSED and closing it without them makes
+    // dagrun REFUSE hermit's real graphs -- measured 2026-08-26, exit 2 on
+    // ci/dag/portable.json ("manifest") and ci/dag/privileged.json
+    // ("requires_host_capability"). Keep this list in step with the Python
+    // edition's STEP_KEYS; the two are asserted identical.
+    "manifest",
+    "requires_host_capability",
 ];
 
 /// Every key a step's `hint` object may carry. Closed for the same reason as [`STEP_KEYS`];

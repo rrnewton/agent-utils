@@ -480,6 +480,20 @@ STEP_KEYS: frozenset[str] = frozenset(
         "write_domain_guarantee",
         "explains",
         "fail_fast_family",
+        # ⚠️ DECLARED HERE, CONSUMED DOWNSTREAM, NOT BY dagrun. Both are read by
+        # hermit's own planner (hermit/scripts/lib/validate_plan.rs):
+        # `requires_host_capability` at :648, which drives the HOST-INAPPLICABLE
+        # decision that stops a node claiming a pass on a machine that cannot run
+        # it, and `manifest` at :382. dagrun ignores both by design.
+        #
+        # They are listed because this schema is CLOSED and closing it without
+        # them makes dagrun REFUSE hermit's real graphs: measured 2026-08-26,
+        # `dagrun list --dag ci/dag/portable.json` exits 2 on `manifest` and
+        # `ci/dag/privileged.json` exits 2 on `requires_host_capability`. A closed
+        # schema that does not know its callers' fields does not raise the bar, it
+        # takes the caller's validate offline.
+        "manifest",
+        "requires_host_capability",
     }
 )
 
