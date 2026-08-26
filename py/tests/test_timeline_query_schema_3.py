@@ -28,6 +28,7 @@ Named `test_timeline_*` rather than `test_query_*` because the packaged workflow
 from __future__ import annotations
 
 import json
+import gzip
 import shutil
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -767,3 +768,36 @@ def test_a_search_corpus_from_another_generation_is_refused(
             offset=0,
             limit=5,
         )
+
+
+def test_a_phase_detail_stored_only_as_gzip_is_still_resolved(
+    archives: dict[str, Path]
+) -> None:
+    """``show`` reads the FILESYSTEM, so a stored-compressed document must resolve without HTTP.
+
+    This is the half of the gzip-only change that the browser cannot vouch for. The server
+    materialises identity bytes from the stored member on demand, so a page keeps working with no
+    twin on disk -- and that made it easy to believe the whole archive was fine. The shipped
+    ``timeline`` executable does not go through the server: it opens
+    ``data/details/<team>/<phase>.json`` directly, and when the twin stopped being written every
+    ``show <phase-ref>`` began failing with "archive file is missing".
+
+    The regression is pinned by removing the identity file and leaving only the ``.gz``, which is
+    exactly the shape a real build now produces.
+    """
+
+    archive = archives["schema-3"]
+    reference = "phase:team-b::phase-1-05"
+    expected = TimelineQuery(archive).show(reference)
+
+    relative = expected["detail_path"]
+    assert isinstance(relative, str) and relative.startswith("data/details/")
+    identity = archive / relative
+    stored = identity.with_name(identity.name + ".gz")
+    if not stored.is_file():
+        stored.write_bytes(gzip.compress(identity.read_bytes(), 6, mtime=0))
+    identity.unlink()
+    assert not identity.exists()
+
+    # Byte-identical, not merely "does not raise": the point is that the reader cannot tell.
+    assert TimelineQuery(archive).show(reference) == expected

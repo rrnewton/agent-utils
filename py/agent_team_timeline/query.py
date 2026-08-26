@@ -3103,9 +3103,12 @@ class TimelineQuery:
         return encoded
 
     def _read_json(self, path: Path) -> JsonValue:
-        return _narrow_json(
-            json.loads(self._read_bytes(path).decode("utf-8")), str(path)
-        )
+        raw = self._read_bytes(path)
+        if path.name.endswith(".gz"):
+            # Counted against the read budget as the bytes actually read off disk, which is what
+            # `_read_bytes` already recorded; decompressing does not read anything more.
+            raw = gzip.decompress(raw)
+        return _narrow_json(json.loads(raw.decode("utf-8")), str(path))
 
     def _read_markdown(self, path: Path) -> str:
         return self._read_bytes(path).decode("utf-8")
@@ -3965,6 +3968,15 @@ class TimelineQuery:
         except ValueError as error:
             raise ValueError(f"archive path escapes root: {relative!r}") from error
         if not path.is_file():
+            # A resource whose stored form is the compressed member has no identity file on
+            # disk. Resolve it the way the server does -- identity first, then the `.gz` -- so
+            # a caller can keep naming the logical path. Without this the CLI reads the
+            # filesystem and finds nothing where a browser, going through the server, sees the
+            # document: `show <phase>` broke exactly that way when the per-phase details
+            # stopped keeping a twin.
+            stored = path.with_name(path.name + ".gz")
+            if stored.is_file():
+                return stored, pure
             raise ValueError(f"archive file is missing: {relative}")
         return path, pure
 
@@ -3976,6 +3988,9 @@ class TimelineQuery:
             or pure.suffix != ".json"
         ):
             raise ValueError(f"phase detail path is outside data/details: {relative!r}")
+        # Validated on the LOGICAL name above, deliberately: `pure` is what the timeline stream
+        # recorded and is always `.json`, while `path` may be the `.gz` the archive stores. A
+        # check against the stored name would reject every detail the moment it is compressed.
         return path
 
     def _rollup_file(self, relative: str, team: str) -> Path:

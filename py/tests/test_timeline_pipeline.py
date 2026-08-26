@@ -2618,6 +2618,18 @@ def test_combined_export_namespaces_teams_and_is_byte_idempotent(
         for value in export_manifest["generated_files"]
     )
     assert "app.js.gz" in export_manifest["generated_files"]
+    # The manifest is an inventory of THIS archive, so every name in it must be a file that is
+    # actually here. The regression this pins shipped: the per-phase details became gzip-only,
+    # and the line recording the plain relative was left beside the one recording the stored
+    # `.gz` -- so a real export named 11,899 `data/details/*.json` that no build writes any more.
+    # Nothing crashed, which is the problem: the manifest quietly stopped describing the archive,
+    # and it is what stale-file removal and any downstream integrity check read.
+    absent = sorted(
+        relative
+        for relative in export_manifest["generated_files"]
+        if not (output / relative).is_file()
+    )
+    assert absent == [], f"export manifest names {len(absent)} file(s) that do not exist"
     artifact_catalog = json.loads(read_stored_text(output / "data" / "artifacts.json"))
     artifact_ids = {
         artifact["artifact_id"] for artifact in artifact_catalog["artifacts"]

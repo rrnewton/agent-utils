@@ -663,7 +663,10 @@ def _build_combined_archive_locked(
                     f"data/details/{rendered.slug}/{PurePosixPath(source_relative).name}"
                 )
                 _safe_generated_path(target_relative)
-                generated_files.add(target_relative)
+                # Named by the file that exists, and only that -- the `.gz` entry is added from
+                # `gzip_only_files` below. Recording the plain relative here as well put 11,899
+                # names in the export manifest for files this build deliberately does not write,
+                # which makes the manifest a false inventory of the archive it describes.
                 gzip_only_files.add(target_relative)
                 changed += _write_gzip_only_json(
                     _output_path(output, target_relative),
