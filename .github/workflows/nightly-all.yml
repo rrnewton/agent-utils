@@ -1,0 +1,98 @@
+name: nightly (everything)
+
+# WHY A NIGHTLY, WHEN EVERY TOOL ALREADY HAS ITS OWN WORKFLOW
+#
+# The per-tool workflows are path-routed: a change under `gent-talk/` runs gent-talk's gate and
+# nothing else, which is what makes this repository behave like a collection of independent tools
+# rather than one monolith that takes twenty minutes to tell you about a typo.
+#
+# Path routing has one blind spot, and it is not hypothetical here: the tools DEPEND on each other.
+# gent-talk's CI is chosen by `gent-talk/**`, so a change to `rs/dagrun/` that breaks a consumer
+# runs dagrun's suite and never gent-talk's. Each workflow is green, main is broken, and nobody
+# learns until the next change to the consumer -- which then looks like the culprit.
+#
+# So this runs the ENTIRE contract, on a schedule, with no path filter and nothing selected. It is
+# the only job in this repository that can observe a cross-tool break, and its failure means "main
+# is broken", not "your change is broken".
+#
+# It is deliberately NOT on push: on every commit it would be the twenty-minute monolith the split
+# exists to avoid, and on a busy day it would be running more often than it finishes.
+
+on:
+  schedule:
+    # 04:17 UTC. Not on the hour: GitHub's scheduler is busiest exactly then, and a nightly that
+    # queues for forty minutes reports yesterday's tree as this morning's news.
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+
+jobs:
+  everything:
+    runs-on: ubuntu-latest
+    # The whole contract, not a selection. If this is routinely hitting the limit, that is a signal
+    # about the contract rather than a number to raise.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # `--all` rather than the selector: selection is a convenience for the edit-run loop, and
+      # this job exists precisely to run what selection would have skipped.
+      - name: the entire repository contract
+        run: make validate-all
+
+      # gent-talk is outside the Rust workspace and outside `make validate-all`'s workspace half,
+      # so its own gate is named here as well. Its Makefile is the same one a developer runs.
+      - name: gent-talk
+        working-directory: gent-talk
+        run: make validate
+
+      # A failure here is about MAIN, not about a pull request, so it has to reach somebody. An
+      # issue rather than a silent red tick on a page nobody opens in the morning.
+      - name: say so, on main, where it will be seen
+        if: failure() && github.event_name == 'schedule'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = `nightly-all: the full contract failed on main`;
+            // One open issue, not one per night: a nightly that has been red for a week should be
+            // a single thread with a week of comments, not seven issues nobody closes.
+            const { data: open } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'nightly',
+            });
+            const body = [
+              `[github-actions] The nightly full-contract run failed on \`main\`.`,
+              ``,
+              `Commit: ${context.sha}`,
+              `Run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              ``,
+              `This job is the only one that can see a CROSS-TOOL break: the per-tool workflows are`,
+              `path-routed, so a change to one tool never runs a dependent tool's suite. A failure`,
+              `here usually means main is broken by an interaction, not by the last commit.`,
+            ].join('\n');
+            if (open.length > 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: open[0].number,
+                body,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                labels: ['nightly'],
+                body,
+              });
+            }

@@ -409,7 +409,14 @@ the binary yourself and re-run."
     }
     # On failure too: a throwaway server left running would hold the port and the next run would
     # refuse to start, for a reason that looks nothing like the failure that caused it.
-    trap shots_cleanup EXIT
+    #
+    # INT, TERM and HUP as well as EXIT, and that is not belt-and-braces. An EXIT trap alone does
+    # not run when the shell is killed by a signal, so a Ctrl-C or a closed terminal orphaned the
+    # server: it was reparented to user systemd and went on holding its port. One was found still
+    # running SIX DAYS after the run that started it, with its own config directory long deleted.
+    # `kill 0` is deliberately not used -- this kills the server it started, not the caller's
+    # process group.
+    trap shots_cleanup EXIT INT TERM HUP
 
     cat > "$SHOTS_TMP/gent-talk.toml" <<EOF
 [server]

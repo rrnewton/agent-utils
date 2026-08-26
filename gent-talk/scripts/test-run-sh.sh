@@ -71,7 +71,10 @@ cleanup() {
     fi
     rm -rf "$TMPDIR_TEST"
 }
-trap cleanup EXIT
+# INT, TERM and HUP as well as EXIT: an EXIT trap alone does not run when the shell is killed by a
+# signal, and everything this suite creates -- containers, images, a user unit, a temp tree --
+# outlives the run if cleanup is skipped.
+trap cleanup EXIT INT TERM HUP
 
 PASS=0
 fail() { echo "FAILED: $*" >&2; exit 1; }
