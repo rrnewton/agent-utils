@@ -3768,8 +3768,18 @@ function stopReading() {
   // Invalidate every read in flight, not only the one that is audible. A fetch that has not come
   // back yet is still going to build a player unless its ticket is stale.
   readingTicket += 1;
+  const wasPending = pendingRead !== null;
   pendingRead = null;
   if (nowPlaying === null) {
+    // ABORTING A READ THAT NEVER STARTED still has to take the highlight off. This returned early,
+    // so a message aborted while its audio was still being fetched stayed lit with nothing coming
+    // — the row claimed to be working on something that had already been abandoned.
+    if (wasPending) {
+      if (readingMode) {
+        setReadState("ready");
+      }
+      renderChannelRows();
+    }
     return;
   }
   const { audio, url } = nowPlaying;
@@ -3819,7 +3829,11 @@ async function fetchSpeech(channel, id) {
  * the reader is never stuck listening to something they have finished with.
  */
 async function readAloud(id) {
-  const already = nowPlaying !== null && nowPlaying.id === id;
+  // A SECOND TAP IS AN ABORT, whether or not the audio has started. Pending counts: the wait is
+  // where a mis-tap is noticed — the message is long, the reader realises they did not want it,
+  // and the only thing they can do is tap the thing they just tapped. Checking `nowPlaying` alone
+  // made that start a SECOND read instead of cancelling the first.
+  const already = (nowPlaying !== null && nowPlaying.id === id) || pendingRead === String(id);
   // Also cancels anything still being fetched, so a double tap cannot end in two players.
   stopReading();
   if (already) {

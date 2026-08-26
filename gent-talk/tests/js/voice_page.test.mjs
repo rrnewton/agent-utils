@@ -5471,6 +5471,51 @@ test("CLEAR IS NOT OFFERED OVER THE CHANNEL, because the channel is not ours to 
   assert.equal(page.el("clear-view").hidden, false, "Clear did not come back with the transcript");
 });
 
+test("A SECOND TAP ABORTS A READ THAT HAS NOT STARTED, and takes the highlight with it", async () => {
+  // The wait is exactly where a mis-tap is noticed: the message is long, the reader realises they
+  // did not want it, and the only thing to do is tap the thing they just tapped. Checking only
+  // `nowPlaying` made that start a SECOND read, because nothing was playing yet.
+  const page = newPage();
+  await signIn(page);
+  const rows = await inReadingMode(page, [message({ id: "1000000000000000001" })]);
+
+  // Not awaited: this is the state mid-flight, which is the only moment the abort exists in.
+  const inFlight = rows[0].dispatch("click", {});
+  assert.equal(rowState(page, 0).pending, "true", "the tap did not register");
+
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  assert.equal(rowState(page, 0).pending, "false", "the aborted row is still lit with nothing coming");
+  assert.equal(
+    page.el("read-aloud").getAttribute("data-read-state"),
+    "ready",
+    "the control still claims a read is in flight"
+  );
+
+  await inFlight;
+  await page.settle();
+  // The abandoned fetch must not come back and start playing anyway.
+  const audible = page.players.filter((p) => p.playCount > 0 && !p.paused);
+  assert.equal(audible.length, 0, "the aborted read played after being cancelled");
+  assert.equal(rowState(page, 0).reading, "false");
+});
+
+test("...and turning the mode off aborts a pending read too", async () => {
+  const page = newPage();
+  await signIn(page);
+  const rows = await inReadingMode(page, [message({ id: "1000000000000000001" })]);
+
+  const inFlight = rows[0].dispatch("click", {});
+  await page.el("read-aloud").click();
+  await page.settle();
+  await inFlight;
+  await page.settle();
+
+  assert.equal(rowState(page, 0).pending, "false", "leaving the mode left a row lit");
+  const audible = page.players.filter((p) => p.playCount > 0 && !p.paused);
+  assert.equal(audible.length, 0, "audio started after the reader left reading mode");
+});
+
 test("the channel spends its width on words, not on insets", async () => {
   // 15% of a 393-pixel phone, on every row, bought what the speaker COLOUR now buys.
   const mine = cssBlock('#discord-log li.discord-message[data-who="me"]');
