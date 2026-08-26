@@ -1878,6 +1878,66 @@ async fn reading_aloud_refuses_a_message_this_server_cannot_see_without_calling_
 }
 
 #[tokio::test]
+async fn read_aloud_borrows_the_agents_own_voice_when_none_is_configured() {
+    // The owner's report: read-aloud refused with "elevenlabs.voice_id is not configured" on a
+    // deployment he considered fully configured -- he had wired the voice agent, and reasonably
+    // expected one configuration to cover both.
+    //
+    // `agent_id` and `voice_id` are different things in ElevenLabs' model: an agent is a prompt, an
+    // LLM, tools AND a voice, while the text-to-speech API takes a voice and knows nothing about
+    // agents. They cannot be one setting. But the agent HAS a voice, and borrowing it is what "read
+    // it in the voice I already configured" means. The test harness's own config names NO voice, so
+    // every other read-aloud test in this file is already travelling this path.
+    let (harness, _store, ids) = todo_harness();
+
+    let (status, _headers, body) = call_bytes(
+        &harness,
+        "POST",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/messages/{}/speak", ids[0]),
+        Some(READ_TOKEN),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a server with an agent but no explicit voice refused to read"
+    );
+    assert!(!body.is_empty());
+    assert_eq!(harness.voice().spoken().len(), 1);
+}
+
+#[tokio::test]
+async fn with_neither_a_voice_nor_an_agent_the_refusal_names_both_ways_to_fix_it() {
+    // Either setting fixes this, and an error naming only one sends the operator to configure the
+    // wrong thing -- which is exactly what happened when it named `voice_id` alone.
+    let toml = gent_talk::testing::config_toml_without_elevenlabs();
+    let (state, discord, elevenlabs) = gent_talk::testing::state_from_toml(&toml);
+    let harness = Harness {
+        router: router(state),
+        discord,
+        elevenlabs: Some(elevenlabs),
+    };
+    let channel = ChannelId(WRITE_CHANNEL.to_owned());
+    let id = harness.discord.seed(&channel, "codex-eng", "read me").0;
+
+    let (status, payload) = call(
+        &harness,
+        "POST",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/messages/{id}/speak"),
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{payload}");
+    let detail = payload["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("api_key") || detail.contains("voice_id"),
+        "the refusal does not name a setting: {detail}"
+    );
+    assert!(harness.voice().spoken().is_empty());
+}
+
+#[tokio::test]
 async fn reading_aloud_needs_read_scope() {
     let (harness, _store, ids) = todo_harness();
     let (status, payload) = call(

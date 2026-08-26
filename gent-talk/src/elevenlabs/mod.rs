@@ -114,29 +114,47 @@ pub fn credentials(config: &ElevenLabsConfig) -> Result<(&str, &Secret), SignedU
     Ok((agent_id, api_key))
 }
 
-/// The credentials read-aloud needs: the account key, and the voice that will speak.
-///
-/// Separate from [`credentials`] deliberately. Reading a message aloud does not involve the
-/// conversational agent at all, so a deployment with a voice and no agent must be able to read --
-/// demanding `agent_id` here would refuse a perfectly configured server for a setting the act does
-/// not use.
+/// The account key, which read-aloud needs whichever voice it ends up using.
 ///
 /// # Errors
 ///
 /// [`SpeechError::NotConfigured`] naming the absent setting, before any call is attempted.
-pub fn speech_credentials(config: &ElevenLabsConfig) -> Result<(&str, &Secret), SpeechError> {
-    let api_key = config
+pub fn speech_key(config: &ElevenLabsConfig) -> Result<&Secret, SpeechError> {
+    config
         .api_key
         .as_ref()
         .filter(|key| !key.expose().trim().is_empty())
-        .ok_or(SpeechError::NotConfigured("elevenlabs.api_key"))?;
-    let voice_id = config
+        .ok_or(SpeechError::NotConfigured("elevenlabs.api_key"))
+}
+
+/// The voice the operator named explicitly, if they named one.
+///
+/// `None` is not an error here: an unset `voice_id` means "use the voice the AGENT already
+/// speaks in", which is resolved against ElevenLabs. See [`SpeechProvider::speak`].
+#[must_use]
+pub fn configured_voice(config: &ElevenLabsConfig) -> Option<&str> {
+    config
         .voice_id
         .as_deref()
         .map(str::trim)
         .filter(|id| !id.is_empty())
-        .ok_or(SpeechError::NotConfigured("elevenlabs.voice_id"))?;
-    Ok((voice_id, api_key))
+}
+
+/// The agent whose own voice read-aloud borrows when no `voice_id` is configured.
+///
+/// # Errors
+///
+/// [`SpeechError::NotConfigured`] when neither setting is present, naming BOTH -- either one fixes
+/// it, and an error naming only one would send the operator to configure the wrong thing.
+pub fn voice_source_agent(config: &ElevenLabsConfig) -> Result<&str, SpeechError> {
+    config
+        .agent_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .ok_or(SpeechError::NotConfigured(
+            "elevenlabs.voice_id (or elevenlabs.agent_id, whose own voice would be used)",
+        ))
 }
 
 /// Why a message could not be read aloud.
@@ -191,6 +209,20 @@ impl SpeechError {
             Self::Empty => "nothing_to_read",
             Self::Transport(_) | Self::Status { .. } => "elevenlabs_error",
         }
+    }
+}
+
+/// Carry a signed-URL-shaped failure across to the speech side.
+///
+/// Read-aloud reuses the agent-configuration GET, so its failures arrive as [`SignedUrlError`].
+/// They are the same three failures with the same three fixes; only the sentence differs.
+#[must_use]
+pub fn speech_from_signed(error: SignedUrlError) -> SpeechError {
+    match error {
+        SignedUrlError::NotConfigured(what) => SpeechError::NotConfigured(what),
+        SignedUrlError::Transport(detail) => SpeechError::Transport(detail),
+        SignedUrlError::Status { status, body } => SpeechError::Status { status, body },
+        SignedUrlError::Shape(detail) => SpeechError::Transport(detail),
     }
 }
 

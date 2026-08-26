@@ -94,11 +94,17 @@ writable = false
 # Environment: GENT_TALK_ELEVENLABS_AGENT_ID / GENT_TALK_ELEVENLABS_API_KEY
 #              GENT_TALK_ELEVENLABS_VOICE_ID
 #
-# voice_id is what reads a channel message aloud in the web app. It is SEPARATE from
-# agent_id: a deployment can have a reading voice and no conversational agent, or the
-# reverse. Absent, read-aloud refuses and names this setting -- it does not fall back to
-# whichever voice the account happens to list first, because that is not a decision
-# anybody made.
+# voice_id is OPTIONAL, and most deployments should leave it unset.
+#
+# An agent and a voice are different things in ElevenLabs' model: an agent is a prompt, an
+# LLM, tools AND a voice, while the text-to-speech API takes a voice and knows nothing
+# about agents. So they cannot be one setting. But the agent HAS a voice, and with voice_id
+# unset the server reads it off the configured agent -- so a channel message is read aloud
+# in the same voice that talks to you, from the one thing you configured.
+#
+# Set it only when those should DIFFER. With neither set, read-aloud refuses and names
+# both: it does not fall back to whichever voice the account happens to list first,
+# because that is not a decision anybody made.
 # agent_id = "agent_..."
 # api_key = "REPLACE-ME"
 

@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use crate::agent_backend::NoAgentBackend;
 use crate::config::Config;
 use crate::discord::fake::FakeDiscord;
-use crate::elevenlabs::fake::{FakeElevenLabs, KNOWN_AGENT_ID, KNOWN_VOICE_ID, VALID_API_KEY};
+use crate::elevenlabs::fake::{FakeElevenLabs, KNOWN_AGENT_ID, VALID_API_KEY};
 use crate::retrieval::LexicalRanker;
 use crate::state::AppState;
 use crate::store::fake::FakeStore;
@@ -54,7 +54,6 @@ writable = true
 [elevenlabs]
 agent_id = "{KNOWN_AGENT_ID}"
 api_key = "{VALID_API_KEY}"
-voice_id = "{KNOWN_VOICE_ID}"
 "#
     )
 }

@@ -8,8 +8,8 @@
 use async_trait::async_trait;
 
 use super::{
-    credentials, speech_credentials, SignedUrl, SignedUrlError, SignedUrlProvider, Speech,
-    SpeechError, SpeechProvider,
+    configured_voice, credentials, speech_from_signed, speech_key, voice_source_agent, SignedUrl,
+    SignedUrlError, SignedUrlProvider, Speech, SpeechError, SpeechProvider,
 };
 use crate::config::{ElevenLabsConfig, Secret};
 
@@ -66,6 +66,43 @@ pub fn speech_request(api_base: &str, voice_id: &str) -> PreparedRequest {
             urlencode(voice_id)
         ),
     }
+}
+
+/// Build the request that reads an agent's own configuration back.
+///
+/// Documented as `GET /v1/convai/agents/{agent_id}`. Read-aloud uses it for ONE field:
+/// `conversation_config.tts.voice_id`, the voice that agent already speaks in.
+#[must_use]
+pub fn agent_request(api_base: &str, agent_id: &str) -> PreparedRequest {
+    PreparedRequest {
+        method: "GET",
+        url: format!(
+            "{}/convai/agents/{}",
+            api_base.trim_end_matches('/'),
+            urlencode(agent_id)
+        ),
+    }
+}
+
+/// Pull the agent's configured voice out of its configuration.
+///
+/// # Errors
+///
+/// [`SpeechError::Status`] shape is not used here; an answer without the field is reported as a
+/// [`SpeechError::NotConfigured`] naming `voice_id`, because that is the operator's fix: the agent
+/// really does not have a voice to borrow, and one has to be named.
+pub fn parse_agent_voice(value: &serde_json::Value) -> Result<String, SpeechError> {
+    value
+        .get("conversation_config")
+        .and_then(|c| c.get("tts"))
+        .and_then(|tts| tts.get("voice_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+        .ok_or(SpeechError::NotConfigured(
+            "elevenlabs.voice_id (the configured agent reports no voice of its own)",
+        ))
 }
 
 /// The body that goes with [`speech_request`].
@@ -125,6 +162,12 @@ pub fn parse_signed_url(
 #[derive(Debug)]
 pub struct HttpElevenLabsClient {
     client: reqwest::Client,
+    /// The agent's own voice, once looked up.
+    ///
+    /// Cached because it is a property of the deployment's configuration, not of the message being
+    /// read: without this, every tap on a message would spend TWO vendor calls instead of one, and
+    /// the extra one would return the same answer every time.
+    borrowed_voice: std::sync::Mutex<Option<String>>,
 }
 
 impl HttpElevenLabsClient {
@@ -143,10 +186,48 @@ impl HttpElevenLabsClient {
             .timeout(std::time::Duration::from_secs(20))
             .build()
             .map_err(|e| SignedUrlError::Transport(e.to_string()))?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            borrowed_voice: std::sync::Mutex::new(None),
+        })
     }
 
-    async fn get(
+    /// Which voice reads a message: the one the operator named, or the AGENT'S OWN.
+    ///
+    /// `agent_id` and `voice_id` are different things in ElevenLabs' model -- an agent is a prompt,
+    /// an LLM, tools AND a voice; the text-to-speech API takes a voice and knows nothing about
+    /// agents. So they cannot be one setting. But the agent HAS a voice, and borrowing it is what
+    /// the operator means by "read it in the voice I already configured": one setting, and the
+    /// message is read by the same voice that talks to them.
+    ///
+    /// `voice_id` remains available for the case those should differ.
+    async fn voice_for(
+        &self,
+        config: &ElevenLabsConfig,
+        api_key: &Secret,
+    ) -> Result<String, SpeechError> {
+        if let Some(named) = configured_voice(config) {
+            return Ok(named.to_owned());
+        }
+        if let Some(held) = self.borrowed_voice.lock().ok().and_then(|v| v.clone()) {
+            return Ok(held);
+        }
+        let agent_id = voice_source_agent(config)?;
+        let request = agent_request(&config.api_base, agent_id);
+        let value = self
+            .get_json(&request, api_key)
+            .await
+            .map_err(speech_from_signed)?;
+        let voice = parse_agent_voice(&value)?;
+        if let Ok(mut held) = self.borrowed_voice.lock() {
+            *held = Some(voice.clone());
+        }
+        Ok(voice)
+    }
+
+    /// The same GET the signed-URL path uses, named so read-aloud can share it rather than grow a
+    /// second HTTP shape against the same vendor.
+    async fn get_json(
         &self,
         request: &PreparedRequest,
         api_key: &Secret,
@@ -183,7 +264,7 @@ impl SignedUrlProvider for HttpElevenLabsClient {
     async fn signed_url(&self, config: &ElevenLabsConfig) -> Result<SignedUrl, SignedUrlError> {
         let (agent_id, api_key) = credentials(config)?;
         let request = signed_url_request(&config.api_base, agent_id);
-        let value = self.get(&request, api_key).await?;
+        let value = self.get_json(&request, api_key).await?;
         parse_signed_url(&value, agent_id)
     }
 }
@@ -191,7 +272,9 @@ impl SignedUrlProvider for HttpElevenLabsClient {
 #[async_trait]
 impl SpeechProvider for HttpElevenLabsClient {
     async fn speak(&self, config: &ElevenLabsConfig, text: &str) -> Result<Speech, SpeechError> {
-        let (voice_id, api_key) = speech_credentials(config)?;
+        let api_key = speech_key(config)?;
+        let voice_id = self.voice_for(config, api_key).await?;
+        let voice_id = voice_id.as_str();
         // Checked BEFORE the call, not after: a blank message would otherwise be billed as a
         // request that returns silence.
         if text.trim().is_empty() {
@@ -305,6 +388,33 @@ mod tests {
             head
         });
         (format!("http://{addr}/v1"), handle)
+    }
+
+    #[test]
+    fn an_agents_own_voice_is_read_out_of_its_configuration() {
+        // The one field read-aloud borrows, at the path ElevenLabs actually puts it:
+        // `conversation_config.tts.voice_id` on `GET /v1/convai/agents/{id}`.
+        let value = serde_json::json!({
+            "agent_id": "agent_1",
+            "name": "lead",
+            "conversation_config": { "tts": { "voice_id": "voice_abc", "model_id": "x" } }
+        });
+        assert_eq!(parse_agent_voice(&value).expect("a voice"), "voice_abc");
+    }
+
+    #[test]
+    fn an_agent_with_no_voice_of_its_own_says_so_rather_than_reading_in_silence() {
+        for value in [
+            serde_json::json!({ "conversation_config": { "tts": {} } }),
+            serde_json::json!({ "conversation_config": {} }),
+            serde_json::json!({}),
+            // Present but blank is the same as absent: it would produce a request to an empty
+            // voice id, which fails later and further away.
+            serde_json::json!({ "conversation_config": { "tts": { "voice_id": "  " } } }),
+        ] {
+            let got = parse_agent_voice(&value);
+            assert!(got.is_err(), "{value} produced {got:?}");
+        }
     }
 
     fn live_config(api_base: String) -> ElevenLabsConfig {

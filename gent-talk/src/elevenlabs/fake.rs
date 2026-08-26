@@ -21,8 +21,8 @@ use async_trait::async_trait;
 
 use super::http::{signed_url_request, speech_request, TTS_CONTENT_TYPE};
 use super::{
-    credentials, speech_credentials, SignedUrl, SignedUrlError, SignedUrlProvider, Speech,
-    SpeechError, SpeechProvider,
+    configured_voice, credentials, speech_key, voice_source_agent, SignedUrl, SignedUrlError,
+    SignedUrlProvider, Speech, SpeechError, SpeechProvider,
 };
 use crate::config::ElevenLabsConfig;
 
@@ -145,7 +145,27 @@ impl SpeechProvider for FakeElevenLabs {
     async fn speak(&self, config: &ElevenLabsConfig, text: &str) -> Result<Speech, SpeechError> {
         // Same gate the real client goes through, first, so an unconfigured server cannot be made
         // to look configured by swapping in this fake.
-        let (voice_id, api_key) = speech_credentials(config)?;
+        let api_key = speech_key(config)?;
+        // Same resolution the real client performs: an explicit voice wins, otherwise the
+        // configured AGENT's own voice is borrowed. A fake that only honoured an explicit voice
+        // would leave the path production actually takes untested.
+        let voice_id = match configured_voice(config) {
+            Some(named) => named.to_owned(),
+            None => {
+                let agent_id = voice_source_agent(config)?;
+                if !self.lock().known_agents.contains(agent_id) {
+                    return Err(SpeechError::from_response(
+                        404,
+                        &format!(
+                            r#"{{"detail":{{"status":"agent_not_found","message":"{agent_id}"}}}}"#
+                        ),
+                        api_key,
+                    ));
+                }
+                KNOWN_VOICE_ID.to_owned()
+            }
+        };
+        let voice_id = voice_id.as_str();
         // ...and the same refusal, BEFORE anything is recorded as spoken: a blank message must not
         // appear in `spoken`, because a test proving "the refusal read nothing" depends on it.
         if text.trim().is_empty() {
