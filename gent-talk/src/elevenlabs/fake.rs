@@ -15,14 +15,16 @@
 //! in production — before any call is attempted, naming the setting.
 
 use std::collections::BTreeSet;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 
 use super::http::{signed_url_request, speech_request, TTS_CONTENT_TYPE};
 use super::{
-    clamp_speed, configured_voice, credentials, speech_key, voice_source_agent, SignedUrl,
-    SignedUrlError, SignedUrlProvider, Speech, SpeechError, SpeechProvider,
+    chat_from_signed, clamp_speed, configured_voice, credentials, speech_key, voice_source_agent,
+    ChatError, SignedUrl, SignedUrlError, SignedUrlProvider, Speech, SpeechError, SpeechProvider,
+    TextChat, TextChatProvider,
 };
 use crate::config::ElevenLabsConfig;
 
@@ -46,17 +48,41 @@ pub const MINTED_URL: &str =
     "wss://api.elevenlabs.io/v1/convai/conversation?agent_id=agent_fake0000000000000000000000\
      &token=fake-conversation-token";
 
+/// Everything one text conversation with the fake agent saw.
+///
+/// The record, not a count, and for the same reason [`FakeElevenLabs::spoken`] is a list: the
+/// claim worth making about a pooled socket is "these eight summaries went down ONE conversation
+/// and the ninth opened another", and a count of conversations cannot say which question landed
+/// on which.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FakeChat {
+    /// Every prompt sent down this conversation, in order.
+    pub asked: Vec<String>,
+    /// Whether it was closed politely. ElevenLabs bills connection time, so "forgotten" and
+    /// "closed" are different outcomes and a test has to be able to tell them apart.
+    pub closed: bool,
+}
+
 /// In-memory ElevenLabs.
 #[derive(Debug)]
 pub struct FakeElevenLabs {
     valid_api_key: String,
-    state: Mutex<State>,
+    /// Shared rather than owned, because an open conversation records into it after the call that
+    /// created it has returned.
+    state: Arc<Mutex<State>>,
 }
 
 #[derive(Debug, Default)]
 struct State {
     known_agents: BTreeSet<String>,
     known_voices: BTreeSet<String>,
+    /// Every text conversation opened, in order.
+    chats: Vec<FakeChat>,
+    /// What the agent answers, when a test has chosen. `None` is an answer derived from which
+    /// conversation and which turn it is, so a test can prove WHICH socket served a summary.
+    answer: Option<String>,
+    /// Make the next turn fail. One-shot, so recovery is testable too.
+    fail_turn: Option<String>,
     /// Every text this fake was asked to read, in order, so a test can prove WHAT was spoken --
     /// and that a refusal spoke nothing.
     spoken: Vec<String>,
@@ -101,16 +127,39 @@ impl FakeElevenLabs {
         known_voices.insert(KNOWN_VOICE_ID.to_owned());
         Self {
             valid_api_key: VALID_API_KEY.to_owned(),
-            state: Mutex::new(State {
+            state: Arc::new(Mutex::new(State {
                 known_agents,
                 known_voices,
+                chats: Vec::new(),
+                answer: None,
+                fail_turn: None,
                 spoken: Vec::new(),
                 speeds: Vec::new(),
                 requested: Vec::new(),
                 minted_url: MINTED_URL.to_owned(),
                 fail_with: None,
-            }),
+            })),
         }
+    }
+
+    /// Every text conversation this fake has held, in order.
+    #[must_use]
+    pub fn chats(&self) -> Vec<FakeChat> {
+        self.lock().chats.clone()
+    }
+
+    /// Fix what the agent answers, so a test can drive the formatting path.
+    pub fn answer_with(&self, text: &str) {
+        self.lock().answer = Some(text.to_owned());
+    }
+
+    /// Make the next TURN fail — the conversation is open and the question is refused.
+    ///
+    /// Distinct from [`FakeElevenLabs::fail_next`], which fails the mint and so means the
+    /// conversation was never opened at all. A pool has to survive the first and report the
+    /// second, and a fake with one control could not tell them apart.
+    pub fn fail_next_turn(&self, detail: &str) {
+        self.lock().fail_turn = Some(detail.to_owned());
     }
 
     /// Declare that this account has `agent_id`.
@@ -259,6 +308,71 @@ impl SignedUrlProvider for FakeElevenLabs {
     }
 }
 
+#[async_trait]
+impl TextChatProvider for FakeElevenLabs {
+    async fn open_text_chat(
+        &self,
+        config: &ElevenLabsConfig,
+        _deadline: Duration,
+    ) -> Result<Box<dyn TextChat>, ChatError> {
+        // A real conversation begins with a real mint, so this one does too — through this fake's
+        // OWN signed-URL path, not around it. That is what makes "this account does not have that
+        // key" and "this account does not have that agent" refusals of a CONVERSATION rather than
+        // refusals a separate code path would have to reinvent and could get wrong differently.
+        let _minted = self.signed_url(config).await.map_err(chat_from_signed)?;
+        let mut state = self.lock();
+        state.chats.push(FakeChat::default());
+        let index = state.chats.len() - 1;
+        drop(state);
+        Ok(Box::new(FakeTextChat {
+            state: Arc::clone(&self.state),
+            index,
+        }))
+    }
+}
+
+/// One conversation with the fake agent.
+#[derive(Debug)]
+pub struct FakeTextChat {
+    state: Arc<Mutex<State>>,
+    index: usize,
+}
+
+impl FakeTextChat {
+    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+#[async_trait]
+impl TextChat for FakeTextChat {
+    async fn ask(&mut self, text: &str, _deadline: Duration) -> Result<String, ChatError> {
+        let mut state = self.lock();
+        if let Some(detail) = state.fail_turn.take() {
+            return Err(ChatError::Transport(detail));
+        }
+        let chat = &mut state.chats[self.index];
+        chat.asked.push(text.to_owned());
+        let turn = chat.asked.len();
+        // Deliberately NOT the prompt back: a fake that echoed its input would let a summariser
+        // that returned the message verbatim pass as one that summarised it. It DOES name the
+        // conversation and the turn, because "which socket served this summary" is the one thing
+        // a pool has to be able to prove.
+        Ok(state.answer.clone().unwrap_or_else(|| {
+            format!(
+                "the fake agent answered on conversation {} turn {turn}",
+                self.index
+            )
+        }))
+    }
+
+    async fn close(self: Box<Self>) {
+        self.lock().chats[self.index].closed = true;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -345,6 +459,76 @@ mod tests {
             .signed_url(&config(Some("agent_someone_elses"), Some(VALID_API_KEY)))
             .await
             .is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_text_conversation_is_refused_on_exactly_the_terms_a_mint_is() {
+        // The load-bearing property for the summariser tests above this one. A fake that opened a
+        // conversation for any key would make every one of them self-certifying.
+        let fake = FakeElevenLabs::new();
+        let deadline = Duration::from_secs(1);
+        assert!(fake.open_text_chat(&good(), deadline).await.is_ok());
+
+        let wrong_key = config(Some(KNOWN_AGENT_ID), Some("xi-wrong-key"));
+        assert!(
+            matches!(
+                fake.open_text_chat(&wrong_key, deadline).await,
+                Err(ChatError::Refused(_))
+            ),
+            "a key this account does not have must not open a conversation"
+        );
+        let no_key = config(Some(KNOWN_AGENT_ID), None);
+        assert!(matches!(
+            fake.open_text_chat(&no_key, deadline).await,
+            Err(ChatError::NotConfigured("elevenlabs.api_key"))
+        ));
+        let unknown_agent = config(Some("agent_someone_elses"), Some(VALID_API_KEY));
+        assert!(matches!(
+            fake.open_text_chat(&unknown_agent, deadline).await,
+            Err(ChatError::Refused(_))
+        ));
+        assert_eq!(
+            fake.chats().len(),
+            1,
+            "a refused conversation must not be recorded as one that happened"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_conversation_records_what_it_was_asked_and_whether_it_was_hung_up() {
+        let fake = FakeElevenLabs::new();
+        let mut chat = fake
+            .open_text_chat(&good(), Duration::from_secs(1))
+            .await
+            .expect("opens");
+        let first = chat
+            .ask("summarise this", Duration::from_secs(1))
+            .await
+            .expect("answers");
+        assert!(
+            !first.contains("summarise this"),
+            "a fake that echoed its input would let a summariser that returned the message \
+             verbatim pass: {first}"
+        );
+        chat.ask("and this", Duration::from_secs(1))
+            .await
+            .expect("answers");
+        assert_eq!(fake.chats()[0].asked, vec!["summarise this", "and this"]);
+        assert!(!fake.chats()[0].closed);
+        chat.close().await;
+        assert!(fake.chats()[0].closed);
+    }
+
+    #[tokio::test]
+    async fn a_refused_turn_is_one_shot_so_recovery_is_testable() {
+        let fake = FakeElevenLabs::new();
+        let mut chat = fake
+            .open_text_chat(&good(), Duration::from_secs(1))
+            .await
+            .expect("opens");
+        fake.fail_next_turn("the conversation was closed at the far end");
+        assert!(chat.ask("one", Duration::from_secs(1)).await.is_err());
+        assert!(chat.ask("two", Duration::from_secs(1)).await.is_ok());
     }
 
     #[tokio::test]

@@ -164,13 +164,46 @@ writable = false
 # target_chars = 160
 # context_messages = 3        # how many preceding messages ride along as context
 #
-# The model to ask. NOTE: no model-backed summariser is wired up yet, so today this setting does
-# exactly one thing — it is folded into the cache key, so setting it invalidates every summary
-# produced without it. Unset means the shipped extractive backend: truncation, no model, no
-# network, no cost. The server says which one it is using at startup, and every summary answer
-# carries the backend name, so a page can never imply a model summary it did not get.
+# The model to ask. NOTE: no backend reads this yet — the agent backend below asks whichever model
+# the ElevenLabs agent is configured with — so today it does exactly one thing: it is folded into
+# the cache key, so setting it invalidates every summary produced without it.
 # Environment: GENT_TALK_SUMMARY_MODEL
 # model = "..."
+
+# WHICH SUMMARISER RUNS.
+#
+#   "extractive"       (the default) truncation. No model, no network, no cost. A deployment that
+#                      has never heard of ElevenLabs works, and nothing starts costing money
+#                      because somebody upgraded.
+#   "elevenlabs_agent" the conversational agent named in [elevenlabs], asked in TEXT over its own
+#                      WebSocket with audio generation suppressed. Needs elevenlabs.agent_id and
+#                      elevenlabs.api_key; without them every summary request refuses by name
+#                      rather than falling back, because a silent fallback to truncation is
+#                      indistinguishable from the agent working badly.
+#
+# The server says which one it is using at startup, and every summary answer carries the backend
+# name, so a page can never imply a model summary it did not get. Every answer also carries
+# generated_in_ms, so a deployment can see what a round trip to the agent actually costs without
+# instrumenting anything.
+#
+# NOTHING IN THE AGENT BACKEND HAS BEEN RUN AGAINST LIVE ELEVENLABS. The protocol was read out of
+# the vendor's SDK and is exercised offline against this repository's own mock, which was written
+# from the same reading. The first real conversation is the experiment.
+# Environment: GENT_TALK_SUMMARY_BACKEND
+# backend = "extractive"
+
+# HOW THE AGENT'S CONVERSATION IS POOLED. Only "elevenlabs_agent" reads these, and both of the
+# first two are folded into the cache key because both change what a summary SAYS.
+#
+# A ConvAI socket is a CONVERSATION: everything asked down one stays in the agent's context,
+# including its own previous answers, and there is no event that resets it. So a socket shared by
+# too many summaries writes the last one in front of all the earlier ones, and a socket per
+# summary pays a mint, a TLS handshake and an initiation round trip every time — and ElevenLabs
+# bills connection time as well as tokens. These are the two dials between those failures; see the
+# module doc of src/summarize/agent.rs for the arithmetic behind the defaults.
+# max_per_socket = 8            # summaries one conversation serves before it is recycled; min 1
+# socket_idle_seconds = 30      # quiet after which a held conversation is closed
+# reply_timeout_seconds = 30    # ceiling on one turn, and on one opening handshake; min 1
 
 [replay]
 # RESUMING A CONVERSATION ACROSS A HANG-UP. The vendor cannot resume a closed conversation, so

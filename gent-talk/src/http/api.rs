@@ -1595,6 +1595,14 @@ pub struct MessageSummaryResponse {
     pub version: String,
     /// The length below which nothing is summarised, so a client can avoid asking at all.
     pub threshold_chars: usize,
+    /// How long the summariser took, in milliseconds, or `null` when none was called.
+    ///
+    /// Answered rather than merely logged because the question "how does a round trip to a hosted
+    /// conversational agent compare with a full-size model" is one a deployment should be able to
+    /// answer from its own traffic, on the first real run, without instrumenting anything.
+    /// `null` for a cache hit or a message below the threshold: a zero would claim the vendor
+    /// answered instantly, which is a different thing from not having asked it.
+    pub generated_in_ms: Option<u64>,
     /// Standing reminder that a summary of third-party text is still third-party text.
     pub untrusted_content_notice: &'static str,
 }
@@ -1609,15 +1617,16 @@ pub async fn message_summary(
     // The granted scope, not the required one: a read token may be served FROM the cache but
     // never writes to it. See `ops::summarize_message`.
     let caller = require(&headers, &state, Scope::Read)?;
-    let (channel, outcome) =
+    let answer =
         ops::summarize_message(&state, caller, &channel_id, &message_id, query.limit).await?;
     Ok(Json(MessageSummaryResponse {
-        channel,
+        channel: answer.channel,
         message_id,
-        outcome,
+        outcome: answer.outcome,
         backend: state.summarizer.describe(),
         version: state.summary_version.to_string(),
         threshold_chars: state.config.summaries.threshold_chars,
+        generated_in_ms: answer.generated_in_ms,
         untrusted_content_notice: untrusted::NOTICE,
     }))
 }

@@ -46,6 +46,7 @@ the reference behind it: what every route does, what the security model is, and 
 | Discord read + post behind a trait | **written, unit-tested; never run against live Discord** |
 | In-memory Discord for tests and `--fake-discord` | **works** |
 | Digest / summarization | **works**, extractive and deterministic (no model call) |
+| Summaries from the ElevenLabs agent (`summaries.backend = "elevenlabs_agent"`) | **written, unit- and integration-tested offline, NEVER RUN AGAINST LIVE ELEVENLABS.** Asks the configured conversational agent in text over its own WebSocket, on a pooled conversation recycled every eight summaries. The frames were read out of the vendor's SDK; the offline tests drive the real socket client against this repository's own mock, which was written from the same reading, so the two agree with each other and not yet with ElevenLabs. Off by default. |
 | Semantic random access (`resolve`) | **works**, lexical ranking behind a `Ranker` trait |
 | Web app: text tab, digest, find-a-message, local speech | **works** |
 | **MCP over Streamable HTTP at `/mcp`** | **works.** Bearer-authenticated, stateless, seven tools, tested end to end. Never yet driven by a real ElevenLabs agent. |
@@ -358,7 +359,11 @@ curl -s -X POST localhost:8080/mcp \
 | Summary threshold | `summaries.threshold_chars` | — | below this nothing is summarised, default `400` |
 | Summary width | `summaries.target_chars` | — | default `160` |
 | Summary context | `summaries.context_messages` | — | preceding messages shown as context, default `3` |
-| Summary model | `summaries.model` | `GENT_TALK_SUMMARY_MODEL` | unset means the extractive backend |
+| Summary model | `summaries.model` | `GENT_TALK_SUMMARY_MODEL` | no backend reads it yet; it only moves the cache key |
+| Summariser | `summaries.backend` | `GENT_TALK_SUMMARY_BACKEND` | `extractive` (default) or `elevenlabs_agent`; an unknown name is refused, not defaulted |
+| Agent conversation budget | `summaries.max_per_socket` | — | summaries one conversation serves before it is recycled, default `8`, minimum 1 |
+| Agent conversation idle close | `summaries.socket_idle_seconds` | — | default `30` |
+| Agent turn deadline | `summaries.reply_timeout_seconds` | — | one turn, and one opening handshake, default `30`, minimum 1 |
 | Resuming | `replay.enabled` | `GENT_TALK_REPLAY_ENABLED` | **off by default**; on, every new call re-sends earlier conversation content to the vendor |
 | Replay budget | `replay.max_chars` / `replay.max_turns` | `GENT_TALK_REPLAY_MAX_CHARS` / `_TURNS` | default `6000` / `40`; oldest dropped first; `0` is refused, not "unlimited" |
 | Replay transport | `replay.transport` | `GENT_TALK_REPLAY_TRANSPORT` | `contextual_update` (default) or `client_data` |
@@ -474,18 +479,28 @@ plus Discord text written by third parties.
 
 ### Cached summaries
 
-`src/summarize/` is a second trait over the same store. The shipped backend is extractive —
-truncation, no model, no network, no cost — and the server says which one is running at startup;
-every summary answer carries the backend name, so a page can never imply a model summary it did
-not get.
+`src/summarize/` is a second trait over the same store. Two backends implement it, chosen by
+`summaries.backend`, and the server says which one is running at startup; every summary answer
+carries the backend name, so a page can never imply a model summary it did not get.
+
+* **`extractive`** (the default) — truncation, no model, no network, no cost. A deployment that
+  has never heard of ElevenLabs works, and nothing starts costing money because somebody upgraded.
+* **`elevenlabs_agent`** — the configured conversational agent, asked in text. See below.
 
 What is actually load-bearing here is the **cache key**, because a cached derived value has one
-failure mode and it is silent. Five things decide what a summary says: the prompt, the model, the
-width, the context window, and the message text. The first four are folded into
-`summarize::policy_version` — one function, one string, part of every key — so changing any of
-them makes every summary produced under the old policy unreachable at once, and a startup sweep
-deletes the entries. The fifth is a separate `content_hash`, so an upstream **edit** invalidates
-one entry rather than the whole cache.
+failure mode and it is silent. What decides what a summary says is the prompt, whatever else the
+backend contributes, every number in `[summaries]`, and the message text. All but the last are
+folded into `summarize::policy_version` — one function, one string, part of every key — so
+changing any of them makes every summary produced under the old policy unreachable at once, and a
+startup sweep deletes the entries. The message text is a separate `content_hash`, so an upstream
+**edit** invalidates one entry rather than the whole cache.
+
+The backend's own contribution comes from the trait rather than from a constant beside the
+constructor: `Summarizer::backend` gives the slug and `Summarizer::policy_input` gives everything
+else. That matters for the agent backend, whose answers depend on *which agent* — a different
+`elevenlabs.agent_id` is a different model, a different system prompt and a different voice of
+writing, and it lives outside `[summaries]` entirely. It goes into `policy_input`, so repointing
+the deployment cannot serve the old agent's summaries.
 
 The version is deliberately legible (`v1-extractive-w3-c160-8f1b…`), because a stale entry is
 diagnosed by someone with a shell. It is FNV-1a and is **not** a security hash: it detects a
@@ -505,6 +520,62 @@ same `0600`. It is bounded by the same retention, it goes with the rest on a pur
 never written by a read-scope caller: `/summary` answers a read token and serves it from the
 cache, but only a write-scope caller's answer is filed. The read token is the one pasted into the
 voice agent, and a durable write reachable from it is what the two-token split exists to prevent.
+
+### Summaries from the ElevenLabs agent
+
+> **Nothing in this section has been run against live ElevenLabs.** The protocol was read out of
+> the vendor's SDK. Every offline test drives the real socket client against this repository's own
+> mock, which was written from the same reading — so the two agree with each other, not with the
+> vendor. The first real conversation is the experiment, and it is instrumented to be one.
+
+There is no REST endpoint for "send this text to my agent, get text back". `simulate_conversation`
+looks like the missing one and is not: it is deprecated, and what it simulates is the *user*. The
+only path is the conversation WebSocket the browser uses, so `src/elevenlabs/socket.rs` opens one,
+sends `conversation_initiation_client_data` with `conversation_config_override.text_only = true`
+— which suppresses speech synthesis, the expensive half — asks a `user_message`, and reads until
+`agent_response`. It answers the vendor's application-level `ping` events while it waits, because
+a conversation that stops echoing them is closed for being idle.
+
+**The pool is the design.** A ConvAI socket is a *conversation*: everything sent down one stays in
+the agent's context, including the agent's own previous answers, and there is no event that resets
+it. Summarising twenty messages down one socket makes each summary an input to the next — context
+grows without bound, cost grows with it, and later summaries are written in front of earlier
+people's messages. A socket per summary avoids all of that and pays a mint, a TLS handshake, a
+WebSocket upgrade and an initiation round trip every single time, on a vendor that bills
+connection time as well as tokens.
+
+So there is **one pooled conversation, recycled every `summaries.max_per_socket` summaries
+(default 8) and closed after `summaries.socket_idle_seconds` of quiet (default 30)**. Counting in
+prompt-equivalents, the k-th summary on a shared socket carries about *k* of them, so a socket
+serving *N* costs about *N(N+1)/2* where *N* separate sockets cost *N*: at N=8 that is 36 for 8,
+with the handshake paid once instead of eight times; at N=32 it would be 528 for 32 and the
+quadratic term has overtaken the handshake it was meant to amortise. Both numbers are folded into
+the cache key, because both change what a summary says. A pooled conversation that fails on its
+first write is retried **once** on a fresh socket — a vendor is free to close an idle conversation
+from its end, and failing a summary for that would make the pool a source of errors the naive
+design does not have. A *fresh* socket that fails is a real failure and is not retried.
+
+**Plain text.** The summary is rendered with `textContent` and read aloud, so a markdown bullet is
+an asterisk on the screen and a word in the ear. The agent is told so, in `PLAIN_TEXT_RULE`, which
+is part of the cache key; and because an instruction is a request a model may decline, what comes
+back is flattened — leading heading and list markers, paired `**`/`__`, and everything
+`summary::condense` already removes. Deliberately conservative: a single `*` is left alone,
+because mangling "the `*` operator" is worse than the bullet that was already stripped.
+
+**It measures itself.** How a round trip to a hosted conversational agent compares with a
+full-size model is an open question nobody here has a number for, so the first real run answers it
+rather than needing a separate experiment. Every summary answer carries `generated_in_ms`
+(`null` for a cache hit or a message below the threshold — a zero would claim the vendor answered
+instantly), `ops` logs one INFO line per request with the backend and the elapsed time, and the
+agent backend logs its own breakdown: `connect_ms` (what the pool exists to avoid paying),
+`answer_ms`, `reused_socket` and `socket_turn`.
+
+The four failures stay apart, as everywhere else on the ElevenLabs side: not configured (names the
+setting, dials nothing), refused (the vendor said no — a rejected key at the mint, or a close
+frame on the socket), unreachable, and a shape this server cannot read. `summarizer_refused` is
+its own code precisely because "the key is wrong" and "the network is down" are fixed differently.
+Every error built from a vendor response goes through `redact`, against both the account key **and
+the minted URL**, which carries a single-use token and is quoted verbatim by a connect failure.
 
 ### Migrations
 

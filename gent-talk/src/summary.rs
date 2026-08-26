@@ -13,6 +13,14 @@ use crate::model::{Message, UserId};
 /// Default width of a spoken digest line.
 pub const DEFAULT_SUMMARY_CHARS: usize = 160;
 
+/// What [`condense`] says when there is nothing speakable left.
+///
+/// A placeholder is right for a digest line — the message exists and has no words in it, and the
+/// listener should hear that. It is NOT right for anything that paid a vendor for an answer, which
+/// is why the constant is public: a caller that must tell "the model said nothing" apart from "the
+/// model said something" has to be able to recognise this without repeating the literal.
+pub const NO_TEXT: &str = "(no text)";
+
 /// One entry of a channel digest.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct DigestEntry {
@@ -44,7 +52,7 @@ pub struct DigestEntry {
 pub fn condense(content: &str, max_chars: usize) -> String {
     let flattened = flatten(content);
     if flattened.is_empty() {
-        return "(no text)".to_owned();
+        return NO_TEXT.to_owned();
     }
     truncate_on_word_boundary(&flattened, max_chars)
 }

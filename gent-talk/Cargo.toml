@@ -60,7 +60,20 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
-tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake"] }
+# `rustls-tls-webpki-roots` is what lets this crate dial a `wss://` URL at all: without a TLS
+# feature, `connect_async` refuses the scheme outright, and the ONLY signed URL ElevenLabs mints is
+# `wss://`. rustls rather than native-tls, and bundled roots rather than the platform store, so
+# that the summariser's socket makes the same trust decision as `reqwest` above it -- one TLS
+# stack, and a trust set that does not vary with the host the container happens to run on.
+#
+# It costs a SECOND copy of `webpki-roots` in the lockfile (0.26 for tungstenite, 1.0 for reqwest),
+# because the two crates pin different majors. That is a duplicated root list, not a second TLS
+# implementation, and it collapses on its own the moment tungstenite moves to 1.0.
+tokio-tungstenite = { version = "0.30", default-features = false, features = [
+    "connect",
+    "handshake",
+    "rustls-tls-webpki-roots",
+] }
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

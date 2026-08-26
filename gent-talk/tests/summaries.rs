@@ -84,7 +84,7 @@ async fn a_short_message_costs_no_summariser_call_at_all() {
     server.seed("the runner stalled");
     let id = server.newest_id().await;
 
-    let (_channel, outcome) =
+    let ops::Summarised { outcome, .. } =
         ops::summarize_message(&server.state, Scope::Write, READ_CHANNEL, &id, None)
             .await
             .expect("summarises");
@@ -101,7 +101,7 @@ async fn a_short_message_costs_no_summariser_call_at_all() {
     let control = new_server(5, 4, 3);
     control.seed("the runner stalled");
     let id = control.newest_id().await;
-    let (_channel, outcome) =
+    let ops::Summarised { outcome, .. } =
         ops::summarize_message(&control.state, Scope::Write, READ_CHANNEL, &id, None)
             .await
             .expect("summarises");
@@ -118,10 +118,13 @@ async fn asking_twice_generates_once() {
     server.seed(&long_text("deploy"));
     let id = server.newest_id().await;
 
-    let (_c, first) = ops::summarize_message(&server.state, Scope::Write, READ_CHANNEL, &id, None)
-        .await
-        .expect("summarises");
-    let (_c, second) = ops::summarize_message(&server.state, Scope::Write, READ_CHANNEL, &id, None)
+    let ops::Summarised { outcome: first, .. } =
+        ops::summarize_message(&server.state, Scope::Write, READ_CHANNEL, &id, None)
+            .await
+            .expect("summarises");
+    let ops::Summarised {
+        outcome: second, ..
+    } = ops::summarize_message(&server.state, Scope::Write, READ_CHANNEL, &id, None)
         .await
         .expect("summarises");
 
@@ -159,9 +162,10 @@ async fn changing_a_summary_setting_makes_every_old_summary_unreachable() {
     let wider_summarizer = wider_server.summarizer.clone();
     let wider_id = newest_id(&wider).await;
 
-    let (_c, outcome) = ops::summarize_message(&wider, Scope::Write, READ_CHANNEL, &wider_id, None)
-        .await
-        .expect("summarises");
+    let ops::Summarised { outcome, .. } =
+        ops::summarize_message(&wider, Scope::Write, READ_CHANNEL, &wider_id, None)
+            .await
+            .expect("summarises");
     assert!(
         matches!(outcome, SummaryOutcome::Generated(_)),
         "a changed policy served a summary produced under the old one: {outcome:?}"
@@ -192,7 +196,7 @@ async fn editing_the_message_upstream_regenerates_only_that_summary() {
     server
         .discord
         .edit(&MessageId(edited.clone()), &long_text("rollback reverted"));
-    let (_c, outcome) =
+    let ops::Summarised { outcome, .. } =
         ops::summarize_message(&server.state, Scope::Write, READ_CHANNEL, &edited, None)
             .await
             .expect("summarises");
@@ -202,7 +206,7 @@ async fn editing_the_message_upstream_regenerates_only_that_summary() {
     );
     assert_eq!(server.summarizer.calls(), 3);
 
-    let (_c, again) =
+    let ops::Summarised { outcome: again, .. } =
         ops::summarize_message(&server.state, Scope::Write, READ_CHANNEL, &untouched, None)
             .await
             .expect("summarises");
@@ -281,7 +285,7 @@ async fn a_read_scope_caller_is_served_from_the_cache_and_never_writes_to_it() {
     let id = server.newest_id().await;
 
     for _ in 0..2 {
-        let (_c, outcome) =
+        let ops::Summarised { outcome, .. } =
             ops::summarize_message(&server.state, Scope::Read, READ_CHANNEL, &id, None)
                 .await
                 .expect("a read token may ask");
@@ -299,7 +303,9 @@ async fn a_read_scope_caller_is_served_from_the_cache_and_never_writes_to_it() {
 
     // THE CONTROL, twice over. The same message, the same store, a WRITE-scope caller: it fills
     // the cache...
-    let (_c, filled) = ops::summarize_message(&server.state, Scope::Write, READ_CHANNEL, &id, None)
+    let ops::Summarised {
+        outcome: filled, ..
+    } = ops::summarize_message(&server.state, Scope::Write, READ_CHANNEL, &id, None)
         .await
         .expect("summarises");
     assert!(matches!(filled, SummaryOutcome::Generated(_)), "{filled:?}");
@@ -307,9 +313,10 @@ async fn a_read_scope_caller_is_served_from_the_cache_and_never_writes_to_it() {
 
     // ...and the read token is then served FROM it, which is the half of the rule that makes the
     // assertions above about the WRITE rather than about a store that never works.
-    let (_c, spent) = ops::summarize_message(&server.state, Scope::Read, READ_CHANNEL, &id, None)
-        .await
-        .expect("summarises");
+    let ops::Summarised { outcome: spent, .. } =
+        ops::summarize_message(&server.state, Scope::Read, READ_CHANNEL, &id, None)
+            .await
+            .expect("summarises");
     assert!(
         matches!(spent, SummaryOutcome::Cached(_)),
         "a read token must still be served from an entry someone else filed: {spent:?}"
@@ -332,9 +339,10 @@ async fn a_store_that_cannot_cache_degrades_to_generating_rather_than_refusing()
     let id = newest_id(&state).await;
 
     for _ in 0..2 {
-        let (_c, outcome) = ops::summarize_message(&state, Scope::Write, READ_CHANNEL, &id, None)
-            .await
-            .expect("an unconfigured store must not make a read fail");
+        let ops::Summarised { outcome, .. } =
+            ops::summarize_message(&state, Scope::Write, READ_CHANNEL, &id, None)
+                .await
+                .expect("an unconfigured store must not make a read fail");
         assert!(
             matches!(outcome, SummaryOutcome::Generated(_)),
             "{outcome:?}"
@@ -360,7 +368,7 @@ async fn a_summariser_that_refuses_is_reported_rather_than_papered_over() {
     assert_eq!(error.code(), "summarizer_error", "{error}");
 
     // One-shot, so the recovery is asserted too: a failure must not disable summarising forever.
-    let (_c, outcome) =
+    let ops::Summarised { outcome, .. } =
         ops::summarize_message(&server.state, Scope::Write, READ_CHANNEL, &id, None)
             .await
             .expect("summarises");

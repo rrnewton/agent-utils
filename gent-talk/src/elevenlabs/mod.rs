@@ -22,6 +22,9 @@
 pub mod fake;
 pub mod http;
 pub mod mock;
+pub mod socket;
+
+use std::time::Duration;
 
 use async_trait::async_trait;
 
@@ -83,6 +86,18 @@ pub fn redact(text: &str, secret: &Secret) -> String {
         return text.to_owned();
     }
     text.replace(needle, REDACTED)
+}
+
+/// [`redact`] against every secret in turn.
+///
+/// A conversation holds more than one: the account key, and the minted URL's single-use token,
+/// which is a credential in its own right and is quoted verbatim by any connect failure. One call
+/// per secret is easy to forget at one of several call sites, so there is a function for it.
+#[must_use]
+pub fn redact_all(text: &str, secrets: &[Secret]) -> String {
+    secrets
+        .iter()
+        .fold(text.to_owned(), |acc, secret| redact(&acc, secret))
 }
 
 /// What [`redact`] leaves behind.
@@ -321,6 +336,144 @@ pub trait SignedUrlProvider: Send + Sync {
     async fn signed_url(&self, config: &ElevenLabsConfig) -> Result<SignedUrl, SignedUrlError>;
 }
 
+/// Why a text turn with the conversational agent could not be completed.
+///
+/// The same four distinguishable failures as [`SignedUrlError`], and for the same reason: "you
+/// never configured an agent", "ElevenLabs refused", "ElevenLabs is unreachable" and "the answer
+/// was not in a shape this server understands" have four different fixes. They must not arrive as
+/// one generic error, because the operator's next action differs in every case.
+///
+/// [`ChatError::Refused`] carries a sentence rather than a status code because a ConvAI refusal
+/// arrives by two different routes: the mint is HTTP and refuses with a status, while the socket
+/// refuses by *closing* with an RFC6455 code. Inventing an HTTP status for a close frame would
+/// make a diagnostic lie about which half said no.
+#[derive(Debug, thiserror::Error)]
+pub enum ChatError {
+    /// A required setting is absent, so no call was attempted.
+    #[error("{0} is not configured; this server cannot talk to a conversational agent")]
+    NotConfigured(&'static str),
+    /// ElevenLabs was reached and said no — a rejected key, an agent that is not on the account,
+    /// or a conversation the vendor closed on us.
+    #[error("elevenlabs refused the conversation: {0}")]
+    Refused(String),
+    /// The conversation never completed: DNS, TCP, TLS, a dropped socket, or a deadline.
+    #[error("the conversational agent could not be reached: {0}")]
+    Transport(String),
+    /// The vendor answered, but not with anything this server can read as a reply.
+    #[error("the conversational agent answered with something this server cannot use: {0}")]
+    Shape(String),
+}
+
+impl ChatError {
+    /// Build a [`ChatError::Refused`] from a vendor response body.
+    ///
+    /// Truncates and redacts for the same reason [`SignedUrlError::from_response`] does: the body
+    /// is third-party text that may quote the credential we just sent, and it ends up in a log.
+    /// Takes every secret the conversation holds, not only the key — see [`redact_all`].
+    #[must_use]
+    pub fn from_response(status: u16, body: &str, secrets: &[Secret]) -> Self {
+        let mut body = redact_all(body, secrets);
+        body.truncate(500);
+        Self::Refused(format!("HTTP {status}: {body}"))
+    }
+
+    /// Build a [`ChatError::Refused`] from a WebSocket close frame.
+    ///
+    /// The reason is vendor text and is redacted on the same terms. So is the CODE's meaning: a
+    /// close with no reason at all is still a refusal, and saying so beats an empty message.
+    #[must_use]
+    pub fn from_close(code: u16, reason: &str, secrets: &[Secret]) -> Self {
+        let mut reason = redact_all(reason, secrets);
+        reason.truncate(500);
+        if reason.trim().is_empty() {
+            reason = "(the vendor gave no reason)".to_owned();
+        }
+        Self::Refused(format!(
+            "the agent closed the conversation with code {code}: {reason}"
+        ))
+    }
+
+    /// Stable machine-readable code for the API layer.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::NotConfigured(_) => "elevenlabs_not_configured",
+            Self::Refused(_) | Self::Transport(_) | Self::Shape(_) => "elevenlabs_error",
+        }
+    }
+}
+
+/// Carry a signed-URL-shaped failure across to the chat side.
+///
+/// A text conversation begins with the same mint the browser uses, so its failures arrive as
+/// [`SignedUrlError`]. They are the same failures with the same fixes; only the sentence differs.
+#[must_use]
+pub fn chat_from_signed(error: SignedUrlError) -> ChatError {
+    match error {
+        SignedUrlError::NotConfigured(what) => ChatError::NotConfigured(what),
+        SignedUrlError::Transport(detail) => ChatError::Transport(detail),
+        // Already redacted and truncated at construction; re-wrapping the sentence is all that is
+        // left to do.
+        SignedUrlError::Status { status, body } => {
+            ChatError::Refused(format!("HTTP {status}: {body}"))
+        }
+        SignedUrlError::Shape(detail) => ChatError::Shape(detail),
+    }
+}
+
+/// One open, text-only conversation with the configured agent.
+///
+/// **A ConvAI socket is a conversation, not a request channel.** Everything asked down one of
+/// these accumulates in the agent's context, including its own previous answers, so a caller that
+/// wants N independent answers cannot simply call [`TextChat::ask`] N times and expect N
+/// independent answers. Deciding how many turns one of these is allowed to serve is the caller's
+/// job; see [`crate::summarize::agent`], which is the only caller in this tree and says why it
+/// picked the number it did.
+#[async_trait]
+pub trait TextChat: Send + std::fmt::Debug {
+    /// Say one thing and read until the agent has said its piece.
+    ///
+    /// Implementations must answer the vendor's application-level `ping` events while waiting,
+    /// because a conversation that stops answering them is closed by the vendor.
+    ///
+    /// # Errors
+    ///
+    /// [`ChatError::Transport`] when the socket fails or `deadline` passes with no reply,
+    /// [`ChatError::Refused`] when the vendor closes the conversation, and [`ChatError::Shape`]
+    /// when what came back is not a reply this server can read.
+    async fn ask(&mut self, text: &str, deadline: Duration) -> Result<String, ChatError>;
+
+    /// Close the conversation politely.
+    ///
+    /// Takes `self` by box because a closed conversation must not be reachable afterwards, and
+    /// returns nothing because there is no useful recovery from a failed goodbye — the socket is
+    /// going away either way. ElevenLabs bills connection time, so this is not optional politeness.
+    async fn close(self: Box<Self>);
+}
+
+/// Opening a text-only conversation with the configured agent.
+///
+/// Separate from [`TextChat`] so that "the vendor would not let us start" and "the conversation
+/// failed once it was running" are different call sites with different errors — and so that a
+/// pool can hold the opener for the whole life of the process while opening and discarding the
+/// conversations themselves.
+#[async_trait]
+pub trait TextChatProvider: Send + Sync {
+    /// Open one text-only conversation.
+    ///
+    /// `deadline` bounds the whole opening handshake — mint, socket, and the vendor's initiation
+    /// metadata — because every one of those steps can hang and none of them should hang forever.
+    ///
+    /// # Errors
+    ///
+    /// [`ChatError`], distinguishing an absent setting from a refusal from unreachability.
+    async fn open_text_chat(
+        &self,
+        config: &ElevenLabsConfig,
+        deadline: Duration,
+    ) -> Result<Box<dyn TextChat>, ChatError>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,7 +561,75 @@ mod tests {
     }
 
     #[test]
+    fn a_chat_refusal_that_echoes_the_key_is_redacted_whichever_half_refused() {
+        // Both halves of a ConvAI conversation can quote the credential back: the mint is an HTTP
+        // API, and a close frame's reason is free text the vendor writes. Neither may reach a log.
+        let key = [Secret::new("xi-secret-key-value")];
+        let from_http = ChatError::from_response(
+            401,
+            r#"{"detail":{"message":"xi-secret-key-value is invalid"}}"#,
+            &key,
+        )
+        .to_string();
+        assert!(!from_http.contains("xi-secret-key-value"), "{from_http}");
+        assert!(from_http.contains(REDACTED), "{from_http}");
+        assert!(from_http.contains("401"), "the status must survive");
+
+        let from_close =
+            ChatError::from_close(1008, "key xi-secret-key-value is not allowed here", &key)
+                .to_string();
+        assert!(!from_close.contains("xi-secret-key-value"), "{from_close}");
+        assert!(
+            from_close.contains("1008"),
+            "the close code must survive: {from_close}"
+        );
+    }
+
+    #[test]
+    fn a_close_with_no_reason_still_says_that_the_vendor_refused() {
+        // A close frame with an empty reason is normal, and "elevenlabs refused the conversation:"
+        // followed by nothing is the least useful line a log can hold.
+        let rendered = ChatError::from_close(1011, "   ", &[Secret::new("k")]).to_string();
+        assert!(rendered.contains("1011"), "{rendered}");
+        assert!(rendered.contains("no reason"), "{rendered}");
+    }
+
+    #[test]
+    fn the_four_chat_failures_stay_apart_when_a_signed_url_failure_is_carried_across() {
+        // The mint's taxonomy has to survive the trip, or "you never configured a key" arrives at
+        // the caller looking like "the vendor is down" and sends the operator to the wrong place.
+        assert!(matches!(
+            chat_from_signed(SignedUrlError::NotConfigured("elevenlabs.agent_id")),
+            ChatError::NotConfigured("elevenlabs.agent_id")
+        ));
+        assert!(matches!(
+            chat_from_signed(SignedUrlError::Transport("dns".to_owned())),
+            ChatError::Transport(_)
+        ));
+        assert!(matches!(
+            chat_from_signed(SignedUrlError::from_response(
+                401,
+                "no",
+                &Secret::new("xi-k")
+            )),
+            ChatError::Refused(_)
+        ));
+        assert!(matches!(
+            chat_from_signed(SignedUrlError::Shape("no signed_url".to_owned())),
+            ChatError::Shape(_)
+        ));
+    }
+
+    #[test]
     fn error_codes_separate_misconfiguration_from_vendor_failure() {
+        assert_eq!(
+            ChatError::NotConfigured("elevenlabs.agent_id").code(),
+            "elevenlabs_not_configured"
+        );
+        assert_eq!(
+            ChatError::Refused("no".to_owned()).code(),
+            "elevenlabs_error"
+        );
         assert_eq!(
             SignedUrlError::NotConfigured("elevenlabs.api_key").code(),
             "elevenlabs_not_configured"

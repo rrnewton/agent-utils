@@ -32,6 +32,7 @@
 //! ignores it. Either way the fence is not something a call site can forget. A summary is still
 //! third-party text when it comes back.
 
+pub mod agent;
 pub mod extractive;
 pub mod fake;
 
@@ -39,6 +40,49 @@ use async_trait::async_trait;
 
 use crate::config::SummariesConfig;
 use crate::model::Message;
+
+/// Which summariser a deployment has asked for.
+///
+/// Configuration rather than a compile-time choice, and **extractive is the default**: a
+/// deployment that has never heard of ElevenLabs must keep working, and paying a vendor for
+/// something truncation already does adequately is not a thing that should happen because someone
+/// upgraded.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Backend {
+    /// [`extractive::ExtractiveSummarizer`]: truncation, no model, no network, no cost.
+    #[default]
+    Extractive,
+    /// [`agent::AgentSummarizer`]: the configured ElevenLabs conversational agent, over its
+    /// text-only WebSocket.
+    ElevenLabsAgent,
+}
+
+impl Backend {
+    /// The name an operator writes in the configuration file.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Extractive => "extractive",
+            Self::ElevenLabsAgent => "elevenlabs_agent",
+        }
+    }
+
+    /// Every backend, so a refusal can list what it would have accepted.
+    #[must_use]
+    pub fn all() -> &'static [Self] {
+        &[Self::Extractive, Self::ElevenLabsAgent]
+    }
+
+    /// Parse a name, or `None`.
+    ///
+    /// Unknown names are refused rather than defaulted to extractive: a typo that silently
+    /// selected truncation would present as "the agent backend does not work", which is the most
+    /// expensive possible way to discover a spelling mistake.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::all().iter().copied().find(|b| b.name() == name)
+    }
+}
 
 /// The framing every summariser is given.
 ///
@@ -112,6 +156,13 @@ pub enum SummaryError {
     /// A required setting is absent, so no call was attempted.
     #[error("{0} is not configured; this server cannot generate a summary")]
     NotConfigured(&'static str),
+    /// The summariser was reached and said no.
+    ///
+    /// Distinct from [`SummaryError::Transport`] on purpose. "The vendor rejected your key" and
+    /// "the vendor is unreachable" look identical from a browser and have nothing in common as
+    /// problems: one is fixed by editing a setting, the other by waiting.
+    #[error("the summariser refused: {0}")]
+    Refused(String),
     /// The request never completed.
     #[error("the summariser could not be reached: {0}")]
     Transport(String),
@@ -126,6 +177,7 @@ impl SummaryError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::NotConfigured(_) => "summarizer_not_configured",
+            Self::Refused(_) => "summarizer_refused",
             Self::Transport(_) | Self::Shape(_) => "summarizer_error",
         }
     }
@@ -138,6 +190,25 @@ pub trait Summarizer: Send + Sync {
     ///
     /// Reported to the caller so a page can never imply a model summary it did not get.
     fn describe(&self) -> &'static str;
+
+    /// The slug this backend contributes to [`policy_version`].
+    ///
+    /// On the trait rather than beside the constructor because it used to be beside the
+    /// constructor, in `main`, where selecting a second backend meant remembering to change a
+    /// second line — and a cache key that still said `extractive` while a model was answering is
+    /// the silent-stale-summary failure with the labels swapped.
+    fn backend(&self) -> &'static str;
+
+    /// Everything else this backend contributes to [`policy_version`].
+    ///
+    /// The default is [`PROMPT`], which is all a backend that sends nothing else has to declare.
+    /// A backend with its own instructions, or whose answers depend on something outside
+    /// [`SummariesConfig`] — the identity of a remote agent, say — returns that here, because
+    /// otherwise changing it leaves every summary produced under the old one being served
+    /// forever.
+    fn policy_input(&self) -> &str {
+        PROMPT
+    }
 
     /// Summarise one message.
     ///
@@ -163,6 +234,15 @@ pub fn policy_version(config: &SummariesConfig, backend: &str) -> String {
     policy_version_of(PROMPT, config, backend)
 }
 
+/// [`policy_version`] for the summariser that is actually running.
+///
+/// The one call every real caller should make: it takes both halves — the slug and the extra
+/// policy input — from the backend itself, so neither can be forgotten at a call site.
+#[must_use]
+pub fn policy_version_for(config: &SummariesConfig, summarizer: &dyn Summarizer) -> String {
+    policy_version_of(summarizer.policy_input(), config, summarizer.backend())
+}
+
 /// [`policy_version`] with the prompt supplied.
 ///
 /// Exists only so a test can vary the prompt, which is otherwise a constant and therefore an
@@ -180,6 +260,18 @@ pub fn policy_version_of(prompt: &str, config: &SummariesConfig, backend: &str) 
         &config.target_chars.to_string(),
         &config.context_messages.to_string(),
         &config.threshold_chars.to_string(),
+        config.backend.name(),
+        // How many summaries share one conversation decides how much of the PREVIOUS summaries
+        // the agent still has in front of it when it writes this one, so it changes the wording
+        // — see `agent::DEFAULT_MAX_PER_SOCKET`. So does the idle timeout, which is the other way
+        // a socket is retired.
+        &config.max_per_socket.to_string(),
+        &config.socket_idle_seconds.to_string(),
+        // The deadline does NOT change the wording, and it is folded in anyway. The rule this
+        // struct is under is "every field", and an exception would need somewhere to be written
+        // down where the next person adding a field would read it; a rare extra cache miss when
+        // an operator retunes a timeout is a much smaller cost than that.
+        &config.reply_timeout_seconds.to_string(),
     ] {
         hash = fnv1a64(hash, part.as_bytes());
         // A separator, so ("ab", "c") and ("a", "bc") do not hash the same.
@@ -236,6 +328,14 @@ mod tests {
         lower_threshold.threshold_chars += 1;
         let mut with_model = config();
         with_model.model = Some("some-model".to_owned());
+        let mut other_backend = config();
+        other_backend.backend = Backend::ElevenLabsAgent;
+        let mut deeper_socket = config();
+        deeper_socket.max_per_socket += 1;
+        let mut longer_idle = config();
+        longer_idle.socket_idle_seconds += 1;
+        let mut longer_deadline = config();
+        longer_deadline.reply_timeout_seconds += 1;
 
         for (what, changed) in [
             ("target_chars", policy_version(&wider, "extractive")),
@@ -248,6 +348,22 @@ mod tests {
                 policy_version(&lower_threshold, "extractive"),
             ),
             ("model", policy_version(&with_model, "extractive")),
+            (
+                "summaries.backend",
+                policy_version(&other_backend, "extractive"),
+            ),
+            (
+                "max_per_socket",
+                policy_version(&deeper_socket, "extractive"),
+            ),
+            (
+                "socket_idle_seconds",
+                policy_version(&longer_idle, "extractive"),
+            ),
+            (
+                "reply_timeout_seconds",
+                policy_version(&longer_deadline, "extractive"),
+            ),
             ("backend", policy_version(&config(), "http")),
         ] {
             assert_ne!(
@@ -322,5 +438,64 @@ mod tests {
             SummaryError::Shape("no text".to_owned()).code(),
             "summarizer_error"
         );
+    }
+
+    #[test]
+    fn a_refusal_is_not_reported_as_unreachability() {
+        // The two have nothing in common as problems: one is fixed by editing a setting, the
+        // other by waiting. A client that cannot tell them apart tells the reader to try again
+        // forever.
+        assert_eq!(
+            SummaryError::Refused("HTTP 401".to_owned()).code(),
+            "summarizer_refused"
+        );
+        assert_ne!(
+            SummaryError::Refused("HTTP 401".to_owned()).code(),
+            SummaryError::Transport("dns".to_owned()).code()
+        );
+    }
+
+    #[test]
+    fn the_version_takes_both_halves_from_the_backend_that_is_actually_running() {
+        // The point of `policy_version_for`: neither the slug nor the extra policy input can be
+        // forgotten at a call site, because neither is written at one.
+        struct Loud;
+        #[async_trait]
+        impl Summarizer for Loud {
+            fn describe(&self) -> &'static str {
+                "a summariser with instructions of its own"
+            }
+            fn backend(&self) -> &'static str {
+                "loud"
+            }
+            fn policy_input(&self) -> &str {
+                "shout it"
+            }
+            async fn summarize(&self, _: &SummaryRequest<'_>) -> Result<String, SummaryError> {
+                unreachable!("this one never runs")
+            }
+        }
+        assert_eq!(
+            policy_version_for(&config(), &Loud),
+            policy_version_of("shout it", &config(), "loud")
+        );
+        assert_ne!(
+            policy_version_for(&config(), &Loud),
+            policy_version_for(&config(), &extractive::ExtractiveSummarizer),
+            "two backends with different instructions must not share a cache"
+        );
+    }
+
+    #[test]
+    fn the_default_backend_is_the_one_that_needs_no_vendor() {
+        assert_eq!(Backend::default(), Backend::Extractive);
+        for backend in Backend::all() {
+            assert_eq!(Backend::from_name(backend.name()), Some(*backend));
+        }
+        // Refused rather than defaulted: a typo that silently selected truncation presents as
+        // "the agent backend does not work".
+        assert_eq!(Backend::from_name("elevenlabs-agent"), None);
+        assert_eq!(Backend::from_name("Extractive"), None);
+        assert_eq!(Backend::from_name(""), None);
     }
 }

@@ -75,6 +75,13 @@ impl Summarizer for FakeSummarizer {
         "an in-memory summariser that counts its calls"
     }
 
+    // Deliberately the extractive slug rather than one of its own: the cache tests substitute
+    // this for the shipped default and must exercise the SAME cache key, or every one of them
+    // would be testing a key no deployment ever writes.
+    fn backend(&self) -> &'static str {
+        super::extractive::BACKEND
+    }
+
     async fn summarize(&self, request: &SummaryRequest<'_>) -> Result<String, SummaryError> {
         let mut state = self.lock();
         if let Some(why) = state.fail_next.take() {

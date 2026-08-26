@@ -996,6 +996,26 @@ impl SummaryOutcome {
     }
 }
 
+/// One summary, and what it cost to obtain.
+///
+/// A struct rather than a tuple because the third member is the whole point of it existing: the
+/// open question about a hosted conversational agent is how long a round trip to one takes
+/// compared with a full-size model, and a deployment that cannot answer that from its own logs and
+/// its own API has to run a separate experiment to find out.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Summarised {
+    /// The channel it came from.
+    pub channel: ChannelInfo,
+    /// Whether it was below the threshold, served from the cache, or generated now.
+    pub outcome: SummaryOutcome,
+    /// Wall-clock milliseconds spent inside the summariser.
+    ///
+    /// `None` when none was called — a message below the threshold, or a cache hit. That is the
+    /// distinction worth keeping: a zero here would say "the vendor answered instantly", which is
+    /// a very different claim from "no vendor was asked".
+    pub generated_in_ms: Option<u64>,
+}
+
 /// One message, summarised — from the cache when the policy and the text are unchanged. Read
 /// scope to ASK; write scope to leave anything behind.
 ///
@@ -1027,7 +1047,7 @@ pub async fn summarize_message(
     channel_id: &str,
     message_id: &str,
     limit: Option<u16>,
-) -> Result<(ChannelInfo, SummaryOutcome), OpError> {
+) -> Result<Summarised, OpError> {
     let window = messages(state, channel_id, limit).await?;
     let position = window
         .messages
@@ -1037,7 +1057,11 @@ pub async fn summarize_message(
     let target = &window.messages[position];
 
     if target.content.chars().count() < state.config.summaries.threshold_chars {
-        return Ok((window.channel.clone(), SummaryOutcome::BelowThreshold));
+        return Ok(Summarised {
+            channel: window.channel.clone(),
+            outcome: SummaryOutcome::BelowThreshold,
+            generated_in_ms: None,
+        });
     }
 
     let key = crate::store::SummaryKey {
@@ -1050,7 +1074,13 @@ pub async fn summarize_message(
     // silently to the caller. The alternative — refusing to summarise because the CACHE is not
     // configured — would make an optional durability feature a hard dependency of a read.
     match state.store.cached_summary(&key).await {
-        Ok(Some(hit)) => return Ok((window.channel.clone(), SummaryOutcome::Cached(hit))),
+        Ok(Some(hit)) => {
+            return Ok(Summarised {
+                channel: window.channel.clone(),
+                outcome: SummaryOutcome::Cached(hit),
+                generated_in_ms: None,
+            })
+        }
         Ok(None) => {}
         Err(error) => tracing::warn!(%error, "summary cache unreadable; generating uncached"),
     }
@@ -1059,7 +1089,21 @@ pub async fn summarize_message(
     let context = &window.messages[start..position];
     let request =
         crate::summarize::SummaryRequest::new(target, context, state.config.summaries.target_chars);
-    let generated = state.summarizer.summarize(&request).await?;
+    // Timed HERE rather than inside a backend, so the number means the same thing whichever
+    // summariser is configured and a deployment can compare them against each other. The backend
+    // is free to log a finer breakdown of its own; this is the one every backend reports.
+    let began = std::time::Instant::now();
+    let generated = state.summarizer.summarize(&request).await;
+    let generated_in_ms = u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX);
+    // Logged on the failure path too. A summariser that takes thirty seconds to time out is a
+    // performance fact about the deployment, and it is the one a person is most likely to want.
+    tracing::info!(
+        backend = state.summarizer.backend(),
+        elapsed_ms = generated_in_ms,
+        ok = generated.is_ok(),
+        "asked the summariser for one message"
+    );
+    let generated = generated?;
     if caller >= crate::auth::Scope::Write {
         if let Err(error) = state.store.cache_summary(&key, &generated).await {
             tracing::warn!(%error, "summary could not be cached; it will be generated again");
@@ -1070,7 +1114,11 @@ pub async fn summarize_message(
              read token may spend the cache and never fill it"
         );
     }
-    Ok((window.channel, SummaryOutcome::Generated(generated)))
+    Ok(Summarised {
+        channel: window.channel,
+        outcome: SummaryOutcome::Generated(generated),
+        generated_in_ms: Some(generated_in_ms),
+    })
 }
 
 #[cfg(test)]

@@ -30,6 +30,10 @@ impl Summarizer for ExtractiveSummarizer {
         "extractive (truncation, no model, no network, no cost)"
     }
 
+    fn backend(&self) -> &'static str {
+        BACKEND
+    }
+
     async fn summarize(&self, request: &SummaryRequest<'_>) -> Result<String, SummaryError> {
         // The context and `SummaryRequest::prompt` are deliberately unused. Truncation cannot use
         // the context, and pretending otherwise by concatenating neighbours would produce a

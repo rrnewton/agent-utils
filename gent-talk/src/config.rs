@@ -60,6 +60,9 @@ pub const ENV_REPLAY_TRANSPORT: &str = "GENT_TALK_REPLAY_TRANSPORT";
 /// Environment variable overriding the model a summariser is asked for.
 pub const ENV_SUMMARY_MODEL: &str = "GENT_TALK_SUMMARY_MODEL";
 
+/// Environment variable choosing which summariser runs. See [`crate::summarize::Backend`].
+pub const ENV_SUMMARY_BACKEND: &str = "GENT_TALK_SUMMARY_BACKEND";
+
 /// Shortest API token this server will accept.
 ///
 /// These tokens are the ONLY thing between the public internet and a bot that can post to the
@@ -155,6 +158,19 @@ pub struct SummariesConfig {
     pub context_messages: usize,
     /// The model to ask, when a model backend is configured. `None` means the extractive default.
     pub model: Option<String>,
+    /// Which summariser runs. Extractive by default; see [`crate::summarize::Backend`].
+    pub backend: crate::summarize::Backend,
+    /// How many summaries share one conversation with the agent before it is recycled.
+    ///
+    /// Only the agent backend reads it, and it is here rather than beside that backend because it
+    /// changes what a summary SAYS: a conversation carries every earlier summary in its context,
+    /// so the answer to the eighth question is written in front of seven other people's messages.
+    /// See [`crate::summarize::agent`] for the arithmetic behind the default.
+    pub max_per_socket: usize,
+    /// How long a conversation with the agent may sit unused before it is closed.
+    pub socket_idle_seconds: u64,
+    /// How long one turn with the agent, or one opening handshake, may take.
+    pub reply_timeout_seconds: u64,
 }
 
 impl Default for SummariesConfig {
@@ -164,6 +180,10 @@ impl Default for SummariesConfig {
             target_chars: crate::summary::DEFAULT_SUMMARY_CHARS,
             context_messages: DEFAULT_SUMMARY_CONTEXT_MESSAGES,
             model: None,
+            backend: crate::summarize::Backend::Extractive,
+            max_per_socket: crate::summarize::agent::DEFAULT_MAX_PER_SOCKET,
+            socket_idle_seconds: crate::summarize::agent::DEFAULT_SOCKET_IDLE_SECONDS,
+            reply_timeout_seconds: crate::summarize::agent::DEFAULT_REPLY_TIMEOUT_SECONDS,
         }
     }
 }
@@ -270,7 +290,10 @@ pub struct AuthConfig {
 /// what happens when something asks for a signed conversation URL without them — that is a loud,
 /// specific refusal naming the absent setting, never a silent fallback. See
 /// [`crate::elevenlabs::credentials`].
-#[derive(Debug)]
+// Clone because the agent summariser has to HOLD this: `Summarizer::summarize` takes no
+// configuration, unlike the signed-URL and speech paths, so a backend that talks to ElevenLabs
+// cannot be handed the settings at call time and must be built with them.
+#[derive(Clone, Debug)]
 pub struct ElevenLabsConfig {
     /// Agent id, recorded so the deployment is self-describing. Public: it identifies a widget.
     pub agent_id: Option<String>,
@@ -407,6 +430,10 @@ struct FileSummaries {
     target_chars: Option<usize>,
     context_messages: Option<usize>,
     model: Option<String>,
+    backend: Option<String>,
+    max_per_socket: Option<usize>,
+    socket_idle_seconds: Option<u64>,
+    reply_timeout_seconds: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -590,7 +617,11 @@ impl Config {
         }
 
         let storage = storage_config(get(ENV_STORAGE_PATH), file.storage)?;
-        let summaries = summaries_config(get(ENV_SUMMARY_MODEL), file.summaries)?;
+        let summaries = summaries_config(
+            get(ENV_SUMMARY_MODEL),
+            get(ENV_SUMMARY_BACKEND),
+            file.summaries,
+        )?;
         let replay = replay_config(
             [
                 get(ENV_REPLAY_ENABLED),
@@ -720,9 +751,26 @@ fn replay_config(
 /// Resolve the `[summaries]` section.
 fn summaries_config(
     model_from_env: Option<&str>,
+    backend_from_env: Option<&str>,
     file: FileSummaries,
 ) -> Result<SummariesConfig, ConfigError> {
     let defaults = SummariesConfig::default();
+    let backend = match backend_from_env.map(str::to_owned).or(file.backend) {
+        Some(name) => {
+            let name = name.trim().to_owned();
+            crate::summarize::Backend::from_name(&name).ok_or_else(|| {
+                let known: Vec<&str> = crate::summarize::Backend::all()
+                    .iter()
+                    .map(|b| b.name())
+                    .collect();
+                ConfigError::Invalid {
+                    field: "summaries.backend".to_owned(),
+                    detail: format!("{name:?} is not a summariser. Use one of {known:?}."),
+                }
+            })?
+        }
+        None => defaults.backend,
+    };
     let summaries = SummariesConfig {
         threshold_chars: file.threshold_chars.unwrap_or(defaults.threshold_chars),
         target_chars: file.target_chars.unwrap_or(defaults.target_chars),
@@ -732,7 +780,33 @@ fn summaries_config(
             .or(file.model)
             .map(|m| m.trim().to_owned())
             .filter(|m| !m.is_empty()),
+        backend,
+        max_per_socket: file.max_per_socket.unwrap_or(defaults.max_per_socket),
+        socket_idle_seconds: file
+            .socket_idle_seconds
+            .unwrap_or(defaults.socket_idle_seconds),
+        reply_timeout_seconds: file
+            .reply_timeout_seconds
+            .unwrap_or(defaults.reply_timeout_seconds),
     };
+    if summaries.max_per_socket == 0 {
+        // Zero is not "unlimited" and must not read as it. A conversation that may serve no
+        // summaries is one that is opened and immediately recycled, for ever, at a mint and a
+        // handshake apiece.
+        return Err(ConfigError::Invalid {
+            field: "summaries.max_per_socket".to_owned(),
+            detail: "must be at least 1. Zero is not 'no limit'; it is a conversation opened and \
+                     thrown away without asking it anything."
+                .to_owned(),
+        });
+    }
+    if summaries.reply_timeout_seconds == 0 {
+        return Err(ConfigError::Invalid {
+            field: "summaries.reply_timeout_seconds".to_owned(),
+            detail: "must be at least 1, or every turn is abandoned before the agent can answer"
+                .to_owned(),
+        });
+    }
     if summaries.target_chars == 0 {
         return Err(ConfigError::Invalid {
             field: "summaries.target_chars".to_owned(),
@@ -1386,6 +1460,75 @@ writable = true
         let cfg = Config::from_toml_and_env(&text, &env(&[(ENV_SUMMARY_MODEL, "from-env")]))
             .expect("valid config");
         assert_eq!(cfg.summaries.model.as_deref(), Some("from-env"));
+    }
+
+    #[test]
+    fn the_summariser_is_the_one_that_needs_no_vendor_until_an_operator_says_otherwise() {
+        // A deployment that has never heard of ElevenLabs must keep working, and paying a vendor
+        // is not a thing that should start happening because somebody upgraded.
+        let cfg = Config::from_toml_and_env(FULL, &env(&[])).expect("valid config");
+        assert_eq!(cfg.summaries.backend, crate::summarize::Backend::Extractive);
+
+        let text = format!("{FULL}\n[summaries]\nbackend = \"elevenlabs_agent\"\n");
+        let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("valid config");
+        assert_eq!(
+            cfg.summaries.backend,
+            crate::summarize::Backend::ElevenLabsAgent
+        );
+
+        let cfg =
+            Config::from_toml_and_env(FULL, &env(&[(ENV_SUMMARY_BACKEND, "elevenlabs_agent")]))
+                .expect("valid config");
+        assert_eq!(
+            cfg.summaries.backend,
+            crate::summarize::Backend::ElevenLabsAgent
+        );
+    }
+
+    #[test]
+    fn a_misspelled_summariser_is_refused_and_the_refusal_lists_the_real_ones() {
+        // Defaulting a typo to extractive would present as "the agent backend does not work",
+        // which is the most expensive possible way to find a spelling mistake.
+        let text = format!("{FULL}\n[summaries]\nbackend = \"elevenlabs-agent\"\n");
+        let err = Config::from_toml_and_env(&text, &env(&[])).expect_err("must refuse");
+        match &err {
+            ConfigError::Invalid { field, detail } => {
+                assert_eq!(field, "summaries.backend");
+                assert!(detail.contains("elevenlabs_agent"), "{detail}");
+                assert!(detail.contains("extractive"), "{detail}");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn a_conversation_budget_of_zero_is_refused_rather_than_read_as_unlimited() {
+        let text = format!("{FULL}\n[summaries]\nmax_per_socket = 0\n");
+        let err = Config::from_toml_and_env(&text, &env(&[])).expect_err("must refuse");
+        assert!(
+            matches!(&err, ConfigError::Invalid { field, .. } if field == "summaries.max_per_socket"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string().contains("not 'no limit'"),
+            "the refusal has to say WHY zero is not unlimited: {err}"
+        );
+
+        let text = format!("{FULL}\n[summaries]\nreply_timeout_seconds = 0\n");
+        let err = Config::from_toml_and_env(&text, &env(&[])).expect_err("must refuse");
+        assert!(
+            matches!(&err, ConfigError::Invalid { field, .. } if field == "summaries.reply_timeout_seconds"),
+            "unexpected error: {err}"
+        );
+
+        let text = format!(
+            "{FULL}\n[summaries]\nmax_per_socket = 3\nsocket_idle_seconds = 5\n\
+             reply_timeout_seconds = 45\n"
+        );
+        let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("valid config");
+        assert_eq!(cfg.summaries.max_per_socket, 3);
+        assert_eq!(cfg.summaries.socket_idle_seconds, 5);
+        assert_eq!(cfg.summaries.reply_timeout_seconds, 45);
     }
 
     #[test]

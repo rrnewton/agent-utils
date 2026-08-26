@@ -337,15 +337,44 @@ async fn main() -> anyhow::Result<()> {
          logged; message content is DEBUG only."
     );
 
+    // ONE client, three capabilities. Building a second would mean two connection pools and two
+    // user agents against the same vendor for no reason. Built here, before the summariser,
+    // because the agent-backed summariser mints its conversations through this same client.
+    let elevenlabs_client =
+        Arc::new(HttpElevenLabsClient::new().context("building the ElevenLabs client")?);
+
     // Say WHICH summariser is running, and under which policy version. A page that reported
     // "summarised" without this could imply a model answer produced by truncation, and the
     // version is what a person with a shell greps the cache by when they suspect a stale entry.
-    let summarizer: Arc<dyn gent_talk::summarize::Summarizer> =
-        Arc::new(gent_talk::summarize::extractive::ExtractiveSummarizer);
-    let summary_version = gent_talk::summarize::policy_version(
-        &config.summaries,
-        gent_talk::summarize::extractive::BACKEND,
-    );
+    let summarizer: Arc<dyn gent_talk::summarize::Summarizer> = match config.summaries.backend {
+        gent_talk::summarize::Backend::Extractive => {
+            Arc::new(gent_talk::summarize::extractive::ExtractiveSummarizer)
+        }
+        gent_talk::summarize::Backend::ElevenLabsAgent => {
+            // Selected but unconfigured is a warning here and a per-request refusal there, not a
+            // refusal to start: the Discord half of this server is useful on its own, and a
+            // deployment that mistyped a key should still come up far enough to say so.
+            if let Err(error) = gent_talk::elevenlabs::credentials(&config.elevenlabs) {
+                tracing::warn!(
+                    %error,
+                    "summaries.backend selects the ElevenLabs agent, but ElevenLabs is not fully \
+                     configured; every summary request will refuse with this exact message"
+                );
+            }
+            Arc::new(gent_talk::summarize::agent::AgentSummarizer::new(
+                Arc::new(
+                    gent_talk::elevenlabs::socket::WebSocketTextChatProvider::new(Arc::clone(
+                        &elevenlabs_client,
+                    )
+                        as Arc<dyn SignedUrlProvider>),
+                ),
+                config.elevenlabs.clone(),
+                gent_talk::summarize::agent::PoolPolicy::from_config(&config.summaries),
+            ))
+        }
+    };
+    let summary_version =
+        gent_talk::summarize::policy_version_for(&config.summaries, summarizer.as_ref());
     tracing::info!(
         backend = summarizer.describe(),
         version = summary_version,
@@ -400,10 +429,6 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let bind = config.bind;
-    // ONE client, two capabilities. Building a second would mean two connection pools and two
-    // user agents against the same vendor for no reason.
-    let elevenlabs_client =
-        Arc::new(HttpElevenLabsClient::new().context("building the ElevenLabs client")?);
     let speech: Arc<dyn SpeechProvider> = Arc::clone(&elevenlabs_client) as Arc<dyn SpeechProvider>;
     let elevenlabs: Arc<dyn SignedUrlProvider> = elevenlabs_client;
     let live_channels: Vec<_> = config.channels.iter().map(|c| c.id.clone()).collect();

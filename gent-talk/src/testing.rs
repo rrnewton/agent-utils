@@ -191,6 +191,22 @@ pub fn state_with_summarizer(
     (state, discord, store, summarizer)
 }
 
+/// A server whose summariser is one the caller built, plus its store.
+///
+/// The counterpart of [`state_with`] for the OTHER pluggable half. [`state_with_summarizer`] hands
+/// back a summariser that counts, which is all `#49 cached-summaries` needed; a summariser that
+/// talks to a vendor is built by the test, out of the vendor stand-in the test also keeps a handle
+/// to, so this takes one rather than making one.
+#[must_use]
+pub fn state_with_backend(
+    text: &str,
+    summarizer: Arc<dyn crate::summarize::Summarizer>,
+) -> (AppState, Arc<FakeDiscord>, Arc<FakeStore>) {
+    let store = Arc::new(FakeStore::new());
+    let (state, discord, _elevenlabs, _erased) = state_pieces_with(text, store.clone(), summarizer);
+    (state, discord, store)
+}
+
 fn state_pieces_with(
     text: &str,
     store: Arc<dyn crate::store::StateStore>,
@@ -221,9 +237,12 @@ fn state_pieces_with(
         // coverage — the timer is `live::poll_forever`, and what it does per tick is `poll_once`.
         live: Arc::new(crate::live::LiveHub::new()),
         summarizer: Arc::clone(&summarizer),
-        summary_version: crate::summarize::policy_version(
+        // Taken from the summariser rather than named here, exactly as `main` takes it, so a test
+        // that substitutes a different backend gets that backend's cache key rather than one this
+        // scaffolding invented.
+        summary_version: crate::summarize::policy_version_for(
             &config_for_version,
-            crate::summarize::extractive::BACKEND,
+            summarizer.as_ref(),
         )
         .into(),
     };
