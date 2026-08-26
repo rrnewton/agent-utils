@@ -85,6 +85,7 @@ from dagrun.model import (
     resolved_wall_timeout,
     step_classification,
     step_failure_reason,
+    graph_structure_violations,
     undeclared_resource_demands,
     write_domain_violations,
 )
@@ -148,6 +149,7 @@ __all__ = [
     "step_failure_reason",
     "DAG_CONFIG_FIELDS",
     "dag_config_carry_diff",
+    "graph_structure_violations",
     "undeclared_resource_demands",
     "write_domain_violations",
     "render_jobs_flag",

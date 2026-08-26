@@ -28,6 +28,7 @@ from dagrun.model import (
     StepClass,
     WriteDomainGuarantee,
     WriteDomainPolicy,
+    graph_structure_violations,
     write_domain_violations,
     resolve_jobs_env,
 )
@@ -202,6 +203,7 @@ def _write_domain_policy(value: object) -> WriteDomainPolicy:
     if value is None:
         return WriteDomainPolicy()
     obj = _as_obj(value, "write_domain_policy")
+    _refuse_unknown_keys(obj, WRITE_DOMAIN_POLICY_KEYS, "write_domain_policy")
     allowed = _opt_str_list(obj, "allowed_domains")
     duplicates = sorted({name for name in allowed if allowed.count(name) > 1})
     if duplicates:
@@ -246,6 +248,7 @@ def _hint_from(value: object, where: str) -> ResourceHint:
     if value is None:
         return ResourceHint()
     obj = _as_obj(value, where)
+    _refuse_unknown_keys(obj, HINT_KEYS, where)
     cls_name = _opt_str(obj, "classification", StepClass.LIGHT.value)
     try:
         classification = StepClass(cls_name)
@@ -447,6 +450,77 @@ def _refuse_uncarried_config_keys(doc: Mapping[str, object]) -> None:
     )
 
 
+#: Every key a ``steps[]`` entry may carry. The step object is CLOSED.
+#:
+#: The top level is deliberately open (see :data:`UNCARRIED_CONFIG_KEYS`): a top-level key nobody
+#: has ever implemented cannot masquerade as a setting that took effect, so tolerating it buys
+#: forward compatibility at no cost. A STEP key is the opposite case. Every one of them is a
+#: per-node instruction, and the near-misses are all real spellings a person writes by accident --
+#: ``dep``, ``cmds``, ``timeouts``, ``env_vars``, ``description`` vs ``desc``. Silently ignored,
+#: the instruction is simply not carried out and the document still says it was: the step runs
+#: with no timeout, no dependency, no environment, and nothing anywhere reports it.
+STEP_KEYS: frozenset[str] = frozenset(
+    {
+        "group",
+        "job",
+        "desc",
+        "description",
+        "cmd",
+        "deps",
+        "env",
+        "hint",
+        "networkonly",
+        "engine_only",
+        "timeout",
+        "cpu_timeout",
+        "jobs_flag",
+        "jobs_env",
+        "skip_reason",
+        "write_domains",
+        "write_domain_guarantee",
+        "explains",
+        "fail_fast_family",
+    }
+)
+
+#: Every key a step's ``hint`` object may carry. Closed for the same reason as
+#: :data:`STEP_KEYS`; ``est_duration`` for ``est_duration_s`` is the canonical silent drop.
+HINT_KEYS: frozenset[str] = frozenset(
+    {
+        "resources",
+        "est_duration_s",
+        "rss_baseline_bytes",
+        "hard_mem_max_bytes",
+        "classification",
+        "preferred_inner_jobs",
+        "measured_effective_cores",
+        "measured_cpu_utilization",
+    }
+)
+
+#: Every key the top-level ``write_domain_policy`` object may carry. Closed: a misspelled
+#: ``require_explicit`` turns a fail-closed policy into no policy at all, silently.
+WRITE_DOMAIN_POLICY_KEYS: frozenset[str] = frozenset({"require_explicit", "allowed_domains"})
+
+
+def _refuse_unknown_keys(
+    m: Mapping[str, object], known: frozenset[str], where: str
+) -> None:
+    """Refuse keys a CLOSED schema object does not define, naming every one of them.
+
+    ``resources`` and ``env`` are caller-defined key spaces and are never narrowed here; only the
+    schema objects themselves are closed.
+    """
+    unknown = sorted(key for key in m if key not in known)
+    if not unknown:
+        return
+    raise DagJsonError(
+        f"{where}: unknown field(s) {', '.join(repr(key) for key in unknown)}. "
+        "This object's schema is CLOSED, because an ignored field reads exactly like one that "
+        "took effect. Known fields: " + ", ".join(sorted(known))
+    )
+
+
 def _refuse_unusable_explains(steps: Sequence[Step]) -> None:
     """Refuse an ``explains`` declaration that cannot mean what it says.
 
@@ -537,6 +611,17 @@ def _dag_from_obj(raw: object) -> DagConfig:
     for i, entry in enumerate(steps_raw):
         where = f"steps[{i}]"
         sm = _as_obj(entry, where)
+        # Name the offending step by TAG as well as by index wherever the document supplies one:
+        # "steps[7]" sends a reader counting entries in a 200-step file. Only the closed-schema
+        # refusal gets the decorated location; the per-field type errors keep their established
+        # "steps[N].field" spelling.
+        group_val, job_val = sm.get("group"), sm.get("job")
+        named = (
+            f"{where} ({group_val}.{job_val})"
+            if isinstance(group_val, str) and isinstance(job_val, str)
+            else where
+        )
+        _refuse_unknown_keys(sm, STEP_KEYS, named)
         skip_text = _opt_str_or_none(sm, "skip_reason")
         try:
             skip_reason = IntentionalSkipReason(skip_text) if skip_text is not None else None
@@ -609,6 +694,14 @@ def _dag_from_obj(raw: object) -> DagConfig:
     violations = write_domain_violations(cfg)
     if violations:
         raise DagJsonError("write-domain policy refused DAG before execution: " + "; ".join(violations))
+    # LAST, because it is the only check that needs the finished configuration (caps and steps
+    # together) and because its findings are about the graph rather than about a field.
+    structural = graph_structure_violations(cfg)
+    if structural:
+        raise DagJsonError(
+            f"<root>: {len(structural)} graph error(s) refused before execution: "
+            + "; ".join(structural)
+        )
     return cfg
 
 

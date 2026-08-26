@@ -43,6 +43,7 @@ from dagrun.model import (
     DagConfig,
     Step,
     command_with_inner_jobs,
+    graph_structure_violations,
     effective_cpu_count,
     effective_cpu_timeout,
     canonical_cpu_timeout,
@@ -2020,6 +2021,18 @@ def run_dag_limited(
         a bound whose breach cannot be attributed to a node reads like enforcement without being
         usable as one.
     """
+    # FIRST, before anything walks the graph. The loader already refuses these, so this is the
+    # door a LIBRARY caller comes through with a hand-built DagConfig -- and a cycle reaching the
+    # planner is not a bad report, it is a RecursionError here and a stack-overflow abort (core
+    # dump) in the Rust edition.
+    structural = graph_structure_violations(cfg)
+    if structural:
+        print(
+            f"[scheduler] ERROR: REFUSING to run before any node starts: {len(structural)} "
+            "graph error(s): " + "; ".join(structural),
+            file=sys.stderr,
+        )
+        return RunResult(ok=False, wall_s=0.0)
     resolved_max_cpus = _resolve_max_cpus_argument(max_cpus, cpu_jobs)
     if error := _self_managed_width_error(cfg, resolved_max_cpus):
         print(

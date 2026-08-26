@@ -831,6 +831,114 @@ def undeclared_resource_demands(cfg: DagConfig) -> list[str]:
     )
 
 
+def graph_structure_violations(cfg: DagConfig) -> list[str]:
+    """Ways the GRAPH ITSELF cannot mean what it says, named before anything runs.
+
+    Each entry describes a graph whose declared steps cannot all be executed in the order the
+    graph asks for.  None of them is a matter of taste.
+
+    DUPLICATE TAG is the worst of the set, because it is the one that stays SILENT.  Two steps
+    declared with the same ``group.job`` collapse into one entry in every ``by_tag`` index the
+    runner builds, so exactly one of them ever runs, the other vanishes without a word, and the
+    summary still counts both as passed.  A run that reports "2 passed" having executed one
+    command is not a partial failure; it is a false report.
+
+    MISSING DEPENDENCY names a predecessor no step declares.  Left to the scheduler this is a
+    "terminal starve" discovered only after every unrelated step has already run, so a typo in
+    one edge costs a full build before it is reported.
+
+    CYCLE is the crash.  Nothing downstream of the loader tolerates one: the bottom-level walk
+    recurses along the cycle until the stack is exhausted, and the critical-path walk never
+    reaches a sink.  Those walks are written for an acyclic graph on purpose; this is the check
+    that makes that assumption true.  The refusal NAMES the cycle, because "there is a cycle" in
+    a 200-node graph is not actionable.
+
+    UNSATISFIABLE RESOURCE DEMAND is a step whose demand exceeds a POSITIVE declared cap, so it
+    can never be admitted however long the run waits.  A cap declared as exactly ``0`` is
+    deliberately NOT included: ``0`` means "blocked on purpose" (see
+    :func:`undeclared_resource_demands`), and a check here would turn that documented affordance
+    into a load error.
+
+    Returns human-readable entries in a deterministic order, empty when the graph is sound.
+    Duplicate tags SHORT-CIRCUIT the remaining checks: while two steps share a tag, every
+    statement about "the step named X" is ambiguous, and reporting edges against an arbitrary
+    winner would be guesswork presented as fact.
+    """
+    # Both language editions of this runner must refuse the same graphs with the same bytes, so
+    # the message text and the traversal order here are a shared contract, pinned by the
+    # cross-language differential.
+
+    counts: dict[str, int] = {}
+    for step in cfg.steps:
+        counts[step.tag] = counts.get(step.tag, 0) + 1
+    duplicates = sorted(tag for tag, n in counts.items() if n > 1)
+    if duplicates:
+        return [
+            f"duplicate step tag '{tag}': declared {counts[tag]} times, but a tag names exactly "
+            "one step -- only ONE of them would ever run and the rest would vanish silently"
+            for tag in duplicates
+        ]
+
+    bad: list[str] = []
+    known = set(counts)
+    for step in cfg.steps:
+        for dep in sorted(set(step.deps) - known):
+            bad.append(
+                f"step {step.tag}: depends on '{dep}', which no step declares"
+            )
+
+    # Iterative three-colour DFS over the dependency relation, matching
+    # :func:`_refuse_unusable_explains`: iterative so a deep chain cannot hit the recursion limit
+    # and turn a validation error into the very crash this check exists to prevent. Only edges
+    # that RESOLVE are followed, so a missing dependency is reported once (above) rather than
+    # also masquerading as a broken cycle.
+    by_tag = {step.tag: step for step in cfg.steps}
+    WHITE, GREY, BLACK = 0, 1, 2
+    colour = {tag: WHITE for tag in by_tag}
+    for root in sorted(by_tag):
+        if colour[root] != WHITE:
+            continue
+        stack: list[tuple[str, bool]] = [(root, False)]
+        path: list[str] = []
+        while stack:
+            tag, leaving = stack.pop()
+            if leaving:
+                colour[tag] = BLACK
+                path.pop()
+                continue
+            if colour[tag] == BLACK:
+                continue
+            if colour[tag] == GREY:
+                cycle = path[path.index(tag):] + [tag]
+                bad.append("dependency cycle: " + " -> ".join(cycle))
+                # ONE cycle per root, then abandon this root entirely: every node still on the
+                # path is retired to BLACK so the outer loop cannot re-enter it and report the
+                # same cycle again from a second entry point. A cycle elsewhere in the graph is
+                # still reached from its own root.
+                for pending in path:
+                    colour[pending] = BLACK
+                stack.clear()
+                break
+            colour[tag] = GREY
+            path.append(tag)
+            stack.append((tag, True))
+            for dep in sorted(set(by_tag[tag].deps)):
+                if dep in by_tag and colour.get(dep) != BLACK:
+                    stack.append((dep, False))
+
+    for step in cfg.steps:
+        if step.skip_reason is not None:
+            continue
+        for name, count in sorted(step.hint.resources.items()):
+            cap = cfg.resource_caps.get(name)
+            if cap is not None and cap > 0 and count > cap:
+                bad.append(
+                    f"step {step.tag}: demands {name}={count} but resource_caps declares "
+                    f"{name}={cap}, so it can never be admitted"
+                )
+    return bad
+
+
 def write_domain_violations(cfg: DagConfig) -> list[str]:
     """Return fail-closed write-domain declaration errors in deterministic order.
 

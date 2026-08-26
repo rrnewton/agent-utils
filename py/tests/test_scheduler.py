@@ -19,6 +19,7 @@ from dagrun.model import (
     IntentionalSkipReason,
     ResourceHint,
     Step,
+    graph_structure_violations,
 )
 from dagrun.protocols import RunResult
 from dagrun.scheduler import (
@@ -466,20 +467,15 @@ def test_absent_cap_reads_differently_from_a_declared_zero() -> None:
     assert _ABSENT not in zero[0], f"a declared 0 must NOT read as absent: {zero[0]}"
 
 
-def test_ungrantable_cap_refuses_instead_of_sleeping_forever(
+def test_ungrantable_cap_refuses_before_anything_runs(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     # A DECLARED cap that is too small, deliberately — not an undeclared resource.
     #
-    # `undeclared_resource_demands` (recovered from `fix/absent-cap-is-not-zero`) now refuses an
-    # UNDECLARED resource in pre-flight, before any step runs, so it would preempt this detector
-    # and there would be no starve left to detect. The two mechanisms overlap on that one case and
-    # the earlier one is the better answer: refusing before any side effect beats running half the
-    # graph and then discovering the rest can never be admitted.
-    #
-    # This detector still earns its place for every starve pre-flight cannot see: a cap that is
-    # declared but can never grant the demand, a dangling dependency, a cycle. That is what is
-    # exercised here.
+    # This USED to be owned by the terminal-starve detector, which could only see it after every
+    # unrelated step had already run: "the satisfiable step still ran" was the pinned behaviour,
+    # and it meant a full build was spent before the graph was called broken.
+    # `graph_structure_violations` sees it in pre-flight, from the document alone, so NOTHING runs.
     cfg = DagConfig(
         steps=(
             _step("g", "needs_gpu", "true", resources={"gpu": 4}),
@@ -489,11 +485,37 @@ def test_ungrantable_cap_refuses_instead_of_sleeping_forever(
     )
     res = _run_dag_bounded(cfg)
     assert res.ok is False, "an ungrantable demand must REFUSE, not hang"
-    assert len(res.outcomes) == 1, "the satisfiable step still ran"
-    assert all(o.ok for o in res.outcomes)
+    assert len(res.outcomes) == 0, "pre-flight refused, so NOTHING may have run"
+    err = capsys.readouterr().err
+    assert "REFUSING to run before any node starts" in err, err
+    assert "demands gpu=4 but resource_caps declares gpu=1" in err, err
+
+
+def test_a_cap_declared_as_zero_stays_the_deliberate_block_the_guide_documents(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The boundary of the pre-flight check, asserted from the other side.
+
+    A cap of exactly 0 is documented as "blocked on purpose", so it is NOT a pre-flight error;
+    the terminal-starve detector still owns it, which is why that detector is not dead code.
+    Without this case, "refuse every demand" would pass the test above.
+    """
+    cfg = DagConfig(
+        steps=(
+            _step("g", "blocked", "true", resources={"gpu": 1}),
+            _step("g", "plain", "true"),
+        ),
+        resource_caps={"gpu": 0},
+    )
+    assert graph_structure_violations(cfg) == []
+    res = _run_dag_bounded(cfg)
+    assert res.ok is False, "the blocked step still cannot run"
+    assert len(res.outcomes) == 1, (
+        "and the starve is still found the late way, by the detector that owns it"
+    )
     err = capsys.readouterr().err
     assert "terminal starve" in err, err
-    assert "starved step(s) (1): g.needs_gpu" in err, err
+    assert "starved step(s) (1): g.blocked" in err, err
 
 
 def test_an_undeclared_resource_is_refused_before_anything_runs(
@@ -520,9 +542,12 @@ def test_an_undeclared_resource_is_refused_before_anything_runs(
     assert "g.needs_gpu: gpu" in err, err
 
 
-def test_dependency_cycle_refuses_instead_of_sleeping_forever() -> None:
-    # The general invariant: a cycle satisfies every declared cap, so no capacity check can see
-    # it -- only "nothing running, nothing launchable, work left" can.
+def test_dependency_cycle_refuses_before_anything_runs_and_names_the_cycle() -> None:
+    # A cycle is not merely a starve: the planner's bottom-level walk recurses along it until the
+    # interpreter raises RecursionError (the Rust edition ABORTS WITH A CORE DUMP). So it cannot
+    # be left to a detector that runs after the acyclic steps have gone; it is refused up front,
+    # and the refusal NAMES the cycle, because "there is a cycle" in a large graph is not
+    # actionable.
     cfg = DagConfig(
         steps=(
             _step("g", "a", "true", deps=["g.b"]),
@@ -530,10 +555,10 @@ def test_dependency_cycle_refuses_instead_of_sleeping_forever() -> None:
             _step("g", "ok", "true"),
         )
     )
+    assert graph_structure_violations(cfg) == ["dependency cycle: g.a -> g.b -> g.a"]
     res = _run_dag_bounded(cfg)
-    assert res.ok is False, "a cycle must REFUSE, not hang"
-    assert len(res.outcomes) == 1, "the one acyclic step still ran"
-    assert all(o.ok for o in res.outcomes)
+    assert res.ok is False, "a cycle must REFUSE, not hang and not crash"
+    assert len(res.outcomes) == 0, "pre-flight refused, so NOTHING may have run"
 
 
 def test_dangling_dep_refuses_instead_of_sleeping_forever() -> None:

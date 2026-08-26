@@ -46,8 +46,8 @@ use crate::attribution::{
 use crate::cgroup::CgroupManager;
 use crate::model::{
     canonical_cpu_timeout, command_with_inner_jobs, effective_cpu_count, effective_cpu_timeout,
-    env_with_inner_jobs, preferred_inner_jobs, resolved_wall_timeout, scale_cpu_timeout,
-    step_classification, step_width_is_resizable, undeclared_resource_demands,
+    env_with_inner_jobs, graph_structure_violations, preferred_inner_jobs, resolved_wall_timeout,
+    scale_cpu_timeout, step_classification, step_width_is_resizable, undeclared_resource_demands,
     validate_jobs_env_config, write_domain_violations, DagConfig, RunResult, Step, StepOutcome,
     JOBS_ENV_ENV,
 };
@@ -3237,6 +3237,29 @@ pub fn run_dag_boxed_deadline_limited(
     order: Option<Vec<String>>,
     run_timeout_s: Option<i64>,
 ) -> RunResult {
+    // FIRST, before anything walks the graph. The loader already refuses these, so this is the
+    // door a LIBRARY caller comes through with a hand-built DagConfig -- and a cycle reaching the
+    // planner is not a bad report, it is a stack-overflow abort (core dump) in this edition and a
+    // RecursionError in the Python edition.
+    let structural = graph_structure_violations(cfg);
+    if !structural.is_empty() {
+        eprintln!(
+            "[scheduler] ERROR: REFUSING to run before any node starts: {} graph error(s): {}",
+            structural.len(),
+            structural.join("; ")
+        );
+        return RunResult {
+            ok: false,
+            wall_s: 0.0,
+            outcomes: Vec::new(),
+            skipped: Vec::new(),
+            not_launched: Vec::new(),
+            intentional_skips: Vec::new(),
+            step_profile_rows: Vec::new(),
+            run_timed_out: false,
+            max_concurrent_steps: 0,
+        };
+    }
     if let Err(error) = validate_max_cpus_rewrite(cfg, max_cpus) {
         eprintln!("[scheduler] ERROR: REFUSING to run before any node starts: {error}");
         return RunResult {
@@ -3696,15 +3719,14 @@ mod tests {
     }
 
     #[test]
-    fn ungrantable_cap_refuses_instead_of_sleeping_forever() {
-        // A DECLARED cap that can never grant the demand — deliberately not an undeclared
-        // resource. `undeclared_resource_demands` refuses that case in pre-flight, before any
-        // step runs, so it would preempt this detector and leave no starve to detect. The two
-        // overlap on that one input and the earlier mechanism is the better answer there.
-        //
-        // This detector still owns every starve pre-flight cannot see: a declared-but-insufficient
-        // cap, a dangling dependency, a cycle. MUST stay in step with the Python twin,
-        // `test_ungrantable_cap_refuses_instead_of_sleeping_forever`.
+    fn ungrantable_cap_refuses_before_anything_runs() {
+        // A DECLARED cap that can never grant the demand. This USED to be owned by the
+        // terminal-starve detector, which could only see it after every unrelated step had
+        // already run: "the satisfiable step still ran; only the starved one is refused" was the
+        // pinned behaviour, and it meant a full build was spent before the graph was called
+        // broken. `graph_structure_violations` sees it in pre-flight, from the document alone, so
+        // NOTHING runs. MUST stay in step with the Python twin,
+        // `test_ungrantable_cap_refuses_before_anything_runs`.
         let cfg = DagConfig {
             steps: vec![
                 step("g", "needs_gpu", "true", &[], 0.0, &[("gpu", 4)]),
@@ -3715,12 +3737,34 @@ mod tests {
         };
         let res = run_dag(&cfg, 4, false, 0);
         assert!(!res.ok, "an ungrantable demand must REFUSE, not hang");
+        assert!(
+            res.outcomes.is_empty(),
+            "pre-flight refused, so NOTHING may have run"
+        );
+    }
+
+    #[test]
+    fn a_cap_declared_as_zero_stays_the_deliberate_block_the_guide_documents() {
+        // The boundary of the pre-flight check, asserted from the other side so "refuse every
+        // demand" cannot pass the case above. A cap of exactly 0 is documented as "blocked on
+        // purpose", so it is NOT a load-time error; the terminal-starve detector still owns it,
+        // which is why that detector is not dead code.
+        let cfg = DagConfig {
+            steps: vec![
+                step("g", "blocked", "true", &[], 0.0, &[("gpu", 1)]),
+                step("g", "plain", "true", &[], 0.0, &[]),
+            ],
+            resource_caps: caps(&[("gpu", 0)]),
+            ..Default::default()
+        };
+        assert!(graph_structure_violations(&cfg).is_empty());
+        let res = run_dag(&cfg, 4, false, 0);
+        assert!(!res.ok, "the blocked step still cannot run");
         assert_eq!(
             res.outcomes.len(),
             1,
-            "the satisfiable step still ran; only the starved one is refused"
+            "and the starve is still found the late way, by the detector that owns it"
         );
-        assert!(res.outcomes.iter().all(|o| o.ok));
     }
 
     #[test]
@@ -3744,9 +3788,11 @@ mod tests {
     }
 
     #[test]
-    fn dependency_cycle_refuses_instead_of_sleeping_forever() {
-        // The general invariant: a cycle satisfies every declared cap, so no capacity check can
-        // see it -- only "nothing running, nothing launchable, work left" can.
+    fn dependency_cycle_refuses_before_anything_runs_and_names_the_cycle() {
+        // A cycle is not merely a starve: the planner's bottom-level walk recurses along it until
+        // the stack overflows and the process ABORTS WITH A CORE DUMP. So it cannot be left to a
+        // detector that runs after the acyclic steps have gone; it is refused up front, and the
+        // refusal NAMES the cycle, because "there is a cycle" in a large graph is not actionable.
         let cfg = DagConfig {
             steps: vec![
                 step("g", "a", "true", &["g.b"], 0.0, &[]),
@@ -3755,10 +3801,16 @@ mod tests {
             ],
             ..Default::default()
         };
+        assert_eq!(
+            graph_structure_violations(&cfg),
+            vec!["dependency cycle: g.a -> g.b -> g.a".to_string()]
+        );
         let res = run_dag(&cfg, 4, false, 0);
-        assert!(!res.ok, "a cycle must REFUSE, not hang");
-        assert_eq!(res.outcomes.len(), 1, "the one acyclic step still ran");
-        assert!(res.outcomes.iter().all(|o| o.ok));
+        assert!(!res.ok, "a cycle must REFUSE, not hang and not abort");
+        assert!(
+            res.outcomes.is_empty(),
+            "pre-flight refused, so NOTHING may have run"
+        );
     }
 
     #[test]

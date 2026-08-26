@@ -46,8 +46,45 @@ steps:
 
 JSON and YAML express the same strict schema. File names ending in `.yaml` or
 `.yml` select YAML; other paths select JSON. Use `--dag -` for JSON on standard
-input. Unknown fields, invalid types, duplicate step tags, missing dependencies,
-cycles, and impossible resource demands are rejected before execution.
+input.
+
+#### What the loader refuses, and where
+
+**Every** subcommand that reads `--dag` — including the inspection ones (`list`,
+`plan`, `ascii`, `dot`, `json`, `yaml`) — refuses these at load, with **exit 2**,
+before any plan is built and before any step runs. `dagrun list --dag x.yaml`
+is therefore a complete, cheap graph check that executes no step.
+
+| refused | the refusal names |
+|---|---|
+| an unknown field in a `steps[]`, `hint`, or `write_domain_policy` object | the step (`steps[3] (test.unit)`), every unknown key, and the known ones |
+| a wrong-typed field | the field and the type wanted |
+| a duplicate step tag | the tag and how many times it was declared |
+| a dependency no step declares | the step and the missing tag |
+| a dependency cycle | **the cycle**, as `a.one -> b.two -> a.one` |
+| a demand above a **positive** `resource_caps` entry | the step, the demand, and the cap |
+| one of the six top-level keys the format does not carry (below) | each key |
+
+Those objects are **closed**: a field they do not define is refused rather than
+ignored, because an ignored field reads exactly like one that took effect —
+`est_duration` for `est_duration_s` is not a smaller estimate, it is no estimate
+at all, silently. The **top level** stays open (a key naming nothing at all is
+tolerated, so forward-compatible additions keep loading), with the six named
+exceptions below.
+
+Two related refusals happen slightly later, at the start of a run rather than at
+load, because they are about capacity rather than about the document:
+
+- a demand for a resource with **no** cap declared (see above — undeclared is
+  not a cap of `0`), and
+- a demand above a cap declared as exactly `0`, which stays the documented
+  deliberate block.
+
+The four *graph* refusals — duplicate tag, missing dependency, cycle, and a
+demand above a positive cap — are re-checked at the scheduler's own entry point
+as well, so a configuration built in memory by a library caller cannot bypass
+the file loader. (The others are properties of the document text, which an
+in-memory configuration does not have.)
 
 #### Six top-level keys the document format does not carry (breaking change)
 

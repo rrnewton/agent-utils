@@ -265,3 +265,162 @@ def test_scheduler_rechecks_write_domains_before_spawning(tmp_path: Path) -> Non
     assert not result.ok
     assert result.outcomes == ()
     assert not marker.exists(), "policy refusal happened after the node wrote"
+
+
+# ------------------------------------------------- the loader's graph contract (closed schema,
+# duplicate tags, missing deps, cycles, unsatisfiable demands)
+#
+# Every case below was ACCEPTED by this loader before, and the first four then produced a wrong
+# run rather than an error: an ignored field, a step that silently never ran, a starve discovered
+# only after unrelated work had completed, and a RecursionError (a stack-overflow core dump in the
+# Rust edition).
+
+
+def test_an_unknown_step_field_is_refused_and_named_with_its_step() -> None:
+    with pytest.raises(DagJsonError) as excinfo:
+        dag_from_json('{"steps":[{"group":"a","job":"one","cmd":"true","bogus_field":42}]}')
+    error = str(excinfo.value)
+    assert "steps[0] (a.one)" in error, error
+    assert "'bogus_field'" in error, error
+    # The known-field list is part of the message: the whole point is that the author meant one
+    # of them.
+    assert "cpu_timeout" in error, error
+
+    # Two at once are named together, sorted, so a reader fixes both in one pass.
+    with pytest.raises(DagJsonError, match=r"'alpha', 'zeta'"):
+        dag_from_json('{"steps":[{"group":"a","job":"one","cmd":"true","zeta":1,"alpha":2}]}')
+
+    # The nested schema objects are closed too. `est_duration` for `est_duration_s` is the
+    # canonical silent drop: the estimate is simply not carried and planning uses 0.
+    with pytest.raises(DagJsonError) as hint_info:
+        dag_from_json(
+            '{"steps":[{"group":"a","job":"one","cmd":"true","hint":{"est_duration":9}}]}'
+        )
+    assert "steps[0].hint" in str(hint_info.value)
+    assert "'est_duration'" in str(hint_info.value)
+
+    with pytest.raises(DagJsonError) as policy_info:
+        dag_from_json('{"steps":[],"write_domain_policy":{"require_explicits":true}}')
+    assert "write_domain_policy" in str(policy_info.value)
+    assert "'require_explicits'" in str(policy_info.value)
+
+
+def test_a_step_declaring_only_known_fields_still_loads() -> None:
+    # The other side, so "refuse every step" cannot pass the case above.
+    dag_from_json(
+        '{"steps":[{"group":"a","job":"one","desc":"d","description":"long",'
+        '"cmd":"true","deps":[],"env":{"K":"V"},"networkonly":false,'
+        '"engine_only":false,"timeout":5,"cpu_timeout":3,"jobs_flag":"-j",'
+        '"jobs_env":"J","explains":[],"fail_fast_family":"fam",'
+        '"hint":{"resources":{},"est_duration_s":1.0,"classification":"light"}}]}'
+    )
+
+
+def test_a_duplicate_step_tag_is_refused_rather_than_silently_dropping_a_step() -> None:
+    # THE SILENT ONE. Two steps, one tag: the runner executed exactly one of them and then
+    # reported "2 passed". Nothing anywhere said a declared command had not been run.
+    with pytest.raises(DagJsonError) as excinfo:
+        dag_from_json(
+            '{"steps":[{"group":"a","job":"one","cmd":"echo FIRST"},'
+            '{"group":"a","job":"one","cmd":"echo SECOND"}]}'
+        )
+    error = str(excinfo.value)
+    assert "duplicate step tag 'a.one'" in error, error
+    assert "declared 2 times" in error, error
+    assert "vanish silently" in error, error
+
+
+def test_a_missing_dependency_is_refused_at_load_not_after_a_full_build() -> None:
+    with pytest.raises(
+        DagJsonError, match=r"step a\.one: depends on 'b\.missing', which no step declares"
+    ):
+        dag_from_json(
+            '{"steps":[{"group":"z","job":"zero","cmd":"true"},'
+            '{"group":"a","job":"one","cmd":"true","deps":["b.missing"]}]}'
+        )
+
+
+def test_a_dependency_cycle_is_refused_and_the_refusal_names_the_cycle() -> None:
+    # The CRASH case. Accepted by the loader, this reached the bottom-level walk and raised
+    # RecursionError; the Rust edition aborted the process with a stack overflow (core dump).
+    with pytest.raises(DagJsonError, match=r"dependency cycle: a\.one -> b\.two -> a\.one"):
+        dag_from_json(
+            '{"steps":[{"group":"a","job":"one","cmd":"true","deps":["b.two"]},'
+            '{"group":"b","job":"two","cmd":"true","deps":["a.one"]}]}'
+        )
+
+    # A self-edge is a one-node cycle and is named the same way.
+    with pytest.raises(DagJsonError, match=r"dependency cycle: a\.one -> a\.one"):
+        dag_from_json('{"steps":[{"group":"a","job":"one","cmd":"true","deps":["a.one"]}]}')
+
+    # A long chain is walked ITERATIVELY, so the cycle check cannot itself be the crash: this
+    # graph is far deeper than CPython's default recursion limit.
+    entries = ",".join(
+        '{"group":"g","job":"s%d","cmd":"true","deps":["g.s%d"]}'
+        % (i, 4999 if i == 0 else i - 1)
+        for i in range(5000)
+    )
+    with pytest.raises(DagJsonError, match=r"dependency cycle: "):
+        dag_from_json('{"steps":[%s]}' % entries)
+
+
+def test_a_demand_above_a_positive_cap_is_refused_but_a_cap_of_zero_stays_a_deliberate_block() -> None:
+    with pytest.raises(
+        DagJsonError,
+        match=(
+            r"step a\.one: demands browser=2 but resource_caps declares browser=1, "
+            r"so it can never be admitted"
+        ),
+    ):
+        dag_from_json(
+            '{"resource_caps":{"browser":1},'
+            '"steps":[{"group":"a","job":"one","cmd":"true",'
+            '"hint":{"resources":{"browser":2}}}]}'
+        )
+
+    # A cap of exactly 0 is documented as "blocked on purpose", so it is NOT a load error.
+    # Asserting the boundary from both sides is what stops this becoming a blanket ban.
+    dag_from_json(
+        '{"resource_caps":{"browser":0},'
+        '"steps":[{"group":"a","job":"one","cmd":"true",'
+        '"hint":{"resources":{"browser":1}}}]}'
+    )
+
+    # An intentionally-skipped step never launches, so its dormant demand is not an error.
+    dag_from_json(
+        '{"resource_caps":{"browser":1},'
+        '"steps":[{"group":"a","job":"one","cmd":"true",'
+        '"skip_reason":"empty-manifest-bucket",'
+        '"hint":{"resources":{"browser":9}}}]}'
+    )
+
+
+def test_a_graph_with_several_faults_reports_them_all_at_once() -> None:
+    with pytest.raises(DagJsonError) as excinfo:
+        dag_from_json(
+            '{"resource_caps":{"browser":1},'
+            '"steps":[{"group":"a","job":"one","cmd":"true","deps":["nope.gone"]},'
+            '{"group":"b","job":"two","cmd":"true","deps":["c.three"]},'
+            '{"group":"c","job":"three","cmd":"true","deps":["b.two"]},'
+            '{"group":"d","job":"four","cmd":"true",'
+            '"hint":{"resources":{"browser":5}}}]}'
+        )
+    error = str(excinfo.value)
+    assert "3 graph error(s)" in error, error
+    assert "'nope.gone'" in error, error
+    assert "dependency cycle: b.two -> c.three -> b.two" in error, error
+    assert "demands browser=5" in error, error
+
+
+def test_a_duplicate_tag_short_circuits_the_edge_checks() -> None:
+    # While two steps share a tag, every statement about "the step named X" is ambiguous, so the
+    # loader reports the ambiguity and nothing built on top of it.
+    with pytest.raises(DagJsonError) as excinfo:
+        dag_from_json(
+            '{"steps":[{"group":"a","job":"one","cmd":"true","deps":["nope.gone"]},'
+            '{"group":"a","job":"one","cmd":"true"}]}'
+        )
+    error = str(excinfo.value)
+    assert "1 graph error(s)" in error, error
+    assert "duplicate step tag" in error, error
+    assert "nope.gone" not in error, error

@@ -1009,6 +1009,149 @@ pub fn undeclared_resource_demands(cfg: &DagConfig) -> Vec<String> {
     out
 }
 
+/// Ways the GRAPH ITSELF cannot mean what it says, named before anything runs.
+///
+/// Each entry describes a graph whose declared steps cannot all be executed in the order the
+/// graph asks for. None of them is a matter of taste.
+///
+/// DUPLICATE TAG is the worst of the set, because it is the one that stays SILENT. Two steps
+/// declared with the same `group.job` collapse into one entry in every `by_tag` index the runner
+/// builds, so exactly one of them ever runs, the other vanishes without a word, and the summary
+/// still counts both as passed. A run that reports "2 passed" having executed one command is not
+/// a partial failure; it is a false report.
+///
+/// MISSING DEPENDENCY names a predecessor no step declares. Left to the scheduler this is a
+/// "terminal starve" discovered only after every unrelated step has already run, so a typo in one
+/// edge costs a full build before it is reported.
+///
+/// CYCLE is the crash. Nothing downstream of the loader tolerates one: the bottom-level walk
+/// recurses along the cycle until the stack is exhausted and the process ABORTS WITH A CORE DUMP,
+/// and the critical-path walk never reaches a sink. Those walks are written for an acyclic graph
+/// on purpose; this is the check that makes that assumption true. The refusal NAMES the cycle,
+/// because "there is a cycle" in a 200-node graph is not actionable.
+///
+/// UNSATISFIABLE RESOURCE DEMAND is a step whose demand exceeds a POSITIVE declared cap, so it can
+/// never be admitted however long the run waits. A cap declared as exactly `0` is deliberately NOT
+/// included: `0` means "blocked on purpose" (see [`undeclared_resource_demands`]), and a check
+/// here would turn that documented affordance into a load error.
+///
+/// Returns human-readable entries in a deterministic order, empty when the graph is sound.
+/// Duplicate tags SHORT-CIRCUIT the remaining checks: while two steps share a tag, every statement
+/// about "the step named X" is ambiguous, and reporting edges against an arbitrary winner would be
+/// guesswork presented as fact.
+pub fn graph_structure_violations(cfg: &DagConfig) -> Vec<String> {
+    // Both language editions of this runner must refuse the same graphs with the same bytes, so
+    // the message text and the traversal order here are a shared contract, pinned by the
+    // cross-language differential.
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for step in &cfg.steps {
+        *counts.entry(step.tag()).or_insert(0) += 1;
+    }
+    let duplicates: Vec<String> = counts
+        .iter()
+        .filter(|(_, n)| **n > 1)
+        .map(|(tag, n)| {
+            format!(
+                "duplicate step tag '{tag}': declared {n} times, but a tag names exactly one \
+                 step -- only ONE of them would ever run and the rest would vanish silently"
+            )
+        })
+        .collect();
+    if !duplicates.is_empty() {
+        return duplicates;
+    }
+
+    let mut bad: Vec<String> = Vec::new();
+    for step in &cfg.steps {
+        let missing: BTreeSet<&String> = step
+            .deps
+            .iter()
+            .filter(|dep| !counts.contains_key(*dep))
+            .collect();
+        for dep in missing {
+            bad.push(format!(
+                "step {}: depends on '{dep}', which no step declares",
+                step.tag()
+            ));
+        }
+    }
+
+    // Iterative three-colour DFS over the dependency relation, matching
+    // `refuse_unusable_explains`: iterative so a deep chain cannot blow the stack and turn a
+    // validation error into the very crash this check exists to prevent. Only edges that RESOLVE
+    // are followed, so a missing dependency is reported once (above) rather than also
+    // masquerading as a broken cycle.
+    let by_tag: BTreeMap<String, &Step> = cfg.steps.iter().map(|s| (s.tag(), s)).collect();
+    #[derive(Clone, Copy, PartialEq)]
+    enum Colour {
+        White,
+        Grey,
+        Black,
+    }
+    let mut colour: BTreeMap<&str, Colour> =
+        by_tag.keys().map(|k| (k.as_str(), Colour::White)).collect();
+    for root in by_tag.keys() {
+        if colour[root.as_str()] != Colour::White {
+            continue;
+        }
+        let mut stack: Vec<(&str, bool)> = vec![(root.as_str(), false)];
+        let mut path: Vec<&str> = Vec::new();
+        while let Some((tag, leaving)) = stack.pop() {
+            if leaving {
+                colour.insert(tag, Colour::Black);
+                path.pop();
+                continue;
+            }
+            match colour[tag] {
+                Colour::Black => continue,
+                Colour::Grey => {
+                    let start = path.iter().position(|t| *t == tag).unwrap_or(0);
+                    let mut cycle: Vec<&str> = path[start..].to_vec();
+                    cycle.push(tag);
+                    bad.push(format!("dependency cycle: {}", cycle.join(" -> ")));
+                    // ONE cycle per root, then abandon this root entirely: every node still on
+                    // the path is retired to Black so the outer loop cannot re-enter it and
+                    // report the same cycle again from a second entry point. A cycle elsewhere in
+                    // the graph is still reached from its own root.
+                    for pending in &path {
+                        colour.insert(pending, Colour::Black);
+                    }
+                    stack.clear();
+                    break;
+                }
+                Colour::White => {}
+            }
+            colour.insert(tag, Colour::Grey);
+            path.push(tag);
+            stack.push((tag, true));
+            let deps: BTreeSet<&str> = by_tag[tag].deps.iter().map(|s| s.as_str()).collect();
+            for dep in deps {
+                if by_tag.contains_key(dep) && colour.get(dep) != Some(&Colour::Black) {
+                    stack.push((dep, false));
+                }
+            }
+        }
+    }
+
+    for step in &cfg.steps {
+        if step.skip_reason.is_some() {
+            continue;
+        }
+        for (name, count) in &step.hint.resources {
+            if let Some(cap) = cfg.resource_caps.get(name) {
+                if *cap > 0 && *count > *cap {
+                    bad.push(format!(
+                        "step {}: demands {name}={count} but resource_caps declares \
+                         {name}={cap}, so it can never be admitted",
+                        step.tag()
+                    ));
+                }
+            }
+        }
+    }
+    bad
+}
+
 /// Return deterministic fail-closed write-domain declaration errors.
 ///
 /// Parsers call this while loading, and scheduler entry points call it again so an

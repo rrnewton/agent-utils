@@ -1149,6 +1149,166 @@ def compare_uncarried_config_keys(py: list[str], rs: list[str], rep: Report) -> 
             rep.ok(label)
 
 
+#: Every graph the loader must REFUSE, as ``(label, document, phrase the refusal must contain)``.
+#:
+#: All five were accepted by both builds until the loader learned to check the graph, and four of
+#: them then produced a wrong run rather than an error: a field that did nothing, a step that
+#: never ran while the summary counted it as passed, a starve found only after unrelated work had
+#: completed, and a crash (``RecursionError`` in Python, a stack-overflow ABORT WITH CORE DUMP in
+#: Rust). Pinned here so the two editions cannot drift back apart one refusal at a time.
+LOADER_REFUSALS: tuple[tuple[str, str, str], ...] = (
+    (
+        "unknown-step-field",
+        '{"steps":[{"group":"a","job":"one","cmd":"true","bogus_field":42}]}',
+        "steps[0] (a.one): unknown field(s) 'bogus_field'",
+    ),
+    (
+        "unknown-hint-field",
+        '{"steps":[{"group":"a","job":"one","cmd":"true","hint":{"est_duration":9}}]}',
+        "steps[0].hint: unknown field(s) 'est_duration'",
+    ),
+    (
+        "unknown-write-domain-policy-field",
+        '{"steps":[],"write_domain_policy":{"require_explicits":true}}',
+        "write_domain_policy: unknown field(s) 'require_explicits'",
+    ),
+    (
+        "duplicate-step-tag",
+        '{"steps":[{"group":"a","job":"one","cmd":"echo FIRST"},'
+        '{"group":"a","job":"one","cmd":"echo SECOND"}]}',
+        "duplicate step tag 'a.one': declared 2 times",
+    ),
+    (
+        "missing-dependency",
+        '{"steps":[{"group":"z","job":"zero","cmd":"true"},'
+        '{"group":"a","job":"one","cmd":"true","deps":["b.missing"]}]}',
+        "step a.one: depends on 'b.missing', which no step declares",
+    ),
+    (
+        "dependency-cycle",
+        '{"steps":[{"group":"a","job":"one","cmd":"true","deps":["b.two"]},'
+        '{"group":"b","job":"two","cmd":"true","deps":["a.one"]}]}',
+        "dependency cycle: a.one -> b.two -> a.one",
+    ),
+    (
+        "self-dependency",
+        '{"steps":[{"group":"a","job":"one","cmd":"true","deps":["a.one"]}]}',
+        "dependency cycle: a.one -> a.one",
+    ),
+    (
+        "demand-above-positive-cap",
+        '{"resource_caps":{"browser":1},"steps":[{"group":"a","job":"one","cmd":"true",'
+        '"hint":{"resources":{"browser":2}}}]}',
+        "step a.one: demands browser=2 but resource_caps declares browser=1",
+    ),
+    (
+        "several-faults-at-once",
+        '{"resource_caps":{"browser":1},'
+        '"steps":[{"group":"a","job":"one","cmd":"true","deps":["nope.gone"]},'
+        '{"group":"b","job":"two","cmd":"true","deps":["c.three"]},'
+        '{"group":"c","job":"three","cmd":"true","deps":["b.two"]},'
+        '{"group":"d","job":"four","cmd":"true","hint":{"resources":{"browser":5}}}]}',
+        "3 graph error(s)",
+    ),
+)
+
+#: Graphs that must still LOAD, so "refuse everything" cannot pass the table above. Each one is
+#: the near-miss of a refusal: the boundary is the part that is easy to get wrong in only one
+#: edition.
+LOADER_ACCEPTANCES: tuple[tuple[str, str], ...] = (
+    (
+        "every-declared-step-field",
+        '{"steps":[{"group":"a","job":"one","desc":"d","description":"long","cmd":"true",'
+        '"deps":[],"env":{"K":"V"},"networkonly":false,"engine_only":false,"timeout":5,'
+        '"cpu_timeout":3,"jobs_flag":"-j","jobs_env":"J","explains":[],'
+        '"fail_fast_family":"fam",'
+        '"hint":{"resources":{},"est_duration_s":1.0,"classification":"light"}}]}',
+    ),
+    (
+        # A cap of exactly 0 is documented as "blocked on purpose", NOT as a load error.
+        "cap-of-zero-is-a-deliberate-block",
+        '{"resource_caps":{"browser":0},"steps":[{"group":"a","job":"one","cmd":"true",'
+        '"hint":{"resources":{"browser":1}}}]}',
+    ),
+    (
+        # An intentionally-skipped step never launches, so its dormant demand cannot starve.
+        "skipped-step-dormant-demand",
+        '{"resource_caps":{"browser":1},"steps":[{"group":"a","job":"one","cmd":"true",'
+        '"skip_reason":"empty-manifest-bucket","hint":{"resources":{"browser":9}}}]}',
+    ),
+    (
+        # A diamond is not a cycle. The three-colour walk grey-lists a node while it is on the
+        # path; a shared ancestor reached twice by different routes must not read as one.
+        "diamond-is-not-a-cycle",
+        '{"steps":[{"group":"g","job":"root","cmd":"true"},'
+        '{"group":"g","job":"left","cmd":"true","deps":["g.root"]},'
+        '{"group":"g","job":"right","cmd":"true","deps":["g.root"]},'
+        '{"group":"g","job":"join","cmd":"true","deps":["g.left","g.right"]}]}',
+    ),
+)
+
+#: Inspection subcommands. Validating in ALL of them is the point: a graph check that needs a run
+#: is not a check, it is a build.
+INSPECTION_SUBCOMMANDS: tuple[str, ...] = ("list", "plan", "ascii", "dot", "json", "yaml")
+
+
+def compare_loader_graph_validation(py: list[str], rs: list[str], rep: Report) -> None:
+    """Both builds must refuse the same broken graphs, with the same bytes, from every entry.
+
+    THE CHEAP CHECK IS THE POINT. A `list` that prints a cyclic graph and exits 0 gives a caller
+    no way to validate a DAG short of running it, and running it was, for a cycle, a crash. So the
+    refusal is asserted on `run` AND on every inspection subcommand, with the same exit code.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        for label, doc, phrase in LOADER_REFUSALS:
+            path = os.path.join(tmp, f"{label}.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(doc)
+            for sub in ("run", *INSPECTION_SUBCOMMANDS):
+                args = (sub, "--dag", path)
+                po = run(py, args)
+                ro = run(rs, args)
+                case = f"loader-refusal:{label}:{sub}"
+                if po.returncode != ro.returncode:
+                    rep.bad(case, f"exit py={po.returncode} rs={ro.returncode}")
+                elif po.returncode != 2:
+                    rep.bad(
+                        case,
+                        f"a broken graph must be REFUSED at load (exit 2), not accepted or "
+                        f"crashed; both builds exited {po.returncode}: {po.stderr!r}",
+                    )
+                elif phrase not in po.stderr or phrase not in ro.stderr:
+                    rep.bad(
+                        case,
+                        f"the refusal must say {phrase!r}; py={po.stderr!r} rs={ro.stderr!r}",
+                    )
+                elif po.stderr != ro.stderr:
+                    rep.bad(case, f"stderr py={po.stderr!r} rs={ro.stderr!r}")
+                else:
+                    rep.ok(case)
+
+        for label, doc in LOADER_ACCEPTANCES:
+            path = os.path.join(tmp, f"ok-{label}.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(doc)
+            args = ("list", "--dag", path)
+            po = run(py, args)
+            ro = run(rs, args)
+            case = f"loader-acceptance:{label}"
+            if po.returncode != ro.returncode:
+                rep.bad(case, f"exit py={po.returncode} rs={ro.returncode}")
+            elif po.returncode != 0:
+                rep.bad(
+                    case,
+                    f"this graph must still LOAD; both builds exited {po.returncode}: "
+                    f"{po.stderr!r}",
+                )
+            elif po.stdout != ro.stdout:
+                rep.bad(case, f"stdout py={po.stdout!r} rs={ro.stdout!r}")
+            else:
+                rep.ok(case)
+
+
 def compare_uncontained_cpu_budget_notice(py: list[str], rs: list[str], rep: Report) -> None:
     """Both builds must describe the same best-effort uncontained CPU-time fallback.
 
@@ -1161,7 +1321,7 @@ def compare_uncontained_cpu_budget_notice(py: list[str], rs: list[str], rep: Rep
         live = os.path.join(tmp, "live.json")
         with open(live, "w", encoding="utf-8") as fh:
             fh.write(
-                '{"steps": [{"group": "g", "job": "a", "kind": "compile", '
+                '{"steps": [{"group": "g", "job": "a", '
                 '"cmd": "true", "cpu_timeout": 7, "timeout": 30}]}'
             )
         po = run(py, ("run", "--dag", live, ACF))
@@ -1189,11 +1349,11 @@ def compare_uncontained_cpu_budget_notice(py: list[str], rs: list[str], rep: Rep
         with open(many, "w", encoding="utf-8") as fh:
             fh.write(
                 '{"steps": ['
-                '{"group": "g", "job": "a", "kind": "compile", "cmd": "true", '
+                '{"group": "g", "job": "a", "cmd": "true", '
                 '"cpu_timeout": 7, "timeout": 30}, '
-                '{"group": "g", "job": "b", "kind": "compile", "cmd": "true", '
+                '{"group": "g", "job": "b", "cmd": "true", '
                 '"cpu_timeout": 5, "timeout": 30}, '
-                '{"group": "g", "job": "c", "kind": "compile", "cmd": "true", '
+                '{"group": "g", "job": "c", "cmd": "true", '
                 '"cpu_timeout": 3, "timeout": 30}]}'
             )
         po = run(py, ("run", "--dag", many, ACF))
@@ -5465,7 +5625,7 @@ def compare_operator_build_width(py: list[str], rs: list[str], rep: Report) -> N
         # A hard 2 GiB per-step cap makes the derived per-step width small and host-independent
         # relative to the scope's, so "refined downward" is observable rather than incidental.
         Path(dag_path).write_text(
-            '{"steps": [{"group": "g", "job": "a", "kind": "compile", '
+            '{"steps": [{"group": "g", "job": "a", '
             '"cmd": "echo WIDTH=$CARGO_BUILD_JOBS", "timeout": 60, '
             '"hint": {"hard_mem_max_bytes": 2147483648}}]}',
             encoding="utf-8",
@@ -5878,6 +6038,7 @@ def compare_dagrun(rand_count: int, seed: int) -> int:
     compare_scalar_parity(py, rs, rep)
     compare_only_errors(py, rs, rep)
     compare_uncarried_config_keys(py, rs, rep)
+    compare_loader_graph_validation(py, rs, rep)
     compare_uncontained_cpu_budget_notice(py, rs, rep)
     compare_escapee_teardown(py, rs, rep)
     compare_term_attribution(py, rs, rep)

@@ -26,8 +26,9 @@ use std::fmt;
 use serde_json::Value;
 
 use crate::model::{
-    resolve_jobs_env, write_domain_violations, DagConfig, IntentionalSkipReason, ResourceHint,
-    Step, StepClass, WriteDomainGuarantee, WriteDomainPolicy, DEFAULT_JOBS_FLAG,
+    graph_structure_violations, resolve_jobs_env, write_domain_violations, DagConfig,
+    IntentionalSkipReason, ResourceHint, Step, StepClass, WriteDomainGuarantee, WriteDomainPolicy,
+    DEFAULT_JOBS_FLAG,
 };
 
 const DEFAULT_MEM_CAP_FLOOR: i64 = 8 * 1024 * 1024 * 1024;
@@ -134,6 +135,83 @@ fn refuse_unusable_explains(steps: &[Step]) -> Result<(), DagJsonError> {
 
 fn err(msg: impl Into<String>) -> DagJsonError {
     DagJsonError(msg.into())
+}
+
+/// Every key a `steps[]` entry may carry. The step object is CLOSED.
+///
+/// The top level is deliberately open (see [`UNCARRIED_CONFIG_KEYS`]): a top-level key nobody has
+/// ever implemented cannot masquerade as a setting that took effect, so tolerating it buys forward
+/// compatibility at no cost. A STEP key is the opposite case. Every one of them is a per-node
+/// instruction, and the near-misses are all real spellings a person writes by accident -- `dep`,
+/// `cmds`, `timeouts`, `env_vars`, `description` vs `desc`. Silently ignored, the instruction is
+/// simply not carried out and the document still says it was: the step runs with no timeout, no
+/// dependency, no environment, and nothing anywhere reports it.
+const STEP_KEYS: [&str; 19] = [
+    "cmd",
+    "cpu_timeout",
+    "deps",
+    "desc",
+    "description",
+    "engine_only",
+    "env",
+    "explains",
+    "fail_fast_family",
+    "group",
+    "hint",
+    "job",
+    "jobs_env",
+    "jobs_flag",
+    "networkonly",
+    "skip_reason",
+    "timeout",
+    "write_domain_guarantee",
+    "write_domains",
+];
+
+/// Every key a step's `hint` object may carry. Closed for the same reason as [`STEP_KEYS`];
+/// `est_duration` for `est_duration_s` is the canonical silent drop.
+const HINT_KEYS: [&str; 8] = [
+    "classification",
+    "est_duration_s",
+    "hard_mem_max_bytes",
+    "measured_cpu_utilization",
+    "measured_effective_cores",
+    "preferred_inner_jobs",
+    "resources",
+    "rss_baseline_bytes",
+];
+
+/// Every key the top-level `write_domain_policy` object may carry. Closed: a misspelled
+/// `require_explicit` turns a fail-closed policy into no policy at all, silently.
+const WRITE_DOMAIN_POLICY_KEYS: [&str; 2] = ["allowed_domains", "require_explicit"];
+
+/// Refuse keys a CLOSED schema object does not define, naming every one of them.
+///
+/// `resources` and `env` are caller-defined key spaces and are never narrowed here; only the
+/// schema objects themselves are closed.
+fn refuse_unknown_keys(
+    m: &serde_json::Map<String, Value>,
+    known: &[&str],
+    where_: &str,
+) -> Result<(), DagJsonError> {
+    let unknown: Vec<String> = m
+        .keys()
+        .filter(|key| !known.contains(&key.as_str()))
+        .map(|key| format!("'{key}'"))
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    // serde_json::Map preserves insertion order only with the `preserve_order` feature; sort so
+    // the refusal is byte-identical to the Python edition's sorted list either way.
+    let mut unknown = unknown;
+    unknown.sort();
+    Err(err(format!(
+        "{where_}: unknown field(s) {}. This object's schema is CLOSED, because an ignored field \
+         reads exactly like one that took effect. Known fields: {}",
+        unknown.join(", "),
+        known.join(", ")
+    )))
 }
 
 // --- typed narrowing helpers (serde_json::Value; narrow explicitly, mirror Python strictness) ---
@@ -321,6 +399,7 @@ fn write_domain_policy(value: Option<&Value>) -> Result<WriteDomainPolicy, DagJs
         return Ok(WriteDomainPolicy::default());
     }
     let obj = as_obj(value, "write_domain_policy")?;
+    refuse_unknown_keys(obj, &WRITE_DOMAIN_POLICY_KEYS, "write_domain_policy")?;
     let allowed = opt_str_list(obj, "allowed_domains")?;
     let mut allowed_domains = BTreeSet::new();
     let mut duplicates = BTreeSet::new();
@@ -395,6 +474,7 @@ fn hint_from(value: Option<&Value>, where_: &str) -> Result<ResourceHint, DagJso
         Some(v) => v,
     };
     let obj = as_obj(value, where_)?;
+    refuse_unknown_keys(obj, &HINT_KEYS, where_)?;
     let cls_name = opt_str(obj, "classification", StepClass::Light.value())?;
     let classification = StepClass::from_value(&cls_name).ok_or_else(|| {
         err(format!(
@@ -491,6 +571,17 @@ pub fn dag_from_value(raw: &Value) -> Result<DagConfig, DagJsonError> {
     for (i, entry) in steps_raw.iter().enumerate() {
         let where_ = format!("steps[{i}]");
         let sm = as_obj(entry, &where_)?;
+        // Name the offending step by TAG as well as by index wherever the document supplies one:
+        // "steps[7]" sends a reader counting entries in a 200-step file. Only the closed-schema
+        // refusal gets the decorated location; the per-field type errors keep their established
+        // "steps[N].field" spelling.
+        let named = match (sm.get("group"), sm.get("job")) {
+            (Some(Value::String(group)), Some(Value::String(job))) => {
+                format!("{where_} ({group}.{job})")
+            }
+            _ => where_.clone(),
+        };
+        refuse_unknown_keys(sm, &STEP_KEYS, &named)?;
         let fail_fast_family = opt_str_or_none(sm, "fail_fast_family")?;
         if fail_fast_family
             .as_ref()
@@ -596,6 +687,16 @@ pub fn dag_from_value(raw: &Value) -> Result<DagConfig, DagJsonError> {
         return Err(err(format!(
             "write-domain policy refused DAG before execution: {}",
             violations.join("; ")
+        )));
+    }
+    // LAST, because it is the only check that needs the finished configuration (caps and steps
+    // together) and because its findings are about the graph rather than about a field.
+    let structural = graph_structure_violations(&cfg);
+    if !structural.is_empty() {
+        return Err(err(format!(
+            "<root>: {} graph error(s) refused before execution: {}",
+            structural.len(),
+            structural.join("; ")
         )));
     }
     Ok(cfg)
@@ -1465,6 +1566,208 @@ steps:
         let cfg = dag_from_json(r#"{"future_thing": 5, "steps": []}"#)
             .expect("an unimplemented key is not a dropped field");
         assert!(cfg.steps.is_empty());
+    }
+
+    // ------------------------------------------------- the loader's graph contract (closed
+    // schema, duplicate tags, missing deps, cycles, unsatisfiable demands)
+    //
+    // Every case below was ACCEPTED by this loader before, and the first four then produced a
+    // wrong run rather than an error: an ignored field, a step that silently never ran, a starve
+    // discovered only after unrelated work had completed, and a stack-overflow abort.
+
+    #[test]
+    fn an_unknown_step_field_is_refused_and_named_with_its_step() {
+        let error =
+            dag_from_json(r#"{"steps":[{"group":"a","job":"one","cmd":"true","bogus_field":42}]}"#)
+                .expect_err("an unknown step field silently did nothing")
+                .0;
+        assert!(error.contains("steps[0] (a.one)"), "{error}");
+        assert!(error.contains("'bogus_field'"), "{error}");
+        // The known-field list is part of the message: the whole point is that the author meant
+        // one of them.
+        assert!(error.contains("cpu_timeout"), "{error}");
+
+        // Two at once are named together, sorted, so a reader fixes both in one pass.
+        let both = dag_from_json(
+            r#"{"steps":[{"group":"a","job":"one","cmd":"true","zeta":1,"alpha":2}]}"#,
+        )
+        .unwrap_err()
+        .0;
+        assert!(both.contains("'alpha', 'zeta'"), "{both}");
+
+        // The nested schema objects are closed too. `est_duration` for `est_duration_s` is the
+        // canonical silent drop: the estimate is simply not carried and planning uses 0.
+        let hint = dag_from_json(
+            r#"{"steps":[{"group":"a","job":"one","cmd":"true","hint":{"est_duration":9}}]}"#,
+        )
+        .unwrap_err()
+        .0;
+        assert!(hint.contains("steps[0].hint"), "{hint}");
+        assert!(hint.contains("'est_duration'"), "{hint}");
+
+        let policy =
+            dag_from_json(r#"{"steps":[],"write_domain_policy":{"require_explicits":true}}"#)
+                .unwrap_err()
+                .0;
+        assert!(policy.contains("write_domain_policy"), "{policy}");
+        assert!(policy.contains("'require_explicits'"), "{policy}");
+    }
+
+    #[test]
+    fn a_step_declaring_only_known_fields_still_loads() {
+        // The other side, so "refuse every step" cannot pass the case above.
+        dag_from_json(
+            r#"{"steps":[{"group":"a","job":"one","desc":"d","description":"long",
+                "cmd":"true","deps":[],"env":{"K":"V"},"networkonly":false,
+                "engine_only":false,"timeout":5,"cpu_timeout":3,"jobs_flag":"-j",
+                "jobs_env":"J","explains":[],"fail_fast_family":"fam",
+                "hint":{"resources":{},"est_duration_s":1.0,"classification":"light"}}]}"#,
+        )
+        .expect("a step using only declared fields must load");
+    }
+
+    #[test]
+    fn a_duplicate_step_tag_is_refused_rather_than_silently_dropping_a_step() {
+        // THE SILENT ONE. Two steps, one tag: the runner executed exactly one of them and then
+        // reported "2 passed". Nothing anywhere said a declared command had not been run.
+        let error = dag_from_json(
+            r#"{"steps":[{"group":"a","job":"one","cmd":"echo FIRST"},
+                         {"group":"a","job":"one","cmd":"echo SECOND"}]}"#,
+        )
+        .expect_err("a duplicate tag silently dropped a step")
+        .0;
+        assert!(error.contains("duplicate step tag 'a.one'"), "{error}");
+        assert!(error.contains("declared 2 times"), "{error}");
+        assert!(error.contains("vanish silently"), "{error}");
+    }
+
+    #[test]
+    fn a_missing_dependency_is_refused_at_load_not_after_a_full_build() {
+        let error = dag_from_json(
+            r#"{"steps":[{"group":"z","job":"zero","cmd":"true"},
+                         {"group":"a","job":"one","cmd":"true","deps":["b.missing"]}]}"#,
+        )
+        .expect_err("a dangling dependency loaded fine and starved mid-run")
+        .0;
+        assert!(
+            error.contains("step a.one: depends on 'b.missing', which no step declares"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_dependency_cycle_is_refused_and_the_refusal_names_the_cycle() {
+        // The CRASH case. Accepted by the loader, this reached the bottom-level walk and aborted
+        // the process with a stack overflow (core dump); the Python edition raised RecursionError.
+        let error = dag_from_json(
+            r#"{"steps":[{"group":"a","job":"one","cmd":"true","deps":["b.two"]},
+                         {"group":"b","job":"two","cmd":"true","deps":["a.one"]}]}"#,
+        )
+        .expect_err("a cycle loaded fine and then crashed the planner")
+        .0;
+        assert!(
+            error.contains("dependency cycle: a.one -> b.two -> a.one"),
+            "the refusal must NAME the cycle: {error}"
+        );
+
+        // A self-edge is a one-node cycle and is named the same way.
+        let self_edge =
+            dag_from_json(r#"{"steps":[{"group":"a","job":"one","cmd":"true","deps":["a.one"]}]}"#)
+                .unwrap_err()
+                .0;
+        assert!(
+            self_edge.contains("dependency cycle: a.one -> a.one"),
+            "{self_edge}"
+        );
+
+        // A long chain is walked ITERATIVELY, so the cycle check cannot itself be the crash.
+        let mut steps: Vec<String> = Vec::new();
+        for i in 0..5000 {
+            let dep = if i == 0 {
+                "\"g.s4999\"".to_string()
+            } else {
+                format!("\"g.s{}\"", i - 1)
+            };
+            steps.push(format!(
+                r#"{{"group":"g","job":"s{i}","cmd":"true","deps":[{dep}]}}"#
+            ));
+        }
+        let deep = dag_from_json(&format!(r#"{{"steps":[{}]}}"#, steps.join(",")))
+            .unwrap_err()
+            .0;
+        assert!(deep.contains("dependency cycle: "), "{deep}");
+    }
+
+    #[test]
+    fn a_demand_above_a_positive_cap_is_refused_but_a_cap_of_zero_stays_a_deliberate_block() {
+        let error = dag_from_json(
+            r#"{"resource_caps":{"browser":1},
+                "steps":[{"group":"a","job":"one","cmd":"true",
+                          "hint":{"resources":{"browser":2}}}]}"#,
+        )
+        .expect_err("an unsatisfiable demand loaded fine")
+        .0;
+        assert!(
+            error.contains(
+                "step a.one: demands browser=2 but resource_caps declares browser=1, so it can \
+                 never be admitted"
+            ),
+            "{error}"
+        );
+
+        // A cap of exactly 0 is documented as "blocked on purpose", so it is NOT a load error.
+        // Asserting the boundary from both sides is what stops this becoming a blanket ban.
+        dag_from_json(
+            r#"{"resource_caps":{"browser":0},
+                "steps":[{"group":"a","job":"one","cmd":"true",
+                          "hint":{"resources":{"browser":1}}}]}"#,
+        )
+        .expect("a cap of 0 is the documented deliberate block, not a load error");
+
+        // An intentionally-skipped step never launches, so its dormant demand is not an error.
+        dag_from_json(
+            r#"{"resource_caps":{"browser":1},
+                "steps":[{"group":"a","job":"one","cmd":"true",
+                          "skip_reason":"empty-manifest-bucket",
+                          "hint":{"resources":{"browser":9}}}]}"#,
+        )
+        .expect("a skipped step's dormant demand cannot starve anything");
+    }
+
+    #[test]
+    fn a_graph_with_several_faults_reports_them_all_at_once() {
+        let error = dag_from_json(
+            r#"{"resource_caps":{"browser":1},
+                "steps":[{"group":"a","job":"one","cmd":"true","deps":["nope.gone"]},
+                         {"group":"b","job":"two","cmd":"true","deps":["c.three"]},
+                         {"group":"c","job":"three","cmd":"true","deps":["b.two"]},
+                         {"group":"d","job":"four","cmd":"true",
+                          "hint":{"resources":{"browser":5}}}]}"#,
+        )
+        .unwrap_err()
+        .0;
+        assert!(error.contains("3 graph error(s)"), "{error}");
+        assert!(error.contains("'nope.gone'"), "{error}");
+        assert!(
+            error.contains("dependency cycle: b.two -> c.three -> b.two"),
+            "{error}"
+        );
+        assert!(error.contains("demands browser=5"), "{error}");
+    }
+
+    #[test]
+    fn a_duplicate_tag_short_circuits_the_edge_checks() {
+        // While two steps share a tag, every statement about "the step named X" is ambiguous, so
+        // the loader reports the ambiguity and nothing built on top of it.
+        let error = dag_from_json(
+            r#"{"steps":[{"group":"a","job":"one","cmd":"true","deps":["nope.gone"]},
+                         {"group":"a","job":"one","cmd":"true"}]}"#,
+        )
+        .unwrap_err()
+        .0;
+        assert!(error.contains("1 graph error(s)"), "{error}");
+        assert!(error.contains("duplicate step tag"), "{error}");
+        assert!(!error.contains("nope.gone"), "{error}");
     }
 
     #[test]
