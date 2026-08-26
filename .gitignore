@@ -84,3 +84,5 @@ gent-talk/cloudflared.deb
 # The same profiling directory, at the repo root when the runner is invoked from here.
 /.safe-ci-dag-runner/
 py/tests/js/browser/benchmark-report.txt
+py/tests/js/browser/benchmark-report.json
+py/tests/js/browser/qa-archive-report.txt

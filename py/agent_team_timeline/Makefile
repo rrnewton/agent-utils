@@ -38,7 +38,7 @@ BOX_FLAGS ?=
 BOX = $(DAGRUN) box --label $(1) --mem $(2) --timeout $(3) --cores $(4) $(BOX_FLAGS) --
 
 .DEFAULT_GOAL := help
-.PHONY: help validate validate-fast unit browser benchmark typecheck clean-browser
+.PHONY: help validate validate-fast unit browser benchmark typecheck qa-archive clean-browser
 
 help:
 	@printf '%s\n' \
@@ -51,6 +51,8 @@ help:
 	  '  make unit            the Python suite for this tool only' \
 	  '  make browser         the Playwright suite against the real static assets' \
 	  '  make benchmark       zoom/pan redraw timings, enforced against a budget' \
+	  '' \
+	  '  make qa-archive ARCHIVE=<dir>   zoom/pan latency on a REAL archive, by level of detail' \
 	  '' \
 	  '  make clean-browser   remove Playwright test-results and traces' \
 	  '' \
@@ -94,6 +96,13 @@ benchmark:
 	cd $(BROWSER) && $(call BOX,timeline-benchmark,6G,900,4) \
 	  node --test benchmark-budget.test.cjs
 	@printf '\n'; cat $(BROWSER)/benchmark-report.txt
+
+# Manual QA, not part of `validate`: it needs a built archive this repository does not ship, and
+# it takes minutes rather than seconds. Unboxed, because it drives the archive's own serve.py and
+# four sequential Chromium sessions -- boxing the make recipe would bound the wrapper, not them.
+qa-archive:
+	@test -n "$(ARCHIVE)" || { printf 'usage: make qa-archive ARCHIVE=<built archive dir>\n'; exit 2; }
+	cd $(BROWSER) && node qa-archive.cjs --archive "$(ARCHIVE)"
 
 clean-browser:
 	rm -rf $(BROWSER)/test-results

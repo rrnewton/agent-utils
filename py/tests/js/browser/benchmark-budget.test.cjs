@@ -150,6 +150,14 @@ function reportMeasurements(report) {
     })
   ].join("\n") + "\n";
   fs.writeFileSync(path.join(__dirname, "benchmark-report.txt"), table, "utf8");
+  // The full report too, not just the table. The text is for a person reading the terminal; the
+  // JSON is what a later comparison actually needs -- every sample, the node counts, the heap,
+  // the resource totals. Both land in the checkout, both are gitignored.
+  fs.writeFileSync(
+    path.join(__dirname, "benchmark-report.json"),
+    JSON.stringify(report, null, 2) + "\n",
+    "utf8"
+  );
 
   // Printed on every run, not only on failure: a number you can only see when it is already too
   // late is not a measurement, it is an alarm.
