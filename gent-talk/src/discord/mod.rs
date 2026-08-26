@@ -129,9 +129,41 @@ fn base64_url_decode(input: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Who Discord says this bot is, as Discord itself reports it.
+///
+/// Distinct from [`self_user_id_from_token`], which reads an id out of the token's own bytes
+/// without asking anybody. That is free and cannot fail, and it is therefore also no evidence
+/// whatsoever that the token still works: a revoked token still decodes. This struct is the
+/// answer to a real call, so obtaining one is proof the credential was accepted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BotIdentity {
+    /// The bot's user snowflake. Public: it is on every message the bot has ever sent.
+    pub id: String,
+    /// The bot's username, so a report can say which application answered rather than only that
+    /// one did. An operator with two bots needs to know they configured the token of the other.
+    pub username: String,
+}
+
 /// Read and post access to Discord channels.
 #[async_trait]
 pub trait DiscordClient: Send + Sync {
+    /// Ask Discord who this token belongs to.
+    ///
+    /// The smallest authenticated call there is: it names no channel, so it separates "the
+    /// credential is bad" from "the credential is fine and this one channel is not reachable" —
+    /// two failures that a channel read alone reports identically often enough to matter, and
+    /// that have completely different fixes.
+    ///
+    /// Required rather than defaulted on purpose. A default would have to invent an answer, and
+    /// an invented answer to "is this token valid" is the single worst thing this trait could
+    /// return.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DiscordError`] exactly as a read does; [`crate::probe::classify`] turns it into
+    /// the same vocabulary a channel failure speaks.
+    async fn identity(&self) -> Result<BotIdentity, DiscordError>;
+
     /// Fetch one page of a channel, returned OLDEST FIRST.
     ///
     /// Discord itself returns newest-first; implementations normalize so that everything above

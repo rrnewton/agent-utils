@@ -36,6 +36,10 @@ impl StateStore for DisabledStore {
         format!("no durable state ({SETTING} is not configured)")
     }
 
+    async fn check_writable(&self) -> Result<String, StoreError> {
+        refuse()
+    }
+
     async fn append_turn(&self, _: &ConversationId, _: &Turn) -> Result<(), StoreError> {
         refuse()
     }

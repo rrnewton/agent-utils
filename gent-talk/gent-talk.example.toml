@@ -55,9 +55,14 @@ live_poll_seconds = 0
 # human reading the channel, though, so messages YOU type into Discord yourself are just somebody
 # else's until you say otherwise. Set this and they are drawn as yours.
 #
+# How to get it: in Discord, User Settings -> Advanced -> Developer Mode on, then right-click your
+# OWN name on any message -> Copy User ID. (The same Developer Mode is what gives you Copy Channel
+# ID for the [[channels]] block below.)
+#
 # Public: a user id is on every message that account has ever sent. Settings can also assign it
 # per account, in the browser, with no restart.
 # owner_user_id = "000000000000000000"
+
 [auth]
 # Credentials THIS server demands of its callers. Not Discord's, not ElevenLabs'.
 # Generate them with:  openssl rand -base64 33
@@ -98,6 +103,11 @@ writable = false
 # secret — it can spend money — and never leaves the server: it goes to ElevenLabs in a header, is
 # never put in a URL, and is redacted out of every error message.
 #
+# Where to get them:
+#   agent_id  https://elevenlabs.io/app/agents -> create or open an agent; the id is in the
+#             dashboard URL and starts with "agent_".
+#   api_key   https://elevenlabs.io/app/settings/api-keys -> Create API Key -> copy. Shown once.
+#
 # With either one unset, /api/v1/signed-url answers 503 and names the setting you are missing. It
 # never falls back to an unsigned URL, because that failure would surface later, in a browser, in
 # a car, as a conversation that silently will not start.
@@ -123,7 +133,7 @@ writable = false
 # api_base = "https://api.elevenlabs.io/v1"
 
 [storage]
-# Durable state: the /voice conversation transcript, how far the owner has read in each channel,
+# Durable state: the /voice conversation transcript, how far you have read in each channel,
 # and the cached summaries below. Everything else this server does is stateless — a channel is
 # never cached as a channel. A cached SUMMARY is: with the shipped extractive backend it is the
 # opening of somebody else's message, so it is a second at-rest copy of third-party text and is
@@ -138,7 +148,7 @@ writable = false
 # defaults it to /var/lib/gent-talk/gent-talk.sqlite3 and declares a VOLUME there.
 #
 # The file is created 0600 and its directory 0700. Anyone with filesystem access to the host can
-# still read it: it holds the owner's speech and third-party channel text in the clear.
+# still read it: it holds your own speech and third-party channel text in the clear.
 # Environment: GENT_TALK_STORAGE_PATH
 # path = "/var/lib/gent-talk/gent-talk.sqlite3"
 
@@ -155,8 +165,8 @@ writable = false
 #                                   # an entry is unreachable by key and nothing announces it.
 #                                   #
 #                                   # It does NOT apply to max_dismissals, and that is deliberate:
-#                                   # expiring a "dealt with" mark would put a message the owner
-#                                   # cleared last month back into his to-do list because time
+#                                   # expiring a "dealt with" mark would put a message you
+#                                   # cleared last month back into your to-do list because time
 #                                   # passed, with nothing on the row saying why. The count bound
 #                                   # is enough there — it is the one table holding no message
 #                                   # text, only two snowflakes and an instant.
@@ -221,7 +231,7 @@ writable = false
 # reconstruction, not a continuation, and the /voice page says which of the two you got.
 #
 # OFF by default, and the reason is privacy rather than caution: every new call re-sends earlier
-# conversation content — the owner's own speech AND any Discord text the agent read out to him,
+# conversation content — your own speech AND any Discord text the agent read out to you,
 # written by other people — to the voice vendor. Turn it on deliberately.
 # Environment: GENT_TALK_REPLAY_ENABLED
 enabled = false

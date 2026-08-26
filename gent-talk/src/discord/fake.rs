@@ -34,9 +34,14 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use super::ratelimit::{Attempt, Headers, RateLimit, RateLimiter, RetryPolicy};
-use super::{DiscordClient, DiscordError};
+use super::{BotIdentity, DiscordClient, DiscordError};
 use crate::config::DEFAULT_DISCORD_API_BASE;
 use crate::model::{sort_oldest_first, ChannelId, Message, MessageId, UserId};
+
+/// The bot user id [`FakeDiscord`] answers `GET /users/@me` with.
+pub const FAKE_BOT_USER_ID: &str = "3000000000000000001";
+/// The bot username [`FakeDiscord`] answers `GET /users/@me` with.
+pub const FAKE_BOT_USERNAME: &str = "gent-talk-fake-bot";
 
 /// A message this fake was asked to post.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -69,6 +74,12 @@ struct State {
     /// mentioned the wrong person.
     authors: BTreeMap<String, UserId>,
     fail_with: Option<String>,
+    /// Whether this fake's account has revoked the token it is being called with.
+    ///
+    /// Sticky rather than one-shot, unlike `fail_with`: a revoked credential does not heal on the
+    /// next request, and a fake whose 401 cleared itself would let a caller that simply retries
+    /// past a bad token look correct.
+    token_revoked: bool,
     /// Queued rate-limit answers. Each one is spent by the next request that is actually SENT, so
     /// a request the limiter held back does not consume one.
     rate_limits: VecDeque<RateLimit>,
@@ -272,6 +283,17 @@ impl FakeDiscord {
         self.lock().fail_with = Some(detail.to_owned());
     }
 
+    /// Answer every call from now on with Discord's own 401, as a revoked bot token does.
+    ///
+    /// The counterpart of [`FakeDiscord::register_channel`] for the CREDENTIAL. Without it this
+    /// fake accepts any token, so "the token is wrong" and "the channel is unreachable" — the two
+    /// failures the diagnostics route most needs to keep apart — would be untestable here, and a
+    /// check written against this fake would be certifying nothing. Sticky, because a real
+    /// revoked token is.
+    pub fn revoke_token(&self) {
+        self.lock().token_revoked = true;
+    }
+
     /// How many reads this fake has been asked for.
     ///
     /// Lets a test prove a read did *not* happen — "the probe was skipped" is otherwise
@@ -295,6 +317,16 @@ impl FakeDiscord {
 
     fn take_failure(&self) -> Option<DiscordError> {
         self.lock().fail_with.take().map(DiscordError::Transport)
+    }
+
+    /// Discord's own answer for a token it will not accept, in the shape a live 401 arrives in,
+    /// so [`crate::probe::classify`] reaches [`crate::probe::Diagnosis::InvalidToken`] through
+    /// the production code path rather than through a test-only shortcut.
+    fn rejected_token(&self) -> Option<DiscordError> {
+        self.lock().token_revoked.then(|| DiscordError::Status {
+            status: 401,
+            body: r#"{"message": "401: Unauthorized", "code": 0}"#.to_owned(),
+        })
     }
 
     /// The rate-limit answer this request gets, if one is queued for it.
@@ -322,6 +354,32 @@ impl FakeDiscord {
 
 #[async_trait]
 impl DiscordClient for FakeDiscord {
+    async fn identity(&self) -> Result<BotIdentity, DiscordError> {
+        // Through the real URL builder, so this fake cannot drift from the endpoint the live
+        // client calls, and through the same limiter, so a queued 429 is spent here too.
+        let request = super::http::identity_request(DEFAULT_DISCORD_API_BASE);
+        self.limiter
+            .run(request.method, &request.url, || async {
+                if let Some(limit) = self.take_rate_limit() {
+                    return Ok(Attempt::Limited(limit));
+                }
+                if let Some(failure) = self.take_failure() {
+                    return Err(failure);
+                }
+                if let Some(rejected) = self.rejected_token() {
+                    return Err(rejected);
+                }
+                Ok(Attempt::Done(
+                    BotIdentity {
+                        id: FAKE_BOT_USER_ID.to_owned(),
+                        username: FAKE_BOT_USERNAME.to_owned(),
+                    },
+                    self.success_headers(),
+                ))
+            })
+            .await
+    }
+
     async fn fetch_page(
         &self,
         channel: &ChannelId,
@@ -344,6 +402,12 @@ impl DiscordClient for FakeDiscord {
                 }
                 if let Some(failure) = self.take_failure() {
                     return Err(failure);
+                }
+                // BEFORE the channel lookup, exactly as Discord orders it: a rejected credential
+                // must never be reported as a channel that does not exist, or the operator is
+                // sent to check a snowflake that was right all along.
+                if let Some(rejected) = self.rejected_token() {
+                    return Err(rejected);
                 }
                 if let Some(unknown) = self.unknown_channel(channel) {
                     return Err(unknown);

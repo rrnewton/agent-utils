@@ -150,6 +150,15 @@ impl StateStore for FakeStore {
         "an in-memory store that is destroyed with the process".to_owned()
     }
 
+    async fn check_writable(&self) -> Result<String, StoreError> {
+        // Through `armed`, like every other operation here, so `FakeStore::fail_next` can make
+        // this check go red. A writability probe that could not be made to fail would certify
+        // nothing about the branch that reports a broken store.
+        let mut state = self.lock();
+        armed(&mut state)?;
+        Ok("the in-memory store accepts writes (and forgets them at exit)".to_owned())
+    }
+
     async fn append_turn(
         &self,
         conversation: &ConversationId,

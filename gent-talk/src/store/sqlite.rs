@@ -357,6 +357,28 @@ impl StateStore for SqliteStore {
         format!("SQLite at {}", self.path.display())
     }
 
+    async fn check_writable(&self) -> Result<String, StoreError> {
+        let path = self.path.clone();
+        self.with_connection(move |connection| {
+            // `BEGIN IMMEDIATE`, not `BEGIN`. A deferred transaction takes no lock until the
+            // first statement, so it would succeed against a read-only file and prove precisely
+            // nothing; an immediate one takes the RESERVED lock up front and fails with
+            // SQLITE_READONLY when the file, the directory, or the filesystem will not have it.
+            //
+            // Dropping it rolls back. That is the whole design: this is reached from a read-scope
+            // route, and it must leave the database byte-for-byte as it found it.
+            let transaction = connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(backend)?;
+            transaction.rollback().map_err(backend)?;
+            Ok(format!(
+                "the SQLite file at {} took a write lock and released it; nothing was written",
+                path.display()
+            ))
+        })
+        .await
+    }
+
     async fn append_turn(
         &self,
         conversation: &ConversationId,

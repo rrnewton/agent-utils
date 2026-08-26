@@ -345,6 +345,35 @@ pub async fn client_config(
     }))
 }
 
+/// `GET /api/v1/diagnostics` — re-run every configuration check and say what is wrong.
+///
+/// Four decisions about this route, each of which could plausibly have gone the other way.
+///
+/// **READ scope.** It reports configuration health and mints nothing, spends nothing, and writes
+/// nothing durable — the storage check takes the write lock and rolls it back precisely so that
+/// this stays true for a read-scope caller. What it *does* is name settings and vendor accounts,
+/// which is why it is authenticated at all rather than sitting beside `/healthz`.
+///
+/// **It always answers 200.** The report IS the answer. Returning 503 when a check fails would
+/// make the interesting case — six red rows, each with a remedy — arrive at a client as an error
+/// with a body it may not even read, and would make this route unusable as the thing you call
+/// precisely *because* something is broken.
+///
+/// **No credential can appear in it.** Every string goes through the deployment's whole secret
+/// list on the way out; see [`crate::diagnostics::redacted`]. A test asserts it against a vendor
+/// that quotes the key back in its own error body, which is a thing vendors do.
+///
+/// **`no-store`.** It names accounts, agent ids and file paths, and it is a point-in-time answer;
+/// neither a proxy nor a browser should keep it.
+pub async fn diagnostics(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    require(&headers, &state, Scope::Read)?;
+    let report = crate::diagnostics::run(&state).await;
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(report)).into_response())
+}
+
 /// `GET /api/v1/signed-url` — mint a short-lived signed conversation URL for the voice agent.
 ///
 /// Two things about this route are deliberate.

@@ -122,9 +122,18 @@ fn an_unreachable_channel_stops_the_server_from_starting() {
         text.contains("1111111111") && text.contains("lead team"),
         "every failing channel must be named by id AND by the label the operator wrote:\n{text}"
     );
+    // "the vendor" rather than "Discord": the `Diagnosis` vocabulary is now shared with the
+    // ElevenLabs and storage checks in `crate::diagnostics`, so the headline no longer names one
+    // vendor. The REMEDY still names discord.com, and the line above already names the channel,
+    // so nothing about which vendor failed is lost — what the assertion is holding is that the
+    // CAUSE is stated rather than collapsed into a bare "unreachable".
     assert!(
-        text.contains("never reached Discord"),
+        text.contains("never reached the vendor"),
         "the cause must be stated, not collapsed into 'unreachable':\n{text}"
+    );
+    assert!(
+        text.contains("discord.com"),
+        "the remedy must still say which host could not be reached:\n{text}"
     );
     assert!(
         text.contains("refusing to start"),

@@ -26,6 +26,19 @@
 //! five different fixes — one is an OAuth2 invite, one is a per-channel permission override, one is
 //! a mistyped snowflake, one is a bad token, and one is a toggle in the developer portal that
 //! produces no error at all. Collapsing them costs the operator the hour this probe exists to save.
+//!
+//! # This vocabulary is shared, not Discord's alone
+//!
+//! [`Diagnosis`] began as "what happened when we read a channel" and is now the vocabulary EVERY
+//! configuration check in this server speaks — see [`crate::diagnostics`], which re-runs these
+//! checks on demand and adds the ElevenLabs and storage ones. That is deliberate: a second
+//! taxonomy would mean two lists of causes, two sets of remedies, and two chances for one of them
+//! to say "unavailable" and stop there. The variants below that name no vendor
+//! ([`Diagnosis::Confirmed`], [`Diagnosis::NotConfigured`], [`Diagnosis::TimedOut`]) exist for
+//! exactly that reason.
+
+use std::borrow::Cow;
+use std::time::Duration;
 
 use crate::discord::{DiscordClient, DiscordError};
 use crate::model::ChannelInfo;
@@ -98,13 +111,46 @@ pub enum Diagnosis {
     Unintelligible(String),
     /// The request was refused locally, before Discord was contacted.
     Refused(String),
+
+    // ---------------------------------------------------------------------------------------
+    // Vendor-neutral variants. Everything above this line began life describing one channel
+    // read; everything below is spoken by the on-demand checks in `crate::diagnostics` as well,
+    // and none of it names Discord.
+    // ---------------------------------------------------------------------------------------
+    /// A check that passed, carrying what it established.
+    ///
+    /// The counterpart of [`Diagnosis::Readable`] for a check that is not a channel read: "the
+    /// key was accepted, and this is the account it reached", "this voice resolves, and here is
+    /// where it came from". The note is the *evidence*, not decoration — a check that says only
+    /// "ok" cannot be distinguished from one that did not run.
+    Confirmed(String),
+    /// A setting this check needs is absent, so nothing was called.
+    ///
+    /// Carries the setting's own name, exactly as
+    /// [`crate::elevenlabs::SignedUrlError::NotConfigured`] and
+    /// [`crate::store::StoreError::Unavailable`] do, because "which setting" is the whole answer.
+    NotConfigured(&'static str),
+    /// ElevenLabs rejected the account API key.
+    KeyRejected,
+    /// ElevenLabs does not have the configured agent on this account.
+    UnknownAgent,
+    /// No voice resolves: none was configured, and the agent has none of its own to borrow.
+    NoVoice,
+    /// The durable store cannot be used, for the reason it gave.
+    StorageUnusable(String),
+    /// The check did not finish inside its time budget.
+    ///
+    /// A FAILED CHECK with a reason, which is the entire point of having a budget: a diagnostics
+    /// route that makes live vendor calls and has no deadline is a diagnostics route that hangs
+    /// exactly when the vendor is the thing that is wrong.
+    TimedOut(u64),
 }
 
 impl Diagnosis {
     /// Whether this diagnosis should stop the server from starting.
     #[must_use]
     pub fn is_failure(&self) -> bool {
-        !matches!(self, Self::Readable { .. })
+        !matches!(self, Self::Readable { .. } | Self::Confirmed(_))
     }
 
     /// Whether this diagnosis is worth saying out loud even though it is not a failure.
@@ -142,16 +188,51 @@ impl Diagnosis {
                 "Discord rate-limited the probe (HTTP 429); readability is unknown"
             }
             Self::UnexpectedStatus { .. } => "Discord answered with an unexpected status",
-            Self::Unreachable(_) => "the request never reached Discord",
-            Self::Unintelligible(_) => "Discord's answer could not be understood",
+            Self::Unreachable(_) => "the request never reached the vendor",
+            Self::Unintelligible(_) => "the vendor's answer could not be understood",
             Self::Refused(_) => "the request was refused before it was sent",
+            Self::Confirmed(_) => "confirmed",
+            Self::NotConfigured(_) => "a setting this check needs is not configured",
+            Self::KeyRejected => "ElevenLabs rejected the account API key (HTTP 401)",
+            Self::UnknownAgent => {
+                "ElevenLabs does not have this agent on the account the key belongs to (HTTP 404)"
+            }
+            Self::NoVoice => {
+                "no voice resolves: none is configured, and the agent reports none of its own"
+            }
+            Self::StorageUnusable(_) => "the durable store cannot be written to",
+            Self::TimedOut(_) => "the check did not answer inside its time budget",
         }
     }
 
     /// What the operator should actually do about it.
+    ///
+    /// A [`Cow`] rather than a `&'static str` because two of the remedies have to NAME something
+    /// — the setting that is missing, the budget that elapsed — and a remedy that says "set the
+    /// setting" without saying which one is the kind of unhelpful this whole module exists to
+    /// delete. Everything with a fixed answer is still borrowed and allocates nothing.
+    ///
+    /// An empty string means "nothing to do", which is only ever the case for a check that
+    /// passed.
     #[must_use]
-    pub fn remedy(&self) -> &'static str {
-        match self {
+    pub fn remedy(&self) -> Cow<'static, str> {
+        Cow::Borrowed(match self {
+            Self::NotConfigured(setting) => {
+                return Cow::Owned(format!(
+                    "Set `{setting}` — in gent-talk.toml, or through its GENT_TALK_ environment \
+                     variable — and restart the server. Nothing was called: this is an \
+                     unconfigured capability rather than a broken one, and until the setting is \
+                     there the feature is simply off."
+                ))
+            }
+            Self::TimedOut(seconds) => {
+                return Cow::Owned(format!(
+                    "The vendor did not answer within {seconds}s, so this check proved nothing \
+                     either way. Check egress from this host — DNS, outbound HTTPS, any proxy — \
+                     and the vendor's own status page, then ask again. A repeatable timeout here \
+                     is a network path that is down, not a slow one."
+                ))
+            }
             Self::Readable {
                 suspect_message_content_intent: false,
                 ..
@@ -202,18 +283,44 @@ impl Diagnosis {
                  few minutes is the right response; anything else is worth reporting."
             }
             Self::Unreachable(_) => {
-                "This process could not reach discord.com. Check egress from the container or \
-                 host: DNS, outbound HTTPS, and any proxy."
+                "This process could not reach the vendor (discord.com, or api.elevenlabs.io). \
+                 Check egress from the container or host: DNS, outbound HTTPS, and any proxy."
             }
             Self::Unintelligible(_) => {
-                "Discord returned something this server cannot parse. If discord.api_base is set \
-                 to a proxy, that proxy is the first suspect."
+                "The vendor returned something this server cannot parse. If discord.api_base or \
+                 elevenlabs.api_base is pointed at a proxy, that proxy is the first suspect."
             }
             Self::Refused(_) => {
                 "This is a bug in this server rather than a configuration problem: the probe only \
                  reads, and a read should not be refused locally. Please report it."
             }
-        }
+            Self::Confirmed(_) => "",
+            Self::KeyRejected => {
+                "ElevenLabs did not accept the account API key. Create a fresh one at \
+                 https://elevenlabs.io/app/settings/api-keys (Create API Key; it is shown once) \
+                 and set elevenlabs.api_key, or GENT_TALK_ELEVENLABS_API_KEY. A key that was \
+                 revoked, or one copied with surrounding whitespace, fails exactly like this."
+            }
+            Self::UnknownAgent => {
+                "The account this key belongs to has no agent with the configured id. Open \
+                 https://elevenlabs.io/app/agents, click the agent you mean, and copy the id out \
+                 of the dashboard URL into elevenlabs.agent_id. If the id looks right, the key \
+                 belongs to a DIFFERENT account or workspace from the one holding the agent — \
+                 check which workspace the elevenlabs.api_key check above reported."
+            }
+            Self::NoVoice => {
+                "Either give the agent a voice — https://elevenlabs.io/app/agents, your agent, \
+                 Voice — or name one directly in elevenlabs.voice_id. elevenlabs.voice_id is \
+                 OPTIONAL precisely because read-aloud borrows the agent's own voice when it is \
+                 unset; with neither present there is nothing to speak with."
+            }
+            Self::StorageUnusable(_) => {
+                "The reason is in the detail above. storage.path must be an ABSOLUTE path to a \
+                 file this process may write, in a directory it may also write (SQLite puts its \
+                 journal beside the database). In a container that means a mounted volume: a \
+                 relative path resolves inside the image and disappears on the next rebuild."
+            }
+        })
     }
 
     /// Extra context that is not fixed text — the status body, the transport error, and so on.
@@ -221,11 +328,24 @@ impl Diagnosis {
     pub fn detail(&self) -> Option<String> {
         match self {
             Self::UnexpectedStatus { status, body } => Some(format!("HTTP {status}: {body}")),
-            Self::Unreachable(detail) | Self::Unintelligible(detail) | Self::Refused(detail) => {
-                Some(detail.clone())
-            }
+            Self::Unreachable(detail)
+            | Self::Unintelligible(detail)
+            | Self::Refused(detail)
+            | Self::Confirmed(detail)
+            | Self::StorageUnusable(detail) => Some(detail.clone()),
+            Self::NotConfigured(setting) => Some((*setting).to_owned()),
             _ => None,
         }
+    }
+
+    /// Whether this diagnosis was reached without calling anything.
+    ///
+    /// Worth its own question because "the vendor said no" and "we never asked" are the two
+    /// answers a reader most needs to tell apart, and they otherwise look identical in a list of
+    /// red rows.
+    #[must_use]
+    pub fn is_unconfigured(&self) -> bool {
+        matches!(self, Self::NotConfigured(_))
     }
 }
 
@@ -331,9 +451,14 @@ fn discord_error_code(body: &str) -> Option<u64> {
         .as_u64()
 }
 
-/// Classify one failed read.
+/// Classify one failed Discord call.
+///
+/// Public because [`crate::diagnostics`] classifies the bot-identity call — `GET /users/@me`,
+/// which is how "is this token any good at all" is answered without a channel — and it must be
+/// classified by THIS function rather than by a second copy of the same match: a token check that
+/// disagreed with the channel checks about what a 401 means would be worse than no token check.
 #[must_use]
-fn classify(error: &DiscordError) -> Diagnosis {
+pub fn classify(error: &DiscordError) -> Diagnosis {
     match error {
         DiscordError::Transport(detail) => Diagnosis::Unreachable(detail.clone()),
         DiscordError::Shape(detail) => Diagnosis::Unintelligible(detail.clone()),
@@ -364,10 +489,42 @@ fn classify(error: &DiscordError) -> Diagnosis {
 /// Reads one message per channel and never writes. Returns a report rather than an error: the
 /// caller decides what a failure means, and the report is the thing worth logging either way.
 pub async fn probe_channels(discord: &dyn DiscordClient, channels: &[ChannelInfo]) -> ProbeReport {
+    probe_channels_within(discord, channels, None).await
+}
+
+/// Probe every configured channel, giving each read at most `budget`.
+///
+/// The same loop as [`probe_channels`], with a deadline. Startup passes `None` — a server that is
+/// refusing to come up can afford to wait for a real answer, and the HTTP client already carries
+/// its own timeout. The on-demand route in [`crate::diagnostics`] passes a budget, because it is
+/// answering a request somebody is waiting on and "the vendor never replied" has to arrive as a
+/// failed check rather than as a request that never ends.
+///
+/// A budget that elapses yields [`Diagnosis::TimedOut`] for that channel and the loop CONTINUES:
+/// one unreachable channel must not hide the state of the others.
+pub async fn probe_channels_within(
+    discord: &dyn DiscordClient,
+    channels: &[ChannelInfo],
+    budget: Option<Duration>,
+) -> ProbeReport {
     let mut outcomes = Vec::with_capacity(channels.len());
     let mut aborted = false;
     for channel in channels {
-        let diagnosis = match discord.fetch_recent(&channel.id, PROBE_LIMIT).await {
+        let read = discord.fetch_recent(&channel.id, PROBE_LIMIT);
+        let answered = match budget {
+            Some(budget) => match tokio::time::timeout(budget, read).await {
+                Ok(answered) => answered,
+                Err(_elapsed) => {
+                    outcomes.push(ChannelProbe {
+                        channel: channel.clone(),
+                        diagnosis: Diagnosis::TimedOut(budget.as_secs()),
+                    });
+                    continue;
+                }
+            },
+            None => read.await,
+        };
+        let diagnosis = match answered {
             Ok(messages) => Diagnosis::Readable {
                 messages: messages.len(),
                 // Vacuously true on an empty channel would be a false alarm, so an empty result
@@ -602,6 +759,9 @@ mod tests {
         struct AlwaysUnauthorized;
         #[async_trait::async_trait]
         impl DiscordClient for AlwaysUnauthorized {
+            async fn identity(&self) -> Result<crate::discord::BotIdentity, DiscordError> {
+                Err(status(401, r#"{"message":"401: Unauthorized","code":0}"#))
+            }
             async fn fetch_page(
                 &self,
                 _channel: &ChannelId,
@@ -637,6 +797,12 @@ mod tests {
         struct BlankContent;
         #[async_trait::async_trait]
         impl DiscordClient for BlankContent {
+            async fn identity(&self) -> Result<crate::discord::BotIdentity, DiscordError> {
+                Ok(crate::discord::BotIdentity {
+                    id: "3000000000000000002".to_owned(),
+                    username: "blank-content-bot".to_owned(),
+                })
+            }
             async fn fetch_page(
                 &self,
                 channel: &ChannelId,

@@ -321,6 +321,64 @@ pub struct SignedUrl {
     pub valid_for_seconds: u32,
 }
 
+/// Who the account API key belongs to, as ElevenLabs reports it.
+///
+/// Every field is optional and none of them is a secret: this is the answer to "which account did
+/// my key actually reach", which is the question behind the most confusing ElevenLabs failure
+/// there is — a key that works perfectly and an agent id that is real, in two different
+/// workspaces, producing a 404 that reads like a typo.
+///
+/// Optional rather than required because the vendor is free to change what it volunteers, and a
+/// diagnostic that refuses to report a *reachable* account over a renamed field would be worse
+/// than one that reports less than it hoped for. See [`Account::describe`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Account {
+    /// The account's own id.
+    pub user_id: Option<String>,
+    /// The workspace the key resolves into, when the vendor names one.
+    pub workspace: Option<String>,
+    /// The subscription tier, which is what decides several of the quotas.
+    pub tier: Option<String>,
+}
+
+impl Account {
+    /// One line naming whatever the vendor was willing to say.
+    ///
+    /// Never empty: "the key was accepted, and ElevenLabs named neither an account nor a
+    /// workspace" is itself the useful answer when that is what happened, and an empty string
+    /// would read as a check that did not run.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(workspace) = &self.workspace {
+            parts.push(format!("workspace {workspace}"));
+        }
+        if let Some(user) = &self.user_id {
+            parts.push(format!("account {user}"));
+        }
+        if let Some(tier) = &self.tier {
+            parts.push(format!("subscription {tier}"));
+        }
+        if parts.is_empty() {
+            return "the key was accepted; ElevenLabs named no account or workspace in its answer"
+                .to_owned();
+        }
+        format!("the key was accepted by {}", parts.join(", "))
+    }
+}
+
+/// What the configured agent is, as ElevenLabs reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentProfile {
+    /// The agent id that was asked about.
+    pub agent_id: String,
+    /// The agent's name in the dashboard, when it has one.
+    pub name: Option<String>,
+    /// The voice this agent speaks in, which read-aloud borrows when `elevenlabs.voice_id` is
+    /// unset. `None` when the agent genuinely has none — see [`crate::probe::Diagnosis::NoVoice`].
+    pub voice_id: Option<String>,
+}
+
 /// Something that can mint a signed conversation URL.
 ///
 /// The configuration is passed in rather than captured at construction so that an implementation
@@ -334,6 +392,30 @@ pub trait SignedUrlProvider: Send + Sync {
     /// Returns [`SignedUrlError`] when a setting is absent, the request fails, ElevenLabs refuses,
     /// or the answer cannot be understood.
     async fn signed_url(&self, config: &ElevenLabsConfig) -> Result<SignedUrl, SignedUrlError>;
+
+    /// Ask ElevenLabs which account the configured API key belongs to.
+    ///
+    /// Needs the key and NOTHING ELSE — no agent, no voice — which is precisely what makes it able
+    /// to say "your key is fine, it is the agent id that is wrong". Minting a signed URL cannot:
+    /// it fails identically for a bad key and for an agent on another account until you read the
+    /// status code, and by then the operator has already changed the wrong setting.
+    ///
+    /// # Errors
+    ///
+    /// [`SignedUrlError::NotConfigured`] when there is no key, and the usual transport, status and
+    /// shape failures otherwise.
+    async fn account(&self, config: &ElevenLabsConfig) -> Result<Account, SignedUrlError>;
+
+    /// Read the configured agent's own configuration back.
+    ///
+    /// # Errors
+    ///
+    /// [`SignedUrlError::NotConfigured`] when the key or the agent id is absent, a 404 status when
+    /// the account has no such agent, and the usual transport and shape failures.
+    async fn agent_profile(
+        &self,
+        config: &ElevenLabsConfig,
+    ) -> Result<AgentProfile, SignedUrlError>;
 }
 
 /// Why a text turn with the conversational agent could not be completed.

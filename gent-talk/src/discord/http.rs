@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use serde_json::json;
 
 use super::ratelimit::{parse_rate_limit, Attempt, Headers, RateLimiter};
-use super::{DiscordClient, DiscordError};
+use super::{BotIdentity, DiscordClient, DiscordError};
 use crate::config::{DiscordConfig, Secret};
 use crate::model::{ChannelId, Message, MessageId, UserId};
 
@@ -121,6 +121,46 @@ pub fn page_request(
 pub fn fetch_request(api_base: &str, channel: &ChannelId, limit: u16) -> PreparedRequest {
     page_request(api_base, channel, limit, None, None)
         .expect("a request with neither cursor is always buildable")
+}
+
+/// Build the request that asks Discord who this token belongs to.
+///
+/// Documented as `GET /users/@me`. It names no channel and needs no permission beyond a valid
+/// token, which is exactly what makes it able to separate a bad credential from an unreachable
+/// channel.
+#[must_use]
+pub fn identity_request(api_base: &str) -> PreparedRequest {
+    PreparedRequest {
+        method: "GET",
+        url: format!("{}/users/@me", api_base.trim_end_matches('/')),
+        body: None,
+    }
+}
+
+/// Read a [`BotIdentity`] out of Discord's answer to [`identity_request`].
+///
+/// # Errors
+///
+/// Returns [`DiscordError::Shape`] when the payload carries no string `id`. The username is
+/// allowed to be absent — it is a label, and refusing an otherwise perfectly good identity over a
+/// missing display name would turn a cosmetic difference into a failed credential check.
+pub fn parse_identity(value: &serde_json::Value) -> Result<BotIdentity, DiscordError> {
+    let id = value
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| {
+            DiscordError::Shape("the identity answer has no string \"id\" field".to_owned())
+        })?;
+    Ok(BotIdentity {
+        id: id.to_owned(),
+        username: value
+            .get("username")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("(no username)")
+            .to_owned(),
+    })
 }
 
 /// Build the request that posts a message.
@@ -375,6 +415,11 @@ impl HttpDiscordClient {
 
 #[async_trait]
 impl DiscordClient for HttpDiscordClient {
+    async fn identity(&self) -> Result<BotIdentity, DiscordError> {
+        let value = self.send(identity_request(&self.api_base)).await?;
+        parse_identity(&value)
+    }
+
     async fn fetch_page(
         &self,
         channel: &ChannelId,

@@ -50,6 +50,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/channels", get(api::list_channels))
         .route("/api/v1/agent-tools", get(api::agent_tools))
         .route("/api/v1/client-config", get(api::client_config))
+        // READ scope. It reports configuration health and never a credential, it writes nothing
+        // durable, and it always answers 200 — the report is the answer, so a failing check is
+        // not an HTTP failure. See `api::diagnostics`.
+        .route("/api/v1/diagnostics", get(api::diagnostics))
         .route("/api/v1/signed-url", get(api::signed_url))
         .route("/api/v1/channels/{channel_id}/messages", get(api::messages))
         .route(

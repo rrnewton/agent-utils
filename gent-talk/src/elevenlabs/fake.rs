@@ -20,11 +20,13 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
-use super::http::{signed_url_request, speech_request, TTS_CONTENT_TYPE};
+use super::http::{
+    account_request, agent_request, signed_url_request, speech_request, TTS_CONTENT_TYPE,
+};
 use super::{
     chat_from_signed, clamp_speed, configured_voice, credentials, speech_key, voice_source_agent,
-    ChatError, SignedUrl, SignedUrlError, SignedUrlProvider, Speech, SpeechError, SpeechProvider,
-    TextChat, TextChatProvider,
+    Account, AgentProfile, ChatError, SignedUrl, SignedUrlError, SignedUrlProvider, Speech,
+    SpeechError, SpeechProvider, TextChat, TextChatProvider,
 };
 use crate::config::ElevenLabsConfig;
 
@@ -34,6 +36,12 @@ pub const VALID_API_KEY: &str = "xi-fake-api-key-not-a-real-one";
 pub const KNOWN_AGENT_ID: &str = "agent_fake0000000000000000000000";
 /// The voice id [`FakeElevenLabs::new`] knows about. Anything else is a 404.
 pub const KNOWN_VOICE_ID: &str = "voice_fake0000000000000000000000";
+/// The workspace [`FakeElevenLabs::new`] says [`VALID_API_KEY`] belongs to.
+pub const FAKE_WORKSPACE: &str = "workspace_fake000000000000000000";
+/// The account id [`FakeElevenLabs::new`] says [`VALID_API_KEY`] belongs to.
+pub const FAKE_USER_ID: &str = "user_fake00000000000000000000000";
+/// The subscription tier [`FakeElevenLabs::new`] reports.
+pub const FAKE_TIER: &str = "creator";
 /// The audio [`FakeElevenLabs::new`] returns. Not real mp3 -- nothing here decodes it -- but it is
 /// BYTES, and distinct per text, so a test can prove which message was actually read.
 #[must_use]
@@ -92,6 +100,12 @@ struct State {
     requested: Vec<String>,
     minted_url: String,
     fail_with: Option<String>,
+    /// Agents that exist on this account but have no voice of their own.
+    ///
+    /// Its own set rather than a flag, because "the agent is not on this account" and "the agent
+    /// is here and has no voice" are two DIFFERENT failures with two different remedies, and a
+    /// fake that could only produce one of them would leave the other's remedy untested.
+    voiceless_agents: BTreeSet<String>,
 }
 
 impl FakeElevenLabs {
@@ -138,8 +152,20 @@ impl FakeElevenLabs {
                 requested: Vec::new(),
                 minted_url: MINTED_URL.to_owned(),
                 fail_with: None,
+                voiceless_agents: BTreeSet::new(),
             })),
         }
+    }
+
+    /// Declare that `agent_id` exists on this account but speaks in no voice of its own.
+    ///
+    /// The equivalent of an agent created in the dashboard and never given a voice. Registers the
+    /// agent as well, so a caller cannot accidentally set this on an agent the account does not
+    /// have and then be testing the 404 path instead.
+    pub fn register_voiceless_agent(&self, agent_id: &str) {
+        let mut state = self.lock();
+        state.known_agents.insert(agent_id.to_owned());
+        state.voiceless_agents.insert(agent_id.to_owned());
     }
 
     /// Every text conversation this fake has held, in order.
@@ -195,6 +221,26 @@ impl FakeElevenLabs {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// ElevenLabs' own shape for a rejected key, deliberately QUOTING the key back.
+    ///
+    /// An upstream is free to echo a credential into its own error text, and
+    /// [`SignedUrlError::from_response`]'s redaction is what stops it reaching a log or a caller.
+    /// One function rather than a copy per call path, so a path added later cannot be the one
+    /// that forgets to redact.
+    fn reject_wrong_key(&self, api_key: &crate::config::Secret) -> Result<(), SignedUrlError> {
+        if api_key.expose() == self.valid_api_key {
+            return Ok(());
+        }
+        Err(SignedUrlError::from_response(
+            401,
+            &format!(
+                r#"{{"detail":{{"status":"invalid_api_key","message":"the key {} is not valid"}}}}"#,
+                api_key.expose()
+            ),
+            api_key,
+        ))
     }
 }
 
@@ -304,6 +350,55 @@ impl SignedUrlProvider for FakeElevenLabs {
             signed_url: self.lock().minted_url.clone(),
             agent_id: agent_id.to_owned(),
             valid_for_seconds: super::DOCUMENTED_VALIDITY_SECONDS,
+        })
+    }
+
+    async fn account(&self, config: &ElevenLabsConfig) -> Result<Account, SignedUrlError> {
+        // The KEY alone, exactly as the live client requires: an operator with no agent
+        // configured must still be able to find out whether their key works.
+        let api_key = config
+            .api_key
+            .as_ref()
+            .filter(|key| !key.expose().trim().is_empty())
+            .ok_or(SignedUrlError::NotConfigured("elevenlabs.api_key"))?;
+        self.lock()
+            .requested
+            .push(account_request(&config.api_base).url);
+        if let Some(detail) = self.lock().fail_with.take() {
+            return Err(SignedUrlError::Transport(detail));
+        }
+        self.reject_wrong_key(api_key)?;
+        Ok(Account {
+            user_id: Some(FAKE_USER_ID.to_owned()),
+            workspace: Some(FAKE_WORKSPACE.to_owned()),
+            tier: Some(FAKE_TIER.to_owned()),
+        })
+    }
+
+    async fn agent_profile(
+        &self,
+        config: &ElevenLabsConfig,
+    ) -> Result<AgentProfile, SignedUrlError> {
+        let (agent_id, api_key) = credentials(config)?;
+        self.lock()
+            .requested
+            .push(agent_request(&config.api_base, agent_id).url);
+        if let Some(detail) = self.lock().fail_with.take() {
+            return Err(SignedUrlError::Transport(detail));
+        }
+        self.reject_wrong_key(api_key)?;
+        if !self.lock().known_agents.contains(agent_id) {
+            return Err(SignedUrlError::from_response(
+                404,
+                &format!(r#"{{"detail":{{"status":"agent_not_found","message":"{agent_id}"}}}}"#),
+                api_key,
+            ));
+        }
+        let voiceless = self.lock().voiceless_agents.contains(agent_id);
+        Ok(AgentProfile {
+            agent_id: agent_id.to_owned(),
+            name: Some("the fake agent".to_owned()),
+            voice_id: (!voiceless).then(|| KNOWN_VOICE_ID.to_owned()),
         })
     }
 }

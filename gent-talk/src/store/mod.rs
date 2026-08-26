@@ -449,6 +449,29 @@ pub trait StateStore: Send + Sync {
     /// A short phrase naming this backend, for the startup banner.
     fn describe(&self) -> String;
 
+    /// Establish that this store COULD be written to, **without writing anything**.
+    ///
+    /// The distinction is load-bearing rather than fussy. This is reached from
+    /// `GET /api/v1/diagnostics`, which is a READ-SCOPE route, and the rule this server holds to
+    /// everywhere else is that no read-scope credential ever writes anything durable. A
+    /// writability check that wrote a canary row would break that rule for the sake of a
+    /// diagnostic — and would put a row in an operator's database every time they tapped
+    /// "check my setup".
+    ///
+    /// So an implementation must prove writability the way a database lets you prove it: take the
+    /// write lock and let it go. See [`sqlite::SqliteStore`], which opens an immediate
+    /// transaction and rolls it back — that touches the file, the directory the journal goes in,
+    /// and the read-only flag, and leaves not one byte changed.
+    ///
+    /// Returns a short phrase saying what was established, so a report can show evidence rather
+    /// than the word "ok".
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Unavailable`] when no store is configured, naming the setting to add;
+    /// [`StoreError::Backend`] when the store is there and cannot be written to, naming why.
+    async fn check_writable(&self) -> Result<String, StoreError>;
+
     /// Record one turn, creating the conversation if this is its first.
     ///
     /// # Errors

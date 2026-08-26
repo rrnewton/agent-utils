@@ -9,7 +9,8 @@ use async_trait::async_trait;
 
 use super::{
     clamp_speed, configured_voice, credentials, speech_from_signed, speech_key, voice_source_agent,
-    SignedUrl, SignedUrlError, SignedUrlProvider, Speech, SpeechError, SpeechProvider, VoiceStyle,
+    Account, AgentProfile, SignedUrl, SignedUrlError, SignedUrlProvider, Speech, SpeechError,
+    SpeechProvider, VoiceStyle,
 };
 use crate::config::{ElevenLabsConfig, Secret};
 
@@ -81,6 +82,65 @@ pub fn agent_request(api_base: &str, agent_id: &str) -> PreparedRequest {
             api_base.trim_end_matches('/'),
             urlencode(agent_id)
         ),
+    }
+}
+
+/// Build the request that asks which account an API key belongs to.
+///
+/// Documented as `GET /v1/user`. The smallest authenticated call on this API: it names no agent
+/// and no voice, so it answers "is this key any good" on its own.
+#[must_use]
+pub fn account_request(api_base: &str) -> PreparedRequest {
+    PreparedRequest {
+        method: "GET",
+        url: format!("{}/user", api_base.trim_end_matches('/')),
+    }
+}
+
+/// Read an [`Account`] out of the answer to [`account_request`].
+///
+/// Every field is looked for in more than one place and none of them is required. That is not
+/// laziness: what this function is FOR is telling an operator which account their key reached,
+/// and a parser that refused the whole answer because the vendor renamed `subscription.tier`
+/// would convert a working key into a failed check.
+#[must_use]
+pub fn parse_account(value: &serde_json::Value) -> Account {
+    let text = |path: &[&str]| -> Option<String> {
+        let mut cursor = value;
+        for key in path {
+            cursor = cursor.get(key)?;
+        }
+        cursor
+            .as_str()
+            .map(str::trim)
+            .filter(|found| !found.is_empty())
+            .map(str::to_owned)
+    };
+    Account {
+        user_id: text(&["user_id"]).or_else(|| text(&["subscription", "user_id"])),
+        workspace: text(&["workspace_id"])
+            .or_else(|| text(&["workspace", "id"]))
+            .or_else(|| text(&["workspace", "name"])),
+        tier: text(&["subscription", "tier"]).or_else(|| text(&["subscription_tier"])),
+    }
+}
+
+/// Read an [`AgentProfile`] out of the answer to [`agent_request`].
+///
+/// A missing voice is [`None`] rather than an error, because "this agent exists and has no voice"
+/// is a real, actionable state with its own remedy, and collapsing it into "the request failed"
+/// would send the operator to look at their API key.
+#[must_use]
+pub fn parse_agent_profile(value: &serde_json::Value, agent_id: &str) -> AgentProfile {
+    AgentProfile {
+        agent_id: agent_id.to_owned(),
+        name: value
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned),
+        voice_id: parse_agent_voice(value).ok(),
     }
 }
 
@@ -338,6 +398,31 @@ impl SignedUrlProvider for HttpElevenLabsClient {
         let request = signed_url_request(&config.api_base, agent_id);
         let value = self.get_json(&request, api_key).await?;
         parse_signed_url(&value, agent_id)
+    }
+
+    async fn account(&self, config: &ElevenLabsConfig) -> Result<Account, SignedUrlError> {
+        // Only the KEY is required here, deliberately: an operator with no agent configured still
+        // needs to be able to find out whether their key works.
+        let api_key = config
+            .api_key
+            .as_ref()
+            .filter(|key| !key.expose().trim().is_empty())
+            .ok_or(SignedUrlError::NotConfigured("elevenlabs.api_key"))?;
+        let value = self
+            .get_json(&account_request(&config.api_base), api_key)
+            .await?;
+        Ok(parse_account(&value))
+    }
+
+    async fn agent_profile(
+        &self,
+        config: &ElevenLabsConfig,
+    ) -> Result<AgentProfile, SignedUrlError> {
+        let (agent_id, api_key) = credentials(config)?;
+        let value = self
+            .get_json(&agent_request(&config.api_base, agent_id), api_key)
+            .await?;
+        Ok(parse_agent_profile(&value, agent_id))
     }
 }
 

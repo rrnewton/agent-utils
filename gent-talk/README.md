@@ -11,8 +11,8 @@ move to a small cloud host unchanged.
 
 The design decision behind it, stated plainly: composing hosted products would also work (see
 [`RELATED_WORK.md`](RELATED_WORK.md), which recommended exactly that), but a server is
-needed either way to hold the Discord credential, and the owner would rather own that front door
-than hand it to a vendor.
+needed either way to hold the Discord credential, and this project would rather own that front
+door than hand it to a vendor.
 
 ## What it does in v0
 
@@ -31,9 +31,18 @@ text-to-speech bot.
 ## Setting it up
 
 **If you are setting this up for the first time, use [`QUICKSTART.md`](QUICKSTART.md).** It runs
-the six steps — Discord bot, tokens, container, Cloudflare Tunnel, ElevenLabs agent, first
+the six steps — Discord bot, tokens, run it, expose it (optional), ElevenLabs agent, first
 conversation — in order, with the exact commands and no gaps to fill in from here. This file is
 the reference behind it: what every route does, what the security model is, and where it stops.
+
+Two things are worth knowing before you begin, because they shape everything else:
+
+* **It assumes no infrastructure.** One machine that can run a static binary, or a container
+  runtime, is the whole requirement. There is no database to provision, no queue, no reverse
+  proxy, no cloud account and no domain. See **From zero** below.
+* **What you have to go and get is a short list, and it is the slow part.** Two vendor dashboards
+  hand out five values between them and one of those is shown exactly once. See **What you must
+  supply** below, which is written as a walkthrough rather than a table for that reason.
 
 ## Status: what works, what is stubbed
 
@@ -53,8 +62,9 @@ the reference behind it: what every route does, what the security model is, and 
 | ElevenLabs voice agent | **reachable, and currently NOT invoking tools.** A real agent has now been driven headlessly (`scripts/run.sh --smoke-agent`): the signed URL mints, the conversation opens, the agent answers — and it calls no tool, saying its tools "appear to be out of date". In the same conversation ElevenLabs reports our MCP server connected with all five tools visible, so the fault is in the agent's own configuration rather than in this server. |
 | **Signed conversation URLs at `/api/v1/signed-url`** | **works against a fake, unverified against live ElevenLabs.** Mints a short-lived signed URL for an agent that has "Enable Authentication" turned on, and `/voice` is a dependency-free page that uses one. Tested end to end against an in-memory ElevenLabs that refuses a wrong key and an unknown agent, and against a loopback HTTP server that proves the account key travels in a header. |
 | Slow path (ask a coding agent for detail) | **seam only.** The route exists and answers HTTP 501 with an explanation. |
-| TLS | **not here.** Terminate in front (Caddy, nginx, a tunnel, or a cloud load balancer). A Cloudflare Tunnel recipe is below. |
+| TLS | **not here.** Terminate in front, with whatever you already use — Caddy, nginx, any tunnel, a cloud load balancer — or do not expose it at all. One worked example is below; it is an example, not a requirement. |
 | Agent smoke test (`scripts/smoke-agent.py`, `run.sh --smoke-agent`) | **works, and it goes red on the real failure.** Holds a real conversation and fails unless a tool invocation appears in this server's own access log. Manual and opt-in: it costs vendor minutes, so it is in no suite and no CI. |
+| Diagnostics route (`GET /api/v1/diagnostics`) | **written, tested against in-memory fakes only.** Re-runs the startup checks on demand and answers a structured report with a remedy on every failure. The Discord and ElevenLabs halves have never met a live vendor. |
 | Deployment check (`scripts/verify-deployment.sh`) | **works.** One command, pass/fail, exits non-zero and names the failing check. Runs in CI against the container on every push, including a negative control that requires it to go red. |
 
 Honest summary: everything except the two vendor-facing halves — live Discord and ElevenLabs — is
@@ -62,37 +72,182 @@ implemented and tested. Those two are exactly the parts that cannot be tested wi
 
 ## What you must supply
 
-Nothing is committed and nothing is hardcoded. You need:
+Nothing is committed and nothing is hardcoded, so every value below is one you go and get. They
+are listed in the order you need them: items 1–4 are what it takes to start the server at all, and
+items 5–7 are the voice half, which the Discord half runs perfectly well without.
 
-1. **A second Discord bot**, separate from whatever your coding agents use, invited to the channels
-   you want to reach, with `View Channel`, `Read Message History`, and — only if you want to post —
-   `Send Messages`. Its token goes in `discord.bot_token` / `GENT_TALK_DISCORD_BOT_TOKEN`.
+Have somewhere to paste things before you begin: two of them — the bot token and the ElevenLabs
+API key — are shown exactly once and cannot be read back afterwards.
 
-   > **Adding the bot to your server is not the same as adding it to the channel.** Authorizing
-   > the OAuth2 invite puts the bot in the *server*; a **private** channel additionally needs the
-   > bot, or a role it has, added in that channel's own **Edit Channel → Permissions**. Missing
-   > that second step is the most common way this server ends up configured for a channel it
-   > cannot read. The [startup channel probe](#the-startup-channel-probe) now catches it at
-   > startup instead of letting it surface later as an empty digest.
+### 1. A Discord bot token
 
-   > **Turn on MESSAGE CONTENT INTENT** while you are in the Developer Portal: **Bot** tab →
-   > **Privileged Gateway Intents**. It is off by default and it is the highest-cost thing to get
-   > wrong here, because it does not fail — a bot without it is handed messages whose `content` is
-   > **empty**, so the channel is found, the message count is right, and every digest line is
-   > blank, with no error anywhere. It reads as a broken summarizer or a broken server.
-   >
-   > Scope, stated honestly: this server reads over the Discord **REST** API, and the documented
-   > blank-content behaviour is on the **gateway** event path; we have never run against live
-   > Discord and cannot tell you from experience whether REST is affected on your account.
-   > Enabling it is one click and removes the question.
-2. **Two API tokens of your own**, for this server's own callers:
-   `openssl rand -base64 33` twice. They must differ and be at least 24 characters; the server
-   refuses to start otherwise.
-3. **The channel snowflake ids** you want reachable, with a label you can say out loud.
-4. *(Later)* an **ElevenLabs agent id** and API key, when the voice half is wired.
+Use a **second, dedicated bot**, separate from whatever your coding agents post with. This one is
+held by a server that may end up reachable from the internet, and the blast radius of the two
+should not be the same.
+
+1. <https://discord.com/developers/applications> → **New Application**. Name it anything.
+2. **Bot** tab → **Reset Token** → **Copy**. That string is `discord.bot_token` /
+   `GENT_TALK_DISCORD_BOT_TOKEN`. It is shown once; paste it somewhere before navigating away.
+3. **Bot** tab → **Privileged Gateway Intents** → turn on **MESSAGE CONTENT INTENT** → **Save
+   Changes**. See the warning below; this is the one that costs an hour.
+4. **OAuth2** → **URL Generator** → scope **`bot`**, then bot permissions **View Channels** and
+   **Read Message History** — and **Send Messages** *only* if you want the bridge to be able to
+   post. Open the generated URL, pick your server, authorize.
+
+> **Adding the bot to your server is not the same as adding it to the channel.** Authorizing
+> the OAuth2 invite puts the bot in the *server*; a **private** channel additionally needs the
+> bot, or a role it has, added in that channel's own **Edit Channel → Permissions**. Missing
+> that second step is the most common way this server ends up configured for a channel it
+> cannot read. The [startup channel probe](#the-startup-channel-probe) now catches it at
+> startup instead of letting it surface later as an empty digest.
+
+> **Turn on MESSAGE CONTENT INTENT** while you are in the Developer Portal: **Bot** tab →
+> **Privileged Gateway Intents**. It is off by default and it is the highest-cost thing to get
+> wrong here, because it does not fail — a bot without it is handed messages whose `content` is
+> **empty**, so the channel is found, the message count is right, and every digest line is
+> blank, with no error anywhere. It reads as a broken summarizer or a broken server.
+>
+> Scope, stated honestly: this server reads over the Discord **REST** API, and the documented
+> blank-content behaviour is on the **gateway** event path; we have never run against live
+> Discord and cannot tell you from experience whether REST is affected on your account.
+> Enabling it is one click and removes the question.
+
+### 2. The channel snowflake ids
+
+In the Discord app: **User Settings → Advanced → Developer Mode** on. Then right-click each
+channel you want reachable → **Copy Channel ID**. They are 17–20 digit numbers.
+
+Give each one a **label you can say out loud** — it is what you will use in a sentence to a voice
+agent, so `lead team` beats `#eng-agents-prod-2`. Labels and ids go in `[[channels]]` or in
+`GENT_TALK_CHANNELS` as `id:label:rw` / `id:label:ro`.
+
+### 3. Your own Discord user id
+
+`discord.owner_user_id` / `GENT_TALK_DISCORD_OWNER_USER_ID`. With Developer Mode already on,
+right-click **your own name** on any message → **Copy User ID**.
+
+**This one cannot be derived from anything the server holds**, which is why it is a setting at all.
+The bot token's first segment *is* the bot's user id, so messages the bridge posts for you are
+recognised for free — but a bot account has no relationship to the person reading the channel. Set
+this and the messages you typed into Discord yourself are drawn as **yours**; leave it unset and
+they arrive as some third party's. It is not a secret: a user id rides on every message that
+account has ever sent. See **Why your own messages need a setting** below, and note that Settings
+in the web app can assign it per account without a restart.
+
+### 4. Two API tokens of your own
+
+These are neither Discord's nor ElevenLabs'. They are what this server demands of *its* callers —
+your phone, your voice agent — and they are the whole of what stands between the internet and your
+Discord.
+
+```sh
+openssl rand -base64 33   # read token  — goes in the phone and in the voice agent
+openssl rand -base64 33   # write token — the capability to post as your bot
+```
+
+They **must differ** and each must be **at least 24 characters**, or the server refuses to start
+rather than coming up weaker than you meant.
+
+### 5. An ElevenLabs API key — only for the voice half
+
+<https://elevenlabs.io/app/settings/api-keys> → **Create API Key** → copy it. It is shown once.
+
+It goes in `elevenlabs.api_key` / `GENT_TALK_ELEVENLABS_API_KEY` and it is used for two things:
+minting the short-lived signed URLs that open a conversation with an authenticated agent, and
+reading a message aloud. It is an **account** secret that can spend money, so it never leaves the
+server — it travels to ElevenLabs in a header, never in a URL, and is redacted out of every error.
+
+### 6. An ElevenLabs agent id — only for the voice half
+
+<https://elevenlabs.io/app/agents> → create an agent (a default template is fine; keep their
+hosted LLM). Open it, and the id is in the dashboard URL — it starts `agent_`. It goes in
+`elevenlabs.agent_id` / `GENT_TALK_ELEVENLABS_AGENT_ID` and is public: it identifies a widget.
+
+### 7. An ElevenLabs voice id — OPTIONAL, and most deployments should skip it
+
+`elevenlabs.voice_id` is **optional and normally left unset**, and the reason is worth knowing
+rather than guessing at. An agent and a voice are different objects in ElevenLabs' model: an agent
+is a prompt, a model, tools *and* a voice, while the text-to-speech API takes a voice and knows
+nothing about agents. With `voice_id` unset, read-aloud **borrows the configured agent's own
+voice** — and the agent's delivery with it, its speed and stability — so a channel message is read
+out by the same voice that talks to you, from the one thing you already configured.
+
+Set it only when those two should deliberately **differ**. With neither a voice id nor an agent id
+configured, read-aloud refuses and names both, rather than falling back to whichever voice the
+account happens to list first.
 
 Copy `gent-talk.example.toml` to `gent-talk.toml` (gitignored) and fill it in, or pass everything
-through the environment.
+through the environment. The environment wins over the file, so a container can be given its
+secrets without them ever touching a disk.
+
+## From zero
+
+This section assumes you have nothing: no cloud account, no domain, no reverse proxy, no
+orchestrator. Three decisions, in order, and only the first is mandatory.
+
+### 1. Run the server somewhere
+
+The minimum is **one machine that can run one process and reach `discord.com` outbound**. There is
+no database to provision — durable state, when you turn it on, is a single SQLite file — and
+nothing about the deployment is tied to the host: a laptop, a Raspberry Pi, a spare VM and a small
+cloud instance are all the same deployment, and moving between them is moving a config file.
+
+Two ways to run it, and neither is preferred:
+
+* **Cargo, on a machine you already have.** A Rust toolchain, `cargo run`, done. `web/` is compiled
+  into the binary, so there is no asset directory to serve and no build step for the front end.
+* **The container image.** `podman build` (or `docker build`) from `gent-talk/Containerfile`. The
+  image runs as a non-root user, contains no configuration, and fails immediately rather than
+  starting with defaults if it is given no credentials.
+
+Both are spelled out under **Running it** below, including the volume mount you need if you want
+state to survive a rebuild. If you just want to look at the web app, `--fake-discord` needs no bot
+and no network.
+
+### 2. Expose it — OPTIONAL
+
+**You do not have to.** A deployment that is only ever reached over your LAN, or only over
+`localhost` through an SSH session, is a supported and complete deployment. The Discord half, the
+web app, the digest, the scrollback and the deployment check all work with no ingress whatsoever.
+Skip to step 3 if that is you.
+
+If you do want to reach it from elsewhere, **any** mechanism is fine, because gent-talk takes no
+position on how bytes arrive. The actual requirement is short:
+
+* **a URL a browser can load**, and
+* **HTTPS if you want the microphone**, because browsers gate `getUserMedia` on a secure context.
+  `localhost` also counts as a secure context, so a local-only setup needs no certificate at all.
+* **gent-talk terminates no TLS itself** and never will. It speaks plain HTTP and expects
+  something in front of it if the front is public.
+
+Pick whichever of these you already know, or already run:
+
+| Way in | What it gives you | What it costs |
+|---|---|---|
+| **Nothing at all** — LAN or `localhost` | The whole application, microphone included over `localhost` | No remote access |
+| **SSH reverse tunnel** (`ssh -R`) | A port on a host you already have | You manage TLS on that host, or use it over `localhost` |
+| **Reverse proxy with a certificate** — Caddy, nginx, Traefik | HTTPS on a name you control | You need a public host and a domain |
+| **A tunnel service** — Cloudflare Tunnel, ngrok, Tailscale Funnel and others | HTTPS with no inbound port open | A vendor account and a dependency on it |
+| **A cloud load balancer** | HTTPS in front of a private instance | Cloud account, per-hour cost |
+| **A VPN or overlay network** — WireGuard, Tailscale, ZeroTier | Reachable from your devices, exposed to nobody | Every client device must join the network |
+
+**A worked example of one of them** — a Cloudflare Tunnel — is written out under
+[Exposing it: one worked example](#exposing-it-one-worked-example) below. It is there because a
+complete example is more useful than six partial ones, not because it is recommended over the rest.
+
+Whatever you choose, bind the server to loopback (`GENT_TALK_BIND=127.0.0.1:8080`, or
+`-p 127.0.0.1:8080:8080` under a container runtime) when something else is fronting it, so the
+only path in is the one you meant.
+
+**One thing does need a public URL: a hosted voice agent.** ElevenLabs calls the MCP endpoint
+machine-to-machine from its own infrastructure, so it must be able to reach your server. If you
+are not wiring up a voice agent, that constraint does not apply to you.
+
+### 3. Check it, from the outside
+
+`scripts/verify-deployment.sh --url <wherever it is>` is the same set of checks wherever you point
+it, which is the point — run it against `http://127.0.0.1:8080` first and against the public URL
+second, and any disagreement is something your ingress did. See **Checking a deployment** below.
 
 ## Running it
 
@@ -149,7 +304,8 @@ podman run --rm --name gent-talk -p 8080:8080 \
   gent-talk:v0
 ```
 
-Behind a tunnel, publish to loopback only so the container has no path in except `cloudflared`:
+Behind a tunnel or a reverse proxy, publish to loopback only, so the container has no path in
+except the thing you put in front of it:
 
 ```sh
 podman run --rm --name gent-talk -p 127.0.0.1:8080:8080 \
@@ -291,8 +447,8 @@ scripts/verify-deployment.sh --url http://127.0.0.1:8080 --channel <your-channel
 It takes the tokens from `$GENT_TALK_READ_TOKEN` / `$GENT_TALK_WRITE_TOKEN`, or from
 `--read-token` / `--write-token`. Because it takes the base URL as an argument, the **same** checks
 run against `http://127.0.0.1:8080` right after `podman run` and against
-`https://<your-tunnel-hostname>` once `cloudflared` is up — if the second disagrees with the
-first, the tunnel changed something.
+`https://<your-public-hostname>` once whatever fronts it is up — if the second disagrees with the
+first, your ingress changed something.
 
 What it asserts, in this order:
 
@@ -332,6 +488,74 @@ curl -s -X POST localhost:8080/mcp \
   -H 'content-type: application/json' -H 'accept: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
+
+## Asking the server what is wrong
+
+`GET /api/v1/diagnostics`, **read scope**, `Cache-Control: no-store`. It re-runs, on demand, the
+checks this server otherwise only runs once at startup, and hands them back **structured** instead
+of only printing them to a console you have to still have open from the last restart.
+
+**It always answers HTTP 200.** The report *is* the answer, so a failing check is not an HTTP
+error — a 500 here would be indistinguishable from the server being broken in some other way, and
+the one thing this route exists to do is tell those apart.
+
+```jsonc
+{
+  "ok": false,
+  "checks": [
+    {
+      "id": "discord.channel",
+      "title": "Discord channel: lead team",  // the label YOU wrote, so you recognise the row
+      "subject": "123456789012345678",        // which one, when there is more than one; else null
+      "status": "fail",                       // pass | warn | fail
+      "summary": "…",                         // the headline, from the shared probe vocabulary
+      "detail": "…",       // the evidence: an account name, the vendor's own error body
+      "remedy": "…",       // what to do about it; null only when there is nothing to do
+      "unconfigured": false // nothing was called, because a setting is absent
+    }
+  ],
+  "passed": 4, "failed": 1, "warned": 1,
+  "budget_seconds": 20,
+  "took_ms": 812
+}
+```
+
+`unconfigured` is kept apart from an ordinary failure on purpose: "the vendor said no" and "you
+never gave us a key" are the same red row in a list and are fixed completely differently.
+
+The checks:
+
+| `id` | What it establishes |
+|---|---|
+| `discord.token` | Discord accepted the bot token, and who it says the bot is |
+| `discord.channel` | **one per configured channel** — readable, or why not |
+| `elevenlabs.api_key` | the key was accepted, and which account/workspace it reached |
+| `elevenlabs.agent` | the configured agent exists and reports a voice |
+| `elevenlabs.voice` | a voice resolves — configured explicitly, or borrowed from the agent |
+| `storage` | the store can be written to, or the named reason it cannot |
+
+`discord.channel` carries **the same five distinguishable causes the startup probe already tells
+apart**, because they have five different fixes: no OAuth2 invite; a per-channel permission
+missing; a mistyped snowflake; a bad token; and the Message Content Intent toggle, which produces
+no error at all and reads as an empty channel. See **The startup channel probe** above for the
+full taxonomy — this route serves that same classification over HTTP rather than only into stdout.
+
+Four properties are the point of it:
+
+* **Every failing check carries a `remedy`** saying what to do next. That is the whole reason this
+  exists: it replaces "unavailable" — a word that tells a reader nothing they can act on — with a
+  sentence naming the setting, the toggle, or the permission.
+* **It never contains a credential.** Every string in the report goes through the same redaction
+  the vendor error paths use, against every secret the deployment holds. A vendor is free to quote
+  a key back inside its own error text, and this route reports vendor error text.
+* **It makes live vendor calls, so it is bounded.** Each check has its own time budget and the
+  whole report has an overall deadline (`budget_seconds`). A vendor that does not answer is a
+  **failed check with a reason**, never a hung request.
+* **Read scope, not write.** It reads configuration state and pokes vendors; it changes nothing.
+
+**Honesty note.** The ElevenLabs and Discord halves of this have been exercised **only against
+in-memory fakes, never against live Discord or live ElevenLabs.** The classification is the same
+code path the startup probe uses, which is itself in the same position — see **Known gaps**.
 
 ## Configuration
 
@@ -380,9 +604,9 @@ Almost nothing in this server is remembered. A channel is never cached as a chan
 question is a fresh Discord fetch, and it stays that way. There is exactly one store,
 `src/store/`, and it holds these:
 
-* the `/voice` **conversation transcript** — what the owner said and what the agent said back;
-* **read marks** — how far the owner has been shown each channel;
-* **"dealt with" marks** — which individual messages the owner has finished with, which is the
+* the `/voice` **conversation transcript** — what you said and what the agent said back;
+* **read marks** — how far you have been shown each channel;
+* **"dealt with" marks** — which individual messages you have finished with, which is the
   overlay `#50 todo-view` is built on. Two snowflakes and an instant per row, and **no message
   text at all**; and
 * **cached summaries** — one short line per long message, filed under the policy that produced
@@ -393,13 +617,13 @@ question is a fresh Discord fetch, and it stays that way. There is exactly one s
   Ours and local in the same sense the read marks are: never sent to Discord, renaming nothing
   there. See "What to call a channel". `#39 channel-alias`.
 
-The first three are the owner's own record. The last is a derived cache, bounded by the same
+The first three are your own record. The last is a derived cache, bounded by the same
 retention as the rest, erased by the same purge, and never filled by a read-scope token.
 
 **Every table is bounded on write, and one of them is bounded differently on purpose.** The
 "dealt with" marks have a count ceiling and **no age limit**, unlike everything else here. An age
-limit would put a message the owner cleared last month back into his to-do list because time
-passed — a lie he cannot diagnose, since nothing on the row would say why it came back — whereas
+limit would put a message you cleared last month back into your to-do list because time
+passed — a lie you cannot diagnose, since nothing on the row would say why it came back — whereas
 an expired summary is merely regenerated. The count bound is enough on its own here for a reason
 it is not enough for a summary: this is the one table that holds nobody's words.
 
@@ -465,7 +689,7 @@ worth saying because it looks like one.
 
 ### Security posture — this is new, and it is a change
 
-This is the first thing gent-talk retains at rest, and what it retains is the owner's own speech
+This is the first thing gent-talk retains at rest, and what it retains is your own speech
 plus Discord text written by third parties.
 
 * The database file is created `0600` and its directory `0700`.
@@ -630,6 +854,7 @@ not, and neither reveals anything about the configuration.
 | GET | `/healthz` | none | liveness |
 | GET | `/api/v1/channels` | read | configured channels |
 | GET | `/api/v1/client-config` | read | what the web app needs at startup |
+| GET | `/api/v1/diagnostics` | read | re-run the startup checks now, structured, with a remedy on every failure — see above |
 | GET | `/api/v1/agent-tools` | read | the voice agent's tool manifest and approval policy |
 | GET | `/api/v1/signed-url` | **write** | mint a short-lived signed conversation URL — see below |
 | GET | `/api/v1/channels/{id}/messages?limit=` | read | full scrollback, oldest first |
@@ -660,9 +885,9 @@ not, and neither reveals anything about the configuration.
 | POST | `/mcp` | read, or **write** per tool | MCP over Streamable HTTP — see below |
 | GET/DELETE | `/mcp` | none | `405`; this endpoint is stateless and has nothing to push |
 
-**The transcript routes require the write scope even to READ.** A stored transcript is the
-owner's own speech plus whatever channel text the assistant read out to him, which is a different
-and more sensitive thing than a digest of a channel he already allowlisted — and `/voice`, the
+**The transcript routes require the write scope even to READ.** A stored transcript is your
+own speech plus whatever channel text the assistant read out to you, which is a different
+and more sensitive thing than a digest of a channel you already allowlisted — and `/voice`, the
 only thing that uses them, already holds the write token. The read token gets `403`, and a test
 asserts it. **None of them is an MCP tool**, and a test holds that line too: text a tool can
 return is text that enters a model's context.
@@ -671,7 +896,7 @@ return is text that enters a model's context.
 case of: every durable write — a turn, a read mark, a cached summary — needs the write scope.
 `/summary` is the interesting one, because it is readable at read scope and yet has something to
 file: a read token is served from the cache when there is a hit and its answer is never written
-back. `/inbox` is the single durable READ a read token may make, because how far the owner has
+back. `/inbox` is the single durable READ a read token may make, because how far you have
 read is the thing the voice agent has to be able to say out loud.
 
 **`/api/v1/inbox` carries `read_state_notice` on every answer**, including the mutating ones,
@@ -778,7 +1003,7 @@ while the interface says resuming is on, which is a feature that is silently doi
 
 ### The transcript is untrusted text
 
-A stored turn is the owner's own speech AND whatever channel text the agent read aloud to him,
+A stored turn is your own speech AND whatever channel text the agent read aloud to you,
 which is third-party Discord text. Every turn is neutralized and the whole record is fenced by
 `src/untrusted.rs`; the preamble sits OUTSIDE the fence, because it is this server speaking and
 the point of the fence is that nothing inside it is. A turn that forges the fence is defused and
@@ -1062,10 +1287,10 @@ Discord shares no read state with a bot, so there is no ack to send and no field
 something dealt with here does **not** mark it read in Discord, and reading it in the Discord app
 does **not** clear it here. The page says that on screen — quoting `store::INBOX_NOTICE` from the
 server's own answer rather than restating it, so the two cannot drift — because the alternative is
-that the owner meets the divergence first and has to guess which of the two is broken.
+that you meet the divergence first and have to guess which of the two is broken.
 
-**The store is single-tenant.** Every mark is "the owner's", with no column saying whose. Sharing
-one deployment between two operators would silently merge their inboxes; that is not a
+**The store is single-tenant.** Every mark is yours, with no column saying whose. Sharing
+one deployment between two people would silently merge their inboxes; that is not a
 configuration this decision survives, and it would have to be revisited rather than worked around.
 
 Three acts, each reachable from a control:
@@ -1077,7 +1302,7 @@ Three acts, each reachable from a control:
   and the **boundary is included**: the row you gave up on is part of what you gave up on, and
   that is tested at the boundary. The `limit` is not decoration: the server resolves `through`
   against a window of its own, so a boundary sent without one is resolved against the server's
-  default and clears messages that were never displayed. Clearing work the owner never saw is the
+  default and clears messages that were never displayed. Clearing work you never saw is the
   worst failure this view has, so the window the list was READ with rides along with the act.
 - **Undo**, as a chip, carrying the exact set the server said it cleared. Not "the last N", which
   is a different set by the time it is pressed. A bulk clear that also claimed messages you had
@@ -1194,9 +1419,9 @@ read and none of this is exercised by any picture.
 ### Choosing the channel is a control, not a line of the scrollback
 
 The picker used to be a row at the **top of the scrolling region**, above the log. That is the
-whole of the defect the owner reported: the control for choosing *what you are reading* scrolled
-away the moment you read anything, and getting back to it meant scrolling a channel to its
-beginning.
+whole of the defect that was reported against it: the control for choosing *what you are reading*
+scrolled away the moment you read anything, and getting back to it meant scrolling a channel to
+its beginning.
 
 **Paging made it worse, and that half was ours.** Once reaching the top loaded another page,
 scrolling toward the picker prepended history above it — so it receded as you approached, and on a
@@ -1223,8 +1448,8 @@ no default, because a default is how a control ends up on a view nobody chose fo
 
 That is a layout decision as much as a semantic one, and it is **measured**: the bar is one strip
 on a 375px phone, six controls do not fit on it, and the pack scrolls — so a control pushed past
-the pack's right edge is exactly as unreachable as the picker used to be. "The bar fits on the
-owner's 375px phone" costs whatever `renderControlBar` really leaves visible against widths read
+the pack's right edge is exactly as unreachable as the picker used to be. "The bar fits on a
+375px phone" costs whatever `renderControlBar` really leaves visible against widths read
 out of web/voice.css, on each view and in text mode, and the same test proves it is not vacuous by
 showing that all six together overflow by about 55px.
 
@@ -1244,13 +1469,13 @@ evidence yet; the first run with a browser is what turns them into any.
 ### What to call a channel
 
 `#39 channel-alias`. A channel arrives with two names and neither is sayable: the snowflake
-`1532416065114607829`, and whatever `label` the operator wrote in the configuration file — which
-is often something like `build noise`, chosen when there was one channel and nobody was addressing
+`1532416065114607829`, and whatever `label` was written in the configuration file — which is often
+something like `build noise`, chosen when there was one channel and nobody was addressing
 it out loud. The motivation is the next feature rather than this one: with several channels
-configured, *"ask the build channel"* has to resolve to something, and a short name the owner
-chose is the only candidate.
+configured, *"ask the build channel"* has to resolve to something, and a short name you chose
+yourself is the only candidate.
 
-So the owner can **give a channel a name of his own, in this app**, from Settings. The alias wins
+So you can **give a channel a name of your own, in this app**, from Settings. The alias wins
 wherever the configured label showed; the label is the fallback, and clearing the alias returns to
 it. `ChannelInfo::display_name` is the one place that rule lives, so the picker, the head of the
 channel and the digest header cannot come to disagree.
@@ -1274,7 +1499,7 @@ sees it. Every answer that sets or clears one carries a standing statement sayin
 shows *that* sentence rather than one of its own.
 
 **The voice agent hears it too.** `list_channels`, the digest header and the tool manifest all
-name the channel the way the owner does, so the name he says out loud is the name the model was
+name the channel the way you do, so the name you say out loud is the name the model was
 given. That is a read of local state on the way out; nothing about it is a write to Discord.
 
 **The agent cannot choose it, and the reason is not the scope.** A hosted voice agent is routinely
@@ -1294,8 +1519,8 @@ anything in Discord, and multi-channel addressing itself — which this only pre
 
 ### Pulling the channel down, and the other end of the same container
 
-The owner found the channel hours out of date: *"especially when I swipe up on this view and it
-shows me something very stale."* The staleness itself was already fixed — the view re-reads on
+This came out of a real report — the channel found hours out of date: *"especially when I swipe up
+on this view and it shows me something very stale."* The staleness itself was already fixed — the view re-reads on
 entry and polls every forty-five seconds while it is up — and that covers being stale *and
 waiting*. It gives no way to say **refresh, now**. `#68 pull-to-refresh`.
 
@@ -1481,9 +1706,9 @@ also read as somewhere you configure one.
 
 A WebSocket close is one event, and the page used to have two things to say about it. That is one
 too few, and the missing one is the common case on a phone: **put the handset in your pocket
-mid-call and iOS suspends the page**, the socket dies, and the page greeted the owner on his return
-with a red panel saying the connection to the voice agent had FAILED. Nothing had failed. He
-switched apps.
+mid-call and iOS suspends the page**, the socket dies, and the page used to greet you on your
+return with a red panel saying the connection to the voice agent had FAILED. Nothing had failed.
+You switched apps.
 
 `socket.onclose` is now the only classifier, and it distinguishes:
 
@@ -1518,8 +1743,8 @@ bar**: one strip that can sit in either of two homes, and that is built to fill 
 
 **Bottom is the default, and "bottom" means directly above the big buttons** — not below them,
 where small icons would sit under the thumb reaching for Talk, and not pinned to the viewport
-floor, which is the corner curvature that ate the first word of the status line on the owner's
-phone. Top — under the title, where it used to be — is a setting, kept in `localStorage` under
+floor, which on a real handset put the first word of the status line into the corner curvature and
+ate it. Top — under the title, where it used to be — is a setting, kept in `localStorage` under
 `gent-talk.voice.bar-placement` and offered in Settings. There is **one** bar and two mount points,
 and `setPlacement()` moves the element between them; two copies would be two gears and two switches
 for the page to keep in agreement, which is the defect rather than the layout.
@@ -1574,9 +1799,9 @@ everything that reads the field.
 *"Summarize my unread messages from the coding agent since I last messaged them"*, and
 `#61 unread-status` established that both halves of that scoping are impossible here. Discord gives
 a bot no read state at all — it is a client concept, with no ack route and no read-state field. And
-the obvious fallback, *since the owner last spoke*, is not computable either: the owner has no
-identity in this server, his own replies are posted **as the bot**, the digest drops the
-bot/human flag, and the only author signal is a display name anyone can set to anything. A button
+the obvious fallback, *since you last spoke*, is not computable either: the digest has no
+identity for you, your own replies through this bridge are posted **as the bot**, the digest drops
+the bot/human flag, and the only author signal is a display name anyone can set to anything. A button
 whose text claims that scoping would produce confident, wrong summaries — the exact failure this
 project already paid for once, when an agent invented a digest. So the shipped default asks for
 what the data genuinely provides: *"Summarize the recent messages from the coding agent in this
@@ -1643,7 +1868,7 @@ toggling Sound must leave exactly one initiation frame on the socket.
 
 ### Mute says so out loud
 
-`#73 mute-is-invisible`, and it is the owner's own complaint: during a long mute the agent "gets
+`#73 mute-is-invisible`, and it came out of a real complaint: during a long mute the agent "gets
 very annoying about asking 'Are you there?'", and turning the prompting down in the ElevenLabs
 dashboard did not help.
 
@@ -1692,7 +1917,7 @@ more interruption than the prompting it replaces.
 
 Pair it with the agent's system prompt: the starting prompt in
 [`QUICKSTART.md`](QUICKSTART.md) now tells the agent, in prose, to hold — "skip your turn, say
-nothing, and do not ask whether he is still there" — when it is told the microphone is muted. It
+nothing, and do not ask whether they are still there" — when it is told the microphone is muted. It
 does **not** name the `skip_turn` tool, which is a separate native vendor feature described further
 down; nothing here wires the two together.
 
@@ -1701,9 +1926,9 @@ periods but does not stop the meter. This makes a long mute quieter, not free.
 ### A typed conversation is a different conversation, not a call with the switches thrown
 
 Because a text-only mode is settled *at initiation*, it can be **chosen** there — and that is what
-**Type** does when it is pressed with nothing open. The owner's report is what this answers:
-reaching a text interface used to mean starting a voice call, muting it, and silencing it. Two of
-those three controls exist to manage a microphone he did not want open, and mute deliberately does
+**Type** does when it is pressed with nothing open. It answers a real report: reaching a text
+interface used to mean starting a voice call, muting it, and silencing it. Two of
+those three controls exist to manage a microphone you did not want open, and mute deliberately does
 not close one — it withholds frames from a live capture graph so that unmuting keeps the agent's
 context — so the phone showed the microphone as in use for a conversation that was being typed.
 
@@ -1826,7 +2051,7 @@ your own model. Then add a custom MCP server integration:
 
 | Field | Value |
 |---|---|
-| Server URL | `https://<your-tunnel-hostname>/mcp` — the path **must** be `/mcp` |
+| Server URL | `https://<your-public-hostname>/mcp` — the path **must** be `/mcp` |
 | Transport | **Streamable HTTP** |
 | Authentication | header `Authorization`, value `Bearer <your gent-talk read token>` |
 | Approval mode | **Fine-Grained Tool Approval** |
@@ -1857,7 +2082,7 @@ post — `post_reply` is not even listed for it. With the write token it can, su
 approval prompt. The conservative first deployment is the read token.
 
 **Say this plainly: the per-tool approval setting is enforced on ElevenLabs' side, and this server
-cannot verify it.** Nothing here can tell whether the owner configured approval correctly, or
+cannot verify it.** Nothing here can tell whether you configured approval correctly, or
 whether it was later changed. What this server enforces is the scope split and the allowlist:
 a read token cannot post, and no token can reach a channel outside the configuration. Do not
 mistake the approval prompt for a guarantee we implement.
@@ -1865,20 +2090,27 @@ mistake the approval prompt for a guarantee we implement.
 Verify the public endpoint before pointing an agent at it — same script, public URL:
 
 ```sh
-scripts/verify-deployment.sh --url https://<your-tunnel-hostname> --channel <snowflake>
+scripts/verify-deployment.sh --url https://<your-public-hostname> --channel <snowflake>
 ```
 
 The read token's `tools/list` must NOT contain `post_reply`; check 2 is the one that asserts it.
 If it fails there, something is wrong with the deployment, not with the agent, and no amount of
 dashboard configuration will fix it.
 
-## Putting it on the public internet with a Cloudflare Tunnel
+## Exposing it: one worked example
 
-The server speaks plain HTTP and holds a bot token, so it must never be exposed directly. A
-Cloudflare Tunnel gives it a public HTTPS hostname with **no inbound port open** on the host: the
-`cloudflared` daemon dials out and Cloudflare terminates TLS.
+**This is optional, and this vendor is not special.** See **From zero → Expose it** above for what
+is actually required (a URL a browser can load; HTTPS if you want the microphone) and for the
+other ways to get there — an SSH reverse tunnel, a reverse proxy with a certificate, a cloud load
+balancer, an overlay network, or no exposure at all. One example is written out in full here
+because a complete recipe is worth more than six sketches; pick a different one freely.
 
-You need a domain on Cloudflare; the hostname can be a subdomain of one you already have.
+What every route shares: the server speaks plain HTTP and holds a bot token, so it must never be
+reachable directly from the internet. Something in front of it terminates TLS.
+
+The example is a Cloudflare Tunnel, which gives it a public HTTPS hostname with **no inbound port
+open** on the host: the `cloudflared` daemon dials out and Cloudflare terminates TLS. You need a
+domain on Cloudflare; the hostname can be a subdomain of one you already have.
 
 ```sh
 # once, on the host
@@ -1924,9 +2156,10 @@ sudo systemctl status cloudflared
 ```
 
 Bind the server to loopback when you do this — `GENT_TALK_BIND=127.0.0.1:8080` — so the only path
-in is the tunnel. With Podman, publish to loopback: `-p 127.0.0.1:8080:8080`.
+in is the tunnel. With Podman, publish to loopback: `-p 127.0.0.1:8080:8080`. That last rule is
+the one part of this section that transfers unchanged to every other way in.
 
-### Do not put Cloudflare Access in front of this
+### If you chose Cloudflare: do not put Cloudflare Access in front of this
 
 Access is the obvious next fence and it is the wrong one here. **Access expects a human with a
 browser**: an unauthenticated request gets a login redirect. ElevenLabs calls this endpoint
@@ -1943,9 +2176,15 @@ CF-Access-Client-Id:     <client id>.access
 CF-Access-Client-Secret: <client secret>
 ```
 
-**A tunnel is transport, not authorization.** It gives you TLS and it hides the host's address; it
-does not decide who may call. This server's bearer tokens do that, and that is the part this
-codebase tests.
+**The general rule, whichever way in you chose: no browser-shaped identity gate in front of
+`/mcp`.** Any SSO, OAuth login wall, or "sign in to continue" interstitial — Cloudflare Access,
+an nginx `auth_request` against an IdP, an application load balancer's OIDC action — assumes a
+human who can be redirected. A hosted voice agent cannot be. If you want a second fence there, it
+has to be one that a machine can satisfy with a header it was configured with.
+
+**Transport is not authorization.** A tunnel, a proxy or a load balancer gives you TLS and hides
+the host's address; none of them decides who may call. This server's bearer tokens do that, and
+that is the part this codebase tests.
 
 ## Where ElevenLabs attaches
 
@@ -1963,7 +2202,7 @@ From the related-work review, and recorded in `src/mcp/mod.rs` so it does not ha
   only transport-level action is closing the conversation. **Pause is ours** — muting stops
   uploading audio while keeping the socket and the agent's context (`web/voice.js`), and Sound off
   silences the agent's voice while its replies keep arriving as text.
-  Two things follow, and both are the owner's observation rather than ours: **billing continues
+  Two things follow, and both are observations from use rather than claims of ours: **billing continues
   while muted** (a conversation is billed for being open, though the vendor discounts silent
   periods), and **the agent will start asking whether you are still there**, because a
   client-side mute is invisible to it — from the vendor's side, muted and "went quiet" are the
@@ -1991,8 +2230,8 @@ on its own documentation, on two counts. Its mode that exposes a local stdio ser
 **SSE only** — Streamable HTTP appears only in the opposite direction, as a client connecting to
 a remote server. And it has **no inbound authentication**: its `--headers Authorization` flag
 forwards a token *outbound* to a backend; there is no mechanism to *require* one from callers.
-Wrapping as-is would therefore leave an unauthenticated public endpoint that can post to the
-owner's Discord. That is disqualifying, and it means "wrapping" would really mean writing both a
+Wrapping as-is would therefore leave an unauthenticated public endpoint that can post to your
+Discord. That is disqualifying, and it means "wrapping" would really mean writing both a
 Streamable HTTP server transport and the authentication into a third-party codebase — with the
 security-critical half written by us anyway.
 
@@ -2022,8 +2261,8 @@ message content.
 ## Security
 
 This is the part that deserves the care. The server holds a credential that can read and post to
-the owner's channels, and it is intended to become publicly reachable — which makes it, not the
-voice agent, the real security boundary of the whole design.
+your channels, and it is designed on the assumption that it may become publicly reachable — which
+makes it, not the voice agent, the real security boundary of the whole design.
 
 **What v0 does.**
 
@@ -2080,7 +2319,7 @@ voice agent, the real security boundary of the whole design.
 * **Channel text transits the agent platform.** Anything `digest_channel`, `find_message` or
   `read_message` returns is sent to ElevenLabs and to whatever model is behind it. The fencing
   constrains how it is *framed*, not where it goes.
-* **Stored transcripts are not encrypted at rest.** Once `storage.path` is set, the owner's
+* **Stored transcripts are not encrypted at rest.** Once `storage.path` is set, your own
   speech and the channel text the agent read aloud sit in the clear in a SQLite file that
   outlives the container. Anyone with host filesystem access can read it. Retention bounds how
   much accumulates; it does not protect what is there.
@@ -2125,7 +2364,7 @@ came back. The scenario that answers WITHOUT calling any tool — the 2026-08-19
 (`tests/js/voice_page.test.mjs`) executes `web/voice.js` itself against a small strict DOM whose
 element set is read out of `web/voice.html`, so a script reaching for an element the page does not
 have fails there rather than silently at the roadside; `cargo test` runs it through
-`tests/voice_page.rs`, which FAILS rather than skips when Node is absent. The fake is not a yes-man — it shares the real client's
+`tests/voice_page.rs`, which FAILS rather than skips when Node is absent. The fake is not a rubber stamp — it shares the real client's
 request validation and ordering contract, and it records what was posted, so the API tests assert
 the actual channel, content, and reply target that reached it. A handler that dropped a post,
 posted to the wrong channel, or ignored the scope split fails those tests. The parts of the live
@@ -2154,7 +2393,7 @@ write-scope fence in the MCP dispatcher (1). All four were reverted; the suite i
 
 Every test above drives behaviour. **Not one of them lays anything out**, so not one of them can
 tell you the page looks right — the `/voice` suite says so about itself. That gap is not
-theoretical: a single photograph of the owner's phone showed three defects the whole suite had
+theoretical: a single photograph of a real phone showed three defects the whole suite had
 passed over, because a clipped paragraph and a control that reads as active on a dead call are
 layout facts and a fixture with no layout engine has no opinion about them.
 
@@ -2190,10 +2429,11 @@ gesture. A scene that ran on the wrong device and passed would be filed as evide
 interface that device does not have, which is why `Scene.profiles` exists and why `--self-test`
 checks the restrictions are still on the scenes that need them.
 
-**Dark is the default, and that is not a preference.** The owner's phone is dark, and the first run
-of this harness captured nothing but light frames, because light is the browser-automation default
-— so every image was real and every one was of a page he never sees. Contrast between the two
-speakers is exactly what does not survive the swap. `--theme light` or `--theme both` when you want
+**Dark is the default, and that is not a preference.** This page is used on a phone in a car,
+where the scheme is usually dark; the first run of this harness captured nothing but light frames,
+because light is the browser-automation default — so every image was real and every one was of a
+page nobody actually looks at. Contrast between the two speakers is exactly what does not survive
+the swap. `--theme light` or `--theme both` when you want
 the other one.
 
 It costs nothing and needs no hardware. The conversation WebSocket is replaced before any page
@@ -2269,6 +2509,7 @@ src/ops.rs            the operations both front doors share: allowlist, fetch, t
 src/live.rs           inbound ingestion (bounded polling), the per-channel fan-out, and the SSE body
 src/replay.rs         rebuilding continuity across a hang-up: the preamble, the budget, the fence
 src/probe.rs          the startup channel reachability probe and its failure taxonomy
+src/diagnostics.rs    those same checks on demand, structured, redacted, and time-bounded
 src/elevenlabs/       the SignedUrlProvider trait, the live client, the in-memory fake
 src/elevenlabs/mock/  the loopback vendor: a real mint endpoint, a real WebSocket, a real MCP client
 src/bin/mock_elevenlabs.rs     that mock as a process, for a browser or the smoke script
@@ -2327,6 +2568,10 @@ The graph is `gent-talk/tests.dag.yaml`. `make dag-check` loads it without runni
 
 Beyond the security list above:
 
+* **`GET /api/v1/diagnostics` has met no real vendor.** Both halves of it — the Discord checks and
+  the ElevenLabs checks — have been exercised only against in-memory fakes. The classification it
+  reports is the startup probe's, which is in exactly the same position; what a live vendor
+  actually returns for each of those cases is still unobserved.
 * `resolve` only searches the window it just fetched (default 50, max 100 messages). Older messages
   are unreachable; there is no pagination and no store.
 * Ranking is lexical. It matches words, not meaning, so a paraphrase with no shared words will miss.

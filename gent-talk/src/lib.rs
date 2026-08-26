@@ -39,6 +39,7 @@ pub mod agent_backend;
 pub mod auth;
 pub mod clock;
 pub mod config;
+pub mod diagnostics;
 pub mod discord;
 pub mod elevenlabs;
 pub mod http;
