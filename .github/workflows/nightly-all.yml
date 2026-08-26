@@ -68,6 +68,17 @@ jobs:
           BOX_FLAGS: --allow-cgroup-failure
         run: make validate-all
 
+      # Same reasoning as the per-push workflow: the gate is a completely-broken detector, so the
+      # value of the nightly run is the SERIES, and a series has to be kept to be a series.
+      - name: keep the benchmark measurements
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: timeline-redraw-benchmark-nightly-${{ github.run_id }}
+          path: py/tests/js/browser/benchmark-report.txt
+          if-no-files-found: ignore
+          retention-days: 90
+
       # gent-talk is outside the Rust workspace and outside `make validate-all`'s workspace half,
       # so its own gate is named here as well. Its Makefile is the same one a developer runs.
       - name: gent-talk

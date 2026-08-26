@@ -24,6 +24,9 @@ on:
 jobs:
   py:
     runs-on: ubuntu-latest
+    # Chromium download plus a browser suite; the ceiling exists so a wedged page fails the job
+    # instead of burning the runner's own six hours.
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: py
@@ -43,6 +46,43 @@ jobs:
         run: python -m pytest -q tests/test_timeline_*.py
       - name: timeline JavaScript core tests
         run: node tests/js/test_timeline_core.js
+
+      # The Playwright suite and the redraw benchmark. This workflow already SELECTED on
+      # `py/tests/js/**` but ran only the plain-node core tests, so the 35-test browser suite --
+      # the only checks here that can see a rendering or interaction regression -- ran nowhere on
+      # push. It ran nowhere at all until recently, which is how a real failure sat in it unseen.
+      #
+      # Not boxed by `dagrun` here. A hosted runner is already a container with its own limits,
+      # `dagrun` cannot always get a delegated cgroup on one, and the job's own `timeout-minutes`
+      # is the ceiling that matters. Boxing is for the developer machine and the nightly, where a
+      # wedged Chromium has a whole workstation to take with it.
+      - name: browser suite and redraw benchmark
+        working-directory: py/tests/js/browser
+        run: |
+          # `npm install`, not `npm ci`: this directory deliberately tracks no lockfile and no
+          # node_modules (see its README), so there is nothing for `ci` to install from.
+          npm install --no-audit --no-fund
+          npx playwright install --with-deps chromium
+          npx playwright test --reporter=line
+          node --test benchmark-budget.test.cjs
+
+      # The measurements, kept. The benchmark's own gate is a completely-broken detector and
+      # deliberately cannot see a 2x regression -- wall-clock on a shared runner is too noisy to
+      # gate on that finely. What DOES catch a gradual regression is the series, so the numbers
+      # are preserved per run rather than scrolling away in a log.
+      #
+      # `always()`, because a run that breached the ceiling is exactly the one whose numbers
+      # someone will want to look at.
+      - name: keep the benchmark measurements
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: timeline-redraw-benchmark-${{ github.sha }}
+          path: |
+            py/tests/js/browser/benchmark-report.txt
+            py/tests/js/browser/test-results/
+          if-no-files-found: ignore
+          retention-days: 90
       - name: dependency-free CLI smoke
         run: |
           python -m agent_team_timeline --version

@@ -702,10 +702,21 @@ time.sleep(60)
         text=True,
         env=environment,
     )
-    deadline = time.monotonic() + 10
+    # 60s, not 10s. This waits for a locally spawned process to write one marker file, which
+    # takes milliseconds when the machine is idle -- so the bound is not measuring anything, it is
+    # only distinguishing "started" from "never will". It was 10s, and that was observed to fail
+    # inside a full suite run while an unrelated archive rebuild saturated the machine: process
+    # spawn plus interpreter startup does not fit in ten seconds on a box under real load.
+    #
+    # Raising it costs nothing when the marker appears (the loop exits on the file, not the
+    # clock) and removes a flake from a gate somebody else is trying to land through.
+    deadline = time.monotonic() + 60
     while not ready.exists() and time.monotonic() < deadline:
         time.sleep(0.05)
-    assert ready.exists()
+    assert ready.exists(), (
+        "the fake rsync never started: it writes its marker immediately, so 60s without one "
+        "means the process was never spawned rather than that it was slow"
+    )
     child_pid = int(ready.read_text(encoding="utf-8"))
     process.terminate()
     stdout, stderr = process.communicate(timeout=10)

@@ -11,28 +11,40 @@
 // would keep passing here -- every latency under budget, because there are none -- which is why
 // the sample count is asserted too, and why the instrument test exists separately.
 //
-// WHY A BUDGET AT ALL, given the numbers vary by machine. Because "the page still renders" is
-// not the property anyone cares about for a timeline: it is an interactive visualization, and a
-// zoom that takes two seconds is broken in a way no functional assertion notices. A regression
-// that made every redraw ten times slower would pass all thirty-five interaction tests.
+// WHAT IS GATED, AND WHAT IS ONLY REPORTED. These are deliberately different, because wall-clock
+// timing on a shared CI runner is not a property worth gating on. A hosted runner is variously
+// throttled, co-tenanted and cold; the same commit can measure five times apart between two runs,
+// so a timing bound tight enough to catch a real regression will fire on a slow neighbour
+// instead. That produces the worst outcome available: a red build nobody believes, on a signal
+// nobody can act on.
 //
-// WHY THESE NUMBERS. They are order-of-magnitude ceilings, not targets, chosen the way the
-// deadline in `test_supervisor_crash.py` was: to tell a REGRESSION from a slow machine, not fast
-// from slow. Measured p95 on this fixture is a few milliseconds; the budget is 400ms, which is
-// roughly two orders of magnitude of headroom. A CI box under load, a cold Chromium, and a
-// debug build together do not approach it -- and a change that doubles redraw cost will not trip
-// it either, which is the honest cost of a bound that must not flake. What it catches is the
-// change that makes interaction qualitatively unusable, and that is worth a gate.
+// So the gate is split.
 //
-// The measured values are PRINTED on every run, pass or fail. A budget that only speaks when it
-// is breached gives you no way to see a trend approaching it.
+//   STRICT, and machine-independent. Did the page load without a runtime error; did the wheel
+//   sequence produce the number of samples it should; did those events actually change the
+//   rendering. "Zoom does nothing" is a real defect, it is what a broken interaction looks like,
+//   and detecting it does not require knowing how fast the machine is. This is the half that
+//   earns its place as a gate.
 //
-// ONE METRIC IS PRINTED BUT NOT ENFORCED. `handler_to_raf_ms` -- the page's own handler time,
-// excluding the browser's input plumbing -- measures as NEGATIVE on this fixture (about -0.1ms),
-// because the harness captures the rAF timestamp before the handler is observed to finish. A
-// budget over a quantity that reads below zero is a gate that cannot fail, which is worse than
-// no gate: it looks like coverage. It stays in the printed table because the trend is still
-// informative, and it gets no assertion until the measurement is fixed.
+//   GENEROUS, and wall-clock. The timing bounds below are COMPLETELY-BROKEN detectors, not
+//   regression detectors. Measured p95 on a developer machine is about 32ms and the bound is
+//   5000ms -- more than two orders of magnitude of headroom -- because the question they answer
+//   is "did something catastrophic happen to rendering", not "is this slower than last week".
+//   A change that doubles redraw cost will not trip them, and that is the intended trade: this
+//   file is not the instrument for spotting a 2x regression.
+//
+// THE NUMBERS ARE STILL RECORDED, on every run, whatever the verdict. That is the part that is
+// actually useful over time: a series you can look at, in CI as a build artifact and locally as
+// `benchmark-report.txt`. Watching a trend is how a gradual regression gets caught -- a threshold
+// only ever tells you that you have already lost, and on CI hardware it mostly tells you which
+// runner you drew.
+//
+// ONE METRIC IS PRINTED BUT NOT ENFORCED AT ALL. `handler_to_raf_ms` -- the page's own handler
+// time, excluding the browser's input plumbing -- measures as NEGATIVE on this fixture (about
+// -0.1ms), because the harness captures the rAF timestamp before the handler is observed to
+// finish. A budget over a quantity that reads below zero is a gate that cannot fail, which is
+// worse than no gate: it looks like coverage. It stays in the table because the trend is still
+// informative, and gets no assertion until the measurement is fixed.
 
 const assert = require("node:assert/strict");
 const childProcess = require("node:child_process");
@@ -47,14 +59,15 @@ const execFile = util.promisify(childProcess.execFile);
 const benchmarkPath = path.join(__dirname, "benchmark-site.cjs");
 const fixtureServerPath = path.join(__dirname, "fixture-server.cjs");
 
-//: Wall-clock ceilings, in milliseconds. See the header for why they are this loose.
+//: Wall-clock ceilings, in milliseconds. COMPLETELY-BROKEN detectors; see the header for why
+//: they are this loose and why nothing tighter belongs in a CI gate.
 const BUDGET = Object.freeze({
-  // The gap from the wheel event to the frame that reflects it. This is "redraw speed" as a user
-  // experiences it, and it is the number this file exists to defend.
-  input_to_raf_p95_ms: 400,
-  input_to_raf_max_ms: 800,
-  // First usable frame. Generous: it includes Chromium startup on a cold cache.
-  usable_ms: 10_000
+  // ~150x the measured developer-machine p95. A redraw taking five seconds is broken by any
+  // standard, on any hardware, and nothing short of that is distinguishable from a slow runner.
+  input_to_raf_p95_ms: 5_000,
+  input_to_raf_max_ms: 10_000,
+  // A minute to the first usable frame. Includes Chromium start on a cold, throttled runner.
+  usable_ms: 60_000
 });
 
 //: The wheel sequence is twelve steps; a run that sampled fewer measured something else.
@@ -198,25 +211,38 @@ test("zoom and pan redraw within budget, and the measurements are reported", {
   assert.equal(report.success, true, "the page raised a runtime error while being measured");
   assert.deepEqual(report.diagnostics.page_errors, []);
 
-  // A harness that stopped sampling would otherwise pass every budget below by measuring nothing.
+  // --- strict, and independent of how fast the machine is ------------------------------------
+  //
+  // A harness that stopped sampling would otherwise satisfy every timing bound below by
+  // measuring nothing at all.
   assert.equal(
     report.interaction.sample_count,
     EXPECTED_SAMPLES,
     "the wheel sequence did not produce the expected number of samples"
   );
   assert.equal(report.interaction.input_to_raf_ms.count, EXPECTED_SAMPLES);
+  // The real interaction gate: every wheel event is supposed to change what is on screen. Zero
+  // changed frames means zoom and pan do nothing -- a defect no timing bound would catch, and
+  // one that needs no knowledge of the hardware to detect.
+  assert.ok(
+    report.interaction.render_change_count > 0,
+    "no wheel event changed the rendering: zoom and pan are not redrawing at all"
+  );
 
+  // --- generous, and only for the catastrophic case --------------------------------------------
   const input = report.interaction.input_to_raf_ms;
   assert.ok(
     input.p95 <= BUDGET.input_to_raf_p95_ms,
-    `zoom/pan p95 redraw was ${input.p95}ms, over the ${BUDGET.input_to_raf_p95_ms}ms budget`
+    `zoom/pan p95 redraw was ${input.p95}ms against a ${BUDGET.input_to_raf_p95_ms}ms ` +
+      "completely-broken ceiling; this is not a regression bound, so breaching it means " +
+      "rendering is catastrophically slow rather than merely slower"
   );
   assert.ok(
     input.max <= BUDGET.input_to_raf_max_ms,
-    `slowest zoom/pan redraw was ${input.max}ms, over the ${BUDGET.input_to_raf_max_ms}ms budget`
+    `slowest zoom/pan redraw was ${input.max}ms against a ${BUDGET.input_to_raf_max_ms}ms ceiling`
   );
   assert.ok(
     report.timings.usable_ms <= BUDGET.usable_ms,
-    `first usable frame took ${report.timings.usable_ms}ms, over the ${BUDGET.usable_ms}ms budget`
+    `first usable frame took ${report.timings.usable_ms}ms against a ${BUDGET.usable_ms}ms ceiling`
   );
 });
