@@ -5516,6 +5516,26 @@ test("...and turning the mode off aborts a pending read too", async () => {
   assert.equal(audible.length, 0, "audio started after the reader left reading mode");
 });
 
+test("ASKED-FOR AND BEING-READ LOOK DIFFERENT, and the loud one is actually loud", async () => {
+  // The first version of the reading treatment was a 14% ACCENT tint with a one-pixel border, and
+  // it was effectively invisible: accent is a blue close in value to the dark surface it sat on,
+  // and the coder tile it usually lands on has no side borders at all now that it runs edge to
+  // edge. Every test passed, because they all asserted the ATTRIBUTE and none of them asserted
+  // that the attribute did anything.
+  const reading = cssBlock('#discord-log li.discord-message[data-reading="true"]');
+  const pending = cssBlock('#discord-log li.discord-message[data-pending="true"]');
+
+  // The event gets the SURFACE: a fill, and a bar that survives a tile with no side borders.
+  assert.match(reading, /background:/, "the row being read has no fill, so it barely shows");
+  assert.match(reading, /box-shadow:\s*inset/, "the bar a borderless tile needs is missing");
+  assert.match(reading, /--warn/, "the reading row is not the colour of the control that stops it");
+
+  // The promise gets an EDGE, and must not be mistaken for the event.
+  assert.match(pending, /outline:/, "the asked-for row has no edge");
+  assert.doesNotMatch(pending, /background:/, "a promise is filled in like an event");
+  assert.notEqual(reading, pending, "the two states are drawn identically");
+});
+
 test("the channel spends its width on words, not on insets", async () => {
   // 15% of a 393-pixel phone, on every row, bought what the speaker COLOUR now buys.
   const mine = cssBlock('#discord-log li.discord-message[data-who="me"]');
