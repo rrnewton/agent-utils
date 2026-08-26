@@ -54,6 +54,7 @@ WORKSPACE = "workspace"
 CROSS = "cross"
 PACKAGES = "packages"
 GENT_TALK = "gent-talk"
+TIMELINE_BROWSER = "timeline-browser"
 HYGIENE = "hygiene"
 
 #: Every group, in the order a full run should execute them: cheapest and most likely to fail
@@ -87,6 +88,20 @@ GROUPS: dict[str, tuple[Check, ...]] = {
         Check("cross-differential", ("make", "cross")),
     ),
     PACKAGES: (Check("packages", ("make", "check-packages")),),
+    TIMELINE_BROWSER: (
+        # Delegated to the tool's OWN Makefile rather than restated here, so there is one
+        # definition of what boxing this tool means and `make validate` in its source directory
+        # runs exactly what CI runs. Restating the `dagrun box` invocation in both places is how
+        # the two drift until the local gate and the CI gate disagree about what passed.
+        #
+        # These ran nowhere before. The suite is 35 tests including pan and zoom, it lived in the
+        # tree fully written, and nothing invoked it -- so a genuine failure sat unnoticed in it.
+        Check("timeline-browser", ("make", "-C", "py/agent_team_timeline", "browser")),
+        # Pass/fail AND a measurement: it prints zoom/pan redraw latency every run and fails when
+        # a redraw breaches the budget. A functional suite cannot see a change that makes
+        # interaction ten times slower; this can.
+        Check("timeline-benchmark", ("make", "-C", "py/agent_team_timeline", "benchmark")),
+    ),
     GENT_TALK: (
         Check("gent-talk-fmt", ("cargo", "fmt", "--check"), cwd="gent-talk"),
         Check("gent-talk-clippy", ("cargo", "clippy", "--all-targets", "--", "-D", "warnings"), cwd="gent-talk"),
@@ -112,6 +127,10 @@ WHY: dict[str, str] = {
     CROSS: "code with a paired cross-language implementation changed",
     PACKAGES: "something that ships inside a distribution changed",
     GENT_TALK: "gent-talk changed (it is outside the Rust workspace and has its own suite)",
+    TIMELINE_BROWSER: (
+        "the timeline's browser-facing assets or its browser suite changed; these drive a real"
+        " Chromium and are the only checks that can see a rendering or interaction regression"
+    ),
     HYGIENE: (
         "always: a consuming project's name can be typed into any file, and a documented default"
         " can be broken from either the prose or the code side"
@@ -128,10 +147,23 @@ PREFIX_RULES: tuple[tuple[str, frozenset[str]], ...] = (
     ("gent-talk/scripts/", frozenset({GENT_TALK, WORKSPACE})),
     ("gent-talk/", frozenset({GENT_TALK})),
     ("rs/", frozenset({WORKSPACE, CROSS, PACKAGES})),
+    # Longest prefix wins, so these beat the bare `py/` rule below. They add the browser group
+    # WITHOUT removing the others: the static bundle is packaged and type-checked like the rest
+    # of the package, so a change to it still owes the workspace and packaging checks. A rule
+    # that selected only the browser group here would be the cheaper-of-the-two answer the
+    # self-test exists to forbid.
+    ("py/agent_team_timeline/static/", frozenset({TIMELINE_BROWSER, WORKSPACE, CROSS, PACKAGES})),
+    ("py/tests/js/", frozenset({TIMELINE_BROWSER, WORKSPACE, CROSS, PACKAGES})),
     ("py/", frozenset({WORKSPACE, CROSS, PACKAGES})),
     ("cross/", frozenset({CROSS})),
     ("common/docs/", frozenset({DOCS, PACKAGES})),
     ("examples/", frozenset({CROSS})),
+    # The log fetcher and its shell wrapper. Type-checked by `make check` (mypy walks the repo)
+    # and covered by `py/tests/test_agent_log_archive_fetcher.py`, so it owes the workspace
+    # group -- and nothing else: it ships in no distribution and has no cross-language twin.
+    # Before this rule it read as unclassified and selected EVERY group, which is the safe
+    # direction to be wrong in but meant a one-line fetcher change ran gent-talk's Rust suite.
+    ("scripts/agent-log-archive/", frozenset({WORKSPACE})),
     ("scripts/embed_userguides.py", frozenset({DOCS, PACKAGES})),
     ("scripts/check_python_packages.py", frozenset({PACKAGES})),
     ("scripts/check_rust_packages.py", frozenset({PACKAGES})),

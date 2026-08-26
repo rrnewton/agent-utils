@@ -45,9 +45,29 @@ SSH_OPTIONS = (
     "ServerAliveCountMax=4",
 )
 RSYNC_SSH_OPTIONS = SSH_OPTIONS[1:]
+
+#: Wall-clock ceilings on every child process this tool starts.
+#:
+#: ``ConnectTimeout`` above bounds the TCP connect and NOTHING ELSE. Authentication happens after
+#: the connection is up, so an ssh that reaches the host and then blocks talking to a dead agent
+#: socket waits forever with ``ConnectTimeout`` satisfied. That is not hypothetical: it is the
+#: observed failure -- a fetch sat for eight minutes having transferred nothing, printed no error,
+#: and would have sat indefinitely.
+#:
+#: Generous on purpose. These exist to tell FINITE from INFINITE, not fast from slow: a probe that
+#: needs four minutes on a loaded host is fine, one that needs four hours is wedged. Setting them
+#: tight would trade a hang for a flake, which is the same outage with a worse explanation.
+PROBE_TIMEOUT_S = 240.0
+MANIFEST_TIMEOUT_S = 900.0
+AGENT_PROBE_TIMEOUT_S = 10.0
+#: Exit status for a child this tool killed on its ceiling. 124 is timeout(1)'s convention, so a
+#: reader who greps for it finds the convention rather than a number invented here.
+TIMED_OUT = 124
 REMOTE_MISSING = 44
 REMOTE_NOT_DIRECTORY = 45
 REMOTE_INACCESSIBLE = 46
+#: This tool's own code for "the host never answered", distinct from any remote exit status.
+REMOTE_UNREACHABLE = 47
 REMOTE_SIZE_FAILED = 47
 REMOTE_OUTSIDE_HOME = 48
 LOW_FREE_PERCENT = 5.0
@@ -1695,6 +1715,71 @@ def _ssh_command(host: str, remote_command: str) -> list[str]:
     return ["ssh", *SSH_OPTIONS, "--", host, remote_command]
 
 
+def _run_bounded(
+    command: Sequence[str], *, timeout_s: float
+) -> subprocess.CompletedProcess[str]:
+    """Run a child process under a wall-clock ceiling, reporting a timeout as a normal failure.
+
+    A ``TimeoutExpired`` is converted into a nonzero ``CompletedProcess`` rather than propagated,
+    because every caller here already has a path for "this probe failed, and here is the stderr" --
+    and turning a hang into that path is the entire point. Raising would replace an infinite wait
+    with a traceback, which is better but still not an answer the operator can act on.
+
+    The exit code is 124, matching :manpage:`timeout(1)`, so a reader who greps for it finds the
+    convention rather than a number this file invented.
+    """
+
+    try:
+        return subprocess.run(
+            list(command),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout_s,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            list(command), TIMED_OUT, "", _timeout_detail(command, timeout_s)
+        )
+
+
+def _run_bounded_bytes(
+    command: Sequence[str], *, timeout_s: float
+) -> subprocess.CompletedProcess[bytes]:
+    """:func:`_run_bounded` for a caller that needs raw bytes.
+
+    Two functions rather than one with a ``text`` switch, because the return type genuinely
+    differs between them and a single signature would have to say ``CompletedProcess[Any]`` --
+    which this repository's type contract forbids, and rightly: every caller here does know
+    which of the two it wants.
+    """
+
+    try:
+        return subprocess.run(
+            list(command),
+            capture_output=True,
+            check=False,
+            timeout=timeout_s,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            list(command), TIMED_OUT, b"", _timeout_detail(command, timeout_s).encode()
+        )
+
+
+def _timeout_detail(command: Sequence[str], timeout_s: float) -> str:
+    """The one sentence a timed-out child gets to explain itself."""
+
+    return (
+        f"timed out after {timeout_s:.0f}s: {shlex.join(command)}. "
+        "The connection was established or never refused, so this is a stall rather than a "
+        "refusal -- most often an SSH agent that holds the connection open without ever "
+        "authenticating."
+    )
+
+
 def _probe_remote_command(
     source: PurePosixPath, home: PurePosixPath, estimate_size: bool
 ) -> str:
@@ -1778,12 +1863,9 @@ def probe_source(operation: Operation, *, estimate_size: bool) -> ProbeObservati
                 detail = "source directory is not readable/searchable"
             elif estimate_size:
                 resolved_source = str(source_resolved)
-                completed = subprocess.run(
+                completed = _run_bounded(
                     ["du", "-sbl", "--", str(source_resolved)],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                    env={**os.environ, "LC_ALL": "C"},
+                    timeout_s=PROBE_TIMEOUT_S,
                 )
                 if completed.returncode != 0:
                     kind = ProbeKind.FAILED
@@ -1800,17 +1882,14 @@ def probe_source(operation: Operation, *, estimate_size: bool) -> ProbeObservati
             else:
                 resolved_source = str(source_resolved)
     else:
-        completed = subprocess.run(
+        completed = _run_bounded(
             _ssh_command(
                 operation.machine.host,
                 _probe_remote_command(
                     operation.source, operation.machine.home, estimate_size
                 ),
             ),
-            capture_output=True,
-            text=True,
-            check=False,
-            env={**os.environ, "LC_ALL": "C"},
+            timeout_s=PROBE_TIMEOUT_S,
         )
         exit_code = completed.returncode
         if exit_code == 0:
@@ -2013,14 +2092,12 @@ def _remote_manifest_stderr(stderr: bytes) -> str:
 def scan_remote_tree(
     operation: Operation, resolved_source: PurePosixPath
 ) -> ManifestScan:
-    completed = subprocess.run(
+    completed = _run_bounded_bytes(
         _ssh_command(
             operation.machine.host,
             _remote_manifest_command(resolved_source, operation.machine.home),
         ),
-        capture_output=True,
-        check=False,
-        env={**os.environ, "LC_ALL": "C"},
+        timeout_s=MANIFEST_TIMEOUT_S,
     )
     if completed.returncode != 0:
         stderr = _remote_manifest_stderr(completed.stderr)
@@ -2400,14 +2477,52 @@ def run_rsync(command: Sequence[str], logger: RunLogger) -> RsyncOutcome:
     )
 
 
+def _agent_socket_answers(candidate: str) -> bool:
+    """Whether *candidate* is an SSH agent that ANSWERS, not merely a socket file that exists.
+
+    The distinction is the whole bug. ``stat`` on a forwarded agent socket whose session has ended
+    still reports ``S_ISSOCK``: the inode outlives the listener. Accepting it on that evidence set
+    ``SSH_AUTH_SOCK`` to a dead socket, printed "Using forwarded SSH agent", and left every
+    subsequent ssh blocked in authentication -- past ``ConnectTimeout``, which had already been
+    satisfied by a TCP connection that succeeded.
+
+    So this asks the agent a question. ``ssh-add -l`` exits 0 with keys, 1 with none (a live agent
+    either way), and 2 when it cannot reach one. Only "cannot reach" disqualifies a socket: an
+    agent with no identities is still an agent, and rejecting it here would silently skip a
+    perfectly good one over a condition ssh itself would report clearly.
+    """
+
+    try:
+        if not stat.S_ISSOCK(Path(candidate).stat().st_mode):
+            return False
+    except OSError:
+        return False
+    if shutil.which("ssh-add") is None:
+        # Cannot ask, so do not claim to know. Existence is the only evidence available, and it is
+        # the evidence this function exists to distrust -- but refusing every socket on a host
+        # without `ssh-add` would break fetching there entirely.
+        return True
+    try:
+        probed = subprocess.run(
+            ["ssh-add", "-l"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=AGENT_PROBE_TIMEOUT_S,
+            env={**os.environ, "SSH_AUTH_SOCK": candidate},
+        )
+    except subprocess.TimeoutExpired:
+        # A dead socket does not always refuse: it can accept the connection and never reply, so
+        # even the liveness probe needs a ceiling. Measured against the real stale sockets on the
+        # host this was written for, `ssh-add -l` produced no output and did not return.
+        return False
+    return probed.returncode in (0, 1)
+
+
 def discover_forwarded_ssh_agent(logger: RunLogger) -> None:
     current = os.environ.get("SSH_AUTH_SOCK")
-    if current is not None:
-        try:
-            if stat.S_ISSOCK(Path(current).stat().st_mode):
-                return
-        except OSError:
-            pass
+    if current is not None and _agent_socket_answers(current):
+        return
     if shutil.which("tmux") is None:
         return
     completed = subprocess.run(
@@ -2421,13 +2536,88 @@ def discover_forwarded_ssh_agent(logger: RunLogger) -> None:
     if completed.returncode != 0 or not value.startswith(prefix):
         return
     candidate = value[len(prefix) :]
-    try:
-        is_socket = stat.S_ISSOCK(Path(candidate).stat().st_mode)
-    except OSError:
-        is_socket = False
-    if is_socket:
-        os.environ["SSH_AUTH_SOCK"] = candidate
-        logger.line("Using forwarded SSH agent from the tmux environment.")
+    if not _agent_socket_answers(candidate):
+        logger.line(
+            f"Ignoring the SSH agent recorded in the tmux environment ({candidate}): the socket "
+            "exists but nothing is listening on it. This is what a forwarded agent leaves behind "
+            "when its session ends, and adopting it makes every later ssh hang instead of fail."
+        )
+        return
+    os.environ["SSH_AUTH_SOCK"] = candidate
+    logger.line("Using forwarded SSH agent from the tmux environment.")
+
+
+PREFLIGHT_TIMEOUT_S = 45.0
+
+
+def _unreachable_probe(detail: str) -> ProbeObservation:
+    """The probe result for a source on a host preflight already proved unreachable.
+
+    Synthesised rather than measured, deliberately: re-asking a host that just failed to answer
+    `ssh <host> true` cannot learn anything the preflight did not, and would spend
+    PROBE_TIMEOUT_S per source doing it. The detail carries the preflight's own message so the
+    receipt says why, not merely that.
+    """
+
+    stamp = utc_now()
+    return ProbeObservation(
+        kind=ProbeKind.FAILED,
+        exit_code=REMOTE_UNREACHABLE,
+        estimated_bytes=None,
+        resolved_source=None,
+        detail=f"host did not answer preflight: {detail}",
+        started_utc=stamp,
+        finished_utc=stamp,
+        duration_seconds=0.0,
+    )
+
+
+def preflight_hosts(
+    operations: Sequence[Operation], logger: RunLogger
+) -> dict[str, str]:
+    """Prove each remote host answers BEFORE any per-source work begins.
+
+    Returns host -> failure detail for the hosts that did not answer; an empty mapping means
+    every host is reachable.
+
+    The per-source probe already bounds itself, so this is not what stops a hang -- it is what
+    stops a hang *per operation*. On the configured archive there are 24 operations across a
+    handful of hosts, so one unauthenticable host costs 24 x PROBE_TIMEOUT_S of waiting to learn
+    a fact that one four-second ssh could have established. Asking once per HOST rather than once
+    per source is the whole saving, and it is why this is keyed on the host.
+
+    ``ssh <host> true`` is the smallest question that exercises the thing that actually breaks:
+    it resolves, connects, and AUTHENTICATES, which is the step `ConnectTimeout` does not cover.
+    A host that fails here is recorded and skipped rather than aborting the run, because a fetch
+    across several machines should still collect from the ones that are up -- the same reason
+    this tool has never treated one bad source as fatal.
+    """
+
+    hosts: list[str] = []
+    for operation in operations:
+        if not operation.local and operation.machine.host not in hosts:
+            hosts.append(operation.machine.host)
+    if not hosts:
+        return {}
+    failures: dict[str, str] = {}
+    for host in hosts:
+        completed = _run_bounded(
+            _ssh_command(host, "true"), timeout_s=PREFLIGHT_TIMEOUT_S
+        )
+        if completed.returncode == 0:
+            continue
+        detail = (completed.stderr or "").strip() or f"ssh exited {completed.returncode}"
+        failures[host] = detail
+        logger.line(f"Preflight: {host} did not answer: {detail}")
+    if failures:
+        logger.line(
+            f"Preflight failed for {len(failures)} of {len(hosts)} host(s). Their sources are "
+            "skipped; every reachable host is still fetched. The usual cause is no SSH agent or "
+            "no Kerberos ticket -- check with `ssh-add -l`."
+        )
+    else:
+        logger.line(f"Preflight: all {len(hosts)} remote host(s) answered.")
+    return failures
 
 
 def _base_result(
@@ -2975,10 +3165,18 @@ def execute_run(
         unfinished_detail = "run stopped before this operation completed"
         try:
             discover_forwarded_ssh_agent(receipt.logger)
+            unreachable_hosts = preflight_hosts(operations, receipt.logger)
             probes: dict[str, ProbeObservation] = {}
             estimate_size = options.mode is not Mode.CHECK_SOURCES
             for operation in operations:
-                probe = probe_source(operation, estimate_size=estimate_size)
+                probe = (
+                    _unreachable_probe(
+                        unreachable_hosts[operation.machine.host]
+                    )
+                    if not operation.local
+                    and operation.machine.host in unreachable_hosts
+                    else probe_source(operation, estimate_size=estimate_size)
+                )
                 if (
                     operation.local
                     and probe.kind is ProbeKind.PRESENT

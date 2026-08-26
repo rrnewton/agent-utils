@@ -43,9 +43,29 @@ jobs:
         with:
           python-version: '3.12'
 
+      # The timeline's browser checks drive a real Chromium, so the runner needs the browser and
+      # the suite's dependencies before `validate-all` reaches them. Named as its own step so a
+      # download failure reads as a download failure rather than as a test failure.
+      - name: browser for the timeline suite
+        working-directory: py/tests/js/browser
+        run: |
+          # `npm install`, not `npm ci`: this directory deliberately tracks no lockfile and no
+          # node_modules (see its README), so there is nothing for `ci` to install from.
+          npm install --no-audit --no-fund
+          npx playwright install --with-deps chromium
+
       # `--all` rather than the selector: selection is a convenience for the edit-run loop, and
       # this job exists precisely to run what selection would have skipped.
+      #
+      # BOX_FLAGS lets the boxed steps degrade instead of refusing. A hosted runner may not
+      # delegate a cgroup, and `dagrun` hard-fails rather than pretending to enforce a bound it
+      # cannot -- which is right locally and wrong here, where the alternative is not running the
+      # test at all. The degradation is partial, not total: `dagrun capabilities` reports
+      # `wall_timeout` available uncontained, so the ceiling that catches a hang still holds and
+      # only the memory/CPU bound is lost, which the runner enforces its own way.
       - name: the entire repository contract
+        env:
+          BOX_FLAGS: --allow-cgroup-failure
         run: make validate-all
 
       # gent-talk is outside the Rust workspace and outside `make validate-all`'s workspace half,

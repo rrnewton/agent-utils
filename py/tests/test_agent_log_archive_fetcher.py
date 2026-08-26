@@ -9,6 +9,7 @@ import socket
 import stat
 import subprocess
 import time
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
@@ -832,3 +833,192 @@ def test_history_rejects_symlinked_state_paths(
     viewed = _run(archive, "--history")
     assert viewed.returncode == 2
     assert "symlink" in viewed.stderr or "safe owned regular file" in viewed.stderr
+
+
+# --- a fetch must FAIL, never hang -------------------------------------------------------------
+#
+# The defect these pin was observed, not imagined: a fetch ran for eight minutes, transferred
+# nothing, printed one line ("Using forwarded SSH agent from the tmux environment"), and would
+# have waited indefinitely. Three separate things had to be true for that, and each gets a test.
+
+
+def _fetcher_module() -> object:
+    """Import the fetcher as a module, so its internals can be exercised directly."""
+
+    import importlib.util
+    import sys
+
+    name = "_fetcher_under_test"
+    cached = sys.modules.get(name)
+    if cached is not None:
+        return cached
+    path = FETCHER_DIR / "fetch_agent_logs.py"
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    # Registered BEFORE exec: the fetcher defines dataclasses, and `@dataclass` resolves the
+    # defining module out of `sys.modules` while the class body is being built. Executing an
+    # unregistered module makes that lookup return None and fail inside `dataclasses`, which
+    # reports as an unrelated AttributeError.
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_a_socket_nothing_is_listening_on_is_not_an_ssh_agent(tmp_path: Path) -> None:
+    """``S_ISSOCK`` is true for an abandoned agent socket, and that is the whole bug.
+
+    A forwarded agent's socket outlives its session: the inode stays, the listener does not. The
+    old check accepted it on existence alone, exported ``SSH_AUTH_SOCK``, announced that it had
+    found an agent, and left every later ssh blocked in AUTHENTICATION -- past ``ConnectTimeout``,
+    which a successful TCP connection had already satisfied.
+    """
+
+    module = _fetcher_module()
+    dead = tmp_path / "dead.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(dead))
+    listener.close()  # the socket FILE remains; nothing is behind it
+    assert stat.S_ISSOCK(dead.stat().st_mode), "fixture must be a real socket file"
+
+    assert module._agent_socket_answers(str(dead)) is False  # type: ignore[attr-defined]
+
+
+def test_a_path_that_is_not_a_socket_is_rejected_without_probing(tmp_path: Path) -> None:
+    module = _fetcher_module()
+    ordinary = tmp_path / "not-a-socket"
+    ordinary.write_text("", encoding="utf-8")
+    assert module._agent_socket_answers(str(ordinary)) is False  # type: ignore[attr-defined]
+    assert module._agent_socket_answers(str(tmp_path / "absent")) is False  # type: ignore[attr-defined]
+
+
+def test_an_agent_holding_no_identities_still_counts_as_an_agent(tmp_path: Path) -> None:
+    """Exit 1 from ``ssh-add -l`` means "no keys", not "no agent".
+
+    Rejecting it would silently skip a perfectly usable agent over a condition ssh itself reports
+    clearly, and would send the fetch down the no-agent path for the wrong reason.
+    """
+
+    module = _fetcher_module()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    ssh_add = fake_bin / "ssh-add"
+    ssh_add.write_text(
+        "#!/bin/sh\necho 'The agent has no identities.'\nexit 1\n", encoding="utf-8"
+    )
+    ssh_add.chmod(0o755)
+    live = tmp_path / "live.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(live))
+    try:
+        previous = os.environ["PATH"]
+        os.environ["PATH"] = f"{fake_bin}{os.pathsep}{previous}"
+        try:
+            assert module._agent_socket_answers(str(live)) is True  # type: ignore[attr-defined]
+        finally:
+            os.environ["PATH"] = previous
+    finally:
+        listener.close()
+
+
+def test_a_child_that_never_returns_becomes_a_failure_rather_than_a_hang() -> None:
+    """``_run_bounded`` converts a stall into the failure path every caller already handles.
+
+    Exit 124 matches :manpage:`timeout(1)` rather than being a number this tool invented, and the
+    detail says "stall, not refusal" because that distinction is what points at the real cause.
+    """
+
+    module = _fetcher_module()
+    started = time.monotonic()
+    completed = module._run_bounded(["sleep", "30"], timeout_s=2.0)  # type: ignore[attr-defined]
+    elapsed = time.monotonic() - started
+
+    assert completed.returncode == 124
+    assert elapsed < 20.0, f"the ceiling did not fire: took {elapsed:.1f}s"
+    assert "timed out after 2s" in completed.stderr
+    assert "stall rather than a refusal" in completed.stderr
+
+    # The bytes-returning twin must behave identically; it exists only because the return type
+    # differs, and a ceiling that fired on one but not the other would be worse than neither.
+    raw = module._run_bounded_bytes(["sleep", "30"], timeout_s=2.0)  # type: ignore[attr-defined]
+    assert raw.returncode == module.TIMED_OUT  # type: ignore[attr-defined]
+    assert b"timed out after 2s" in raw.stderr
+
+
+def test_every_remote_host_is_smoke_tested_once_before_any_source_is_probed(
+    tmp_path: Path,
+) -> None:
+    """One question per HOST, not per source, and a failing host skips its sources.
+
+    Twenty-four operations across a handful of hosts is the real configuration. Learning that a
+    host cannot authenticate by probing each of its sources in turn costs one probe ceiling per
+    source to establish a fact one ssh could have settled -- which is the difference between
+    failing in seconds and failing in an hour and a half.
+
+    A failed host is recorded and SKIPPED rather than aborting the run: a fetch spanning several
+    machines should still collect from the ones that are up.
+    """
+
+    module = _fetcher_module()
+
+    class _Machine:
+        def __init__(self, host: str) -> None:
+            self.host = host
+
+    class _Operation:
+        def __init__(self, host: str) -> None:
+            self.machine = _Machine(host)
+            self.local = False
+
+    asked: list[list[str]] = []
+
+    def _fake_run(
+        command: Sequence[str], *, timeout_s: float, text: bool = True
+    ) -> subprocess.CompletedProcess[str]:
+        recorded = list(command)
+        asked.append(recorded)
+        ok = recorded[-2] != "down.example"
+        return subprocess.CompletedProcess(
+            recorded,
+            0 if ok else 255,
+            "",
+            "" if ok else "Permission denied (publickey).",
+        )
+
+    class _Logger:
+        def __init__(self) -> None:
+            self.lines: list[str] = []
+
+        def line(self, text: str) -> None:
+            self.lines.append(text)
+
+    module._run_bounded = _fake_run  # type: ignore[attr-defined]
+    logger = _Logger()
+    operations = [
+        _Operation("up.example"),
+        _Operation("up.example"),
+        _Operation("down.example"),
+        _Operation("down.example"),
+        _Operation("down.example"),
+    ]
+
+    failures = module.preflight_hosts(operations, logger)  # type: ignore[attr-defined]
+
+    assert set(failures) == {"down.example"}
+    assert "Permission denied" in failures["down.example"]
+    # Two hosts, five operations: asked once per host.
+    assert len(asked) == 2, f"expected one probe per host, got {len(asked)}"
+    assert any("did not answer" in line for line in logger.lines)
+
+
+def test_a_source_on_an_unreachable_host_is_failed_without_being_probed() -> None:
+    """The synthesised probe carries the preflight's reason, so the receipt says WHY."""
+
+    module = _fetcher_module()
+    probe = module._unreachable_probe("Permission denied (publickey).")  # type: ignore[attr-defined]
+
+    assert probe.kind is module.ProbeKind.FAILED  # type: ignore[attr-defined]
+    assert probe.exit_code == module.REMOTE_UNREACHABLE  # type: ignore[attr-defined]
+    assert probe.duration_seconds == 0.0
+    assert "did not answer preflight" in probe.detail
+    assert "Permission denied" in probe.detail

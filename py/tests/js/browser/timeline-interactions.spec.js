@@ -672,6 +672,16 @@ test("transcript search uses search shards and opens safe linked message context
   page.on("requestfailed", function (request) {
     failedRequests.push(request.url());
   });
+  // `requestfailed` fires only for NETWORK-level failures, so an HTTP 404 never reaches it --
+  // it surfaces as a console error whose text carries no URL. Recording status and URL here is
+  // what lets the assertion below name which resource failed instead of reporting that some
+  // unnamed one did.
+  const httpErrors = [];
+  page.on("response", function (response) {
+    if (response.status() >= 400) {
+      httpErrors.push(response.status() + " " + response.url());
+    }
+  });
   await routeSingleDaySchema2Fixture(page, fixture, async function (route) {
     detailRequests += 1;
     await route.fulfill({
@@ -752,7 +762,19 @@ test("transcript search uses search shards and opens safe linked message context
   await page.getByTestId("search").fill("sentinel");
   await expect(card).toHaveAttribute("data-transcript-search-result-count", "2");
   await expect(drawer.locator(".search-result-role")).toHaveText(["event", "system"]);
-  expect(consoleErrors).toEqual([]);
+  // This fixture deliberately serves no `data/timeline-v3.json` so the suite exercises the
+  // schema-2 fallback an older archive is in (see README). The page handles that 404 by design,
+  // but Chromium still logs it, so asserting an empty console asserted against the fixture's own
+  // premise -- and did so with a message naming no URL, which is why it stayed unexplained.
+  //
+  // Named exactly, so any OTHER 404 is still a failure rather than being absorbed by a blanket
+  // allowance.
+  expect(httpErrors).toEqual([
+    "404 " + new URL("data/timeline-v3.json", page.url()).href
+  ]);
+  expect(consoleErrors.filter(function (text) {
+    return !text.startsWith("Failed to load resource:");
+  })).toEqual([]);
   expect(failedRequests).toEqual([]);
 });
 
