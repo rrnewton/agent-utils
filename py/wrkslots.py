@@ -9,26 +9,39 @@ import dataclasses
 import datetime as dt
 import errno
 import fcntl
+import fnmatch
 import hashlib
 import json
 import os
 import re
+import shlex
 import socket
 import stat
 import subprocess
 import sys
 import time
 import uuid
-from collections.abc import Iterator, Mapping, Sequence, Set as AbstractSet
+from collections.abc import Callable, Iterator, Mapping, Sequence, Set as AbstractSet
 from pathlib import Path
 
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 SCHEMA = 2
 CONFIG_NAME = ".wrkslots.yml"
 # Configuration keys that may be absent. Absent is a meaning, not a default to
 # be materialised: no `max_active_slots` key means allocation is uncapped.
-OPTIONAL_CONFIG_KEYS = frozenset({"max_active_slots"})
+OPTIONAL_CONFIG_KEYS = frozenset(
+    {
+        "max_active_slots",
+        "layout",
+        "cache_globs",
+        "repo_cache_globs",
+        "post_provision_hooks",
+        "disk_advisory_bytes",
+        "disk_provisioning_floor_bytes",
+        "disk_emergency_bytes",
+    }
+)
 # Fields `init --repair` may overwrite when the caller names a different value.
 # Everything else is refused, because a configuration says where live state
 # already is and rewriting that relocates rather than repairs.
@@ -36,6 +49,8 @@ _CONFIG_REPAIR_UPDATABLE = frozenset({"schema", "max_active_slots"})
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 REMOTE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+GIB = 1024**3
+HOLD_SCHEMA = 1
 
 
 class Refusal(RuntimeError):
@@ -51,12 +66,20 @@ class Config:
     root: Path
     config_path: Path
     worktrees: Path
+    control: Path
     machine: str
     default_remote: str
     default_landed_ref: str
     heartbeat_ttl_seconds: int
     liveness_command: Path
     max_active_slots: int | None = None
+    layout: str = "nested"
+    cache_globs: tuple[str, ...] = ()
+    repo_cache_globs: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    post_provision_hooks: tuple[str, ...] = ()
+    disk_advisory_bytes: int | None = None
+    disk_provisioning_floor_bytes: int | None = None
+    disk_emergency_bytes: int | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -135,6 +158,23 @@ class PlannedCheckout:
     landed_ref: str
 
 
+@dataclasses.dataclass(frozen=True)
+class CacheSlot:
+    slot: str
+    machine: str
+    checkouts: tuple[Checkout, ...]
+    state: str = "active"
+
+
+@dataclasses.dataclass(frozen=True)
+class CacheDirectory:
+    path: Path
+    checkout_root: Path
+    checkout_device: int
+    checkout_inode: int
+    checkout_mount_id: int
+
+
 def _utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
 
@@ -186,6 +226,125 @@ def _validate_full_ref(value: str, label: str) -> str:
     ):
         raise Refusal(f"invalid full {label} {value!r}")
     return value
+
+
+def _validate_layout(value: str) -> str:
+    if value not in {"nested", "flat"}:
+        raise Refusal(f"invalid layout {value!r}; expected 'nested' or 'flat'")
+    return value
+
+
+def _validate_cache_glob(value: str) -> str:
+    if not value or value != value.strip() or "\x00" in value:
+        raise Refusal("cache globs must be non-empty relative paths without surrounding space")
+    candidate = Path(value)
+    if candidate.is_absolute() or ".." in candidate.parts:
+        raise Refusal(f"cache glob must stay inside each checkout: {value!r}")
+    normalized = candidate.as_posix()
+    if not normalized or normalized == ".":
+        raise Refusal("cache glob must not name the checkout root")
+    parts = Path(normalized).parts
+    if any("**" in part and part != "**" for part in parts):
+        raise Refusal(
+            "cache glob recursive wildcards ('**') must occupy a complete path component"
+        )
+    if any(part == ".git" for part in parts):
+        raise Refusal("cache globs must never name Git administrative data")
+    if any(character in parts[0] for character in "*?["):
+        raise Refusal(
+            "cache glob's first path component must be literal so it cannot match source broadly"
+        )
+    return normalized
+
+
+def _glob_matches_path(pattern: str, path: str) -> bool:
+    """Match one slash-delimited path without allowing '*' to cross a slash."""
+
+    pattern_parts = tuple(part for part in pattern.split("/") if part)
+    path_parts = tuple(part for part in path.split("/") if part)
+
+    def matches(pattern_index: int, path_index: int) -> bool:
+        if pattern_index == len(pattern_parts):
+            return path_index == len(path_parts)
+        part = pattern_parts[pattern_index]
+        if part == "**":
+            return matches(pattern_index + 1, path_index) or (
+                path_index < len(path_parts) and matches(pattern_index, path_index + 1)
+            )
+        return (
+            path_index < len(path_parts)
+            and fnmatch.fnmatchcase(path_parts[path_index], part)
+            and matches(pattern_index + 1, path_index + 1)
+        )
+
+    return matches(0, 0)
+
+
+def _cache_glob_contains_path(pattern: str, path: str) -> bool:
+    parts = tuple(part for part in path.split("/") if part)
+    return any(
+        _glob_matches_path(pattern, "/".join(parts[:length]))
+        for length in range(1, len(parts) + 1)
+    )
+
+
+def _validate_hook(value: str) -> str:
+    if not value.strip() or "\x00" in value:
+        raise Refusal("post-provision hooks must be non-empty shell commands")
+    return value
+
+
+def _string_tuple(
+    value: object,
+    label: str,
+    validator: Callable[[str], str],
+    *,
+    unique: bool = True,
+) -> tuple[str, ...]:
+    result: list[str] = []
+    for index, item in enumerate(_as_list(value, label)):
+        raw = _as_str(item, f"{label}[{index}]")
+        validated = validator(raw)
+        if unique and validated in result:
+            raise StateError(f"{label} contains duplicate entry {validated!r}")
+        result.append(validated)
+    return tuple(result)
+
+
+def _cache_glob_groups(value: object, label: str) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    raw = _as_mapping(value, label)
+    result: list[tuple[str, tuple[str, ...]]] = []
+    for name in sorted(raw):
+        _validate_name(name, f"{label} repository name")
+        globs = _string_tuple(raw[name], f"{label}.{name}", _validate_cache_glob)
+        if not globs:
+            raise StateError(f"{label}.{name} must contain at least one cache glob")
+        result.append((name, globs))
+    return tuple(result)
+
+
+def _cache_glob_assignments(
+    values: Sequence[str], label: str
+) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    grouped: dict[str, list[str]] = {}
+    for raw in values:
+        name, separator, pattern = raw.partition("=")
+        if not separator:
+            raise Refusal(f"{label} must use NAME=PATH-GLOB: {raw!r}")
+        _validate_name(name, f"{label} repository name")
+        validated = _validate_cache_glob(pattern)
+        entries = grouped.setdefault(name, [])
+        if validated in entries:
+            raise Refusal(f"duplicate {label} for {name}: {validated!r}")
+        entries.append(validated)
+    return tuple((name, tuple(grouped[name])) for name in sorted(grouped))
+
+
+def _cache_globs_for(config: Config, checkout_name: str | None) -> tuple[str, ...]:
+    selected = list(config.cache_globs)
+    if checkout_name is not None:
+        selected.extend(dict(config.repo_cache_globs).get(checkout_name, ()))
+    return tuple(dict.fromkeys(selected))
 
 
 def _as_mapping(value: object, label: str) -> Mapping[str, object]:
@@ -279,12 +438,103 @@ def _ensure_no_symlink_components(root: Path, path: Path, label: str) -> None:
             raise Refusal(f"cannot inspect {label} path {current}: {exc}") from exc
 
 
+def _ensure_no_mount_components(root: Path, path: Path, label: str) -> None:
+    try:
+        relative = path.relative_to(root)
+    except ValueError as exc:
+        raise Refusal(f"{label} escapes its managed root: {path}") from exc
+    current = root
+    for part in relative.parts:
+        current = current / part
+        try:
+            if os.path.ismount(current):
+                raise Refusal(f"{label} crosses a mount point: {current}")
+        except OSError as exc:
+            raise Refusal(f"cannot inspect {label} mount path {current}: {exc}") from exc
+
+
+def _mountinfo_path(value: str) -> Path:
+    decoded = value
+    for escaped, character in (
+        ("\\040", " "),
+        ("\\011", "\t"),
+        ("\\012", "\n"),
+        ("\\134", "\\"),
+    ):
+        decoded = decoded.replace(escaped, character)
+    return Path(decoded)
+
+
+def _assert_no_mountinfo_crossing(root: Path, path: Path, label: str) -> None:
+    if not _path_is_within(path, root):
+        raise Refusal(f"{label} escapes its managed root: {path}")
+    mountinfo_path = Path("/proc/self/mountinfo")
+    try:
+        lines = mountinfo_path.read_text(
+            encoding="utf-8", errors="surrogateescape"
+        ).splitlines()
+    except OSError as exc:
+        raise Refusal(
+            f"cannot prove {label} contains no mount points because {mountinfo_path} "
+            f"is unreadable: {exc}"
+        ) from exc
+    for line in lines:
+        left, separator, _right = line.partition(" - ")
+        if not separator:
+            continue
+        fields = left.split()
+        if len(fields) < 5:
+            continue
+        mount_point = _mountinfo_path(fields[4])
+        if (
+            mount_point.is_absolute()
+            and mount_point != root
+            and _path_is_within(mount_point, root)
+            and (
+                _path_is_within(path, mount_point)
+                or _path_is_within(mount_point, path)
+            )
+        ):
+            raise Refusal(f"{label} crosses or contains a mount point: {mount_point}")
+
+
 def _path_is_within(candidate: Path, parent: Path) -> bool:
     try:
         candidate.relative_to(parent)
         return True
     except ValueError:
         return False
+
+
+def _fd_mount_id(fd: int, label: str) -> int:
+    path = Path("/proc/self/fdinfo") / str(fd)
+    try:
+        contents = path.read_text(encoding="ascii")
+    except OSError as exc:
+        raise Refusal(f"cannot determine mount identity for {label}: {exc}") from exc
+    for line in contents.splitlines():
+        key, separator, raw = line.partition(":")
+        if key == "mnt_id" and separator:
+            try:
+                value = int(raw.strip())
+            except ValueError as exc:
+                raise Refusal(f"invalid mount identity for {label}: {raw!r}") from exc
+            if value > 0:
+                return value
+    raise Refusal(f"cannot determine mount identity for {label}: mnt_id is absent")
+
+
+def _open_directory_identity(path: Path, label: str) -> tuple[int, int, int]:
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise Refusal(f"cannot safely open {label} {path}: {exc}") from exc
+    try:
+        metadata = os.fstat(fd)
+        return metadata.st_dev, metadata.st_ino, _fd_mount_id(fd, str(path))
+    finally:
+        os.close(fd)
 
 
 def _config_payload(
@@ -295,6 +545,13 @@ def _config_payload(
     heartbeat_ttl_seconds: int,
     liveness_command: str,
     max_active_slots: int | None = None,
+    layout: str = "nested",
+    cache_globs: Sequence[str] = (),
+    repo_cache_globs: Sequence[tuple[str, Sequence[str]]] = (),
+    post_provision_hooks: Sequence[str] = (),
+    disk_advisory_bytes: int | None = None,
+    disk_provisioning_floor_bytes: int | None = None,
+    disk_emergency_bytes: int | None = None,
 ) -> dict[str, object]:
     payload: dict[str, object] = {
         "schema": SCHEMA,
@@ -310,7 +567,34 @@ def _config_payload(
     # configuration written before the field existed.
     if max_active_slots is not None:
         payload["max_active_slots"] = max_active_slots
+    if layout != "nested":
+        payload["layout"] = layout
+    if cache_globs:
+        payload["cache_globs"] = list(cache_globs)
+    if repo_cache_globs:
+        payload["repo_cache_globs"] = {
+            name: list(patterns) for name, patterns in repo_cache_globs
+        }
+    if post_provision_hooks:
+        payload["post_provision_hooks"] = list(post_provision_hooks)
+    if disk_advisory_bytes is not None:
+        payload["disk_advisory_bytes"] = disk_advisory_bytes
+        payload["disk_provisioning_floor_bytes"] = disk_provisioning_floor_bytes
+        payload["disk_emergency_bytes"] = disk_emergency_bytes
     return payload
+
+
+def _canonical_config_payload(value: Mapping[str, object]) -> dict[str, object]:
+    canonical = dict(value)
+    if canonical.get("layout") == "nested":
+        canonical.pop("layout")
+    if canonical.get("cache_globs") == []:
+        canonical.pop("cache_globs")
+    if canonical.get("repo_cache_globs") == {}:
+        canonical.pop("repo_cache_globs")
+    if canonical.get("post_provision_hooks") == []:
+        canonical.pop("post_provision_hooks")
+    return canonical
 
 
 def _repaired_config(
@@ -336,6 +620,12 @@ def _repaired_config(
     conflicts: list[str] = []
     for key, want in payload.items():
         if key not in repaired:
+            if key == "layout" and want == "flat":
+                conflicts.append(
+                    "layout: absent means nested; repair will not reinterpret existing "
+                    "storage as flat"
+                )
+                continue
             repaired[key] = want
             changes.append(f"added {key}={want!r}")
             continue
@@ -367,6 +657,32 @@ def _repaired_config(
     return repaired, changes
 
 
+def _config_is_authoritative_candidate(root: Path, config_path: Path) -> bool:
+    if config_path.is_symlink():
+        return True
+    try:
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return True
+    if not isinstance(raw, dict):
+        return True
+    worktrees_value = raw.get("worktrees_dir")
+    layout_value = raw.get("layout", "nested")
+    if not isinstance(worktrees_value, str) or layout_value not in {"nested", "flat"}:
+        return True
+    candidate = Path(worktrees_value)
+    if candidate.is_absolute() or not candidate.parts or ".." in candidate.parts:
+        return True
+    worktrees = root / Path(os.path.normpath(str(candidate)))
+    control = worktrees if layout_value == "nested" else worktrees.parent
+    return (
+        (control / "wrkslots").is_symlink()
+        or any(control.glob("ACTIVE.*.json"))
+        or any(control.glob("ARCHIVED.*.json"))
+        or any(control.glob("ACTIVE.*.journal"))
+    )
+
+
 def _discover_root(explicit: str | None) -> Path:
     if explicit is not None:
         candidate = Path(explicit).absolute()
@@ -374,10 +690,15 @@ def _discover_root(explicit: str | None) -> Path:
             raise Refusal(f"project root must be an existing real directory: {candidate}")
         return candidate.resolve(strict=True)
     current = Path.cwd().resolve(strict=True)
+    fallback: Path | None = None
     for candidate in (current, *current.parents):
         config_path = candidate / CONFIG_NAME
         if config_path.exists() or config_path.is_symlink():
-            return candidate
+            fallback = candidate
+            if _config_is_authoritative_candidate(candidate, config_path):
+                return candidate
+    if fallback is not None:
+        return fallback
     raise Refusal(f"no {CONFIG_NAME} found; run 'wrkslots init' from the project root")
 
 
@@ -422,6 +743,12 @@ def _load_config(explicit_root: str | None, machine_override: str | None) -> Con
     del relative
     if not worktrees.is_dir() or worktrees.is_symlink():
         raise StateError(f"configured worktrees directory is missing or unsafe: {worktrees}")
+    layout = _validate_layout(
+        _as_str(raw.get("layout", "nested"), "configuration.layout")
+    )
+    control = worktrees if layout == "nested" else worktrees.parent
+    if not control.is_dir() or control.is_symlink():
+        raise StateError(f"configured control directory is missing or unsafe: {control}")
     remote = _validate_remote(
         _as_str(raw["default_remote"], "configuration.default_remote")
     )
@@ -447,10 +774,61 @@ def _load_config(explicit_root: str | None, machine_override: str | None) -> Con
             f"configured liveness command is missing, not runnable, or unsafe: {liveness_command}"
         )
     cap = raw.get("max_active_slots")
+    cache_globs = (
+        ()
+        if "cache_globs" not in raw
+        else _string_tuple(
+            raw["cache_globs"], "configuration.cache_globs", _validate_cache_glob
+        )
+    )
+    repo_cache_globs = (
+        ()
+        if "repo_cache_globs" not in raw
+        else _cache_glob_groups(
+            raw["repo_cache_globs"], "configuration.repo_cache_globs"
+        )
+    )
+    post_provision_hooks = (
+        ()
+        if "post_provision_hooks" not in raw
+        else _string_tuple(
+            raw["post_provision_hooks"],
+            "configuration.post_provision_hooks",
+            _validate_hook,
+            unique=False,
+        )
+    )
+    disk_keys = (
+        "disk_advisory_bytes",
+        "disk_provisioning_floor_bytes",
+        "disk_emergency_bytes",
+    )
+    present_disk_keys = [key for key in disk_keys if key in raw]
+    if present_disk_keys and len(present_disk_keys) != len(disk_keys):
+        raise StateError(
+            "configuration disk thresholds must supply advisory, provisioning floor, "
+            "and emergency bytes together"
+        )
+    disk_values: tuple[int | None, int | None, int | None]
+    if present_disk_keys:
+        advisory = _as_int(raw[disk_keys[0]], f"configuration.{disk_keys[0]}", minimum=1)
+        provisioning = _as_int(
+            raw[disk_keys[1]], f"configuration.{disk_keys[1]}", minimum=1
+        )
+        emergency = _as_int(raw[disk_keys[2]], f"configuration.{disk_keys[2]}", minimum=1)
+        if not emergency < provisioning < advisory:
+            raise StateError(
+                "configuration disk thresholds must satisfy "
+                "emergency < provisioning floor < advisory"
+            )
+        disk_values = advisory, provisioning, emergency
+    else:
+        disk_values = None, None, None
     return Config(
         root=root,
         config_path=path,
         worktrees=worktrees,
+        control=control,
         machine=machine,
         default_remote=remote,
         default_landed_ref=landed_ref,
@@ -465,25 +843,69 @@ def _load_config(explicit_root: str | None, machine_override: str | None) -> Con
             if cap is None
             else _as_int(cap, "configuration.max_active_slots", minimum=0)
         ),
+        layout=layout,
+        cache_globs=cache_globs,
+        repo_cache_globs=repo_cache_globs,
+        post_provision_hooks=post_provision_hooks,
+        disk_advisory_bytes=disk_values[0],
+        disk_provisioning_floor_bytes=disk_values[1],
+        disk_emergency_bytes=disk_values[2],
     )
 
 
 def _active_path(config: Config, machine: str | None = None) -> Path:
     selected = machine or config.machine
     _validate_name(selected, "machine")
-    return config.worktrees / f"ACTIVE.{selected}.json"
+    return config.control / f"ACTIVE.{selected}.json"
 
 
 def _archive_path(config: Config, machine: str | None = None) -> Path:
     selected = machine or config.machine
     _validate_name(selected, "machine")
-    return config.worktrees / f"ARCHIVED.{selected}.json"
+    return config.control / f"ARCHIVED.{selected}.json"
 
 
 def _journal_path(config: Config, machine: str | None = None) -> Path:
     selected = machine or config.machine
     _validate_name(selected, "machine")
-    return config.worktrees / f"ACTIVE.{selected}.journal"
+    return config.control / f"ACTIVE.{selected}.journal"
+
+
+def _hold_path(config: Config, slot: str, machine: str | None = None) -> Path:
+    selected = machine or config.machine
+    _validate_name(selected, "machine")
+    _validate_name(slot, "slot")
+    return config.control / f"HOLD.{len(selected)}.{selected}.{slot}.json"
+
+
+def _load_hold(
+    config: Config, slot: str, machine: str | None = None
+) -> dict[str, object] | None:
+    selected = machine or config.machine
+    path = _hold_path(config, slot, selected)
+    if not path.exists() and not path.is_symlink():
+        return None
+    raw = _as_mapping(_read_json(path, "slot hold"), "slot hold")
+    _exact_keys(raw, {"schema", "machine", "slot", "held_at", "reason"}, set(), "slot hold")
+    if _as_int(raw["schema"], "slot hold.schema") != HOLD_SCHEMA:
+        raise StateError(f"unsupported slot hold schema in {path}")
+    if _as_str(raw["machine"], "slot hold.machine") != selected:
+        raise StateError(f"slot hold machine does not match its filename: {path}")
+    if _as_str(raw["slot"], "slot hold.slot") != slot:
+        raise StateError(f"slot hold name does not match its filename: {path}")
+    _parse_timestamp(_as_str(raw["held_at"], "slot hold.held_at"), "slot hold.held_at")
+    if not _as_str(raw["reason"], "slot hold.reason").strip():
+        raise StateError(f"slot hold has an empty reason: {path}")
+    return dict(raw)
+
+
+def _assert_not_held(config: Config, record: ActiveRecord) -> None:
+    hold = _load_hold(config, record.slot, record.machine)
+    if hold is not None:
+        raise Refusal(
+            f"slot {record.slot} is held: {_as_str(hold['reason'], 'slot hold.reason')}; "
+            f"run 'wrkslots unhold {record.slot}' only when the hold is no longer needed"
+        )
 
 
 def _lock_path(subject: Path) -> Path:
@@ -536,12 +958,11 @@ def _locked(subject: Path, *, exclusive: bool, wait_seconds: float) -> Iterator[
 
 @contextlib.contextmanager
 def _locked_config(path: Path, wait_seconds: float) -> Iterator[int]:
-    lock_path = path.with_name(f"{path.name}.lock")
+    lock_path = path.parent
     try:
         fd = os.open(
             lock_path,
-            os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
-            0o644,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
         )
     except OSError as exc:
         raise Refusal(f"cannot open configuration lock {lock_path}: {exc}") from exc
@@ -550,9 +971,9 @@ def _locked_config(path: Path, wait_seconds: float) -> Iterator[int]:
     except OSError as exc:
         os.close(fd)
         raise Refusal(f"cannot inspect configuration lock {lock_path}: {exc}") from exc
-    if not stat.S_ISREG(mode):
+    if not stat.S_ISDIR(mode):
         os.close(fd)
-        raise Refusal(f"configuration lock is not a regular file: {lock_path}")
+        raise Refusal(f"configuration lock is not a directory: {lock_path}")
     deadline = time.monotonic() + wait_seconds
     try:
         while True:
@@ -562,7 +983,8 @@ def _locked_config(path: Path, wait_seconds: float) -> Iterator[int]:
             except BlockingIOError as exc:
                 if time.monotonic() >= deadline:
                     raise Refusal(
-                        f"configuration lock is busy for {lock_path}; retry after init exits"
+                        f"configuration lock is busy for {lock_path}; retry after the "
+                        "other wrkslots mutation exits"
                     ) from exc
                 time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
         yield fd
@@ -575,10 +997,17 @@ def _locked_config(path: Path, wait_seconds: float) -> Iterator[int]:
 
 @contextlib.contextmanager
 def _mutation_locks(config: Config, wait_seconds: float) -> Iterator[None]:
-    global_subject = config.worktrees / "ACTIVE"
-    with _locked(global_subject, exclusive=True, wait_seconds=wait_seconds):
-        with _locked(_active_path(config), exclusive=True, wait_seconds=wait_seconds):
-            yield
+    with _locked_config(config.config_path, wait_seconds):
+        current = _load_config(str(config.root), config.machine)
+        if current != config:
+            raise Refusal(
+                "configuration changed while this command was starting; rerun so it "
+                "uses one coherent policy"
+            )
+        global_subject = config.control / "ACTIVE"
+        with _locked(global_subject, exclusive=True, wait_seconds=wait_seconds):
+            with _locked(_active_path(config), exclusive=True, wait_seconds=wait_seconds):
+                yield
 
 
 def _fsync_directory(directory: Path) -> None:
@@ -1032,6 +1461,8 @@ def _load_archive(config: Config, machine: str | None = None) -> ArchiveState:
         )
         if not checkouts or len({checkout.name for checkout in checkouts}) != len(checkouts):
             raise StateError(f"{label} has no checkouts or duplicate checkout names")
+        if config.layout == "flat" and len(checkouts) != 1:
+            raise StateError(f"{label} has multiple checkouts under flat layout")
         for checkout in checkouts:
             expected, _destination = _checkout_path(config, slot, checkout.name)
             if checkout.path != expected:
@@ -1098,7 +1529,7 @@ def _archive_to_obj(state: ArchiveState) -> dict[str, object]:
 def _state_files(config: Config) -> list[tuple[str, Path]]:
     result: list[tuple[str, Path]] = []
     pattern = re.compile(r"^ACTIVE\.(?P<machine>[A-Za-z0-9][A-Za-z0-9._-]{0,63})\.json$")
-    for path in sorted(config.worktrees.glob("ACTIVE.*.json")):
+    for path in sorted(config.control.glob("ACTIVE.*.json")):
         match = pattern.fullmatch(path.name)
         if match is None:
             raise StateError(f"unexpected active-state filename: {path}")
@@ -1111,7 +1542,7 @@ def _archive_files(config: Config) -> list[tuple[str, Path]]:
     pattern = re.compile(
         r"^ARCHIVED\.(?P<machine>[A-Za-z0-9][A-Za-z0-9._-]{0,63})\.json$"
     )
-    for path in sorted(config.worktrees.glob("ARCHIVED.*.json")):
+    for path in sorted(config.control.glob("ARCHIVED.*.json")):
         match = pattern.fullmatch(path.name)
         if match is None:
             raise StateError(f"unexpected archive-state filename: {path}")
@@ -1185,6 +1616,8 @@ def _assert_registry_storage_consistent(
     config: Config,
     states: Sequence[ActiveState],
     allowed_unregistered_slot: str | None = None,
+    *,
+    allow_unregistered_migration_slots: bool = False,
 ) -> None:
     records = [record for state in states for record in state.slots]
     expected_slots = {record.slot for record in records}
@@ -1203,7 +1636,7 @@ def _assert_registry_storage_consistent(
     unexpected = sorted(actual_slots - expected_slots)
     if allowed_unregistered_slot is not None:
         unexpected = [slot for slot in unexpected if slot != allowed_unregistered_slot]
-    if unexpected:
+    if unexpected and not allow_unregistered_migration_slots:
         raise StateError(
             f"managed worktrees directory has a directory without an active row: {unexpected[0]}"
         )
@@ -1401,7 +1834,11 @@ class GitVcs:
         _validate_ref(branch, "branch")
         return branch
 
-    def status(self, checkout: Path) -> str:
+    def status(self, checkout: Path, cache_globs: Sequence[str] = ()) -> str:
+        pathspecs = ["."]
+        for pattern in cache_globs:
+            pathspecs.append(f":(exclude,glob){pattern}")
+            pathspecs.append(f":(exclude,glob){pattern}/**")
         result = self._run(
             checkout,
             [
@@ -1409,9 +1846,45 @@ class GitVcs:
                 "--porcelain=v2",
                 "--untracked-files=all",
                 "--ignored=matching",
+                "--",
+                *pathspecs,
             ],
         )
         return result.stdout
+
+    def tracked_cache_paths(
+        self, checkout: Path, cache_globs: Sequence[str]
+    ) -> tuple[str, ...]:
+        if not cache_globs:
+            return ()
+        indexed = self._run(checkout, ["ls-files", "--recurse-submodules", "-z"])
+        committed = self._run(
+            checkout,
+            ["ls-tree", "-r", "--name-only", "-z", "HEAD"],
+        )
+        paths = [
+            path
+            for output in (indexed.stdout, committed.stdout)
+            for path in output.split("\x00")
+            if path
+            and any(
+                _cache_glob_contains_path(pattern, path) for pattern in cache_globs
+            )
+        ]
+        return tuple(dict.fromkeys(paths))
+
+    def submodule_paths(self, checkout: Path) -> tuple[str, ...]:
+        indexed = self._run(checkout, ["ls-files", "--stage", "-z"])
+        committed = self._run(checkout, ["ls-tree", "-r", "-z", "HEAD"])
+        paths: list[str] = []
+        for output in (indexed.stdout, committed.stdout):
+            for record in output.split("\x00"):
+                if not record:
+                    continue
+                metadata, separator, path = record.partition("\t")
+                if separator and metadata.startswith("160000 "):
+                    paths.append(path)
+        return tuple(dict.fromkeys(paths))
 
     def assert_ordinary_index(self, checkout: Path) -> None:
         assume = self._run(checkout, ["ls-files", "-v"])
@@ -1515,6 +1988,33 @@ class GitVcs:
         refs = tuple(line for line in result.stdout.splitlines() if line)
         return refs
 
+    def ref_exists(self, checkout: Path, ref: str) -> bool:
+        _validate_full_ref(ref, "remote ref")
+        result = self._run(
+            checkout, ["show-ref", "--verify", "--quiet", ref], check=False
+        )
+        if result.returncode not in (0, 1):
+            raise Refusal(f"cannot determine whether ref {ref} exists")
+        return result.returncode == 0
+
+    def commit_paths(self, checkout: Path, commit: str) -> tuple[str, ...]:
+        if not SHA_RE.fullmatch(commit):
+            raise Refusal(f"cannot inspect paths for invalid commit {commit!r}")
+        result = self._run(
+            checkout,
+            [
+                "diff-tree",
+                "--root",
+                "--no-commit-id",
+                "--name-only",
+                "-r",
+                "-m",
+                "-z",
+                commit,
+            ],
+        )
+        return tuple(dict.fromkeys(path for path in result.stdout.split("\x00") if path))
+
     def is_ancestor(self, checkout: Path, ancestor: str, descendant: str) -> bool:
         self.verify_ref(checkout, descendant, "landed ref")
         result = self._run(
@@ -1530,6 +2030,17 @@ class GitVcs:
 
     def remove_worktree(self, repository: Path, checkout: Path) -> None:
         self._run(repository, ["worktree", "remove", "--", str(checkout)])
+
+    def delete_branch_at(self, repository: Path, branch: str, expected_head: str) -> None:
+        if not self.branch_exists(repository, branch):
+            return
+        actual = self.verify_ref(repository, f"refs/heads/{branch}", "created branch")
+        if actual != expected_head:
+            raise Refusal(
+                f"created branch {branch} moved from {expected_head} to {actual}; "
+                "preserve it instead of aborting provisioning"
+            )
+        self._run(repository, ["branch", "-D", "--", branch])
 
 
 def _repository_path(config: Config, raw: str) -> tuple[str, Path]:
@@ -1555,7 +2066,7 @@ def _checkout_path(config: Config, slot: str, name: str) -> tuple[str, Path]:
     _validate_name(slot, "slot")
     _validate_name(name, "checkout name")
     slot_path = config.worktrees / slot
-    destination = slot_path / name
+    destination = slot_path if config.layout == "flat" else slot_path / name
     _ensure_no_symlink_components(config.root, destination, "checkout")
     relative = destination.relative_to(config.root).as_posix()
     return relative, destination
@@ -1681,7 +2192,7 @@ def _capture_caller_process(pid: int, label: str) -> ProcessIdentity:
     return identity
 
 
-def _assert_registered_liveness(config: Config, record: ActiveRecord) -> None:
+def _registered_liveness_state(config: Config, record: ActiveRecord) -> tuple[str, str]:
     env = {
         "LC_ALL": "C",
         "PATH": "/usr/bin:/bin",
@@ -1711,18 +2222,27 @@ def _assert_registered_liveness(config: Config, record: ActiveRecord) -> None:
             env=env,
         )
     except OSError as exc:
-        raise Refusal(f"registered liveness command could not run: {exc}") from exc
+        return "unverifiable", f"registered liveness command could not run: {exc}"
     detail = (completed.stderr or completed.stdout).strip().splitlines()
     first = detail[0] if detail else "no detail"
     if completed.returncode == 0:
-        return
+        return "dead", first
     if completed.returncode == 1:
-        raise Refusal(f"registered liveness authority reports owner alive: {first}")
+        return "alive", first
     if completed.returncode == 2:
-        raise Refusal(f"registered liveness authority is unverifiable: {first}")
-    raise Refusal(
+        return "unverifiable", first
+    return "unverifiable", (
         f"registered liveness command returned unexpected rc {completed.returncode}: {first}"
     )
+
+
+def _assert_registered_liveness(config: Config, record: ActiveRecord) -> None:
+    state, detail = _registered_liveness_state(config, record)
+    if state == "dead":
+        return
+    if state == "alive":
+        raise Refusal(f"registered liveness authority reports owner alive: {detail}")
+    raise Refusal(f"registered liveness authority is unverifiable: {detail}")
 
 
 def _process_state(identity: ProcessIdentity | None) -> tuple[str, str]:
@@ -2027,6 +2547,8 @@ def _heartbeat_diagnosis(record: ActiveRecord) -> tuple[float, bool]:
 def _assert_record_paths(config: Config, record: ActiveRecord) -> None:
     expected_slot = config.worktrees / record.slot
     _ensure_no_symlink_components(config.root, expected_slot, "slot")
+    if config.layout == "flat" and len(record.checkouts) != 1:
+        raise StateError(f"slot {record.slot} has multiple checkouts under flat layout")
     for checkout in record.checkouts:
         if (
             checkout.remote != config.default_remote
@@ -2066,7 +2588,116 @@ def _assert_checkout_identity_unchanged(
         )
 
 
-def _assert_checkout_safe(config: Config, checkout: Checkout, vcs: GitVcs) -> Checkout:
+def _unpushed_evidence(
+    checkout: Checkout, path: Path, head: str, vcs: GitVcs
+) -> dict[str, object]:
+    same_named_ref = f"refs/remotes/{checkout.remote}/{checkout.branch}"
+    exists = vcs.ref_exists(path, same_named_ref)
+    command: str | None = None
+    touched = vcs.commit_paths(path, head)
+    if exists:
+        command = shlex.join(
+            [
+                "git",
+                "--literal-pathspecs",
+                "-C",
+                str(path),
+                "diff",
+                head,
+                same_named_ref,
+                "--",
+                *touched,
+            ]
+        )
+    return {
+        "same_named_remote_ref": same_named_ref if exists else None,
+        "touched_files": list(touched),
+        "diagnostic_command": command,
+    }
+
+
+def _unpushed_refusal(checkout: Checkout, path: Path, head: str, vcs: GitVcs) -> str:
+    evidence = _unpushed_evidence(checkout, path, head, vcs)
+    same_named_ref = evidence["same_named_remote_ref"]
+    base = (
+        f"checkout {checkout.name} HEAD {head} is not reachable from any "
+        f"refs/remotes/{checkout.remote}/* ref"
+    )
+    if same_named_ref is None:
+        return (
+            f"{base}. A same-named remote ref does not exist; publish the branch before finishing"
+        )
+    command = _as_str(evidence["diagnostic_command"], "unpushed diagnostic command")
+    return (
+        f"{base}. Same-named remote ref {same_named_ref} exists, so there are two "
+        "opposite readings: this commit is genuinely unpushed, or the remote branch "
+        "was rebased and this local tip is stale. Do not force-push based on this "
+        f"refusal. Run `{command}`; empty output means the touched content is already "
+        "present at the remote tip"
+    )
+
+
+def _assert_cache_policy_untracked_path(
+    config: Config,
+    checkout_name: str,
+    path: Path,
+    vcs: GitVcs,
+    cache_globs: Sequence[str],
+) -> None:
+    if not cache_globs:
+        return
+    tracked = vcs.tracked_cache_paths(path, cache_globs)
+    if tracked:
+        raise Refusal(
+            f"configured cache policy for checkout {checkout_name} overlaps tracked source "
+            f"at {tracked[0]}; narrow cache_globs before cleanup or finish"
+        )
+    for submodule in vcs.submodule_paths(path):
+        submodule_parts = Path(submodule).parts
+        for pattern in cache_globs:
+            pattern_parts = Path(pattern).parts
+            wildcard_index = next(
+                (
+                    index
+                    for index, part in enumerate(pattern_parts)
+                    if any(character in part for character in "*?[")
+                ),
+                len(pattern_parts),
+            )
+            literal_prefix = pattern_parts[:wildcard_index]
+            if wildcard_index == len(pattern_parts):
+                overlaps = (
+                    submodule_parts[: len(pattern_parts)] == pattern_parts
+                    or pattern_parts[: len(submodule_parts)] == submodule_parts
+                )
+            else:
+                overlaps = (
+                    submodule_parts[: len(literal_prefix)] == literal_prefix
+                    or literal_prefix[: len(submodule_parts)] == submodule_parts
+                )
+            if overlaps:
+                raise Refusal(
+                    f"configured cache policy for checkout {checkout_name} may cross "
+                    f"Git submodule {submodule}; configure that repository separately"
+                )
+
+
+def _assert_cache_policy_untracked(
+    config: Config, checkout: Checkout, vcs: GitVcs
+) -> None:
+    path = _stored_path(config, checkout.path, "checkout path")
+    _assert_cache_policy_untracked_path(
+        config, checkout.name, path, vcs, _cache_globs_for(config, checkout.name)
+    )
+
+
+def _assert_checkout_safe(
+    config: Config,
+    checkout: Checkout,
+    vcs: GitVcs,
+    *,
+    refresh_remote: bool = True,
+) -> Checkout:
     path = _stored_path(config, checkout.path, "checkout path")
     _relative, repository = _repository_path(config, checkout.repository)
     head = vcs.verify_existing_worktree(repository, path)
@@ -2082,7 +2713,8 @@ def _assert_checkout_safe(config: Config, checkout: Checkout, vcs: GitVcs) -> Ch
         )
     vcs.assert_ordinary_history(path)
     vcs.assert_ordinary_index(path)
-    status = vcs.status(path)
+    _assert_cache_policy_untracked(config, checkout, vcs)
+    status = vcs.status(path, _cache_globs_for(config, checkout.name))
     if status:
         first = status.splitlines()[0]
         raise Refusal(
@@ -2095,18 +2727,16 @@ def _assert_checkout_safe(config: Config, checkout: Checkout, vcs: GitVcs) -> Ch
             f"checkout {checkout.name} remote {checkout.remote} URL changed; "
             "preserve the checkout for inspection"
         )
-    vcs.fetch_remote(path, checkout.remote, checkout.landed_ref)
-    if vcs.remote_url_sha256(path, checkout.remote) != checkout.remote_url_sha256:
-        raise Refusal(
-            f"checkout {checkout.name} remote {checkout.remote} URL changed during fetch; "
-            "preserve the checkout for inspection"
-        )
+    if refresh_remote:
+        vcs.fetch_remote(path, checkout.remote, checkout.landed_ref)
+        if vcs.remote_url_sha256(path, checkout.remote) != checkout.remote_url_sha256:
+            raise Refusal(
+                f"checkout {checkout.name} remote {checkout.remote} URL changed during fetch; "
+                "preserve the checkout for inspection"
+            )
     remote_refs = vcs.remote_refs_containing(path, checkout.remote, head)
     if not remote_refs:
-        raise Refusal(
-            f"checkout {checkout.name} HEAD {head} is not reachable from any "
-            f"refs/remotes/{checkout.remote}/* ref; fetch or publish it before finishing"
-        )
+        raise Refusal(_unpushed_refusal(checkout, path, head, vcs))
     if not vcs.is_ancestor(path, head, checkout.landed_ref):
         raise Refusal(
             f"checkout {checkout.name} HEAD {head} is not an ancestor of configured landed ref "
@@ -2123,13 +2753,23 @@ def _assert_slot_contents(config: Config, record: ActiveRecord) -> Path:
     slot_path = config.worktrees / record.slot
     if not slot_path.is_dir() or slot_path.is_symlink():
         raise Refusal(f"slot directory is missing or unsafe: {slot_path}")
-    expected = {checkout.name for checkout in record.checkouts}
+    if config.layout == "flat":
+        if len(record.checkouts) != 1:
+            raise StateError(f"slot {record.slot} has multiple checkouts under flat layout")
+        checkout = record.checkouts[0]
+        expected_path, _destination = _checkout_path(config, record.slot, checkout.name)
+        if checkout.path != expected_path:
+            raise StateError(
+                f"slot {record.slot} checkout path does not equal the flat slot root"
+            )
+        return slot_path
+    expected_names = {checkout.name for checkout in record.checkouts}
     try:
         actual = {entry.name for entry in slot_path.iterdir()}
     except OSError as exc:
         raise Refusal(f"cannot inspect slot directory {slot_path}: {exc}") from exc
-    extras = sorted(actual - expected)
-    missing = sorted(expected - actual)
+    extras = sorted(actual - expected_names)
+    missing = sorted(expected_names - actual)
     if extras or missing:
         details: list[str] = []
         if extras:
@@ -2141,11 +2781,20 @@ def _assert_slot_contents(config: Config, record: ActiveRecord) -> Path:
 
 
 def _handoff_preconditions(
-    config: Config, record: ActiveRecord, vcs: GitVcs
+    config: Config,
+    record: ActiveRecord,
+    vcs: GitVcs,
+    *,
+    refresh_remote: bool = True,
 ) -> tuple[Path, tuple[Checkout, ...]]:
     _assert_record_paths(config, record)
     slot_path = _assert_slot_contents(config, record)
-    final_checkouts = tuple(_assert_checkout_safe(config, item, vcs) for item in record.checkouts)
+    final_checkouts = tuple(
+        _assert_checkout_safe(
+            config, item, vcs, refresh_remote=refresh_remote
+        )
+        for item in record.checkouts
+    )
     return slot_path, final_checkouts
 
 
@@ -2166,9 +2815,9 @@ def _remove_preconditions(
 
 
 def _refuse_partial_state(config: Config) -> None:
-    leftovers = sorted(config.worktrees.glob("ACTIVE.*.json.tmp.*"))
-    leftovers += sorted(config.worktrees.glob("ARCHIVED.*.json.tmp.*"))
-    leftovers += sorted(config.worktrees.glob("ACTIVE.*.journal.tmp.*"))
+    leftovers = sorted(config.control.glob("ACTIVE.*.json.tmp.*"))
+    leftovers += sorted(config.control.glob("ARCHIVED.*.json.tmp.*"))
+    leftovers += sorted(config.control.glob("ACTIVE.*.journal.tmp.*"))
     if leftovers:
         raise StateError(
             f"partial atomic update found: {leftovers[0]}; preserve it and use 'wrkslots recover'"
@@ -2176,7 +2825,7 @@ def _refuse_partial_state(config: Config) -> None:
 
 
 def _outstanding_journals(config: Config) -> list[Path]:
-    return sorted(config.worktrees.glob("ACTIVE.*.journal"))
+    return sorted(config.control.glob("ACTIVE.*.journal"))
 
 
 def _assert_no_journal(config: Config) -> None:
@@ -2296,6 +2945,50 @@ def _cmd_init(args: argparse.Namespace) -> int:
     worktrees_relative, worktrees = _relative_inside(
         root, args.worktrees_dir, "worktrees directory"
     )
+    layout = _validate_layout(args.layout)
+    if args.heartbeat_ttl_seconds < 1:
+        raise Refusal("heartbeat TTL must be at least one second")
+    if args.max_active_slots is not None and args.max_active_slots < 0:
+        raise Refusal("max active slots must be non-negative")
+    cache_globs = tuple(_validate_cache_glob(value) for value in args.cache_glob or ())
+    if len(cache_globs) != len(set(cache_globs)):
+        raise Refusal("cache globs must not contain duplicates")
+    repo_cache_globs = _cache_glob_assignments(
+        args.repo_cache_glob or (), "repository cache glob"
+    )
+    post_provision_hooks = tuple(
+        _validate_hook(value) for value in args.post_provision_hook or ()
+    )
+    disk_gib = (
+        args.disk_advisory_gib,
+        args.disk_provisioning_floor_gib,
+        args.disk_emergency_gib,
+    )
+    if any(value is not None for value in disk_gib) and not all(
+        value is not None for value in disk_gib
+    ):
+        raise Refusal(
+            "disk policy requires --disk-advisory-gib, "
+            "--disk-provisioning-floor-gib, and --disk-emergency-gib together"
+        )
+    if all(value is not None for value in disk_gib):
+        advisory_gib, provisioning_gib, emergency_gib = disk_gib
+        assert advisory_gib is not None
+        assert provisioning_gib is not None
+        assert emergency_gib is not None
+        if min(advisory_gib, provisioning_gib, emergency_gib) < 1:
+            raise Refusal("disk thresholds must each be at least 1 GiB")
+        if not emergency_gib < provisioning_gib < advisory_gib:
+            raise Refusal(
+                "disk thresholds must satisfy emergency < provisioning floor < advisory"
+            )
+        disk_bytes = (
+            advisory_gib * GIB,
+            provisioning_gib * GIB,
+            emergency_gib * GIB,
+        )
+    else:
+        disk_bytes = (None, None, None)
     payload = _config_payload(
         worktrees_relative,
         machine,
@@ -2304,13 +2997,38 @@ def _cmd_init(args: argparse.Namespace) -> int:
         args.heartbeat_ttl_seconds,
         liveness_relative,
         args.max_active_slots,
+        layout,
+        cache_globs,
+        repo_cache_globs,
+        post_provision_hooks,
+        disk_bytes[0],
+        disk_bytes[1],
+        disk_bytes[2],
     )
     config_path = root / CONFIG_NAME
     with _locked_config(config_path, args.wait_lock):
         _recover_config_write(config_path, payload)
         if config_path.exists() or config_path.is_symlink():
             existing = _as_mapping(_read_json(config_path, "configuration"), "configuration")
-            if dict(existing) != payload:
+            if _canonical_config_payload(existing) != payload:
+                existing_worktrees = existing.get("worktrees_dir")
+                if isinstance(existing_worktrees, str):
+                    _relative, existing_worktrees_path = _relative_inside(
+                        root, existing_worktrees, "existing worktrees directory"
+                    )
+                    existing_layout = existing.get("layout", "nested")
+                    if existing_layout in {"nested", "flat"}:
+                        existing_control = (
+                            existing_worktrees_path
+                            if existing_layout == "nested"
+                            else existing_worktrees_path.parent
+                        )
+                        journals = sorted(existing_control.glob("ACTIVE.*.journal"))
+                        if journals:
+                            raise Refusal(
+                                f"cannot change configuration while recovery journal "
+                                f"{journals[0]} exists; recover or explicitly abort it first"
+                            )
                 if not args.repair:
                     raise Refusal(
                         f"{config_path} already has different configuration; "
@@ -2329,17 +3047,9 @@ def _cmd_init(args: argparse.Namespace) -> int:
     if worktrees.exists() and (not worktrees.is_dir() or worktrees.is_symlink()):
         raise Refusal(f"worktrees directory is not a real directory: {worktrees}")
     worktrees.mkdir(parents=True, exist_ok=True)
-    config = Config(
-        root=root,
-        config_path=config_path,
-        worktrees=worktrees,
-        machine=machine,
-        default_remote=remote,
-        default_landed_ref=landed_ref,
-        heartbeat_ttl_seconds=args.heartbeat_ttl_seconds,
-        liveness_command=liveness_command,
-        max_active_slots=args.max_active_slots,
-    )
+    config = _load_config(str(root), machine)
+    worktrees = config.worktrees
+    control = config.control
     with _mutation_locks(config, args.wait_lock):
         _recover_partial_updates(config, True)
         _refuse_partial_state(config)
@@ -2355,9 +3065,9 @@ def _cmd_init(args: argparse.Namespace) -> int:
             _atomic_write_json(
                 archive_path, _archive_to_obj(ArchiveState(machine, 0, ()))
             )
-        link = worktrees / "wrkslots"
+        link = control / "wrkslots"
         executable = Path(__file__).resolve()
-        relative_target = Path(os.path.relpath(executable, start=worktrees))
+        relative_target = Path(os.path.relpath(executable, start=control))
         if link.exists() or link.is_symlink():
             if not link.is_symlink():
                 raise Refusal(f"control path exists and is not a symlink: {link}")
@@ -2367,9 +3077,13 @@ def _cmd_init(args: argparse.Namespace) -> int:
                 )
         else:
             link.symlink_to(relative_target)
-            _fsync_directory(worktrees)
+            _fsync_directory(control)
     print(f"initialized wrkslots in {root}")
-    print(f"machine={machine} worktrees={worktrees_relative}")
+    print(
+        f"machine={machine} worktrees={config.worktrees.relative_to(root)} "
+        f"layout={config.layout} "
+        f"control={control.relative_to(root)}"
+    )
     print(f"command={link} -> {relative_target}")
     return 0
 
@@ -2381,6 +3095,8 @@ def _create_plan(config: Config, args: argparse.Namespace, vcs: GitVcs) -> tuple
     starts = _assignments(args.start, "start point")
     if not repositories:
         raise Refusal("create requires at least one --repo NAME=PATH")
+    if config.layout == "flat" and len(repositories) != 1:
+        raise Refusal("flat layout requires exactly one repository per slot")
     if set(branches) != set(repositories):
         missing = sorted(set(repositories) - set(branches))
         extra = sorted(set(branches) - set(repositories))
@@ -2478,6 +3194,78 @@ def _assert_active_slot_cap(config: Config, states: Sequence[ActiveState]) -> No
     )
 
 
+def _free_bytes(path: Path) -> int:
+    try:
+        filesystem = os.statvfs(path)
+    except OSError as exc:
+        raise Refusal(f"cannot measure free space on {path}: {exc}") from exc
+    return filesystem.f_bavail * filesystem.f_frsize
+
+
+def _disk_status(config: Config) -> dict[str, object]:
+    free = _free_bytes(config.worktrees)
+    advisory = config.disk_advisory_bytes
+    provisioning = config.disk_provisioning_floor_bytes
+    emergency = config.disk_emergency_bytes
+    if advisory is None or provisioning is None or emergency is None:
+        state = "unconfigured"
+    elif free < emergency:
+        state = "emergency"
+    elif free < provisioning:
+        state = "provisioning-blocked"
+    elif free < advisory:
+        state = "advisory"
+    else:
+        state = "healthy"
+    return {
+        "free_bytes": free,
+        "state": state,
+        "advisory_bytes": advisory,
+        "provisioning_floor_bytes": provisioning,
+        "emergency_bytes": emergency,
+    }
+
+
+def _format_gib(value: int) -> str:
+    return f"{value / GIB:.1f} GiB"
+
+
+def _assert_create_disk_space(config: Config, override: bool) -> None:
+    status = _disk_status(config)
+    state = _as_str(status["state"], "disk state")
+    free = _as_int(status["free_bytes"], "disk free bytes")
+    remedy = "run 'wrkslots audit' and 'wrkslots clean-caches', then retry"
+    if state == "emergency":
+        threshold = _as_int(status["emergency_bytes"], "disk emergency bytes", minimum=1)
+        raise Refusal(
+            f"free space {_format_gib(free)} is below the emergency floor "
+            f"{_format_gib(threshold)}; stop builds, publish durable work, and {remedy}. "
+            "--override-disk-floor does not bypass the emergency floor"
+        )
+    if state == "provisioning-blocked" and not override:
+        threshold = _as_int(
+            status["provisioning_floor_bytes"],
+            "disk provisioning floor bytes",
+            minimum=1,
+        )
+        raise Refusal(
+            f"free space {_format_gib(free)} is below the provisioning floor "
+            f"{_format_gib(threshold)}; {remedy}. Use --override-disk-floor only "
+            "after inspecting the pressure"
+        )
+    if state == "provisioning-blocked":
+        print(
+            f"WARNING: overriding disk provisioning floor with {_format_gib(free)} free; "
+            f"{remedy}",
+            file=sys.stderr,
+        )
+    elif state == "advisory":
+        print(
+            f"WARNING: disk free space is advisory at {_format_gib(free)}; {remedy}",
+            file=sys.stderr,
+        )
+
+
 def _assert_agent_and_slot_free(config: Config, slot: str, agent: str) -> None:
     states = _load_all_active(config)
     for state in states:
@@ -2507,6 +3295,7 @@ def _create_journal_payload(
     *,
     created_at: str,
     heartbeat_at: str,
+    hook_progress: int,
 ) -> dict[str, object]:
     return {
         "schema": SCHEMA,
@@ -2523,7 +3312,89 @@ def _create_journal_payload(
         "coordinator_lease": _identity_to_obj(coordinator_lease),
         "planned": [_planned_to_obj(item) for item in plan],
         "created": [_checkout_to_obj(item) for item in created],
+        "post_provision_hooks": list(config.post_provision_hooks),
+        "hook_progress": hook_progress,
+        "hook_failure": None,
+        "failure_policy": "leave-for-inspection",
     }
+
+
+def _run_post_provision_hooks(
+    config: Config,
+    created: Sequence[Checkout],
+    journal_path: Path,
+    journal: dict[str, object],
+    *,
+    start: int = 0,
+) -> int:
+    hooks = config.post_provision_hooks
+    total = len(created) * len(hooks)
+    if start < 0 or start > total:
+        raise StateError("create journal hook progress is out of range")
+    for step in range(start, total):
+        checkout = created[step // len(hooks)]
+        hook_index = step % len(hooks)
+        command = hooks[hook_index]
+        path = _stored_path(config, checkout.path, "hook checkout path")
+        attempt = {
+            "checkout": checkout.name,
+            "hook_index": hook_index,
+            "command": command,
+            "status": "running",
+        }
+        journal["hook_failure"] = attempt
+        _atomic_write_json(journal_path, journal)
+        env = os.environ.copy()
+        env.update(
+            {
+                "WRKSLOTS_PROJECT_ROOT": str(config.root),
+                "WRKSLOTS_SLOT": path.parent.name if config.layout == "nested" else path.name,
+                "WRKSLOTS_CHECKOUT": str(path),
+                "WRKSLOTS_CHECKOUT_NAME": checkout.name,
+            }
+        )
+        print(
+            f"post-provision hook {step + 1}/{total} checkout={checkout.name}: {command}"
+        )
+        try:
+            completed = subprocess.run(
+                ["/bin/sh", "-c", command],
+                cwd=path,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        except OSError as exc:
+            attempt["status"] = "failed-to-start"
+            attempt["detail"] = str(exc)
+            journal["hook_failure"] = attempt
+            _atomic_write_json(journal_path, journal)
+            raise Refusal(
+                f"post-provision hook {hook_index + 1} for checkout {checkout.name} "
+                f"could not start: {exc}; slot was left for inspection with journal "
+                f"{journal_path}. Fix the cause and run 'wrkslots recover'"
+            ) from exc
+        if completed.returncode != 0:
+            attempt["status"] = "failed"
+            attempt["returncode"] = completed.returncode
+            journal["hook_failure"] = attempt
+            _atomic_write_json(journal_path, journal)
+            if completed.stdout:
+                print("post-provision hook stdout:", file=sys.stderr)
+                print(completed.stdout, end="" if completed.stdout.endswith("\n") else "\n", file=sys.stderr)
+            if completed.stderr:
+                print("post-provision hook stderr:", file=sys.stderr)
+                print(completed.stderr, end="" if completed.stderr.endswith("\n") else "\n", file=sys.stderr)
+            raise Refusal(
+                f"post-provision hook {hook_index + 1} for checkout {checkout.name} "
+                f"failed with rc {completed.returncode}; slot was left for inspection "
+                f"with journal {journal_path}. Fix the cause and run 'wrkslots recover'"
+            )
+        journal["hook_progress"] = step + 1
+        journal["hook_failure"] = None
+        _atomic_write_json(journal_path, journal)
+    return total
 
 
 def _cmd_create(args: argparse.Namespace) -> int:
@@ -2550,6 +3421,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
         _ensure_state_shard(config)
         state = _load_active(config)
         _assert_agent_and_slot_free(config, args.slot, args.agent)
+        _assert_create_disk_space(config, args.override_disk_floor)
         slot_path = config.worktrees / args.slot
         if slot_path.exists() or slot_path.is_symlink():
             raise Refusal(f"slot path already exists: {slot_path}")
@@ -2569,10 +3441,12 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 created,
                 created_at=created_at,
                 heartbeat_at=heartbeat_at,
+                hook_progress=0,
             ),
         )
-        slot_path.mkdir(mode=0o755)
-        _fsync_directory(config.worktrees)
+        if config.layout == "nested":
+            slot_path.mkdir(mode=0o755)
+            _fsync_directory(config.worktrees)
         for item in plan:
             _relative, repository = _repository_path(config, item.repository)
             destination = _stored_path(config, item.destination, "checkout destination")
@@ -2600,9 +3474,24 @@ def _cmd_create(args: argparse.Namespace) -> int:
                     created,
                     created_at=created_at,
                     heartbeat_at=heartbeat_at,
+                    hook_progress=0,
                 ),
             )
             _interrupt_for_test("after-create-worktree")
+        hook_journal = _create_journal_payload(
+            config,
+            args,
+            owner,
+            coordinator_lease,
+            plan,
+            created,
+            created_at=created_at,
+            heartbeat_at=heartbeat_at,
+            hook_progress=0,
+        )
+        hook_progress = _run_post_provision_hooks(
+            config, created, journal_path, hook_journal
+        )
         for checkout in created:
             _assert_checkout_identity_unchanged(config, checkout, vcs)
         if owner is not None:
@@ -2636,6 +3525,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 created,
                 created_at=created_at,
                 heartbeat_at=heartbeat_at,
+                hook_progress=hook_progress,
             ),
         )
         record = ActiveRecord(
@@ -2680,6 +3570,8 @@ def _existing_checkouts(
     remote_urls = _assignments(args.remote_url, "trusted remote URL")
     if not repositories:
         raise Refusal("at least one --repo NAME=PATH is required")
+    if config.layout == "flat" and len(repositories) != 1:
+        raise Refusal("flat layout requires exactly one repository per slot")
     if set(remote_urls) != set(repositories):
         raise Refusal("trusted remote URLs must exactly match repositories")
     checkouts: list[Checkout] = []
@@ -2778,7 +3670,9 @@ def _register_existing(
     )
 
 
-def _cmd_register(args: argparse.Namespace) -> int:
+def _cmd_register(
+    args: argparse.Namespace, *, allow_unregistered_migration_slots: bool = False
+) -> int:
     config = _load_config(args.project_root, args.machine)
     owner = _capture_caller_process(args.owner_pid, "owner")
     coordinator_lease = _capture_caller_process(
@@ -2789,7 +3683,10 @@ def _cmd_register(args: argparse.Namespace) -> int:
         _assert_no_journal(config)
         states, archives = _validate_global_state(config)
         _assert_registry_storage_consistent(
-            config, states, allowed_unregistered_slot=args.slot
+            config,
+            states,
+            allowed_unregistered_slot=args.slot,
+            allow_unregistered_migration_slots=allow_unregistered_migration_slots,
         )
         before = _global_rows(states, archives)
         _ensure_state_shard(config)
@@ -2832,7 +3729,7 @@ def _cmd_import_existing(args: argparse.Namespace) -> int:
         raise Refusal(
             "--apply requires --verified-live, --owner-pid, and --coordinator-pid"
         )
-    return _cmd_register(args)
+    return _cmd_register(args, allow_unregistered_migration_slots=True)
 
 
 def _expected_generation(record: ActiveRecord, expected: int) -> None:
@@ -3012,7 +3909,975 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
     return 0
 
 
-def _status_record(record: ActiveRecord) -> dict[str, object]:
+def _cmd_hold(args: argparse.Namespace) -> int:
+    config = _load_config(args.project_root, args.machine)
+    _validate_name(args.slot, "slot")
+    reason = args.reason.strip()
+    if not reason:
+        raise Refusal("hold requires a non-empty --reason")
+    with _mutation_locks(config, args.wait_lock):
+        _refuse_partial_state(config)
+        _assert_no_journal(config)
+        states, _archives = _validate_global_state(config)
+        _assert_registry_storage_consistent(config, states)
+        record = _find_record(_load_active(config), args.slot)
+        path = _hold_path(config, record.slot, record.machine)
+        existing = _load_hold(config, record.slot, record.machine)
+        if existing is not None:
+            if _as_str(existing["reason"], "slot hold.reason") != reason:
+                raise Refusal(
+                    f"slot {record.slot} is already held for a different reason: "
+                    f"{existing['reason']}"
+                )
+            print(f"already held slot={record.slot} reason={reason}")
+            return 0
+        _atomic_write_json(
+            path,
+            {
+                "schema": HOLD_SCHEMA,
+                "machine": record.machine,
+                "slot": record.slot,
+                "held_at": _utc_now(),
+                "reason": reason,
+            },
+        )
+    print(f"held slot={record.slot} reason={reason}")
+    return 0
+
+
+def _cmd_unhold(args: argparse.Namespace) -> int:
+    config = _load_config(args.project_root, args.machine)
+    _validate_name(args.slot, "slot")
+    with _mutation_locks(config, args.wait_lock):
+        _refuse_partial_state(config)
+        _assert_no_journal(config)
+        states, _archives = _validate_global_state(config)
+        _assert_registry_storage_consistent(config, states)
+        record = _find_record(_load_active(config), args.slot)
+        path = _hold_path(config, record.slot, record.machine)
+        if _load_hold(config, record.slot, record.machine) is None:
+            raise Refusal(f"slot {record.slot} is not held")
+        _remove_control_file(path)
+    print(f"released hold slot={record.slot}")
+    return 0
+
+
+def _cache_directories_for_path(
+    config: Config,
+    checkout_path: Path,
+    checkout_name: str,
+    vcs: GitVcs,
+    cache_globs: Sequence[str],
+    source_repository: Path | None = None,
+) -> tuple[CacheDirectory, ...]:
+    candidates: set[Path] = set()
+    if not checkout_path.is_dir() or checkout_path.is_symlink():
+        raise Refusal(f"checkout is missing or unsafe for cache inspection: {checkout_path}")
+    checkout_identity = _open_directory_identity(checkout_path, "checkout")
+    if source_repository is None:
+        if vcs.repository_root(checkout_path) != checkout_path.absolute():
+            raise Refusal(f"cache target is not a Git checkout root: {checkout_path}")
+    else:
+        vcs.verify_existing_worktree(source_repository, checkout_path)
+    if checkout_identity != _open_directory_identity(checkout_path, "checkout"):
+        raise Refusal(f"checkout changed during cache inspection: {checkout_path}")
+    _assert_cache_policy_untracked_path(
+        config, checkout_name, checkout_path, vcs, cache_globs
+    )
+    for pattern in cache_globs:
+        try:
+            matches = checkout_path.glob(pattern)
+            for candidate in matches:
+                absolute = candidate.absolute()
+                if not _path_is_within(absolute, checkout_path) or absolute == checkout_path:
+                    raise Refusal(
+                        f"cache glob {pattern!r} escaped checkout {checkout_path}"
+                    )
+                _ensure_no_symlink_components(checkout_path, absolute, "cache path")
+                _ensure_no_mount_components(checkout_path, absolute, "cache path")
+                _assert_no_mountinfo_crossing(checkout_path, absolute, "cache path")
+                if candidate.is_symlink():
+                    raise Refusal(f"configured cache path is a symlink: {candidate}")
+                if not candidate.exists():
+                    continue
+                if not candidate.is_dir():
+                    raise Refusal(f"configured cache path is not a directory: {candidate}")
+                candidates.add(absolute)
+        except (OSError, ValueError) as exc:
+            raise Refusal(
+                f"cannot expand cache glob {pattern!r} in {checkout_path}: {exc}"
+            ) from exc
+    selected: list[Path] = []
+    for candidate in sorted(candidates, key=lambda value: (len(value.parts), str(value))):
+        if any(_path_is_within(candidate, parent) for parent in selected):
+            continue
+        selected.append(candidate)
+    if checkout_identity != _open_directory_identity(checkout_path, "checkout"):
+        raise Refusal(f"checkout changed during cache inspection: {checkout_path}")
+    return tuple(
+        CacheDirectory(
+            path=path,
+            checkout_root=checkout_path,
+            checkout_device=checkout_identity[0],
+            checkout_inode=checkout_identity[1],
+            checkout_mount_id=checkout_identity[2],
+        )
+        for path in selected
+    )
+
+
+def _cache_directories_for_checkout(
+    config: Config, checkout: Checkout
+) -> tuple[CacheDirectory, ...]:
+    checkout_path = _stored_path(config, checkout.path, "checkout path")
+    vcs = GitVcs()
+    _relative, repository = _repository_path(config, checkout.repository)
+    return _cache_directories_for_path(
+        config,
+        checkout_path,
+        checkout.name,
+        vcs,
+        _cache_globs_for(config, checkout.name),
+        repository,
+    )
+
+
+def _unregistered_cache_roots(config: Config, slot: str) -> tuple[Path, ...]:
+    slot_path = config.worktrees / slot
+    if not slot_path.is_dir() or slot_path.is_symlink():
+        raise Refusal(f"unregistered slot is missing or unsafe: {slot_path}")
+    candidates = (slot_path,) if config.layout == "flat" else tuple(slot_path.iterdir())
+    roots: list[Path] = []
+    vcs = GitVcs()
+    for candidate in candidates:
+        if not candidate.is_dir() or candidate.is_symlink():
+            raise Refusal(
+                f"unregistered slot {slot} contains a non-checkout entry: {candidate}"
+            )
+        if vcs.repository_root(candidate) != candidate.absolute():
+            raise Refusal(
+                f"unregistered slot {slot} entry is not a Git checkout root: {candidate}"
+            )
+        roots.append(candidate.absolute())
+    if not roots:
+        raise Refusal(f"unregistered slot {slot} contains no Git checkouts")
+    return tuple(roots)
+
+
+def _cache_directories(
+    config: Config, checkouts: Sequence[Checkout]
+) -> tuple[CacheDirectory, ...]:
+    return tuple(
+        path
+        for checkout in checkouts
+        for path in _cache_directories_for_checkout(config, checkout)
+    )
+
+
+def _cache_slot_directories(
+    config: Config, cache_slot: CacheSlot
+) -> tuple[CacheDirectory, ...]:
+    registered = _cache_directories(config, cache_slot.checkouts)
+    vcs = GitVcs()
+    roots = (
+        _unregistered_cache_roots(config, cache_slot.slot)
+        if cache_slot.state == "unregistered"
+        else ()
+    )
+    if roots and config.repo_cache_globs and not config.cache_globs:
+        raise Refusal(
+            f"unregistered slot {cache_slot.slot} has no trusted repository-name mapping; "
+            "import it or configure a global cache_globs policy before cleanup"
+        )
+    unregistered: list[CacheDirectory] = []
+    for index, root in enumerate(roots):
+        label = f"unregistered-{index + 1}"
+        unregistered.extend(
+            _cache_directories_for_path(
+                config,
+                root,
+                label,
+                vcs,
+                config.cache_globs,
+            )
+        )
+    return (*registered, *unregistered)
+
+
+def _journal_cache_slot(config: Config, machine: str | None = None) -> CacheSlot | None:
+    selected_machine = machine or config.machine
+    path = _journal_path(config, selected_machine)
+    if not path.exists() and not path.is_symlink():
+        return None
+    raw = _as_mapping(_read_json(path, "cache recovery journal"), "cache recovery journal")
+    if _as_int(raw.get("schema"), "cache recovery journal.schema") != SCHEMA:
+        raise StateError("unsupported cache recovery journal schema")
+    if (
+        _as_str(raw.get("machine"), "cache recovery journal.machine")
+        != selected_machine
+    ):
+        raise StateError("cache recovery journal belongs to a different machine")
+    kind = _as_str(raw.get("kind"), "cache recovery journal.kind")
+    slot = _validate_name(
+        _as_str(raw.get("slot"), "cache recovery journal.slot"), "slot"
+    )
+    if kind == "create":
+        checkouts = tuple(
+            _checkout_from_obj(item, f"cache recovery journal.created[{index}]")
+            for index, item in enumerate(
+                _as_list(raw.get("created"), "cache recovery journal.created")
+            )
+        )
+    elif kind == "finish":
+        record = _record_from_obj(raw.get("record"), "cache recovery journal.record")
+        if record.slot != slot or record.machine != selected_machine:
+            raise StateError("finish journal cache record does not match its shard or slot")
+        _assert_record_paths(config, record)
+        removed = {
+            _as_str(item, f"cache recovery journal.removed[{index}]")
+            for index, item in enumerate(
+                _as_list(raw.get("removed"), "cache recovery journal.removed")
+            )
+        }
+        if not removed <= {checkout.name for checkout in record.checkouts}:
+            raise StateError("finish journal cache record names an unknown removed checkout")
+        checkouts = tuple(
+            checkout for checkout in record.checkouts if checkout.name not in removed
+        )
+    else:
+        raise StateError(f"unsupported cache recovery journal kind {kind!r}")
+    if config.layout == "flat" and len(checkouts) > 1:
+        raise StateError("flat-layout create journal records multiple checkouts")
+    vcs = GitVcs()
+    present: list[Checkout] = []
+    for checkout in checkouts:
+        expected, destination = _checkout_path(config, slot, checkout.name)
+        if checkout.path != expected:
+            raise StateError(
+                f"cache recovery journal checkout {checkout.name} escapes slot {slot}"
+            )
+        _relative, repository = _repository_path(config, checkout.repository)
+        if not destination.exists() and not destination.is_symlink():
+            if destination.absolute() in vcs.listed_worktrees(repository):
+                raise Refusal(
+                    f"journaled checkout {checkout.name} is missing but Git still registers it"
+                )
+            continue
+        if destination.is_symlink() or not destination.is_dir():
+            raise Refusal(f"journaled checkout is unsafe for cache cleanup: {destination}")
+        vcs.verify_existing_worktree(repository, destination)
+        present.append(checkout)
+    return CacheSlot(
+        slot=slot,
+        machine=selected_machine,
+        checkouts=tuple(present),
+        state=f"{kind}-journal",
+    )
+
+
+def _all_journal_cache_slots(config: Config) -> tuple[CacheSlot, ...]:
+    slots: list[CacheSlot] = []
+    seen: dict[str, str] = {}
+    for path in _outstanding_journals(config):
+        match = re.fullmatch(
+            r"ACTIVE\.([A-Za-z0-9][A-Za-z0-9._-]{0,63})\.journal", path.name
+        )
+        if match is None:
+            raise StateError(f"invalid recovery journal filename: {path}")
+        cache_slot = _journal_cache_slot(config, match.group(1))
+        assert cache_slot is not None
+        previous = seen.get(cache_slot.slot)
+        if previous is not None:
+            raise StateError(
+                f"slot {cache_slot.slot!r} has recovery journals on both "
+                f"{previous} and {cache_slot.machine}"
+            )
+        seen[cache_slot.slot] = cache_slot.machine
+        slots.append(cache_slot)
+    return tuple(slots)
+
+
+def _open_parent_directory(
+    root: Path,
+    path: Path,
+    label: str,
+    *,
+    expected_root_identity: tuple[int, int, int] | None = None,
+) -> tuple[int, str, int]:
+    try:
+        relative = path.relative_to(root)
+    except ValueError as exc:
+        raise Refusal(f"{label} escapes its managed root: {path}") from exc
+    if not relative.parts:
+        raise Refusal(f"{label} must not be the managed root")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        current_fd = os.open(root, flags)
+    except OSError as exc:
+        raise Refusal(f"cannot open managed root {root}: {exc}") from exc
+    try:
+        root_metadata = os.fstat(current_fd)
+        root_mount_id = _fd_mount_id(current_fd, str(root))
+        if expected_root_identity is not None:
+            actual_root_identity = (
+                root_metadata.st_dev,
+                root_metadata.st_ino,
+                root_mount_id,
+            )
+            if actual_root_identity != expected_root_identity:
+                raise Refusal(f"{label} checkout identity changed before cleanup: {root}")
+        for part in relative.parts[:-1]:
+            next_fd = os.open(part, flags, dir_fd=current_fd)
+            if _fd_mount_id(next_fd, str(path)) != root_mount_id:
+                os.close(next_fd)
+                raise Refusal(f"{label} crossed a mount point while opening {path}")
+            os.close(current_fd)
+            current_fd = next_fd
+        return current_fd, relative.parts[-1], root_mount_id
+    except OSError as exc:
+        os.close(current_fd)
+        raise Refusal(f"cannot safely open {label} parent for {path}: {exc}") from exc
+    except Refusal:
+        os.close(current_fd)
+        raise
+
+
+def _open_cache_directory(
+    config: Config, cache: CacheDirectory
+) -> tuple[int, int, str] | None:
+    path = cache.path
+    _ensure_no_symlink_components(cache.checkout_root, path, "cache path")
+    _ensure_no_mount_components(cache.checkout_root, path, "cache path")
+    _assert_no_mountinfo_crossing(cache.checkout_root, path, "cache path")
+    parent_fd, name, checkout_mount_id = _open_parent_directory(
+        cache.checkout_root,
+        path,
+        "cache path",
+        expected_root_identity=(
+            cache.checkout_device,
+            cache.checkout_inode,
+            cache.checkout_mount_id,
+        ),
+    )
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        cache_fd = os.open(name, flags, dir_fd=parent_fd)
+    except FileNotFoundError:
+        os.close(parent_fd)
+        return None
+    except OSError as exc:
+        os.close(parent_fd)
+        raise Refusal(f"cannot safely open cache directory {path}: {exc}") from exc
+    if _fd_mount_id(cache_fd, str(path)) != checkout_mount_id:
+        os.close(cache_fd)
+        os.close(parent_fd)
+        raise Refusal(f"cache path crossed a mount point while opening {path}")
+    return parent_fd, cache_fd, name
+
+
+def _directory_names(directory_fd: int, path: Path) -> list[str]:
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        scan_fd = os.open(".", flags, dir_fd=directory_fd)
+    except OSError as exc:
+        raise Refusal(f"cannot open cache directory {path} for enumeration: {exc}") from exc
+    try:
+        with os.scandir(scan_fd) as entries:
+            return sorted(entry.name for entry in entries)
+    except OSError as exc:
+        raise Refusal(f"cannot enumerate cache directory {path}: {exc}") from exc
+    finally:
+        os.close(scan_fd)
+
+
+def _allocated_open_directory(
+    directory_fd: int, path: Path, device: int, mount_id: int
+) -> int:
+    try:
+        metadata = os.fstat(directory_fd)
+        if metadata.st_dev != device:
+            raise Refusal(f"cache path crossed onto another filesystem: {path}")
+        if _fd_mount_id(directory_fd, str(path)) != mount_id:
+            raise Refusal(f"cache path crossed a mount point: {path}")
+        total = metadata.st_blocks * 512
+        names = _directory_names(directory_fd, path)
+        for name in names:
+            if name == ".git":
+                raise Refusal(f"cache directory contains nested Git metadata: {path / name}")
+            try:
+                child = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise Refusal(f"cannot inspect cache entry {path / name}: {exc}") from exc
+            if not stat.S_ISDIR(child.st_mode):
+                total += child.st_blocks * 512
+                continue
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+            try:
+                child_fd = os.open(name, flags, dir_fd=directory_fd)
+            except OSError as exc:
+                raise Refusal(f"cache directory changed during inspection: {path / name}: {exc}") from exc
+            try:
+                opened = os.fstat(child_fd)
+                if (opened.st_dev, opened.st_ino) != (child.st_dev, child.st_ino):
+                    raise Refusal(f"cache directory changed during inspection: {path / name}")
+                if _fd_mount_id(child_fd, str(path / name)) != mount_id:
+                    raise Refusal(f"cache path crossed a mount point: {path / name}")
+                total += _allocated_open_directory(
+                    child_fd, path / name, device, mount_id
+                )
+            finally:
+                os.close(child_fd)
+        return total
+    except OSError as exc:
+        raise Refusal(f"cannot measure cache directory {path}: {exc}") from exc
+
+
+def _allocated_cache_bytes(config: Config, cache: CacheDirectory) -> int:
+    path = cache.path
+    opened = _open_cache_directory(config, cache)
+    if opened is None:
+        return 0
+    parent_fd, cache_fd, _name = opened
+    try:
+        device = os.fstat(cache_fd).st_dev
+        mount_id = _fd_mount_id(cache_fd, str(path))
+        return _allocated_open_directory(cache_fd, path, device, mount_id)
+    finally:
+        os.close(cache_fd)
+        os.close(parent_fd)
+
+
+def _clear_open_directory(
+    directory_fd: int, path: Path, device: int, mount_id: int
+) -> int:
+    metadata = os.fstat(directory_fd)
+    if metadata.st_dev != device:
+        raise Refusal(f"cache path crossed onto another filesystem: {path}")
+    if _fd_mount_id(directory_fd, str(path)) != mount_id:
+        raise Refusal(f"cache path crossed a mount point: {path}")
+    total = metadata.st_blocks * 512
+    names = _directory_names(directory_fd, path)
+    for name in names:
+        if name == ".git":
+            raise Refusal(f"cache directory contains nested Git metadata: {path / name}")
+        try:
+            child = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise Refusal(f"cannot inspect cache entry {path / name}: {exc}") from exc
+        if stat.S_ISDIR(child.st_mode):
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+            try:
+                child_fd = os.open(name, flags, dir_fd=directory_fd)
+            except OSError as exc:
+                raise Refusal(f"cache directory changed during cleanup: {path / name}: {exc}") from exc
+            try:
+                opened = os.fstat(child_fd)
+                if (opened.st_dev, opened.st_ino) != (child.st_dev, child.st_ino):
+                    raise Refusal(f"cache directory changed during cleanup: {path / name}")
+                if _fd_mount_id(child_fd, str(path / name)) != mount_id:
+                    raise Refusal(f"cache path crossed a mount point: {path / name}")
+                total += _clear_open_directory(child_fd, path / name, device, mount_id)
+            finally:
+                os.close(child_fd)
+            try:
+                current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if (
+                not stat.S_ISDIR(current.st_mode)
+                or (current.st_dev, current.st_ino) != (child.st_dev, child.st_ino)
+            ):
+                raise Refusal(f"cache directory changed during cleanup: {path / name}")
+            try:
+                os.rmdir(name, dir_fd=directory_fd)
+            except OSError as exc:
+                raise Refusal(f"cannot remove cache directory {path / name}: {exc}") from exc
+        else:
+            try:
+                os.unlink(name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise Refusal(f"cannot remove cache entry {path / name}: {exc}") from exc
+            total += child.st_blocks * 512
+    if _directory_names(directory_fd, path):
+        raise Refusal(f"cache directory changed while it was being cleaned: {path}")
+    return total
+
+
+def _remove_cache_directory(config: Config, cache: CacheDirectory) -> int:
+    path = cache.path
+    opened = _open_cache_directory(config, cache)
+    if opened is None:
+        return 0
+    parent_fd, cache_fd, name = opened
+    try:
+        original = os.fstat(cache_fd)
+        mount_id = _fd_mount_id(cache_fd, str(path))
+        # Complete a read-only traversal before deletion begins. The destructive
+        # traversal repeats every identity check so replacements still fail closed.
+        _allocated_open_directory(cache_fd, path, original.st_dev, mount_id)
+        size = _clear_open_directory(cache_fd, path, original.st_dev, mount_id)
+        try:
+            current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return size
+        if (
+            not stat.S_ISDIR(current.st_mode)
+            or (current.st_dev, current.st_ino) != (original.st_dev, original.st_ino)
+        ):
+            raise Refusal(f"cache directory changed before final removal: {path}")
+        try:
+            os.rmdir(name, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        except OSError as exc:
+            raise Refusal(f"cannot remove configured cache directory {path}: {exc}") from exc
+        return size
+    finally:
+        os.close(cache_fd)
+        os.close(parent_fd)
+
+
+def _cmd_clean_caches(args: argparse.Namespace) -> int:
+    config = _load_config(args.project_root, args.machine)
+    if not config.cache_globs and not config.repo_cache_globs:
+        raise Refusal("no cache globs are configured")
+    only = tuple(args.only or ())
+    for slot in only:
+        _validate_name(slot, "slot")
+    with _mutation_locks(config, args.wait_lock):
+        _refuse_partial_state(config)
+        states, _archives = _validate_global_state(config)
+        cache_slots = {
+            record.slot: CacheSlot(record.slot, record.machine, record.checkouts)
+            for state in states
+            for record in state.slots
+        }
+        registered_slots = {
+            record.slot for candidate in states for record in candidate.slots
+        }
+        journal_slots = _all_journal_cache_slots(config)
+        registered_slots.update(slot.slot for slot in journal_slots)
+        for journal_slot in journal_slots:
+            cache_slots[journal_slot.slot] = journal_slot
+        malformed_slots: dict[str, str] = {}
+        for entry in sorted(config.worktrees.iterdir(), key=lambda path: path.name):
+            if not entry.is_dir() or entry.is_symlink() or entry.name in registered_slots:
+                continue
+            try:
+                _validate_name(entry.name, "unregistered slot")
+            except Refusal as exc:
+                if args.yes:
+                    raise Refusal(
+                        f"cannot bulk-clean malformed unregistered directory {entry}: {exc}"
+                    ) from exc
+                malformed_slots[entry.name] = str(exc)
+                continue
+            cache_slots[entry.name] = CacheSlot(
+                entry.name,
+                config.machine,
+                (),
+                "unregistered",
+            )
+        unknown = sorted(set(only) - set(cache_slots))
+        if unknown:
+            raise Refusal(f"unknown slot(s) for cache cleanup: {', '.join(unknown)}")
+        selected = set(cache_slots) if args.yes else set(only)
+        rows: list[dict[str, object]] = [
+                {
+                    "slot": slot,
+                    "machine": None,
+                    "cache_bytes": 0,
+                "action": "BLOCKED",
+                "paths": [],
+                "hold_reason": None,
+                "registered": False,
+                "state": "unregistered",
+                "cache_error": error,
+                "policy_note": None,
+            }
+            for slot, error in sorted(malformed_slots.items())
+        ]
+        plans: dict[str, tuple[CacheDirectory, ...]] = {}
+        for slot in sorted(cache_slots):
+            cache_slot = cache_slots[slot]
+            hold = _load_hold(config, slot, cache_slot.machine)
+            directories: tuple[CacheDirectory, ...]
+            cache_error: str | None = None
+            policy_note = (
+                "repository-specific cache globs were not applied because this slot has no "
+                "trusted repository-name mapping"
+                if cache_slot.state == "unregistered" and config.repo_cache_globs
+                else None
+            )
+            if hold is not None:
+                directories = ()
+                cache_bytes = 0
+                action = "HELD"
+            else:
+                try:
+                    directories = _cache_slot_directories(config, cache_slot)
+                    cache_bytes = sum(
+                        _allocated_cache_bytes(config, cache) for cache in directories
+                    )
+                except Refusal as exc:
+                    if slot in selected:
+                        raise Refusal(
+                            f"cannot clean selected slot {slot}: {exc}"
+                        ) from exc
+                    directories = ()
+                    cache_bytes = 0
+                    cache_error = str(exc)
+                    action = "BLOCKED"
+                else:
+                    if slot in selected:
+                        action = "REMOVED"
+                        plans[slot] = directories
+                    else:
+                        action = "REPORT"
+            rows.append(
+                {
+                    "slot": slot,
+                    "machine": cache_slot.machine,
+                    "cache_bytes": cache_bytes,
+                    "action": action,
+                    "paths": [str(cache.path) for cache in directories],
+                    "hold_reason": None if hold is None else hold["reason"],
+                    "registered": cache_slot.state == "active",
+                    "state": cache_slot.state,
+                    "cache_error": cache_error,
+                    "policy_note": policy_note,
+                }
+            )
+        removed_bytes = 0
+        for row in rows:
+            slot = _as_str(row["slot"], "cache row slot")
+            for cache in plans.get(slot, ()):
+                removed_bytes += _remove_cache_directory(config, cache)
+    payload = {
+        "schema": SCHEMA,
+        "cache_globs": list(config.cache_globs),
+        "repo_cache_globs": {
+            name: list(patterns) for name, patterns in config.repo_cache_globs
+        },
+        "removed_bytes": removed_bytes,
+        "slots": rows,
+    }
+    if args.format == "json":
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        mode = "delete" if selected else "report-only"
+        print(
+            f"cache_mode={mode} slots={len(rows)} removed={_format_gib(removed_bytes)}"
+        )
+        for row in rows:
+            print(
+                f"{row['action']}: {row['slot']} cache={_format_gib(_as_int(row['cache_bytes'], 'cache bytes'))}"
+                + (
+                    f" reason={row['hold_reason']}"
+                    if row["hold_reason"] is not None
+                    else ""
+                )
+                + (
+                    f" error={row['cache_error']}"
+                    if row["cache_error"] is not None
+                    else ""
+                )
+                + (
+                    f" note={row['policy_note']}"
+                    if row["policy_note"] is not None
+                    else ""
+                )
+            )
+    return 0
+
+
+def _audit_record(config: Config, record: ActiveRecord) -> tuple[dict[str, object], bool]:
+    owner_state, owner_detail = _process_state(record.owner)
+    liveness_state, liveness_detail = _registered_liveness_state(config, record)
+    agent_running = not (
+        liveness_state == "dead"
+        and (owner_state == "dead" or record.owner is None)
+    )
+    hold = _load_hold(config, record.slot, record.machine)
+    cache_bytes = 0
+    cache_error: str | None = None
+    try:
+        cache_bytes = sum(
+            _allocated_cache_bytes(config, cache)
+            for cache in _cache_directories(config, record.checkouts)
+        )
+    except Refusal as exc:
+        cache_error = str(exc)
+    if hold is not None:
+        return (
+            {
+                "slot": record.slot,
+                "machine": record.machine,
+                "agent": record.agent,
+                "verdict": "HELD",
+                "reasons": [_as_str(hold["reason"], "slot hold.reason")],
+                "owner_state": owner_state,
+                "liveness_state": liveness_state,
+                "cache_bytes": cache_bytes,
+                "cache_error": cache_error,
+            },
+            agent_running,
+        )
+    reasons: list[str] = []
+    if record.handoff is None:
+        reasons.append("no owner-alive handoff is recorded")
+    if liveness_state != "dead":
+        reasons.append(f"liveness is {liveness_state}: {liveness_detail}")
+    if record.owner is None and record.coordinator_recovery_note is None:
+        reasons.append("no owner generation or coordinator recovery evidence is recorded")
+    elif record.owner is not None and owner_state != "dead":
+        reasons.append(f"recorded owner is {owner_state}: {owner_detail}")
+    slot_path = config.worktrees / record.slot
+    final_checkouts: tuple[Checkout, ...] | None = None
+    try:
+        _slot_path, final_checkouts = _handoff_preconditions(
+            config, record, GitVcs(), refresh_remote=False
+        )
+    except Refusal as exc:
+        reasons.append(str(exc))
+    if (
+        record.handoff is not None
+        and final_checkouts is not None
+        and final_checkouts != record.checkouts
+    ):
+        reasons.append("checkout changed after its recorded handoff")
+    if (
+        record.handoff is not None
+        and liveness_state == "dead"
+        and (record.owner is None or owner_state == "dead")
+        and final_checkouts == record.checkouts
+    ):
+        try:
+            _assert_slot_unused(slot_path, record)
+        except Refusal as exc:
+            reasons.append(str(exc))
+            agent_running = True
+    if cache_error is not None:
+        reasons.append(f"cache inspection failed: {cache_error}")
+    return (
+        {
+            "slot": record.slot,
+            "machine": record.machine,
+            "agent": record.agent,
+            "verdict": "DELETABLE" if not reasons else "BLOCKED",
+            "reasons": reasons,
+            "owner_state": owner_state,
+            "liveness_state": liveness_state,
+            "cache_bytes": cache_bytes,
+            "cache_error": cache_error,
+        },
+        agent_running,
+    )
+
+
+def _cmd_audit(args: argparse.Namespace) -> int:
+    config = _load_config(args.project_root, args.machine)
+    with _locked(config.control / "ACTIVE", exclusive=False, wait_seconds=args.wait_lock):
+        _refuse_partial_state(config)
+        states, _archives = _validate_global_state(config)
+        records = [record for state in states for record in state.slots]
+        journal_slots = {slot.slot: slot for slot in _all_journal_cache_slots(config)}
+        rows: list[dict[str, object]] = []
+        running_agent_count = 0
+        for record in records:
+            row, running = _audit_record(config, record)
+            journal_slot = journal_slots.get(record.slot)
+            if journal_slot is not None:
+                reasons = row["reasons"]
+                assert isinstance(reasons, list)
+                reasons.insert(
+                    0,
+                    f"interrupted {journal_slot.state.replace('-', ' ')} requires "
+                    "wrkslots recover",
+                )
+                row["verdict"] = "BLOCKED"
+            rows.append(row)
+            running_agent_count += int(running)
+        try:
+            on_disk = {
+                entry.name
+                for entry in config.worktrees.iterdir()
+                if entry.is_dir() and not entry.is_symlink()
+            }
+        except OSError as exc:
+            raise Refusal(f"cannot enumerate worktree slots in {config.worktrees}: {exc}") from exc
+        registered = {record.slot for record in records}
+        for slot in sorted(on_disk - registered):
+            journal_slot = journal_slots.get(slot)
+            cache_bytes = 0
+            cache_error: str | None = None
+            try:
+                unregistered = (
+                    journal_slot
+                    if journal_slot is not None
+                    else CacheSlot(slot, config.machine, (), "unregistered")
+                )
+                cache_bytes = sum(
+                    _allocated_cache_bytes(config, cache)
+                    for cache in _cache_slot_directories(config, unregistered)
+                )
+            except Refusal as exc:
+                cache_error = str(exc)
+            rows.append(
+                {
+                    "slot": slot,
+                    "machine": None if journal_slot is None else journal_slot.machine,
+                    "agent": None,
+                    "verdict": "BLOCKED",
+                    "reasons": [
+                        (
+                            f"interrupted {journal_slot.state.replace('-', ' ')} requires "
+                            "wrkslots recover"
+                            if journal_slot is not None
+                            else "directory has no active registry row; inspect or import it"
+                        )
+                    ],
+                    "owner_state": (
+                        journal_slot.state
+                        if journal_slot is not None
+                        else "unregistered"
+                    ),
+                    "liveness_state": "unverifiable",
+                    "cache_bytes": cache_bytes,
+                    "cache_error": cache_error,
+                }
+            )
+        for journal_slot in sorted(journal_slots.values(), key=lambda item: item.slot):
+            if journal_slot.slot in registered or journal_slot.slot in on_disk:
+                continue
+            rows.append(
+                {
+                    "slot": journal_slot.slot,
+                    "machine": journal_slot.machine,
+                    "agent": None,
+                    "verdict": "BLOCKED",
+                    "reasons": [
+                        f"interrupted {journal_slot.state.replace('-', ' ')} requires "
+                        "wrkslots recover"
+                    ],
+                    "owner_state": journal_slot.state,
+                    "liveness_state": "unverifiable",
+                    "cache_bytes": 0,
+                    "cache_error": None,
+                }
+            )
+        worktree_count = len(on_disk)
+        disk = _disk_status(config)
+    sorted_rows = sorted(rows, key=lambda row: str(row["slot"]))
+    payload = {
+        "schema": SCHEMA,
+        "worktree_count": worktree_count,
+        "running_agent_count": running_agent_count,
+        "leak": worktree_count > running_agent_count,
+        "remote_refs_refreshed": False,
+        "disk": disk,
+        "slots": sorted_rows,
+    }
+    if args.format == "json":
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        print(
+            f"worktrees={worktree_count} running_agents={running_agent_count} "
+            f"leak={'yes' if payload['leak'] else 'no'} disk={disk['state']} "
+            f"free={_format_gib(_as_int(disk['free_bytes'], 'disk free bytes'))}"
+        )
+        for row in sorted_rows:
+            reasons = row["reasons"]
+            assert isinstance(reasons, list)
+            detail = "; ".join(str(reason) for reason in reasons) or "all removal proofs pass"
+            if row["cache_error"] is not None:
+                detail += f"; cache inspection: {row['cache_error']}"
+            print(f"{row['verdict']}: {row['slot']}: {detail}")
+    return 0
+
+
+def _cmd_unpushed(args: argparse.Namespace) -> int:
+    config = _load_config(args.project_root, args.machine)
+    if args.slot is not None:
+        _validate_name(args.slot, "slot")
+    with _locked(config.control / "ACTIVE", exclusive=False, wait_seconds=args.wait_lock):
+        _refuse_partial_state(config)
+        states, _archives = _validate_global_state(config)
+        _assert_registry_storage_consistent(config, states)
+        records = [
+            record
+            for state in states
+            if state.machine == config.machine
+            for record in state.slots
+            if args.slot is None or record.slot == args.slot
+        ]
+        rows: list[dict[str, object]] = []
+        vcs = GitVcs()
+        for record in records:
+            for checkout in record.checkouts:
+                path = _stored_path(config, checkout.path, "checkout path")
+                head = vcs.verify_existing_worktree(
+                    _repository_path(config, checkout.repository)[1], path
+                )
+                branch = vcs.branch(path)
+                if branch != checkout.branch:
+                    raise Refusal(
+                        f"checkout {checkout.name} branch changed: expected "
+                        f"{checkout.branch}, found {branch}; preserve it for inspection"
+                    )
+                if vcs.remote_url_sha256(path, checkout.remote) != checkout.remote_url_sha256:
+                    raise Refusal(
+                        f"checkout {checkout.name} remote {checkout.remote} URL changed"
+                    )
+                vcs.fetch_remote(path, checkout.remote, checkout.landed_ref)
+                if vcs.remote_url_sha256(path, checkout.remote) != checkout.remote_url_sha256:
+                    raise Refusal(
+                        f"checkout {checkout.name} remote {checkout.remote} URL changed during fetch"
+                    )
+                containing = vcs.remote_refs_containing(path, checkout.remote, head)
+                evidence = _unpushed_evidence(checkout, path, head, vcs)
+                rows.append(
+                    {
+                        "slot": record.slot,
+                        "checkout": checkout.name,
+                        "head": head,
+                        "state": "PUBLISHED" if containing else "UNPUSHED-OR-STALE",
+                        "containing_remote_refs": list(containing),
+                        "same_named_remote_ref": evidence["same_named_remote_ref"],
+                        "touched_files": evidence["touched_files"],
+                        "diagnostic_command": (
+                            None if containing else evidence["diagnostic_command"]
+                        ),
+                    }
+                )
+    payload = {"schema": SCHEMA, "slots": rows}
+    if args.format == "json":
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        for row in rows:
+            print(f"{row['state']}: {row['slot']}/{row['checkout']} HEAD={row['head']}")
+            if row["state"] == "UNPUSHED-OR-STALE":
+                if row["same_named_remote_ref"] is None:
+                    print("  no same-named remote ref exists; publish the branch")
+                else:
+                    print(
+                        f"  same-named remote ref={row['same_named_remote_ref']}; two readings: "
+                        "genuinely unpushed or stale after remote rebase"
+                    )
+                    print(
+                        f"  compare={row['diagnostic_command']} (empty output means content present)"
+                    )
+    return 0
+
+
+def _status_record(
+    config: Config, record: ActiveRecord, *, tolerate_hold_error: bool = False
+) -> dict[str, object]:
     process_state, process_detail = _process_state(record.owner)
     age, expired = _heartbeat_diagnosis(record)
     value = _record_to_obj(record)
@@ -3020,6 +4885,17 @@ def _status_record(record: ActiveRecord) -> dict[str, object]:
     value["owner_detail"] = process_detail
     value["heartbeat_age_seconds"] = int(age)
     value["heartbeat_expired"] = expired
+    try:
+        hold = _load_hold(config, record.slot, record.machine)
+        hold_error: str | None = None
+    except Refusal as exc:
+        if not tolerate_hold_error:
+            raise
+        hold = None
+        hold_error = str(exc)
+    value["held"] = hold is not None
+    value["hold_reason"] = None if hold is None else hold["reason"]
+    value["hold_error"] = hold_error
     return value
 
 
@@ -3048,6 +4924,10 @@ def _slot_findings(config: Config, states: Sequence[ActiveState]) -> list[dict[s
     for state in states:
         for record in state.slots:
             expected.add(record.slot)
+            try:
+                _load_hold(config, record.slot, record.machine)
+            except Refusal as exc:
+                note("invalid-hold", record.slot, state.machine, str(exc))
             slot_path = config.worktrees / record.slot
             if not slot_path.is_dir() or slot_path.is_symlink():
                 note(
@@ -3057,25 +4937,34 @@ def _slot_findings(config: Config, states: Sequence[ActiveState]) -> list[dict[s
                     f"active row but no slot directory at {slot_path}",
                 )
                 continue
-            try:
-                actual = {entry.name for entry in slot_path.iterdir()}
-            except OSError as exc:
-                note(
-                    "slot-unreadable", record.slot, state.machine,
-                    f"cannot inspect {slot_path}: {exc}",
-                )
-                continue
-            want = {checkout.name for checkout in record.checkouts}
-            for name in sorted(want - actual):
-                note(
-                    "missing-checkout", record.slot, state.machine,
-                    f"record names checkout {name!r} but it is not in the slot",
-                )
-            for name in sorted(actual - want):
-                note(
-                    "unexpected-entry", record.slot, state.machine,
-                    f"slot holds {name!r}, which its record does not name",
-                )
+            if config.layout == "flat":
+                if len(record.checkouts) != 1:
+                    note(
+                        "flat-layout-cardinality",
+                        record.slot,
+                        state.machine,
+                        "flat layout requires exactly one checkout",
+                    )
+            else:
+                try:
+                    actual = {entry.name for entry in slot_path.iterdir()}
+                except OSError as exc:
+                    note(
+                        "slot-unreadable", record.slot, state.machine,
+                        f"cannot inspect {slot_path}: {exc}",
+                    )
+                    continue
+                want = {checkout.name for checkout in record.checkouts}
+                for name in sorted(want - actual):
+                    note(
+                        "missing-checkout", record.slot, state.machine,
+                        f"record names checkout {name!r} but it is not in the slot",
+                    )
+                for name in sorted(actual - want):
+                    note(
+                        "unexpected-entry", record.slot, state.machine,
+                        f"slot holds {name!r}, which its record does not name",
+                    )
             process_state, process_detail = _process_state(record.owner)
             if process_state == "dead":
                 note(
@@ -3105,9 +4994,9 @@ def _slot_findings(config: Config, states: Sequence[ActiveState]) -> list[dict[s
     # `status` refuses outright on a partial atomic update. Diagnosis reports
     # it instead, because an operator looking at a wedged registry needs to see
     # the interrupted write alongside everything else, not in place of it.
-    leftovers = sorted(config.worktrees.glob("ACTIVE.*.json.tmp.*"))
-    leftovers += sorted(config.worktrees.glob("ARCHIVED.*.json.tmp.*"))
-    leftovers += sorted(config.worktrees.glob("ACTIVE.*.journal.tmp.*"))
+    leftovers = sorted(config.control.glob("ACTIVE.*.json.tmp.*"))
+    leftovers += sorted(config.control.glob("ARCHIVED.*.json.tmp.*"))
+    leftovers += sorted(config.control.glob("ACTIVE.*.journal.tmp.*"))
     for path in leftovers:
         note(
             "partial-atomic-update", None, None,
@@ -3129,7 +5018,7 @@ def _slot_findings(config: Config, states: Sequence[ActiveState]) -> list[dict[s
 def _cmd_doctor(args: argparse.Namespace) -> int:
     config = _load_config(args.project_root, args.machine)
     with _locked(
-        config.worktrees / "ACTIVE", exclusive=False, wait_seconds=args.wait_lock
+        config.control / "ACTIVE", exclusive=False, wait_seconds=args.wait_lock
     ):
         all_states, _archives = _validate_global_state(config)
         states = (
@@ -3139,7 +5028,9 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         )
         findings = _slot_findings(config, states)
         rows = [
-            _status_record(record) for state in states for record in state.slots
+            _status_record(config, record, tolerate_hold_error=True)
+            for state in states
+            for record in state.slots
         ]
     cap = config.max_active_slots
     if args.format == "json":
@@ -3149,6 +5040,8 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
                     "schema": SCHEMA,
                     "project_root": str(config.root),
                     "worktrees_dir": str(config.worktrees),
+                    "control_dir": str(config.control),
+                    "layout": config.layout,
                     "machines": [state.machine for state in states],
                     "active": rows,
                     "max_active_slots": cap,
@@ -3160,7 +5053,8 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         )
     else:
         print(
-            f"project={config.root} worktrees={config.worktrees} "
+            f"project={config.root} worktrees={config.worktrees} control={config.control} "
+            f"layout={config.layout} "
             f"active={len(rows)} cap={'none' if cap is None else cap} "
             f"findings={len(findings)}"
         )
@@ -3182,7 +5076,7 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
 def _cmd_status(args: argparse.Namespace) -> int:
     config = _load_config(args.project_root, args.machine)
     with _locked(
-        config.worktrees / "ACTIVE", exclusive=False, wait_seconds=args.wait_lock
+        config.control / "ACTIVE", exclusive=False, wait_seconds=args.wait_lock
     ):
         _refuse_partial_state(config)
         all_states, _archives = _validate_global_state(config)
@@ -3194,7 +5088,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
         )
         journals = [path.name for path in _outstanding_journals(config)]
         records = [
-            _status_record(record)
+            _status_record(config, record)
             for state in states
             for record in state.slots
             if args.slot is None or record.slot == args.slot
@@ -3206,6 +5100,8 @@ def _cmd_status(args: argparse.Namespace) -> int:
                     "schema": SCHEMA,
                     "project_root": str(config.root),
                     "worktrees_dir": str(config.worktrees),
+                    "control_dir": str(config.control),
+                    "layout": config.layout,
                     "machines": [state.machine for state in states],
                     "active": records,
                     "journals": journals,
@@ -3216,7 +5112,8 @@ def _cmd_status(args: argparse.Namespace) -> int:
         )
         return 0
     print(
-        f"project={config.root} worktrees={config.worktrees} "
+        f"project={config.root} worktrees={config.worktrees} control={config.control} "
+        f"layout={config.layout} "
         f"active={len(records)} journals={len(journals)}"
     )
     if journals:
@@ -3228,7 +5125,8 @@ def _cmd_status(args: argparse.Namespace) -> int:
         print(
             f"{value['machine']}/{value['slot']}: agent={value['agent']} task={value['task']} "
             f"generation={value['generation']} owner={owner_state} "
-            f"heartbeat_age={value['heartbeat_age_seconds']}s expired={'yes' if expired else 'no'}"
+            f"heartbeat_age={value['heartbeat_age_seconds']}s expired={'yes' if expired else 'no'} "
+            f"held={'yes' if value['held'] is True else 'no'}"
         )
     return 0
 
@@ -3341,15 +5239,19 @@ def _finish_remove_paths(
     if remaining:
         if not slot_path.is_dir() or slot_path.is_symlink():
             raise Refusal(f"partially removed slot directory is missing or unsafe: {slot_path}")
-        try:
-            actual = {entry.name for entry in slot_path.iterdir()}
-        except OSError as exc:
-            raise Refusal(f"cannot inspect interrupted slot {slot_path}: {exc}") from exc
-        expected = {item.name for item in remaining}
-        if actual != expected:
-            raise Refusal(
-                f"interrupted slot contents changed: expected {sorted(expected)}, found {sorted(actual)}"
-            )
+        if config.layout == "nested":
+            try:
+                actual = {entry.name for entry in slot_path.iterdir()}
+            except OSError as exc:
+                raise Refusal(f"cannot inspect interrupted slot {slot_path}: {exc}") from exc
+            expected = {item.name for item in remaining}
+            if actual != expected:
+                raise Refusal(
+                    f"interrupted slot contents changed: expected {sorted(expected)}, "
+                    f"found {sorted(actual)}"
+                )
+        elif len(remaining) != 1:
+            raise StateError("flat-layout removal has more than one remaining checkout")
         for checkout in remaining:
             current = _assert_checkout_safe(config, checkout, vcs)
             if current != checkout:
@@ -3364,6 +5266,8 @@ def _finish_remove_paths(
     for checkout in remaining:
         _relative, repository = _repository_path(config, checkout.repository)
         path = _stored_path(config, checkout.path, "checkout path")
+        for cache in _cache_directories_for_checkout(config, checkout):
+            _remove_cache_directory(config, cache)
         vcs.remove_worktree(repository, path)
         _interrupt_for_test("after-remove-before-journal")
         removed.add(checkout.name)
@@ -3432,6 +5336,7 @@ def _begin_finish(
 ) -> None:
     vcs = GitVcs()
     _load_archive(config)
+    _assert_not_held(config, record)
     _slot_path, final_checkouts = _remove_preconditions(config, record, vcs)
     final_record = dataclasses.replace(record, checkouts=final_checkouts)
     state = _replace_record(state, final_record)
@@ -3529,6 +5434,7 @@ def _cmd_remove(args: argparse.Namespace) -> int:
         _assert_caller_process(coordinator, "coordinator")
         if record.handoff is None:
             raise Refusal(f"slot {record.slot} has no recorded handoff")
+        _assert_not_held(config, record)
         _assert_registered_liveness(config, record)
         owner_state, detail = _process_state(record.owner)
         if record.owner is None and record.coordinator_recovery_note is None:
@@ -3552,9 +5458,9 @@ def _cmd_remove(args: argparse.Namespace) -> int:
 
 
 def _recover_partial_updates(config: Config, discard: bool) -> bool:
-    leftovers = sorted(config.worktrees.glob("ACTIVE.*.json.tmp.*"))
-    leftovers += sorted(config.worktrees.glob("ARCHIVED.*.json.tmp.*"))
-    leftovers += sorted(config.worktrees.glob("ACTIVE.*.journal.tmp.*"))
+    leftovers = sorted(config.control.glob("ACTIVE.*.json.tmp.*"))
+    leftovers += sorted(config.control.glob("ARCHIVED.*.json.tmp.*"))
+    leftovers += sorted(config.control.glob("ACTIVE.*.journal.tmp.*"))
     if not leftovers:
         return False
     if not discard:
@@ -3624,8 +5530,157 @@ def _recover_partial_updates(config: Config, discard: bool) -> bool:
     return True
 
 
+def _abort_create(
+    config: Config,
+    journal_path: Path,
+    slot: str,
+    plan: Sequence[PlannedCheckout],
+    recorded_created: Sequence[Checkout],
+) -> None:
+    slot_path = config.worktrees / slot
+    vcs = GitVcs()
+    recorded_by_name = {checkout.name: checkout for checkout in recorded_created}
+    if config.layout == "nested" and slot_path.exists():
+        if not slot_path.is_dir() or slot_path.is_symlink():
+            raise Refusal(f"cannot abort unsafe slot path: {slot_path}")
+        expected_entries = {
+            item.name
+            for item in plan
+            if _stored_path(config, item.destination, "checkout destination").exists()
+        }
+        actual_entries = {entry.name for entry in slot_path.iterdir()}
+        if actual_entries != expected_entries:
+            raise Refusal(
+                f"cannot abort slot with unexpected root contents: expected "
+                f"{sorted(expected_entries)}, found {sorted(actual_entries)}"
+            )
+    preflight: list[
+        tuple[
+            PlannedCheckout,
+            Path,
+            Path,
+            str,
+            bool,
+            Checkout | None,
+            tuple[CacheDirectory, ...],
+        ]
+    ] = []
+    for item in plan:
+        _relative, repository = _repository_path(config, item.repository)
+        destination = _stored_path(config, item.destination, "checkout destination")
+        recorded = recorded_by_name.get(item.name)
+        expected_head = item.start_point if recorded is None else recorded.head
+        if destination.exists() or destination.is_symlink():
+            if destination.is_symlink() or not destination.is_dir():
+                raise Refusal(f"cannot abort unsafe checkout path: {destination}")
+            head = vcs.verify_existing_worktree(repository, destination)
+            branch = vcs.branch(destination)
+            if head != expected_head or branch != item.branch:
+                raise Refusal(
+                    f"cannot abort changed checkout {item.name}: expected branch "
+                    f"{item.branch} at {expected_head}, found {branch} at {head}"
+                )
+            operation_paths = vcs.operation_paths(destination)
+            if operation_paths:
+                raise Refusal(
+                    f"cannot abort checkout {item.name} with an unfinished Git operation: "
+                    f"{operation_paths[0]}"
+                )
+            vcs.assert_ordinary_history(destination)
+            vcs.assert_ordinary_index(destination)
+            checkout = recorded or Checkout(
+                name=item.name,
+                path=item.destination,
+                repository=item.repository,
+                branch=item.branch,
+                start_point=item.start_point,
+                remote=item.remote,
+                remote_url_sha256=item.remote_url_sha256,
+                landed_ref=item.landed_ref,
+                head=expected_head,
+            )
+            _assert_cache_policy_untracked(config, checkout, vcs)
+            status = vcs.status(destination, _cache_globs_for(config, checkout.name))
+            if status:
+                first = status.splitlines()[0]
+                raise Refusal(
+                    f"cannot abort changed checkout {item.name}: source state is dirty "
+                    f"({first}); preserve it for inspection"
+                )
+            present = True
+            caches = _cache_directories_for_checkout(config, checkout)
+        elif destination.absolute() in vcs.listed_worktrees(repository):
+            raise Refusal(
+                f"cannot abort missing checkout still registered by Git: {destination}"
+            )
+        else:
+            present = False
+            checkout = None
+            caches = ()
+        if vcs.branch_exists(repository, item.branch):
+            branch_head = vcs.verify_ref(
+                repository, f"refs/heads/{item.branch}", "created branch"
+            )
+            if branch_head != expected_head:
+                raise Refusal(
+                    f"created branch {item.branch} moved from {expected_head} to "
+                    f"{branch_head}; preserve it instead of aborting provisioning"
+                )
+        preflight.append(
+            (item, repository, destination, expected_head, present, checkout, caches)
+        )
+    if slot_path.exists():
+        _assert_slot_unused(slot_path)
+    for item, repository, destination, expected_head, present, checkout, caches in preflight:
+        if present:
+            assert checkout is not None
+            head = vcs.verify_existing_worktree(repository, destination)
+            branch = vcs.branch(destination)
+            if head != expected_head or branch != item.branch:
+                raise Refusal(
+                    f"cannot abort changed checkout {item.name}: expected branch "
+                    f"{item.branch} at {expected_head}, found {branch} at {head}"
+                )
+            operation_paths = vcs.operation_paths(destination)
+            if operation_paths:
+                raise Refusal(
+                    f"cannot abort checkout {item.name} with an unfinished Git operation: "
+                    f"{operation_paths[0]}"
+                )
+            vcs.assert_ordinary_history(destination)
+            vcs.assert_ordinary_index(destination)
+            _assert_cache_policy_untracked(config, checkout, vcs)
+            status = vcs.status(destination, _cache_globs_for(config, checkout.name))
+            if status:
+                first = status.splitlines()[0]
+                raise Refusal(
+                    f"cannot abort changed checkout {item.name}: source state is dirty "
+                    f"({first}); preserve it for inspection"
+                )
+            for cache in caches:
+                _remove_cache_directory(config, cache)
+            vcs.remove_worktree(repository, destination)
+            _fsync_directory(config.worktrees)
+    for item, repository, _destination, expected_head, _present, _checkout, _caches in preflight:
+        vcs.delete_branch_at(repository, item.branch, expected_head)
+    if slot_path.exists():
+        try:
+            slot_path.rmdir()
+        except OSError as exc:
+            raise Refusal(f"cannot remove aborted slot directory {slot_path}: {exc}") from exc
+        _fsync_directory(config.worktrees)
+    _remove_control_file(journal_path)
+    print(f"aborted incomplete create slot={slot}; removed provisional worktrees and branches")
+
+
 def _recover_create(
-    config: Config, path: Path, raw: Mapping[str, object], state: ActiveState
+    config: Config,
+    path: Path,
+    raw: Mapping[str, object],
+    state: ActiveState,
+    *,
+    retry_running_hook: bool,
+    abort_create: bool,
 ) -> None:
     required = {
         "schema",
@@ -3643,7 +5698,13 @@ def _recover_create(
         "planned",
         "created",
     }
-    _exact_keys(raw, required, set(), "create journal")
+    optional = {
+        "post_provision_hooks",
+        "hook_progress",
+        "hook_failure",
+        "failure_policy",
+    }
+    _exact_keys(raw, required, optional, "create journal")
     machine = _as_str(raw["machine"], "create journal.machine")
     if machine != config.machine or path != _journal_path(config, machine):
         raise StateError(
@@ -3665,6 +5726,42 @@ def _recover_create(
             _as_list(raw["created"], "create journal.created")
         )
     )
+    journal_hooks = (
+        ()
+        if "post_provision_hooks" not in raw
+        else _string_tuple(
+            raw["post_provision_hooks"],
+            "create journal.post_provision_hooks",
+            _validate_hook,
+            unique=False,
+        )
+    )
+    if journal_hooks != config.post_provision_hooks:
+        raise StateError("create journal post-provision hooks differ from configuration")
+    hook_progress = _as_int(raw.get("hook_progress", 0), "create journal.hook_progress")
+    total_hook_steps = len(plan) * len(journal_hooks)
+    if hook_progress > total_hook_steps:
+        raise StateError("create journal hook progress exceeds its hook plan")
+    if "failure_policy" in raw and _as_str(
+        raw["failure_policy"], "create journal.failure_policy"
+    ) != "leave-for-inspection":
+        raise StateError("create journal has an unsupported hook failure policy")
+    hook_failure = raw.get("hook_failure")
+    failure: Mapping[str, object] | None = None
+    hook_failure_status: str | None = None
+    if hook_failure is not None:
+        failure = _as_mapping(hook_failure, "create journal.hook_failure")
+        _exact_keys(
+            failure,
+            {"checkout", "hook_index", "command", "status"},
+            {"returncode", "detail"},
+            "create journal.hook_failure",
+        )
+        hook_failure_status = _as_str(
+            failure["status"], "create journal.hook_failure.status"
+        )
+        if hook_failure_status not in {"running", "failed", "failed-to-start"}:
+            raise StateError("create journal has an unknown hook failure status")
     if not plan:
         raise StateError("create journal contains no planned checkouts")
     if len({item.name for item in plan}) != len(plan):
@@ -3675,6 +5772,55 @@ def _recover_create(
         item.name for item in plan[: len(recorded_created)]
     ]:
         raise StateError("create journal's completed checkouts are not a planned prefix")
+    if hook_progress > len(recorded_created) * len(journal_hooks):
+        raise StateError("create journal ran hooks for a checkout not durably recorded")
+    if failure is not None:
+        if not journal_hooks or hook_progress >= total_hook_steps:
+            raise StateError("create journal records a failed hook after hook completion")
+        if len(recorded_created) != len(plan):
+            raise StateError("create journal records a hook before every checkout was created")
+        expected_checkout = plan[hook_progress // len(journal_hooks)].name
+        expected_hook_index = hook_progress % len(journal_hooks)
+        failure_checkout = _as_str(
+            failure["checkout"], "create journal.hook_failure.checkout"
+        )
+        failure_hook_index = _as_int(
+            failure["hook_index"], "create journal.hook_failure.hook_index"
+        )
+        failure_command = _as_str(
+            failure["command"], "create journal.hook_failure.command"
+        )
+        if (
+            failure_checkout != expected_checkout
+            or failure_hook_index != expected_hook_index
+            or failure_command != journal_hooks[expected_hook_index]
+        ):
+            raise StateError("create journal hook failure does not match its progress")
+        if hook_failure_status == "running":
+            if "returncode" in failure or "detail" in failure:
+                raise StateError("running create hook records impossible completion details")
+            if not retry_running_hook and not abort_create:
+                raise Refusal(
+                    "the create journal records a hook that was running when provisioning "
+                    "stopped; it may already have completed. Inspect its effects, then rerun "
+                    "recover with --retry-running-hook to authorize another execution"
+                )
+        elif hook_failure_status == "failed":
+            returncode = failure.get("returncode")
+            if (
+                not isinstance(returncode, int)
+                or isinstance(returncode, bool)
+                or returncode == 0
+                or "detail" in failure
+            ):
+                raise StateError("failed create hook has invalid completion details")
+        elif (
+            "returncode" in failure
+            or not _as_str(
+                failure.get("detail"), "create journal.hook_failure.detail"
+            ).strip()
+        ):
+            raise StateError("failed-to-start create hook has invalid completion details")
     planned_by_name = {item.name: item for item in plan}
     for item in plan:
         expected_destination, _destination = _checkout_path(config, slot, item.name)
@@ -3748,6 +5894,14 @@ def _recover_create(
         raise StateError("create journal has no coordinator lease")
     existing_record = next((item for item in state.slots if item.slot == slot), None)
     if existing_record is not None:
+        if abort_create:
+            raise Refusal(
+                f"cannot abort create for slot {slot}: its ACTIVE row is already durable"
+            )
+        if hook_progress != total_hook_steps:
+            raise StateError(
+                "create journal reached ACTIVE publication before post-provision hooks completed"
+            )
         expected_record = ActiveRecord(
             slot=slot,
             agent=agent,
@@ -3780,11 +5934,14 @@ def _recover_create(
         _remove_control_file(path)
         print(f"recovered create: active state was durable; cleared journal for {slot}")
         return
+    if abort_create:
+        _abort_create(config, path, slot, plan, recorded_created)
+        return
     _assert_agent_and_slot_free(config, slot, agent)
     slot_path = config.worktrees / slot
     if slot_path.exists() and (not slot_path.is_dir() or slot_path.is_symlink()):
         raise Refusal(f"create recovery found an unsafe slot path: {slot_path}")
-    if not slot_path.exists():
+    if not slot_path.exists() and config.layout == "nested":
         slot_path.mkdir(mode=0o755)
         _fsync_directory(config.worktrees)
     vcs = GitVcs()
@@ -3832,13 +5989,32 @@ def _recover_create(
         updated_journal = dict(raw)
         updated_journal["created"] = [_checkout_to_obj(value) for value in created]
         _atomic_write_json(path, updated_journal)
-    actual = {entry.name for entry in slot_path.iterdir()}
-    expected = {item.name for item in plan}
-    if actual != expected:
-        raise Refusal(
-            f"create recovery found unexpected slot contents: expected {sorted(expected)}, "
-            f"found {sorted(actual)}"
-        )
+    if config.layout == "nested":
+        actual = {entry.name for entry in slot_path.iterdir()}
+        expected = {item.name for item in plan}
+        if actual != expected:
+            raise Refusal(
+                f"create recovery found unexpected slot contents: expected {sorted(expected)}, "
+                f"found {sorted(actual)}"
+            )
+    updated_journal = dict(raw)
+    updated_journal["created"] = [_checkout_to_obj(value) for value in created]
+    updated_journal["post_provision_hooks"] = list(journal_hooks)
+    updated_journal["hook_progress"] = hook_progress
+    updated_journal["hook_failure"] = None
+    updated_journal["failure_policy"] = "leave-for-inspection"
+    _atomic_write_json(path, updated_journal)
+    hook_progress = _run_post_provision_hooks(
+        config,
+        created,
+        path,
+        updated_journal,
+        start=hook_progress,
+    )
+    if hook_progress != total_hook_steps:
+        raise StateError("create recovery did not complete its post-provision hooks")
+    for checkout in created:
+        _assert_checkout_identity_unchanged(config, checkout, vcs)
     record = ActiveRecord(
         slot=slot,
         agent=agent,
@@ -3935,6 +6111,7 @@ def _recover_finish(
             f"coordinator process generation mismatch for slot {current.slot}"
         )
     _assert_caller_process(coordinator, "coordinator")
+    _assert_not_held(config, current)
     _assert_registered_liveness(config, current)
     owner_state, detail = _process_state(current.owner)
     if current.owner is None and current.coordinator_recovery_note is None:
@@ -3984,8 +6161,19 @@ def _cmd_recover(args: argparse.Namespace) -> int:
             )
             if journal_coordinator != coordinator:
                 raise Refusal("create recovery requires the recorded coordinator process")
-            _recover_create(config, path, raw, state)
+            _recover_create(
+                config,
+                path,
+                raw,
+                state,
+                retry_running_hook=args.retry_running_hook,
+                abort_create=args.abort_create,
+            )
         elif kind == "finish":
+            if args.retry_running_hook or args.abort_create:
+                raise Refusal(
+                    "--retry-running-hook and --abort-create apply only to create journals"
+                )
             _recover_finish(config, path, raw, state, coordinator)
         else:
             raise StateError(f"unknown recovery journal kind {kind!r}")
@@ -4023,10 +6211,13 @@ def _add_repo_options(parser: argparse.ArgumentParser) -> None:
 def _build_parser() -> argparse.ArgumentParser:
     description = """Safely manage opaque Git worktree slots with one active slot per agent.
 
-Read-only: status and import-existing without --apply.
+Read-only: status, doctor, audit, import-existing without --apply, and
+clean-caches without --only or --yes. unpushed refreshes remote-tracking refs
+but does not mutate registry state.
 Mutating: init, create, register, import-existing --apply, adopt,
-recover-unbound-owner, heartbeat, finish, remove, and recover. Every mutating command takes a state lock and
-atomically replaces the affected machine shard.
+recover-unbound-owner, heartbeat, hold, unhold, clean-caches deletion, finish,
+remove, and recover. Registry mutations take a state lock and atomically replace
+the affected machine shard.
 """
     epilog = """Lifecycle:
   wrkslots init --liveness-command ci-hub/health/agent_liveness_probe.py
@@ -4037,7 +6228,8 @@ atomically replaces the affected machine shard.
   wrkslots finish slot01 --agent codex-1 --owner-pid PID --expected-generation 1 \\
     --validation "exact command and result"
 
-finish proves clean index/tracked/untracked/ignored state, no unfinished Git
+finish proves clean index/tracked/untracked/ignored state outside configured
+regenerable cache paths, no unfinished Git
 operation, remote durability, exact landed ancestry, and path identity, then
 records the owner-alive handoff while retaining physical storage. remove is
 coordinator-only and proceeds only after the registered liveness command
@@ -4086,6 +6278,12 @@ Exit status: 0 success, 2 command-line usage, 3 fail-closed refusal.
     init.add_argument(
         "--worktrees-dir", default="worktrees", help="relative opaque directory (default: worktrees)"
     )
+    init.add_argument(
+        "--layout",
+        choices=("nested", "flat"),
+        default="nested",
+        help="nested puts repositories under each slot; flat makes one checkout the slot root",
+    )
     init.add_argument("--default-remote", default="origin")
     init.add_argument("--default-landed-ref", default="refs/remotes/origin/main")
     init.add_argument("--heartbeat-ttl-seconds", type=int, default=3600)
@@ -4101,6 +6299,27 @@ Exit status: 0 success, 2 command-line usage, 3 fail-closed refusal.
         help="refuse create/register beyond this many active slots on this machine "
         "(default: uncapped)",
     )
+    init.add_argument(
+        "--cache-glob",
+        action="append",
+        metavar="PATH-GLOB",
+        help="checkout-relative regenerable directory glob applied to every repository",
+    )
+    init.add_argument(
+        "--repo-cache-glob",
+        action="append",
+        metavar="NAME=PATH-GLOB",
+        help="regenerable directory glob applied only to repository NAME (repeatable)",
+    )
+    init.add_argument(
+        "--post-provision-hook",
+        action="append",
+        metavar="SHELL-COMMAND",
+        help="ordered shell command run in every new checkout (repeatable)",
+    )
+    init.add_argument("--disk-advisory-gib", type=int)
+    init.add_argument("--disk-provisioning-floor-gib", type=int)
+    init.add_argument("--disk-emergency-gib", type=int)
     init.add_argument(
         "--repair",
         action="store_true",
@@ -4132,6 +6351,23 @@ Exit status: 0 success, 2 command-line usage, 3 fail-closed refusal.
     doctor.add_argument("--format", choices=("human", "json"), default="human")
     doctor.set_defaults(handler=_cmd_doctor)
 
+    audit = subparsers.add_parser(
+        "audit",
+        description="read-only leak audit with per-slot deletion verdicts",
+        help="show leak counts and DELETABLE/BLOCKED/HELD verdicts",
+    )
+    audit.add_argument("--format", choices=("human", "json"), default="human")
+    audit.set_defaults(handler=_cmd_audit)
+
+    unpushed = subparsers.add_parser(
+        "unpushed",
+        description="report remote containment and two-readings evidence for every HEAD",
+        help="diagnose unpublished or stale-after-rebase local tips",
+    )
+    unpushed.add_argument("--slot")
+    unpushed.add_argument("--format", choices=("human", "json"), default="human")
+    unpushed.set_defaults(handler=_cmd_unpushed)
+
     create = subparsers.add_parser(
         "create",
         description="create fresh Git worktrees and register one active owner",
@@ -4153,6 +6389,11 @@ Exit status: 0 success, 2 command-line usage, 3 fail-closed refusal.
     )
     create.add_argument(
         "--start", action="append", metavar="NAME=REF", help="default: configured landed ref"
+    )
+    create.add_argument(
+        "--override-disk-floor",
+        action="store_true",
+        help="allow create below the provisioning floor, but never below the emergency floor",
     )
     create.set_defaults(handler=_cmd_create)
 
@@ -4222,6 +6463,40 @@ Exit status: 0 success, 2 command-line usage, 3 fail-closed refusal.
     heartbeat.add_argument("--expected-generation", type=int, required=True)
     heartbeat.set_defaults(handler=_cmd_heartbeat)
 
+    hold = subparsers.add_parser(
+        "hold",
+        description="protect one active slot from cache cleanup and removal",
+        help="protect a slot from cache cleanup and removal",
+    )
+    hold.add_argument("slot")
+    hold.add_argument("--reason", required=True)
+    hold.set_defaults(handler=_cmd_hold)
+
+    unhold = subparsers.add_parser(
+        "unhold",
+        description="release a slot hold",
+        help="release a slot hold",
+    )
+    unhold.add_argument("slot")
+    unhold.set_defaults(handler=_cmd_unhold)
+
+    clean_caches = subparsers.add_parser(
+        "clean-caches",
+        description=(
+            "report or remove configured regenerable cache directories without source/liveness gates"
+        ),
+        help="report or remove configured regenerable cache directories",
+    )
+    selection = clean_caches.add_mutually_exclusive_group()
+    selection.add_argument("--only", action="append", metavar="SLOT")
+    selection.add_argument(
+        "--yes",
+        action="store_true",
+        help="remove configured caches from every unheld active or unregistered slot",
+    )
+    clean_caches.add_argument("--format", choices=("human", "json"), default="human")
+    clean_caches.set_defaults(handler=_cmd_clean_caches)
+
     finish = subparsers.add_parser(
         "finish",
         description="prove landed safety and record the owner-alive handoff",
@@ -4256,6 +6531,17 @@ Exit status: 0 success, 2 command-line usage, 3 fail-closed refusal.
         action="store_true",
         help="discard an incomplete temp write only when its prior durable file is valid",
     )
+    create_recovery = recover.add_mutually_exclusive_group()
+    create_recovery.add_argument(
+        "--retry-running-hook",
+        action="store_true",
+        help="after inspection, rerun a hook whose journal status is ambiguously 'running'",
+    )
+    create_recovery.add_argument(
+        "--abort-create",
+        action="store_true",
+        help="after inspection, remove an incomplete create's unchanged worktrees and branches",
+    )
     recover.set_defaults(handler=_cmd_recover)
     return parser
 
@@ -4276,6 +6562,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             parser.error("init uses its DIRECTORY argument, not --project-root")
         if args.max_active_slots is not None and args.max_active_slots < 0:
             parser.error("--max-active-slots must be non-negative")
+        for option, value in (
+            ("--disk-advisory-gib", args.disk_advisory_gib),
+            ("--disk-provisioning-floor-gib", args.disk_provisioning_floor_gib),
+            ("--disk-emergency-gib", args.disk_emergency_gib),
+        ):
+            if value is not None and value <= 0:
+                parser.error(f"{option} must be positive")
     handler = getattr(args, "handler", None)
     if handler is None:
         parser.print_help()

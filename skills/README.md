@@ -15,7 +15,7 @@ Each tool skill points to the installed command's quickstart, help, and embedded
 - `agent-team-timeline` — archive and visualize coordinator and subagent activity.
 - `herdr-run` — run an allowlisted command in a Herdr pane, outside whatever constrains the caller; a sandboxed agent's blocked `git` is one case, not the definition.
 - `herdr-agent` — durably deliver and inspect prompts for an interactive agent in a Herdr pane.
-- `wrkslots` — manage one isolated Git worktree slot per active agent, record its handoff, and remove it only after verified owner absence.
+- `wrkslots` — provision and audit isolated Git worktree slots, protect or reclaim their caches, record handoff, and remove source only after verified owner absence.
 
 ## Install in an agent harness
 
