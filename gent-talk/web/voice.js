@@ -3562,6 +3562,11 @@ function renderChannelRows() {
     // The place the reader asked to come back to, marked on the row itself so it is findable by
     // eye once they are near it.
     row.setAttribute("data-marked", placeMarker === id ? "true" : "false");
+    // IS THIS MESSAGE ITSELF AN ANSWER? The opposite direction from `data-replied`, and the more
+    // reliable one: that is derived from whatever happens to be loaded and misses an answer
+    // further back than the window, whereas the pointer for this is ON the message. Correct
+    // whether or not the message it answers is anywhere on screen.
+    row.setAttribute("data-is-reply", row.getAttribute("data-reply-to") ? "true" : "false");
     // WHICH ROW IS SPEAKING. Without it the reader taps, waits, and has nothing but the sound to
     // tell them which message they hit — on a list where the next act archives it.
     row.setAttribute("data-reading", isReading ? "true" : "false");
@@ -4221,6 +4226,24 @@ function discordNode(message) {
   li.setAttribute("data-author-bot", message.author_is_bot ? "true" : "false");
   const meta = document.createElement("div");
   meta.className = "meta";
+  // The reply mark, FIRST in the meta line so it lands at the row's upper-left corner.
+  //
+  // A span with an accessible name rather than a bare glyph: an arrow on its own is announced as
+  // "left arrow", or as nothing, and neither says "this is a reply". The glyph is `aria-hidden` so
+  // a screen reader reads the name and not the character beside it.
+  if (message.reply_to) {
+    const mark = document.createElement("span");
+    mark.className = "reply-mark";
+    mark.setAttribute("title", "a reply");
+    const glyph = document.createElement("span");
+    glyph.setAttribute("aria-hidden", "true");
+    glyph.textContent = "↩";
+    const said = document.createElement("span");
+    said.className = "sr-only";
+    said.textContent = "reply. ";
+    mark.append(glyph, said);
+    meta.append(mark);
+  }
   const author = document.createElement("span");
   // An author name is channel data too, and a display name can be anything at all.
   author.textContent = message.author_is_bot ? `${message.author} (bot)` : String(message.author);

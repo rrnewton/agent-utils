@@ -5618,6 +5618,48 @@ test("...and there is exactly ONE place, because a list of them is a second inbo
   assert.equal(rowState(page, 1).marked, "true");
 });
 
+test("A MESSAGE THAT IS ITSELF A REPLY SAYS SO", async () => {
+  // The channel already derived the OPPOSITE direction — `data-replied` marks a message somebody
+  // answered — and had nothing for "this one is an answer", even though the pointer was already on
+  // the row. #97 reply-indicator.
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [
+    message({ id: "1000000000000000001", content: "is the runner wedged?" }),
+    message({ id: "1000000000000000002", content: "restarted it", reply_to: "1000000000000000001" }),
+  ]);
+
+  assert.equal(rowState(page, 0).isReply, "false", "the question was marked as an answer");
+  assert.equal(rowState(page, 1).isReply, "true", "the answer is not marked at all");
+
+  const mark = row(page, 1).descendants().find((n) => n.className === "reply-mark");
+  assert.ok(mark, "there is no mark on the row, only an attribute nobody can see");
+  assert.equal(
+    row(page, 0).descendants().filter((n) => n.className === "reply-mark").length,
+    0,
+    "every row carries a reply mark"
+  );
+
+  // A bare arrow is announced as "left arrow" or as nothing, and neither says "reply".
+  assert.match(mark.text(), /reply/i, "the mark has no accessible name");
+});
+
+test("...and it is correct even when the message it answers is not loaded", async () => {
+  // This is why it is worth its own signal rather than being inferred from the list. `data-replied`
+  // is DERIVED from what happens to be loaded and misses an answer further back than the window;
+  // this pointer is on the message itself.
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [
+    message({ id: "1000000000000000002", content: "restarted it", reply_to: "999999999999999999" }),
+  ]);
+  assert.equal(
+    rowState(page, 0).isReply,
+    "true",
+    "a reply to something outside the window stopped looking like a reply"
+  );
+});
+
 test("the channel spends its width on words, not on insets", async () => {
   // 15% of a 393-pixel phone, on every row, bought what the speaker COLOUR now buys.
   const mine = cssBlock('#discord-log li.discord-message[data-who="me"]');
@@ -8343,6 +8385,7 @@ const rowState = (page, i) => ({
   ownRead: row(page, i).getAttribute("data-own-read"),
   pending: row(page, i).getAttribute("data-pending"),
   marked: row(page, i).getAttribute("data-marked"),
+  isReply: row(page, i).getAttribute("data-is-reply"),
 });
 
 /** Two messages where the second answers the first, as Discord records a reply. */
@@ -8365,11 +8408,11 @@ test("A MESSAGE SOMEBODY HAS ANSWERED IS DIMMED; AN UNANSWERED ONE IS NOT", asyn
 
   // Both axes named, because they are independent: being ANSWERED is derived from what happens to
   // be loaded, being ARCHIVED is the reader's own declaration, and neither implies the other.
-  assert.deepStrictEqual(rowState(page, 0), { replied: "true", archived: "false", reading: "false", ownRead: "false", pending: "false", marked: "false" });
+  assert.deepStrictEqual(rowState(page, 0), { replied: "true", archived: "false", reading: "false", ownRead: "false", pending: "false", marked: "false", isReply: "false" });
   // The ANSWER is not itself answered. Discord marks only the answering message, so a naive
   // implementation that set the flag on whichever row carried a pointer would dim this one.
-  assert.deepStrictEqual(rowState(page, 1), { replied: "false", archived: "false", reading: "false", ownRead: "false", pending: "false", marked: "false" });
-  assert.deepStrictEqual(rowState(page, 2), { replied: "false", archived: "false", reading: "false", ownRead: "false", pending: "false", marked: "false" });
+  assert.deepStrictEqual(rowState(page, 1), { replied: "false", archived: "false", reading: "false", ownRead: "false", pending: "false", marked: "false", isReply: "true" });
+  assert.deepStrictEqual(rowState(page, 2), { replied: "false", archived: "false", reading: "false", ownRead: "false", pending: "false", marked: "false", isReply: "false" });
 
   // And it is DRAWN, not merely recorded in an attribute.
   const dimmed = cssBlock('#discord-log li.discord-message[data-replied="true"]');
