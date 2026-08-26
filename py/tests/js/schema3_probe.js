@@ -19,6 +19,49 @@
 const assert = require("assert");
 const fs = require("fs");
 const path = require("path");
+const zlib = require("zlib");
+
+// The shipped page runs in a browser, while these tests deliberately run its reader functions
+// under Node.js. Supply the browser interfaces from Node's standard library so the harness is the
+// same on Node.js 16 and newer, and still exercises app.js's own inflateGzipMember body instead of
+// skipping it or substituting a different reader.
+global.Blob = require("buffer").Blob;
+global.Response = class Response {
+  constructor(body) {
+    this.body = body;
+  }
+
+  async arrayBuffer() {
+    const reader = this.body.getReader();
+    const chunks = [];
+    for (;;) {
+      const item = await reader.read();
+      if (item.done) {
+        break;
+      }
+      chunks.push(Buffer.from(item.value));
+    }
+    const buffer = Buffer.concat(chunks);
+    return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
+  }
+};
+const { TransformStream } = require("stream/web");
+global.DecompressionStream = class DecompressionStream {
+  constructor(format) {
+    assert.strictEqual(format, "gzip");
+    const chunks = [];
+    const stream = new TransformStream({
+      transform(chunk) {
+        chunks.push(Buffer.from(chunk));
+      },
+      flush(controller) {
+        controller.enqueue(zlib.gunzipSync(Buffer.concat(chunks)));
+      }
+    });
+    this.readable = stream.readable;
+    this.writable = stream.writable;
+  }
+};
 
 const APP_PATH = path.resolve(
   __dirname,

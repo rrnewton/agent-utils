@@ -15,6 +15,7 @@
 
 const assert = require("assert");
 const fs = require("fs");
+const http = require("http");
 
 const { loadReader } = require("./schema3_probe.js");
 
@@ -25,7 +26,44 @@ assert.ok(baseUrl, "usage: schema3_http_probe.js <base-url> <request.json>");
 //: Count what crosses the wire, and against which path, so the Python side can assert on the
 //: shape of the traffic and not merely on the answer.
 const traffic = [];
-const nativeFetch = global.fetch;
+const nativeFetch = function (url, init) {
+  return new Promise(function (resolve, reject) {
+    const request = http.request(url, {
+      method: "GET",
+      headers: (init && init.headers) || {}
+    }, function (response) {
+      const chunks = [];
+      response.on("data", function (chunk) { chunks.push(Buffer.from(chunk)); });
+      response.on("end", function () {
+        const buffer = Buffer.concat(chunks);
+        resolve({
+          ok: response.statusCode >= 200 && response.statusCode < 300,
+          status: response.statusCode,
+          statusText: response.statusMessage || "",
+          headers: {
+            get: function (name) {
+              const value = response.headers[String(name).toLowerCase()];
+              if (Array.isArray(value)) {
+                return value.join(", ");
+              }
+              return value === undefined ? null : String(value);
+            }
+          },
+          arrayBuffer: async function () {
+            return buffer.buffer.slice(
+              buffer.byteOffset,
+              buffer.byteOffset + buffer.byteLength
+            );
+          },
+          text: async function () { return buffer.toString("utf8"); },
+          json: async function () { return JSON.parse(buffer.toString("utf8")); }
+        });
+      });
+    });
+    request.on("error", reject);
+    request.end();
+  });
+};
 global.fetch = async function (url, init) {
   const absolute = new URL(url, baseUrl).href;
   const response = await nativeFetch(absolute, init);
