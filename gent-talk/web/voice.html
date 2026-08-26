@@ -1103,7 +1103,7 @@
           voice agent and being read a channel message are two different things to want, and the
           one you want is decided by which list you are looking at.
         -->
-        <button id="read-aloud" class="control control-talk" type="button" aria-pressed="false" hidden>
+        <button id="read-aloud" class="control control-read" type="button" aria-pressed="false" hidden>
           <span class="control-ring" aria-hidden="true"></span>
           <svg
             class="control-icon"
@@ -1121,6 +1121,39 @@
           </svg>
           <span id="read-aloud-label" class="control-label">Read</span>
         </button>
+
+        <!--
+          Reading pace, beside the control it acts on. A popover rather than a fourth control in
+          the bar: it is adjusted rarely and read never, so it should not hold a permanent tile.
+        -->
+        <button id="read-speed" class="control control-read" type="button" hidden
+                aria-haspopup="dialog" aria-expanded="false">
+          <svg class="control-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none"
+               stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M4 18a9 9 0 1 1 16 0" />
+            <path d="M12 14l4.5-4.5" />
+          </svg>
+          <span id="read-speed-label" class="control-label">Pace</span>
+        </button>
+
+        <!--
+          Anchored to the dock rather than to the row, because it belongs to the MODE and not to
+          any one message. `hidden` until asked for.
+        -->
+        <div id="speed-popover" class="popover" role="dialog" aria-label="Reading pace" hidden>
+          <label id="speed-value" for="read-speed-range">Pace</label>
+          <input
+            id="read-speed-range"
+            type="range"
+            min="50"
+            max="200"
+            step="5"
+            aria-label="reading pace, percent of the agent's own"
+          />
+          <p class="hint">
+            Unset, a message is read at whatever pace the voice agent is configured with.
+          </p>
+        </div>
 
         <button id="talk" class="control control-talk" type="button">
           <span class="control-ring" aria-hidden="true"></span>

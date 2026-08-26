@@ -21,8 +21,8 @@ use async_trait::async_trait;
 
 use super::http::{signed_url_request, speech_request, TTS_CONTENT_TYPE};
 use super::{
-    configured_voice, credentials, speech_key, voice_source_agent, SignedUrl, SignedUrlError,
-    SignedUrlProvider, Speech, SpeechError, SpeechProvider,
+    clamp_speed, configured_voice, credentials, speech_key, voice_source_agent, SignedUrl,
+    SignedUrlError, SignedUrlProvider, Speech, SpeechError, SpeechProvider,
 };
 use crate::config::ElevenLabsConfig;
 
@@ -60,6 +60,8 @@ struct State {
     /// Every text this fake was asked to read, in order, so a test can prove WHAT was spoken --
     /// and that a refusal spoke nothing.
     spoken: Vec<String>,
+    /// The speed asked for on each of those, after clamping.
+    speeds: Vec<Option<f64>>,
     /// Every URL this fake was asked to fetch, in order. Lets a test prove a mint did NOT happen.
     requested: Vec<String>,
     minted_url: String,
@@ -74,6 +76,12 @@ impl FakeElevenLabs {
     #[must_use]
     pub fn spoken(&self) -> Vec<String> {
         self.lock().spoken.clone()
+    }
+
+    /// The speed each of those was asked for, after clamping. `None` means the agent's own.
+    #[must_use]
+    pub fn speeds(&self) -> Vec<Option<f64>> {
+        self.lock().speeds.clone()
     }
 }
 
@@ -97,6 +105,7 @@ impl FakeElevenLabs {
                 known_agents,
                 known_voices,
                 spoken: Vec::new(),
+                speeds: Vec::new(),
                 requested: Vec::new(),
                 minted_url: MINTED_URL.to_owned(),
                 fail_with: None,
@@ -142,7 +151,12 @@ impl FakeElevenLabs {
 
 #[async_trait]
 impl SpeechProvider for FakeElevenLabs {
-    async fn speak(&self, config: &ElevenLabsConfig, text: &str) -> Result<Speech, SpeechError> {
+    async fn speak(
+        &self,
+        config: &ElevenLabsConfig,
+        text: &str,
+        speed: Option<f64>,
+    ) -> Result<Speech, SpeechError> {
         // Same gate the real client goes through, first, so an unconfigured server cannot be made
         // to look configured by swapping in this fake.
         let api_key = speech_key(config)?;
@@ -197,6 +211,7 @@ impl SpeechProvider for FakeElevenLabs {
             ));
         }
         self.lock().spoken.push(text.to_owned());
+        self.lock().speeds.push(clamp_speed(speed));
         Ok(Speech {
             audio: fake_audio(text),
             content_type: TTS_CONTENT_TYPE.to_owned(),

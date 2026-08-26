@@ -1045,6 +1045,8 @@ function newPage(store = new Map(), script = SCRIPT) {
     restoreCalls: [],
     /** Which message ids were sent to the voice service, in order. */
     speakCalls: [],
+    /** The full path of each read, so a test can see the pace that travelled with it. */
+    speakPaths: [],
     /** Set to a status to make every read-aloud fail that way. */
     speakStatus: 0,
     /** Every player the page built, so a test can end one and see what follows. */
@@ -1371,9 +1373,10 @@ function newPage(store = new Map(), script = SCRIPT) {
       }
       // Read-aloud. Bytes rather than JSON, and RECORDED, so a test can prove which message was
       // sent to the vendor and that a refusal sent none.
-      const wantsSpeech = /\/messages\/([^/]+)\/speak$/.exec(String(path));
+      const wantsSpeech = /\/messages\/([^/]+)\/speak(?:\?|$)/.exec(String(path));
       if (wantsSpeech) {
         page.speakCalls.push(wantsSpeech[1]);
+        page.speakPaths.push(String(path));
         if (page.speakStatus) {
           return json(page.speakStatus, {
             error: "elevenlabs_not_configured",
@@ -1732,6 +1735,12 @@ const TUNING_BANDS = {
     "they belong to and one message fills the screen"],
   DEFAULT_MSG_SCALE: [80, 150,
     "what an unconfigured reader gets, and it has to be a size that is actually offered"],
+  MIN_READ_SPEED: [25, 100,
+    "the slowest a message may be read, as a percentage of the agent's own pace. Much below half " +
+    "and the words stop being words, which is a vendor request nobody wanted to pay for"],
+  MAX_READ_SPEED: [110, 400,
+    "the fastest. Past about double, the audio outruns being able to follow it, and the reader " +
+    "taps again rather than listening"],
   HOLD_MS: [250, 1500,
     "how long a finger rests before the row shows who sent it and when. Below about a quarter of " +
     "a second an ordinary tap becomes a hold and the message stops folding; past a second and a " +
@@ -5030,6 +5039,80 @@ test("tapping the message that is PLAYING stops it, and stopping archives nothin
   // The object URL is released; this mode fetches one per message and never revoking them is a
   // leak that grows with the backlog.
   assert.equal(page.revokedUrls.length, 1, "the audio URL was never released");
+});
+
+test("THE MESSAGE BEING READ STAYS OPEN ACROSS THE POLL THAT REBUILDS THE LIST", async () => {
+  // The owner watched a message he was listening to collapse mid-read and assumed a stray tap. It
+  // was not. The channel re-reads itself every DISCORD_POLL_MS, `applyNewestPage` rebuilds every
+  // row, and a freshly built row starts FOLDED — so a long message folded itself on the next poll,
+  // every time, while its own audio was still playing.
+  const page = newPage();
+  await signIn(page);
+  const rows = await inReadingMode(page, [
+    message({ id: "1000000000000000001", content: "w".repeat(4000) }),
+  ]);
+
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  assert.equal(row(page, 0).getAttribute("data-collapsed"), "false", "reading did not open it");
+
+  // The poll, exactly as it happens on its own.
+  await page.el("refresh-discord").click();
+  await page.settle();
+
+  assert.equal(rowState(page, 0).reading, "true", "the rebuild lost track of what was playing");
+  assert.equal(
+    row(page, 0).getAttribute("data-collapsed"),
+    "false",
+    "the message being read folded itself under the reader"
+  );
+});
+
+test("the row being read says so where its author was", async () => {
+  const page = newPage();
+  await signIn(page);
+  const rows = await inReadingMode(page, [
+    message({ id: "1000000000000000001", author: "alice", author_is_bot: false }),
+  ]);
+
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  const mark = row(page, 0).descendants().find((n) => n.className === "msg-author reading-mark");
+  assert.ok(mark, "nothing in the row says it is the one being read");
+  assert.equal(mark.text(), "reading");
+
+  // ...and it goes back to naming the author once the audio is done.
+  await page.players[0].end();
+  await page.settle();
+  assert.match(row(page, 0).text(), /alice/, "the author never came back");
+  assert.doesNotMatch(row(page, 0).text(), /reading/, "the row still claims to be playing");
+});
+
+test("the reading pace is the AGENT'S until the reader chooses one", async () => {
+  const page = newPage();
+  await signIn(page);
+  const rows = await inReadingMode(page, [message({ id: "1000000000000000001" })]);
+
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  assert.equal(
+    page.speakPaths[0].includes("speed="),
+    false,
+    "an unset pace sent 100%, overriding an agent configured to speak faster"
+  );
+
+  page.el("read-speed-range").value = "150";
+  await page.el("read-speed-range").dispatch("input", {});
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  assert.match(
+    page.speakPaths[page.speakPaths.length - 1],
+    /speed=1\.50/,
+    `the chosen pace never reached the server; paths=${JSON.stringify(page.speakPaths)}`
+  );
+  assert.equal(page.storage.get("gent-talk.voice.read-speed"), "150", "the pace was not kept");
 });
 
 test("with reading mode OFF a tap folds the message and speaks nothing", async () => {
@@ -9046,10 +9129,17 @@ test("THERE IS EXACTLY ONE COMPOSER, AND IT IS IN THE BAR", () => {
     assert.equal(PAGE_IDS.has(dead), false, `the dock composer's #${dead} is still in the page`);
   }
   const dock = HTML.slice(HTML.indexOf('id="dock"'));
+  // TEXT inputs, not every input. The claim is that there is one place to TYPE — a range slider
+  // for the reading pace lives in the dock too and is not a second composer. Counting every
+  // `<input>` made this test fail for a control nobody could type into, which would have pushed
+  // the next person to weaken the assertion rather than sharpen it.
+  const typeable = (dock.match(/<input[^>]*>/g) || []).filter(
+    (tag) => !/type="(range|checkbox|radio|button)"/.test(tag)
+  );
   assert.equal(
-    (dock.match(/<input/g) || []).length,
+    typeable.length,
     1,
-    "the dock holds more than one text input, so there are two composers"
+    `the dock holds more than one text input, so there are two composers: ${typeable}`
   );
   // The one that is left is inside the bar, between the pack and the switch.
   const bar = barSlice();

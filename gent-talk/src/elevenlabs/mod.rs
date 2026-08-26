@@ -226,6 +226,26 @@ pub fn speech_from_signed(error: SignedUrlError) -> SpeechError {
     }
 }
 
+/// How a voice should sound, as the configured agent already sounds.
+///
+/// Read-aloud borrows the agent's whole delivery, not merely its voice id. The owner set his agent
+/// to speak faster than default and then heard read-aloud speak at default -- correctly, because
+/// nothing was carrying the speed across. A voice at the wrong pace is a different voice.
+///
+/// Every field is optional and an absent one is simply not sent, so the vendor's own default
+/// applies. This never invents a value.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct VoiceStyle {
+    /// The synthesis model the agent uses.
+    pub model_id: Option<String>,
+    /// 1.0 is the vendor's default; below is slower, above is faster.
+    pub speed: Option<f64>,
+    /// How consistent the delivery is between generations.
+    pub stability: Option<f64>,
+    /// How closely the output tracks the original voice.
+    pub similarity_boost: Option<f64>,
+}
+
 /// Audio for one message, as the vendor returned it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Speech {
@@ -244,7 +264,35 @@ pub trait SpeechProvider: Send + Sync {
     ///
     /// Returns [`SpeechError`] when a setting is absent, the text is empty, the request fails, or
     /// ElevenLabs refuses.
-    async fn speak(&self, config: &ElevenLabsConfig, text: &str) -> Result<Speech, SpeechError>;
+    ///
+    /// `speed` overrides whatever the agent is configured with, for a reader who wants this
+    /// particular pass faster or slower. `None` means "however the agent speaks".
+    async fn speak(
+        &self,
+        config: &ElevenLabsConfig,
+        text: &str,
+        speed: Option<f64>,
+    ) -> Result<Speech, SpeechError>;
+}
+
+/// The speeds this server will ask a vendor for.
+///
+/// Bounded because the reader drives it from a slider and the vendor charges per request: below a
+/// half the words stop being words, and above double the audio is faster than it can be followed,
+/// so both ends are a request nobody wanted to pay for.
+pub const MIN_SPEECH_SPEED: f64 = 0.5;
+/// See [`MIN_SPEECH_SPEED`].
+pub const MAX_SPEECH_SPEED: f64 = 2.0;
+
+/// Clamp a requested speed into the range this server will ask for, or drop it if it is not a
+/// number at all.
+#[must_use]
+pub fn clamp_speed(speed: Option<f64>) -> Option<f64> {
+    let value = speed?;
+    if !value.is_finite() {
+        return None;
+    }
+    Some(value.clamp(MIN_SPEECH_SPEED, MAX_SPEECH_SPEED))
 }
 
 /// A minted, short-lived conversation URL.

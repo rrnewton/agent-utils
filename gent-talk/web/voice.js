@@ -27,6 +27,7 @@ const TOKEN_KEY = "gent-talk.token"; // shared with the main app on purpose.
 const MIC_SETTINGS_KEY = "gent-talk.voice.mic";
 const WIDTH_KEY = "gent-talk.voice.width";
 const MSG_SCALE_KEY = "gent-talk.voice.msg-scale";
+const READ_SPEED_KEY = "gent-talk.voice.read-speed";
 
 const el = (id) => document.getElementById(id);
 
@@ -2723,8 +2724,14 @@ function renderControls() {
   // starting audio playback over it, would both be worse than the swap.
   const reading = currentView === "discord" && !live;
   el("read-aloud").hidden = !reading;
+  el("read-speed").hidden = !reading;
   el("read-aloud").setAttribute("aria-pressed", readingMode ? "true" : "false");
   el("read-aloud-label").textContent = readingMode ? "Reading" : "Read";
+  // The popover belongs to a control that is on screen. Leaving it open over the transcript would
+  // be a dialog about a mode the reader has left.
+  if (!reading) {
+    closeSpeedPopover();
+  }
   el("speaker").hidden = chat;
   el("talk").hidden = chat || reading;
   el("hang-up").hidden = !live;
@@ -3360,10 +3367,18 @@ function noteAuthor(id, name, isBot) {
  * `children` keeps it to the same handful of DOM operations the rest of this page uses.
  */
 function childByClass(row, className) {
+  // Matched among the element's classes rather than against the whole attribute. The row being
+  // read carries `msg-author reading-mark`, and an exact-string match stopped finding it the
+  // moment the second class was added -- so the label could be set to "reading" and never set
+  // back, which is precisely the bug that reached the suite.
+  const has = (node) =>
+    String(node.className || "")
+      .split(/\s+/)
+      .includes(className);
   const stack = [...(row.children || [])];
   while (stack.length > 0) {
     const node = stack.pop();
-    if (node.className === className) {
+    if (has(node)) {
       return node;
     }
     if (node.children) {
@@ -3374,6 +3389,12 @@ function childByClass(row, className) {
 }
 
 const doneButtonOf = (row) => childByClass(row, "done-button");
+
+/** How a row names its author: the display name, and `(bot)` when it is one. */
+function authorLabel(row) {
+  const name = row.getAttribute("data-author") || "";
+  return row.getAttribute("data-author-bot") === "true" ? `${name} (bot)` : name;
+}
 
 function renderChannelRows() {
   const list = el("discord-log");
@@ -3420,21 +3441,40 @@ function renderChannelRows() {
     // to see what they had archived, and no way to change their mind about it.
     const isArchived = archivedIds.has(id);
     row.setAttribute("data-archived", isArchived ? "true" : "false");
+    const isReading = nowPlaying !== null && nowPlaying.id === id;
     // WHICH ROW IS SPEAKING. Without it the reader taps, waits, and has nothing but the sound to
     // tell them which message they hit — on a list where the next act archives it.
-    row.setAttribute(
-      "data-reading",
-      nowPlaying !== null && nowPlaying.id === id ? "true" : "false"
-    );
+    row.setAttribute("data-reading", isReading ? "true" : "false");
+    // THE ROW BEING READ STAYS OPEN.
+    //
+    // The owner watched a message he was listening to collapse mid-read and assumed a stray tap.
+    // It was not: the channel re-reads itself every DISCORD_POLL_MS, `applyNewestPage` rebuilds
+    // every row, and a freshly built row starts folded. So a long message being read aloud folded
+    // itself on the next poll, every time, while its own audio was still playing. Hearing the
+    // whole message and being shown a clamped third of it is the wrong pair.
+    const entry = foldables.find((held) => held.li === row);
+    if (isReading && entry && isFolded(entry)) {
+      setFolded(entry, false);
+    }
+
     // The row's own way back, labelled for what it will DO rather than for what the row is. In the
     // To do filter an archived row is never on screen, so this only ever reads "Done" there.
     // WHO, printed only where the colour cannot say it. `me` and `coder` are drawn as the
     // transcript's two speakers, so their names are a line of chrome restating what the row's own
     // colour already said. A third party is one of many and has to be named.
     const who = row.getAttribute("data-who");
-    const author = childByClass(row, "msg-author");
-    if (author) {
-      author.hidden = who === "me" || who === "coder";
+    // THE AUTHOR LINE, decided ONCE. It used to be set twice — the name here and `reading` in a
+    // later block — and the later write is the one that lost, so the row being read never said so.
+    //
+    // While the audio runs, `reading` replaces the name: that is the fact the reader wants at a
+    // glance on a list where the next thing that happens is the row archiving itself. It is shown
+    // even for a principal whose colour already names them, because hiding it would leave the row
+    // saying nothing at all.
+    const named = childByClass(row, "msg-author");
+    if (named) {
+      named.className = isReading ? "msg-author reading-mark" : "msg-author";
+      named.textContent = isReading ? "reading" : authorLabel(row);
+      named.hidden = !isReading && (who === "me" || who === "coder");
     }
     const done = doneButtonOf(row);
     if (done) {
@@ -3505,6 +3545,50 @@ function toggleMessageDetails(li, message) {
 // failed to fetch, or that the reader stopped two seconds in — which is the one thing this mode
 // must not do, because the archive is how they know what is left.
 
+/**
+ * How fast a message is read, as a PERCENTAGE, or null for "however the agent speaks".
+ *
+ * Null is a real value and not zero: the owner set his agent to speak faster than default, and the
+ * right behaviour with no preference expressed is to match it rather than to impose 100%. The
+ * server borrows the agent's pace when this sends nothing.
+ *
+ * The bounds match the server's own clamp: below half the words stop being words, above double the
+ * audio outruns following it, and both ends are a vendor request nobody wanted to pay for.
+ */
+const MIN_READ_SPEED = 50;
+const MAX_READ_SPEED = 200;
+let readSpeed = null;
+
+const clampReadSpeed = (value) => {
+  const n = Math.round(Number(value));
+  return Number.isFinite(n) ? Math.min(MAX_READ_SPEED, Math.max(MIN_READ_SPEED, n)) : null;
+};
+
+/** Put the pace on the page and remember it. */
+function applyReadSpeed(value) {
+  readSpeed = value === null ? null : clampReadSpeed(value);
+  const shown = readSpeed === null ? 100 : readSpeed;
+  el("read-speed-range").value = String(shown);
+  el("speed-value").textContent =
+    readSpeed === null ? "Pace: as the agent speaks" : `Pace: ${readSpeed}%`;
+  el("read-speed-label").textContent = readSpeed === null ? "Pace" : `${readSpeed}%`;
+  try {
+    if (readSpeed === null) {
+      localStorage.removeItem(READ_SPEED_KEY);
+    } else {
+      localStorage.setItem(READ_SPEED_KEY, String(readSpeed));
+    }
+  } catch (_error) {
+    // A browser that refuses storage still reads at the chosen pace for this session.
+  }
+}
+
+/** What was stored, clamped. Absent means "as the agent speaks", which is not the same as 100%. */
+function storedReadSpeed() {
+  const held = localStorage.getItem(READ_SPEED_KEY);
+  return held === null ? null : clampReadSpeed(held);
+}
+
 /** Is a tap on a message a request to hear it? Session-only, and only in the channel view. */
 let readingMode = false;
 
@@ -3533,8 +3617,11 @@ function stopReading() {
 
 /** Fetch the audio for one message. Bytes, not JSON, so it cannot go through `api`. */
 async function fetchSpeech(channel, id) {
+  // Nothing at all when no pace was chosen, so the server borrows the agent's. Sending 100 would
+  // silently OVERRIDE an agent configured to speak faster, which is the bug this avoids.
+  const pace = readSpeed === null ? "" : `?speed=${(readSpeed / 100).toFixed(2)}`;
   const response = await fetch(
-    `/api/v1/channels/${encodeURIComponent(channel)}/messages/${encodeURIComponent(id)}/speak`,
+    `/api/v1/channels/${encodeURIComponent(channel)}/messages/${encodeURIComponent(id)}/speak${pace}`,
     { method: "POST", headers: { Authorization: `Bearer ${token()}` } }
   );
   if (!response.ok) {
@@ -5922,6 +6009,7 @@ el("resume-toggle").addEventListener("change", () => {
 // branch on here and no second definition of "is this a desktop" to drift.
 applyReadingWidth(storedReadingWidth());
 applyMsgScale(storedMsgScale());
+applyReadSpeed(storedReadSpeed());
 el("reading-width").addEventListener("input", () => readingWidthChanged(el("reading-width").value));
 el("msg-scale").addEventListener("input", () => msgScaleChanged(el("msg-scale").value));
 el("width-grip").addEventListener("pointerdown", onGripDown);
@@ -5936,6 +6024,22 @@ el("width-grip").addEventListener("keydown", onGripKey);
 document.addEventListener("visibilitychange", onVisibility);
 
 el("talk").addEventListener("click", onTalk);
+/** Take the pace popover down. Safe to call when it is already down. */
+function closeSpeedPopover() {
+  el("speed-popover").hidden = true;
+  el("read-speed").setAttribute("aria-expanded", "false");
+}
+
+el("read-speed").addEventListener("click", () => {
+  const open = el("speed-popover").hidden;
+  el("speed-popover").hidden = !open;
+  el("read-speed").setAttribute("aria-expanded", open ? "true" : "false");
+});
+
+el("read-speed-range").addEventListener("input", () => {
+  applyReadSpeed(el("read-speed-range").value);
+});
+
 el("read-aloud").addEventListener("click", () => {
   readingMode = !readingMode;
   // Turning it OFF stops what is playing. Leaving audio running under a reader who has just said

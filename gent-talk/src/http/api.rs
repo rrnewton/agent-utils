@@ -378,14 +378,14 @@ pub async fn speak(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((channel_id, message_id)): Path<(String, String)>,
-    Query(query): Query<LimitQuery>,
+    Query(query): Query<SpeakQuery>,
 ) -> Result<Response, ApiError> {
     require(&headers, &state, Scope::Read)?;
     let (_channel, message) =
         ops::message_by_id(&state, &channel_id, &message_id, query.limit).await?;
     let spoken = state
         .speech
-        .speak(&state.config.elevenlabs, &message.content)
+        .speak(&state.config.elevenlabs, &message.content, query.speed)
         .await?;
     Ok((
         [
@@ -398,6 +398,19 @@ pub async fn speak(
         spoken.audio,
     )
         .into_response())
+}
+
+/// Query parameters for reading a message aloud.
+#[derive(Debug, Default, Deserialize)]
+pub struct SpeakQuery {
+    /// How many recent messages to look through for the id.
+    pub limit: Option<u16>,
+    /// How fast to read, overriding the agent's own pace for this one request.
+    ///
+    /// Clamped rather than validated: a slider is a blunt instrument and a request refused for
+    /// being slightly out of range would be a tap that did nothing. See
+    /// [`crate::elevenlabs::clamp_speed`].
+    pub speed: Option<f64>,
 }
 
 /// Query parameters for the read endpoints.

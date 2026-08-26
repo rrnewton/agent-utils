@@ -8,8 +8,8 @@
 use async_trait::async_trait;
 
 use super::{
-    configured_voice, credentials, speech_from_signed, speech_key, voice_source_agent, SignedUrl,
-    SignedUrlError, SignedUrlProvider, Speech, SpeechError, SpeechProvider,
+    clamp_speed, configured_voice, credentials, speech_from_signed, speech_key, voice_source_agent,
+    SignedUrl, SignedUrlError, SignedUrlProvider, Speech, SpeechError, SpeechProvider, VoiceStyle,
 };
 use crate::config::{ElevenLabsConfig, Secret};
 
@@ -92,9 +92,7 @@ pub fn agent_request(api_base: &str, agent_id: &str) -> PreparedRequest {
 /// [`SpeechError::NotConfigured`] naming `voice_id`, because that is the operator's fix: the agent
 /// really does not have a voice to borrow, and one has to be named.
 pub fn parse_agent_voice(value: &serde_json::Value) -> Result<String, SpeechError> {
-    value
-        .get("conversation_config")
-        .and_then(|c| c.get("tts"))
+    agent_tts(value)
         .and_then(|tts| tts.get("voice_id"))
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
@@ -105,10 +103,73 @@ pub fn parse_agent_voice(value: &serde_json::Value) -> Result<String, SpeechErro
         ))
 }
 
-/// The body that goes with [`speech_request`].
+fn agent_tts(value: &serde_json::Value) -> Option<&serde_json::Value> {
+    value.get("conversation_config").and_then(|c| c.get("tts"))
+}
+
+/// Pull the agent's DELIVERY out of its configuration: how fast, how stable, which model.
+///
+/// Separate from [`parse_agent_voice`] because they fail differently. A missing voice id is a
+/// refusal -- there is nothing to speak with. A missing speed is not: the vendor's default applies
+/// and the reader hears something. So this returns a style with holes in it rather than an error,
+/// and every hole means "do not send that field at all".
 #[must_use]
-pub fn speech_body(text: &str) -> serde_json::Value {
-    serde_json::json!({ "text": text, "model_id": TTS_MODEL })
+pub fn parse_agent_style(value: &serde_json::Value) -> VoiceStyle {
+    let Some(tts) = agent_tts(value) else {
+        return VoiceStyle::default();
+    };
+    let number = |key: &str| tts.get(key).and_then(serde_json::Value::as_f64);
+    VoiceStyle {
+        model_id: tts
+            .get("model_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned),
+        speed: number("speed"),
+        stability: number("stability"),
+        similarity_boost: number("similarity_boost"),
+    }
+}
+
+/// The body that goes with [`speech_request`].
+///
+/// `voice_settings` is only present when there is something to say about the voice, and only the
+/// fields actually known are inside it. Sending a default this server made up would OVERRIDE the
+/// account's own setting with a guess.
+#[must_use]
+pub fn speech_body(text: &str, style: &VoiceStyle, speed: Option<f64>) -> serde_json::Value {
+    let mut body = serde_json::Map::new();
+    body.insert(
+        "text".to_owned(),
+        serde_json::Value::String(text.to_owned()),
+    );
+    body.insert(
+        "model_id".to_owned(),
+        serde_json::Value::String(
+            style
+                .model_id
+                .clone()
+                .unwrap_or_else(|| TTS_MODEL.to_owned()),
+        ),
+    );
+    let mut settings = serde_json::Map::new();
+    let mut put = |key: &str, value: Option<f64>| {
+        if let Some(number) = value.and_then(serde_json::Number::from_f64) {
+            settings.insert(key.to_owned(), serde_json::Value::Number(number));
+        }
+    };
+    // The READER's speed wins over the agent's, because they asked for it on this pass.
+    put("speed", clamp_speed(speed).or(style.speed));
+    put("stability", style.stability);
+    put("similarity_boost", style.similarity_boost);
+    if !settings.is_empty() {
+        body.insert(
+            "voice_settings".to_owned(),
+            serde_json::Value::Object(settings),
+        );
+    }
+    serde_json::Value::Object(body)
 }
 
 /// Percent-encode the few characters that could change the meaning of a query string.
@@ -162,12 +223,12 @@ pub fn parse_signed_url(
 #[derive(Debug)]
 pub struct HttpElevenLabsClient {
     client: reqwest::Client,
-    /// The agent's own voice, once looked up.
+    /// The agent's own voice AND delivery, once looked up.
     ///
     /// Cached because it is a property of the deployment's configuration, not of the message being
     /// read: without this, every tap on a message would spend TWO vendor calls instead of one, and
     /// the extra one would return the same answer every time.
-    borrowed_voice: std::sync::Mutex<Option<String>>,
+    borrowed_voice: std::sync::Mutex<Option<(String, VoiceStyle)>>,
 }
 
 impl HttpElevenLabsClient {
@@ -205,24 +266,35 @@ impl HttpElevenLabsClient {
         &self,
         config: &ElevenLabsConfig,
         api_key: &Secret,
-    ) -> Result<String, SpeechError> {
-        if let Some(named) = configured_voice(config) {
-            return Ok(named.to_owned());
-        }
+    ) -> Result<(String, VoiceStyle), SpeechError> {
         if let Some(held) = self.borrowed_voice.lock().ok().and_then(|v| v.clone()) {
             return Ok(held);
         }
-        let agent_id = voice_source_agent(config)?;
+        // Even with a voice named explicitly, the AGENT is still asked -- for its delivery. An
+        // operator who set their agent to speak quickly and then named a voice separately still
+        // means "at the pace I chose"; hearing that voice at the vendor's default pace is the bug
+        // this exists to avoid. With no agent to ask, an explicit voice speaks with the vendor's
+        // defaults, which is all there is to go on.
+        let named = configured_voice(config).map(str::to_owned);
+        let agent_id = match voice_source_agent(config) {
+            Ok(id) => id,
+            Err(absent) => return named.map(|v| (v, VoiceStyle::default())).ok_or(absent),
+        };
         let request = agent_request(&config.api_base, agent_id);
         let value = self
             .get_json(&request, api_key)
             .await
             .map_err(speech_from_signed)?;
-        let voice = parse_agent_voice(&value)?;
+        let style = parse_agent_style(&value);
+        let voice = match named {
+            Some(explicit) => explicit,
+            None => parse_agent_voice(&value)?,
+        };
+        let resolved = (voice, style);
         if let Ok(mut held) = self.borrowed_voice.lock() {
-            *held = Some(voice.clone());
+            *held = Some(resolved.clone());
         }
-        Ok(voice)
+        Ok(resolved)
     }
 
     /// The same GET the signed-URL path uses, named so read-aloud can share it rather than grow a
@@ -271,10 +343,15 @@ impl SignedUrlProvider for HttpElevenLabsClient {
 
 #[async_trait]
 impl SpeechProvider for HttpElevenLabsClient {
-    async fn speak(&self, config: &ElevenLabsConfig, text: &str) -> Result<Speech, SpeechError> {
+    async fn speak(
+        &self,
+        config: &ElevenLabsConfig,
+        text: &str,
+        speed: Option<f64>,
+    ) -> Result<Speech, SpeechError> {
         let api_key = speech_key(config)?;
-        let voice_id = self.voice_for(config, api_key).await?;
-        let voice_id = voice_id.as_str();
+        let (voice, style) = self.voice_for(config, api_key).await?;
+        let voice_id = voice.as_str();
         // Checked BEFORE the call, not after: a blank message would otherwise be billed as a
         // request that returns silence.
         if text.trim().is_empty() {
@@ -285,7 +362,7 @@ impl SpeechProvider for HttpElevenLabsClient {
             .client
             .post(&request.url)
             .header(API_KEY_HEADER, api_key.expose())
-            .json(&speech_body(text))
+            .json(&speech_body(text, &style, speed))
             .send()
             .await
             .map_err(|e| SpeechError::Transport(super::redact(&e.to_string(), api_key)))?;
