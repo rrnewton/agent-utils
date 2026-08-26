@@ -14,6 +14,7 @@ import agent_team_timeline.orc as orc_module
 import agent_team_timeline.pipeline as pipeline_module
 import pytest
 
+from agent_team_timeline.build_store import DEFAULT_STORE_SUFFIX, team_build_root
 from agent_team_timeline.archive import (
     JsonValue,
     as_array,
@@ -264,7 +265,7 @@ def _snapshot_database(snapshot_root: Path, source: OrcSourceCopy) -> Path:
 
 def _manifest_snapshot_database(archive: Path, kind: str) -> Path:
     manifest_path = (
-        archive / "teams" / "orc-test" / "raw" / "source-manifest.json"
+        team_build_root(archive, "orc-test") / "raw" / "source-manifest.json"
     )
     root = as_object(read_json(manifest_path), str(manifest_path))
     source = next(
@@ -306,7 +307,7 @@ def _managed_task_projections(archive: Path) -> tuple[Path, ...]:
 
 def _manifest_task_projection(archive: Path) -> tuple[Path, dict[str, JsonValue]]:
     manifest_path = (
-        archive / "teams" / "orc-test" / "raw" / "source-manifest.json"
+        team_build_root(archive, "orc-test") / "raw" / "source-manifest.json"
     )
     root = as_object(read_json(manifest_path), str(manifest_path))
     task = next(
@@ -864,7 +865,7 @@ def _split_table_continuation_fixture(tmp_path: Path) -> Path:
 
 
 def _source_manifest(archive: Path) -> dict[str, JsonValue]:
-    path = archive / "teams" / "orc-test" / "raw" / "source-manifest.json"
+    path = team_build_root(archive, "orc-test") / "raw" / "source-manifest.json"
     return as_object(read_json(path), str(path))
 
 
@@ -891,7 +892,7 @@ def _write_manifest_links(
     mismatch the test exists to create.
     """
 
-    path = archive / "teams" / "orc-test" / "raw" / "source-manifest.json"
+    path = team_build_root(archive, "orc-test") / "raw" / "source-manifest.json"
     manifest: dict[str, object] = dict(_source_manifest(archive))
     manifest["schema_version"] = schema_version
     manifest["continuation_sessions"] = [dict(link) for link in links]
@@ -2766,9 +2767,7 @@ def test_task_note_server_sync_id_preserves_team_digest_and_summary_cache(
         for item in as_array(
             as_object(
                 read_json(
-                    archive
-                    / "teams"
-                    / "orc-test"
+                    team_build_root(archive, "orc-test")
                     / "raw"
                     / "source-manifest.json"
                 ),
@@ -2818,7 +2817,7 @@ def test_task_note_author_fill_and_change_preserve_frozen_attribution_and_cache(
             archive, "orc-test", "heuristic", "fixture"
         )
         manifest_path = (
-            archive / "teams" / "orc-test" / "raw" / "source-manifest.json"
+            team_build_root(archive, "orc-test") / "raw" / "source-manifest.json"
         )
         manifest = as_object(read_json(manifest_path), str(manifest_path))
         task = next(
@@ -3714,7 +3713,15 @@ def test_duplicate_agent_block_identity_is_rejected(tmp_path: Path) -> None:
 
 def _downgrade_orc_manifest_to_v1(path: Path) -> tuple[OrcSourceCopy, ...]:
     root = as_object(read_json(path), str(path))
-    archive = path.parent.parent.parent.parent
+    # `path` is `<store>/<slug>/raw/source-manifest.json`, and `<store>` is either the archive's
+    # own `teams/` or the sibling build store named after it -- so the archive is no longer
+    # simply four parents up. Both layouts, because a fixture may establish either.
+    store_root = path.parent.parent.parent
+    archive = (
+        store_root.parent / store_root.name.removesuffix(DEFAULT_STORE_SUFFIX)
+        if store_root.name.endswith(DEFAULT_STORE_SUFFIX)
+        else store_root.parent
+    )
     snapshots = snapshot_root(archive, path.parent.parent.name)
     legacy_sources: list[JsonValue] = []
     object_paths: set[Path] = set()
@@ -3787,7 +3794,7 @@ def test_pipeline_migrates_v1_manifest_across_auxiliary_rewrite_idempotently(
         archive, source, ROOT, "orc-test", "America/New_York"
     )
     manifest_path = (
-        archive / "teams" / "orc-test" / "raw" / "source-manifest.json"
+        team_build_root(archive, "orc-test") / "raw" / "source-manifest.json"
     )
     _downgrade_orc_manifest_to_v1(manifest_path)
     _append_root_message(root_db, "root-appended", "Authoritative appended result")
@@ -3837,7 +3844,7 @@ def test_v1_unchanged_migration_preserves_semantics_digest_and_summary_cache(
         archive, source, ROOT, "orc-test", "America/New_York"
     )
     manifest_path = (
-        archive / "teams" / "orc-test" / "raw" / "source-manifest.json"
+        team_build_root(archive, "orc-test") / "raw" / "source-manifest.json"
     )
     legacy_sources = _downgrade_orc_manifest_to_v1(manifest_path)
     snapshots = snapshot_root(archive, "orc-test")
@@ -3845,9 +3852,9 @@ def test_v1_unchanged_migration_preserves_semantics_digest_and_summary_cache(
         snapshots, ROOT, "orc-test", "America/New_York", legacy_sources
     )
     before = replace(initial, sources=legacy_team.sources)
-    raw_team_path = archive / "teams" / "orc-test" / "raw" / "team.json"
+    raw_team_path = team_build_root(archive, "orc-test") / "raw" / "team.json"
     assert write_json_if_changed(raw_team_path, narrow_json(before.to_json_obj()))
-    (archive / "teams" / "orc-test" / "raw" / "artifacts.json").unlink()
+    (team_build_root(archive, "orc-test") / "raw" / "artifacts.json").unlink()
     before_digest = _legacy_source_digest(before)
     assert source_digest(before) == before_digest
     before_paths = tuple(item.path for item in before.sources)
@@ -3930,7 +3937,7 @@ def test_partial_object_publication_failure_keeps_manifest_and_retries(
     archive = tmp_path / "archive"
     ingest_orc(archive, source, ROOT, "orc-test", "America/New_York")
     manifest_path = (
-        archive / "teams" / "orc-test" / "raw" / "source-manifest.json"
+        team_build_root(archive, "orc-test") / "raw" / "source-manifest.json"
     )
     prior_manifest = manifest_path.read_bytes()
     prior_root = _manifest_snapshot_database(archive, "session")
@@ -3976,7 +3983,7 @@ def test_task_projection_publication_failure_keeps_manifest_and_retries(
     archive = tmp_path / "archive"
     ingest_orc(archive, source, ROOT, "orc-test", "America/New_York")
     manifest_path = (
-        archive / "teams" / "orc-test" / "raw" / "source-manifest.json"
+        team_build_root(archive, "orc-test") / "raw" / "source-manifest.json"
     )
     prior_manifest = manifest_path.read_bytes()
     prior_projection, _ = _manifest_task_projection(archive)
@@ -4083,7 +4090,7 @@ def test_noncanonical_task_projection_fails_closed(tmp_path: Path) -> None:
     archive = tmp_path / "archive"
     ingest_orc(archive, source, ROOT, "orc-test", "America/New_York")
     manifest_path = (
-        archive / "teams" / "orc-test" / "raw" / "source-manifest.json"
+        team_build_root(archive, "orc-test") / "raw" / "source-manifest.json"
     )
     root = as_object(read_json(manifest_path), str(manifest_path))
     task = next(
@@ -4122,7 +4129,7 @@ def test_directory_fsync_failure_leaves_reusable_orphan(
     archive = tmp_path / "archive"
     ingest_orc(archive, source, ROOT, "orc-test", "America/New_York")
     manifest_path = (
-        archive / "teams" / "orc-test" / "raw" / "source-manifest.json"
+        team_build_root(archive, "orc-test") / "raw" / "source-manifest.json"
     )
     prior_manifest = manifest_path.read_bytes()
     _append_root_message(root_db, "root-appended", "fsync candidate")
@@ -4205,9 +4212,9 @@ def test_post_snapshot_parse_failure_keeps_old_manifest_and_raw_team(
     archive = tmp_path / "archive"
     ingest_orc(archive, source, ROOT, "orc-test", "America/New_York")
     manifest_path = (
-        archive / "teams" / "orc-test" / "raw" / "source-manifest.json"
+        team_build_root(archive, "orc-test") / "raw" / "source-manifest.json"
     )
-    raw_team_path = archive / "teams" / "orc-test" / "raw" / "team.json"
+    raw_team_path = team_build_root(archive, "orc-test") / "raw" / "team.json"
     prior_manifest = manifest_path.read_bytes()
     prior_raw_team = raw_team_path.read_bytes()
     prior_root = _manifest_snapshot_database(archive, "session")
@@ -4250,7 +4257,7 @@ def test_malformed_v2_projection_is_rejected_before_snapshot(tmp_path: Path) -> 
     archive = tmp_path / "archive"
     ingest_orc(archive, source, ROOT, "orc-test", "America/New_York")
     manifest_path = (
-        archive / "teams" / "orc-test" / "raw" / "source-manifest.json"
+        team_build_root(archive, "orc-test") / "raw" / "source-manifest.json"
     )
     root = as_object(read_json(manifest_path), str(manifest_path))
     sources = as_array(root.get("sources"), f"{manifest_path}: sources")
@@ -4271,7 +4278,7 @@ def test_v2_manifest_rejects_unknown_top_level_field(tmp_path: Path) -> None:
     archive = tmp_path / "archive"
     ingest_orc(archive, source, ROOT, "orc-test", "America/New_York")
     manifest_path = (
-        archive / "teams" / "orc-test" / "raw" / "source-manifest.json"
+        team_build_root(archive, "orc-test") / "raw" / "source-manifest.json"
     )
     manifest = as_object(read_json(manifest_path), str(manifest_path))
     manifest["unexpected"] = True
@@ -4286,7 +4293,7 @@ def test_v2_manifest_rejects_missing_nested_field(tmp_path: Path) -> None:
     archive = tmp_path / "archive"
     ingest_orc(archive, source, ROOT, "orc-test", "America/New_York")
     manifest_path = (
-        archive / "teams" / "orc-test" / "raw" / "source-manifest.json"
+        team_build_root(archive, "orc-test") / "raw" / "source-manifest.json"
     )
     manifest = as_object(read_json(manifest_path), str(manifest_path))
     session = next(
@@ -4309,7 +4316,7 @@ def test_v2_manifest_rejects_invalid_observed_enrichment_digest(
     archive = tmp_path / "archive"
     ingest_orc(archive, source, ROOT, "orc-test", "America/New_York")
     manifest_path = (
-        archive / "teams" / "orc-test" / "raw" / "source-manifest.json"
+        team_build_root(archive, "orc-test") / "raw" / "source-manifest.json"
     )
     manifest = as_object(read_json(manifest_path), str(manifest_path))
     task = next(
@@ -4332,7 +4339,7 @@ def test_v1_migration_failure_preserves_snapshot_and_manifest(tmp_path: Path) ->
     archive = tmp_path / "archive"
     ingest_orc(archive, source, ROOT, "orc-test", "America/New_York")
     manifest_path = (
-        archive / "teams" / "orc-test" / "raw" / "source-manifest.json"
+        team_build_root(archive, "orc-test") / "raw" / "source-manifest.json"
     )
     _downgrade_orc_manifest_to_v1(manifest_path)
     snapshot_db = _manifest_snapshot_database(archive, "session")
@@ -4352,7 +4359,7 @@ def test_unknown_orc_manifest_schema_is_rejected_before_snapshot(tmp_path: Path)
     archive = tmp_path / "archive"
     ingest_orc(archive, source, ROOT, "orc-test", "America/New_York")
     manifest_path = (
-        archive / "teams" / "orc-test" / "raw" / "source-manifest.json"
+        team_build_root(archive, "orc-test") / "raw" / "source-manifest.json"
     )
     root = as_object(read_json(manifest_path), str(manifest_path))
     snapshot_db = _manifest_snapshot_database(archive, "session")
@@ -4496,7 +4503,7 @@ def test_orc_pipeline_builds_one_day_archive_idempotently(tmp_path: Path) -> Non
         "inter_agent_message"
     ) == 3
     manifest = json.loads(
-        (archive / "teams" / "orc-test" / "raw" / "source-manifest.json").read_text(
+        (team_build_root(archive, "orc-test") / "raw" / "source-manifest.json").read_text(
             encoding="utf-8"
         )
     )
@@ -4529,9 +4536,7 @@ def test_orc_pipeline_allows_narrowing_but_rejects_widening_ingest_window(
     assert narrowed.window_end_ms == window.end_ms
     manifest = json.loads(
         (
-            archive
-            / "teams"
-            / "orc-test"
+            team_build_root(archive, "orc-test")
             / "raw"
             / "source-manifest.json"
         ).read_text(encoding="utf-8")
@@ -5295,7 +5300,7 @@ def test_accepted_prefix_rewrite_retains_the_pre_rewrite_snapshot(
     archive = tmp_path / "archive"
     ingest_orc(archive, source, ROOT, "orc-test", "UTC")
     snapshots = snapshot_root(archive, "orc-test")
-    manifest_path = archive / "teams" / "orc-test" / "raw" / "source-manifest.json"
+    manifest_path = team_build_root(archive, "orc-test") / "raw" / "source-manifest.json"
     pre_rewrite = _manifest_snapshot_database(archive, "session")
     pre_rewrite_sha256 = orc_module._sha256_file(pre_rewrite)
     _backfill_token_count(root_db, 2, 445)
@@ -5388,7 +5393,7 @@ def test_a_schema_v1_source_records_where_its_pre_rewrite_bytes_actually_are(
     source, root_db, _ = _override_fixture(tmp_path)
     archive = tmp_path / "archive"
     ingest_orc(archive, source, ROOT, "orc-test", "UTC")
-    manifest_path = archive / "teams" / "orc-test" / "raw" / "source-manifest.json"
+    manifest_path = team_build_root(archive, "orc-test") / "raw" / "source-manifest.json"
     _downgrade_orc_manifest_to_v1(manifest_path)
     snapshots = snapshot_root(archive, "orc-test")
     mirrored = snapshots / ".orc" / "sessions" / ROOT / "session.db"
@@ -5459,7 +5464,7 @@ def test_a_hand_deleted_retained_snapshot_does_not_break_a_later_ingest(
     assert report.orc_prefix_overrides == ()
     # The fact of the override survives its evidence: the manifest still records that this source
     # was re-baselined, which is the part a later reader must not be able to lose.
-    manifest_path = archive / "teams" / "orc-test" / "raw" / "source-manifest.json"
+    manifest_path = team_build_root(archive, "orc-test") / "raw" / "source-manifest.json"
     manifest = as_object(read_json(manifest_path), str(manifest_path))
     session = next(
         as_object(item, "source")
@@ -5623,7 +5628,7 @@ def test_accepted_prefix_rewrite_round_trips_through_the_source_manifest(
         "report.orc_prefix_overrides",
     )
     assert len(recorded) == 1
-    manifest_path = archive / "teams" / "orc-test" / "raw" / "source-manifest.json"
+    manifest_path = team_build_root(archive, "orc-test") / "raw" / "source-manifest.json"
     manifest = as_object(read_json(manifest_path), str(manifest_path))
     session = next(
         as_object(item, "source")
@@ -5687,7 +5692,7 @@ def test_forged_prefix_override_records_are_rejected(
     ingest_orc(archive, source, ROOT, "orc-test", "UTC")
     _backfill_token_count(root_db, 2, 445)
     ingest_orc(archive, source, ROOT, "orc-test", "UTC", accept_prefix_rewrite=(ROOT,))
-    manifest_path = archive / "teams" / "orc-test" / "raw" / "source-manifest.json"
+    manifest_path = team_build_root(archive, "orc-test") / "raw" / "source-manifest.json"
     manifest = as_object(read_json(manifest_path), str(manifest_path))
     sources = as_array(manifest.get("sources"), "sources")
     for index, item in enumerate(sources):
@@ -5715,7 +5720,7 @@ def test_a_retention_pointer_aimed_at_the_current_snapshot_is_rejected(
     ingest_orc(archive, source, ROOT, "orc-test", "UTC")
     _backfill_token_count(root_db, 2, 445)
     ingest_orc(archive, source, ROOT, "orc-test", "UTC", accept_prefix_rewrite=(ROOT,))
-    manifest_path = archive / "teams" / "orc-test" / "raw" / "source-manifest.json"
+    manifest_path = team_build_root(archive, "orc-test") / "raw" / "source-manifest.json"
     manifest = as_object(read_json(manifest_path), str(manifest_path))
     sources = as_array(manifest.get("sources"), "sources")
     for index, item in enumerate(sources):
@@ -5877,7 +5882,7 @@ def test_orc_ingest_cli_authorizes_a_second_session_only_when_named(
 
 
 def _promoted_task_note_records(archive: Path) -> tuple[dict[str, JsonValue], ...]:
-    path = archive / "teams" / "orc-test" / "raw" / "task-notes.jsonl"
+    path = team_build_root(archive, "orc-test") / "raw" / "task-notes.jsonl"
     return tuple(read_jsonl(path))
 
 
@@ -5890,9 +5895,9 @@ def test_task_notes_are_promoted_into_the_normalized_model(tmp_path: Path) -> No
         archive, source, ROOT, "orc-test", "America/New_York"
     )
     _, projection = _manifest_task_projection(archive)
-    notes_path = archive / "teams" / "orc-test" / "raw" / "task-notes.jsonl"
+    notes_path = team_build_root(archive, "orc-test") / "raw" / "task-notes.jsonl"
     raw_team = as_object(
-        read_json(archive / "teams" / "orc-test" / "raw" / "team.json"),
+        read_json(team_build_root(archive, "orc-test") / "raw" / "team.json"),
         "team.json",
     )
 
@@ -5996,7 +6001,7 @@ def test_promoted_task_notes_are_not_reimported_on_a_repeat_ingest(
     source, _, task_db = _fixture(tmp_path)
     archive = tmp_path / "archive"
     ingest_orc(archive, source, ROOT, "orc-test", "America/New_York")
-    notes_path = archive / "teams" / "orc-test" / "raw" / "task-notes.jsonl"
+    notes_path = team_build_root(archive, "orc-test") / "raw" / "task-notes.jsonl"
     after_first = notes_path.read_bytes()
 
     _, repeated = ingest_orc(
@@ -6034,7 +6039,7 @@ def test_promoted_task_note_disagreeing_about_its_core_is_refused(
     source, _, _ = _fixture(tmp_path)
     archive = tmp_path / "archive"
     ingest_orc(archive, source, ROOT, "orc-test", "America/New_York")
-    notes_path = archive / "teams" / "orc-test" / "raw" / "task-notes.jsonl"
+    notes_path = team_build_root(archive, "orc-test") / "raw" / "task-notes.jsonl"
     promoted = pipeline_module._load_promoted_task_notes(archive, "orc-test")
     tampered = tuple(
         replace(note, content="not what was promoted") if note.note_id == 2 else note
@@ -6057,7 +6062,7 @@ def test_promoted_task_notes_out_of_order_are_refused(tmp_path: Path) -> None:
     source, _, _ = _fixture(tmp_path)
     archive = tmp_path / "archive"
     ingest_orc(archive, source, ROOT, "orc-test", "America/New_York")
-    notes_path = archive / "teams" / "orc-test" / "raw" / "task-notes.jsonl"
+    notes_path = team_build_root(archive, "orc-test") / "raw" / "task-notes.jsonl"
     promoted = pipeline_module._load_promoted_task_notes(archive, "orc-test")
     notes_path.write_text(
         canonical_jsonl(
@@ -6084,14 +6089,14 @@ def test_orc_ingest_stores_tool_payloads_outside_the_generation_marker(tmp_path:
     source, _, _ = _fixture(tmp_path)
     archive = tmp_path / "archive"
     _, report = ingest_orc(archive, source, ROOT, "orc-test", "America/New_York")
-    payload_root = archive / "teams" / "orc-test" / "payloads"
+    payload_root = team_build_root(archive, "orc-test") / "payloads"
 
     assert report.tool_payloads > 0
     assert report.newly_stored_tool_payloads == report.tool_payloads
     assert sorted(payload_root.glob("*.jsonl"))
     assert verify_payload_store(payload_root) == ()
 
-    marker_path = archive / "teams" / "orc-test" / "raw" / "normalized-generation.json"
+    marker_path = team_build_root(archive, "orc-test") / "raw" / "normalized-generation.json"
     marker = as_object(read_json(marker_path), str(marker_path))
     assert "payloads_sha256" not in marker
 
@@ -6105,7 +6110,7 @@ def test_a_tampered_payload_shard_is_caught_by_verification(tmp_path: Path) -> N
     source, _, _ = _fixture(tmp_path)
     archive = tmp_path / "archive"
     ingest_orc(archive, source, ROOT, "orc-test", "America/New_York")
-    payload_root = archive / "teams" / "orc-test" / "payloads"
+    payload_root = team_build_root(archive, "orc-test") / "payloads"
     manifest = load_payload_manifest(payload_root)
     assert manifest is not None
     shard = sorted(payload_root.glob("*.jsonl"))[0]
@@ -6126,11 +6131,11 @@ def test_pre_promotion_generation_marker_still_builds(tmp_path: Path) -> None:
     archive = tmp_path / "archive"
     ingest_orc(archive, source, ROOT, "orc-test", "America/New_York")
     marker_path = (
-        archive / "teams" / "orc-test" / "raw" / "normalized-generation.json"
+        team_build_root(archive, "orc-test") / "raw" / "normalized-generation.json"
     )
     marker = as_object(read_json(marker_path), str(marker_path))
     del marker["task_notes_sha256"]
-    (archive / "teams" / "orc-test" / "raw" / "task-notes.jsonl").unlink()
+    (team_build_root(archive, "orc-test") / "raw" / "task-notes.jsonl").unlink()
     write_json_if_changed(marker_path, narrow_json(marker))
 
     team = load_archived_team(archive, "orc-test")

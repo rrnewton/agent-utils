@@ -120,6 +120,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
+from agent_team_timeline.build_store import candidate_store_roots
 from agent_team_timeline.archive import (
     ARCHIVE_MARKER_FILE,
     JsonValue,
@@ -361,15 +362,22 @@ def _copied_snapshots_before(archive: Path) -> bool:
     over snapshots that do not exist.
     """
 
-    teams = archive / "teams"
-    if teams.is_symlink() or not teams.is_dir():
-        return False
-    return any(
-        entry.is_dir()
-        and not entry.is_symlink()
-        and entry.joinpath(*_SOURCE_MANIFEST).is_file()
-        for entry in teams.iterdir()
-    )
+    # Both build-state layouts, because the manifest is no longer necessarily inside the archive:
+    # `build_store` moved `raw/` to a sibling directory, and an archive part-way through that
+    # migration has manifests in each. Consulting only `teams/` would answer "no snapshots have
+    # ever been copied" for a fully migrated archive -- which turns this refusal off exactly where
+    # it is needed, since a migrated archive is by definition one that has been ingested before.
+    for root in candidate_store_roots(archive):
+        if root.is_symlink() or not root.is_dir():
+            continue
+        if any(
+            entry.is_dir()
+            and not entry.is_symlink()
+            and entry.joinpath(*_SOURCE_MANIFEST).is_file()
+            for entry in root.iterdir()
+        ):
+            return True
+    return False
 
 
 def _recorded_store(archive: Path, store_root: Path) -> Path:

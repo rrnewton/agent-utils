@@ -18,6 +18,7 @@ from agent_team_timeline.archive import (
     canonical_json,
     narrow_json,
     read_json,
+    read_json_stored,
     write_json_if_changed,
     write_text_if_changed,
 )
@@ -38,6 +39,7 @@ from agent_team_timeline.search_index import build_search_records
 from agent_team_timeline.static_assets import (
     gzip_sidecar_path,
     sync_gzip_sidecar,
+    write_gzip_only,
     write_text_with_gzip_invalidation,
 )
 from agent_team_timeline.timeline_v3 import is_schema_3_path, write_timeline_v3
@@ -519,6 +521,16 @@ def _write_compressible_json(path: Path, value: JsonValue) -> int:
     )
 
 
+def _write_gzip_only_json(path: Path, value: JsonValue) -> int:
+    """Store a browser-facing document as ``<path>.gz`` with no identity twin.
+
+    The combiner's counterpart to ``render._write_gzip_only_json``; see that docstring for
+    why the two families this is used for are stored compressed and nothing else.
+    """
+
+    return write_gzip_only(path, canonical_json(value))
+
+
 def _build_combined_archive_locked(
     archive: Path,
     team_slugs: Sequence[str],
@@ -564,7 +576,9 @@ def _build_combined_archive_locked(
                     team=team,
                     root=team_root,
                     timeline=as_object(read_json(timeline_path), str(timeline_path)),
-                    artifacts=as_object(read_json(artifacts_path), str(artifacts_path)),
+                    artifacts=as_object(
+                        read_json_stored(artifacts_path), str(artifacts_path)
+                    ),
                 )
             )
 
@@ -590,7 +604,6 @@ def _build_combined_archive_locked(
             {
                 "README.md",
                 _EXPORT_MANIFEST,
-                "data/artifacts.json",
             }
         )
         compressible_files = {
@@ -598,6 +611,9 @@ def _build_combined_archive_locked(
             for relative in _COMMON_FILES
             if PurePosixPath(relative).suffix in {".css", ".html", ".js"}
         }
+        #: Relatives whose stored form is ``<relative>.gz`` alone. Disjoint from
+        #: `compressible_files`, which keeps an identity file and gains a companion.
+        gzip_only_files: set[str] = set()
         changed = 0
 
         first_root = rendered_teams[0].root
@@ -642,14 +658,14 @@ def _build_combined_archive_locked(
                     phase.get("detail_path"), where + ".detail_path"
                 )
                 source_path = rendered.root / source_relative
-                detail = as_object(read_json(source_path), str(source_path))
+                detail = as_object(read_json_stored(source_path), str(source_path))
                 target_relative = (
                     f"data/details/{rendered.slug}/{PurePosixPath(source_relative).name}"
                 )
                 _safe_generated_path(target_relative)
                 generated_files.add(target_relative)
-                compressible_files.add(target_relative)
-                changed += _write_compressible_json(
+                gzip_only_files.add(target_relative)
+                changed += _write_gzip_only_json(
                     _output_path(output, target_relative),
                     _transform_detail(rendered.slug, detail, str(source_path)),
                 )
@@ -720,10 +736,10 @@ def _build_combined_archive_locked(
         # this function writes, a few lines below, before it names anything. See
         # `render.retired_generation_files` for why an older one already on disk is left where it
         # is rather than swept.
-        changed += _write_compressible_json(
+        changed += _write_gzip_only_json(
             _output_path(output, "data/artifacts.json"), artifact_catalog
         )
-        compressible_files.add("data/artifacts.json")
+        gzip_only_files.add("data/artifacts.json")
         search_records: list[dict[str, JsonValue]] = []
         for rendered in rendered_teams:
             rendered_range = as_object(
@@ -776,6 +792,13 @@ def _build_combined_archive_locked(
                 sidecar_relative = relative + ".gz"
                 _safe_generated_path(sidecar_relative)
                 generated_files.add(sidecar_relative)
+        # A gzip-only relative is named by the file that exists. Naming the plain
+        # relative would point stale-file removal at something never written and
+        # leave the `.gz` unnamed, which is the shape that gets swept as an orphan.
+        for relative in sorted(gzip_only_files):
+            sidecar_relative = relative + ".gz"
+            _safe_generated_path(sidecar_relative)
+            generated_files.add(sidecar_relative)
 
         # Schema 3, and only schema 3. `write_timeline_shards` used to run here first, and
         # stopped the day `static/app.js` learned to read schema 3 -- item 2 of the checklist on

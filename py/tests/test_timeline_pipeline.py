@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+from agent_team_timeline.build_store import team_build_root
 from agent_team_timeline.archive import narrow_json, write_json_if_changed
 from agent_team_timeline.artifacts import extract_artifacts
 from agent_team_timeline.cli import main as timeline_main
@@ -69,7 +70,12 @@ from agent_team_timeline.summarize import PLAIN_LANGUAGE_ROLLUP_STYLE, SummaryRe
 from agent_team_timeline.terminology import GlossaryTerm, glossary_term_id
 from agent_team_timeline.window import DateWindow
 from agent_team_timeline.snapshot_store import resolve_snapshot_root
-from tests.timeline_projection import schema_1_timeline_text
+from tests.timeline_projection import (
+    read_stored_text,
+    detail_documents,
+    schema_1_timeline_text,
+    stored_path,
+)
 from tests.timeline_legacy_generations import write_legacy_schema_2
 
 
@@ -207,7 +213,7 @@ def _team(extra_root_text: str = "") -> TeamData:
 
 def _write_team(archive: Path, team: TeamData) -> None:
     write_json_if_changed(
-        archive / "teams" / team.team_slug / "raw" / "team.json",
+        team_build_root(archive, team.team_slug) / "raw" / "team.json",
         narrow_json(team.to_json_obj()),
     )
 
@@ -410,11 +416,7 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
     assert result_edges[0]["target_id"] == ROOT
     assert result_edges[0]["source_ms"] == child_track["end_ms"]
     assert result_edges[0]["target_ms"] == child_track["end_ms"]
-    detail = json.loads(
-        next((tmp_path / "data" / "details").glob("*.json")).read_text(
-            encoding="utf-8"
-        )
-    )
+    detail = json.loads(next(iter(detail_documents(tmp_path / "data" / "details").values())))
     assert all("at_ms" in entry and "role" in entry for entry in detail["transcript"])
     rollup = timeline["rollups"][0]
     assert rollup["summary_available"] is True
@@ -513,7 +515,7 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
     assert timeline["events"].count(
         {"agent_id": CHILD, "at_ms": START + 10_000, "kind": "tool_call"}
     ) == 3
-    detail_path = tmp_path / timeline["phases"][0]["detail_path"]
+    detail_path = stored_path(tmp_path / timeline["phases"][0]["detail_path"])
     assert detail_path.is_file()
     name_path = (
         tmp_path
@@ -656,7 +658,7 @@ def _legacy_message_projection(archived: TeamData) -> dict[str, dict[str, object
 
 
 def _seed_legacy_message_projection(archive: Path, archived: TeamData) -> tuple[Path, int]:
-    root = archive / "teams" / archived.team_slug / "raw" / "messages"
+    root = team_build_root(archive, archived.team_slug) / "raw" / "messages"
     root.mkdir(parents=True, exist_ok=True)
     written = 0
     for thread_id, payload in _legacy_message_projection(archived).items():
@@ -675,7 +677,7 @@ def test_ingest_no_longer_writes_the_per_thread_message_projection(
         resolve_snapshot_root(tmp_path, team.team_slug),
     )
 
-    assert not (tmp_path / "teams" / team.team_slug / "raw" / "messages").exists()
+    assert not (team_build_root(tmp_path, team.team_slug) / "raw" / "messages").exists()
     assert report.retired_message_projections == 0
     assert report.retired_message_projection_bytes == 0
 
@@ -743,7 +745,7 @@ def test_message_projection_sweep_leaves_every_file_it_did_not_write(
     nested.mkdir()
     (nested / "kept.json").write_text("{}\n", encoding="utf-8")
     link = root / "elsewhere.json"
-    link.symlink_to(tmp_path / "teams" / team.team_slug / "raw" / "team.json")
+    link.symlink_to(team_build_root(tmp_path, team.team_slug) / "raw" / "team.json")
 
     _, report = _write_ingested_team(
         tmp_path, team.team_slug, team, None, 0,
@@ -759,7 +761,7 @@ def test_message_projection_sweep_leaves_every_file_it_did_not_write(
     assert sidecar.read_bytes() == b"not a projection"
     assert (nested / "kept.json").read_text(encoding="utf-8") == "{}\n"
     assert link.is_symlink()
-    assert (tmp_path / "teams" / team.team_slug / "raw" / "team.json").is_file()
+    assert (team_build_root(tmp_path, team.team_slug) / "raw" / "team.json").is_file()
 
 
 def test_message_projection_sweep_takes_every_thread_shaped_name_not_only_this_run_s(
@@ -811,7 +813,7 @@ def test_message_projection_sweep_ignores_a_symlinked_directory(tmp_path: Path) 
     decoy.mkdir()
     victim = decoy / f"{ROOT}.json"
     victim.write_text("{}\n", encoding="utf-8")
-    root = tmp_path / "teams" / team.team_slug / "raw" / "messages"
+    root = team_build_root(tmp_path, team.team_slug) / "raw" / "messages"
     root.symlink_to(decoy, target_is_directory=True)
 
     _, report = _write_ingested_team(
@@ -851,7 +853,7 @@ def test_build_after_retiring_the_message_projection_serves_a_working_archive(
     timeline = json.loads(schema_1_timeline_text(tmp_path))
     assert {agent["id"] for agent in timeline["agents"]} == {ROOT, CHILD}
     for phase in timeline["phases"]:
-        assert (tmp_path / phase["detail_path"]).is_file()
+        assert stored_path(tmp_path / phase["detail_path"]).is_file()
 
     # The sweep must not leave the presentation inventory believing it still owns something, so a
     # second build has to be a no-op rather than re-converging on the changed tree.
@@ -1167,7 +1169,7 @@ def test_build_embeds_standalone_site_identity(tmp_path: Path) -> None:
         "explicit",
     )
     write_json_if_changed(
-        tmp_path / "teams" / team.team_slug / "raw" / "site-identity.json",
+        team_build_root(tmp_path, team.team_slug) / "raw" / "site-identity.json",
         narrow_json(identity.to_json_obj()),
     )
     summarize_archive(tmp_path, team.team_slug, "heuristic", "test-model")
@@ -1197,8 +1199,8 @@ def test_phase_details_emit_conservative_pull_request_link_spans(tmp_path: Path)
     build_archive(tmp_path, team.team_slug)
 
     detail_objects = [
-        json.loads(path.read_text(encoding="utf-8"))
-        for path in (tmp_path / "data" / "details").glob("*.json")
+        json.loads(text)
+        for text in detail_documents(tmp_path / "data" / "details").values()
     ]
     entry = next(
         transcript_entry
@@ -1238,8 +1240,8 @@ def test_phase_details_emit_conservative_pull_request_link_spans(tmp_path: Path)
     )
     build_archive(tmp_path, team.team_slug)
     enriched_details = [
-        json.loads(path.read_text(encoding="utf-8"))
-        for path in (tmp_path / "data" / "details").glob("*.json")
+        json.loads(text)
+        for text in detail_documents(tmp_path / "data" / "details").values()
     ]
     enriched_entry = next(
         transcript_entry
@@ -1515,7 +1517,7 @@ def test_team_slug_and_archived_identity_cannot_escape_archive(tmp_path: Path) -
         load_archived_team(tmp_path, "../../outside")
 
     team = replace(_team(), team_slug="other-team")
-    target = tmp_path / "teams" / "codex-test" / "raw" / "team.json"
+    target = team_build_root(tmp_path, "codex-test") / "raw" / "team.json"
     write_json_if_changed(target, narrow_json(team.to_json_obj()))
     with pytest.raises(ValueError, match="does not match requested"):
         load_archived_team(tmp_path, "codex-test")
@@ -1909,11 +1911,13 @@ def test_single_team_export_wide_to_narrow_removes_stale_slice_data(
     _write_team(tmp_path, team)
     output = tmp_path / "slice-export"
     build_archive(tmp_path, team.team_slug, output=output)
-    wide_details = set((output / "data" / "details").glob("*.json"))
+    wide_documents = detail_documents(output / "data" / "details")
+    wide_details = set(wide_documents)
     assert len(wide_details) > 1
+    # Against the parsed document, not the stored bytes: the stored form is compressed, so a
+    # substring search over the file would report "absent" for text that is plainly there.
     assert any(
-        b"Verify the archived report" in path.read_bytes()
-        for path in wide_details
+        "Verify the archived report" in text for text in wide_documents.values()
     )
 
     window = DateWindow(
@@ -1930,11 +1934,16 @@ def test_single_team_export_wide_to_narrow_removes_stale_slice_data(
         display_window=window,
         output=output,
     )
-    narrow_details = set((output / "data" / "details").glob("*.json"))
+    narrow_details = set(detail_documents(output / "data" / "details"))
     stale_details = wide_details - narrow_details
     assert stale_details
     assert all(not path.exists() for path in stale_details)
-    assert all(not path.with_name(path.name + ".gz").exists() for path in stale_details)
+    # And no identity twin left behind either: the stored name is `<phase>.json.gz`, so the
+    # thing a sweep could plausibly miss is the `.json` an older layout wrote beside it.
+    assert all(
+        not path.with_name(path.name.removesuffix(".gz")).exists()
+        for path in stale_details
+    )
     for path in output.rglob("*"):
         if not path.is_file():
             continue
@@ -2008,9 +2017,7 @@ def test_build_without_summary_cache_uses_presentation_only_fallbacks(
     assert timeline["glossary_path"] == ""
     assert {rollup["kind"] for rollup in timeline["rollups"]} == {"hourly"}
     for phase in timeline["phases"]:
-        detail = json.loads(
-            (output / phase["detail_path"]).read_text(encoding="utf-8")
-        )
+        detail = json.loads(read_stored_text(output / phase["detail_path"]))
         assert detail["transcript"]
         assert detail["stats"] == phase["stats"]
         assert detail["phrase"] == "Summary unavailable"
@@ -2081,9 +2088,7 @@ def test_build_preserves_available_phase_summaries_in_patchy_archive(
     missing_record = next(
         phase for phase in timeline["phases"] if phase["id"] == missing.phase_id
     )
-    missing_detail = json.loads(
-        (output / missing_record["detail_path"]).read_text(encoding="utf-8")
-    )
+    missing_detail = json.loads(read_stored_text(output / missing_record["detail_path"]))
     assert missing_detail["summary_available"] is False
     assert missing_detail["raw_summary_path"] == ""
     assert not stale_markdown.exists()
@@ -2137,9 +2142,7 @@ def test_build_invalidates_backfilled_phase_and_dependent_summaries(
     assert child_phase["summary_available"] is False
     assert child_agent["summary_available"] is False
     assert timeline["rollups"][0]["summary_available"] is False
-    detail = json.loads(
-        (output / child_phase["detail_path"]).read_text(encoding="utf-8")
-    )
+    detail = json.loads(read_stored_text(output / child_phase["detail_path"]))
     assert "Recovered evidence changes" in json.dumps(detail["transcript"])
 
     summary_root = tmp_path / "teams" / team.team_slug / "summary_data"
@@ -2491,7 +2494,7 @@ def test_combined_export_namespaces_teams_and_is_byte_idempotent(
     for team in (first_team, second_team):
         _write_team(tmp_path, team)
         write_json_if_changed(
-            tmp_path / "teams" / team.team_slug / "raw" / "artifacts.json",
+            team_build_root(tmp_path, team.team_slug) / "raw" / "artifacts.json",
             narrow_json(extract_artifacts(team).to_json_obj()),
         )
         summarize_archive(
@@ -2558,7 +2561,7 @@ def test_combined_export_namespaces_teams_and_is_byte_idempotent(
         first_team.team_slug,
     }
     for phase in timeline["phases"]:
-        detail_path = output / phase["detail_path"]
+        detail_path = stored_path(output / phase["detail_path"])
         assert detail_path.is_file()
         assert phase["detail_path"].startswith(f"data/details/{phase['team']}/")
     assert (output / "Makefile").is_file()
@@ -2615,9 +2618,7 @@ def test_combined_export_namespaces_teams_and_is_byte_idempotent(
         for value in export_manifest["generated_files"]
     )
     assert "app.js.gz" in export_manifest["generated_files"]
-    artifact_catalog = json.loads(
-        (output / "data" / "artifacts.json").read_text(encoding="utf-8")
-    )
+    artifact_catalog = json.loads(read_stored_text(output / "data" / "artifacts.json"))
     artifact_ids = {
         artifact["artifact_id"] for artifact in artifact_catalog["artifacts"]
     }
@@ -2781,6 +2782,10 @@ def test_presentation_stale_cleanup_cannot_delete_raw_team_data(tmp_path: Path) 
 def test_combined_export_stale_cleanup_rejects_symlinked_summary_parent(
     tmp_path: Path,
 ) -> None:
+    # A directory outside the summaries tree, holding something the sweep must not reach.
+    # Deliberately a plain path rather than the build store: what matters is only that it
+    # is somewhere else, and routing it through the store would imply a relevance it has
+    # none of.
     raw_root = tmp_path / "teams" / "victim" / "raw"
     raw_root.mkdir(parents=True)
     raw_path = raw_root / "valuable.md"
@@ -3171,7 +3176,7 @@ def _tear_normalized_generation(archive: Path, team_slug: str) -> None:
     """
 
     write_json_if_changed(
-        archive / "teams" / team_slug / "raw" / "source-manifest.json",
+        team_build_root(archive, team_slug) / "raw" / "source-manifest.json",
         narrow_json(
             {
                 "schema_version": 2,
@@ -3239,7 +3244,7 @@ def test_transcript_extraction_carries_a_torn_team_and_still_projects_the_health
 
     # Repairing the team needs no extraction-side intervention.
     write_json_if_changed(
-        tmp_path / "teams" / "orc-test" / "raw" / "source-manifest.json",
+        team_build_root(tmp_path, "orc-test") / "raw" / "source-manifest.json",
         narrow_json({"schema_version": 1, "provider": "codex", "sources": []}),
     )
     assert extract_transcripts_archive(tmp_path).partial is False

@@ -18,6 +18,7 @@ from pathlib import Path
 
 import pytest
 
+from agent_team_timeline.build_store import team_build_root
 from agent_team_timeline.archive_gc import plan_collection
 from agent_team_timeline.cli import main as timeline_main
 from agent_team_timeline.losslessness import audit_codex_losslessness
@@ -114,7 +115,7 @@ def test_the_manifest_records_the_root_relative_to_the_archive(tmp_path: Path) -
     _sessions, archive, _origin_path = _first_ingest(tmp_path)
 
     manifest = json.loads(
-        (archive / "teams" / "codex-test" / "raw" / "source-manifest.json").read_text(
+        (team_build_root(archive, "codex-test") / "raw" / "source-manifest.json").read_text(
             encoding="utf-8"
         )
     )

@@ -2065,15 +2065,20 @@ class TranscriptQuery:
     than claiming one guarantee for both.
     """
 
+    #: The projections a shipped archive carries. `occurrences.jsonl` is deliberately absent:
+    #: it is the exporter's monotonic baseline, read only by the next extraction, and the
+    #: largest thing the exporter writes -- so it lives in the build store beside the rest of
+    #: the rerun state rather than in the directory an operator ships. Its digest is still in
+    #: the manifest; what is gone is the requirement that this reader find a file the archive
+    #: was never meant to carry.
     _FILES = (
-        "occurrences.jsonl",
         "prompts.jsonl",
         "messages.jsonl",
         "system-inputs.jsonl",
     )
 
-    #: The two projections any query actually consults. The other two are declared, checked
-    #: for presence, and never opened -- naming them here is what keeps that deliberate.
+    #: The two projections any query actually consults. The third is declared, checked for
+    #: presence, and never opened -- naming them here is what keeps that deliberate.
     _CONSULTED = ("prompts.jsonl", "messages.jsonl")
 
     def __init__(self, root: Path, *, verify: bool = False) -> None:
@@ -2099,9 +2104,9 @@ class TranscriptQuery:
             if path.is_symlink() or not path.is_file():
                 raise ValueError(f"transcript export file is missing or unsafe: {path}")
             declared_bytes = _optional_json_int(entry.get("bytes"), f"{name}.bytes")
-            # The stat happens here, for all four files, and not in `_SeekableJsonlText`.
+            # The stat happens here, for every projection present, not in `_SeekableJsonlText`.
             # It used to happen only there, which meant it happened only for the two
-            # projections a query opens -- so a truncated `occurrences.jsonl` was accepted in
+            # projections a query opens -- so a truncated third projection was accepted in
             # silence by an open that had already been told how long the file should be. The
             # constructor's old digest loop caught that; a size check is the cheap half of
             # what it caught, and the half that costs a stat is the half worth keeping
@@ -2122,9 +2127,9 @@ class TranscriptQuery:
         self._readers: dict[str, _SeekableJsonlText] = {}
         self._verified: set[str] = set()
         # `verify` means "rely on nothing this archive merely promises". It re-digests every
-        # managed projection end to end -- all four, because "the old guarantee at the old
-        # price" is not a guarantee if it silently drops the two files the old constructor
-        # hashed and no query reads -- and it also widens the message read in
+        # managed projection end to end -- all of them, because "the old guarantee at the old
+        # price" is not a guarantee if it silently drops the one this archive carries and no
+        # query reads -- and it also widens the message read in
         # :meth:`list_messages` from a seek to a full scan, because those are the two places
         # a slice read substitutes an invariant for a measurement.
         self._exhaustive = verify

@@ -65,6 +65,51 @@ def write_text_with_gzip_invalidation(
     return changed
 
 
+def write_gzip_only(path: Path, text: str) -> int:
+    """Store *text* as ``<path>.gz`` and nothing else; report files changed.
+
+    The counterpart to :func:`write_text_with_gzip_invalidation`, for resources where the archive
+    keeps the compressed member as *the* stored form. The server materialises identity bytes from
+    it on demand, so nothing downstream can tell the twin is gone -- see the class docstring on
+    ``standalone_server.TimelineRequestHandler``.
+
+    Why this exists rather than "write the twin, then delete it": deleting would make every
+    rebuild look like a change, because the next run would find the identity file missing and
+    rewrite it. Compressing deterministically and comparing the *compressed* bytes keeps a
+    no-op rebuild a no-op, which is what the ``changed`` counters and stale-file removal are
+    built on.
+
+    An identity twin left over from the layout that stored both is removed here, so an existing
+    archive sheds it on the first rebuild instead of needing a migration step.
+    """
+
+    sidecar = gzip_sidecar_path(path)
+    if path.is_symlink() or sidecar.is_symlink():
+        raise ValueError(f"refusing unsafe gzip-only target: {path}")
+    if sidecar.exists() and not sidecar.is_file():
+        raise ValueError(f"refusing unsafe gzip sidecar: {sidecar}")
+    changed = 0
+    body = deterministic_gzip(text.encode("utf-8"))
+    if not sidecar.is_file() or sidecar.read_bytes() != body:
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        fd, raw_tmp = tempfile.mkstemp(prefix=f".{sidecar.name}.", dir=sidecar.parent)
+        tmp = Path(raw_tmp)
+        try:
+            with os.fdopen(fd, "wb") as output:
+                output.write(body)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(tmp, sidecar)
+        finally:
+            if tmp.exists():
+                tmp.unlink()
+        changed += 1
+    if path.is_file():
+        path.unlink()
+        changed += 1
+    return changed
+
+
 def _files_equal(left: Path, right: Path) -> bool:
     if not left.is_file() or left.stat().st_size != right.stat().st_size:
         return False
@@ -135,5 +180,6 @@ __all__ = [
     "deterministic_gzip",
     "gzip_sidecar_path",
     "sync_gzip_sidecar",
+    "write_gzip_only",
     "write_text_with_gzip_invalidation",
 ]

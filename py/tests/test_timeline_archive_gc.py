@@ -49,6 +49,7 @@ from pathlib import Path
 
 import pytest
 
+from agent_team_timeline.build_store import team_build_root
 from agent_team_timeline.archive import ARCHIVE_MARKER_FILE
 from agent_team_timeline.archive_gc import (
     ArchiveGcError,
@@ -895,7 +896,7 @@ def test_the_reclaim_reason_warns_that_it_removes_the_last_fallback(tmp_path: Pa
     assert reason in format_gc_report(report, "text")
     # An ingest archive can be rebuilt from what is beside it, and the reason says so only when
     # that is true here -- see the export case below.
-    assert "reads the teams/*/raw beside it" in reason
+    assert "reads the raw turns already reachable from here" in reason
 
     # With the monolith already gone -- the state a migrated archive is actually in -- the same
     # reason says the sharper thing rather than the same thing.
@@ -1199,7 +1200,7 @@ def test_an_export_is_told_that_its_rebuild_is_somewhere_else(tmp_path: Path) ->
         slugs.append(slug)
     build_combined_archive(archive, tuple(slugs), output=output, display_timezone="UTC")
     assert (output / ARCHIVE_MARKER_FILE).is_file()
-    assert not any((output / "teams" / slug / "raw").exists() for slug in slugs)
+    assert not any((team_build_root(output, slug) / "raw").exists() for slug in slugs)
 
     write_legacy_schema_2(output)
     _assert_the_website_reads_schema_three(output)
@@ -1207,7 +1208,7 @@ def test_an_export_is_told_that_its_rebuild_is_somewhere_else(tmp_path: Path) ->
 
     assert "it cannot be run here" in reason
     assert "the ingest archive it was built from" in reason
-    assert "reads the teams/*/raw beside it" not in reason
+    assert "reads the raw turns already reachable from here" not in reason
 
 
 def test_source_snapshots_are_measured_and_never_touched(tmp_path: Path) -> None:

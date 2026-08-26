@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from agent_team_timeline.build_store import shared_build_root
 from agent_team_timeline.archive import JsonValue, as_object, narrow_json
 from agent_team_timeline.cli import main as timeline_main
 from agent_team_timeline.model import Agent, Event, TeamData
@@ -211,7 +212,7 @@ def test_current_message_class_supersedes_stale_occurrence_projection(
     assert corrected.reclassified == 1
 
     root = tmp_path / "extracted" / "transcripts"
-    occurrences = _jsonl(root / "occurrences.jsonl")
+    occurrences = _jsonl(shared_build_root(tmp_path) / "occurrences.jsonl")
     assert len(occurrences) == 1
     assert occurrences[0]["record_type"] == "system_input"
     assert _jsonl(root / "prompts.jsonl") == []
@@ -259,7 +260,7 @@ def test_provenance_overlay_migrates_occurrence_without_duplicates_or_id_churn(
 
     export_transcripts(tmp_path, (legacy_team,), (rule,))
     root = tmp_path / "extracted" / "transcripts"
-    before_occurrences = _jsonl(root / "occurrences.jsonl")
+    before_occurrences = _jsonl(shared_build_root(tmp_path) / "occurrences.jsonl")
     before_by_type = {
         str(record["record_type"]): record for record in before_occurrences
     }
@@ -284,7 +285,7 @@ def test_provenance_overlay_migrates_occurrence_without_duplicates_or_id_churn(
     assert migrated.responses == 1
     assert migrated.carried_forward == 0
     assert migrated.reclassified == 0
-    occurrences = _jsonl(root / "occurrences.jsonl")
+    occurrences = _jsonl(shared_build_root(tmp_path) / "occurrences.jsonl")
     assert len(occurrences) == 2
     by_type = {str(record["record_type"]): record for record in occurrences}
     assert by_type["prompt"]["record_id"] == before_by_type["prompt"]["record_id"]
@@ -327,7 +328,7 @@ def test_provenance_overlay_rejects_other_immutable_changes(
     team = replace(_team((legacy,)), provider="orc")
     export_transcripts(tmp_path, (team,))
     occurrences = (
-        tmp_path / "extracted" / "transcripts" / "occurrences.jsonl"
+        shared_build_root(tmp_path) / "occurrences.jsonl"
     )
     before = occurrences.read_bytes()
 
@@ -643,7 +644,7 @@ def test_logical_prompt_report_deduplicates_identical_fork_occurrences(
 
     assert report.prompts == 1
     occurrences = _jsonl(
-        tmp_path / "extracted" / "transcripts" / "occurrences.jsonl"
+        shared_build_root(tmp_path) / "occurrences.jsonl"
     )
     assert len(occurrences) == 2
     prompts = _jsonl(tmp_path / "extracted" / "transcripts" / "prompts.jsonl")

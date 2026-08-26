@@ -45,6 +45,7 @@ from agent_team_timeline.summarize import (
 from agent_team_timeline.static_assets import (
     gzip_sidecar_path,
     sync_gzip_sidecar,
+    write_gzip_only,
     write_text_with_gzip_invalidation,
 )
 from agent_team_timeline.timeline_shards import (
@@ -629,6 +630,23 @@ def _write_compressible_json(path: Path, value: JsonValue) -> int:
     )
 
 
+def _write_gzip_only_json(path: Path, value: JsonValue) -> int:
+    """Store a browser-facing document as ``<path>.gz`` with no identity twin.
+
+    For the two families that dominate the archive's size and are only ever fetched by a browser
+    -- the per-phase detail documents and the artifact catalogue -- the compressed member is the
+    stored form. Both were previously kept twice: on the measured archive the identity copies came
+    to 203.4 MiB of detail across 11,899 phases plus a 47.0 MiB catalogue, none of which was ever
+    sent, because every client that fetches them announces gzip and gets the companion.
+
+    The path recorded in the timeline stream stays ``.json``. That is the resource; ``.json.gz``
+    is how it is stored, and the server presents one from the other. Keeping the logical name
+    means ``app.js`` needs no notion of this at all.
+    """
+
+    return write_gzip_only(path, canonical_json(value))
+
+
 def _standalone_server() -> str:
     return (files("agent_team_timeline") / "standalone_server.py").read_text(
         encoding="utf-8"
@@ -1123,6 +1141,9 @@ def render_archive(
     previous_presentation_files = _previous_presentation_files(archive)
     changed = 0
     compressible_paths: set[str] = set()
+    #: Relatives stored as ``<relative>.gz`` only. Disjoint from `compressible_paths`, which is
+    #: the set that keeps an identity file *and* gains a companion.
+    gzip_only_paths: set[str] = set()
     published_summary_paths: set[str] = set()
     phase_paths: dict[str, str] = {}
     agents_by_id = {agent.thread_id: agent for agent in team.agents}
@@ -1141,7 +1162,8 @@ def render_archive(
         phase_agent_name = _agent_name(agent, agent_names)
         raw_path = f"teams/{team.team_slug}/summaries/phases/{phase.phase_id}.md"
         detail_path = f"data/details/{phase.phase_id}.json"
-        compressible_paths.update((raw_path, detail_path))
+        compressible_paths.add(raw_path)
+        gzip_only_paths.add(detail_path)
         phase_paths[phase.phase_id] = detail_path
         artifact_ids = artifact_index.ids_for_range(
             phase.start_ms, phase.end_ms, phase.agent_id
@@ -1186,7 +1208,7 @@ def render_archive(
             "artifact_ids": list(artifact_ids),
             "output_artifact_ids": list(output_artifact_ids),
         }
-        changed += _write_compressible_json(
+        changed += _write_gzip_only_json(
             _generated_path(archive, detail_path), narrow_json(detail, detail_path)
         )
 
@@ -1623,11 +1645,11 @@ def render_archive(
         "projects": [project.to_json_obj() for project in artifact_catalog.projects],
         "stats": timeline_stats,
     }
-    changed += _write_compressible_json(
+    changed += _write_gzip_only_json(
         _generated_path(archive, "data/artifacts.json"),
         narrow_json(artifact_catalog.to_json_obj(), "artifact catalog"),
     )
-    compressible_paths.add("data/artifacts.json")
+    gzip_only_paths.add("data/artifacts.json")
     timeline_json = narrow_json(timeline)
     if not isinstance(timeline_json, dict):
         raise AssertionError("timeline projection must be an object")
@@ -1655,8 +1677,7 @@ def render_archive(
         changed += v3_report.files_changed
     generated_files = set(_PRESENTATION_COMMON)
     generated_files.update(published_summary_paths)
-    generated_files.update(phase_paths.values())
-    generated_files.update({_PRESENTATION_MANIFEST, "data/artifacts.json"})
+    generated_files.update({_PRESENTATION_MANIFEST})
     if not _published:
         generated_files.add(SCHEMA_1_TIMELINE_PATH)
     if v3_report is not None:
@@ -1664,6 +1685,11 @@ def render_archive(
     for relative in sorted(compressible_paths):
         if gzip_sidecar_path(_generated_path(archive, relative)).is_file():
             generated_files.add(relative + ".gz")
+    # A gzip-only relative is named in the manifest by the file that *exists*. Naming the plain
+    # relative would make stale-file removal look for a file this build deliberately did not
+    # write, and leave the `.gz` unnamed -- which is the shape that gets swept as an orphan.
+    for relative in sorted(gzip_only_paths):
+        generated_files.add(relative + ".gz")
     retired_files = (
         retired_generation_files(archive, generated_files) if _published else frozenset()
     )

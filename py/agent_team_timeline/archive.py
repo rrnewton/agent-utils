@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 import os
@@ -172,6 +173,27 @@ def read_json(path: Path) -> JsonValue:
     """Read JSON while narrowing it to the archive's recursive value type."""
 
     raw: object = json.loads(path.read_text(encoding="utf-8"))
+    return narrow_json(raw, str(path))
+
+
+def read_json_stored(path: Path) -> JsonValue:
+    """Read ``path``, accepting a stored ``path.gz`` as the same document.
+
+    Resources whose stored form is the compressed member have no identity file on disk, so a
+    reader that opens the ``.json`` name directly finds nothing. This resolves the name the way
+    the server does -- identity first, then the gzip member -- so a caller can keep naming the
+    logical path without caring which of the two the writer chose.
+    """
+
+    if path.is_file():
+        return read_json(path)
+    sidecar = path.with_name(path.name + ".gz")
+    if not sidecar.is_file():
+        # The original name, not the sidecar's: the caller asked for a document, and the fact
+        # that this looked for a compressed copy too is not the thing that went wrong.
+        raise FileNotFoundError(f"no such file: {path}")
+    with gzip.open(sidecar, "rt", encoding="utf-8") as handle:
+        raw: object = json.load(handle)
     return narrow_json(raw, str(path))
 
 

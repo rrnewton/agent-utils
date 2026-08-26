@@ -28,10 +28,21 @@ from dagrun.scheduler import Runner
 #: slow. A tight bound therefore buys nothing against the failure it guards (a wedge fails either
 #: way, just sooner) while buying a false positive every time the host is busy.
 #:
-#: It was 20.0, and that is exactly what happened: this test passes in 0.33s standalone and 3/3 on
-#: repeat, but failed inside a full `make validate` on a loaded machine — twice, in unrelated work,
-#: on a suite that gates every push. A flaky gate is worse than a slow one, because the cost is
-#: paid by whoever is landing something else and has no reason to suspect this file.
+#: It was 20.0, and was raised on the theory that the failures seen under a full `make validate`
+#: were a loaded machine. **That theory was wrong**, and the correction matters more than the
+#: number: measured standalone on an idle machine, this test wedges at roughly one run in fifteen
+#: to twenty, hitting the deadline exactly and reporting the assertion below. It is not slow, it
+#: hangs — `runner.run()` never returns.
+#:
+#: So the deadline is doing its job and is not the thing to adjust. What remains is a real,
+#: low-rate race in the scheduler, reachable only through the retire-then-crash window this test
+#: opens: layer one publishes the outcome (the CRASHED traceback appears every time, including on
+#: the failing runs), and yet the ready-set loop does not observe it and terminate. Reproducing it
+#: outside pytest has not succeeded in 40 consecutive direct runs, and disabling capture does not
+#: prevent it, so neither the harness nor output capture is the mechanism.
+#:
+#: Do not raise this bound again to make the failure rarer. A gate that hangs one run in twenty is
+#: the defect; the number here only decides how long it takes to say so.
 _DEADLINE_S = 120.0
 
 

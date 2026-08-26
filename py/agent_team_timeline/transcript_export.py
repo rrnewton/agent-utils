@@ -23,6 +23,7 @@ from agent_team_timeline.archive import (
     write_text_if_changed,
 )
 from agent_team_timeline.model import Event, TeamData, source_digest
+from agent_team_timeline.build_store import shared_build_file, shared_build_root
 from agent_team_timeline.render import (
     archive_makefile,
     prune_retired_query_artifacts,
@@ -31,12 +32,26 @@ from agent_team_timeline.render import (
 
 
 TRANSCRIPT_EXPORT_SCHEMA_VERSION = 1
+#: The projections the archive publishes: what a reader of a shipped archive opens.
 _MANAGED_FILES = (
-    "occurrences.jsonl",
     "prompts.jsonl",
     "messages.jsonl",
     "system-inputs.jsonl",
 )
+
+#: The monotonic union, which is *input to the next run* rather than output of this one.
+#:
+#: It is the largest thing this module writes -- 106.3 MiB against 110.2 MiB for all three
+#: published projections combined -- and nothing that consumes an archive opens it: not the
+#: browser, not any subcommand of the shipped CLI. Its one reader is `export_transcripts`
+#: itself, which reads the previous generation to carry forward the records of teams that could
+#: not be loaded this run. That is the definition of rerun state, so it lives in the build store
+#: beside the other rerun state rather than in the directory an operator ships.
+#:
+#: Its digest stays in the manifest. Where the bytes live is a packaging decision; whether the
+#: generation can be checked against what produced it is not, and dropping the record because
+#: the file moved would trade a real guarantee for a directory listing.
+_BASELINE_FILE = "occurrences.jsonl"
 _AUTHORSHIP_RULES_FILE = "authorship-rules.json"
 _UNCLASSIFIED_AUTHOR_KINDS = frozenset({"external_or_unknown", "unknown"})
 _RULE_AUTHOR_KINDS = frozenset(
@@ -1053,7 +1068,9 @@ def _logical_records(
     return sorted(result, key=_record_sort_key)
 
 
-def _validate_previous_manifest(root: Path) -> dict[str, JsonValue] | None:
+def _validate_previous_manifest(
+    root: Path, archive: Path
+) -> dict[str, JsonValue] | None:
     path = root / "manifest.json"
     if not path.exists():
         return None
@@ -1061,10 +1078,14 @@ def _validate_previous_manifest(root: Path) -> dict[str, JsonValue] | None:
     if manifest.get("schema_version") != TRANSCRIPT_EXPORT_SCHEMA_VERSION:
         raise ValueError(f"unsupported transcript export manifest at {path}")
     files = as_object(manifest.get("files"), f"{path}.files")
-    for name in _MANAGED_FILES:
+    for name in (*_MANAGED_FILES, _BASELINE_FILE):
         entry = as_object(files.get(name), f"{path}.files.{name}")
         expected = as_string(entry.get("sha256"), f"{path}.files.{name}.sha256")
-        managed = root / name
+        managed = (
+            shared_build_file(archive, name)
+            if name == _BASELINE_FILE
+            else root / name
+        )
         if not managed.is_file() or managed.is_symlink():
             raise ValueError(f"transcript export file is missing or unsafe: {managed}")
         actual = hashlib.sha256(managed.read_bytes()).hexdigest()
@@ -1132,7 +1153,8 @@ def export_transcripts(
             + ", ".join(sorted(skipped_slugs & loaded_slugs))
         )
     root = archive / "extracted" / "transcripts"
-    previous_manifest = _validate_previous_manifest(root)
+    baseline_root = shared_build_root(archive)
+    previous_manifest = _validate_previous_manifest(root, archive)
     if previous_manifest is not None:
         previous_teams = {
             as_string(value, "transcript manifest team")
@@ -1151,7 +1173,7 @@ def export_transcripts(
                 "monotonic transcript export cannot omit previously extracted teams: "
                 + ", ".join(omitted)
             )
-    previous_occurrences = read_jsonl(root / "occurrences.jsonl")
+    previous_occurrences = read_jsonl(shared_build_file(archive, _BASELINE_FILE))
     configured_rules = (
         tuple(prompt_authorship_rules)
         if prompt_authorship_rules is not None
@@ -1235,12 +1257,16 @@ def export_transcripts(
     changed = 0
     for name in _MANAGED_FILES:
         changed += int(write_text_if_changed(root / name, texts[name]))
+    baseline_root.mkdir(parents=True, exist_ok=True)
+    changed += int(
+        write_text_if_changed(baseline_root / _BASELINE_FILE, texts[_BASELINE_FILE])
+    )
     changed += int(
         write_text_if_changed(root / _AUTHORSHIP_RULES_FILE, rules_text)
     )
 
     file_manifest: dict[str, JsonValue] = {}
-    for name in _MANAGED_FILES:
+    for name in (*_MANAGED_FILES, _BASELINE_FILE):
         text = texts[name]
         file_manifest[name] = {
             "sha256": _sha256_text(text),

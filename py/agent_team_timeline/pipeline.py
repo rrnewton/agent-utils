@@ -15,6 +15,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from agent_team_timeline import __version__
+from agent_team_timeline.build_store import (
+    ingested_team_slugs,
+    ensure_build_store,
+    resolve_build_root,
+    team_build_root as _build_root,
+)
 from agent_team_timeline.archive import (
     ARCHIVE_MARKER_FILE,
     JsonValue,
@@ -255,7 +261,7 @@ def _ensure_archive(archive: Path, team_slug: str, *, create: bool) -> None:
         if marker.get("tool") != "agent-team-timeline" or marker.get("schema_version") != 1:
             raise ValueError(f"invalid agent-team-timeline archive marker at {marker_path}")
         return
-    legacy_raw = archive / "teams" / team_slug / "raw" / "team.json"
+    legacy_raw = _build_root(archive, team_slug) / "raw" / "team.json"
     if legacy_raw.is_file():
         legacy_marker: dict[str, JsonValue] = {
             "schema_version": 1,
@@ -526,7 +532,7 @@ def _archive_team(team: TeamData) -> tuple[TeamData, tuple[str, ...]]:
 
 def _payload_root(archive: Path, team_slug: str) -> Path:
     _validate_team_slug(team_slug)
-    return archive / "teams" / team_slug / "payloads"
+    return _build_root(archive, team_slug) / "payloads"
 
 
 def rehydrate_tool_payloads(archive: Path, team: TeamData) -> TeamData:
@@ -576,12 +582,12 @@ def rehydrate_tool_payloads(archive: Path, team: TeamData) -> TeamData:
 
 def _raw_team_path(archive: Path, team_slug: str) -> Path:
     _validate_team_slug(team_slug)
-    return archive / "teams" / team_slug / "raw" / "team.json"
+    return _build_root(archive, team_slug) / "raw" / "team.json"
 
 
 def _artifact_catalog_path(archive: Path, team_slug: str) -> Path:
     _validate_team_slug(team_slug)
-    return archive / "teams" / team_slug / "raw" / "artifacts.json"
+    return _build_root(archive, team_slug) / "raw" / "artifacts.json"
 
 
 def _summary_root(archive: Path, team_slug: str) -> Path:
@@ -634,17 +640,17 @@ def snapshot_root_for(archive: Path, team_slug: str) -> Path:
 
 def _source_manifest_path(archive: Path, team_slug: str) -> Path:
     _validate_team_slug(team_slug)
-    return archive / "teams" / team_slug / "raw" / "source-manifest.json"
+    return _build_root(archive, team_slug) / "raw" / "source-manifest.json"
 
 
 def _normalized_generation_path(archive: Path, team_slug: str) -> Path:
     _validate_team_slug(team_slug)
-    return archive / "teams" / team_slug / "raw" / "normalized-generation.json"
+    return _build_root(archive, team_slug) / "raw" / "normalized-generation.json"
 
 
 def _task_notes_path(archive: Path, team_slug: str) -> Path:
     _validate_team_slug(team_slug)
-    return archive / "teams" / team_slug / "raw" / "task-notes.jsonl"
+    return _build_root(archive, team_slug) / "raw" / "task-notes.jsonl"
 
 
 def _load_promoted_task_notes(archive: Path, team_slug: str) -> tuple[TaskNote, ...]:
@@ -736,7 +742,7 @@ def _merge_promoted_task_notes(
 
 def _retired_message_projection_root(archive: Path, team_slug: str) -> Path:
     _validate_team_slug(team_slug)
-    return archive / "teams" / team_slug / "raw" / "messages"
+    return _build_root(archive, team_slug) / "raw" / "messages"
 
 
 def _retire_message_projections(archive: Path, team_slug: str) -> tuple[int, int]:
@@ -843,7 +849,7 @@ def _canonical_json_file_sha256(path: Path) -> str:
 
 def _site_identity_path(archive: Path, team_slug: str) -> Path:
     _validate_team_slug(team_slug)
-    return archive / "teams" / team_slug / "raw" / "site-identity.json"
+    return _build_root(archive, team_slug) / "raw" / "site-identity.json"
 
 
 def load_site_identity(
@@ -1213,7 +1219,7 @@ def _write_ingested_team(
     }
     changed += int(
         _write_json_durable(
-            archive / "teams" / team_slug / "raw" / "source-snapshot.json",
+            _build_root(archive, team_slug) / "raw" / "source-snapshot.json",
             narrow_json(snapshot),
         )
     )
@@ -1959,16 +1965,7 @@ def extract_transcripts_archive(
     with archive_writer_lock(archive):
         selected = tuple(team_slugs)
         if not selected:
-            teams_root = archive / "teams"
-            selected = tuple(
-                sorted(
-                    path.name
-                    for path in teams_root.iterdir()
-                    if path.is_dir()
-                    and not path.is_symlink()
-                    and (path / "raw" / "team.json").is_file()
-                )
-            ) if teams_root.is_dir() else ()
+            selected = ingested_team_slugs(archive)
         if not selected:
             raise ValueError(f"no ingested teams found in {archive}")
         if len(set(selected)) != len(selected):

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import re
 
+from agent_team_timeline.build_store import team_build_root as _build_root
 from agent_team_timeline.archive import (
     JsonValue,
     as_array,

@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 import agent_team_timeline.losslessness as losslessness_module
+from agent_team_timeline.build_store import team_build_root
 from agent_team_timeline.cli import main as timeline_main
 from agent_team_timeline.losslessness import (
     audit_archive_losslessness,
@@ -190,7 +191,7 @@ def _ingest(tmp_path: Path, *, extra: bytes = b"", child: bool = False) -> Path:
 
 
 def _payload_root(archive: Path) -> Path:
-    return archive / "teams" / "codex-test" / "payloads"
+    return team_build_root(archive, "codex-test") / "payloads"
 
 
 # --------------------------------------------------------------------------------------------
@@ -233,7 +234,7 @@ def test_payload_tree_is_gitignored_and_tracked_files_stay_clean(tmp_path: Path)
     ]
     tracked = "\n".join(
         path.read_text(encoding="utf-8")
-        for path in (archive / "teams" / "codex-test" / "raw").rglob("*")
+        for path in (team_build_root(archive, "codex-test") / "raw").rglob("*")
         if path.is_file()
     )
     # The stdout the payload tree now holds is exactly the kind of content that must not reach a
@@ -502,7 +503,7 @@ def test_reverting_to_the_old_behaviour_fails_the_gate(
     """
 
     archive = _ingest(tmp_path)
-    team_path = archive / "teams" / "codex-test" / "raw" / "team.json"
+    team_path = team_build_root(archive, "codex-test") / "raw" / "team.json"
     document = json.loads(team_path.read_text(encoding="utf-8"))
     for tool in document["tool_calls"]:
         tool.pop("input_payload", None)
@@ -630,7 +631,7 @@ def test_the_cwd_redaction_is_declared_rather_than_counted_as_a_loss(tmp_path: P
 
 def test_an_uncovered_provider_is_named_rather_than_omitted(tmp_path: Path) -> None:
     archive = _ingest(tmp_path)
-    manifest_path = archive / "teams" / "codex-test" / "raw" / "source-manifest.json"
+    manifest_path = team_build_root(archive, "codex-test") / "raw" / "source-manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["provider"] = "orc"
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
@@ -934,7 +935,7 @@ def test_blanking_every_message_fails_the_gate(tmp_path: Path) -> None:
     archive = _ingest(tmp_path, child=True)
     assert audit_codex_losslessness(archive, "codex-test").sound
 
-    team_path = archive / "teams" / "codex-test" / "raw" / "team.json"
+    team_path = team_build_root(archive, "codex-test") / "raw" / "team.json"
     document = json.loads(team_path.read_text(encoding="utf-8"))
     for event in document["events"]:
         event["text"] = ""

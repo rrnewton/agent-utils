@@ -125,10 +125,11 @@ def _write_export(
     payload = {
         "prompts.jsonl": prompts,
         "messages.jsonl": messages,
-        # Declared, checked for presence and size, and opened by no query. They are here
-        # because the constructor's contract covers all four, which is exactly the property
-        # `test_a_truncated_unconsulted_projection_is_still_refused_at_open` pins.
-        "occurrences.jsonl": [{"record_id": "occurrence:1"}],
+        # Declared, checked for presence and size, and opened by no query. It is here
+        # because the constructor's contract covers every projection the archive carries,
+        # which is what `test_a_truncated_unconsulted_projection_is_still_refused_at_open`
+        # pins. The monotonic baseline is not among them: it is rerun state and lives in the
+        # build store, so an archive that does not carry it is correct rather than damaged.
         "system-inputs.jsonl": [{"record_id": "system-input:1"}],
     }
     files: dict[str, object] = {}
@@ -387,12 +388,12 @@ def test_a_truncated_unconsulted_projection_is_still_refused_at_open(
     """A damaged file no query reads is still a damaged generation.
 
     The size check used to live in the reader, which meant it ran only for the two
-    projections a query opens -- so a truncated ``occurrences.jsonl`` was accepted in silence
-    by an open that had already been told how long the file should be.
+    projections a query opens -- so a truncated ``system-inputs.jsonl`` was accepted in
+    silence by an open that had already been told how long the file should be.
     """
 
     root = _write_export(tmp_path, [_prompt(1, 100, "team-a", "owner_human", "x")], [])
-    for name in ("occurrences.jsonl", "system-inputs.jsonl", "prompts.jsonl"):
+    for name in ("system-inputs.jsonl", "prompts.jsonl"):
         path = root / "extracted" / "transcripts" / name
         original = path.read_bytes()
         path.write_bytes(original[: len(original) // 2])

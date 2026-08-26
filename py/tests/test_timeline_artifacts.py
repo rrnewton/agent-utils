@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from agent_team_timeline.build_store import team_build_root
 from agent_team_timeline.archive import narrow_json, read_json
 from agent_team_timeline.artifacts import (
     ArtifactKind,
@@ -26,7 +27,7 @@ from agent_team_timeline.pipeline import (
     summarize_archive,
 )
 from agent_team_timeline.snapshot_store import resolve_snapshot_root
-from tests.timeline_projection import schema_1_timeline_text
+from tests.timeline_projection import read_stored_text, schema_1_timeline_text
 
 
 ROOT = "00000000-0000-0000-0000-000000000001"
@@ -421,7 +422,7 @@ def test_ingest_writes_catalog_before_redacting_tool_payloads(tmp_path: Path) ->
     assert report.artifacts >= 2  # repository plus pull request
     assert report.projects == 1
     catalog_path = (
-        tmp_path / "teams" / team.team_slug / "raw" / "artifacts.json"
+        team_build_root(tmp_path, team.team_slug) / "raw" / "artifacts.json"
     )
     assert catalog_path.is_file()
     catalog = load_artifact_catalog(tmp_path, team.team_slug, archived)
@@ -450,9 +451,7 @@ def test_build_associates_catalog_with_phase_agent_and_rollups(tmp_path: Path) -
     first = build_archive(tmp_path, team.team_slug)
     second = build_archive(tmp_path, team.team_slug)
 
-    catalog = json.loads(
-        (tmp_path / "data" / "artifacts.json").read_text(encoding="utf-8")
-    )
+    catalog = json.loads(read_stored_text(tmp_path / "data" / "artifacts.json"))
     pull = next(
         item
         for item in catalog["artifacts"]
@@ -468,9 +467,7 @@ def test_build_associates_catalog_with_phase_agent_and_rollups(tmp_path: Path) -
         for item in timeline["phases"]
         if artifact_id in item["output_artifact_ids"]
     )
-    detail = json.loads(
-        (tmp_path / phase["detail_path"]).read_text(encoding="utf-8")
-    )
+    detail = json.loads(read_stored_text(tmp_path / phase["detail_path"]))
     assert artifact_id in detail["artifact_ids"]
     assert artifact_id in detail["output_artifact_ids"]
     assert artifact_id in timeline["agents"][0]["output_artifact_ids"]
@@ -515,7 +512,7 @@ def test_ingest_never_persists_cwd_or_repository_credentials(tmp_path: Path) -> 
     assert archived.sources[0].repository_url is None
     persisted = "\n".join(
         path.read_text(encoding="utf-8")
-        for path in (tmp_path / "teams" / team.team_slug / "raw").rglob("*.json")
+        for path in (team_build_root(tmp_path, team.team_slug) / "raw").rglob("*.json")
     )
     assert "supersecret" not in persisted
     assert "/home/private" not in persisted

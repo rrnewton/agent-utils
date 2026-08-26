@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from agent_team_timeline.build_store import team_build_root
 from agent_team_timeline.archive import as_array, as_object, narrow_json, write_json_if_changed
 from agent_team_timeline.cli import _parser
 from agent_team_timeline.model import Agent, Edge, Event, SourceSnapshot, TeamData
@@ -257,7 +258,7 @@ def test_built_site_uses_exact_window_and_only_selected_agents(tmp_path: Path) -
     window = parse_date_window("2026-07-21", "2026-07-22", "America/New_York")
     assert window is not None
     team = apply_date_window(_team(), window)
-    raw_path = tmp_path / "teams" / team.team_slug / "raw" / "team.json"
+    raw_path = team_build_root(tmp_path, team.team_slug) / "raw" / "team.json"
     write_json_if_changed(raw_path, narrow_json(team.to_json_obj()))
 
     report = summarize_archive(tmp_path, team.team_slug, "heuristic", "test-model")
@@ -355,7 +356,7 @@ def test_built_site_keeps_silent_agent_whose_lifetime_overlaps_window(
         ),
         window,
     )
-    raw_path = tmp_path / "teams" / team.team_slug / "raw" / "team.json"
+    raw_path = team_build_root(tmp_path, team.team_slug) / "raw" / "team.json"
     write_json_if_changed(raw_path, narrow_json(team.to_json_obj()))
 
     report = summarize_archive(tmp_path, team.team_slug, "heuristic", "test-model")

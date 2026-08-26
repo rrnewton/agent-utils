@@ -57,6 +57,10 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
+from agent_team_timeline.build_store import (
+    ingested_team_slugs,
+    team_build_root as _build_root,
+)
 from agent_team_timeline.archive import (
     JsonValue,
     as_array,
@@ -849,7 +853,7 @@ def _build_index(archive: Path, team: TeamData) -> _ArchiveIndex:
         inputs[raw_call_id] = tool.input_payload.sha256 if tool.input_payload else None
         outputs[raw_call_id] = tool.output_payload.sha256 if tool.output_payload else None
         refs.extend(ref for ref in (tool.input_payload, tool.output_payload) if ref is not None)
-    resolved = resolve_payloads(archive / "teams" / team.team_slug / "payloads", refs)
+    resolved = resolve_payloads(_build_root(archive, team.team_slug) / "payloads", refs)
     return _ArchiveIndex(
         lines=frozenset(lines),
         event_content=content,
@@ -1099,7 +1103,7 @@ def audit_codex_losslessness(archive: Path, team_slug: str) -> LosslessnessRepor
 
     from agent_team_timeline.pipeline import load_archived_team, snapshot_root_for
 
-    team_root = archive / "teams" / team_slug
+    team_root = _build_root(archive, team_slug)
     manifest_path = team_root / "raw" / "source-manifest.json"
     if not manifest_path.is_file():
         return _skipped(team_slug, "unknown", "the team has no raw/source-manifest.json")
@@ -1377,20 +1381,7 @@ def audit_archive_losslessness(
 
     selected = tuple(team_slugs)
     if not selected:
-        teams_root = archive / "teams"
-        selected = (
-            tuple(
-                sorted(
-                    path.name
-                    for path in teams_root.iterdir()
-                    if path.is_dir()
-                    and not path.is_symlink()
-                    and (path / "raw" / "team.json").is_file()
-                )
-            )
-            if teams_root.is_dir()
-            else ()
-        )
+        selected = ingested_team_slugs(archive)
     if not selected:
         raise ValueError(f"no ingested teams found in {archive}")
     if len(set(selected)) != len(selected):

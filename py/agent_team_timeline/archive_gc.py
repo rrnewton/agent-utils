@@ -205,6 +205,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
+from agent_team_timeline.build_store import candidate_store_roots
 from agent_team_timeline.archive import (
     ARCHIVE_MARKER_FILE,
     JsonValue,
@@ -853,19 +854,25 @@ def _holds_raw_turns(root: Path) -> bool:
 
     The distinction is ingest archive against combined export, and it is not cosmetic: both carry
     ``.agent-team-timeline.json`` and both are things `gc` runs on, but only the first can be
-    rebuilt from itself. Asked as "is there a ``teams/<slug>/raw/``" rather than by looking for a
-    marker that says which kind of archive this is, because no such marker exists and inventing
+    rebuilt from itself. Asked as "is there a ``<store>/<slug>/raw/``" rather than by looking for
+    a marker that says which kind of archive this is, because no such marker exists and inventing
     one to answer a sentence in a reason string would be the tail wagging the dog -- the question
-    the sentence is actually making a promise about is literally "are the raw turns here".
+    the sentence is actually making a promise about is literally "are the raw turns reachable".
+
+    *Reachable*, not *inside*. `build_store` moved ``raw/`` to a sibling of the archive, and an
+    ingest archive that has migrated can still be rebuilt without a network or a token: the
+    material is beside the archive rather than within it. Asking only about ``teams/`` would call
+    such an archive a combined export and tell its operator the way back is on another machine,
+    at the exact moment ``--empty-trash`` is about to make the question permanent.
     """
 
-    teams = root / "teams"
-    if not teams.is_dir() or teams.is_symlink():
-        return False
-    for team in teams.iterdir():
-        raw = team / "raw"
-        if raw.is_dir() and not raw.is_symlink():
-            return True
+    for store in candidate_store_roots(root):
+        if not store.is_dir() or store.is_symlink():
+            continue
+        for team in store.iterdir():
+            raw = team / "raw"
+            if raw.is_dir() and not raw.is_symlink():
+                return True
     return False
 
 
@@ -906,10 +913,12 @@ def _schema_2_reclaim_reason(root: Path) -> str:
         "schema 3 becomes the only generation this archive has"
     )
     rebuild = (
-        "the way back is a rebuild, which costs no tokens and reads the teams/*/raw beside it"
+        "the way back is a rebuild, which costs no tokens and reads the raw turns already "
+        "reachable from here -- in <output>.build/*/raw, or teams/*/raw on an archive that has "
+        "not migrated"
         if _holds_raw_turns(root)
-        else "the way back is a rebuild, and it cannot be run here: this archive has no "
-        "teams/*/raw, which is what a combined export looks like -- the raw turns are in the "
+        else "the way back is a rebuild, and it cannot be run here: this archive has no raw "
+        "turns in either place, which is what a combined export looks like -- they are in the "
         "ingest archive it was built from, wherever that is"
     )
     return (

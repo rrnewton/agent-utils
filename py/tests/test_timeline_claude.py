@@ -8,6 +8,7 @@ import shutil
 
 import pytest
 
+from agent_team_timeline.build_store import team_build_root
 from agent_team_timeline.claude import (
     ClaudeParseError,
     ClaudeSourceCopy,
@@ -392,9 +393,7 @@ def test_pipeline_snapshots_claude_and_reuses_unchanged_archive(tmp_path: Path) 
     ]
     manifest = json.loads(
         (
-            archive
-            / "teams"
-            / "claude-fixture"
+            team_build_root(archive, "claude-fixture")
             / "raw"
             / "source-manifest.json"
         ).read_text(encoding="utf-8")
@@ -441,7 +440,7 @@ def test_cli_exposes_bounded_claude_ingest(tmp_path: Path) -> None:
     assert status == 0
     raw = json.loads(
         (
-            archive / "teams" / "claude-fixture" / "raw" / "team.json"
+            team_build_root(archive, "claude-fixture") / "raw" / "team.json"
         ).read_text(encoding="utf-8")
     )
     assert raw["provider"] == "claude"

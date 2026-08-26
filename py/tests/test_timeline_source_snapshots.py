@@ -13,6 +13,7 @@ import pytest
 
 import agent_team_timeline.codex as codex_module
 import agent_team_timeline.pipeline as pipeline_module
+from agent_team_timeline.build_store import team_build_root
 from agent_team_timeline.cli import main as timeline_main
 from agent_team_timeline.codex import (
     CodexParseError,
@@ -372,7 +373,7 @@ def _snapshot(archive: Path) -> Path:
 
 
 def _manifest(archive: Path) -> Path:
-    return archive / "teams" / "codex-test" / "raw" / "source-manifest.json"
+    return team_build_root(archive, "codex-test") / "raw" / "source-manifest.json"
 
 
 def _first_ingest(tmp_path: Path, data: bytes | None = None) -> tuple[Path, Path, Path]:
@@ -412,9 +413,7 @@ def test_ingest_copies_complete_lines_then_parses_the_backup(tmp_path: Path) -> 
     assert manifest["source_root"] == str(sessions.resolve())
     identity = json.loads(
         (
-            archive
-            / "teams"
-            / "codex-test"
+            team_build_root(archive, "codex-test")
             / "raw"
             / "site-identity.json"
         ).read_text(encoding="utf-8")
@@ -460,7 +459,7 @@ def test_real_ingest_writes_no_per_thread_message_projection(tmp_path: Path) -> 
     # Nothing anywhere in the archive, not just under the one team: this is the check that catches
     # a second writer being added later under a different team root.
     assert [path for path in archive.rglob("messages") if path.is_dir()] == []
-    raw = archive / "teams" / "codex-test" / "raw"
+    raw = team_build_root(archive, "codex-test") / "raw"
     assert sorted(path.name for path in raw.iterdir()) == [
         "artifacts.json",
         "site-identity.json",
@@ -474,7 +473,7 @@ def test_real_ingest_retires_a_legacy_projection_and_says_so_on_stderr(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     sessions, archive, _ = _first_ingest(tmp_path)
-    legacy = archive / "teams" / "codex-test" / "raw" / "messages"
+    legacy = team_build_root(archive, "codex-test") / "raw" / "messages"
     legacy.mkdir()
     payload = json.dumps({"agent": {}, "turns": [], "messages": []}) + "\n"
     for thread_id in (ROOT, CHILD):
@@ -763,7 +762,7 @@ def test_cli_accepts_ordered_repeatable_continuation_sessions(tmp_path: Path) ->
     ] == [CONTINUATION, CONTINUATION_TWO]
     assert manifest["continuation_sessions"][1]["predecessor_thread_id"] == CONTINUATION
     raw = json.loads(
-        (archive / "teams" / "codex-test" / "raw" / "team.json").read_text(
+        (team_build_root(archive, "codex-test") / "raw" / "team.json").read_text(
             encoding="utf-8"
         )
     )
@@ -934,7 +933,7 @@ def test_collaboration_edge_cannot_overwrite_continuation_edge(tmp_path: Path) -
     child = origin.with_name("rollout-child.jsonl")
     child.write_bytes(_child_bytes())
     baseline, _ = ingest_codex(archive, sessions, ROOT, "codex-test", "UTC")
-    raw_team = archive / "teams" / "codex-test" / "raw" / "team.json"
+    raw_team = team_build_root(archive, "codex-test") / "raw" / "team.json"
     raw_before = raw_team.read_bytes()
     edge_id = f"codex-continuation-{CONTINUATION}"
     origin.write_bytes(
@@ -1022,7 +1021,7 @@ def test_continuation_source_truncation_fails_without_replacing_archive(
         continuation_thread_ids=(CONTINUATION,),
     )
     manifest_before = _manifest(archive).read_bytes()
-    raw_team = archive / "teams" / "codex-test" / "raw" / "team.json"
+    raw_team = team_build_root(archive, "codex-test") / "raw" / "team.json"
     team_before = raw_team.read_bytes()
     child_bytes = continuation_child.read_bytes()
     continuation_child.write_bytes(child_bytes.rsplit(b"\n", 2)[0] + b"\n")

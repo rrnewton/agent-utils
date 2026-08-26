@@ -13,6 +13,7 @@ import pytest
 
 import agent_team_timeline.cli as cli_module
 import agent_team_timeline.project_config as project_config_module
+from agent_team_timeline.build_store import team_build_root
 from agent_team_timeline.claude import ClaudeParseError
 from agent_team_timeline.cli import main as timeline_main
 from agent_team_timeline.identity import IdentityOverrides
@@ -920,7 +921,7 @@ def test_ingest_project_keeps_a_failed_team_in_the_projection_end_to_end(
 
     assert timeline_main(["ingest-project", "--config", str(config_path)]) == 0
     assert "teams: 2 succeeded, 0 failed" in capsys.readouterr().out
-    normalized_two = archive / "teams" / "team-two" / "raw" / "team.json"
+    normalized_two = team_build_root(archive, "team-two") / "raw" / "team.json"
     snapshot_before = normalized_two.read_bytes()
     prompts_before = prompts_path.read_text(encoding="utf-8")
     assert prompts_before

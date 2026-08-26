@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import functools
+import gzip
 import hashlib
 import http.server
 import io
@@ -13,6 +14,7 @@ import re
 import threading
 import urllib.parse
 import webbrowser
+import zlib
 from email.utils import formatdate
 from pathlib import Path
 from typing import BinaryIO
@@ -78,6 +80,12 @@ _ETAG_CACHE_LIMIT = 512
 _MAX_RANGE_BYTES = 16 << 20
 
 _RANGE = re.compile(r"^bytes=(\d*)-(\d*)$")
+
+#: Ceiling on inflating a `.gz`-only resource for a client that refused gzip. Generous, because
+#: the point is to bound a memory bomb rather than to ration the fallback: the largest such
+#: resource measured is the 49,264,239-byte artifact catalogue, and the fallback is only reached
+#: by a client that sent `Accept-Encoding: identity` -- which no browser does.
+_MAX_INFLATE_BYTES = 512 << 20
 
 #: Path components this server will not serve from, at any depth, under any name.
 #:
@@ -183,8 +191,33 @@ def _etag_matches(raw_header: str, etag: str) -> bool:
     return False
 
 
+def _inflate(path: Path) -> bytes | None:
+    """Return the decompressed contents of *path*, or ``None`` if it is not usable as one."""
+
+    try:
+        with gzip.open(path, "rb") as compressed:
+            body = compressed.read(_MAX_INFLATE_BYTES + 1)
+    except (OSError, EOFError, gzip.BadGzipFile, zlib.error):
+        return None
+    return None if len(body) > _MAX_INFLATE_BYTES else body
+
+
 class TimelineRequestHandler(http.server.SimpleHTTPRequestHandler):
-    """Serve identity files or deterministic ``.gz`` companions with validators."""
+    """Serve a resource from its identity bytes or from a ``.gz`` that stands in for them.
+
+    A ``.gz`` companion is a *complete* representation here, not a transfer-time optimisation
+    layered over a mandatory plain twin. When ``foo.json`` is absent and ``foo.json.gz`` is
+    present, the compressed member is what the archive stores and this server answers
+    ``GET /foo.json`` from it -- sending the stored bytes under ``Content-Encoding: gzip`` to the
+    ordinary client, and inflating them only for a client that explicitly refused gzip or asked
+    for a byte range.
+
+    That is what lets the archive stop writing the twin. Both files existed because the identity
+    copy was the resource and the ``.gz`` was an accelerator, so the plain bytes had to be on disk
+    even though no browser ever received them: on the measured archive that was 203.4 MiB of
+    per-phase detail and a 47.0 MiB artifact catalogue kept for a fallback nobody took. Inverting
+    which one is mandatory costs one inflate on the fallback path and removes both.
+    """
 
     _cache_control_sent = False
 
@@ -246,35 +279,58 @@ class TimelineRequestHandler(http.server.SimpleHTTPRequestHandler):
             self.send_error(404, "File not found")
             return None
         source_path = self._selected_source_path()
-        if source_path is None or not source_path.is_file() or source_path.is_symlink():
+        if source_path is None:
             return super().send_head()
         sidecar_path = source_path.with_name(source_path.name + ".gz")
-        vary = sidecar_path.is_file() and not sidecar_path.is_symlink()
+        source_ok = source_path.is_file() and not source_path.is_symlink()
+        sidecar_ok = sidecar_path.is_file() and not sidecar_path.is_symlink()
+        if not source_ok and not sidecar_ok:
+            return super().send_head()
+        # True when the `.gz` is the only thing on disk, so it *is* the resource rather than a
+        # companion to one. The identity representation still exists as far as HTTP is concerned;
+        # it is simply materialised on demand instead of stored.
+        gz_only = sidecar_ok and not source_ok
+        vary = sidecar_ok
         raw_range = self.headers.get("Range", "")
-        # A range request is served from the identity representation, always. A byte range over
-        # a `.gz` companion would be a range over bytes the client never asked for by name and
-        # cannot decode in isolation -- half a gzip stream is not half a document -- so content
-        # coding and byte ranges are simply not combined here. Nothing is lost for the case this
-        # exists to serve: a schema-3 shard *is* the `.gz`, it has no plain twin, and a range
+        # A range is served from the identity representation, always. A byte range over a `.gz`
+        # companion would be a range over bytes the client never asked for by name and cannot
+        # decode in isolation -- half a gzip stream is not half a document -- so content coding
+        # and byte ranges are not combined. Nothing is lost for the case this exists to serve: a
+        # schema-3 shard *is* the `.gz`, it is requested under its own `.gz` name, and a range
         # over it addresses exactly the bytes its sidecar index named.
         use_gzip = (
-            vary
+            sidecar_ok
             and not raw_range
             and accepts_gzip(self.headers.get("Accept-Encoding", ""))
         )
-        selected_path = sidecar_path if use_gzip else source_path
         handle: BinaryIO | None = None
+        inflated: bytes | None = None
+        if gz_only and not use_gzip:
+            inflated = _inflate(sidecar_path)
+            if inflated is None:
+                self.send_error(404, "File not found")
+                return None
         try:
-            handle = selected_path.open("rb")
-            selected_stat = os.fstat(handle.fileno())
-            source_stat = source_path.stat()
+            if inflated is not None:
+                selected_stat = sidecar_path.stat()
+                handle = io.BytesIO(inflated)
+            else:
+                handle = (sidecar_path if use_gzip else source_path).open("rb")
+                selected_stat = os.fstat(handle.fileno())
+            source_stat = (sidecar_path if gz_only else source_path).stat()
         except OSError:
             if handle is not None:
                 handle.close()
             self.send_error(404, "File not found")
             return None
 
-        etag = _strong_etag(selected_path, selected_stat)
+        if inflated is not None:
+            # A distinct validator, because these are distinct bytes. Deriving it from the stored
+            # member's digest keeps it strong and free, and the suffix keeps a client that holds
+            # the inflated form from ever matching it against the compressed one.
+            etag = _strong_etag(sidecar_path, selected_stat)[:-1] + '-identity"'
+        else:
+            etag = _strong_etag(sidecar_path if use_gzip else source_path, selected_stat)
         if _etag_matches(self.headers.get("If-None-Match", ""), etag):
             handle.close()
             self.send_response(304)
@@ -288,7 +344,11 @@ class TimelineRequestHandler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
             return None
 
-        size = selected_stat.st_size
+        # The size of the *selected representation*, which for a materialised identity body is
+        # what was inflated, not what the stored member weighs. Taking `st_size` here would
+        # advertise the compressed length against uncompressed bytes and resolve every range
+        # against the wrong extent.
+        size = len(inflated) if inflated is not None else selected_stat.st_size
         # `If-Range` makes a range conditional on the representation being the one the client
         # already has part of. If it does not match, the correct answer is the whole thing, not a
         # slice of a different file stitched onto the client's stale prefix.

@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 import agent_team_timeline.pipeline as pipeline_module
+from agent_team_timeline.build_store import team_build_root
 from agent_team_timeline.model import TeamData
 from agent_team_timeline.orc import (
     OrcContinuationLink,
@@ -44,7 +45,7 @@ def _spec(value: str | OrcContinuationSpec) -> OrcContinuationSpec:
 
 
 def _manifest_path(archive: Path) -> Path:
-    path = archive / "teams" / "orc-test" / "raw" / "source-manifest.json"
+    path = team_build_root(archive, "orc-test") / "raw" / "source-manifest.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -393,7 +394,7 @@ def test_orc_pipeline_rejects_resolved_boundary_drift_before_normalization(
             (OrcContinuationSpec(NEXT, "restart-message"),),
         )
     assert not (
-        archive / "teams" / "orc-test" / "raw" / "source-manifest.json"
+        team_build_root(archive, "orc-test") / "raw" / "source-manifest.json"
     ).exists()
 
 
@@ -444,7 +445,7 @@ def test_orc_normalizer_schema_bump_fails_closed_until_reingest(
     archive = tmp_path / "archive"
     ingest_orc(archive, source, FIXTURE_ROOT, "orc-test", "UTC")
     marker_path = (
-        archive / "teams" / "orc-test" / "raw" / "normalized-generation.json"
+        team_build_root(archive, "orc-test") / "raw" / "normalized-generation.json"
     )
     marker = json.loads(marker_path.read_text(encoding="utf-8"))
 

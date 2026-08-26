@@ -195,3 +195,52 @@ def _key(record: dict[str, JsonValue], field: str) -> tuple[int, str]:
 
 
 __all__ = ["reconstruct_from_schema_3", "schema_1_timeline_text"]
+
+
+def stored_path(path: Path) -> Path:
+    """Resolve a logical archive path to the file that actually holds it.
+
+    The archive stores some browser-facing documents as ``<name>.gz`` and nothing else -- the
+    per-phase details and the artifact catalogue -- and the server materialises the identity
+    bytes from that on demand. A test asserting the document *exists* is asserting about the
+    resource, not about which of the two spellings the writer chose, so it asks here.
+    """
+
+    return path if path.is_file() else path.with_name(path.name + ".gz")
+
+
+def detail_documents(details_root: Path) -> dict[Path, str]:
+    """Every per-phase detail document under *details_root*, as text, keyed by its stored path.
+
+    Details are stored as ``<phase>.json.gz`` with no identity twin, so a test that globs
+    ``*.json`` finds an empty directory and reports it as "no details were written". Both
+    spellings are accepted here because the tests are about the documents. Text, for the reason
+    :func:`read_stored_text` gives.
+    """
+
+    found: dict[Path, str] = {}
+    for path in sorted(details_root.glob("*.json.gz")):
+        with gzip.open(path, "rt", encoding="utf-8") as handle:
+            found[path] = handle.read()
+    for path in sorted(details_root.glob("*.json")):
+        found[path] = path.read_text(encoding="utf-8")
+    return found
+
+
+def read_stored_text(path: Path) -> str:
+    """Return a stored archive document's text, whether it is stored plain or as a gzip member.
+
+    Text rather than a parsed object, matching :func:`schema_1_timeline_text` above and for the
+    same reason: the caller writes ``json.loads(...)`` and gets the loose typing a test assertion
+    needs. Returning the archive's strict ``JsonValue`` instead would make every ``detail[...]``
+    in this suite a type error about a recursive union, which is retyping a hundred assertions in
+    the vocabulary of a reader they are not about.
+    """
+
+    if path.is_file():
+        return path.read_text(encoding="utf-8")
+    sidecar = path.with_name(path.name + ".gz")
+    if not sidecar.is_file():
+        raise FileNotFoundError(f"no such file: {path}")
+    with gzip.open(sidecar, "rt", encoding="utf-8") as handle:
+        return handle.read()

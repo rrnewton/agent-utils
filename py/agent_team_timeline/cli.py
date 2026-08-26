@@ -11,6 +11,11 @@ from importlib.resources import files
 from pathlib import Path
 
 from agent_team_timeline import __version__
+from agent_team_timeline.build_store import (
+    format_migration_report as format_build_migration_report,
+    ingested_team_slugs,
+    migrate_build_state,
+)
 from agent_team_timeline.archive import as_array, as_object, read_json
 from agent_team_timeline.archive_gc import collect, format_gc_report
 from agent_team_timeline.claude import ClaudeParseError
@@ -137,6 +142,37 @@ def _orc_continuation_arg(raw: str) -> OrcContinuationSpec:
 def _add_archive(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--output", required=True, help="version-controllable archive directory")
     parser.add_argument("--team", required=True, help="stable team slug, for example example-team")
+
+
+def _add_build_root(parser: argparse.ArgumentParser) -> None:
+    """Offer the build store's location, on the same commands that can create one.
+
+    The counterpart to `--snapshot-root`, but offered on `migrate-build-state` **only**, which is
+    the difference worth explaining. Snapshot resolution takes the requested root as an argument
+    and hands it to the one function every provider addresses through, so a flag on `ingest` has
+    somewhere to go. Build-state paths are resolved independently at a dozen call sites deep
+    inside the pipeline, and the thing that makes them agree is the recorded pointer, not a
+    parameter -- so the way to put the store somewhere else is to establish it there, which is
+    what `migrate-build-state --build-root DIR --move` does. It writes the pointer even when there
+    is nothing to move, so it is also how a fresh archive is told where its store goes.
+
+    Accepting the flag on `ingest` and ignoring it would be the worse option: a flag that is
+    accepted and has no effect is indistinguishable from one that worked.
+    """
+
+    parser.add_argument(
+        "--build-root",
+        dest="build_root",
+        default=None,
+        metavar="DIR",
+        help=(
+            "where to keep intermediate build state -- the normalized team, the artifact "
+            "catalogue, the provenance manifests, the payload store -- which is what a rebuild "
+            "reads and what nothing else does (default: <output>.build, a sibling of the "
+            "archive; an archive that already keeps it inside itself keeps doing so until "
+            "`migrate-build-state` is run)"
+        ),
+    )
 
 
 def _add_snapshot_root(parser: argparse.ArgumentParser) -> None:
@@ -650,6 +686,34 @@ def _parser() -> argparse.ArgumentParser:
         help="report format (default: %(default)s)",
     )
     collect_garbage.set_defaults(handler="gc")
+
+    migrate_build_parser = sub.add_parser(
+        "migrate-build-state",
+        help="move intermediate build state out of the published archive",
+        description=(
+            "Relocate teams/*/raw and teams/*/payloads to a sibling store, so the archive holds "
+            "only what a consumer of it opens. That state is what ingestion computes from the "
+            "vendor snapshots -- the normalized team, the artifact catalogue, the provenance "
+            "manifests -- and no browser or CLI reads any of it: on the measured archive it was "
+            "717 MiB of 1.5 GiB, shipped to every machine that served the site. It is relocated "
+            "rather than deleted because it is what makes the next ingest incremental. Nothing "
+            "moves unless --move is given; without it this prints what would move, from where, "
+            "and to where. The move is a rename when the store is on the same filesystem, which "
+            "it is by default. teams/*/summaries and teams/*/summary_data stay: the first is "
+            "output the shipped CLI reads, the second holds the paid summary cache and the "
+            "spend receipts run_stats reports from"
+        ),
+    )
+    migrate_build_parser.add_argument(
+        "--output", required=True, help="built or ingested archive directory"
+    )
+    _add_build_root(migrate_build_parser)
+    migrate_build_parser.add_argument(
+        "--move",
+        action="store_true",
+        help="actually relocate the build state; without this the command only reports",
+    )
+    migrate_build_parser.set_defaults(handler="migrate_build_state")
 
     migrate_snapshots_parser = sub.add_parser(
         "migrate-snapshots",
@@ -1342,6 +1406,22 @@ def _inspect(archive: Path) -> int:
     return 0
 
 
+def _migrate_build_state(
+    archive: Path, requested: Path | None, *, move: bool
+) -> int:
+    """Report or perform the relocation, under the archive writer lock in both cases.
+
+    The dry run takes the lock for the reason `_migrate_snapshots` does: the report is the input
+    to a human's decision, and one computed while a build was moving files underneath it would
+    describe an archive that never existed.
+    """
+
+    with archive_writer_lock(archive):
+        result = migrate_build_state(archive, requested, apply=move)
+    print(format_build_migration_report(result, applied=move), end="")
+    return 0
+
+
 def _migrate_snapshots(
     archive: Path,
     requested: Path | None,
@@ -1386,18 +1466,7 @@ def _transcript_teams(archive: Path, raw: object) -> tuple[str, ...]:
         if len(set(selected)) != len(selected):
             raise ValueError("--team must not repeat a team slug")
         return selected
-    teams_root = archive / "teams"
-    if not teams_root.is_dir():
-        raise ValueError(f"no ingested teams found in {archive}")
-    discovered = tuple(
-        sorted(
-            path.name
-            for path in teams_root.iterdir()
-            if path.is_dir()
-            and not path.is_symlink()
-            and (path / "raw" / "team.json").is_file()
-        )
-    )
+    discovered = ingested_team_slugs(archive)
     if not discovered:
         raise ValueError(f"no ingested teams found in {archive}")
     return discovered
@@ -1579,6 +1648,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 end="",
             )
             return 0
+        except (OSError, ValueError) as error:
+            print(f"{PROG}: {error}", file=sys.stderr)
+            return 2
+    if handler == "migrate_build_state":
+        try:
+            return _migrate_build_state(
+                _path(str(ns.output)),
+                _path(str(ns.build_root)) if ns.build_root is not None else None,
+                move=bool(ns.move),
+            )
         except (OSError, ValueError) as error:
             print(f"{PROG}: {error}", file=sys.stderr)
             return 2
