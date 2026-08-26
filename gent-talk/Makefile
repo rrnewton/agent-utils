@@ -35,14 +35,14 @@ validate-boxed:
 # to do with this tool -- and `./bin/` is GITIGNORED, existing only after `./setup` has run, so
 # pointing at it failed on a fresh clone for a reason that had nothing to do with it either.
 #
-# The graph itself, loaded without running anything. Offline and instant.
+# The graph itself, checked without running anything. Offline and instant.
 #
-# IT PROVES LESS THAN IT LOOKS LIKE IT PROVES, and that is worth saying here rather than letting
-# the next person assume otherwise: `dagrun list` parses the document and prints it. Measured, it
-# does NOT reject an unknown field, a duplicate step tag, a missing dependency, or a cycle -- the
-# user guide's "rejected before execution" holds only inside `run`, and not for all of those even
-# there. So this catches a file that stopped being loadable YAML or lost a required field, and
-# nothing about the shape of the graph. See the dagrun issue filed alongside this.
+# This used to prove almost nothing, and said so: `dagrun list` parsed the document and printed it,
+# accepting an unknown field, a duplicate step tag, a missing dependency and a cycle -- the last of
+# which CRASHED the runner rather than being refused. `#96 dagrun-loader-validation` moved all of
+# those into the loader, so every inspection subcommand gets them: this now refuses a closed-schema
+# violation, a duplicate tag, a missing dependency, a named cycle, and a demand above its cap, at
+# exit 2, having executed nothing.
 dag-check:
 	cd .. && ./common/bin/dagrun list --dag gent-talk/tests.dag.yaml >/dev/null
 
