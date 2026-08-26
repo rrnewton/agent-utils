@@ -275,6 +275,12 @@
               every long row would spend a model call every time a thumb slipped. It lives beside
               "Collapse all" because the two act on the same thing — what a folded message shows.
             -->
+            <!--
+              The way back to a kept place. Offered only when there IS one, and only over the
+              channel — the transcript has no message ids to mark. Press and hold a message to set
+              it; see `setPlaceMarker`.
+            -->
+            <button id="jump-marker" class="chip" type="button" hidden>My place</button>
             <button id="summarise" class="chip" type="button" aria-pressed="false" hidden>
               <span id="summarise-label">Summaries</span>
             </button>

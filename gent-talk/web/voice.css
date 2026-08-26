@@ -748,6 +748,20 @@ body {
   }
 }
 
+/*
+ * THE KEPT PLACE. A quiet edge, not a state: the reader is not reading this row now, they intend
+ * to come back to it. It must be findable once they are near it and must not compete with the row
+ * that is actually speaking.
+ */
+#discord-log li.discord-message[data-marked="true"] {
+  box-shadow: inset 0.2rem 0 0 var(--muted);
+}
+
+/* ...except when it IS the row speaking, where the loud state wins outright. */
+#discord-log li.discord-message[data-marked="true"][data-reading="true"] {
+  box-shadow: inset 0.25rem 0 0 var(--warn);
+}
+
 /* `reading`, in the row's own meta line, where the author's name was. Italic and in the accent,
    so it reads as a STATE of the row rather than as somebody called "reading". */
 .reading-mark {

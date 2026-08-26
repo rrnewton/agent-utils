@@ -29,6 +29,7 @@ const WIDTH_KEY = "gent-talk.voice.width";
 const MSG_SCALE_KEY = "gent-talk.voice.msg-scale";
 const READ_SPEED_KEY = "gent-talk.voice.read-speed";
 const MARK_OWN_KEY = "gent-talk.voice.mark-own-read";
+const MARKER_KEY = "gent-talk.voice.place-marker";
 
 const el = (id) => document.getElementById(id);
 
@@ -538,7 +539,32 @@ function liveFolds() {
   return foldables;
 }
 
+/**
+ * Which messages the reader has OPENED, by message id.
+ *
+ * The channel re-reads itself every DISCORD_POLL_MS and `applyNewestPage` rebuilds every row, and a
+ * freshly built row starts folded — so a message opened by hand collapsed itself under the reader
+ * within forty-five seconds, repeatedly, while they were still reading it. The row being read
+ * aloud was given a special case for this; every other row was left with the bug.
+ *
+ * A SET OF IDS rather than a flag on the row, because the row is the thing being thrown away. The
+ * id is what survives a rebuild, so the id is what has to carry the state.
+ *
+ * Session-only and unbounded within the session: a reader who opens two hundred messages has two
+ * hundred short strings, and forgetting one of them is the bug.
+ */
+const expandedIds = new Set();
+
 function setFolded(entry, folded) {
+  // Recorded BEFORE anything is drawn, so every path that folds a row -- the control, the tap, the
+  // read-aloud auto-open -- feeds the same record without having to remember to.
+  if (entry.id) {
+    if (folded) {
+      expandedIds.delete(entry.id);
+    } else {
+      expandedIds.add(entry.id);
+    }
+  }
   entry.li.setAttribute("data-collapsed", folded ? "true" : "false");
   // `#49 cached-summaries`. A summary REPLACES the clamped opening lines; it never sits above
   // them. Two condensations of the same message stacked on one row is not a shorter row, and it
@@ -594,7 +620,9 @@ function foldable(li, meta, body, text, messageId) {
     li.append(entry.note);
     applySummaryState(entry);
   }
-  setFolded(entry, true);
+  // Folded UNLESS the reader had already opened this message. The rebuild is invisible to them;
+  // a message that was open before the poll is open after it.
+  setFolded(entry, !(entry.id !== null && expandedIds.has(entry.id)));
   // Toggling changes the height of something that may be far above the viewport, which is the one
   // case the browser's own scroll anchoring does not cover.
   fold.addEventListener("click", () => {
@@ -893,6 +921,8 @@ function renderScrollTools() {
   // a mode that changes nothing, since a voice turn has no message id to key a summary under.
   el("summarise").hidden =
     currentView !== "discord" || !folds.some((entry) => entry.id !== null);
+  // The way back. Only where a marker can mean something, and only when one is set.
+  el("jump-marker").hidden = currentView !== "discord" || placeMarker === null;
 }
 
 /**
@@ -3529,6 +3559,9 @@ function renderChannelRows() {
     // reader can still change their mind about, and it is the only thing on screen during a wait
     // that is entirely somebody else's network.
     row.setAttribute("data-pending", pendingRead === id ? "true" : "false");
+    // The place the reader asked to come back to, marked on the row itself so it is findable by
+    // eye once they are near it.
+    row.setAttribute("data-marked", placeMarker === id ? "true" : "false");
     // WHICH ROW IS SPEAKING. Without it the reader taps, waits, and has nothing but the sound to
     // tell them which message they hit — on a list where the next act archives it.
     row.setAttribute("data-reading", isReading ? "true" : "false");
@@ -3593,6 +3626,58 @@ function renderChannelRows() {
  * `textContent` throughout — an author name and a channel's own timestamp are third-party text,
  * and this is the one place they are shown in full.
  */
+/**
+ * The message the reader asked to come back to, by id, or null.
+ *
+ * NOT called a pin. Discord already has pinned messages and they are a channel-wide, shared,
+ * server-side thing; this is one reader's place in one browser, and borrowing the word would
+ * promise the wrong feature. It is a PLACE MARKER, there is exactly one, and setting a new one
+ * moves it — a list of them would be a second inbox to work through.
+ *
+ * Kept across reloads, because the whole point is coming back.
+ */
+let placeMarker = null;
+
+function loadPlaceMarker() {
+  try {
+    placeMarker = localStorage.getItem(MARKER_KEY);
+  } catch (_error) {
+    placeMarker = null;
+  }
+}
+
+function setPlaceMarker(id) {
+  placeMarker = id === null ? null : String(id);
+  try {
+    if (placeMarker === null) {
+      localStorage.removeItem(MARKER_KEY);
+    } else {
+      localStorage.setItem(MARKER_KEY, placeMarker);
+    }
+  } catch (_error) {
+    // A browser that refuses storage still honours the marker for this session.
+  }
+  renderChannelRows();
+  renderScrollTools();
+}
+
+/** Take the reader back to where they left off, if that message is still loaded. */
+function jumpToMarker() {
+  if (placeMarker === null) {
+    return;
+  }
+  const row = [...el("discord-log").children].find(
+    (li) => li.getAttribute("data-id") === placeMarker
+  );
+  if (!row) {
+    // Honest rather than silent: the marker is real, the message is simply not in the window yet.
+    setStatus("that message is further back than what is loaded — pull down or walk back to it.");
+    return;
+  }
+  row.scrollIntoView();
+  setStatus("back where you left off.");
+}
+
 function toggleMessageDetails(li, message) {
   const open = childByClass(li, "msg-details");
   if (open) {
@@ -3610,7 +3695,19 @@ function toggleMessageDetails(li, message) {
   const id = document.createElement("div");
   id.className = "msg-id";
   id.textContent = `id ${message.id}`;
-  details.append(who, when, id);
+  // KEEPING YOUR PLACE lives here rather than on a gesture of its own. Press-and-hold already
+  // opens this sheet, and a second long-press meaning something different from the first would be
+  // a gesture nobody could discover and everybody would trigger by accident.
+  const mark = document.createElement("button");
+  mark.className = "chip";
+  mark.setAttribute("type", "button");
+  const marked = placeMarker === String(message.id);
+  mark.textContent = marked ? "Forget my place" : "Keep my place here";
+  mark.addEventListener("click", () => {
+    setPlaceMarker(marked ? null : String(message.id));
+    setStatus(marked ? "place forgotten." : "place kept — the chip takes you back.");
+  });
+  details.append(who, when, id, mark);
   li.append(details);
 }
 
@@ -6232,6 +6329,7 @@ applyReadingWidth(storedReadingWidth());
 applyMsgScale(storedMsgScale());
 applyReadSpeed(storedReadSpeed());
 applyMarkOwnRead(storedMarkOwnRead());
+loadPlaceMarker();
 el("reading-width").addEventListener("input", () => readingWidthChanged(el("reading-width").value));
 el("msg-scale").addEventListener("input", () => msgScaleChanged(el("msg-scale").value));
 el("width-grip").addEventListener("pointerdown", onGripDown);
@@ -6266,6 +6364,8 @@ el("mark-own-read").addEventListener("change", () => {
     guardQuietly(() => loadTodo({ keepPosition: true, ownAct: true }))();
   }
 });
+
+el("jump-marker").addEventListener("click", jumpToMarker);
 
 el("read-speed-range").addEventListener("input", () => {
   applyReadSpeed(el("read-speed-range").value);

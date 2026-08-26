@@ -5536,6 +5536,88 @@ test("ASKED-FOR AND BEING-READ LOOK DIFFERENT, and the loud one is actually loud
   assert.notEqual(reading, pending, "the two states are drawn identically");
 });
 
+test("A MESSAGE YOU OPENED STAYS OPEN WHEN THE CHANNEL RE-READS ITSELF", async () => {
+  // The reported bug: a long message collapsed itself under the reader, repeatedly, while they
+  // were still reading it. The channel re-reads every DISCORD_POLL_MS, `applyNewestPage` rebuilds
+  // every row, and a fresh row starts folded. The row being READ ALOUD had a special case for
+  // this; every other row was left with it.
+  const page = newPage();
+  await signIn(page);
+  const rows = await showDiscord(page, [
+    message({ id: "1000000000000000001", content: "a".repeat(4000) }),
+    message({ id: "1000000000000000002", content: "b".repeat(4000) }),
+  ]);
+  assert.equal(rows[0].getAttribute("data-collapsed"), "true");
+
+  await rows[0].dispatch("click", {});
+  assert.equal(row(page, 0).getAttribute("data-collapsed"), "false", "the tap did not open it");
+
+  await reReadChannel(page);
+
+  assert.equal(
+    row(page, 0).getAttribute("data-collapsed"),
+    "false",
+    "the message the reader opened collapsed itself under them"
+  );
+  // ...and one they never opened is still closed: this restores a choice, it does not open the list.
+  assert.equal(row(page, 1).getAttribute("data-collapsed"), "true", "the rebuild opened everything");
+});
+
+test("...and folding it again is remembered too, so the poll cannot re-open it", async () => {
+  const page = newPage();
+  await signIn(page);
+  const rows = await showDiscord(page, [message({ id: "1000000000000000001", content: "c".repeat(4000) })]);
+
+  await rows[0].dispatch("click", {});
+  await rows[0].dispatch("click", {});
+  assert.equal(row(page, 0).getAttribute("data-collapsed"), "true");
+
+  await reReadChannel(page);
+  assert.equal(row(page, 0).getAttribute("data-collapsed"), "true", "the poll re-opened a closed message");
+});
+
+test("A KEPT PLACE SURVIVES, and the way back is offered only when there is one", async () => {
+  // Not called a pin: Discord's pinned messages are channel-wide, shared and server-side, and this
+  // is one reader's place in one browser.
+  const page = newPage();
+  await signIn(page);
+  const rows = await showDiscord(page, [
+    message({ id: "1000000000000000001" }),
+    message({ id: "1000000000000000002" }),
+  ]);
+  assert.equal(page.el("jump-marker").hidden, true, "a way back is offered with nowhere to go");
+
+  await hold(page, rows[1]);
+  const keep = rows[1].descendants().find((n) => n.text() === "Keep my place here");
+  assert.ok(keep, "the details sheet offers no way to keep a place");
+  await keep.click();
+  await page.settle();
+
+  assert.equal(page.el("jump-marker").hidden, false, "the way back was not offered");
+  assert.equal(rowState(page, 1).marked, "true", "the kept row is not findable by eye");
+  assert.equal(rowState(page, 0).marked, "false", "every row was marked");
+  assert.equal(page.storage.get("gent-talk.voice.place-marker"), "1000000000000000002");
+});
+
+test("...and there is exactly ONE place, because a list of them is a second inbox", async () => {
+  const page = newPage();
+  await signIn(page);
+  const rows = await showDiscord(page, [
+    message({ id: "1000000000000000001" }),
+    message({ id: "1000000000000000002" }),
+  ]);
+
+  await hold(page, rows[0]);
+  await rows[0].descendants().find((n) => n.text() === "Keep my place here").click();
+  await page.settle();
+  await hold(page, rows[1]);
+  await rows[1].descendants().find((n) => n.text() === "Keep my place here").click();
+  await page.settle();
+
+  assert.equal(rowState(page, 0).marked, "false", "the old place was kept as well as the new one");
+  assert.equal(rowState(page, 1).marked, "true");
+});
+
 test("the channel spends its width on words, not on insets", async () => {
   // 15% of a 393-pixel phone, on every row, bought what the speaker COLOUR now buys.
   const mine = cssBlock('#discord-log li.discord-message[data-who="me"]');
@@ -8260,6 +8342,7 @@ const rowState = (page, i) => ({
   reading: row(page, i).getAttribute("data-reading"),
   ownRead: row(page, i).getAttribute("data-own-read"),
   pending: row(page, i).getAttribute("data-pending"),
+  marked: row(page, i).getAttribute("data-marked"),
 });
 
 /** Two messages where the second answers the first, as Discord records a reply. */
@@ -8282,11 +8365,11 @@ test("A MESSAGE SOMEBODY HAS ANSWERED IS DIMMED; AN UNANSWERED ONE IS NOT", asyn
 
   // Both axes named, because they are independent: being ANSWERED is derived from what happens to
   // be loaded, being ARCHIVED is the reader's own declaration, and neither implies the other.
-  assert.deepStrictEqual(rowState(page, 0), { replied: "true", archived: "false", reading: "false", ownRead: "false", pending: "false" });
+  assert.deepStrictEqual(rowState(page, 0), { replied: "true", archived: "false", reading: "false", ownRead: "false", pending: "false", marked: "false" });
   // The ANSWER is not itself answered. Discord marks only the answering message, so a naive
   // implementation that set the flag on whichever row carried a pointer would dim this one.
-  assert.deepStrictEqual(rowState(page, 1), { replied: "false", archived: "false", reading: "false", ownRead: "false", pending: "false" });
-  assert.deepStrictEqual(rowState(page, 2), { replied: "false", archived: "false", reading: "false", ownRead: "false", pending: "false" });
+  assert.deepStrictEqual(rowState(page, 1), { replied: "false", archived: "false", reading: "false", ownRead: "false", pending: "false", marked: "false" });
+  assert.deepStrictEqual(rowState(page, 2), { replied: "false", archived: "false", reading: "false", ownRead: "false", pending: "false", marked: "false" });
 
   // And it is DRAWN, not merely recorded in an attribute.
   const dimmed = cssBlock('#discord-log li.discord-message[data-replied="true"]');
