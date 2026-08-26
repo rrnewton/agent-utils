@@ -632,6 +632,24 @@ body {
   filter: none;
 }
 
+/*
+ * THE ROW BEING READ ALOUD.
+ *
+ * Louder than any other row state, and deliberately the only one that ADDS rather than removes:
+ * archived and answered both recede, and a row that is speaking is the one thing on the list
+ * actively happening. Without it the reader taps, waits for audio to fetch, and has nothing but
+ * the sound to tell them which message they hit — on a list where finishing archives it.
+ *
+ * It also beats the archived treatment, which matters when re-reading something already filed:
+ * a greyed, desaturated row that is currently speaking would look inert while talking.
+ */
+#discord-log li.discord-message[data-reading="true"] {
+  opacity: 1;
+  filter: none;
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
 /* Anchor for the mark above, and the reason a swipe can move the row: a transform on a static
    element still paints, but the strike would travel with it and the row's own box would not. */
 #discord-log li.discord-message {

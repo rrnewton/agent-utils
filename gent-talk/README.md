@@ -346,7 +346,8 @@ curl -s -X POST localhost:8080/mcp \
 | Write token | `auth.write_token` | `GENT_TALK_WRITE_TOKEN` | **secret**, ≥ 24 chars, must differ |
 | Channels | `[[channels]]` | `GENT_TALK_CHANNELS` | `id:label:rw` / `id:label:ro`, comma separated |
 | ElevenLabs agent id | `elevenlabs.agent_id` | `GENT_TALK_ELEVENLABS_AGENT_ID` | public |
-| ElevenLabs API key | `elevenlabs.api_key` | `GENT_TALK_ELEVENLABS_API_KEY` | **secret**, needed to mint signed URLs |
+| ElevenLabs API key | `elevenlabs.api_key` | `GENT_TALK_ELEVENLABS_API_KEY` | **secret**, needed to mint signed URLs and to read messages aloud |
+| ElevenLabs voice id | `elevenlabs.voice_id` | `GENT_TALK_ELEVENLABS_VOICE_ID` | public; without it read-aloud refuses with `503`, naming the setting |
 | ElevenLabs API base | `elevenlabs.api_base` | `GENT_TALK_ELEVENLABS_API_BASE` | `https://api.elevenlabs.io/v1` |
 | Storage path | `storage.path` | `GENT_TALK_STORAGE_PATH` | absolute; unset means **no durable state** |
 | Conversations kept | `storage.max_conversations` | — | default `50`, oldest dropped first |
@@ -929,6 +930,8 @@ different fixes:
 | What happened | Status | `error` |
 |---|---|---|
 | `elevenlabs.api_key` or `elevenlabs.agent_id` is not set | `503` | `elevenlabs_not_configured`, naming the setting |
+| `elevenlabs.api_key` or `elevenlabs.voice_id` is not set, on read-aloud | `503` | `elevenlabs_not_configured`, naming the setting |
+| the message to be read aloud has no text | `422` | `nothing_to_read`; no vendor call is made, so nothing is billed |
 | ElevenLabs refused us, or is unreachable | `502` | `elevenlabs_error`, carrying the vendor status |
 | The caller has no token, or only the read token | `401` / `403` | `unauthenticated` / `forbidden` |
 

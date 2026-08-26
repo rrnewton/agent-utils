@@ -31,6 +31,8 @@ pub const ENV_WRITE_TOKEN: &str = "GENT_TALK_WRITE_TOKEN";
 pub const ENV_ELEVENLABS_API_KEY: &str = "GENT_TALK_ELEVENLABS_API_KEY";
 /// Environment variable carrying the ElevenLabs agent id.
 pub const ENV_ELEVENLABS_AGENT_ID: &str = "GENT_TALK_ELEVENLABS_AGENT_ID";
+/// Which ElevenLabs voice reads a message aloud. Public: it identifies a catalogue voice.
+pub const ENV_ELEVENLABS_VOICE_ID: &str = "GENT_TALK_ELEVENLABS_VOICE_ID";
 /// Environment variable overriding the ElevenLabs API base, so a test or a proxy can point
 /// elsewhere.
 pub const ENV_ELEVENLABS_API_BASE: &str = "GENT_TALK_ELEVENLABS_API_BASE";
@@ -276,6 +278,14 @@ pub struct ElevenLabsConfig {
     pub api_key: Option<Secret>,
     /// API base, so a test or a proxy can point elsewhere.
     pub api_base: String,
+    /// Which catalogue voice reads a message aloud.
+    ///
+    /// Optional and separate from `agent_id`: a deployment can have a conversational agent and no
+    /// reading voice, or a reading voice and no agent, and the two failures have different fixes.
+    /// Absent means read-aloud is unavailable, which is a loud refusal naming this setting rather
+    /// than a silent fallback to whichever voice the account happens to list first -- an account's
+    /// first voice is not a decision anybody made.
+    pub voice_id: Option<String>,
 }
 
 impl Default for ElevenLabsConfig {
@@ -284,6 +294,7 @@ impl Default for ElevenLabsConfig {
             agent_id: None,
             api_key: None,
             api_base: DEFAULT_ELEVENLABS_API_BASE.to_owned(),
+            voice_id: None,
         }
     }
 }
@@ -386,6 +397,7 @@ struct FileElevenLabs {
     agent_id: Option<String>,
     api_key: Option<Secret>,
     api_base: Option<String>,
+    voice_id: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -622,6 +634,9 @@ impl Config {
                     .map(str::to_owned)
                     .or(file.elevenlabs.api_base)
                     .unwrap_or_else(|| DEFAULT_ELEVENLABS_API_BASE.to_owned()),
+                voice_id: get(ENV_ELEVENLABS_VOICE_ID)
+                    .map(str::to_owned)
+                    .or(file.elevenlabs.voice_id),
             },
             storage,
             summaries,

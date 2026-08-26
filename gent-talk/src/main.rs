@@ -10,7 +10,7 @@ use gent_talk::discord::fake::FakeDiscord;
 use gent_talk::discord::http::HttpDiscordClient;
 use gent_talk::discord::DiscordClient;
 use gent_talk::elevenlabs::http::HttpElevenLabsClient;
-use gent_talk::elevenlabs::SignedUrlProvider;
+use gent_talk::elevenlabs::{SignedUrlProvider, SpeechProvider};
 use gent_talk::probe::{self, ENV_SKIP_STARTUP_PROBE};
 use gent_talk::retrieval::LexicalRanker;
 use gent_talk::state::AppState;
@@ -400,8 +400,12 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let bind = config.bind;
-    let elevenlabs: Arc<dyn SignedUrlProvider> =
+    // ONE client, two capabilities. Building a second would mean two connection pools and two
+    // user agents against the same vendor for no reason.
+    let elevenlabs_client =
         Arc::new(HttpElevenLabsClient::new().context("building the ElevenLabs client")?);
+    let speech: Arc<dyn SpeechProvider> = Arc::clone(&elevenlabs_client) as Arc<dyn SpeechProvider>;
+    let elevenlabs: Arc<dyn SignedUrlProvider> = elevenlabs_client;
     let live_channels: Vec<_> = config.channels.iter().map(|c| c.id.clone()).collect();
     let live_limit = config.discord.default_fetch_limit;
     let state = AppState {
@@ -410,6 +414,7 @@ async fn main() -> anyhow::Result<()> {
         ranker: Arc::new(LexicalRanker),
         agent: Arc::new(NoAgentBackend),
         elevenlabs,
+        speech,
         store,
         live: Arc::clone(&live),
         summarizer,

@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use crate::agent_backend::NoAgentBackend;
 use crate::config::Config;
 use crate::discord::fake::FakeDiscord;
-use crate::elevenlabs::fake::{FakeElevenLabs, KNOWN_AGENT_ID, VALID_API_KEY};
+use crate::elevenlabs::fake::{FakeElevenLabs, KNOWN_AGENT_ID, KNOWN_VOICE_ID, VALID_API_KEY};
 use crate::retrieval::LexicalRanker;
 use crate::state::AppState;
 use crate::store::fake::FakeStore;
@@ -54,6 +54,7 @@ writable = true
 [elevenlabs]
 agent_id = "{KNOWN_AGENT_ID}"
 api_key = "{VALID_API_KEY}"
+voice_id = "{KNOWN_VOICE_ID}"
 "#
     )
 }
@@ -119,6 +120,23 @@ pub fn state_with_store() -> (AppState, Arc<FakeDiscord>, Arc<FakeStore>) {
     let store = Arc::new(FakeStore::new());
     let (state, discord, _elevenlabs, _erased) = state_pieces(&config_toml(), store.clone());
     (state, discord, store)
+}
+
+/// A server with its store AND its ElevenLabs stand-in.
+///
+/// Read-aloud is the first feature that needs both at once: the act is "speak this message, then
+/// archive it", and proving it means asking the vendor what it was told and asking the store what
+/// was dismissed.
+#[must_use]
+pub fn state_with_store_and_voice() -> (
+    AppState,
+    Arc<FakeDiscord>,
+    Arc<FakeStore>,
+    Arc<FakeElevenLabs>,
+) {
+    let store = Arc::new(FakeStore::new());
+    let (state, discord, elevenlabs, _erased) = state_pieces(&config_toml(), store.clone());
+    (state, discord, store, elevenlabs)
 }
 
 /// A server built from arbitrary configuration text, plus a handle to its in-memory store.
@@ -196,6 +214,7 @@ fn state_pieces_with(
         ranker: Arc::new(LexicalRanker),
         agent: Arc::new(NoAgentBackend),
         elevenlabs: elevenlabs.clone(),
+        speech: elevenlabs.clone(),
         store: Arc::clone(&store),
         // A real hub, never a stub: a test drives `live::poll_once` or `AppState::live.publish`
         // directly and then reads the SSE route, which is the whole ingestion path minus the

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use crate::agent_backend::AgentBackend;
 use crate::config::Config;
 use crate::discord::DiscordClient;
-use crate::elevenlabs::SignedUrlProvider;
+use crate::elevenlabs::{SignedUrlProvider, SpeechProvider};
 use crate::live::LiveHub;
 use crate::model::{ChannelId, ChannelInfo};
 use crate::retrieval::Ranker;
@@ -23,6 +23,12 @@ pub struct AppState {
     pub ranker: Arc<dyn Ranker>,
     /// Mints short-lived signed conversation URLs for the configured ElevenLabs agent.
     pub elevenlabs: Arc<dyn SignedUrlProvider>,
+    /// Reads one message aloud in the configured ElevenLabs voice.
+    ///
+    /// A SEPARATE capability from minting a conversation URL, held separately, because the two
+    /// use different settings and fail for different reasons: a deployment can read aloud without
+    /// having a conversational agent at all.
+    pub speech: Arc<dyn SpeechProvider>,
     /// Slow-path backend (absent in v0).
     pub agent: Arc<dyn AgentBackend>,
     /// Turns one long channel message into one short line.

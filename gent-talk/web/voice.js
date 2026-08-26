@@ -303,6 +303,15 @@ function showView(name) {
   jumpNewestWanted[name] = false;
   // The chips belong to the list you are looking at, and you are now looking at a different one.
   renderScrollTools();
+  // Leaving the channel takes the reading with it: audio that goes on playing over the transcript
+  // is audio the reader cannot see the source of, on a list where the next thing it does is
+  // archive a message.
+  if (!discord) {
+    readingMode = false;
+    stopReading();
+  }
+  // Read replaces Talk in this view, so the control pane has to be re-decided on every switch.
+  renderControls();
   // ...and so does the channel picker, which is a member of the bar now rather than a row at the
   // top of the scrollback. LAST, and after `currentView` is set, for the same reason `showScreen`
   // ends this way: the bar decides what it shows from the view that is now up. `#83
@@ -2708,8 +2717,16 @@ function renderControls() {
   // about: the old way to reach typing left both of them on screen, in states you had to set by
   // hand, acting on a microphone you never wanted open.
   const chat = live && session.chat;
+  // READ REPLACES TALK IN THE CHANNEL VIEW. Two different things to want, and which one you want
+  // is decided by the list in front of you. Talk stays available in the voice view, and a live
+  // call keeps it everywhere — hiding the control that ends a conversation you are having, or
+  // starting audio playback over it, would both be worse than the swap.
+  const reading = currentView === "discord" && !live;
+  el("read-aloud").hidden = !reading;
+  el("read-aloud").setAttribute("aria-pressed", readingMode ? "true" : "false");
+  el("read-aloud-label").textContent = readingMode ? "Reading" : "Read";
   el("speaker").hidden = chat;
-  el("talk").hidden = chat;
+  el("talk").hidden = chat || reading;
   el("hang-up").hidden = !live;
   el("hangup-label").textContent = chat ? "End chat" : "Hang up";
   el("control-pane").className = chat ? "chat" : live ? "" : "solo";
@@ -3403,6 +3420,12 @@ function renderChannelRows() {
     // to see what they had archived, and no way to change their mind about it.
     const isArchived = archivedIds.has(id);
     row.setAttribute("data-archived", isArchived ? "true" : "false");
+    // WHICH ROW IS SPEAKING. Without it the reader taps, waits, and has nothing but the sound to
+    // tell them which message they hit — on a list where the next act archives it.
+    row.setAttribute(
+      "data-reading",
+      nowPlaying !== null && nowPlaying.id === id ? "true" : "false"
+    );
     // The row's own way back, labelled for what it will DO rather than for what the row is. In the
     // To do filter an archived row is never on screen, so this only ever reads "Done" there.
     // WHO, printed only where the colour cannot say it. `me` and `coder` are drawn as the
@@ -3465,8 +3488,122 @@ function toggleMessageDetails(li, message) {
   li.append(details);
 }
 
+// --- reading a message aloud ----------------------------------------------------------------
+//
+// The owner's ask: in the channel view, the Talk control becomes READ. Turn it on and a tap on any
+// message sends that message's full text to ElevenLabs and plays it; when the audio finishes, the
+// message archives itself. Not hands-free — a tap per message — but it turns a backlog of long
+// bot messages into something that can be worked through with a thumb and an ear, with the greyed
+// rows showing exactly how far you have got.
+//
+// WHY THE SERVER MAKES THE VENDOR CALL. Reading aloud costs money and needs an ElevenLabs account
+// key. A key this page could use is a key this page could leak, so the browser asks its OWN server
+// for audio and never learns the credential; see `api::speak`.
+//
+// WHY THE ARCHIVE IS ON `ended` AND NOT ON TAP. "Read it" and "I am done with it" are the same act
+// only if the reading actually happened. Archiving on tap would file away a message whose audio
+// failed to fetch, or that the reader stopped two seconds in — which is the one thing this mode
+// must not do, because the archive is how they know what is left.
+
+/** Is a tap on a message a request to hear it? Session-only, and only in the channel view. */
+let readingMode = false;
+
+/** The message being read right now, and the player reading it. Null when nothing is playing. */
+let nowPlaying = null;
+
+/** Stop whatever is playing and forget it. Safe to call when nothing is. */
+function stopReading() {
+  if (nowPlaying === null) {
+    return;
+  }
+  const { audio, url } = nowPlaying;
+  nowPlaying = null;
+  try {
+    audio.pause();
+  } catch (_error) {
+    // A player that will not pause is not a reason to leave the page in a reading state.
+  }
+  // The object URL holds the audio alive until it is revoked, and this mode fetches one per
+  // message: not revoking is a leak that grows with the length of the backlog.
+  if (url && typeof URL !== "undefined" && URL.revokeObjectURL) {
+    URL.revokeObjectURL(url);
+  }
+  renderChannelRows();
+}
+
+/** Fetch the audio for one message. Bytes, not JSON, so it cannot go through `api`. */
+async function fetchSpeech(channel, id) {
+  const response = await fetch(
+    `/api/v1/channels/${encodeURIComponent(channel)}/messages/${encodeURIComponent(id)}/speak`,
+    { method: "POST", headers: { Authorization: `Bearer ${token()}` } }
+  );
+  if (!response.ok) {
+    // The FAILURE body is JSON even though the success body is audio, so the reason survives.
+    let detail = `HTTP ${response.status}`;
+    try {
+      const payload = JSON.parse(await response.text());
+      if (payload && payload.detail) {
+        detail = payload.detail;
+      }
+    } catch (_error) {
+      // A non-JSON failure body is not worth a second failure; the status still says something.
+    }
+    throw new Error(detail);
+  }
+  return response.blob();
+}
+
 /**
- * Tapping the message folds or unfolds it.
+ * Read one message aloud, and archive it when the audio finishes.
+ *
+ * Tapping the message that is already playing STOPS it, so the same gesture is its own cancel and
+ * the reader is never stuck listening to something they have finished with.
+ */
+async function readAloud(id) {
+  const already = nowPlaying !== null && nowPlaying.id === id;
+  stopReading();
+  if (already) {
+    return;
+  }
+  const channel = el("discord-channel").value;
+  if (!channel) {
+    return;
+  }
+  setStatus("fetching the audio…");
+  let blob;
+  try {
+    blob = await fetchSpeech(channel, id);
+  } catch (error) {
+    // BOTH places, and this one is why it is caught here at all: `guardQuietly` puts the reason in
+    // the standing error panel, which is right for a background failure and wrong for a tap. The
+    // reader touched a specific message and is waiting to hear it; the answer belongs on the line
+    // under their thumb as well. Rethrown, so the panel still gets it.
+    setStatus(`could not read that message aloud: ${error.message}`);
+    throw error;
+  }
+  const url = URL.createObjectURL(blob);
+  const audio = new Audio(url);
+  nowPlaying = { id, audio, url };
+  audio.addEventListener("ended", () => {
+    // Only if THIS is still the message playing. The reader may have tapped another one while
+    // this was finishing, and archiving on a stale `ended` would file away the wrong message.
+    if (nowPlaying === null || nowPlaying.id !== id) {
+      return;
+    }
+    stopReading();
+    guardQuietly(() => dismissMessages({ messages: [String(id)] }))();
+  });
+  audio.addEventListener("error", () => {
+    stopReading();
+    setStatus("that message could not be played.");
+  });
+  renderChannelRows();
+  await audio.play();
+  setStatus("");
+}
+
+/**
+ * What a tap on the message itself means.
  *
  * The owner's report: the fold control was a small target on a line already carrying four other
  * things, and the message beside it is enormous. So the message IS the control.
@@ -3475,7 +3612,7 @@ function toggleMessageDetails(li, message) {
  * row — the button keeps its scroll anchoring and its `aria-expanded`, and a keyboard user who
  * tabs to it gets the same act the tap performs.
  */
-function tapToFold(li, fold) {
+function tapRow(li, fold) {
   li.addEventListener("click", (event) => {
     if (suppressNextRowClick) {
       suppressNextRowClick = false;
@@ -3490,7 +3627,18 @@ function tapToFold(li, fold) {
     if (selection && String(selection) !== "") {
       return;
     }
-    fold.click();
+    // IN READING MODE A TAP IS A REQUEST TO HEAR IT, not to fold it. One gesture, two meanings,
+    // decided by a mode the reader turned on deliberately and can see in the control bar.
+    if (readingMode) {
+      guardQuietly(() => readAloud(li.getAttribute("data-id")))();
+      return;
+    }
+    // A SHORT message has no fold control, and that is fine: it is already whole. The handler is
+    // still attached to every row, because reading mode has to reach a short message too — gating
+    // this on foldability made the shortest messages the only ones that could not be read aloud.
+    if (fold) {
+      fold.click();
+    }
   });
 }
 
@@ -3701,10 +3849,8 @@ function discordNode(message) {
   // is the message id, which is what `#49 cached-summaries` keys a summary under — the transcript
   // has none to give, so it gets no summary line and the two lists still share one definition of
   // "long enough to fold".
-  const fold = foldable(li, meta, body, message.content, String(message.id));
-  if (fold) {
-    tapToFold(li, fold);
-  }
+  // EVERY row, foldable or not. See `tapRow`.
+  tapRow(li, foldable(li, meta, body, message.content, String(message.id)));
   // `#51 reply-view`. Every raw message can be answered, and the affordance is on the row rather
   // than in a menu — Discord's own idiom, and the thing that makes a reply a REPLY rather than a
   // loose message.
@@ -5779,6 +5925,21 @@ el("width-grip").addEventListener("keydown", onGripKey);
 document.addEventListener("visibilitychange", onVisibility);
 
 el("talk").addEventListener("click", onTalk);
+el("read-aloud").addEventListener("click", () => {
+  readingMode = !readingMode;
+  // Turning it OFF stops what is playing. Leaving audio running under a reader who has just said
+  // "not this any more" is the kind of thing that gets a tab muted and never opened again.
+  if (!readingMode) {
+    stopReading();
+  }
+  setStatus(
+    readingMode
+      ? "reading mode: tap a message to hear it, and it archives when it finishes."
+      : "reading mode off."
+  );
+  renderControls();
+  renderChannelRows();
+});
 el("hang-up").addEventListener("click", stop);
 el("clear-view").addEventListener("click", onClear);
 // `guardQuietly`, not `guard`: erasing a stored record must never be able to hang up a live call.

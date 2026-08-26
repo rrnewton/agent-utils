@@ -92,6 +92,13 @@ writable = false
 # never falls back to an unsigned URL, because that failure would surface later, in a browser, in
 # a car, as a conversation that silently will not start.
 # Environment: GENT_TALK_ELEVENLABS_AGENT_ID / GENT_TALK_ELEVENLABS_API_KEY
+#              GENT_TALK_ELEVENLABS_VOICE_ID
+#
+# voice_id is what reads a channel message aloud in the web app. It is SEPARATE from
+# agent_id: a deployment can have a reading voice and no conversational agent, or the
+# reverse. Absent, read-aloud refuses and names this setting -- it does not fall back to
+# whichever voice the account happens to list first, because that is not a decision
+# anybody made.
 # agent_id = "agent_..."
 # api_key = "REPLACE-ME"
 

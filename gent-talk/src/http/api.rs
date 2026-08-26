@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth::{self, AuthError, Scope};
 use crate::discord::DiscordError;
-use crate::elevenlabs::{SignedUrl, SignedUrlError};
+use crate::elevenlabs::{SignedUrl, SignedUrlError, SpeechError};
 use crate::model::{ChannelInfo, Message, MessageId};
 use crate::ops::{self, OpError};
 use crate::retrieval::Resolution;
@@ -111,6 +111,25 @@ impl From<SignedUrlError> for ApiError {
         };
         // `Display` for every variant is already redacted at construction; see
         // `SignedUrlError::from_response`.
+        Self::new(status, code, value.to_string())
+    }
+}
+
+impl From<SpeechError> for ApiError {
+    fn from(value: SpeechError) -> Self {
+        let code = value.code();
+        let status = match value {
+            // The operator has to set `elevenlabs.voice_id` and restart. Retrying will not help,
+            // and this is distinguishable from ElevenLabs having refused us.
+            SpeechError::NotConfigured(_) => StatusCode::SERVICE_UNAVAILABLE,
+            // The CALLER asked for something impossible, and no vendor call was made. 422 rather
+            // than 502: nothing upstream went wrong, and a reader must not be told the voice
+            // service is broken because they tapped a message with no words in it.
+            SpeechError::Empty => StatusCode::UNPROCESSABLE_ENTITY,
+            SpeechError::Transport(_) | SpeechError::Status { .. } => StatusCode::BAD_GATEWAY,
+        };
+        // `Display` for every variant is already redacted at construction; see
+        // `SpeechError::from_response`.
         Self::new(status, code, value.to_string())
     }
 }
@@ -329,6 +348,45 @@ pub async fn signed_url(
         .signed_url(&state.config.elevenlabs)
         .await?;
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(minted)).into_response())
+}
+
+/// `POST /api/v1/channels/{channel_id}/messages/{message_id}/speak`
+///
+/// Read a message aloud, and hand back the AUDIO rather than a URL to it.
+///
+/// A POST even though it changes nothing here: it spends money at a vendor, and a GET is fair
+/// game for a browser, a proxy or a crawler to fetch speculatively. The key never leaves this
+/// process -- the browser could not call ElevenLabs itself without being given an account
+/// credential, which is the whole reason this route exists rather than a signed URL.
+///
+/// The message is looked up in the fetched window by id, so a message this server cannot see is a
+/// 404 rather than an invented request. The text sent is the message's OWN text, never anything
+/// the caller supplied: this route must not become a way to spend the operator's ElevenLabs
+/// balance on arbitrary strings.
+pub async fn speak(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((channel_id, message_id)): Path<(String, String)>,
+    Query(query): Query<LimitQuery>,
+) -> Result<Response, ApiError> {
+    require(&headers, &state, Scope::Read)?;
+    let (_channel, message) =
+        ops::message_by_id(&state, &channel_id, &message_id, query.limit).await?;
+    let spoken = state
+        .speech
+        .speak(&state.config.elevenlabs, &message.content)
+        .await?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, spoken.content_type.as_str()),
+            // Audio for one message never goes in a shared cache: it is derived from a channel
+            // this server authenticates access to, and the reader's own browser re-asking is
+            // cheaper to reason about than a proxy holding somebody else's message.
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        spoken.audio,
+    )
+        .into_response())
 }
 
 /// Query parameters for the read endpoints.

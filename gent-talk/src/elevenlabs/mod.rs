@@ -114,6 +114,107 @@ pub fn credentials(config: &ElevenLabsConfig) -> Result<(&str, &Secret), SignedU
     Ok((agent_id, api_key))
 }
 
+/// The credentials read-aloud needs: the account key, and the voice that will speak.
+///
+/// Separate from [`credentials`] deliberately. Reading a message aloud does not involve the
+/// conversational agent at all, so a deployment with a voice and no agent must be able to read --
+/// demanding `agent_id` here would refuse a perfectly configured server for a setting the act does
+/// not use.
+///
+/// # Errors
+///
+/// [`SpeechError::NotConfigured`] naming the absent setting, before any call is attempted.
+pub fn speech_credentials(config: &ElevenLabsConfig) -> Result<(&str, &Secret), SpeechError> {
+    let api_key = config
+        .api_key
+        .as_ref()
+        .filter(|key| !key.expose().trim().is_empty())
+        .ok_or(SpeechError::NotConfigured("elevenlabs.api_key"))?;
+    let voice_id = config
+        .voice_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .ok_or(SpeechError::NotConfigured("elevenlabs.voice_id"))?;
+    Ok((voice_id, api_key))
+}
+
+/// Why a message could not be read aloud.
+///
+/// The same four distinguishable failures as [`SignedUrlError`], for the same reason: "you never
+/// configured a voice", "ElevenLabs rejected the key", "ElevenLabs is unreachable" and "the answer
+/// was not audio" have four different fixes and must not arrive as one generic error.
+#[derive(Debug, thiserror::Error)]
+pub enum SpeechError {
+    /// A required setting is absent, so no call was attempted.
+    #[error("{0} is not configured; this server cannot read a message aloud")]
+    NotConfigured(&'static str),
+    /// The request never completed.
+    #[error("elevenlabs request failed: {0}")]
+    Transport(String),
+    /// ElevenLabs answered with a non-success status.
+    #[error("elevenlabs returned HTTP {status}: {body}")]
+    Status {
+        /// HTTP status code.
+        status: u16,
+        /// Response body, truncated and redacted.
+        body: String,
+    },
+    /// There was nothing worth sending, so nothing was sent.
+    ///
+    /// A separate variant rather than an empty success: spending a vendor call on a message with
+    /// no speakable text bills the account for silence, and answering with zero bytes of audio
+    /// would reach the reader as a player that does nothing and says nothing about why.
+    #[error("this message has no text to read aloud")]
+    Empty,
+}
+
+impl SpeechError {
+    /// Build a [`SpeechError::Status`] from a vendor response body, truncated and redacted.
+    ///
+    /// Goes through the same [`redact`] the signed-URL path uses: an upstream is free to echo the
+    /// credential back in its own error text, and that text ends up in a log and in an API answer.
+    #[must_use]
+    pub fn from_response(status: u16, body: &str, api_key: &Secret) -> Self {
+        let mut body = redact(body, api_key);
+        body.truncate(500);
+        Self::Status { status, body }
+    }
+}
+
+impl SpeechError {
+    /// Stable machine-readable code for the API layer.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::NotConfigured(_) => "elevenlabs_not_configured",
+            Self::Empty => "nothing_to_read",
+            Self::Transport(_) | Self::Status { .. } => "elevenlabs_error",
+        }
+    }
+}
+
+/// Audio for one message, as the vendor returned it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Speech {
+    /// The encoded audio. Handed to the caller verbatim; this server does not transcode.
+    pub audio: Vec<u8>,
+    /// What the audio IS, so the browser is told rather than left to sniff.
+    pub content_type: String,
+}
+
+/// Turning a message's text into audio.
+#[async_trait]
+pub trait SpeechProvider: Send + Sync {
+    /// Read `text` aloud in the configured voice.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpeechError`] when a setting is absent, the text is empty, the request fails, or
+    /// ElevenLabs refuses.
+    async fn speak(&self, config: &ElevenLabsConfig, text: &str) -> Result<Speech, SpeechError>;
+}
+
 /// A minted, short-lived conversation URL.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct SignedUrl {
@@ -149,6 +250,7 @@ mod tests {
             agent_id: agent.map(str::to_owned),
             api_key: key.map(Secret::new),
             api_base: crate::config::DEFAULT_ELEVENLABS_API_BASE.to_owned(),
+            voice_id: None,
         }
     }
 

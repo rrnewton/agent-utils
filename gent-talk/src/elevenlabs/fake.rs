@@ -19,14 +19,28 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 
-use super::http::signed_url_request;
-use super::{credentials, SignedUrl, SignedUrlError, SignedUrlProvider};
+use super::http::{signed_url_request, speech_request, TTS_CONTENT_TYPE};
+use super::{
+    credentials, speech_credentials, SignedUrl, SignedUrlError, SignedUrlProvider, Speech,
+    SpeechError, SpeechProvider,
+};
 use crate::config::ElevenLabsConfig;
 
 /// The API key [`FakeElevenLabs::new`] accepts. Anything else is a 401.
 pub const VALID_API_KEY: &str = "xi-fake-api-key-not-a-real-one";
 /// The agent id [`FakeElevenLabs::new`] knows about. Anything else is a 404.
 pub const KNOWN_AGENT_ID: &str = "agent_fake0000000000000000000000";
+/// The voice id [`FakeElevenLabs::new`] knows about. Anything else is a 404.
+pub const KNOWN_VOICE_ID: &str = "voice_fake0000000000000000000000";
+/// The audio [`FakeElevenLabs::new`] returns. Not real mp3 -- nothing here decodes it -- but it is
+/// BYTES, and distinct per text, so a test can prove which message was actually read.
+#[must_use]
+pub fn fake_audio(text: &str) -> Vec<u8> {
+    let mut audio = b"FAKE-MP3:".to_vec();
+    audio.extend_from_slice(text.as_bytes());
+    audio
+}
+
 /// The URL [`FakeElevenLabs::new`] mints.
 pub const MINTED_URL: &str =
     "wss://api.elevenlabs.io/v1/convai/conversation?agent_id=agent_fake0000000000000000000000\
@@ -42,10 +56,25 @@ pub struct FakeElevenLabs {
 #[derive(Debug, Default)]
 struct State {
     known_agents: BTreeSet<String>,
+    known_voices: BTreeSet<String>,
+    /// Every text this fake was asked to read, in order, so a test can prove WHAT was spoken --
+    /// and that a refusal spoke nothing.
+    spoken: Vec<String>,
     /// Every URL this fake was asked to fetch, in order. Lets a test prove a mint did NOT happen.
     requested: Vec<String>,
     minted_url: String,
     fail_with: Option<String>,
+}
+
+impl FakeElevenLabs {
+    /// Every text this fake was asked to read, in order.
+    ///
+    /// The point of the list rather than a count: "the reader tapped the second message and the
+    /// SECOND message is what was spoken" is the claim worth making, and a count cannot make it.
+    #[must_use]
+    pub fn spoken(&self) -> Vec<String> {
+        self.lock().spoken.clone()
+    }
 }
 
 impl Default for FakeElevenLabs {
@@ -60,10 +89,14 @@ impl FakeElevenLabs {
     pub fn new() -> Self {
         let mut known_agents = BTreeSet::new();
         known_agents.insert(KNOWN_AGENT_ID.to_owned());
+        let mut known_voices = BTreeSet::new();
+        known_voices.insert(KNOWN_VOICE_ID.to_owned());
         Self {
             valid_api_key: VALID_API_KEY.to_owned(),
             state: Mutex::new(State {
                 known_agents,
+                known_voices,
+                spoken: Vec::new(),
                 requested: Vec::new(),
                 minted_url: MINTED_URL.to_owned(),
                 fail_with: None,
@@ -104,6 +137,50 @@ impl FakeElevenLabs {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+#[async_trait]
+impl SpeechProvider for FakeElevenLabs {
+    async fn speak(&self, config: &ElevenLabsConfig, text: &str) -> Result<Speech, SpeechError> {
+        // Same gate the real client goes through, first, so an unconfigured server cannot be made
+        // to look configured by swapping in this fake.
+        let (voice_id, api_key) = speech_credentials(config)?;
+        // ...and the same refusal, BEFORE anything is recorded as spoken: a blank message must not
+        // appear in `spoken`, because a test proving "the refusal read nothing" depends on it.
+        if text.trim().is_empty() {
+            return Err(SpeechError::Empty);
+        }
+        let request = speech_request(&config.api_base, voice_id);
+        self.lock().requested.push(request.url);
+
+        if let Some(detail) = self.lock().fail_with.take() {
+            return Err(SpeechError::Transport(detail));
+        }
+        if api_key.expose() != self.valid_api_key {
+            // Quotes the key back deliberately, exactly as the signed-URL path does: an upstream
+            // is free to, and the redaction is what stops it reaching a log or a caller.
+            return Err(SpeechError::from_response(
+                401,
+                &format!(
+                    r#"{{"detail":{{"status":"invalid_api_key","message":"the key {} is not valid"}}}}"#,
+                    api_key.expose()
+                ),
+                api_key,
+            ));
+        }
+        if !self.lock().known_voices.contains(voice_id) {
+            return Err(SpeechError::from_response(
+                404,
+                &format!(r#"{{"detail":{{"status":"voice_not_found","message":"{voice_id}"}}}}"#),
+                api_key,
+            ));
+        }
+        self.lock().spoken.push(text.to_owned());
+        Ok(Speech {
+            audio: fake_audio(text),
+            content_type: TTS_CONTENT_TYPE.to_owned(),
+        })
     }
 }
 
@@ -157,6 +234,7 @@ mod tests {
             agent_id: agent.map(str::to_owned),
             api_key: key.map(Secret::new),
             api_base: DEFAULT_ELEVENLABS_API_BASE.to_owned(),
+            voice_id: None,
         }
     }
 

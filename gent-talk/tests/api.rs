@@ -21,13 +21,29 @@ use tower::ServiceExt as _;
 struct Harness {
     router: axum::Router,
     discord: Arc<FakeDiscord>,
+    /// The ElevenLabs stand-in THIS server was built with, where the builder exposes one.
+    ///
+    /// An `Option` rather than a fresh fake for the harnesses that do not expose theirs: handing
+    /// back a DIFFERENT fake would answer "what was spoken?" with the silence of an object the
+    /// server never held, which is a lie a test would eventually be written against.
+    elevenlabs: Option<Arc<gent_talk::elevenlabs::fake::FakeElevenLabs>>,
+}
+
+impl Harness {
+    /// The voice this server really speaks through. Panics on a harness that has none.
+    fn voice(&self) -> &gent_talk::elevenlabs::fake::FakeElevenLabs {
+        self.elevenlabs
+            .as_deref()
+            .expect("this harness was not built with a voice handle")
+    }
 }
 
 fn harness() -> Harness {
-    let (state, discord) = gent_talk::testing::state();
+    let (state, discord, elevenlabs) = gent_talk::testing::state_parts();
     Harness {
         router: router(state),
         discord,
+        elevenlabs: Some(elevenlabs),
     }
 }
 
@@ -64,6 +80,36 @@ async fn call(
         .to_bytes();
     let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
     (status, value)
+}
+
+/// Like [`call`], but for a route whose body is BYTES rather than JSON, and which is judged by
+/// its headers as much as by its body.
+async fn call_bytes(
+    harness: &Harness,
+    method: &str,
+    uri: &str,
+    token: Option<&str>,
+) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+    let mut builder = Request::builder().method(method).uri(uri);
+    if let Some(token) = token {
+        builder = builder.header("authorization", format!("Bearer {token}"));
+    }
+    let request = builder.body(Body::empty()).expect("request");
+    let response = harness
+        .router
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("router responds");
+    let status = response.status();
+    let headers = response.headers().clone();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    (status, headers, bytes.to_vec())
 }
 
 fn seed_lead_channel(harness: &Harness) {
@@ -508,10 +554,11 @@ fn urlencoding(value: &str) -> String {
 async fn messages_carry_both_a_spoken_time_and_the_exact_instant() {
     let toml = gent_talk::testing::config_toml()
         .replace("[server]", "[server]\ntimezone = \"America/New_York\"");
-    let (state, discord, _elevenlabs) = gent_talk::testing::state_from_toml(&toml);
+    let (state, discord, elevenlabs) = gent_talk::testing::state_from_toml(&toml);
     let harness = Harness {
         router: router(state),
         discord,
+        elevenlabs: Some(elevenlabs),
     };
     seed_lead_channel(&harness);
     let (status, payload) = call(
@@ -1003,11 +1050,12 @@ async fn every_rendered_message_carries_its_authors_snowflake() {
 // --- durable state -----------------------------------------------------------------------------
 
 fn store_harness() -> (Harness, std::sync::Arc<gent_talk::store::fake::FakeStore>) {
-    let (state, discord, store) = gent_talk::testing::state_with_store();
+    let (state, discord, store, elevenlabs) = gent_talk::testing::state_with_store_and_voice();
     (
         Harness {
             router: router(state),
             discord,
+            elevenlabs: Some(elevenlabs),
         },
         store,
     )
@@ -1370,6 +1418,7 @@ async fn an_unconfigured_store_refuses_loudly_instead_of_answering_from_nowhere(
     let harness = Harness {
         router: router(state),
         discord,
+        elevenlabs: None,
     };
     for (method, uri) in [
         ("GET", "/api/v1/conversations"),
@@ -1538,6 +1587,7 @@ fn replay_harness(extra: &str) -> (Harness, std::sync::Arc<gent_talk::store::fak
         Harness {
             router: router(state),
             discord,
+            elevenlabs: None,
         },
         store,
     )
@@ -1763,6 +1813,83 @@ async fn a_read_token_may_look_at_the_to_do_list_and_may_not_change_it() {
     assert_eq!(status, StatusCode::OK, "{payload}");
     assert_eq!(payload["count"], 1);
     assert_eq!(payload["messages"], serde_json::json!([ids[0]]));
+}
+
+#[tokio::test]
+async fn reading_a_message_aloud_speaks_that_message_and_hands_back_audio() {
+    // Read-aloud. The browser cannot call ElevenLabs itself without being handed an account
+    // credential, so this server makes the call and returns the AUDIO.
+    let (harness, _store, ids) = todo_harness();
+
+    let (status, headers, body) = call_bytes(
+        &harness,
+        "POST",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/messages/{}/speak", ids[0]),
+        Some(READ_TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers.get("content-type").and_then(|v| v.to_str().ok()),
+        Some("audio/mpeg"),
+        "the browser is left to sniff what this is"
+    );
+    // Audio for one message must not sit in a shared cache: it is derived from a channel this
+    // server authenticates access to.
+    assert_eq!(
+        headers.get("cache-control").and_then(|v| v.to_str().ok()),
+        Some("no-store")
+    );
+    assert!(!body.is_empty(), "no audio came back");
+
+    // THE MESSAGE'S OWN TEXT was what got spoken -- not a caller-supplied string, and not some
+    // other message. This is the claim a byte count could not make.
+    let spoken = harness.voice().spoken();
+    assert_eq!(
+        spoken.len(),
+        1,
+        "expected exactly one vendor call: {spoken:?}"
+    );
+    assert!(
+        !spoken[0].is_empty(),
+        "the vendor was asked to read an empty string"
+    );
+}
+
+#[tokio::test]
+async fn reading_aloud_refuses_a_message_this_server_cannot_see_without_calling_the_vendor() {
+    // A 404 rather than an invented request. Otherwise this route is a way to spend the operator's
+    // ElevenLabs balance on any id a caller cares to type.
+    let (harness, _store, _ids) = todo_harness();
+
+    let (status, payload) = call(
+        &harness,
+        "POST",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/messages/999999999999999999/speak"),
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{payload}");
+    assert!(
+        harness.voice().spoken().is_empty(),
+        "the vendor was called for a message that does not exist"
+    );
+}
+
+#[tokio::test]
+async fn reading_aloud_needs_read_scope() {
+    let (harness, _store, ids) = todo_harness();
+    let (status, payload) = call(
+        &harness,
+        "POST",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/messages/{}/speak", ids[0]),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{payload}");
+    assert!(harness.voice().spoken().is_empty());
 }
 
 #[tokio::test]

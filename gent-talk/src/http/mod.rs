@@ -97,6 +97,11 @@ pub fn router(state: AppState) -> Router {
         // acts that change that. READ scope to look, WRITE scope to change — the same split every
         // durable write on this server takes, and the reason it is not "read scope because it is
         // only a flag" is that the flag outlives the process and another device reads it back.
+        // `#50` read-aloud. POST because it spends money at a vendor; see `api::speak`.
+        .route(
+            "/api/v1/channels/{channel_id}/messages/{message_id}/speak",
+            post(api::speak),
+        )
         .route("/api/v1/channels/{channel_id}/todo", get(api::todo))
         .route("/api/v1/channels/{channel_id}/dismiss", post(api::dismiss))
         .route("/api/v1/channels/{channel_id}/restore", post(api::restore))

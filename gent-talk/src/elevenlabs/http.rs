@@ -7,7 +7,10 @@
 
 use async_trait::async_trait;
 
-use super::{credentials, SignedUrl, SignedUrlError, SignedUrlProvider};
+use super::{
+    credentials, speech_credentials, SignedUrl, SignedUrlError, SignedUrlProvider, Speech,
+    SpeechError, SpeechProvider,
+};
 use crate::config::{ElevenLabsConfig, Secret};
 
 /// A request, described independently of any HTTP client.
@@ -37,6 +40,38 @@ pub fn signed_url_request(api_base: &str, agent_id: &str) -> PreparedRequest {
             urlencode(agent_id)
         ),
     }
+}
+
+/// The default ElevenLabs model for reading a message aloud.
+///
+/// Named here rather than left to the vendor's account default, so two deployments of this server
+/// read the same text the same way and a change of model is a change to this line.
+pub const TTS_MODEL: &str = "eleven_turbo_v2_5";
+
+/// The audio this server asks for, and therefore what it tells the browser it is sending.
+pub const TTS_CONTENT_TYPE: &str = "audio/mpeg";
+
+/// Build the request that reads text aloud.
+///
+/// Documented as `POST /v1/text-to-speech/{voice_id}` with the account key in the `xi-api-key`
+/// header. A POST rather than a GET even though it only reads: it SPENDS MONEY at a vendor, and a
+/// GET is fair game for a browser, a proxy or a crawler to fetch speculatively.
+#[must_use]
+pub fn speech_request(api_base: &str, voice_id: &str) -> PreparedRequest {
+    PreparedRequest {
+        method: "POST",
+        url: format!(
+            "{}/text-to-speech/{}",
+            api_base.trim_end_matches('/'),
+            urlencode(voice_id)
+        ),
+    }
+}
+
+/// The body that goes with [`speech_request`].
+#[must_use]
+pub fn speech_body(text: &str) -> serde_json::Value {
+    serde_json::json!({ "text": text, "model_id": TTS_MODEL })
 }
 
 /// Percent-encode the few characters that could change the meaning of a query string.
@@ -153,6 +188,48 @@ impl SignedUrlProvider for HttpElevenLabsClient {
     }
 }
 
+#[async_trait]
+impl SpeechProvider for HttpElevenLabsClient {
+    async fn speak(&self, config: &ElevenLabsConfig, text: &str) -> Result<Speech, SpeechError> {
+        let (voice_id, api_key) = speech_credentials(config)?;
+        // Checked BEFORE the call, not after: a blank message would otherwise be billed as a
+        // request that returns silence.
+        if text.trim().is_empty() {
+            return Err(SpeechError::Empty);
+        }
+        let request = speech_request(&config.api_base, voice_id);
+        let response = self
+            .client
+            .post(&request.url)
+            .header(API_KEY_HEADER, api_key.expose())
+            .json(&speech_body(text))
+            .send()
+            .await
+            .map_err(|e| SpeechError::Transport(super::redact(&e.to_string(), api_key)))?;
+        let status = response.status();
+        if !status.is_success() {
+            // The FAILURE body is text; the success body is audio. Only this branch decodes as a
+            // string, because calling `.text()` on megabytes of mp3 would be nonsense.
+            let body = response.text().await.unwrap_or_default();
+            return Err(SpeechError::from_response(status.as_u16(), &body, api_key));
+        }
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or(TTS_CONTENT_TYPE)
+            .to_owned();
+        let audio = response
+            .bytes()
+            .await
+            .map_err(|e| SpeechError::Transport(super::redact(&e.to_string(), api_key)))?;
+        Ok(Speech {
+            audio: audio.to_vec(),
+            content_type,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,6 +312,7 @@ mod tests {
             agent_id: Some("agent_live".to_owned()),
             api_key: Some(Secret::new("xi-live-key-value")),
             api_base,
+            voice_id: Some("voice_live".to_owned()),
         }
     }
 

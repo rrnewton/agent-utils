@@ -75,6 +75,7 @@ impl Harness {
             agent_id: Some(MOCK_AGENT_ID.to_owned()),
             api_key: Some(Secret::new(MOCK_API_KEY)),
             api_base: self.mock.api_base(),
+            voice_id: None,
         };
         client.signed_url(&config).await.map(|url| url.signed_url)
     }
@@ -136,6 +137,7 @@ async fn the_real_client_mints_a_url_this_process_can_actually_open() {
             agent_id: Some(MOCK_AGENT_ID.to_owned()),
             api_key: Some(Secret::new(MOCK_API_KEY)),
             api_base: harness.mock.api_base(),
+            voice_id: None,
         })
         .await
         .expect("mints");
@@ -260,6 +262,7 @@ async fn an_unknown_agent_is_a_404_rather_than_a_conversation() {
             agent_id: Some("agent_that_does_not_exist".to_owned()),
             api_key: Some(Secret::new(MOCK_API_KEY)),
             api_base: harness.mock.api_base(),
+            voice_id: None,
         })
         .await
         .expect_err("an unknown agent has no conversation");

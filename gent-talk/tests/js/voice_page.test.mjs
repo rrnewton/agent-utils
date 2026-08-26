@@ -752,6 +752,14 @@ const json = (status, body) => ({
   text: async () => JSON.stringify(body),
 });
 
+/** An AUDIO answer, as `api::speak` sends one: bytes, not JSON. */
+const audio = (status, bytes) => ({
+  ok: status < 400,
+  status,
+  text: async () => bytes,
+  blob: async () => ({ bytes }),
+});
+
 /** A gent-talk error response, exactly as `ApiError` serializes one. */
 function errorResponse(status, error, detail) {
   return async () => json(status, { error, detail });
@@ -1032,6 +1040,13 @@ function newPage(store = new Map(), script = SCRIPT) {
     /** Every dismissal and every restoration the page sent, exactly as it went out. */
     dismissCalls: [],
     restoreCalls: [],
+    /** Which message ids were sent to the voice service, in order. */
+    speakCalls: [],
+    /** Set to a status to make every read-aloud fail that way. */
+    speakStatus: 0,
+    /** Every player the page built, so a test can end one and see what follows. */
+    players: [],
+    revokedUrls: [],
     /** What the server says produced the summaries. Quoted back by the page, never invented. */
     summaryBackend: "extractive (truncation, no model, no network, no cost)",
     /**
@@ -1223,6 +1238,53 @@ function newPage(store = new Map(), script = SCRIPT) {
     },
     atob,
     btoa,
+    // Read-aloud needs three things a browser has and this fixture did not: a way to turn a blob
+    // into a URL, a player, and a way for the TEST to say the audio finished. Playback is the one
+    // event that matters here — the page archives a message on `ended` — so the player records
+    // its listeners and the test fires them.
+    URL: {
+      createObjectURL: (blob) => `blob:${(blob && blob.bytes) || "audio"}`,
+      revokeObjectURL: (url) => {
+        page.revokedUrls.push(url);
+      },
+    },
+    Audio: class FakeAudio {
+      constructor(url) {
+        this.url = url;
+        this.paused = false;
+        this.playCount = 0;
+        this.listeners = new Map();
+        page.players.push(this);
+      }
+
+      addEventListener(type, fn) {
+        this.listeners.set(type, fn);
+      }
+
+      async play() {
+        this.playCount += 1;
+      }
+
+      pause() {
+        this.paused = true;
+      }
+
+      /** What the browser does when the audio runs out. */
+      async end() {
+        const fn = this.listeners.get("ended");
+        if (fn) {
+          await fn();
+        }
+      }
+
+      /** ...and what it does when the audio will not play at all. */
+      async fail() {
+        const fn = this.listeners.get("error");
+        if (fn) {
+          await fn();
+        }
+      }
+    },
     // Real ones. The page decodes the stream's bytes exactly as a browser hands them over, so a
     // chunk boundary landing in the middle of a multi-byte character behaves here as it would
     // there — `{ stream: true }` is doing real work rather than being copied from an example.
@@ -1303,6 +1365,19 @@ function newPage(store = new Map(), script = SCRIPT) {
             ? { channel: page.channels[at] }
             : { channel: page.channels[at], alias_notice: page.aliasNotice }
         );
+      }
+      // Read-aloud. Bytes rather than JSON, and RECORDED, so a test can prove which message was
+      // sent to the vendor and that a refusal sent none.
+      const wantsSpeech = /\/messages\/([^/]+)\/speak$/.exec(String(path));
+      if (wantsSpeech) {
+        page.speakCalls.push(wantsSpeech[1]);
+        if (page.speakStatus) {
+          return json(page.speakStatus, {
+            error: "elevenlabs_not_configured",
+            detail: "elevenlabs.voice_id is not configured",
+          });
+        }
+        return audio(200, `MP3:${wantsSpeech[1]}`);
       }
       if (/\/dismiss$/.test(String(path))) {
         const body = JSON.parse((options && options.body) || "null");
@@ -4831,6 +4906,157 @@ test("the reader can resize MESSAGE text, and it survives a reload", async () =>
   );
 });
 
+// --- reading a message aloud ------------------------------------------------------------------
+//
+// The owner's ask: in the channel view Talk becomes READ; turn it on, tap a message, hear it, and
+// it archives itself when the audio finishes. The greyed rows then say how far through you are.
+
+const readButton = (page) => page.el("read-aloud");
+
+async function inReadingMode(page, messages) {
+  const rows = await showDiscord(page, messages);
+  await readButton(page).click();
+  await page.settle();
+  return rows;
+}
+
+test("READ REPLACES TALK IN THE CHANNEL VIEW, and Talk comes back in the transcript", async () => {
+  const page = newPage();
+  await signIn(page);
+  assert.equal(readButton(page).hidden, true, "Read is offered over the voice transcript");
+  assert.equal(page.el("talk").hidden, false);
+
+  await showDiscord(page, [message({ id: "1000000000000000001" })]);
+  assert.equal(readButton(page).hidden, false, "Read is not offered where the messages are");
+  assert.equal(page.el("talk").hidden, true, "Talk is still taking room in the channel view");
+
+  await page.el("view-switch").click();
+  await page.settle();
+  assert.equal(readButton(page).hidden, true, "Read followed the reader back to the transcript");
+  assert.equal(page.el("talk").hidden, false);
+});
+
+test("tapping a message in reading mode speaks THAT message", async () => {
+  const page = newPage();
+  await signIn(page);
+  const rows = await inReadingMode(page, [
+    message({ id: "1000000000000000001", content: "first" }),
+    message({ id: "1000000000000000002", content: "second" }),
+  ]);
+
+  await rows[1].dispatch("click", {});
+  await page.settle();
+
+  assert.deepEqual(page.speakCalls, ["1000000000000000002"], "the wrong message was read");
+  assert.equal(page.players.length, 1, "no player was built");
+  assert.equal(page.players[0].playCount, 1, "the audio was fetched but never played");
+  assert.equal(rowState(page, 1).reading, "true", "nothing on screen says which row is speaking");
+  assert.equal(rowState(page, 0).reading, "false");
+});
+
+test("the message archives itself when the audio FINISHES, and not before", async () => {
+  const page = newPage();
+  await signIn(page);
+  const rows = await inReadingMode(page, [message({ id: "1000000000000000001", content: "first" })]);
+
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  assert.deepEqual(page.dismissCalls, [], "the message was archived before it had been read");
+
+  await page.players[0].end();
+  await page.settle();
+  assert.deepEqual(
+    page.dismissCalls,
+    [{ messages: ["1000000000000000001"] }],
+    "finishing the audio did not archive the message"
+  );
+  assert.equal(rowState(page, 0).archived, "true", "the row did not grey once it had been read");
+  assert.equal(rowState(page, 0).reading, "false", "the row is still marked as speaking");
+});
+
+test("audio that FAILS archives nothing — the archive is how the reader knows what is left", async () => {
+  const page = newPage();
+  await signIn(page);
+  const rows = await inReadingMode(page, [message({ id: "1000000000000000001" })]);
+
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  await page.players[0].fail();
+  await page.settle();
+
+  assert.deepEqual(page.dismissCalls, [], "a message that could not be played was filed away");
+  assert.equal(rowState(page, 0).archived, "false");
+  assert.equal(rowState(page, 0).reading, "false", "the row is stuck looking like it is speaking");
+});
+
+test("a read that the SERVER refuses archives nothing and says why", async () => {
+  const page = newPage();
+  await signIn(page);
+  page.speakStatus = 503;
+  const rows = await inReadingMode(page, [message({ id: "1000000000000000001" })]);
+
+  await rows[0].dispatch("click", {});
+  await page.settle();
+
+  assert.equal(page.players.length, 0, "a player was built for audio that never arrived");
+  assert.deepEqual(page.dismissCalls, [], "a message nobody heard was archived");
+  // BOTH places, and they are not the same job. The standing panel is what survives; the status
+  // line is the answer under the thumb that just tapped. A tap that reports only into a panel the
+  // reader is not looking at reads as a tap that did nothing.
+  assert.match(page.el("error").text(), /voice_id|configured/i, "the standing panel says nothing");
+  assert.match(
+    page.el("status").textContent,
+    /could not read that message aloud/i,
+    "the tap got no answer where the reader was looking"
+  );
+});
+
+test("tapping the message that is PLAYING stops it, and stopping archives nothing", async () => {
+  const page = newPage();
+  await signIn(page);
+  const rows = await inReadingMode(page, [message({ id: "1000000000000000001" })]);
+
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  await rows[0].dispatch("click", {});
+  await page.settle();
+
+  assert.equal(page.players[0].paused, true, "a second tap did not stop the audio");
+  assert.deepEqual(page.dismissCalls, [], "stopping halfway filed the message away");
+  assert.equal(rowState(page, 0).reading, "false");
+  // The object URL is released; this mode fetches one per message and never revoking them is a
+  // leak that grows with the backlog.
+  assert.equal(page.revokedUrls.length, 1, "the audio URL was never released");
+});
+
+test("with reading mode OFF a tap folds the message and speaks nothing", async () => {
+  const page = newPage();
+  await signIn(page);
+  const rows = await showDiscord(page, [
+    message({ id: "1000000000000000001", content: "z".repeat(4000) }),
+  ]);
+
+  await rows[0].dispatch("click", {});
+  await page.settle();
+
+  assert.deepEqual(page.speakCalls, [], "a tap outside reading mode spent a vendor call");
+  assert.equal(rows[0].getAttribute("data-collapsed"), "false", "the tap did not fold instead");
+});
+
+test("leaving the channel view stops the reading rather than playing over the transcript", async () => {
+  const page = newPage();
+  await signIn(page);
+  const rows = await inReadingMode(page, [message({ id: "1000000000000000001" })]);
+  await rows[0].dispatch("click", {});
+  await page.settle();
+
+  await page.el("view-switch").click();
+  await page.settle();
+
+  assert.equal(page.players[0].paused, true, "audio kept playing after leaving the channel");
+  assert.deepEqual(page.dismissCalls, [], "leaving the view archived the message");
+});
+
 test("the channel spends its width on words, not on insets", async () => {
   // 15% of a 393-pixel phone, on every row, bought what the speaker COLOUR now buys.
   const mine = cssBlock('#discord-log li.discord-message[data-who="me"]');
@@ -7533,6 +7759,7 @@ const archiveButton = (li) =>
 const rowState = (page, i) => ({
   replied: row(page, i).getAttribute("data-replied"),
   archived: row(page, i).getAttribute("data-archived"),
+  reading: row(page, i).getAttribute("data-reading"),
 });
 
 /** Two messages where the second answers the first, as Discord records a reply. */
@@ -7555,11 +7782,11 @@ test("A MESSAGE SOMEBODY HAS ANSWERED IS DIMMED; AN UNANSWERED ONE IS NOT", asyn
 
   // Both axes named, because they are independent: being ANSWERED is derived from what happens to
   // be loaded, being ARCHIVED is the reader's own declaration, and neither implies the other.
-  assert.deepStrictEqual(rowState(page, 0), { replied: "true", archived: "false" });
+  assert.deepStrictEqual(rowState(page, 0), { replied: "true", archived: "false", reading: "false" });
   // The ANSWER is not itself answered. Discord marks only the answering message, so a naive
   // implementation that set the flag on whichever row carried a pointer would dim this one.
-  assert.deepStrictEqual(rowState(page, 1), { replied: "false", archived: "false" });
-  assert.deepStrictEqual(rowState(page, 2), { replied: "false", archived: "false" });
+  assert.deepStrictEqual(rowState(page, 1), { replied: "false", archived: "false", reading: "false" });
+  assert.deepStrictEqual(rowState(page, 2), { replied: "false", archived: "false", reading: "false" });
 
   // And it is DRAWN, not merely recorded in an attribute.
   const dimmed = cssBlock('#discord-log li.discord-message[data-replied="true"]');
