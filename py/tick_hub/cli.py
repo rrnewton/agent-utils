@@ -333,6 +333,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="persist the advanced fired-state (default: dry-run, mutate nothing)",
     )
     tick_p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "show EVERY reminder regardless of when it last fired, and print a line "
+            "for the clean ones too (implies no state write; refuses --flush)"
+        ),
+    )
+    tick_p.add_argument(
         "--no-header",
         action="store_true",
         help="suppress the explanatory stderr banner (pure machine parsing)",
@@ -401,16 +409,35 @@ def _cmd_tick(ns: argparse.Namespace, c: Palette) -> int:
     now = int(ns.now) if isinstance(ns.now, int) else wall_clock_now()
     current_tick_min = ns.current_tick_min if isinstance(ns.current_tick_min, int) else None
     fired_path = _resolve_fired_path(ns.fired_state if isinstance(ns.fired_state, str) else None)
-    fired = load_fired_state(fired_path)
+    pending = bool(ns.dry_run)
+    if pending and bool(ns.flush):
+        # Refuse rather than silently ignore one of them. --pending reports what
+        # WOULD run; --flush records what DID. Advancing the cadence from a report
+        # that deliberately ignored the cadence would mark every reminder as just
+        # fired, which is the one outcome that silently destroys the schedule.
+        print(
+            f"{PROG}: --dry-run and --flush are mutually exclusive: --dry-run ignores "
+            "the fired-state, so persisting its result would reset every cadence",
+            file=sys.stderr,
+        )
+        return 2
 
+    # ⚠️ THE FIRED-STATE IS STILL READ AND STILL NOT WRITTEN. Passing {} to run_tick
+    # is what makes this a real report of everything pending: is_due() treats a
+    # reminder with no recorded epoch as never-run and therefore due, so an empty
+    # mapping means "ask every reminder". The file on disk is untouched either way
+    # -- run_tick is pure with respect to it and only --flush persists, which the
+    # guard above has already excluded.
+    fired = load_fired_state(fired_path)
     result = run_tick(
         cfg,
         state,
         now=now,
-        fired=fired,
+        fired={} if pending else fired,
         gate_runner=SubprocessGateRunner(),
         age_probe=GlobFileAgeProbe(),
         current_tick_min=current_tick_min,
+        report_pending=pending,
     )
 
     if not bool(ns.no_header):
@@ -430,7 +457,9 @@ def _cmd_tick(ns: argparse.Namespace, c: Palette) -> int:
         print(f"{PROG}: fired-state persisted to {fired_path}", file=sys.stderr)
     else:
         print(
-            f"{PROG}: dry-run (fired-state NOT persisted; pass --flush to persist)",
+            f"{PROG}: no state write (fired-state NOT persisted; pass --flush to persist). "
+            f"This still consults the fired-state, so it shows only what is DUE -- "
+            f"pass --dry-run to ignore it and see everything outstanding.",
             file=sys.stderr,
         )
     return 0

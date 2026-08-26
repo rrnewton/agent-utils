@@ -73,6 +73,29 @@ def format_unevaluable(name: str, dependencies: Sequence[str]) -> str:
     )
 
 
+def format_clean(name: str) -> str:
+    """Format a gate that RAN and found nothing wrong.
+
+    ⚠️ THIS EXISTS BECAUSE SILENCE MEANT TWO THINGS. In an ordinary tick a clean
+    gate emits nothing, and so does a gate that was never reached — the reader
+    cannot tell "checked, fine" from "not checked". Every other outcome already
+    has a line; this was the one that did not, and its absence is the ambiguity a
+    pending report exists to remove.
+    """
+    return f"CLEAN: {name} ran and found nothing to report"
+
+
+def format_suppressed(name: str, missing_flags: Sequence[str]) -> str:
+    """Format a reminder NOT evaluated because a required flag is off.
+
+    Distinct from CLEAN and from every NO-SIGNAL: nothing was measured, and the
+    reason is configuration rather than failure. Naming the flags lets the reader
+    act instead of wondering why the gate is missing from the report.
+    """
+    flags = ",".join(missing_flags) or "(none recorded)"
+    return f"SUPPRESSED: {name} did not run; required flag(s) not set: {flags}"
+
+
 def format_error(text: str) -> str:
     """Format an operational ``ERROR`` record."""
     return f"ERROR: {text}"

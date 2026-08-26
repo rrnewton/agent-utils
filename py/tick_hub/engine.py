@@ -35,9 +35,11 @@ from tick_hub.emit import (
     HEALTH_STATUS_OK,
     HEALTH_STATUS_STALE,
     format_action,
+    format_clean,
     format_error,
     format_health,
     format_note,
+    format_suppressed,
     format_unevaluable,
 )
 from tick_hub.model import Emit, EmitKind, Gate, GateWhen, HealthCheck, Reminder, TickConfig
@@ -331,6 +333,7 @@ def run_tick(
     gate_runner: GateRunner,
     age_probe: FileAgeProbe,
     current_tick_min: int | None = None,
+    report_pending: bool = False,
 ) -> TickResult:
     """Run one tick and return the emitted lines plus the advanced fired-state (pure w.r.t. I/O,
     which is confined to the injected ``gate_runner`` / ``age_probe``)."""
@@ -356,6 +359,16 @@ def run_tick(
                 continue
             if not _flags_satisfied(rem.requires_flags, state.flags):
                 # Flag-suppressed: do NOT consume the cadence, so it fires promptly once enabled.
+                if report_pending:
+                    # In a pending report this must be VISIBLE. Skipping silently
+                    # is how a suppressed gate becomes indistinguishable from a
+                    # clean one, which is the whole reason this mode exists.
+                    missing = tuple(
+                        flag
+                        for flag in rem.requires_flags
+                        if not state.flags.get(flag, False)
+                    )
+                    lines.append(format_suppressed(rem.name, missing))
                 continue
             outcome, captured, error = _eval_gate(rem.gate, gate_runner)
             evaluations.append(_ReminderEvaluation(rem, outcome, captured, error))
@@ -435,6 +448,8 @@ def run_tick(
                     )
                     actions += 1
                     continue
+                if report_pending:
+                    lines.append(format_clean(rem.name))
                 new_fired[rem.name] = now  # the check ran; the cadence clock resets
                 continue
             try:
