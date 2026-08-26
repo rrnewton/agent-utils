@@ -5728,6 +5728,17 @@ function setTokenState(text) {
 const NO_TOKEN_YET = "no token saved in this browser — paste your write-scope token above.";
 
 function applyClientConfig(config) {
+  // WHO THIS BRIDGE IS, from the server, before a single message is drawn.
+  //
+  // The page used to learn this only as a side effect of the reader replying from the app, or of
+  // the live feed delivering a message this server had posted. A reader who had done neither got a
+  // channel in which NOTHING was recognised: their own words were not "me", and the bridge's own
+  // account still counted as a second bot, so the "the only bot that is not us" guess for the
+  // coding agent became a coin toss it declines to call. Every row fell through to the same
+  // third-party colour, which is exactly what the owner reported seeing.
+  if (config && config.self_author_id) {
+    noteSelfAuthor(config.self_author_id);
+  }
   const select = el("discord-channel");
   // `#39 channel-alias`. Both pickers are drawn from the same list and through the same naming
   // rule, so the name in the bar and the name in Settings are one answer rather than two.

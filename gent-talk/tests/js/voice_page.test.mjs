@@ -940,6 +940,7 @@ function newPage(store = new Map(), script = SCRIPT) {
         elevenlabs_agent_id: "agent_test",
         live_poll_seconds: page.livePollSeconds,
         replay_enabled: page.replayEnabled,
+        self_author_id: page.selfAuthorId,
       }),
     /**
      * The channels this server is configured for, as the server would serialize them.
@@ -989,6 +990,8 @@ function newPage(store = new Map(), script = SCRIPT) {
     /** `#46 conversation-replay`: every replay fetch, and the knobs that shape the answer. */
     replayCalls: [],
     replayEnabled: true,
+    /** The account this bridge posts as, as the server reads it out of its own bot token. */
+    selfAuthorId: "1000000000000000009",
     replayStatus: 200,
     replayMaxTurns: 40,
     replayTransport: "contextual_update",
@@ -5055,6 +5058,53 @@ test("leaving the channel view stops the reading rather than playing over the tr
 
   assert.equal(page.players[0].paused, true, "audio kept playing after leaving the channel");
   assert.deepEqual(page.dismissCalls, [], "leaving the view archived the message");
+});
+
+test("THE BRIDGE IS RECOGNISED FROM THE FIRST RENDER, WITHOUT THE READER HAVING REPLIED", async () => {
+  // The owner's report: every message in the channel was the same colour, including his own.
+  //
+  // The page learned which account this bridge posts as only as a side effect of a reply sent
+  // from the app, or of the live feed delivering a `self_posted` message. Until one of those
+  // happened `selfAuthorId` was null, so nothing was `me` — AND the bridge still counted as a
+  // second bot, which turned "the only bot that is not us" into a coin toss the page declines to
+  // call. Every row fell through to the third-party colour. The server knows the answer from its
+  // own token and now says so.
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [
+    // The bridge, posting the owner's words on his behalf.
+    message({ id: "1000000000000000001", author: "gent-talk", author_id: "1000000000000000009", author_is_bot: true }),
+    // The coding agent: the only OTHER bot in the channel.
+    message({ id: "1000000000000000002", author: "MyDiscordBot", author_id: "20", author_is_bot: true }),
+    // A person who is neither.
+    message({ id: "1000000000000000003", author: "alice", author_id: "30", author_is_bot: false }),
+  ]);
+
+  assert.equal(whoOf(page, 0), "me", "the bridge's own messages are not recognised as the owner's");
+  assert.equal(whoOf(page, 1), "coder", "the lone other bot was not taken to be the coding agent");
+  assert.equal(whoOf(page, 2), "human", "a person was not drawn as one");
+
+  // The three buckets are three DIFFERENT treatments, which is the whole complaint: they were one.
+  const mine = cssBlock('#discord-log li.discord-message[data-who="me"]');
+  const theirs = cssBlock('#discord-log li.discord-message[data-who="coder"]');
+  assert.match(mine, /--mine/, "the owner's messages do not use the transcript's own colour");
+  assert.match(theirs, /--theirs/, "the coding agent is not drawn as the transcript's other speaker");
+});
+
+test("without the server's answer the page still recognises nobody — which is why it is sent", async () => {
+  // The control for the test above. An older server sends no `self_author_id`, and the page has to
+  // degrade to the behaviour that had the bug rather than inventing an id: labelling somebody
+  // else's messages as the owner's would be worse than labelling nobody's.
+  const page = newPage();
+  page.selfAuthorId = null;
+  await signIn(page);
+  await showDiscord(page, [
+    message({ id: "1000000000000000001", author: "gent-talk", author_id: "1000000000000000009", author_is_bot: true }),
+    message({ id: "1000000000000000002", author: "MyDiscordBot", author_id: "20", author_is_bot: true }),
+  ]);
+
+  assert.notEqual(whoOf(page, 0), "me", "an id nobody supplied was invented");
+  assert.equal(whoOf(page, 1), "bot", "with two unidentified bots the coder guess must decline");
 });
 
 test("the channel spends its width on words, not on insets", async () => {

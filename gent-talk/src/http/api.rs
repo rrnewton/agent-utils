@@ -300,6 +300,14 @@ pub struct ClientConfigResponse {
     /// what resuming will do, and the control's own note has to say what the next call will be —
     /// both of which are questions asked while there is no conversation to fetch.
     pub replay_enabled: bool,
+    /// The Discord account this bridge posts as, when it can be known.
+    ///
+    /// NOT a secret: a bot's user id is visible on every message it has ever sent. It is here so
+    /// the channel view can tell the owner's own words -- posted on his behalf by this bridge --
+    /// from everybody else's, on the FIRST render rather than only after he has replied from the
+    /// app. `None` when the token is not in the shape ids can be read from; the page then falls
+    /// back to learning it the old way.
+    pub self_author_id: Option<String>,
     /// Seconds between live ingestion ticks, or `0` when live ingestion is OFF.
     ///
     /// The page needs this to tell the truth about its own channel view. With ingestion off the
@@ -322,6 +330,9 @@ pub async fn client_config(
         version: env!("CARGO_PKG_VERSION"),
         live_poll_seconds: state.config.discord.live_poll_seconds,
         replay_enabled: state.config.replay.enabled,
+        self_author_id: crate::discord::self_user_id_from_token(
+            state.config.discord.bot_token.expose(),
+        ),
     }))
 }
 

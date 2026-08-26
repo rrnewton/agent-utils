@@ -21,10 +21,13 @@
   --mine: #24405c; /* what YOU said */
   --mine-edge: #33587b;
   --theirs: #1d2026; /* what the AGENT said */
-  /* Everyone else in the channel: other people, and any bot that is not the coding agent. Warm,
-     so it is not read as a lighter or darker version of either principal. */
-  --third: #3a3325;
-  --third-edge: #5b5039;
+  /* Everyone else in the channel: other people, and any bot that is not the coding agent.
+     Warm, so it is not read as a lighter or darker version of either principal, but QUIET --
+     the coding agent is the thing being read and must stay the loudest row on the list. An
+     earlier version of this was strong enough to dominate the view, which only showed up
+     because a classification bug was sending every message here. */
+  --third: #26221b;
+  --third-edge: #3b3529;
   /*
    * How far a message is pushed off its own side of the list.
    *
@@ -63,8 +66,8 @@
     --mine: #dbeaf8;
     --mine-edge: #b4d0e8;
     --theirs: #ffffff;
-    --third: #fdf3e3;
-    --third-edge: #e7d5b4;
+    --third: #faf6ee;
+    --third-edge: #e8e0cf;
     --dock: #eef1f5;
     --ok: #1f8f4c;
     --idle: #98a1b0;
