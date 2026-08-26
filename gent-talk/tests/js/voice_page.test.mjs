@@ -4471,7 +4471,10 @@ test("YOUR OWN TURN DOES NOT YANK YOU TO THE BOTTOM once you have scrolled up", 
 
   // The control: the OLD rule, an unconditional scroll on every arrival. It has to fail.
   const control = await parked(
-    brokenScript("function followIfPinned(pinned) {\n  if (pinned) {", "function followIfPinned(pinned) {\n  if (true) {")
+    brokenScript(
+      'function followIfPinned(pinned) {\n  if (pinned && currentView === "voice") {',
+      "function followIfPinned(pinned) {\n  if (true) {"
+    )
   );
   assert.notEqual(
     control.area.scrollTop,
@@ -5826,6 +5829,169 @@ test("SENDING A REPLY does not move you — the whole complaint, pinned", async 
   await page.settle();
 
   assert.equal(area.scrollTop, parked, "replying threw away the reader's place in the backlog");
+});
+
+// --- ...AND THE SAME FOR THE VOICE TRANSCRIPT ---------------------------------------------------
+//
+// The audit above pinned every path in the CHANNEL and recorded, honestly, that it had not reached
+// the other list: deleting `showView`'s jump left the whole suite green, because on the channel
+// path the entry read lands on the newest anyway. So the line was load-bearing for the transcript
+// and nothing was watching it. This is that half.
+//
+// TWO OF THESE ARE ALREADY HERE and are not repeated: "a turn arriving FOLLOWS the newest line for
+// a reader already at the bottom" and "JUMP TO NEWEST appears only when something arrived off
+// screen, and takes you there" are both about the transcript, both use a transcript tall enough to
+// scroll, and between them pin the two arrival cases — follow when pinned, hold still and raise the
+// chip when not. What was missing is everything about ENTERING and LEAVING this view.
+//
+// Writing them found two defects, neither of which the channel has:
+//
+//   * A SAVED scrollTop IS NOT "KEEP ME ON THE NEWEST". A call goes on talking while you read a
+//     backlog, so the transcript is the one list that grows while nobody is in it. Coming back put
+//     the reader at the offset the bottom used to be at — several turns above the end, with nothing
+//     saying so. `viewScroll` remembers whether they were on the newest now, which is the rule the
+//     channel's own re-read has always settled by.
+//   * A TURN ARRIVING ASKED THE WRONG LIST whether the reader was at the bottom. Both panes share
+//     one #scroll-area, so a turn landing while the reader was at the bottom of the CHANNEL
+//     scrolled the channel and put the CHANNEL's chip away, and never raised the transcript's.
+
+/** A stored conversation long enough that restoring it really overflows the scroll area. */
+const tallConversation = (count = 12) =>
+  Array.from({ length: count }, (_unused, i) => ({
+    speaker: i % 2 === 0 ? "you" : "agent",
+    text: longMessage(`turn ${i + 1}`),
+    at_ms: 1_700_000_000_000 + i * 60_000,
+  }));
+
+/** A live call with a transcript that overflows, and a tall channel waiting behind the switch. */
+async function talkingBesideAChannel(page) {
+  page.messages = tallChannel();
+  await startTalking(page);
+  return fillTranscript(page);
+}
+
+/** The turn at the end of the transcript, as a rectangle the reader can be asked to look at. */
+function newestTurnOnScreen(page) {
+  const rows = page.el("transcript").children;
+  const rect = rows[rows.length - 1].getBoundingClientRect();
+  const viewport = page.el("scroll-area").clientHeight;
+  return { rect, viewport, visible: rect.bottom > 0 && rect.top < viewport };
+}
+
+test("a FIRST entry into the voice transcript lands on the newest turn", async () => {
+  // The transcript's counterpart to "the channel view opens on the NEWEST message". A stored
+  // conversation is what makes a first entry have anything in it at all: the page opens on this
+  // view with nothing in the list, and restoring an earlier conversation is what fills it.
+  //
+  // No helper that scrolls: `signIn` is the page's own load path and touches no scroll position.
+  const page = newPage();
+  page.storedTurns.set("conv_earlier", tallConversation());
+  const area = page.el("scroll-area");
+
+  await signIn(page);
+  await page.settle();
+
+  assert.ok(
+    area.scrollHeight > area.clientHeight * 2,
+    `the restored transcript is ${area.scrollHeight} tall in a ${area.clientHeight} box, so it ` +
+      "does not overflow and landing at the bottom would prove nothing"
+  );
+  assert.ok(atBottomOf(area), "the transcript opened at the top of the restored conversation");
+  const newest = newestTurnOnScreen(page);
+  assert.ok(
+    newest.visible,
+    `the newest turn occupies ${newest.rect.top}..${newest.rect.bottom} of a 0..${newest.viewport} ` +
+      "viewport, so the reader was taken somewhere it cannot be seen"
+  );
+});
+
+test("SWITCHING VIEWS AND COMING BACK KEEPS YOUR PLACE IN THE TRANSCRIPT TOO", async () => {
+  // `viewScroll` holds both views and only the channel half was tested. Glancing at the backlog
+  // must not cost a reader their place in what the assistant said ten turns ago either.
+  const page = newPage();
+  const area = await talkingBesideAChannel(page);
+  const parked = parkMidway(page);
+  assert.ok(parked > 0, "the transcript is not tall enough to have a place to lose");
+
+  await page.el("view-switch").click();
+  await page.settle();
+  assert.equal(page.tab(), "discord", "the switch did not reach the channel");
+  await page.el("view-switch").click();
+  await page.settle();
+  assert.equal(page.tab(), "voice");
+
+  assert.equal(area.scrollTop, parked, "coming back to the transcript lost the reader's place");
+});
+
+test("...but a reader who left ON THE NEWEST TURN comes back to the NEWEST TURN", async () => {
+  // The defect a saved scrollTop cannot see, and the one line in `showView` this whole audit could
+  // not reach until now. The call goes on talking while the reader is over on the channel, so the
+  // transcript GROWS while they are away — and "where I was" for a reader parked on the newest line
+  // is the newest line, not the number of pixels the newest line used to sit at.
+  const page = newPage();
+  const area = await talkingBesideAChannel(page);
+  assert.ok(atBottomOf(area), "the reader is not on the newest turn, so this is not the case here");
+
+  await page.el("view-switch").click(); // over to the channel...
+  await page.settle();
+  assert.equal(page.tab(), "discord", "the switch did not reach the channel");
+  area.scrollTop = 0; // ...and up to the top of the backlog, far from the transcript's own bottom
+  for (const n of [1, 2, 3]) {
+    assistantSays(page, longMessage(`while you were away ${n}`));
+  }
+
+  await page.el("view-switch").click(); // and back
+  await page.settle();
+  assert.equal(page.tab(), "voice");
+
+  assert.ok(
+    area.scrollHeight > area.clientHeight * 2,
+    "the transcript does not overflow, so landing at the bottom would prove nothing"
+  );
+  assert.ok(
+    atBottomOf(area),
+    `coming back left the reader at ${area.scrollTop} of a transcript that now ends at ` +
+      `${area.scrollHeight - area.clientHeight} — where the newest turn USED to be, not where it is`
+  );
+  const newest = newestTurnOnScreen(page);
+  assert.ok(
+    newest.visible,
+    `the newest turn occupies ${newest.rect.top}..${newest.rect.bottom} of a 0..${newest.viewport} ` +
+      "viewport, so the reader was taken somewhere it cannot be seen"
+  );
+  assert.equal(page.el("jump-newest").hidden, true, "the reader IS on the newest turn");
+});
+
+test("A TURN ARRIVING WHILE YOU READ THE CHANNEL SAYS SO WHEN YOU COME BACK", async () => {
+  // Both panes share one #scroll-area, so `atBottom` answers about whichever list is UP. A turn
+  // landing while the reader sat at the bottom of the channel was therefore read as "the reader is
+  // pinned to the transcript": it scrolled the channel, put the CHANNEL's chip away, and left the
+  // transcript's unraised. The reader came back to their place with three turns below it and
+  // nothing on the screen admitting they existed.
+  const page = newPage();
+  const area = await talkingBesideAChannel(page);
+  const parked = parkMidway(page);
+  assert.ok(parked > 0, "the transcript is not tall enough to have a place to lose");
+
+  await page.el("view-switch").click();
+  await page.settle();
+  assert.equal(page.tab(), "discord", "the switch did not reach the channel");
+  assert.ok(atBottomOf(area), "the reader is not at the bottom of the channel, which is the case");
+  const inTheChannel = area.scrollTop;
+
+  assistantSays(page, longMessage("while you were reading the backlog"));
+
+  assert.equal(area.scrollTop, inTheChannel, "a voice turn moved the channel the reader was on");
+
+  await page.el("view-switch").click();
+  await page.settle();
+
+  assert.equal(area.scrollTop, parked, "coming back to the transcript lost the reader's place");
+  assert.equal(
+    page.el("jump-newest").hidden,
+    false,
+    "a turn arrived while the reader was away and nothing on the transcript said so"
+  );
 });
 
 test("the channel spends its width on words, not on insets", async () => {

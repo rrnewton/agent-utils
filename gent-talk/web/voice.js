@@ -296,10 +296,21 @@ let currentView = "voice";
  * transcript and coming back put a reader who was forty messages into a backlog at the bottom
  * again, with no way to find where they had been.
  *
- * `null` means "never been here", which is the only case where landing on the newest message is
- * right — arriving at the TOP of a long channel is the failure the unconditional jump was
+ * `null` means "never been here", which is one of the two cases where landing on the newest message
+ * is right — arriving at the TOP of a long channel is the failure the unconditional jump was
  * originally protecting against, and that reasoning was sound for a FIRST entry and wrong for
  * every one after it.
+ *
+ * THE OTHER CASE IS `atNewest`, and a saved `top` alone cannot express it. A scrollTop is the offset
+ * the newest line HAPPENED to be at when the reader left; it is not the instruction "keep me on the
+ * newest". Restore it after four turns have arrived in a transcript nobody was watching and the
+ * reader lands where the bottom used to be, several turns above the end, with nothing saying so —
+ * which is losing their place, not keeping it. This is the same rule the channel's own re-read
+ * settles by (`settleAfterRead`): follow the newest for a reader who was on it, restore the offset
+ * for a reader who was not.
+ *
+ * @type {{voice: null | {top: number, atNewest: boolean},
+ *         discord: null | {top: number, atNewest: boolean}}}
  */
 const viewScroll = { voice: null, discord: null };
 
@@ -311,7 +322,8 @@ function showView(name) {
   // whichever pane is now up and says nothing about where the reader was.
   const leaving = currentView;
   if (leaving && leaving !== name) {
-    viewScroll[leaving] = el("scroll-area").scrollTop;
+    const area = el("scroll-area");
+    viewScroll[leaving] = { top: area.scrollTop, atNewest: atBottom(area) };
   }
   currentView = name;
   el("pane-voice").hidden = name !== "voice";
@@ -326,10 +338,15 @@ function showView(name) {
   //
   // On every entry AFTER that, it is the reader's place, and throwing it away is the same defect
   // one level up. A glance at the transcript and back should not cost forty messages of scrolling.
+  //
+  // ...unless the place they left was THE NEWEST LINE, which is an instruction rather than an
+  // offset: turns can land in the transcript while the reader is over on the channel, and putting
+  // them back at the number the bottom used to be is the same "your place moved" defect wearing the
+  // fix's clothes. See `viewScroll`.
   const held = viewScroll[name];
-  const returning = typeof held === "number";
+  const returning = held !== null && !held.atNewest;
   if (returning) {
-    el("scroll-area").scrollTop = held;
+    el("scroll-area").scrollTop = held.top;
   } else {
     scrollToNewest();
   }
@@ -510,9 +527,16 @@ function restoreScroll(mark) {
  * When it is false the scroll position is left exactly alone and the "Newest" chip appears —
  * silently leaving the reader in place would be the other half of the same defect, since they
  * would have no way of knowing something had arrived at all.
+ *
+ * AND ONLY WHILE THE TRANSCRIPT IS THE LIST ON SCREEN. `pinned` is measured on #scroll-area, which
+ * both panes share, so a turn arriving while the reader is over on the channel was asking "is the
+ * reader at the bottom of the CHANNEL?" and following the answer: it scrolled the channel and put
+ * the channel's chip away, and it never raised the transcript's. A call goes on talking while you
+ * read a backlog, so that is the ordinary case, not a corner — and its cost was silence. The turn
+ * belongs to a list nobody is looking at, so the only right act is to raise that list's chip.
  */
 function followIfPinned(pinned) {
-  if (pinned) {
+  if (pinned && currentView === "voice") {
     scrollToNewest();
     return;
   }
