@@ -754,7 +754,32 @@ body {
  * that is actually speaking.
  */
 #discord-log li.discord-message[data-marked="true"] {
-  box-shadow: inset 0.2rem 0 0 var(--muted);
+  box-shadow: inset 0.2rem 0 0 var(--accent);
+}
+
+/*
+ * THE LINE, which is the part that has to work at speed.
+ *
+ * An inset bar is findable once you are already looking at the row. Scrolling back through a long
+ * channel with a thumb, nothing narrow registers — so the marker also draws a full-width rule
+ * across the list at its top edge, which is the one shape the eye catches while everything else
+ * is a blur.
+ *
+ * Bounded to the row rather than to the viewport. A viewport-wide negative inset would have been
+ * a wider line and a horizontal scrollbar: `#scroll-area` sets `overflow-y`, which makes the other
+ * axis resolve to `auto` rather than `visible`, so anything overhanging it becomes scrollable
+ * width. On the coder tile — which is most of what a backlog is, and runs edge to edge — the row
+ * IS the full width, so nothing is lost where it matters.
+ */
+#discord-log li.discord-message[data-marked="true"]::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: -0.3rem;
+  height: 2px;
+  background: var(--accent);
+  pointer-events: none;
 }
 
 /* ...except when it IS the row speaking, where the loud state wins outright. */

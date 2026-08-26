@@ -3527,6 +3527,10 @@ function renderChannelRows() {
     persistJson(AUTHORS_KEY, authorsSeen);
     renderIdentityRows();
   }
+  // The kept place follows the reader down the backlog. Done BEFORE the rows are marked, so the
+  // row that ends up carrying the marker is the one this pass draws it on rather than the one the
+  // previous pass did.
+  advanceMarkerPastRead();
   for (const row of rows) {
     const id = row.getAttribute("data-id") || "";
     // DIMS, never hides. See the note at the head of this section: this is derived from what
@@ -3559,8 +3563,6 @@ function renderChannelRows() {
     // reader can still change their mind about, and it is the only thing on screen during a wait
     // that is entirely somebody else's network.
     row.setAttribute("data-pending", pendingRead === id ? "true" : "false");
-    // The place the reader asked to come back to, marked on the row itself so it is findable by
-    // eye once they are near it.
     row.setAttribute("data-marked", placeMarker === id ? "true" : "false");
     // IS THIS MESSAGE ITSELF AN ANSWER? The opposite direction from `data-replied`, and the more
     // reliable one: that is derived from whatever happens to be loaded and misses an answer
@@ -3664,6 +3666,60 @@ function setPlaceMarker(id) {
   }
   renderChannelRows();
   renderScrollTools();
+}
+
+/**
+ * Move the kept place forward past everything that has been dealt with.
+ *
+ * The marker means "the oldest thing I still have to deal with", not "a message I bookmarked". So
+ * working downward through a backlog has to carry it along: read a message, archive it, and the
+ * place is now the next one — otherwise coming back takes the reader to something they finished.
+ *
+ * THE RULE IS "the first unread row at or after where the marker is", which is stricter than
+ * "skip whatever is read below it" and deliberately so. Advancing past an UNREAD row to reach a
+ * later unread one would step over the exact thing the marker exists to protect.
+ *
+ * When everything from the marker onward has been dealt with, it parks on the newest loaded
+ * message rather than disappearing: the reader is caught up, and a marker that silently vanished
+ * would look like it had been lost.
+ */
+function advanceMarkerPastRead() {
+  if (placeMarker === null) {
+    return;
+  }
+  const rows = [...el("discord-log").children];
+  const at = rows.findIndex((li) => li.getAttribute("data-id") === placeMarker);
+  // Not loaded: the marker is further back than the window, and guessing where it should go from
+  // a list that does not contain it would move it somewhere nobody chose.
+  if (at < 0) {
+    return;
+  }
+  // Read from the SOURCE, not from the row's attributes. This runs before the pass that writes
+  // them, so the attributes still describe the previous render -- and the case that matters most
+  // is the one immediately after a dismissal, where they would say the message is still unread and
+  // the marker would refuse to move past the thing the reader just dealt with.
+  const dealtWith = (li) =>
+    readAlready(
+      li.getAttribute("data-id") || "",
+      bucketFor(li.getAttribute("data-author-id"), li.getAttribute("data-author-bot") === "true")
+    );
+  let i = at;
+  while (i < rows.length && dealtWith(rows[i])) {
+    i += 1;
+  }
+  if (i === at) {
+    return;
+  }
+  const landing = i < rows.length ? rows[i] : rows[rows.length - 1];
+  const id = landing.getAttribute("data-id");
+  if (id && id !== placeMarker) {
+    placeMarker = id;
+    try {
+      localStorage.setItem(MARKER_KEY, placeMarker);
+    } catch (_error) {
+      // As elsewhere: a browser that refuses storage still honours it for this session.
+    }
+  }
 }
 
 /** Take the reader back to where they left off, if that message is still loaded. */

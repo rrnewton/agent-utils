@@ -5660,6 +5660,84 @@ test("...and it is correct even when the message it answers is not loaded", asyn
   );
 });
 
+const keepPlaceAt = async (page, row) => {
+  await hold(page, row);
+  await row.descendants().find((n) => n.text() === "Keep my place here").click();
+  await page.settle();
+};
+
+test("THE KEPT PLACE FOLLOWS THE READER DOWN THE BACKLOG", async () => {
+  // The marker means "the oldest thing I still have to deal with", not "a message I bookmarked".
+  // Working downward has to carry it along, or coming back lands on something already finished.
+  const page = newPage();
+  await signIn(page);
+  const rows = await showDiscord(page, [
+    message({ id: "1000000000000000001" }),
+    message({ id: "1000000000000000002" }),
+    message({ id: "1000000000000000003" }),
+  ]);
+  await keepPlaceAt(page, rows[0]);
+  assert.equal(rowState(page, 0).marked, "true");
+
+  // Deal with the marked one and the one under it.
+  await doneButton(row(page, 0)).click();
+  await page.settle();
+  await doneButton(row(page, 1)).click();
+  await page.settle();
+
+  assert.equal(rowState(page, 2).marked, "true", "the place did not follow the reader");
+  assert.equal(rowState(page, 0).marked, "false", "it stayed on a message already dealt with");
+  assert.equal(rowState(page, 1).marked, "false");
+});
+
+test("...but it never steps OVER something still unread", async () => {
+  // The rule is "the first unread row at or after the marker", not "skip whatever is read below
+  // it". Jumping past an unread row to reach a later unread one would step over exactly the thing
+  // the marker exists to protect.
+  const page = newPage();
+  await signIn(page);
+  const rows = await showDiscord(page, [
+    message({ id: "1000000000000000001" }),
+    message({ id: "1000000000000000002" }),
+    message({ id: "1000000000000000003" }),
+  ]);
+  await keepPlaceAt(page, rows[0]);
+
+  // The one BELOW the marker is dealt with; the marked one itself is not.
+  await doneButton(row(page, 1)).click();
+  await page.settle();
+
+  assert.equal(rowState(page, 0).marked, "true", "the place stepped over an unread message");
+});
+
+test("...and when everything is dealt with it parks rather than vanishing", async () => {
+  const page = newPage();
+  await signIn(page);
+  const rows = await showDiscord(page, [
+    message({ id: "1000000000000000001" }),
+    message({ id: "1000000000000000002" }),
+  ]);
+  await keepPlaceAt(page, rows[0]);
+  await doneButton(row(page, 0)).click();
+  await page.settle();
+  await doneButton(row(page, 1)).click();
+  await page.settle();
+
+  assert.equal(page.el("jump-marker").hidden, false, "the marker disappeared when caught up");
+  assert.equal(rowState(page, 1).marked, "true", "it did not park on the newest message");
+});
+
+test("the kept place draws a line across the list, not only an edge on one row", async () => {
+  // An inset bar is findable once you are already looking at the row. Scrolling back fast, nothing
+  // narrow registers.
+  const rule = cssBlock('#discord-log li.discord-message[data-marked="true"]::before');
+  assert.match(rule, /height:/, "there is no rule drawn at all");
+  assert.match(rule, /--accent/, "the line is not coloured");
+  // Bounded to the row: `#scroll-area` sets overflow-y, so the other axis resolves to `auto` and
+  // anything overhanging becomes scrollable width.
+  assert.doesNotMatch(rule, /-100vw/, "a viewport-wide line brings a horizontal scrollbar with it");
+});
+
 test("the channel spends its width on words, not on insets", async () => {
   // 15% of a 393-pixel phone, on every row, bought what the speaker COLOUR now buys.
   const mine = cssBlock('#discord-log li.discord-message[data-who="me"]');
