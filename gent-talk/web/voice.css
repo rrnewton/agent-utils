@@ -678,6 +678,58 @@ body {
   background: color-mix(in srgb, var(--accent) 14%, var(--theirs));
 }
 
+/*
+ * ASKED FOR, and not yet speaking.
+ *
+ * The reader taps and then waits on this server, on ElevenLabs, and on a whole message being
+ * synthesised. Until this existed nothing changed on screen for the entire wait, so the tap read
+ * as a control that did nothing — and the reader tapped again.
+ *
+ * Deliberately QUIETER than `data-reading`: it is a promise rather than an event, and the two must
+ * not be confused. The pulse is what says "working" without needing a spinner in every row.
+ */
+#discord-log li.discord-message[data-pending="true"] {
+  opacity: 1;
+  filter: none;
+  border-color: var(--accent);
+  animation: pending-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes pending-pulse {
+  0%, 100% { box-shadow: inset 0 0 0 1px transparent; }
+  50% { box-shadow: inset 0 0 0 1px var(--accent); }
+}
+
+/* A reader who has asked not to be moved is not asking to be moved by this either. */
+@media (prefers-reduced-motion: reduce) {
+  #discord-log li.discord-message[data-pending="true"] {
+    animation: none;
+    box-shadow: inset 0 0 0 1px var(--accent);
+  }
+}
+
+/* THE CONTROL'S OWN STATE. `working` is the one that matters — it is the answer to "did my tap do
+   anything" when the answer is "yes, and it is still going". */
+#control-pane #read-aloud[data-read-state="working"] .control-ring {
+  animation: read-working 1s linear infinite;
+  border-color: var(--accent);
+}
+
+@keyframes read-working {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+#control-pane #read-aloud[data-read-state="failed"] {
+  background: var(--danger, #b3453a);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #control-pane #read-aloud[data-read-state="working"] .control-ring {
+    animation: none;
+  }
+}
+
 /* `reading`, in the row's own meta line, where the author's name was. Italic and in the accent,
    so it reads as a STATE of the row rather than as somebody called "reading". */
 .reading-mark {
@@ -1613,7 +1665,11 @@ textarea {
  * The large controls are shorter and wider than they were: a rectangle under the thumb, not a
  * pair of tall slabs eating a third of the display.
  */
+/* Positioned, so the pace popover has something to be absolute AGAINST. Without this it resolved
+   against the initial containing block and `bottom: calc(100% + 0.4rem)` put it a full viewport
+   height above the page — the button worked, the panel was simply off screen. */
 #control-pane {
+  position: relative;
   display: grid;
   grid-template-columns: 3.5rem 1fr 1fr;
   grid-template-rows: 1fr 1fr;
@@ -1751,7 +1807,31 @@ textarea {
  * double-width control with nothing beside it. It is one of two now: Read, and the pace it is
  * read at. Same 3x2 grid, two members, no second layout.
  */
-#control-pane .control-read {
+/*
+ * PLACEMENT IS EXPLICIT, and that is the fix rather than a tidy-up.
+ *
+ * All three of these carried `grid-row: 1 / span 2` and no column, so the grid auto-placed them in
+ * DOM ORDER: Read landed in column 1 -- the narrow 3.5rem strip meant for Sound and Clear -- and
+ * Pace took column 3, which on a phone is the easiest place on the whole screen to reach. The most
+ * used control got the worst position and the least used got the best, decided by nothing but the
+ * order the buttons happen to appear in the markup.
+ *
+ * Read is the reason this view has a bar, so Read owns the thumb. Pace sits beside it. `Hide read`
+ * is a filter you set and forget, so it takes the mini column the other views use for exactly that
+ * kind of control.
+ */
+#control-pane #read-aloud {
+  grid-column: 3;
+  grid-row: 1 / span 2;
+}
+
+#control-pane #read-speed {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+}
+
+#control-pane #todo-filter {
+  grid-column: 1;
   grid-row: 1 / span 2;
 }
 

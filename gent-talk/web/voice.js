@@ -2740,6 +2740,9 @@ function renderControls() {
   // looks like a way out.
   el("read-aloud-label").textContent = readingMode ? "Stop" : "Read";
   el("read-aloud").setAttribute("data-active", readingMode ? "true" : "false");
+  // The state the READER cares about, on the control they pressed. Reset to a plain ready when the
+  // mode is off, so a failure from the last session does not greet them on the next one.
+  el("read-aloud").setAttribute("data-read-state", readingMode ? readState : "idle");
   // The popover belongs to a control that is on screen. Leaving it open over the transcript would
   // be a dialog about a mode the reader has left.
   if (!reading) {
@@ -3462,6 +3465,10 @@ function renderChannelRows() {
       !isArchived && markOwnRead && who === "me" ? "true" : "false"
     );
     const isReading = nowPlaying !== null && nowPlaying.id === id;
+    // ASKED FOR, but not yet speaking. Distinct from `data-reading` on purpose: this one the
+    // reader can still change their mind about, and it is the only thing on screen during a wait
+    // that is entirely somebody else's network.
+    row.setAttribute("data-pending", pendingRead === id ? "true" : "false");
     // WHICH ROW IS SPEAKING. Without it the reader taps, waits, and has nothing but the sound to
     // tell them which message they hit — on a list where the next act archives it.
     row.setAttribute("data-reading", isReading ? "true" : "false");
@@ -3664,11 +3671,44 @@ let nowPlaying = null;
  */
 let readingTicket = 0;
 
+/**
+ * The message a tap has ASKED for, before any audio exists.
+ *
+ * The whole of the responsiveness complaint. A tap starts a fetch to this server, which starts a
+ * request to ElevenLabs, which synthesises the entire message; only when that returns did anything
+ * on screen change. The reader tapped and watched nothing happen for seconds — which, before the
+ * one-voice-at-a-time fix, is exactly why they tapped again.
+ *
+ * Set SYNCHRONOUSLY, on the tap, and cleared when the audio starts or the attempt dies. Held apart
+ * from `nowPlaying` because "about to be read" and "being read" are different facts and must not
+ * look the same: one of them the reader can still change their mind about.
+ */
+let pendingRead = null;
+
+/**
+ * What the Read control is doing, for the reader rather than for the code.
+ *
+ * `idle` — the mode is off. `ready` — on, nothing in flight. `working` — a read is being fetched.
+ * `failed` — the last attempt did not produce audio.
+ *
+ * There is deliberately no "connected" state. Each text-to-speech request stands alone and nothing
+ * is held open between them, so a connection indicator would be describing a session that does not
+ * exist. What the reader can actually be told is whether something is in flight now and whether
+ * the last one worked, which is what these four say.
+ */
+let readState = "idle";
+
+function setReadState(state) {
+  readState = state;
+  renderControls();
+}
+
 /** Stop whatever is playing and forget it. Safe to call when nothing is. */
 function stopReading() {
   // Invalidate every read in flight, not only the one that is audible. A fetch that has not come
   // back yet is still going to build a player unless its ticket is stale.
   readingTicket += 1;
+  pendingRead = null;
   if (nowPlaying === null) {
     return;
   }
@@ -3730,11 +3770,20 @@ async function readAloud(id) {
     return;
   }
   const ticket = readingTicket;
-  setStatus("fetching the audio…");
+  // BEFORE the await, and this is the point: everything below is remote, and the reader is owed an
+  // answer now rather than when ElevenLabs is finished.
+  pendingRead = String(id);
+  setReadState("working");
+  renderChannelRows();
   let blob;
   try {
     blob = await fetchSpeech(channel, id);
   } catch (error) {
+    if (ticket === readingTicket) {
+      pendingRead = null;
+      setReadState("failed");
+      renderChannelRows();
+    }
     // BOTH places, and this one is why it is caught here at all: `guardQuietly` puts the reason in
     // the standing error panel, which is right for a background failure and wrong for a tap. The
     // reader touched a specific message and is waiting to hear it; the answer belongs on the line
@@ -3749,6 +3798,8 @@ async function readAloud(id) {
   if (ticket !== readingTicket) {
     return;
   }
+  // The wait is over: it is being READ now, not merely asked for.
+  pendingRead = null;
   const url = URL.createObjectURL(blob);
   const audio = new Audio(url);
   nowPlaying = { id, audio, url };
@@ -3768,9 +3819,9 @@ async function readAloud(id) {
     stopReading();
     setStatus("that message could not be played.");
   });
+  setReadState("ready");
   renderChannelRows();
   await audio.play();
-  setStatus("");
 }
 
 /**
@@ -6150,6 +6201,7 @@ el("read-aloud").addEventListener("click", () => {
   if (!readingMode) {
     stopReading();
   }
+  setReadState(readingMode ? "ready" : "idle");
   setStatus(
     readingMode
       ? "reading mode: tap a message to hear it, and it archives when it finishes."

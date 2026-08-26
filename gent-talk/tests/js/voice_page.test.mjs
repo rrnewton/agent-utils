@@ -5309,6 +5309,77 @@ test("the Read control becomes a way OUT once a session is on", async () => {
   );
 });
 
+test("READ OWNS THE THUMB POSITION, and placement is explicit so DOM order cannot decide it", async () => {
+  // All three bar controls carried `grid-row: 1 / span 2` and no column, so the grid auto-placed
+  // them in DOM order: Read into column 1 — the narrow 3.5rem strip meant for Sound and Clear —
+  // and Pace into column 3, the easiest place on a phone to reach. #94 read-aloud-bar-layout.
+  assert.match(cssBlock("#control-pane #read-aloud"), /grid-column:\s*3/, "Read is not on the thumb");
+  assert.match(cssBlock("#control-pane #read-speed"), /grid-column:\s*2/, "Pace is not beside Read");
+  assert.match(cssBlock("#control-pane #todo-filter"), /grid-column:\s*1/, "the filter took a big tile");
+});
+
+test("the pace popover is anchored to something, so pressing Pace actually shows it", async () => {
+  // It was `position: absolute` with no positioned ancestor, so it resolved against the initial
+  // containing block: `bottom: calc(100% + 0.4rem)` put it a viewport height above the page. The
+  // handler ran, the element unhid, and there was nothing to see. #94.
+  assert.match(
+    cssBlock("#control-pane"),
+    /position:\s*relative/,
+    "the popover has no positioned ancestor, so it lands off screen"
+  );
+
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [message({ id: "1000000000000000001" })]);
+  assert.equal(page.el("speed-popover").hidden, true, "it ships open");
+  await page.el("read-speed").click();
+  await page.settle();
+  assert.equal(page.el("speed-popover").hidden, false, "pressing Pace did not open it");
+  assert.equal(page.el("read-speed").getAttribute("aria-expanded"), "true");
+});
+
+test("A TAP SHOWS IMMEDIATELY, before anything has been fetched", async () => {
+  // The complaint: tap a message, watch nothing happen for seconds. Everything after the tap is
+  // remote — this server, then ElevenLabs, then synthesising the whole message — and until this
+  // the row changed only when the audio arrived. #95 read-aloud-responsiveness.
+  const page = newPage();
+  await signIn(page);
+  const rows = await inReadingMode(page, [message({ id: "1000000000000000001" })]);
+
+  // Deliberately NOT awaited: this is the state of the world mid-flight, which is the whole point.
+  const inFlight = rows[0].dispatch("click", {});
+  assert.equal(rowState(page, 0).pending, "true", "the tap left no mark until the audio arrived");
+  assert.equal(
+    page.el("read-aloud").getAttribute("data-read-state"),
+    "working",
+    "the control does not say a read is in flight"
+  );
+
+  await inFlight;
+  await page.settle();
+  // ...and once it is really speaking, it is no longer merely promised.
+  assert.equal(rowState(page, 0).pending, "false", "the row is still pending while it plays");
+  assert.equal(rowState(page, 0).reading, "true");
+  assert.equal(page.el("read-aloud").getAttribute("data-read-state"), "ready");
+});
+
+test("a read that fails says so on the control rather than only in a toast", async () => {
+  const page = newPage();
+  await signIn(page);
+  page.speakStatus = 503;
+  const rows = await inReadingMode(page, [message({ id: "1000000000000000001" })]);
+
+  await rows[0].dispatch("click", {});
+  await page.settle();
+
+  assert.equal(page.el("read-aloud").getAttribute("data-read-state"), "failed");
+  assert.equal(rowState(page, 0).pending, "false", "the row is stuck looking like it is loading");
+  // Leaving the mode clears it: last session's failure must not greet the next one.
+  await page.el("read-aloud").click();
+  await page.settle();
+  assert.equal(page.el("read-aloud").getAttribute("data-read-state"), "idle");
+});
+
 test("the channel spends its width on words, not on insets", async () => {
   // 15% of a 393-pixel phone, on every row, bought what the speaker COLOUR now buys.
   const mine = cssBlock('#discord-log li.discord-message[data-who="me"]');
@@ -8032,6 +8103,7 @@ const rowState = (page, i) => ({
   archived: row(page, i).getAttribute("data-archived"),
   reading: row(page, i).getAttribute("data-reading"),
   ownRead: row(page, i).getAttribute("data-own-read"),
+  pending: row(page, i).getAttribute("data-pending"),
 });
 
 /** Two messages where the second answers the first, as Discord records a reply. */
@@ -8054,11 +8126,11 @@ test("A MESSAGE SOMEBODY HAS ANSWERED IS DIMMED; AN UNANSWERED ONE IS NOT", asyn
 
   // Both axes named, because they are independent: being ANSWERED is derived from what happens to
   // be loaded, being ARCHIVED is the reader's own declaration, and neither implies the other.
-  assert.deepStrictEqual(rowState(page, 0), { replied: "true", archived: "false", reading: "false", ownRead: "false" });
+  assert.deepStrictEqual(rowState(page, 0), { replied: "true", archived: "false", reading: "false", ownRead: "false", pending: "false" });
   // The ANSWER is not itself answered. Discord marks only the answering message, so a naive
   // implementation that set the flag on whichever row carried a pointer would dim this one.
-  assert.deepStrictEqual(rowState(page, 1), { replied: "false", archived: "false", reading: "false", ownRead: "false" });
-  assert.deepStrictEqual(rowState(page, 2), { replied: "false", archived: "false", reading: "false", ownRead: "false" });
+  assert.deepStrictEqual(rowState(page, 1), { replied: "false", archived: "false", reading: "false", ownRead: "false", pending: "false" });
+  assert.deepStrictEqual(rowState(page, 2), { replied: "false", archived: "false", reading: "false", ownRead: "false", pending: "false" });
 
   // And it is DRAWN, not merely recorded in an attribute.
   const dimmed = cssBlock('#discord-log li.discord-message[data-replied="true"]');
