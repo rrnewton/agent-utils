@@ -2727,8 +2727,19 @@ function renderControls() {
   const reading = currentView === "discord" && !live;
   el("read-aloud").hidden = !reading;
   el("read-speed").hidden = !reading;
+  // The archive filter belongs to the CHANNEL, so it appears with the channel and not with a call.
+  el("todo-filter").hidden = !reading;
+  el("todo-filter-label").textContent = todoMode ? "Showing" : "Hide read";
   el("read-aloud").setAttribute("aria-pressed", readingMode ? "true" : "false");
-  el("read-aloud-label").textContent = readingMode ? "Reading" : "Read";
+  // THE CONTROL SAYS WHICH ACT IT PERFORMS, not which state you are in. "Reading" described the
+  // state and left the reader guessing what pressing it would do; "Stop" is the act, and the
+  // colour change is what makes starting and ending a session legible at a glance.
+  //
+  // The session is VIRTUAL -- each text-to-speech request stands alone and nothing is held open
+  // between them -- but it is a mode the reader turned on, so it needs a visible way out that
+  // looks like a way out.
+  el("read-aloud-label").textContent = readingMode ? "Stop" : "Read";
+  el("read-aloud").setAttribute("data-active", readingMode ? "true" : "false");
   // The popover belongs to a control that is on screen. Leaving it open over the transcript would
   // be a dialog about a mode the reader has left.
   if (!reading) {
@@ -3637,8 +3648,27 @@ let readingMode = false;
 /** The message being read right now, and the player reading it. Null when nothing is playing. */
 let nowPlaying = null;
 
+/**
+ * ONE VOICE AT A TIME, and the counter is what makes that true.
+ *
+ * The owner tapped a message twice and heard TWO copies of it read over each other. `readAloud`
+ * stops whatever is playing and then AWAITS the audio — so a second tap arriving during that await
+ * found nothing playing to stop, and both fetches went on to build a player. `nowPlaying` was
+ * overwritten by the second, leaving the first with no reference and nothing able to pause it: two
+ * voices, and only one of them stoppable.
+ *
+ * A boolean "busy" flag would not fix it either, because the act has to remain INTERRUPTIBLE — the
+ * whole point of tapping again is to stop. So every attempt takes a ticket, and any attempt whose
+ * ticket is stale by the time its audio arrives throws that audio away instead of playing it. The
+ * last tap wins, always, and nothing else ever reaches a speaker.
+ */
+let readingTicket = 0;
+
 /** Stop whatever is playing and forget it. Safe to call when nothing is. */
 function stopReading() {
+  // Invalidate every read in flight, not only the one that is audible. A fetch that has not come
+  // back yet is still going to build a player unless its ticket is stale.
+  readingTicket += 1;
   if (nowPlaying === null) {
     return;
   }
@@ -3690,6 +3720,7 @@ async function fetchSpeech(channel, id) {
  */
 async function readAloud(id) {
   const already = nowPlaying !== null && nowPlaying.id === id;
+  // Also cancels anything still being fetched, so a double tap cannot end in two players.
   stopReading();
   if (already) {
     return;
@@ -3698,6 +3729,7 @@ async function readAloud(id) {
   if (!channel) {
     return;
   }
+  const ticket = readingTicket;
   setStatus("fetching the audio…");
   let blob;
   try {
@@ -3710,19 +3742,29 @@ async function readAloud(id) {
     setStatus(`could not read that message aloud: ${error.message}`);
     throw error;
   }
+  // THE TICKET CHECK, and it is the whole fix. Anything that happened while this was in flight --
+  // another tap, a stop, leaving the view -- has already moved the ticket on, and this audio is
+  // something nobody is waiting for any more. Dropped before a player exists, because a player
+  // that exists is a player that can be heard.
+  if (ticket !== readingTicket) {
+    return;
+  }
   const url = URL.createObjectURL(blob);
   const audio = new Audio(url);
   nowPlaying = { id, audio, url };
   audio.addEventListener("ended", () => {
-    // Only if THIS is still the message playing. The reader may have tapped another one while
-    // this was finishing, and archiving on a stale `ended` would file away the wrong message.
-    if (nowPlaying === null || nowPlaying.id !== id) {
+    // Only if THIS is still the read in progress. The reader may have tapped another message while
+    // this was finishing, and archiving on a stale `ended` would file away the wrong one.
+    if (ticket !== readingTicket || nowPlaying === null || nowPlaying.id !== id) {
       return;
     }
     stopReading();
     guardQuietly(() => dismissMessages({ messages: [String(id)] }))();
   });
   audio.addEventListener("error", () => {
+    if (ticket !== readingTicket) {
+      return;
+    }
     stopReading();
     setStatus("that message could not be played.");
   });
@@ -6216,7 +6258,6 @@ el("view-switch").addEventListener("click", () => {
 // asked for fresh messages is not a request to stop reading the one in front of you. A reader who
 // was at the bottom still follows, which is the case where "keep my place" and "show me the
 // newest" are the same instruction.
-el("refresh-discord").addEventListener("click", guardQuietly(() => loadDiscord({ keepPosition: true })));
 // Changing channel is not a re-read; it is a different history, and its bottom is where to start.
 // The walk back resets with it: a cursor from one channel means nothing in another, and carrying
 // one across would ask the server to step back from a message that is not there.

@@ -111,6 +111,13 @@ GROUPS: dict[str, tuple[Check, ...]] = {
         # The pattern is expanded by node, not by a shell, so there is no glob for a shell to eat.
         # `cargo test` runs both through their own harnesses too; this keeps the fast loop honest.
         Check("gent-talk-page", ("node", "--test", "tests/js/*.test.mjs"), cwd="gent-talk"),
+        # The boxed graph, LOADED but not run -- offline and instant. Running it here would be
+        # running the same suites a second time.
+        #
+        # This catches a DAG that stopped being loadable, and measurably nothing more: `dagrun
+        # list` does not reject an unknown field, a duplicate tag, a missing dependency or a
+        # cycle. Named honestly so nobody reads a green tick here as "the graph is well formed".
+        Check("gent-talk-dag", ("./bin/dagrun", "list", "--dag", "gent-talk/tests.dag.yaml")),
     ),
 }
 

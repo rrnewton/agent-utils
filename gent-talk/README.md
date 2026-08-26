@@ -2215,6 +2215,25 @@ scripts/screenshots.py         photographs /voice in every state, so an agent ca
 QUICKSTART.md         the six-step setup path, start to first conversation
 ```
 
+## Running the tests
+
+```bash
+cd gent-talk && make validate        # fmt, clippy, the Rust suites and both page suites
+cd gent-talk && make page            # just the page suites — seconds
+cd gent-talk && make validate-boxed  # the same, plus screenshots, under dagrun
+```
+
+`make validate` needs only a Rust and a node toolchain, so it works on a fresh clone.
+
+**Prefer `validate-boxed` locally.** It runs the same suites through `dagrun`, which gives each
+step a wall and CPU timeout, a memory cap, and process-tree teardown inside a cgroup. That last
+part is not a nicety: the screenshot harness starts a real server and a real browser, and the
+teardown is setsid-proof — they are reaped with the step whether or not the script's own trap
+fired. One that was not once ran for six days holding a port. The graph also caps `browser: 1`,
+so two Chromiums can never run at once however many steps ask for one.
+
+The graph is `gent-talk/tests.dag.yaml`. `make dag-check` loads it without running anything.
+
 ## Known gaps
 
 Beyond the security list above:

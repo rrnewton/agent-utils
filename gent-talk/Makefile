@@ -10,10 +10,40 @@
 # The root one runs everything below by name, so the two cannot drift into different definitions of
 # what validating gent-talk means.
 
-.PHONY: validate fmt check test page container-smoke clean
+.PHONY: validate validate-boxed dag-check fmt check test page container-smoke clean
 
 # The whole gate for this tool, cheapest and most likely to fail first.
-validate: fmt check test
+#
+# UNBOXED, and deliberately the default: it needs nothing but a Rust and a node toolchain, so it
+# works on a fresh clone and on a CI runner with no cgroup delegation. `validate-boxed` is the
+# better one where it can run.
+validate: fmt check test dag-check
+
+# The same suites, run through dagrun: per-step wall and CPU timeouts, memory caps, and
+# process-tree teardown inside nested cgroups.
+#
+# PREFER THIS LOCALLY. It is the only path that bounds what the screenshot harness starts -- the
+# teardown is setsid-proof, so a browser or a throwaway server is reaped with the step whether or
+# not the script's own trap fired. One that was not once ran for six days holding a port.
+#
+# It also adds the screenshot suite, which plain `validate` leaves out because it needs a browser.
+validate-boxed:
+	cd .. && ./bin/dagrun run --dag gent-talk/tests.dag.yaml
+
+# `./bin/dagrun`, not a bare `dagrun`: this repository ships the tool it uses, and depending on
+# the caller having installed it would make this tool's gate fail for a reason that has nothing to
+# do with this tool.
+#
+# The graph itself, loaded without running anything. Offline and instant.
+#
+# IT PROVES LESS THAN IT LOOKS LIKE IT PROVES, and that is worth saying here rather than letting
+# the next person assume otherwise: `dagrun list` parses the document and prints it. Measured, it
+# does NOT reject an unknown field, a duplicate step tag, a missing dependency, or a cycle -- the
+# user guide's "rejected before execution" holds only inside `run`, and not for all of those even
+# there. So this catches a file that stopped being loadable YAML or lost a required field, and
+# nothing about the shape of the graph. See the dagrun issue filed alongside this.
+dag-check:
+	cd .. && ./bin/dagrun list --dag gent-talk/tests.dag.yaml >/dev/null
 
 fmt:
 	cargo fmt --all -- --check

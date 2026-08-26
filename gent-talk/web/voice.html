@@ -159,34 +159,19 @@
 
             <div id="pane-discord" hidden>
               <!--
-                `#83 channel-selector-in-bar`. The channel PICKER used to be the other half of
-                this row, and being in here is what made it useless: this is inside #scroll-area,
-                so the control for choosing what you are reading scrolled away the moment you read
-                anything — and `#65 scrollback-paging` then made scrolling toward it PREPEND more
-                history, so it receded as you approached. It lives on the control bar now.
+                NOTHING LIVES ABOVE THE MESSAGES ANY MORE, and that is the whole point.
+                `#83 channel-selector-in-bar` already found this once: a control placed here is
+                inside #scroll-area, so it scrolls away the moment you read anything — and
+                `#65 scrollback-paging` then made scrolling toward it PREPEND more history, so it
+                RECEDES as you approach. The channel picker moved to the bar for exactly that
+                reason, and Refresh and the archive filter were left behind with a justification
+                that did not survive contact with a long channel: on a real backlog they are
+                simply unreachable.
 
-                Refresh stays. It is a re-read of what is already on screen rather than a choice
-                about what to read, it keeps your place, and it is the desktop and keyboard path a
-                gesture cannot be — a keyboard reaches it wherever the list is scrolled to.
+                Refresh is gone rather than moved. Pull down past the newest message to re-read —
+                the standard idiom, already implemented (`#pull-refresh`), and the one a thumb
+                reaches without hunting. `Hide archived` is a control bar member now.
               -->
-              <div class="row">
-                <button id="refresh-discord" type="button">Refresh</button>
-                <!--
-                  `#50 todo-view`. A SUB-TOGGLE of this view, not a third tab: it is the same list
-                  filtered, and a tab would imply a second place messages live. It sits in the
-                  view's own header rather than among the floating chips because it changes what
-                  the list IS, where those change how it is displayed.
-
-                  THE ONLY FILTER, and deliberately so. `#84 reply-aware-dismissal` arrived with a second one
-                  — an "Inbox" toggle over an archive kept in this browser — and two controls that
-                  both mean "show me what is left" is worse than either alone. This one wins on the
-                  merits: dismissal is recorded on the SERVER, so it survives a different browser
-                  and a cleared cache, and it already has an undo and a bulk clear. What that issue
-                  contributed instead is the two things `#50` listed as its own follow-ups — the
-                  swipe, and the derived "replied" signal.
-                -->
-                <button id="todo-filter" type="button" aria-pressed="false">Hide archived</button>
-              </div>
               <!--
                 `#63 status-line-placement`. The channel's own summary — how much is loaded, and
                 whether that is the whole channel — used to be a line on the status strip, and that
@@ -1153,6 +1138,18 @@
             <path d="M18.5 5.5a9 9 0 0 1 0 13" />
           </svg>
           <span id="read-aloud-label" class="control-label">Read</span>
+        </button>
+
+        <!--
+          The archive filter, in the BAR. It changes what the list is, so it belongs beside the
+          other things that act on the list rather than inside the list it filters.
+        -->
+        <button id="todo-filter" class="control control-read" type="button" aria-pressed="false" hidden>
+          <svg class="control-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none"
+               stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3 5h18l-7 8v6l-4 2v-8z" />
+          </svg>
+          <span id="todo-filter-label" class="control-label">Hide read</span>
         </button>
 
         <!--

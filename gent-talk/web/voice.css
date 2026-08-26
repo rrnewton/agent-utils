@@ -1755,6 +1755,23 @@ textarea {
   grid-row: 1 / span 2;
 }
 
+/*
+ * READING MODE, ON. The control that starts a session has to look like the control that ends one,
+ * or the reader cannot tell from the bar whether they are in the mode at all -- which is how a tap
+ * meant to stop becomes a tap that reads another message.
+ *
+ * `--warn` rather than the accent: this is the way OUT, and it should read as the same kind of
+ * thing as Hang up rather than as another thing to start.
+ */
+#control-pane .control-read[data-active="true"] {
+  background: var(--warn);
+  color: var(--on-warn, #10131a);
+}
+
+#control-pane .control-read[data-active="true"] .control-icon {
+  stroke: currentColor;
+}
+
 /* The pace popover. Anchored to the dock because it belongs to the MODE, not to any one message,
    and it must not be clipped by the row it was opened from. */
 .popover {

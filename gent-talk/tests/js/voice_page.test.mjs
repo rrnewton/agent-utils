@@ -4821,8 +4821,7 @@ test("the channel view counts only when the count is the CHANNEL'S, and pluraliz
   assert.match(channelSummaryText(page), /^2 messages from lead team$/);
 
   page.messages = [message({ id: "1" })];
-  await page.el("refresh-discord").click();
-  await page.settle();
+  await reReadChannel(page);
   assert.match(channelSummaryText(page), /^1 message from lead team$/, "singular, not '1 messages'");
   // Replaced, never stacked: a background poll runs every forty-five seconds, and a summary that
   // accumulated would grow a line each time. `#63 status-line-placement`.
@@ -5057,8 +5056,7 @@ test("THE MESSAGE BEING READ STAYS OPEN ACROSS THE POLL THAT REBUILDS THE LIST",
   assert.equal(row(page, 0).getAttribute("data-collapsed"), "false", "reading did not open it");
 
   // The poll, exactly as it happens on its own.
-  await page.el("refresh-discord").click();
-  await page.settle();
+  await reReadChannel(page);
 
   assert.equal(rowState(page, 0).reading, "true", "the rebuild lost track of what was playing");
   assert.equal(
@@ -5252,6 +5250,65 @@ test("...and they are kept out of the queue, and come straight back when it is t
   );
 });
 
+test("ONE VOICE AT A TIME: tapping twice never leaves two readings talking over each other", async () => {
+  // The owner tapped a message twice and heard two copies read over each other. `readAloud` stops
+  // whatever is playing and then AWAITS the audio, so a second tap arriving during that await
+  // found nothing playing to stop; both fetches built a player, `nowPlaying` kept only the second,
+  // and the first was audible with nothing able to pause it.
+  const page = newPage();
+  await signIn(page);
+  const rows = await inReadingMode(page, [message({ id: "1000000000000000001" })]);
+
+  // Both taps land BEFORE either fetch resolves — the race, reproduced rather than described.
+  const first = rows[0].dispatch("click", {});
+  const second = rows[0].dispatch("click", {});
+  await first;
+  await second;
+  await page.settle();
+
+  const audible = page.players.filter((p) => p.playCount > 0 && !p.paused);
+  assert.ok(audible.length <= 1, `${audible.length} readings are audible at once`);
+});
+
+test("...and a tap on ANOTHER message never leaves the first one playing", async () => {
+  const page = newPage();
+  await signIn(page);
+  const rows = await inReadingMode(page, [
+    message({ id: "1000000000000000001", content: "one" }),
+    message({ id: "1000000000000000002", content: "two" }),
+  ]);
+
+  const a = rows[0].dispatch("click", {});
+  const b = rows[1].dispatch("click", {});
+  await a;
+  await b;
+  await page.settle();
+
+  const audible = page.players.filter((p) => p.playCount > 0 && !p.paused);
+  assert.ok(audible.length <= 1, `${audible.length} readings are audible at once`);
+  assert.equal(rowState(page, 0).reading, "false", "the first message is still marked as reading");
+});
+
+test("the Read control becomes a way OUT once a session is on", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [message({ id: "1000000000000000001" })]);
+
+  assert.equal(page.el("read-aloud-label").text(), "Read");
+  assert.equal(page.el("read-aloud").getAttribute("data-active"), "false");
+
+  await page.el("read-aloud").click();
+  await page.settle();
+  // The ACT, not the state: "Reading" left the reader guessing what pressing it would do.
+  assert.equal(page.el("read-aloud-label").text(), "Stop", "the control does not say how to leave");
+  assert.equal(page.el("read-aloud").getAttribute("data-active"), "true");
+  assert.match(
+    cssBlock('#control-pane .control-read[data-active="true"]'),
+    /--warn/,
+    "an active session looks exactly like an inactive one"
+  );
+});
+
 test("the channel spends its width on words, not on insets", async () => {
   // 15% of a 393-pixel phone, on every row, bought what the speaker COLOUR now buys.
   const mine = cssBlock('#discord-log li.discord-message[data-who="me"]');
@@ -5427,8 +5484,7 @@ test("Refresh re-reads the channel rather than appending to it", async () => {
   await showDiscord(page, [message({ id: "1", content: "one" })]);
 
   page.messages = [message({ id: "2", content: "two" })];
-  await page.el("refresh-discord").click();
-  await page.settle();
+  await reReadChannel(page);
 
   const lines = page.el("discord-log").children;
   assert.equal(lines.length, 1, "Refresh appended instead of replacing");
@@ -5604,8 +5660,7 @@ function anchorRow(page) {
 /** Re-read the channel with a different set of messages, without toggling the view. */
 async function refreshDiscord(page, messages) {
   page.messages = messages;
-  await page.el("refresh-discord").click();
-  await page.settle();
+  await reReadChannel(page);
   return page.el("discord-log").children;
 }
 
@@ -6634,8 +6689,7 @@ test("REFRESH keeps your place too — asking for fresh messages is not asking t
   area.scrollTop = 120;
 
   page.messages = [...tallChannel(), message({ id: "13", content: longMessage("brand new") })];
-  await page.el("refresh-discord").click();
-  await page.settle();
+  await reReadChannel(page);
 
   assert.equal(page.el("discord-log").children.length, 13, "Refresh did not re-read the channel");
   assert.equal(area.scrollTop, 120, "Refresh threw the reader to the bottom");
@@ -6980,8 +7034,7 @@ test("AND THE COUNT SURVIVES THE NEXT POLL, WHICH NOBODY ASKED FOR", async () =>
   );
 
   // ...and the Refresh button is the same re-read by hand, so it must not do it either.
-  await page.el("refresh-discord").click();
-  await page.settle();
+  await reReadChannel(page);
   assert.match(channelSummaryText(page), /^6 messages from lead team$/);
   assert.equal(page.el("load-older").hidden, true);
 });
@@ -7015,8 +7068,7 @@ test("A REFRESH DOES NOT THROW AWAY WHAT THE READER WALKED BACK TO", async () =>
   await page.settle();
   assert.equal(page.el("discord-log").children.length, 8);
 
-  await page.el("refresh-discord").click();
-  await page.settle();
+  await reReadChannel(page);
 
   assert.equal(
     page.el("discord-log").children.length,
@@ -7049,8 +7101,7 @@ test("AND THE STEP AFTER A REFRESH GOES FURTHER BACK, NOT OVER THE SAME GROUND",
   await showDiscord(page, []);
   await page.el("load-older").click();
   await page.settle();
-  await page.el("refresh-discord").click();
-  await page.settle();
+  await reReadChannel(page);
 
   await page.el("load-older").click();
   await page.settle();
@@ -7078,8 +7129,7 @@ test("a channel that is WHOLE replaces on a refresh rather than accumulating", a
   page.channelPage = async () =>
     json(200, { channel: CHANNEL, messages: [message({ id: "2", content: "two" })], has_more: false });
 
-  await page.el("refresh-discord").click();
-  await page.settle();
+  await reReadChannel(page);
 
   const lines = page.el("discord-log").children;
   assert.equal(lines.length, 1, "a whole-channel read kept a message that no longer exists");
@@ -7565,22 +7615,35 @@ test("A SECOND FINGER DOES NOT RE-ANCHOR THE TRAVEL", async () => {
   assert.equal(page.pagesServed.length, readsBefore, "a pinch refreshed the channel");
 });
 
-test("the gesture does not take the button away, because a desktop has no gesture", async () => {
-  // `#55 voice-desktop-app`. The two are deliberately DIFFERENT, and the difference is the whole
-  // reason both exist: Refresh is pressed from wherever you are reading and keeps your place; the
-  // pull is made at the top and asks for what is new. Asserted as a contrast in one page, because
-  // separately each is satisfied by the other's behaviour.
-  assert.ok(PAGE_IDS.has("refresh-discord"), "the desktop and keyboard path is gone");
+test("NOTHING LIVES ABOVE THE MESSAGES, and the poll and the pull are what re-read", async () => {
+  // `#55 voice-desktop-app` kept a Refresh button on the reasoning that a desktop has no pull
+  // gesture, and that the two acts differ: Refresh keeps your place, the pull asks for what is new.
+  // Both halves were true and the placement was still wrong. The button lived INSIDE #scroll-area,
+  // above the message list, so on a long channel it sat behind an unbounded scrollback — and
+  // `#65 scrollback-paging` made scrolling toward it PREPEND more history, so it receded as you
+  // approached. `#83 channel-selector-in-bar` had already found exactly this for the channel
+  // picker and moved that out; Refresh and the archive filter were left behind.
+  //
+  // WHAT REPLACES IT. The channel re-reads itself every DISCORD_POLL_MS without being asked, and
+  // that re-read still keeps the reader's place — the property the button was credited with. The
+  // pull is there for "now, please". The archive filter, which changes what the list IS, moved to
+  // the control bar rather than being deleted.
+  assert.equal(PAGE_IDS.has("refresh-discord"), false, "a control still sits above the messages");
+  assert.equal(
+    markupHolds("scroll-area", "todo-filter"),
+    false,
+    "the archive filter is still stranded above an unbounded scrollback"
+  );
+  assert.ok(PAGE_IDS.has("todo-filter"), "the archive filter was deleted rather than moved");
+
   const page = newPage();
   await signIn(page);
   const area = await walkedBackChannel(page);
-  assert.equal(page.el("refresh-discord").hidden, false, "the button is not on the channel view");
 
   area.scrollTop = Math.round((area.scrollHeight - area.clientHeight) * 0.5);
   const parked = area.scrollTop;
-  await page.el("refresh-discord").click();
-  await page.settle();
-  assert.equal(area.scrollTop, parked, "the button stopped keeping the reader's place");
+  await reReadChannel(page);
+  assert.equal(area.scrollTop, parked, "the poll stopped keeping the reader's place");
 
   area.scrollTop = 0;
   await pullDown(page, PULL_ARM_PX);
@@ -7951,6 +8014,19 @@ test("the reply screen shows the message being answered, in full, with its id", 
 const row = (page, i) => page.el("discord-log").children[i];
 const archiveButton = (li) =>
   li.descendants().find((node) => node.className === "archive-button");
+/**
+ * Make the channel re-read itself, the way it now really happens.
+ *
+ * There is no Refresh button any more: it lived above the message list, inside the scroll area,
+ * which on a long channel put it behind an unbounded scrollback — and `#65 scrollback-paging` made
+ * scrolling toward it PREPEND more history, so it receded as you approached. The re-reads that
+ * remain are the 45-second poll and the pull gesture, so tests drive the poll.
+ */
+async function reReadChannel(page) {
+  assert.ok(page.expireTimers(DISCORD_POLL_MS) > 0, "no channel poll was armed to re-read with");
+  await page.settle();
+}
+
 const rowState = (page, i) => ({
   replied: row(page, i).getAttribute("data-replied"),
   archived: row(page, i).getAttribute("data-archived"),
@@ -8105,8 +8181,7 @@ test("the archive survives the poll that rebuilds the list", async () => {
   await doneButton(row(page, 0)).click();
   await page.settle();
 
-  await page.el("refresh-discord").click();
-  await page.settle();
+  await reReadChannel(page);
 
   assert.equal(
     rowState(page, 0).archived,
