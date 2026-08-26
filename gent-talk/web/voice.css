@@ -510,10 +510,30 @@ body {
   border-bottom-right-radius: 0.15rem;
 }
 
+/*
+ * THE CODING AGENT'S MESSAGES ARE TILES, NOT CELLS.
+ *
+ * They are the thing this view exists to read, and they are long, so they get the whole width:
+ * negative margins cancel the scroll area's own gutter exactly, and what is left between the words
+ * and the edge of the screen is the smallest gutter that still reads as text rather than as
+ * something falling off the display.
+ *
+ * No side borders and no rounding, because a full-width box with rounded corners reads as a card
+ * that has outgrown its container. The top and bottom borders stay: they are what separates one
+ * message from the next now that the inset no longer does it.
+ *
+ * They still cannot be confused with the owner's own messages, which keep their right indent AND
+ * their colour -- two signals, either of which would do on its own.
+ */
 #discord-log li.discord-message[data-who="coder"] {
   background: var(--theirs);
-  margin-right: var(--speaker-inset);
-  border-bottom-left-radius: 0.15rem;
+  margin-left: calc(-0.75rem - env(safe-area-inset-left));
+  margin-right: calc(-0.75rem - env(safe-area-inset-right));
+  padding-left: calc(0.4rem + env(safe-area-inset-left));
+  padding-right: calc(0.4rem + env(safe-area-inset-right));
+  border-left: none;
+  border-right: none;
+  border-radius: 0;
 }
 
 /* THIRD PARTIES: other people, and any bot that is not the coding agent.
@@ -622,7 +642,8 @@ body {
  * Declared AFTER the replied rule so a row that is both lands here, which is the right way round:
  * archived is the reader's own decision and outranks an inference about what happens to be loaded.
  */
-#discord-log li.discord-message[data-archived="true"] {
+#discord-log li.discord-message[data-archived="true"],
+#discord-log li.discord-message[data-own-read="true"] {
   opacity: 0.42;
   filter: grayscale(1);
 }
@@ -631,7 +652,8 @@ body {
    Reply and an Unarchive, and a control nobody can read is a control that looks broken. The
    opacity half of this is handled by the shared rules below; the tint has to be restored here
    because `filter` does not inherit that treatment. */
-#discord-log li.discord-message[data-archived="true"]:focus-within {
+#discord-log li.discord-message[data-archived="true"]:focus-within,
+#discord-log li.discord-message[data-own-read="true"]:focus-within {
   filter: none;
 }
 
@@ -1153,7 +1175,8 @@ body {
   }
 
   /* The archived row's colour, on the same terms and for the same reason. */
-  #discord-log li.discord-message[data-archived="true"]:hover {
+  #discord-log li.discord-message[data-archived="true"]:hover,
+  #discord-log li.discord-message[data-own-read="true"]:hover {
     filter: none;
   }
 }
@@ -1942,6 +1965,9 @@ textarea {
   }
 
   #discord-log li.discord-message[data-who="coder"] {
+    /* A desk has the room, and a full-bleed tile a metre wide is the "phone layout stretched
+       sideways" the whole block exists to remove. The inset comes back. */
+    margin-left: 0;
     margin-right: min(15%, 6rem);
   }
 

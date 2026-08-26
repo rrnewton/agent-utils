@@ -28,6 +28,7 @@ const MIC_SETTINGS_KEY = "gent-talk.voice.mic";
 const WIDTH_KEY = "gent-talk.voice.width";
 const MSG_SCALE_KEY = "gent-talk.voice.msg-scale";
 const READ_SPEED_KEY = "gent-talk.voice.read-speed";
+const MARK_OWN_KEY = "gent-talk.voice.mark-own-read";
 
 const el = (id) => document.getElementById(id);
 
@@ -244,6 +245,7 @@ const HELP_TOPICS = [
   "canned-prompts",
   "identities",
   "channel-alias",
+  "mark-own",
   "reading-width",
   "resuming",
   "live-messages",
@@ -3439,8 +3441,15 @@ function renderChannelRows() {
     // Being archived is DECLARED by the reader, so unlike `data-replied` it is not evidence that
     // might be incomplete — but a channel view that removed the row would leave the reader no way
     // to see what they had archived, and no way to change their mind about it.
+    const who = row.getAttribute("data-who");
     const isArchived = archivedIds.has(id);
     row.setAttribute("data-archived", isArchived ? "true" : "false");
+    // Separate from the declared archive: this one is implied, carries no undo, and disappears
+    // the moment the setting is turned off.
+    row.setAttribute(
+      "data-own-read",
+      !isArchived && markOwnRead && who === "me" ? "true" : "false"
+    );
     const isReading = nowPlaying !== null && nowPlaying.id === id;
     // WHICH ROW IS SPEAKING. Without it the reader taps, waits, and has nothing but the sound to
     // tell them which message they hit — on a list where the next act archives it.
@@ -3462,7 +3471,6 @@ function renderChannelRows() {
     // WHO, printed only where the colour cannot say it. `me` and `coder` are drawn as the
     // transcript's two speakers, so their names are a line of chrome restating what the row's own
     // colour already said. A third party is one of many and has to be named.
-    const who = row.getAttribute("data-who");
     // THE AUTHOR LINE, decided ONCE. It used to be set twice — the name here and `reading` in a
     // later block — and the later write is the one that lost, so the row being read never said so.
     //
@@ -3587,6 +3595,40 @@ function applyReadSpeed(value) {
 function storedReadSpeed() {
   const held = localStorage.getItem(READ_SPEED_KEY);
   return held === null ? null : clampReadSpeed(held);
+}
+
+/**
+ * Are the reader's OWN messages already read?
+ *
+ * ON unless they have said otherwise. A message this bridge posted is one the owner dictated
+ * moments earlier: it is read by the only definition that matters, and leaving it in the queue
+ * makes the queue partly a record of things he said rather than things waiting for him.
+ *
+ * Held apart from the declared archive, and rendered with its own attribute, because it is not a
+ * dismissal: nothing is recorded on the server, there is nothing to undo, and turning the setting
+ * off must bring every one of them straight back. Writing a real dismissal per own-message would
+ * be chatty, one-way, and wrong the moment the reader changed their mind.
+ */
+let markOwnRead = true;
+
+function applyMarkOwnRead(on) {
+  markOwnRead = Boolean(on);
+  el("mark-own-read").checked = markOwnRead;
+  try {
+    localStorage.setItem(MARK_OWN_KEY, markOwnRead ? "1" : "0");
+  } catch (_error) {
+    // A browser that refuses storage still honours the choice for this session.
+  }
+}
+
+/** What was stored. ABSENT MEANS ON: the default is the behaviour, not merely the initial value. */
+function storedMarkOwnRead() {
+  return localStorage.getItem(MARK_OWN_KEY) !== "0";
+}
+
+/** Is this row one the reader never has to deal with? Declared archive, or own-and-implicitly-read. */
+function readAlready(id, who) {
+  return archivedIds.has(String(id)) || (markOwnRead && who === "me");
 }
 
 /** Is a tap on a message a request to hear it? Session-only, and only in the channel view. */
@@ -4662,7 +4704,16 @@ async function loadTodo(options) {
     const payload = await api(
       `/api/v1/channels/${encodeURIComponent(channel)}/todo?limit=${DISCORD_PAGE_LIMIT}`
     );
-    const messages = payload.messages || [];
+    // THE QUEUE, minus the reader's own words when they have said those are already read.
+    //
+    // Filtered HERE rather than on the server: this is a preference held in one browser, and the
+    // `/todo` route answers the same way for every client. Filtered BEFORE the count, because a
+    // backlog number that includes rows nobody can see is the kind of number a reader stops
+    // believing.
+    const served = payload.messages || [];
+    const messages = markOwnRead
+      ? served.filter((m) => bucketFor(m.author_id, m.author_is_bot) !== "me")
+      : served;
     const list = el("discord-log");
     list.replaceChildren(...messages.map(discordNode));
     // The walk back belongs to the UNFILTERED channel. Leaving a cursor armed here would let a
@@ -6010,6 +6061,7 @@ el("resume-toggle").addEventListener("change", () => {
 applyReadingWidth(storedReadingWidth());
 applyMsgScale(storedMsgScale());
 applyReadSpeed(storedReadSpeed());
+applyMarkOwnRead(storedMarkOwnRead());
 el("reading-width").addEventListener("input", () => readingWidthChanged(el("reading-width").value));
 el("msg-scale").addEventListener("input", () => msgScaleChanged(el("msg-scale").value));
 el("width-grip").addEventListener("pointerdown", onGripDown);
@@ -6034,6 +6086,15 @@ el("read-speed").addEventListener("click", () => {
   const open = el("speed-popover").hidden;
   el("speed-popover").hidden = !open;
   el("read-speed").setAttribute("aria-expanded", open ? "true" : "false");
+});
+
+el("mark-own-read").addEventListener("change", () => {
+  applyMarkOwnRead(el("mark-own-read").checked);
+  // Both: the channel view re-greys, and the queue is a different list than it was a moment ago.
+  renderChannelRows();
+  if (todoMode) {
+    guardQuietly(() => loadTodo({ keepPosition: true, ownAct: true }))();
+  }
 });
 
 el("read-speed-range").addEventListener("input", () => {

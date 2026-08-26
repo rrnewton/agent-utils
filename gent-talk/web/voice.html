@@ -465,6 +465,23 @@
 
             <section class="settings-group">
               <div class="group-head">
+                <h2>Your own messages</h2>
+                <button class="help-link" id="help-link-mark-own" type="button" data-help="mark-own" aria-label="About marking your own messages read" title="What this does">?</button>
+              </div>
+              <!--
+                ON by default, and deliberately: a message this bridge posted is one the owner
+                dictated moments earlier. It is already read by the only definition that matters,
+                and leaving it in the queue means the queue is partly a record of things he said.
+              -->
+              <label class="toggle">
+                <input id="mark-own-read" type="checkbox" checked />
+                Mark my own messages as read
+              </label>
+              <p class="hint">Greyed here, and kept out of the queue.</p>
+            </section>
+
+            <section class="settings-group">
+              <div class="group-head">
                 <h2>Text size</h2>
               </div>
               <!--
@@ -745,6 +762,22 @@
                 where it is, <strong>greyed and drained of colour</strong>, so you can see what you
                 have dealt with and change your mind. <strong>Hide archived</strong> takes them out
                 of the list entirely, which is what turns the channel from a log into a queue.
+              </p>
+            </article>
+
+            <article id="help-mark-own" class="help-entry">
+              <h2>Your own messages</h2>
+              <p class="hint">
+                A message posted on your behalf is one you dictated moments earlier, so it is
+                already read by the only definition that matters. Leaving it in the queue would
+                make the queue partly a record of things <em>you</em> said rather than things
+                waiting for you.
+              </p>
+              <p class="hint">
+                With this on they are greyed in the channel and left out of the list behind
+                <strong>Hide archived</strong>. It is not an archive: nothing is recorded on the
+                server, there is nothing to undo, and turning it off brings every one of them
+                straight back. Nothing here changes anything in Discord.
               </p>
             </article>
 

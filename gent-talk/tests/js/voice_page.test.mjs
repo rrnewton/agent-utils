@@ -5190,6 +5190,68 @@ test("without the server's answer the page still recognises nobody — which is 
   assert.equal(whoOf(page, 1), "bot", "with two unidentified bots the coder guess must decline");
 });
 
+const OWN = { author: "gent-talk", author_id: "1000000000000000009", author_is_bot: true };
+const CODER = { author: "MyDiscordBot", author_id: "20", author_is_bot: true };
+
+test("THE CODING AGENT'S MESSAGES RUN EDGE TO EDGE; THE OWNER'S KEEP THEIR INDENT", async () => {
+  // The agent's messages are the thing this view exists to read, and they are long. The owner's
+  // stay indented and coloured, so the two are still told apart by two signals either of which
+  // would do alone.
+  const coder = cssBlock('#discord-log li.discord-message[data-who="coder"]');
+  assert.match(coder, /margin-left:\s*calc\(-/, "the agent's messages do not reclaim the gutter");
+  assert.match(coder, /border-radius:\s*0/, "a full-width box with rounded corners is a card");
+  assert.doesNotMatch(coder, /--speaker-inset/, "the agent's messages are still inset");
+
+  const mine = cssBlock('#discord-log li.discord-message[data-who="me"]');
+  assert.match(mine, /--speaker-inset/, "the owner's messages lost their indent");
+  assert.match(mine, /--mine/, "the owner's messages lost their colour");
+});
+
+test("MY OWN MESSAGES ARE READ ALREADY, BY DEFAULT, WITHOUT VISITING SETTINGS", async () => {
+  const page = newPage();
+  await signIn(page);
+  assert.equal(page.el("mark-own-read").checked, true, "the default is not on");
+
+  await showDiscord(page, [
+    message({ id: "1000000000000000001", ...OWN }),
+    message({ id: "1000000000000000002", ...CODER }),
+  ]);
+
+  assert.equal(whoOf(page, 0), "me");
+  assert.equal(rowState(page, 0).ownRead, "true", "the owner's own message is not marked read");
+  assert.equal(rowState(page, 1).ownRead, "false", "the agent's message was marked read too");
+  // It is NOT the declared archive: nothing was recorded, so there is nothing to undo.
+  assert.equal(rowState(page, 0).archived, "false", "an implied read was filed as a dismissal");
+  assert.deepEqual(page.dismissCalls, [], "a dismissal was written for a message nobody archived");
+});
+
+test("...and they are kept out of the queue, and come straight back when it is turned off", async () => {
+  const page = newPage();
+  await signIn(page);
+  page.messages = [
+    message({ id: "1000000000000000001", ...OWN }),
+    message({ id: "1000000000000000002", ...CODER }),
+  ];
+  await showDiscord(page, page.messages);
+  await turnTodoOn(page);
+
+  assert.equal(
+    page.el("discord-log").children.length,
+    1,
+    "the queue still holds the reader's own words"
+  );
+  assert.equal(row(page, 0).getAttribute("data-id"), "1000000000000000002");
+
+  // Turning it off is the whole undo. Nothing was written, so nothing has to be unwritten.
+  await page.el("mark-own-read").setChecked(false);
+  await page.settle();
+  assert.equal(
+    page.el("discord-log").children.length,
+    2,
+    "turning the setting off did not bring the reader's own messages back"
+  );
+});
+
 test("the channel spends its width on words, not on insets", async () => {
   // 15% of a 393-pixel phone, on every row, bought what the speaker COLOUR now buys.
   const mine = cssBlock('#discord-log li.discord-message[data-who="me"]');
@@ -7893,6 +7955,7 @@ const rowState = (page, i) => ({
   replied: row(page, i).getAttribute("data-replied"),
   archived: row(page, i).getAttribute("data-archived"),
   reading: row(page, i).getAttribute("data-reading"),
+  ownRead: row(page, i).getAttribute("data-own-read"),
 });
 
 /** Two messages where the second answers the first, as Discord records a reply. */
@@ -7915,11 +7978,11 @@ test("A MESSAGE SOMEBODY HAS ANSWERED IS DIMMED; AN UNANSWERED ONE IS NOT", asyn
 
   // Both axes named, because they are independent: being ANSWERED is derived from what happens to
   // be loaded, being ARCHIVED is the reader's own declaration, and neither implies the other.
-  assert.deepStrictEqual(rowState(page, 0), { replied: "true", archived: "false", reading: "false" });
+  assert.deepStrictEqual(rowState(page, 0), { replied: "true", archived: "false", reading: "false", ownRead: "false" });
   // The ANSWER is not itself answered. Discord marks only the answering message, so a naive
   // implementation that set the flag on whichever row carried a pointer would dim this one.
-  assert.deepStrictEqual(rowState(page, 1), { replied: "false", archived: "false", reading: "false" });
-  assert.deepStrictEqual(rowState(page, 2), { replied: "false", archived: "false", reading: "false" });
+  assert.deepStrictEqual(rowState(page, 1), { replied: "false", archived: "false", reading: "false", ownRead: "false" });
+  assert.deepStrictEqual(rowState(page, 2), { replied: "false", archived: "false", reading: "false", ownRead: "false" });
 
   // And it is DRAWN, not merely recorded in an attribute.
   const dimmed = cssBlock('#discord-log li.discord-message[data-replied="true"]');
