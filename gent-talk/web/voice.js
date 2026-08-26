@@ -686,10 +686,43 @@ function applySummaryState(entry) {
 }
 
 /** The standing sentence at the head of the channel view while the mode is on. */
+/**
+ * How long the summaries actually took, in the order they were measured.
+ *
+ * The owner asked for this as an EXPERIMENT: a round trip to the ElevenLabs agent is expected to
+ * beat a full-size model with a harness, and the way to find out is to measure it rather than to
+ * reason about it. The server times each generation and reports `generated_in_ms`; without this
+ * the number existed and nobody could see it.
+ *
+ * Only GENERATED summaries are recorded. A cache hit and a below-threshold answer both report no
+ * time at all, and averaging a zero into them would report a backend as faster than it is —
+ * precisely the wrong direction for a measurement meant to inform a choice.
+ */
+const summaryTimes = [];
+
+/** The median, which is what a reader wants: one slow first call must not describe the rest. */
+function typicalSummaryMs() {
+  if (summaryTimes.length === 0) {
+    return null;
+  }
+  const sorted = [...summaryTimes].sort((a, b) => a - b);
+  return sorted[Math.floor(sorted.length / 2)];
+}
+
 function summaryNoteText() {
   const base = "Collapsed messages show a summary instead of their opening lines. Tap More for " +
     "the message itself.";
-  return summaryBackend ? `${base} Summaries by ${summaryBackend}.` : base;
+  const parts = [base];
+  if (summaryBackend) {
+    parts.push(`Summaries by ${summaryBackend}.`);
+  }
+  const typical = typicalSummaryMs();
+  if (typical !== null) {
+    const seconds = (typical / 1000).toFixed(1);
+    // The COUNT as well as the time, because a median over two samples is not a median.
+    parts.push(`Typically ${seconds}s (${summaryTimes.length} measured).`);
+  }
+  return parts.join(" ");
 }
 
 /** Every row's summary line brought back into agreement with what the server has said. */
@@ -759,6 +792,11 @@ async function fetchSummary(id) {
   }
   if (payload && payload.backend) {
     summaryBackend = payload.backend;
+  }
+  // Absent on a cache hit and on a below-threshold answer, and absent is not zero: neither of
+  // those asked the vendor anything, so neither is evidence about how fast the vendor is.
+  if (payload && typeof payload.generated_in_ms === "number") {
+    summaryTimes.push(payload.generated_in_ms);
   }
   // `below_threshold` is an ANSWER, not an omission: the server considers the message short
   // enough to read as it is, and a shortened copy of something already short would be a claim

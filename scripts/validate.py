@@ -117,7 +117,10 @@ GROUPS: dict[str, tuple[Check, ...]] = {
         # This catches a DAG that stopped being loadable, and measurably nothing more: `dagrun
         # list` does not reject an unknown field, a duplicate tag, a missing dependency or a
         # cycle. Named honestly so nobody reads a green tick here as "the graph is well formed".
-        Check("gent-talk-dag", ("./bin/dagrun", "list", "--dag", "gent-talk/tests.dag.yaml")),
+        # `common/bin/dagrun`, which is TRACKED. `./bin/` is gitignored and only exists after
+        # `./setup` has run, so shelling out to it made this check fail on a fresh clone --
+        # for a reason that has nothing to do with whatever the author changed.
+        Check("gent-talk-dag", ("common/bin/dagrun", "list", "--dag", "gent-talk/tests.dag.yaml")),
     ),
 }
 

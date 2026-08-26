@@ -28,11 +28,12 @@ validate: fmt check test dag-check
 #
 # It also adds the screenshot suite, which plain `validate` leaves out because it needs a browser.
 validate-boxed:
-	cd .. && ./bin/dagrun run --dag gent-talk/tests.dag.yaml
+	cd .. && ./common/bin/dagrun run --dag gent-talk/tests.dag.yaml
 
-# `./bin/dagrun`, not a bare `dagrun`: this repository ships the tool it uses, and depending on
-# the caller having installed it would make this tool's gate fail for a reason that has nothing to
-# do with this tool.
+# `./common/bin/dagrun`, not a bare `dagrun` and not `./bin/dagrun`. This repository ships the tool
+# it uses, so depending on the caller having installed one would fail for a reason that has nothing
+# to do with this tool -- and `./bin/` is GITIGNORED, existing only after `./setup` has run, so
+# pointing at it failed on a fresh clone for a reason that had nothing to do with it either.
 #
 # The graph itself, loaded without running anything. Offline and instant.
 #
@@ -43,7 +44,7 @@ validate-boxed:
 # there. So this catches a file that stopped being loadable YAML or lost a required field, and
 # nothing about the shape of the graph. See the dagrun issue filed alongside this.
 dag-check:
-	cd .. && ./bin/dagrun list --dag gent-talk/tests.dag.yaml >/dev/null
+	cd .. && ./common/bin/dagrun list --dag gent-talk/tests.dag.yaml >/dev/null
 
 fmt:
 	cargo fmt --all -- --check
