@@ -19,6 +19,56 @@
 const assert = require("assert");
 const fs = require("fs");
 const path = require("path");
+const zlib = require("zlib");
+
+// The shipped page runs in a browser, while these tests deliberately run its reader functions
+// under whatever Node.js the developer already has. Node.js 16 has the required standard-library
+// pieces but does not expose all three browser interfaces as globals. Supply only what is absent,
+// so newer Node.js versions continue to exercise their native implementations and older versions
+// still execute app.js's own inflateGzipMember body instead of skipping it.
+if (typeof global.Blob !== "function") {
+  global.Blob = require("buffer").Blob;
+}
+if (typeof global.Response !== "function") {
+  global.Response = class Response {
+    constructor(body) {
+      this.body = body;
+    }
+
+    async arrayBuffer() {
+      const reader = this.body.getReader();
+      const chunks = [];
+      for (;;) {
+        const item = await reader.read();
+        if (item.done) {
+          break;
+        }
+        chunks.push(Buffer.from(item.value));
+      }
+      const buffer = Buffer.concat(chunks);
+      return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
+    }
+  };
+}
+if (typeof global.DecompressionStream !== "function") {
+  const { TransformStream } = require("stream/web");
+  global.DecompressionStream = class DecompressionStream {
+    constructor(format) {
+      assert.strictEqual(format, "gzip");
+      const chunks = [];
+      const stream = new TransformStream({
+        transform(chunk) {
+          chunks.push(Buffer.from(chunk));
+        },
+        flush(controller) {
+          controller.enqueue(zlib.gunzipSync(Buffer.concat(chunks)));
+        }
+      });
+      this.readable = stream.readable;
+      this.writable = stream.writable;
+    }
+  };
+}
 
 const APP_PATH = path.resolve(
   __dirname,

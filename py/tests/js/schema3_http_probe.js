@@ -15,38 +15,126 @@
 
 const assert = require("assert");
 const fs = require("fs");
+const http = require("http");
 
 const { loadReader } = require("./schema3_probe.js");
 
-const baseUrl = process.argv[2];
-const request = JSON.parse(fs.readFileSync(process.argv[3], "utf8"));
-assert.ok(baseUrl, "usage: schema3_http_probe.js <base-url> <request.json>");
+function fetchWithHttp(url, init, requestFunction) {
+  return new Promise(function (resolve, reject) {
+    let response = null;
+    let settled = false;
+    const makeRequest = requestFunction || http.request;
+    const outgoing = makeRequest(url, {
+      method: "GET",
+      headers: (init && init.headers) || {}
+    });
+
+    function cleanup() {
+      outgoing.removeListener("error", fail);
+      if (response !== null) {
+        response.removeListener("data", collect);
+        response.removeListener("aborted", incomplete);
+        response.removeListener("error", responseFailed);
+        response.removeListener("end", finish);
+        response.removeListener("close", closed);
+      }
+    }
+
+    function fail(error) {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      if (response !== null && !response.destroyed) {
+        response.destroy();
+      }
+      if (!outgoing.destroyed) {
+        outgoing.destroy();
+      }
+      reject(error instanceof Error ? error : new Error(String(error)));
+    }
+
+    function incomplete() {
+      fail(new Error("HTTP response ended before its declared body was complete: " + url));
+    }
+
+    function responseFailed(error) {
+      fail(new Error(
+        "HTTP response failed before its declared body was complete: " +
+          String((error && error.message) || error)
+      ));
+    }
+
+    function closed() {
+      if (response !== null && !response.complete) {
+        incomplete();
+      }
+    }
+
+    const chunks = [];
+    let received = 0;
+    function collect(chunk) {
+      const data = Buffer.from(chunk);
+      chunks.push(data);
+      received += data.byteLength;
+    }
+
+    function finish() {
+      assert.notStrictEqual(response, null);
+      const declaredRaw = response.headers["content-length"];
+      const declared = Array.isArray(declaredRaw) ? declaredRaw[0] : declaredRaw;
+      if (declared !== undefined && Number(declared) !== received) {
+        incomplete();
+        return;
+      }
+      settled = true;
+      cleanup();
+      const buffer = Buffer.concat(chunks);
+      resolve({
+        ok: response.statusCode >= 200 && response.statusCode < 300,
+        status: response.statusCode,
+        statusText: response.statusMessage || "",
+        headers: {
+          get: function (name) {
+            const value = response.headers[String(name).toLowerCase()];
+            if (Array.isArray(value)) {
+              return value.join(", ");
+            }
+            return value === undefined ? null : String(value);
+          }
+        },
+        arrayBuffer: async function () {
+          return buffer.buffer.slice(
+            buffer.byteOffset,
+            buffer.byteOffset + buffer.byteLength
+          );
+        },
+        text: async function () { return buffer.toString("utf8"); },
+        json: async function () { return JSON.parse(buffer.toString("utf8")); }
+      });
+    }
+
+    outgoing.once("error", fail);
+    outgoing.once("response", function (incoming) {
+      response = incoming;
+      incoming.on("data", collect);
+      incoming.once("aborted", incomplete);
+      incoming.once("error", responseFailed);
+      incoming.once("end", finish);
+      incoming.once("close", closed);
+    });
+    outgoing.end();
+  });
+}
+
+function fetchForNode(candidate) {
+  return typeof candidate === "function" ? candidate.bind(global) : fetchWithHttp;
+}
 
 //: Count what crosses the wire, and against which path, so the Python side can assert on the
 //: shape of the traffic and not merely on the answer.
 const traffic = [];
-const nativeFetch = global.fetch;
-global.fetch = async function (url, init) {
-  const absolute = new URL(url, baseUrl).href;
-  const response = await nativeFetch(absolute, init);
-  const buffer = await response.arrayBuffer();
-  traffic.push({
-    path: String(url),
-    status: response.status,
-    bytes: buffer.byteLength,
-    ranged: Boolean(init && init.headers && init.headers.Range),
-    conditional: Boolean(init && init.headers && init.headers["If-Range"])
-  });
-  return {
-    ok: response.ok,
-    status: response.status,
-    statusText: response.statusText,
-    headers: response.headers,
-    arrayBuffer: async function () { return buffer; },
-    text: async function () { return Buffer.from(buffer).toString("utf8"); },
-    json: async function () { return JSON.parse(Buffer.from(buffer).toString("utf8")); }
-  };
-};
 
 function mark() {
   return traffic.length;
@@ -75,6 +163,31 @@ function since(start) {
 }
 
 async function main() {
+  const baseUrl = process.argv[2];
+  const request = JSON.parse(fs.readFileSync(process.argv[3], "utf8"));
+  assert.ok(baseUrl, "usage: schema3_http_probe.js <base-url> <request.json>");
+  const nativeFetch = fetchForNode(global.fetch);
+  global.fetch = async function (url, init) {
+    const absolute = new URL(url, baseUrl).href;
+    const response = await nativeFetch(absolute, init);
+    const buffer = await response.arrayBuffer();
+    traffic.push({
+      path: String(url),
+      status: response.status,
+      bytes: buffer.byteLength,
+      ranged: Boolean(init && init.headers && init.headers.Range),
+      conditional: Boolean(init && init.headers && init.headers["If-Range"])
+    });
+    return {
+      ok: response.ok,
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+      arrayBuffer: async function () { return buffer; },
+      text: async function () { return Buffer.from(buffer).toString("utf8"); },
+      json: async function () { return JSON.parse(Buffer.from(buffer).toString("utf8")); }
+    };
+  };
   const reader = loadReader();
   const app = reader.app;
 
@@ -337,7 +450,11 @@ async function main() {
   }) + "\n");
 }
 
-main().catch(function (error) {
-  process.stderr.write(String((error && error.stack) || error) + "\n");
-  process.exitCode = 1;
-});
+if (require.main === module) {
+  main().catch(function (error) {
+    process.stderr.write(String((error && error.stack) || error) + "\n");
+    process.exitCode = 1;
+  });
+}
+
+module.exports = { fetchForNode: fetchForNode, fetchWithHttp: fetchWithHttp };
