@@ -48,6 +48,16 @@ max_count_scan = 500
 # 30 is a reasonable place to start. Environment: GENT_TALK_LIVE_POLL_SECONDS
 live_poll_seconds = 0
 
+# owner_user_id is YOUR Discord user id, and it cannot be worked out from anything above.
+#
+# The bot token identifies the BOT — the server reads that straight out of it, so messages this
+# bridge posts on your behalf are recognised for free. A bot's account has no relationship to the
+# human reading the channel, though, so messages YOU type into Discord yourself are just somebody
+# else's until you say otherwise. Set this and they are drawn as yours.
+#
+# Public: a user id is on every message that account has ever sent. Settings can also assign it
+# per account, in the browser, with no restart.
+# owner_user_id = "000000000000000000"
 [auth]
 # Credentials THIS server demands of its callers. Not Discord's, not ElevenLabs'.
 # Generate them with:  openssl rand -base64 33

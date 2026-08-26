@@ -348,6 +348,7 @@ curl -s -X POST localhost:8080/mcp \
 | Channels | `[[channels]]` | `GENT_TALK_CHANNELS` | `id:label:rw` / `id:label:ro`, comma separated |
 | ElevenLabs agent id | `elevenlabs.agent_id` | `GENT_TALK_ELEVENLABS_AGENT_ID` | public |
 | ElevenLabs API key | `elevenlabs.api_key` | `GENT_TALK_ELEVENLABS_API_KEY` | **secret**, needed to mint signed URLs and to read messages aloud |
+| Your own Discord user id | `discord.owner_user_id` | `GENT_TALK_DISCORD_OWNER_USER_ID` | public; **cannot be derived** — see below. Without it, messages you type into Discord yourself are drawn as a third party |
 | ElevenLabs voice id | `elevenlabs.voice_id` | `GENT_TALK_ELEVENLABS_VOICE_ID` | public; **optional** — read-aloud borrows the configured agent's own voice when this is unset |
 | ElevenLabs API base | `elevenlabs.api_base` | `GENT_TALK_ELEVENLABS_API_BASE` | `https://api.elevenlabs.io/v1` |
 | Storage path | `storage.path` | `GENT_TALK_STORAGE_PATH` | absolute; unset means **no durable state** |
@@ -2285,6 +2286,23 @@ scripts/smoke-agent.py         the manual, billed check that the AGENT really ca
 scripts/screenshots.py         photographs /voice in every state, so an agent can SEE the page
 QUICKSTART.md         the six-step setup path, start to first conversation
 ```
+
+### Why your own messages need a setting
+
+Two accounts carry your words in a channel: the one this bridge posts as, and the one you type
+into Discord with yourself. The channel view draws both as yours.
+
+The first is free. A Discord bot token's first segment IS the bot's user id, so the server reads it
+out of its own token and tells the page before the first message is drawn.
+
+**The second cannot be derived from anything this server holds.** A bot's account has no
+relationship to the human reading the channel — the token says what the bot is, not who you are.
+So it is `discord.owner_user_id`, and until you set it your own messages come through as somebody
+else's.
+
+You can also set it without a restart: **Settings lists every account it has seen** and lets you
+say which is which. That is the faster fix, and it is per-browser; the configuration setting is for
+a deployment that would rather state it once.
 
 ## Running the tests
 

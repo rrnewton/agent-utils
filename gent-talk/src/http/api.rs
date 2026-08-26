@@ -308,6 +308,14 @@ pub struct ClientConfigResponse {
     /// app. `None` when the token is not in the shape ids can be read from; the page then falls
     /// back to learning it the old way.
     pub self_author_id: Option<String>,
+    /// The READER's own Discord account, when the operator has said what it is.
+    ///
+    /// Distinct from `self_author_id`, which is the BRIDGE's account and is read out of the bot
+    /// token. This one cannot be derived from anything the server holds — a bot's account has no
+    /// relationship to the human reading the channel — so it is absent unless configured. The page
+    /// draws both as the owner's own words, because they are: one typed into Discord, one dictated
+    /// through this bridge.
+    pub owner_author_id: Option<String>,
     /// Seconds between live ingestion ticks, or `0` when live ingestion is OFF.
     ///
     /// The page needs this to tell the truth about its own channel view. With ingestion off the
@@ -333,6 +341,7 @@ pub async fn client_config(
         self_author_id: crate::discord::self_user_id_from_token(
             state.config.discord.bot_token.expose(),
         ),
+        owner_author_id: state.config.discord.owner_user_id.clone(),
     }))
 }
 

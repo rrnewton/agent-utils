@@ -2788,6 +2788,10 @@ function renderControls() {
   }
   el("speaker").hidden = chat;
   el("talk").hidden = chat || reading;
+  // CLEAR IS FOR THE TRANSCRIPT, which is this page's own record of a conversation and can be
+  // thrown away. The channel is Discord's, it is not ours to clear, and the button offered an act
+  // that either means nothing or means something alarming. Absent in the channel view.
+  el("clear-view").hidden = reading;
   el("hang-up").hidden = !live;
   el("hangup-label").textContent = chat ? "End chat" : "Hang up";
   el("control-pane").className = chat ? "chat" : live ? "" : "solo";
@@ -3176,6 +3180,20 @@ let authorsSeen = {};
  */
 let selfAuthorId = null;
 
+/**
+ * The reader's OWN Discord account, when the deployment has been told what it is.
+ *
+ * Two accounts are the owner's words and both must be drawn as his: the one this bridge posts as,
+ * and the one he types into Discord with himself. The first is free — it is readable out of the
+ * bot token. The SECOND CANNOT BE DERIVED from anything the server holds, because a bot's account
+ * has no relationship to the human reading the channel, so it is configuration
+ * (`discord.owner_user_id`) or a per-account choice in Settings, and absent until one of those.
+ *
+ * Kept separate from `selfAuthorId` rather than folded into it: they are learned in different ways
+ * and one of them can be wrong in a way the other cannot.
+ */
+let ownerAuthorId = null;
+
 function loadIdentities() {
   const read = (key, fallback) => {
     try {
@@ -3236,8 +3254,12 @@ function bucketFor(authorId, isBot) {
   if (identities[id]) {
     return identities[id];
   }
-  // 2. It is us. Known by construction, not by name.
+  // 2. It is us. Known by construction, not by name — either account the owner speaks through:
+  //    the bridge posting on his behalf, or the one he types into Discord with.
   if (selfAuthorId && id === selfAuthorId) {
+    return "me";
+  }
+  if (ownerAuthorId && id === ownerAuthorId) {
     return "me";
   }
   if (!isBot) {
@@ -6008,6 +6030,9 @@ function applyClientConfig(config) {
   if (config && config.self_author_id) {
     noteSelfAuthor(config.self_author_id);
   }
+  // The reader's own Discord account, if the operator has said what it is. Not derivable; see
+  // `ownerAuthorId`.
+  ownerAuthorId = (config && config.owner_author_id) || null;
   const select = el("discord-channel");
   // `#39 channel-alias`. Both pickers are drawn from the same list and through the same naming
   // rule, so the name in the bar and the name in Settings are one answer rather than two.

@@ -941,6 +941,7 @@ function newPage(store = new Map(), script = SCRIPT) {
         live_poll_seconds: page.livePollSeconds,
         replay_enabled: page.replayEnabled,
         self_author_id: page.selfAuthorId,
+        owner_author_id: page.ownerAuthorId,
       }),
     /**
      * The channels this server is configured for, as the server would serialize them.
@@ -992,6 +993,8 @@ function newPage(store = new Map(), script = SCRIPT) {
     replayEnabled: true,
     /** The account this bridge posts as, as the server reads it out of its own bot token. */
     selfAuthorId: "1000000000000000009",
+    /** The reader's OWN Discord account. Not derivable; configured or chosen in Settings. */
+    ownerAuthorId: null,
     replayStatus: 200,
     replayMaxTurns: 40,
     replayTransport: "contextual_update",
@@ -5417,6 +5420,55 @@ test("...and a cache hit is not averaged in as instant", async () => {
   const note = page.el("summary-note").text();
   assert.doesNotMatch(note, /0\.0s/, "an unmeasured summary was averaged in as instant");
   assert.doesNotMatch(note, /measured/, "it claims a measurement it never made");
+});
+
+test("THE OWNER'S OWN DISCORD MESSAGES ARE HIS, NOT A STRANGER'S", async () => {
+  // Two accounts carry the owner's words: the one this bridge posts as, and the one he types into
+  // Discord with himself. The first is free — it is read out of the bot token. The second CANNOT
+  // be derived: a bot's account has no relationship to the human reading the channel. So messages
+  // he had typed himself came through as a third party, brown and centred, beside his own dictated
+  // ones drawn as his.
+  const page = newPage();
+  page.ownerAuthorId = "777000000000000777";
+  await signIn(page);
+  await showDiscord(page, [
+    message({ id: "1", author: "gent-talk", author_id: "1000000000000000009", author_is_bot: true }),
+    message({ id: "2", author: "the owner", author_id: "777000000000000777", author_is_bot: false }),
+    message({ id: "3", author: "alice", author_id: "30", author_is_bot: false }),
+  ]);
+
+  assert.equal(whoOf(page, 0), "me", "the bridge's own posts stopped being the owner's");
+  assert.equal(whoOf(page, 1), "me", "the owner's own Discord account is drawn as a stranger");
+  assert.equal(whoOf(page, 2), "human", "everybody became the owner");
+});
+
+test("...and without being told, it says nobody rather than guessing", async () => {
+  // There is no derivation to fall back on, and inventing one would paint somebody else's messages
+  // as the owner's. Settings can still assign it per account without a restart.
+  const page = newPage();
+  page.ownerAuthorId = null;
+  await signIn(page);
+  await showDiscord(page, [
+    message({ id: "2", author: "the owner", author_id: "777000000000000777", author_is_bot: false }),
+  ]);
+  assert.equal(whoOf(page, 0), "human", "an account nobody named was claimed as the owner's");
+});
+
+test("CLEAR IS NOT OFFERED OVER THE CHANNEL, because the channel is not ours to clear", async () => {
+  const page = newPage();
+  await signIn(page);
+  assert.equal(page.el("clear-view").hidden, false, "Clear left the transcript, where it belongs");
+
+  await showDiscord(page, [message({ id: "1000000000000000001" })]);
+  assert.equal(
+    page.el("clear-view").hidden,
+    true,
+    "Clear is offered over a Discord channel, where it either means nothing or means something alarming"
+  );
+
+  await page.el("view-switch").click();
+  await page.settle();
+  assert.equal(page.el("clear-view").hidden, false, "Clear did not come back with the transcript");
 });
 
 test("the channel spends its width on words, not on insets", async () => {

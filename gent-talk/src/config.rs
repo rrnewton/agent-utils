@@ -33,6 +33,8 @@ pub const ENV_ELEVENLABS_API_KEY: &str = "GENT_TALK_ELEVENLABS_API_KEY";
 pub const ENV_ELEVENLABS_AGENT_ID: &str = "GENT_TALK_ELEVENLABS_AGENT_ID";
 /// Which ElevenLabs voice reads a message aloud. Public: it identifies a catalogue voice.
 pub const ENV_ELEVENLABS_VOICE_ID: &str = "GENT_TALK_ELEVENLABS_VOICE_ID";
+/// The reader's OWN Discord account, so their own messages are drawn as theirs.
+pub const ENV_DISCORD_OWNER_USER_ID: &str = "GENT_TALK_DISCORD_OWNER_USER_ID";
 /// Environment variable overriding the ElevenLabs API base, so a test or a proxy can point
 /// elsewhere.
 pub const ENV_ELEVENLABS_API_BASE: &str = "GENT_TALK_ELEVENLABS_API_BASE";
@@ -249,6 +251,17 @@ impl Default for ReplayConfig {
 pub struct DiscordConfig {
     /// Bot token. Sent as `Authorization: Bot <token>`.
     pub bot_token: Secret,
+    /// The reader's own Discord user id, when they have said what it is.
+    ///
+    /// THIS CANNOT BE DERIVED, and that is why it is a setting. The bot token identifies the BOT
+    /// -- `self_user_id_from_token` reads that straight out of it -- and a bot's account has no
+    /// relationship to the human reading the channel. So the bridge's own posts are recognised for
+    /// free, and messages the owner typed into Discord HIMSELF are just somebody else's until he
+    /// says otherwise. The web app can also be told per-account in Settings, which needs no
+    /// restart; this is the answer for a deployment that would rather state it once.
+    ///
+    /// Public: a user id is visible on every message that account has ever sent.
+    pub owner_user_id: Option<String>,
     /// API base, so a test or a proxy can point elsewhere.
     pub api_base: String,
     /// Default number of messages a fetch returns.
@@ -391,6 +404,7 @@ struct FileServer {
 #[serde(deny_unknown_fields)]
 struct FileDiscord {
     bot_token: Option<Secret>,
+    owner_user_id: Option<String>,
     api_base: Option<String>,
     default_fetch_limit: Option<u16>,
     max_fetch_limit: Option<u16>,
@@ -640,6 +654,11 @@ impl Config {
             timezone,
             discord: DiscordConfig {
                 bot_token,
+                owner_user_id: get(ENV_DISCORD_OWNER_USER_ID)
+                    .map(str::to_owned)
+                    .or(file.discord.owner_user_id)
+                    .map(|id| id.trim().to_owned())
+                    .filter(|id| !id.is_empty()),
                 api_base: file
                     .discord
                     .api_base
