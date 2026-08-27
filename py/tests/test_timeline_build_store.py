@@ -222,9 +222,10 @@ def test_the_transcript_baseline_is_rerun_state_and_lives_in_the_store(
     """The monotonic union is input to the next extraction, not output of this one.
 
     It is the largest thing the exporter writes -- 106.3 MiB against 110.2 MiB for all three
-    published projections combined on the measured archive -- and nothing that consumes an
-    archive opens it. Shipping it meant every machine that served the site carried a copy of
-    the exporter's scratch space.
+    published projections combined on the measured archive, in an earlier measurement taken
+    while those were still plain text -- and nothing that consumes an archive opens it.
+    Shipping it meant every machine that served the site carried a copy of the exporter's
+    scratch space.
     """
 
     from wrkviz.build_store import SHARED_TENANT, shared_build_root

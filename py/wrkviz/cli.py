@@ -616,8 +616,16 @@ def _parser() -> argparse.ArgumentParser:
 
     extract_transcripts = sub.add_parser(
         "extract-transcripts",
-        help="write append-only prompt/response JSONL from normalized logs; zero tokens",
-        description="write append-only prompt/response JSONL from normalized logs; zero tokens",
+        help=(
+            "write append-only prompt/response JSONL from normalized logs, as seekable gzip "
+            "with a sidecar index; zero tokens"
+        ),
+        description=(
+            "write append-only prompt/response JSONL from normalized logs, as seekable gzip "
+            "with a sidecar index; zero tokens. Run it once on an archive an older wrkviz "
+            "extracted: it migrates the plain .jsonl corpus in place, which prompts, messages "
+            "and stats queries need before they will read it."
+        ),
     )
     extract_transcripts.add_argument(
         "--output", required=True, help="durable archive directory"
@@ -1885,7 +1893,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
                 print(
                     "JSONL: "
-                    f"{config.output / 'extracted' / 'transcripts' / 'prompts.jsonl'}"
+                    f"{config.output / 'extracted' / 'transcripts' / 'prompts.jsonl.gz'}"
                 )
             print("website: not built (run `wrkviz build` separately)")
             print(f"run metadata: {project_run_path}")
@@ -1982,7 +1990,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"{report.reclassified} source records reclassified, "
                 f"{report.files_changed} files changed"
             )
-            print(f"JSONL: {archive / 'extracted' / 'transcripts' / 'prompts.jsonl'}")
+            print(
+                f"JSONL: {archive / 'extracted' / 'transcripts' / 'prompts.jsonl.gz'}"
+            )
             print(f"run metadata: {run_path}")
             if partiality is not None:
                 print(f"{PROG}: {partiality}", file=sys.stderr)

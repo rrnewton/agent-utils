@@ -520,14 +520,44 @@ wrkviz extract-transcripts --output ./timelines/example-team
 ```
 
 This reads only normalized coordinator events. It writes
-`extracted/transcripts/occurrences.jsonl`, `prompts.jsonl`, `messages.jsonl`,
-`system-inputs.jsonl`, and a digest-bound manifest. `occurrences.jsonl` retains every physical
+`extracted/transcripts/occurrences.jsonl`, `prompts.jsonl.gz`, `messages.jsonl.gz`,
+`system-inputs.jsonl.gz`, and a digest-bound manifest. `occurrences.jsonl` retains every physical
 provider/team occurrence, while
 `prompts.jsonl` collapses only source-identical logical fork copies and contains verbatim authored
 or externally submitted prompts;
 `messages.jsonl` adds coordinator responses associated by provider turn identity. Synthetic Claude
 notifications, scheduled inputs, and inter-agent messages are retained separately rather than
 counted as the user's prompts. Every record has a stable occurrence ID and source provenance.
+
+The three published projections are **seekable containers**: a multi-member gzip file at
+`<name>.jsonl.gz` with a sidecar index at `<name>.jsonl.gz.index.jsonl` recording where each
+member sits and which instants it spans. That is what lets `prompts --tail` and
+`messages --range` read the members holding the answer instead of the file. On the measured
+archive, 139,183,322 bytes (132.7 MiB) of plain JSONL became 29,494,442 bytes (28.1 MiB) of
+containers and sidecars, about a fifth of the size, with no second copy of anything. Each
+is an ordinary `.gz`: `gunzip -c messages.jsonl.gz` reproduces the exact bytes the plain file
+held, which is why the manifest's `sha256` and `bytes` still describe the uncompressed JSONL and
+still hold the values they held before. `c_sha256` and `c_bytes` describe the file on disk.
+`occurrences.jsonl` is unaffected — it is rerun state in the build store, not published output.
+
+**Upgrading an archive extracted before the container.** If an older wrkviz extracted the archive,
+it still holds plain `prompts.jsonl`, `messages.jsonl` and `system-inputs.jsonl`, and its manifest
+has no `container` field. This version does not read that corpus. The `prompts`, `messages` and
+`stats` queries refuse it and exit 2 with "… re-run extract-transcripts to rebuild the corpus".
+That covers `wrkviz query` and any `./timeline` this version has written. Run the extraction once:
+
+```bash
+wrkviz extract-transcripts --output ./timelines/example-team
+```
+
+`extract-transcripts` accepts the old manifest and migrates the corpus in place, and so does
+`ingest-project`, which runs it. Migration writes the containers, deletes the plain files and
+rewrites `./timeline`. The manifest's `sha256` and `bytes` keep their values. `wrkviz build` does
+not extract. It rewrites `./timeline` with the new reader but leaves the corpus as it was. An
+archive that is only rebuilt therefore keeps refusing those queries until `extract-transcripts`
+runs. After migration, an older wrkviz cannot read the corpus. These limits are deliberate.
+Keeping a second, plain-text reader alive for a one-time migration would be lasting debt, and
+having `build` extract would tie every build to the extraction and its failures.
 
 Reruns take a monotonic union: a provider-side rewrite or rotation cannot delete an occurrence that
 was already extracted. Prompt ordinals are a convenient current 1-based chronological projection,
@@ -824,9 +854,10 @@ example-team/
 ├── extracted/transcripts/
 │   ├── manifest.json                # source generations + file digests; zero-token contract
 │   ├── occurrences.jsonl            # every physical provider/team source occurrence
-│   ├── prompts.jsonl                # global chronological authored prompt report
-│   ├── messages.jsonl               # prompts plus mechanically linked responses
-│   └── system-inputs.jsonl          # retained scheduled/synthetic coordinator inputs
+│   ├── prompts.jsonl.gz             # global chronological authored prompt report
+│   ├── messages.jsonl.gz            # prompts plus mechanically linked responses
+│   ├── system-inputs.jsonl.gz       # retained scheduled/synthetic coordinator inputs
+│   └── *.jsonl.gz.index.jsonl       # one sidecar per projection: the member table a seek uses
 ├── data/
 │   ├── timeline-v3.json             # the only bootstrap a build writes; shards under timeline-v3/
 │   │                                #   read by `./timeline` and by the browser alike

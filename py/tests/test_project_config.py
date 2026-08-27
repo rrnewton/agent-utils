@@ -13,6 +13,7 @@ import pytest
 
 import wrkviz.cli as cli_module
 import wrkviz.project_config as project_config_module
+from wrkviz.archive import JsonValue, as_array
 from wrkviz.build_store import team_build_root
 from wrkviz.claude import ClaudeParseError
 from wrkviz.cli import main as timeline_main
@@ -25,6 +26,7 @@ from wrkviz.orc import (
     OrcPrefixRowChange,
 )
 from wrkviz.pipeline import IngestReport
+from wrkviz.seekable_jsonl import SeekableJsonlReader
 from wrkviz.project_config import (
     ClaudeProjectSource,
     CodexProjectSource,
@@ -46,6 +48,13 @@ from wrkviz.window import DateWindow
 
 CLAUDE_SESSION_ID = "11111111-1111-4111-8111-111111111111"
 CLAUDE_FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "claude"
+
+
+def _projected_prompts(path: Path) -> list[dict[str, JsonValue]]:
+    """The prompt projection's records, read out of its seekable container."""
+
+    with SeekableJsonlReader(path) as reader:
+        return [dict(record) for record in reader.iter_records()]
 
 
 def _manifest(output: str = "../summary/widget") -> dict[str, object]:
@@ -917,13 +926,13 @@ def test_ingest_project_keeps_a_failed_team_in_the_projection_end_to_end(
         },
     )
     archive = tmp_path / "archive"
-    prompts_path = archive / "extracted" / "transcripts" / "prompts.jsonl"
+    prompts_path = archive / "extracted" / "transcripts" / "prompts.jsonl.gz"
 
     assert timeline_main(["ingest-project", "--config", str(config_path)]) == 0
     assert "teams: 2 succeeded, 0 failed" in capsys.readouterr().out
     normalized_two = team_build_root(archive, "team-two") / "raw" / "team.json"
     snapshot_before = normalized_two.read_bytes()
-    prompts_before = prompts_path.read_text(encoding="utf-8")
+    prompts_before = _projected_prompts(prompts_path)
     assert prompts_before
 
     # A provider-side corruption of exactly one team's source, which is the shape of the failure
@@ -938,12 +947,12 @@ def test_ingest_project_keeps_a_failed_team_in_the_projection_end_to_end(
     assert "team-one (claude): ingest:" in captured.out
     assert "2 normalized archive teams" in captured.out
     assert normalized_two.read_bytes() == snapshot_before
-    prompts_after = prompts_path.read_text(encoding="utf-8")
+    prompts_after = _projected_prompts(prompts_path)
     assert prompts_after == prompts_before
     occurrence_teams = {
-        team
-        for line in prompts_after.splitlines()
-        for team in json.loads(line)["occurrence_teams"]
+        str(team)
+        for record in prompts_after
+        for team in as_array(record["occurrence_teams"], "occurrence_teams")
     }
     assert occurrence_teams == {"team-one", "team-two"}
 
@@ -1400,7 +1409,7 @@ def test_ingest_project_projects_around_a_new_team_whose_first_ingest_failed(
         },
     )
     archive = tmp_path / "archive"
-    prompts_path = archive / "extracted" / "transcripts" / "prompts.jsonl"
+    prompts_path = archive / "extracted" / "transcripts" / "prompts.jsonl.gz"
 
     assert timeline_main(["ingest-project", "--config", str(config_path)]) == 2
     captured = capsys.readouterr()
@@ -1413,7 +1422,7 @@ def test_ingest_project_projects_around_a_new_team_whose_first_ingest_failed(
         "prompt authorship rule newcomer-owner (team newcomer has no normalized data)"
         in captured.err
     )
-    first_prompts = prompts_path.read_text(encoding="utf-8")
+    first_prompts = _projected_prompts(prompts_path)
     assert first_prompts
 
     # A new prompt arrives for the healthy team while the newcomer is still broken.
@@ -1440,9 +1449,11 @@ def test_ingest_project_projects_around_a_new_team_whose_first_ingest_failed(
 
     assert timeline_main(["ingest-project", "--config", str(config_path)]) == 2
     capsys.readouterr()
-    second_prompts = prompts_path.read_text(encoding="utf-8")
-    assert "A brand new question." in second_prompts
-    assert len(second_prompts.splitlines()) == len(first_prompts.splitlines()) + 1
+    second_prompts = _projected_prompts(prompts_path)
+    assert "A brand new question." in {
+        str(record["text"]) for record in second_prompts
+    }
+    assert len(second_prompts) == len(first_prompts) + 1
 
     run = json.loads(
         sorted((archive / "runs").glob("*.json"))[-1].read_text(encoding="utf-8")

@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 from wrkviz.build_store import team_build_root
-from wrkviz.archive import narrow_json, write_json_if_changed
+from wrkviz.archive import as_array, narrow_json, write_json_if_changed
 from wrkviz.artifacts import extract_artifacts
 from wrkviz.cli import main as timeline_main
 from wrkviz.github_enrich import pull_metadata_path
@@ -65,6 +65,7 @@ from wrkviz.query import (
     QueryFilters,
     TimelineQuery,
 )
+from wrkviz.seekable_jsonl import SeekableJsonlReader
 from wrkviz.server import make_server
 from wrkviz.summarize import PLAIN_LANGUAGE_ROLLUP_STYLE, SummaryResult
 from wrkviz.terminology import GlossaryTerm, glossary_term_id
@@ -3242,16 +3243,16 @@ def test_transcript_extraction_carries_a_torn_team_and_still_projects_the_health
     # A ValueError is a classified data fault, so no traceback is kept for it.
     assert partial.skipped_teams[0].traceback is None
 
-    prompts = [
-        json.loads(line)
-        for line in (tmp_path / "extracted" / "transcripts" / "prompts.jsonl")
-        .read_text(encoding="utf-8")
-        .splitlines()
-    ]
+    with SeekableJsonlReader(
+        tmp_path / "extracted" / "transcripts" / "prompts.jsonl.gz"
+    ) as reader:
+        prompts = list(reader.iter_records())
     texts = {str(record["text"]) for record in prompts}
     assert "A brand new question." in texts
     assert {
-        team for record in prompts for team in record["occurrence_teams"]
+        str(team)
+        for record in prompts
+        for team in as_array(record["occurrence_teams"], "occurrence_teams")
     } == {"codex-test", "orc-test"}
 
     # Repairing the team needs no extraction-side intervention.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import json
 import stat
 import subprocess
@@ -14,6 +15,7 @@ from wrkviz.build_store import shared_build_root
 from wrkviz.archive import JsonValue, as_object, narrow_json
 from wrkviz.cli import main as timeline_main
 from wrkviz.model import Agent, Event, TeamData
+from wrkviz.seekable_jsonl import SeekableJsonlReader
 from wrkviz.transcript_export import (
     PromptAuthorshipRule,
     TranscriptTeamSkip,
@@ -81,11 +83,45 @@ def _team(events: tuple[Event, ...]) -> TeamData:
 
 
 def _jsonl(path: Path) -> list[dict[str, JsonValue]]:
+    """Read one exported projection, whichever container it is in.
+
+    The three published projections are multi-member gzip with a sidecar; the monotonic baseline
+    in the build store is still plain text. Both are read here through their own reader rather
+    than through ``query.py``, so an assertion about what the exporter *wrote* does not become an
+    assertion about what the query layer can be persuaded to return.
+    """
+
+    if not path.exists() and path.with_name(path.name + ".gz").is_file():
+        with SeekableJsonlReader(path.with_name(path.name + ".gz")) as reader:
+            return list(reader.iter_records())
     result: list[dict[str, JsonValue]] = []
     for index, line in enumerate(path.read_text(encoding="utf-8").splitlines()):
         raw: object = json.loads(line)
         result.append(as_object(narrow_json(raw), f"record {index}"))
     return result
+
+
+def _rewind_to_plain_corpus(root: Path) -> str:
+    """Put a corpus back the way an extraction before the container left it.
+
+    That means plain text beside a manifest that describes it. The plain generation is rebuilt
+    by inflating the containers rather than by an old exporter, which is the only way to build
+    one without keeping the old writer alive. It is faithful, because rebuilding it *is*
+    inflating the container. Returns the manifest text it wrote.
+    """
+
+    manifest_path = root / "manifest.json"
+    legacy = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for name in ("prompts.jsonl", "messages.jsonl", "system-inputs.jsonl"):
+        with gzip.open(root / (name + ".gz"), "rb") as handle:
+            (root / name).write_bytes(handle.read())
+        (root / (name + ".gz")).unlink()
+        (root / (name + ".gz.index.jsonl")).unlink()
+        for key in ("container", "path", "index_path", "c_sha256", "c_bytes"):
+            legacy["files"][name].pop(key)
+    text = json.dumps(legacy, indent=1)
+    manifest_path.write_text(text, encoding="utf-8")
+    return text
 
 
 def test_export_is_idempotent_and_monotonic_across_missing_source_records(
@@ -104,7 +140,9 @@ def test_export_is_idempotent_and_monotonic_across_missing_source_records(
     assert report.prompts == 2
     assert report.responses == 1
     assert report.system_inputs == 1
-    assert report.files_changed == 8
+    # Eleven, not eight: each published projection is now a container *and* a sidecar index,
+    # which is three more files than the three plain ones it replaced.
+    assert report.files_changed == 11
     assert export_transcripts(tmp_path, (first,)).files_changed == 0
     assert (tmp_path / "timeline").is_file()
     assert not (tmp_path / "query.py").exists()
@@ -652,6 +690,128 @@ def test_logical_prompt_report_deduplicates_identical_fork_occurrences(
     assert prompts[0]["occurrence_teams"] == ["alpha", "beta"]
 
 
+def test_a_plain_corpus_migrates_in_place_without_moving_a_digest(
+    tmp_path: Path,
+) -> None:
+    """The migration onto the container, and the claim that makes it safe.
+
+    ``sha256`` and ``bytes`` describe the uncompressed stream both before and after, so the
+    migration must not move either number: the exporter's canonical encoding and
+    `seekable_jsonl`'s are the same encoding, and gzip is lossless, so the digest an operator
+    recorded against the plain corpus still identifies the corpus inside the container. That is
+    the whole reason this could be done as a replacement rather than as a new generation, and it
+    is asserted here rather than asserted in a comment.
+
+    The plain generation is reconstructed from the container rather than produced by an old
+    exporter, which is the only way to write this test without keeping the old writer alive --
+    and it is faithful, because reconstructing it *is* inflating the container.
+    """
+
+    team = _team(
+        (
+            _event("prompt-one", "turn-one", 200, "user_prompt", "One", 1),
+            _event("response-one", "turn-one", 250, "assistant_message", "Done", 2),
+            _event("scheduled", "turn-system", 300, "system_input", "Tick", 3),
+        )
+    )
+    export_transcripts(tmp_path, (team,))
+    root = tmp_path / "extracted" / "transcripts"
+    manifest_path = root / "manifest.json"
+    container_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    legacy = json.loads(_rewind_to_plain_corpus(root))
+
+    export_transcripts(tmp_path, (team,))
+
+    migrated = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert migrated == container_manifest
+    for name in ("prompts.jsonl", "messages.jsonl", "system-inputs.jsonl"):
+        assert migrated["files"][name]["sha256"] == legacy["files"][name]["sha256"]
+        assert migrated["files"][name]["bytes"] == legacy["files"][name]["bytes"]
+        assert not (root / name).exists()
+        assert (root / (name + ".gz")).is_file()
+        assert (root / (name + ".gz.index.jsonl")).is_file()
+
+
+def test_a_corpus_extracted_before_the_container_is_refused_until_it_is_extracted_again(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The upgrade rule, as an operator meets it at the command line.
+
+    An archive extracted before the container holds plain JSONL. The queries do not read it:
+    they name it and name the remedy, and they exit 2. They do not answer from a second,
+    plain-text reader. Running the extraction once more is the whole remedy. The same commands
+    then answer from the migrated corpus. The class-level refusal is pinned by
+    ``test_an_uncompressed_corpus_is_refused_by_name``. This test pins what the operator sees,
+    through both `wrkviz query` and the archive's own ``./timeline``.
+    """
+
+    team = _team(
+        (
+            _event("prompt-one", "turn-one", 200, "user_prompt", "One", 1),
+            _event("response-one", "turn-one", 250, "assistant_message", "Done", 2),
+            _event("scheduled", "turn-system", 300, "system_input", "Tick", 3),
+        )
+    )
+    export_transcripts(tmp_path, (team,))
+    _rewind_to_plain_corpus(tmp_path / "extracted" / "transcripts")
+    launcher = tmp_path / "timeline"
+    assert launcher.is_file()
+
+    for action in ("prompts", "messages", "stats"):
+        assert timeline_main(("query", "--output", str(tmp_path), action)) == 2, action
+        captured = capsys.readouterr()
+        assert captured.out == "", action
+        assert "is an uncompressed transcript projection" in captured.err, action
+        assert "re-run extract-transcripts to rebuild the corpus" in captured.err, action
+
+        refused = subprocess.run(
+            (str(launcher), action),
+            cwd=tmp_path,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert refused.returncode == 2, (action, refused.stdout, refused.stderr)
+        assert refused.stdout == "", action
+        assert "re-run extract-transcripts to rebuild the corpus" in refused.stderr, action
+
+    # The remedy the refusal names: `extract-transcripts` runs exactly this export. (`stats`
+    # also needs a built timeline, which this archive never had, so it is not asked again.)
+    export_transcripts(tmp_path, (team,))
+
+    assert (
+        timeline_main(("query", "--output", str(tmp_path), "--format", "text", "prompts"))
+        == 0
+    )
+    assert "One" in capsys.readouterr().out
+    assert (
+        timeline_main(
+            ("query", "--output", str(tmp_path), "--format", "jsonl", "messages")
+        )
+        == 0
+    )
+    records = [
+        as_object(narrow_json(json.loads(line)), "messages record")
+        for line in capsys.readouterr().out.splitlines()
+    ]
+    assert [record["text"] for record in records] == ["One", "Done"]
+    answered = subprocess.run(
+        (str(launcher), "prompts", "--format", "jsonl"),
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert answered.returncode == 0, answered.stderr
+    assert answered.stderr == ""
+    prompts = [
+        as_object(narrow_json(json.loads(line)), "timeline JSONL record")
+        for line in answered.stdout.splitlines()
+    ]
+    assert [prompt["text"] for prompt in prompts] == ["One"]
+
+
 def test_prompt_query_fails_closed_on_digest_mismatch(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -659,8 +819,10 @@ def test_prompt_query_fails_closed_on_digest_mismatch(
         tmp_path,
         (_team((_event("prompt", "turn", 100, "user_prompt", "Original", 1),)),),
     )
-    prompts = tmp_path / "extracted" / "transcripts" / "prompts.jsonl"
-    prompts.write_text(prompts.read_text(encoding="utf-8") + "{}\n", encoding="utf-8")
+    prompts = tmp_path / "extracted" / "transcripts" / "prompts.jsonl.gz"
+    # An extra gzip member appended to the container: still a perfectly valid `.gz`, still
+    # inflatable, and still refused -- the manifest said how long the file is.
+    prompts.write_bytes(prompts.read_bytes() + gzip.compress(b"{}\n"))
 
     assert (
         timeline_main(

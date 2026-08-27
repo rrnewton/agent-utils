@@ -147,8 +147,13 @@ cd ./timelines/example-team
 ./timeline prompts --range 200-300
 ```
 
-The full chronological JSONL report is `extracted/transcripts/prompts.jsonl`;
-`messages.jsonl` adds coordinator responses linked mechanically by provider turn identity.
+The full chronological JSONL report is `extracted/transcripts/prompts.jsonl.gz`;
+`messages.jsonl.gz` adds coordinator responses linked mechanically by provider turn identity.
+Both are ordinary multi-member gzip, so `gunzip -c prompts.jsonl.gz` gives the plain JSONL, and
+the `.index.jsonl` sidecar beside each is what lets a query read only the part it needs. An archive
+extracted by an older wrkviz holds plain `.jsonl` files instead. Its `prompts`, `messages` and
+`stats` queries refuse until `extract-transcripts` runs once more and migrates it (see the user
+guide).
 `timeline prompts` defaults to `--which human`, where durable `owner_human` and `other_human`
 labels count as human. `--which bot` selects `agent` and `system`; `--which all` also includes
 unknown or externally unattributed records. Selection never guesses authorship from message prose.

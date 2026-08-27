@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 import pytest
 
+from wrkviz.archive import as_string
 from wrkviz.build_store import team_build_root
 from wrkviz.claude import ClaudeSourceCopy
 from wrkviz.claude_history import (
@@ -27,6 +28,7 @@ from wrkviz.project_config import (
     ingest_project,
     load_project_ingest_config,
 )
+from wrkviz.seekable_jsonl import SeekableJsonlReader
 from tests.timeline_projection import schema_1_timeline_text
 from tests.timeline_snapshots import snapshot_root
 
@@ -233,12 +235,10 @@ def test_pipeline_ingests_builds_and_projects_history_prompts(tmp_path: Path) ->
     assert len(timeline["agents"]) == 3
 
     report = extract_transcripts_archive(archive)
-    prompts = [
-        json.loads(line)
-        for line in (archive / "extracted" / "transcripts" / "prompts.jsonl")
-        .read_text(encoding="utf-8")
-        .splitlines()
-    ]
+    with SeekableJsonlReader(
+        archive / "extracted" / "transcripts" / "prompts.jsonl.gz"
+    ) as reader:
+        prompts = list(reader.iter_records())
     assert report.prompts == 4
     assert [prompt["text"] for prompt in prompts] == [
         "oldest, before session ids",
@@ -342,15 +342,14 @@ def test_project_config_derives_covered_sessions_from_claude_teams(tmp_path: Pat
 
     # The projection carries the full-transcript prompt once, from its own team, and the
     # history prompts from theirs.
-    prompts = [
-        json.loads(line)
-        for line in (config.output / "extracted" / "transcripts" / "prompts.jsonl")
-        .read_text(encoding="utf-8")
-        .splitlines()
-    ]
+    with SeekableJsonlReader(
+        config.output / "extracted" / "transcripts" / "prompts.jsonl.gz"
+    ) as reader:
+        prompts = list(reader.iter_records())
     by_team: dict[str, int] = {}
     for prompt in prompts:
-        by_team[prompt["team_slug"]] = by_team.get(prompt["team_slug"], 0) + 1
+        team = as_string(prompt["team_slug"], "team_slug")
+        by_team[team] = by_team.get(team, 0) + 1
     assert by_team["claude-history-host01"] == 4
     assert "covered by a full transcript" not in {prompt["text"] for prompt in prompts}
 
