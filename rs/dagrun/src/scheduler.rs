@@ -1272,6 +1272,10 @@ impl Runner {
     /// Drive the DAG to completion; returns `(ok, wall_seconds)`.
     fn run(&self) -> (bool, f64) {
         let mut handles: Vec<(thread::JoinHandle<()>, Step)> = Vec::new();
+        // One pending completion is enough to make the ready set worth scanning again. The
+        // timeout remains the polling bound for outer deadlines and cross-process resources,
+        // while a finished local step no longer waits for that timeout to expire.
+        let (scheduler_wake, scheduler_wake_rx) = std::sync::mpsc::sync_channel(1);
         let wall_start = Instant::now();
         for (tag, reason) in &self.intentional_skips {
             emit(&format!("[{tag}] SKIPPED reason={}", reason.value()));
@@ -1575,6 +1579,7 @@ impl Runner {
             }
             for (step, resource_reservation) in launchable {
                 let shared = Arc::clone(&self.shared);
+                let scheduler_wake = scheduler_wake.clone();
                 let keep_going = self.keep_going;
                 let verbosity = self.verbosity;
                 let default_jobs_flag = self.default_jobs_flag.clone();
@@ -1605,6 +1610,7 @@ impl Runner {
                         #[cfg(test)]
                         if let Some(body) = supervisor_override {
                             body(&recovery.step);
+                            let _ = scheduler_wake.try_send(());
                             return;
                         }
                         with_supervisor_guard(recovery, move || {
@@ -1628,11 +1634,12 @@ impl Runner {
                                 resource_reservation,
                             });
                         });
+                        let _ = scheduler_wake.try_send(());
                     }),
                     swept_step,
                 ));
             }
-            thread::sleep(LOOP_SLEEP);
+            let _ = scheduler_wake_rx.recv_timeout(LOOP_SLEEP);
         }
         for (h, _step) in handles {
             let _ = h.join();
