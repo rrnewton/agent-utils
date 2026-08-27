@@ -46,7 +46,8 @@ pub use ambient::{
 pub use attribution::{
     bind_process_tests, culprit_columns, default_log_dir, mint_step_nonce, process_snapshot,
     recognize, Culprit, InFlightTest, ProcessObservation, RunEvidence, StepStream, TestEvent,
-    TestTracker, LOG_DIR_ENV, NO_LOGS_ENV, STEP_NONCE_ENV,
+    TestTracker, LOG_DIR_ENV, NO_LOGS_ENV, REQUIRE_STRUCTURED_TEST_COUNTS_ENV, STEP_NONCE_ENV,
+    TEST_COUNTS_PATH_ENV,
 };
 pub use capabilities::{enforcement_manifest, is_enforced, Capability, Lane, ENFORCEMENT_REGISTRY};
 #[allow(deprecated)]
