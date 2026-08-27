@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import contextlib
 import io
 import json
@@ -1116,31 +1117,39 @@ def test_unboxed_run_enforces_a_lower_bound_and_exposes_its_escape() -> None:
                 env=env,
             )
 
-    breach = _run(spin, "burn")
-    breach_out = breach.stdout + breach.stderr
-    assert "running UNBOXED" in breach_out, (
-        "this test is only meaningful with boxing OFF; if the run was boxed it is exercising the "
-        f"cgroup path and proves nothing about the fallback:\n{breach_out}"
-    )
-    assert breach.returncode == 1, (
-        "an UNBOXED step that burns 20x its CPU budget must FAIL; exit 0 here is the original "
-        f"defect (declared budget, no enforcement). got {breach.returncode}\n{breach_out}"
-    )
-    assert "CPU-TIMEOUT >3s cpu" in breach_out, (
-        f"expected the CPU budget to fire, not the (300s) wall timeout:\n{breach_out}"
-    )
-    assert "PROCFS SUBTREE" in breach_out, (
-        "an unboxed breach must NAME the degraded accounting that produced it, so a reader can "
-        f"weigh its known blind spots:\n{breach_out}"
-    )
+    # The idle control has its own temporary directory and process group. Start it first so its
+    # required 20 seconds of wall time overlaps the three independent enforcement invocations.
+    # Every invocation and every assertion below is unchanged; only their waiting overlaps.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        idle_future = executor.submit(_run, sleeper, "idle")
 
-    parallel = _run(multi, "multi")
-    parallel_out = parallel.stdout + parallel.stderr
-    assert parallel.returncode == 1, parallel_out
-    assert parallel_out.count("CPU-TIMEOUT >3s cpu") == 2, parallel_out
-    assert parallel_out.count("PROCFS SUBTREE") == 2, parallel_out
+        breach = _run(spin, "burn")
+        breach_out = breach.stdout + breach.stderr
+        assert "running UNBOXED" in breach_out, (
+            "this test is only meaningful with boxing OFF; if the run was boxed it is exercising the "
+            f"cgroup path and proves nothing about the fallback:\n{breach_out}"
+        )
+        assert breach.returncode == 1, (
+            "an UNBOXED step that burns 20x its CPU budget must FAIL; exit 0 here is the original "
+            f"defect (declared budget, no enforcement). got {breach.returncode}\n{breach_out}"
+        )
+        assert "CPU-TIMEOUT >3s cpu" in breach_out, (
+            f"expected the CPU budget to fire, not the (300s) wall timeout:\n{breach_out}"
+        )
+        assert "PROCFS SUBTREE" in breach_out, (
+            "an unboxed breach must NAME the degraded accounting that produced it, so a reader can "
+            f"weigh its known blind spots:\n{breach_out}"
+        )
 
-    idle = _run(sleeper, "idle")
+        parallel = _run(multi, "multi")
+        parallel_out = parallel.stdout + parallel.stderr
+        assert parallel.returncode == 1, parallel_out
+        assert parallel_out.count("CPU-TIMEOUT >3s cpu") == 2, parallel_out
+        assert parallel_out.count("PROCFS SUBTREE") == 2, parallel_out
+
+        escaped = _run(escapee, "escape")
+        idle = idle_future.result()
+
     idle_out = idle.stdout + idle.stderr
     assert idle.returncode == 0, (
         "a step that sleeps 20s on a 3s CPU budget burns ~no CPU and must SURVIVE. Killing it "
@@ -1148,7 +1157,6 @@ def test_unboxed_run_enforces_a_lower_bound_and_exposes_its_escape() -> None:
         f"exact confusion this bound exists to avoid. got {idle.returncode}\n{idle_out}"
     )
 
-    escaped = _run(escapee, "escape")
     escaped_out = escaped.stdout + escaped.stderr
     assert escaped.returncode == 0, (
         "the procfs process-group floor unexpectedly claimed cgroup-equivalent coverage; a "

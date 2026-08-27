@@ -81,8 +81,19 @@ fn run_unboxed(dir: &PathBuf, name: &str, body: &str) -> (Option<i32>, String) {
 fn unboxed_cpu_timeout_enforces_a_lower_bound_and_exposes_its_escape() {
     let dir = std::env::temp_dir().join(format!("dagrun_unboxed_cpu_{}", std::process::id()));
 
-    // --- negative side: the breach must be killed ---
+    // The idle control writes a different DAG and owns a different process group. Start it first
+    // so its required 20 seconds of wall time overlaps the three independent enforcement
+    // invocations. Every invocation and every assertion below is unchanged; only their waiting
+    // overlaps.
+    let idle_dir = dir.clone();
+    let idle = std::thread::spawn(move || run_unboxed(&idle_dir, "idle", SLEEPER_DAG));
+
     let (code, out) = run_unboxed(&dir, "burn", BREACH_DAG);
+    let (parallel_code, parallel_out) = run_unboxed(&dir, "multi", MULTI_BREACH_DAG);
+    let (escape_code, escape_out) = run_unboxed(&dir, "escape", ESCAPEE_DAG);
+    let (idle_code, idle_out) = idle.join().expect("idle control thread panicked");
+
+    // --- negative side: the breach must be killed ---
     assert!(
         out.contains("running UNBOXED"),
         "this test is only meaningful with boxing OFF; a boxed run exercises the cgroup path and \
@@ -106,7 +117,6 @@ fn unboxed_cpu_timeout_enforces_a_lower_bound_and_exposes_its_escape() {
 
     // Two simultaneous breaches prove active monitors share the procfs snapshot without losing
     // either step's enforcement result.
-    let (parallel_code, parallel_out) = run_unboxed(&dir, "multi", MULTI_BREACH_DAG);
     assert_eq!(parallel_code, Some(1), "{parallel_out}");
     assert_eq!(
         parallel_out.matches("CPU-TIMEOUT >3s cpu").count(),
@@ -119,9 +129,6 @@ fn unboxed_cpu_timeout_enforces_a_lower_bound_and_exposes_its_escape() {
         "{parallel_out}"
     );
 
-    // --- positive side: an idle step far past its budget in WALL terms must survive ---
-    let (idle_code, idle_out) = run_unboxed(&dir, "idle", SLEEPER_DAG);
-    let (escape_code, escape_out) = run_unboxed(&dir, "escape", ESCAPEE_DAG);
     assert_eq!(
         escape_code,
         Some(0),
