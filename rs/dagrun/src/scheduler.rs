@@ -27,13 +27,13 @@
 // for the perf-log sink either way.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::{BufReader, Read};
+use std::io::{BufReader, IsTerminal, Read};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::panic::AssertUnwindSafe;
 use std::process::ExitStatus;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -1058,9 +1058,84 @@ fn with_supervisor_guard<F: FnOnce()>(recovery: SupervisorRecovery, body: F) {
     );
 }
 
+/// Lines [`emit`] has written, recorded only in test builds. Mirrors [`WARNINGS`], for the same
+/// reason and with the same caveat: tests run concurrently, so a reader must FILTER BY ITS OWN
+/// step tag rather than assume it owns the buffer.
+#[cfg(test)]
+static EMITTED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
 /// Serialize one status line to stdout (each `println!` is atomic, so lines never interleave).
 fn emit(line: &str) {
     println!("{line}");
+    #[cfg(test)]
+    EMITTED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(line.to_string());
+}
+
+/// Every emitted line containing `needle`, for tests that must assert on console output.
+#[cfg(test)]
+fn emitted_containing(needle: &str) -> Vec<String> {
+    EMITTED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .filter(|l| l.contains(needle))
+        .cloned()
+        .collect()
+}
+
+/// The searchable signpost printed immediately before a failing step's output.
+///
+/// A CONSTANT PREFIX, then the step tag: `DAGRUN STEP ERROR [group.job]`. Both greps therefore
+/// work -- the bare constant finds every occurrence in a scrollback, and the reader learns which
+/// step failed without scrolling on to the `FAIL` line.
+///
+/// It is printed WHETHER OR NOT COLOUR IS ENABLED, and that is deliberate: the string and the
+/// escape sequences answer different needs. A transcript with colour stripped -- a redirected log
+/// -- is exactly where someone greps for this, so suppressing the marker alongside the colour
+/// would remove it from the one place it cannot be spotted by eye.
+pub const STEP_ERROR_MARKER: &str = "DAGRUN STEP ERROR";
+
+/// Process-wide colour opt-out, set by `--no-color`.
+///
+/// A flag rather than a parameter because colour is a property of this process's terminal, not of
+/// any one step, and threading it would change every public `run_dag*` signature to carry a value
+/// none of them vary.
+static COLOUR_DISABLED: AtomicBool = AtomicBool::new(false);
+
+/// Turn off ANSI colour for the rest of the process. The marker keeps printing.
+pub fn disable_colour() {
+    COLOUR_DISABLED.store(true, Ordering::Relaxed);
+}
+
+/// Whether to wrap failure output in ANSI red.
+///
+/// THREE WAYS TO SAY NO, AND THE LAST TWO MATTER MORE THAN THE FLAG. Writing escape sequences into
+/// a redirected stream is the failure this check exists to avoid: a captured log full of `\x1b[31m`
+/// is harder to read and harder to grep than an uncoloured one, which would defeat the marker
+/// above. So colour requires ALL of:
+///
+/// * `--no-color` not passed ([`disable_colour`]);
+/// * `NO_COLOR` unset -- the cross-tool convention, honoured for any value including empty; and
+/// * stdout actually being a terminal.
+///
+/// The last two are cached: neither the environment nor stdout's kind changes during a run.
+fn colour_enabled() -> bool {
+    static AUTO: OnceLock<bool> = OnceLock::new();
+    let auto = *AUTO
+        .get_or_init(|| std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal());
+    auto && !COLOUR_DISABLED.load(Ordering::Relaxed)
+}
+
+/// Wrap `line` in ANSI red when colour is on; return it unchanged when it is off.
+fn red(line: &str) -> String {
+    if colour_enabled() {
+        format!("\u{1b}[31m{line}\u{1b}[0m")
+    } else {
+        line.to_string()
+    }
 }
 
 /// Lines [`warn`] has written, recorded only in test builds. See [`warn`].
@@ -3256,6 +3331,16 @@ fn run_step(ctx: StepCtx) {
             step.desc
         ));
     } else {
+        // THE SIGNPOST LEADS, and the blank line above it is part of the signpost: scrolling back
+        // through a long transcript, the eye finds the gap before it finds the text.
+        //
+        // THIS ARM ONLY. The two ABORT arms above are NOT step errors -- a step cut short by the
+        // outer run budget, or reaped by eager-exit after a PEER failed, did not fail. Marking
+        // them would print one marker per cancelled step, so a single real failure in a wide graph
+        // would bury its own signpost under a screenful of them and the searchable string would
+        // stop distinguishing anything. Did-not-run is not failed.
+        emit("");
+        emit(&red(&format!("{STEP_ERROR_MARKER} [{tag}]")));
         if let Some(c) = &culprit {
             // NAME THE TEST, NOT JUST THE NODE. "the strict-compat step timed out" is not
             // actionable; "test X started and never completed, 37 tests in" is.
@@ -3268,10 +3353,10 @@ fn run_step(ctx: StepCtx) {
                 ));
             }
         }
-        emit(&format!(
+        emit(&red(&format!(
             "[{tag}] \u{2717} FAIL   {} ({dur}s, {reason})",
             step.desc
-        ));
+        )));
         if oom > 0 {
             emit(&format!(
                 "[{tag}] \u{25b2} MEMORY CAP HIT: OOM-killed at its inner cgroup MemoryMax \
@@ -3293,7 +3378,7 @@ fn run_step(ctx: StepCtx) {
             ));
         }
         for line in failure_detail_lines(&tag, &[&combined], verbosity) {
-            emit(&line);
+            emit(&red(&line));
         }
         emit(&format!("[{tag}] ----- end detail -----"));
     }
@@ -4210,6 +4295,99 @@ mod tests {
         let seq: Vec<&str> = contents.split_whitespace().collect();
         assert_eq!(seq, vec!["A", "B"]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The marker leads a failing step, and appears on NOTHING else.
+    ///
+    /// THE TWO NEGATIVES ARE THE POINT. A marker that appears on every step is exactly as useless
+    /// as one that appears on none: the string is only searchable while it is rare. So this pins
+    /// all three outcomes in ONE graph, where a change that broadened the marker would have to
+    /// break the pass or the abort assertion to satisfy the fail one.
+    #[test]
+    fn the_step_error_marker_leads_a_failure_and_marks_neither_a_pass_nor_an_abort() {
+        // THE ABORTED PEER MUST BE GENUINELY ABORTED, AND THAT NEEDS CARE. A DEPENDENT of the
+        // failing step is dependency-SKIPPED and never reaches the abort arm at all -- an earlier
+        // draft used one, and a mutation that marked aborts still passed, because the assertion
+        // could not fail for the reason it named. An abort needs an INDEPENDENT step in flight
+        // when the failure trips eager-exit: several jobs, and a sleeper slow enough to still be
+        // running.
+        let cfg = DagConfig {
+            steps: vec![
+                step(
+                    "mark",
+                    "boom",
+                    "sleep 0.2; echo doomed; exit 1",
+                    &[],
+                    0.0,
+                    &[],
+                ),
+                step("mark", "fine", "true", &[], 0.0, &[]),
+                step("mark", "sleeper", "sleep 30", &[], 0.0, &[]),
+            ],
+            ..Default::default()
+        };
+        let res = run_dag(&cfg, 3, false, 1);
+        assert!(
+            !res.ok,
+            "the graph must fail for this test to mean anything"
+        );
+        let outcomes: BTreeMap<String, StepOutcome> = res
+            .outcomes
+            .iter()
+            .map(|o| (o.tag.clone(), o.clone()))
+            .collect();
+        assert!(
+            outcomes["mark.sleeper"].aborted,
+            "the peer must be genuinely ABORTED for the negative below to mean anything: {:?}",
+            outcomes["mark.sleeper"]
+        );
+        assert!(
+            outcomes["mark.fine"].ok,
+            "the control step must have passed"
+        );
+
+        // POSITIVE: exactly one marker, naming the failing step.
+        let marked = emitted_containing(STEP_ERROR_MARKER);
+        let mine: Vec<&String> = marked.iter().filter(|l| l.contains("[mark.")).collect();
+        assert_eq!(
+            mine.len(),
+            1,
+            "expected exactly one marker for this graph, saw: {mine:?}"
+        );
+        assert!(
+            mine[0].contains(&format!("{STEP_ERROR_MARKER} [mark.boom]")),
+            "the marker must carry the failing step's tag: {:?}",
+            mine[0]
+        );
+        // NEGATIVE 1: the passing step is not marked.
+        assert!(
+            !mine[0].contains("mark.fine"),
+            "a passing step must not be marked: {mine:?}"
+        );
+        // NEGATIVE 2: the eager-exit ABORTED peer is not marked. Did-not-run is not failed.
+        assert!(
+            !mine[0].contains("mark.sleeper"),
+            "an eager-exit aborted step must not be marked: {mine:?}"
+        );
+    }
+
+    /// Colour is off when stdout is not a terminal, so the marker stays greppable in a captured
+    /// log. Under `cargo test` stdout is a pipe -- the same condition a redirected log has -- so
+    /// this asserts the property that matters rather than simulating it.
+    #[test]
+    fn failure_output_carries_no_escape_sequences_when_stdout_is_not_a_terminal() {
+        let cfg = DagConfig {
+            steps: vec![step("plain", "boom", "echo doomed; exit 1", &[], 0.0, &[])],
+            ..Default::default()
+        };
+        let res = run_dag(&cfg, 1, false, 1);
+        assert!(!res.ok);
+        for line in emitted_containing("plain.boom") {
+            assert!(
+                !line.contains('\u{1b}'),
+                "no ANSI escape may reach a non-terminal stdout: {line:?}"
+            );
+        }
     }
 
     #[test]

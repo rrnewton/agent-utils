@@ -367,6 +367,7 @@ fn run_help(c: &Palette) -> String {
             ("--profile-sync BACKEND", "download+upload the shared profile summary (for ephemeral CI)"),
             ("--profile-sync-direction D", "both (default) | download | upload"),
             ("-k, --keep-going", "after failure, continue independent work; skip failed dependents"),
+            ("--no-color", "suppress ANSI colour in failure output. The searchable DAGRUN STEP ERROR marker still prints: it is what a plain log is grepped for. Colour is also off automatically when NO_COLOR is set or stdout is not a terminal"),
             ("--run-timeout SECONDS", "OUTER wall budget for the WHOLE run; cuts in-flight steps and still reports"),
             ("--admission [WAIT_S]", "HOST-WIDE memory admission (opt-in): reserve --max-mem against a durable ledger every runner on the host shares. GRANT / QUEUE (says how many holders are ahead) / REFUSE (says the number to ask for). WAIT_S = how long to wait while queued (default 0 = report and exit 4; at most 86400). Requires --max-mem"),
             ("--allow-cgroup-failure", "if cgroup boxing is unavailable, run UNBOXED with a warning instead of erroring"),
@@ -1097,6 +1098,9 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
                 a.profile_sync_direction = v;
             }
             "-k" | "--keep-going" => a.keep_going = true,
+            // Colour only. The DAGRUN STEP ERROR marker keeps printing: the string is MORE useful
+            // in a plain log, not less, because a stripped transcript is where it gets grepped.
+            "--no-color" => crate::scheduler::disable_colour(),
             "--cgroups" => return Err(
                 "--cgroups has been removed (cgroup-v2 boxing is ON by default); drop the flag. \
                      Per-node resource limits are DAG fields (cpu_timeout, memory, pids)."
