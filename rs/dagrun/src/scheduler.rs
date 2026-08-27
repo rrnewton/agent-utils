@@ -32,7 +32,7 @@ use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::panic::AssertUnwindSafe;
 use std::process::ExitStatus;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -41,7 +41,7 @@ use crate::ambient::{capture_ambient_snapshot, PsiReading};
 use crate::attribution::{
     bind_process_tests, capture_max_bytes, capture_truncation_notice, default_log_dir,
     mint_step_nonce, process_snapshot, recognize, Culprit, RunEvidence, StepStream, TestEvent,
-    STEP_NONCE_ENV,
+    REQUIRE_STRUCTURED_TEST_COUNTS_ENV, STEP_NONCE_ENV, TEST_COUNTS_PATH_ENV,
 };
 use crate::cgroup::CgroupManager;
 use crate::model::{
@@ -155,6 +155,9 @@ pub fn start_run_cpu_budget(
 /// actual step clock, so it exports that clock's epoch before spawning the child.  Consumers add
 /// their own (smaller) allowance to this value and therefore keep one ordering across execs.
 pub const STEP_STARTED_MONOTONIC_NS_ENV: &str = "DAGRUN_STEP_STARTED_MONOTONIC_NS";
+
+/// Unique suffix for the scheduler-owned structured-count path of each step.
+static TEST_COUNTS_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Read Linux's process-independent monotonic clock in nanoseconds.
 ///
@@ -2283,6 +2286,52 @@ fn captured_test_counts(bytes: &[u8]) -> CapturedTestCounts {
     }
 }
 
+fn structured_test_counts_path(evidence: Option<&RunEvidence>) -> Option<std::path::PathBuf> {
+    let evidence = evidence?;
+    let sequence = TEST_COUNTS_SEQ.fetch_add(1, Ordering::Relaxed);
+    Some(evidence.dir().join(format!(
+        ".test-counts-{}-{sequence}.json",
+        std::process::id()
+    )))
+}
+
+fn read_structured_test_counts(path: &std::path::Path) -> Option<CapturedTestCounts> {
+    let bytes = std::fs::read(path).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let object = value.as_object()?;
+    if object.len() != 3 || object.get("schema").and_then(serde_json::Value::as_u64) != Some(1) {
+        return None;
+    }
+    let executed = object
+        .get("executed_tests")
+        .and_then(serde_json::Value::as_u64)?;
+    let filtered = object
+        .get("filtered_tests")
+        .and_then(serde_json::Value::as_u64)?;
+    Some(CapturedTestCounts {
+        executed: Some(executed),
+        filtered: Some(filtered),
+    })
+}
+
+fn resolved_test_counts(
+    structured_required: bool,
+    path: Option<&std::path::Path>,
+    captured: &[u8],
+) -> CapturedTestCounts {
+    if let Some(counts) = path.and_then(read_structured_test_counts) {
+        return counts;
+    }
+    if structured_required {
+        CapturedTestCounts {
+            executed: None,
+            filtered: None,
+        }
+    } else {
+        captured_test_counts(captured)
+    }
+}
+
 /// Adapt a cgroup `cpu.pressure` `{avg10, avg60}` map to a typed [`PsiReading`] for the enrichment
 /// builder; `None` (unreadable / unboxed) passes straight through.
 fn psi_from(pressure: Option<BTreeMap<String, f64>>) -> Option<PsiReading> {
@@ -2691,6 +2740,20 @@ fn run_step(ctx: StepCtx) {
     // double-fork escapee once it has left the step's process group AND its parentage. See
     // [`kill_by_nonce`].
     let nonce = mint_step_nonce(&tag);
+    let structured_test_counts_required =
+        std::env::var(REQUIRE_STRUCTURED_TEST_COUNTS_ENV).is_ok_and(|value| value == "1");
+    let test_counts_path = structured_test_counts_path(evidence.as_deref());
+    if let Some(path) = &test_counts_path {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                warn(&format!(
+                    "[scheduler] WARNING: cannot clear structured test-count path for {tag}: {error}"
+                ));
+            }
+        }
+    }
     let mut cmd = Command::new("bash");
     cmd.arg("-c").arg(&run_cmd);
     for (k, v) in &step.env {
@@ -2705,6 +2768,10 @@ fn run_step(ctx: StepCtx) {
         cmd.env(name, value);
     }
     cmd.env(STEP_NONCE_ENV, &nonce);
+    cmd.env_remove(TEST_COUNTS_PATH_ENV);
+    if let Some(path) = &test_counts_path {
+        cmd.env(TEST_COUNTS_PATH_ENV, path);
+    }
     // Own process group (pgid == child pid) so teardown can reap the whole tree with a
     // negative-pid kill without ever touching the runner's own group.
     cmd.process_group(0);
@@ -3164,7 +3231,14 @@ fn run_step(ctx: StepCtx) {
         (cap.tail(), cap.total, cap.dropped())
     };
     let summary = last_line(&combined);
-    let test_counts = captured_test_counts(&combined);
+    let test_counts = resolved_test_counts(
+        structured_test_counts_required,
+        test_counts_path.as_deref(),
+        &combined,
+    );
+    if let Some(path) = &test_counts_path {
+        let _ = std::fs::remove_file(path);
+    }
 
     // Build the per-step profile row (perflog step-profile schema keys + dynamic cpu.* counters).
     let mut row: ProfileRow = BTreeMap::new();
@@ -3922,6 +3996,45 @@ mod tests {
                 executed: None,
                 filtered: None
             }
+        );
+    }
+
+    #[test]
+    fn structured_counts_replace_printed_banners_when_required() {
+        let path = std::env::temp_dir().join(format!(
+            "dagrun-structured-counts-{}-{}.json",
+            std::process::id(),
+            TEST_COUNTS_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(
+            &path,
+            br#"{"schema":1,"executed_tests":7,"filtered_tests":11}"#,
+        )
+        .unwrap();
+        let printed = b"running 999 tests\ntest result: ok. 999 passed; 0 failed; 0 filtered out\n";
+        assert_eq!(
+            resolved_test_counts(true, Some(&path), printed),
+            CapturedTestCounts {
+                executed: Some(7),
+                filtered: Some(11)
+            }
+        );
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            resolved_test_counts(true, None, printed),
+            CapturedTestCounts {
+                executed: None,
+                filtered: None
+            },
+            "a printed banner must not create receipt evidence in structured mode"
+        );
+        assert_eq!(
+            resolved_test_counts(false, None, printed),
+            CapturedTestCounts {
+                executed: Some(999),
+                filtered: Some(0)
+            },
+            "clients that have not opted in retain the compatibility parser"
         );
     }
 
