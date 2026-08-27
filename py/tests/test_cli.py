@@ -255,6 +255,22 @@ def test_missing_and_malformed_dag_exit_2() -> None:
         assert _capture(["list", "--dag", str(junk)])[0] == 2
 
 
+def test_wrong_document_error_names_the_path_contents_and_next_action(tmp_path: Path) -> None:
+    path = tmp_path / "not-a-dag.yaml"
+    path.write_text("schema: 2\nbucket: example\ntest: []\n", encoding="utf-8")
+
+    rc, out, err = _capture(["list", "--dag", str(path)])
+
+    assert rc == 2
+    assert out == ""
+    assert err == (
+        f"dagrun: {path}: expected a dagrun DAG document with a top-level 'steps' list; "
+        "found no 'steps' key (top-level keys: 'bucket', 'schema', 'test'). This may be a "
+        "different document type. Pass a dagrun DAG file, or run `dagrun quickstart` for the "
+        "schema.\n"
+    )
+
+
 def test_run_max_mem_exits_0() -> None:
     # --max-mem picks a memory-aware active-step ceiling; a passing DAG still exits 0.
     with tempfile.TemporaryDirectory() as tmp:

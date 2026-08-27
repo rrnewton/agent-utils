@@ -83,6 +83,35 @@ def _as_obj(value: object, where: str) -> dict[str, object]:
     return out
 
 
+def _json_type_name(value: object) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, str):
+        return "str"
+    if isinstance(value, list):
+        return "list"
+    if isinstance(value, dict):
+        return "dict"
+    return type(value).__name__
+
+
+def _steps_list_error(doc: Mapping[str, object]) -> DagJsonError:
+    keys = ", ".join(repr(key) for key in sorted(doc)) or "(none)"
+    if "steps" not in doc:
+        found = f"no 'steps' key (top-level keys: {keys})"
+    else:
+        found = f"'steps' with type {_json_type_name(doc['steps'])} (top-level keys: {keys})"
+    return DagJsonError(
+        "<root>: expected a dagrun DAG document with a top-level 'steps' list; "
+        f"found {found}. This may be a different document type. Pass a dagrun DAG file, "
+        "or run `dagrun quickstart` for the schema."
+    )
+
+
 def _req_str(m: Mapping[str, object], key: str, where: str) -> str:
     val = m.get(key)
     if not isinstance(val, str):
@@ -619,7 +648,7 @@ def _dag_from_obj(raw: object) -> DagConfig:
     default_step_timeout = _opt_int(doc, "default_step_timeout", 0)
     steps_raw = doc.get("steps")
     if not isinstance(steps_raw, list):
-        raise DagJsonError("<root>: 'steps' must be a list")
+        raise _steps_list_error(doc)
     policy = _write_domain_policy(doc.get("write_domain_policy"))
     steps: list[Step] = []
     for i, entry in enumerate(steps_raw):

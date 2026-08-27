@@ -1158,6 +1158,12 @@ def compare_uncarried_config_keys(py: list[str], rs: list[str], rep: Report) -> 
 #: Rust). Pinned here so the two editions cannot drift back apart one refusal at a time.
 LOADER_REFUSALS: tuple[tuple[str, str, str], ...] = (
     (
+        "different-document-type",
+        '{"schema":2,"bucket":"example","test":[]}',
+        "expected a dagrun DAG document with a top-level 'steps' list; found no 'steps' key "
+        "(top-level keys: 'bucket', 'schema', 'test')",
+    ),
+    (
         "unknown-step-field",
         '{"steps":[{"group":"a","job":"one","cmd":"true","bogus_field":42}]}',
         "steps[0] (a.one): unknown field(s) 'bogus_field'",

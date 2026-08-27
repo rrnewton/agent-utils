@@ -201,6 +201,24 @@ def test_strict_parse_errors() -> None:
         assert raised, f"expected DagJsonError for: {doc!r}"
 
 
+def test_a_non_dag_document_names_what_was_read_and_what_to_do() -> None:
+    with pytest.raises(DagJsonError) as excinfo:
+        dag_from_json('{"schema": 2, "bucket": "example", "test": []}')
+    assert str(excinfo.value) == (
+        "<root>: expected a dagrun DAG document with a top-level 'steps' list; found no "
+        "'steps' key (top-level keys: 'bucket', 'schema', 'test'). This may be a different "
+        "document type. Pass a dagrun DAG file, or run `dagrun quickstart` for the schema."
+    )
+
+    with pytest.raises(DagJsonError) as wrong_type:
+        dag_from_json('{"steps": "not a list"}')
+    assert str(wrong_type.value) == (
+        "<root>: expected a dagrun DAG document with a top-level 'steps' list; found "
+        "'steps' with type str (top-level keys: 'steps'). This may be a different document "
+        "type. Pass a dagrun DAG file, or run `dagrun quickstart` for the schema."
+    )
+
+
 def test_write_domain_policy_roundtrip_and_fail_closed_parse() -> None:
     good = (
         '{"steps": ['

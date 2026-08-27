@@ -877,18 +877,19 @@ fn load(dag_arg: &str) -> Result<DagConfig, LoadError> {
         std::io::stdin()
             .read_to_string(&mut buf)
             .map_err(|e| LoadError(format!("{e}")))?;
-        return dag_from_json(&buf).map_err(LoadError::from);
+        return dag_from_json(&buf).map_err(|e| load_parse_error("<stdin>", e));
     }
     let text = std::fs::read_to_string(Path::new(dag_arg)).map_err(|e| {
         // Match Python's message shape: "[Errno 2] No such file or directory: 'path'".
         LoadError(format!("{e}: '{dag_arg}'"))
     })?;
     // Auto-detect the interchange format by file extension: .yaml/.yml -> YAML, else JSON.
-    if is_yaml_path(dag_arg) {
-        dag_from_yaml(&text).map_err(LoadError::from)
+    let parsed = if is_yaml_path(dag_arg) {
+        dag_from_yaml(&text)
     } else {
-        dag_from_json(&text).map_err(LoadError::from)
-    }
+        dag_from_json(&text)
+    };
+    parsed.map_err(|e| load_parse_error(dag_arg, e))
 }
 
 /// Whether a `--dag` path names a YAML file (case-insensitive `.yaml`/`.yml`).
@@ -899,10 +900,10 @@ fn is_yaml_path(path: &str) -> bool {
 
 struct LoadError(String);
 
-impl From<DagJsonError> for LoadError {
-    fn from(e: DagJsonError) -> Self {
-        LoadError(e.0)
-    }
+fn load_parse_error(source: &str, error: DagJsonError) -> LoadError {
+    let detail = error.0;
+    let detail = detail.strip_prefix("<root>: ").unwrap_or(&detail);
+    LoadError(format!("{source}: {detail}"))
 }
 
 // --------------------------------------------------------------------------- run subcommand
@@ -3752,6 +3753,28 @@ mod tests {
             r#"{"steps":[{"group":"build","job":"app","cmd":"echo {args}"},{"group":"test","job":"unit","cmd":"true","deps":["build.app"]}]}"#,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn a_wrong_document_error_names_the_path_contents_and_next_action() {
+        let path = std::env::temp_dir().join(format!(
+            "dagrun-wrong-document-{}-{}.yaml",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::write(&path, "schema: 2\nbucket: example\ntest: []\n").unwrap();
+        let error = load(path.to_str().unwrap()).unwrap_err().0;
+        assert_eq!(
+            error,
+            format!(
+                "{}: expected a dagrun DAG document with a top-level 'steps' list; found no \
+                 'steps' key (top-level keys: 'bucket', 'schema', 'test'). This may be a \
+                 different document type. Pass a dagrun DAG file, or run `dagrun quickstart` \
+                 for the schema.",
+                path.display()
+            )
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
