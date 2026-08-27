@@ -7,9 +7,9 @@ import hashlib
 import json
 from pathlib import Path
 
-from agent_team_timeline.codex import load_codex_team
-from agent_team_timeline.phases import build_phases
-from agent_team_timeline.search_index import build_search_records
+from wrkviz.codex import load_codex_team
+from wrkviz.phases import build_phases
+from wrkviz.search_index import build_search_records
 
 
 ROOT = "root-thread"

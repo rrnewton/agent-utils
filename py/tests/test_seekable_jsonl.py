@@ -25,8 +25,8 @@ from pathlib import Path
 
 import pytest
 
-from agent_team_timeline.archive import JsonValue
-from agent_team_timeline.seekable_jsonl import (
+from wrkviz.archive import JsonValue
+from wrkviz.seekable_jsonl import (
     DEFAULT_TARGET_CHUNK_BYTES,
     INDEX_FORMAT,
     ChunkIndex,
@@ -923,7 +923,7 @@ def test_a_failed_index_write_leaves_new_data_with_no_sidecar_rather_than_a_stal
     def explode(target: Path, text: str, *, executable: bool = False) -> bool:
         raise OSError("no space left on device")
 
-    monkeypatch.setattr("agent_team_timeline.seekable_jsonl.write_text_if_changed", explode)
+    monkeypatch.setattr("wrkviz.seekable_jsonl.write_text_if_changed", explode)
     shifted = [_record(index, at=2_000 + index) for index in range(400)]
     with pytest.raises(OSError):
         write_seekable_jsonl(path, shifted, target_chunk_bytes=_TARGET)

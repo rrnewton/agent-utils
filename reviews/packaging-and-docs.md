@@ -29,7 +29,7 @@ findings are recorded in `reviews/herdr-run.md` and `reviews/rust-source-launche
 
 ## Findings resolved
 
-1. `agent-team-timeline` was source-only and documented a broken aggregate install. It now has an
+1. `wrkviz` was source-only and documented a broken aggregate install. It now has an
    independent manifest, README, user guide, license, command entry point, wheel, sdist, and isolated
    artifact smoke test. Its explicit exception is Rust parity, not package quality.
 2. Sixteen paired package documents, two timeline documents, and package licenses were duplicated

@@ -7,14 +7,14 @@ from pathlib import Path
 
 import pytest
 
-from agent_team_timeline.build_store import team_build_root
-from agent_team_timeline.archive import as_array, as_object, narrow_json, write_json_if_changed
-from agent_team_timeline.cli import _parser
-from agent_team_timeline.model import Agent, Edge, Event, SourceSnapshot, TeamData
-from agent_team_timeline.model_io import team_from_json_obj
-from agent_team_timeline.phases import build_phases
-from agent_team_timeline.pipeline import build_archive, summarize_archive
-from agent_team_timeline.window import apply_date_window, parse_date_window
+from wrkviz.build_store import team_build_root
+from wrkviz.archive import as_array, as_object, narrow_json, write_json_if_changed
+from wrkviz.cli import _parser
+from wrkviz.model import Agent, Edge, Event, SourceSnapshot, TeamData
+from wrkviz.model_io import team_from_json_obj
+from wrkviz.phases import build_phases
+from wrkviz.pipeline import build_archive, summarize_archive
+from wrkviz.window import apply_date_window, parse_date_window
 from tests.timeline_projection import schema_1_timeline_text
 
 

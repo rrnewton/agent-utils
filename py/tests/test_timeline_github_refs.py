@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from agent_team_timeline.github_refs import (
+from wrkviz.github_refs import (
     GitHubRepository,
     PullRequestReferenceKind,
     find_pull_request_references,

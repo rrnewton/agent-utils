@@ -6,9 +6,9 @@ from pathlib import Path
 
 import pytest
 
-import agent_team_timeline.cli as timeline_cli
-from agent_team_timeline.pipeline import SummarizeReport
-from agent_team_timeline.token_usage import TokenUsage
+import wrkviz.cli as timeline_cli
+from wrkviz.pipeline import SummarizeReport
+from wrkviz.token_usage import TokenUsage
 
 
 def _report() -> SummarizeReport:

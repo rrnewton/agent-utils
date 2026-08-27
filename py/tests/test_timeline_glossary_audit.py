@@ -7,14 +7,14 @@ from pathlib import Path
 
 import pytest
 
-from agent_team_timeline import cli as timeline_cli
-from agent_team_timeline.archive import JsonValue, write_json_if_changed
-from agent_team_timeline.glossary_audit import (
+from wrkviz import cli as timeline_cli
+from wrkviz.archive import JsonValue, write_json_if_changed
+from wrkviz.glossary_audit import (
     audit_legacy_glossaries,
     audit_legacy_term,
     format_glossary_audit,
 )
-from agent_team_timeline.terminology import glossary_term_id
+from wrkviz.terminology import glossary_term_id
 
 
 def _term(

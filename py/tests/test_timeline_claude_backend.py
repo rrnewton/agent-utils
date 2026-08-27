@@ -8,10 +8,10 @@ from pathlib import Path
 
 import pytest
 
-from agent_team_timeline import cli as timeline_cli
-from agent_team_timeline.naming import AgentNameError, AgentNameJob, name_agents
-from agent_team_timeline.summarize import SummaryError, SummaryJob, summarize_jobs
-from agent_team_timeline.token_usage import TokenUsage, parse_claude_json_usage
+from wrkviz import cli as timeline_cli
+from wrkviz.naming import AgentNameError, AgentNameJob, name_agents
+from wrkviz.summarize import SummaryError, SummaryJob, summarize_jobs
+from wrkviz.token_usage import TokenUsage, parse_claude_json_usage
 
 
 def _summary_job() -> SummaryJob:
@@ -180,7 +180,7 @@ def test_claude_summary_uses_safe_structured_mode_and_exact_receipts(
     assert run["service_tier"] is None
     assert run["newly_spent_usage"]["total_tokens"] == 36
     call = json.loads(log.read_text(encoding="utf-8"))
-    assert Path(call["cwd"]).name.startswith("agent-team-timeline-summary-")
+    assert Path(call["cwd"]).name.startswith("wrkviz-summary-")
     args = call["args"]
     assert args[:3] == ["--print", "--output-format", "json"]
     serialized_schema = json.loads(args[args.index("--json-schema") + 1])

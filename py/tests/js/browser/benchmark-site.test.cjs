@@ -109,7 +109,7 @@ test("fixture smoke records load, resource, structure, heap, and wheel metrics",
   const fileReport = JSON.parse(fs.readFileSync(jsonPath, "utf8"));
   assert.deepEqual(fileReport, stdoutReport);
   assert.equal(stdoutReport.success, true);
-  assert.equal(stdoutReport.benchmark, "agent-team-timeline-real-site");
+  assert.equal(stdoutReport.benchmark, "wrkviz-real-site");
   assert.ok(stdoutReport.timings.navigation_domcontentloaded_ms >= 0);
   assert.ok(stdoutReport.timings.usable_ms >= 0);
   assert.ok(stdoutReport.payload_resources.resource_count > 0);

@@ -49,38 +49,38 @@ from pathlib import Path
 
 import pytest
 
-from agent_team_timeline.build_store import team_build_root
-from agent_team_timeline.archive import ARCHIVE_MARKER_FILE
-from agent_team_timeline.archive_gc import (
+from wrkviz.build_store import team_build_root
+from wrkviz.archive import ARCHIVE_MARKER_FILE
+from wrkviz.archive_gc import (
     ArchiveGcError,
     TRASH_ROOT,
     collect,
     format_gc_report,
     plan_collection,
 )
-from agent_team_timeline.cli import _inspect_counts
-from agent_team_timeline.cli import main as timeline_main
-from agent_team_timeline.multi_team import build_combined_archive
-from agent_team_timeline.pipeline import (
+from wrkviz.cli import _inspect_counts
+from wrkviz.cli import main as timeline_main
+from wrkviz.multi_team import build_combined_archive
+from wrkviz.pipeline import (
     _ensure_bulk_content_ignored,
     build_archive,
     summarize_archive,
 )
-from agent_team_timeline.query import (
+from wrkviz.query import (
     QueryFilters,
     SearchResults,
     TimelineQuery,
     schema_3_completeness,
 )
-from agent_team_timeline.render import SCHEMA_1_TIMELINE_PATH
-from agent_team_timeline.timeline_shards import (
+from wrkviz.render import SCHEMA_1_TIMELINE_PATH
+from wrkviz.timeline_shards import (
     SCHEMA_2_BOOTSTRAP_PATH,
     SCHEMA_2_IS_PUBLISHED,
     SCHEMA_2_ROOT,
     schema_2_is_published,
     write_timeline_shards,
 )
-from agent_team_timeline.timeline_v3 import SCHEMA_3_BOOTSTRAP_PATH, SCHEMA_3_ROOT
+from wrkviz.timeline_v3 import SCHEMA_3_BOOTSTRAP_PATH, SCHEMA_3_ROOT
 from tests.test_timeline_pipeline import _team, _write_team
 from tests.timeline_projection import schema_1_timeline_text
 from tests.timeline_legacy_generations import write_legacy_schema_2
@@ -108,7 +108,7 @@ def _publishing_schema_2(monkeypatch: pytest.MonkeyPatch) -> None:
     """
 
     monkeypatch.setattr(
-        "agent_team_timeline.timeline_shards.SCHEMA_2_IS_PUBLISHED", True
+        "wrkviz.timeline_shards.SCHEMA_2_IS_PUBLISHED", True
     )
 
 
@@ -979,7 +979,7 @@ def test_the_constant_and_the_website_cannot_drift_apart(tmp_path: Path) -> None
     archive's own copy of the bundle.
     """
 
-    app = (files("agent_team_timeline") / "static" / "app.js").read_text(encoding="utf-8")
+    app = (files("wrkviz") / "static" / "app.js").read_text(encoding="utf-8")
 
     if SCHEMA_2_IS_PUBLISHED:
         assert SCHEMA_2_BOOTSTRAP_PATH in app
@@ -1326,7 +1326,7 @@ def test_the_trash_is_gitignored_before_it_can_exist(tmp_path: Path) -> None:
 
 
 def test_gc_refuses_a_directory_that_is_not_an_archive(tmp_path: Path) -> None:
-    with pytest.raises(ArchiveGcError, match="not an agent-team-timeline archive"):
+    with pytest.raises(ArchiveGcError, match="not a wrkviz archive"):
         collect(tmp_path)
 
 
@@ -1344,7 +1344,7 @@ def test_gc_waits_for_the_writer_lock(tmp_path: Path) -> None:
             sys.executable,
             "-c",
             "import fcntl, pathlib, sys, time\n"
-            "lock = pathlib.Path(sys.argv[1]) / '.agent-team-timeline.lock'\n"
+            "lock = pathlib.Path(sys.argv[1]) / '.wrkviz.lock'\n"
             "handle = open(lock, 'a+b')\n"
             "fcntl.flock(handle.fileno(), fcntl.LOCK_EX)\n"
             "pathlib.Path(sys.argv[2]).write_text('yes')\n"

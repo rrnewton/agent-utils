@@ -9,7 +9,7 @@ own version and documentation, and only the console commands that belong to it.
 | `dagrun` | `dagrun` | `dagrun`, `cpuset-alloc` | Run and inspect resource-aware CI DAGs; the companion allocator reserves isolated CPU sets for benchmarks. |
 | `tick-hub` | `tick_hub` | `tick-hub` | Evaluate cadenced reminders and health checks in one deterministic tick. |
 | `pr-landing-planner` | `pr_landing_planner` | `pr-landing-planner` | Produce an advisory, conflict-aware pull-request landing plan. |
-| `agent-team-timeline` | `agent_team_timeline` | `agent-team-timeline` | Build a durable, zoomable local timeline from coordinator and subagent transcripts. |
+| `wrkviz` | `wrkviz` | `wrkviz` | Build a durable, zoomable local timeline from coordinator and subagent transcripts. |
 | `parallel-experiment-runner` | `parallel_experiment_runner` | `parallel-experiment-runner` | Run boxed, resource-bounded concurrent seed sweeps. |
 | `herdr-run` | `herdr_run` | `herdr-run`, `herdr-agent` | Run policy-admitted commands and durably message interactive agents through Herdr panes. |
 
@@ -19,7 +19,7 @@ Install a tool from its project directory during development:
 python3 -m pip install ./py/dagrun
 python3 -m pip install ./py/tick_hub
 python3 -m pip install ./py/pr_landing_planner
-python3 -m pip install ./py/agent_team_timeline
+python3 -m pip install ./py/wrkviz
 python3 -m pip install ./py/parallel_experiment_runner
 python3 -m pip install ./py/herdr_run
 ```

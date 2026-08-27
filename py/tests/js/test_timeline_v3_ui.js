@@ -61,7 +61,7 @@ function buildShard(relativePath, groups, timestampKey) {
   const data = Buffer.concat(chunks);
   const plain = Buffer.concat(uncompressed);
   const header = {
-    format: "agent-team-timeline/seekable-jsonl-index",
+    format: "wrkviz/seekable-jsonl-index",
     version: 1,
     codec: "gzip",
     codec_level: 6,

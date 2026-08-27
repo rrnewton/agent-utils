@@ -25,7 +25,7 @@ ENTRYPOINT_MODULES = [
     "tick_hub",
     "pr_landing_planner",
     "parallel_experiment_runner",
-    "agent_team_timeline",
+    "wrkviz",
     "herdr_run",
     "herdr_run.agent_cli",
 ]

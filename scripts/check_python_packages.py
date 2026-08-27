@@ -95,10 +95,10 @@ PROJECTS: tuple[Project, ...] = (
         required_dependencies=("pyyaml",),
     ),
     Project(
-        directory="agent_team_timeline",
-        distribution="agent-team-timeline",
-        package="agent_team_timeline",
-        commands=("agent-team-timeline",),
+        directory="wrkviz",
+        distribution="wrkviz",
+        package="wrkviz",
+        commands=("wrkviz",),
         resources=(
             "README.md",
             "USER_GUIDE.md",

@@ -14,7 +14,7 @@ Each template contains one `{{DISTRIBUTION}}` placeholder. The corresponding
 `fragments/python/` or `fragments/rust/` document supplies package-specific text. Package trees link
 to the generated documents; packaged artifacts contain ordinary files and remain self-contained.
 
-`agent-team-timeline/` is a single-implementation tool, so its `README.md` and `USER_GUIDE.md` are
+`wrkviz/` is a single-implementation tool, so its `README.md` and `USER_GUIDE.md` are
 canonical directly. `dagrun/PLANNER_DESIGN.md` specifies the CPA allocator shared by that tool's
 two implementations.
 

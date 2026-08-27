@@ -217,16 +217,16 @@ STANDALONE_DOCUMENTS: tuple[StandaloneDocument, ...] = (
         source="common/docs/herdr-run/CONFIG_TEMPLATE.yaml",
     ),
     StandaloneDocument(
-        tool="agent-team-timeline",
+        tool="wrkviz",
         document="README",
         language="python",
-        source="common/docs/agent-team-timeline/README.md",
+        source="common/docs/wrkviz/README.md",
     ),
     StandaloneDocument(
-        tool="agent-team-timeline",
+        tool="wrkviz",
         document="USER_GUIDE",
         language="python",
-        source="common/docs/agent-team-timeline/USER_GUIDE.md",
+        source="common/docs/wrkviz/USER_GUIDE.md",
     ),
     StandaloneDocument(
         tool="parallel-experiment-runner",
@@ -297,14 +297,14 @@ def _package_links() -> tuple[PackageLink, ...]:
                 "common/docs/herdr-run/QUICKSTART.md",
             ),
             PackageLink(
-                "py/agent_team_timeline/README.md",
-                "common/docs/agent-team-timeline/README.md",
+                "py/wrkviz/README.md",
+                "common/docs/wrkviz/README.md",
             ),
             PackageLink(
-                "py/agent_team_timeline/USER_GUIDE.md",
-                "common/docs/agent-team-timeline/USER_GUIDE.md",
+                "py/wrkviz/USER_GUIDE.md",
+                "common/docs/wrkviz/USER_GUIDE.md",
             ),
-            PackageLink("py/agent_team_timeline/LICENSE", "LICENSE"),
+            PackageLink("py/wrkviz/LICENSE", "LICENSE"),
             PackageLink(
                 "py/parallel_experiment_runner/README.md",
                 "common/docs/parallel-experiment-runner/README.md",

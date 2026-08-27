@@ -32,10 +32,10 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-from agent_team_timeline import timeline_shards
-from agent_team_timeline.archive import JsonValue, as_object, narrow_json
-from agent_team_timeline.timeline_shards import write_timeline_shards
-from agent_team_timeline.timeline_v3 import SCHEMA_3_BOOTSTRAP_PATH
+from wrkviz import timeline_shards
+from wrkviz.archive import JsonValue, as_object, narrow_json
+from wrkviz.timeline_shards import write_timeline_shards
+from wrkviz.timeline_v3 import SCHEMA_3_BOOTSTRAP_PATH
 
 from tests.timeline_projection import reconstruct_from_schema_3
 
@@ -62,7 +62,7 @@ def schema_3_search_records(archive: Path) -> list[dict[str, JsonValue]]:
     container instead of a plausible-looking substitute.
 
     ``gzip.open`` reads a multi-member file end to end, so no sidecar is needed here: this is the
-    documented fallback path of :mod:`agent_team_timeline.seekable_jsonl`, and using it keeps the
+    documented fallback path of :mod:`wrkviz.seekable_jsonl`, and using it keeps the
     helper independent of the seeking machinery whose tests it helps set up.
     """
 

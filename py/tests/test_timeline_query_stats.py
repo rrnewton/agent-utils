@@ -8,11 +8,11 @@ from pathlib import Path
 
 import pytest
 
-from agent_team_timeline.archive import JsonValue, as_object, narrow_json
-from agent_team_timeline.cli import main as timeline_main
-from agent_team_timeline.model import Agent, Event, TeamData
-from agent_team_timeline.query import TextTotals
-from agent_team_timeline.transcript_export import export_transcripts
+from wrkviz.archive import JsonValue, as_object, narrow_json
+from wrkviz.cli import main as timeline_main
+from wrkviz.model import Agent, Event, TeamData
+from wrkviz.query import TextTotals
+from wrkviz.transcript_export import export_transcripts
 
 
 def _event(

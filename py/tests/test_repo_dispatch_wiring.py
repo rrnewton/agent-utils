@@ -21,7 +21,7 @@ RUST_TOOLS = (
     "herdr-agent",
 )
 PYTHON_ONLY_TOOLS = (
-    "agent-team-timeline",
+    "wrkviz",
     "parallel-experiment-runner",
 )
 RESOLVER_TOOLS = RUST_TOOLS + PYTHON_ONLY_TOOLS

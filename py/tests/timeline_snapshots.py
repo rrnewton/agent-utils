@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from agent_team_timeline.snapshot_store import resolve_snapshot_root
+from wrkviz.snapshot_store import resolve_snapshot_root
 
 
 def snapshot_root(archive: Path, team_slug: str) -> Path:

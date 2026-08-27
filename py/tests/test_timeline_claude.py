@@ -8,22 +8,22 @@ import shutil
 
 import pytest
 
-from agent_team_timeline.build_store import team_build_root
-from agent_team_timeline.claude import (
+from wrkviz.build_store import team_build_root
+from wrkviz.claude import (
     ClaudeParseError,
     ClaudeSourceCopy,
     discover_claude_sources,
     load_claude_team,
     snapshot_claude_lineage,
 )
-from agent_team_timeline.cli import main
-from agent_team_timeline.phases import aggregate_stats, build_phases
-from agent_team_timeline.pipeline import (
+from wrkviz.cli import main
+from wrkviz.phases import aggregate_stats, build_phases
+from wrkviz.pipeline import (
     build_archive,
     ingest_claude,
     summarize_archive,
 )
-from agent_team_timeline.window import parse_date_window
+from wrkviz.window import parse_date_window
 from tests.timeline_snapshots import snapshot_root
 from tests.timeline_projection import schema_1_timeline_text
 
@@ -386,10 +386,10 @@ def test_pipeline_snapshots_claude_and_reuses_unchanged_archive(tmp_path: Path) 
     assert first.sources == 5
     assert second.files_changed == 0
     assert (archive / ".gitignore").read_text(encoding="utf-8").splitlines() == [
-        "/.agent-team-timeline.lock",
+        "/.wrkviz.lock",
         "/teams/*/source_snapshots/",
         "/teams/*/payloads/",
-        "/.agent-team-timeline-trash/",
+        "/.wrkviz-trash/",
     ]
     manifest = json.loads(
         (

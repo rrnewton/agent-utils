@@ -41,7 +41,7 @@ const WHEEL_SEQUENCE = Object.freeze([
 
 const HELP = `Usage: node benchmark-site.cjs [options] <url>
 
-Benchmark a served agent-team-timeline site with a deterministic Chromium run.
+Benchmark a served wrkviz site with a deterministic Chromium run.
 The complete report is printed as JSON; --json also writes it to disk.
 
 Options:
@@ -405,7 +405,7 @@ async function benchmarkSite(options) {
   let browser = null;
   const base = {
     schema_version: 1,
-    benchmark: "agent-team-timeline-real-site",
+    benchmark: "wrkviz-real-site",
     generated_at: new Date().toISOString(),
     url: options.url,
     viewport: { width: 1440, height: 900 },

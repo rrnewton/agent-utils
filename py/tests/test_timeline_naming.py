@@ -9,7 +9,7 @@ import sys
 
 import pytest
 
-from agent_team_timeline.naming import (
+from wrkviz.naming import (
     PROMPT_VERSION,
     AgentNameError,
     AgentNameJob,
@@ -20,7 +20,7 @@ from agent_team_timeline.naming import (
     build_agent_name_prompt,
     name_agents,
 )
-from agent_team_timeline.token_usage import TokenUsage
+from wrkviz.token_usage import TokenUsage
 
 
 def _job(
@@ -443,7 +443,7 @@ for required in (
 assert 'model_reasoning_effort="high"' in args
 expected_service_tier = os.environ["FAKE_CODEX_SERVICE_TIER"]
 assert f'service_tier="{expected_service_tier}"' in args
-assert Path.cwd().name.startswith("agent-team-timeline-name-")
+assert Path.cwd().name.startswith("wrkviz-name-")
 repository_check = subprocess.run(
     ["git", "rev-parse", "--is-inside-work-tree"],
     text=True,

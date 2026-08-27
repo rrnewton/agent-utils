@@ -18,7 +18,7 @@ const path = require("path");
 const vm = require("vm");
 
 const source = fs.readFileSync(
-  path.resolve(__dirname, "../../agent_team_timeline/static/app.js"),
+  path.resolve(__dirname, "../../wrkviz/static/app.js"),
   "utf8"
 );
 

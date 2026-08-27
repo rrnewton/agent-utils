@@ -6,9 +6,9 @@ matching a regular expression or checking an excerpt, and it is the wrong shape 
 this file asks, which is whether the bundle can actually *read an archive* -- because every part
 that could be wrong lives in the seam between three components a stub replaces:
 
-* the writer, :func:`agent_team_timeline.timeline_v3.write_timeline_v3`, which decides where a
+* the writer, :func:`wrkviz.timeline_v3.write_timeline_v3`, which decides where a
   member ends and what its sidecar says about it;
-* the server, :mod:`agent_team_timeline.standalone_server`, which is copied verbatim into the
+* the server, :mod:`wrkviz.standalone_server`, which is copied verbatim into the
   archive as ``serve.py`` and answers one byte range with a 206, honours ``If-Range``, and answers
   416 past the end; and
 * the reader in ``app.js``, which turns a catalogue entry into a byte range and a byte range back
@@ -37,10 +37,10 @@ from pathlib import Path
 
 import pytest
 
-from agent_team_timeline.archive import JsonValue
-from agent_team_timeline.query import QueryFilters, TimelineQuery
-from agent_team_timeline.standalone_server import make_static_server
-from agent_team_timeline.timeline_v3 import write_timeline_v3
+from wrkviz.archive import JsonValue
+from wrkviz.query import QueryFilters, TimelineQuery
+from wrkviz.standalone_server import make_static_server
+from wrkviz.timeline_v3 import write_timeline_v3
 
 from tests.test_timeline_v3_search import _records, _timeline
 
@@ -52,7 +52,7 @@ _PROBE = _JS / "schema3_http_probe.js"
 #: result list at this many rows, so a differential that asked the Python reader for a different
 #: page size would be comparing two different answers and calling the difference a bug.
 _APP_JS = (
-    Path(__file__).parent.parent / "agent_team_timeline" / "static" / "app.js"
+    Path(__file__).parent.parent / "wrkviz" / "static" / "app.js"
 ).read_text(encoding="utf-8")
 _LIMIT_MATCH = re.search(r"var SEARCH_RESULT_LIMIT = (\d+);", _APP_JS)
 assert _LIMIT_MATCH is not None, "app.js no longer declares SEARCH_RESULT_LIMIT"
@@ -69,7 +69,7 @@ def _obj(value: JsonValue, where: str) -> dict[str, JsonValue]:
     The probe prints JSON, so everything arrives as `JsonValue` and every assertion below would
     otherwise be an unchecked index into an unknown shape. These three helpers make the narrowing
     explicit and give `--strict` something to hold, which is the same contract
-    `agent_team_timeline.archive` imposes on the library's own JSON.
+    `wrkviz.archive` imposes on the library's own JSON.
     """
 
     assert isinstance(value, dict), where

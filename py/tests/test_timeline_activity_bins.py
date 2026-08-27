@@ -7,8 +7,8 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from agent_team_timeline.activity_bins import ActivityBin, build_activity_bins
-from agent_team_timeline.phases import (
+from wrkviz.activity_bins import ActivityBin, build_activity_bins
+from wrkviz.phases import (
     PhaseStats,
     PhaseWindow,
     StateSegment,

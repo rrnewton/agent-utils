@@ -10,11 +10,11 @@ from pathlib import Path
 
 import pytest
 
-from agent_team_timeline.build_store import shared_build_root
-from agent_team_timeline.archive import JsonValue, as_object, narrow_json
-from agent_team_timeline.cli import main as timeline_main
-from agent_team_timeline.model import Agent, Event, TeamData
-from agent_team_timeline.transcript_export import (
+from wrkviz.build_store import shared_build_root
+from wrkviz.archive import JsonValue, as_object, narrow_json
+from wrkviz.cli import main as timeline_main
+from wrkviz.model import Agent, Event, TeamData
+from wrkviz.transcript_export import (
     PromptAuthorshipRule,
     TranscriptTeamSkip,
     export_transcripts,

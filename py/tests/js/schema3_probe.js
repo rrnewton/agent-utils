@@ -74,7 +74,7 @@ const APP_PATH = path.resolve(
   __dirname,
   "..",
   "..",
-  "agent_team_timeline",
+  "wrkviz",
   "static",
   "app.js"
 );

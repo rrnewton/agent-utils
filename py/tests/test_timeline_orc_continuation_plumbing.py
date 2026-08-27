@@ -8,17 +8,17 @@ from pathlib import Path
 
 import pytest
 
-import agent_team_timeline.pipeline as pipeline_module
-from agent_team_timeline.build_store import team_build_root
-from agent_team_timeline.model import TeamData
-from agent_team_timeline.orc import (
+import wrkviz.pipeline as pipeline_module
+from wrkviz.build_store import team_build_root
+from wrkviz.model import TeamData
+from wrkviz.orc import (
     OrcContinuationLink,
     OrcContinuationSpec,
     OrcParseError,
     OrcSnapshotResult,
     OrcSourceCopy,
 )
-from agent_team_timeline.pipeline import (
+from wrkviz.pipeline import (
     _load_orc_source_manifest,
     ingest_orc,
     load_archived_team,

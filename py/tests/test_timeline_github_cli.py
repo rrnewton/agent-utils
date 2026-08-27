@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-import agent_team_timeline.cli as timeline_cli
-from agent_team_timeline.github_enrich import PullMetadataReport
+import wrkviz.cli as timeline_cli
+from wrkviz.github_enrich import PullMetadataReport
 
 
 def test_partial_metadata_failure_still_rebuilds_successes(

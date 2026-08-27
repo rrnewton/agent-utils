@@ -6,8 +6,8 @@ from datetime import datetime, timezone
 
 import pytest
 
-from agent_team_timeline.model import Agent, Event, TeamData
-from agent_team_timeline.phases import build_phases
+from wrkviz.model import Agent, Event, TeamData
+from wrkviz.phases import build_phases
 
 
 ROOT = "root"

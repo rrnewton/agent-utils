@@ -11,21 +11,21 @@ import threading
 
 import pytest
 
-import agent_team_timeline.codex as codex_module
-import agent_team_timeline.pipeline as pipeline_module
-from agent_team_timeline.build_store import team_build_root
-from agent_team_timeline.cli import main as timeline_main
-from agent_team_timeline.codex import (
+import wrkviz.codex as codex_module
+import wrkviz.pipeline as pipeline_module
+from wrkviz.build_store import team_build_root
+from wrkviz.cli import main as timeline_main
+from wrkviz.codex import (
     CodexParseError,
     CodexSnapshotResult,
     CodexSourceCopy,
     load_codex_team,
     snapshot_codex_lineage,
 )
-from agent_team_timeline.pipeline import ingest_codex
-from agent_team_timeline.phases import build_phases
-from agent_team_timeline.pipeline import _phase_jobs
-from agent_team_timeline.summarize import _input_hash
+from wrkviz.pipeline import ingest_codex
+from wrkviz.phases import build_phases
+from wrkviz.pipeline import _phase_jobs
+from wrkviz.summarize import _input_hash
 from tests.timeline_snapshots import snapshot_root
 
 
@@ -1058,8 +1058,8 @@ def test_snapshot_directory_symlink_escape_is_rejected(
     origin.parent.mkdir(parents=True)
     origin.write_bytes(_root_bytes())
     archive.mkdir()
-    (archive / ".agent-team-timeline.json").write_text(
-        '{"schema_version":1,"tool":"agent-team-timeline"}\n', encoding="utf-8"
+    (archive / ".wrkviz.json").write_text(
+        '{"schema_version":1,"tool":"wrkviz"}\n', encoding="utf-8"
     )
     snapshots = snapshot_root(archive, "codex-test")
     outside = tmp_path / "outside"

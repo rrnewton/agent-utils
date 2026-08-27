@@ -11,17 +11,17 @@ from pathlib import Path
 
 import pytest
 
-import agent_team_timeline.losslessness as losslessness_module
-from agent_team_timeline.build_store import team_build_root
-from agent_team_timeline.cli import main as timeline_main
-from agent_team_timeline.losslessness import (
+import wrkviz.losslessness as losslessness_module
+from wrkviz.build_store import team_build_root
+from wrkviz.cli import main as timeline_main
+from wrkviz.losslessness import (
     audit_archive_losslessness,
     audit_codex_losslessness,
     format_losslessness_audit,
     unscope_codex_id,
 )
-from agent_team_timeline.model import PayloadRef
-from agent_team_timeline.payloads import (
+from wrkviz.model import PayloadRef
+from wrkviz.payloads import (
     load_payload_manifest,
     merge_payloads,
     payload_digest,
@@ -31,7 +31,7 @@ from agent_team_timeline.payloads import (
     shard_name,
     verify_payload_store,
 )
-from agent_team_timeline.pipeline import (
+from wrkviz.pipeline import (
     ingest_codex,
     load_archived_team,
     rehydrate_tool_payloads,
@@ -224,13 +224,13 @@ def test_payload_tree_is_gitignored_and_tracked_files_stay_clean(tmp_path: Path)
 
     archive = _ingest(tmp_path)
     assert (archive / ".gitignore").read_text(encoding="utf-8").splitlines() == [
-        "/.agent-team-timeline.lock",
+        "/.wrkviz.lock",
         "/teams/*/source_snapshots/",
         "/teams/*/payloads/",
         # Local recovery state, like the lock: `gc --delete` renames what it reclaims into here
         # rather than unlinking it, and a quarter-gigabyte of reclaimed files must not turn up
         # as a proposed addition to the operator's next commit.
-        "/.agent-team-timeline-trash/",
+        "/.wrkviz-trash/",
     ]
     tracked = "\n".join(
         path.read_text(encoding="utf-8")

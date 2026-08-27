@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_team_timeline.archive import (
+from wrkviz.archive import (
     JsonValue,
     as_array,
     as_int,
@@ -22,14 +22,14 @@ from agent_team_timeline.archive import (
     narrow_json,
     read_json,
 )
-from agent_team_timeline.cli import main as timeline_main
-from agent_team_timeline.query import _compile_search_matcher
-from agent_team_timeline.search_bloom import (
+from wrkviz.cli import main as timeline_main
+from wrkviz.query import _compile_search_matcher
+from wrkviz.search_bloom import (
     bloom_might_contain,
     build_trigram_bloom,
     compact_search_text,
 )
-from agent_team_timeline.timeline_shards import write_timeline_shards
+from wrkviz.timeline_shards import write_timeline_shards
 from tests.timeline_legacy_generations import schema_2_writer_enabled
 
 
@@ -1383,7 +1383,7 @@ def test_standalone_search_rejects_v2_only_options_without_a_corpus(
     tmp_path: Path,
 ) -> None:
     root = _site(tmp_path)
-    source = Path(__file__).resolve().parents[1] / "agent_team_timeline" / "query.py"
+    source = Path(__file__).resolve().parents[1] / "wrkviz" / "query.py"
     bundled = root / "query.py"
     shutil.copyfile(source, bundled)
 
@@ -1660,7 +1660,7 @@ def test_bundled_query_source_runs_without_the_installed_package(
     tmp_path: Path,
 ) -> None:
     root = _site(tmp_path)
-    source = Path(__file__).resolve().parents[1] / "agent_team_timeline" / "query.py"
+    source = Path(__file__).resolve().parents[1] / "wrkviz" / "query.py"
     bundled = root / "query.py"
     shutil.copyfile(source, bundled)
 

@@ -13,19 +13,19 @@ from pathlib import Path
 
 import pytest
 
-from agent_team_timeline.build_store import team_build_root
-from agent_team_timeline.archive import narrow_json, write_json_if_changed
-from agent_team_timeline.artifacts import extract_artifacts
-from agent_team_timeline.cli import main as timeline_main
-from agent_team_timeline.github_enrich import pull_metadata_path
-from agent_team_timeline.github_metadata import (
+from wrkviz.build_store import team_build_root
+from wrkviz.archive import narrow_json, write_json_if_changed
+from wrkviz.artifacts import extract_artifacts
+from wrkviz.cli import main as timeline_main
+from wrkviz.github_enrich import pull_metadata_path
+from wrkviz.github_metadata import (
     PullRequestKey,
     PullRequestMetadata,
     PullRequestMetadataCache,
     save_pull_request_metadata_cache,
 )
-from agent_team_timeline.identity import HostIdentity, ProjectIdentity, SiteIdentity
-from agent_team_timeline.model import (
+from wrkviz.identity import HostIdentity, ProjectIdentity, SiteIdentity
+from wrkviz.model import (
     Agent,
     Edge,
     Event,
@@ -35,13 +35,13 @@ from agent_team_timeline.model import (
     Turn,
     source_digest,
 )
-from agent_team_timeline.multi_team import (
+from wrkviz.multi_team import (
     _remove_stale_files,
     build_combined_archive,
 )
-from agent_team_timeline.periods import Period, periods_for_range
-from agent_team_timeline.phases import PhaseStats, PhaseWindow, build_phases
-from agent_team_timeline.pipeline import (
+from wrkviz.periods import Period, periods_for_range
+from wrkviz.phases import PhaseStats, PhaseWindow, build_phases
+from wrkviz.pipeline import (
     IngestReport,
     _agent_name_jobs,
     _definition_evidence,
@@ -56,20 +56,20 @@ from agent_team_timeline.pipeline import (
     record_run,
     summarize_archive,
 )
-from agent_team_timeline.render import (
+from wrkviz.render import (
     _remove_stale_presentation_files,
     prune_retired_query_artifacts,
 )
-from agent_team_timeline.query import (
+from wrkviz.query import (
     SCHEMA_3_BOOTSTRAP_PATH,
     QueryFilters,
     TimelineQuery,
 )
-from agent_team_timeline.server import make_server
-from agent_team_timeline.summarize import PLAIN_LANGUAGE_ROLLUP_STYLE, SummaryResult
-from agent_team_timeline.terminology import GlossaryTerm, glossary_term_id
-from agent_team_timeline.window import DateWindow
-from agent_team_timeline.snapshot_store import resolve_snapshot_root
+from wrkviz.server import make_server
+from wrkviz.summarize import PLAIN_LANGUAGE_ROLLUP_STYLE, SummaryResult
+from wrkviz.terminology import GlossaryTerm, glossary_term_id
+from wrkviz.window import DateWindow
+from wrkviz.snapshot_store import resolve_snapshot_root
 from tests.timeline_projection import (
     read_stored_text,
     detail_documents,
@@ -559,7 +559,7 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
 
     run_path = record_run(
         tmp_path,
-        ("agent-team-timeline", "summarize"),
+        ("wrkviz", "summarize"),
         "2026-08-05T00:00:00Z",
         "completed",
         team.team_slug,
@@ -1546,8 +1546,8 @@ def test_build_refuses_symlinked_generated_parent_before_touching_victim(
     output = tmp_path / "output"
     output.mkdir()
     write_json_if_changed(
-        output / ".agent-team-timeline.json",
-        {"schema_version": 1, "tool": "agent-team-timeline"},
+        output / ".wrkviz.json",
+        {"schema_version": 1, "tool": "wrkviz"},
     )
     victim = tmp_path / "victim"
     victim.mkdir()
@@ -1576,7 +1576,7 @@ def test_build_only_run_preserves_source_digest_and_team_history(tmp_path: Path)
     )
     record_run(
         tmp_path,
-        ("agent-team-timeline", "refresh"),
+        ("wrkviz", "refresh"),
         "2026-08-05T00:00:00Z",
         "completed",
         "codex-test",
@@ -1586,7 +1586,7 @@ def test_build_only_run_preserves_source_digest_and_team_history(tmp_path: Path)
     )
     record_run(
         tmp_path,
-        ("agent-team-timeline", "build"),
+        ("wrkviz", "build"),
         "2026-08-05T01:00:00Z",
         "completed",
         "other-team",
@@ -1612,7 +1612,7 @@ def test_concurrent_run_records_are_serialized_without_lost_updates(
             barrier.wait()
             record_run(
                 tmp_path,
-                ("agent-team-timeline", "build", str(index)),
+                ("wrkviz", "build", str(index)),
                 "2026-08-05T01:00:00Z",
                 "completed",
                 "codex-test",
@@ -1895,7 +1895,7 @@ def test_summary_window_can_backfill_one_hour_without_other_rollup_levels(
     )
     assert first_export["files_changed"] > 0
     assert second_export["files_changed"] == 0
-    assert (export / ".agent-team-timeline.json").is_file()
+    assert (export / ".wrkviz.json").is_file()
     timeline = json.loads(schema_1_timeline_text(export))
     assert {item["kind"] for item in timeline["rollups"]} == {"hourly"}
     assert all(
@@ -2599,7 +2599,7 @@ def test_combined_export_namespaces_teams_and_is_byte_idempotent(
     assert "./timeline agents --team TEAM --format jsonl" in exported_readme
     assert "./timeline show phase:TEAM::PHASE_ID --transcript" in exported_readme
     assert "data/export.json" in exported_readme
-    assert (output / ".agent-team-timeline.json").is_file()
+    assert (output / ".wrkviz.json").is_file()
     export_manifest = json.loads(
         (output / "data" / "export.json").read_text(encoding="utf-8")
     )
@@ -3387,3 +3387,66 @@ def test_a_real_build_is_read_through_schema_three(tmp_path: Path) -> None:
         "rollups", QueryFilters()
     )
     assert oldest.activity_bins(QueryFilters()) == query.activity_bins(QueryFilters())
+
+
+# --- the rename must not orphan an archive built before it ---------------------------------------
+
+
+def test_an_archive_built_before_the_rename_is_still_an_archive(tmp_path: Path) -> None:
+    """`.agent-team-timeline.json` saying `"tool": "agent-team-timeline"` must still be recognised.
+
+    Both the marker's NAME and the `tool` value inside it carried the old name, so a rename that
+    changed only the code would have made every existing archive unrecognisable. The failure would
+    not even have looked like a rename: `_ensure_archive` would fall through to its non-empty-
+    directory guard and refuse with "refusing non-empty non-archive output directory", which reads
+    as a safety refusal about the operator's own data.
+    """
+
+    from wrkviz.archive import (
+        ARCHIVE_MARKER_FILE,
+        LEGACY_ARCHIVE_MARKER_FILE,
+        archive_marker_path,
+        is_archive_marker,
+    )
+
+    archive = tmp_path / "built-before-the-rename"
+    archive.mkdir()
+    (archive / LEGACY_ARCHIVE_MARKER_FILE).write_text(
+        '{\n  "schema_version": 1,\n  "tool": "agent-team-timeline"\n}\n', encoding="utf-8"
+    )
+
+    assert archive_marker_path(archive).name == LEGACY_ARCHIVE_MARKER_FILE
+    assert is_archive_marker({"schema_version": 1, "tool": "agent-team-timeline"})
+    assert is_archive_marker({"schema_version": 1, "tool": "wrkviz"})
+    # Still not a licence to accept anything: a foreign marker is refused as before.
+    assert not is_archive_marker({"schema_version": 1, "tool": "something-else"})
+    assert not is_archive_marker({"schema_version": 2, "tool": "wrkviz"})
+
+    # A fresh archive is created under the CURRENT name, not the one it is compatible with.
+    fresh = tmp_path / "fresh"
+    fresh.mkdir()
+    assert archive_marker_path(fresh).name == ARCHIVE_MARKER_FILE
+
+
+def test_a_build_migrates_a_pre_rename_marker_and_leaves_no_second_one(tmp_path: Path) -> None:
+    """Migration happens on the next build, not through a command an operator must know about.
+
+    The marker is two hundred bytes and the build already holds the writer lock, so there is no
+    reason to make somebody run a migration for it -- and every reason not to leave two markers
+    behind, since a directory carrying both is ambiguous about which one a reader should trust.
+    """
+
+    team = _team()
+    _write_team(tmp_path, team)
+    output = tmp_path / "site"
+    output.mkdir()
+    (output / ".agent-team-timeline.json").write_text(
+        '{"schema_version": 1, "tool": "agent-team-timeline"}\n', encoding="utf-8"
+    )
+
+    build_archive(tmp_path, team.team_slug, output=output)
+
+    assert (output / ".wrkviz.json").is_file()
+    assert not (output / ".agent-team-timeline.json").exists(), (
+        "the pre-rename marker must be removed, not left beside the new one"
+    )

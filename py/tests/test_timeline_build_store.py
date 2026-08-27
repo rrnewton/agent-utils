@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_team_timeline.build_store import (
+from wrkviz.build_store import (
     BUILD_POINTER_FILE,
     BuildLocationError,
     TENANTS,
@@ -227,7 +227,7 @@ def test_the_transcript_baseline_is_rerun_state_and_lives_in_the_store(
     the exporter's scratch space.
     """
 
-    from agent_team_timeline.build_store import SHARED_TENANT, shared_build_root
+    from wrkviz.build_store import SHARED_TENANT, shared_build_root
 
     archive = tmp_path / "widget"
     archive.mkdir()
@@ -248,7 +248,7 @@ def test_an_unmigrated_archive_keeps_its_baseline_beside_the_projection(
     side effect of an extraction is the silent relocation this design refuses everywhere else.
     """
 
-    from agent_team_timeline.build_store import shared_build_root
+    from wrkviz.build_store import shared_build_root
 
     archive = tmp_path / "widget"
     _legacy_team(archive, "team-one")

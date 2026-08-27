@@ -36,15 +36,15 @@ from pathlib import Path
 
 import pytest
 
-from agent_team_timeline.archive import JsonValue, canonical_json
-from agent_team_timeline.query import (
+from wrkviz.archive import JsonValue, canonical_json
+from wrkviz.query import (
     SCHEMA_3_BOOTSTRAP_PATH,
     QueryFilters,
     TimelineQuery,
 )
-from agent_team_timeline.timeline_shards import write_timeline_shards
+from wrkviz.timeline_shards import write_timeline_shards
 from tests.timeline_legacy_generations import schema_2_writer_enabled
-from agent_team_timeline.timeline_v3 import SCHEMA_3_ROOT, write_timeline_v3
+from wrkviz.timeline_v3 import SCHEMA_3_ROOT, write_timeline_v3
 
 
 DAY_MS = 24 * 60 * 60 * 1000

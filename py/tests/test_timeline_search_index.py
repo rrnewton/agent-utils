@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from agent_team_timeline.model import Agent, Event, TeamData, ToolCall
-from agent_team_timeline.search_index import build_search_records
+from wrkviz.model import Agent, Event, TeamData, ToolCall
+from wrkviz.search_index import build_search_records
 
 
 START = 1_800_000_000_000

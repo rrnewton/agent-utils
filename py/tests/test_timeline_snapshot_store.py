@@ -18,13 +18,13 @@ from pathlib import Path
 
 import pytest
 
-from agent_team_timeline.build_store import team_build_root
-from agent_team_timeline.archive_gc import plan_collection
-from agent_team_timeline.cli import main as timeline_main
-from agent_team_timeline.losslessness import audit_codex_losslessness
-from agent_team_timeline.pipeline import build_archive, ingest_codex, ingest_orc
-from agent_team_timeline.project_config import load_project_ingest_config
-from agent_team_timeline.snapshot_store import (
+from wrkviz.build_store import team_build_root
+from wrkviz.archive_gc import plan_collection
+from wrkviz.cli import main as timeline_main
+from wrkviz.losslessness import audit_codex_losslessness
+from wrkviz.pipeline import build_archive, ingest_codex, ingest_orc
+from wrkviz.project_config import load_project_ingest_config
+from wrkviz.snapshot_store import (
     SNAPSHOT_POINTER_FILE,
     SnapshotLocationError,
     default_store_root,
@@ -32,7 +32,7 @@ from agent_team_timeline.snapshot_store import (
     plan_snapshot_migration,
     resolve_snapshot_root,
 )
-from agent_team_timeline.standalone_server import make_static_server
+from wrkviz.standalone_server import make_static_server
 from tests.test_timeline_orc import ROOT as ORC_ROOT, _append_task_note, _fixture as _orc_fixture
 from tests.test_timeline_source_snapshots import (
     ROOT as CODEX_ROOT,

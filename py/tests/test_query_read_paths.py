@@ -1,4 +1,4 @@
-"""Contract tests for the slicing read paths in :mod:`agent_team_timeline.query`.
+"""Contract tests for the slicing read paths in :mod:`wrkviz.query`.
 
 The read path was rewritten to stop materializing the transcript projections, and a rewrite
 whose entire point is "it costs less" needs its cost asserted rather than described. Three
@@ -14,7 +14,7 @@ answer, so the answer is computed both ways and compared, over a sweep of window
 deliberately lands on, one before, and one after instants shared by several records.
 
 *A differential against the package reader.* ``_ChunkedJsonlReader`` is a standalone-library
-copy of :class:`agent_team_timeline.seekable_jsonl.SeekableJsonlReader`, kept separate because
+copy of :class:`wrkviz.seekable_jsonl.SeekableJsonlReader`, kept separate because
 this file is copied verbatim into every generated archive as the ``./timeline`` executable and
 may import nothing but the standard library. The duplication is pinned here rather than by a
 comment, because a comment does not fail.
@@ -32,15 +32,15 @@ from pathlib import Path
 
 import pytest
 
-from agent_team_timeline.archive import JsonValue
-from agent_team_timeline.query import (
+from wrkviz.archive import JsonValue
+from wrkviz.query import (
     ArchiveReadError,
     OrdinalRange,
     QueryFilters,
     TranscriptQuery,
     _ChunkedJsonlReader,
 )
-from agent_team_timeline.seekable_jsonl import (
+from wrkviz.seekable_jsonl import (
     SeekableJsonlReader,
     write_seekable_jsonl,
 )

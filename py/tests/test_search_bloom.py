@@ -4,9 +4,9 @@ import base64
 
 import pytest
 
-from agent_team_timeline.archive import JsonValue
-from agent_team_timeline.query import _bloom_might_match
-from agent_team_timeline.search_bloom import (
+from wrkviz.archive import JsonValue
+from wrkviz.query import _bloom_might_match
+from wrkviz.search_bloom import (
     TRIGRAM_BLOOM_ALGORITHM,
     ascii_lower_utf8,
     bloom_might_contain,

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from agent_team_timeline.archive import narrow_json
-from agent_team_timeline.identity import (
+from wrkviz.archive import narrow_json
+from wrkviz.identity import (
     HostIdentity,
     ProjectIdentity,
     SiteIdentity,

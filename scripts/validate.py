@@ -96,11 +96,11 @@ GROUPS: dict[str, tuple[Check, ...]] = {
         #
         # These ran nowhere before. The suite is 35 tests including pan and zoom, it lived in the
         # tree fully written, and nothing invoked it -- so a genuine failure sat unnoticed in it.
-        Check("timeline-browser", ("make", "-C", "py/agent_team_timeline", "browser")),
+        Check("timeline-browser", ("make", "-C", "py/wrkviz", "browser")),
         # Pass/fail AND a measurement: it prints zoom/pan redraw latency every run and fails when
         # a redraw breaches the budget. A functional suite cannot see a change that makes
         # interaction ten times slower; this can.
-        Check("timeline-benchmark", ("make", "-C", "py/agent_team_timeline", "benchmark")),
+        Check("timeline-benchmark", ("make", "-C", "py/wrkviz", "benchmark")),
     ),
     GENT_TALK: (
         Check("gent-talk-fmt", ("cargo", "fmt", "--check"), cwd="gent-talk"),
@@ -163,7 +163,7 @@ PREFIX_RULES: tuple[tuple[str, frozenset[str]], ...] = (
     # of the package, so a change to it still owes the workspace and packaging checks. A rule
     # that selected only the browser group here would be the cheaper-of-the-two answer the
     # self-test exists to forbid.
-    ("py/agent_team_timeline/static/", frozenset({TIMELINE_BROWSER, WORKSPACE, CROSS, PACKAGES})),
+    ("py/wrkviz/static/", frozenset({TIMELINE_BROWSER, WORKSPACE, CROSS, PACKAGES})),
     ("py/tests/js/", frozenset({TIMELINE_BROWSER, WORKSPACE, CROSS, PACKAGES})),
     ("py/", frozenset({WORKSPACE, CROSS, PACKAGES})),
     ("cross/", frozenset({CROSS})),

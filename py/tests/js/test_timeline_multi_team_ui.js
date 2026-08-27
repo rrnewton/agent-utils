@@ -5,7 +5,7 @@ const fs = require("fs");
 const path = require("path");
 const vm = require("vm");
 
-const appPath = path.resolve(__dirname, "../../agent_team_timeline/static/app.js");
+const appPath = path.resolve(__dirname, "../../wrkviz/static/app.js");
 const source = fs.readFileSync(appPath, "utf8");
 
 function functionSource(name) {

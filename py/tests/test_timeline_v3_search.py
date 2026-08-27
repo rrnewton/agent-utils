@@ -8,7 +8,7 @@ there is invisible in the shape of the output and visible only in *which* record
 battery of queries, and full equality of the answer.
 
 The battery is built from the failure modes the case study in
-`agent_team_timeline/ai_docs/TRANSCRIPT_SEARCH_CASE_STUDY.md` actually recorded, rather than from
+`wrkviz/ai_docs/TRANSCRIPT_SEARCH_CASE_STUDY.md` actually recorded, rather than from
 the axes of the API:
 
 * its acceptance query, ``backend maturity B3``, and the ``B3`` that motivated it -- two UTF-8
@@ -45,16 +45,16 @@ from pathlib import Path
 
 import pytest
 
-from agent_team_timeline.archive import JsonValue, as_object, read_json
-from agent_team_timeline.query import ArchiveReadError
-from agent_team_timeline.query import QueryFilters, SearchResults, TimelineQuery
-from agent_team_timeline.timeline_shards import (
+from wrkviz.archive import JsonValue, as_object, read_json
+from wrkviz.query import ArchiveReadError
+from wrkviz.query import QueryFilters, SearchResults, TimelineQuery
+from wrkviz.timeline_shards import (
     SCHEMA_2_BOOTSTRAP_PATH,
     write_timeline_shards,
 )
-from agent_team_timeline.seekable_jsonl import write_seekable_jsonl
+from wrkviz.seekable_jsonl import write_seekable_jsonl
 from tests.timeline_legacy_generations import schema_2_writer_enabled
-from agent_team_timeline.timeline_v3 import (
+from wrkviz.timeline_v3 import (
     SCHEMA_3_BOOTSTRAP_PATH,
     SCHEMA_3_SEARCH_BLOOM_ROOT,
     SCHEMA_3_SEARCH_LINKS_ROOT,

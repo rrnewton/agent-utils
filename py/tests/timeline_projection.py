@@ -30,14 +30,14 @@ import gzip
 import json
 from pathlib import Path
 
-from agent_team_timeline.archive import (
+from wrkviz.archive import (
     JsonValue,
     as_array,
     as_object,
     as_string,
     read_json,
 )
-from agent_team_timeline.timeline_v3 import (
+from wrkviz.timeline_v3 import (
     SCHEMA_3_BOOTSTRAP_PATH,
     SCHEMA_3_RECORD_KIND_KEY,
     SCHEMA_3_TIMESTAMP_KEY,

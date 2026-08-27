@@ -5,13 +5,13 @@ import http.client
 import threading
 from pathlib import Path
 
-from agent_team_timeline.server import make_server
-from agent_team_timeline.standalone_server import (
+from wrkviz.server import make_server
+from wrkviz.standalone_server import (
     accepts_gzip,
     cache_control_for_path,
     parse_byte_range,
 )
-from agent_team_timeline.static_assets import (
+from wrkviz.static_assets import (
     deterministic_gzip,
     gzip_sidecar_path,
     sync_gzip_sidecar,

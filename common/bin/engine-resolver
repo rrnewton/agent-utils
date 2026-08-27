@@ -3,7 +3,7 @@
 #
 # The paired commands (`dagrun`, `cpuset-alloc`, `tick-hub`, `pr-landing-planner`, `herdr-run`, and
 # `herdr-agent`) have tracked Python and Cargo-backed Rust launchers under their respective `*/bin`
-# directories. `agent-team-timeline` and `parallel-experiment-runner` are intentionally Python-only.
+# directories. `wrkviz` and `parallel-experiment-runner` are intentionally Python-only.
 # Every tracked command link in this directory points here, so the top-level `./bin` symlink exposes
 # one consistent command surface after any setup mode.
 #
@@ -16,7 +16,7 @@
 #     exact path are always visible in logs.
 #
 # The resolved tool name is this script's invocation basename. The tracked links for `dagrun`,
-# `cpuset-alloc`, `pr-landing-planner`, `tick-hub`, `agent-team-timeline`,
+# `cpuset-alloc`, `pr-landing-planner`, `tick-hub`, `wrkviz`,
 # `parallel-experiment-runner`, `herdr-run`, and `herdr-agent` all point here.
 set -euo pipefail
 

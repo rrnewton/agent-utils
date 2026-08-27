@@ -10,12 +10,12 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
-import agent_team_timeline.orc as orc_module
-import agent_team_timeline.pipeline as pipeline_module
+import wrkviz.orc as orc_module
+import wrkviz.pipeline as pipeline_module
 import pytest
 
-from agent_team_timeline.build_store import DEFAULT_STORE_SUFFIX, team_build_root
-from agent_team_timeline.archive import (
+from wrkviz.build_store import DEFAULT_STORE_SUFFIX, team_build_root
+from wrkviz.archive import (
     JsonValue,
     as_array,
     as_int,
@@ -27,8 +27,8 @@ from agent_team_timeline.archive import (
     read_jsonl,
     write_json_if_changed,
 )
-from agent_team_timeline.cli import main as timeline_main
-from agent_team_timeline.orc import (
+from wrkviz.cli import main as timeline_main
+from wrkviz.orc import (
     OrcContinuationLink,
     OrcContinuationSpec,
     OrcParseError,
@@ -36,16 +36,16 @@ from agent_team_timeline.orc import (
     load_orc_team,
     snapshot_orc_lineage,
 )
-from agent_team_timeline.model import TeamData, source_digest
-from agent_team_timeline.payloads import load_payload_manifest, verify_payload_store
-from agent_team_timeline.phases import build_phases
-from agent_team_timeline.pipeline import (
+from wrkviz.model import TeamData, source_digest
+from wrkviz.payloads import load_payload_manifest, verify_payload_store
+from wrkviz.phases import build_phases
+from wrkviz.pipeline import (
     build_archive,
     ingest_orc,
     load_archived_team,
     summarize_archive,
 )
-from agent_team_timeline.window import apply_date_window, parse_date_window
+from wrkviz.window import apply_date_window, parse_date_window
 from tests.timeline_snapshots import snapshot_root
 from tests.timeline_projection import schema_1_timeline_text
 

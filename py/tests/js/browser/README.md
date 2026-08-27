@@ -1,8 +1,8 @@
-# Agent Team Timeline browser checks
+# wrkviz browser checks
 
 This directory runs the production timeline assets against a small, deterministic
 Codex-team fixture. The fixture server uses only Node's standard library and exposes
-no repository files outside `py/agent_team_timeline/static/`.
+no repository files outside `py/wrkviz/static/`.
 
 Install and run from this directory:
 

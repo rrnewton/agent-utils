@@ -28,7 +28,7 @@ need this source tree or knowledge of the sibling implementation.
 
 | Command | Purpose | Python distribution |
 |---|---|---|
-| `agent-team-timeline` | Build durable, zoomable local timelines from coordinator and subagent transcripts. | `agent-team-timeline` |
+| `wrkviz` | Build durable, zoomable local timelines from coordinator and subagent transcripts. | `wrkviz` |
 | `parallel-experiment-runner` | Run boxed, resource-bounded concurrent seed sweeps through `dagrun`. | `parallel-experiment-runner` |
 
 These tools are independently installable and follow the same package

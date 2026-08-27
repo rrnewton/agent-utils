@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import pytest
 
-from agent_team_timeline.summary_artifacts import (
+from wrkviz.summary_artifacts import (
     SummaryArtifactProvenance,
     make_summary_provenance,
 )
-from agent_team_timeline.summary_registry import (
+from wrkviz.summary_registry import (
     ContextComponent,
     ContextCoverage,
     GLOSSARY_DEFINITION_SUMMARIZER,

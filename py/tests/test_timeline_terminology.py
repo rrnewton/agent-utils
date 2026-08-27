@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from agent_team_timeline.terminology import (
+from wrkviz.terminology import (
     GlossaryTerm,
     TermSource,
     glossary_catalog_markdown,

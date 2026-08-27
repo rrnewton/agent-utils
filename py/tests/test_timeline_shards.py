@@ -22,14 +22,14 @@ from pathlib import Path
 
 import pytest
 
-from agent_team_timeline.archive import JsonValue, as_array, as_object, read_json
-from agent_team_timeline.search_bloom import (
+from wrkviz.archive import JsonValue, as_array, as_object, read_json
+from wrkviz.search_bloom import (
     TRIGRAM_BLOOM_HASH_COUNT,
     build_trigram_bloom,
     bloom_might_contain,
     trigram_bloom_from_catalog,
 )
-from agent_team_timeline.timeline_shards import (
+from wrkviz.timeline_shards import (
     SCHEMA_2_BOOTSTRAP_PATH,
     write_timeline_shards,
 )
@@ -488,7 +488,7 @@ def test_the_writer_refuses_to_run_for_a_build(tmp_path: Path) -> None:
     fact, and makes the flip impossible to land as a one-line lie that left the writer running.
     """
 
-    import agent_team_timeline.timeline_shards as module
+    import wrkviz.timeline_shards as module
 
     # The autouse fixture above has lifted the constant for this test as for every other, so it is
     # put back here -- which is also the only way to reach the branch a build would reach. What the

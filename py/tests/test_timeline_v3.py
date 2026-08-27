@@ -37,7 +37,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_team_timeline.archive import (
+from wrkviz.archive import (
     JsonValue,
     as_array,
     as_object,
@@ -45,15 +45,15 @@ from agent_team_timeline.archive import (
     as_string,
     read_json,
 )
-from agent_team_timeline.query import (
+from wrkviz.query import (
     agent_ref,
     is_schema_3_shard_name as query_is_schema_3_shard_name,
     phase_ref,
     rollup_ref,
 )
-from agent_team_timeline.seekable_jsonl import SeekableJsonlReader, index_path_for
-from agent_team_timeline.timeline_shards import activity_bounds
-from agent_team_timeline.timeline_v3 import (
+from wrkviz.seekable_jsonl import SeekableJsonlReader, index_path_for
+from wrkviz.timeline_shards import activity_bounds
+from wrkviz.timeline_v3 import (
     agent_reference,
     phase_reference,
     rollup_reference,

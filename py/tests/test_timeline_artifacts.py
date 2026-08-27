@@ -8,9 +8,9 @@ from pathlib import Path
 
 import pytest
 
-from agent_team_timeline.build_store import team_build_root
-from agent_team_timeline.archive import narrow_json, read_json
-from agent_team_timeline.artifacts import (
+from wrkviz.build_store import team_build_root
+from wrkviz.archive import narrow_json, read_json
+from wrkviz.artifacts import (
     ArtifactKind,
     ArtifactRangeIndex,
     EvidenceRelation,
@@ -19,14 +19,14 @@ from agent_team_timeline.artifacts import (
     extract_artifacts,
     output_artifact_ids_for_range,
 )
-from agent_team_timeline.model import Agent, Event, SourceSnapshot, TeamData, ToolCall
-from agent_team_timeline.pipeline import (
+from wrkviz.model import Agent, Event, SourceSnapshot, TeamData, ToolCall
+from wrkviz.pipeline import (
     _write_ingested_team,
     build_archive,
     load_artifact_catalog,
     summarize_archive,
 )
-from agent_team_timeline.snapshot_store import resolve_snapshot_root
+from wrkviz.snapshot_store import resolve_snapshot_root
 from tests.timeline_projection import read_stored_text, schema_1_timeline_text
 
 

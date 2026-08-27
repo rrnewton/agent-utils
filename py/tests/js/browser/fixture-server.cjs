@@ -11,7 +11,7 @@ const staticRoot = path.resolve(
   "..",
   "..",
   "..",
-  "agent_team_timeline",
+  "wrkviz",
   "static"
 );
 const staticPrefix = staticRoot + path.sep;

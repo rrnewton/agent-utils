@@ -11,21 +11,21 @@ from typing import cast
 
 import pytest
 
-import agent_team_timeline.cli as cli_module
-import agent_team_timeline.project_config as project_config_module
-from agent_team_timeline.build_store import team_build_root
-from agent_team_timeline.claude import ClaudeParseError
-from agent_team_timeline.cli import main as timeline_main
-from agent_team_timeline.identity import IdentityOverrides
-from agent_team_timeline.model import TeamData
-from agent_team_timeline.orc import (
+import wrkviz.cli as cli_module
+import wrkviz.project_config as project_config_module
+from wrkviz.build_store import team_build_root
+from wrkviz.claude import ClaudeParseError
+from wrkviz.cli import main as timeline_main
+from wrkviz.identity import IdentityOverrides
+from wrkviz.model import TeamData
+from wrkviz.orc import (
     OrcAppendPrefixOverride,
     OrcContinuationSpec,
     OrcPrefixColumnChange,
     OrcPrefixRowChange,
 )
-from agent_team_timeline.pipeline import IngestReport
-from agent_team_timeline.project_config import (
+from wrkviz.pipeline import IngestReport
+from wrkviz.project_config import (
     ClaudeProjectSource,
     CodexProjectSource,
     OrcProjectSource,
@@ -35,13 +35,13 @@ from agent_team_timeline.project_config import (
     ingest_project,
     load_project_ingest_config,
 )
-from agent_team_timeline.transcript_export import (
+from wrkviz.transcript_export import (
     DroppedAuthorshipRule,
     PromptAuthorshipRule,
     TranscriptExportReport,
     TranscriptTeamSkip,
 )
-from agent_team_timeline.window import DateWindow
+from wrkviz.window import DateWindow
 
 
 CLAUDE_SESSION_ID = "11111111-1111-4111-8111-111111111111"

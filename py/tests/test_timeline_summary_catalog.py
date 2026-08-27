@@ -6,15 +6,15 @@ from pathlib import Path
 
 import pytest
 
-from agent_team_timeline.summary_artifacts import make_summary_provenance
-from agent_team_timeline.summary_catalog import (
+from wrkviz.summary_artifacts import make_summary_provenance
+from wrkviz.summary_catalog import (
     SummaryArtifactCatalog,
     SummaryArtifactReference,
     load_summary_catalog,
     merge_summary_catalog,
     select_summary_artifact,
 )
-from agent_team_timeline.summary_registry import (
+from wrkviz.summary_registry import (
     ContextComponent,
     ContextCoverage,
     TECHNICAL_ROLLUP_SUMMARIZER,

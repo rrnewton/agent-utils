@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_team_timeline.summarize import (
+from wrkviz.summarize import (
     GLOSSARY_DEFINITION_PROMPT_VERSION,
     GLOSSARY_DEFINITION_STYLE,
     PLAIN_LANGUAGE_ROLLUP_STYLE,
@@ -30,7 +30,7 @@ from agent_team_timeline.summarize import (
     knowledge_text_has_link,
     summarize_jobs,
 )
-from agent_team_timeline.token_usage import TokenUsage
+from wrkviz.token_usage import TokenUsage
 
 
 def _job(
@@ -366,7 +366,7 @@ for required in (
 expected_service_tier = os.environ.get("FAKE_CODEX_SERVICE_TIER")
 if expected_service_tier is not None:
     assert f'service_tier="{expected_service_tier}"' in args
-assert Path.cwd().name.startswith("agent-team-timeline-summary-")
+assert Path.cwd().name.startswith("wrkviz-summary-")
 repository_check = subprocess.run(
     ["git", "rev-parse", "--is-inside-work-tree"],
     text=True,

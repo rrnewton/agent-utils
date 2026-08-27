@@ -8,12 +8,12 @@ from pathlib import Path
 
 import pytest
 
-from agent_team_timeline.github_enrich import (
+from wrkviz.github_enrich import (
     discover_pull_request_keys,
     enrich_pull_request_metadata,
     pull_metadata_path,
 )
-from agent_team_timeline.github_metadata import (
+from wrkviz.github_metadata import (
     HttpResponse,
     load_pull_request_metadata_cache,
 )

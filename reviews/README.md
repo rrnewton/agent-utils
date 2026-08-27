@@ -30,7 +30,7 @@ reviews below cover more than one command.
 | Tool | Its related work |
 | --- | --- |
 | `herdr-run` | [`common/docs/herdr-run/RELATED_WORK.md`](../common/docs/herdr-run/RELATED_WORK.md) |
-| `agent-team-timeline` | [`common/docs/agent-team-timeline/RELATED_WORK.md`](../common/docs/agent-team-timeline/RELATED_WORK.md) |
+| `wrkviz` | [`common/docs/wrkviz/RELATED_WORK.md`](../common/docs/wrkviz/RELATED_WORK.md) |
 | `gent-talk` | [`gent-talk/RELATED_WORK.md`](../gent-talk/RELATED_WORK.md) |
 
 For a paired tool the folder is the one under `common/docs/`, which holds that tool's authoritative
@@ -41,7 +41,7 @@ implementation and no `common/docs/` entry, so its document sits next to its own
 
 Supporting research too long to live in a tool's document is kept here:
 
-- [agent-team-timeline comparative analysis](research/agent-team-timeline-comparative-analysis.md)
+- [wrkviz comparative analysis](research/wrkviz-comparative-analysis.md)
 
 The standard reproducibility entry points are:
 

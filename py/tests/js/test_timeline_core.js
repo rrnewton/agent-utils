@@ -7,7 +7,7 @@ const core = require(path.resolve(
   __dirname,
   "..",
   "..",
-  "agent_team_timeline",
+  "wrkviz",
   "static",
   "timeline-core.js"
 ));
