@@ -33,22 +33,34 @@
 
 const childProcess = require("node:child_process");
 const fs = require("node:fs");
+const http = require("node:http");
 const net = require("node:net");
+const os = require("node:os");
 const path = require("node:path");
 
 //: Four, not three. `day` lands in `lifetime` rather than `detail` on a normal window -- a day
 //: across ~1400px is about 61s per pixel against a 60s threshold -- so `hour` is what actually
 //: exercises the level that draws individual phases, which is the expensive one.
 //:
-//: A KNOWN, UNRESOLVED FAILURE, recorded because a retry hides it otherwise. The fourth level of
-//: a run whose levels DIFFER fails to load, whichever level is fourth: `hour` when it is fourth,
-//: `day` when it is fourth. Established by experiment: every level passes alone; any two pass
-//: together; `fit,fit,fit,fit` passes; three differing levels pass. It presents as a 120s load
-//: timeout with no page error, no console error and no failed request, against a server started
-//: fresh for that level. Ruled out: memory (181G of 1010G used), /dev/shm (504G free), server
-//: teardown (process-group kill plus a settle delay did not help). The remaining suspect is state
-//: accumulating in this parent process across sequential Playwright launches. Each level is
-//: retried once, which makes the tool usable and is not a fix.
+//: WHAT HAPPENED TO THE "FOURTH LEVEL" FAILURE, and why there is no retry here any more. This
+//: file used to record a load that timed out at 120s with no page error, no console error and no
+//: failed request, and to retry each level once to work around it. The retry is gone, because a
+//: retry standing around a failure nobody has explained hides the next one.
+//:
+//: One mechanism that produces EXACTLY that signature was found and is fixed below: the server's
+//: log went to a pipe this process could not read, and a full pipe stops `serve.py` answering
+//: without killing it or refusing a connection. See `measure`, where it is described and where
+//: the numbers behind it are recorded.
+//:
+//: What is NOT established is that this was the failure recorded here, and it should not be
+//: claimed. Against a 13,760-phase, 2,656-agent, 264,719-tool-call archive the recorded failure
+//: did not recur once in fourteen consecutive four-level runs -- fifty-six levels -- taken before
+//: any change, so there was no live instance left to attribute. Two facts bound it. That archive
+//: logs 39-72 requests per level and the pipe holds about 962, a thirteenfold margin, so the
+//: deadlock cannot fire on an archive this quiet; and the site inside a rebuilt archive is not
+//: the site the original run measured, so the request pattern that mattered may no longer exist.
+//: If a load ever times out here again, the error now carries a probe of the server taken before
+//: teardown and the tail of that server's log, which is what the original investigation lacked.
 const LEVELS = ["fit", "week", "day", "hour"];
 
 function parseArguments(argv) {
@@ -108,9 +120,23 @@ async function unusedPort() {
   });
 }
 
+function hasExited(child) {
+  return child.exitCode !== null || child.signalCode !== null;
+}
+
 async function stopGroup(child) {
   // Signal the GROUP (negative pid), then wait, then SIGKILL the group. Signalling the pid alone
   // leaves anything the server spawned, and leaves the server itself if it declines SIGTERM.
+  // `python3` here is a launcher that forks the real interpreter rather than exec'ing it, so the
+  // pid Node holds is not the pid that is listening -- the group is what has to be addressed.
+  //
+  // A child that has ALREADY exited is left alone, for two reasons. It has been reaped, so its
+  // pid is free for the kernel to reissue and `kill(-pid)` would be aimed at whoever holds it
+  // next; and its `exit` event has already fired, so waiting for another one would spend the
+  // full eight seconds below learning nothing.
+  if (hasExited(child)) {
+    return;
+  }
   const done = new Promise(function (resolve) { child.once("exit", resolve); });
   try {
     process.kill(-child.pid, "SIGTERM");
@@ -135,9 +161,15 @@ async function stopGroup(child) {
 }
 
 
-async function waitForServer(port, timeoutMs) {
+async function waitForServer(port, timeoutMs, child) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
+    if (child && hasExited(child)) {
+      throw new Error(
+        "the archive's serve.py exited before it began listening (status=" +
+        String(child.exitCode) + " signal=" + String(child.signalCode) + ")"
+      );
+    }
     const reachable = await new Promise(function (resolve) {
       const socket = net.connect(port, "127.0.0.1");
       socket.once("connect", function () {
@@ -145,6 +177,7 @@ async function waitForServer(port, timeoutMs) {
         resolve(true);
       });
       socket.once("error", function () {
+        socket.destroy();
         resolve(false);
       });
     });
@@ -154,6 +187,52 @@ async function waitForServer(port, timeoutMs) {
     await new Promise(function (resolve) { setTimeout(resolve, 200); });
   }
   throw new Error("the archive's serve.py did not start within " + timeoutMs + "ms");
+}
+
+//: Ask the server for the entry point and say, in one line, what happened. Run when a level has
+//: just failed and BEFORE the server is torn down, because "did the server answer at the moment
+//: the page gave up" is the question that separates a stalled server from a stalled page, and it
+//: is unanswerable afterwards.
+async function probeServer(port, timeoutMs) {
+  const startedAt = Date.now();
+  return new Promise(function (resolve) {
+    const request = http.get(
+      { host: "127.0.0.1", port: port, path: "/", agent: false },
+      function (response) {
+        response.resume();
+        response.once("end", function () {
+          resolve(
+            "answered HTTP " + response.statusCode + " in " + (Date.now() - startedAt) + "ms"
+          );
+        });
+      }
+    );
+    request.setTimeout(timeoutMs, function () {
+      request.destroy(new Error("timeout"));
+      resolve(
+        "DID NOT ANSWER within " + timeoutMs + "ms -- the server has stopped serving, so the " +
+        "page was waiting on it rather than on itself"
+      );
+    });
+    request.once("error", function (error) {
+      resolve("connection failed: " + (error && error.message ? error.message : String(error)));
+    });
+  });
+}
+
+function tailOf(logPath, lines) {
+  let text;
+  try {
+    text = fs.readFileSync(logPath, "utf8");
+  } catch (error) {
+    return "    <unreadable: " + (error && error.message ? error.message : error) + ">";
+  }
+  const all = text.split("\n").filter(function (line) { return line.length > 0; });
+  const kept = all.slice(-lines).map(function (line) { return "    " + line; });
+  return (
+    "    (" + all.length + " logged line(s) in total)\n" +
+    (kept.length ? kept.join("\n") : "    <the server logged nothing>")
+  );
 }
 
 function runBenchmark(url, level, timeoutMs) {
@@ -215,8 +294,7 @@ function renderTable(reports) {
       (String(shape.render_duration_ms) + "ms").padStart(9) +
       (String(input.p50) + "ms").padStart(9) +
       (String(input.p95) + "ms").padStart(9) +
-      (String(input.max) + "ms").padStart(9) +
-      (entry.retried ? "  (retried)" : "");
+      (String(input.max) + "ms").padStart(9);
   });
   return [
     "",
@@ -250,23 +328,65 @@ async function main() {
     throw new Error("not a built archive (no serve.py): " + archive);
   }
 
+  // Somewhere for the servers to log. One file per level, removed when the whole run succeeds
+  // and named in the error when it does not.
+  const logDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "wrkviz-qa-"));
+
   // A FRESH server per level, not one shared across the run. The reason that matters for the
   // numbers is the HTTP cache: a shared server let level N load from level N-1's warm cache, so
   // the later rows measured a state a real reader would not have and the rows were not
   // comparable with each other.
   async function measure(level) {
     const port = await unusedPort();
-    // `detached`, so the server can be killed as a process GROUP. A bare SIGTERM to the pid was
-    // observed leaving servers alive -- four at once during a four-level run that should never
-    // have had more than one.
-    const child = childProcess.spawn("python3", [server, "--port", String(port)], {
-      cwd: archive,
-      stdio: ["ignore", "pipe", "pipe"],
-      detached: true
-    });
+    const logPath = path.join(logDirectory, "serve-" + level + ".log");
+    const logFd = fs.openSync(logPath, "w");
+    let child;
     try {
-      await waitForServer(port, 30_000);
+      // THE SERVER'S OUTPUT GOES TO A FILE, NEVER TO A PIPE, and that is load-bearing rather
+      // than tidy. `serve.py` logs every non-index request to stderr, and a pipe nobody reads
+      // holds 64KiB. The parent cannot read it: it spends the whole of a level blocked inside
+      // `spawnSync` waiting for the benchmark, so its event loop -- and with it any drain of the
+      // pipe -- is stopped for exactly the window in which the requests happen. When the buffer
+      // fills, `serve.py` blocks in `write`, and because `sys.stderr` is one lock-protected
+      // stream every other request thread queues behind it: the server stops answering, without
+      // dying and without ever refusing a connection.
+      //
+      // That failure is invisible from the browser's side. The page's pending fetches simply
+      // never settle, so there is no page error, no console error and no failed request -- only
+      // a load that times out. Measured against this archive's own `serve.py`: with a pipe the
+      // 963rd request was never answered; with a file 3,000 requests and 251KB of log went
+      // through untouched. Attaching a `data` listener is NOT the fix -- with the parent inside
+      // `spawnSync` the listener never runs, and the same server wedged after 172 requests.
+      //
+      // A real archive today logs 39-72 lines per level, so there is roughly a thirteenfold
+      // margin and this is a trap rather than a daily failure. It is still the cheapest possible
+      // fix for the most confusing possible symptom, and a noisier archive walks straight into
+      // it.
+      //
+      // `detached`, so the server can be killed as a process GROUP. A bare SIGTERM to the pid was
+      // observed leaving servers alive -- four at once during a four-level run that should never
+      // have had more than one.
+      child = childProcess.spawn("python3", [server, "--port", String(port)], {
+        cwd: archive,
+        stdio: ["ignore", logFd, logFd],
+        detached: true
+      });
+    } finally {
+      // The child has its own duplicate; holding this one open only keeps the file alive.
+      fs.closeSync(logFd);
+    }
+    try {
+      await waitForServer(port, 30_000, child);
       return runBenchmark("http://127.0.0.1:" + port + "/", level, options.timeoutMs);
+    } catch (error) {
+      // Diagnose BEFORE the teardown, while the failing state still exists. Whether the server
+      // answers right now is the one fact that decides where to look next, and killing it first
+      // throws that fact away.
+      const probe = await probeServer(port, 5_000);
+      error.message +=
+        "\n  server probe: " + probe +
+        "\n  server log " + logPath + ":\n" + tailOf(logPath, 12);
+      throw error;
     } finally {
       await stopGroup(child);
       // Let the port and the browser teardown settle before the next level starts.
@@ -277,23 +397,9 @@ async function main() {
   const reports = [];
   for (const level of options.levels) {
     process.stderr.write("  measuring zoom=" + level + "...\n");
-    let report;
-    let retried = false;
-    try {
-      report = await measure(level);
-    } catch (error) {
-      // ONE retry, and it is disclosed in the output rather than laundering a failure into a
-      // pass. See the note above `LEVELS` for exactly what is and is not understood about the
-      // failure this exists for.
-      process.stderr.write(
-        "  zoom=" + level + " failed, retrying once: " +
-        String(error && error.message).split("\n")[0] + "\n"
-      );
-      retried = true;
-      report = await measure(level);
-    }
-    reports.push({ level: level, report: report, retried: retried });
+    reports.push({ level: level, report: await measure(level) });
   }
+  fs.rmSync(logDirectory, { recursive: true, force: true });
 
   const table = renderTable(reports);
   process.stdout.write(table);

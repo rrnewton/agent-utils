@@ -243,7 +243,7 @@ async function zoomToSpan(page, targetSpanMs, timeoutMs) {
   let span = before;
   let steps = 0;
   while (span > targetSpanMs && steps < MAX_STEPS) {
-    await wheelSample(page, { name: "seek", kind: "zoom", deltaX: 0, deltaY: -360 }, steps, timeoutMs);
+    await wheelSample(page, { name: "seek", kind: "zoom", deltaX: 0, deltaY: -360 }, timeoutMs);
     const next = await currentSpanMs(page);
     if (!Number.isFinite(next) || next >= span) {
       // The view stopped narrowing: either a floor was reached or the wheel stopped being
@@ -258,7 +258,16 @@ async function zoomToSpan(page, targetSpanMs, timeoutMs) {
 }
 
 
-async function wheelSample(page, action, index, timeoutMs) {
+//: Every wheel sample gets its own key, and the page's sample array is never cleared, so the key
+//: has to be unique for the LIFE of the run rather than for the phase it is in. Numbering each
+//: phase from zero was a silent corruption: `zoomToSpan` seeks with keys 0..n before measuring
+//: begins, so the measured samples 0..11 found the SEEK samples already in the array and returned
+//: instantly with their latencies. Every level that seeks at all -- which is every level but the
+//: fitted one -- reported up to twelve stale numbers taken while the view was somewhere else.
+let wheelSampleSequence = 0;
+
+async function wheelSample(page, action, timeoutMs) {
+  const key = "wheel-" + (wheelSampleSequence += 1);
   const selector = "#time-axis";
   const target = page.locator(selector);
   const box = await target.boundingBox();
@@ -285,19 +294,19 @@ async function wheelSample(page, action, index, timeoutMs) {
           inputToRaf = null;
         }
         window.__agentTimelineBenchmarkSamples.push({
-          index: settings.index,
+          key: settings.key,
           input_to_raf_ms: inputToRaf,
           handler_to_raf_ms: frameAt - handlerAt
         });
       });
     }, { once: true, passive: true });
-  }, { selector: selector, index: index });
+  }, { selector: selector, key: key });
 
   await page.mouse.wheel(action.deltaX, action.deltaY);
-  const sampleHandle = await page.waitForFunction(function (sampleIndex) {
+  const sampleHandle = await page.waitForFunction(function (sampleKey) {
     const samples = window.__agentTimelineBenchmarkSamples || [];
-    return samples.find(function (sample) { return sample.index === sampleIndex; }) || false;
-  }, index, { timeout: Math.min(timeoutMs, 5_000) });
+    return samples.find(function (sample) { return sample.key === sampleKey; }) || false;
+  }, key, { timeout: Math.min(timeoutMs, 5_000) });
   const sample = await sampleHandle.jsonValue();
 
   let renderChanged = false;
@@ -504,7 +513,6 @@ async function benchmarkSite(options) {
       samples.push(await wheelSample(
         page,
         WHEEL_SEQUENCE[index],
-        index,
         options.timeoutMs
       ));
     }
