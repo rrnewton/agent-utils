@@ -149,6 +149,7 @@ pub struct DiagnosticsReport {
 /// construction, and this catches anything that arrived by a path nobody thought about — a store
 /// backend error quoting a connection string, a transport error quoting a URL somebody put a
 /// token in.
+///
 /// Built from [`secrets_of`] rather than from its own list, so that a test asserting "none of
 /// these appears" and the code doing the removing cannot disagree about what "these" are. A
 /// second, hand-maintained list here is exactly how a credential added later comes to be the one
@@ -283,9 +284,16 @@ pub async fn run(state: &AppState) -> DiagnosticsReport {
     checks.extend(discord_channels(state, &deadline).await);
 
     checks.push(elevenlabs_key(state, &deadline).await);
-    let (agent_check, profile) = elevenlabs_agent(state, &deadline).await;
-    checks.push(agent_check);
-    checks.push(elevenlabs_voice(state, profile.as_ref()));
+    // One vendor call answers both of these, and the voice check reads the agent's verdict as
+    // well as its profile — so the voice row is BUILT first and PUSHED second, which is the
+    // cheapest way to keep reading order without cloning a diagnosis to satisfy the borrow.
+    let (agent, profile) = elevenlabs_agent(state, &deadline).await;
+    let voice = elevenlabs_voice(state, profile.as_ref(), &agent);
+    checks.push(
+        Check::new("elevenlabs.agent", "ElevenLabs agent", agent)
+            .about(state.config.elevenlabs.agent_id.clone().unwrap_or_default()),
+    );
+    checks.push(voice);
 
     checks.push(storage(state, &deadline).await);
 
@@ -376,10 +384,12 @@ async fn elevenlabs_key(state: &AppState, deadline: &Deadline) -> Check {
 ///
 /// Hands the profile back as well as the check, so the voice check below can reuse the one call
 /// rather than spending a second vendor request to learn the same thing.
-async fn elevenlabs_agent(state: &AppState, deadline: &Deadline) -> (Check, Option<AgentProfile>) {
+async fn elevenlabs_agent(
+    state: &AppState,
+    deadline: &Deadline,
+) -> (Diagnosis, Option<AgentProfile>) {
     let config = &state.config.elevenlabs;
-    let (diagnosis, profile) = match within(deadline, state.elevenlabs.agent_profile(config)).await
-    {
+    match within(deadline, state.elevenlabs.agent_profile(config)).await {
         Err(timed_out) => (timed_out, None),
         Ok(Ok(profile)) => match &profile.voice_id {
             Some(voice) => (
@@ -398,12 +408,7 @@ async fn elevenlabs_agent(state: &AppState, deadline: &Deadline) -> (Check, Opti
             None => (Diagnosis::NoVoice, Some(profile)),
         },
         Ok(Err(error)) => (classify_elevenlabs(&error, Diagnosis::UnknownAgent), None),
-    };
-    (
-        Check::new("elevenlabs.agent", "ElevenLabs agent", diagnosis)
-            .about(config.agent_id.clone().unwrap_or_default()),
-        profile,
-    )
+    }
 }
 
 /// Does a voice resolve — either configured outright, or borrowed from the agent?
@@ -411,12 +416,21 @@ async fn elevenlabs_agent(state: &AppState, deadline: &Deadline) -> (Check, Opti
 /// No vendor call of its own: it is a question about how two settings combine, and the answer is
 /// already in hand. `elevenlabs.voice_id` is OPTIONAL, and this check is the thing that makes
 /// that claim checkable rather than a sentence in a README.
-fn elevenlabs_voice(state: &AppState, profile: Option<&AgentProfile>) -> Check {
+///
+/// `agent` is the diagnosis the agent check reached, and it is taken for one specific reason. If
+/// the agent lookup TIMED OUT, or the key was rejected, then this check knows nothing about
+/// whether a voice would have resolved — and answering [`Diagnosis::NoVoice`] there would print
+/// "give the agent a voice" over a network failure, which is a wrong instruction, not merely an
+/// unhelpful one. So the real cause is carried down instead, and the row says what actually went
+/// wrong.
+fn elevenlabs_voice(state: &AppState, profile: Option<&AgentProfile>, agent: &Diagnosis) -> Check {
     let config = &state.config.elevenlabs;
     let diagnosis = match (
         configured_voice(config),
         profile.and_then(|p| p.voice_id.as_deref()),
     ) {
+        // An explicitly named voice needs no agent at all, so it resolves even when the agent
+        // check went red. That is not optimism: read-aloud really does work in this state.
         (Some(named), _) => Diagnosis::Confirmed(format!(
             "elevenlabs.voice_id names {named} explicitly, so that is the voice read-aloud uses"
         )),
@@ -424,9 +438,10 @@ fn elevenlabs_voice(state: &AppState, profile: Option<&AgentProfile>) -> Check {
             "elevenlabs.voice_id is unset, so read-aloud borrows the agent's own voice, \
              {borrowed} — which is the intended default and needs no setting"
         )),
-        // Nothing configured and nothing to borrow. If the agent check above failed for a reason
-        // of its own, that reason is the one to fix first; this row says what the consequence is.
-        (None, None) => Diagnosis::NoVoice,
+        // Nothing configured, and nothing to borrow. Either the agent genuinely has no voice —
+        // in which case `agent` is already `NoVoice` and repeating it is right — or the agent
+        // could not be read at all, in which case THAT is the fault and this row must say so.
+        (None, None) => agent.clone(),
     };
     Check::new("elevenlabs.voice", "Read-aloud voice", diagnosis)
 }

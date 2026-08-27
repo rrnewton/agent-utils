@@ -272,7 +272,10 @@ async fn the_report_redacts_a_credential_the_vendor_error_types_never_saw() {
         text(storage, "detail").contains("could not open the database"),
         "{storage:#}"
     );
-    assert!(text(storage, "detail").contains("<redacted>"), "{storage:#}");
+    assert!(
+        text(storage, "detail").contains("<redacted>"),
+        "{storage:#}"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -537,6 +540,34 @@ async fn an_unset_voice_id_is_reported_as_borrowed_rather_than_missing() {
     let detail = text(voice, "detail");
     assert!(detail.contains("borrows"), "{voice:#}");
     assert!(detail.contains(KNOWN_VOICE_ID), "{voice:#}");
+}
+
+#[tokio::test]
+async fn an_agent_that_could_not_be_read_does_not_make_the_voice_row_blame_the_voice() {
+    // A wrong instruction is worse than a vague one. With no `voice_id` set, the voice is
+    // borrowed from the agent — so when the AGENT lookup fails for a reason of its own, this row
+    // knows nothing about whether a voice would have resolved. Printing "give the agent a voice"
+    // over a rejected API key sends the reader to the wrong dashboard page entirely.
+    let (state, _discord, _elevenlabs) = gent_talk::testing::state_from_toml(&toml_with(&format!(
+        "[elevenlabs]\napi_key = \"xi-a-key-this-account-does-not-have\"\nagent_id = \"{KNOWN_AGENT_ID}\""
+    )));
+    let body = report(state).await;
+    let agent = check(&body, "elevenlabs.agent");
+    let voice = check(&body, "elevenlabs.voice");
+    assert_eq!(agent["status"], "fail", "{agent:#}");
+    assert_eq!(voice["status"], "fail", "{voice:#}");
+    assert_eq!(
+        voice["summary"], agent["summary"],
+        "the voice row must carry the REAL cause down, not invent one: {body:#}"
+    );
+    assert!(
+        text(voice, "remedy").contains("elevenlabs.api_key"),
+        "the remedy must point at the rejected key, not at a missing voice: {voice:#}"
+    );
+    assert!(
+        !text(voice, "remedy").contains("give the agent a voice"),
+        "{voice:#}"
+    );
 }
 
 #[tokio::test]
