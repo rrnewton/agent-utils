@@ -937,6 +937,19 @@ h1 {
   fill: #a77bf3;
 }
 
+/* The torn top edge of a block whose height hit the cap. Team-block height is linear in agents
+   present, so a burst of sixty cannot be drawn at true scale in a 78px row; the saw-tooth says
+   the bar continues past what is shown, rather than letting a sixty-agent hour look identical to
+   a nine-agent one. Hover and selection still read normally because this is a separate node
+   rather than another modulation of the block's own fill. */
+.activity-bin-overflow {
+  fill: none;
+  stroke: #ffd166;
+  stroke-width: 1.5;
+  stroke-linejoin: miter;
+  pointer-events: none;
+}
+
 .activity-bin-group:hover .activity-bin-block,
 .activity-bin-group:focus-visible .activity-bin-block {
   filter: brightness(1.35);

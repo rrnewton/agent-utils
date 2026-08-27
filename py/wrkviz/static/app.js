@@ -39,8 +39,32 @@
   var COMPACT_LABEL_WIDTH = 72;
   var AGGREGATE_LABEL_WIDTH = 128;
   var AGGREGATE_TEAM_HEIGHT = 78;
-  var AGGREGATE_WORKER_SCALE = 10;
-  var AGGREGATE_WORKER_MAX_HEIGHT = 48;
+  // A team block is as tall as the team was big: **linear** in agents present, at this many
+  // pixels each. Three concurrent agents draw three times the height of one, which is the only
+  // rule under which a reader can compare two blocks by eye and get the ratio right. The height
+  // this used to have was `log2(1 + average)`, and under a log there is no ratio to read: three
+  // agents drew twice one agent, ten drew three and a half times it, and the picture quietly
+  // said "busier" while refusing to say how much.
+  //
+  // SIX pixels, chosen against the concurrency this tool actually sees rather than picked for
+  // roundness. On a 2,656-agent archive the per-hour average present concurrency has a median of
+  // 1.9, a p90 of 6.0 and a p99 of 9.5 agents. Six pixels makes the median block 11px -- a bar,
+  // not a hairline -- puts the p90 at 36px, and reaches the cap just past the p99. Ten pixels
+  // would saturate at five agents and flatten the whole busy half of the distribution together;
+  // three would draw the median as a 6px sliver.
+  var AGGREGATE_PIXELS_PER_AGENT = 6;
+  // What a log scale bought, and what has to be paid for now that it is gone: the compression of
+  // outliers. Linear height and a 78px row cannot both be honoured by a 60-agent burst, so the
+  // block is clamped here -- at nine agents, the row's honest capacity -- and a clamped block is
+  // drawn with a torn top edge (`activity-bin-overflow`) so the reader is TOLD the bar continues
+  // past what is shown instead of being handed a bar that quietly ties with a nine-agent one.
+  // On the archive above that is ~1.5% of bins: rare enough to read as an exception, common
+  // enough that a reader will meet the convention and learn it.
+  var AGGREGATE_BIN_MAX_HEIGHT = 54;
+  // A floor, not a measurement. A bin with a trace of activity still has to be a click and hover
+  // target, so it is drawn at 4px even though its agent count says less. Blocks at the floor are
+  // NOT proportional to each other and are not meant to be read against each other.
+  var AGGREGATE_BIN_MIN_HEIGHT = 4;
   var STATE_HEIGHT = 6;
   var MIN_VIEW_MS = 1000;
   var SEARCH_RESULT_LIMIT = 100;
@@ -4198,6 +4222,50 @@
     ].join(":");
   }
 
+  // How tall one team block is, and whether that height is the whole truth.
+  //
+  // `agents` is the team's size during the bin: the coordinator, counted as the fraction of the
+  // bin it has activity evidence for, plus the average number of workers present. Counting the
+  // coordinator as an agent rather than as a fixed 10px pedestal is what makes the height a
+  // straight multiple of a count -- with a pedestal, one worker drew 16px and three drew 28px,
+  // which is 1.75x for 3x the team and is exactly the misreading a linear scale is for.
+  //
+  // Returned as a record rather than a number because the caller needs all three parts: the
+  // height to draw, whether it was clamped (so it can draw the torn edge), and the count itself
+  // (so the tooltip can state the number the picture could not).
+  function activityBinHeight(coordinatorPresence, averageWorkers) {
+    var agents = clamp(number(coordinatorPresence, 0), 0, 1) +
+      Math.max(0, number(averageWorkers, 0));
+    var wanted = agents * AGGREGATE_PIXELS_PER_AGENT;
+    return {
+      agents: agents,
+      height: clamp(wanted, AGGREGATE_BIN_MIN_HEIGHT, AGGREGATE_BIN_MAX_HEIGHT),
+      // Saturated only when the clamp costs a visible amount. A block whose true height is a
+      // third of a pixel over the cap is not misleading anybody, and marking it would spend the
+      // torn edge -- whose whole value is that it is rare -- on rounding.
+      saturated: wanted - AGGREGATE_BIN_MAX_HEIGHT > 0.5,
+      capacityAgents: AGGREGATE_BIN_MAX_HEIGHT / AGGREGATE_PIXELS_PER_AGENT
+    };
+  }
+
+  // The torn top edge of a clamped block: a saw-tooth polyline, the printer's convention for "cut
+  // off, continues past here". Drawn instead of, say, a brighter fill because it survives the
+  // three things that already modulate a block's colour -- coverage opacity, the summary-available
+  // hue, and the hover and selection filters -- none of which leave a spare colour to mean this.
+  function saturationEdgePoints(x, y, width) {
+    var tooth = 4;
+    var rise = 2.5;
+    var steps = Math.max(2, Math.round(width / tooth));
+    var points = [];
+    for (var step = 0; step <= steps; step += 1) {
+      points.push(
+        (x + (width * step) / steps).toFixed(2) + "," +
+        (y + (step % 2 ? rise : 0)).toFixed(2)
+      );
+    }
+    return points.join(" ");
+  }
+
   function renderActivityBin(bin, team, rowIndex, layer) {
     var start = number(bin.start_ms, NaN);
     var end = number(bin.end_ms, NaN);
@@ -4237,12 +4305,8 @@
       number(workers.peak_concurrency, 0)
     ));
     var rowTop = rowIndex * AGGREGATE_TEAM_HEIGHT;
-    var height = clamp(
-      (coordinatorCoverage > 0 ? 10 : 4) +
-        Math.log2(1 + average) * AGGREGATE_WORKER_SCALE,
-      4,
-      AGGREGATE_WORKER_MAX_HEIGHT + 10
-    );
+    var block = activityBinHeight(coordinatorCoverage, average);
+    var height = block.height;
     var y = rowTop + 8;
     var key = aggregateSelectionKey(bin);
     var hasSummary = summaryAvailableInRange(text(bin.team), start, end);
@@ -4251,7 +4315,8 @@
     var group = svgElement("g", {
       class: "activity-bin-group " +
         (hasSummary ? "summary-available" : "summary-unavailable") +
-        (selected ? " is-selected" : ""),
+        (selected ? " is-selected" : "") +
+        (block.saturated ? " is-saturated" : ""),
       role: "button",
       tabindex: "0",
       "data-team": text(bin.team),
@@ -4260,9 +4325,15 @@
       "data-summary-available": hasSummary ? "true" : "false",
       "data-start-ms": String(start),
       "data-end-ms": String(end),
+      "data-agents-present": block.agents.toFixed(2),
+      "data-height-saturated": block.saturated ? "true" : "false",
       "aria-pressed": selected ? "true" : "false",
       "aria-label": text(team.label, text(team.slug)) +
         " combined activity. " + formatRange(start, end) +
+        ". " + block.agents.toFixed(1) + " agents present on average" +
+        (block.saturated
+          ? ", drawn clamped at " + block.capacityAgents.toFixed(0)
+          : "") +
         (hasSummary ? ". Summary available" : ". No summary generated")
     });
     group.appendChild(svgElement("rect", {
@@ -4274,11 +4345,22 @@
       class: "activity-bin-block activity-bin-combined",
       "fill-opacity": (0.16 + coverage * 0.84).toFixed(3)
     }));
+    if (block.saturated) {
+      group.appendChild(svgElement("polyline", {
+        points: saturationEdgePoints(x, y, width),
+        class: "activity-bin-overflow",
+        "aria-hidden": "true"
+      }));
+    }
     group.addEventListener("pointerenter", function (event) {
       showTooltip(
         event,
         text(team.label, text(team.slug)) + " · Team activity",
         formatRange(start, end) +
+          "\nAgents present on average: " + block.agents.toFixed(2) +
+          (block.saturated
+            ? " (block height clamped at " + block.capacityAgents.toFixed(0) + ")"
+            : "") +
           "\nCoordinator activity evidence: " +
             Math.round(coordinatorCoverage * 100) + "%" +
           "\nEstimated average present workers: " + average.toFixed(2) +

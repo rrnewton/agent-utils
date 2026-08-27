@@ -222,6 +222,7 @@ const phases = [
 ];
 
 const AGGREGATE_HOUR_START_MS = Date.UTC(2026, 2, 9, 3);
+const AGGREGATE_BURST_START_MS = AGGREGATE_HOUR_START_MS + 60 * minute;
 const AGGREGATE_GAP_START_MS = AGGREGATE_HOUR_START_MS + 2 * 60 * minute;
 const AGGREGATE_LATER_START_MS = AGGREGATE_HOUR_START_MS + 3 * 60 * minute;
 
@@ -239,22 +240,31 @@ function activityBin(role, resolution, startMs, endMs, average, peak, coverage, 
   };
 }
 
+// THE THREE HOURLY BINS ARE A SCALE, not three arbitrary numbers. Team-block height is linear in
+// agents present -- coordinator presence plus average worker concurrency -- so the first hour is
+// built to hold exactly three agents and the last exactly one, and the browser suite asserts the
+// drawn heights are in a 3:1 ratio. Change these numbers and that assertion is what breaks.
+//
+// The middle hour is a burst past the height cap, and it describes a team larger than this
+// fixture's own four-agent roster on purpose: the cap sits at nine agents, so nothing a
+// four-agent fixture could honestly report would ever reach it, and the clamped rendering would
+// go untested by anything short of a real archive.
 const activityBins = [
   activityBin(
     "coordinator", "hourly", AGGREGATE_HOUR_START_MS,
-    AGGREGATE_HOUR_START_MS + 60 * minute, 0.75, 1, 0.75, 1
+    AGGREGATE_BURST_START_MS, 1, 1, 1, 1
   ),
   activityBin(
     "workers", "hourly", AGGREGATE_HOUR_START_MS,
-    AGGREGATE_HOUR_START_MS + 60 * minute, 1.4, 3, 0.9, 3
+    AGGREGATE_BURST_START_MS, 2, 3, 0.9, 3
   ),
   activityBin(
-    "workers", "hourly", AGGREGATE_HOUR_START_MS + 60 * minute,
-    AGGREGATE_GAP_START_MS, 0.5, 1, 0.5, 1
+    "workers", "hourly", AGGREGATE_BURST_START_MS,
+    AGGREGATE_GAP_START_MS, 12.5, 24, 0.5, 26
   ),
   activityBin(
     "workers", "hourly", AGGREGATE_LATER_START_MS,
-    AGGREGATE_LATER_START_MS + 60 * minute, 0.25, 1, 0.25, 1
+    AGGREGATE_LATER_START_MS + 60 * minute, 1, 1, 0.25, 1
   ),
   activityBin(
     "coordinator", "daily", Date.UTC(2026, 2, 9), Date.UTC(2026, 2, 10),
@@ -635,6 +645,8 @@ module.exports = {
   DATA_END_MS: DATA_END_MS,
   AGENT_A_ACTIVITY_START_MS: AGENT_A_ACTIVITY_START_MS,
   AGENT_A_ACTIVITY_END_MS: AGENT_A_ACTIVITY_END_MS,
+  AGGREGATE_HOUR_START_MS: AGGREGATE_HOUR_START_MS,
+  AGGREGATE_BURST_START_MS: AGGREGATE_BURST_START_MS,
   AGGREGATE_GAP_START_MS: AGGREGATE_GAP_START_MS,
   AGGREGATE_LATER_START_MS: AGGREGATE_LATER_START_MS,
   FIRST_DAY_ACTIVITY_START_MS: FIRST_DAY_ACTIVITY_START_MS,

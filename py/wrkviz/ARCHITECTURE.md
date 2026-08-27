@@ -76,9 +76,13 @@ agent. Structural fork/join edges are shown there only for the selected agent fa
 minutes per pixel, the aggregate level
 suppresses agents, phases, states, and edges entirely and renders one compact row per team from the
 precomputed bins. It chooses the narrowest hourly/daily/weekly resolution whose nominal bin is at
-least eight pixels wide. Coordinator and worker evidence is one downward-extending block:
-log-scaled height encodes estimated average worker presence, opacity encodes activity-evidence
-coverage, and a distinct hue marks ranges with cached summaries. Teams sort by descending recorded
+least eight pixels wide. Coordinator and worker evidence is one downward-extending block: height is
+**linear** in the number of agents present — six pixels per agent, counting the coordinator as the
+fraction of the bin it has evidence for, so three concurrent agents draw three times the height of
+one — opacity encodes activity-evidence coverage, and a distinct hue marks ranges with cached
+summaries. Height is clamped at the row's capacity of nine agents, and a clamped block is drawn
+with a saw-tooth top edge so a burst beyond the cap is not silently indistinguishable from one at
+it; the true count is in the tooltip and the accessible name. Teams sort by descending recorded
 event volume. Omitted zero-activity bins preserve gaps. These thresholds and suppressions are part
 of the performance contract and are covered by browser tests.
 

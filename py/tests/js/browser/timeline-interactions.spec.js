@@ -3,7 +3,9 @@
 const { test, expect } = require("@playwright/test");
 const { createHash } = require("crypto");
 const {
+  AGGREGATE_BURST_START_MS,
   AGGREGATE_GAP_START_MS,
+  AGGREGATE_HOUR_START_MS,
   AGGREGATE_LATER_START_MS,
   AGENT_A_ACTIVITY_END_MS,
   AGENT_A_ACTIVITY_START_MS,
@@ -1760,16 +1762,51 @@ test("semantic zoom drops subpixel detail within a deterministic DOM budget", as
   await expect(svg.locator(
     '.activity-bin-group[data-start-ms="' + AGGREGATE_LATER_START_MS + '"]'
   )).toHaveCount(1);
-  const busyHeight = Number(await svg.locator(
-    '.activity-bin-group[data-activity-role="combined"]'
-  ).first().locator("rect").getAttribute("height"));
-  const quieterHeight = Number(await svg.locator(
-    '.activity-bin-group[data-start-ms="' + AGGREGATE_LATER_START_MS + '"] rect'
-  ).getAttribute("height"));
-  expect(busyHeight).toBeGreaterThan(quieterHeight);
-  const busyOpacity = Number(await svg.locator(
-    '.activity-bin-group[data-activity-role="combined"]'
-  ).first().locator("rect").getAttribute("fill-opacity"));
+  // Height is LINEAR in agents present, which is the only rule under which a reader can compare
+  // two team blocks and get the ratio right. The fixture's first hour holds three agents (a
+  // coordinator present throughout plus two workers on average) and its last holds one, so the
+  // drawn heights must be in a 3:1 ratio -- not the 2:1 the superseded log scale gave.
+  const threeAgentBin = svg.locator(
+    '.activity-bin-group[data-start-ms="' + AGGREGATE_HOUR_START_MS + '"]'
+  );
+  const oneAgentBin = svg.locator(
+    '.activity-bin-group[data-start-ms="' + AGGREGATE_LATER_START_MS + '"]'
+  );
+  await expect(threeAgentBin).toHaveAttribute("data-agents-present", "3.00");
+  await expect(oneAgentBin).toHaveAttribute("data-agents-present", "1.00");
+  const busyHeight = Number(
+    await threeAgentBin.locator("rect").getAttribute("height")
+  );
+  const quieterHeight = Number(
+    await oneAgentBin.locator("rect").getAttribute("height")
+  );
+  expect(busyHeight).toBe(quieterHeight * 3);
+
+  // What linear costs, and how it is paid. A burst far above typical concurrency cannot be drawn
+  // at true scale in one team row, so it is clamped -- and a clamped block carries a saw-tooth
+  // top edge, because a twelve-agent hour silently drawn exactly as tall as a nine-agent one is
+  // the misreading this whole change exists to remove. The count it could not draw is still in
+  // the DOM and in the accessible name.
+  const burstBin = svg.locator(
+    '.activity-bin-group[data-start-ms="' + AGGREGATE_BURST_START_MS + '"]'
+  );
+  await expect(burstBin).toHaveAttribute("data-height-saturated", "true");
+  await expect(burstBin).toHaveAttribute("data-agents-present", "12.50");
+  await expect(burstBin).toHaveAttribute("aria-label", /drawn clamped at 9/);
+  await expect(burstBin.locator(".activity-bin-overflow")).toHaveCount(1);
+  const burstHeight = Number(await burstBin.locator("rect").getAttribute("height"));
+  expect(burstHeight).toBeGreaterThan(busyHeight);
+  // `quieterHeight` is one agent's worth of pixels, so this is "the clamp really did cost it
+  // height" -- twelve and a half agents at true scale would not fit in the row.
+  expect(burstHeight).toBeLessThan(12.5 * quieterHeight);
+  await expect(threeAgentBin).toHaveAttribute("data-height-saturated", "false");
+  await expect(threeAgentBin.locator(".activity-bin-overflow")).toHaveCount(0);
+  await expect(oneAgentBin).toHaveAttribute("data-height-saturated", "false");
+  await expect(oneAgentBin.locator(".activity-bin-overflow")).toHaveCount(0);
+
+  const busyOpacity = Number(
+    await threeAgentBin.locator("rect").getAttribute("fill-opacity")
+  );
   const quieterOpacity = Number(await svg.locator(
     '.activity-bin-group[data-start-ms="' + AGGREGATE_LATER_START_MS + '"] rect'
   ).getAttribute("fill-opacity"));
