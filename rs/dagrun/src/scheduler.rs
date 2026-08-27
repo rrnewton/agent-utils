@@ -2624,25 +2624,24 @@ fn run_step(ctx: StepCtx) {
     // tracker the readers already feed, so it adds no parsing and cannot disagree with the
     // step's own output. A step with no test events (a build, a manifest gate) falls back to
     // elapsed time, which still separates "moving" from "stationary" for a reader watching.
-    let progress_stop = Arc::new(AtomicBool::new(false));
+    let (progress_stop, progress_stop_rx) = std::sync::mpsc::channel();
     let progress_thread = {
-        let stop = Arc::clone(&progress_stop);
         let psink = Arc::clone(&sink);
         let ptag = tag.clone();
         let pstart = start;
         thread::spawn(move || {
             let tick = Duration::from_millis(200);
             let mut since = Duration::ZERO;
-            while !stop.load(Ordering::Relaxed) {
-                thread::sleep(tick);
+            loop {
+                match progress_stop_rx.recv_timeout(tick) {
+                    Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                }
                 since += tick;
                 if since < PROGRESS_INTERVAL {
                     continue;
                 }
                 since = Duration::ZERO;
-                if stop.load(Ordering::Relaxed) {
-                    break;
-                }
                 let p = psink.progress();
                 let secs = pstart.elapsed().as_secs();
                 if p.is_silent() {
@@ -2863,7 +2862,7 @@ fn run_step(ctx: StepCtx) {
     if let Some(m) = monitor {
         join_bounded(m, &tag, "monitor", JOIN_WAIT);
     }
-    progress_stop.store(true, Ordering::Relaxed);
+    let _ = progress_stop.send(());
     join_bounded(progress_thread, &tag, "progress", JOIN_WAIT);
     // BOUNDED, and this is the join that actually hung. A surviving escapee inherited the step's
     // stdout/stderr pipe write ends, so those pipes never reach EOF and a plain `join()` here
