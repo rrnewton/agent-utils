@@ -1366,10 +1366,14 @@ impl Runner {
                         .map(|current| (budget, current))
                 });
                 let cpu_breach = cpu_reading.flatten().is_some_and(|(budget, current)| {
-                    current.saturating_sub(budget.started_usage_usec) >= budget.limit_usec()
+                    current >= budget.started_usage_usec
+                        && current - budget.started_usage_usec >= budget.limit_usec()
                 });
-                let cpu_accounting_lost = self.run_cpu_budget.is_some()
-                    && cpu_reading.is_some_and(|reading| reading.is_none());
+                let cpu_accounting_lost = match cpu_reading {
+                    None => false,
+                    Some(None) => true,
+                    Some(Some((budget, current))) => current < budget.started_usage_usec,
+                };
                 if (wall_breach || cpu_breach || cpu_accounting_lost) && !sh.run_timed_out {
                     sh.run_timed_out = true;
                     sh.run_cpu_timed_out = cpu_breach;
@@ -1390,8 +1394,9 @@ impl Runner {
                     if cpu_accounting_lost {
                         eprintln!(
                             "[scheduler] RUN CPU ACCOUNTING LOST: the outer cgroup cpu.stat \
-                             usage_usec became unreadable. Cutting {} in-flight step(s) short \
-                             rather than continuing under an unenforced CPU budget: {}",
+                             usage_usec became unreadable or moved backwards. Cutting {} \
+                             in-flight step(s) short rather than continuing under an unenforced \
+                             CPU budget: {}",
                             cut.len(),
                             shown_names
                         );
@@ -4814,6 +4819,27 @@ mod tests {
             "the refusal must name the missing measurement: {error}"
         );
         assert_eq!(start_run_cpu_budget(&None, None).unwrap(), None);
+    }
+
+    #[test]
+    fn whole_run_cpu_budget_fails_closed_if_the_counter_moves_backwards() {
+        let manager = Arc::new(RunCpuCgroups::new(1_000_000, 0));
+        let cgroups: BoxedCgroups = Some(manager.clone());
+        let budget = start_run_cpu_budget(&cgroups, Some(1)).unwrap();
+        manager.usage_usec.store(0, Ordering::SeqCst);
+        let cfg = DagConfig {
+            steps: vec![step("g", "must-not-run", "true", &[], 1.0, &[])],
+            ..Default::default()
+        };
+
+        let result =
+            run_dag_boxed_deadline_with_cpu(&cfg, 1, true, 0, cgroups, None, Some(1), None, budget);
+
+        assert!(!result.ok);
+        assert!(result.run_timed_out);
+        assert!(!result.run_cpu_timed_out);
+        assert!(result.run_cpu_accounting_failed);
+        assert!(result.outcomes.is_empty());
     }
 
     #[test]
