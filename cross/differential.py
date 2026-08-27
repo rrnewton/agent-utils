@@ -23,10 +23,11 @@ asserts:
   dependency-skipped/not-launched counts. Counts are
   compared under ``--keep-going`` so they are deterministic (the default eager-exit path
   races on which in-flight step is cancelled first, so only its exit code is compared).
-* ``--only`` selection (Feature A) agrees: running EXACTLY one named step matches on exit code
-  and counts, and an unknown ``--only`` tag exits 2 on both builds. A successful ``sweep`` must
-  produce the same width rows and table schema; measured timing cells and the ``--profile`` table
-  are not byte-compared because runtimes legitimately differ.
+* ``--selected`` selection agrees: a named leaf brings in its full dependency ancestry, while
+  ``--ignore-selected-deps`` runs only the named node. Both builds match on exit code and counts,
+  and reject an unknown selected tag or the dependency-ignoring flag without a selection.
+  A successful ``sweep`` must produce the same width rows and table schema; measured timing cells
+  and the ``--profile`` table are not byte-compared because runtimes legitimately differ.
 * The memory-aware ``--max-steps`` decision and modeled footprint from ``--max-mem`` match,
   including effective-width scaling, hard/default/engine-only runnable steps, prompt refusal when
   even one step cannot fit, CPA infeasibility driven by learned RSS, and signed-64 saturation.
@@ -1052,10 +1053,10 @@ def _static_parity(py: list[str], rs: list[str], dag_path: str, name: str, rep: 
     rep.json_byte_identical += 1
 
 
-def _first_tag(fx: Fixture) -> str | None:
-    """The ``group.job`` tag of the fixture's first step, or ``None`` for an empty/odd DAG.
+def _first_selection(fx: Fixture) -> tuple[str, int] | None:
+    """The first step's tag and dependency-inclusive node count, or ``None`` for an odd DAG.
 
-    Used to exercise ``--only`` selection parity (Feature A) on a concrete, present tag."""
+    Used to exercise ``--selected`` parity on a concrete, present tag."""
     steps = fx.dag.get("steps")
     if not isinstance(steps, list) or not steps:
         return None
@@ -1063,26 +1064,85 @@ def _first_tag(fx: Fixture) -> str | None:
     if not isinstance(first, dict):
         return None
     group, job = first.get("group"), first.get("job")
-    if isinstance(group, str) and isinstance(job, str):
-        return f"{group}.{job}"
-    return None
+    if not isinstance(group, str) or not isinstance(job, str):
+        return None
+    tag = f"{group}.{job}"
+    direct: dict[str, tuple[str, ...]] = {}
+    for step in steps:
+        if not isinstance(step, dict):
+            return None
+        step_group, step_job, deps = step.get("group"), step.get("job"), step.get("deps", [])
+        if (
+            not isinstance(step_group, str)
+            or not isinstance(step_job, str)
+            or not isinstance(deps, list)
+            or any(not isinstance(dep, str) for dep in deps)
+        ):
+            return None
+        direct[f"{step_group}.{step_job}"] = tuple(deps)
+    selected = {tag}
+    pending = [tag]
+    while pending:
+        current = pending.pop()
+        for dep in direct.get(current, ()):
+            if dep not in direct:
+                return None
+            if dep not in selected:
+                selected.add(dep)
+                pending.append(dep)
+    return tag, len(selected)
 
 
-def compare_only_errors(py: list[str], rs: list[str], rep: Report) -> None:
-    """``--only`` with an unknown tag must exit 2 on BOTH builds (Feature A error parity)."""
+def compare_selected_behavior(py: list[str], rs: list[str], rep: Report) -> None:
+    """Selected-step dependency handling and usage errors must agree in both builds."""
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "dag.json")
         with open(path, "w", encoding="utf-8") as fh:
-            fh.write('{"steps": [{"group": "g", "job": "j", "cmd": "true"}]}')
-        po = run(py, ("run", "--dag", path, "-q", "--only", "no.pe", NOPROF, NOFB, ACF))
-        ro = run(rs, ("run", "--dag", path, "-q", "--only", "no.pe", NOPROF, NOFB, ACF))
-        label = "only-unknown-tag"
-        if po.returncode != ro.returncode:
-            rep.bad(label, f"exit py={po.returncode} rs={ro.returncode}")
-        elif po.returncode != 2:
-            rep.bad(label, f"expected exit 2 for an unknown --only tag; got {po.returncode}")
-        else:
-            rep.ok(label)
+            fh.write(
+                '{"steps": ['
+                '{"group": "a", "job": "root", "cmd": "true"},'
+                '{"group": "b", "job": "middle", "cmd": "true", "deps": ["a.root"]},'
+                '{"group": "c", "job": "leaf", "cmd": "true", "deps": ["b.middle"]}'
+                "]}"
+            )
+
+        cases = (
+            ("selected-dependency-ancestry", ("--selected", "c.leaf"), 0, 3),
+            (
+                "selected-ignore-dependencies",
+                ("--selected", "c.leaf", "--ignore-selected-deps"),
+                0,
+                1,
+            ),
+            ("selected-ignore-requires-selection", ("--ignore-selected-deps",), 2, None),
+            ("selected-unknown-tag", ("--selected", "no.pe"), 2, None),
+            ("selected-retired-only-flag", ("--only", "c.leaf"), 2, None),
+            (
+                "selected-ignore-boolean-value",
+                ("--selected", "c.leaf", "--ignore-selected-deps=true"),
+                2,
+                None,
+            ),
+        )
+        for label, extra, expected_exit, expected_nodes in cases:
+            args = ("run", "--dag", path, "-q", *extra, NOPROF, NOFB, ACF)
+            po = run(py, args)
+            ro = run(rs, args)
+            pc, rc = _counts(po.stderr), _counts(ro.stderr)
+            if po.returncode != ro.returncode:
+                rep.bad(label, f"exit py={po.returncode} rs={ro.returncode}")
+            elif po.returncode != expected_exit:
+                rep.bad(label, f"expected exit {expected_exit}; got {po.returncode}")
+            elif expected_nodes is None:
+                rep.ok(label)
+            elif pc is None or rc is None:
+                rep.bad(label, f"missing summary counts py={po.stderr!r} rs={ro.stderr!r}")
+            elif pc != rc:
+                rep.bad(label, f"counts py={pc} rs={rc}")
+            elif sum(pc) != expected_nodes:
+                rep.bad(label, f"expected {expected_nodes} accounted nodes; got counts {pc}")
+            else:
+                rep.ok(label)
 
 
 #: Top-level DAG-document keys that name a real ``DagConfig`` field the format cannot carry, and
@@ -2415,20 +2475,20 @@ def compare_fixture(py: list[str], rs: list[str], fx: Fixture, rep: Report) -> N
             else:
                 rep.ok(label)
 
-        # 6) --only selection parity (Feature A): running EXACTLY the named step(s) must agree on
-        # exit code AND the passed/failed/aborted/intentionally-skipped/dependency-skipped/
-        # not-launched counts across both builds. Selecting a
-        # single step at -s1 is deterministic (its deps outside the selection are dropped), so the
-        # counts are reproducible even though full-DAG timing is not.
-        tag = _first_tag(fx)
-        if tag is not None:
-            only_args = (
-                "run", "--dag", dag_path, "-q", "-s", "1", "-j", "64", "--only", tag,
+        # 6) --selected parity: the named step and its dependency ancestry must agree on exit code
+        # and the passed/failed/aborted/intentionally-skipped/dependency-skipped/not-launched
+        # counts across both builds. Serial execution makes the counts reproducible even though
+        # full-DAG timing is not.
+        selection = _first_selection(fx)
+        if selection is not None:
+            tag, expected_nodes = selection
+            selected_args = (
+                "run", "--dag", dag_path, "-q", "-s", "1", "-j", "64", "--selected", tag,
                 NOPROF, NOFB, ACF,
             )
-            po = run(py, only_args)
-            ro = run(rs, only_args)
-            label = f"{fx.name}/only({tag})"
+            po = run(py, selected_args)
+            ro = run(rs, selected_args)
+            label = f"{fx.name}/selected({tag})"
             pc, rc = _counts(po.stderr), _counts(ro.stderr)
             if po.returncode != ro.returncode:
                 rep.bad(label, f"exit py={po.returncode} rs={ro.returncode}")
@@ -2436,9 +2496,8 @@ def compare_fixture(py: list[str], rs: list[str], fx: Fixture, rep: Report) -> N
                 rep.bad(label, f"missing summary counts py={po.stderr!r} rs={ro.stderr!r}")
             elif pc != rc:
                 rep.bad(label, f"counts py={pc} rs={rc}")
-            elif pc != (1, 0, 0, 0, 0, 0) and pc != (0, 1, 0, 0, 0, 0):
-                # --only <one tag> runs exactly one step: it either passes or fails, nothing else.
-                rep.bad(label, f"--only one step should run exactly one step; got counts {pc}")
+            elif sum(pc) != expected_nodes:
+                rep.bad(label, f"expected {expected_nodes} accounted nodes; got counts {pc}")
             else:
                 rep.ok(label)
 
@@ -4865,7 +4924,7 @@ def compare_cli_schema(py: list[str], rs: list[str], rep: Report) -> None:
         "run": (
             "--dag", "--max-steps", "--max-cpus", "--cores", "--cpuset", "--pin",
             "--max-mem",
-            "--only",
+            "--selected", "--ignore-selected-deps",
             "--args", "--stress", "--perf-dir", "--no-profile", "--profile", "--planner",
             "--show-plan", "--no-profile-feedback", "--profile-memory-feedback",
             "--profile-sync",
@@ -4886,11 +4945,11 @@ def compare_cli_schema(py: list[str], rs: list[str], rep: Report) -> None:
         "pin-run": ("--cores", "--tag"),
     }
     command_forbidden_flags: dict[str, tuple[str, ...]] = {
-        # Retained as a hidden 0.13 compatibility alias, not as public run vocabulary.
-        "run": ("--jobs",),
+        # `--jobs` is a hidden 0.13 compatibility alias; `--only` is retired rather than aliased.
+        "run": ("--jobs", "--only"),
         # `box` is a front door for ONE command, not a second `run`. A `--dag` here would mean
         # the two editions had grown different ideas of what the subcommand is for.
-        "box": ("--dag", "--only", "--stress"),
+        "box": ("--dag", "--selected", "--ignore-selected-deps", "--stress"),
     }
     summary_action_contracts: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
         "build": (
@@ -6042,7 +6101,7 @@ def compare_dagrun(rand_count: int, seed: int) -> int:
         compare_example_static(py, rs, fx, rep)
     compare_yaml_isomorphism(py, rs, rep)
     compare_scalar_parity(py, rs, rep)
-    compare_only_errors(py, rs, rep)
+    compare_selected_behavior(py, rs, rep)
     compare_uncarried_config_keys(py, rs, rep)
     compare_loader_graph_validation(py, rs, rep)
     compare_uncontained_cpu_budget_notice(py, rs, rep)
