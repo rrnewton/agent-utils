@@ -61,7 +61,7 @@ use crate::scheduler::{
 };
 use crate::sizing::{
     box_mem_budget_bytes, cpu_count, jobs_for_budget, parse_size, stress_control_floor_bytes,
-    stress_copy_footprint_bytes,
+    stress_copy_footprint_bytes, transitive_deps,
 };
 use crate::summary::{self, Summary, DEFAULT_MAX_BUCKETS, DEFAULT_RESERVOIR_K};
 use crate::sync::{self, SyncBackend};
@@ -172,7 +172,7 @@ fn help_text(c: &Palette) -> String {
         e2 = ex(&format!(
             "{PROG} box --mem 512M --timeout 30 --cores 2 -- ./probe.sh"
         )),
-        e3 = ex(&format!("{PROG} run --dag dag.json --only build.app")),
+        e3 = ex(&format!("{PROG} run --dag dag.json --selected build.app")),
         e6 = ex(&format!(
             "{PROG} plan --dag dag.json --planner critical-path"
         )),
@@ -230,10 +230,11 @@ yaml: --dag also accepts .yaml/.yml (isomorphic to JSON; allows comments + multi
         r3 = k(&format!("{PROG} run   --dag dag.json")),
         studies = h("Profile & experiment with individual steps"),
         s1 = k(&format!("{PROG} run   --dag dag.json --profile        # per-step timing/memory table after the run")),
-        s2 = k(&format!("{PROG} run   --dag dag.json --only test.unit # run EXACTLY that step (NOT its deps)")),
+        s2 = k(&format!("{PROG} run   --dag dag.json --selected test.unit # run that step and all of its dependencies")),
         s3 = k(&format!("{PROG} sweep --dag dag.json --step build.app --jobs 1..8  # -j1..-j8 speedup table")),
         studies_note = c.dim(
-            "--only drops dependency edges to steps outside the selection (inputs assumed present); \
+            "--selected includes every dependency needed by the named steps. Add \
+             --ignore-selected-deps only when those inputs are already present and must not run. \
              sweep passes each width through the step jobs_flag and/or jobs_env channel and reports wall/user/sys/rss + speedup."
         ),
         store = h("Where profiling data lands (by default)"),
@@ -349,7 +350,8 @@ fn run_help(c: &Palette) -> String {
             ("-j, --max-cpus N", "outer CPU-bandwidth limit and maximum width of any one runner-controlled step (default: effective container/affinity budget tightened by the shared 90% slice); a bare -jN also works"),
             ("--cores/--cpuset/--pin K", "hard CPU PINNING, opt-in: reserve K least-busy free cores and require an exact cgroup cpuset; fail closed when unavailable"),
             ("--max-mem SPEC", "RAM budget (e.g. 8G): becomes the outer scope's MemoryMax (it can tighten the derived host boundary, never widen it) and derives a conservative model-based --max-steps ceiling; with explicit --max-steps, the tighter value wins"),
-            ("--only TAG[,TAG...]", "run EXACTLY the named step(s); dependency edges outside the selection are dropped"),
+            ("--selected TAG[,TAG...]", "run the named step(s) and every dependency they require"),
+            ("--ignore-selected-deps", "valid only with --selected: run only the named steps and drop dependency edges outside the selection"),
             ("--args STRING", "replace the opt-in {args} token in selected step commands"),
             ("--stress N", "duplicate the graph into N disconnected components; --max-steps controls active copies, --max-cpus caps each width/shared bandwidth, and expansion is limited to 100,000 generated nodes"),
             ("--perf-dir DIR", "write per-step + whole-run resource-usage CSVs into DIR"),
@@ -920,7 +922,8 @@ struct RunArgs {
     max_cpus_source: Option<&'static str>,
     cores: Option<i64>,
     max_mem: Option<String>,
-    only: Option<String>,
+    selected: Option<String>,
+    ignore_selected_deps: bool,
     passthrough_args: Option<String>,
     stress: i64,
     perf_dir: Option<String>,
@@ -986,7 +989,8 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
         max_cpus_source: None,
         cores: None,
         max_mem: None,
-        only: None,
+        selected: None,
+        ignore_selected_deps: false,
         passthrough_args: None,
         stress: 1,
         perf_dir: None,
@@ -1061,7 +1065,8 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
                 a.cores = Some(cores);
             }
             "--max-mem" => a.max_mem = Some(take_value(inline, &mut i)?),
-            "--only" => a.only = Some(take_value(inline, &mut i)?),
+            "--selected" => a.selected = Some(take_value(inline, &mut i)?),
+            "--ignore-selected-deps" => a.ignore_selected_deps = true,
             "--args" => a.passthrough_args = Some(take_value(inline, &mut i)?),
             "--stress" => {
                 let v = take_value(inline, &mut i)?;
@@ -1888,7 +1893,7 @@ fn report_profile_written(perf_dir: &str, source: &str) {
     }
 }
 
-// --------------------------------------------------------------------------- --only selection
+// --------------------------------------------------------------------------- selected steps
 
 /// Split a comma-separated `group.job` tag list, dropping empty entries.
 fn parse_tag_list(raw: &str) -> Vec<String> {
@@ -1898,20 +1903,25 @@ fn parse_tag_list(raw: &str) -> Vec<String> {
         .collect()
 }
 
-// Return a DAG containing EXACTLY the named steps (Feature A).
+// Return the named steps and, by default, every dependency they require.
 //
-// Dependency edges to steps OUTSIDE the selection are dropped (their outputs are assumed
-// present); edges among selected steps are preserved so a selected sub-graph still runs in the
-// right order. Registration order is preserved, matching the Python build. `Err` on unknown tag.
-fn filter_only(cfg: &DagConfig, tags: &[String]) -> Result<DagConfig, String> {
-    let by_tag: HashSet<String> = cfg.steps.iter().map(|s| s.tag()).collect();
+// `ignore_selected_deps` keeps only the named steps and drops dependency edges to steps outside
+// the selection because their outputs are assumed already present. Edges among selected steps are
+// preserved. Registration order is preserved in both modes, matching the Python build. `Err` on
+// an unknown named tag.
+fn select_steps(
+    cfg: &DagConfig,
+    tags: &[String],
+    ignore_selected_deps: bool,
+) -> Result<DagConfig, String> {
+    let by_tag: HashSet<String> = cfg.steps.iter().map(Step::tag).collect();
     let unknown: Vec<String> = tags
         .iter()
-        .filter(|t| !by_tag.contains(*t))
+        .filter(|tag| !by_tag.contains(*tag))
         .cloned()
         .collect();
     if !unknown.is_empty() {
-        let mut known: Vec<String> = by_tag.into_iter().collect();
+        let mut known: Vec<String> = by_tag.iter().cloned().collect();
         known.sort();
         let known_s = if known.is_empty() {
             "(none)".to_string()
@@ -1919,11 +1929,23 @@ fn filter_only(cfg: &DagConfig, tags: &[String]) -> Result<DagConfig, String> {
             known.join(", ")
         };
         return Err(format!(
-            "--only: unknown step tag(s): {}. Known tags: {known_s}",
+            "--selected: unknown step tag(s): {}. Known tags: {known_s}",
             unknown.join(", ")
         ));
     }
-    let selected: HashSet<String> = tags.iter().cloned().collect();
+    let mut selected: HashSet<String> = tags.iter().cloned().collect();
+    if !ignore_selected_deps {
+        let dependencies = transitive_deps(&cfg.steps);
+        for tag in tags {
+            selected.extend(
+                dependencies
+                    .get(tag)
+                    .expect("selected tags were validated against the DAG")
+                    .iter()
+                    .cloned(),
+            );
+        }
+    }
     let mut new_cfg = cfg.clone();
     new_cfg.steps = cfg
         .steps
@@ -1931,7 +1953,9 @@ fn filter_only(cfg: &DagConfig, tags: &[String]) -> Result<DagConfig, String> {
         .filter(|s| selected.contains(&s.tag()))
         .map(|s| {
             let mut step = s.clone();
-            step.deps.retain(|d| selected.contains(d));
+            if ignore_selected_deps {
+                step.deps.retain(|dep| selected.contains(dep));
+            }
             step
         })
         .collect();
@@ -1952,7 +1976,7 @@ fn apply_passthrough_args(cfg: &DagConfig, args: Option<&str>) -> Result<DagConf
         return Err(format!(
             "--args was given but no selected step declares the '{ARGS_PLACEHOLDER}' placeholder \
              in its cmd. Add {{args}} to the step's cmd where the extra args should go, or scope \
-             the selection (--only) to a step that accepts them."
+             the selection (--selected) to a step that accepts them."
         ));
     }
     if !declared {
@@ -2020,7 +2044,7 @@ fn stress_expansion_guard(cfg: &DagConfig, n: i64) -> i32 {
     eprintln!(
         "{PROG}: --stress {n}: REFUSED — expansion would create {generated} generated DAG \
          nodes/control units, exceeding safety limit {MAX_STRESS_GENERATED_NODES}; narrow \
-         --only or lower --stress"
+         --selected or lower --stress"
     );
     2
 }
@@ -2778,15 +2802,19 @@ fn apply_admission(a: &RunArgs) -> Result<Option<crate::admission::MemoryReserva
 }
 
 fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
-    // Feature A: --only runs EXACTLY the named step(s). Validate/filter BEFORE cgroup bring-up so
-    // a bad tag fails fast (exit 2) without needing a systemd scope.
-    let filtered = if let Some(only) = a.only.as_deref() {
-        let tags = parse_tag_list(only);
+    // A selection includes its full dependency ancestry by default. Validate and select BEFORE
+    // cgroup bring-up so a bad combination or tag fails fast (exit 2) without needing a scope.
+    if a.ignore_selected_deps && a.selected.is_none() {
+        eprintln!("{PROG}: run: --ignore-selected-deps requires --selected");
+        return 2;
+    }
+    let filtered = if let Some(selected) = a.selected.as_deref() {
+        let tags = parse_tag_list(selected);
         if tags.is_empty() {
-            eprintln!("{PROG}: run: --only requires at least one tag");
+            eprintln!("{PROG}: run: --selected requires at least one tag");
             return 2;
         }
-        match filter_only(cfg, &tags) {
+        match select_steps(cfg, &tags, a.ignore_selected_deps) {
             Ok(f) => Some(f),
             Err(e) => {
                 eprintln!("{PROG}: {e}");
@@ -3789,8 +3817,39 @@ mod tests {
         let cfg = tiny();
         let applied = apply_passthrough_args(&cfg, Some("--case xyz")).unwrap();
         assert_eq!(applied.steps[0].cmd, "echo --case xyz");
-        let selected = filter_only(&cfg, &["test.unit".to_string()]).unwrap();
+        let selected = select_steps(&cfg, &["test.unit".to_string()], true).unwrap();
         assert!(apply_passthrough_args(&selected, Some("x")).is_err());
+    }
+
+    #[test]
+    fn selected_step_includes_every_dependency_it_requires() {
+        let cfg = dag_from_json(
+            r#"{"steps":[
+                {"group":"package","job":"tarball","cmd":"true","deps":["test.unit"]},
+                {"group":"test","job":"unit","cmd":"true","deps":["build.app"]},
+                {"group":"build","job":"app","cmd":"true"}
+            ]}"#,
+        )
+        .unwrap();
+
+        let selected = select_steps(&cfg, &["package.tarball".to_string()], false).unwrap();
+        assert_eq!(
+            selected.steps.iter().map(Step::tag).collect::<Vec<_>>(),
+            ["package.tarball", "test.unit", "build.app"]
+        );
+        assert_eq!(selected.steps[0].deps, ["test.unit"]);
+        assert_eq!(selected.steps[1].deps, ["build.app"]);
+    }
+
+    #[test]
+    fn selected_dependencies_can_be_explicitly_ignored() {
+        let cfg = tiny();
+        let selected = select_steps(&cfg, &["test.unit".to_string()], true).unwrap();
+        assert_eq!(
+            selected.steps.iter().map(Step::tag).collect::<Vec<_>>(),
+            ["test.unit"]
+        );
+        assert!(selected.steps[0].deps.is_empty());
     }
 
     /// A stress expansion is one of the two places the PRODUCT rebuilds a `DagConfig` around a
@@ -3959,12 +4018,14 @@ mod tests {
     }
 
     #[test]
-    fn run_help_exposes_every_run_only_surface() {
+    fn run_help_exposes_every_run_surface() {
         let palette = Palette { enabled: false };
         let help = run_help(&palette);
         for flag in [
             "--max-steps",
             "--max-cpus",
+            "--selected",
+            "--ignore-selected-deps",
             "--args",
             "--stress",
             "--cores",
@@ -3983,10 +4044,21 @@ mod tests {
         assert!(help.contains("maximum active DAG steps"));
         assert!(help.contains("outer CPU-bandwidth limit"));
         assert!(help.contains("maximum width of any one runner-controlled step"));
+        assert!(help.contains("every dependency they require"));
+        assert!(help.contains("run only the named steps"));
 
         let sweep = sweep_help(&palette);
         assert!(sweep.contains("--jobs RANGE"));
         assert!(!sweep.contains("--max-cpus"));
+    }
+
+    #[test]
+    fn ignoring_selected_dependencies_requires_a_selection() {
+        let cfg = tiny();
+        let args = parse_run_args(&["--ignore-selected-deps".into(), "--quiet".into()]).unwrap();
+        let palette = Palette { enabled: false };
+
+        assert_eq!(cmd_run(&cfg, &args, &palette), 2);
     }
 
     #[test]

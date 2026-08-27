@@ -85,7 +85,7 @@ from dagrun.scheduler import (
     cap_config_max_cpus,
     run_dag_limited,
 )
-from dagrun.sizing import jobs_for_budget, parse_size
+from dagrun.sizing import jobs_for_budget, parse_size, transitive_deps
 from dagrun.viz import to_ascii, to_dot
 
 PROG = "dagrun"
@@ -170,8 +170,8 @@ def _epilog(c: Palette) -> str:
         f"  {ex(f'{PROG} quickstart')}                       {c.dim('# get started (schema + runnable demo)')}\n"
         f"  {ex(f'{PROG} run --dag dag.json')}               {c.dim('# run it; exit 0 iff all steps pass')}\n"
         f"  {ex(f'{PROG} run --dag dag.json --profile')}     {c.dim('# ...and print a per-step profile table')}\n"
-        f"  {ex(f'{PROG} run --dag dag.json --only build.app')} {c.dim('# run EXACTLY one step (not its deps)')}\n"
-        f"  {ex(f'{PROG} run --dag dag.json --only test.unit --stress 10 -s 2 -j 100')} {c.dim('# 2 active copies sharing 100 CPU-equivalents')}\n"
+        f"  {ex(f'{PROG} run --dag dag.json --selected build.app')} {c.dim('# run one selected step and its dependencies')}\n"
+        f"  {ex(f'{PROG} run --dag dag.json --selected test.unit --stress 10 -s 2 -j 100')} {c.dim('# 2 active graph copies sharing 100 CPU-equivalents')}\n"
         f"  {ex(f'{PROG} plan --dag dag.json --planner critical-path')} {c.dim('# show learned estimates + the plan')}\n"
         f"  {ex(f'{PROG} sweep --dag dag.json --step build.app --jobs 1..8')} {c.dim('# parallel-speedup study')}\n"
         f"  {ex(f'{PROG} ascii --dag dag.json')}             {c.dim('# quick ASCII view of the graph')}\n"
@@ -210,11 +210,11 @@ def _quickstart(c: Palette) -> str:
 
 {h('Profile & experiment with individual steps')}
   {k(f'{PROG} run   --dag dag.json --profile')}          {c.dim('# print a per-step timing/memory table after the run')}
-  {k(f'{PROG} run   --dag dag.json --only test.unit')}   {c.dim('# run EXACTLY that step (NOT its deps; inputs assumed present)')}
-  {k(f'{PROG} run   --dag dag.json --only build.app,test.unit')}  {c.dim('# one or more, comma-separated')}
+  {k(f'{PROG} run   --dag dag.json --selected test.unit')}   {c.dim('# run that step and all of its dependencies')}
+  {k(f'{PROG} run   --dag dag.json --selected build.app,test.unit')}  {c.dim('# one or more, comma-separated')}
   {k(f'{PROG} sweep --dag dag.json --step build.app --jobs 1..8')}  {c.dim('# run one step at -j1..-j8, print a speedup table')}
-  {c.dim('--only drops dependency edges to steps outside the selection (their outputs are')}
-  {c.dim('assumed already present); it is for profiling/experimenting on a step in isolation.')}
+  {c.dim('--selected includes every dependency needed by the named steps. Add')}
+  {c.dim('--ignore-selected-deps only when those inputs are already present and must not run.')}
   {c.dim('sweep passes each width through the step jobs_flag and/or jobs_env channel and reports wall/user/sys/rss + speedup.')}
 
 {h('Where profiling data lands (by default)')}
@@ -444,13 +444,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-steps, the tighter value wins",
     )
     run_p.add_argument(
-        "--only",
+        "--selected",
         metavar="TAG[,TAG...]",
         default=None,
-        help="run EXACTLY the named step(s) and nothing else (comma-separated 'group.job' tags). "
-        "Dependency edges to steps OUTSIDE the selection are dropped (their outputs are assumed "
-        "already present) - this is for profiling/experimenting on a step in isolation; it does "
-        "NOT run the step's dependencies. Errors if a named tag does not exist.",
+        help="run the named step(s) and every dependency they require (comma-separated "
+        "'group.job' tags). Errors if a named tag does not exist.",
+    )
+    run_p.add_argument(
+        "--ignore-selected-deps",
+        action="store_true",
+        help="valid only with --selected: run only the named steps, dropping dependency edges "
+        "to steps outside the selection because their outputs are assumed already present",
     )
     run_p.add_argument(
         "--args",
@@ -460,7 +464,7 @@ def build_parser() -> argparse.ArgumentParser:
         "accepts passthrough by placing the reserved token '{args}' in its cmd (it also picks the "
         "position); this STRING is substituted there verbatim (shell syntax, quote once). Use the "
         "--args=... form when the string starts with '-' (e.g. --args='-k test_xyz --verbose'). "
-        "Combine with --only to scope a step down to one test case, then --stress N to multiply "
+        "Combine with --selected to scope a step down to one test case, then --stress N to multiply "
         "it. Errors if no selected step declares '{args}'. A declared step with no --args runs "
         "with the token removed.",
     )
@@ -475,7 +479,8 @@ def build_parser() -> argparse.ArgumentParser:
         "outer CPU bandwidth. "
         "Reports the largest measured number of overlapping child processes, "
         "the per-copy PASS/FAIL RATIO (e.g. '7/10 passed'), and which copies failed. Combine with "
-        "--only to copy one suspect node (e.g. --only test.unit). The ratio is the finding, so "
+        "--selected to copy one suspect graph (e.g. --selected test.unit). Add "
+        "--ignore-selected-deps to omit its dependencies. The ratio is the finding, so "
         "this implies --keep-going. N is still capped by the box memory budget (N x per-copy "
         "footprint must fit) and expansion may create at most 100,000 DAG nodes/control units. "
         "Each copy gets DAGRUN_COPY (zero-padded index, e.g. 03) and "
@@ -1264,9 +1269,9 @@ def _report_profile_written(perf_dir: str, source: str) -> None:
         print(f"  {path}", file=sys.stderr)
 
 
-# --------------------------------------------------------------------------- --only selection
-class _OnlyError(Exception):
-    """A ``--only`` / ``--step`` selection referenced a tag that does not exist."""
+# --------------------------------------------------------------------------- selected steps
+class _SelectedError(Exception):
+    """A ``--selected`` / ``--step`` selection referenced a tag that does not exist."""
 
 
 def _parse_tag_list(raw: str) -> list[str]:
@@ -1274,23 +1279,33 @@ def _parse_tag_list(raw: str) -> list[str]:
     return [tag.strip() for tag in raw.split(",") if tag.strip()]
 
 
-def _filter_only(cfg: DagConfig, tags: Sequence[str]) -> DagConfig:
-    """Return a DAG containing EXACTLY the named steps (Feature A).
+def _select_steps(
+    cfg: DagConfig, tags: Sequence[str], *, ignore_selected_deps: bool = False
+) -> DagConfig:
+    """Return the named steps and, by default, every dependency they require.
 
-    Dependency edges pointing OUTSIDE the selection are dropped (their outputs are assumed
-    present); edges among selected steps are preserved so a selected sub-graph still runs in the
-    right order. Registration order is preserved, so both language builds filter identically.
-    Raises :class:`_OnlyError` if any tag is unknown."""
+    ``ignore_selected_deps`` keeps only the named steps and drops dependency edges to steps outside
+    the selection because their outputs are assumed already present. Edges among selected steps are
+    preserved. Registration order is preserved in both modes so both language builds agree. Raises
+    :class:`_SelectedError` if any named tag does not exist."""
     by_tag = cfg.by_tag()
     unknown = [tag for tag in tags if tag not in by_tag]
     if unknown:
         known = ", ".join(sorted(by_tag)) or "(none)"
-        raise _OnlyError(
-            f"--only: unknown step tag(s): {', '.join(unknown)}. Known tags: {known}"
+        raise _SelectedError(
+            f"--selected: unknown step tag(s): {', '.join(unknown)}. Known tags: {known}"
         )
     selected = set(tags)
+    if not ignore_selected_deps:
+        dependencies = transitive_deps(cfg.steps)
+        for tag in tags:
+            selected.update(dependencies[tag])
     new_steps = tuple(
-        dataclasses.replace(step, deps=[d for d in step.deps if d in selected])
+        (
+            dataclasses.replace(step, deps=[dep for dep in step.deps if dep in selected])
+            if ignore_selected_deps
+            else step
+        )
         for step in cfg.steps
         if step.tag in selected
     )
@@ -1323,7 +1338,7 @@ def _apply_passthrough_args(cfg: DagConfig, args: str | None) -> DagConfig:
         raise _ArgsError(
             f"--args was given but no selected step declares the {ARGS_PLACEHOLDER!r} placeholder "
             "in its cmd. Add {args} to the step's cmd where the extra args should go, or scope the "
-            "selection (--only) to a step that accepts them."
+            "selection (--selected) to a step that accepts them."
         )
     if not any_declared:
         return cfg  # nothing to substitute; leave the DAG byte-identical
@@ -1408,7 +1423,7 @@ def _stress_expansion_guard(cfg: DagConfig, n: int) -> int:
     print(
         f"{PROG}: --stress {n}: REFUSED — expansion would create {generated} generated DAG "
         f"nodes/control units, exceeding safety limit {MAX_STRESS_GENERATED_NODES}; narrow "
-        "--only or lower --stress",
+        "--selected or lower --stress",
         file=sys.stderr,
     )
     return 2
@@ -2590,17 +2605,24 @@ def _apply_admission(ns: argparse.Namespace) -> int:
 
 
 def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
-    # Feature A: --only runs EXACTLY the named step(s). Validate/filter BEFORE cgroup bring-up so a
-    # bad tag fails fast (exit 2) without needing a systemd scope.
-    only_raw = ns.only if isinstance(ns.only, str) else None
-    if only_raw is not None:
-        tags = _parse_tag_list(only_raw)
+    # A selection includes its full dependency ancestry by default. Validate and select BEFORE
+    # cgroup bring-up so a bad combination or tag fails fast (exit 2) without needing a scope.
+    selected_raw = ns.selected if isinstance(ns.selected, str) else None
+    ignore_selected_deps = bool(ns.ignore_selected_deps)
+    if ignore_selected_deps and selected_raw is None:
+        print(
+            f"{PROG}: run: --ignore-selected-deps requires --selected",
+            file=sys.stderr,
+        )
+        return 2
+    if selected_raw is not None:
+        tags = _parse_tag_list(selected_raw)
         if not tags:
-            print(f"{PROG}: run: --only requires at least one tag", file=sys.stderr)
+            print(f"{PROG}: run: --selected requires at least one tag", file=sys.stderr)
             return 2
         try:
-            cfg = _filter_only(cfg, tags)
-        except _OnlyError as exc:
+            cfg = _select_steps(cfg, tags, ignore_selected_deps=ignore_selected_deps)
+        except _SelectedError as exc:
             print(f"{PROG}: {exc}", file=sys.stderr)
             return 2
 

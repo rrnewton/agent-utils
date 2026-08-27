@@ -75,7 +75,8 @@ def test_run_help_lists_flags_and_cores_pinning() -> None:
         "--max-steps",
         "--max-cpus",
         "--cores",
-        "--only",
+        "--selected",
+        "--ignore-selected-deps",
         "--planner",
         "--keep-going",
     ):
@@ -87,6 +88,8 @@ def test_run_help_lists_flags_and_cores_pinning() -> None:
     low = " ".join(out.lower().split())
     assert "pinning" in low or "cpuset" in low or "affinity" in low
     assert "opt-in" in low and "off by default" in low
+    assert "every dependency they require" in low
+    assert "run only the named steps" in low
 
 
 def test_run_help_has_no_rust_binary_mention() -> None:
@@ -341,28 +344,49 @@ def test_run_perf_dir_writes_csv() -> None:
         assert not list(perf.glob("*.lock"))
 
 
-def test_run_only_runs_exactly_selected_step() -> None:
-    # --only runs EXACTLY the named step(s) and nothing else (deps not run). The selected step's
-    # dep (build.app) is NOT executed, so exactly one step passes.
-    dag = (
-        '{"steps": ['
-        '{"group": "build", "job": "app", "cmd": "true"},'
-        '{"group": "test", "job": "unit", "cmd": "true", "deps": ["build.app"]}'
-        "]}"
-    )
+def test_run_selected_runs_full_dependency_ancestry_in_order() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "dag.json"
-        path.write_text(dag, encoding="utf-8")
-        rc, _, err = _capture(["run", "--dag", str(path), "--only", "test.unit", "-q", _ACF])
+        order = Path(tmp) / "order"
+        path.write_text(
+            json.dumps(
+                {
+                    "steps": [
+                        {
+                            "group": "package",
+                            "job": "tarball",
+                            "cmd": f"printf 'package\\n' >> {order}",
+                            "deps": ["test.unit"],
+                        },
+                        {
+                            "group": "test",
+                            "job": "unit",
+                            "cmd": f"printf 'test\\n' >> {order}",
+                            "deps": ["build.app"],
+                        },
+                        {
+                            "group": "build",
+                            "job": "app",
+                            "cmd": f"printf 'build\\n' >> {order}",
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        rc, _, err = _capture(
+            ["run", "--dag", str(path), "--selected", "package.tarball", "-q", _ACF]
+        )
         assert rc == 0
+        assert order.read_text(encoding="utf-8") == "build\ntest\npackage\n"
         assert (
-            "1 passed, 0 failed, 0 aborted, 0 intentionally skipped, "
+            "3 passed, 0 failed, 0 aborted, 0 intentionally skipped, "
             "0 dependency-skipped, 0 not launched"
         ) in err
 
 
-def test_run_only_multiple_steps() -> None:
-    # A comma-separated selection runs exactly those steps.
+def test_run_selected_multiple_steps() -> None:
+    # A comma-separated selection runs those steps and any dependencies they require.
     dag = (
         '{"steps": ['
         '{"group": "a", "job": "x", "cmd": "true"},'
@@ -373,7 +397,9 @@ def test_run_only_multiple_steps() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "dag.json"
         path.write_text(dag, encoding="utf-8")
-        rc, _, err = _capture(["run", "--dag", str(path), "--only", "a.x,c.z", "-q", _ACF])
+        rc, _, err = _capture(
+            ["run", "--dag", str(path), "--selected", "a.x,c.z", "-q", _ACF]
+        )
         assert rc == 0
         assert (
             "2 passed, 0 failed, 0 aborted, 0 intentionally skipped, "
@@ -408,10 +434,47 @@ def test_keep_going_launches_later_independent_work_and_reports_full_accounting(
         assert "not launched:" not in err
 
 
-def test_run_only_unknown_tag_exits_2() -> None:
+def test_run_selected_can_ignore_dependencies() -> None:
+    dag = (
+        '{"steps": ['
+        '{"group": "build", "job": "app", "cmd": "true"},'
+        '{"group": "test", "job": "unit", "cmd": "true", "deps": ["build.app"]}'
+        "]}"
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "dag.json"
+        path.write_text(dag, encoding="utf-8")
+        rc, _, err = _capture(
+            [
+                "run",
+                "--dag",
+                str(path),
+                "--selected",
+                "test.unit",
+                "--ignore-selected-deps",
+                "-q",
+                _ACF,
+            ]
+        )
+        assert rc == 0
+        assert (
+            "1 passed, 0 failed, 0 aborted, 0 intentionally skipped, "
+            "0 dependency-skipped, 0 not launched"
+        ) in err
+
+
+def test_ignore_selected_deps_requires_selected() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         dag = _demo_path(tmp)
-        rc, _, err = _capture(["run", "--dag", dag, "--only", "no.pe", "-q", _ACF])
+        rc, _, err = _capture(["run", "--dag", dag, "--ignore-selected-deps", "-q", _ACF])
+        assert rc == 2
+        assert "--ignore-selected-deps requires --selected" in err
+
+
+def test_run_selected_unknown_tag_exits_2() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        dag = _demo_path(tmp)
+        rc, _, err = _capture(["run", "--dag", dag, "--selected", "no.pe", "-q", _ACF])
         assert rc == 2
         assert "unknown step tag" in err
 
@@ -803,8 +866,8 @@ def test_stress_reports_ratio_all_pass() -> None:
         assert "--stress 3: OK" in err and "max safe" in err
 
 
-def test_stress_single_node_via_only() -> None:
-    # The common case: stress ONE suspect node selected with --only (its deps are dropped).
+def test_stress_single_node_while_ignoring_selected_dependencies() -> None:
+    # A focused experiment can stress one selected node after explicitly dropping its dependencies.
     dag = (
         '{"steps": ['
         '{"group": "build", "job": "app", "cmd": "true"},'
@@ -815,7 +878,18 @@ def test_stress_single_node_via_only() -> None:
         path = Path(tmp) / "dag.json"
         path.write_text(dag, encoding="utf-8")
         rc, out, err = _capture(
-            ["run", "--dag", str(path), "--only", "test.unit", "--stress", "4", "-q", _ACF]
+            [
+                "run",
+                "--dag",
+                str(path),
+                "--selected",
+                "test.unit",
+                "--ignore-selected-deps",
+                "--stress",
+                "4",
+                "-q",
+                _ACF,
+            ]
         )
         assert rc == 0
         assert "test.unit: 4/4 passed" in out
@@ -1018,9 +1092,8 @@ def test_args_declared_but_not_passed_removes_token() -> None:
         assert "{args}" not in out
 
 
-def test_args_composes_with_only_and_stress() -> None:
-    # The full owner scenario: scope to one node (--only), pass a specific test case (--args),
-    # multiply it (--stress). All three compose; the per-copy ratio is reported.
+def test_args_composes_with_selected_ignored_dependencies_and_stress() -> None:
+    # Scope to one node, explicitly omit its dependencies, pass a test case, and multiply it.
     with tempfile.TemporaryDirectory() as tmp:
         dag = Path(tmp) / "dag.json"
         dag.write_text(
@@ -1032,8 +1105,19 @@ def test_args_composes_with_only_and_stress() -> None:
             encoding="utf-8",
         )
         rc, out, err = _capture(
-            ["run", "--dag", str(dag), "--only", "dbi.file_metadata",
-             "--args=--case xyz", "--stress", "5", "-q", _ACF]
+            [
+                "run",
+                "--dag",
+                str(dag),
+                "--selected",
+                "dbi.file_metadata",
+                "--ignore-selected-deps",
+                "--args=--case xyz",
+                "--stress",
+                "5",
+                "-q",
+                _ACF,
+            ]
         )
         assert rc == 0, err
         assert "dbi.file_metadata: 5/5 passed" in out
