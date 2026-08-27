@@ -1391,13 +1391,24 @@ pub struct RunResult {
     /// Per-step measurement rows (column -> value) to forward to a metrics sink; empty when no
     /// cgroup manager supplied per-step metrics.
     pub step_profile_rows: Vec<BTreeMap<String, String>>,
-    /// The WHOLE RUN hit its outer wall budget and was cut short.
+    /// The WHOLE RUN hit an outer wall or CPU budget, or lost required CPU accounting, and was
+    /// cut short.
     ///
     /// Distinct from a step's own `timed_out`: no single node necessarily misbehaved, the
     /// combination did. A consumer that records results must be able to tell "this run produced a
     /// verdict about the tree" from "this run was stopped by its own budget with work still
     /// outstanding", and `ok == false` alone cannot.
     pub run_timed_out: bool,
+    /// The WHOLE RUN crossed its cumulative CPU-time budget.
+    ///
+    /// `run_timed_out` is also set. This narrower bit lets callers distinguish consumed CPU from
+    /// elapsed wall time instead of reporting the two quantities as interchangeable.
+    pub run_cpu_timed_out: bool,
+    /// Required whole-run CPU accounting became unreadable after execution started.
+    ///
+    /// This is fail-closed and also sets `run_timed_out`, because continuing would turn a named
+    /// CPU cap into an unenforced claim.
+    pub run_cpu_accounting_failed: bool,
     /// Largest number of step child processes observed alive at the same time. Measured from
     /// successful spawn until wait observes exit, not inferred from jobs or scheduler admission.
     pub max_concurrent_steps: usize,

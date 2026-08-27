@@ -132,6 +132,14 @@ pub trait CgroupManager: Send + Sync {
     }
     /// Per-step cgroup-v2 CPU counters from `cpu.stat`.
     fn cpu_stats(&self, tag: &str) -> Option<BTreeMap<String, i64>>;
+    /// Whole-run cgroup-v2 CPU consumption from the outer scope's `cpu.stat`, in microseconds.
+    ///
+    /// DEFAULTS TO `None`, DELIBERATELY. A caller asking for a whole-run CPU budget must refuse
+    /// when this measurement is absent; treating an unreadable counter as zero would make the
+    /// guard silently stop enforcing itself.
+    fn run_cpu_usage_usec(&self) -> Option<i64> {
+        None
+    }
     /// Per-step CPU pressure-stall averages (`cpu.pressure` `some` line: `avg10`, `avg60`),
     /// sampled at step start + end to attribute contention. `None` when disabled/unreadable.
     fn cpu_pressure(&self, tag: &str) -> Option<BTreeMap<String, f64>>;
@@ -2131,6 +2139,21 @@ impl CgroupManager for Cgroups {
         Some(out)
     }
 
+    fn run_cpu_usage_usec(&self) -> Option<i64> {
+        if !self.enabled {
+            return None;
+        }
+        let root = self.root.as_ref()?;
+        let text = read_trim(root, "cpu.stat")?;
+        text.lines().find_map(|line| {
+            let mut parts = line.split_whitespace();
+            match (parts.next(), parts.next(), parts.next()) {
+                (Some("usage_usec"), Some(value), None) => value.parse().ok(),
+                _ => None,
+            }
+        })
+    }
+
     fn cpu_pressure(&self, tag: &str) -> Option<BTreeMap<String, f64>> {
         let child = self.child(tag)?;
         if !self.enabled {
@@ -2835,6 +2858,32 @@ mod tests {
             root: Some(root),
             containment: Containment::Full,
         }
+    }
+
+    #[test]
+    fn whole_run_cpu_usage_reads_only_the_outer_usage_counter() {
+        let root = temp_scope("run-cpu-usage");
+        let cg = planted_manager(root.clone());
+
+        assert_eq!(cg.run_cpu_usage_usec(), None, "absent cpu.stat is UNKNOWN");
+        fs::write(
+            root.join("cpu.stat"),
+            "usage_usec 5195284\nuser_usec 3645063\nsystem_usec 1550222\nnr_periods 9\n",
+        )
+        .unwrap();
+        assert_eq!(cg.run_cpu_usage_usec(), Some(5_195_284));
+
+        fs::write(
+            root.join("cpu.stat"),
+            "usage_usec not-a-number\nuser_usec 7\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cg.run_cpu_usage_usec(),
+            None,
+            "a malformed usage counter must not become measured zero"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -89,8 +89,10 @@ pub use reservation::{acquire as reserve_cores, held_cores, reclaim_dead, Reserv
 #[allow(deprecated)]
 pub use scheduler::{
     cap_config_cpu_jobs, cap_config_max_cpus, run_dag, run_dag_boxed, run_dag_boxed_deadline,
-    run_dag_boxed_deadline_limited, run_dag_boxed_limited, run_dag_boxed_ordered,
-    run_dag_boxed_ordered_limited, run_dag_limited, steps_violating_run_timeout,
+    run_dag_boxed_deadline_limited, run_dag_boxed_deadline_limited_with_cpu,
+    run_dag_boxed_deadline_with_cpu, run_dag_boxed_limited, run_dag_boxed_ordered,
+    run_dag_boxed_ordered_limited, run_dag_limited, start_run_cpu_budget,
+    steps_violating_run_timeout, RunCpuBudget,
 };
 pub use sizing::{
     box_mem_budget_bytes, cgroup_mem_max_bytes, jobs_footprint_bytes, jobs_for_budget,

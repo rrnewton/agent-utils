@@ -102,6 +102,52 @@ fn cpu_seconds_from_stats(stats: &BTreeMap<String, i64>) -> Option<f64> {
 /// Optional per-step cgroup manager shared (behind an `Arc`) across the run's supervisor threads.
 pub type BoxedCgroups = Option<Arc<dyn CgroupManager>>;
 
+/// One cumulative whole-run CPU allowance, measured from the outer cgroup's `cpu.stat`.
+///
+/// A caller that executes several scheduler passes for one logical run constructs this ONCE and
+/// passes the same value to every pass. Retries and sequential lanes therefore spend from one
+/// allowance rather than silently receiving a fresh one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunCpuBudget {
+    timeout_s: i64,
+    started_usage_usec: i64,
+}
+
+impl RunCpuBudget {
+    fn limit_usec(self) -> i64 {
+        self.timeout_s.saturating_mul(1_000_000)
+    }
+
+    /// Configured whole-run CPU allowance in seconds.
+    pub fn timeout_s(self) -> i64 {
+        self.timeout_s
+    }
+}
+
+/// Start one cumulative whole-run CPU allowance from the live outer cgroup counter.
+///
+/// Refuses when a positive allowance was requested but exact accounting is unavailable. Reading
+/// an absent counter as zero would publish a CPU cap that cannot fire.
+pub fn start_run_cpu_budget(
+    cgroups: &BoxedCgroups,
+    timeout_s: Option<i64>,
+) -> Result<Option<RunCpuBudget>, String> {
+    let Some(timeout_s) = timeout_s.filter(|value| *value > 0) else {
+        return Ok(None);
+    };
+    let cgroups = cgroups
+        .as_ref()
+        .ok_or_else(|| "whole-run CPU budget requires cgroup CPU accounting".to_string())?;
+    let started_usage_usec = cgroups.run_cpu_usage_usec().ok_or_else(|| {
+        "whole-run CPU budget requested, but the outer cgroup cpu.stat usage_usec is unreadable"
+            .to_string()
+    })?;
+    Ok(Some(RunCpuBudget {
+        timeout_s,
+        started_usage_usec,
+    }))
+}
+
 /// Monotonic start epoch of the enclosing DAG step, serialized for nested consumers.
 ///
 /// A nested timeout cannot safely start a fresh clock after its own setup: doing so makes a
@@ -197,6 +243,10 @@ struct Shared {
     failed_families: HashSet<String>,
     /// The WHOLE RUN exceeded its outer wall budget and cut its in-flight steps short.
     run_timed_out: bool,
+    /// The whole-run CPU budget, rather than the wall backstop, caused the cut.
+    run_cpu_timed_out: bool,
+    /// Exact whole-run CPU accounting became unreadable after the run started.
+    run_cpu_accounting_failed: bool,
     /// Child processes currently alive, and the largest count observed during this run.
     active_processes: usize,
     max_concurrent_steps: usize,
@@ -1064,6 +1114,8 @@ struct Runner {
     /// Independent of every per-step budget, and that independence is the point: no combination of
     /// individually-legal steps can run past it.
     run_timeout_s: Option<i64>,
+    /// Cumulative outer-cgroup CPU allowance shared across scheduler passes.
+    run_cpu_budget: Option<RunCpuBudget>,
     /// Durable, incrementally-flushed evidence for this run (per-step logs + boundary journal), or
     /// `None` when the operator opted out or the directory could not be created.
     evidence: Option<Arc<RunEvidence>>,
@@ -1100,6 +1152,7 @@ impl Runner {
         cgroups: BoxedCgroups,
         order_override: Option<Vec<String>>,
         run_timeout_s: Option<i64>,
+        run_cpu_budget: Option<RunCpuBudget>,
         resource_coordinator: Option<ResourceCoordinator>,
     ) -> Self {
         let max_cpus = max_cpus.max(1);
@@ -1164,6 +1217,7 @@ impl Runner {
             cpu_timeout_multiplier: capped.cpu_timeout_multiplier,
             cpu_timeout_platform: capped.cpu_timeout_platform.clone(),
             run_timeout_s,
+            run_cpu_budget,
             evidence: RunEvidence::open(default_log_dir()).map(Arc::new),
             resource_coordinator,
             shared: Arc::new(Mutex::new(Shared {
@@ -1180,6 +1234,8 @@ impl Runner {
                 fail_fast_family_index,
                 failed_families: HashSet::new(),
                 run_timed_out: false,
+                run_cpu_timed_out: false,
+                run_cpu_accounting_failed: false,
                 active_processes: 0,
                 max_concurrent_steps: 0,
                 counted_processes: HashSet::new(),
@@ -1298,34 +1354,95 @@ impl Runner {
             let mut launchable = Vec::new();
             {
                 let mut sh = lock_shared(&self.shared);
-                // OUTER BUDGET, CHECKED IN OUR OWN LOOP AND NOT BY AN EXTERNAL KILLER. Stopping
-                // the run from inside is the entire reason this exists: an outside kill (a CI job
-                // cancellation, a systemd RuntimeMaxSec) also destroys the evidence, so the bound
-                // that fires FIRST must be one that can still write rows, flush the journal, and
-                // hand a verdict back to the caller.
-                if let Some(dl) = deadline {
-                    if Instant::now() >= dl && !sh.run_timed_out {
-                        sh.run_timed_out = true;
-                        sh.failed = true;
-                        sh.stop = true;
-                        let cut: Vec<(String, u32, Option<String>)> = sh
-                            .running_pids
-                            .iter()
-                            .map(|(k, v)| (k.clone(), *v, sh.running_nonces.get(k).cloned()))
-                            .collect();
-                        let names: Vec<String> = cut.iter().map(|(t, _, _)| t.clone()).collect();
+                // OUTER BUDGETS, CHECKED IN OUR OWN LOOP AND NOT BY AN EXTERNAL KILLER. CPU time
+                // is the primary load-independent quantity; wall time remains a backstop for a
+                // wedged process that consumes no CPU. Stopping from inside preserves rows and the
+                // journal, unlike an outside job or scope kill.
+                let wall_breach = deadline.is_some_and(|dl| Instant::now() >= dl);
+                let cpu_reading = self.run_cpu_budget.map(|budget| {
+                    self.cgroups
+                        .as_ref()
+                        .and_then(|cgroups| cgroups.run_cpu_usage_usec())
+                        .map(|current| (budget, current))
+                });
+                let cpu_breach = cpu_reading.flatten().is_some_and(|(budget, current)| {
+                    current.saturating_sub(budget.started_usage_usec) >= budget.limit_usec()
+                });
+                let cpu_accounting_lost = self.run_cpu_budget.is_some()
+                    && cpu_reading.is_some_and(|reading| reading.is_none());
+                if (wall_breach || cpu_breach || cpu_accounting_lost) && !sh.run_timed_out {
+                    sh.run_timed_out = true;
+                    sh.run_cpu_timed_out = cpu_breach;
+                    sh.run_cpu_accounting_failed = cpu_accounting_lost;
+                    sh.failed = true;
+                    sh.stop = true;
+                    let cut: Vec<(String, u32, Option<String>)> = sh
+                        .running_pids
+                        .iter()
+                        .map(|(k, v)| (k.clone(), *v, sh.running_nonces.get(k).cloned()))
+                        .collect();
+                    let names: Vec<String> = cut.iter().map(|(t, _, _)| t.clone()).collect();
+                    let shown_names = if names.is_empty() {
+                        "<none running>".to_string()
+                    } else {
+                        names.join(", ")
+                    };
+                    if cpu_accounting_lost {
                         eprintln!(
-                            "[scheduler] RUN TIMEOUT: the whole run exceeded its outer budget of \
-                             {}s ({:.1}s elapsed). Cutting {} in-flight step(s) short so the run \
-                             can still report: {}",
+                            "[scheduler] RUN CPU ACCOUNTING LOST: the outer cgroup cpu.stat \
+                             usage_usec became unreadable. Cutting {} in-flight step(s) short \
+                             rather than continuing under an unenforced CPU budget: {}",
+                            cut.len(),
+                            shown_names
+                        );
+                        if let Some(e) = &self.evidence {
+                            e.record(
+                                "run_cpu_accounting_lost",
+                                &[
+                                    ("cut_steps", names.join(",")),
+                                    ("done", sh.done.len().to_string()),
+                                ],
+                            );
+                        }
+                    } else if cpu_breach {
+                        let (budget, current) =
+                            cpu_reading.flatten().expect("breach has a reading");
+                        let measured_s =
+                            current.saturating_sub(budget.started_usage_usec) as f64 / 1_000_000.0;
+                        eprintln!(
+                            "[scheduler] RUN CPU TIMEOUT: the whole run consumed {:.3}s CPU \
+                             against its {}s CPU budget. Cutting {} in-flight step(s) short so \
+                             the run can still report: {}",
+                            measured_s,
+                            budget.timeout_s,
+                            cut.len(),
+                            shown_names
+                        );
+                        if let Some(e) = &self.evidence {
+                            e.record(
+                                "run_cpu_timeout",
+                                &[
+                                    ("budget_s", budget.timeout_s.to_string()),
+                                    ("measured_s", format!("{measured_s:.3}")),
+                                    ("unit", "cpu_seconds".to_string()),
+                                    (
+                                        "wall_elapsed_s",
+                                        format!("{:.3}", wall_start.elapsed().as_secs_f64()),
+                                    ),
+                                    ("cut_steps", names.join(",")),
+                                    ("done", sh.done.len().to_string()),
+                                ],
+                            );
+                        }
+                    } else {
+                        eprintln!(
+                            "[scheduler] RUN TIMEOUT: the whole run exceeded its outer wall \
+                             budget of {}s ({:.1}s elapsed). Cutting {} in-flight step(s) short \
+                             so the run can still report: {}",
                             self.run_timeout_s.unwrap_or(0),
                             wall_start.elapsed().as_secs_f64(),
                             cut.len(),
-                            if names.is_empty() {
-                                "<none running>".to_string()
-                            } else {
-                                names.join(", ")
-                            }
+                            shown_names
                         );
                         if let Some(e) = &self.evidence {
                             e.record(
@@ -1336,17 +1453,18 @@ impl Runner {
                                         "elapsed_s",
                                         format!("{:.3}", wall_start.elapsed().as_secs_f64()),
                                     ),
+                                    ("unit", "wall_seconds".to_string()),
                                     ("cut_steps", names.join(",")),
                                     ("done", sh.done.len().to_string()),
                                 ],
                             );
                         }
-                        let admitted: Vec<String> = sh.running.iter().cloned().collect();
-                        for tag in admitted {
-                            sh.aborted.insert(tag);
-                        }
-                        reap_many(&self.cgroups, &cut);
                     }
+                    let admitted: Vec<String> = sh.running.iter().cloned().collect();
+                    for tag in admitted {
+                        sh.aborted.insert(tag);
+                    }
+                    reap_many(&self.cgroups, &cut);
                 }
                 let skipped = self.skipped(&sh);
                 // After eager-exit has tripped, ONE class of step may still start: a diagnostic
@@ -1699,6 +1817,8 @@ impl Runner {
             intentional_skips: self.intentional_skips.clone(),
             step_profile_rows: sh.step_profile_rows.clone(),
             run_timed_out: sh.run_timed_out,
+            run_cpu_timed_out: sh.run_cpu_timed_out,
+            run_cpu_accounting_failed: sh.run_cpu_accounting_failed,
             max_concurrent_steps: sh.max_concurrent_steps,
         }
     }
@@ -3366,7 +3486,36 @@ pub fn run_dag_boxed_deadline(
     max_cpus: Option<i64>,
     run_timeout_s: Option<i64>,
 ) -> RunResult {
-    run_dag_boxed_deadline_limited(
+    run_dag_boxed_deadline_with_cpu(
+        cfg,
+        max_steps,
+        keep_going,
+        verbosity,
+        cgroups,
+        order,
+        max_cpus,
+        run_timeout_s,
+        None,
+    )
+}
+
+/// Like [`run_dag_boxed_deadline`], with a cumulative whole-run CPU allowance.
+///
+/// Reuse the same [`RunCpuBudget`] across sequential lanes and retry scheduler calls. Constructing
+/// a fresh value for each call would reset the allowance and make retries unbounded again.
+#[allow(clippy::too_many_arguments)]
+pub fn run_dag_boxed_deadline_with_cpu(
+    cfg: &DagConfig,
+    max_steps: i64,
+    keep_going: bool,
+    verbosity: i64,
+    cgroups: BoxedCgroups,
+    order: Option<Vec<String>>,
+    max_cpus: Option<i64>,
+    run_timeout_s: Option<i64>,
+    run_cpu_budget: Option<RunCpuBudget>,
+) -> RunResult {
+    run_dag_boxed_deadline_limited_with_cpu(
         cfg,
         max_steps,
         max_cpus.unwrap_or(max_steps),
@@ -3375,6 +3524,7 @@ pub fn run_dag_boxed_deadline(
         cgroups,
         order,
         run_timeout_s,
+        run_cpu_budget,
     )
 }
 
@@ -3389,6 +3539,32 @@ pub fn run_dag_boxed_deadline_limited(
     cgroups: BoxedCgroups,
     order: Option<Vec<String>>,
     run_timeout_s: Option<i64>,
+) -> RunResult {
+    run_dag_boxed_deadline_limited_with_cpu(
+        cfg,
+        max_steps,
+        max_cpus,
+        keep_going,
+        verbosity,
+        cgroups,
+        order,
+        run_timeout_s,
+        None,
+    )
+}
+
+/// Deadline-aware boxed run with cumulative whole-run CPU accounting.
+#[allow(clippy::too_many_arguments)]
+pub fn run_dag_boxed_deadline_limited_with_cpu(
+    cfg: &DagConfig,
+    max_steps: i64,
+    max_cpus: i64,
+    keep_going: bool,
+    verbosity: i64,
+    cgroups: BoxedCgroups,
+    order: Option<Vec<String>>,
+    run_timeout_s: Option<i64>,
+    run_cpu_budget: Option<RunCpuBudget>,
 ) -> RunResult {
     // FIRST, before anything walks the graph. The loader already refuses these, so this is the
     // door a LIBRARY caller comes through with a hand-built DagConfig -- and a cycle reaching the
@@ -3410,6 +3586,8 @@ pub fn run_dag_boxed_deadline_limited(
             intentional_skips: Vec::new(),
             step_profile_rows: Vec::new(),
             run_timed_out: false,
+            run_cpu_timed_out: false,
+            run_cpu_accounting_failed: false,
             max_concurrent_steps: 0,
         };
     }
@@ -3424,6 +3602,8 @@ pub fn run_dag_boxed_deadline_limited(
             intentional_skips: Vec::new(),
             step_profile_rows: Vec::new(),
             run_timed_out: false,
+            run_cpu_timed_out: false,
+            run_cpu_accounting_failed: false,
             max_concurrent_steps: 0,
         };
     }
@@ -3443,6 +3623,8 @@ pub fn run_dag_boxed_deadline_limited(
             intentional_skips: Vec::new(),
             step_profile_rows: Vec::new(),
             run_timed_out: false,
+            run_cpu_timed_out: false,
+            run_cpu_accounting_failed: false,
             max_concurrent_steps: 0,
         };
     }
@@ -3470,6 +3652,8 @@ pub fn run_dag_boxed_deadline_limited(
             intentional_skips: Vec::new(),
             step_profile_rows: Vec::new(),
             run_timed_out: false,
+            run_cpu_timed_out: false,
+            run_cpu_accounting_failed: false,
             max_concurrent_steps: 0,
         };
     }
@@ -3497,6 +3681,8 @@ pub fn run_dag_boxed_deadline_limited(
                 intentional_skips: Vec::new(),
                 step_profile_rows: Vec::new(),
                 run_timed_out: false,
+                run_cpu_timed_out: false,
+                run_cpu_accounting_failed: false,
                 max_concurrent_steps: 0,
             };
         }
@@ -3533,6 +3719,8 @@ pub fn run_dag_boxed_deadline_limited(
                 intentional_skips: Vec::new(),
                 step_profile_rows: Vec::new(),
                 run_timed_out: false,
+                run_cpu_timed_out: false,
+                run_cpu_accounting_failed: false,
                 max_concurrent_steps: 0,
             };
         }
@@ -3546,6 +3734,7 @@ pub fn run_dag_boxed_deadline_limited(
         cgroups,
         order,
         run_timeout_s,
+        run_cpu_budget,
         resource_coordinator,
     );
     // ANNOUNCE THE EVIDENCE PATH ONCE, AT THE START. A durable log nobody can find is not
@@ -4493,6 +4682,172 @@ mod tests {
         fn kill_all_remaining(&self) -> i64 {
             0
         }
+    }
+
+    struct RunCpuCgroups {
+        usage_usec: std::sync::atomic::AtomicI64,
+        increment_per_read_usec: i64,
+    }
+
+    impl RunCpuCgroups {
+        fn new(usage_usec: i64, increment_per_read_usec: i64) -> Self {
+            Self {
+                usage_usec: std::sync::atomic::AtomicI64::new(usage_usec),
+                increment_per_read_usec,
+            }
+        }
+    }
+
+    impl CgroupManager for RunCpuCgroups {
+        fn enabled(&self) -> bool {
+            true
+        }
+
+        fn prepare_command(
+            &self,
+            _tag: &str,
+            cmd: &str,
+            _mem_max: Option<i64>,
+            _cpu_count: Option<i64>,
+        ) -> String {
+            cmd.to_string()
+        }
+
+        fn kill(&self, _tag: &str) -> bool {
+            false
+        }
+
+        fn cleanup(&self, _tag: &str) {}
+
+        fn oom_kills(&self, _tag: &str) -> i64 {
+            0
+        }
+
+        fn peak_bytes(&self, _tag: &str) -> Option<i64> {
+            None
+        }
+
+        fn cpu_stats(&self, _tag: &str) -> Option<BTreeMap<String, i64>> {
+            Some(BTreeMap::from([("usage_usec".to_string(), 0)]))
+        }
+
+        fn run_cpu_usage_usec(&self) -> Option<i64> {
+            Some(
+                self.usage_usec
+                    .fetch_add(self.increment_per_read_usec, Ordering::SeqCst),
+            )
+        }
+
+        fn cpu_pressure(&self, _tag: &str) -> Option<BTreeMap<String, f64>> {
+            None
+        }
+
+        fn thread_count(&self, _tag: &str) -> Option<i64> {
+            None
+        }
+
+        fn kill_all_remaining(&self) -> i64 {
+            0
+        }
+    }
+
+    #[test]
+    fn whole_run_cpu_budget_fires_and_the_wall_backstop_does_not_carry_it() {
+        let manager = Arc::new(RunCpuCgroups::new(0, 600_000));
+        let cgroups: BoxedCgroups = Some(manager);
+        let budget = start_run_cpu_budget(&cgroups, Some(1)).unwrap();
+        let mut slow = step("g", "slow", "sleep 2", &[], 1.0, &[]);
+        slow.timeout = 2;
+        let cfg = DagConfig {
+            steps: vec![slow],
+            ..Default::default()
+        };
+
+        let result = run_dag_boxed_deadline_with_cpu(
+            &cfg,
+            1,
+            true,
+            0,
+            cgroups,
+            None,
+            Some(1),
+            Some(3),
+            budget,
+        );
+
+        assert!(!result.ok);
+        assert!(result.run_timed_out);
+        assert!(result.run_cpu_timed_out);
+        assert!(!result.run_cpu_accounting_failed);
+        assert!(
+            result.outcomes[0].duration_s < 2.0,
+            "the CPU guard must cut the step before its own 2s wall limit: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn whole_run_cpu_budget_is_silent_below_the_limit() {
+        let manager = Arc::new(RunCpuCgroups::new(0, 0));
+        let cgroups: BoxedCgroups = Some(manager);
+        let budget = start_run_cpu_budget(&cgroups, Some(1)).unwrap();
+        let cfg = DagConfig {
+            steps: vec![step("g", "quick", "true", &[], 1.0, &[])],
+            ..Default::default()
+        };
+
+        let result =
+            run_dag_boxed_deadline_with_cpu(&cfg, 1, true, 0, cgroups, None, Some(1), None, budget);
+
+        assert!(result.ok, "healthy run must remain green: {result:?}");
+        assert!(!result.run_timed_out);
+        assert!(!result.run_cpu_timed_out);
+        assert!(!result.run_cpu_accounting_failed);
+    }
+
+    #[test]
+    fn whole_run_cpu_budget_refuses_when_exact_accounting_is_absent() {
+        let cgroups: BoxedCgroups = Some(Arc::new(ProfileCaptureCgroups::default()));
+        let error = start_run_cpu_budget(&cgroups, Some(1)).unwrap_err();
+        assert!(
+            error.contains("usage_usec is unreadable"),
+            "the refusal must name the missing measurement: {error}"
+        );
+        assert_eq!(start_run_cpu_budget(&None, None).unwrap(), None);
+    }
+
+    #[test]
+    fn whole_run_cpu_budget_is_cumulative_across_scheduler_calls() {
+        let manager = Arc::new(RunCpuCgroups::new(0, 0));
+        let cgroups: BoxedCgroups = Some(manager.clone());
+        let budget = start_run_cpu_budget(&cgroups, Some(1)).unwrap();
+        let cfg = DagConfig {
+            steps: vec![step("g", "quick", "true", &[], 1.0, &[])],
+            ..Default::default()
+        };
+
+        let first = run_dag_boxed_deadline_with_cpu(
+            &cfg,
+            1,
+            true,
+            0,
+            cgroups.clone(),
+            None,
+            Some(1),
+            None,
+            budget,
+        );
+        assert!(first.ok);
+
+        manager.usage_usec.store(1_100_000, Ordering::SeqCst);
+        let second =
+            run_dag_boxed_deadline_with_cpu(&cfg, 1, true, 0, cgroups, None, Some(1), None, budget);
+        assert!(!second.ok);
+        assert!(second.run_cpu_timed_out);
+        assert!(
+            second.outcomes.is_empty(),
+            "the exhausted shared allowance must refuse to launch fresh work: {second:?}"
+        );
     }
 
     // ------------------------------------------------------------------ censoring provenance
@@ -5516,7 +5871,7 @@ mod tests {
                 .collect::<BTreeMap<String, i64>>(),
             ..Default::default()
         };
-        Runner::new(&cfg, 1, 1, false, 0, None, None, None, None)
+        Runner::new(&cfg, 1, 1, false, 0, None, None, None, None, None)
     }
 
     #[test]
