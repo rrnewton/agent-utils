@@ -231,29 +231,54 @@ say what you meant about overlap too: pass `-s` as well. The hidden 0.13
 `--jobs N` alias resolves to `--max-cpus` first and therefore sets the same
 default. Nothing runs in the other direction: `-s` never changes the CPU budget.
 
-A non-empty effective `jobs_flag` makes the inner width runner-controlled: when
-an authored or profile-derived width exceeds `--max-cpus`, the planner and
-scheduler cap the recommendation, appended command flag, and per-step `cpu.max`
-together. An empty or whitespace-only `jobs_flag` instead
-prevents command rewriting; paired with a positive `preferred_inner_jobs`, it
+A non-empty effective `jobs_flag` or `jobs_env` makes the inner width
+runner-controlled: when an authored or profile-derived width exceeds
+`--max-cpus`, the planner and scheduler cap the recommendation, guest-visible
+width, and per-step `cpu.max` together. `jobs_flag` appends the width to the
+command; `jobs_env` sets the named environment variable. At the DAG level,
+`default_jobs_env` is inherited by steps; when that field is absent,
+`SAFE_CI_DAG_RUNNER_JOBS_ENV` supplies the host-specific default. A step-level
+value overrides the default, `null` inherits it, and `""` opts that step out.
+Names must be valid shell environment-variable identifiers or the DAG is
+refused before a child starts. Shell startup/control names that remain
+assignable but would change how the wrapper starts or resolves commands are
+also refused: `BASH_ENV`, `ENV`, `BASH_COMPAT`, `BASH_XTRACEFD`,
+`POSIXLY_CORRECT`, `PATH`, `CDPATH`, `GLOBIGNORE`, and `EXECIGNORE`.
+
+At the final guest boundary, the configured key is absent from the wrapper's
+initial environment. The runner first exports an opaque nonnumeric probe and
+requires exact agreement in the current shell, an ordinary child process, and
+a fresh Bash child with profile files disabled. Only then does it export the
+numeric width and check it again before the guest command. This behavioral
+guard catches Bash-owned or rewritten parameters without trying to enumerate
+that open-ended namespace: for example, readonly `BASHOPTS`, dynamic `LINENO`,
+and startup-reset `IFS` all fail closed. A failed probe ends the step with exit
+status 125 and does not run the guest command.
+
+Empty or whitespace-only effective flag **and** environment channels prevent
+rewriting; paired with a positive `preferred_inner_jobs`, that
 declares a self-managed fixed command width. If that declared width
 exceeds the run budget, the run is refused before any DAG step process is
 created because silently throttling (for example) a hardcoded `make -j32`
 inside `--max-cpus 16` would oversubscribe and mislabel its memory/profile data.
 File-backed runs reject before cgroup setup; a stdin DAG may already have
-entered its outer scope before it can be read and validated. A sweep likewise requires a non-empty
-`jobs_flag`, since otherwise changing `sweep --jobs` would not change the guest.
+entered its outer scope before it can be read and validated. A sweep likewise
+requires at least one effective width channel, since otherwise changing
+`sweep --jobs` would not change the guest.
 
 The runner cannot infer hidden concurrency that a command does not declare. An
 arbitrary guest may still create more threads than `--max-cpus`; outer
 `cpu.max` limits their total CPU bandwidth, not their count. Use a controllable
-`jobs_flag`, fix the command's own worker setting, or use `--cores` when fixed
+`jobs_flag`/`jobs_env`, fix the command's own worker setting, or use `--cores` when fixed
 CPU eligibility is required.
 
 Under boxing the runner also exports a bounded build-worker width to each step
 (never through `MAKEFLAGS`, which would reach determinism-sensitive targets), so
 that a build tool cannot compute a width from the granted quota alone and
-OOM-race the linker. **If you set that variable yourself, your value wins.** A
+OOM-race the linker. **If no `jobs_env` channel targets that variable and you
+set it yourself, your value wins.** When `jobs_env` names the same variable,
+the admitted per-step width is intentionally more specific and wins inside the
+child, including across the boxed scope's ambient export. A
 quota is a ceiling, not a parallelism instruction, so the derived width applies
 only when you expressed nothing — and in that case it is refined downward per
 step from that step's own cores and memory cap. Either way the run prints one

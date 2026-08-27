@@ -34,6 +34,10 @@ pub const WALL_CPU_BACKSTOP_FACTOR: i64 = 3;
 /// Default command-line template for a step's inner-job width.
 pub const DEFAULT_JOBS_FLAG: &str = "-j";
 
+/// Machine-level name of the environment variable through which the runner delivers a step's
+/// admitted inner width. Cargo's `CARGO_BUILD_JOBS` is the motivating channel.
+pub const JOBS_ENV_ENV: &str = "SAFE_CI_DAG_RUNNER_JOBS_ENV";
+
 // Deliberately SMALL default caps for a step that DECLARES NOTHING — the "forcing function".
 // An undeclared step is boxed into a tight 1-core / 1-GiB / 10-s-CPU floor, so a real step
 // immediately hits the cap and must DECLARE its true needs, generating per-node resource
@@ -246,6 +250,9 @@ pub struct Step {
     /// disables appending (the step manages its own concurrency), making that declared width rigid
     /// rather than planner-adjustable. See [`render_jobs_flag`].
     pub jobs_flag: Option<String>,
+    /// Environment variable through which this step accepts its worker count. `None` inherits
+    /// [`DagConfig::default_jobs_env`]; an empty string disables the env channel for this step.
+    pub jobs_env: Option<String>,
     /// Typed pre-execution omission, separate from PASS and dependency skip.
     pub skip_reason: Option<IntentionalSkipReason>,
     /// Presence-sensitive declaration: `None` is omitted; `Some(vec![])` explicitly declares no
@@ -280,6 +287,112 @@ pub fn render_jobs_flag(template: &str, inner_jobs: i64) -> String {
 /// DagConfig-level default; `None` inherits the default.
 pub fn effective_jobs_flag<'a>(step: &'a Step, default_jobs_flag: &'a str) -> &'a str {
     step.jobs_flag.as_deref().unwrap_or(default_jobs_flag)
+}
+
+fn normalize_jobs_env(raw: &str, source: &str) -> Result<String, String> {
+    const SHELL_CONTROL_NAMES: [&str; 9] = [
+        "BASH_COMPAT",
+        "BASH_ENV",
+        "BASH_XTRACEFD",
+        "CDPATH",
+        "ENV",
+        "EXECIGNORE",
+        "GLOBIGNORE",
+        "PATH",
+        "POSIXLY_CORRECT",
+    ];
+    let name = raw.trim();
+    if name.is_empty() {
+        return Ok(String::new());
+    }
+    let mut bytes = name.bytes();
+    let valid_first = bytes
+        .next()
+        .is_some_and(|byte| byte == b'_' || byte.is_ascii_alphabetic());
+    if !valid_first || !bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric()) {
+        return Err(format!(
+            "{source}={name:?} is not a valid environment variable name"
+        ));
+    }
+    if SHELL_CONTROL_NAMES.contains(&name) {
+        return Err(format!(
+            "{source}={name:?} is a shell startup/control variable, not a safe jobs environment channel"
+        ));
+    }
+    Ok(name.to_string())
+}
+
+/// Resolve the machine's default inner-width environment channel.
+///
+/// An explicit value wins over [`JOBS_ENV_ENV`]; absent input means no env channel. Malformed
+/// names are refused because silently disabling the channel would make an env-only step appear
+/// resizable while leaving its guest width uncontrolled.
+pub fn resolve_jobs_env(explicit: Option<&str>) -> Result<String, String> {
+    match explicit {
+        Some(value) => normalize_jobs_env(value, JOBS_ENV_ENV),
+        None => match std::env::var(JOBS_ENV_ENV) {
+            Ok(value) => normalize_jobs_env(&value, JOBS_ENV_ENV),
+            Err(std::env::VarError::NotPresent) => Ok(String::new()),
+            Err(std::env::VarError::NotUnicode(_)) => Err(format!(
+                "{JOBS_ENV_ENV} is not valid UTF-8 and cannot name an environment variable"
+            )),
+        },
+    }
+}
+
+/// The inner-width environment channel in effect for a step.
+pub fn effective_jobs_env<'a>(step: &'a Step, default_jobs_env: &'a str) -> &'a str {
+    let (name, source) = match step.jobs_env.as_deref() {
+        Some(name) => (name, "jobs_env"),
+        None => (default_jobs_env, "default_jobs_env"),
+    };
+    normalize_jobs_env(name, source)
+        .unwrap_or_else(|error| panic!("invalid jobs-env configuration: {error}"));
+    name.trim()
+}
+
+/// Return the environment assignment carrying a step's admitted width, when configured.
+pub fn env_with_inner_jobs(
+    step: &Step,
+    default_jobs_env: &str,
+    inner_jobs: Option<i64>,
+) -> Option<(String, String)> {
+    let width = inner_jobs?;
+    let name = effective_jobs_env(step, default_jobs_env).trim();
+    (!name.is_empty()).then(|| (name.to_string(), width.to_string()))
+}
+
+/// Whether the runner can change a step's guest-visible inner width through argv or environment.
+pub fn step_width_is_resizable(
+    step: &Step,
+    default_jobs_flag: &str,
+    default_jobs_env: &str,
+) -> bool {
+    // Resolve the env channel first so a valid jobs flag cannot short-circuit validation of a
+    // malformed programmatic jobs_env value.
+    let jobs_env = effective_jobs_env(step, default_jobs_env);
+    !effective_jobs_flag(step, default_jobs_flag)
+        .trim()
+        .is_empty()
+        || !jobs_env.trim().is_empty()
+}
+
+/// Validate all jobs-env channels in a programmatically constructed configuration.
+pub fn validate_jobs_env_config(cfg: &DagConfig) -> Result<(), String> {
+    normalize_jobs_env(&cfg.default_jobs_env, "default_jobs_env")?;
+    for step in &cfg.steps {
+        if let Some(value) = &step.jobs_env {
+            normalize_jobs_env(value, &format!("{}.jobs_env", step.tag()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Refuse an invalid programmatic jobs-env configuration at APIs that cannot return a typed error.
+pub(crate) fn assert_valid_jobs_env_config(cfg: &DagConfig) {
+    if let Err(error) = validate_jobs_env_config(cfg) {
+        panic!("invalid jobs-env configuration: {error}");
+    }
 }
 
 /// Return a step command with its effective inner-job flag appended when requested.
@@ -586,6 +699,9 @@ pub struct DagConfig {
     pub default_step_timeout: i64,
     /// Default inner-parallelism flag template for steps that don't set their own `jobs_flag`.
     pub default_jobs_flag: String,
+    /// Default inner-parallelism environment channel for steps without their own `jobs_env`.
+    /// Empty means this machine offers no environment channel.
+    pub default_jobs_env: String,
     /// Deliberately SMALL default inner memory.max (bytes) for a step that declares NO memory
     /// hint (the forcing function; see `DEFAULT_SMALL_MEM_CAP_BYTES`). `None` disables it.
     pub default_step_mem_cap_bytes: Option<i64>,
@@ -616,6 +732,7 @@ impl Default for DagConfig {
             outer_mem_safety_factor: 1.0,
             default_step_timeout: 0,
             default_jobs_flag: DEFAULT_JOBS_FLAG.to_string(),
+            default_jobs_env: String::new(),
             // The SMALL forcing-function caps are active by default. The declarations-first
             // migration supplied measured budgets for nodes that exceed the floor; an explicit
             // per-step declaration still wins. `--unsafe-no-cgroups` is the deliberately loud
@@ -656,7 +773,7 @@ impl DagConfig {
 /// Written down so a reader can see the whole surface at once; the compiler holds it honest,
 /// because [`dag_config_carry_diff`] destructures `DagConfig` exhaustively (no `..`) and a new
 /// field therefore fails to build until it is given a comparison here too.
-pub const DAG_CONFIG_FIELDS: [&str; 14] = [
+pub const DAG_CONFIG_FIELDS: [&str; 15] = [
     "steps",
     "description",
     "resource_caps",
@@ -665,6 +782,7 @@ pub const DAG_CONFIG_FIELDS: [&str; 14] = [
     "outer_mem_safety_factor",
     "default_step_timeout",
     "default_jobs_flag",
+    "default_jobs_env",
     "default_step_mem_cap_bytes",
     "default_step_cpu_count",
     "default_step_cpu_timeout",
@@ -701,6 +819,7 @@ pub fn dag_config_carry_diff(from: &DagConfig, to: &DagConfig) -> Vec<String> {
         outer_mem_safety_factor: from_outer_mem_safety_factor,
         default_step_timeout: from_default_step_timeout,
         default_jobs_flag: from_default_jobs_flag,
+        default_jobs_env: from_default_jobs_env,
         default_step_mem_cap_bytes: from_default_step_mem_cap_bytes,
         default_step_cpu_count: from_default_step_cpu_count,
         default_step_cpu_timeout: from_default_step_cpu_timeout,
@@ -717,6 +836,7 @@ pub fn dag_config_carry_diff(from: &DagConfig, to: &DagConfig) -> Vec<String> {
         outer_mem_safety_factor: to_outer_mem_safety_factor,
         default_step_timeout: to_default_step_timeout,
         default_jobs_flag: to_default_jobs_flag,
+        default_jobs_env: to_default_jobs_env,
         default_step_mem_cap_bytes: to_default_step_mem_cap_bytes,
         default_step_cpu_count: to_default_step_cpu_count,
         default_step_cpu_timeout: to_default_step_cpu_timeout,
@@ -769,6 +889,11 @@ pub fn dag_config_carry_diff(from: &DagConfig, to: &DagConfig) -> Vec<String> {
         "default_jobs_flag",
         from_default_jobs_flag.clone(),
         to_default_jobs_flag.clone(),
+    );
+    note(
+        "default_jobs_env",
+        from_default_jobs_env.clone(),
+        to_default_jobs_env.clone(),
     );
     note(
         "default_step_mem_cap_bytes",
@@ -1152,6 +1277,7 @@ mod tests {
             timeout: DEFAULT_STEP_TIMEOUT,
             cpu_timeout: 0,
             jobs_flag: None,
+            jobs_env: None,
             skip_reason: None,
             write_domains: None,
             write_domain_guarantee: None,
@@ -1174,6 +1300,7 @@ mod tests {
             timeout: DEFAULT_STEP_TIMEOUT,
             cpu_timeout: 0,
             jobs_flag: jobs_flag.map(str::to_string),
+            jobs_env: None,
             skip_reason: None,
             write_domains: None,
             write_domain_guarantee: None,
@@ -1207,6 +1334,70 @@ mod tests {
         assert_eq!(command_with_inner_jobs(&s3, "-j", Some(4)), "mytool");
         let s4 = bare_step("fixed", Some("   "));
         assert_eq!(command_with_inner_jobs(&s4, "-j", Some(4)), "fixed");
+    }
+
+    #[test]
+    fn jobs_env_resolves_overrides_and_marks_env_only_steps_resizable() {
+        assert_eq!(
+            resolve_jobs_env(Some(" CARGO_BUILD_JOBS ")).unwrap(),
+            "CARGO_BUILD_JOBS"
+        );
+        assert!(resolve_jobs_env(Some("not a name")).is_err());
+        assert_eq!(resolve_jobs_env(Some("LINENO")).unwrap(), "LINENO");
+        assert_eq!(resolve_jobs_env(Some("BASHOPTS")).unwrap(), "BASHOPTS");
+
+        let mut step = bare_step("cargo build", Some(""));
+        assert!(!step_width_is_resizable(&step, "-j", ""));
+        assert!(step_width_is_resizable(&step, "-j", "CARGO_BUILD_JOBS"));
+        assert_eq!(
+            env_with_inner_jobs(&step, "CARGO_BUILD_JOBS", Some(4)),
+            Some(("CARGO_BUILD_JOBS".to_string(), "4".to_string()))
+        );
+
+        step.jobs_env = Some("MAKEFLAGS_J".to_string());
+        assert_eq!(effective_jobs_env(&step, "CARGO_BUILD_JOBS"), "MAKEFLAGS_J");
+        assert_eq!(
+            env_with_inner_jobs(&step, "CARGO_BUILD_JOBS", Some(2)),
+            Some(("MAKEFLAGS_J".to_string(), "2".to_string()))
+        );
+        step.jobs_env = Some(String::new());
+        assert!(!step_width_is_resizable(&step, "-j", "CARGO_BUILD_JOBS"));
+    }
+
+    #[test]
+    fn shell_startup_control_jobs_env_names_are_refused() {
+        for name in [
+            "BASH_COMPAT",
+            "BASH_ENV",
+            "BASH_XTRACEFD",
+            "CDPATH",
+            "ENV",
+            "EXECIGNORE",
+            "GLOBIGNORE",
+            "PATH",
+            "POSIXLY_CORRECT",
+        ] {
+            let error = resolve_jobs_env(Some(name)).unwrap_err();
+            assert!(error.contains("shell startup/control variable"), "{name}: {error}");
+        }
+    }
+
+    #[test]
+    fn malformed_programmatic_jobs_env_is_refused() {
+        let mut cfg = DagConfig {
+            default_jobs_env: "bad=name".to_string(),
+            ..Default::default()
+        };
+        assert!(validate_jobs_env_config(&cfg).is_err());
+        cfg.default_jobs_env.clear();
+        let mut step = bare_step("true", None);
+        step.jobs_env = Some("not a name".to_string());
+        cfg.steps = vec![step];
+        assert!(validate_jobs_env_config(&cfg).is_err());
+        assert!(std::panic::catch_unwind(|| {
+            step_width_is_resizable(&cfg.steps[0], &cfg.default_jobs_flag, &cfg.default_jobs_env)
+        })
+        .is_err());
     }
 
     #[test]
@@ -1333,6 +1524,7 @@ mod cpu_timeout_multiplier_tests {
             timeout: DEFAULT_STEP_TIMEOUT,
             cpu_timeout,
             jobs_flag: None,
+            jobs_env: None,
             skip_reason: None,
             write_domains: None,
             write_domain_guarantee: None,
@@ -1500,6 +1692,7 @@ mod carry_tests {
             timeout: DEFAULT_STEP_TIMEOUT,
             cpu_timeout: 0,
             jobs_flag: None,
+            jobs_env: None,
             skip_reason: None,
             write_domains: None,
             write_domain_guarantee: None,
@@ -1529,6 +1722,7 @@ mod carry_tests {
             outer_mem_safety_factor: 1.2,
             default_step_timeout: 600,
             default_jobs_flag: "--jobs {n}".to_string(),
+            default_jobs_env: "BUILD_JOBS".to_string(),
             default_step_mem_cap_bytes: None,
             default_step_cpu_count: Some(4),
             default_step_cpu_timeout: 120,

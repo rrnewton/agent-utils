@@ -9,6 +9,7 @@ Per-step supervision reaps complete process trees and records structured outcome
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 import sys
 import threading
@@ -44,7 +45,6 @@ from dagrun.model import (
     command_with_inner_jobs,
     effective_cpu_count,
     effective_cpu_timeout,
-    effective_jobs_flag,
     canonical_cpu_timeout,
     resolved_wall_timeout,
     scale_cpu_timeout,
@@ -55,6 +55,7 @@ from dagrun.model import (
     env_with_inner_jobs,
     step_width_is_resizable,
     JOBS_ENV_ENV,
+    validate_jobs_env_config,
 )
 from dagrun.profile_enrich import (
     resolve_effective_inner_jobs,
@@ -105,6 +106,48 @@ _THREAD_JOIN_S = 2.0
 #: the durable log and the in-memory capture are both unaffected by it. MUST match
 #: ``STREAM_LINE_MAX_BYTES`` in ``rs/dagrun/src/scheduler.rs``.
 _STREAM_LINE_MAX_BYTES = 1024 * 1024
+
+#: An opaque, deliberately non-numeric assignment used to prove that a configured jobs channel is
+#: an ordinary exported variable rather than a readonly or shell-synthesized parameter such as
+#: ``BASHOPTS`` or ``LINENO``. The value is never visible to the guest command.
+_JOBS_ENV_PROBE_VALUE = "__dagrun_jobs_env_capability_probe__"
+
+
+def _checked_jobs_env_export(name: str, value: str) -> str:
+    """Assign ``name`` only after bash and a child process preserve arbitrary text.
+
+    The configured key is deliberately absent from the outer ``bash`` environment (see the spawn
+    path below), so startup-sensitive variables cannot act before this guard. The non-numeric
+    probe prevents a dynamic numeric parameter from passing by coincidence -- ``LINENO=1`` used
+    to pass when the guard itself happened to be on line one. ``printenv`` is an independent
+    process boundary, proving the exported value is what a real build tool will inherit.
+    """
+    quoted_probe = shlex.quote(_JOBS_ENV_PROBE_VALUE)
+    quoted_value = shlex.quote(value)
+    child_probe = shlex.quote(
+        f'[ "${{{name}-}}" = "$1" ] && '
+        f'[ "$(/usr/bin/printenv {name} 2>/dev/null)" = "$1" ]'
+    )
+    failure = shlex.quote(
+        f"dagrun: ERROR: jobs environment variable {name} cannot safely retain "
+        f"assigned width {value}; refusing guest command"
+    )
+    return (
+        f"if ! export {name}={quoted_probe} || "
+        f"[ \"${{{name}-}}\" != {quoted_probe} ] || "
+        f"[ \"$(/usr/bin/printenv {name} 2>/dev/null)\" != {quoted_probe} ] || "
+        f"! /bin/bash --noprofile --norc -c {child_probe} "
+        f"dagrun-jobs-env-probe {quoted_probe}; then\n"
+        f"  printf '%s\\n' {failure} >&2\n"
+        "  exit 125\n"
+        "fi\n"
+        f"if ! export {name}={quoted_value} || "
+        f"[ \"${{{name}-}}\" != {quoted_value} ] || "
+        f"[ \"$(/usr/bin/printenv {name} 2>/dev/null)\" != {quoted_value} ]; then\n"
+        f"  printf '%s\\n' {failure} >&2\n"
+        "  exit 125\n"
+        "fi\n"
+    )
 
 
 class BudgetUnit(Enum):
@@ -259,11 +302,12 @@ def cap_config_max_cpus(cfg: DagConfig, max_cpus: int) -> DagConfig:
     """Copy ``cfg`` with every runner-controlled per-step CPU width capped to ``max_cpus``.
 
     The clamp is intentionally visible: a caller-authored width changed by the run budget must
-    not look as though it executed unchanged. A step whose effective ``jobs_flag`` is empty manages
-    its own command width and cannot be rewritten; its declared width is left unchanged so run
-    entry points can refuse an over-budget configuration instead of corrupting scheduling/profile
-    metadata. The undeclared-step ``cpu.max`` default is capped too.
+    not look as though it executed unchanged. A step with neither a jobs flag nor a jobs-env
+    channel manages its own command width and cannot be rewritten; its declared width is left
+    unchanged so run entry points can refuse an over-budget configuration instead of corrupting
+    scheduling/profile metadata. The undeclared-step ``cpu.max`` default is capped too.
     """
+    validate_jobs_env_config(cfg)
     budget = max(1, max_cpus)
     default_cpu_count = cfg.default_step_cpu_count
     if default_cpu_count is not None and default_cpu_count > budget:
@@ -277,12 +321,14 @@ def cap_config_max_cpus(cfg: DagConfig, max_cpus: int) -> DagConfig:
     for step in cfg.steps:
         width = step.hint.preferred_inner_jobs
         if width is not None and width > budget:
-            if not effective_jobs_flag(step, cfg.default_jobs_flag).strip():
+            if not step_width_is_resizable(
+                step, cfg.default_jobs_flag, cfg.default_jobs_env
+            ):
                 steps.append(step)
                 continue
             _warn(
                 f"step {step.tag} preferred_inner_jobs={width} exceeds --max-cpus {budget}; "
-                f"capping its command width and per-step cpu.max to {budget}"
+                f"capping its guest width and per-step cpu.max to {budget}"
             )
             step = replace(
                 step,
@@ -302,7 +348,7 @@ def cap_config_max_cpus(cfg: DagConfig, max_cpus: int) -> DagConfig:
 def _self_managed_width_violations(
     cfg: DagConfig, max_cpus: int
 ) -> tuple[tuple[str, int], ...]:
-    """Declared over-budget widths the runner cannot rewrite because ``jobs_flag`` is empty."""
+    """Declared over-budget widths the runner cannot rewrite through either width channel."""
 
     budget = max(1, max_cpus)
     return tuple(
@@ -505,6 +551,7 @@ class Runner:
         run_timeout_s: int | None = None,
     ) -> None:
         self.max_cpus = _resolve_max_cpus_argument(max_cpus, cpu_jobs)
+        validate_jobs_env_config(cfg)
         if error := _self_managed_width_error(cfg, self.max_cpus):
             raise ValueError(error)
         # Public 0.13 attribute retained for source compatibility; new code uses max_cpus.
@@ -1087,7 +1134,14 @@ class Runner:
         inner_jobs = preferred_inner_jobs(step)
         # Deliver the width through this machine's env channel when it has one. Empty overlay
         # when the host configured none, so behaviour is unchanged where nothing is set.
-        env.update(env_with_inner_jobs(step, self.cfg.default_jobs_env, inner_jobs))
+        jobs_env = env_with_inner_jobs(step, self.cfg.default_jobs_env, inner_jobs)
+        if jobs_env:
+            # Do not expose a caller-selected key to bash startup. Names such as BASH_ENV can run
+            # code before the command string reaches its first guard, while dynamic parameters
+            # such as LINENO may be rewritten during startup. The checked final-boundary export
+            # below is the sole authority for the guest-visible value.
+            name = next(iter(jobs_env))
+            env.pop(name, None)
         cpu_count = effective_cpu_count(step, self.cfg.default_step_cpu_count)
         # SMALL default caps for an undeclared step (the forcing function): fall back to the
         # DAG's tight 1-GiB memory.max / 1-core cpu.max / 10-s CPU-time floor when the step
@@ -1120,6 +1174,13 @@ class Runner:
         # step's jobs_flag template (or the DagConfig default, e.g. "-j"). No-op when the step
         # declares no preferred_inner_jobs.
         base_cmd = command_with_inner_jobs(step, self.cfg.default_jobs_flag, inner_jobs)
+        if jobs_env:
+            # The real cgroup wrapper exports its scope/operator CARGO_BUILD_JOBS before running
+            # ``base_cmd``. Put the per-step allocation at the final command boundary as well as
+            # in Popen's environment so a configured CARGO_BUILD_JOBS channel wins there. The
+            # name was validated before any node could spawn and the value is a decimal integer.
+            name, env_value = next(iter(jobs_env.items()))
+            base_cmd = f"{_checked_jobs_env_export(name, env_value)}{base_cmd}"
 
         # When per-step cgroups are enabled, prepare_command wraps the command so the bash
         # leader self-moves into the step's child cgroup BEFORE forking any grandchild (the
