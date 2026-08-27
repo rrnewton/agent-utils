@@ -14,6 +14,11 @@
 //
 //     node qa-archive.cjs --archive ~/logs/summary/myproject
 //
+// If you have no captured archive of that size, generate one: `make -C ../../../wrkviz
+// synth-archive OUT=/tmp/synth PRESET=large` writes deterministic transcripts and builds them
+// through the ordinary path. `synthetic-scale.spec.js` gates on a small version of the same
+// thing; the large sizes exist for exactly this file.
+//
 // WHY THREE LEVELS. `timeline-core.semanticZoomLevel` picks a level of detail from
 // milliseconds-per-pixel -- `detail` at or under a minute per pixel, `lifetime` at or under five,
 // `aggregate` beyond -- so one archive draws three substantially different scenes depending only

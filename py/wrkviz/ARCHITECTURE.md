@@ -86,6 +86,19 @@ it; the true count is in the tooltip and the accessible name. Teams sort by desc
 event volume. Omitted zero-activity bins preserve gaps. These thresholds and suppressions are part
 of the performance contract and are covered by browser tests.
 
+Covering them needs an archive wide enough in *time* to reach them, which is why `synthetic.py`
+exists. The small committed browser fixture spans one afternoon, so every zoom a reader can reach
+in it is the detail level and the other two branches are unreachable; the scale evidence otherwise
+available was a manual run against a captured archive that cannot be committed. `synthetic.py`
+writes deterministic coordinator and subagent transcripts at a requested size — overlapping
+lifetimes, nested spawns, tool bursts, messages in both directions, work stopping overnight — and
+the ordinary ingest, summarize and build path turns them into a real archive. The browser suite
+generates the small `ci` size — 201 agents, 1,212 phases and 5,917 tool calls over eleven days —
+and asserts that a fitted view is aggregate, that zooming in walks through lifetime into detail,
+and that each level draws and suppresses what this section says it does. Its output is never
+committed: it is derived, it is tens of megabytes, and it is regenerated whenever the package
+changes.
+
 ### Static delivery and schema compatibility
 
 Website builds keep every uncompressed identity file intact. They also create

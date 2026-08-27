@@ -38,7 +38,34 @@ path is covered by `../test_timeline_v3_ui.js` and by `tests/test_timeline_v3_we
 serves a real build through the archive's own `serve.py` so the byte ranges are answered by the
 server that ships with the archive.
 
-The fixture intentionally has four agents: one coordinator, two overlapping agents,
+## The second fixture: a generated archive with levels of detail
+
+`synthetic-scale.spec.js` runs against a different fixture, for a question the four-agent one
+cannot answer. `timeline-core.semanticZoomLevel` picks `detail`, `lifetime` or `aggregate` from
+milliseconds-per-pixel, so an archive spanning one afternoon renders `detail` at every reachable
+zoom and the other two branches — the ones that suppress phases, then agents and edges, and keep a
+large archive responsive — are never taken.
+
+That fixture is generated rather than committed. `python3 -m wrkviz.synthetic` writes deterministic
+Claude-shaped coordinator and subagent transcripts at a requested size, and the ordinary
+ingest/summarize/build path turns them into a real archive, served here by the `serve.py` inside
+it. The size the spec uses is the `ci` preset — 201 agents, 1,212 phases and about 6,000 tool
+calls over eleven days — which takes about ten seconds to build and is cached under a fingerprint
+of both the requested size and the package that produced it, so a later run is a few hundred
+milliseconds and an edit to the builder invalidates it. The cache lives in `.synthetic-archive/`
+and is not tracked: it is 30 MB of content-addressed shards and their sidecars, and committing a
+generated tree of that shape would make every builder change a large diff nobody reads.
+
+For a bigger one, by hand:
+
+```bash
+make -C ../../../wrkviz synth-archive OUT=/tmp/synth PRESET=large
+make -C ../../../wrkviz qa-archive ARCHIVE=/tmp/synth/archive
+```
+
+## The small fixture
+
+The four-agent fixture intentionally has: one coordinator, two overlapping agents,
 and a third agent whose lifetime starts exactly when the first ends. That makes the
 packed-lane assertion cover both overlap and half-open lifetime reuse. Its spawn,
 intermediate message, and lifetime result also verify that fork/join edges remain visible

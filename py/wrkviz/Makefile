@@ -38,7 +38,8 @@ BOX_FLAGS ?=
 BOX = $(DAGRUN) box --label $(1) --mem $(2) --timeout $(3) --cores $(4) $(BOX_FLAGS) --
 
 .DEFAULT_GOAL := help
-.PHONY: help validate validate-fast unit browser benchmark typecheck qa-archive clean-browser
+.PHONY: help validate validate-fast unit browser benchmark typecheck qa-archive synth-archive \
+	clean-browser
 
 help:
 	@printf '%s\n' \
@@ -53,6 +54,8 @@ help:
 	  '  make benchmark       zoom/pan redraw timings, enforced against a budget' \
 	  '' \
 	  '  make qa-archive ARCHIVE=<dir>   zoom/pan latency on a REAL archive, by level of detail' \
+	  '  make synth-archive OUT=<dir>    generate + build a synthetic archive at scale' \
+	  '                                  PRESET=ci|large|archive (default: $(PRESET))' \
 	  '' \
 	  '  make clean-browser   remove Playwright test-results and traces' \
 	  '' \
@@ -103,6 +106,23 @@ benchmark:
 qa-archive:
 	@test -n "$(ARCHIVE)" || { printf 'usage: make qa-archive ARCHIVE=<built archive dir>\n'; exit 2; }
 	cd $(BROWSER) && node qa-archive.cjs --archive "$(ARCHIVE)"
+
+# Manual QA's other half: an archive to point `qa-archive` at, when you do not have a real one.
+# `wrkviz.synthetic` writes deterministic coordinator/subagent transcripts at a requested size and
+# runs the ordinary ingest/summarize/build path over them, so the result is a real archive rather
+# than a mock -- servable, searchable, and shaped like a captured one.
+#
+# Not part of `validate`, and never committed: `archive` is calibrated to a measured real corpus
+# and writes gigabytes. The size the browser suite gates on is the small `ci` one, which that
+# suite generates for itself.
+#
+#     make synth-archive OUT=/tmp/synth PRESET=large
+#     make qa-archive ARCHIVE=/tmp/synth/archive
+PRESET ?= large
+synth-archive:
+	@test -n "$(OUT)" || { printf 'usage: make synth-archive OUT=<dir> [PRESET=ci|large|archive]\n'; exit 2; }
+	cd $(REPO_ROOT)/py && PYTHONPATH=. $(PYTHON) -m wrkviz.synthetic \
+	  --out "$(OUT)" --preset $(PRESET) --build
 
 clean-browser:
 	rm -rf $(BROWSER)/test-results
