@@ -53,6 +53,7 @@ use crate::model::{
 };
 use crate::proccpu::{subtree_cpu_seconds, CPU_SOURCE_CGROUP, CPU_SOURCE_PROCFS};
 use crate::profile_enrich::{resolve_effective_inner_jobs, step_enrichment_columns};
+use crate::resource_caps::{Acquire as SharedResourceAcquire, Coordinator as ResourceCoordinator};
 
 /// A per-step measurement row (column -> value), matching the perflog step-profile schema.
 type ProfileRow = BTreeMap<String, String>;
@@ -1066,6 +1067,9 @@ struct Runner {
     /// Durable, incrementally-flushed evidence for this run (per-step logs + boundary journal), or
     /// `None` when the operator opted out or the directory could not be created.
     evidence: Option<Arc<RunEvidence>>,
+    /// Cross-process enforcement of this DAG's existing `resource_caps`, enabled only when the
+    /// caller supplies `DAGRUN_RESOURCE_CAPS_PATH`.
+    resource_coordinator: Option<ResourceCoordinator>,
     shared: Arc<Mutex<Shared>>,
     /// TEST-ONLY: run this instead of the guarded supervisor body, on the supervisor's own thread.
     ///
@@ -1096,6 +1100,7 @@ impl Runner {
         cgroups: BoxedCgroups,
         order_override: Option<Vec<String>>,
         run_timeout_s: Option<i64>,
+        resource_coordinator: Option<ResourceCoordinator>,
     ) -> Self {
         let max_cpus = max_cpus.max(1);
         let capped = cap_config_max_cpus(cfg, max_cpus);
@@ -1160,6 +1165,7 @@ impl Runner {
             cpu_timeout_platform: capped.cpu_timeout_platform.clone(),
             run_timeout_s,
             evidence: RunEvidence::open(default_log_dir()).map(Arc::new),
+            resource_coordinator,
             shared: Arc::new(Mutex::new(Shared {
                 done: HashMap::new(),
                 running: HashSet::new(),
@@ -1285,7 +1291,7 @@ impl Runner {
             .map(|s| wall_start + Duration::from_secs(s as u64));
         loop {
             self.sweep_dead_supervisors(&handles);
-            let mut launchable: Vec<Step> = Vec::new();
+            let mut launchable = Vec::new();
             {
                 let mut sh = lock_shared(&self.shared);
                 // OUTER BUDGET, CHECKED IN OUR OWN LOOP AND NOT BY AN EXTERNAL KILLER. Stopping
@@ -1353,6 +1359,24 @@ impl Runner {
                     !blocked_by_fail_fast(sh, tag)
                         || is_exempt_from_eager_exit(sh, tag, &failed_now)
                 };
+                if let Some(coordinator) = &self.resource_coordinator {
+                    let eligible: HashSet<String> = self
+                        .order
+                        .iter()
+                        .filter(|tag| {
+                            let step = &self.steps[*tag];
+                            !sh.done.contains_key(*tag)
+                                && !sh.running.contains(*tag)
+                                && !skipped.contains(*tag)
+                                && step.skip_reason.is_none()
+                                && startable_after_stop(&sh, tag)
+                                && deps_known(&sh, step)
+                                && deps_ok(&sh, step)
+                        })
+                        .cloned()
+                        .collect();
+                    coordinator.retain_pending(&eligible);
+                }
                 // Do not end the run while a permitted diagnostic is still waiting to start.
                 // Terminates: the set is finite, each member runs at most once, and a member
                 // whose deps can never be satisfied is excluded here rather than waited on.
@@ -1390,6 +1414,9 @@ impl Runner {
                             + blocked_by_family.len()
                             >= self.steps.len())
                 {
+                    if let Some(coordinator) = &self.resource_coordinator {
+                        coordinator.clear_pending();
+                    }
                     break;
                 }
                 {
@@ -1417,9 +1444,66 @@ impl Runner {
                         if !res_free(&sh, &step) {
                             continue;
                         }
+                        let resource_reservation = match &self.resource_coordinator {
+                            Some(coordinator)
+                                if step.hint.resources.values().any(|demand| *demand > 0) =>
+                            {
+                                match coordinator.try_acquire(tag, &step.hint.resources) {
+                                    Ok(SharedResourceAcquire::Waiting { newly_queued }) => {
+                                        if newly_queued {
+                                            let resources = step
+                                                .hint
+                                                .resources
+                                                .iter()
+                                                .map(|(name, demand)| format!("{name}={demand}"))
+                                                .collect::<Vec<_>>()
+                                                .join(",");
+                                            emit(&format!(
+                                                "[{tag}] WAIT resource_caps {resources} shared with other scheduler processes"
+                                            ));
+                                            if let Some(evidence) = &self.evidence {
+                                                evidence.record(
+                                                    "resource_wait_start",
+                                                    &[
+                                                        ("step", tag.clone()),
+                                                        ("resources", resources),
+                                                    ],
+                                                );
+                                            }
+                                        }
+                                        continue;
+                                    }
+                                    Ok(SharedResourceAcquire::Granted {
+                                        reservation,
+                                        waited_seconds,
+                                    }) => {
+                                        if waited_seconds >= LOOP_SLEEP.as_secs_f64() {
+                                            emit(&format!(
+                                                "[{tag}] READY resource_caps after {waited_seconds:.3}s wait"
+                                            ));
+                                            if let Some(evidence) = &self.evidence {
+                                                evidence.record(
+                                                    "resource_wait_end",
+                                                    &[
+                                                        ("step", tag.clone()),
+                                                        (
+                                                            "waited_s",
+                                                            format!("{waited_seconds:.3}"),
+                                                        ),
+                                                    ],
+                                                );
+                                            }
+                                        }
+                                        Ok(Some(reservation))
+                                    }
+                                    Err(error) => Err(error),
+                                }
+                            }
+                            _ => Ok(None),
+                        };
                         sh.running.insert(tag.clone());
                         acquire(&mut sh, &step);
-                        launchable.push(step);
+                        launchable.push((step, resource_reservation));
                     }
                     // TERMINAL STARVE. Nothing is launchable, nothing is running, and work
                     // remains: no future event can change that, because every state transition in
@@ -1440,7 +1524,15 @@ impl Runner {
                         + self.intentional_skips.len()
                         + blocked_by_family.len();
                     let remaining = self.steps.len().saturating_sub(accounted);
-                    if launchable.is_empty() && sh.running.is_empty() && remaining > 0 {
+                    let waiting_on_shared_resource = self
+                        .resource_coordinator
+                        .as_ref()
+                        .is_some_and(ResourceCoordinator::has_pending);
+                    if launchable.is_empty()
+                        && sh.running.is_empty()
+                        && remaining > 0
+                        && !waiting_on_shared_resource
+                    {
                         let mut stuck: Vec<String> = self
                             .order
                             .iter()
@@ -1481,7 +1573,7 @@ impl Runner {
                     }
                 }
             }
-            for step in launchable {
+            for (step, resource_reservation) in launchable {
                 let shared = Arc::clone(&self.shared);
                 let keep_going = self.keep_going;
                 let verbosity = self.verbosity;
@@ -1533,6 +1625,7 @@ impl Runner {
                                 cpu_timeout_multiplier,
                                 cpu_timeout_platform,
                                 run_origin: wall_start,
+                                resource_reservation,
                             });
                         });
                     }),
@@ -1543,6 +1636,9 @@ impl Runner {
         }
         for (h, _step) in handles {
             let _ = h.join();
+        }
+        if let Some(coordinator) = &self.resource_coordinator {
+            coordinator.clear_pending();
         }
         // NORMAL-exit backstop: reap any step cgroup that still has live procs (a setsid orphan a
         // step left behind lives there). Does NOT stop the outer scope, so a green run stays green.
@@ -2014,6 +2110,9 @@ struct StepCtx {
     /// one run can be tested for OVERLAP. Monotonic, not wall clock: a clock step mid-run must not
     /// make one step appear to precede another.
     run_origin: Instant,
+    /// Kept alive for exactly the child step's lifetime. Waiting occurred before `run_step`, so
+    /// it is deliberately excluded from the step's wall and CPU budgets.
+    resource_reservation: Result<Option<crate::resource_caps::Reservation>, String>,
 }
 
 /// Tear down one step's whole process tree: SIGTERM grace, then `cgroup.kill`/SIGKILL.
@@ -2265,8 +2364,50 @@ fn run_step(ctx: StepCtx) {
         cpu_timeout_multiplier,
         cpu_timeout_platform,
         run_origin,
+        resource_reservation,
     } = ctx;
     let tag = step.tag();
+    let _resource_reservation = match resource_reservation {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            let reason = format!("resource_caps shared-state refusal: {error}");
+            {
+                let mut sh = lock_shared(&shared);
+                retire(&mut sh, &step);
+                sh.done.insert(
+                    tag.clone(),
+                    StepOutcome::failed(
+                        tag.clone(),
+                        0.0,
+                        reason.clone(),
+                        None,
+                        false,
+                        0,
+                        false,
+                        0,
+                        false,
+                        0,
+                        0,
+                        cpu_timeout_multiplier,
+                        &cpu_timeout_platform,
+                        false,
+                        None,
+                        None,
+                    ),
+                );
+                trip_fail_fast(&mut sh, &cgroups, keep_going, &tag);
+            }
+            if let Some(evidence) = &evidence {
+                evidence.record(
+                    "resource_refusal",
+                    &[("step", tag.clone()), ("reason", reason.clone())],
+                );
+            }
+            emit(&format!("[{tag}] \u{2717} REFUSED {reason}"));
+            eprintln!("[{tag}] REFUSED: {reason}");
+            return;
+        }
+    };
     emit(&format!("[{tag}] \u{25b6} START  {}", step.desc));
 
     // Append the step's inner-parallelism (concurrency) flag when it declares one. No-op when the
@@ -2348,6 +2489,10 @@ fn run_step(ctx: StepCtx) {
     for (k, v) in &step.env {
         cmd.env(k, v);
     }
+    // The outer step already owns its declared resource capacities. A nested runner belongs to
+    // that step's process tree and must not ask for the same capacity again, which would wait on
+    // itself forever. Independent top-level runners receive the path from their own launcher.
+    cmd.env_remove(crate::resource_caps::PATH_ENV);
     if let Some((name, value)) = &jobs_env {
         // Runner authority wins over a DAG-supplied value on the same channel.
         cmd.env(name, value);
@@ -3365,6 +3510,25 @@ pub fn run_dag_boxed_deadline_limited(
             eprintln!("[scheduler] \u{26a0} {notice}");
         }
     }
+    let resource_coordinator = match ResourceCoordinator::from_env(&cfg.resource_caps) {
+        Ok(coordinator) => coordinator,
+        Err(error) => {
+            eprintln!(
+                "[scheduler] ERROR: REFUSING to run before any node starts: resource_caps shared state is unusable: {error}"
+            );
+            return RunResult {
+                ok: false,
+                wall_s: 0.0,
+                outcomes: Vec::new(),
+                skipped: Vec::new(),
+                not_launched: Vec::new(),
+                intentional_skips: Vec::new(),
+                step_profile_rows: Vec::new(),
+                run_timed_out: false,
+                max_concurrent_steps: 0,
+            };
+        }
+    };
     let runner = Runner::new(
         cfg,
         max_steps,
@@ -3374,6 +3538,7 @@ pub fn run_dag_boxed_deadline_limited(
         cgroups,
         order,
         run_timeout_s,
+        resource_coordinator,
     );
     // ANNOUNCE THE EVIDENCE PATH ONCE, AT THE START. A durable log nobody can find is not
     // evidence; and printing it only on failure is printing it only where the run still had a
@@ -5343,7 +5508,7 @@ mod tests {
                 .collect::<BTreeMap<String, i64>>(),
             ..Default::default()
         };
-        Runner::new(&cfg, 1, 1, false, 0, None, None, None)
+        Runner::new(&cfg, 1, 1, false, 0, None, None, None, None)
     }
 
     #[test]

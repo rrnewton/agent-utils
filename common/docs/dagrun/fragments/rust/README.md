@@ -45,3 +45,11 @@ For Rust harnesses, cargo-nextest supplies libtest's `--exact TEST` arguments,
 so the process snapshot can bind each child to its test. Ordinary `cargo test`
 runs several tests inside one shared binary; its process tree alone does not
 identify the live test and remains explicitly unattributed.
+
+`resource_caps` normally apply within one runner process. A launcher that permits
+several independent runners to share the same scarce resources can set
+`DAGRUN_RESOURCE_CAPS_PATH` to one shared state file. The existing capacities
+then apply across those processes as well. A waiting step does not start its
+wall or CPU timer until every requested capacity is granted, and child commands
+do not inherit the path because they are already inside the outer step's grant.
+Malformed state and conflicting capacities refuse before a node starts.

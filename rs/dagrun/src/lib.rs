@@ -32,6 +32,7 @@ pub mod perflog;
 pub mod proccpu;
 pub mod profile_enrich;
 pub mod reservation;
+pub mod resource_caps;
 pub mod scheduler;
 pub mod sizing;
 pub mod summary;
