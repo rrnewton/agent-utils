@@ -2684,12 +2684,11 @@ fn run_step(ctx: StepCtx) {
     // The contractual capability remains false for uncontained runs; the warning names this
     // lower-bound attempt without promoting it to cgroup-equivalent enforcement. The poll is
     // interruptible, so joining it at step end returns promptly.
-    let monitor_stop = Arc::new(AtomicBool::new(false));
+    let (monitor_stop, monitor_stop_rx) = std::sync::mpsc::channel();
     let thread_peak = Arc::new(Mutex::new(None::<i64>));
     let cpu_exceeded = Arc::new(AtomicBool::new(false));
     let termination_culprit = Arc::new(Mutex::new(None::<Culprit>));
     let monitor: Option<thread::JoinHandle<()>> = if boxed || cpu_budget > 0 {
-        let stop = Arc::clone(&monitor_stop);
         let peak = Arc::clone(&thread_peak);
         let cpu_flag = Arc::clone(&cpu_exceeded);
         let cg = cgroups.clone();
@@ -2713,8 +2712,11 @@ fn run_step(ctx: StepCtx) {
                 // One-shot, so an unmeasurable budget is stated once per step, not once per tick.
                 let mut unmeasurable_warned = false;
                 let tick = Duration::from_millis(50);
-                while !stop.load(Ordering::Relaxed) {
-                    thread::sleep(tick);
+                loop {
+                    match monitor_stop_rx.recv_timeout(tick) {
+                        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    }
                     since += tick;
                     if since < MONITOR_INTERVAL {
                         continue;
@@ -2865,7 +2867,7 @@ fn run_step(ctx: StepCtx) {
     // Reap the whole tree (cgroup.kill + killpg) so orphan grandchildren die now and the readers
     // see EOF; then stop the monitor and join the reader threads.
     reap(&cgroups, &tag, pid, Some(&nonce));
-    monitor_stop.store(true, Ordering::Relaxed);
+    let _ = monitor_stop.send(());
     if let Some(m) = monitor {
         join_bounded(m, &tag, "monitor", JOIN_WAIT);
     }
