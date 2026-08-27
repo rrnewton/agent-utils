@@ -351,8 +351,7 @@ def parse_ordinal_range(raw: str) -> OrdinalRange:
 # EOF unless a `--limit`, a `--tail` or a window end stops it. See `list_messages` for why no
 # sound upper bound exists rather than merely not having been written yet.
 #
-# Two physical formats need slicing, and they get two readers rather than one, because they
-# are genuinely different problems:
+# Everything that needs slicing is now one physical format, and there is one reader for it:
 #
 # `_ChunkedJsonlReader` reads a schema-3 shard -- a multi-member gzip file with the sidecar
 # index written by `wrkviz.seekable_jsonl`. It is a *reimplementation* of that
@@ -373,17 +372,26 @@ def parse_ordinal_range(raw: str) -> OrdinalRange:
 # generation is present, and falls back to schema 2 and then schema 1 when it is not. See that
 # class for the completeness rule and for which stream answers which question.
 #
-# `_SeekableJsonlText` reads the *uncompressed* transcript projections under
-# `extracted/transcripts/`. Those have no sidecar and deliberately gain none: adding a
-# chunked `.gz` twin beside them would recreate exactly the duplication schema 3 exists to
-# remove (the archive already carries 2.42 GB of `.json` beside 0.19 GB of `.gz`), and it is
-# unnecessary, because an uncompressed file sorted on its key can be binary-searched in
-# place. The two invariants that makes sound are writer invariants, not lucky properties of
-# today's data: `transcript_export` emits both files through `sorted(..., key=_record_sort_key)`
-# whose first component is `timestamp_ms`, and assigns `ordinal` by `enumerate(prompts, 1)`
-# over that same sorted list, so in `prompts.jsonl` the ordinal is exactly the line number
-# plus one. Both are re-checked at the records a seek actually lands on, so a projection that
-# ever stops honouring them fails loudly instead of silently returning the wrong window.
+# `TranscriptQuery`, at the bottom, reads the transcript projections under
+# `extracted/transcripts/` through that same reader. They used to be plain `.jsonl`, sliced by
+# a second reader that bisected them by byte offset in place, and the note that stood here
+# argued they should stay that way: a chunked `.gz` *twin* beside each plain file would have
+# recreated exactly the duplication schema 3 exists to remove, and an uncompressed file sorted
+# on its key does not need an index to be searched. Both halves of that were true and neither
+# was an argument against the change actually made -- the plain file is not twinned, it is
+# *gone*, and 132.7 MiB of it became 28.1 MiB with no second copy of anything. What the note
+# was right about is the price, and the price was paid here: every seek that was a byte offset
+# is now a line number resolved through the member table, because a compressed stream has no
+# meaningful midpoint to probe.
+#
+# The two writer invariants the seeks rest on are unchanged, and are still checked rather than
+# trusted. `transcript_export` emits every projection through `sorted(..., key=_record_sort_key)`
+# whose first component is `timestamp_ms`, so a bisect over the member table's time bounds is
+# sound; and it assigns `ordinal` by `enumerate(prompts, 1)` over that same sorted list, so in
+# `prompts.jsonl` the ordinal is exactly the line number plus one -- which is now *how* an
+# ordinal range is located, a direct `read_lines`, rather than a key to bisect on. Both are
+# re-checked at the records a seek actually lands on, so a projection that ever stops honouring
+# them fails loudly instead of silently returning the wrong window.
 
 
 class ArchiveReadError(ValueError):
@@ -405,20 +413,16 @@ _CHUNK_INDEX_SUFFIX = ".index.jsonl"
 # syscall overhead disappears against parsing.
 _SCAN_BLOCK_BYTES = 1 << 18
 
-# Read granularity for a bisect probe, which wants one record and nothing else. Deliberately
-# far smaller than `_SCAN_BLOCK_BYTES`: a bisect over the 105 MB message projection takes
-# about twenty-seven probes, so reading a scan-sized block at each one would turn a seek that
-# should cost a few hundred kilobytes into seven megabytes. The mean transcript record is
-# about 1.6 KB, so 4 KiB answers most probes in one read; a longer record is caught by
-# doubling rather than by a second guess at the right constant, which bounds the wasted read
-# at one record's length however long that record turns out to be.
-_PROBE_BLOCK_BYTES = 1 << 12
-
-# The first backwards read of a tail. Twenty records at the measured mean fit inside it, so
-# the common tail costs one read; the window doubles rather than guessing again.
-_TAIL_BLOCK_BYTES = 1 << 16
-
 _GZIP_WBITS = 16 + zlib.MAX_WBITS
+
+
+class _UncompressedDigestMismatch(ArchiveReadError):
+    """A container whose inflated stream does not hash to what it was declared to hash to.
+
+    Distinct from :class:`ArchiveReadError` so that a caller which knows what the file *is* can
+    say so -- ``TranscriptQuery`` re-raises it as "transcript export generation is incomplete",
+    naming the projection -- without matching on the reader's prose.
+    """
 
 
 @dataclass(frozen=True)
@@ -646,6 +650,18 @@ class _ChunkedJsonlReader:
         return self._index is not None
 
     @property
+    def bytes_read(self) -> int:
+        """Every byte this reader has physically read, sidecar included.
+
+        The two counters stay separate for the schema-3 assertions, which are about the shard
+        and would be muddied by a fixed 0.06% of index; this is the number a *caller* pays, and
+        the transcript paths assert on it because "opening the corpus reads nothing" has to
+        include the sidecar or it is not the claim it sounds like.
+        """
+
+        return self.data_bytes_read + self.index_bytes_read
+
+    @property
     def index(self) -> _ChunkIndex:
         """The accepted sidecar, or an error if this reader is scanning without one."""
 
@@ -704,6 +720,101 @@ class _ChunkedJsonlReader:
                     yield _decode_record(
                         lines[offset], f"{self.path} line {member.l0 + offset}"
                     )
+
+    def iter_records_from(
+        self, first: int
+    ) -> Iterator[tuple[int, dict[str, JsonValue]]]:
+        """Yield ``(0-based line number, record)`` from *first* to the end of the file.
+
+        The open-ended sibling of :meth:`read_lines`, and separate from it for two reasons.
+        It reports the line number, which is what an error message about a projection needs to
+        be actionable and what an ordinal check compares against. And it does not need an upper
+        bound, so it never asks for :attr:`record_count` -- which without a sidecar is a whole
+        extra scan, exactly the cost this method exists to avoid paying twice.
+        """
+
+        if first < 0:
+            raise ArchiveReadError(f"invalid first line {first}")
+        if self._index is None:
+            for number, record in enumerate(self._scan()):
+                if number >= first:
+                    yield number, record
+            return
+        cursor = max(bisect_right(self._member_starts, first) - 1, 0)
+        with self.path.open("rb") as handle:
+            for member in self._index.members[cursor:]:
+                if member.n == 0:
+                    continue
+                lines = self._member_lines(handle, member)
+                for offset in range(max(first - member.l0, 0), member.n):
+                    number = member.l0 + offset
+                    yield number, _decode_record(
+                        lines[offset], f"{self.path} line {number}"
+                    )
+
+    def seek_first_line(self, key: str, target: int) -> int:
+        """The line number of the first record whose integer *key* is at least *target*.
+
+        The replacement for a byte-offset bisect over a plain file, and the reason the index is
+        not optional for speed: the search is a :func:`bisect_left` over the member table's
+        upper time bounds, which selects the one member the answer can start in, followed by a
+        walk of that member's lines. A member whose ``t1`` is below the target cannot hold a
+        record at or above it whatever its internal order, which is what makes the bisect sound
+        against the weaker "sorted across members" guarantee the sidecar actually publishes.
+
+        Returns the record count -- one past the last line -- when nothing reaches *target*,
+        which is the same "empty span" answer a caller gets from asking for lines past the end.
+        """
+
+        index = self._index
+        if index is None or not index.timestamps_sorted or key != index.timestamp_key:
+            # Correct without the index, and without the sortedness the bisect needs, at the
+            # cost of a scan. Losing the sidecar must cost speed and nothing else.
+            last = -1
+            for number, record in self.iter_records_from(0):
+                last = number
+                if _integer_field(record, key, f"{self.path} line {number}") >= target:
+                    return number
+            return last + 1
+        cursor = bisect_left(self._member_ends, target)
+        with self.path.open("rb") as handle:
+            for member in index.members[cursor:]:
+                if member.n == 0:
+                    continue
+                for offset, line in enumerate(self._member_lines(handle, member)):
+                    number = member.l0 + offset
+                    where = f"{self.path} line {number}"
+                    if _integer_field(_decode_record(line, where), key, where) >= target:
+                        return number
+        return index.record_count
+
+    def iter_records_verified(
+        self, expected_u_sha256: str | None
+    ) -> Iterator[dict[str, JsonValue]]:
+        """Yield every record, reproducing the uncompressed digest as the bytes go past.
+
+        This is the path a query that genuinely needs the whole projection takes, and on it the
+        archive's integrity contract is checked in full and very nearly for free: the digest is
+        folded over bytes that are being inflated anyway. The check happens at the *end*, so a
+        caller that abandons the iterator early gets no guarantee and no false one either.
+        """
+
+        digest = hashlib.sha256()
+        if self._index is None:
+            yield from self._scan(digest)
+        else:
+            with self.path.open("rb") as handle:
+                for member in self._index.members:
+                    data = self._inflate_member(handle, member)
+                    digest.update(data)
+                    for offset, line in enumerate(_split_member(data, str(self.path))):
+                        yield _decode_record(
+                            line, f"{self.path} line {member.l0 + offset}"
+                        )
+        if expected_u_sha256 is not None and digest.hexdigest() != expected_u_sha256:
+            raise _UncompressedDigestMismatch(
+                f"{self.path}: the inflated stream does not match the declared digest"
+            )
 
     def read_range(
         self, start_ms: int | None, end_ms: int | None
@@ -784,6 +895,16 @@ class _ChunkedJsonlReader:
             if member.overlaps(start_ms, end_ms):
                 yield member
 
+    def member_lines(self, handle: BinaryIO, member: _ChunkMember) -> list[bytes]:
+        """The whole lines of one member, honouring this reader's member cache.
+
+        Public because :class:`_ChunkedBackwardCursor` walks the member table itself -- reading
+        it in reverse is the one access pattern this class does not offer as a method -- and a
+        cursor that reached around the cache would report costs the reader is not paying.
+        """
+
+        return self._member_lines(handle, member)
+
     def _member_lines(self, handle: BinaryIO, member: _ChunkMember) -> list[bytes]:
         if self._members is not None:
             cached = self._members.get(member.c_off)
@@ -795,6 +916,9 @@ class _ChunkedJsonlReader:
         return self._read_member_lines(handle, member)
 
     def _read_member_lines(self, handle: BinaryIO, member: _ChunkMember) -> list[bytes]:
+        return _split_member(self._inflate_member(handle, member), str(self.path))
+
+    def _inflate_member(self, handle: BinaryIO, member: _ChunkMember) -> bytes:
         handle.seek(member.c_off)
         raw = handle.read(member.c_len)
         self.data_bytes_read += len(raw)
@@ -816,9 +940,9 @@ class _ChunkedJsonlReader:
                 f"{self.path}: member at {member.c_off} inflates to {len(data)} bytes, "
                 f"index says {member.u_len}"
             )
-        return _split_member(data, str(self.path))
+        return data
 
-    def _scan(self) -> Iterator[dict[str, JsonValue]]:
+    def _scan(self, digest: "hashlib._Hash | None" = None) -> Iterator[dict[str, JsonValue]]:
         """Walk the whole shard when there is no usable sidecar, counting what it costs.
 
         A member boundary is *not* a line boundary as far as this loop is concerned, and that
@@ -832,6 +956,9 @@ class _ChunkedJsonlReader:
         the guarantee this method exists to provide, and on precisely the path that runs when
         the index has been lost. Lines are therefore reassembled across both window and member
         boundaries, and the only place a newline is demanded is the end of the stream.
+
+        *digest*, when given, is fed the inflated bytes -- every one of them, in order, which is
+        what makes it the uncompressed-stream digest the sidecar and the manifest both name.
         """
 
         number = 0
@@ -852,6 +979,8 @@ class _ChunkedJsonlReader:
                         f"{self.path}: not a gzip member: {error}"
                     ) from error
                 if chunk:
+                    if digest is not None:
+                        digest.update(chunk)
                     remainder += chunk
                     cut = remainder.rfind(b"\n")
                     if cut >= 0:
@@ -874,6 +1003,91 @@ def _within(at_ms: int, start_ms: int | None, end_ms: int | None) -> bool:
     if start_ms is not None and at_ms < start_ms:
         return False
     return end_ms is None or at_ms < end_ms
+
+
+def _integer_field(record: dict[str, JsonValue], key: str, where: str) -> int:
+    """The integer at *key*, refusing rather than treating a missing one as a position.
+
+    A seek key is not optional the way a schema-3 event's ``at_ms`` is: a record with no
+    ``timestamp_ms`` has no place in a sorted projection at all, so a search that skipped it
+    would be searching a sequence the file does not contain.
+    """
+
+    value = record.get(key)
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ArchiveReadError(f"{where}: {key} is not an integer")
+    return value
+
+
+class _ChunkedBackwardCursor:
+    """A backwards read of a chunked projection that widens without re-reading what it has.
+
+    This is the member-addressed replacement for the byte-addressed cursor the plain projections
+    had, and it exists for the same reason that one did: "the last twenty records matching a
+    team" cannot be answered by one backwards read of twenty records, so the caller widens -- and
+    if widening means asking for a bigger tail from scratch, round *k* re-reads everything rounds
+    1..k-1 read. Measured on the plain 105,453,039-byte message projection, a ``--tail 20``
+    restricted to a team whose last message sat at index 35,578 of 66,114 read 201,412,186
+    bytes -- 1.9 times the file -- to return twenty records. Keeping the buffer put the ceiling
+    at one pass, and that ceiling is the whole point of a method whose justification is that it
+    does not read the file.
+
+    What the container changes is the *granularity*, and it changes it in the caller's favour.
+    The old cursor widened by a doubling byte window because it had no way to know where a
+    record began; this one widens by one member, which is ~1 MiB of records already known to be
+    whole. So the doubling is gone: a round is a member, the first round of a plain ``--tail 20``
+    inflates exactly one, and a filtered tail walks back one member at a time until it has
+    enough. It is still a full pass in the shape where the accepted records stop early in the
+    file, and no buffer discipline can fix that -- the rejected records between them and the end
+    have to be crossed once.
+
+    Requires an index. Without one there are no member extents to walk backwards over, and
+    `_tail_matching` takes a forward scan instead rather than pretending otherwise.
+    """
+
+    def __init__(self, reader: _ChunkedJsonlReader, end: int | None) -> None:
+        self._reader = reader
+        self._members = reader.index.members
+        self._starts = tuple(member.l0 for member in self._members)
+        total = reader.index.record_count
+        self._end = total if end is None else max(min(end, total), 0)
+        self._start = self._end
+        self._buffer: list[dict[str, JsonValue]] = []
+
+    @property
+    def exhausted(self) -> bool:
+        """Whether the cursor has reached line zero and nothing earlier remains."""
+
+        return self._start == 0
+
+    def _widen(self) -> None:
+        """Prepend the member holding the line just before the current window."""
+
+        cursor = max(bisect_right(self._starts, self._start - 1) - 1, 0)
+        while cursor > 0 and self._members[cursor].n == 0:
+            cursor -= 1
+        member = self._members[cursor]
+        if member.n == 0:
+            raise ArchiveReadError(
+                f"{self._reader.path}: no member holds line {self._start - 1}"
+            )
+        with self._reader.path.open("rb") as handle:
+            lines = self._reader.member_lines(handle, member)
+        upper = min(self._start, member.l0 + member.n)
+        self._buffer = [
+            _decode_record(
+                lines[number - member.l0], f"{self._reader.path} line {number}"
+            )
+            for number in range(member.l0, upper)
+        ] + self._buffer
+        self._start = member.l0
+
+    def extend_to(self, wanted: int) -> list[dict[str, JsonValue]]:
+        """Widen until the buffer holds *wanted* records, or the file runs out."""
+
+        while len(self._buffer) < wanted and not self.exhausted:
+            self._widen()
+        return self._buffer
 
 
 SCHEMA_3_BOOTSTRAP_PATH = "data/timeline-v3.json"
@@ -1742,280 +1956,36 @@ def _schema_3_tree(root: Path) -> frozenset[str]:
     return frozenset(found)
 
 
-class _SeekableJsonlText:
-    """Binary-search an uncompressed, key-sorted JSONL projection in place.
+#: How the transcript manifest says its published projections are stored. One value, checked
+#: rather than assumed, so an archive written by a future exporter in some other container is
+#: refused by name instead of being inflated as gzip and hoped over.
+_TRANSCRIPT_CONTAINER = "multi-member-gzip"
+_TRANSCRIPT_CONTAINER_SUFFIX = ".gz"
 
-    The archive's transcript projections are plain `.jsonl` -- that is their integrity
-    contract, digested in `extracted/transcripts/manifest.json` -- and this reads slices of
-    them without a sidecar, an index, or a second copy on disk. A sorted uncompressed file
-    does not need one: the position of a key is recoverable by probing.
-
-    Probing costs ``O(log bytes)`` reads of one record each rather than ``O(1)``, and that is
-    the whole trade. Against the alternative -- publishing a chunked `.gz` twin of every
-    projection -- it saves about 24 MB of duplicated bytes per rebuild on the measured
-    archive and costs roughly twenty-seven extra small reads on a query that would otherwise
-    have read one member. The duplication is the thing schema 3 was built to stop.
-    """
-
-    def __init__(self, path: Path, *, expected_bytes: int | None = None) -> None:
-        if path.is_symlink() or not path.is_file():
-            raise ValueError(f"transcript export file is missing or unsafe: {path}")
-        self.path = path
-        self.bytes_read = 0
-        self.size = path.stat().st_size
-        # The manifest's byte count is checked at open even when the digest is not, because
-        # it is a stat and it catches the failure the digest check was written for: a
-        # generation that was interrupted, or a file appended to after the manifest was
-        # written. What it cannot catch -- an equal-length rewrite -- is what
-        # :meth:`stream_verified` and ``--verify`` are for.
-        if expected_bytes is not None and expected_bytes != self.size:
-            raise ValueError(
-                f"transcript export generation is incomplete: {path.name} holds "
-                f"{self.size} bytes, the manifest declares {expected_bytes}"
-            )
-
-    def stream_verified(self, expected_sha256: str | None) -> Iterator[bytes]:
-        """Yield every line, reproducing the manifest digest as the bytes go past.
-
-        This is the path a query that genuinely needs the whole file takes, and on it the
-        archive's integrity contract is checked in full and for free -- the digest is folded
-        over bytes already being read. The verification happens at the *end*, so a caller
-        that abandons the iterator early gets no guarantee and no false one either.
-        """
-
-        digest = hashlib.sha256()
-        window = _PROBE_BLOCK_BYTES
-        with self.path.open("rb") as handle:
-            remainder = b""
-            while True:
-                block = handle.read(window)
-                if not block:
-                    break
-                # Ramped for the same reason `iter_from` is: a caller with `--limit 5`
-                # abandons this iterator after the first few records, and reading a
-                # scan-sized block to satisfy it would make the smallest possible request
-                # cost a quarter of a megabyte. A caller who does read to the end reaches
-                # full block size after six reads.
-                window = min(window * 4, _SCAN_BLOCK_BYTES)
-                self.bytes_read += len(block)
-                digest.update(block)
-                remainder += block
-                lines = remainder.split(b"\n")
-                remainder = lines.pop()
-                yield from (line for line in lines if line)
-            if remainder:
-                yield remainder
-        if expected_sha256 is not None and digest.hexdigest() != expected_sha256:
-            raise ValueError(
-                f"transcript export generation is incomplete: {self.path.name}"
-            )
-
-    def iter_from(self, offset: int) -> Iterator[tuple[int, bytes]]:
-        """Yield ``(line start offset, line)`` from *offset*, which must be a line start.
-
-        The read window ramps from a probe-sized block up to a scan-sized one. Both ends
-        matter: a caller taking three records from the middle of a 105 MB file should not pay
-        a quarter of a megabyte to get them, and a caller streaming the rest of the file
-        should not pay a syscall every four kilobytes to do it.
-        """
-
-        window = _PROBE_BLOCK_BYTES
-        with self.path.open("rb") as handle:
-            handle.seek(offset)
-            position = offset
-            remainder = b""
-            while True:
-                block = handle.read(window)
-                if not block:
-                    break
-                window = min(window * 4, _SCAN_BLOCK_BYTES)
-                self.bytes_read += len(block)
-                remainder += block
-                while True:
-                    cut = remainder.find(b"\n")
-                    if cut < 0:
-                        break
-                    line = remainder[:cut]
-                    remainder = remainder[cut + 1 :]
-                    if line:
-                        yield position, line
-                    position += cut + 1
-            if remainder:
-                yield position, remainder
-
-    def backwards(self, end: int | None = None) -> "_BackwardCursor":
-        """Open a resumable backwards read ending at *end*.
-
-        *end* must be a line start -- in practice the offset a :meth:`seek_first` returned --
-        so that "the last twenty records before this instant" is one backwards read from
-        there rather than a forward scan of everything preceding it.
-        """
-
-        return _BackwardCursor(self, end)
-
-    def tail_lines(self, count: int, *, end: int | None = None) -> list[bytes]:
-        """Return the last *count* non-empty lines before *end*, reading backwards."""
-
-        if count <= 0:
-            return []
-        cursor = self.backwards(end)
-        return cursor.extend_to(count)[-count:]
-
-    def seek_first(self, key: str, target: int, where: str) -> int:
-        """Return the offset of the first record whose integer *key* is at least *target*.
-
-        A textbook offset bisect with one wrinkle worth naming: the search space is byte
-        offsets, but only line starts are meaningful, so the probe reads forward from the
-        midpoint to the next line boundary and evaluates *that* record. The predicate
-        "the first record starting at or after this offset has key >= target" is monotone in
-        the offset precisely because the file is sorted, which is why the answer is the
-        smallest offset satisfying it and not merely some offset that does.
-        """
-
-        low = 0
-        high = self.size
-        while low < high:
-            middle = (low + high) // 2
-            probe = self._record_at_or_after(middle, key, where)
-            if probe is None or probe[1] >= target:
-                high = middle
-            else:
-                low = middle + 1
-        aligned = self._record_at_or_after(low, key, where)
-        return self.size if aligned is None else aligned[0]
-
-    def _record_at_or_after(
-        self, offset: int, key: str, where: str
-    ) -> tuple[int, int] | None:
-        """The ``(line start, key)`` of the first record starting at or after *offset*."""
-
-        with self.path.open("rb") as handle:
-            start = offset
-            if offset > 0:
-                handle.seek(offset - 1)
-                probe = handle.read(1)
-                self.bytes_read += len(probe)
-                if probe != b"\n":
-                    skipped = self._advance_past_newline(handle)
-                    if skipped is None:
-                        return None
-                    start = skipped
-            handle.seek(start)
-            line = self._read_line(handle)
-        if not line:
-            return None
-        record = _decode_record(line, f"{where}:{start}")
-        value = record.get(key)
-        if not isinstance(value, int) or isinstance(value, bool):
-            raise ValueError(f"{where}:{start}: {key} is not an integer")
-        return start, value
-
-    def _advance_past_newline(self, handle: BinaryIO) -> int | None:
-        position = handle.tell()
-        window = _PROBE_BLOCK_BYTES
-        while True:
-            block = handle.read(window)
-            if not block:
-                return None
-            window = min(window * 2, _SCAN_BLOCK_BYTES)
-            self.bytes_read += len(block)
-            cut = block.find(b"\n")
-            if cut >= 0:
-                return position + cut + 1
-            position += len(block)
-
-    def _read_line(self, handle: BinaryIO) -> bytes:
-        collected = b""
-        window = _PROBE_BLOCK_BYTES
-        while True:
-            block = handle.read(window)
-            if not block:
-                return collected
-            window = min(window * 2, _SCAN_BLOCK_BYTES)
-            self.bytes_read += len(block)
-            cut = block.find(b"\n")
-            if cut >= 0:
-                return collected + block[:cut]
-            collected += block
-
-
-class _BackwardCursor:
-    """A backwards read of a projection that widens without re-reading what it has.
-
-    This exists because the obvious shape does not compose with filtering. "The last twenty
-    records matching a team" cannot be answered by one backwards read of twenty lines, so the
-    caller widens -- and if widening means calling ``tail_lines`` again with a bigger count,
-    round *k* re-reads everything rounds 1..k-1 read. Measured on the 105,453,039-byte message
-    projection, a ``--tail 20`` restricted to a team whose last message sits at index 35,578 of
-    66,114 read 201,412,186 bytes: 1.9 times the file, to return twenty records. With the buffer
-    kept, the same query reads 112,283,226 -- the message projection once and the prompt
-    projection once, since the selection is resolved through both -- and neither byte twice.
-    One pass is the only ceiling worth having on a method whose entire justification is that it
-    does not read the file.
-
-    It is still a full pass in that shape, and no buffer discipline can fix that: the accepted
-    records end at index 35,578, so a backwards walk has to cross the 30,536 rejected ones to
-    reach them. What was removed is the second and third crossing, not the first.
-
-    The window still doubles per round, for the reason it always did: a selection that rejects
-    most of what it sees would otherwise cost one syscall per rejected record. What changed is
-    that the doubling now buys *additional* bytes rather than a larger re-read.
-    """
-
-    def __init__(self, reader: _SeekableJsonlText, end: int | None) -> None:
-        self._reader = reader
-        self._start = reader.size if end is None else max(min(end, reader.size), 0)
-        self._buffer = b""
-        self._window = _TAIL_BLOCK_BYTES
-
-    @property
-    def exhausted(self) -> bool:
-        """Whether the window has reached offset zero and nothing earlier remains."""
-
-        return self._start == 0
-
-    def _widen(self) -> None:
-        start = max(0, self._start - self._window)
-        with self._reader.path.open("rb") as handle:
-            handle.seek(start)
-            block = handle.read(self._start - start)
-        self._reader.bytes_read += len(block)
-        self._buffer = block + self._buffer
-        self._start = start
-        self._window *= 2
-
-    def lines(self) -> list[bytes]:
-        """The complete non-empty lines in the buffer, in file order.
-
-        The earliest element is dropped unless the window has reached offset zero: it may be
-        the tail of a record that begins before the window, and nothing in the buffer can tell
-        it apart from a whole one. Dropping it is conservative rather than lossy -- the next
-        widen brings it back with its beginning attached.
-        """
-
-        collected = [line for line in self._buffer.split(b"\n") if line]
-        if self._start > 0 and collected:
-            collected.pop(0)
-        return collected
-
-    def extend_to(self, wanted: int) -> list[bytes]:
-        """Widen until the buffer holds *wanted* complete lines, or the file runs out."""
-
-        collected = self.lines()
-        while len(collected) < wanted and not self.exhausted:
-            self._widen()
-            collected = self.lines()
-        return collected
+#: The field every published projection is sorted on and every transcript seek resolves against.
+_TRANSCRIPT_TIMESTAMP_KEY = "timestamp_ms"
 
 
 @dataclass(frozen=True)
 class _ManagedFile:
-    """One manifest-declared transcript projection and everything claimed about it."""
+    """One manifest-declared transcript projection and everything claimed about it.
+
+    Two digests, because two different things are being described. ``sha256`` and
+    ``declared_bytes`` are the *uncompressed* JSONL stream -- the archive's integrity contract,
+    unchanged in meaning and unchanged in value by the move onto the container -- while
+    ``compressed_sha256`` and ``compressed_bytes`` are the file that is actually on disk. A
+    reader that conflated them would either ``stat`` the wrong number or claim a guarantee it
+    had not checked.
+    """
 
     name: str
     path: Path
+    index_path: Path
     sha256: str
     declared_bytes: int | None
+    records: int | None
+    compressed_sha256: str | None
+    compressed_bytes: int | None
 
 
 class TranscriptQuery:
@@ -2029,40 +1999,59 @@ class TranscriptQuery:
     happened after full materialization. Of what it hashed, 115,261,964 bytes -- the
     occurrence log and the system-input projection -- are consulted by no query at all.
 
-    The same three questions now cost 3,054,373 bytes, 65,536 bytes and zero: the range read
-    seeks to its span, ``--tail 20`` reads one backwards block, and constructing this object
-    reads nothing whatsoever. `test_query_read_paths.py` asserts each of those as a bound on
-    :attr:`bytes_read` rather than as a duration.
+    The same three questions now cost 5,395,830 bytes, 91,702 bytes and zero on a corpus that is
+    29,494,442 bytes on disk: the range read seeks to its span, ``--tail 20`` inflates one member
+    from the end, and constructing this object reads nothing whatsoever.
+    `test_query_read_paths.py` asserts each of those as a bound on :attr:`bytes_read` rather than
+    as a duration.
 
     Now nothing is read until a query asks for it, and what a query asks for is a slice.
 
-    **The integrity contract, restated honestly**, because it did change and pretending
-    otherwise would be worse than the change:
+    **Where the bytes are.** The three published projections are multi-member gzip containers
+    with the sidecar index `wrkviz.seekable_jsonl` writes -- the same physical format
+    schema 3's shards use, read through the same :class:`_ChunkedJsonlReader`. They were plain
+    text until the corpus moved onto the container, and the manifest says which it is holding
+    rather than leaving a reader to infer it from a filename. A manifest that still describes
+    plain text is refused with the remedy named, because reading it would mean carrying a second
+    slicing reader for a generation one ``extract-transcripts`` replaces.
 
-    * At open, every managed file is checked for existence, for not being a symlink, and --
-      where the manifest declares one -- for its exact byte count. That is four ``stat``
-      calls and it catches the failure the constructor's digest loop was written to catch: a
-      generation interrupted midway, or a file appended to after the manifest was written.
-      All four, not just the two a query consults: a truncated ``occurrences.jsonl`` says the
-      generation is damaged whether or not this particular question would have read it, and
-      an open that only checked what it intended to read would report a healthy archive while
-      holding the evidence that it is not.
-    * A query that reads a file *end to end* verifies its digest in full, folded over bytes
-      it was reading anyway, so it costs nothing. ``stats`` and an unfiltered ``prompts``
-      still fail closed exactly as before.
-    * A query that reads a *slice* verifies the byte count and the structure of the records
-      it returns, and does not reproduce the whole-file digest -- it never read the whole
-      file. ``verify=True`` (``--verify`` on the command line) restores the complete check on
-      demand, for the reader who wants the old guarantee at the old price.
-    * A manifest written before the per-file ``bytes`` field existed declares no size, so
-      there is nothing to check with a ``stat``; such a file gets the complete digest check on
-      first use instead. Degrading to "no check" there would silently weaken exactly the
-      oldest archives, which is the one direction this change must not go.
+    **The integrity contract, restated honestly**, because it changed twice and pretending
+    otherwise would be worse than either change:
 
-    **What a slice read does not promise.** An equal-length rewrite of bytes no query touched
-    is invisible to a size check, and no amount of seeking will see it -- that is what
-    ``--verify`` is for, and why the bullet above says which measurement each path made rather
-    than claiming one guarantee for both.
+    * ``sha256`` and ``bytes`` in the manifest still describe the **uncompressed** JSONL stream,
+      with the same values they had before the container existed. ``c_sha256`` and ``c_bytes``
+      describe the file on disk. Keeping both is what lets a cheap check and an exhaustive one
+      mean different, statable things.
+    * At open, every managed projection is checked for existence, for not being a symlink, and
+      for its exact compressed byte count -- three ``stat`` calls, and still nothing read.
+    * The first time a projection is *opened for reading*, its sidecar is read and the manifest's
+      ``sha256``, ``bytes`` and ``records`` are compared against the sidecar's ``u_sha256``,
+      ``u_size`` and ``record_count``. That is three integer comparisons over a file that is
+      0.06% of the container, and it is *stronger* than the size check it replaces: the archive's
+      declared content digest is now confirmed before the first record comes back, rather than
+      only by a query that happened to read the whole file.
+    * All three projections, not just the two a query consults: a truncated
+      ``system-inputs.jsonl`` says the generation is damaged whether or not this particular
+      question would have read it, and an open that only checked what it intended to read would
+      report a healthy archive while holding the evidence that it is not.
+    * A query that reads a projection *end to end* reproduces the digest in full, folded over
+      bytes it was inflating anyway, so it costs almost nothing. ``stats`` and an unfiltered
+      ``prompts`` still fail closed exactly as before.
+    * A query that reads a *slice* checks the container against the sidecar and the sidecar
+      against the manifest, and does not inflate the rest of the file to confirm it agrees with
+      its own index. ``verify=True`` (``--verify`` on the command line) does exactly that, for
+      the reader who wants the complete guarantee at the complete price -- and also reproduces
+      ``c_sha256`` over the container's own bytes, which is the one claim in the manifest that a
+      wholesale replacement of container *and* sidecar would have to forge separately.
+    * A projection whose sidecar is missing gets the complete digest check on first use instead.
+      Nothing else vouches for the stream in that case, and a read without the index is a full
+      scan regardless, so the digest is very nearly free where it is most needed.
+
+    **What a slice read does not promise.** A container that disagrees with its own sidecar -- a
+    member rewritten to inflate to something else of the same compressed length, with a
+    forged ``u_sha256`` -- is invisible to every O(1) check, and no amount of seeking will see
+    it. That is what ``--verify`` is for, and why the bullets above say which measurement each
+    path made rather than claiming one guarantee for both.
     """
 
     #: The projections a shipped archive carries. `occurrences.jsonl` is deliberately absent:
@@ -2100,31 +2089,24 @@ class TranscriptQuery:
         self._declared: dict[str, _ManagedFile] = {}
         for name in self._FILES:
             entry = as_object(files.get(name), f"transcript manifest files.{name}")
-            path = self.transcript_root / name
-            if path.is_symlink() or not path.is_file():
-                raise ValueError(f"transcript export file is missing or unsafe: {path}")
-            declared_bytes = _optional_json_int(entry.get("bytes"), f"{name}.bytes")
-            # The stat happens here, for every projection present, not in `_SeekableJsonlText`.
-            # It used to happen only there, which meant it happened only for the two
+            declared = self._declare(name, entry)
+            # The stat happens here, for every projection the archive publishes, not inside the
+            # reader. It used to happen only inside, which meant it happened only for the two
             # projections a query opens -- so a truncated third projection was accepted in
             # silence by an open that had already been told how long the file should be. The
             # constructor's old digest loop caught that; a size check is the cheap half of
             # what it caught, and the half that costs a stat is the half worth keeping
             # unconditional.
-            if declared_bytes is not None:
-                size = path.stat().st_size
-                if size != declared_bytes:
+            if declared.compressed_bytes is not None:
+                size = declared.path.stat().st_size
+                if size != declared.compressed_bytes:
                     raise ValueError(
-                        f"transcript export generation is incomplete: {name} holds "
-                        f"{size} bytes, the manifest declares {declared_bytes}"
+                        f"transcript export generation is incomplete: {declared.path.name} "
+                        f"holds {size} bytes, the manifest declares "
+                        f"{declared.compressed_bytes}"
                     )
-            self._declared[name] = _ManagedFile(
-                name=name,
-                path=path,
-                sha256=as_string(entry.get("sha256"), f"{name}.sha256"),
-                declared_bytes=declared_bytes,
-            )
-        self._readers: dict[str, _SeekableJsonlText] = {}
+            self._declared[name] = declared
+        self._readers: dict[str, _ChunkedJsonlReader] = {}
         self._verified: set[str] = set()
         # `verify` means "rely on nothing this archive merely promises". It re-digests every
         # managed projection end to end -- all of them, because "the old guarantee at the old
@@ -2135,6 +2117,7 @@ class TranscriptQuery:
         self._exhaustive = verify
         if verify:
             for name in self._FILES:
+                self._verify_container(name)
                 self._verify_whole(name)
 
     @property
@@ -2149,46 +2132,166 @@ class TranscriptQuery:
 
         return sum(reader.bytes_read for reader in self._readers.values())
 
+    def _declare(self, name: str, entry: dict[str, JsonValue]) -> _ManagedFile:
+        """Resolve one manifest entry to the container on disk and what is claimed about it.
+
+        The container is named by the manifest and then *checked against the projection's own
+        name*, rather than simply joined onto the transcript root. An entry is data read from
+        the archive, and a reader that followed an arbitrary relative path out of one would
+        follow ``../../..`` just as willingly.
+        """
+
+        container = entry.get("container")
+        if container is None:
+            raise ValueError(
+                f"{name} is an uncompressed transcript projection; this reader reads the "
+                "seekable container only -- re-run extract-transcripts to rebuild the corpus"
+            )
+        if as_string(container, f"{name}.container") != _TRANSCRIPT_CONTAINER:
+            raise ValueError(
+                f"{name} declares container {container!r}; this reader implements "
+                f"{_TRANSCRIPT_CONTAINER!r} only"
+            )
+        expected_name = name + _TRANSCRIPT_CONTAINER_SUFFIX
+        declared_path = as_string(entry.get("path"), f"{name}.path")
+        if declared_path != expected_name:
+            raise ValueError(
+                f"{name} declares its container as {declared_path!r}, not {expected_name!r}"
+            )
+        declared_index = as_string(entry.get("index_path"), f"{name}.index_path")
+        if declared_index != expected_name + _CHUNK_INDEX_SUFFIX:
+            raise ValueError(
+                f"{name} declares its index as {declared_index!r}, not "
+                f"{expected_name + _CHUNK_INDEX_SUFFIX!r}"
+            )
+        path = self.transcript_root / expected_name
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"transcript export file is missing or unsafe: {path}")
+        return _ManagedFile(
+            name=name,
+            path=path,
+            index_path=self.transcript_root / declared_index,
+            sha256=as_string(entry.get("sha256"), f"{name}.sha256"),
+            declared_bytes=_optional_json_int(entry.get("bytes"), f"{name}.bytes"),
+            records=_optional_json_int(entry.get("records"), f"{name}.records"),
+            compressed_sha256=None
+            if entry.get("c_sha256") is None
+            else as_string(entry.get("c_sha256"), f"{name}.c_sha256"),
+            compressed_bytes=_optional_json_int(entry.get("c_bytes"), f"{name}.c_bytes"),
+        )
+
     def _managed(self, name: str) -> _ManagedFile:
         declared = self._declared.get(name)
         if declared is None:
             raise ValueError(f"{name} is not a managed transcript projection")
         return declared
 
-    def _reader(self, name: str) -> _SeekableJsonlText:
+    def _reader(self, name: str) -> _ChunkedJsonlReader:
         existing = self._readers.get(name)
         if existing is not None:
             return existing
         declared = self._managed(name)
-        reader = _SeekableJsonlText(declared.path, expected_bytes=declared.declared_bytes)
+        reader = _ChunkedJsonlReader(declared.path, index_path=declared.index_path)
+        # Registered before anything else can fail or recurse: `_verify_whole` below asks for
+        # this same reader, and an unregistered one would build a second and pay twice.
         self._readers[name] = reader
-        if declared.declared_bytes is None and name not in self._verified:
-            # No declared length to check, so the only guard left is the digest. Pay for it
-            # once, here, rather than answering from bytes nothing has vouched for.
+        if reader.has_index:
+            self._agree_with_sidecar(declared, reader.index)
+        elif name not in self._verified:
+            # No sidecar, so nothing O(1) vouches for the stream and every read is a full scan
+            # anyway. Pay for the digest once, here, rather than answering from bytes nothing
+            # has vouched for.
             self._verify_whole(name)
         return reader
 
-    def _verify_whole(self, name: str) -> None:
-        declared = self._managed(name)
-        reader = self._readers.get(name)
-        if reader is None:
-            reader = _SeekableJsonlText(
-                declared.path, expected_bytes=declared.declared_bytes
+    @staticmethod
+    def _agree_with_sidecar(declared: _ManagedFile, index: _ChunkIndex) -> None:
+        """Confirm the manifest's claims about the stream against the sidecar's own.
+
+        Three comparisons of numbers already in memory, and together they are the check that
+        used to require reading the whole file: the sidecar's ``u_sha256`` is the digest of the
+        uncompressed stream, which is exactly what the manifest records. What they cannot
+        establish is that the container *inflates to* that stream -- for that, see
+        ``--verify``.
+        """
+
+        if index.timestamp_key != _TRANSCRIPT_TIMESTAMP_KEY:
+            raise ValueError(
+                f"{declared.path.name} is indexed on {index.timestamp_key!r}, not "
+                f"{_TRANSCRIPT_TIMESTAMP_KEY!r}; a transcript seek would search the wrong axis"
             )
-            self._readers[name] = reader
-        for _line in reader.stream_verified(declared.sha256):
+        if index.u_sha256 != declared.sha256:
+            raise ValueError(
+                f"transcript export generation is incomplete: {declared.name} indexes a "
+                "stream the manifest does not describe"
+            )
+        if declared.declared_bytes is not None and index.u_size != declared.declared_bytes:
+            raise ValueError(
+                f"transcript export generation is incomplete: {declared.name} indexes "
+                f"{index.u_size} uncompressed bytes, the manifest declares "
+                f"{declared.declared_bytes}"
+            )
+        if declared.records is not None and index.record_count != declared.records:
+            raise ValueError(
+                f"transcript export generation is incomplete: {declared.name} indexes "
+                f"{index.record_count} records, the manifest declares {declared.records}"
+            )
+
+    def _verify_container(self, name: str) -> None:
+        """Reproduce the manifest's digest of the *file on disk*, for ``--verify`` only.
+
+        Cheap beside the inflate that follows it, and it closes the one gap that inflating does
+        not: a container swapped wholesale for a consistent container-plus-sidecar pair whose
+        stream digest was also written into the manifest would inflate perfectly and reproduce
+        every other number. ``c_sha256`` is the only claim in the manifest that a wholesale
+        replacement has to forge separately, so it is the only one worth checking separately.
+
+        Skipped when the manifest predates the field, which is the same rule every other
+        optional claim here follows: an absent claim is not a failed one.
+        """
+
+        declared = self._managed(name)
+        if declared.compressed_sha256 is None:
+            return
+        digest = hashlib.sha256()
+        reader = self._reader(name)
+        with declared.path.open("rb") as handle:
+            while True:
+                block = handle.read(_SCAN_BLOCK_BYTES)
+                if not block:
+                    break
+                # Charged to the reader rather than kept locally: these bytes came off that
+                # projection's file on this query's behalf, and :attr:`bytes_read` is the
+                # number callers assert against. A pass that did not show up in it would make
+                # ``--verify`` look free.
+                reader.data_bytes_read += len(block)
+                digest.update(block)
+        if digest.hexdigest() != declared.compressed_sha256:
+            raise ValueError(
+                f"transcript export generation is incomplete: {declared.path.name} does not "
+                "hash to the compressed digest the manifest declares"
+            )
+
+    def _verify_whole(self, name: str) -> None:
+        for _record in self._stream_verifying(name):
             pass
+
+    def _stream_verifying(self, name: str) -> Iterator[dict[str, JsonValue]]:
+        declared = self._managed(name)
+        reader = self._reader(name)
+        expected = None if name in self._verified else declared.sha256
+        try:
+            yield from reader.iter_records_verified(expected)
+        except _UncompressedDigestMismatch as error:
+            raise ValueError(
+                f"transcript export generation is incomplete: {name}"
+            ) from error
         self._verified.add(name)
 
     def _stream(self, name: str) -> Iterator[dict[str, JsonValue]]:
         """Yield every record in one projection, verifying its digest as the bytes go past."""
 
-        declared = self._managed(name)
-        reader = self._reader(name)
-        expected = None if name in self._verified else declared.sha256
-        for number, line in enumerate(reader.stream_verified(expected)):
-            yield _decode_record(line, f"{declared.path}:{number + 1}")
-        self._verified.add(name)
+        yield from self._stream_verifying(name)
 
     @staticmethod
     def _selected(record: dict[str, JsonValue], filters: QueryFilters) -> bool:
@@ -2227,24 +2330,25 @@ class TranscriptQuery:
     ) -> Iterator[dict[str, JsonValue]]:
         """Yield records with ``start_ms <= timestamp_ms``, stopping at *end_ms*.
 
-        The sortedness the bisect depends on is re-checked across the span actually read.
-        That is the honest amount to check -- it cannot vouch for bytes nobody looked at --
-        and it is enough to turn "the projection stopped being sorted and the seek silently
+        The sortedness the seek depends on is re-checked across the span actually read. That is
+        the honest amount to check -- it cannot vouch for records nobody looked at -- and it is
+        enough to turn "the projection stopped being sorted and the seek silently
         under-returned" into a refusal at the first record out of order.
         """
 
         reader = self._reader(name)
         where = str(self._managed(name).path)
-        offset = (
-            0 if start_ms is None else reader.seek_first("timestamp_ms", start_ms, where)
+        first = (
+            0
+            if start_ms is None
+            else reader.seek_first_line(_TRANSCRIPT_TIMESTAMP_KEY, start_ms)
         )
         previous: int | None = None
-        for position, line in reader.iter_from(offset):
-            record = _decode_record(line, f"{where}:{position}")
+        for number, record in reader.iter_records_from(first):
             at_ms = as_int(record.get("timestamp_ms"), "transcript record.timestamp_ms")
             if previous is not None and at_ms < previous:
                 raise ValueError(
-                    f"{where}:{position}: records are not ordered by timestamp_ms, so a "
+                    f"{where} line {number}: records are not ordered by timestamp_ms, so a "
                     "seeked read would under-return; rebuild the transcript export"
                 )
             previous = at_ms
@@ -2255,31 +2359,30 @@ class TranscriptQuery:
     def _iter_prompts_by_ordinal(
         self, ordinal_range: OrdinalRange
     ) -> Iterator[dict[str, JsonValue]]:
-        """Yield the prompts in an inclusive ordinal range, seeking straight to the first.
+        """Yield the prompts in an inclusive ordinal range, reading exactly those lines.
 
-        ``ordinal`` is bisectable for the same reason ``timestamp_ms`` is: the exporter
-        assigns it with ``enumerate(prompts, 1)`` over the already-sorted projection, so it
-        is the line number plus one. Consecutiveness is asserted across the records returned
-        rather than assumed, because the failure mode of a non-dense ordinal column is a
-        window that quietly omits its middle.
+        ``ordinal`` needs no seek at all, and did not deserve one even when the projection was
+        plain text: the exporter assigns it with ``enumerate(prompts, 1)`` over the sorted
+        projection, so it *is* the line number plus one, and a container addressed by line
+        number turns "prompts 3978 to 3980" into a direct read of three lines. What was a
+        bisect on a column is now an arithmetic identity -- which is why the identity is
+        asserted at every record returned rather than at none of them. A projection whose
+        ordinals ever stopped agreeing with their line numbers would, before, have been found
+        by a bisect and returned; now it would be read from the wrong place, so it is refused.
         """
 
         reader = self._reader("prompts.jsonl")
         where = str(self._managed("prompts.jsonl").path)
-        offset = reader.seek_first("ordinal", ordinal_range.first, where)
-        expected: int | None = None
-        for position, line in reader.iter_from(offset):
-            record = _decode_record(line, f"{where}:{position}")
+        for number, record in reader.iter_records_from(max(ordinal_range.first - 1, 0)):
             ordinal = as_int(record.get("ordinal"), "prompt.ordinal")
             if ordinal > ordinal_range.last:
                 return
-            if expected is not None and ordinal != expected:
+            if ordinal != number + 1:
                 raise ValueError(
-                    f"{where}:{position}: prompt ordinals jump from {expected - 1} to "
-                    f"{ordinal}; the projection is not the dense chronological index its "
-                    "manifest declares"
+                    f"{where} line {number}: prompt ordinal is {ordinal}, not {number + 1}; "
+                    "the projection is not the dense chronological index its manifest "
+                    "declares, so an ordinal range cannot be located by line"
                 )
-            expected = ordinal + 1
             yield record
 
     def _tail_matching(
@@ -2290,40 +2393,47 @@ class TranscriptQuery:
         *,
         end: int | None = None,
     ) -> list[dict[str, JsonValue]]:
-        """Return the last *count* accepted records, reading backwards from *end*.
+        """Return the last *count* accepted records, reading backwards from line *end*.
 
         The filter is applied *during* the backwards walk, so this returns *count* records
-        that match rather than the matches among the last *count* records. The window widens
-        by a factor of four when the records it caught were filtered away, rather than by one
-        record at a time: a selection that rejects most of what it sees would otherwise cost
-        one backwards read per rejected record.
+        that match rather than the matches among the last *count* records. The walk widens a
+        member at a time on a :class:`_ChunkedBackwardCursor` rather than by re-issuing a bigger
+        tail, which is what keeps the total at one pass: each round handles only the records the
+        round actually added -- exactly the front of the buffer, because widening only
+        prepends -- so neither the inflate nor the JSON is paid for twice.
 
-        The widening happens on a :class:`_BackwardCursor` rather than by re-issuing a bigger
-        ``tail_lines``, which is what keeps the total at one pass. Each round decodes only the
-        lines the round actually added -- they are exactly the front of the buffer, because
-        widening only prepends -- so neither the bytes nor the JSON is paid for twice.
+        Without a sidecar there are no member extents to walk backwards over, so the tail is
+        taken by a forward scan keeping a sliding window of accepted records. That reads the
+        whole projection once, which is what every read costs when the index is missing, and it
+        is a bound rather than a regression: the round-based cursor cannot do better than one
+        pass either.
         """
 
         reader = self._reader(name)
-        where = str(self._managed(name).path)
-        cursor = reader.backwards(end)
+        if not reader.has_index:
+            sliding: list[dict[str, JsonValue]] = []
+            for number, record in reader.iter_records_from(0):
+                if end is not None and number >= end:
+                    break
+                if accept(record):
+                    sliding.append(dict(record))
+                    if len(sliding) > count:
+                        del sliding[0]
+            return sliding
+        cursor = _ChunkedBackwardCursor(reader, end)
         matched: list[dict[str, JsonValue]] = []
         decoded = 0
         wanted = max(count, 1)
         while True:
-            lines = cursor.extend_to(wanted)
-            fresh = lines[: len(lines) - decoded]
-            decoded = len(lines)
+            records = cursor.extend_to(wanted)
+            fresh = records[: len(records) - decoded]
+            decoded = len(records)
             matched = [
-                dict(record)
-                for record in (
-                    _decode_record(line, f"{where}: tail record") for line in fresh
-                )
-                if accept(record)
+                dict(record) for record in fresh if accept(record)
             ] + matched
             if len(matched) >= count or cursor.exhausted:
                 return matched[-count:]
-            wanted = max(len(lines), wanted) * 4
+            wanted = max(len(records), wanted) * 4
 
     def _prompt_candidates(
         self, filters: QueryFilters, ordinal_range: OrdinalRange | None
@@ -2367,14 +2477,14 @@ class TranscriptQuery:
 
         start_ms, end_ms = self._window_bounds(filters)
         if tail is not None and ordinal_range is None and start_ms is None:
-            end_offset = (
+            end_line = (
                 None
                 if end_ms is None
-                else self._reader("prompts.jsonl").seek_first(
-                    "timestamp_ms", end_ms, str(self._managed("prompts.jsonl").path)
+                else self._reader("prompts.jsonl").seek_first_line(
+                    _TRANSCRIPT_TIMESTAMP_KEY, end_ms
                 )
             )
-            return self._tail_matching("prompts.jsonl", tail, accept, end=end_offset)
+            return self._tail_matching("prompts.jsonl", tail, accept, end=end_line)
         result: list[dict[str, JsonValue]] = []
         for record in self._prompt_candidates(filters, ordinal_range):
             if not accept(record):
@@ -2475,17 +2585,17 @@ class TranscriptQuery:
             return item
 
         if tail is not None:
-            end_offset = (
+            end_line = (
                 None
                 if window_end is None
-                else self._reader("messages.jsonl").seek_first(
-                    "timestamp_ms", window_end, str(self._managed("messages.jsonl").path)
+                else self._reader("messages.jsonl").seek_first_line(
+                    _TRANSCRIPT_TIMESTAMP_KEY, window_end
                 )
             )
             return [
                 project(record)
                 for record in self._tail_matching(
-                    "messages.jsonl", tail, accept, end=end_offset
+                    "messages.jsonl", tail, accept, end=end_line
                 )
             ]
         result: list[dict[str, JsonValue]] = []

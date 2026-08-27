@@ -29,24 +29,55 @@ from wrkviz.render import (
     prune_retired_query_artifacts,
     standalone_query_source,
 )
+from wrkviz.seekable_jsonl import WriteReport, write_seekable_jsonl
 
 
 TRANSCRIPT_EXPORT_SCHEMA_VERSION = 1
 #: The projections the archive publishes: what a reader of a shipped archive opens.
+#:
+#: These names are the *logical* projections, which is also how `manifest.json` keys them and how
+#: every reader in this tree names them. What lands on disk is the same name with
+#: :data:`_CONTAINER_SUFFIX` appended, plus the sidecar index beside it.
 _MANAGED_FILES = (
     "prompts.jsonl",
     "messages.jsonl",
     "system-inputs.jsonl",
 )
 
+#: How the published projections are stored, recorded per file in the manifest so a reader
+#: dispatches on a declaration rather than on a filename.
+#:
+#: The three of them used to be plain text -- 132.7 MiB on the measured archive -- because a
+#: sorted uncompressed file can be binary-searched in place and a compressed *twin* beside it
+#: would have recreated exactly the duplication schema 3 exists to remove. Replacing the file is a
+#: different proposition from twinning it, and it is the one taken here: the corpus is now the
+#: same multi-member gzip container schema 3's shards use, at 1 MiB of uncompressed payload per
+#: member, with the sidecar index that makes a member addressable. Every seek that used to be a
+#: byte offset is now a line number resolved through the member table.
+#:
+#: **The integrity contract is unchanged in value, not merely in spirit.** `sha256` and `bytes`
+#: still describe the uncompressed JSONL stream, and on the measured archive they are the same
+#: hex digits after the migration as before it, because `seekable_jsonl` encodes a record exactly
+#: as `canonical_jsonl` does and gzip is lossless. What is added is `c_sha256`/`c_bytes` for the
+#: bytes actually on disk, and the sidecar's own `u_sha256` -- so a reader can now confirm the
+#: manifest's digest against the container in O(1) at open, where before it could only confirm a
+#: length.
+_TRANSCRIPT_CONTAINER = "multi-member-gzip"
+_CONTAINER_SUFFIX = ".gz"
+
+#: The field the member table's `t0`/`t1` bounds are taken from. Every published projection
+#: carries it, and `query.py` seeks on it under this exact name.
+_TRANSCRIPT_TIMESTAMP_KEY = "timestamp_ms"
+
 #: The monotonic union, which is *input to the next run* rather than output of this one.
 #:
 #: It is the largest thing this module writes -- 106.3 MiB against 110.2 MiB for all three
-#: published projections combined -- and nothing that consumes an archive opens it: not the
-#: browser, not any subcommand of the shipped CLI. Its one reader is `export_transcripts`
-#: itself, which reads the previous generation to carry forward the records of teams that could
-#: not be loaded this run. That is the definition of rerun state, so it lives in the build store
-#: beside the other rerun state rather than in the directory an operator ships.
+#: published projections combined, in an earlier measurement taken while those were still
+#: plain text -- and nothing that consumes an archive opens it: not the browser, not any
+#: subcommand of the shipped CLI. Its one reader is `export_transcripts` itself, which reads
+#: the previous generation to carry forward the records of teams that could not be loaded
+#: this run. That is the definition of rerun state, so it lives in the build store beside the
+#: other rerun state rather than in the directory an operator ships.
 #:
 #: Its digest stays in the manifest. Where the bytes live is a packaging decision; whether the
 #: generation can be checked against what produced it is not, and dropping the record because
@@ -1068,6 +1099,104 @@ def _logical_records(
     return sorted(result, key=_record_sort_key)
 
 
+def _container_manifest_entry(report: WriteReport) -> dict[str, JsonValue]:
+    """Describe one published projection: its content, and the container holding it.
+
+    ``sha256``/``bytes`` are the uncompressed stream -- the same two numbers this manifest has
+    always carried for this projection, with the same values -- and ``c_sha256``/``c_bytes``
+    are the file on disk. Both are here because they answer different questions: a reader
+    ``stat``s the container and compares ``c_bytes``, then compares ``sha256`` against the
+    sidecar's ``u_sha256``, and only ``--verify`` inflates the whole thing to prove it.
+
+    The two names come from the writer's own report rather than from string arithmetic here,
+    so the manifest cannot describe a sidecar path the writer did not use.
+    """
+
+    index = report.index
+    return {
+        "sha256": index.u_sha256,
+        "bytes": index.u_size,
+        "records": index.record_count,
+        "container": _TRANSCRIPT_CONTAINER,
+        "path": report.path.name,
+        "index_path": report.index_path.name,
+        "c_sha256": index.c_sha256,
+        "c_bytes": index.c_size,
+    }
+
+
+def _remove_superseded_plain_projection(path: Path) -> int:
+    """Delete the uncompressed projection the container replaced, if one is still there.
+
+    This is deliberately a deletion rather than the "retire it, let ``gc`` reap it" grace
+    `render.retired_generation_files` extends to the superseded *presentation* generations, and
+    the two cases differ in the way that decides it. A retired presentation generation is still
+    readable by a reader that predates its replacement -- an old ``app.js``, an old ``./timeline``
+    copied out of the archive -- so deleting it during an unrelated rebuild would break somebody
+    else's tool hours later. The transcript corpus has neither property. It is one generation
+    described by one manifest, so the moment the manifest names the container the plain file is
+    bytes nothing vouches for, sitting in the directory whose entire purpose is that everything in
+    it is vouched for; and the archive's own ``./timeline`` is rewritten by this same function, so
+    there is no in-archive reader left behind to read it. Re-running ``extract-transcripts``
+    reproduces the corpus either way, which is what makes the deletion recoverable rather than
+    merely defensible.
+
+    A symlink of that name is left alone and not counted: it is not this exporter's output, and
+    unlinking a file the operator put there is not a decision a rebuild gets to make.
+    """
+
+    if path.is_symlink() or not path.is_file():
+        return 0
+    path.unlink()
+    return 1
+
+
+def _previous_generation_file(
+    root: Path,
+    archive: Path,
+    name: str,
+    entry: dict[str, JsonValue],
+    where: Path,
+) -> tuple[Path, str]:
+    """Which file the previous manifest's entry describes, and the digest it claims for it.
+
+    Both shapes are accepted, and both are met in practice by the same archive: the run that
+    migrates a corpus onto the container reads a manifest describing plain text, and every run
+    after it reads one describing a container. Refusing the older shape here would make the
+    migration require deleting the manifest first, which would throw away the omission guard on
+    exactly the run where it is most useful.
+    """
+
+    if name == _BASELINE_FILE:
+        return (
+            shared_build_file(archive, name),
+            as_string(entry.get("sha256"), f"{where}.files.{name}.sha256"),
+        )
+    container = entry.get("container")
+    if container is None:
+        return root / name, as_string(
+            entry.get("sha256"), f"{where}.files.{name}.sha256"
+        )
+    if as_string(container, f"{where}.files.{name}.container") != _TRANSCRIPT_CONTAINER:
+        raise ValueError(
+            f"{where}: {name} declares container {container!r}, which this exporter does not "
+            f"write; expected {_TRANSCRIPT_CONTAINER!r}"
+        )
+    declared = as_string(entry.get("path"), f"{where}.files.{name}.path")
+    if declared != name + _CONTAINER_SUFFIX:
+        raise ValueError(
+            f"{where}: {name} declares its container as {declared!r}, not "
+            f"{name + _CONTAINER_SUFFIX!r}"
+        )
+    # The digest compared against the bytes on disk is the *compressed* one. `sha256` describes
+    # the stream inside the container and cannot be reproduced without inflating it, which is
+    # work this guard has no reason to do: it is asking whether the previous generation is
+    # intact, and a container that hashes correctly holds a stream that inflates correctly.
+    return root / declared, as_string(
+        entry.get("c_sha256"), f"{where}.files.{name}.c_sha256"
+    )
+
+
 def _validate_previous_manifest(
     root: Path, archive: Path
 ) -> dict[str, JsonValue] | None:
@@ -1080,12 +1209,7 @@ def _validate_previous_manifest(
     files = as_object(manifest.get("files"), f"{path}.files")
     for name in (*_MANAGED_FILES, _BASELINE_FILE):
         entry = as_object(files.get(name), f"{path}.files.{name}")
-        expected = as_string(entry.get("sha256"), f"{path}.files.{name}.sha256")
-        managed = (
-            shared_build_file(archive, name)
-            if name == _BASELINE_FILE
-            else root / name
-        )
+        managed, expected = _previous_generation_file(root, archive, name, entry, path)
         if not managed.is_file() or managed.is_symlink():
             raise ValueError(f"transcript export file is missing or unsafe: {managed}")
         actual = hashlib.sha256(managed.read_bytes()).hexdigest()
@@ -1247,40 +1371,40 @@ def export_transcripts(
     system_inputs = _logical_records(occurrences, "system_input")
     messages = sorted([*prompts, *responses], key=_record_sort_key)
 
-    texts = {
-        "occurrences.jsonl": canonical_jsonl(occurrences),
-        "prompts.jsonl": canonical_jsonl(prompts),
-        "messages.jsonl": canonical_jsonl(messages),
-        "system-inputs.jsonl": canonical_jsonl(system_inputs),
+    projections: dict[str, Sequence[dict[str, JsonValue]]] = {
+        "prompts.jsonl": prompts,
+        "messages.jsonl": messages,
+        "system-inputs.jsonl": system_inputs,
     }
     rules_text = _rules_text(rules)
     changed = 0
+    file_manifest: dict[str, JsonValue] = {}
     for name in _MANAGED_FILES:
-        changed += int(write_text_if_changed(root / name, texts[name]))
+        report = write_seekable_jsonl(
+            root / (name + _CONTAINER_SUFFIX),
+            projections[name],
+            timestamp_key=_TRANSCRIPT_TIMESTAMP_KEY,
+        )
+        changed += int(report.data_changed) + int(report.index_changed)
+        changed += _remove_superseded_plain_projection(root / name)
+        file_manifest[name] = _container_manifest_entry(report)
+    # The monotonic baseline stays plain text. It is rerun state in the build store rather than
+    # something an archive publishes, nothing seeks into it, and the one reader it has --
+    # `read_jsonl`, at the top of the next run -- reads it whole. Compressing it would buy bytes
+    # in a directory the operator does not ship and cost the property that makes it debuggable.
+    occurrences_text = canonical_jsonl(occurrences)
     baseline_root.mkdir(parents=True, exist_ok=True)
     changed += int(
-        write_text_if_changed(baseline_root / _BASELINE_FILE, texts[_BASELINE_FILE])
+        write_text_if_changed(baseline_root / _BASELINE_FILE, occurrences_text)
     )
     changed += int(
         write_text_if_changed(root / _AUTHORSHIP_RULES_FILE, rules_text)
     )
-
-    file_manifest: dict[str, JsonValue] = {}
-    for name in (*_MANAGED_FILES, _BASELINE_FILE):
-        text = texts[name]
-        file_manifest[name] = {
-            "sha256": _sha256_text(text),
-            "bytes": len(text.encode("utf-8")),
-            "records": len(
-                occurrences
-                if name == "occurrences.jsonl"
-                else prompts
-                if name == "prompts.jsonl"
-                else messages
-                if name == "messages.jsonl"
-                else system_inputs
-            ),
-        }
+    file_manifest[_BASELINE_FILE] = {
+        "sha256": _sha256_text(occurrences_text),
+        "bytes": len(occurrences_text.encode("utf-8")),
+        "records": len(occurrences),
+    }
     file_manifest[_AUTHORSHIP_RULES_FILE] = {
         "sha256": _sha256_text(rules_text),
         "bytes": len(rules_text.encode("utf-8")),
