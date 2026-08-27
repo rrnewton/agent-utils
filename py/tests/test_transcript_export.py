@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import json
 import stat
 import subprocess
@@ -14,6 +15,7 @@ from wrkviz.build_store import shared_build_root
 from wrkviz.archive import JsonValue, as_object, narrow_json
 from wrkviz.cli import main as timeline_main
 from wrkviz.model import Agent, Event, TeamData
+from wrkviz.seekable_jsonl import SeekableJsonlReader
 from wrkviz.transcript_export import (
     PromptAuthorshipRule,
     TranscriptTeamSkip,
@@ -81,6 +83,17 @@ def _team(events: tuple[Event, ...]) -> TeamData:
 
 
 def _jsonl(path: Path) -> list[dict[str, JsonValue]]:
+    """Read one exported projection, whichever container it is in.
+
+    The three published projections are multi-member gzip with a sidecar; the monotonic baseline
+    in the build store is still plain text. Both are read here through their own reader rather
+    than through ``query.py``, so an assertion about what the exporter *wrote* does not become an
+    assertion about what the query layer can be persuaded to return.
+    """
+
+    if not path.exists() and path.with_name(path.name + ".gz").is_file():
+        with SeekableJsonlReader(path.with_name(path.name + ".gz")) as reader:
+            return list(reader.iter_records())
     result: list[dict[str, JsonValue]] = []
     for index, line in enumerate(path.read_text(encoding="utf-8").splitlines()):
         raw: object = json.loads(line)
@@ -104,7 +117,9 @@ def test_export_is_idempotent_and_monotonic_across_missing_source_records(
     assert report.prompts == 2
     assert report.responses == 1
     assert report.system_inputs == 1
-    assert report.files_changed == 8
+    # Eleven, not eight: each published projection is now a container *and* a sidecar index,
+    # which is three more files than the three plain ones it replaced.
+    assert report.files_changed == 11
     assert export_transcripts(tmp_path, (first,)).files_changed == 0
     assert (tmp_path / "timeline").is_file()
     assert not (tmp_path / "query.py").exists()
@@ -652,6 +667,58 @@ def test_logical_prompt_report_deduplicates_identical_fork_occurrences(
     assert prompts[0]["occurrence_teams"] == ["alpha", "beta"]
 
 
+def test_a_plain_corpus_migrates_in_place_without_moving_a_digest(
+    tmp_path: Path,
+) -> None:
+    """The migration onto the container, and the claim that makes it safe.
+
+    ``sha256`` and ``bytes`` describe the uncompressed stream both before and after, so the
+    migration must not move either number: the exporter's canonical encoding and
+    `seekable_jsonl`'s are the same encoding, and gzip is lossless, so the digest an operator
+    recorded against the plain corpus still identifies the corpus inside the container. That is
+    the whole reason this could be done as a replacement rather than as a new generation, and it
+    is asserted here rather than asserted in a comment.
+
+    The plain generation is reconstructed from the container rather than produced by an old
+    exporter, which is the only way to write this test without keeping the old writer alive --
+    and it is faithful, because reconstructing it *is* inflating the container.
+    """
+
+    team = _team(
+        (
+            _event("prompt-one", "turn-one", 200, "user_prompt", "One", 1),
+            _event("response-one", "turn-one", 250, "assistant_message", "Done", 2),
+            _event("scheduled", "turn-system", 300, "system_input", "Tick", 3),
+        )
+    )
+    export_transcripts(tmp_path, (team,))
+    root = tmp_path / "extracted" / "transcripts"
+    manifest_path = root / "manifest.json"
+    container_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    # Rewind to the pre-container generation: plain text beside a manifest that describes it.
+    legacy = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for name in ("prompts.jsonl", "messages.jsonl", "system-inputs.jsonl"):
+        with gzip.open(root / (name + ".gz"), "rb") as handle:
+            (root / name).write_bytes(handle.read())
+        (root / (name + ".gz")).unlink()
+        (root / (name + ".gz.index.jsonl")).unlink()
+        for key in ("container", "path", "index_path", "c_sha256", "c_bytes"):
+            legacy["files"][name].pop(key)
+    manifest_path.write_text(json.dumps(legacy, indent=1), encoding="utf-8")
+
+    export_transcripts(tmp_path, (team,))
+
+    migrated = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert migrated == container_manifest
+    for name in ("prompts.jsonl", "messages.jsonl", "system-inputs.jsonl"):
+        assert migrated["files"][name]["sha256"] == legacy["files"][name]["sha256"]
+        assert migrated["files"][name]["bytes"] == legacy["files"][name]["bytes"]
+        assert not (root / name).exists()
+        assert (root / (name + ".gz")).is_file()
+        assert (root / (name + ".gz.index.jsonl")).is_file()
+
+
 def test_prompt_query_fails_closed_on_digest_mismatch(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -659,8 +726,10 @@ def test_prompt_query_fails_closed_on_digest_mismatch(
         tmp_path,
         (_team((_event("prompt", "turn", 100, "user_prompt", "Original", 1),)),),
     )
-    prompts = tmp_path / "extracted" / "transcripts" / "prompts.jsonl"
-    prompts.write_text(prompts.read_text(encoding="utf-8") + "{}\n", encoding="utf-8")
+    prompts = tmp_path / "extracted" / "transcripts" / "prompts.jsonl.gz"
+    # An extra gzip member appended to the container: still a perfectly valid `.gz`, still
+    # inflatable, and still refused -- the manifest said how long the file is.
+    prompts.write_bytes(prompts.read_bytes() + gzip.compress(b"{}\n"))
 
     assert (
         timeline_main(

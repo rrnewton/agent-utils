@@ -465,14 +465,24 @@ wrkviz extract-transcripts --output ./timelines/example-team
 ```
 
 This reads only normalized coordinator events. It writes
-`extracted/transcripts/occurrences.jsonl`, `prompts.jsonl`, `messages.jsonl`,
-`system-inputs.jsonl`, and a digest-bound manifest. `occurrences.jsonl` retains every physical
+`extracted/transcripts/occurrences.jsonl`, `prompts.jsonl.gz`, `messages.jsonl.gz`,
+`system-inputs.jsonl.gz`, and a digest-bound manifest. `occurrences.jsonl` retains every physical
 provider/team occurrence, while
 `prompts.jsonl` collapses only source-identical logical fork copies and contains verbatim authored
 or externally submitted prompts;
 `messages.jsonl` adds coordinator responses associated by provider turn identity. Synthetic Claude
 notifications, scheduled inputs, and inter-agent messages are retained separately rather than
 counted as the user's prompts. Every record has a stable occurrence ID and source provenance.
+
+The three published projections are **seekable containers**: a multi-member gzip file at
+`<name>.jsonl.gz` with a sidecar index at `<name>.jsonl.gz.index.jsonl` recording where each
+member sits and which instants it spans. That is what lets `prompts --tail` and
+`messages --range` read the members holding the answer instead of the file — 129.7 MiB of plain
+JSONL became 21.4 MiB of container on the measured archive, with no second copy of anything. Each
+is an ordinary `.gz`: `gunzip -c messages.jsonl.gz` reproduces the exact bytes the plain file
+held, which is why the manifest's `sha256` and `bytes` still describe the uncompressed JSONL and
+still hold the values they held before. `c_sha256` and `c_bytes` describe the file on disk.
+`occurrences.jsonl` is unaffected — it is rerun state in the build store, not published output.
 
 Reruns take a monotonic union: a provider-side rewrite or rotation cannot delete an occurrence that
 was already extracted. Prompt ordinals are a convenient current 1-based chronological projection,
@@ -769,9 +779,10 @@ example-team/
 ├── extracted/transcripts/
 │   ├── manifest.json                # source generations + file digests; zero-token contract
 │   ├── occurrences.jsonl            # every physical provider/team source occurrence
-│   ├── prompts.jsonl                # global chronological authored prompt report
-│   ├── messages.jsonl               # prompts plus mechanically linked responses
-│   └── system-inputs.jsonl          # retained scheduled/synthetic coordinator inputs
+│   ├── prompts.jsonl.gz             # global chronological authored prompt report
+│   ├── messages.jsonl.gz            # prompts plus mechanically linked responses
+│   ├── system-inputs.jsonl.gz       # retained scheduled/synthetic coordinator inputs
+│   └── *.jsonl.gz.index.jsonl       # one sidecar per projection: the member table a seek uses
 ├── data/
 │   ├── timeline-v3.json             # the only bootstrap a build writes; shards under timeline-v3/
 │   │                                #   read by `./timeline` and by the browser alike

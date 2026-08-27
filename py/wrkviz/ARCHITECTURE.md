@@ -23,7 +23,11 @@ The durable archive and a website export are distinct concepts:
   is the source-identical-deduplicated chronological prompt corpus, `messages.jsonl` adds
   mechanically turn-linked responses, and `system-inputs.jsonl` retains synthetic/scheduled inputs
   without mislabeling them as the owner's prompts. Its manifest binds every file digest and source
-  generation.
+  generation. The three published projections are stored as seekable containers —
+  `prompts.jsonl.gz` and its `.index.jsonl` sidecar, and so on — so a query reads the members its
+  answer lives in rather than the file; the manifest's `sha256` and `bytes` still describe the
+  uncompressed JSONL, unchanged by the container. `occurrences.jsonl` stays plain text because it
+  is rerun state in the build store, not something an archive publishes.
 - A slice export is a deterministic view over selected teams and a half-open UTC interval. It may
   contain only 2026-08-06 22:00 through 2026-08-07 07:00 EDT even though the archive retains more.
 - Rebuilding an export never invokes a model. Missing summaries degrade to normalized transcript
@@ -447,9 +451,11 @@ audience is explicitly unavailable, while phase transcript queries remain indepe
 availability.
 
 The `prompts` and `messages` query actions are an independent read-only boundary over
-`extracted/transcripts/`; they do not require `data/timeline.json`. The loader verifies the schema
-and SHA-256 of all managed JSONL against `extracted/transcripts/manifest.json` before returning a
-record. Prompt ordinals are 1-based inclusive chronological indexes for convenient slicing. Stable
+`extracted/transcripts/`; they do not require `data/timeline.json`. The loader checks the schema,
+each container's size, and each container's declared content digest — the manifest's `sha256`
+against the sidecar index's `u_sha256`, which is an O(1) comparison rather than a full read —
+before returning a record. `--verify` inflates every projection end to end and reproduces the
+digest for real. Prompt ordinals are 1-based inclusive chronological indexes for convenient slicing. Stable
 `record_id` values are the durable identity because discovering older history can change ordinals.
 Prompt queries default to `human`, defined only by `author_kind` values `owner_human` and
 `other_human`; `bot` is `agent` or `system`, while `all` retains unresolved classifications. No

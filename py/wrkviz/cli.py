@@ -1810,7 +1810,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
                 print(
                     "JSONL: "
-                    f"{config.output / 'extracted' / 'transcripts' / 'prompts.jsonl'}"
+                    f"{config.output / 'extracted' / 'transcripts' / 'prompts.jsonl.gz'}"
                 )
             print("website: not built (run `wrkviz build` separately)")
             print(f"run metadata: {project_run_path}")
@@ -1907,7 +1907,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"{report.reclassified} source records reclassified, "
                 f"{report.files_changed} files changed"
             )
-            print(f"JSONL: {archive / 'extracted' / 'transcripts' / 'prompts.jsonl'}")
+            print(
+                f"JSONL: {archive / 'extracted' / 'transcripts' / 'prompts.jsonl.gz'}"
+            )
             print(f"run metadata: {run_path}")
             if partiality is not None:
                 print(f"{PROG}: {partiality}", file=sys.stderr)
