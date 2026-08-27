@@ -51,7 +51,7 @@ struct Claim {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Record {
     pid: u32,
-    starttime: Option<u64>,
+    starttime: u64,
     request: String,
     tag: String,
     ticket: u64,
@@ -65,10 +65,7 @@ impl Record {
         let pid = value_u64(obj.get("pid")?)
             .and_then(|value| u32::try_from(value).ok())
             .filter(|value| *value > 0)?;
-        let starttime = match obj.get("starttime")? {
-            Value::Null => None,
-            value => Some(value_u64(value).filter(|value| *value > 0)?),
-        };
+        let starttime = value_u64(obj.get("starttime")?).filter(|value| *value > 0)?;
         let request = obj.get("request")?.as_str()?.to_string();
         let tag = obj.get("tag")?.as_str()?.to_string();
         let ticket = value_u64(obj.get("ticket")?)?;
@@ -119,10 +116,7 @@ impl Record {
             .collect();
         Value::Object(Map::from_iter([
             ("pid".to_string(), Value::from(self.pid)),
-            (
-                "starttime".to_string(),
-                self.starttime.map(Value::from).unwrap_or(Value::Null),
-            ),
+            ("starttime".to_string(), Value::from(self.starttime)),
             ("request".to_string(), Value::String(self.request.clone())),
             ("tag".to_string(), Value::String(self.tag.clone())),
             ("ticket".to_string(), Value::from(self.ticket)),
@@ -155,22 +149,29 @@ fn value_i64(value: &Value) -> Option<i64> {
     }
 }
 
-fn proc_starttime(pid: u32) -> Option<u64> {
-    let text = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let rparen = text.rfind(')')?;
-    text.get(rparen + 2..)?
+fn proc_starttime(pid: u32) -> Result<Option<u64>, String> {
+    let path = format!("/proc/{pid}/stat");
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("read process identity {path}: {error}")),
+    };
+    let rparen = text
+        .rfind(')')
+        .ok_or_else(|| format!("process identity {path} has no command terminator"))?;
+    let starttime = text
+        .get(rparen + 2..)
+        .ok_or_else(|| format!("process identity {path} has no fields"))?
         .split_whitespace()
-        .nth(19)?
+        .nth(19)
+        .ok_or_else(|| format!("process identity {path} has no starttime"))?
         .parse()
-        .ok()
+        .map_err(|error| format!("parse process identity {path} starttime: {error}"))?;
+    Ok(Some(starttime))
 }
 
-fn holder_alive(record: &Record) -> bool {
-    match proc_starttime(record.pid) {
-        None => false,
-        Some(_) if record.starttime.is_none() => true,
-        Some(current) => record.starttime == Some(current),
-    }
+fn holder_alive(record: &Record) -> Result<bool, String> {
+    Ok(proc_starttime(record.pid)?.is_some_and(|current| current == record.starttime))
 }
 
 struct LedgerLock {
@@ -372,10 +373,16 @@ fn store(path: &Path, ledger: &Ledger) -> Result<(), String> {
     result
 }
 
-fn sweep(ledger: &mut Ledger) -> bool {
+fn sweep(ledger: &mut Ledger) -> Result<bool, String> {
     let before = ledger.requests.len();
-    ledger.requests.retain(holder_alive);
-    ledger.requests.len() != before
+    let mut retained = Vec::with_capacity(before);
+    for record in std::mem::take(&mut ledger.requests) {
+        if holder_alive(&record)? {
+            retained.push(record);
+        }
+    }
+    ledger.requests = retained;
+    Ok(ledger.requests.len() != before)
 }
 
 fn claims_for(
@@ -442,18 +449,20 @@ impl Reservation {
         let claims = claims_for(demands, capacities)?;
         let _lock = LedgerLock::acquire(path)?;
         let mut ledger = load(path)?;
-        sweep(&mut ledger);
+        sweep(&mut ledger)?;
         if let Some(error) = capacity_conflict(&ledger, &claims) {
             return Err(error);
         }
         let pid = std::process::id();
-        let starttime = proc_starttime(pid);
+        let starttime = proc_starttime(pid)?.ok_or_else(|| {
+            format!("could not read current process identity from /proc/{pid}/stat")
+        })?;
         let ticket = ledger.next_ticket;
         ledger.next_ticket = ledger
             .next_ticket
             .checked_add(1)
             .ok_or_else(|| "resource_caps ticket counter overflowed".to_string())?;
-        let request = format!("{pid}-{}-{ticket}", starttime.unwrap_or(0));
+        let request = format!("{pid}-{starttime}-{ticket}");
         ledger.requests.push(Record {
             pid,
             starttime,
@@ -480,7 +489,7 @@ impl Reservation {
         }
         let _lock = LedgerLock::acquire(&self.path)?;
         let mut ledger = load(&self.path)?;
-        let changed = sweep(&mut ledger);
+        let changed = sweep(&mut ledger)?;
         let index = ledger
             .requests
             .iter()
@@ -546,7 +555,7 @@ impl Reservation {
         }
         let _lock = LedgerLock::acquire(&self.path)?;
         let mut ledger = load(&self.path)?;
-        sweep(&mut ledger);
+        sweep(&mut ledger)?;
         ledger
             .requests
             .retain(|record| record.request != self.request);
@@ -617,7 +626,7 @@ impl Coordinator {
         }
         let _lock = LedgerLock::acquire(&path)?;
         let mut ledger = load(&path)?;
-        if sweep(&mut ledger) {
+        if sweep(&mut ledger)? {
             store(&path, &ledger)?;
         }
         for record in &ledger.requests {
@@ -766,6 +775,74 @@ mod tests {
             .err()
             .expect("malformed shared state must be refused");
         assert!(error.contains("is corrupt"), "{error}");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn state_without_process_starttime_is_refused() {
+        let path = temp_path("missing-process-starttime");
+        cleanup(&path);
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "next_ticket": 1,
+                "requests": [{
+                    "pid": std::process::id(),
+                    "starttime": null,
+                    "request": "missing-identity",
+                    "tag": "g.step",
+                    "ticket": 0,
+                    "state": "held",
+                    "resources": {"guest": {"demand": 1, "capacity": 1}}
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let error = Coordinator::new(path.clone(), BTreeMap::from([("guest".into(), 1)]))
+            .err()
+            .expect("state without a reusable-process guard must be refused");
+        assert!(error.contains("invalid request"), "{error}");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn request_from_exited_process_is_reclaimed() {
+        let path = temp_path("exited-process");
+        cleanup(&path);
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let starttime = proc_starttime(pid).unwrap().unwrap();
+        store(
+            &path,
+            &Ledger {
+                next_ticket: 1,
+                requests: vec![Record {
+                    pid,
+                    starttime,
+                    request: format!("{pid}-{starttime}-0"),
+                    tag: "g.exited".to_string(),
+                    ticket: 0,
+                    state: RequestState::Held,
+                    claims: BTreeMap::from([(
+                        "guest".to_string(),
+                        Claim {
+                            demand: 1,
+                            capacity: 1,
+                        },
+                    )]),
+                }],
+            },
+        )
+        .unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        Coordinator::new(path.clone(), BTreeMap::from([("guest".into(), 1)])).unwrap();
+        assert!(load(&path).unwrap().requests.is_empty());
         cleanup(&path);
     }
 

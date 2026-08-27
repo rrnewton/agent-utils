@@ -30,13 +30,13 @@ impl Fixture {
         let counter = dir.join("counter");
         let observations = dir.join("observations");
         let holder_command = format!(
-            "value=$(cat {counter}); printf '%s' \"$value\" >> {observations}; while [ ! -e {release} ]; do sleep 0.02; done; printf '%s\\n' \"$((value + 1))\" > {counter}",
+            "test -z \"${{DAGRUN_RESOURCE_CAPS_PATH+x}}\"; value=$(cat {counter}); printf '%s' \"$value\" >> {observations}; while [ ! -e {release} ]; do sleep 0.02; done; printf '%s\\n' \"$((value + 1))\" > {counter}",
             counter = counter.display(),
             observations = observations.display(),
             release = dir.join("release").display(),
         );
         let writer_command = format!(
-            "value=$(cat {counter}); printf '%s' \"$value\" >> {observations}; printf '%s\\n' \"$((value + 1))\" > {counter}",
+            "test -z \"${{DAGRUN_RESOURCE_CAPS_PATH+x}}\"; value=$(cat {counter}); printf '%s' \"$value\" >> {observations}; printf '%s\\n' \"$((value + 1))\" > {counter}",
             counter = counter.display(),
             observations = observations.display(),
         );
