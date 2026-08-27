@@ -1066,7 +1066,12 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
             }
             "--max-mem" => a.max_mem = Some(take_value(inline, &mut i)?),
             "--selected" => a.selected = Some(take_value(inline, &mut i)?),
-            "--ignore-selected-deps" => a.ignore_selected_deps = true,
+            "--ignore-selected-deps" => {
+                if inline.is_some() {
+                    return Err(format!("unrecognized argument: {arg}"));
+                }
+                a.ignore_selected_deps = true;
+            }
             "--args" => a.passthrough_args = Some(take_value(inline, &mut i)?),
             "--stress" => {
                 let v = take_value(inline, &mut i)?;
@@ -4059,6 +4064,25 @@ mod tests {
         let palette = Palette { enabled: false };
 
         assert_eq!(cmd_run(&cfg, &args, &palette), 2);
+    }
+
+    #[test]
+    fn retired_only_flag_and_boolean_value_are_rejected() {
+        assert_eq!(
+            parse_run_args(&["--only".into(), "test.unit".into()])
+                .err()
+                .as_deref(),
+            Some("unrecognized argument: --only")
+        );
+        assert_eq!(
+            parse_run_args(&[
+                "--selected=test.unit".into(),
+                "--ignore-selected-deps=true".into()
+            ])
+            .err()
+            .as_deref(),
+            Some("unrecognized argument: --ignore-selected-deps=true")
+        );
     }
 
     #[test]

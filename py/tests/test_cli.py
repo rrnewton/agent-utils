@@ -82,6 +82,7 @@ def test_run_help_lists_flags_and_cores_pinning() -> None:
     ):
         assert flag in out, flag
     assert "--jobs" not in out
+    assert "--only" not in out
     # Discoverable pinning aliases + intent keywords (greppable).
     assert "--cpuset" in out and "--pin" in out
     # argparse line-wraps help, so collapse whitespace before substring checks.
@@ -477,6 +478,26 @@ def test_run_selected_unknown_tag_exits_2() -> None:
         rc, _, err = _capture(["run", "--dag", dag, "--selected", "no.pe", "-q", _ACF])
         assert rc == 2
         assert "unknown step tag" in err
+
+
+def test_retired_only_flag_and_boolean_value_are_rejected() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        dag = _demo_path(tmp)
+        with pytest.raises(SystemExit) as only_error:
+            main(["run", "--dag", dag, "--only", "test.unit"])
+        assert only_error.value.code == 2
+        with pytest.raises(SystemExit) as boolean_value_error:
+            main(
+                [
+                    "run",
+                    "--dag",
+                    dag,
+                    "--selected",
+                    "test.unit",
+                    "--ignore-selected-deps=true",
+                ]
+            )
+        assert boolean_value_error.value.code == 2
 
 
 def test_run_profile_prints_table() -> None:

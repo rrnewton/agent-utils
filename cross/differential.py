@@ -1116,6 +1116,13 @@ def compare_selected_behavior(py: list[str], rs: list[str], rep: Report) -> None
             ),
             ("selected-ignore-requires-selection", ("--ignore-selected-deps",), 2, None),
             ("selected-unknown-tag", ("--selected", "no.pe"), 2, None),
+            ("selected-retired-only-flag", ("--only", "c.leaf"), 2, None),
+            (
+                "selected-ignore-boolean-value",
+                ("--selected", "c.leaf", "--ignore-selected-deps=true"),
+                2,
+                None,
+            ),
         )
         for label, extra, expected_exit, expected_nodes in cases:
             args = ("run", "--dag", path, "-q", *extra, NOPROF, NOFB, ACF)
@@ -4938,8 +4945,8 @@ def compare_cli_schema(py: list[str], rs: list[str], rep: Report) -> None:
         "pin-run": ("--cores", "--tag"),
     }
     command_forbidden_flags: dict[str, tuple[str, ...]] = {
-        # Retained as a hidden 0.13 compatibility alias, not as public run vocabulary.
-        "run": ("--jobs",),
+        # `--jobs` is a hidden 0.13 compatibility alias; `--only` is retired rather than aliased.
+        "run": ("--jobs", "--only"),
         # `box` is a front door for ONE command, not a second `run`. A `--dag` here would mean
         # the two editions had grown different ideas of what the subcommand is for.
         "box": ("--dag", "--selected", "--ignore-selected-deps", "--stress"),
