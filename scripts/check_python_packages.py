@@ -817,7 +817,11 @@ def _smoke_wheel(
     smoke_root: Path,
 ) -> None:
     environment_root = smoke_root / project.directory
-    venv.EnvBuilder(with_pip=True, clear=True).create(environment_root)
+    # The package under test needs a fresh environment; it does not need a private copy of pip.
+    # Bootstrapping pip separately into all six environments spends most of this check installing
+    # the same validation tool.  The validator's pip can target each empty environment directly,
+    # while the import-path assertion below still proves the wheel landed in that environment.
+    venv.EnvBuilder(with_pip=False, clear=True).create(environment_root)
     bindir, python = _venv_paths(environment_root)
     env = _offline_env()
     run_root = smoke_root / "work" / project.directory
@@ -830,9 +834,11 @@ def _smoke_wheel(
 
     _run(
         [
-            str(python),
+            sys.executable,
             "-m",
             "pip",
+            "--python",
+            str(python),
             "install",
             "--no-index",
             "--no-deps",

@@ -358,13 +358,16 @@ def _inspect(crate: Crate, version: str, archive: Path) -> dict[str, str]:
 
 
 def _smoke(
-    crate: Crate, version: str, documents: dict[str, str], target_root: Path
+    crate: Crate,
+    version: str,
+    documents: dict[str, str],
+    target_root: Path,
+    run_root: Path,
 ) -> None:
     bindir = target_root / "debug"
     suffix = ".exe" if os.name == "nt" else ""
     env = dict(os.environ)
     env["NO_COLOR"] = "1"
-    run_root = target_root / "smoke-cwd"
     run_root.mkdir()
 
     for binary in crate.bins:
@@ -409,6 +412,9 @@ def main() -> int:
             )
         with tempfile.TemporaryDirectory(prefix="agent-utils-rust-packages-") as raw:
             package_root = Path(raw)
+            target_root = package_root / "target"
+            smoke_root = package_root / "smoke"
+            smoke_root.mkdir()
             for crate in CRATES:
                 version, bins, libraries = _metadata(crate)
                 if bins != set(crate.bins):
@@ -421,10 +427,9 @@ def main() -> int:
                         f"{crate.name}: library targets {sorted(libraries)}, "
                         f"expected {[crate.library]}"
                     )
-                target_root = package_root / crate.name
                 archive = _package(crate, version, target_root)
                 documents = _inspect(crate, version, archive)
-                _smoke(crate, version, documents, target_root)
+                _smoke(crate, version, documents, target_root, smoke_root / crate.name)
                 print(
                     f"check_rust_packages: ok {crate.name} {version} "
                     f"({', '.join(crate.bins)})"
