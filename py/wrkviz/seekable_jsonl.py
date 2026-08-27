@@ -6,6 +6,14 @@ filtering happens after full materialization. Everything below exists to make "t
 records" and "everything between two timestamps" cost the size of the answer instead of the size
 of the archive.
 
+Both of the archive's large record sets are now written through here: schema 3's shards, and --
+since the transcript corpus was migrated -- `extracted/transcripts/`'s three published
+projections, which went from 129.7 MiB of plain JSONL to 21.4 MiB with no second copy of anything
+and no change to the digests recorded in their manifest. That migration is what
+:func:`write_seekable_jsonl_lines` was built for and what the paragraph below about the existing
+integrity contract was measuring; the corpus now uses the records door instead, because the
+exporter has the records in hand and both doors encode a record identically.
+
 Container
 ---------
 A **multi-member gzip file**. gzip's format is the concatenation of independently decodable
