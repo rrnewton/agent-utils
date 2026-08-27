@@ -548,7 +548,8 @@ def stress_copy_footprint_bytes(
     concurrent set) is a deliberate UPPER BOUND: it never under-charges, so the derived ceiling
     errs toward refusing rather than OOMing sibling agents. Intentional pre-execution skips are
     excluded because no copy can spawn them. For the common single-node stress
-    (``--only dbi.file_metadata --stress N``) the sum is exactly that one node's cap."""
+    (``--selected dbi.file_metadata --ignore-selected-deps --stress N``) the sum is exactly that
+    one node's cap."""
     effective_default = (
         default_step_bytes
         if default_step_bytes is not None and default_step_bytes > 0

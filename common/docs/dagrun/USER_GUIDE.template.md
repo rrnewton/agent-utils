@@ -467,11 +467,19 @@ what a boxed run enforces, the second is what survives when boxing is off.
 
 ## Select, parameterize, and stress a step
 
-`--only` runs exactly the named tags, not their dependencies. It is useful for
-profiling an artifact whose prerequisites already exist:
+`--selected` runs the named tags and every dependency they require. Selecting a leaf therefore
+runs its full ancestry in dependency order:
 
 ```sh
-dagrun run --dag pipeline.yaml --only test.unit
+dagrun run --dag pipeline.yaml --selected test.unit
+```
+
+When all prerequisite outputs are already present and must not be rebuilt,
+`--ignore-selected-deps` runs only the named tags and drops dependency edges to steps outside the
+selection:
+
+```sh
+dagrun run --dag pipeline.yaml --selected test.unit --ignore-selected-deps
 ```
 
 A command opts into passthrough arguments by including the reserved `{args}`
@@ -484,7 +492,7 @@ token:
 ```
 
 ```sh
-dagrun run --dag pipeline.yaml --only test.unit --args='-k retry'
+dagrun run --dag pipeline.yaml --selected test.unit --args='-k retry'
 ```
 
 Passing `--args` is rejected unless a selected command declares the token.
@@ -528,7 +536,7 @@ run from a copy:
 ```
 
 ```sh
-dagrun run --dag pipeline.yaml --only demo.repeat --stress 10 -j 10
+dagrun run --dag pipeline.yaml --selected demo.repeat --ignore-selected-deps --stress 10 -j 10
 ```
 
 That produces `out/run-01.log` ... `out/run-10.log` from one invocation.

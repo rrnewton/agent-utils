@@ -85,7 +85,7 @@ jobs:
             rs/target/release/dagrun run --dag "$dag" --allow-cgroup-failure --no-profile "${extra[@]}"
             echo "::endgroup::"
           done
-      - name: exercise --only, --profile, sweep, and the default profile store (both builds)
+      - name: exercise --selected, --profile, sweep, and the default profile store (both builds)
         env:
           PYTHONPATH: py
         run: |
@@ -93,21 +93,26 @@ jobs:
           ex=examples/06-step-sweep.json
           # Both builds share the same CLI, so run the identical checks against each.
           for build in "python3 -m dagrun" "rs/target/release/dagrun"; do
-            echo "::group::$build run --only (Feature A: run EXACTLY one step, not its deps)"
-            $build run --dag "$ex" --only build.app --allow-cgroup-failure --no-profile
+            echo "::group::$build run --selected (selected leaf plus dependency ancestry)"
+            $build run --dag "$ex" --selected package.tarball --allow-cgroup-failure --no-profile
             echo "::endgroup::"
 
-            echo "::group::$build run --only unknown tag must exit 2"
+            echo "::group::$build run --selected --ignore-selected-deps (named step only)"
+            $build run --dag "$ex" --selected test.unit --ignore-selected-deps \
+              --allow-cgroup-failure --no-profile
+            echo "::endgroup::"
+
+            echo "::group::$build run --selected unknown tag must exit 2"
             rc=0
-            $build run --dag "$ex" --only no.pe --allow-cgroup-failure --no-profile || rc=$?
+            $build run --dag "$ex" --selected no.pe --allow-cgroup-failure --no-profile || rc=$?
             if [ "$rc" -ne 2 ]; then
-              echo "expected exit code 2 for an unknown --only tag, got $rc" >&2; exit 1
+              echo "expected exit code 2 for an unknown --selected tag, got $rc" >&2; exit 1
             fi
             echo "::endgroup::"
 
             echo "::group::$build run --profile (Feature C: per-step timing/memory table)"
             # The table goes to stdout; capture it and assert the header + a real step row appear.
-            table="$($build run --dag "$ex" --only build.app --profile \
+            table="$($build run --dag "$ex" --selected build.app --profile \
               --allow-cgroup-failure --no-profile)"
             echo "$table"
             echo "$table" | grep -q 'per-step profile:' \

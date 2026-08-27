@@ -149,11 +149,14 @@ This example exists to demonstrate the **per-step profiling tools**. Its `build.
 CPU-bound workload that *actually scales* with its inner parallelism: it splits a fixed amount of
 pure-shell work across N workers, where N is the inner-jobs width the runner passes in via the step's
 `jobs_flag`. So a `sweep` of it produces a real speedup curve. `test.unit` and `package.tarball` are
-quick downstream steps so `--only` is meaningful.
+quick downstream steps so dependency-aware `--selected` is meaningful.
 
 ```sh
-# Run EXACTLY one step (its dependency build.app is NOT run — inputs assumed present):
-dagrun run --dag examples/06-step-sweep.json --only test.unit --allow-cgroup-failure
+# Run one step and its build dependency:
+dagrun run --dag examples/06-step-sweep.json --selected test.unit --allow-cgroup-failure
+
+# Run only the named step when its build output is already present:
+dagrun run --dag examples/06-step-sweep.json --selected test.unit --ignore-selected-deps --allow-cgroup-failure
 
 # Run the whole DAG and print a per-step profile table afterwards:
 dagrun run --dag examples/06-step-sweep.json --profile --allow-cgroup-failure

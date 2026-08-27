@@ -1,5 +1,5 @@
 {
-  "description": "A DAG built to demonstrate the per-step profiling tools: `sweep` (parallel-speedup study), `run --only` (run exactly one step), `run --profile` (per-step table), and the default auto-logging profile store. The `build.app` step is a small CPU-bound workload that ACTUALLY scales with its inner parallelism: it splits a fixed amount of pure-shell work across N parallel workers, where N is the inner-jobs width the runner passes in via the step's jobs_flag. So `sweep --step build.app --jobs 1..8` shows a real speedup curve, and every run/sweep auto-appends resource-usage CSVs to ./.dagrun/profiles/.",
+  "description": "A DAG built to demonstrate the per-step profiling tools: `sweep` (parallel-speedup study), `run --selected` (run selected steps and their dependencies), `run --profile` (per-step table), and the default auto-logging profile store. The `build.app` step is a small CPU-bound workload that ACTUALLY scales with its inner parallelism: it splits a fixed amount of pure-shell work across N parallel workers, where N is the inner-jobs width the runner passes in via the step's jobs_flag. So `sweep --step build.app --jobs 1..8` shows a real speedup curve, and every run/sweep auto-appends resource-usage CSVs to ./.dagrun/profiles/.",
   "steps": [
     {
       "group": "build",
@@ -18,7 +18,7 @@
       "group": "test",
       "job": "unit",
       "desc": "unit tests",
-      "description": "A quick downstream step so the DAG is more than one node: it depends on build.app and just echoes. Use `run --only test.unit` to run EXACTLY this step (its build.app dependency is NOT run - its output is assumed already present), which is handy for profiling one step in isolation.",
+      "description": "A quick downstream step so the DAG is more than one node: it depends on build.app and just echoes. Use `run --selected test.unit` to run it after build.app, or add `--ignore-selected-deps` when the build output is already present and only this step should run.",
       "cmd": "echo unit-tests-ok && sleep 0.2",
       "deps": ["build.app"]
     },
