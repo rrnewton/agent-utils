@@ -203,9 +203,10 @@ later by someone who was not in it:
 - pull-request descriptions
 - **commit message bodies**
 
-It does **not** apply to commit message titles, which should stay clean, and it
-does not apply to what you say to the owner in conversation — he knows who he
-is talking to.
+It does **not** apply to commit or pull-request titles, which should stay clean.
+Put the identifier in the commit body or pull-request description instead. It
+also does not apply to what you say to the owner in conversation — he knows who
+he is talking to.
 
 The owner sometimes prefixes his own messages with `[human]`. The point is that
 anyone reading a thread later can tell at a glance which voices are people and
