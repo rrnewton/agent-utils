@@ -253,6 +253,28 @@ fn type_name(v: &Value) -> &'static str {
     }
 }
 
+fn steps_list_error(doc: &serde_json::Map<String, Value>) -> DagJsonError {
+    let mut keys: Vec<String> = doc.keys().map(|key| format!("'{key}'")).collect();
+    keys.sort();
+    let keys = if keys.is_empty() {
+        "(none)".to_string()
+    } else {
+        keys.join(", ")
+    };
+    let found = match doc.get("steps") {
+        None => format!("no 'steps' key (top-level keys: {keys})"),
+        Some(value) => format!(
+            "'steps' with type {} (top-level keys: {keys})",
+            type_name(value)
+        ),
+    };
+    err(format!(
+        "<root>: expected a dagrun DAG document with a top-level 'steps' list; found {found}. \
+         This may be a different document type. Pass a dagrun DAG file, or run `dagrun \
+         quickstart` for the schema."
+    ))
+}
+
 // Reject bools masquerading as ints and floats that are not exact integers (Python's
 // `isinstance(val, bool) or not isinstance(val, int)`).
 fn number_as_int(v: &Value) -> Option<i64> {
@@ -578,7 +600,7 @@ pub fn dag_from_value(raw: &Value) -> Result<DagConfig, DagJsonError> {
     let policy = write_domain_policy(doc.get("write_domain_policy"))?;
     let steps_raw = match doc.get("steps") {
         Some(Value::Array(items)) => items,
-        _ => return Err(err("<root>: 'steps' must be a list")),
+        _ => return Err(steps_list_error(doc)),
     };
     let mut steps: Vec<Step> = Vec::with_capacity(steps_raw.len());
     for (i, entry) in steps_raw.iter().enumerate() {
@@ -1441,6 +1463,27 @@ steps:
         for doc in bad {
             assert!(dag_from_json(doc).is_err(), "expected error for: {doc}");
         }
+    }
+
+    #[test]
+    fn a_non_dag_document_names_what_was_read_and_what_to_do() {
+        let error = dag_from_yaml("schema: 2\nbucket: example\ntest: []\n")
+            .unwrap_err()
+            .0;
+        assert_eq!(
+            error,
+            "<root>: expected a dagrun DAG document with a top-level 'steps' list; found no \
+             'steps' key (top-level keys: 'bucket', 'schema', 'test'). This may be a different \
+             document type. Pass a dagrun DAG file, or run `dagrun quickstart` for the schema."
+        );
+
+        let wrong_type = dag_from_json(r#"{"steps":"not a list"}"#).unwrap_err().0;
+        assert_eq!(
+            wrong_type,
+            "<root>: expected a dagrun DAG document with a top-level 'steps' list; found \
+             'steps' with type str (top-level keys: 'steps'). This may be a different document \
+             type. Pass a dagrun DAG file, or run `dagrun quickstart` for the schema."
+        );
     }
 
     #[test]

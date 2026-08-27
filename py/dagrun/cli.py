@@ -922,13 +922,20 @@ def build_parser() -> argparse.ArgumentParser:
 def _load(dag_arg: str) -> DagConfig:
     if dag_arg == "-":
         # stdin has no filename to auto-detect from: default to JSON.
-        return dag_from_json(sys.stdin.read())
-    path = Path(dag_arg)
-    text = path.read_text(encoding="utf-8")
-    # Auto-detect the interchange format by extension: .yaml/.yml -> YAML, else JSON.
-    if path.suffix.lower() in (".yaml", ".yml"):
-        return dag_from_yaml(text)
-    return dag_from_json(text)
+        source = "<stdin>"
+        text = sys.stdin.read()
+        load_text = dag_from_json
+    else:
+        path = Path(dag_arg)
+        source = dag_arg
+        text = path.read_text(encoding="utf-8")
+        # Auto-detect the interchange format by extension: .yaml/.yml -> YAML, else JSON.
+        load_text = dag_from_yaml if path.suffix.lower() in (".yaml", ".yml") else dag_from_json
+    try:
+        return load_text(text)
+    except DagJsonError as exc:
+        detail = str(exc).removeprefix("<root>: ")
+        raise DagJsonError(f"{source}: {detail}") from exc
 
 
 def _git_sha() -> str:
