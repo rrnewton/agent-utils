@@ -399,16 +399,29 @@ def _standalone_expected() -> tuple[tuple[StandaloneDocument, str], ...]:
     return tuple(expected)
 
 
-def _replace_with_link(item: PackageLink) -> None:
+def _replace_with_link(item: PackageLink) -> bool:
     destination = REPO_ROOT / item.destination
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.is_symlink() and os.readlink(destination) == item.relative_target:
-        return
+        return False
     if destination.exists() or destination.is_symlink():
         if destination.is_dir() and not destination.is_symlink():
             raise IsADirectoryError(f"package link destination is a directory: {item.destination}")
         destination.unlink()
     destination.symlink_to(item.relative_target)
+    return True
+
+
+def _write_text_if_changed(path: Path, text: str) -> bool:
+    """Write *text* only when *path* does not already contain those bytes."""
+
+    try:
+        if not path.is_symlink() and path.read_text(encoding="utf-8") == text:
+            return False
+    except (FileNotFoundError, IsADirectoryError, UnicodeError):
+        pass
+    path.write_text(text, encoding="utf-8")
+    return True
 
 
 def _link_is_current(item: PackageLink) -> bool:
@@ -431,11 +444,11 @@ def generate() -> list[str]:
     for render, text in rendered:
         destination = REPO_ROOT / render.destination
         destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(text, encoding="utf-8")
-        written.append(render.destination)
+        if _write_text_if_changed(destination, text):
+            written.append(render.destination)
     for link in PACKAGE_LINKS:
-        _replace_with_link(link)
-        written.append(link.destination)
+        if _replace_with_link(link):
+            written.append(link.destination)
     return written
 
 

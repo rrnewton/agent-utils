@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import re
 import sys
 import zipfile
@@ -61,7 +62,7 @@ def test_embed_check_reports_both_staleness_and_lint(
     assert any("sibling package" in error for error in lint_errors)
 
 
-def test_embed_prevalidates_every_input_before_writing(
+def test_embed_generate_prevalidates_and_writes_only_changed_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     docs = _load_script("embed_userguides")
@@ -88,6 +89,21 @@ def test_embed_prevalidates_every_input_before_writing(
         docs.generate()
 
     assert first_destination.read_text(encoding="utf-8") == "leave me alone\n"
+    second_fragment = tmp_path / second.fragment
+    second_fragment.parent.mkdir(parents=True, exist_ok=True)
+    second_fragment.write_text("also valid\n", encoding="utf-8")
+    assert docs.generate() == [first.destination, second.destination]
+    assert first_destination.read_text(encoding="utf-8") == "valid\n"
+
+    old_mtime_ns = 1_600_000_000_000_000_000
+    os.utime(first_destination, ns=(old_mtime_ns, old_mtime_ns))
+
+    assert docs.generate() == []
+    assert first_destination.stat().st_mtime_ns == old_mtime_ns
+
+    first_destination.write_text("stale\n", encoding="utf-8")
+    assert docs.generate() == [first.destination]
+    assert first_destination.read_text(encoding="utf-8") == "valid\n"
 
 
 def test_embed_check_rejects_regular_copy_and_wrong_link_target(
