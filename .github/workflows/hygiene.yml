@@ -1,0 +1,55 @@
+name: hygiene
+
+# THE CHECKS THAT APPLY TO EVERY CHANGE, WITH NO PATH FILTER.
+#
+# `scripts/validate.py` puts these in an ALWAYS-ON group: a consuming project's name can be typed
+# into any file, and a documented default can be broken from either the prose side or the code side,
+# so neither is something a path filter can reason about. That was true locally and false in CI.
+#
+# Every other workflow here is path-routed, which is what makes this repository behave like a
+# collection of independent tools. None of them runs these guards. So a client name reached `main`
+# in `3e2b0ed` and sat there through two more commits: the author's tool-specific workflow was
+# green, and the only thing that would have caught it was a validator run by hand.
+#
+# This is the gap closed. It has no `paths:` on purpose — adding one would reintroduce exactly the
+# assumption these checks exist to refuse — and it is seconds long, so running it on everything
+# costs nothing worth saving.
+#
+# It is deliberately NOT the nightly. The nightly runs the whole contract and answers "is main
+# broken"; this answers "does this change say something it must not", which has to be known before
+# it lands rather than the following morning.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  guards:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Self-test first, in both cases. A guard that has quietly stopped being able to fail is
+      # worse than no guard, because it reports success in the same words.
+      - name: the client-name guard can still fail
+        run: python3 scripts/check_client_names.py --self-test
+
+      - name: no file names a project that consumes this repository
+        run: python3 scripts/check_client_names.py
+
+      - name: the documented-defaults guard can still fail
+        run: python3 scripts/check_documented_defaults.py --self-test
+
+      - name: every documented default still matches the constant behind it
+        run: python3 scripts/check_documented_defaults.py
+
+      # The selector decides what every other workflow and every local run is allowed to skip. If
+      # its own mapping is wrong, everything downstream is wrong quietly.
+      - name: the validation selector cannot silently under-run
+        run: python3 scripts/validate.py --self-test

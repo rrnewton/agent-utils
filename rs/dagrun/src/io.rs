@@ -166,17 +166,17 @@ const STEP_KEYS: [&str; 21] = [
     "timeout",
     "write_domain_guarantee",
     "write_domains",
-    // ⚠️ DECLARED HERE, CONSUMED DOWNSTREAM, NOT BY dagrun. Both are read by
-    // hermit's planner (hermit/scripts/lib/validate_plan.rs):
-    // `requires_host_capability` at :648, driving the HOST-INAPPLICABLE decision
-    // that stops a node claiming a pass on a machine that cannot run it, and
-    // `manifest` at :382. dagrun ignores both by design.
+    // ⚠️ DECLARED HERE, CONSUMED DOWNSTREAM, NOT BY dagrun. Both are read by a
+    // consuming project's own planner, not by anything in this repository:
+    // `requires_host_capability` drives that planner's HOST-INAPPLICABLE
+    // decision, which stops a node claiming a pass on a machine that cannot run
+    // it, and `manifest` names the artifact set. dagrun ignores both by design.
     //
-    // Listed because this schema is CLOSED and closing it without them makes
-    // dagrun REFUSE hermit's real graphs -- measured 2026-08-26, exit 2 on
-    // ci/dag/portable.json ("manifest") and ci/dag/privileged.json
-    // ("requires_host_capability"). Keep this list in step with the Python
-    // edition's STEP_KEYS; the two are asserted identical.
+    // Listed because this schema is CLOSED, and closing it without them made
+    // dagrun REFUSE graphs that were already in use -- measured 2026-08-26,
+    // exit 2 on `manifest` for one real graph and on `requires_host_capability`
+    // for another. Keep this list in step with the Python edition's STEP_KEYS;
+    // the two are asserted identical.
     "manifest",
     "requires_host_capability",
 ];
@@ -219,6 +219,14 @@ fn refuse_unknown_keys(
     // the refusal is byte-identical to the Python edition's sorted list either way.
     let mut unknown = unknown;
     unknown.sort();
+    // BOTH lists, and this one was the half that was missing. `known` was joined in DECLARATION
+    // order while the Python edition joins `sorted(known)`, so the two agreed only for as long as
+    // the Rust array happened to be alphabetical. It stopped being so the moment two fields were
+    // appended to the end of it, and the differential went red on seven checks with the same
+    // twenty-one field names in a different order. The sentence above already claimed this was
+    // handled; now it is.
+    let mut known: Vec<&str> = known.to_vec();
+    known.sort_unstable();
     Err(err(format!(
         "{where_}: unknown field(s) {}. This object's schema is CLOSED, because an ignored field \
          reads exactly like one that took effect. Known fields: {}",
