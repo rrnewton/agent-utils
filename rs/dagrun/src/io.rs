@@ -27,8 +27,8 @@ use serde_json::Value;
 
 use crate::model::{
     graph_structure_violations, resolve_jobs_env, validate_cmdtype_config, write_domain_violations,
-    CmdType, DagConfig, IntentionalSkipReason, ResourceHint, Step, StepClass, WriteDomainGuarantee,
-    WriteDomainPolicy, DEFAULT_JOBS_FLAG,
+    CmdType, DagConfig, DagManifest, IntentionalSkipReason, ResourceHint, Step, StepClass,
+    WriteDomainGuarantee, WriteDomainPolicy, DEFAULT_JOBS_FLAG,
 };
 
 const DEFAULT_MEM_CAP_FLOOR: i64 = 8 * 1024 * 1024 * 1024;
@@ -167,14 +167,13 @@ const STEP_KEYS: [&str; 22] = [
     "timeout",
     "write_domain_guarantee",
     "write_domains",
-    // ⚠️ DECLARED HERE, CONSUMED DOWNSTREAM, NOT BY dagrun. Both are read by a
-    // consuming project's own planner, not by anything in this repository:
-    // `requires_host_capability` drives that planner's HOST-INAPPLICABLE
+    // ⚠️ DECLARED HERE, CONSUMED DOWNSTREAM, NOT BY dagrun.
+    // `requires_host_capability` drives a consuming planner's HOST-INAPPLICABLE
     // decision, which stops a node claiming a pass on a machine that cannot run
-    // it, and `manifest` names the artifact set. dagrun ignores both by design.
+    // it. dagrun ignores it by design.
     //
-    // Listed because this schema is CLOSED, and closing it without them made
-    // dagrun REFUSE graphs that were already in use -- measured 2026-08-26,
+    // Retained because this schema is CLOSED, and closing it without both fields
+    // made dagrun REFUSE graphs that were already in use -- measured 2026-08-26,
     // exit 2 on `manifest` for one real graph and on `requires_host_capability`
     // for another. Keep this list in step with the Python edition's STEP_KEYS;
     // the two are asserted identical.
@@ -194,6 +193,9 @@ const HINT_KEYS: [&str; 8] = [
     "resources",
     "rss_baseline_bytes",
 ];
+
+/// Every key the existing per-step `manifest` object may carry.
+const MANIFEST_KEYS: [&str; 2] = ["category", "lane"];
 
 /// Every key the top-level `write_domain_policy` object may carry. Closed: a misspelled
 /// `require_explicit` turns a fail-closed policy into no policy at all, silently.
@@ -337,6 +339,26 @@ fn opt_str_or_none(
         Some(Value::String(s)) => Ok(Some(s.clone())),
         Some(_) => Err(err(format!("field '{key}' must be a string or null"))),
     }
+}
+
+fn manifest_from(value: Option<&Value>, where_: &str) -> Result<Option<DagManifest>, DagJsonError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let object = as_obj(value, where_)?;
+    refuse_unknown_keys(object, &MANIFEST_KEYS, where_)?;
+    let lane = req_str(object, "lane", where_)?;
+    let category = req_str(object, "category", where_)?;
+    if lane.is_empty() {
+        return Err(err(format!("{where_}.lane: must be non-empty")));
+    }
+    if category.is_empty() {
+        return Err(err(format!("{where_}.category: must be non-empty")));
+    }
+    Ok(Some(DagManifest { lane, category }))
 }
 
 fn opt_int_or_none(
@@ -648,6 +670,7 @@ pub fn dag_from_value(raw: &Value) -> Result<DagConfig, DagJsonError> {
             description: opt_str(sm, "description", "")?,
             cmd: req_str(sm, "cmd", &where_)?,
             cmdtype,
+            manifest: manifest_from(sm.get("manifest"), &format!("{where_}.manifest"))?,
             deps: opt_str_list(sm, "deps")?,
             env: opt_str_str_map(sm, "env", &where_)?,
             hint: hint_from(sm.get("hint"), &format!("{where_}.hint"))?,
@@ -1046,6 +1069,16 @@ fn emit_step(s: &mut String, step: &Step, base: usize) {
             json_str(step.cmdtype.value())
         ));
     }
+    if let Some(manifest) = &step.manifest {
+        s.push_str(&key);
+        s.push_str("\"manifest\": {\n");
+        s.push_str(&" ".repeat(base + 4));
+        s.push_str(&format!("\"lane\": {},\n", json_str(&manifest.lane)));
+        s.push_str(&" ".repeat(base + 4));
+        s.push_str(&format!("\"category\": {}\n", json_str(&manifest.category)));
+        s.push_str(&key);
+        s.push_str("},\n");
+    }
     s.push_str(&key);
     s.push_str("\"deps\": ");
     emit_str_list(s, &step.deps, base + 2);
@@ -1358,9 +1391,47 @@ steps:
         );
         assert_eq!(step.hint.classification, StepClass::Light);
         assert_eq!(step.jobs_flag, None);
+        assert_eq!(step.manifest, None);
         assert!(cfg.resource_caps.is_empty());
         assert_eq!(cfg.mem_cap_factor, 1.25);
         assert_eq!(cfg.default_jobs_flag, "-j");
+    }
+
+    #[test]
+    fn manifest_selection_roundtrips_and_refuses_malformed_values() {
+        let doc = r#"{"steps":[{"group":"e2e","job":"manifest_applications","cmd":"true",
+            "manifest":{"lane":"portable","category":"applications"}}]}"#;
+        let cfg = dag_from_json(doc).unwrap();
+        assert_eq!(
+            cfg.steps[0].manifest,
+            Some(DagManifest {
+                lane: "portable".into(),
+                category: "applications".into(),
+            })
+        );
+        let encoded = dag_to_json(&cfg);
+        assert_eq!(dag_to_json(&dag_from_json(&encoded).unwrap()), encoded);
+
+        for (value, expected) in [
+            (
+                r#"{"lane":"portable"}"#,
+                "manifest: field 'category' must be a string",
+            ),
+            (
+                r#"{"lane":"","category":"applications"}"#,
+                "manifest.lane: must be non-empty",
+            ),
+            (
+                r#"{"lane":"portable","category":"applications","future":"value"}"#,
+                "manifest: unknown field(s) 'future'",
+            ),
+        ] {
+            let input = format!(
+                r#"{{"steps":[{{"group":"e2e","job":"manifest_applications","cmd":"true","manifest":{value}}}]}}"#
+            );
+            let error = dag_from_json(&input).unwrap_err().to_string();
+            assert!(error.contains(expected), "{error}");
+        }
     }
 
     #[test]

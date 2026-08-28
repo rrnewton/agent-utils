@@ -34,6 +34,7 @@ fn step(timeout: i64, cpu_timeout: i64) -> Step {
         description: String::new(),
         cmd: "true".into(),
         cmdtype: dagrun::CmdType::Unknown,
+        manifest: None,
         deps: Vec::new(),
         env: Default::default(),
         hint: Default::default(),

@@ -185,6 +185,14 @@ class ResourceHint:
     measured_cpu_utilization: float | None = None
 
 
+@dataclass(frozen=True)
+class DagManifest:
+    """The manifest cell population selected by one DAG step."""
+
+    lane: str
+    category: str
+
+
 @dataclass
 class Step:
     """One node in the DAG: a shell command plus its dependencies and resource hint."""
@@ -256,6 +264,10 @@ class Step:
     # dependency closure, while independent families continue. None preserves the existing
     # global eager-exit behavior, so existing graphs do not silently become keep-going runs.
     fail_fast_family: str | None = None
+    # Typed manifest selection carried by a manifest bucket step. Consumers use this value
+    # instead of reconstructing the lane and category from ``cmd``. Kept after the established
+    # positional fields so existing programmatic Step(...) calls retain their argument meaning.
+    manifest: DagManifest | None = None
 
     def explains_a_failure_in(self, failed: Container[str]) -> bool:
         """Whether this step is exempt from eager-exit given the set of tags that FAILED.

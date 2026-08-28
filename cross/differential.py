@@ -409,6 +409,7 @@ def representative_fixtures() -> list[Fixture]:
                         "job": "smoke",
                         "desc": "browser smoke",
                         "cmd": "echo e2e",
+                        "manifest": {"lane": "portable", "category": "applications"},
                         "deps": ["build.app"],
                         "hint": {"resources": {"browser": 1}, "classification": "latency-bound"},
                     },
@@ -1302,6 +1303,18 @@ LOADER_REFUSALS: tuple[tuple[str, str, str], ...] = (
         "steps[0].hint: unknown field(s) 'est_duration'",
     ),
     (
+        "incomplete-manifest-selection",
+        '{"steps":[{"group":"a","job":"one","cmd":"true",'
+        '"manifest":{"lane":"portable"}}]}',
+        "steps[0].manifest: field 'category' must be a string",
+    ),
+    (
+        "unknown-manifest-field",
+        '{"steps":[{"group":"a","job":"one","cmd":"true",'
+        '"manifest":{"lane":"portable","category":"applications","future":1}}]}',
+        "steps[0].manifest: unknown field(s) 'future'",
+    ),
+    (
         "unknown-write-domain-policy-field",
         '{"steps":[],"write_domain_policy":{"require_explicits":true}}',
         "write_domain_policy: unknown field(s) 'require_explicits'",
@@ -1353,6 +1366,7 @@ LOADER_ACCEPTANCES: tuple[tuple[str, str], ...] = (
     (
         "every-declared-step-field",
         '{"steps":[{"group":"a","job":"one","desc":"d","description":"long","cmd":"true",'
+        '"manifest":{"lane":"portable","category":"applications"},'
         '"deps":[],"env":{"K":"V"},"networkonly":false,"engine_only":false,"timeout":5,'
         '"cpu_timeout":3,"cmdtype":"generic-with-flag","jobs_flag":"-j","jobs_env":"J","explains":[],'
         '"fail_fast_family":"fam",'
