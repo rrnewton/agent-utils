@@ -103,7 +103,8 @@ a simple command receives them at the end, while a compound command puts an
 unquoted `$DAGRUN_EXTRA_ARGS` where they belong. A compound command without that
 placement is refused. `-j3` is one shell word;
 `--jobs 3` is two, and quoting the variable would turn those two arguments into
-one, so dagrun refuses that quoted multi-word form. The valid values are
+one, so dagrun refuses that double-quoted multi-word form; single quotes prevent
+expansion and are also refused. The valid values are
 `unknown` (default), `make`, `cargo-build`, `cargo-test`, `cargo-nextest`,
 `generic-dash-j-command`, and `generic-with-flag`. The last requires a
 step-level `jobs_flag`. Under `unknown`, `DAGRUN_EXTRA_ARGS` is absent and the

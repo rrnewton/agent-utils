@@ -347,13 +347,15 @@ two, so an unquoted `$DAGRUN_EXTRA_ARGS` expands and word-splits into the two
 arguments `--jobs` and `3`. Quoting it as `"$DAGRUN_EXTRA_ARGS"` suppresses word
 splitting and would pass the single wrong argument `--jobs 3`; dagrun refuses
 that quoted form before any step starts for every command type whose value has
-multiple words. A quoted one-word value such as `-j3` remains one argument.
+multiple words. Double-quoting a one-word value such as `-j3` still passes one
+correct argument. Single quotes prevent variable expansion entirely and are
+always refused when they surround `DAGRUN_EXTRA_ARGS`.
 `generic-with-flag` requires a non-empty step-level `jobs_flag`; other known
 values refuse a simultaneous non-empty `jobs_flag` rather than silently choosing
 between two command-line descriptions.
 
-Empty or whitespace-only effective flag **and** environment channels prevent
-rewriting; paired with a positive `preferred_inner_jobs`, that
+Under `cmdtype: unknown`, empty or whitespace-only effective flag **and**
+environment channels prevent rewriting; paired with a positive `preferred_inner_jobs`, that
 declares a self-managed fixed command width. If that declared width
 exceeds the run budget, the run is refused before any DAG step process is
 created because silently throttling (for example) a hardcoded `make -j32`
