@@ -66,6 +66,7 @@ from dagrun.model import (
     DAGRUN_EXTRA_ARGS_ENV,
     DEFAULT_STEP_TIMEOUT,
     WALL_CPU_BACKSTOP_FACTOR,
+    DagManifest,
     DagConfig,
     CmdType,
     ResourceHint,
@@ -143,6 +144,7 @@ __all__ = [
     "is_enforced",
     # DAG model
     "Step",
+    "DagManifest",
     "CmdType",
     "StepClass",
     "ResourceHint",
