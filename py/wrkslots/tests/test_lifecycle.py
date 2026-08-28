@@ -15,6 +15,7 @@ import pytest
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 PY_ROOT = PACKAGE_ROOT.parent
 WRKSLOTS = PACKAGE_ROOT / "__main__.py"
+COMPATIBILITY_COMMAND = PY_ROOT / "wrkslots.py"
 sys.path.insert(0, str(PY_ROOT))
 from wrkslots import cli as wrkslots  # noqa: E402
 
@@ -2111,6 +2112,114 @@ def test_configuration_from_an_older_build_is_dead_until_repaired(tmp_path: Path
     assert current["machine"] == stale["machine"]
     assert current["worktrees_dir"] == stale["worktrees_dir"]
     assert current["heartbeat_ttl_seconds"] == stale["heartbeat_ttl_seconds"]
+
+
+def test_empty_state_from_an_older_build_is_dead_until_repaired(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    active_path = project / "worktrees" / "ACTIVE.testhost.json"
+    archive_path = project / "worktrees" / "ARCHIVED.testhost.json"
+    for path in (active_path, archive_path):
+        state = json.loads(path.read_text(encoding="utf-8"))
+        state["schema"] = 1
+        path.write_text(
+            json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+
+    refused = command(project, "status", "--all-machines", "--format", "json")
+    assert refused.returncode == 3
+    assert "unsupported active state schema" in refused.stderr
+    assert refused.stdout == ""
+
+    repaired = _repair(project)
+    assert repaired.returncode == 0, repaired.stderr
+    assert f"REPAIRED {active_path}: schema 1 -> {wrkslots.SCHEMA}" in repaired.stdout
+    assert f"REPAIRED {archive_path}: schema 1 -> {wrkslots.SCHEMA}" in repaired.stdout
+
+    healthy = command(project, "status", "--all-machines", "--format", "json")
+    assert healthy.returncode == 0, healthy.stderr
+    assert json.loads(healthy.stdout)["active"] == []
+    assert json.loads(active_path.read_text(encoding="utf-8"))["schema"] == wrkslots.SCHEMA
+    assert json.loads(archive_path.read_text(encoding="utf-8"))["schema"] == wrkslots.SCHEMA
+
+
+def test_state_repair_refuses_non_empty_state_without_changes(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    active_path = project / "worktrees" / "ACTIVE.testhost.json"
+    archive_path = project / "worktrees" / "ARCHIVED.testhost.json"
+    active = json.loads(active_path.read_text(encoding="utf-8"))
+    active["schema"] = 1
+    active["revision"] = 1
+    active_path.write_text(
+        json.dumps(active, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    archive_path.write_text('{"schema": 1}\n', encoding="utf-8")
+    before_active = active_path.read_bytes()
+    before_archive = archive_path.read_bytes()
+
+    refused = _repair(project)
+
+    assert refused.returncode == 3
+    assert "cannot repair non-empty active state" in refused.stderr
+    assert active_path.read_bytes() == before_active
+    assert archive_path.read_bytes() == before_archive
+    status = command(project, "status", "--all-machines", "--format", "json")
+    assert status.returncode == 3
+    assert status.stdout == ""
+
+
+def test_state_repair_refuses_a_malformed_file_without_reporting_empty(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    active_path = project / "worktrees" / "ACTIVE.testhost.json"
+    active_path.write_text('{"schema": 1}\n', encoding="utf-8")
+    before = active_path.read_bytes()
+
+    refused = _repair(project)
+
+    assert refused.returncode == 3
+    assert "active state has invalid fields" in refused.stderr
+    assert active_path.read_bytes() == before
+    status = command(project, "status", "--all-machines", "--format", "json")
+    assert status.returncode == 3
+    assert "active state has invalid fields" in status.stderr
+    assert status.stdout == ""
+
+
+def test_repair_updates_the_pre_packaging_control_symlink(tmp_path: Path) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    link = project / "worktrees" / "wrkslots"
+    source_alias = tmp_path / "agent-utils"
+    source_alias.symlink_to(PY_ROOT.parent, target_is_directory=True)
+    old_command_path = source_alias / "py" / "wrkslots.py"
+    old_target = Path(os.path.relpath(old_command_path, start=link.parent))
+    link.unlink()
+    link.symlink_to(old_target)
+    old_command = subprocess.run(
+        [str(link), "--version"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert old_command.returncode == 0, old_command.stderr
+    assert old_command.stdout.strip() == "wrkslots 0.4.1"
+
+    repaired = _repair(project)
+
+    assert repaired.returncode == 0, repaired.stderr
+    assert f"REPAIRED {link}:" in repaired.stdout
+    assert link.resolve() == WRKSLOTS.resolve()
+    status = subprocess.run(
+        [str(link), "--project-root", str(project), "status", "--all-machines"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert status.returncode == 0, status.stderr
 
 
 def test_repair_refuses_to_relocate_live_state_and_lists_every_conflict(

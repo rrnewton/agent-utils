@@ -28,6 +28,11 @@ hand.
 Run `wrkslots quickstart` for copyable commands and `wrkslots COMMAND --help` for the exact inputs
 and effects of one operation.
 
+A configuration written by an older build makes normal commands refuse. `init --repair` can add
+compatible configuration fields, upgrade the exact empty schema-1 active and archive files, and
+replace the repository command symlink written before packaging. It refuses populated, malformed,
+or other unsupported state rather than reporting an empty or partial slot list.
+
 ## Registered running command
 
 `init --liveness-command PATH` records an executable path relative to the project root. During

@@ -54,7 +54,9 @@ only for the matching `--repo NAME=...` checkout.
 
 A configuration written by an older build that lacks required fields makes commands refuse.
 `init --repair` adds compatible fields and prints every change, but must not be used to reinterpret
-populated nested storage as flat storage.
+populated nested storage as flat storage. It also upgrades the exact empty schema-1 active and
+archive files and the repository command symlink written before packaging. It refuses populated,
+malformed, or other unsupported state rather than reporting an empty or partial slot list.
 
 ## Create and recover provisioning
 

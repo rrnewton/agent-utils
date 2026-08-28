@@ -6,7 +6,7 @@ from __future__ import annotations
 import os
 import sys
 
-_PKG_PARENT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_PKG_PARENT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 if _PKG_PARENT not in sys.path:
     sys.path.insert(0, _PKG_PARENT)
 

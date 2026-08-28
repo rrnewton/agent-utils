@@ -1557,6 +1557,84 @@ def _archive_to_obj(state: ArchiveState) -> dict[str, object]:
     }
 
 
+def _empty_state_repair_payload(
+    path: Path, label: str, machine: str, rows_field: str
+) -> dict[str, object] | None:
+    raw = _as_mapping(_read_json(path, label), label)
+    _exact_keys(raw, {"schema", "machine", "revision", rows_field}, set(), label)
+    schema = _as_int(raw["schema"], f"{label}.schema")
+    if schema == SCHEMA:
+        return None
+    if schema != 1:
+        raise StateError(f"unsupported {label} schema in {path}")
+    actual_machine = _as_str(raw["machine"], f"{label}.machine")
+    if actual_machine != machine:
+        raise StateError(
+            f"{label} machine mismatch: filename says {machine}, content says "
+            f"{actual_machine}"
+        )
+    revision = _as_int(raw["revision"], f"{label}.revision")
+    rows = _as_list(raw[rows_field], f"{label}.{rows_field}")
+    if revision != 0 or rows:
+        raise StateError(
+            f"cannot repair non-empty {label} written with schema 1 in {path}"
+        )
+    return {
+        "schema": SCHEMA,
+        "machine": machine,
+        "revision": 0,
+        rows_field: [],
+    }
+
+
+def _repair_empty_state_from_schema_one(config: Config) -> None:
+    active_path = _active_path(config)
+    archive_path = _archive_path(config)
+    active_payload = (
+        _empty_state_repair_payload(
+            active_path, "active state", config.machine, "slots"
+        )
+        if active_path.exists() or active_path.is_symlink()
+        else None
+    )
+    archive_payload = (
+        _empty_state_repair_payload(
+            archive_path, "archive state", config.machine, "records"
+        )
+        if archive_path.exists() or archive_path.is_symlink()
+        else None
+    )
+
+    # Validate both durable files before rewriting either one. A malformed
+    # current file must not leave the pair half-repaired.
+    if active_payload is None and (active_path.exists() or active_path.is_symlink()):
+        _load_active(config)
+    if archive_payload is None and (
+        archive_path.exists() or archive_path.is_symlink()
+    ):
+        _load_archive(config)
+
+    for path, payload in (
+        (active_path, active_payload),
+        (archive_path, archive_payload),
+    ):
+        if payload is None:
+            continue
+        _atomic_write_json(path, payload)
+        print(f"REPAIRED {path}: schema 1 -> {SCHEMA}")
+
+
+def _atomic_replace_symlink(path: Path, target: Path) -> None:
+    temporary = path.parent / f".{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+    try:
+        temporary.symlink_to(target)
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    finally:
+        if temporary.is_symlink():
+            temporary.unlink()
+
+
 def _state_files(config: Config) -> list[tuple[str, Path]]:
     result: list[tuple[str, Path]] = []
     pattern = re.compile(r"^ACTIVE\.(?P<machine>[A-Za-z0-9][A-Za-z0-9._-]{0,63})\.json$")
@@ -3119,6 +3197,8 @@ def _cmd_init(args: argparse.Namespace) -> int:
     with _mutation_locks(config, args.wait_lock):
         _recover_partial_updates(config, True)
         _refuse_partial_state(config)
+        if args.repair:
+            _repair_empty_state_from_schema_one(config)
         active_path = _active_path(config)
         if active_path.exists() or active_path.is_symlink():
             _load_active(config)
@@ -3137,9 +3217,20 @@ def _cmd_init(args: argparse.Namespace) -> int:
         if link.exists() or link.is_symlink():
             if not link.is_symlink():
                 raise Refusal(f"control path exists and is not a symlink: {link}")
-            if Path(os.readlink(link)) != relative_target:
+            existing_target = Path(os.readlink(link))
+            previous_executable = executable.parent.with_suffix(".py")
+            existing_executable = (link.parent / existing_target).resolve()
+            if (
+                args.repair
+                and previous_executable.is_file()
+                and not previous_executable.is_symlink()
+                and existing_executable == previous_executable
+            ):
+                _atomic_replace_symlink(link, relative_target)
+                print(f"REPAIRED {link}: {existing_target} -> {relative_target}")
+            elif existing_target != relative_target:
                 raise Refusal(
-                    f"control symlink points elsewhere: {link} -> {os.readlink(link)}"
+                    f"control symlink points elsewhere: {link} -> {existing_target}"
                 )
         else:
             link.symlink_to(relative_target)
@@ -6702,9 +6793,9 @@ Exit status: 0 success, 2 command-line usage, 3 fail-closed refusal.
     init.add_argument(
         "--repair",
         action="store_true",
-        help="migrate a configuration written by an older build: add missing "
-        "fields and bump the schema, refusing any field that already has a "
-        "conflicting value",
+        help="migrate files written by an older build: repair compatible "
+        "configuration, exact empty schema-1 machine state, and the previous "
+        "repository command symlink; refuse conflicting or populated state",
     )
     init.set_defaults(handler=_cmd_init)
 

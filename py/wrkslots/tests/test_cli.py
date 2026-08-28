@@ -8,6 +8,7 @@ from pathlib import Path
 
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+COMPATIBILITY_COMMAND = PACKAGE_ROOT.parent / "wrkslots.py"
 
 
 def _run(*args: str) -> subprocess.CompletedProcess[str]:
@@ -28,6 +29,19 @@ def test_quickstart_teaches_the_normal_lifecycle() -> None:
         assert f"wrkslots {command}" in completed.stdout
     assert "--remote product=upstream" in completed.stdout
     assert "--remote-url product=URL" in completed.stdout
+
+
+def test_pre_packaging_repository_command_still_runs() -> None:
+    completed = subprocess.run(
+        [sys.executable, str(COMPATIBILITY_COMMAND), "--version"],
+        cwd=PACKAGE_ROOT.parent,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "wrkslots 0.4.1"
 
 
 def test_every_command_help_explains_effect_and_inputs() -> None:
