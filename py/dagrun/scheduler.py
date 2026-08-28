@@ -119,6 +119,12 @@ _LOOP_SLEEP_S = 0.05
 #: Per-step monitor poll interval (seconds) for descendant-thread-peak sampling.
 _MONITOR_INTERVAL_S = 1.0
 
+# Public CLI policy permits 50 ms through 10 s. Keep the library defensive as well: callers can
+# bypass argparse, and a zero/negative interval would turn the monitor into a busy loop while an
+# enormous interval would defeat the feature's purpose.
+MIN_PROFILE_TIMESERIES_INTERVAL_S = 0.05
+MAX_PROFILE_TIMESERIES_INTERVAL_S = 10.0
+
 #: Grace period to wait for a process to die after a timeout-triggered reap (seconds).
 _POST_TIMEOUT_WAIT_S = 10.0
 
@@ -230,6 +236,80 @@ def _cpu_seconds_from_stats(stats: Mapping[str, int]) -> float | None:
     """
     usage_usec = stats.get("usage_usec")
     return None if usage_usec is None else usage_usec / 1_000_000
+
+
+def _step_timeseries_sample(
+    *,
+    step: str,
+    inner_jobs: int,
+    sample_index: int,
+    sample_kind: str,
+    elapsed_s: float,
+    cpu_stats: Mapping[str, int] | None,
+    thread_count: int | None,
+    previous_elapsed_s: float | None,
+    previous_cpu_stats: Mapping[str, int] | None,
+) -> dict[str, object]:
+    """Build one cgroup CPU trace sample without inventing measurements.
+
+    ``cpu.stat`` values are cumulative. Rates therefore use the actual monotonic interval and
+    consecutive counter deltas; a missing counter, a missing baseline, or a counter reset leaves
+    that derived cell blank. A real zero delta remains the measured number zero.
+    """
+
+    row: dict[str, object] = {
+        "step": step,
+        "inner_jobs": inner_jobs,
+        "sample_index": sample_index,
+        "sample_kind": sample_kind,
+        "elapsed_s": f"{max(elapsed_s, 0.0):.6f}",
+        "interval_s": "",
+        "cpu_usage_s": "",
+        "user_s": "",
+        "sys_s": "",
+        "effective_cores": "",
+        "user_cores": "",
+        "system_cores": "",
+        "throttled_s": "",
+        "interval_throttled_s": "",
+        "thread_count": "" if thread_count is None else thread_count,
+    }
+    for source, target in (
+        ("usage_usec", "cpu_usage_s"),
+        ("user_usec", "user_s"),
+        ("system_usec", "sys_s"),
+        ("throttled_usec", "throttled_s"),
+    ):
+        if cpu_stats is not None and source in cpu_stats:
+            row[target] = f"{cpu_stats[source] / 1_000_000.0:.6f}"
+
+    if previous_elapsed_s is None:
+        return row
+    interval_s = elapsed_s - previous_elapsed_s
+    if interval_s <= 0.0:
+        return row
+    row["interval_s"] = f"{interval_s:.6f}"
+    if cpu_stats is None or previous_cpu_stats is None:
+        return row
+
+    for source, target, scale in (
+        ("usage_usec", "effective_cores", interval_s * 1_000_000.0),
+        ("user_usec", "user_cores", interval_s * 1_000_000.0),
+        ("system_usec", "system_cores", interval_s * 1_000_000.0),
+        ("throttled_usec", "interval_throttled_s", 1_000_000.0),
+    ):
+        current = cpu_stats.get(source)
+        previous = previous_cpu_stats.get(source)
+        if current is None or previous is None or current < previous:
+            continue
+        row[target] = (
+            f"{(current - previous) / scale:.4f}"
+            if target.endswith("cores")
+            else f"{(current - previous) / scale:.6f}"
+        )
+    return row
+
+
 #: Rendered for a capacity lookup that found NOTHING. A distinct token, never a value, because
 #: ``.get(r, 0)`` FUSES "not declared" with "declared as 0" and that fusion is the whole defect
 #: class here: an undeclared ``resource_caps`` entry reads identically to a deliberate
@@ -443,6 +523,11 @@ class _NoopMetricsSink:
     ) -> str | None:
         return None
 
+    def record_step_timeseries(
+        self, rows: Sequence[Mapping[str, object]], *, jobs: int
+    ) -> str | None:
+        return None
+
 
 class _NoopCgroupManager:
     """The default :class:`CgroupManager` used when the caller passes ``cgroups=None``.
@@ -524,6 +609,7 @@ class Runner:
         verbosity: int = 1,
         order: Sequence[str] | None = None,
         run_timeout_s: int | None = None,
+        profile_timeseries_interval_s: float | None = None,
     ) -> None: ...
 
     @overload
@@ -539,6 +625,7 @@ class Runner:
         verbosity: int = 1,
         order: Sequence[str] | None = None,
         run_timeout_s: int | None = None,
+        profile_timeseries_interval_s: float | None = None,
     ) -> None: ...
 
     @overload
@@ -554,6 +641,7 @@ class Runner:
         verbosity: int = 1,
         order: Sequence[str] | None = None,
         run_timeout_s: int | None = None,
+        profile_timeseries_interval_s: float | None = None,
     ) -> None: ...
 
     def __init__(
@@ -568,7 +656,20 @@ class Runner:
         verbosity: int = 1,
         order: Sequence[str] | None = None,
         run_timeout_s: int | None = None,
+        profile_timeseries_interval_s: float | None = None,
     ) -> None:
+        if profile_timeseries_interval_s is not None and not (
+            MIN_PROFILE_TIMESERIES_INTERVAL_S
+            <= profile_timeseries_interval_s
+            <= MAX_PROFILE_TIMESERIES_INTERVAL_S
+        ):
+            raise ValueError(
+                "profile_timeseries_interval_s must be between "
+                f"{MIN_PROFILE_TIMESERIES_INTERVAL_S:g} and "
+                f"{MAX_PROFILE_TIMESERIES_INTERVAL_S:g} seconds"
+            )
+        if profile_timeseries_interval_s is not None and not cgroups.enabled:
+            raise ValueError("time-series profiling requires active cgroup-v2 containment")
         self.max_cpus = _resolve_max_cpus_argument(max_cpus, cpu_jobs)
         validate_jobs_env_config(cfg)
         validate_cmdtype_config(cfg)
@@ -631,6 +732,8 @@ class Runner:
         self.retired: set[str] = set()
         self.aborted: set[str] = set()  # tags killed by eager-exit (labelled ABORTED, not FAIL)
         self.step_profile_rows: list[Mapping[str, object]] = []
+        self.step_timeseries_rows: list[Mapping[str, object]] = []
+        self.profile_timeseries_interval_s = profile_timeseries_interval_s
         self.failed = False  # a genuine (non-aborted) step failed
         # Global eager-exit remains the compatibility default for a failed step without a family.
         self.stop = False
@@ -1300,8 +1403,9 @@ class Runner:
         wall_budget = resolved_wall_timeout(
             step, self.cfg.default_step_timeout, self.cfg.cpu_timeout_multiplier
         )
+        trace_started = time.monotonic()
         start = time.time()
-        started_offset_s = time.monotonic() - self.run_origin_monotonic
+        started_offset_s = trace_started - self.run_origin_monotonic
         stream = self.verbosity >= 2
         timed_out = False
         cpu_timed_out = False
@@ -1492,6 +1596,67 @@ class Runner:
 
         monitor_stop = threading.Event()
         thread_peak: int | None = None
+        trace_sample_index = 0
+        trace_previous_elapsed_s: float | None = None
+        trace_previous_cpu_stats: Mapping[str, int] | None = None
+        trace_warning_emitted = False
+        trace_finalized = False
+        trace_state_lock = threading.Lock()
+
+        def _capture_timeseries_sample(sample_kind: str) -> None:
+            """Capture one best-effort trace point without weakening the CPU-time guard."""
+
+            nonlocal trace_sample_index, trace_previous_elapsed_s
+            nonlocal trace_previous_cpu_stats, trace_warning_emitted, trace_finalized, thread_peak
+            if self.profile_timeseries_interval_s is None:
+                return
+            elapsed_s = time.monotonic() - trace_started
+            sample_error: Exception | None = None
+            try:
+                stats = self.cgroups.cpu_stats(step.tag)
+                count = self.cgroups.thread_count(step.tag)
+            except Exception as exc:
+                # Profiling is evidence, not execution authority. A broken optional sample must
+                # be visible, but must not kill the monitor thread that enforces CPU-time limits.
+                # Preserve the scheduled point with blank measurements so a read failure cannot
+                # silently erase the mandatory start/final boundary or imply a zero delta.
+                sample_error = exc
+                stats = None
+                count = None
+            with trace_state_lock:
+                # A cgroup read can theoretically outlive the bounded monitor join. Once the
+                # synchronous boundary sample commits, discard any late periodic result so
+                # ``final`` remains the last row and the delta state cannot race.
+                if trace_finalized and sample_kind != "final":
+                    return
+                if sample_kind == "final":
+                    trace_finalized = True
+                if sample_error is not None and not trace_warning_emitted:
+                    trace_warning_emitted = True
+                    _warn(
+                        f"step {step.tag!r}: time-series sample unavailable ({sample_error}); "
+                        "continuing the step without inventing data"
+                    )
+                # Match the ordinary peak semantics: the pre-work baseline is not evidence of
+                # work-time concurrency. Periodic and final observations do contribute.
+                if count is not None and sample_kind != "start":
+                    thread_peak = count if thread_peak is None else max(thread_peak, count)
+                row = _step_timeseries_sample(
+                    step=step.tag,
+                    inner_jobs=resolve_effective_inner_jobs(profile_inner_jobs),
+                    sample_index=trace_sample_index,
+                    sample_kind=sample_kind,
+                    elapsed_s=elapsed_s,
+                    cpu_stats=stats,
+                    thread_count=count,
+                    previous_elapsed_s=trace_previous_elapsed_s,
+                    previous_cpu_stats=trace_previous_cpu_stats,
+                )
+                with self.lock:
+                    self.step_timeseries_rows.append(row)
+                trace_sample_index += 1
+                trace_previous_elapsed_s = elapsed_s
+                trace_previous_cpu_stats = None if stats is None else dict(stats)
 
         def _monitor() -> None:
             # THE MONITOR IS THE ONLY ENFORCER of the per-step CPU-time budget. If it dies, the
@@ -1520,7 +1685,29 @@ class Runner:
             nonlocal thread_peak, cpu_timed_out, termination_culprit
             # One-shot, so an unmeasurable budget is stated once per step, not once per tick.
             unmeasurable_warned = False
-            while not monitor_stop.wait(_MONITOR_INTERVAL_S):
+            now = time.monotonic()
+            next_guard_deadline = now + _MONITOR_INTERVAL_S
+            trace_interval = self.profile_timeseries_interval_s
+            next_trace_deadline = (
+                now + trace_interval if trace_interval is not None else float("inf")
+            )
+            while True:
+                deadline = min(next_guard_deadline, next_trace_deadline)
+                if monitor_stop.wait(max(0.0, deadline - time.monotonic())):
+                    return
+                now = time.monotonic()
+                if trace_interval is not None and now >= next_trace_deadline:
+                    _capture_timeseries_sample("periodic")
+                    # Advance from the absolute schedule rather than from the end of the read.
+                    # A slow sample therefore exposes a long actual interval instead of drifting
+                    # every later point, and missed ticks are not emitted as fake catch-up rows.
+                    now = time.monotonic()
+                    skipped = int((now - next_trace_deadline) // trace_interval) + 1
+                    next_trace_deadline += skipped * trace_interval
+                if now < next_guard_deadline:
+                    continue
+                skipped_guards = int((now - next_guard_deadline) // _MONITOR_INTERVAL_S) + 1
+                next_guard_deadline += skipped_guards * _MONITOR_INTERVAL_S
                 count = self.cgroups.thread_count(step.tag)
                 if count is not None:
                     thread_peak = count if thread_peak is None else max(thread_peak, count)
@@ -1584,6 +1771,7 @@ class Runner:
                     reap(proc, self.cgroups, step.tag, nonce=nonce)
                     return
 
+        _capture_timeseries_sample("start")
         reader = threading.Thread(target=_pump, daemon=True)
         monitor = threading.Thread(target=_monitor, daemon=True)
         reader.start()
@@ -1627,6 +1815,11 @@ class Runner:
         # Reap the whole process group so any orphan grandchildren are SIGKILLed now instead
         # of leaking into later steps (and this lets the abandoned reader finally see EOF).
         reap(proc, self.cgroups, step.tag, nonce=nonce)
+
+        # A periodic timer can miss an arbitrarily short final phase. Sample synchronously after
+        # the process tree is quiescent and BEFORE cleanup destroys the counters; this also gives
+        # a sub-interval step a useful start/final pair.
+        _capture_timeseries_sample("final")
 
         # Read the step's cgroup measurements BEFORE cleanup() rmdirs the child cgroup.
         # memory_events is read once and oom is taken from it, so the OOM count and the
@@ -1890,6 +2083,7 @@ class Runner:
             not_launched=not_launched,
             intentional_skips=self.intentional_skips,
             step_profile_rows=tuple(self.step_profile_rows),
+            step_timeseries_rows=tuple(self.step_timeseries_rows),
             run_timed_out=self.run_timed_out,
             max_concurrent_steps=self.max_concurrent_steps,
         )
@@ -1928,6 +2122,7 @@ def run_dag(
     order: Sequence[str] | None = None,
     core_budget: int | None = None,
     run_timeout_s: int | None = None,
+    profile_timeseries_interval_s: float | None = None,
 ) -> RunResult:
     """Run a whole DAG and return its :class:`RunResult`.
 
@@ -1947,6 +2142,7 @@ def run_dag(
         verbosity=verbosity,
         order=order,
         run_timeout_s=run_timeout_s,
+        profile_timeseries_interval_s=profile_timeseries_interval_s,
     )
 
 
@@ -1963,6 +2159,7 @@ def run_dag_limited(
     verbosity: int = 1,
     order: Sequence[str] | None = None,
     run_timeout_s: int | None = None,
+    profile_timeseries_interval_s: float | None = None,
 ) -> RunResult:
     """Type signature accepting the canonical per-step-width keyword."""
 
@@ -1982,6 +2179,7 @@ def run_dag_limited(
     verbosity: int = 1,
     order: Sequence[str] | None = None,
     run_timeout_s: int | None = None,
+    profile_timeseries_interval_s: float | None = None,
 ) -> RunResult:
     """Type signature accepting matching canonical and compatibility keywords."""
 
@@ -2001,6 +2199,7 @@ def run_dag_limited(
     verbosity: int = 1,
     order: Sequence[str] | None = None,
     run_timeout_s: int | None = None,
+    profile_timeseries_interval_s: float | None = None,
 ) -> RunResult:
     """Type signature accepting the compatibility per-step-width keyword."""
 
@@ -2019,6 +2218,7 @@ def run_dag_limited(
     verbosity: int = 1,
     order: Sequence[str] | None = None,
     run_timeout_s: int | None = None,
+    profile_timeseries_interval_s: float | None = None,
 ) -> RunResult:
     """Run a DAG with independent active-step and per-step CPU-width limits.
 
@@ -2050,6 +2250,9 @@ def run_dag_limited(
         FAIL CLOSED: if any step may run as long as the whole run, this refuses to start, because
         a bound whose breach cannot be attributed to a node reads like enforcement without being
         usable as one.
+    :param profile_timeseries_interval_s: opt-in cgroup CPU sampling interval. Requires active
+        cgroup-v2 containment. Samples remain in :class:`RunResult` and a supplied metrics sink
+        writes them separately from the aggregate profile rows.
     """
     # FIRST, before anything walks the graph. The loader already refuses these, so this is the
     # door a LIBRARY caller comes through with a hand-built DagConfig -- and a cycle reaching the
@@ -2106,6 +2309,13 @@ def run_dag_limited(
             return RunResult(ok=False, wall_s=0.0)
     sink: MetricsSink = metrics if metrics is not None else _NoopMetricsSink()
     manager: CgroupManager = cgroups if cgroups is not None else _NoopCgroupManager()
+    if profile_timeseries_interval_s is not None and not manager.enabled:
+        print(
+            "[scheduler] ERROR: time-series profiling requires active cgroup-v2 containment; "
+            "no step was started",
+            file=sys.stderr,
+        )
+        return RunResult(ok=False, wall_s=0.0)
     if cgroups is not None and not cgroups.enabled:
         # A supplied manager represents requested containment, so expose degraded enforcement.
         _warn(
@@ -2129,6 +2339,7 @@ def run_dag_limited(
         verbosity=verbosity,
         order=order,
         run_timeout_s=run_timeout_s,
+        profile_timeseries_interval_s=profile_timeseries_interval_s,
     )
     window: RunWindow = sink.start_run_window()
     ok = runner.run()
@@ -2156,6 +2367,17 @@ def run_dag_limited(
             f"metrics sink recorded no location for {len(result.step_profile_rows)} step "
             "profile row(s); the rows may have been dropped."
         )
+    if result.step_timeseries_rows:
+        trace_location = sink.record_step_timeseries(
+            result.step_timeseries_rows, jobs=max(1, max_steps)
+        )
+        if metrics is not None and trace_location is None:
+            _warn(
+                f"metrics sink recorded no location for {len(result.step_timeseries_rows)} "
+                "step time-series row(s); the rows may have been dropped."
+            )
+        elif trace_location is not None:
+            print(f"[scheduler] step time-series written to {trace_location}", file=sys.stderr)
     return result
 
 

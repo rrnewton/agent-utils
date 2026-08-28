@@ -135,6 +135,11 @@ writes; the command always reports the files it appended. The raw store, not
 the authored DAG, is the source of learned scaling data. Every successful
 profiling-enabled sweep atomically refreshes a deterministic machine/container-specific
 `scaling_model_*.json` sidecar beside it; that cache can be rebuilt at any time.
+For a view of parallelism within a step, `run` and `sweep` accept the opt-in
+`--profile-timeseries DURATION` sampler (50ms through 10s). It requires active
+cgroup-v2 containment and writes CPU/thread traces under
+`<profile-dir>/traces/<run_id>.csv`; those high-volume rows are diagnostic data,
+not independent trials consumed by the scaling estimator.
 Sweep rows and the sidecar carry a command-shape digest, and summaries retain
 separate reservoirs per digest, so identified old command data is never mixed
 into the current curve (blank pre-digest rows are a compatibility fallback only).

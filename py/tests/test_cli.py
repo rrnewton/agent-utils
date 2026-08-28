@@ -770,8 +770,9 @@ def test_target_sweep_completes_pass_one_in_topological_order(
         verbosity: int,
         *,
         vary_width: bool = True,
+        profile_timeseries_interval_s: float | None = None,
     ) -> cli._SweepMeasure:
-        del cfg, cgroups, metrics, verbosity
+        del cfg, cgroups, metrics, verbosity, profile_timeseries_interval_s
         calls.append((step.tag, inner_jobs, vary_width))
         return cli._SweepMeasure(1.0, 1.0, 0.0, 1024, True)
 
@@ -824,8 +825,9 @@ def test_target_sweep_starts_a_second_cumulative_pass_and_finishes_it(
         verbosity: int,
         *,
         vary_width: bool = True,
+        profile_timeseries_interval_s: float | None = None,
     ) -> cli._SweepMeasure:
-        del step, cfg, cgroups, metrics, verbosity, vary_width
+        del step, cfg, cgroups, metrics, verbosity, vary_width, profile_timeseries_interval_s
         calls.append(inner_jobs)
         return cli._SweepMeasure(1.0, 1.0, 0.0, None, True)
 
@@ -889,8 +891,9 @@ def test_target_sweep_characterizes_a_fixed_node_only_once(
         verbosity: int,
         *,
         vary_width: bool = True,
+        profile_timeseries_interval_s: float | None = None,
     ) -> cli._SweepMeasure:
-        del cfg, cgroups, metrics, verbosity
+        del cfg, cgroups, metrics, verbosity, profile_timeseries_interval_s
         calls.append((step.tag, inner_jobs, vary_width))
         return cli._SweepMeasure(1.0, 1.0, 0.0, None, True)
 
@@ -992,8 +995,9 @@ def test_target_sweep_refines_sparse_explicit_widths(
         verbosity: int,
         *,
         vary_width: bool = True,
+        profile_timeseries_interval_s: float | None = None,
     ) -> cli._SweepMeasure:
-        del step, cfg, cgroups, metrics, verbosity, vary_width
+        del step, cfg, cgroups, metrics, verbosity, vary_width, profile_timeseries_interval_s
         calls.append(inner_jobs)
         return cli._SweepMeasure(1.0, 1.0, 0.0, None, True)
 

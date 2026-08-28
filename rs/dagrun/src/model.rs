@@ -1641,6 +1641,9 @@ pub struct RunResult {
     /// Per-step measurement rows (column -> value) to forward to a metrics sink; empty when no
     /// cgroup manager supplied per-step metrics.
     pub step_profile_rows: Vec<BTreeMap<String, String>>,
+    /// Opt-in per-step CPU/thread samples, ordered by step completion and then sample index.
+    /// Empty when time-series profiling was not requested.
+    pub step_timeseries_rows: Vec<BTreeMap<String, String>>,
     /// The WHOLE RUN hit an outer wall or CPU budget, or lost required CPU accounting, and was
     /// cut short.
     ///

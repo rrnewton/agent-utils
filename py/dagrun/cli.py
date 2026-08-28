@@ -83,6 +83,8 @@ from dagrun.profile_enrich import container_core_budget
 from dagrun.protocols import CgroupManager, MetricsSink, RunWindow, StepOutcome
 from dagrun.reservation import Reservation
 from dagrun.scheduler import (
+    MAX_PROFILE_TIMESERIES_INTERVAL_S,
+    MIN_PROFILE_TIMESERIES_INTERVAL_S,
     _self_managed_width_error,
     cap_config_max_cpus,
     nested_run_refusal,
@@ -124,6 +126,28 @@ MAX_RUN_CPUS = (2**63 - 1) // 100_000
 MAX_RUN_CPU_JOBS = MAX_RUN_CPUS
 # Hard bound on config objects materialized by --stress before any graph expansion occurs.
 MAX_STRESS_GENERATED_NODES = 100_000
+
+
+def _parse_profile_timeseries_duration(raw: str) -> float:
+    """Parse the opt-in sampling interval, bounded to a useful and safe range."""
+
+    try:
+        seconds = parse_target_duration(raw)
+    except ValueError:
+        raise ValueError(
+            f"invalid --profile-timeseries {raw!r}: expected seconds or an ms/s/m/h suffix"
+        ) from None
+    if not (
+        MIN_PROFILE_TIMESERIES_INTERVAL_S
+        <= seconds
+        <= MAX_PROFILE_TIMESERIES_INTERVAL_S
+    ):
+        raise ValueError(
+            f"invalid --profile-timeseries {raw!r}: duration must be between "
+            f"{MIN_PROFILE_TIMESERIES_INTERVAL_S * 1000:g}ms and "
+            f"{MAX_PROFILE_TIMESERIES_INTERVAL_S:g}s"
+        )
+    return seconds
 
 
 # --------------------------------------------------------------------------- colors
@@ -537,6 +561,13 @@ def build_parser() -> argparse.ArgumentParser:
         "rss_hwm | oom | inner_jobs) to the terminal",
     )
     run_p.add_argument(
+        "--profile-timeseries",
+        metavar="DURATION",
+        default=None,
+        help="OPT-IN: sample each boxed step's cgroup CPU use over time at this interval "
+        "(50ms..10s) and write a trace CSV under the profile directory",
+    )
+    run_p.add_argument(
         "--planner",
         choices=[p.value for p in Planner],
         default=Planner.GREEDY_LPT.value,
@@ -703,6 +734,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-profile",
         action="store_true",
         help="disable the default auto-logging profile store for this sweep",
+    )
+    sweep_p.add_argument(
+        "--profile-timeseries",
+        metavar="DURATION",
+        default=None,
+        help="OPT-IN: sample each boxed sweep trial's cgroup CPU use over time at this interval "
+        "(50ms..10s) and write a trace CSV under the profile directory",
     )
     sweep_p.add_argument(
         "--allow-cgroup-failure",
@@ -1818,6 +1856,12 @@ class _SweepMetricsSink:
         enriched = [{**row, **self._metadata} for row in rows]
         return self._sink.record_step_profiles(enriched, jobs=jobs)
 
+    def record_step_timeseries(
+        self, rows: Sequence[Mapping[str, object]], *, jobs: int
+    ) -> str | None:
+        enriched = [{**row, **self._metadata} for row in rows]
+        return self._sink.record_step_timeseries(enriched, jobs=jobs)
+
 
 class _SweepCpuMetricsSink:
     """Fill unboxed sweep CPU columns from the same RUSAGE_CHILDREN window shown in the table.
@@ -1849,6 +1893,11 @@ class _SweepCpuMetricsSink:
                 copied["sys_s"] = sys_s
             enriched.append(copied)
         return self._sink.record_step_profiles(enriched, jobs=jobs)
+
+    def record_step_timeseries(
+        self, rows: Sequence[Mapping[str, object]], *, jobs: int
+    ) -> str | None:
+        return self._sink.record_step_timeseries(rows, jobs=jobs)
 
 
 def _parse_jobs_range(raw: str) -> tuple[int, int]:
@@ -1885,6 +1934,7 @@ def _run_single_step(
     verbosity: int,
     *,
     vary_width: bool = True,
+    profile_timeseries_interval_s: float | None = None,
 ) -> _SweepMeasure:
     """Run ONE step at a fixed inner-parallelism width and measure it.
 
@@ -1911,6 +1961,7 @@ def _run_single_step(
         metrics=persisted_metrics,
         keep_going=False,
         verbosity=verbosity,
+        profile_timeseries_interval_s=profile_timeseries_interval_s,
     )
     wall_measured = time.monotonic() - wall_start
     ru1 = resource.getrusage(resource.RUSAGE_CHILDREN)
@@ -2025,6 +2076,7 @@ def _run_legacy_sweep(
     sweep_git_sha: str,
     verbosity: int,
     c: Palette,
+    profile_timeseries_interval_s: float | None = None,
 ) -> int:
     """The original one-step dense-range command, kept byte-compatible in normal output."""
 
@@ -2064,6 +2116,7 @@ def _run_legacy_sweep(
                 cgroups,
                 _sweep_sink(perf_dir, sweep_git_sha, {}, cgroups),
                 verbosity,
+                profile_timeseries_interval_s=profile_timeseries_interval_s,
             )
             if not m.ok:
                 print(
@@ -2110,6 +2163,7 @@ def _run_target_sweep(
     sweep_git_sha: str,
     verbosity: int,
     c: Palette,
+    profile_timeseries_interval_s: float | None = None,
 ) -> int:
     """Run a graph-wide, soft-target, cumulative multi-pass scaling sweep."""
 
@@ -2218,6 +2272,7 @@ def _run_target_sweep(
                     _sweep_sink(perf_dir, sweep_git_sha, metadata, cgroups),
                     verbosity,
                     vary_width=False,
+                    profile_timeseries_interval_s=profile_timeseries_interval_s,
                 )
                 if not measure.ok:
                     print(
@@ -2256,6 +2311,7 @@ def _run_target_sweep(
                         cgroups,
                         _sweep_sink(perf_dir, sweep_git_sha, metadata, cgroups),
                         verbosity,
+                        profile_timeseries_interval_s=profile_timeseries_interval_s,
                     )
                     if not measure.ok:
                         print(
@@ -2310,6 +2366,21 @@ def _cmd_sweep(ns: argparse.Namespace, c: Palette) -> int:
     target_raw = ns.target_time if isinstance(ns.target_time, str) else None
     step_tag = ns.step if isinstance(ns.step, str) else None
     jobs_spec = ns.jobs if isinstance(ns.jobs, str) else None
+    timeseries_value = getattr(ns, "profile_timeseries", None)
+    timeseries_raw = timeseries_value if isinstance(timeseries_value, str) else None
+    if timeseries_raw is not None and bool(ns.no_profile):
+        print(
+            f"{PROG}: sweep: --profile-timeseries cannot be combined with --no-profile",
+            file=sys.stderr,
+        )
+        return 2
+    profile_timeseries_interval_s: float | None = None
+    if timeseries_raw is not None:
+        try:
+            profile_timeseries_interval_s = _parse_profile_timeseries_duration(timeseries_raw)
+        except ValueError as exc:
+            print(f"{PROG}: sweep: {exc}", file=sys.stderr)
+            return 2
     if target_raw is None and (step_tag is None or jobs_spec is None):
         print(
             f"{PROG}: sweep: without --target-time, --step and --jobs are required",
@@ -2380,6 +2451,13 @@ def _cmd_sweep(ns: argparse.Namespace, c: Palette) -> int:
     )
     if code != 0:
         return code
+    if profile_timeseries_interval_s is not None and cgroups is None:
+        print(
+            f"{PROG}: sweep: --profile-timeseries requires active cgroup-v2 containment; "
+            "no step was started",
+            file=sys.stderr,
+        )
+        return 3
 
     perf_dir, source = _resolve_profile_dir(ns.perf_dir, bool(ns.no_profile))
     sweep_git_sha = _git_sha() if perf_dir is not None else ""
@@ -2396,6 +2474,7 @@ def _cmd_sweep(ns: argparse.Namespace, c: Palette) -> int:
             sweep_git_sha,
             verbosity,
             c,
+            profile_timeseries_interval_s,
         )
     else:
         code = _run_target_sweep(
@@ -2409,6 +2488,7 @@ def _cmd_sweep(ns: argparse.Namespace, c: Palette) -> int:
             sweep_git_sha=sweep_git_sha,
             verbosity=verbosity,
             c=c,
+            profile_timeseries_interval_s=profile_timeseries_interval_s,
         )
     if perf_dir is not None:
         _report_profile_written(perf_dir, source)
@@ -3167,6 +3247,22 @@ def _apply_admission(ns: argparse.Namespace) -> int:
 
 
 def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
+    timeseries_value = getattr(ns, "profile_timeseries", None)
+    timeseries_raw = timeseries_value if isinstance(timeseries_value, str) else None
+    if timeseries_raw is not None and bool(ns.no_profile):
+        print(
+            f"{PROG}: run: --profile-timeseries cannot be combined with --no-profile",
+            file=sys.stderr,
+        )
+        return 2
+    profile_timeseries_interval_s: float | None = None
+    if timeseries_raw is not None:
+        try:
+            profile_timeseries_interval_s = _parse_profile_timeseries_duration(timeseries_raw)
+        except ValueError as exc:
+            print(f"{PROG}: run: {exc}", file=sys.stderr)
+            return 2
+
     # A selection includes its full dependency ancestry by default. Validate and select BEFORE
     # cgroup bring-up so a bad combination or tag fails fast (exit 2) without needing a scope.
     selected_raw = ns.selected if isinstance(ns.selected, str) else None
@@ -3248,6 +3344,13 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
     )
     if code != 0:
         return code
+    if profile_timeseries_interval_s is not None and cgroups is None:
+        print(
+            f"{PROG}: run: --profile-timeseries requires active cgroup-v2 containment; "
+            "no step was started",
+            file=sys.stderr,
+        )
+        return 3
 
     # Opt-in --cores K: constrain the whole run tree to K reserved cores. Apply it here,
     # after the boxing re-exec has settled (the re-exec'd in-scope child re-enters _run and applies
@@ -3413,7 +3516,12 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
     if perf_dir is not None:
         from dagrun.perflog import CsvMetricsSink
 
-        csv_metrics = CsvMetricsSink(perf_dir, git_sha=_git_sha())
+        csv_metrics = CsvMetricsSink(
+            perf_dir,
+            git_sha=_git_sha(),
+            enforcement_kind="cgroup-v2" if cgroups is not None else "unboxed",
+            runner_name="run",
+        )
         metrics = csv_metrics
         profile_run_id = csv_metrics.run_id
 
@@ -3430,6 +3538,7 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
         verbosity=verbosity,
         order=list(plan.order),
         run_timeout_s=_effective_run_timeout(ns),
+        profile_timeseries_interval_s=profile_timeseries_interval_s,
     )
     passed = sum(1 for o in result.outcomes if o.ok)
     failed = sum(1 for o in result.outcomes if not o.ok and not o.aborted)

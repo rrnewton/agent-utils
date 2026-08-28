@@ -5,6 +5,8 @@
 //! * [`STEP_PROFILE_COLUMNS`] — per-step measurement rows, in
 //!   `<output_dir>/step_profiles_<machine_id>_<container_class>.csv`, widened per run with any
 //!   dynamic `cpu.*` keys (existing columns first, new columns appended; no column ever dropped).
+//! * [`STEP_TIMESERIES_COLUMNS`] — opt-in interval samples, in
+//!   `<output_dir>/traces/<run_id>.csv`, separate from the trial-level estimator input.
 //!
 //! The contention split (`pct_we` / `pct_other` / `total_busy_pct`) is derived from `/proc/stat`
 //! sampled at window start/end vs. this process's accumulated CHILD CPU time (from
@@ -126,6 +128,38 @@ pub const STEP_PROFILE_COLUMNS: [&str; 58] = [
     "memory_events_max",
     "memory_events_oom",
     "memory_events_oom_kill",
+];
+
+/// Stable columns for an opt-in per-step CPU/thread time series.
+///
+/// The provenance prefix identifies the machine, execution, and enforcement lane. Sweep-only
+/// metadata is appended as a sorted dynamic tail so ordinary runs keep this compact schema while
+/// sweep traces remain attributable to their pass, width, and workload cohort.
+pub const STEP_TIMESERIES_COLUMNS: [&str; 24] = [
+    "timestamp",
+    "machine_id",
+    "container_class",
+    "git_sha",
+    "outer_jobs",
+    "profile_base_sha",
+    "enforcement_kind",
+    "runner_name",
+    "run_id",
+    "step",
+    "inner_jobs",
+    "sample_index",
+    "sample_kind",
+    "elapsed_s",
+    "interval_s",
+    "cpu_usage_s",
+    "user_s",
+    "sys_s",
+    "effective_cores",
+    "user_cores",
+    "system_cores",
+    "throttled_s",
+    "interval_throttled_s",
+    "thread_count",
 ];
 
 /// A per-step measurement row (heterogeneous column -> value, matching the CSV).
@@ -614,6 +648,91 @@ pub fn append_step_profiles(
     result
 }
 
+/// Write one execution's opt-in per-step time series to
+/// `<output_dir>/traces/<run_id>.csv` and return that exact path.
+///
+/// Unlike the machine-wide step profile, this file is execution-scoped. Callers use the same
+/// `run_id` for this trace and the corresponding aggregate rows. Missing measurements remain
+/// empty cells.
+#[allow(clippy::too_many_arguments)]
+pub fn append_step_timeseries(
+    output_dir: &Path,
+    rows: &[ProfileRow],
+    git_sha: &str,
+    outer_jobs: i64,
+    profile_base_sha: Option<&str>,
+    enforcement_kind: &str,
+    runner_name: &str,
+    run_id: &str,
+) -> Option<PathBuf> {
+    if rows.is_empty() {
+        return None;
+    }
+    let traces = ensure_dir(&output_dir.join("traces"))?;
+    let safe_run_id: String = run_id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let safe_run_id = if safe_run_id.is_empty() {
+        "unknown"
+    } else {
+        &safe_run_id
+    };
+    let path = traces.join(format!("{safe_run_id}.csv"));
+    let mut common: BTreeMap<String, String> = BTreeMap::new();
+    common.insert("timestamp".into(), timestamp());
+    common.insert("machine_id".into(), machine_id());
+    common.insert("container_class".into(), container_class());
+    common.insert("git_sha".into(), git_sha.into());
+    common.insert("outer_jobs".into(), outer_jobs.to_string());
+    common.insert(
+        "profile_base_sha".into(),
+        profile_base_sha.unwrap_or(git_sha).into(),
+    );
+    common.insert("enforcement_kind".into(), enforcement_kind.into());
+    common.insert("runner_name".into(), runner_name.into());
+    common.insert("run_id".into(), run_id.into());
+
+    let full_rows: Vec<BTreeMap<String, String>> = rows
+        .iter()
+        .map(|row| {
+            let mut full = common.clone();
+            full.extend(row.clone());
+            full
+        })
+        .collect();
+    let standard: std::collections::HashSet<&str> =
+        STEP_TIMESERIES_COLUMNS.iter().copied().collect();
+    let mut extra = std::collections::BTreeSet::new();
+    for row in &full_rows {
+        for key in row.keys() {
+            if !standard.contains(key.as_str()) {
+                extra.insert(key.clone());
+            }
+        }
+    }
+    let mut columns: Vec<String> = STEP_TIMESERIES_COLUMNS
+        .iter()
+        .map(|value| value.to_string())
+        .collect();
+    columns.extend(extra);
+
+    let mut result = Some(path.clone());
+    with_file_lock(&path, || {
+        if let Err(error) = append_rows_merging_header(&path, &full_rows, &columns) {
+            eprintln!("[perflog] time-series write failed ({error})");
+            result = None;
+        }
+    });
+    result
+}
+
 /// A started whole-run measurement bracket; [`PerfWindow::finish`] appends one summary row.
 pub struct PerfWindow {
     output_dir: PathBuf,
@@ -785,6 +904,85 @@ mod tests {
             ]
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn time_series_uses_run_scoped_path_and_stamps_provenance() {
+        let dir = std::env::temp_dir().join(format!(
+            "dagrun_timeseries_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let row = ProfileRow::from([
+            ("step".into(), "build.app".into()),
+            ("inner_jobs".into(), "4".into()),
+            ("sample_index".into(), "0".into()),
+            ("sample_kind".into(), "start".into()),
+            ("elapsed_s".into(), "0.000001".into()),
+            ("interval_s".into(), String::new()),
+            ("cpu_usage_s".into(), "0.000000".into()),
+            ("user_s".into(), "0.000000".into()),
+            ("sys_s".into(), "0.000000".into()),
+            ("effective_cores".into(), String::new()),
+            ("user_cores".into(), String::new()),
+            ("system_cores".into(), String::new()),
+            ("throttled_s".into(), "0.000000".into()),
+            ("interval_throttled_s".into(), String::new()),
+            ("thread_count".into(), "1".into()),
+            ("sweep_id".into(), "sweep-1".into()),
+        ]);
+        let path = append_step_timeseries(
+            &dir,
+            &[row],
+            "abc123",
+            8,
+            Some("base456"),
+            "cgroup-v2",
+            "sweep",
+            "run789",
+        )
+        .expect("trace path");
+        assert_eq!(path, dir.join("traces/run789.csv"));
+        let text = fs::read_to_string(path).unwrap();
+        let mut lines = text.lines();
+        let header = lines.next().unwrap();
+        assert_eq!(
+            header,
+            STEP_TIMESERIES_COLUMNS
+                .iter()
+                .copied()
+                .chain(std::iter::once("sweep_id"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let values = parse_csv_line(lines.next().unwrap());
+        let columns = parse_csv_line(header);
+        let written: BTreeMap<String, String> = columns.into_iter().zip(values).collect();
+        assert_eq!(written["git_sha"], "abc123");
+        assert_eq!(written["outer_jobs"], "8");
+        assert_eq!(written["profile_base_sha"], "base456");
+        assert_eq!(written["enforcement_kind"], "cgroup-v2");
+        assert_eq!(written["runner_name"], "sweep");
+        assert_eq!(written["run_id"], "run789");
+        assert_eq!(written["sample_kind"], "start");
+        assert_eq!(written["sweep_id"], "sweep-1");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_time_series_creates_no_trace_directory() {
+        let dir = std::env::temp_dir().join(format!(
+            "dagrun_empty_timeseries_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            append_step_timeseries(&dir, &[], "abc123", 1, None, "cgroup-v2", "run", "empty",)
+                .is_none()
+        );
+        assert!(!dir.join("traces").exists());
     }
 
     #[test]

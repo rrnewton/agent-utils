@@ -1,11 +1,12 @@
 # `examples/` — runnable dagrun DAGs
 
-Seven small, self-contained DAGs you can run immediately, each demonstrating one core idea. The
+Eight DAGs demonstrate the runner's core ideas. The
 first six use `sleep`/`echo`/pure shell and finish in a few seconds. Example 07 is an intentionally
 CPU-intensive, standard-library-only Python scaling benchmark; start with its reduced-work smoke
-command before spending a larger target allowance. Each example also carries `description` fields (a
-top-level one for the whole DAG and one per node) — free-form documentation that never affects
-scheduling.
+command before spending a larger target allowance. Example 08 is a real, comparatively expensive
+clean-build benchmark with Linux/toolchain prerequisites. Each example also carries `description`
+fields (a top-level one for the whole DAG and one per node) — free-form documentation that never
+affects scheduling.
 
 Two of them (`02-diamond` and `04-memory-aware`) additionally ship a **side-by-side YAML edition**
 (`.yaml`) that loads to the *exact same DAG* as its `.json` twin — a "literate" version with inline
@@ -170,7 +171,7 @@ dagrun sweep --dag examples/06-step-sweep.json --step build.app --jobs 1..8 --al
 Every `run` and `sweep` above **auto-logs** resource-usage CSVs to the default profile store,
 `./.dagrun/profiles/` (relative to your current directory) — you do not need `--perf-dir`. The
 tool prints exactly where it appended. Drop `--allow-cgroup-failure` on a Linux host with a
-systemd user session to get real per-step boxing, which also fills in the `rss_hwm` (peak memory)
+systemd user session to get real per-step boxing, which also fills in the `peak_bytes` (peak memory)
 column from each step's cgroup. Override the location with `--perf-dir DIR` or
 `$DAGRUN_PROFILE_DIR`, or turn logging off with `--no-profile`. Consider gitignoring `./.dagrun/`.
 
@@ -222,6 +223,38 @@ YAML and can be rebuilt from those CSVs; each successful profiling-enabled sweep
 refreshes the machine/container sidecar named
 `scaling_model_<machine_id>_<container_class>.json`. Command-shape digests keep identified older
 workloads out of the current curve and are retained as separate reservoirs in portable summaries.
+
+## 8. `08-dagrun-clean-build-sweep.yaml` — a real clean-build scaling sweep
+
+This one-node graph measures how the release build of the `dagrun` binary responds to the worker
+count supplied by the `cargo-build` cmdtype. Every sample creates a fresh target directory, disables
+incremental compilation, and runs locked and offline. The caller's downloaded registry/source cache
+stays warm, while neither the repository target nor another sample's compiled artifacts can turn a
+later width into an incremental build.
+
+The fixture is intentionally Linux/x86_64-specific and expects its Rust dependencies to be cached
+already. It also requires a pre-existing `DAGRUN_CARGO_SWEEP_ROOT`; the fresh per-sample target
+directories below it are retained for inspection and caller-managed cleanup. Run it only under real
+cgroup-v2 containment so both width enforcement and the optional time series are attributable:
+
+```sh
+study_root=$(mktemp -d /tmp/dagrun-cargo-build-sweep.XXXXXXXX)
+mkdir -p "$study_root/targets" "$study_root/profiles"
+DAGRUN_CARGO_SWEEP_ROOT="$study_root/targets" dagrun sweep \
+  --dag examples/08-dagrun-clean-build-sweep.yaml \
+  --step build.dagrun \
+  --target-time 0 \
+  --repeat 3 \
+  --profile-timeseries 250ms \
+  --perf-dir "$study_root/profiles"
+```
+
+A zero target completes the mandatory automatic topology pass and starts no refinement pass. The
+aggregate rows and `scaling_model_*.json` describe speedup, CPU work, and memory by width. Each
+sample also writes `profiles/traces/<run_id>.csv`, whose interval effective-core and thread-count
+series can reveal sequential startup/shutdown regions hidden by whole-step averages. This benchmark
+can consume substantial time and disk space; remove `study_root` only after preserving any reports
+or raw evidence you need.
 
 ## See also
 

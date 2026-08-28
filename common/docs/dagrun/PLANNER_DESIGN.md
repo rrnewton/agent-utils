@@ -222,6 +222,11 @@ container identity. They retain raw and contention-adjusted wall evidence, CPU w
 parallelism, throttling, memory peaks, and the sweep provenance needed to distinguish passes and
 repeats.
 
+An opt-in interval sampler writes separate `traces/<run_id>.csv` files with start, periodic, and
+final cgroup CPU/thread observations. These traces expose phase behavior inside one trial, but they
+are diagnostic evidence rather than additional estimator samples: the aggregate
+`step_profiles_*.csv` rows remain the model's input.
+
 Each sweep row carries a stable digest of the step command, command type, width-injection channel,
 and environment. Planning selects the current DAG's digest cohort exclusively once one exists;
 identified rows from another command shape are never blended into it. Blank rows written before

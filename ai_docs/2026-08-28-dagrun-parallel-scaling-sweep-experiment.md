@@ -78,6 +78,11 @@ The optional, high-volume `perf record` and hot-window `wprof` capture proposed 
 not part of this change. They remain a separate opt-in extension because they require a process
 lifetime sampling hook, artifact-size policy, and explicit tool-availability/failure semantics.
 
+> **Later update (2026-08-28).** Dagrun now has an opt-in cgroup CPU/thread lifetime sampler:
+> `run` and `sweep` accept `--profile-timeseries DURATION` and write separate
+> `traces/<run_id>.csv` files. This supplies the sampling hook and exposes within-step parallelism;
+> `perf record` and hot-window `wprof` capture remain unimplemented.
+
 ### Storage policy
 
 Profiles are written by default under `./.dagrun/profiles/`, relative to the caller's current

@@ -678,6 +678,34 @@ exact match exists for a step, rows carrying another non-empty digest are never
 mixed into that curve; before then, blank rows from stores created before digest
 tracking remain a compatibility fallback.
 
+### Parallelism over time
+
+Aggregate wall and CPU time can hide a sequential startup or shutdown phase.
+Add `--profile-timeseries DURATION` to `run` or `sweep` to sample each active
+step's cgroup CPU counters and descendant thread count during its lifetime:
+
+```sh
+dagrun sweep --dag pipeline.yaml --step build.app --jobs 1..8 \
+  --profile-timeseries 250ms --perf-dir /tmp/dagrun-build-study
+```
+
+The interval accepts 50ms through 10s, including the ordinary `ms`, `s`, `m`,
+and `h` duration suffixes. Time-series collection requires active cgroup-v2
+containment and fails before starting a step when that evidence source is not
+available. It cannot be combined with `--no-profile`.
+
+Each trace contains an explicit start sample, periodic samples scheduled against
+absolute deadlines, and a final sample before cgroup cleanup. Rows report
+cumulative user/system/total CPU, interval effective cores, interval throttled
+time, elapsed time, and observed descendant thread count. Missing or reset
+counters stay blank rather than being reported as zero.
+
+These higher-volume rows are written separately as
+`<profile-dir>/traces/<run_id>.csv`; the command prints the exact path. Sweep
+provenance follows the fixed trace columns. Traces diagnose phase behavior but
+are not treated as independent trials by the duration, memory, or scaling
+estimators; the aggregate `step_profiles_*.csv` rows remain their dataset.
+
 ### Dataset versus model
 
 The raw per-step CSV is the source of truth. The authored DAG remains portable

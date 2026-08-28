@@ -22,6 +22,7 @@ from dagrun.protocols import MetricsSink, RunWindow
 __all__ = [
     "CSV_COLUMNS",
     "STEP_PROFILE_COLUMNS",
+    "STEP_TIMESERIES_COLUMNS",
     "ENRICHMENT_COLUMNS",
     "CENSORING_COLUMNS",
     "new_run_id",
@@ -30,6 +31,7 @@ __all__ = [
     "container_class",
     "store_paths",
     "append_step_profiles",
+    "append_step_timeseries",
     "PerfWindow",
     "CsvMetricsSink",
     "effective_cpu_quota",
@@ -148,6 +150,37 @@ STEP_PROFILE_COLUMNS = [
     *ENRICHMENT_COLUMNS,
     # Run-overlap and applied-cap provenance (appended; blank when unavailable).
     *CENSORING_COLUMNS,
+]
+
+#: Fixed prefix for the opt-in interval-level trace. The first nine fields are the same run
+#: context used by the aggregate profile store. Sweep provenance, when present, is appended as a
+#: sorted dynamic tail so Python and Rust can write the same schema without teaching the sampler
+#: about sweep policy.
+STEP_TIMESERIES_COLUMNS = [
+    "timestamp",
+    "machine_id",
+    "container_class",
+    "git_sha",
+    "outer_jobs",
+    "profile_base_sha",
+    "enforcement_kind",
+    "runner_name",
+    "run_id",
+    "step",
+    "inner_jobs",
+    "sample_index",
+    "sample_kind",
+    "elapsed_s",
+    "interval_s",
+    "cpu_usage_s",
+    "user_s",
+    "sys_s",
+    "effective_cores",
+    "user_cores",
+    "system_cores",
+    "throttled_s",
+    "interval_throttled_s",
+    "thread_count",
 ]
 
 
@@ -386,6 +419,58 @@ def append_step_profiles(
         # on us, and a racing opener that recreates the path only ever overlaps our post-write
         # teardown, never another writer's write. Best-effort (cosmetic): a failed unlink never
         # breaks logging.
+        try:
+            lock_path.unlink()
+        except OSError:
+            pass
+    return path
+
+
+def append_step_timeseries(
+    output_dir: str | Path,
+    rows: Sequence[Mapping[str, object]],
+    *,
+    git_sha: str,
+    outer_jobs: int,
+    profile_base_sha: str | None = None,
+    enforcement_kind: str = "unverified",
+    runner_name: str = "local",
+    run_id: str,
+) -> Path | None:
+    """Append one run's interval-level step samples to ``traces/<run_id>.csv``.
+
+    Time-series rows deliberately live outside the aggregate profile CSV: they are high-volume
+    observations within a trial, not independent trials for the scaling estimator. The run id is
+    also stamped into every row and sanitized only for the filename, so a caller-supplied id can
+    never escape the trace directory. Dynamic fields (notably sweep provenance) follow the fixed
+    schema in sorted order.
+    """
+    if not rows:
+        return None
+    logs_dir = _ensure_dir(Path(output_dir) / "traces")
+    if logs_dir is None:
+        return None
+    safe_run_id = re.sub(r"[^A-Za-z0-9_.-]", "_", run_id) or "unknown"
+    path = logs_dir / f"{safe_run_id}.csv"
+    common: dict[str, object] = {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "machine_id": machine_id(),
+        "container_class": container_class(),
+        "git_sha": git_sha,
+        "outer_jobs": outer_jobs,
+        "profile_base_sha": git_sha if profile_base_sha is None else profile_base_sha,
+        "enforcement_kind": enforcement_kind,
+        "runner_name": runner_name,
+        "run_id": run_id,
+    }
+    full_rows = [{**common, **row} for row in rows]
+    fieldnames = list(STEP_TIMESERIES_COLUMNS)
+    standard = set(fieldnames)
+    fieldnames.extend(sorted({key for row in full_rows for key in row if key not in standard}))
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    with open(lock_path, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        _append_rows_merging_header(path, full_rows, fieldnames)
         try:
             lock_path.unlink()
         except OSError:
@@ -648,6 +733,22 @@ class CsvMetricsSink(MetricsSink):
         of run outcome. Returns the CSV path as a string, or ``None`` when recording was skipped
         (a visible warning is emitted)."""
         path = append_step_profiles(
+            self.output_dir,
+            rows,
+            git_sha=self.git_sha,
+            outer_jobs=jobs,
+            profile_base_sha=self.profile_base_sha,
+            enforcement_kind=self.enforcement_kind,
+            runner_name=self.runner_name,
+            run_id=self.run_id,
+        )
+        return None if path is None else str(path)
+
+    def record_step_timeseries(
+        self, rows: Sequence[Mapping[str, object]], *, jobs: int
+    ) -> str | None:
+        """Persist opt-in interval samples in this execution's dedicated trace CSV."""
+        path = append_step_timeseries(
             self.output_dir,
             rows,
             git_sha=self.git_sha,

@@ -266,6 +266,18 @@ class MetricsSink(Protocol):
         """
         ...
 
+    def record_step_timeseries(
+        self, rows: Sequence[Mapping[str, object]], *, jobs: int
+    ) -> str | None:
+        """Write opt-in, interval-level per-step measurements to durable storage.
+
+        Unlike :meth:`record_step_profiles`, these rows are a high-volume trace rather than one
+        aggregate row per step. ``jobs`` is the maximum active-step count for the DAG execution.
+        Returns an exact human-readable location, or ``None`` when recording was skipped; a
+        requested sink must surface a skip.
+        """
+        ...
+
 
 @dataclass(frozen=True)
 class StepOutcome:
@@ -382,3 +394,7 @@ class RunResult:
     #: from successful process creation until wait() observes exit; it is not inferred from the
     #: requested job count or scheduler admission.
     max_concurrent_steps: int = 0
+    #: Opt-in interval measurements of achieved parallelism within each step. Empty unless the
+    #: caller requested time-series profiling; retained separately from the one-row-per-step
+    #: profile dataset so existing estimators cannot accidentally treat intervals as trials.
+    step_timeseries_rows: tuple[Mapping[str, object], ...] = field(default_factory=tuple)

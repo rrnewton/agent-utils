@@ -78,6 +78,190 @@ pub fn nested_run_refusal(allow_unwise_nest_dagruns: bool) -> Option<String> {
 /// A per-step measurement row (column -> value), matching the perflog step-profile schema.
 type ProfileRow = BTreeMap<String, String>;
 
+#[derive(Clone, Copy, Default)]
+struct TimeseriesSnapshot {
+    elapsed_s: f64,
+    usage_usec: Option<i64>,
+    user_usec: Option<i64>,
+    system_usec: Option<i64>,
+    throttled_usec: Option<i64>,
+}
+
+#[derive(Default)]
+struct TimeseriesCapture {
+    rows: Vec<ProfileRow>,
+    previous: Option<TimeseriesSnapshot>,
+    read_warning_emitted: bool,
+    finalized: bool,
+}
+
+fn cpu_stat(stats: Option<&BTreeMap<String, i64>>, key: &str) -> Option<i64> {
+    stats.and_then(|values| values.get(key).copied())
+}
+
+fn seconds_cell(usec: Option<i64>) -> String {
+    usec.map(|value| format!("{:.6}", value as f64 / 1_000_000.0))
+        .unwrap_or_default()
+}
+
+fn interval_rate_cell(
+    current: Option<i64>,
+    previous: Option<i64>,
+    interval_s: Option<f64>,
+) -> String {
+    match (current, previous, interval_s) {
+        (Some(current), Some(previous), Some(interval_s))
+            if current >= previous && interval_s > 0.0 =>
+        {
+            format!(
+                "{:.4}",
+                (current - previous) as f64 / 1_000_000.0 / interval_s
+            )
+        }
+        _ => String::new(),
+    }
+}
+
+fn interval_seconds_cell(
+    current: Option<i64>,
+    previous: Option<i64>,
+    interval_s: Option<f64>,
+) -> String {
+    match (current, previous, interval_s) {
+        (Some(current), Some(previous), Some(_)) if current >= previous => {
+            format!("{:.6}", (current - previous) as f64 / 1_000_000.0)
+        }
+        _ => String::new(),
+    }
+}
+
+fn record_timeseries_sample(
+    capture: &Arc<Mutex<TimeseriesCapture>>,
+    tag: &str,
+    inner_jobs: i64,
+    sample_kind: &str,
+    elapsed_s: f64,
+    cpu_stats: Option<&BTreeMap<String, i64>>,
+    thread_count: Option<i64>,
+) {
+    let snapshot = TimeseriesSnapshot {
+        elapsed_s,
+        usage_usec: cpu_stat(cpu_stats, "usage_usec"),
+        user_usec: cpu_stat(cpu_stats, "user_usec"),
+        system_usec: cpu_stat(cpu_stats, "system_usec"),
+        throttled_usec: cpu_stat(cpu_stats, "throttled_usec"),
+    };
+    let mut capture = capture
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // A cgroup read can theoretically outlive the bounded monitor join. Once the synchronous
+    // boundary sample commits, discard any late periodic result so `final` stays last.
+    if capture.finalized && sample_kind != "final" {
+        return;
+    }
+    if sample_kind == "final" {
+        capture.finalized = true;
+    }
+    let previous = capture.previous;
+    let interval_s = previous
+        .map(|value| elapsed_s - value.elapsed_s)
+        .filter(|value| *value > 0.0);
+    let mut row = ProfileRow::new();
+    row.insert("step".into(), tag.into());
+    row.insert("inner_jobs".into(), inner_jobs.to_string());
+    row.insert("sample_index".into(), capture.rows.len().to_string());
+    row.insert("sample_kind".into(), sample_kind.into());
+    row.insert("elapsed_s".into(), format!("{elapsed_s:.6}"));
+    row.insert(
+        "interval_s".into(),
+        interval_s
+            .map(|value| format!("{value:.6}"))
+            .unwrap_or_default(),
+    );
+    row.insert("cpu_usage_s".into(), seconds_cell(snapshot.usage_usec));
+    row.insert("user_s".into(), seconds_cell(snapshot.user_usec));
+    row.insert("sys_s".into(), seconds_cell(snapshot.system_usec));
+    row.insert(
+        "effective_cores".into(),
+        interval_rate_cell(
+            snapshot.usage_usec,
+            previous.and_then(|value| value.usage_usec),
+            interval_s,
+        ),
+    );
+    row.insert(
+        "user_cores".into(),
+        interval_rate_cell(
+            snapshot.user_usec,
+            previous.and_then(|value| value.user_usec),
+            interval_s,
+        ),
+    );
+    row.insert(
+        "system_cores".into(),
+        interval_rate_cell(
+            snapshot.system_usec,
+            previous.and_then(|value| value.system_usec),
+            interval_s,
+        ),
+    );
+    row.insert("throttled_s".into(), seconds_cell(snapshot.throttled_usec));
+    row.insert(
+        "interval_throttled_s".into(),
+        interval_seconds_cell(
+            snapshot.throttled_usec,
+            previous.and_then(|value| value.throttled_usec),
+            interval_s,
+        ),
+    );
+    row.insert(
+        "thread_count".into(),
+        thread_count
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+    );
+    capture.previous = Some(snapshot);
+    capture.rows.push(row);
+}
+
+fn read_timeseries_measurements(
+    cgroups: &BoxedCgroups,
+    tag: &str,
+    capture: &Arc<Mutex<TimeseriesCapture>>,
+) -> (Option<BTreeMap<String, i64>>, Option<i64>) {
+    let Some(manager) = cgroups.as_ref() else {
+        return (None, None);
+    };
+    match std::panic::catch_unwind(AssertUnwindSafe(|| {
+        (manager.cpu_stats(tag), manager.thread_count(tag))
+    })) {
+        Ok(values) => values,
+        Err(payload) => {
+            let mut capture = capture
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !capture.read_warning_emitted {
+                capture.read_warning_emitted = true;
+                warn(&format!(
+                    "[scheduler] ⚠ step {tag:?}: time-series sample unavailable ({}); continuing the step without inventing data",
+                    panic_detail(payload.as_ref())
+                ));
+            }
+            (None, None)
+        }
+    }
+}
+
+fn advance_deadline(mut deadline: Instant, interval: Duration, now: Instant) -> Instant {
+    while deadline <= now {
+        deadline = deadline.checked_add(interval).unwrap_or(now);
+        if deadline == now {
+            return now.checked_add(interval).unwrap_or(now);
+        }
+    }
+    deadline
+}
+
 /// Final cgroup CPU counters for the durable step journal, with their units in the key names.
 ///
 /// These are the readings already taken BEFORE `cleanup()` removes the step's cgroup, so they
@@ -253,6 +437,8 @@ struct Shared {
     stop: bool,
     /// Accumulated per-step measurement rows (forwarded to a metrics sink after the run).
     step_profile_rows: Vec<ProfileRow>,
+    /// Opt-in interval samples, accumulated after each step's final pre-cleanup observation.
+    step_timeseries_rows: Vec<ProfileRow>,
     /// Per-step ownership nonce, so the eager-cancel path can terminate another step's escapees
     /// as thoroughly as that step's own supervisor would (see [`kill_by_nonce`]).
     running_nonces: HashMap<String, String>,
@@ -1223,6 +1409,8 @@ struct Runner {
     /// Cross-process enforcement of this DAG's existing `resource_caps`, enabled only when the
     /// caller supplies `DAGRUN_RESOURCE_CAPS_PATH`.
     resource_coordinator: Option<ResourceCoordinator>,
+    /// Opt-in interval for exact cgroup CPU/thread samples.
+    profile_timeseries_interval: Option<Duration>,
     shared: Arc<Mutex<Shared>>,
     /// TEST-ONLY: run this instead of the guarded supervisor body, on the supervisor's own thread.
     ///
@@ -1255,6 +1443,7 @@ impl Runner {
         run_timeout_s: Option<i64>,
         run_cpu_budget: Option<RunCpuBudget>,
         resource_coordinator: Option<ResourceCoordinator>,
+        profile_timeseries_interval: Option<Duration>,
     ) -> Self {
         let max_cpus = max_cpus.max(1);
         let capped = cap_config_max_cpus(cfg, max_cpus);
@@ -1321,6 +1510,7 @@ impl Runner {
             run_cpu_budget,
             evidence: RunEvidence::open(default_log_dir()).map(Arc::new),
             resource_coordinator,
+            profile_timeseries_interval,
             shared: Arc::new(Mutex::new(Shared {
                 done: HashMap::new(),
                 running: HashSet::new(),
@@ -1330,6 +1520,7 @@ impl Runner {
                 failed: false,
                 stop: false,
                 step_profile_rows: Vec::new(),
+                step_timeseries_rows: Vec::new(),
                 running_nonces: HashMap::new(),
                 explains_index,
                 fail_fast_family_index,
@@ -1817,6 +2008,7 @@ impl Runner {
                 let evidence = self.evidence.clone();
                 let cpu_timeout_multiplier = self.cpu_timeout_multiplier;
                 let cpu_timeout_platform = self.cpu_timeout_platform.clone();
+                let profile_timeseries_interval = self.profile_timeseries_interval;
                 let recovery = SupervisorRecovery {
                     step: step.clone(),
                     shared: Arc::clone(&shared),
@@ -1854,6 +2046,7 @@ impl Runner {
                                 evidence,
                                 cpu_timeout_multiplier,
                                 cpu_timeout_platform,
+                                profile_timeseries_interval,
                                 run_origin: wall_start,
                                 resource_reservation,
                             });
@@ -1922,6 +2115,7 @@ impl Runner {
             not_launched,
             intentional_skips: self.intentional_skips.clone(),
             step_profile_rows: sh.step_profile_rows.clone(),
+            step_timeseries_rows: sh.step_timeseries_rows.clone(),
             run_timed_out: sh.run_timed_out,
             run_cpu_timed_out: sh.run_cpu_timed_out,
             run_cpu_accounting_failed: sh.run_cpu_accounting_failed,
@@ -2385,6 +2579,8 @@ struct StepCtx {
     evidence: Option<Arc<RunEvidence>>,
     cpu_timeout_multiplier: f64,
     cpu_timeout_platform: String,
+    /// Sampling interval for opt-in exact cgroup CPU/thread traces.
+    profile_timeseries_interval: Option<Duration>,
     /// Monotonic origin every profiled step measures its start/finish offset from, so two rows of
     /// one run can be tested for OVERLAP. Monotonic, not wall clock: a clock step mid-run must not
     /// make one step appear to precede another.
@@ -2642,6 +2838,7 @@ fn run_step(ctx: StepCtx) {
         evidence,
         cpu_timeout_multiplier,
         cpu_timeout_platform,
+        profile_timeseries_interval,
         run_origin,
         resource_reservation,
     } = ctx;
@@ -2976,12 +3173,28 @@ fn run_step(ctx: StepCtx) {
         })
     };
 
-    // Poll once per MONITOR_INTERVAL for two purposes: (1) a per-step peak descendant-thread
-    // count when cgroup boxing exists, and (2) CPU-time budget enforcement. The exact cgroup
-    // counter remains primary. Uncontained runs get a best-effort procfs process-group floor.
-    // The contractual capability remains false for uncontained runs; the warning names this
-    // lower-bound attempt without promoting it to cgroup-equivalent enforcement. The poll is
-    // interruptible, so joining it at step end returns promptly.
+    // An opt-in trace always has a synchronous start observation. The CLI refuses this mode
+    // without active cgroup-v2, but keeping the reads optional here preserves the library's
+    // missing-is-blank posture if an injected manager loses a file after preflight.
+    let timeseries = profile_timeseries_interval.map(|_| {
+        let capture = Arc::new(Mutex::new(TimeseriesCapture::default()));
+        let (stats, threads) = read_timeseries_measurements(&cgroups, &tag, &capture);
+        record_timeseries_sample(
+            &capture,
+            &tag,
+            resolve_effective_inner_jobs(profile_inner_jobs),
+            "start",
+            start.elapsed().as_secs_f64(),
+            stats.as_ref(),
+            threads,
+        );
+        capture
+    });
+
+    // Poll for three related purposes: (1) a per-step peak descendant-thread count, (2) CPU-time
+    // budget enforcement, and (3) optional CPU/thread trace samples. Deadlines are absolute
+    // `Instant`s, advanced from their previous target rather than from the wake-up time, so slow
+    // reads do not accumulate sampling drift. The poll remains interruptible for prompt teardown.
     let (monitor_stop, monitor_stop_rx) = std::sync::mpsc::channel();
     let thread_peak = Arc::new(Mutex::new(None::<i64>));
     let cpu_exceeded = Arc::new(AtomicBool::new(false));
@@ -2999,6 +3212,9 @@ fn run_step(ctx: StepCtx) {
         let mculprit = Arc::clone(&termination_culprit);
         let mstart = start;
         let mlane = lane;
+        let mtrace = timeseries.clone();
+        let trace_interval = profile_timeseries_interval;
+        let trace_inner_jobs = resolve_effective_inner_jobs(profile_inner_jobs);
         Some(thread::spawn(move || {
             // THE MONITOR IS THE ONLY ENFORCER of the per-step CPU-time budget, and nothing ever
             // joins it for a result. If it dies the budget is not merely unmeasured -- it stops
@@ -3006,25 +3222,77 @@ fn run_step(ctx: StepCtx) {
             // (#80 runner-supervisor-crash-loud)
             let body_tag = t.clone();
             let body = std::panic::catch_unwind(AssertUnwindSafe(move || {
-                let mut since = Duration::ZERO;
                 // One-shot, so an unmeasurable budget is stated once per step, not once per tick.
                 let mut unmeasurable_warned = false;
-                let tick = Duration::from_millis(50);
+                let mut next_monitor = mstart
+                    .checked_add(MONITOR_INTERVAL)
+                    .unwrap_or_else(Instant::now);
+                let mut next_trace =
+                    trace_interval.and_then(|interval| mstart.checked_add(interval));
                 loop {
-                    match monitor_stop_rx.recv_timeout(tick) {
+                    let deadline = next_trace.map_or(next_monitor, |trace| trace.min(next_monitor));
+                    let wait = deadline.saturating_duration_since(Instant::now());
+                    match monitor_stop_rx.recv_timeout(wait) {
                         Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                     }
-                    since += tick;
-                    if since < MONITOR_INTERVAL {
+                    let now = Instant::now();
+                    let monitor_due = now >= next_monitor;
+                    let trace_due = next_trace.is_some_and(|deadline| now >= deadline);
+                    if !monitor_due && !trace_due {
                         continue;
                     }
-                    since = Duration::ZERO;
-                    if let Some(c) = &cg {
-                        if let Some(n) = c.thread_count(&t) {
+                    if monitor_due {
+                        next_monitor = advance_deadline(next_monitor, MONITOR_INTERVAL, now);
+                    }
+                    let (stats, threads) = if trace_due {
+                        mtrace.as_ref().map_or((None, None), |capture| {
+                            read_timeseries_measurements(&cg, &t, capture)
+                        })
+                    } else {
+                        (
+                            if boxed {
+                                cg.as_ref().and_then(|manager| manager.cpu_stats(&t))
+                            } else {
+                                None
+                            },
+                            if boxed {
+                                cg.as_ref().and_then(|manager| manager.thread_count(&t))
+                            } else {
+                                None
+                            },
+                        )
+                    };
+                    // The cgroup reads themselves may take longer than one requested interval.
+                    // Advance the trace schedule from the post-read instant so the next loop
+                    // skips every elapsed deadline instead of emitting a burst of tiny catch-up
+                    // intervals. The recorded time likewise describes when the sampled counters
+                    // were actually available, not when the read began.
+                    let sampled_at = Instant::now();
+                    if let Some(n) = threads {
+                        if monitor_due || trace_due {
                             let mut p = peak.lock().unwrap();
                             *p = Some(p.map_or(n, |cur| cur.max(n)));
                         }
+                    }
+                    if trace_due {
+                        if let Some(capture) = &mtrace {
+                            record_timeseries_sample(
+                                capture,
+                                &t,
+                                trace_inner_jobs,
+                                "periodic",
+                                sampled_at.saturating_duration_since(mstart).as_secs_f64(),
+                                stats.as_ref(),
+                                threads,
+                            );
+                        }
+                        if let (Some(deadline), Some(interval)) = (next_trace, trace_interval) {
+                            next_trace = Some(advance_deadline(deadline, interval, sampled_at));
+                        }
+                    }
+                    if !monitor_due {
+                        continue;
                     }
                     if cpu_timeout <= 0
                         || cpu_flag.load(Ordering::Relaxed)
@@ -3035,9 +3303,7 @@ fn run_step(ctx: StepCtx) {
 
                     let (measured, source) = if boxed {
                         (
-                            cg.as_ref()
-                                .and_then(|c| c.cpu_stats(&t))
-                                .and_then(|stats| cpu_seconds_from_stats(&stats)),
+                            stats.as_ref().and_then(cpu_seconds_from_stats),
                             CPU_SOURCE_CGROUP,
                         )
                     } else {
@@ -3181,6 +3447,26 @@ fn run_step(ctx: StepCtx) {
     // measurements is worth far more.
     for r in readers {
         join_bounded(r, &tag, "output reader", JOIN_WAIT);
+    }
+
+    // A periodic deadline can miss an arbitrarily short final phase. Sample synchronously after
+    // the process tree is quiescent and before cleanup destroys the cgroup counters. The guarded
+    // read keeps this optional evidence path from turning a sampler failure into a step failure.
+    if let Some(capture) = &timeseries {
+        let (stats, threads) = read_timeseries_measurements(&cgroups, &tag, capture);
+        if let Some(n) = threads {
+            let mut current_peak = thread_peak.lock().unwrap();
+            *current_peak = Some(current_peak.map_or(n, |current| current.max(n)));
+        }
+        record_timeseries_sample(
+            capture,
+            &tag,
+            resolve_effective_inner_jobs(profile_inner_jobs),
+            "final",
+            start.elapsed().as_secs_f64(),
+            stats.as_ref(),
+            threads,
+        );
     }
 
     // TEST-LEVEL ATTRIBUTION, derived from the step's own output stream. Computed here, after the
@@ -3358,6 +3644,16 @@ fn run_step(ctx: StepCtx) {
         let mut sh = lock_shared(&shared);
         retire(&mut sh, &step);
         sh.step_profile_rows.push(row);
+        if let Some(capture) = &timeseries {
+            sh.step_timeseries_rows.extend(
+                capture
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .rows
+                    .iter()
+                    .cloned(),
+            );
+        }
         let was_aborted = sh.aborted.contains(&tag);
         // Distinguish the two ways a step gets cancelled. "Another step failed" and "the whole run
         // ran out of budget" call for completely different follow-up, and reporting both with the
@@ -3775,6 +4071,7 @@ pub fn run_dag_boxed_deadline_limited_with_cpu(
         run_timeout_s,
         run_cpu_budget,
         resource_caps_path,
+        None,
     )
 }
 
@@ -3802,6 +4099,64 @@ pub fn run_dag_boxed_deadline_limited_with_resource_caps(
         run_timeout_s,
         None,
         resource_caps_path,
+        None,
+    )
+}
+
+/// CLI-only deepest scheduler path carrying an opt-in cgroup time-series interval.
+///
+/// Public library wrappers intentionally retain their existing signatures and pass no interval.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_dag_boxed_deadline_limited_with_resource_caps_and_timeseries(
+    cfg: &DagConfig,
+    max_steps: i64,
+    max_cpus: i64,
+    keep_going: bool,
+    verbosity: i64,
+    cgroups: BoxedCgroups,
+    order: Option<Vec<String>>,
+    run_timeout_s: Option<i64>,
+    resource_caps_path: Option<PathBuf>,
+    profile_timeseries_interval: Option<Duration>,
+) -> RunResult {
+    run_dag_boxed_deadline_limited_with_cpu_and_resource_caps(
+        cfg,
+        max_steps,
+        max_cpus,
+        keep_going,
+        verbosity,
+        cgroups,
+        order,
+        run_timeout_s,
+        None,
+        resource_caps_path,
+        profile_timeseries_interval,
+    )
+}
+
+/// CLI-only isolated-run path carrying an opt-in cgroup time-series interval.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_dag_boxed_limited_with_timeseries(
+    cfg: &DagConfig,
+    max_steps: i64,
+    max_cpus: i64,
+    keep_going: bool,
+    verbosity: i64,
+    cgroups: BoxedCgroups,
+    profile_timeseries_interval: Option<Duration>,
+) -> RunResult {
+    run_dag_boxed_deadline_limited_with_cpu_and_resource_caps(
+        cfg,
+        max_steps,
+        max_cpus,
+        keep_going,
+        verbosity,
+        cgroups,
+        None,
+        None,
+        None,
+        None,
+        profile_timeseries_interval,
     )
 }
 
@@ -3817,7 +4172,22 @@ fn run_dag_boxed_deadline_limited_with_cpu_and_resource_caps(
     run_timeout_s: Option<i64>,
     run_cpu_budget: Option<RunCpuBudget>,
     resource_caps_path: Option<PathBuf>,
+    profile_timeseries_interval: Option<Duration>,
 ) -> RunResult {
+    if let Some(interval) = profile_timeseries_interval {
+        if !(Duration::from_millis(50)..=Duration::from_secs(10)).contains(&interval) {
+            eprintln!(
+                "[scheduler] ERROR: time-series profiling interval must be between 50ms and 10s; no step was started"
+            );
+            return RunResult::default();
+        }
+        if !matches!(&cgroups, Some(manager) if manager.enabled()) {
+            eprintln!(
+                "[scheduler] ERROR: time-series profiling requires active cgroup-v2 containment; no step was started"
+            );
+            return RunResult::default();
+        }
+    }
     // FIRST, before anything walks the graph. The loader already refuses these, so this is the
     // door a LIBRARY caller comes through with a hand-built DagConfig -- and a cycle reaching the
     // planner is not a bad report, it is a stack-overflow abort (core dump) in this edition and a
@@ -3837,6 +4207,7 @@ fn run_dag_boxed_deadline_limited_with_cpu_and_resource_caps(
             not_launched: Vec::new(),
             intentional_skips: Vec::new(),
             step_profile_rows: Vec::new(),
+            step_timeseries_rows: Vec::new(),
             run_timed_out: false,
             run_cpu_timed_out: false,
             run_cpu_accounting_failed: false,
@@ -3853,6 +4224,7 @@ fn run_dag_boxed_deadline_limited_with_cpu_and_resource_caps(
             not_launched: Vec::new(),
             intentional_skips: Vec::new(),
             step_profile_rows: Vec::new(),
+            step_timeseries_rows: Vec::new(),
             run_timed_out: false,
             run_cpu_timed_out: false,
             run_cpu_accounting_failed: false,
@@ -3874,6 +4246,7 @@ fn run_dag_boxed_deadline_limited_with_cpu_and_resource_caps(
             not_launched: Vec::new(),
             intentional_skips: Vec::new(),
             step_profile_rows: Vec::new(),
+            step_timeseries_rows: Vec::new(),
             run_timed_out: false,
             run_cpu_timed_out: false,
             run_cpu_accounting_failed: false,
@@ -3903,6 +4276,7 @@ fn run_dag_boxed_deadline_limited_with_cpu_and_resource_caps(
             not_launched: Vec::new(),
             intentional_skips: Vec::new(),
             step_profile_rows: Vec::new(),
+            step_timeseries_rows: Vec::new(),
             run_timed_out: false,
             run_cpu_timed_out: false,
             run_cpu_accounting_failed: false,
@@ -3932,6 +4306,7 @@ fn run_dag_boxed_deadline_limited_with_cpu_and_resource_caps(
                 not_launched: Vec::new(),
                 intentional_skips: Vec::new(),
                 step_profile_rows: Vec::new(),
+                step_timeseries_rows: Vec::new(),
                 run_timed_out: false,
                 run_cpu_timed_out: false,
                 run_cpu_accounting_failed: false,
@@ -3971,6 +4346,7 @@ fn run_dag_boxed_deadline_limited_with_cpu_and_resource_caps(
                     not_launched: Vec::new(),
                     intentional_skips: Vec::new(),
                     step_profile_rows: Vec::new(),
+                    step_timeseries_rows: Vec::new(),
                     run_timed_out: false,
                     run_cpu_timed_out: false,
                     run_cpu_accounting_failed: false,
@@ -3997,6 +4373,7 @@ fn run_dag_boxed_deadline_limited_with_cpu_and_resource_caps(
         run_timeout_s,
         run_cpu_budget,
         resource_coordinator,
+        profile_timeseries_interval,
     );
     // ANNOUNCE THE EVIDENCE PATH ONCE, AT THE START. A durable log nobody can find is not
     // evidence; and printing it only on failure is printing it only where the run still had a
@@ -5076,6 +5453,243 @@ mod tests {
         fn kill_all_remaining(&self) -> i64 {
             0
         }
+    }
+
+    struct TimeseriesCgroups {
+        reads: std::sync::atomic::AtomicI64,
+        cleaned: AtomicBool,
+    }
+
+    impl TimeseriesCgroups {
+        fn new() -> Self {
+            Self {
+                reads: std::sync::atomic::AtomicI64::new(0),
+                cleaned: AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl CgroupManager for TimeseriesCgroups {
+        fn enabled(&self) -> bool {
+            true
+        }
+
+        fn prepare_command(
+            &self,
+            _tag: &str,
+            cmd: &str,
+            _mem_max: Option<i64>,
+            _cpu_count: Option<i64>,
+        ) -> String {
+            cmd.to_string()
+        }
+
+        fn kill(&self, _tag: &str) -> bool {
+            true
+        }
+
+        fn cleanup(&self, _tag: &str) {
+            self.cleaned.store(true, Ordering::Relaxed);
+        }
+
+        fn oom_kills(&self, _tag: &str) -> i64 {
+            0
+        }
+
+        fn peak_bytes(&self, _tag: &str) -> Option<i64> {
+            None
+        }
+
+        fn cpu_stats(&self, _tag: &str) -> Option<BTreeMap<String, i64>> {
+            if self.cleaned.load(Ordering::Relaxed) {
+                return None;
+            }
+            let value = self.reads.fetch_add(50_000, Ordering::Relaxed);
+            Some(BTreeMap::from([
+                ("usage_usec".to_string(), value),
+                ("user_usec".to_string(), value * 3 / 4),
+                ("system_usec".to_string(), value / 4),
+                ("throttled_usec".to_string(), value / 10),
+            ]))
+        }
+
+        fn cpu_pressure(&self, _tag: &str) -> Option<BTreeMap<String, f64>> {
+            None
+        }
+
+        fn thread_count(&self, _tag: &str) -> Option<i64> {
+            (!self.cleaned.load(Ordering::Relaxed)).then_some(3)
+        }
+
+        fn kill_all_remaining(&self) -> i64 {
+            0
+        }
+    }
+
+    #[test]
+    fn timeseries_has_start_periodic_and_final_samples_before_cleanup() {
+        let mut traced = step("trace", "sleep", "sleep 0.25", &[], 0.0, &[]);
+        traced.hint.preferred_inner_jobs = Some(2);
+        traced.jobs_flag = Some(String::new());
+        let cfg = DagConfig {
+            steps: vec![traced],
+            ..Default::default()
+        };
+        let manager = Arc::new(TimeseriesCgroups::new());
+        let result = run_dag_boxed_limited_with_timeseries(
+            &cfg,
+            1,
+            2,
+            false,
+            0,
+            Some(manager.clone()),
+            Some(Duration::from_millis(50)),
+        );
+        assert!(result.ok);
+        assert!(manager.cleaned.load(Ordering::Relaxed));
+        assert!(result.step_timeseries_rows.len() >= 3);
+        assert_eq!(result.step_timeseries_rows[0]["sample_kind"], "start");
+        assert_eq!(
+            result.step_timeseries_rows.last().unwrap()["sample_kind"],
+            "final"
+        );
+        assert!(result
+            .step_timeseries_rows
+            .iter()
+            .any(|row| row["sample_kind"] == "periodic"));
+        let expected = [
+            "step",
+            "inner_jobs",
+            "sample_index",
+            "sample_kind",
+            "elapsed_s",
+            "interval_s",
+            "cpu_usage_s",
+            "user_s",
+            "sys_s",
+            "effective_cores",
+            "user_cores",
+            "system_cores",
+            "throttled_s",
+            "interval_throttled_s",
+            "thread_count",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<std::collections::BTreeSet<_>>();
+        for (index, row) in result.step_timeseries_rows.iter().enumerate() {
+            assert_eq!(row["sample_index"], index.to_string());
+            assert_eq!(row["step"], "trace.sleep");
+            assert_eq!(row["inner_jobs"], "2");
+            assert_eq!(
+                row.keys()
+                    .cloned()
+                    .collect::<std::collections::BTreeSet<_>>(),
+                expected
+            );
+        }
+        let final_row = result.step_timeseries_rows.last().unwrap();
+        assert!(!final_row["cpu_usage_s"].is_empty());
+        assert!(!final_row["effective_cores"].is_empty());
+        assert_eq!(final_row["thread_count"], "3");
+    }
+
+    #[test]
+    fn timeseries_deltas_are_blank_after_missing_or_reset_counters() {
+        let capture = Arc::new(Mutex::new(TimeseriesCapture::default()));
+        let initial = BTreeMap::from([
+            ("usage_usec".to_string(), 1_000_000),
+            ("user_usec".to_string(), 750_000),
+            ("system_usec".to_string(), 250_000),
+            ("throttled_usec".to_string(), 100_000),
+        ]);
+        record_timeseries_sample(&capture, "g.j", 4, "start", 0.0, Some(&initial), Some(1));
+        let reset = BTreeMap::from([
+            ("usage_usec".to_string(), 500_000),
+            ("user_usec".to_string(), 800_000),
+            ("system_usec".to_string(), 100_000),
+            ("throttled_usec".to_string(), 50_000),
+        ]);
+        record_timeseries_sample(&capture, "g.j", 4, "periodic", 1.0, Some(&reset), Some(2));
+        record_timeseries_sample(&capture, "g.j", 4, "final", 2.0, None, None);
+        record_timeseries_sample(&capture, "g.j", 4, "periodic", 2.1, Some(&reset), Some(3));
+        let rows = &capture.lock().unwrap().rows;
+        assert_eq!(rows.len(), 3, "a late monitor sample must not follow final");
+        assert_eq!(rows[0]["interval_s"], "");
+        assert_eq!(rows[1]["interval_s"], "1.000000");
+        assert_eq!(rows[1]["effective_cores"], "");
+        assert_eq!(rows[1]["user_cores"], "0.0500");
+        assert_eq!(rows[1]["system_cores"], "");
+        assert_eq!(rows[1]["interval_throttled_s"], "");
+        assert_eq!(rows[2]["cpu_usage_s"], "");
+        assert_eq!(rows[2]["effective_cores"], "");
+        assert_eq!(rows[2]["thread_count"], "");
+    }
+
+    #[test]
+    fn timeseries_library_path_refuses_unboxed_before_spawn() {
+        let dir = std::env::temp_dir().join(format!(
+            "dagrun_timeseries_library_refusal_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("spawned");
+        let cfg = DagConfig {
+            steps: vec![step(
+                "g",
+                "j",
+                &format!("touch {}", marker.display()),
+                &[],
+                0.0,
+                &[],
+            )],
+            ..Default::default()
+        };
+        let result = run_dag_boxed_limited_with_timeseries(
+            &cfg,
+            1,
+            1,
+            false,
+            0,
+            None,
+            Some(Duration::from_millis(50)),
+        );
+        assert!(!result.ok);
+        assert!(!marker.exists());
+        assert!(result.step_timeseries_rows.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn timeseries_is_empty_without_opt_in() {
+        let cfg = DagConfig {
+            steps: vec![step("g", "j", "true", &[], 0.0, &[])],
+            ..Default::default()
+        };
+        let result = run_dag_boxed_limited(
+            &cfg,
+            1,
+            1,
+            false,
+            0,
+            Some(Arc::new(TimeseriesCgroups::new())),
+        );
+        assert!(result.ok);
+        assert!(result.step_timeseries_rows.is_empty());
+    }
+
+    #[test]
+    fn sampling_deadlines_advance_from_the_original_cadence() {
+        let start = Instant::now();
+        let interval = Duration::from_millis(50);
+        let next = advance_deadline(
+            start + interval,
+            interval,
+            start + Duration::from_millis(160),
+        );
+        assert_eq!(next.duration_since(start), Duration::from_millis(200));
     }
 
     struct RunCpuCgroups {
@@ -6286,7 +6900,7 @@ mod tests {
                 .collect::<BTreeMap<String, i64>>(),
             ..Default::default()
         };
-        Runner::new(&cfg, 1, 1, false, 0, None, None, None, None, None)
+        Runner::new(&cfg, 1, 1, false, 0, None, None, None, None, None, None)
     }
 
     #[test]

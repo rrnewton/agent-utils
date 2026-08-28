@@ -1,0 +1,22 @@
+description: >-
+  Real clean-build scaling benchmark for the dagrun Rust binary. Each invocation compiles into a
+  fresh target directory beneath DAGRUN_CARGO_SWEEP_ROOT, so every width starts without compiled
+  artifacts while preserving the caller's Cargo registry/source cache and the repository target.
+  DAGRUN_CARGO_SWEEP_ROOT must already exist; retained target directories are caller-managed. This
+  offline fixture requires cached dependencies and targets x86_64-unknown-linux-gnu.
+steps:
+  - group: build
+    job: dagrun
+    desc: clean release build of the dagrun binary
+    cmd: >-
+      target=$(mktemp -d "${DAGRUN_CARGO_SWEEP_ROOT:?}/target.XXXXXXXX") &&
+      CARGO_INCREMENTAL=0 CARGO_NET_OFFLINE=true CARGO_TARGET_DIR="$target"
+      cargo build --manifest-path rs/Cargo.toml --package dagrun --bin dagrun
+      --release --locked --offline --target x86_64-unknown-linux-gnu --quiet
+      $DAGRUN_EXTRA_ARGS
+    cmdtype: cargo-build
+    timeout: 1800
+    cpu_timeout: 3600
+    hint:
+      classification: cpu-bound
+      hard_mem_max_bytes: 17179869184

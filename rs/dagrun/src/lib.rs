@@ -86,7 +86,9 @@ pub use model::{
     StepOutcome, WriteDomainGuarantee, WriteDomainPolicy, DAGRUN_EXTRA_ARGS_ENV, DAG_CONFIG_FIELDS,
     DEFAULT_JOBS_FLAG, DEFAULT_STEP_TIMEOUT, JOBS_ENV_ENV, WALL_CPU_BACKSTOP_FACTOR,
 };
-pub use perflog::{append_step_profiles, PerfWindow};
+pub use perflog::{
+    append_step_profiles, append_step_timeseries, PerfWindow, STEP_TIMESERIES_COLUMNS,
+};
 pub use profile_enrich::{
     container_core_budget, resolve_effective_inner_jobs, step_enrichment_columns,
 };

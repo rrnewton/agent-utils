@@ -452,7 +452,8 @@ def parse_target_duration(raw: str) -> float:
 
     A bare number means seconds; ``ms``, ``s``, ``m``, and ``h`` suffixes are accepted.  This is a
     soft sweep target, not a process timeout, so the parser deliberately returns a duration value
-    without attaching any kill semantics to it.
+    without attaching any kill semantics to it. Zero means “complete mandatory pass one, then
+    start no optional refinement pass.”
     """
 
     text = raw.strip()

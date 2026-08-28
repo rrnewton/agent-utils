@@ -30,7 +30,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::capabilities::enforcement_manifest;
 use crate::cgroup::{
@@ -54,11 +54,12 @@ use crate::model::{
     step_classification, step_width_is_resizable, DagConfig, ResourceHint, Step, StepOutcome,
     DEFAULT_STEP_TIMEOUT, JOBS_ENV_ENV,
 };
-use crate::perflog::{append_step_profiles, child_cpu_seconds, PerfWindow};
+use crate::perflog::{append_step_profiles, append_step_timeseries, child_cpu_seconds, PerfWindow};
 use crate::profile_enrich::container_core_budget;
 use crate::scheduler::{
-    cap_config_max_cpus, nested_run_refusal, run_dag_boxed_deadline_limited_with_resource_caps,
-    run_dag_boxed_limited, validate_max_cpus_rewrite, BoxedCgroups,
+    cap_config_max_cpus, nested_run_refusal,
+    run_dag_boxed_deadline_limited_with_resource_caps_and_timeseries,
+    run_dag_boxed_limited_with_timeseries, validate_max_cpus_rewrite, BoxedCgroups,
 };
 use crate::sizing::{
     box_mem_budget_bytes, cpu_count, jobs_for_budget, parse_size, stress_control_floor_bytes,
@@ -361,6 +362,7 @@ fn run_help(c: &Palette) -> String {
             ("--args STRING", "replace the opt-in {args} token in selected step commands"),
             ("--stress N", "duplicate the graph into N disconnected components; --max-steps controls active copies, --max-cpus caps each width/shared bandwidth, and expansion is limited to 100,000 generated nodes"),
             ("--perf-dir DIR", "write per-step + whole-run resource-usage CSVs into DIR"),
+            ("--profile-timeseries DURATION", "opt-in cgroup CPU/thread trace interval (50ms..10s); writes traces/<run_id>.csv"),
             ("--no-profile", "disable the default auto-logging profile store for this run"),
             ("--profile", "after the run, print a per-step profile (timing/memory) table"),
             ("--planner NAME", "dispatch-ordering planner: greedy-lpt (default) | critical-path | cpa"),
@@ -406,6 +408,7 @@ fn sweep_help(c: &Palette) -> String {
             ("--target-time DURATION", "soft multi-pass allowance (ms/s/m/h suffix accepted): pass 1 and every started pass finish"),
             ("--repeat K", "run each width K times and keep the fastest (default: 1)"),
             ("--perf-dir DIR", "write the sweep's resource-usage CSVs into DIR"),
+            ("--profile-timeseries DURATION", "opt-in cgroup CPU/thread trace interval (50ms..10s); writes traces/<run_id>.csv"),
             ("--no-profile", "disable the default auto-logging profile store"),
             ("--allow-cgroup-failure", "if cgroup boxing is unavailable, run UNBOXED with a warning"),
             ("--unsafe-no-cgroups", "DELIBERATELY skip cgroup boxing entirely (unsafe)"),
@@ -934,6 +937,20 @@ fn load_parse_error(source: &str, error: DagJsonError) -> LoadError {
 /// period used for per-step `cpu.max`.
 const MAX_RUN_CPUS: i64 = i64::MAX / 100_000;
 const MAX_STRESS_GENERATED_NODES: i64 = 100_000;
+const MIN_PROFILE_TIMESERIES_INTERVAL: Duration = Duration::from_millis(50);
+const MAX_PROFILE_TIMESERIES_INTERVAL: Duration = Duration::from_secs(10);
+
+fn parse_profile_timeseries_duration(raw: &str) -> Result<Duration, String> {
+    let duration = parse_target_duration(raw).map_err(|_| {
+        format!("invalid --profile-timeseries '{raw}': expected seconds or an ms/s/m/h suffix")
+    })?;
+    if !(MIN_PROFILE_TIMESERIES_INTERVAL..=MAX_PROFILE_TIMESERIES_INTERVAL).contains(&duration) {
+        return Err(format!(
+            "invalid --profile-timeseries '{raw}': duration must be between 50ms and 10s"
+        ));
+    }
+    Ok(duration)
+}
 
 struct RunArgs {
     dag: Option<String>,
@@ -948,6 +965,7 @@ struct RunArgs {
     stress: i64,
     perf_dir: Option<String>,
     no_profile: bool,
+    profile_timeseries: Option<Duration>,
     profile: bool,
     planner: String,
     show_plan: bool,
@@ -1017,6 +1035,7 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
         stress: 1,
         perf_dir: None,
         no_profile: false,
+        profile_timeseries: None,
         profile: false,
         planner: Planner::GreedyLpt.value().to_string(),
         show_plan: false,
@@ -1105,6 +1124,10 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
             }
             "--perf-dir" => a.perf_dir = Some(take_value(inline, &mut i)?),
             "--no-profile" => a.no_profile = true,
+            "--profile-timeseries" => {
+                let value = take_value(inline, &mut i)?;
+                a.profile_timeseries = Some(parse_profile_timeseries_duration(&value)?);
+            }
             "--profile" => a.profile = true,
             "--planner" => a.planner = validate_planner(take_value(inline, &mut i)?)?,
             "--show-plan" => a.show_plan = true,
@@ -1213,6 +1236,9 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
             }
         }
         i += 1;
+    }
+    if a.no_profile && a.profile_timeseries.is_some() {
+        return Err("--profile-timeseries cannot be combined with --no-profile".to_string());
     }
     Ok(a)
 }
@@ -1624,6 +1650,20 @@ fn resolve_profile_dir(perf_dir: Option<&str>, no_profile: bool) -> (Option<Stri
         }
     }
     (Some(DEFAULT_PROFILE_DIR.to_string()), "default")
+}
+
+fn require_timeseries_cgroups(
+    command: &str,
+    interval: Option<Duration>,
+    cgroups: &BoxedCgroups,
+) -> Result<(), i32> {
+    if interval.is_some() && !matches!(cgroups, Some(manager) if manager.enabled()) {
+        eprintln!(
+            "{PROG}: {command}: --profile-timeseries requires active cgroup-v2 containment; no step was started"
+        );
+        return Err(3);
+    }
+    Ok(())
 }
 
 /// Validate a `--planner` value, returning the canonical string or a usage error.
@@ -2520,6 +2560,7 @@ fn run_single_step(
     perf_dir: Option<&str>,
     git: &str,
     verbosity: i64,
+    profile_timeseries_interval: Option<Duration>,
 ) -> SweepMeasure {
     run_isolated_step(
         base,
@@ -2532,6 +2573,7 @@ fn run_single_step(
         git,
         verbosity,
         None,
+        profile_timeseries_interval,
     )
 }
 
@@ -2548,6 +2590,7 @@ fn run_isolated_step(
     git: &str,
     verbosity: i64,
     sweep_meta: Option<&SweepProfileMeta>,
+    profile_timeseries_interval: Option<Duration>,
 ) -> SweepMeasure {
     let mut step = base.clone();
     step.deps.clear();
@@ -2560,8 +2603,15 @@ fn run_isolated_step(
     let (u0, s0) = child_cpu_seconds();
     let window = perf_dir.map(|d| PerfWindow::start(Path::new(d), git));
     let start = Instant::now();
-    let mut result =
-        run_dag_boxed_limited(&one, 1, max_cpus.max(1), false, verbosity, cgroups.clone());
+    let mut result = run_dag_boxed_limited_with_timeseries(
+        &one,
+        1,
+        max_cpus.max(1),
+        false,
+        verbosity,
+        cgroups.clone(),
+        profile_timeseries_interval,
+    );
     let measured = start.elapsed().as_secs_f64();
     let (u1, s1) = child_cpu_seconds();
     let measured_user_s = (u1 - u0).max(0.0);
@@ -2599,19 +2649,52 @@ fn run_isolated_step(
             );
         }
     }
+    if let Some(meta) = sweep_meta {
+        for row in &mut result.step_timeseries_rows {
+            row.insert("sweep_mode".into(), "target-time".into());
+            row.insert("sweep_id".into(), meta.sweep_id.clone());
+            row.insert("sweep_pass".into(), meta.pass.to_string());
+            row.insert("sweep_sample".into(), meta.sample.to_string());
+            row.insert("sweep_repeat".into(), meta.repeat.to_string());
+            row.insert("sweep_width_source".into(), meta.width_source.clone());
+            row.insert("workload_digest".into(), meta.workload_digest.clone());
+            row.insert("sweep_target_s".into(), format!("{:.6}", meta.target_s));
+            row.insert(
+                "sweep_physical_cores".into(),
+                meta.topology.physical_cores.to_string(),
+            );
+            row.insert(
+                "sweep_logical_cpus".into(),
+                meta.topology.logical_cpus.to_string(),
+            );
+        }
+    }
     if let Some(d) = perf_dir {
-        // The whole run's rows are appended in this one call, so a freshly minted run_id
-        // (`None`) groups exactly this execution.
+        let profile_run_id = crate::perflog::new_run_id();
         append_step_profiles(
             Path::new(d),
             &result.step_profile_rows,
             git,
             profile_outer_jobs.max(1),
             None,
-            sweep_enforcement_kind(cgroups.is_some()),
+            profile_enforcement_kind(cgroups.is_some()),
             "sweep",
-            None,
+            Some(&profile_run_id),
         );
+        if profile_timeseries_interval.is_some() {
+            if let Some(path) = append_step_timeseries(
+                Path::new(d),
+                &result.step_timeseries_rows,
+                git,
+                profile_outer_jobs.max(1),
+                None,
+                profile_enforcement_kind(cgroups.is_some()),
+                "sweep",
+                &profile_run_id,
+            ) {
+                eprintln!("[scheduler] step time-series written to {}", path.display());
+            }
+        }
     }
     let row = result.step_profile_rows.first();
     let wall_s = row
@@ -2632,7 +2715,7 @@ fn run_isolated_step(
 
 /// Profile provenance for a sweep execution. Sweep rows describe the containment that actually
 /// wrapped the measured step, rather than inheriting the generic writer's unknown/default value.
-fn sweep_enforcement_kind(cgroup_manager_present: bool) -> &'static str {
+fn profile_enforcement_kind(cgroup_manager_present: bool) -> &'static str {
     if cgroup_manager_present {
         "cgroup-v2"
     } else {
@@ -2733,6 +2816,7 @@ struct SweepArgs {
     repeat: i64,
     perf_dir: Option<String>,
     no_profile: bool,
+    profile_timeseries: Option<Duration>,
     allow_cgroup_failure: bool,
     unsafe_no_cgroups: bool,
     verbosity: i64,
@@ -2747,6 +2831,7 @@ fn parse_sweep_args(rest: &[String]) -> Result<SweepArgs, String> {
         repeat: 1,
         perf_dir: None,
         no_profile: false,
+        profile_timeseries: None,
         allow_cgroup_failure: false,
         unsafe_no_cgroups: false,
         verbosity: 0,
@@ -2781,12 +2866,19 @@ fn parse_sweep_args(rest: &[String]) -> Result<SweepArgs, String> {
             }
             "--perf-dir" => a.perf_dir = Some(take_value(inline, &mut i)?),
             "--no-profile" => a.no_profile = true,
+            "--profile-timeseries" => {
+                let value = take_value(inline, &mut i)?;
+                a.profile_timeseries = Some(parse_profile_timeseries_duration(&value)?);
+            }
             "--allow-cgroup-failure" => a.allow_cgroup_failure = true,
             "--unsafe-no-cgroups" => a.unsafe_no_cgroups = true,
             "-v" => a.verbosity += 1,
             other => return Err(format!("unrecognized argument: {other}")),
         }
         i += 1;
+    }
+    if a.no_profile && a.profile_timeseries.is_some() {
+        return Err("--profile-timeseries cannot be combined with --no-profile".to_string());
     }
     Ok(a)
 }
@@ -2870,6 +2962,9 @@ fn cmd_sweep(a: &SweepArgs, c: &Palette) -> i32 {
         Ok(cg) => cg,
         Err(code) => return code,
     };
+    if let Err(code) = require_timeseries_cgroups("sweep", a.profile_timeseries, &cgroups) {
+        return code;
+    }
     let (perf_dir, source) = resolve_profile_dir(a.perf_dir.as_deref(), a.no_profile);
     let git = git_sha();
 
@@ -2885,6 +2980,7 @@ fn cmd_sweep(a: &SweepArgs, c: &Palette) -> i32 {
                 perf_dir.as_deref(),
                 &git,
                 a.verbosity,
+                a.profile_timeseries,
             );
             if !m.ok {
                 eprintln!(
@@ -2986,6 +3082,9 @@ fn cmd_target_time_sweep(a: &SweepArgs, c: &Palette) -> i32 {
         Ok(cgroups) => cgroups,
         Err(code) => return code,
     };
+    if let Err(code) = require_timeseries_cgroups("sweep", a.profile_timeseries, &cgroups) {
+        return code;
+    }
     let (perf_dir, profile_source) = resolve_profile_dir(a.perf_dir.as_deref(), a.no_profile);
     let git = git_sha();
     let target_s = target.as_secs_f64();
@@ -3083,6 +3182,7 @@ fn cmd_target_time_sweep(a: &SweepArgs, c: &Palette) -> i32 {
                     &git,
                     a.verbosity,
                     Some(&meta),
+                    a.profile_timeseries,
                 );
                 if !measure.ok {
                     eprintln!(
@@ -3129,6 +3229,7 @@ fn cmd_target_time_sweep(a: &SweepArgs, c: &Palette) -> i32 {
                         &git,
                         a.verbosity,
                         Some(&meta),
+                        a.profile_timeseries,
                     );
                     if !measure.ok {
                         eprintln!(
@@ -3450,6 +3551,9 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
         Ok(cg) => cg,
         Err(code) => return code,
     };
+    if let Err(code) = require_timeseries_cgroups("run", a.profile_timeseries, &cgroups) {
+        return code;
+    }
 
     // Opt-in --cores K: constrain the whole run tree to K reserved cores. Apply it here,
     // after the boxing re-exec has settled (the re-exec'd in-scope child re-enters cmd_run and
@@ -3629,8 +3733,12 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
     let window = perf_dir
         .as_deref()
         .map(|d| PerfWindow::start(Path::new(d), &git));
+    let profile_enforcement = profile_enforcement_kind(matches!(
+        &cgroups,
+        Some(manager) if manager.enabled()
+    ));
 
-    let result = run_dag_boxed_deadline_limited_with_resource_caps(
+    let result = run_dag_boxed_deadline_limited_with_resource_caps_and_timeseries(
         cfg,
         max_steps,
         max_cpus,
@@ -3640,6 +3748,7 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
         Some(plan.order.clone()),
         a.run_timeout,
         resource_caps_path,
+        a.profile_timeseries,
     );
     let passed = result.outcomes.iter().filter(|o| o.ok).count();
     let failed = result
@@ -3677,11 +3786,27 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
             &result.step_profile_rows,
             &git,
             max_steps,
-            profile_run_id.as_deref(),
-            "unverified",
-            "local",
             None,
+            profile_enforcement,
+            "run",
+            profile_run_id.as_deref(),
         );
+        if a.profile_timeseries.is_some() {
+            if let Some(run_id) = profile_run_id.as_deref() {
+                if let Some(path) = append_step_timeseries(
+                    Path::new(d),
+                    &result.step_timeseries_rows,
+                    &git,
+                    max_steps,
+                    None,
+                    profile_enforcement,
+                    "run",
+                    run_id,
+                ) {
+                    eprintln!("[scheduler] step time-series written to {}", path.display());
+                }
+            }
+        }
         report_profile_written(d, source);
     }
 
@@ -4683,6 +4808,150 @@ mod tests {
         let sweep = sweep_help(&palette);
         assert!(sweep.contains("--jobs RANGE"));
         assert!(!sweep.contains("--max-cpus"));
+        assert!(help.contains("--profile-timeseries"));
+        assert!(sweep.contains("--profile-timeseries"));
+    }
+
+    #[test]
+    fn profile_timeseries_interval_is_bounded_and_conflicts_with_no_profile() {
+        assert_eq!(
+            parse_run_args(&["--profile-timeseries=50ms".into()])
+                .unwrap()
+                .profile_timeseries,
+            Some(Duration::from_millis(50))
+        );
+        assert_eq!(
+            parse_sweep_args(&["--profile-timeseries".into(), "10s".into()])
+                .unwrap()
+                .profile_timeseries,
+            Some(Duration::from_secs(10))
+        );
+        for invalid in ["49ms", "10.001s", "nope"] {
+            assert!(
+                parse_run_args(&[format!("--profile-timeseries={invalid}")]).is_err(),
+                "run accepted {invalid}"
+            );
+            assert!(
+                parse_sweep_args(&[format!("--profile-timeseries={invalid}")]).is_err(),
+                "sweep accepted {invalid}"
+            );
+        }
+        assert_eq!(
+            parse_run_args(&["--profile-timeseries=100ms".into(), "--no-profile".into()])
+                .err()
+                .as_deref(),
+            Some("--profile-timeseries cannot be combined with --no-profile")
+        );
+        assert_eq!(
+            parse_sweep_args(&["--no-profile".into(), "--profile-timeseries=100ms".into()])
+                .err()
+                .as_deref(),
+            Some("--profile-timeseries cannot be combined with --no-profile")
+        );
+    }
+
+    #[test]
+    fn run_timeseries_refuses_unboxed_before_spawning_a_step() {
+        let dir = std::env::temp_dir().join(format!(
+            "dagrun_timeseries_refusal_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("spawned");
+        let mut cfg = tiny();
+        cfg.steps.truncate(1);
+        cfg.steps[0].cmd = format!("touch {}", marker.display());
+        let args = parse_run_args(&[
+            "--unsafe-no-cgroups".into(),
+            "--profile-timeseries=50ms".into(),
+            format!("--perf-dir={}", dir.display()),
+            "--quiet".into(),
+        ])
+        .unwrap();
+        assert_eq!(cmd_run(&cfg, &args, &Palette { enabled: false }), 3);
+        assert!(!marker.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ordinary_run_profiles_share_one_run_id_and_name_the_unboxed_runner() {
+        let dir = std::env::temp_dir().join(format!(
+            "dagrun_run_profile_provenance_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let args = parse_run_args(&[
+            "--unsafe-no-cgroups".into(),
+            "--no-profile-feedback".into(),
+            format!("--perf-dir={}", dir.display()),
+            "--quiet".into(),
+        ])
+        .unwrap();
+        assert_eq!(cmd_run(&tiny(), &args, &Palette { enabled: false }), 0);
+        let profile = crate::perflog::store_paths(&dir)
+            .into_iter()
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("step_profiles_"))
+            })
+            .unwrap();
+        let text = std::fs::read_to_string(profile).unwrap();
+        let mut lines = text.lines();
+        let header = crate::perflog::parse_csv_line(lines.next().unwrap());
+        let rows: Vec<BTreeMap<String, String>> = lines
+            .map(|line| {
+                header
+                    .iter()
+                    .cloned()
+                    .zip(crate::perflog::parse_csv_line(line))
+                    .collect()
+            })
+            .collect();
+        assert_eq!(rows.len(), 2);
+        let run_id = &rows[0]["run_id"];
+        assert!(!run_id.is_empty());
+        assert!(rows.iter().all(|row| &row["run_id"] == run_id));
+        assert!(rows
+            .iter()
+            .all(|row| row["profile_base_sha"] == row["git_sha"]));
+        assert!(rows.iter().all(|row| row["enforcement_kind"] == "unboxed"));
+        assert!(rows.iter().all(|row| row["runner_name"] == "run"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sweep_timeseries_refuses_unboxed_before_spawning_a_step() {
+        let dir = std::env::temp_dir().join(format!(
+            "dagrun_sweep_timeseries_refusal_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("spawned");
+        let dag = dir.join("dag.json");
+        let cfg = dag_from_json(&format!(
+            r#"{{"steps":[{{"group":"g","job":"j","cmd":"touch {}","cmdtype":"generic-with-flag","jobs_flag":"--jobs"}}]}}"#,
+            marker.display()
+        ))
+        .unwrap();
+        std::fs::write(&dag, dag_to_json(&cfg)).unwrap();
+        let args = parse_sweep_args(&[
+            format!("--dag={}", dag.display()),
+            "--step=g.j".into(),
+            "--jobs=1".into(),
+            "--unsafe-no-cgroups".into(),
+            "--profile-timeseries=50ms".into(),
+            format!("--perf-dir={}", dir.display()),
+        ])
+        .unwrap();
+        assert_eq!(cmd_sweep(&args, &Palette { enabled: false }), 3);
+        assert!(!marker.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -5026,6 +5295,7 @@ mod tests {
             repeat: 1,
             perf_dir: None,
             no_profile: true,
+            profile_timeseries: None,
             allow_cgroup_failure: false,
             unsafe_no_cgroups: false,
             verbosity: 0,
@@ -5037,9 +5307,9 @@ mod tests {
     }
 
     #[test]
-    fn sweep_profile_enforcement_tracks_cgroup_manager_presence() {
-        assert_eq!(sweep_enforcement_kind(true), "cgroup-v2");
-        assert_eq!(sweep_enforcement_kind(false), "unboxed");
+    fn profile_enforcement_tracks_cgroup_manager_presence() {
+        assert_eq!(profile_enforcement_kind(true), "cgroup-v2");
+        assert_eq!(profile_enforcement_kind(false), "unboxed");
     }
 
     #[test]
