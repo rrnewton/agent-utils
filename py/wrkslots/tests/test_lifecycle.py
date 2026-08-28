@@ -1,4 +1,4 @@
-"""Focused safety and lifecycle tests for the standalone wrkslots command."""
+"""Focused safety and lifecycle tests for the wrkslots distribution."""
 
 from __future__ import annotations
 
@@ -12,10 +12,22 @@ from pathlib import Path
 import pytest
 
 
-PY_ROOT = Path(__file__).resolve().parents[1]
-WRKSLOTS = PY_ROOT / "wrkslots.py"
+PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+PY_ROOT = PACKAGE_ROOT.parent
+WRKSLOTS = PACKAGE_ROOT / "__main__.py"
 sys.path.insert(0, str(PY_ROOT))
-import wrkslots  # noqa: E402
+from wrkslots import cli as wrkslots  # noqa: E402
+
+
+def source_environment(extra: dict[str, str] | None = None) -> dict[str, str]:
+    environment = os.environ.copy()
+    previous = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = (
+        str(PY_ROOT) if not previous else f"{PY_ROOT}{os.pathsep}{previous}"
+    )
+    if extra:
+        environment.update(extra)
+    return environment
 
 
 def git(path: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -38,13 +50,11 @@ def command(
     machine: str | None = None,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    argv = [sys.executable, str(WRKSLOTS), "--project-root", str(project)]
+    argv = [sys.executable, "-m", "wrkslots", "--project-root", str(project)]
     if machine is not None:
         argv.extend(("--machine", machine))
     argv.extend(args)
-    process_env = os.environ.copy()
-    if env:
-        process_env.update(env)
+    process_env = source_environment(env)
     return subprocess.run(
         argv,
         text=True,
@@ -116,6 +126,7 @@ def initialize(
         text=True,
         capture_output=True,
         check=False,
+        env=source_environment(),
     )
     assert completed.returncode == 0, completed.stderr
 
@@ -180,7 +191,6 @@ def create(
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     pid = os.getpid() if owner_pid is None else owner_pid
-    remote_url = git(project / repository_name, "remote", "get-url", "origin").stdout.strip()
     owner_args = ["--owner-pid", str(pid)] if bind_owner else []
     return command(
         project,
@@ -197,8 +207,6 @@ def create(
         str(os.getpid()),
         "--repo",
         f"{checkout_name}={repository_name}",
-        "--remote-url",
-        f"{checkout_name}={remote_url}",
         "--branch",
         f"{checkout_name}={branch}",
         machine=machine,
@@ -376,7 +384,8 @@ def test_same_slot_race_has_one_winner(tmp_path: Path) -> None:
     project, repository, _remote = make_project(tmp_path)
     base = [
         sys.executable,
-        str(WRKSLOTS),
+        "-m",
+        "wrkslots",
         "--project-root",
         str(project),
         "--wait-lock",
@@ -393,20 +402,20 @@ def test_same_slot_race_has_one_winner(tmp_path: Path) -> None:
         str(os.getpid()),
         "--repo",
         "product=repo",
-        "--remote-url",
-        f"product={git(repository, 'remote', 'get-url', 'origin').stdout.strip()}",
     ]
     first = subprocess.Popen(
         [*base, "--agent", "codex-1", "--branch", "product=codex/race-one"],
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        env=source_environment(),
     )
     second = subprocess.Popen(
         [*base, "--agent", "codex-2", "--branch", "product=codex/race-two"],
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        env=source_environment(),
     )
     first.communicate(timeout=20)
     second.communicate(timeout=20)
@@ -446,7 +455,7 @@ def test_lock_conflict_refuses_without_state_change(tmp_path: Path) -> None:
             "import sys, time",
             "from pathlib import Path",
             f"sys.path.insert(0, {str(PY_ROOT)!r})",
-            "import wrkslots",
+            "from wrkslots import cli as wrkslots",
             f"subject = Path({str(project / 'worktrees' / 'ACTIVE')!r})",
             "with wrkslots._locked(subject, exclusive=True, wait_seconds=0):",
             "    print('locked', flush=True)",
@@ -559,8 +568,6 @@ def test_create_refuses_owner_generation_change_before_publication(
             str(os.getpid()),
             "--repo",
             "product=repo",
-            "--remote-url",
-            f"product={git(project / 'repo', 'remote', 'get-url', 'origin').stdout.strip()}",
             "--branch",
             "product=codex/task",
         ]
@@ -649,6 +656,164 @@ def test_crash_after_git_removal_before_journal_update_recovers(tmp_path: Path) 
     assert recovered.returncode == 0, recovered.stderr
     assert active_slots(project) == []
     assert not (project / "worktrees" / "slot01").exists()
+
+
+def test_process_entering_after_final_scan_before_path_move_is_not_deleted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    commit_task(repository, checkout(project), "codex/task")
+    handed_off = finish(project)
+    assert handed_off.returncode == 0, handed_off.stderr
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+    original_assert = wrkslots._assert_slot_unused
+    calls = 0
+    entrant: subprocess.Popen[str] | None = None
+
+    def enter_after_scan(
+        slot_path: Path, record: wrkslots.ActiveRecord | None = None
+    ) -> None:
+        nonlocal calls, entrant
+        original_assert(slot_path, record)
+        calls += 1
+        if calls == 2:
+            entrant = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    "import os,sys,time; os.chdir(sys.argv[1]); "
+                    "print(os.getcwd(), flush=True); time.sleep(60)",
+                    str(checkout(project)),
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            assert entrant.stdout is not None
+            assert entrant.stdout.readline().strip() == str(checkout(project))
+
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", enter_after_scan)
+    try:
+        returncode = wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "remove",
+                "slot01",
+                "--coordinator-pid",
+                str(os.getpid()),
+                "--expected-generation",
+                "1",
+            ]
+        )
+
+        assert returncode == 3
+        assert "live process" in capsys.readouterr().err
+        assert entrant is not None
+        assert checkout(project).is_dir()
+        assert Path(os.readlink(f"/proc/{entrant.pid}/cwd")) == checkout(project)
+        assert not list((project / "worktrees").glob(".slot01.fenced.*"))
+        assert not (project / "worktrees" / "ACTIVE.testhost.journal").exists()
+        assert len(active_slots(project)) == 1
+    finally:
+        if entrant is not None:
+            entrant.terminate()
+            entrant.wait(timeout=10)
+
+
+@pytest.mark.parametrize(
+    ("layout", "worktrees_directory"),
+    ((None, "worktrees"), ("flat", "worktrees/slots")),
+)
+def test_crash_after_path_fence_recovers_from_fenced_storage(
+    tmp_path: Path, layout: str | None, worktrees_directory: str
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path,
+        layout=layout,
+        worktrees_directory=worktrees_directory,
+    )
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    commit_task(repository, checkout(project), "codex/task")
+    handed_off = finish(project)
+    assert handed_off.returncode == 0, handed_off.stderr
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+
+    interrupted = command(
+        project,
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-path-fence-before-journal"},
+    )
+
+    assert interrupted.returncode == 86
+    assert not checkout(project).exists()
+    assert len(list(slots_directory(project).glob(".slot01.fenced.*"))) == 1
+    recovered = command(project, "recover", "--coordinator-pid", str(os.getpid()))
+    assert recovered.returncode == 0, recovered.stderr
+    assert active_slots(project) == []
+    assert not list(slots_directory(project).glob(".slot01.fenced.*"))
+
+
+def test_crash_after_archive_before_active_delete_recovers_exact_overlap(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    commit_task(repository, checkout(project), "codex/task")
+    handed_off = finish(project)
+    assert handed_off.returncode == 0, handed_off.stderr
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+
+    interrupted = command(
+        project,
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-archive-before-active"},
+    )
+
+    assert interrupted.returncode == 86
+    assert len(active_slots(project)) == 1
+    archive_path = project / "worktrees" / "ARCHIVED.testhost.json"
+    archive = json.loads(archive_path.read_text(encoding="utf-8"))
+    assert len(archive["records"]) == 1
+    assert not (project / "worktrees" / "slot01").exists()
+    assert (project / "worktrees" / "ACTIVE.testhost.journal").is_file()
+
+    original_archive = archive_path.read_text(encoding="utf-8")
+    archive["records"][0]["purpose"] = "mismatched archive"
+    archive_path.write_text(json.dumps(archive, indent=2) + "\n", encoding="utf-8")
+    refused = command(project, "recover", "--coordinator-pid", str(os.getpid()))
+    assert refused.returncode == 3
+    assert "active on testhost and archived on testhost" in refused.stderr
+    assert len(active_slots(project)) == 1
+    assert (project / "worktrees" / "ACTIVE.testhost.journal").is_file()
+    archive_path.write_text(original_archive, encoding="utf-8")
+
+    recovered = command(project, "recover", "--coordinator-pid", str(os.getpid()))
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert active_slots(project) == []
+    archive = json.loads(archive_path.read_text(encoding="utf-8"))
+    assert len(archive["records"]) == 1
+    assert not (project / "worktrees" / "ACTIVE.testhost.journal").exists()
 
 
 def test_changed_finish_journal_cannot_redirect_deletion(tmp_path: Path) -> None:
@@ -887,6 +1052,127 @@ def test_create_fetches_remote_before_selecting_default_start(tmp_path: Path) ->
 
     assert made.returncode == 0, made.stderr
     assert git(checkout(project), "rev-parse", "HEAD").stdout.strip() == advanced
+
+
+def test_create_defaults_to_origin_and_accepts_a_configured_remote_name(tmp_path: Path) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+
+    defaulted = create(project, slot="slot01", branch="codex/default-origin")
+
+    assert defaulted.returncode == 0, defaulted.stderr
+    default_row = active_slots(project)[0]
+    assert isinstance(default_row, dict)
+    default_checkouts = default_row["checkouts"]
+    assert isinstance(default_checkouts, list)
+    default_checkout = default_checkouts[0]
+    assert isinstance(default_checkout, dict)
+    assert default_checkout["remote"] == "origin"
+
+    second_root = tmp_path / "second"
+    second_root.mkdir()
+    second_project, second_repository, second_remote = make_project(second_root)
+    git(second_repository, "remote", "add", "upstream", str(second_remote))
+    selected = command(
+        second_project,
+        "create",
+        "slot02",
+        "--agent",
+        "codex-2",
+        "--task",
+        "task-slot02",
+        "--purpose",
+        "configured remote selection",
+        "--owner-pid",
+        str(os.getpid()),
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--repo",
+        "product=repo",
+        "--remote",
+        "product=upstream",
+        "--branch",
+        "product=codex/upstream",
+    )
+
+    assert selected.returncode == 0, selected.stderr
+    selected_row = active_slots(second_project)[0]
+    assert isinstance(selected_row, dict)
+    selected_checkouts = selected_row["checkouts"]
+    assert isinstance(selected_checkouts, list)
+    checkout_row = selected_checkouts[0]
+    assert isinstance(checkout_row, dict)
+    assert checkout_row["remote"] == "upstream"
+    assert checkout_row["landed_ref"] == "refs/remotes/upstream/main"
+
+
+def test_create_can_verify_the_selected_configured_remote_url(tmp_path: Path) -> None:
+    project, repository, remote = make_project(tmp_path)
+    git(repository, "remote", "add", "upstream", str(remote))
+
+    selected = command(
+        project,
+        "create",
+        "slot01",
+        "--agent",
+        "codex-1",
+        "--task",
+        "task-slot01",
+        "--purpose",
+        "configured remote URL verification",
+        "--owner-pid",
+        str(os.getpid()),
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--repo",
+        "product=repo",
+        "--remote",
+        "product=upstream",
+        "--remote-url",
+        f"product={remote}",
+        "--branch",
+        "product=codex/upstream",
+    )
+
+    assert selected.returncode == 0, selected.stderr
+    row = active_slots(project)[0]
+    assert isinstance(row, dict)
+    checkouts = row["checkouts"]
+    assert isinstance(checkouts, list)
+    checkout_row = checkouts[0]
+    assert isinstance(checkout_row, dict)
+    assert checkout_row["remote"] == "upstream"
+    assert checkout_row["remote_url_sha256"] == wrkslots._GitVcs().remote_url_sha256(
+        checkout(project), "upstream"
+    )
+
+    mismatched = command(
+        project,
+        "create",
+        "slot02",
+        "--agent",
+        "codex-2",
+        "--task",
+        "task-slot02",
+        "--purpose",
+        "mismatched remote URL",
+        "--owner-pid",
+        str(os.getpid()),
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--repo",
+        "product=repo",
+        "--remote",
+        "product=upstream",
+        "--remote-url",
+        "product=file:///wrong",
+        "--branch",
+        "product=codex/wrong",
+    )
+
+    assert mismatched.returncode == 3
+    assert "differs from trusted provisioning input" in mismatched.stderr
+    assert len(active_slots(project)) == 1
+    assert not checkout(project, "slot02").exists()
 
 
 def test_ignored_file_is_preserved_by_finish_refusal(tmp_path: Path) -> None:
@@ -1318,7 +1604,8 @@ def test_remove_refuses_live_process_using_slot(tmp_path: Path) -> None:
 def test_import_existing_is_dry_run_then_registers_verified_live_slot(
     tmp_path: Path,
 ) -> None:
-    project, repository, _remote = make_project(tmp_path)
+    project, repository, remote = make_project(tmp_path)
+    git(repository, "remote", "add", "upstream", str(remote))
     tree = checkout(project)
     tree.parent.mkdir()
     git(repository, "worktree", "add", "-b", "codex/imported", str(tree), "origin/main")
@@ -1333,8 +1620,10 @@ def test_import_existing_is_dry_run_then_registers_verified_live_slot(
         "import existing",
         "--repo",
         "product=repo",
+        "--remote",
+        "product=upstream",
         "--remote-url",
-        f"product={git(repository, 'remote', 'get-url', 'origin').stdout.strip()}",
+        f"product={remote}",
     )
 
     dry_run = command(project, *common)
@@ -1353,7 +1642,15 @@ def test_import_existing_is_dry_run_then_registers_verified_live_slot(
         str(os.getpid()),
     )
     assert applied.returncode == 0, applied.stderr
-    assert len(active_slots(project)) == 1
+    rows = active_slots(project)
+    assert len(rows) == 1
+    row = rows[0]
+    assert isinstance(row, dict)
+    checkouts = row["checkouts"]
+    assert isinstance(checkouts, list)
+    imported = checkouts[0]
+    assert isinstance(imported, dict)
+    assert imported["remote"] == "upstream"
     assert tree.is_dir()
 
 
@@ -1445,8 +1742,6 @@ def test_register_refuses_owner_generation_change_before_publication(
             "--verified-live",
             "--repo",
             "product=repo",
-            "--remote-url",
-            f"product={git(repository, 'remote', 'get-url', 'origin').stdout.strip()}",
         ]
     )
     captured = capsys.readouterr()
@@ -1482,8 +1777,6 @@ def test_path_escape_and_symlink_are_refused_without_touching_target(tmp_path: P
         str(os.getpid()),
         "--repo",
         "product=../outside",
-        "--remote-url",
-        "product=file:///outside",
         "--branch",
         "product=codex/escape",
     )
@@ -1949,6 +2242,7 @@ def test_flat_layout_keeps_controls_beside_slots_and_completes_lifecycle(
         tmp_path,
         worktrees_directory="worktrees/slots",
         layout="flat",
+        cache_globs=("target",),
     )
     control = project / "worktrees"
     slots = control / "slots"
@@ -1987,11 +2281,24 @@ def test_flat_layout_keeps_controls_beside_slots_and_completes_lifecycle(
     assert row["checkouts"][0]["path"] == "worktrees/slots/slot01"
 
     task_head = commit_task(repository, tree, "codex/task")
+    cache = tree / "target"
+    cache.mkdir()
+    (cache / "artifact").write_bytes(b"regenerable cache")
     handed_off = finish(project)
     assert handed_off.returncode == 0, handed_off.stderr
     mark_owner_dead(project)
     set_liveness(project, "dead")
     monkeypatch.setattr(wrkslots, "_assert_slot_unused", lambda *_args: None)
+    removed_cache_paths: list[Path] = []
+    original_remove_cache_directory = wrkslots._remove_cache_directory
+
+    def record_cache_removal(
+        config: wrkslots.Config, cache_directory: wrkslots.CacheDirectory
+    ) -> int:
+        removed_cache_paths.append(cache_directory.path)
+        return original_remove_cache_directory(config, cache_directory)
+
+    monkeypatch.setattr(wrkslots, "_remove_cache_directory", record_cache_removal)
 
     remove_code = wrkslots.main(
         [
@@ -2008,6 +2315,9 @@ def test_flat_layout_keeps_controls_beside_slots_and_completes_lifecycle(
     captured = capsys.readouterr()
 
     assert remove_code == 0, captured.err
+    assert len(removed_cache_paths) == 1
+    assert removed_cache_paths[0].name == "target"
+    assert any(part.startswith(".slot01.fenced.") for part in removed_cache_paths[0].parts)
     assert not tree.exists()
     assert slots.is_dir()
     archive = json.loads(

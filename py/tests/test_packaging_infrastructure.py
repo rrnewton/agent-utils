@@ -139,7 +139,7 @@ def test_embed_check_rejects_regular_copy_and_wrong_link_target(
 def test_package_docs_and_licenses_are_authoritative_links() -> None:
     docs = _load_script("embed_userguides")
 
-    assert len(docs.PACKAGE_LINKS) == 36
+    assert len(docs.PACKAGE_LINKS) == 39
     for link in docs.PACKAGE_LINKS:
         destination = REPO_ROOT / link.destination
         assert destination.is_symlink(), link.destination

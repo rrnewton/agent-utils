@@ -77,11 +77,11 @@ check-test-suite-selector:
 		fi; \
 	done
 
-# test_wrkslots calls `lsof +D` and then inspects /proc before removing a slot.
+# test_lifecycle calls `lsof +D` and then inspects /proc before removing a slot.
 # On a shared host both operations walk every unrelated process: measured with
 # 3,754 processes, one empty two-directory test slot took about 30 seconds even
 # though no process used it. A PID namespace keeps the real lsof and /proc checks
-# while limiting them to the test and its children. The three tests below manage
+# while limiting them to the test and its children. The four tests below manage
 # child PIDs whose signal/reap behaviour must remain host-visible, so they run in
 # the ordinary environment. If unprivileged namespaces are unavailable, run the
 # original single pytest command; availability changes cost, never coverage.
@@ -90,14 +90,15 @@ ifneq ($(TEST_SUITE),rust)
 	@cd py && \
 	if command -v unshare >/dev/null 2>&1 \
 		&& unshare --user --map-root-user --pid --fork --mount-proc true >/dev/null 2>&1; then \
-		python3 -m pytest -q --ignore=tests/test_wrkslots.py && \
+		python3 -m pytest -q --ignore=wrkslots/tests/test_lifecycle.py && \
 		unshare --user --map-root-user --pid --fork --mount-proc \
-			python3 -m pytest -q tests/test_wrkslots.py \
-			-k 'not test_lock_conflict_refuses_without_state_change and not test_adopt_refuses_pid_outside_invoking_process_ancestry and not test_remove_refuses_live_process_using_slot' && \
+			python3 -m pytest -q -c pyproject.toml --rootdir=. wrkslots/tests/test_lifecycle.py \
+			-k 'not test_lock_conflict_refuses_without_state_change and not test_process_entering_after_final_scan_before_path_move_is_not_deleted and not test_adopt_refuses_pid_outside_invoking_process_ancestry and not test_remove_refuses_live_process_using_slot' && \
 		python3 -m pytest -q \
-			tests/test_wrkslots.py::test_lock_conflict_refuses_without_state_change \
-			tests/test_wrkslots.py::test_adopt_refuses_pid_outside_invoking_process_ancestry \
-			tests/test_wrkslots.py::test_remove_refuses_live_process_using_slot; \
+			wrkslots/tests/test_lifecycle.py::test_lock_conflict_refuses_without_state_change \
+			wrkslots/tests/test_lifecycle.py::test_process_entering_after_final_scan_before_path_move_is_not_deleted \
+			wrkslots/tests/test_lifecycle.py::test_adopt_refuses_pid_outside_invoking_process_ancestry \
+			wrkslots/tests/test_lifecycle.py::test_remove_refuses_live_process_using_slot; \
 	else \
 		python3 -m pytest -q; \
 	fi

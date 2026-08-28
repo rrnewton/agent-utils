@@ -149,6 +149,19 @@ PROJECTS: tuple[Project, ...] = (
         required_dependencies=("pyyaml",),
         command_userguides=(("herdr-agent", "AGENT_USER_GUIDE.md"),),
     ),
+    Project(
+        directory="wrkslots",
+        distribution="wrkslots",
+        package="wrkslots",
+        commands=("wrkslots",),
+        resources=(
+            "README.md",
+            "USER_GUIDE.md",
+            "py.typed",
+            "examples/liveness_probe.py",
+        ),
+        required_dependencies=(),
+    ),
 )
 
 _DIST_SEP = re.compile(r"[-_.]+")
@@ -194,7 +207,7 @@ _COMMON_DOC_TERMS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ),
 )
 _REQUIREMENT_NAME = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)")
-_PUBLIC_SCAN_IGNORED = {"__pycache__", "build", "dist"}
+_PUBLIC_SCAN_IGNORED = {"__pycache__", "build", "dist", "tests"}
 
 _PublicDocNode = ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef
 

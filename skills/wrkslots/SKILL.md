@@ -20,7 +20,7 @@ probe or occupancy scan failure is never evidence that a slot is clear.
 For a single repository whose slot directory must itself be the checkout root, use flat layout:
 
 ```sh
-agent-utils/py/wrkslots.py init \
+wrkslots init . \
   --worktrees-dir worktrees/slots --layout flat \
   --liveness-command worktrees/agent_liveness_probe.py \
   --max-active-slots 12 \
@@ -58,15 +58,19 @@ populated nested storage as flat storage.
 
 ## Create and recover provisioning
 
-Create one fresh slot for one agent. The remote URL is trusted provisioning input; it is not learned
-from mutable Git configuration. Record the coordinator process generation even when the owner will
-adopt later.
+Create one fresh slot for one agent. Repeat `--repo` and `--branch` for multiple repositories. The
+configured `origin` remote is used by default; use `--remote NAME=REMOTE` to select another
+already-configured remote. Use `--remote-url NAME=URL` when the caller must verify the selected
+remote's exact fetch URL; otherwise wrkslots records its configured URL. Wrkslots requires the
+recorded remote identity to remain unchanged. Record the coordinator process generation even when
+the owner will adopt later.
 
 ```sh
 worktrees/wrkslots create slot01 \
   --agent codex-1 --task task-123 --purpose "fix parser" \
   --coordinator-pid "$COORDINATOR_PID" --owner-pid "$OWNER_PID" \
-  --repo product=. --remote-url product=https://github.com/example/product \
+  --repo product=. --remote product=origin \
+  --remote-url product=https://github.com/example/product \
   --branch product=codex/fix-parser
 ```
 

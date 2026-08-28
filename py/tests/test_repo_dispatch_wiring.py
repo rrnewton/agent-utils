@@ -23,6 +23,7 @@ RUST_TOOLS = (
 PYTHON_ONLY_TOOLS = (
     "wrkviz",
     "parallel-experiment-runner",
+    "wrkslots",
 )
 RESOLVER_TOOLS = RUST_TOOLS + PYTHON_ONLY_TOOLS
 

@@ -229,6 +229,18 @@ STANDALONE_DOCUMENTS: tuple[StandaloneDocument, ...] = (
         source="common/docs/wrkviz/USER_GUIDE.md",
     ),
     StandaloneDocument(
+        tool="wrkslots",
+        document="README",
+        language="python",
+        source="common/docs/wrkslots/README.md",
+    ),
+    StandaloneDocument(
+        tool="wrkslots",
+        document="USER_GUIDE",
+        language="python",
+        source="common/docs/wrkslots/USER_GUIDE.md",
+    ),
+    StandaloneDocument(
         tool="parallel-experiment-runner",
         document="README",
         language="python",
@@ -305,6 +317,15 @@ def _package_links() -> tuple[PackageLink, ...]:
                 "common/docs/wrkviz/USER_GUIDE.md",
             ),
             PackageLink("py/wrkviz/LICENSE", "LICENSE"),
+            PackageLink(
+                "py/wrkslots/README.md",
+                "common/docs/wrkslots/README.md",
+            ),
+            PackageLink(
+                "py/wrkslots/USER_GUIDE.md",
+                "common/docs/wrkslots/USER_GUIDE.md",
+            ),
+            PackageLink("py/wrkslots/LICENSE", "LICENSE"),
             PackageLink(
                 "py/parallel_experiment_runner/README.md",
                 "common/docs/parallel-experiment-runner/README.md",
