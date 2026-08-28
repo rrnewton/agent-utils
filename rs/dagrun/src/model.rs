@@ -267,6 +267,19 @@ pub struct ResourceHint {
     pub measured_cpu_utilization: Option<f64>,
 }
 
+/// The manifest cell population selected by one DAG step.
+///
+/// This is serialized as the existing `manifest` object in DAG JSON. Keeping it on [`Step`]
+/// means a consumer can use the declared lane and category directly instead of reconstructing
+/// them from the shell command that happens to execute the selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DagManifest {
+    /// Manifest lane selected by the step.
+    pub lane: String,
+    /// Manifest category selected by the step.
+    pub category: String,
+}
+
 /// One node in the DAG: a shell command plus its dependencies and resource hint.
 #[derive(Debug, Clone)]
 pub struct Step {
@@ -284,6 +297,8 @@ pub struct Step {
     pub cmd: String,
     /// Known command-line shape for delivering the admitted width.
     pub cmdtype: CmdType,
+    /// Typed manifest selection carried by a manifest bucket step.
+    pub manifest: Option<DagManifest>,
     /// Tags (`"group.job"`) this step depends on.
     pub deps: Vec<String>,
     /// Environment variables added to the step process.
@@ -1716,6 +1731,7 @@ mod tests {
             description: String::new(),
             cmd: "true".into(),
             cmdtype: CmdType::Unknown,
+            manifest: None,
             deps: vec![],
             env: BTreeMap::new(),
             hint,
@@ -1742,6 +1758,7 @@ mod tests {
             description: String::new(),
             cmd: cmd.into(),
             cmdtype: CmdType::Unknown,
+            manifest: None,
             deps: vec![],
             env: BTreeMap::new(),
             hint: ResourceHint::default(),
@@ -1997,6 +2014,7 @@ mod cpu_timeout_multiplier_tests {
             description: String::new(),
             cmd: "true".into(),
             cmdtype: CmdType::Unknown,
+            manifest: None,
             deps: vec![],
             env: std::collections::BTreeMap::new(),
             hint: ResourceHint::default(),
@@ -2168,6 +2186,7 @@ mod carry_tests {
             description: String::new(),
             cmd: "true".into(),
             cmdtype: CmdType::Unknown,
+            manifest: None,
             deps: vec![],
             env: BTreeMap::new(),
             hint: ResourceHint::default(),

@@ -23,6 +23,7 @@ from dagrun.model import (
     DEFAULT_JOBS_FLAG,
     CmdType,
     DagConfig,
+    DagManifest,
     IntentionalSkipReason,
     ResourceHint,
     Step,
@@ -523,15 +524,13 @@ STEP_KEYS: frozenset[str] = frozenset(
         "write_domain_guarantee",
         "explains",
         "fail_fast_family",
-        # ⚠️ DECLARED HERE, CONSUMED DOWNSTREAM, NOT BY dagrun. Both are read by a
-        # consuming project's own planner, not by anything in this repository:
-        # `requires_host_capability` drives that planner's HOST-INAPPLICABLE
-        # decision, which stops a node claiming a pass on a machine that cannot
-        # run it, and `manifest` names the artifact set. dagrun ignores both by
-        # design.
+        # ⚠️ DECLARED HERE, CONSUMED DOWNSTREAM, NOT BY dagrun.
+        # `requires_host_capability` drives a consuming planner's
+        # HOST-INAPPLICABLE decision, which stops a node claiming a pass on a
+        # machine that cannot run it. dagrun ignores it by design.
         #
-        # They are listed because this schema is CLOSED, and closing it without
-        # them made dagrun REFUSE graphs that were already in use: measured
+        # Retained because this schema is CLOSED, and closing it without both fields
+        # made dagrun REFUSE graphs that were already in use: measured
         # 2026-08-26, `dagrun list` exited 2 on `manifest` for one real graph and
         # on `requires_host_capability` for another. A closed schema that does not
         # know its callers' fields does not raise the bar, it takes the caller's
@@ -555,6 +554,22 @@ HINT_KEYS: frozenset[str] = frozenset(
         "measured_cpu_utilization",
     }
 )
+
+MANIFEST_KEYS: frozenset[str] = frozenset({"lane", "category"})
+
+
+def _manifest_from(value: object, where: str) -> DagManifest | None:
+    if value is None:
+        return None
+    obj = _as_obj(value, where)
+    _refuse_unknown_keys(obj, MANIFEST_KEYS, where)
+    lane = _req_str(obj, "lane", where)
+    category = _req_str(obj, "category", where)
+    if not lane:
+        raise DagJsonError(f"{where}.lane: must be non-empty")
+    if not category:
+        raise DagJsonError(f"{where}.category: must be non-empty")
+    return DagManifest(lane=lane, category=category)
 
 #: Every key the top-level ``write_domain_policy`` object may carry. Closed: a misspelled
 #: ``require_explicit`` turns a fail-closed policy into no policy at all, silently.
@@ -697,6 +712,7 @@ def _dag_from_obj(raw: object) -> DagConfig:
                 desc=_opt_str(sm, "desc", ""),
                 description=_opt_str(sm, "description", ""),
                 cmd=_req_str(sm, "cmd", where),
+                manifest=_manifest_from(sm.get("manifest"), f"{where}.manifest"),
                 cmdtype=_cmdtype_field(sm, where),
                 deps=_opt_str_list(sm, "deps"),
                 env=_opt_str_str_map(sm, "env", where),
@@ -799,6 +815,14 @@ def _step_to_json(step: Step) -> dict[str, object]:
         "description": step.description,
         "cmd": step.cmd,
         "cmdtype": step.cmdtype.value,
+        "manifest": (
+            {
+                "lane": step.manifest.lane,
+                "category": step.manifest.category,
+            }
+            if step.manifest is not None
+            else None
+        ),
         "deps": list(step.deps),
         "env": dict(sorted(step.env.items())),
         "networkonly": step.networkonly,
@@ -821,6 +845,8 @@ def _step_to_json(step: Step) -> dict[str, object]:
         del obj["cpu_timeout"]
     if step.cmdtype is CmdType.UNKNOWN:
         del obj["cmdtype"]
+    if step.manifest is None:
+        del obj["manifest"]
     if step.skip_reason is None:
         del obj["skip_reason"]
     # Emitted only when declared, like write_domains below: a graph that does not use the

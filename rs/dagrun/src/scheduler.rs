@@ -4601,6 +4601,7 @@ mod tests {
             description: String::new(),
             cmd: cmd.into(),
             cmdtype: crate::model::CmdType::Unknown,
+            manifest: None,
             deps: deps.iter().map(|s| s.to_string()).collect(),
             env: BTreeMap::new(),
             hint: ResourceHint {

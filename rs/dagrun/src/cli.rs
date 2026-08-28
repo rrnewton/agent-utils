@@ -209,7 +209,7 @@ dagrun --help\n\n\
 {store}\n  {store_dir}\n  {store_note}\n\n\
 {planning}\n  {pl1}\n  {pl2}\n  {pl3}\n  {plan_note}\n\n\
 {schema}  {schema_note}\n  \
-step:   group, job, desc, description, cmd, cmdtype, deps[], env{{}}, timeout, jobs_flag, jobs_env, networkonly, engine_only, hint{{}}\n  \
+step:   group, job, desc, description, cmd, cmdtype, manifest{{lane,category}}, deps[], env{{}}, timeout, jobs_flag, jobs_env, networkonly, engine_only, hint{{}}\n  \
 hint:   resources{{name:int}}, est_duration_s, rss_baseline_bytes, hard_mem_max_bytes,\n          classification(\"cpu-bound\"|\"latency-bound\"|\"light\"), preferred_inner_jobs\n  \
 top:    description, resource_caps{{name:int}}, mem_cap_factor, mem_cap_floor_bytes,\n          outer_mem_safety_factor, default_step_timeout, default_jobs_flag, default_jobs_env\n  \
 desc = short label; description = long-form docs (often multi-line, great in YAML)\n  \
@@ -746,6 +746,7 @@ fn box_config(
             description: String::new(),
             cmd,
             cmdtype: crate::model::CmdType::Unknown,
+            manifest: None,
             deps: Vec::new(),
             env: BTreeMap::new(),
             hint: ResourceHint {

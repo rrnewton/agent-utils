@@ -9,6 +9,7 @@ import pytest
 from dagrun.io import DagJsonError, dag_from_json, dag_to_json
 from dagrun.model import (
     DagConfig,
+    DagManifest,
     ResourceHint,
     Step,
     StepClass,
@@ -84,7 +85,35 @@ def test_minimal_document_defaults() -> None:
     assert resolved_wall_timeout(step, cfg.default_step_timeout) == 1800
     assert step.cpu_timeout == 0  # CPU-time guard disabled by default
     assert step.hint.classification is StepClass.LIGHT
+    assert step.manifest is None
     assert cfg.resource_caps == {} and cfg.mem_cap_factor == 1.25
+
+
+def test_manifest_selection_roundtrips_and_refuses_malformed_values() -> None:
+    doc = (
+        '{"steps":[{"group":"e2e","job":"manifest_applications","cmd":"true",'
+        '"manifest":{"lane":"portable","category":"applications"}}]}'
+    )
+    cfg = dag_from_json(doc)
+    assert cfg.steps[0].manifest == DagManifest(lane="portable", category="applications")
+    encoded = dag_to_json(cfg)
+    assert dag_to_json(dag_from_json(encoded)) == encoded
+
+    malformed = [
+        ('{"lane":"portable"}', "manifest: field 'category' must be a string"),
+        ('{"lane":"","category":"applications"}', "manifest.lane: must be non-empty"),
+        (
+            '{"lane":"portable","category":"applications","future":"value"}',
+            "manifest: unknown field(s) 'future'",
+        ),
+    ]
+    for value, message in malformed:
+        with pytest.raises(DagJsonError) as raised:
+            dag_from_json(
+                '{"steps":[{"group":"e2e","job":"manifest_applications",'
+                f'"cmd":"true","manifest":{value}}}]}}'
+            )
+        assert message in str(raised.value)
 
 
 def test_cpu_timeout_roundtrip_and_conditional_emit() -> None:
