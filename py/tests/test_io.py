@@ -86,6 +86,7 @@ def test_minimal_document_defaults() -> None:
     assert step.cpu_timeout == 0  # CPU-time guard disabled by default
     assert step.hint.classification is StepClass.LIGHT
     assert step.manifest is None
+    assert step.integration_test_binaries is None
     assert cfg.resource_caps == {} and cfg.mem_cap_factor == 1.25
 
 
@@ -112,6 +113,39 @@ def test_manifest_selection_roundtrips_and_refuses_malformed_values() -> None:
             dag_from_json(
                 '{"steps":[{"group":"e2e","job":"manifest_applications",'
                 f'"cmd":"true","manifest":{value}}}]}}'
+            )
+        assert message in str(raised.value)
+
+
+def test_integration_test_binaries_roundtrip_and_refuse_malformed_values() -> None:
+    doc = (
+        '{"steps":[{"group":"test","job":"cli","cmd":"true",'
+        '"integration_test_binaries":["unit_alpha","unit_beta"]}]}'
+    )
+    cfg = dag_from_json(doc)
+    assert cfg.steps[0].integration_test_binaries == ["unit_alpha", "unit_beta"]
+    encoded = dag_to_json(cfg)
+    assert dag_to_json(dag_from_json(encoded)) == encoded
+
+    for value, message in [
+        ('"unit_alpha"', "field 'integration_test_binaries' must be a list of strings"),
+        (
+            '["unit_alpha",7]',
+            "field 'integration_test_binaries' must contain only strings",
+        ),
+        (
+            '["unit_alpha",""]',
+            "field 'integration_test_binaries' must not contain empty names",
+        ),
+        (
+            '["unit_alpha","unit_alpha"]',
+            "field 'integration_test_binaries' contains duplicate name 'unit_alpha'",
+        ),
+    ]:
+        with pytest.raises(DagJsonError) as raised:
+            dag_from_json(
+                '{"steps":[{"group":"test","job":"cli","cmd":"true",'
+                f'"integration_test_binaries":{value}}}]}}'
             )
         assert message in str(raised.value)
 

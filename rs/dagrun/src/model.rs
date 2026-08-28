@@ -299,6 +299,11 @@ pub struct Step {
     pub cmdtype: CmdType,
     /// Typed manifest selection carried by a manifest bucket step.
     pub manifest: Option<DagManifest>,
+    /// Exact Cargo integration-test binary targets executed by this step.
+    ///
+    /// `None` means the serialized step did not declare this field. A present list is authoritative
+    /// only when the consuming audit also verifies that the command executes the same targets.
+    pub integration_test_binaries: Option<Vec<String>>,
     /// Tags (`"group.job"`) this step depends on.
     pub deps: Vec<String>,
     /// Environment variables added to the step process.
@@ -1706,6 +1711,7 @@ mod tests {
             cmd: "true".into(),
             cmdtype: CmdType::Unknown,
             manifest: None,
+            integration_test_binaries: None,
             deps: vec![],
             env: BTreeMap::new(),
             hint,
@@ -1733,6 +1739,7 @@ mod tests {
             cmd: cmd.into(),
             cmdtype: CmdType::Unknown,
             manifest: None,
+            integration_test_binaries: None,
             deps: vec![],
             env: BTreeMap::new(),
             hint: ResourceHint::default(),
@@ -1949,6 +1956,7 @@ mod cpu_timeout_multiplier_tests {
             cmd: "true".into(),
             cmdtype: CmdType::Unknown,
             manifest: None,
+            integration_test_binaries: None,
             deps: vec![],
             env: std::collections::BTreeMap::new(),
             hint: ResourceHint::default(),
@@ -2121,6 +2129,7 @@ mod carry_tests {
             cmd: "true".into(),
             cmdtype: CmdType::Unknown,
             manifest: None,
+            integration_test_binaries: None,
             deps: vec![],
             env: BTreeMap::new(),
             hint: ResourceHint::default(),

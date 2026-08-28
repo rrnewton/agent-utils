@@ -755,6 +755,7 @@ mod tests {
             cmd: "true".into(),
             cmdtype: crate::model::CmdType::Unknown,
             manifest: None,
+            integration_test_binaries: None,
             deps: deps.iter().map(|s| s.to_string()).collect(),
             env: BTreeMap::new(),
             hint: ResourceHint {
@@ -942,6 +943,7 @@ mod tests {
             cmd: "true".into(),
             cmdtype: crate::model::CmdType::Unknown,
             manifest: None,
+            integration_test_binaries: None,
             deps: vec![],
             env: BTreeMap::new(),
             hint,

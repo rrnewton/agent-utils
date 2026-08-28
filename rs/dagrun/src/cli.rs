@@ -744,6 +744,7 @@ fn box_config(
             cmd,
             cmdtype: crate::model::CmdType::Unknown,
             manifest: None,
+            integration_test_binaries: None,
             deps: Vec::new(),
             env: BTreeMap::new(),
             hint: ResourceHint {

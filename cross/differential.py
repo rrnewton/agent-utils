@@ -410,6 +410,7 @@ def representative_fixtures() -> list[Fixture]:
                         "desc": "browser smoke",
                         "cmd": "echo e2e",
                         "manifest": {"lane": "portable", "category": "applications"},
+                        "integration_test_binaries": ["unit_alpha", "unit_beta"],
                         "deps": ["build.app"],
                         "hint": {"resources": {"browser": 1}, "classification": "latency-bound"},
                     },
@@ -1315,6 +1316,18 @@ LOADER_REFUSALS: tuple[tuple[str, str, str], ...] = (
         "steps[0].manifest: unknown field(s) 'future'",
     ),
     (
+        "empty-integration-test-binary",
+        '{"steps":[{"group":"a","job":"one","cmd":"true",'
+        '"integration_test_binaries":["unit_alpha",""]}]}',
+        "field 'integration_test_binaries' must not contain empty names",
+    ),
+    (
+        "duplicate-integration-test-binary",
+        '{"steps":[{"group":"a","job":"one","cmd":"true",'
+        '"integration_test_binaries":["unit_alpha","unit_alpha"]}]}',
+        "field 'integration_test_binaries' contains duplicate name 'unit_alpha'",
+    ),
+    (
         "unknown-write-domain-policy-field",
         '{"steps":[],"write_domain_policy":{"require_explicits":true}}',
         "write_domain_policy: unknown field(s) 'require_explicits'",
@@ -1367,6 +1380,7 @@ LOADER_ACCEPTANCES: tuple[tuple[str, str], ...] = (
         "every-declared-step-field",
         '{"steps":[{"group":"a","job":"one","desc":"d","description":"long","cmd":"true",'
         '"manifest":{"lane":"portable","category":"applications"},'
+        '"integration_test_binaries":["unit_alpha"],'
         '"deps":[],"env":{"K":"V"},"networkonly":false,"engine_only":false,"timeout":5,'
         '"cpu_timeout":3,"cmdtype":"generic-with-flag","jobs_flag":"-j","jobs_env":"J","explains":[],'
         '"fail_fast_family":"fam",'

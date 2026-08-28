@@ -146,7 +146,7 @@ fn err(msg: impl Into<String>) -> DagJsonError {
 /// `cmds`, `timeouts`, `env_vars`, `description` vs `desc`. Silently ignored, the instruction is
 /// simply not carried out and the document still says it was: the step runs with no timeout, no
 /// dependency, no environment, and nothing anywhere reports it.
-const STEP_KEYS: [&str; 22] = [
+const STEP_KEYS: [&str; 23] = [
     "cmd",
     "cmdtype",
     "cpu_timeout",
@@ -159,6 +159,7 @@ const STEP_KEYS: [&str; 22] = [
     "fail_fast_family",
     "group",
     "hint",
+    "integration_test_binaries",
     "job",
     "jobs_env",
     "jobs_flag",
@@ -169,10 +170,11 @@ const STEP_KEYS: [&str; 22] = [
     "write_domains",
     // ⚠️ DECLARED HERE, CONSUMED DOWNSTREAM, NOT BY dagrun.
     // `requires_host_capability` drives a consuming planner's HOST-INAPPLICABLE
-    // decision, which stops a node claiming a pass on a machine that cannot run
-    // it. dagrun ignores it by design.
+    // decision, while `manifest` and `integration_test_binaries` carry other
+    // consumer-owned selection facts. dagrun retains them but does not interpret
+    // them by design.
     //
-    // Retained because this schema is CLOSED, and closing it without both fields
+    // Retained because this schema is CLOSED, and closing it without these fields
     // made dagrun REFUSE graphs that were already in use -- measured 2026-08-26,
     // exit 2 on `manifest` for one real graph and on `requires_host_capability`
     // for another. Keep this list in step with the Python edition's STEP_KEYS;
@@ -457,6 +459,28 @@ fn present_str_list(
     }
 }
 
+fn integration_test_binaries_from(
+    m: &serde_json::Map<String, Value>,
+) -> Result<Option<Vec<String>>, DagJsonError> {
+    let Some(values) = present_str_list(m, "integration_test_binaries")? else {
+        return Ok(None);
+    };
+    let mut seen = BTreeSet::new();
+    for value in &values {
+        if value.trim().is_empty() {
+            return Err(err(
+                "field 'integration_test_binaries' must not contain empty names",
+            ));
+        }
+        if !seen.insert(value) {
+            return Err(err(format!(
+                "field 'integration_test_binaries' contains duplicate name '{value}'"
+            )));
+        }
+    }
+    Ok(Some(values))
+}
+
 fn write_domain_policy(value: Option<&Value>) -> Result<WriteDomainPolicy, DagJsonError> {
     let Some(value) = value else {
         return Ok(WriteDomainPolicy::default());
@@ -671,6 +695,7 @@ pub fn dag_from_value(raw: &Value) -> Result<DagConfig, DagJsonError> {
             cmd: req_str(sm, "cmd", &where_)?,
             cmdtype,
             manifest: manifest_from(sm.get("manifest"), &format!("{where_}.manifest"))?,
+            integration_test_binaries: integration_test_binaries_from(sm)?,
             deps: opt_str_list(sm, "deps")?,
             env: opt_str_str_map(sm, "env", &where_)?,
             hint: hint_from(sm.get("hint"), &format!("{where_}.hint"))?,
@@ -1079,6 +1104,12 @@ fn emit_step(s: &mut String, step: &Step, base: usize) {
         s.push_str(&key);
         s.push_str("},\n");
     }
+    if let Some(targets) = &step.integration_test_binaries {
+        s.push_str(&key);
+        s.push_str("\"integration_test_binaries\": ");
+        emit_str_list(s, targets, base + 2);
+        s.push_str(",\n");
+    }
     s.push_str(&key);
     s.push_str("\"deps\": ");
     emit_str_list(s, &step.deps, base + 2);
@@ -1392,6 +1423,7 @@ steps:
         assert_eq!(step.hint.classification, StepClass::Light);
         assert_eq!(step.jobs_flag, None);
         assert_eq!(step.manifest, None);
+        assert_eq!(step.integration_test_binaries, None);
         assert!(cfg.resource_caps.is_empty());
         assert_eq!(cfg.mem_cap_factor, 1.25);
         assert_eq!(cfg.default_jobs_flag, "-j");
@@ -1428,6 +1460,44 @@ steps:
         ] {
             let input = format!(
                 r#"{{"steps":[{{"group":"e2e","job":"manifest_applications","cmd":"true","manifest":{value}}}]}}"#
+            );
+            let error = dag_from_json(&input).unwrap_err().to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn integration_test_binaries_roundtrip_and_refuse_malformed_values() {
+        let doc = r#"{"steps":[{"group":"test","job":"cli","cmd":"true",
+            "integration_test_binaries":["unit_alpha","unit_beta"]}]}"#;
+        let cfg = dag_from_json(doc).unwrap();
+        assert_eq!(
+            cfg.steps[0].integration_test_binaries,
+            Some(vec!["unit_alpha".into(), "unit_beta".into()])
+        );
+        let encoded = dag_to_json(&cfg);
+        assert_eq!(dag_to_json(&dag_from_json(&encoded).unwrap()), encoded);
+
+        for (value, expected) in [
+            (
+                r#""unit_alpha""#,
+                "field 'integration_test_binaries' must be a list of strings",
+            ),
+            (
+                r#"["unit_alpha",7]"#,
+                "field 'integration_test_binaries' must contain only strings",
+            ),
+            (
+                r#"["unit_alpha",""]"#,
+                "field 'integration_test_binaries' must not contain empty names",
+            ),
+            (
+                r#"["unit_alpha","unit_alpha"]"#,
+                "field 'integration_test_binaries' contains duplicate name 'unit_alpha'",
+            ),
+        ] {
+            let input = format!(
+                r#"{{"steps":[{{"group":"test","job":"cli","cmd":"true","integration_test_binaries":{value}}}]}}"#
             );
             let error = dag_from_json(&input).unwrap_err().to_string();
             assert!(error.contains(expected), "{error}");
