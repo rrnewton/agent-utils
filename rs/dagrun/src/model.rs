@@ -12,6 +12,8 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashSet;
 
+use crate::test_results::TestResult;
+
 /// Wall-clock backstop (seconds) for a step that declares NO wall budget AND no CPU budget to
 /// derive one from. Wall time is LOAD-DEPENDENT, so it is only a defence-in-depth hang backstop;
 /// the CPU-time budget is the real, load-immune guard.
@@ -1535,6 +1537,8 @@ pub struct StepOutcome {
     pub executed_tests: Option<u64>,
     /// Tests filtered according to the same complete captured output.
     pub filtered_tests: Option<u64>,
+    /// Terminal per-test results from a controlled runner. `None` means they were not recorded.
+    pub test_results: Option<Vec<TestResult>>,
     /// Child process exit code; negative for a Unix signal; `None` if never collected.
     pub returncode: Option<i64>,
     /// Human-readable failure reason; `""` when `ok`.
@@ -1560,6 +1564,7 @@ impl StepOutcome {
             summary,
             executed_tests,
             filtered_tests,
+            test_results: None,
             returncode,
             reason: String::new(),
             aborted: false,
@@ -1610,6 +1615,7 @@ impl StepOutcome {
             summary,
             executed_tests,
             filtered_tests,
+            test_results: None,
             returncode,
             reason,
             aborted,
@@ -1632,6 +1638,7 @@ impl StepOutcome {
             summary,
             executed_tests,
             filtered_tests,
+            test_results: None,
             returncode,
             reason: "ABORTED (eager-exit after another step failed; --keep-going would continue independent work)"
                 .to_string(),
