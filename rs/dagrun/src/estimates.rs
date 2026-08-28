@@ -2144,6 +2144,7 @@ mod tests {
             cmd: "true".into(),
             cmdtype: crate::model::CmdType::Unknown,
             manifest: None,
+            integration_test_binaries: None,
             deps: deps.iter().map(|s| s.to_string()).collect(),
             env: BTreeMap::new(),
             hint: ResourceHint {
@@ -2923,6 +2924,7 @@ t,m,affinity16_cpu-max-max,a,1,a,u,l,m.heavy,cpu-bound,8,5.0,0,True,False,0,1000
             cmd: "true".into(),
             cmdtype: crate::model::CmdType::Unknown,
             manifest: None,
+            integration_test_binaries: None,
             deps: vec!["m.prep".into()],
             env: BTreeMap::new(),
             hint: ResourceHint {

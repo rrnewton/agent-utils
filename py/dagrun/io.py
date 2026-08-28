@@ -242,6 +242,23 @@ def _present_str_list(m: Mapping[str, object], key: str) -> list[str] | None:
     return out
 
 
+def _integration_test_binaries(m: Mapping[str, object]) -> list[str] | None:
+    values = _present_str_list(m, "integration_test_binaries")
+    if values is None:
+        return None
+    if any(not value.strip() for value in values):
+        raise DagJsonError(
+            "field 'integration_test_binaries' must not contain empty names"
+        )
+    duplicates = sorted({value for value in values if values.count(value) > 1})
+    if duplicates:
+        raise DagJsonError(
+            "field 'integration_test_binaries' contains duplicate name "
+            + repr(duplicates[0])
+        )
+    return values
+
+
 def _write_domain_policy(value: object) -> WriteDomainPolicy:
     if value is None:
         return WriteDomainPolicy()
@@ -513,6 +530,7 @@ STEP_KEYS: frozenset[str] = frozenset(
         "deps",
         "env",
         "hint",
+        "integration_test_binaries",
         "networkonly",
         "engine_only",
         "timeout",
@@ -526,10 +544,11 @@ STEP_KEYS: frozenset[str] = frozenset(
         "fail_fast_family",
         # ⚠️ DECLARED HERE, CONSUMED DOWNSTREAM, NOT BY dagrun.
         # `requires_host_capability` drives a consuming planner's
-        # HOST-INAPPLICABLE decision, which stops a node claiming a pass on a
-        # machine that cannot run it. dagrun ignores it by design.
+        # HOST-INAPPLICABLE decision, while `manifest` and
+        # `integration_test_binaries` carry other consumer-owned selection facts.
+        # dagrun retains them but does not interpret them by design.
         #
-        # Retained because this schema is CLOSED, and closing it without both fields
+        # Retained because this schema is CLOSED, and closing it without these fields
         # made dagrun REFUSE graphs that were already in use: measured
         # 2026-08-26, `dagrun list` exited 2 on `manifest` for one real graph and
         # on `requires_host_capability` for another. A closed schema that does not
@@ -713,6 +732,7 @@ def _dag_from_obj(raw: object) -> DagConfig:
                 description=_opt_str(sm, "description", ""),
                 cmd=_req_str(sm, "cmd", where),
                 manifest=_manifest_from(sm.get("manifest"), f"{where}.manifest"),
+                integration_test_binaries=_integration_test_binaries(sm),
                 cmdtype=_cmdtype_field(sm, where),
                 deps=_opt_str_list(sm, "deps"),
                 env=_opt_str_str_map(sm, "env", where),
@@ -823,6 +843,11 @@ def _step_to_json(step: Step) -> dict[str, object]:
             if step.manifest is not None
             else None
         ),
+        "integration_test_binaries": (
+            list(step.integration_test_binaries)
+            if step.integration_test_binaries is not None
+            else None
+        ),
         "deps": list(step.deps),
         "env": dict(sorted(step.env.items())),
         "networkonly": step.networkonly,
@@ -847,6 +872,8 @@ def _step_to_json(step: Step) -> dict[str, object]:
         del obj["cmdtype"]
     if step.manifest is None:
         del obj["manifest"]
+    if step.integration_test_binaries is None:
+        del obj["integration_test_binaries"]
     if step.skip_reason is None:
         del obj["skip_reason"]
     # Emitted only when declared, like write_domains below: a graph that does not use the
