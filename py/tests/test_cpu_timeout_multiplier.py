@@ -34,6 +34,7 @@ from dagrun.model import (
     scale_cpu_timeout,
     step_failure_reason,
 )
+from dagrun.protocols import StepOutcome
 
 
 def step(cpu_timeout: int = 0) -> Step:
@@ -71,6 +72,30 @@ def breach(
         cpu_timeout_multiplier=cpu_timeout_multiplier,
         cpu_timeout_platform=cpu_timeout_platform,
     )
+
+
+def test_step_outcome_retains_every_failure_fact_hidden_by_reason_precedence() -> None:
+    outcome = StepOutcome.failed(
+        "g.j",
+        duration_s=1.0,
+        summary="",
+        returncode=-9,
+        oomed=True,
+        oom_kills=3,
+        timed_out=True,
+        timeout=30,
+        pids_guard_tripped=False,
+        pids_guard_reason=None,
+        detail_write_failure=(),
+        cpu_timed_out=True,
+        cpu_timeout=10,
+        cpu_timeout_canonical=10,
+    )
+    assert outcome.reason.startswith("OOM-KILLED")
+    assert outcome.oomed
+    assert outcome.oom_kills == 3
+    assert outcome.timed_out
+    assert outcome.cpu_timed_out
 
 
 class TestUnityIsAStrictNoOp:

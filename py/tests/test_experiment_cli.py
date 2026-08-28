@@ -57,7 +57,8 @@ def _spec(**kw: object) -> ExperimentSpec:
 def _outcome(returncode: int = 0, *, aborted: bool = False, pids_events: int = 0) -> StepOutcome:
     return StepOutcome(
         tag="seed.3", ok=(returncode == 0 and not aborted), duration_s=1.0,
-        summary="", returncode=returncode, aborted=aborted, pids_events=pids_events,
+        summary="", returncode=returncode, oomed=False, oom_kills=0, timed_out=False,
+        cpu_timed_out=False, aborted=aborted, pids_events=pids_events,
     )
 
 

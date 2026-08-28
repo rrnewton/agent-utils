@@ -1517,6 +1517,17 @@ pub struct StepOutcome {
     pub filtered_tests: Option<u64>,
     /// Child process exit code; negative for a Unix signal; `None` if never collected.
     pub returncode: Option<i64>,
+    /// Whether this step or one of its descendants hit the step's inner memory limit.
+    ///
+    /// Kept separately from `reason`: the display string follows a precedence rule, so an OOM
+    /// can otherwise hide a simultaneous wall- or CPU-timeout from typed consumers.
+    pub oomed: bool,
+    /// Number of `oom_kill` events observed for this step's inner cgroup.
+    pub oom_kills: i64,
+    /// Whether the step exceeded its wall-clock bound.
+    pub timed_out: bool,
+    /// Whether the step exceeded its CPU-time bound.
+    pub cpu_timed_out: bool,
     /// Human-readable failure reason; `""` when `ok`.
     pub reason: String,
     /// True when eager-exit killed this in-flight step after ANOTHER step failed.
@@ -1541,6 +1552,10 @@ impl StepOutcome {
             executed_tests,
             filtered_tests,
             returncode,
+            oomed: false,
+            oom_kills: 0,
+            timed_out: false,
+            cpu_timed_out: false,
             reason: String::new(),
             aborted: false,
         }
@@ -1591,6 +1606,10 @@ impl StepOutcome {
             executed_tests,
             filtered_tests,
             returncode,
+            oomed,
+            oom_kills,
+            timed_out,
+            cpu_timed_out,
             reason,
             aborted,
         }
@@ -1613,6 +1632,10 @@ impl StepOutcome {
             executed_tests,
             filtered_tests,
             returncode,
+            oomed: false,
+            oom_kills: 0,
+            timed_out: false,
+            cpu_timed_out: false,
             reason: "ABORTED (eager-exit after another step failed; --keep-going would continue independent work)"
                 .to_string(),
             aborted: true,
@@ -1914,6 +1937,46 @@ mod tests {
                 ""
             ),
             "exit 1"
+        );
+    }
+
+    #[test]
+    fn step_outcome_retains_every_failure_fact_hidden_by_reason_precedence() {
+        let outcome = StepOutcome::failed(
+            "g.j".into(),
+            1.0,
+            String::new(),
+            Some(-9),
+            true,
+            3,
+            true,
+            30,
+            true,
+            10,
+            10,
+            DEFAULT_CPU_TIMEOUT_MULTIPLIER,
+            "",
+            false,
+            None,
+            None,
+        );
+        assert!(
+            outcome.reason.starts_with("OOM-KILLED"),
+            "{}",
+            outcome.reason
+        );
+        assert!(
+            outcome.oomed,
+            "OOM must remain typed when it wins the display precedence"
+        );
+        assert_eq!(outcome.oom_kills, 3);
+        assert!(
+            outcome.timed_out,
+            "wall timeout must not vanish behind the OOM message"
+        );
+        assert!(
+            outcome.cpu_timed_out,
+            "CPU timeout must not vanish behind the OOM message"
         );
     }
 }

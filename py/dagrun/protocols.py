@@ -293,6 +293,14 @@ class StepOutcome:
     summary: str
     #: Child process exit code; negative for a Unix signal; ``None`` if never collected.
     returncode: int | None
+    #: Whether this step or one of its descendants hit the step's inner memory limit.
+    oomed: bool
+    #: Number of ``oom_kill`` events observed for this step's inner cgroup.
+    oom_kills: int
+    #: Whether the step exceeded its wall-clock bound.
+    timed_out: bool
+    #: Whether the step exceeded its CPU-time bound.
+    cpu_timed_out: bool
     #: Human-readable failure reason (from :func:`step_failure_reason`); "" when :attr:`ok`.
     reason: str = ""
     #: True when eager-exit killed this in-flight step after ANOTHER step failed — a
@@ -357,6 +365,10 @@ class StepOutcome:
             duration_s=duration_s,
             summary=summary,
             returncode=returncode,
+            oomed=oomed,
+            oom_kills=oom_kills,
+            timed_out=timed_out,
+            cpu_timed_out=cpu_timed_out,
             reason=reason,
             aborted=aborted,
             pids_events=pids_events,
