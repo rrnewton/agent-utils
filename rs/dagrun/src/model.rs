@@ -39,6 +39,10 @@ pub const DEFAULT_JOBS_FLAG: &str = "-j";
 /// admitted inner width. Cargo's `CARGO_BUILD_JOBS` is the motivating channel.
 pub const JOBS_ENV_ENV: &str = "DAGRUN_JOBS_ENV";
 
+/// Shell variable through which a known [`CmdType`] exposes its width arguments in a compound
+/// command. It is deliberately absent for [`CmdType::Unknown`].
+pub const DAGRUN_EXTRA_ARGS_ENV: &str = "DAGRUN_EXTRA_ARGS";
+
 // Deliberately SMALL default caps for a step that DECLARES NOTHING — the "forcing function".
 // An undeclared step is boxed into a tight 1-core / 1-GiB / 10-s-CPU floor, so a real step
 // immediately hits the cap and must DECLARE its true needs, generating per-node resource
@@ -89,6 +93,55 @@ pub enum StepClass {
     /// The step has no special CPU or latency classification.
     #[default]
     Light,
+}
+
+/// Known command-line shapes for runner-controlled inner parallelism.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CmdType {
+    /// No known command-line shape; retain the existing jobs-flag and jobs-env behavior.
+    #[default]
+    Unknown,
+    /// Make-compatible `-jN`.
+    Make,
+    /// `cargo build --jobs N`.
+    CargoBuild,
+    /// `cargo test --jobs N`.
+    CargoTest,
+    /// `cargo nextest run --test-threads N`.
+    CargoNextest,
+    /// A command accepting the common `-jN` spelling.
+    GenericDashJCommand,
+    /// A command whose `jobs_flag` explicitly describes the spelling.
+    GenericWithFlag,
+}
+
+impl CmdType {
+    /// Stable DAG-document value.
+    pub fn value(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Make => "make",
+            Self::CargoBuild => "cargo-build",
+            Self::CargoTest => "cargo-test",
+            Self::CargoNextest => "cargo-nextest",
+            Self::GenericDashJCommand => "generic-dash-j-command",
+            Self::GenericWithFlag => "generic-with-flag",
+        }
+    }
+
+    /// Parse one stable DAG-document value.
+    pub fn from_value(text: &str) -> Option<Self> {
+        match text {
+            "unknown" => Some(Self::Unknown),
+            "make" => Some(Self::Make),
+            "cargo-build" => Some(Self::CargoBuild),
+            "cargo-test" => Some(Self::CargoTest),
+            "cargo-nextest" => Some(Self::CargoNextest),
+            "generic-dash-j-command" => Some(Self::GenericDashJCommand),
+            "generic-with-flag" => Some(Self::GenericWithFlag),
+            _ => None,
+        }
+    }
 }
 
 /// Closed vocabulary for nodes deliberately omitted before process spawn.
@@ -225,6 +278,8 @@ pub struct Step {
     pub description: String,
     /// Shell command (`bash -c`), run from the run's working directory.
     pub cmd: String,
+    /// Known command-line shape for delivering the admitted width.
+    pub cmdtype: CmdType,
     /// Tags (`"group.job"`) this step depends on.
     pub deps: Vec<String>,
     /// Environment variables added to the step process.
@@ -335,7 +390,10 @@ fn normalize_jobs_env(raw: &str, source: &str) -> Result<String, String> {
             "{source}={name:?} is not a valid environment variable name"
         ));
     }
-    if matches!(name, "DAGRUN_OUTER_RUN" | "DAGRUN_STEP") {
+    if matches!(
+        name,
+        "DAGRUN_EXTRA_ARGS" | "DAGRUN_OUTER_RUN" | "DAGRUN_STEP"
+    ) {
         return Err(format!(
             "{source}={name:?} is reserved by dagrun and cannot carry a step's worker count"
         ));
@@ -383,7 +441,8 @@ pub fn env_with_inner_jobs(
     (!name.is_empty()).then(|| (name.to_string(), width.to_string()))
 }
 
-/// Whether the runner can change a step's guest-visible inner width through argv or environment.
+/// Whether the runner can change a step's guest-visible inner width through cmdtype, argv, or
+/// environment.
 pub fn step_width_is_resizable(
     step: &Step,
     default_jobs_flag: &str,
@@ -392,6 +451,9 @@ pub fn step_width_is_resizable(
     // Resolve the env channel first so a valid jobs flag cannot short-circuit validation of a
     // malformed programmatic jobs_env value.
     let jobs_env = effective_jobs_env(step, default_jobs_env);
+    if step.cmdtype != CmdType::Unknown {
+        return true;
+    }
     !effective_jobs_flag(step, default_jobs_flag)
         .trim()
         .is_empty()
@@ -416,14 +478,24 @@ pub(crate) fn assert_valid_jobs_env_config(cfg: &DagConfig) {
     }
 }
 
-/// Return a step command with its effective inner-job flag appended when requested.
+/// Return a step command with its effective inner-job arguments when requested.
 ///
-/// A missing width or empty/whitespace-only effective template leaves the command unchanged.
+/// A known cmdtype supplies its own spelling and leaves a command containing
+/// `DAGRUN_EXTRA_ARGS` unchanged. `unknown` retains the existing jobs-flag behavior.
 pub fn command_with_inner_jobs(
     step: &Step,
     default_jobs_flag: &str,
     inner_jobs: Option<i64>,
 ) -> String {
+    if step.cmdtype != CmdType::Unknown {
+        let Some(extra_args) = cmdtype_extra_args(step, inner_jobs) else {
+            return step.cmd.clone();
+        };
+        if command_uses_extra_args(&step.cmd) {
+            return step.cmd.clone();
+        }
+        return format!("{} {extra_args}", step.cmd);
+    }
     match inner_jobs {
         None => step.cmd.clone(),
         Some(n) => {
@@ -434,6 +506,175 @@ pub fn command_with_inner_jobs(
                 format!("{} {}", step.cmd, render_jobs_flag(template, n))
             }
         }
+    }
+}
+
+/// Whether a command contains either documented `DAGRUN_EXTRA_ARGS` expansion.
+pub fn command_uses_extra_args(command: &str) -> bool {
+    extra_args_references(command).0
+}
+
+fn extra_args_references(command: &str) -> (bool, bool, bool) {
+    let bytes = command.as_bytes();
+    let braced = b"${DAGRUN_EXTRA_ARGS}";
+    let plain = b"$DAGRUN_EXTRA_ARGS";
+    let mut present = false;
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+    let mut quote = 0u8;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if quote != b'\'' && byte == b'\\' {
+            index = (index + 2).min(bytes.len());
+            continue;
+        }
+        if byte == b'\'' || byte == b'"' {
+            if quote == 0 {
+                quote = byte;
+            } else if quote == byte {
+                quote = 0;
+            }
+            index += 1;
+            continue;
+        }
+        let braced_match = bytes[index..].starts_with(braced);
+        let plain_match = bytes[index..].starts_with(plain)
+            && bytes
+                .get(index + plain.len())
+                .is_none_or(|next| *next != b'_' && !next.is_ascii_alphanumeric());
+        let matched = if braced_match {
+            braced.len()
+        } else if plain_match {
+            plain.len()
+        } else {
+            0
+        };
+        if matched > 0 {
+            present = true;
+            single_quoted |= quote == b'\'';
+            double_quoted |= quote == b'"';
+            index += matched;
+        } else {
+            index += 1;
+        }
+    }
+    (present, single_quoted, double_quoted)
+}
+
+fn command_is_compound(command: &str) -> bool {
+    let bytes = command.as_bytes();
+    let mut quote = 0u8;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if quote != b'\'' && byte == b'\\' {
+            index = (index + 2).min(bytes.len());
+            continue;
+        }
+        if byte == b'\'' || byte == b'"' {
+            if quote == 0 {
+                quote = byte;
+            } else if quote == byte {
+                quote = 0;
+            }
+            index += 1;
+            continue;
+        }
+        if quote == 0 && (matches!(byte, b';' | b'\n' | b'|') || bytes[index..].starts_with(b"&&"))
+        {
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
+
+/// Width arguments supplied by a known command type.
+pub fn cmdtype_extra_args(step: &Step, inner_jobs: Option<i64>) -> Option<String> {
+    let width = inner_jobs?;
+    match step.cmdtype {
+        CmdType::Unknown => None,
+        CmdType::Make | CmdType::GenericDashJCommand => Some(format!("-j{width}")),
+        CmdType::CargoBuild | CmdType::CargoTest => Some(format!("--jobs {width}")),
+        CmdType::CargoNextest => Some(format!("--test-threads {width}")),
+        CmdType::GenericWithFlag => Some(render_jobs_flag(
+            step.jobs_flag
+                .as_deref()
+                .expect("validated generic-with-flag requires jobs_flag"),
+            width,
+        )),
+    }
+}
+
+/// `DAGRUN_EXTRA_ARGS` assignment for a known command type.
+pub fn cmdtype_env_with_inner_jobs(
+    step: &Step,
+    inner_jobs: Option<i64>,
+) -> Option<(String, String)> {
+    cmdtype_extra_args(step, inner_jobs).map(|args| (DAGRUN_EXTRA_ARGS_ENV.to_string(), args))
+}
+
+/// Refuse ambiguous cmdtype configuration and wrong multi-token quoting.
+pub fn validate_cmdtype_config(cfg: &DagConfig) -> Result<(), String> {
+    for step in &cfg.steps {
+        if step.cmdtype == CmdType::GenericWithFlag
+            && step
+                .jobs_flag
+                .as_deref()
+                .is_none_or(|flag| flag.trim().is_empty())
+        {
+            return Err(format!(
+                "step {}: cmdtype generic-with-flag requires a non-empty jobs_flag",
+                step.tag()
+            ));
+        }
+        if !matches!(step.cmdtype, CmdType::Unknown | CmdType::GenericWithFlag)
+            && step
+                .jobs_flag
+                .as_deref()
+                .is_some_and(|flag| !flag.trim().is_empty())
+        {
+            return Err(format!(
+                "step {}: jobs_flag is valid with cmdtype generic-with-flag, not {}",
+                step.tag(),
+                step.cmdtype.value()
+            ));
+        }
+        if let Some(extra_args) = cmdtype_extra_args(step, Some(1)) {
+            let (present, single_quoted, double_quoted) = extra_args_references(&step.cmd);
+            if command_is_compound(&step.cmd) && !present {
+                return Err(format!(
+                    "step {}: compound cmd with cmdtype {} must place unquoted \
+                     $DAGRUN_EXTRA_ARGS or ${{DAGRUN_EXTRA_ARGS}} where the width belongs",
+                    step.tag(),
+                    step.cmdtype.value()
+                ));
+            }
+            if single_quoted {
+                return Err(format!(
+                    "step {}: DAGRUN_EXTRA_ARGS must not be single-quoted because the shell \
+                     would not expand it",
+                    step.tag()
+                ));
+            }
+            if extra_args.split_whitespace().count() > 1 && double_quoted {
+                return Err(format!(
+                    "step {}: DAGRUN_EXTRA_ARGS must be unquoted for cmdtype {} because it \
+                     contains multiple shell words; quoting it would pass one argument",
+                    step.tag(),
+                    step.cmdtype.value()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Refuse an invalid programmatic cmdtype configuration at APIs without a typed error.
+pub(crate) fn assert_valid_cmdtype_config(cfg: &DagConfig) {
+    if let Err(error) = validate_cmdtype_config(cfg) {
+        panic!("invalid cmdtype configuration: {error}");
     }
 }
 
@@ -1444,6 +1685,7 @@ mod tests {
             desc: String::new(),
             description: String::new(),
             cmd: "true".into(),
+            cmdtype: CmdType::Unknown,
             deps: vec![],
             env: BTreeMap::new(),
             hint,
@@ -1469,6 +1711,7 @@ mod tests {
             desc: String::new(),
             description: String::new(),
             cmd: cmd.into(),
+            cmdtype: CmdType::Unknown,
             deps: vec![],
             env: BTreeMap::new(),
             hint: ResourceHint::default(),
@@ -1557,7 +1800,7 @@ mod tests {
             step_width_is_resizable(&cfg.steps[0], &cfg.default_jobs_flag, &cfg.default_jobs_env)
         })
         .is_err());
-        for reserved in ["DAGRUN_OUTER_RUN", "DAGRUN_STEP"] {
+        for reserved in ["DAGRUN_EXTRA_ARGS", "DAGRUN_OUTER_RUN", "DAGRUN_STEP"] {
             cfg.default_jobs_env = reserved.to_string();
             cfg.steps.clear();
             assert!(
@@ -1683,6 +1926,7 @@ mod cpu_timeout_multiplier_tests {
             desc: "d".into(),
             description: String::new(),
             cmd: "true".into(),
+            cmdtype: CmdType::Unknown,
             deps: vec![],
             env: std::collections::BTreeMap::new(),
             hint: ResourceHint::default(),
@@ -1853,6 +2097,7 @@ mod carry_tests {
             desc: "d".into(),
             description: String::new(),
             cmd: "true".into(),
+            cmdtype: CmdType::Unknown,
             deps: vec![],
             env: BTreeMap::new(),
             hint: ResourceHint::default(),

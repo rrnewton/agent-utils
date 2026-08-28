@@ -270,6 +270,7 @@ mod tests {
             desc: String::new(),
             description: String::new(),
             cmd: "true".into(),
+            cmdtype: crate::model::CmdType::Unknown,
             deps: deps.iter().map(|s| s.to_string()).collect(),
             env: BTreeMap::new(),
             hint: ResourceHint {
@@ -341,6 +342,7 @@ mod tests {
             desc: String::new(),
             description: String::new(),
             cmd: "true".into(),
+            cmdtype: crate::model::CmdType::Unknown,
             deps: deps.iter().map(|s| s.to_string()).collect(),
             env: BTreeMap::new(),
             hint: ResourceHint {
@@ -385,6 +387,7 @@ mod tests {
             desc: String::new(),
             description: String::new(),
             cmd: "true".into(),
+            cmdtype: crate::model::CmdType::Unknown,
             deps: deps.iter().map(|s| s.to_string()).collect(),
             env: BTreeMap::new(),
             hint: ResourceHint {

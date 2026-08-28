@@ -203,10 +203,11 @@ dagrun --help\n\n\
 {store}\n  {store_dir}\n  {store_note}\n\n\
 {planning}\n  {pl1}\n  {pl2}\n  {pl3}\n  {plan_note}\n\n\
 {schema}  {schema_note}\n  \
-step:   group, job, desc, description, cmd, deps[], env{{}}, timeout, jobs_flag, jobs_env, networkonly, engine_only, hint{{}}\n  \
+step:   group, job, desc, description, cmd, cmdtype, deps[], env{{}}, timeout, jobs_flag, jobs_env, networkonly, engine_only, hint{{}}\n  \
 hint:   resources{{name:int}}, est_duration_s, rss_baseline_bytes, hard_mem_max_bytes,\n          classification(\"cpu-bound\"|\"latency-bound\"|\"light\"), preferred_inner_jobs\n  \
 top:    description, resource_caps{{name:int}}, mem_cap_factor, mem_cap_floor_bytes,\n          outer_mem_safety_factor, default_step_timeout, default_jobs_flag, default_jobs_env\n  \
 desc = short label; description = long-form docs (often multi-line, great in YAML)\n  \
+cmdtype: unknown (default) | make | cargo-build | cargo-test | cargo-nextest |\n          generic-dash-j-command | generic-with-flag; known types append width arguments or set\n          DAGRUN_EXTRA_ARGS for an unquoted placement in a compound command\n  \
 jobs_flag: appended with a step preferred_inner_jobs; \"-j\"->\"-j 4\", \"-j%d\"->\"-j4\", \"--jobs=\"->\"--jobs=4\"\n  \
           empty/whitespace means a fixed self-managed width: it cannot be rewritten or swept\n  \
 jobs_env: environment variable receiving the same admitted width; absent inherits default_jobs_env\n  \
@@ -235,7 +236,7 @@ yaml: --dag also accepts .yaml/.yml (isomorphic to JSON; allows comments + multi
         studies_note = c.dim(
             "--selected includes every dependency needed by the named steps. Add \
              --ignore-selected-deps only when those inputs are already present and must not run. \
-             sweep passes each width through the step jobs_flag and/or jobs_env channel and reports wall/user/sys/rss + speedup."
+             sweep passes each width through cmdtype, jobs_flag, and/or jobs_env and reports wall/user/sys/rss + speedup."
         ),
         store = h("Where profiling data lands (by default)"),
         store_dir = k("./.dagrun/profiles/   (created on demand, relative to CWD)"),
@@ -371,6 +372,7 @@ fn run_help(c: &Palette) -> String {
             ("--run-timeout SECONDS", "OUTER wall budget for the WHOLE run; cuts in-flight steps and still reports"),
             ("--admission [WAIT_S]", "HOST-WIDE memory admission (opt-in): reserve --max-mem against a durable ledger every runner on the host shares. GRANT / QUEUE (says how many holders are ahead) / REFUSE (says the number to ask for). WAIT_S = how long to wait while queued (default 0 = report and exit 4; at most 86400). Requires --max-mem"),
             ("--resource-caps-path FILE", "make resource_caps apply across runner processes through this existing state file; otherwise caps are process-local. $DAGRUN_RESOURCE_CAPS_PATH is the secondary route and the flag wins"),
+            ("cmdtype (DAG field)", "unknown (default) | make | cargo-build | cargo-test | cargo-nextest | generic-dash-j-command | generic-with-flag; known types append width arguments unless cmd places unquoted $DAGRUN_EXTRA_ARGS or ${DAGRUN_EXTRA_ARGS}"),
             ("--allow-cgroup-failure", "if cgroup boxing is unavailable, run UNBOXED with a warning instead of erroring"),
             ("--unsafe-no-cgroups", "DELIBERATELY skip cgroup boxing entirely (unsafe)"),
             ("--allow-unwise-nest-dagruns", "allow a reviewed temporary nested dagrun exception; flatten the caller instead"),
@@ -726,6 +728,7 @@ fn box_config(
             desc: argv.join(" "),
             description: String::new(),
             cmd,
+            cmdtype: crate::model::CmdType::Unknown,
             deps: Vec::new(),
             env: BTreeMap::new(),
             hint: ResourceHint {
@@ -4085,6 +4088,21 @@ mod tests {
         assert!(help.contains("every dependency they require"));
         assert!(help.contains("run only the named steps"));
         assert!(help.contains("$DAGRUN_RESOURCE_CAPS_PATH"));
+        for cmdtype in [
+            "unknown",
+            "make",
+            "cargo-build",
+            "cargo-test",
+            "cargo-nextest",
+            "generic-dash-j-command",
+            "generic-with-flag",
+        ] {
+            assert!(
+                help.contains(cmdtype),
+                "missing cmdtype {cmdtype} from run help"
+            );
+        }
+        assert!(help.contains("$DAGRUN_EXTRA_ARGS"));
 
         let sweep = sweep_help(&palette);
         assert!(sweep.contains("--jobs RANGE"));

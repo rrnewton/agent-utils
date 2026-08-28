@@ -328,7 +328,8 @@ def test_a_step_declaring_only_known_fields_still_loads() -> None:
     dag_from_json(
         '{"steps":[{"group":"a","job":"one","desc":"d","description":"long",'
         '"cmd":"true","deps":[],"env":{"K":"V"},"networkonly":false,'
-        '"engine_only":false,"timeout":5,"cpu_timeout":3,"jobs_flag":"-j",'
+        '"engine_only":false,"timeout":5,"cpu_timeout":3,"cmdtype":"generic-with-flag",'
+        '"jobs_flag":"-j",'
         '"jobs_env":"J","explains":[],"fail_fast_family":"fam",'
         '"hint":{"resources":{},"est_duration_s":1.0,"classification":"light"}}]}'
     )

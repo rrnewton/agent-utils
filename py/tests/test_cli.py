@@ -93,13 +93,23 @@ def test_run_help_lists_flags_and_cores_pinning() -> None:
     assert "opt-in" in low and "off by default" in low
     assert "every dependency they require" in low
     assert "run only the named steps" in low
+    for cmdtype in (
+        "unknown",
+        "make",
+        "cargo-build",
+        "cargo-test",
+        "cargo-nextest",
+        "generic-dash-j-command",
+        "generic-with-flag",
+    ):
+        assert cmdtype in out
+    assert "$DAGRUN_EXTRA_ARGS" in out
 
 
 def test_run_help_has_no_rust_binary_mention() -> None:
-    """The Python help must describe the PYTHON tool only - no Rust binary / cargo."""
+    """The Python help must not direct the reader to a Rust executable."""
     _, out, _ = _capture_help(["run", "--help"])
     low = out.lower()
-    assert "cargo" not in low
     assert "rs/target" not in low
     assert "rust binary" not in low
 
@@ -199,12 +209,12 @@ def test_summary_action_schema_rejects_invalid_invocations(args: list[str]) -> N
 
 
 def test_python_quickstart_mentions_python_install_only() -> None:
-    """The Python quickstart install step must mention pip, never cargo/the Rust binary."""
+    """The Python quickstart install step must not direct the reader to the Rust binary."""
     rc, out, _ = _capture(["quickstart"])
     assert rc == 0
     low = out.lower()
     assert "pip install" in low
-    assert "cargo" not in low
+    assert "cargo install" not in low
     assert "rs/target" not in low
 
 

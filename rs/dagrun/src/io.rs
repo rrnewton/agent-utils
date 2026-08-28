@@ -26,9 +26,9 @@ use std::fmt;
 use serde_json::Value;
 
 use crate::model::{
-    graph_structure_violations, resolve_jobs_env, write_domain_violations, DagConfig,
-    IntentionalSkipReason, ResourceHint, Step, StepClass, WriteDomainGuarantee, WriteDomainPolicy,
-    DEFAULT_JOBS_FLAG,
+    graph_structure_violations, resolve_jobs_env, validate_cmdtype_config, write_domain_violations,
+    CmdType, DagConfig, IntentionalSkipReason, ResourceHint, Step, StepClass, WriteDomainGuarantee,
+    WriteDomainPolicy, DEFAULT_JOBS_FLAG,
 };
 
 const DEFAULT_MEM_CAP_FLOOR: i64 = 8 * 1024 * 1024 * 1024;
@@ -146,8 +146,9 @@ fn err(msg: impl Into<String>) -> DagJsonError {
 /// `cmds`, `timeouts`, `env_vars`, `description` vs `desc`. Silently ignored, the instruction is
 /// simply not carried out and the document still says it was: the step runs with no timeout, no
 /// dependency, no environment, and nothing anywhere reports it.
-const STEP_KEYS: [&str; 21] = [
+const STEP_KEYS: [&str; 22] = [
     "cmd",
+    "cmdtype",
     "cpu_timeout",
     "deps",
     "desc",
@@ -625,6 +626,12 @@ pub fn dag_from_value(raw: &Value) -> Result<DagConfig, DagJsonError> {
             _ => where_.clone(),
         };
         refuse_unknown_keys(sm, &STEP_KEYS, &named)?;
+        let cmdtype_text = opt_str(sm, "cmdtype", CmdType::Unknown.value())?;
+        let cmdtype = CmdType::from_value(&cmdtype_text).ok_or_else(|| {
+            err(format!(
+                "{where_}.cmdtype: unknown value '{cmdtype_text}'; valid values: unknown, make, cargo-build, cargo-test, cargo-nextest, generic-dash-j-command, generic-with-flag"
+            ))
+        })?;
         let fail_fast_family = opt_str_or_none(sm, "fail_fast_family")?;
         if fail_fast_family
             .as_ref()
@@ -638,6 +645,7 @@ pub fn dag_from_value(raw: &Value) -> Result<DagConfig, DagJsonError> {
             desc: opt_str(sm, "desc", "")?,
             description: opt_str(sm, "description", "")?,
             cmd: req_str(sm, "cmd", &where_)?,
+            cmdtype,
             deps: opt_str_list(sm, "deps")?,
             env: opt_str_str_map(sm, "env", &where_)?,
             hint: hint_from(sm.get("hint"), &format!("{where_}.hint"))?,
@@ -725,6 +733,7 @@ pub fn dag_from_value(raw: &Value) -> Result<DagConfig, DagJsonError> {
         // parsed DAG gets the 1-GiB / 1-core / 10-s floor. Callers override via the DagConfig fields.
         ..DagConfig::default()
     };
+    validate_cmdtype_config(&cfg).map_err(err)?;
     let violations = write_domain_violations(&cfg);
     if !violations.is_empty() {
         return Err(err(format!(
@@ -1028,6 +1037,13 @@ fn emit_step(s: &mut String, step: &Step, base: usize) {
     ));
     s.push_str(&key);
     s.push_str(&format!("\"cmd\": {},\n", json_str(&step.cmd)));
+    if step.cmdtype != CmdType::Unknown {
+        s.push_str(&key);
+        s.push_str(&format!(
+            "\"cmdtype\": {},\n",
+            json_str(step.cmdtype.value())
+        ));
+    }
     s.push_str(&key);
     s.push_str("\"deps\": ");
     emit_str_list(s, &step.deps, base + 2);
@@ -1683,7 +1699,8 @@ steps:
         dag_from_json(
             r#"{"steps":[{"group":"a","job":"one","desc":"d","description":"long",
                 "cmd":"true","deps":[],"env":{"K":"V"},"networkonly":false,
-                "engine_only":false,"timeout":5,"cpu_timeout":3,"jobs_flag":"-j",
+                "engine_only":false,"timeout":5,"cpu_timeout":3,
+                "cmdtype":"generic-with-flag","jobs_flag":"-j",
                 "jobs_env":"J","explains":[],"fail_fast_family":"fam",
                 "hint":{"resources":{},"est_duration_s":1.0,"classification":"light"}}]}"#,
         )

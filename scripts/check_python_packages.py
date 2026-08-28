@@ -390,7 +390,11 @@ def _unexpected_package_members(
 
 def _doc_violations(project: Project, text: str) -> list[str]:
     errors: list[str] = []
-    for foreign in _FOREIGN_DOC_TERMS.finditer(text):
+    checked_text = text
+    if project.distribution == "dagrun":
+        for value in ("cargo-build", "cargo-test", "cargo-nextest"):
+            checked_text = checked_text.replace(value, " " * len(value))
+    for foreign in _FOREIGN_DOC_TERMS.finditer(checked_text):
         if foreign.group(0).lower() not in project.doc_term_exemptions:
             errors.append(f"foreign-language term {foreign.group(0)!r}")
     for description, pattern in _COMMON_DOC_TERMS:

@@ -255,7 +255,7 @@ For each step `i`, define its **admissible width set** `W_i`:
 - If `i` is an intentional pre-execution skip, `W_i = {1}` with zero wall, CPU-area, and memory
   demand. It remains visible in plan output as `est_source=skip` but cannot suppress allocation for
   runnable work.
-- If `i` has empty/whitespace-only effective `jobs_flag` **and** `jobs_env` channels, its command
+- If `i` has `cmdtype: unknown` and empty/whitespace-only effective `jobs_flag` **and** `jobs_env` channels, its command
   manages a **fixed** width.
   The run refuses before process creation when its positive declared `preferred_inner_jobs > P`;
   otherwise `W_i` contains that declared width. With no positive declared width, the configured

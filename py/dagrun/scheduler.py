@@ -43,6 +43,8 @@ from dagrun.model import (
     DagConfig,
     Step,
     command_with_inner_jobs,
+    cmdtype_env_with_inner_jobs,
+    DAGRUN_EXTRA_ARGS_ENV,
     graph_structure_violations,
     effective_cpu_count,
     effective_cpu_timeout,
@@ -57,6 +59,7 @@ from dagrun.model import (
     step_width_is_resizable,
     JOBS_ENV_ENV,
     validate_jobs_env_config,
+    validate_cmdtype_config,
 )
 from dagrun.proccpu import (
     CPU_SOURCE_CGROUP,
@@ -316,12 +319,13 @@ def cap_config_max_cpus(cfg: DagConfig, max_cpus: int) -> DagConfig:
     """Copy ``cfg`` with every runner-controlled per-step CPU width capped to ``max_cpus``.
 
     The clamp is intentionally visible: a caller-authored width changed by the run budget must
-    not look as though it executed unchanged. A step with neither a jobs flag nor a jobs-env
+    not look as though it executed unchanged. A step with no known cmdtype, jobs flag, or jobs-env
     channel manages its own command width and cannot be rewritten; its declared width is left
     unchanged so run entry points can refuse an over-budget configuration instead of corrupting
     scheduling/profile metadata. The undeclared-step ``cpu.max`` default is capped too.
     """
     validate_jobs_env_config(cfg)
+    validate_cmdtype_config(cfg)
     budget = max(1, max_cpus)
     default_cpu_count = cfg.default_step_cpu_count
     if default_cpu_count is not None and default_cpu_count > budget:
@@ -388,7 +392,8 @@ def _self_managed_width_error(cfg: DagConfig, max_cpus: int) -> str | None:
     )
     return (
         f"--max-cpus {max(1, max_cpus)} cannot lower guest parallelism for step(s) that offer "
-        f"no width channel: {detail}; this machine must declare one -- set "
+        f"no width channel: {detail}; this machine must declare one -- set cmdtype to a known "
+        "value, set "
         f"${JOBS_ENV_ENV} to the guest's worker-count ENV VAR (e.g. CARGO_BUILD_JOBS), or set "
         "the step's jobs_flag to its worker-count OPTION -- or reduce preferred_inner_jobs, or "
         "raise --max-cpus"
@@ -566,6 +571,7 @@ class Runner:
     ) -> None:
         self.max_cpus = _resolve_max_cpus_argument(max_cpus, cpu_jobs)
         validate_jobs_env_config(cfg)
+        validate_cmdtype_config(cfg)
         if error := _self_managed_width_error(cfg, self.max_cpus):
             raise ValueError(error)
         # Public 0.13 attribute retained for source compatibility; new code uses max_cpus.
@@ -1264,6 +1270,9 @@ class Runner:
         # when the host configured none, so behaviour is unchanged where nothing is set.
         jobs_env = env_with_inner_jobs(step, self.cfg.default_jobs_env, inner_jobs)
         env.update(jobs_env)
+        cmdtype_env = cmdtype_env_with_inner_jobs(step, inner_jobs)
+        env.pop(DAGRUN_EXTRA_ARGS_ENV, None)
+        env.update(cmdtype_env)
         # Runner authority wins over both DAG-supplied values and the configurable jobs-env
         # channel. The step tag identifies which outer node launched a nested scheduler; the
         # DAGRUN_STEP nonce remains dedicated to process-tree ownership and teardown.

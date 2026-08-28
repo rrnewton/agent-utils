@@ -643,6 +643,55 @@ def representative_fixtures() -> list[Fixture]:
             },
         )
     )
+    fixtures.append(
+        Fixture(
+            "cmdtype_simple_append",
+            {
+                "steps": [
+                    {
+                        "group": "g",
+                        "job": "j",
+                        "cmd": "sh -c 'test \"$#\" = 2 && test \"$1\" = --jobs && test \"$2\" = 3' c",
+                        "cmdtype": "cargo-build",
+                        "hint": {"preferred_inner_jobs": 3},
+                    }
+                ]
+            },
+        )
+    )
+    fixtures.append(
+        Fixture(
+            "cmdtype_compound_placement",
+            {
+                "steps": [
+                    {
+                        "group": "g",
+                        "job": "j",
+                        "cmd": 'c() { [ "$#" = 2 ] && [ "$1" = --jobs ] && [ "$2" = 3 ]; }; z() { [ "$#" = 0 ]; }; c $DAGRUN_EXTRA_ARGS && z',
+                        "cmdtype": "cargo-build",
+                        "hint": {"preferred_inner_jobs": 3},
+                    }
+                ]
+            },
+        )
+    )
+    fixtures.append(
+        Fixture(
+            "cmdtype_unknown_has_no_variable",
+            {
+                "steps": [
+                    {
+                        "group": "g",
+                        "job": "j",
+                        "cmd": 'test -z "${DAGRUN_EXTRA_ARGS+x}"',
+                        "cmdtype": "unknown",
+                        "jobs_flag": "",
+                        "hint": {"preferred_inner_jobs": 3},
+                    }
+                ]
+            },
+        )
+    )
 
     return fixtures
 
@@ -1229,6 +1278,25 @@ LOADER_REFUSALS: tuple[tuple[str, str, str], ...] = (
         "steps[0] (a.one): unknown field(s) 'bogus_field'",
     ),
     (
+        "unknown-cmdtype",
+        '{"steps":[{"group":"a","job":"one","cmd":"true","cmdtype":"cargo"}]}',
+        "valid values: unknown, make, cargo-build, cargo-test, cargo-nextest, "
+        "generic-dash-j-command, generic-with-flag",
+    ),
+    (
+        "quoted-multi-word-extra-args",
+        '{"steps":[{"group":"a","job":"one",'
+        '"cmd":"cargo build \\"$DAGRUN_EXTRA_ARGS\\"","cmdtype":"cargo-build",'
+        '"hint":{"preferred_inner_jobs":3}}]}',
+        "DAGRUN_EXTRA_ARGS must be unquoted",
+    ),
+    (
+        "compound-cmdtype-without-placement",
+        '{"steps":[{"group":"a","job":"one","cmd":"prepare && cargo build",'
+        '"cmdtype":"cargo-build","hint":{"preferred_inner_jobs":3}}]}',
+        "compound cmd with cmdtype cargo-build must place unquoted",
+    ),
+    (
         "unknown-hint-field",
         '{"steps":[{"group":"a","job":"one","cmd":"true","hint":{"est_duration":9}}]}',
         "steps[0].hint: unknown field(s) 'est_duration'",
@@ -1286,7 +1354,7 @@ LOADER_ACCEPTANCES: tuple[tuple[str, str], ...] = (
         "every-declared-step-field",
         '{"steps":[{"group":"a","job":"one","desc":"d","description":"long","cmd":"true",'
         '"deps":[],"env":{"K":"V"},"networkonly":false,"engine_only":false,"timeout":5,'
-        '"cpu_timeout":3,"jobs_flag":"-j","jobs_env":"J","explains":[],'
+        '"cpu_timeout":3,"cmdtype":"generic-with-flag","jobs_flag":"-j","jobs_env":"J","explains":[],'
         '"fail_fast_family":"fam",'
         '"hint":{"resources":{},"est_duration_s":1.0,"classification":"light"}}]}',
     ),
@@ -6235,7 +6303,11 @@ def compare_package_guides(
     for language, command, forbidden in pairs:
         outcome = run(command, ("--userguide",))
         lowered = outcome.stdout.lower()
-        leaks = [token for token in forbidden if token in lowered]
+        checked = lowered
+        if tool == "dagrun" and language == "py":
+            for value in ("cargo-build", "cargo-test", "cargo-nextest"):
+                checked = checked.replace(value, " " * len(value))
+        leaks = [token for token in forbidden if token in checked]
         if outcome.returncode != 0:
             rep.bad(f"guide:{language}", f"exit={outcome.returncode}: {outcome.stderr}")
         elif tool not in lowered or len(outcome.stdout) < 500:

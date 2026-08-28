@@ -216,7 +216,7 @@ def _quickstart(c: Palette) -> str:
   {k(f'{PROG} sweep --dag dag.json --step build.app --jobs 1..8')}  {c.dim('# run one step at -j1..-j8, print a speedup table')}
   {c.dim('--selected includes every dependency needed by the named steps. Add')}
   {c.dim('--ignore-selected-deps only when those inputs are already present and must not run.')}
-  {c.dim('sweep passes each width through the step jobs_flag and/or jobs_env channel and reports wall/user/sys/rss + speedup.')}
+  {c.dim('sweep passes each width through cmdtype, jobs_flag, and/or jobs_env and reports wall/user/sys/rss + speedup.')}
 
 {h('Where profiling data lands (by default)')}
   {c.dim('Every run and sweep AUTO-LOGS resource-usage CSVs to a repo-local store:')}
@@ -243,7 +243,7 @@ def _quickstart(c: Palette) -> str:
   {c.dim(f'Use {k("--no-profile-feedback")} to ignore the store and plan from the DAG hints only.')}
 
 {h('DAG schema')}  {c.dim('(only group/job/cmd are required per step; everything else has defaults)')}
-  step:   group, job, desc, description, cmd, deps[], env{{}}, timeout, jobs_flag, jobs_env, networkonly, engine_only, hint{{}}
+  step:   group, job, desc, description, cmd, cmdtype, deps[], env{{}}, timeout, jobs_flag, jobs_env, networkonly, engine_only, hint{{}}
   hint:   resources{{name:int}}, est_duration_s, rss_baseline_bytes, hard_mem_max_bytes,
           classification("cpu-bound"|"latency-bound"|"light"), preferred_inner_jobs
   top:    description, resource_caps{{name:int}}, mem_cap_factor, mem_cap_floor_bytes,
@@ -252,6 +252,9 @@ def _quickstart(c: Palette) -> str:
   {c.dim('YAML: --dag also accepts .yaml/.yml (isomorphic to JSON; allows comments + block-scalar')}
   {c.dim('  descriptions). The yaml subcommand emits YAML; json emits canonical JSON.')}
   {c.dim('resource_caps bound concurrent demand - e.g. {"browser":1} serializes browser steps.')}
+  {c.dim('cmdtype: unknown (default) | make | cargo-build | cargo-test | cargo-nextest |')}
+  {c.dim('  generic-dash-j-command | generic-with-flag. Known types append width arguments,')}
+  {c.dim('  or set DAGRUN_EXTRA_ARGS for an unquoted placement in a compound command.')}
   {c.dim('jobs_flag: template appended with a step preferred_inner_jobs, e.g. "-j" -> "-j 4",')}
   {c.dim('  "-j%d" -> "-j4", "--jobs=" -> "--jobs=4", "--num-threads" -> "--num-threads 4".')}
   {c.dim('  Empty/whitespace means a fixed self-managed width: it cannot be rewritten or swept.')}
@@ -388,6 +391,17 @@ def build_parser() -> argparse.ArgumentParser:
     run_p = sub.add_parser(
         "run", allow_abbrev=False, help="run a DAG (exit 0 iff every step passes)",
         description="run a DAG (exit 0 iff every step passes)",
+        formatter_class=_ColorHelp,
+        epilog="DAG field cmdtype valid values:\n"
+        "  unknown (default)\n"
+        "  make\n"
+        "  cargo-build\n"
+        "  cargo-test\n"
+        "  cargo-nextest\n"
+        "  generic-dash-j-command\n"
+        "  generic-with-flag\n"
+        "Known types append their width arguments unless cmd contains unquoted "
+        "$DAGRUN_EXTRA_ARGS or ${DAGRUN_EXTRA_ARGS}.",
     )
     run_p.add_argument(
         "--dag",
@@ -649,7 +663,7 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         metavar="RANGE",
         help="inner-parallelism widths to sweep: 'LO..HI' (e.g. 1..8) or a bare 'N' meaning 1..N. "
-        "Each width is passed into the step command via its jobs_flag mechanism.",
+        "Each width is passed into the step through cmdtype, jobs_flag, and/or jobs_env.",
     )
     sweep_p.add_argument(
         "--repeat",
@@ -1705,7 +1719,7 @@ def _run_single_step(
     """Run ONE step at a fixed inner-parallelism width and measure it.
 
     The step's ``preferred_inner_jobs`` is overridden to ``inner_jobs`` (so the width flows into
-    the command via the jobs_flag mechanism) and its dependencies are cleared (a sweep runs the
+    the command via cmdtype, jobs_flag, and/or jobs_env) and its dependencies are cleared (a sweep runs the
     one step in isolation). CPU (user/sys) is measured from ``RUSAGE_CHILDREN`` deltas around the
     run; wall from the step's own recorded elapsed time; peak RSS from the step cgroup
     (``memory.peak``) when boxing is active."""

@@ -122,7 +122,9 @@ def test_a_malformed_name_is_REFUSED_not_ignored() -> None:
         resolve_jobs_env(env={JOBS_ENV_ENV: "not a name"})
 
 
-@pytest.mark.parametrize("reserved", ["DAGRUN_OUTER_RUN", "DAGRUN_STEP"])
+@pytest.mark.parametrize(
+    "reserved", ["DAGRUN_EXTRA_ARGS", "DAGRUN_OUTER_RUN", "DAGRUN_STEP"]
+)
 def test_runner_owned_names_cannot_become_the_jobs_channel(reserved: str) -> None:
     with pytest.raises(ValueError, match="reserved by dagrun"):
         resolve_jobs_env(reserved, env={})

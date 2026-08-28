@@ -102,6 +102,7 @@ fn one_step(cmd: &str, timeout: i64, cpu_timeout: i64) -> DagConfig {
         desc: String::new(),
         description: String::new(),
         cmd: cmd.into(),
+        cmdtype: dagrun::CmdType::Unknown,
         deps: Vec::new(),
         env: BTreeMap::new(),
         hint: ResourceHint::default(),

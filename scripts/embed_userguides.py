@@ -370,10 +370,14 @@ def _lint(item: Render | StandaloneDocument, text: str) -> list[str]:
         line = text.count("\n", 0, template_match.start()) + 1
         errors.append(f"unexpanded template syntax at line {line}")
     exemptions = getattr(item, "exemptions", ())
+    language_text = text
+    if item.language == "python" and item.tool == "dagrun":
+        for value in ("cargo-build", "cargo-test", "cargo-nextest"):
+            language_text = language_text.replace(value, " " * len(value))
     for description, pattern in COMMON_FORBIDDEN + LANGUAGE_FORBIDDEN[item.language]:
         if description in exemptions:
             continue
-        match = pattern.search(text)
+        match = pattern.search(language_text)
         if match is not None:
             line = text.count("\n", 0, match.start()) + 1
             errors.append(f"{description} at line {line}: {match.group(0)!r}")

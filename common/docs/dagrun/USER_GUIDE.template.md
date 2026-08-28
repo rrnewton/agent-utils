@@ -283,6 +283,39 @@ before the guest command, the runner checks both assignment status and exact
 readback; if the requested width did not stick, that step fails without running
 the guest command.
 
+`cmdtype` provides the known command-line forms without requiring each step to
+spell its own `jobs_flag`. Its valid values and the exact value used for a width
+of 3 are:
+
+| `cmdtype` | `DAGRUN_EXTRA_ARGS` / appended text |
+|---|---|
+| `unknown` (default) | none; the existing `jobs_flag`/`jobs_env` rules still apply |
+| `make` | `-j3` |
+| `cargo-build` | `--jobs 3` |
+| `cargo-test` | `--jobs 3` |
+| `cargo-nextest` | `--test-threads 3` |
+| `generic-dash-j-command` | `-j3` |
+| `generic-with-flag` | the required step-level `jobs_flag`, rendered with 3 |
+
+For a simple command, dagrun appends that text. For a compound command, put
+`$DAGRUN_EXTRA_ARGS` or `${DAGRUN_EXTRA_ARGS}` unquoted exactly where the
+arguments belong; detecting either form prevents a second appended copy. For
+example, `prepare && build-tool $DAGRUN_EXTRA_ARGS` receives `--jobs 3` at that
+position. The variable is set only when a known `cmdtype` has an effective
+width. Under `unknown` it is removed from the step environment, including an
+ambient or step-supplied value. A compound command with no placement is refused
+rather than appending the arguments to whichever command happens to be last.
+
+Shell tokenization matters. `-j3` contains one shell word. `--jobs 3` contains
+two, so an unquoted `$DAGRUN_EXTRA_ARGS` expands and word-splits into the two
+arguments `--jobs` and `3`. Quoting it as `"$DAGRUN_EXTRA_ARGS"` suppresses word
+splitting and would pass the single wrong argument `--jobs 3`; dagrun refuses
+that quoted form before any step starts for every command type whose value has
+multiple words. A quoted one-word value such as `-j3` remains one argument.
+`generic-with-flag` requires a non-empty step-level `jobs_flag`; other known
+values refuse a simultaneous non-empty `jobs_flag` rather than silently choosing
+between two command-line descriptions.
+
 Empty or whitespace-only effective flag **and** environment channels prevent
 rewriting; paired with a positive `preferred_inner_jobs`, that
 declares a self-managed fixed command width. If that declared width
@@ -297,8 +330,8 @@ requires at least one effective width channel, since otherwise changing
 The runner cannot infer hidden concurrency that a command does not declare. An
 arbitrary guest may still create more threads than `--max-cpus`; outer
 `cpu.max` limits their total CPU bandwidth, not their count. Use a controllable
-`jobs_flag`/`jobs_env`, fix the command's own worker setting, or use `--cores` when fixed
-CPU eligibility is required.
+`cmdtype`, `jobs_flag`, or `jobs_env`; fix the command's own worker setting; or
+use `--cores` when fixed CPU eligibility is required.
 
 Under boxing the runner also exports a bounded build-worker width to each step
 (never through `MAKEFLAGS`, which would reach determinism-sensitive targets), so

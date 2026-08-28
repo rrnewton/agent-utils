@@ -1599,6 +1599,7 @@ pub fn build_plan(
     mem_budget: Option<i64>,
 ) -> Plan {
     crate::model::assert_valid_jobs_env_config(cfg);
+    crate::model::assert_valid_cmdtype_config(cfg);
     let mut resolved: HashMap<String, Resolved> = HashMap::new();
     let mut est: HashMap<String, f64> = HashMap::new();
     for step in &cfg.steps {
@@ -2141,6 +2142,7 @@ mod tests {
             desc: String::new(),
             description: String::new(),
             cmd: "true".into(),
+            cmdtype: crate::model::CmdType::Unknown,
             deps: deps.iter().map(|s| s.to_string()).collect(),
             env: BTreeMap::new(),
             hint: ResourceHint {
@@ -2918,6 +2920,7 @@ t,m,affinity16_cpu-max-max,a,1,a,u,l,m.heavy,cpu-bound,8,5.0,0,True,False,0,1000
             desc: String::new(),
             description: String::new(),
             cmd: "true".into(),
+            cmdtype: crate::model::CmdType::Unknown,
             deps: vec!["m.prep".into()],
             env: BTreeMap::new(),
             hint: ResourceHint {

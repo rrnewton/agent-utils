@@ -23,6 +23,7 @@ from dagrun.model import (
     effective_cpu_count,
     step_width_is_resizable,
     validate_jobs_env_config,
+    validate_cmdtype_config,
 )
 from dagrun.sizing import (
     _memory_footprint_fits,
@@ -1522,6 +1523,7 @@ def build_plan(
     applies only to CPA allocation.
     """
     validate_jobs_env_config(cfg)
+    validate_cmdtype_config(cfg)
     speedups = speedups or {}
     resolved: dict[str, tuple[float, str, int | None, str, int]] = {}
     est: dict[str, float] = {}

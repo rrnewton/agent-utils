@@ -96,6 +96,22 @@ DEFAULT_JOBS_FLAG = "-j"
 #: any host too small for their declared width.
 JOBS_ENV_ENV = "DAGRUN_JOBS_ENV"
 
+#: Shell variable through which a known ``cmdtype`` exposes its width arguments inside a
+#: compound command. It is deliberately absent for ``unknown``.
+DAGRUN_EXTRA_ARGS_ENV = "DAGRUN_EXTRA_ARGS"
+
+
+class CmdType(Enum):
+    """Known command-line shapes for runner-controlled inner parallelism."""
+
+    UNKNOWN = "unknown"
+    MAKE = "make"
+    CARGO_BUILD = "cargo-build"
+    CARGO_TEST = "cargo-test"
+    CARGO_NEXTEST = "cargo-nextest"
+    GENERIC_DASH_J_COMMAND = "generic-dash-j-command"
+    GENERIC_WITH_FLAG = "generic-with-flag"
+
 
 class StepClass(Enum):
     """How a step uses the machine, used for scheduling decisions."""
@@ -202,6 +218,9 @@ class Step:
     # inherits DagConfig.default_jobs_env (normally set from $DAGRUN_JOBS_ENV by the
     # host, not by the graph); "" disables the env channel for this step specifically.
     jobs_env: str | None = None
+    # Known command-line shape for delivering the admitted width. ``unknown`` preserves the
+    # existing jobs_flag/jobs_env behavior and never sets DAGRUN_EXTRA_ARGS.
+    cmdtype: CmdType = CmdType.UNKNOWN
     # A typed, pre-execution omission. This is not PASS and is kept separate from
     # dependency-skipped nodes in RunResult. Unknown strings are rejected by the loader.
     skip_reason: IntentionalSkipReason | None = None
@@ -275,7 +294,9 @@ def effective_jobs_flag(step: Step, default_jobs_flag: str) -> str:
 
 
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_RUNNER_ENV_NAMES = frozenset({"DAGRUN_OUTER_RUN", "DAGRUN_STEP"})
+_RUNNER_ENV_NAMES = frozenset(
+    {"DAGRUN_EXTRA_ARGS", "DAGRUN_OUTER_RUN", "DAGRUN_STEP"}
+)
 
 
 def resolve_jobs_env(
@@ -347,33 +368,162 @@ def env_with_inner_jobs(
 def step_width_is_resizable(step: Step, default_jobs_flag: str, default_jobs_env: str) -> bool:
     """Can the runner actually lower this step's declared inner width?
 
-    True when EITHER channel is available. This is the predicate the capacity refusal keys on:
-    a step that offers neither channel bakes its width into its own command, so clamping its
-    cgroup quota alone would leave the original worker count running inside a smaller box --
-    a slowdown disguised as a limit, which is the outcome the refusal exists to prevent.
+    True when a known cmdtype or either existing channel is available. This is the predicate the
+    capacity refusal keys on: a step with no way to receive the changed width bakes it into its
+    own command, so clamping its cgroup quota alone would leave the original worker count running
+    inside a smaller box -- a slowdown disguised as a limit.
     """
     # Resolve the env channel first so a valid jobs flag cannot short-circuit validation of a
     # malformed programmatic jobs_env value.
     jobs_env = effective_jobs_env(step, default_jobs_env)
+    if step.cmdtype is not CmdType.UNKNOWN:
+        return True
     return bool(effective_jobs_flag(step, default_jobs_flag).strip() or jobs_env.strip())
 
 
 def command_with_inner_jobs(
     step: Step, default_jobs_flag: str, inner_jobs: int | None
 ) -> str:
-    """The step's shell command with its inner-parallelism flag appended, when applicable.
+    """The step's shell command with its inner-parallelism arguments, when applicable.
 
-    Appends ``<rendered-flag>`` (see :func:`render_jobs_flag`) to the command when
-    ``inner_jobs`` is set and the effective jobs-flag template contains a non-whitespace token. A
-    ``None`` width or an empty/whitespace-only template leaves the command unchanged (the step then
-    declares no inner parallelism, or manages its own).
+    A known cmdtype supplies its own spelling and leaves a command containing
+    ``$DAGRUN_EXTRA_ARGS`` or ``${DAGRUN_EXTRA_ARGS}`` unchanged. ``unknown`` retains the existing
+    effective jobs-flag behavior. A missing width leaves every command unchanged.
     """
+    if step.cmdtype is not CmdType.UNKNOWN:
+        extra_args = cmdtype_extra_args(step, inner_jobs)
+        if extra_args is None or command_uses_extra_args(step.cmd):
+            return step.cmd
+        return f"{step.cmd} {extra_args}"
     if inner_jobs is None:
         return step.cmd
     template = effective_jobs_flag(step, default_jobs_flag)
     if not template.strip():
         return step.cmd
     return f"{step.cmd} {render_jobs_flag(template, inner_jobs)}"
+
+
+def command_uses_extra_args(command: str) -> bool:
+    """Whether a command contains either documented DAGRUN_EXTRA_ARGS expansion."""
+    present, _single_quoted, _double_quoted = _extra_args_references(command)
+    return present
+
+
+def _extra_args_references(command: str) -> tuple[bool, bool, bool]:
+    """Return presence plus whether a reference occurs inside single or double quotes."""
+    present = single_quoted = double_quoted = False
+    quote = ""
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if quote != "'" and char == "\\":
+            index += 2
+            continue
+        if char in "'\"":
+            if not quote:
+                quote = char
+            elif quote == char:
+                quote = ""
+            index += 1
+            continue
+        matched = 0
+        if command.startswith("${DAGRUN_EXTRA_ARGS}", index):
+            matched = len("${DAGRUN_EXTRA_ARGS}")
+        elif command.startswith("$DAGRUN_EXTRA_ARGS", index):
+            end = index + len("$DAGRUN_EXTRA_ARGS")
+            if end == len(command) or not (command[end].isalnum() or command[end] == "_"):
+                matched = len("$DAGRUN_EXTRA_ARGS")
+        if matched:
+            present = True
+            single_quoted = single_quoted or quote == "'"
+            double_quoted = double_quoted or quote == '"'
+            index += matched
+            continue
+        index += 1
+    return present, single_quoted, double_quoted
+
+
+def _command_is_compound(command: str) -> bool:
+    quote = ""
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if quote != "'" and char == "\\":
+            index += 2
+            continue
+        if char in "'\"":
+            if not quote:
+                quote = char
+            elif quote == char:
+                quote = ""
+            index += 1
+            continue
+        if not quote and (
+            char in ";\n" or command.startswith("&&", index) or char == "|"
+        ):
+            return True
+        index += 1
+    return False
+
+
+def cmdtype_extra_args(step: Step, inner_jobs: int | None) -> str | None:
+    """Width arguments supplied by a known cmdtype, or ``None`` when none apply."""
+    if inner_jobs is None or step.cmdtype is CmdType.UNKNOWN:
+        return None
+    if step.cmdtype in (CmdType.MAKE, CmdType.GENERIC_DASH_J_COMMAND):
+        return f"-j{inner_jobs}"
+    if step.cmdtype in (CmdType.CARGO_BUILD, CmdType.CARGO_TEST):
+        return f"--jobs {inner_jobs}"
+    if step.cmdtype is CmdType.CARGO_NEXTEST:
+        return f"--test-threads {inner_jobs}"
+    if step.cmdtype is CmdType.GENERIC_WITH_FLAG:
+        assert step.jobs_flag is not None
+        return render_jobs_flag(step.jobs_flag, inner_jobs)
+    raise AssertionError(f"unhandled cmdtype {step.cmdtype.value}")
+
+
+def cmdtype_env_with_inner_jobs(step: Step, inner_jobs: int | None) -> dict[str, str]:
+    """DAGRUN_EXTRA_ARGS for a known cmdtype; unknown leaves the variable absent."""
+    extra_args = cmdtype_extra_args(step, inner_jobs)
+    return {} if extra_args is None else {DAGRUN_EXTRA_ARGS_ENV: extra_args}
+
+
+def validate_cmdtype_config(cfg: DagConfig) -> None:
+    """Refuse ambiguous cmdtype configuration and wrong multi-token quoting."""
+    for step in cfg.steps:
+        if step.cmdtype is CmdType.GENERIC_WITH_FLAG and (
+            step.jobs_flag is None or not step.jobs_flag.strip()
+        ):
+            raise ValueError(
+                f"step {step.tag}: cmdtype generic-with-flag requires a non-empty jobs_flag"
+            )
+        if (
+            step.cmdtype not in (CmdType.UNKNOWN, CmdType.GENERIC_WITH_FLAG)
+            and step.jobs_flag is not None
+            and step.jobs_flag.strip()
+        ):
+            raise ValueError(
+                f"step {step.tag}: jobs_flag is valid with cmdtype generic-with-flag, not "
+                f"{step.cmdtype.value}"
+            )
+        extra_args = cmdtype_extra_args(step, 1)
+        present, single_quoted, double_quoted = _extra_args_references(step.cmd)
+        if extra_args is not None and _command_is_compound(step.cmd) and not present:
+            raise ValueError(
+                f"step {step.tag}: compound cmd with cmdtype {step.cmdtype.value} must place "
+                "unquoted $DAGRUN_EXTRA_ARGS or ${DAGRUN_EXTRA_ARGS} where the width belongs"
+            )
+        if extra_args is not None and single_quoted:
+            raise ValueError(
+                f"step {step.tag}: DAGRUN_EXTRA_ARGS must not be single-quoted because the "
+                "shell would not expand it"
+            )
+        if extra_args is not None and len(extra_args.split()) > 1 and double_quoted:
+            raise ValueError(
+                f"step {step.tag}: DAGRUN_EXTRA_ARGS must be unquoted for cmdtype "
+                f"{step.cmdtype.value} because it contains multiple shell words; quoting it "
+                "would pass one argument"
+            )
 
 
 def step_classification(step: Step) -> StepClass:

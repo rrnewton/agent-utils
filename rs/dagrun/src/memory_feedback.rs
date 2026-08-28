@@ -614,6 +614,7 @@ mod tests {
             desc: String::new(),
             description: String::new(),
             cmd: "true".into(),
+            cmdtype: crate::model::CmdType::Unknown,
             deps: Vec::new(),
             env: BTreeMap::new(),
             hint: crate::model::ResourceHint::default(),

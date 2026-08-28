@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 
 from dagrun.model import (
     DEFAULT_JOBS_FLAG,
+    CmdType,
     DagConfig,
     IntentionalSkipReason,
     ResourceHint,
@@ -31,6 +32,7 @@ from dagrun.model import (
     graph_structure_violations,
     write_domain_violations,
     resolve_jobs_env,
+    validate_cmdtype_config,
 )
 
 __all__ = [
@@ -151,6 +153,17 @@ def _jobs_env_field(m: Mapping[str, object], key: str, where: str) -> str | None
         return resolve_jobs_env(raw, env={})
     except ValueError as exc:
         raise DagJsonError(f"{where}.{key}: {exc}") from exc
+
+
+def _cmdtype_field(m: Mapping[str, object], where: str) -> CmdType:
+    raw = _opt_str(m, "cmdtype", CmdType.UNKNOWN.value)
+    try:
+        return CmdType(raw)
+    except ValueError as exc:
+        valid = ", ".join(value.value for value in CmdType)
+        raise DagJsonError(
+            f"{where}.cmdtype: unknown value {raw!r}; valid values: {valid}"
+        ) from exc
 
 
 def _opt_int_or_none(m: Mapping[str, object], key: str) -> int | None:
@@ -495,6 +508,7 @@ STEP_KEYS: frozenset[str] = frozenset(
         "desc",
         "description",
         "cmd",
+        "cmdtype",
         "deps",
         "env",
         "hint",
@@ -683,6 +697,7 @@ def _dag_from_obj(raw: object) -> DagConfig:
                 desc=_opt_str(sm, "desc", ""),
                 description=_opt_str(sm, "description", ""),
                 cmd=_req_str(sm, "cmd", where),
+                cmdtype=_cmdtype_field(sm, where),
                 deps=_opt_str_list(sm, "deps"),
                 env=_opt_str_str_map(sm, "env", where),
                 hint=_hint_from(sm.get("hint"), f"{where}.hint"),
@@ -735,6 +750,10 @@ def _dag_from_obj(raw: object) -> DagConfig:
         default_jobs_env=default_jobs_env,
         write_domain_policy=policy,
     )
+    try:
+        validate_cmdtype_config(cfg)
+    except ValueError as exc:
+        raise DagJsonError(str(exc)) from exc
     violations = write_domain_violations(cfg)
     if violations:
         raise DagJsonError("write-domain policy refused DAG before execution: " + "; ".join(violations))
@@ -779,6 +798,7 @@ def _step_to_json(step: Step) -> dict[str, object]:
         "desc": step.desc,
         "description": step.description,
         "cmd": step.cmd,
+        "cmdtype": step.cmdtype.value,
         "deps": list(step.deps),
         "env": dict(sorted(step.env.items())),
         "networkonly": step.networkonly,
@@ -799,6 +819,8 @@ def _step_to_json(step: Step) -> dict[str, object]:
         del obj["timeout"]
     if step.cpu_timeout == 0:
         del obj["cpu_timeout"]
+    if step.cmdtype is CmdType.UNKNOWN:
+        del obj["cmdtype"]
     if step.skip_reason is None:
         del obj["skip_reason"]
     # Emitted only when declared, like write_domains below: a graph that does not use the

@@ -46,11 +46,12 @@ use crate::attribution::{
 };
 use crate::cgroup::CgroupManager;
 use crate::model::{
-    canonical_cpu_timeout, command_with_inner_jobs, effective_cpu_count, effective_cpu_timeout,
-    env_with_inner_jobs, graph_structure_violations, preferred_inner_jobs, resolved_wall_timeout,
-    scale_cpu_timeout, step_classification, step_width_is_resizable, undeclared_resource_demands,
+    canonical_cpu_timeout, cmdtype_env_with_inner_jobs, command_with_inner_jobs,
+    effective_cpu_count, effective_cpu_timeout, env_with_inner_jobs, graph_structure_violations,
+    preferred_inner_jobs, resolved_wall_timeout, scale_cpu_timeout, step_classification,
+    step_width_is_resizable, undeclared_resource_demands, validate_cmdtype_config,
     validate_jobs_env_config, write_domain_violations, DagConfig, RunResult, Step, StepOutcome,
-    JOBS_ENV_ENV,
+    DAGRUN_EXTRA_ARGS_ENV, JOBS_ENV_ENV,
 };
 use crate::proccpu::{subtree_cpu_seconds, CPU_SOURCE_CGROUP, CPU_SOURCE_PROCFS};
 use crate::profile_enrich::{resolve_effective_inner_jobs, step_enrichment_columns};
@@ -718,11 +719,12 @@ pub fn uncontained_cpu_budget_warning(cfg: &DagConfig) -> Option<String> {
 /// This is intentionally visible: a caller-authored width that the run budget changes must not
 /// look as though it executed unchanged. The top-level undeclared-step cpu.max default is capped
 /// too, even though no jobs flag is appended for an undeclared command.
-/// A declared over-budget width with neither a jobs flag nor jobs-env channel is left unchanged:
+/// A declared over-budget width with no known cmdtype, jobs flag, or jobs-env channel is left unchanged:
 /// the runner cannot rewrite that guest's width, and [`validate_max_cpus_rewrite`] makes execution
 /// fail closed instead of falsely claiming the width was lowered.
 pub fn cap_config_max_cpus(cfg: &DagConfig, max_cpus: i64) -> DagConfig {
     crate::model::assert_valid_jobs_env_config(cfg);
+    crate::model::assert_valid_cmdtype_config(cfg);
     let max_cpus = max_cpus.max(1);
     let mut capped = cfg.clone();
     if let Some(default) = capped
@@ -766,6 +768,7 @@ pub fn cap_config_max_cpus(cfg: &DagConfig, max_cpus: i64) -> DagConfig {
 /// so callers must refuse before any step starts.
 pub(crate) fn validate_max_cpus_rewrite(cfg: &DagConfig, max_cpus: i64) -> Result<(), String> {
     validate_jobs_env_config(cfg)?;
+    validate_cmdtype_config(cfg)?;
     let max_cpus = max_cpus.max(1);
     let mut bad: Vec<(String, i64)> = cfg
         .steps
@@ -791,7 +794,8 @@ pub(crate) fn validate_max_cpus_rewrite(cfg: &DagConfig, max_cpus: i64) -> Resul
         .join(", ");
     Err(format!(
         "--max-cpus {max_cpus} cannot lower guest parallelism for step(s) that offer no width \
-         channel: {detail}; this machine must declare one -- set ${JOBS_ENV_ENV} to the guest's \
+         channel: {detail}; this machine must declare one -- set cmdtype to a known value, set \
+         ${JOBS_ENV_ENV} to the guest's \
          worker-count ENV VAR (e.g. CARGO_BUILD_JOBS), or set the step's jobs_flag to its \
          worker-count OPTION -- or reduce preferred_inner_jobs, or raise --max-cpus"
     ))
@@ -2689,6 +2693,7 @@ fn run_step(ctx: StepCtx) {
     // step has no preferred_inner_jobs.
     let inner_jobs = preferred_inner_jobs(&step, None);
     let jobs_env = env_with_inner_jobs(&step, &default_jobs_env, inner_jobs);
+    let cmdtype_env = cmdtype_env_with_inner_jobs(&step, inner_jobs);
     let mut base_cmd = command_with_inner_jobs(&step, &default_jobs_flag, inner_jobs);
     if let Some((name, value)) = &jobs_env {
         // The real cgroup wrapper exports its scope/operator CARGO_BUILD_JOBS before executing
@@ -2777,6 +2782,10 @@ fn run_step(ctx: StepCtx) {
     cmd.arg("-c").arg(&run_cmd);
     for (k, v) in &step.env {
         cmd.env(k, v);
+    }
+    cmd.env_remove(DAGRUN_EXTRA_ARGS_ENV);
+    if let Some((name, value)) = &cmdtype_env {
+        cmd.env(name, value);
     }
     // The outer step already owns its declared resource capacities. A nested runner belongs to
     // that step's process tree and must not ask for the same capacity again, which would wait on
@@ -4205,6 +4214,7 @@ mod tests {
             desc: String::new(),
             description: String::new(),
             cmd: cmd.into(),
+            cmdtype: crate::model::CmdType::Unknown,
             deps: deps.iter().map(|s| s.to_string()).collect(),
             env: BTreeMap::new(),
             hint: ResourceHint {
@@ -5938,7 +5948,7 @@ mod tests {
             validate_max_cpus_rewrite(&cfg, 2).unwrap_err(),
             "--max-cpus 2 cannot lower guest parallelism for step(s) that offer no width channel: \
              g.wide (preferred_inner_jobs=8); this machine must declare one -- set \
-             $DAGRUN_JOBS_ENV to the guest's worker-count ENV VAR (e.g. \
+             cmdtype to a known value, set $DAGRUN_JOBS_ENV to the guest's worker-count ENV VAR (e.g. \
              CARGO_BUILD_JOBS), or set the step's jobs_flag to its worker-count OPTION -- or \
              reduce preferred_inner_jobs, or raise --max-cpus"
         );

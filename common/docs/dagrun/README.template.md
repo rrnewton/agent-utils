@@ -71,12 +71,18 @@ spelling of `-j` is `--max-cpus`; migrate the 0.13 `run --jobs` spelling to it.
 A hidden compatibility alias keeps existing 0.13 scripts working but is not
 public run vocabulary; differing simultaneous values conflict and are rejected.
 `sweep --jobs RANGE` remains the width-range option for a per-step speedup
-experiment. A non-empty `jobs_flag` or `jobs_env` lets the runner rewrite an
-inner width down to `--max-cpus`; `default_jobs_env` supplies the environment
-channel inherited by steps, and `DAGRUN_JOBS_ENV` supplies that
-default when the document omits it. Empty effective channels prevent rewriting.
-When paired with a positive declared width, that width is self-managed and the
-run refuses it if it exceeds the total budget.
+experiment. A known step `cmdtype` supplies the runner's exact width arguments;
+a simple command receives them at the end, while a compound command puts an
+unquoted `$DAGRUN_EXTRA_ARGS` where they belong. A compound command without that
+placement is refused. `-j3` is one shell word;
+`--jobs 3` is two, and quoting the variable would turn those two arguments into
+one, so dagrun refuses that quoted multi-word form. The valid values are
+`unknown` (default), `make`, `cargo-build`, `cargo-test`, `cargo-nextest`,
+`generic-dash-j-command`, and `generic-with-flag`. The last requires a
+step-level `jobs_flag`. Under `unknown`, `DAGRUN_EXTRA_ARGS` is absent and the
+existing `jobs_flag`/`jobs_env` rules apply. `default_jobs_env` supplies the
+environment channel inherited by steps, and `DAGRUN_JOBS_ENV` supplies that
+default when the document omits it.
 
 The current planners do not jointly optimize inner width, co-running load, and
 memory. Greedy-LPT and critical-path choose only dispatch order. CPA chooses
