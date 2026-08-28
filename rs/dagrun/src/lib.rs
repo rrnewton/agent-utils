@@ -38,6 +38,7 @@ pub mod sizing;
 pub mod summary;
 pub mod sweep;
 pub mod sync;
+pub mod test_results;
 pub mod viz;
 
 pub use ambient::{
@@ -113,6 +114,7 @@ pub use sweep::{
     machine_topology, parse_cpu_list, parse_target_duration, parse_widths, refine_width_grid,
     stable_topological_order, workload_digest, MachineTopology,
 };
+pub use test_results::{TestResult, TestResults};
 pub use viz::{to_ascii, to_dot};
 
 /// Command name used in diagnostics and version output.

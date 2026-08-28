@@ -977,6 +977,8 @@ mod tests {
             description: String::new(),
             cmd: "true".into(),
             cmdtype: crate::model::CmdType::Unknown,
+            manifest: None,
+            integration_test_binaries: None,
             deps: vec![],
             env: std::collections::BTreeMap::new(),
             hint: hint.clone(),

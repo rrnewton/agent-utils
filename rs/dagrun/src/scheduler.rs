@@ -56,6 +56,8 @@ use crate::model::{
 use crate::proccpu::{subtree_cpu_seconds, CPU_SOURCE_CGROUP, CPU_SOURCE_PROCFS};
 use crate::profile_enrich::{resolve_effective_inner_jobs, step_enrichment_columns};
 use crate::resource_caps::{Acquire as SharedResourceAcquire, Coordinator as ResourceCoordinator};
+use crate::test_results::TestResult;
+use crate::test_results::TestResults;
 
 /// The outer DAG step that launched this process. A second scheduler in that process tree must
 /// refuse by default instead of competing with its parent while reporting a whole inner graph as
@@ -1179,6 +1181,7 @@ fn publish_supervisor_failure(
                 summary,
                 executed_tests: None,
                 filtered_tests: None,
+                test_results: None,
                 returncode: None,
                 oomed: false,
                 oom_kills: 0,
@@ -2434,10 +2437,11 @@ fn last_line(bytes: &[u8]) -> String {
 
 /// Test counts extracted from one step's COMPLETE captured output, before
 /// verbosity decides how much of that output is presented to a human.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CapturedTestCounts {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CapturedTestResults {
     executed: Option<u64>,
     filtered: Option<u64>,
+    results: Option<Vec<TestResult>>,
 }
 
 fn count_between(line: &str, prefix: &str, suffix: &str) -> Option<u64> {
@@ -2449,7 +2453,7 @@ fn count_between(line: &str, prefix: &str, suffix: &str) -> Option<u64> {
     digits.parse().ok()
 }
 
-fn captured_test_counts(bytes: &[u8]) -> CapturedTestCounts {
+fn captured_test_counts(bytes: &[u8]) -> CapturedTestResults {
     let text = String::from_utf8_lossy(bytes);
     let mut running_total = 0u64;
     let mut running_seen = false;
@@ -2488,12 +2492,13 @@ fn captured_test_counts(bytes: &[u8]) -> CapturedTestCounts {
         }
     }
     if overflow {
-        return CapturedTestCounts {
+        return CapturedTestResults {
             executed: None,
             filtered: None,
+            results: None,
         };
     }
-    CapturedTestCounts {
+    CapturedTestResults {
         // Match the canonical parser: `running N` is the primary executed
         // signal; passed-count summaries are only a truncation fallback.
         executed: if running_seen {
@@ -2504,6 +2509,7 @@ fn captured_test_counts(bytes: &[u8]) -> CapturedTestCounts {
             None
         },
         filtered: filtered_seen.then_some(filtered_total),
+        results: None,
     }
 }
 
@@ -2516,22 +2522,13 @@ fn structured_test_counts_path(evidence: Option<&RunEvidence>) -> Option<std::pa
     )))
 }
 
-fn read_structured_test_counts(path: &std::path::Path) -> Option<CapturedTestCounts> {
+fn read_structured_test_counts(path: &std::path::Path) -> Option<CapturedTestResults> {
     let bytes = std::fs::read(path).ok()?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    let object = value.as_object()?;
-    if object.len() != 3 || object.get("schema").and_then(serde_json::Value::as_u64) != Some(1) {
-        return None;
-    }
-    let executed = object
-        .get("executed_tests")
-        .and_then(serde_json::Value::as_u64)?;
-    let filtered = object
-        .get("filtered_tests")
-        .and_then(serde_json::Value::as_u64)?;
-    Some(CapturedTestCounts {
-        executed: Some(executed),
-        filtered: Some(filtered),
+    let report = TestResults::from_json_slice(&bytes).ok()?;
+    Some(CapturedTestResults {
+        executed: Some(report.executed_tests),
+        filtered: Some(report.filtered_tests),
+        results: report.results,
     })
 }
 
@@ -2539,14 +2536,15 @@ fn resolved_test_counts(
     structured_required: bool,
     path: Option<&std::path::Path>,
     captured: &[u8],
-) -> CapturedTestCounts {
+) -> CapturedTestResults {
     if let Some(counts) = path.and_then(read_structured_test_counts) {
         return counts;
     }
     if structured_required {
-        CapturedTestCounts {
+        CapturedTestResults {
             executed: None,
             filtered: None,
+            results: None,
         }
     } else {
         captured_test_counts(captured)
@@ -3668,7 +3666,7 @@ fn run_step(ctx: StepCtx) {
         // ran out of budget" call for completely different follow-up, and reporting both with the
         // eager-exit wording sends a reader hunting for a failing peer that does not exist.
         let cut_by_run_budget = was_aborted && sh.run_timed_out;
-        let outcome = if was_aborted {
+        let mut outcome = if was_aborted {
             StepOutcome::aborted_outcome(
                 tag.clone(),
                 elapsed,
@@ -3706,6 +3704,7 @@ fn run_step(ctx: StepCtx) {
                 test_counts.filtered,
             )
         };
+        outcome.test_results = test_counts.results;
         let reason = outcome.reason.clone();
         sh.done.insert(tag.clone(), outcome);
         if !was_aborted && !ok {
@@ -4444,9 +4443,10 @@ mod tests {
         // executed denominator exactly as in the canonical Python parser.
         assert_eq!(
             counts,
-            CapturedTestCounts {
+            CapturedTestResults {
                 executed: Some(5),
-                filtered: Some(11)
+                filtered: Some(11),
+                results: None,
             }
         );
 
@@ -4455,9 +4455,10 @@ mod tests {
         );
         assert_eq!(
             fallback,
-            CapturedTestCounts {
+            CapturedTestResults {
                 executed: Some(9),
-                filtered: Some(2)
+                filtered: Some(2),
+                results: None,
             }
         );
     }
@@ -4468,16 +4469,18 @@ mod tests {
             captured_test_counts(
                 b"running 0 tests\ntest result: ok. 0 passed; 0 failed; 0 filtered out\n"
             ),
-            CapturedTestCounts {
+            CapturedTestResults {
                 executed: Some(0),
-                filtered: Some(0)
+                filtered: Some(0),
+                results: None,
             }
         );
         assert_eq!(
             captured_test_counts(b"build completed successfully\n"),
-            CapturedTestCounts {
+            CapturedTestResults {
                 executed: None,
-                filtered: None
+                filtered: None,
+                results: None,
             }
         );
     }
@@ -4491,31 +4494,37 @@ mod tests {
         ));
         std::fs::write(
             &path,
-            br#"{"schema":1,"executed_tests":7,"filtered_tests":11}"#,
+            br#"{"schema":2,"executed_tests":2,"filtered_tests":11,"results":[{"id":"suite$passes","result":"pass","attempts":1},{"id":"suite$recovers","result":"pass","attempts":2}]}"#,
         )
         .unwrap();
         let printed = b"running 999 tests\ntest result: ok. 999 passed; 0 failed; 0 filtered out\n";
         assert_eq!(
             resolved_test_counts(true, Some(&path), printed),
-            CapturedTestCounts {
-                executed: Some(7),
-                filtered: Some(11)
+            CapturedTestResults {
+                executed: Some(2),
+                filtered: Some(11),
+                results: Some(vec![
+                    TestResult::new("suite$passes".into(), true, 1).unwrap(),
+                    TestResult::new("suite$recovers".into(), true, 2).unwrap(),
+                ]),
             }
         );
         std::fs::remove_file(&path).unwrap();
         assert_eq!(
             resolved_test_counts(true, None, printed),
-            CapturedTestCounts {
+            CapturedTestResults {
                 executed: None,
-                filtered: None
+                filtered: None,
+                results: None,
             },
             "a printed banner must not create receipt evidence in structured mode"
         );
         assert_eq!(
             resolved_test_counts(false, None, printed),
-            CapturedTestCounts {
+            CapturedTestResults {
                 executed: Some(999),
-                filtered: Some(0)
+                filtered: Some(0),
+                results: None,
             },
             "clients that have not opted in retain the compatibility parser"
         );

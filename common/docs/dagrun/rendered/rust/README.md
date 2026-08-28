@@ -68,11 +68,13 @@ step and does not derive functional counts from human-readable output. A
 controlled test framework writes exactly one JSON object to that path:
 
 ```json
-{"schema":1,"executed_tests":23,"filtered_tests":5}
+{"schema":2,"executed_tests":2,"filtered_tests":5,"results":[{"id":"suite$passes","result":"pass","attempts":1},{"id":"suite$recovers","result":"pass","attempts":2}]}
 ```
 
-A missing or malformed file leaves both counts unknown. Printing a line that
-looks like a libtest summary cannot create receipt evidence in this mode.
+A missing or malformed file leaves the counts and individual results unknown.
+Retained schema-1 count-only files remain readable but have no current write
+path and provide no individual-result authority. Printing a line that looks
+like a libtest summary cannot create receipt evidence in this mode.
 
 `resource_caps` apply within one runner process by default. To apply the same
 capacities across independent runners, pass `run --resource-caps-path FILE`.
