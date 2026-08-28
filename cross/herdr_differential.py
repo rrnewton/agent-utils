@@ -913,8 +913,8 @@ spool_dir: .audit-spool
 
 
 #: Workspace label used by the reap fixtures. Deliberately not a name any real session would carry,
-#: so a host that happens to be running a live Herdr server cannot resolve it and the verdicts stay
-#: the same everywhere. Without that, this section would pass or fail depending on the machine.
+#: so a reachable Herdr server cannot resolve it. A host with no reachable server reports the
+#: safety-equivalent unavailable-evidence reason instead; both paths must keep the pane UNKNOWN.
 _REAP_WORKSPACE = "cross-differential-fixture"
 
 _REAP_CONFIG = f"""\
@@ -944,6 +944,15 @@ def _reap_record(pane_id: str, workspace: str, exit_code: str = "0") -> str:
         },
         indent=2,
         sort_keys=True,
+    )
+
+
+def _workspace_is_safely_unresolvable(stdout: str) -> bool:
+    """The two safe reasons a planted workspace cannot establish live-pane evidence."""
+
+    return (
+        "no workspace labelled" in stdout
+        or "evidence unavailable: workspace list:" in stdout
     )
 
 
@@ -992,7 +1001,7 @@ def _reap(harness: Harness, report: Report) -> None:
         '"STALE": 0' in python.stdout
         and '"UNKNOWN": 1' in python.stdout
         and '"reapable": []' in python.stdout
-        and "no workspace labelled" in python.stdout,
+        and _workspace_is_safely_unresolvable(python.stdout),
         "a workspace herdr cannot resolve must reap nothing and say why: "
         f"{_describe(python)}",
     )
@@ -1287,9 +1296,9 @@ def build_report(
         "intentionally ignores caller PATH and exposes no safe executable override"
     )
     report.notes.append(
-        "reap is paired on the host-independent verdicts (empty spool, unresolvable workspace, "
-        "out of scope); STALE and SHELL_ALIVE need a pane a live Herdr server still lists, and are "
-        "covered by planted-population unit tests in each edition instead"
+        "reap is paired on safety-equivalent verdicts (empty spool, unresolvable or unavailable "
+        "workspace evidence, out of scope); STALE and SHELL_ALIVE need a pane a live Herdr server "
+        "still lists, and are covered by planted-population unit tests in each edition instead"
     )
     report.notes.append(
         "NUL cannot be represented in a POSIX argv entry; all other terminal-control classes are covered"

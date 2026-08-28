@@ -171,6 +171,10 @@ class ResourceHint:
     est_duration_s: float = 0.0
     # Estimated peak resident memory (bytes). None excludes the step from the memory model.
     rss_baseline_bytes: int | None = None
+    # Width at which ``rss_baseline_bytes`` was measured exactly. This is planner-derived,
+    # transient provenance (authored DAG readers/writers deliberately do not expose it): when set,
+    # the memory model must not apply the legacy width heuristic again at that same width.
+    rss_baseline_inner_jobs: int | None = None
     # Explicit hard per-step memory cap (bytes); overrides the derived cap when set.
     hard_mem_max_bytes: int | None = None
     classification: StepClass = StepClass.LIGHT

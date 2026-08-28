@@ -41,8 +41,9 @@ use crate::cgroup::{
     DIRECT_CGROUP_ENV, FORCE_ATTEMPT_ENV,
 };
 use crate::estimates::{
-    apply_plan_to_config, build_plan, feedback_identity, load_step_samples, load_step_speedups,
-    plan_to_json, plan_to_text, Plan, Planner, DEFAULT_MIN_SAMPLES,
+    apply_plan_to_config, build_plan_with_max_steps, feedback_identity,
+    load_step_samples_for_workloads, load_step_speedups_for_workloads, plan_to_json, plan_to_text,
+    write_scaling_model_for_workloads, Plan, Planner, DEFAULT_MIN_SAMPLES,
 };
 use crate::io::{dag_from_json, dag_from_yaml, dag_to_json, dag_to_yaml, DagJsonError};
 use crate::memory_feedback::{
@@ -64,6 +65,10 @@ use crate::sizing::{
     stress_copy_footprint_bytes, transitive_deps,
 };
 use crate::summary::{self, Summary, DEFAULT_MAX_BUCKETS, DEFAULT_RESERVOIR_K};
+use crate::sweep::{
+    coarse_widths, cumulative_width_grid, limit_topology, machine_topology, parse_target_duration,
+    parse_widths, stable_topological_order, workload_digest, MachineTopology,
+};
 use crate::sync::{self, SyncBackend};
 use crate::viz::{to_ascii, to_dot};
 use crate::{PROG, VERSION};
@@ -144,7 +149,7 @@ fn help_text(c: &Palette) -> String {
          {commands}\n\
          \x20 run        run a DAG (exit 0 iff every step passes)\n\
          \x20 box        box ONE command with --mem/--timeout/--cores (no DAG file)\n\
-         \x20 sweep      parallel-speedup sweep of ONE step (inner -j1..-jN + timing table)\n\
+         \x20 sweep      target-time parallel-scaling sweep of one step or a whole DAG\n\
          \x20 plan       show learned estimates + the scheduled order (does NOT run anything)\n\
          \x20 list       list the steps\n\
          \x20 ascii      draw the DAG as ASCII art\n\
@@ -392,12 +397,13 @@ fn run_help(c: &Palette) -> String {
 fn sweep_help(c: &Palette) -> String {
     render_subcommand_help(
         c,
-        "sweep --dag FILE --step TAG --jobs RANGE [options]",
-        "Parallel-speedup sweep of ONE step across inner -j widths (wall/user/sys/rss + speedup table).",
+        "sweep --dag FILE [--target-time DURATION] [--step TAG] [--jobs RANGE] [options]",
+        "Profile parallel scaling for one step or a whole DAG (wall/user/sys/rss + speedup table).",
         &[
             ("--dag FILE", "DAG file ('-' = stdin) [required]"),
-            ("--step TAG", "the single group.job step to sweep [required]"),
-            ("--jobs RANGE", "inner widths: LO..HI or a bare N (= 1..N) [required]"),
+            ("--step TAG", "limit the sweep to one group.job step (required in legacy mode)"),
+            ("--jobs RANGE", "inner widths: LO..HI or bare N (= 1..N); target mode also accepts comma lists and defaults to machine topology"),
+            ("--target-time DURATION", "soft multi-pass allowance (ms/s/m/h suffix accepted): pass 1 and every started pass finish"),
             ("--repeat K", "run each width K times and keep the fastest (default: 1)"),
             ("--perf-dir DIR", "write the sweep's resource-usage CSVs into DIR"),
             ("--no-profile", "disable the default auto-logging profile store"),
@@ -423,6 +429,10 @@ fn plan_help(c: &Palette) -> String {
             (
                 "--max-mem SPEC",
                 "RAM budget (e.g. 8G) used by the cpa planner",
+            ),
+            (
+                "--max-steps N",
+                "maximum active steps whose concurrent memory the cpa planner must fit",
             ),
             ("--format FORMAT", "text (default) | json"),
             ("--perf-dir DIR", "read the profile store from DIR"),
@@ -487,7 +497,7 @@ fn summary_build_help(c: &Palette) -> String {
             ("--out FILE", "write JSON to FILE instead of stdout"),
             (
                 "--reservoir-cap K",
-                "maximum samples retained per (step, inner_jobs) bucket",
+                "maximum samples retained per (step, inner_jobs, workload_digest) bucket",
             ),
             ("-h, --help", "show this help and exit"),
         ],
@@ -504,7 +514,7 @@ fn summary_merge_help(c: &Palette) -> String {
             ("--out FILE", "write JSON to FILE instead of stdout"),
             (
                 "--reservoir-cap K",
-                "maximum samples retained per bucket after the merge",
+                "maximum samples retained per (step, inner_jobs, workload_digest) bucket after the merge",
             ),
             ("-h, --help", "show this help and exit"),
         ],
@@ -527,6 +537,10 @@ fn summary_plan_help(c: &Palette) -> String {
                 "greedy-lpt (default) | critical-path | cpa",
             ),
             ("--max-mem SPEC", "RAM budget used by the cpa planner"),
+            (
+                "--max-steps N",
+                "maximum active steps whose concurrent memory the cpa planner must fit",
+            ),
             ("--format FORMAT", "text (default) | json"),
             ("-h, --help", "show this help and exit"),
         ],
@@ -1720,13 +1734,24 @@ fn build_feedback_plan(
     planner: Planner,
     core_budget: Option<i64>,
     mem_budget: Option<i64>,
+    max_steps: Option<i64>,
 ) -> Plan {
     match feedback_dir {
         Some(dir) => {
             let (mid, cc) = feedback_identity();
-            let samples = load_step_samples(Path::new(dir), &mid, &cc);
-            let speedups = load_step_speedups(Path::new(dir), &mid, &cc);
-            build_plan(
+            let expected: HashMap<String, String> = cfg
+                .steps
+                .iter()
+                .map(|step| {
+                    (
+                        step.tag(),
+                        workload_digest(step, &cfg.default_jobs_flag, &cfg.default_jobs_env),
+                    )
+                })
+                .collect();
+            let samples = load_step_samples_for_workloads(Path::new(dir), &mid, &cc, &expected);
+            let speedups = load_step_speedups_for_workloads(Path::new(dir), &mid, &cc, &expected);
+            build_plan_with_max_steps(
                 cfg,
                 &samples,
                 planner,
@@ -1734,9 +1759,10 @@ fn build_feedback_plan(
                 &speedups,
                 core_budget,
                 mem_budget,
+                max_steps,
             )
         }
-        None => build_plan(
+        None => build_plan_with_max_steps(
             cfg,
             &std::collections::HashMap::new(),
             planner,
@@ -1744,6 +1770,7 @@ fn build_feedback_plan(
             &std::collections::HashMap::new(),
             core_budget,
             mem_budget,
+            max_steps,
         ),
     }
 }
@@ -1756,10 +1783,21 @@ fn build_plan_from_summary(
     planner: Planner,
     core_budget: Option<i64>,
     mem_budget: Option<i64>,
+    max_steps: Option<i64>,
 ) -> Plan {
-    let samples = summary::step_samples_from_summary(summary);
-    let speedups = summary::step_speedups_from_summary(summary, None);
-    build_plan(
+    let expected: HashMap<String, String> = cfg
+        .steps
+        .iter()
+        .map(|step| {
+            (
+                step.tag(),
+                workload_digest(step, &cfg.default_jobs_flag, &cfg.default_jobs_env),
+            )
+        })
+        .collect();
+    let samples = summary::step_samples_from_summary_for_workloads(summary, &expected);
+    let speedups = summary::step_speedups_from_summary_for_workloads(summary, None, &expected);
+    build_plan_with_max_steps(
         cfg,
         &samples,
         planner,
@@ -1767,6 +1805,7 @@ fn build_plan_from_summary(
         &speedups,
         core_budget,
         mem_budget,
+        max_steps,
     )
 }
 
@@ -1783,6 +1822,7 @@ fn local_store_summary(feedback_dir: Option<&str>, mid: &str, cc: &str) -> Summa
 /// DOWNLOAD the shared summary, MERGE it with this machine's local store, and build the plan from
 /// the result. Returns `None` to fall back to the normal CSV-feedback plan (sync off / a backend
 /// failure). A backend failure degrades LOUDLY without failing the run. Mirrors `_sync_seed_plan`.
+#[allow(clippy::too_many_arguments)] // Mirrors the plan inputs without hiding distinct budgets.
 fn sync_seed_plan(
     cfg: &DagConfig,
     backend: Option<&dyn SyncBackend>,
@@ -1791,6 +1831,7 @@ fn sync_seed_plan(
     do_download: bool,
     core_budget: Option<i64>,
     mem_budget: Option<i64>,
+    max_steps: Option<i64>,
 ) -> Option<Plan> {
     let backend = backend?;
     if !do_download {
@@ -1830,18 +1871,49 @@ fn sync_seed_plan(
         planner,
         core_budget,
         mem_budget,
+        max_steps,
     ))
 }
 
 // Merge THIS run's per-step samples into the shared summary and publish them. Degrades LOUDLY on
 // failure (a warning) so the run's exit code is preserved but the skip is never silent. Mirrors
 // Python's `_sync_upload`.
-fn sync_upload(backend: &dyn SyncBackend, rows: &[std::collections::BTreeMap<String, String>]) {
+fn rows_with_observation_ids(
+    rows: &[std::collections::BTreeMap<String, String>],
+    run_id: &str,
+) -> Vec<std::collections::HashMap<String, String>> {
+    rows.iter()
+        .map(|row| {
+            let mut copied: std::collections::HashMap<String, String> = row
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            let observation_id = row
+                .get("observation_id")
+                .filter(|value| !value.is_empty())
+                .or_else(|| row.get("run_id").filter(|value| !value.is_empty()))
+                .map_or_else(|| run_id.to_string(), Clone::clone);
+            copied.insert("observation_id".to_string(), observation_id);
+            copied
+        })
+        .collect()
+}
+
+fn sync_upload(
+    backend: &dyn SyncBackend,
+    rows: &[std::collections::BTreeMap<String, String>],
+    local_run_id: Option<&str>,
+) {
     let (mid, cc) = feedback_identity();
-    let hash_rows: Vec<std::collections::HashMap<String, String>> = rows
-        .iter()
-        .map(|r| r.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-        .collect();
+    let minted_run_id;
+    let observation_run_id = match local_run_id {
+        Some(run_id) => run_id,
+        None => {
+            minted_run_id = crate::perflog::new_run_id();
+            &minted_run_id
+        }
+    };
+    let hash_rows = rows_with_observation_ids(rows, observation_run_id);
     let affinity = crate::estimates::affinity_width(&cc);
     let delta = summary::summary_from_rows(
         &hash_rows,
@@ -1916,6 +1988,39 @@ fn report_profile_written(perf_dir: &str, source: &str) {
     }
     for path in csvs {
         eprintln!("  {path}");
+    }
+}
+
+/// Refresh the inspectable derived model from the authoritative raw profile CSV.
+fn refresh_scaling_model(perf_dir: &str, cfg: &DagConfig) {
+    let machine = crate::perflog::machine_id();
+    let container = crate::perflog::container_class();
+    let expected: HashMap<String, String> = cfg
+        .steps
+        .iter()
+        .map(|step| {
+            (
+                step.tag(),
+                workload_digest(step, &cfg.default_jobs_flag, &cfg.default_jobs_env),
+            )
+        })
+        .collect();
+    let speedups =
+        load_step_speedups_for_workloads(Path::new(perf_dir), &machine, &container, &expected);
+    match write_scaling_model_for_workloads(
+        Path::new(perf_dir),
+        &machine,
+        &container,
+        &speedups,
+        Some(&expected),
+    ) {
+        Ok(path) => eprintln!(
+            "{PROG}: derived scaling model refreshed at {} (rebuildable from the profile CSVs)",
+            path.display()
+        ),
+        Err(error) => eprintln!(
+            "{PROG}: WARNING could not refresh derived scaling model under {perf_dir}: {error}"
+        ),
     }
 }
 
@@ -2363,6 +2468,20 @@ struct SweepMeasure {
     ok: bool,
 }
 
+/// Provenance attached to rows produced by a target-time sweep. These are dynamic profile columns:
+/// old readers ignore them, while experiment analysis can reconstruct which cumulative pass and
+/// machine grid produced each sample.
+struct SweepProfileMeta {
+    sweep_id: String,
+    pass: usize,
+    sample: usize,
+    repeat: i64,
+    width_source: String,
+    workload_digest: String,
+    target_s: f64,
+    topology: MachineTopology,
+}
+
 /// Parse a sweep width range: `"LO..HI"` or a bare `"N"` (meaning `1..N`).
 fn parse_jobs_range(raw: &str) -> Result<(i64, i64), String> {
     let text = raw.trim();
@@ -2402,24 +2521,83 @@ fn run_single_step(
     git: &str,
     verbosity: i64,
 ) -> SweepMeasure {
+    run_isolated_step(
+        base,
+        cfg,
+        Some(inner_jobs),
+        inner_jobs,
+        1,
+        cgroups,
+        perf_dir,
+        git,
+        verbosity,
+        None,
+    )
+}
+
+/// Run a node alone, optionally overriding its guest-visible width.
+#[allow(clippy::too_many_arguments)]
+fn run_isolated_step(
+    base: &Step,
+    cfg: &DagConfig,
+    inner_jobs: Option<i64>,
+    max_cpus: i64,
+    profile_outer_jobs: i64,
+    cgroups: &BoxedCgroups,
+    perf_dir: Option<&str>,
+    git: &str,
+    verbosity: i64,
+    sweep_meta: Option<&SweepProfileMeta>,
+) -> SweepMeasure {
     let mut step = base.clone();
     step.deps.clear();
-    step.hint.preferred_inner_jobs = Some(inner_jobs);
+    if let Some(inner_jobs) = inner_jobs {
+        step.hint.preferred_inner_jobs = Some(inner_jobs);
+    }
     let mut one = cfg.clone();
     one.steps = vec![step];
 
     let (u0, s0) = child_cpu_seconds();
     let window = perf_dir.map(|d| PerfWindow::start(Path::new(d), git));
     let start = Instant::now();
-    let result = run_dag_boxed_limited(&one, 1, inner_jobs, false, verbosity, cgroups.clone());
+    let mut result =
+        run_dag_boxed_limited(&one, 1, max_cpus.max(1), false, verbosity, cgroups.clone());
     let measured = start.elapsed().as_secs_f64();
     let (u1, s1) = child_cpu_seconds();
+    let measured_user_s = (u1 - u0).max(0.0);
+    let measured_sys_s = (s1 - s0).max(0.0);
     if let Some(w) = &window {
         w.finish(
             if result.ok { "pass" } else { "fail" },
             result.outcomes.len(),
-            inner_jobs,
+            profile_outer_jobs.max(1),
         );
+    }
+    for row in &mut result.step_profile_rows {
+        if row.get("user_s").is_none_or(|value| value.is_empty()) {
+            row.insert("user_s".into(), format!("{measured_user_s:.3}"));
+        }
+        if row.get("sys_s").is_none_or(|value| value.is_empty()) {
+            row.insert("sys_s".into(), format!("{measured_sys_s:.3}"));
+        }
+        if let Some(meta) = sweep_meta {
+            row.insert("sweep_mode".into(), "target-time".into());
+            row.insert("sweep_id".into(), meta.sweep_id.clone());
+            row.insert("sweep_pass".into(), meta.pass.to_string());
+            row.insert("sweep_sample".into(), meta.sample.to_string());
+            row.insert("sweep_repeat".into(), meta.repeat.to_string());
+            row.insert("sweep_width_source".into(), meta.width_source.clone());
+            row.insert("workload_digest".into(), meta.workload_digest.clone());
+            row.insert("sweep_target_s".into(), format!("{:.6}", meta.target_s));
+            row.insert(
+                "sweep_physical_cores".into(),
+                meta.topology.physical_cores.to_string(),
+            );
+            row.insert(
+                "sweep_logical_cpus".into(),
+                meta.topology.logical_cpus.to_string(),
+            );
+        }
     }
     if let Some(d) = perf_dir {
         // The whole run's rows are appended in this one call, so a freshly minted run_id
@@ -2428,10 +2606,10 @@ fn run_single_step(
             Path::new(d),
             &result.step_profile_rows,
             git,
-            1,
+            profile_outer_jobs.max(1),
             None,
-            "unverified",
-            "local",
+            sweep_enforcement_kind(cgroups.is_some()),
+            "sweep",
             None,
         );
     }
@@ -2445,10 +2623,20 @@ fn run_single_step(
         .and_then(|s| s.parse::<i64>().ok());
     SweepMeasure {
         wall_s,
-        user_s: (u1 - u0).max(0.0),
-        sys_s: (s1 - s0).max(0.0),
+        user_s: measured_user_s,
+        sys_s: measured_sys_s,
         rss_hwm,
         ok: result.ok,
+    }
+}
+
+/// Profile provenance for a sweep execution. Sweep rows describe the containment that actually
+/// wrapped the measured step, rather than inheriting the generic writer's unknown/default value.
+fn sweep_enforcement_kind(cgroup_manager_present: bool) -> &'static str {
+    if cgroup_manager_present {
+        "cgroup-v2"
+    } else {
+        "unboxed"
     }
 }
 
@@ -2488,10 +2676,60 @@ fn print_sweep_table(
     println!("{}", render_table(&headers, &table, c));
 }
 
+fn print_fixed_sweep_measure(step: &str, measure: SweepMeasure, c: &Palette) {
+    let headers = vec![
+        "jobs".to_string(),
+        "wall_s".to_string(),
+        "user_s".to_string(),
+        "sys_s".to_string(),
+        "rss_hwm".to_string(),
+        "speedup".to_string(),
+    ];
+    let table = vec![vec![
+        "fixed".to_string(),
+        format!("{:.3}", measure.wall_s),
+        format!("{:.3}", measure.user_s),
+        format!("{:.3}", measure.sys_s),
+        human_bytes(measure.rss_hwm),
+        "-".to_string(),
+    ]];
+    println!("{}", c.bold(&format!("parallel-speedup sweep: {step}")));
+    println!("{}", render_table(&headers, &table, c));
+}
+
+fn target_width_source(
+    width: i64,
+    initial_widths: &[i64],
+    topology: MachineTopology,
+    explicit: bool,
+) -> String {
+    if !initial_widths.contains(&width) {
+        return "midpoint".to_string();
+    }
+    if explicit {
+        return "explicit".to_string();
+    }
+    let mut sources = Vec::new();
+    if width > 0 && (width & (width - 1)) == 0 && width <= topology.physical_cores {
+        sources.push("power-of-two");
+    }
+    if width == topology.physical_cores {
+        sources.push("physical-cores");
+    }
+    if width == topology.logical_cpus {
+        sources.push("logical-threads");
+    }
+    if sources.is_empty() {
+        sources.push("midpoint");
+    }
+    sources.join("+")
+}
+
 struct SweepArgs {
     dag: Option<String>,
     step: Option<String>,
     jobs: Option<String>,
+    target_time: Option<String>,
     repeat: i64,
     perf_dir: Option<String>,
     no_profile: bool,
@@ -2505,6 +2743,7 @@ fn parse_sweep_args(rest: &[String]) -> Result<SweepArgs, String> {
         dag: None,
         step: None,
         jobs: None,
+        target_time: None,
         repeat: 1,
         perf_dir: None,
         no_profile: false,
@@ -2533,6 +2772,7 @@ fn parse_sweep_args(rest: &[String]) -> Result<SweepArgs, String> {
             "--dag" => a.dag = Some(take_value(inline, &mut i)?),
             "--step" => a.step = Some(take_value(inline, &mut i)?),
             "--jobs" => a.jobs = Some(take_value(inline, &mut i)?),
+            "--target-time" => a.target_time = Some(take_value(inline, &mut i)?),
             "--repeat" => {
                 let v = take_value(inline, &mut i)?;
                 a.repeat = v
@@ -2553,6 +2793,9 @@ fn parse_sweep_args(rest: &[String]) -> Result<SweepArgs, String> {
 
 /// Per-step parallel-speedup sweep (Feature B).
 fn cmd_sweep(a: &SweepArgs, c: &Palette) -> i32 {
+    if a.target_time.is_some() {
+        return cmd_target_time_sweep(a, c);
+    }
     let dag_arg = match &a.dag {
         Some(d) => d.clone(),
         None => {
@@ -2647,6 +2890,9 @@ fn cmd_sweep(a: &SweepArgs, c: &Palette) -> i32 {
                 eprintln!(
                     "{PROG}: sweep: step '{step_tag}' FAILED at -j{jobs}; aborting the sweep"
                 );
+                if let Some(d) = perf_dir.as_deref() {
+                    report_profile_written(d, source);
+                }
                 return 1;
             }
             best = Some(match best {
@@ -2660,6 +2906,286 @@ fn cmd_sweep(a: &SweepArgs, c: &Palette) -> i32 {
     print_sweep_table(&step_tag, lo, &measures, c);
     if let Some(d) = perf_dir.as_deref() {
         report_profile_written(d, source);
+        refresh_scaling_model(d, &cfg);
+    }
+    0
+}
+
+/// Graph-wide, target-time parallel-scaling experiment.
+///
+/// The allowance is checked only here, between complete passes. Pass one is unconditional, and
+/// once any later pass starts its complete cumulative grid is run for every selected resizable
+/// node before the allowance is consulted again.
+fn cmd_target_time_sweep(a: &SweepArgs, c: &Palette) -> i32 {
+    let dag_arg = match &a.dag {
+        Some(dag) => dag,
+        None => {
+            eprintln!("{PROG} sweep: error: the following arguments are required: --dag");
+            return 2;
+        }
+    };
+    let target =
+        match parse_target_duration(a.target_time.as_deref().expect("target-time mode selected")) {
+            Ok(target) => target,
+            Err(error) => {
+                eprintln!("{PROG}: sweep: {error}");
+                return 2;
+            }
+        };
+    let cfg = match load(dag_arg) {
+        Ok(cfg) => cfg,
+        Err(error) => {
+            eprintln!("{PROG}: {}", error.0);
+            return 2;
+        }
+    };
+
+    let order = match stable_topological_order(&cfg.steps) {
+        Ok(order) => order,
+        Err(error) => {
+            eprintln!("{PROG}: sweep: {error}");
+            return 2;
+        }
+    };
+    let selected: Vec<usize> = match a.step.as_deref() {
+        Some(tag) => match cfg.steps.iter().position(|step| step.tag() == tag) {
+            Some(index) => vec![index],
+            None => {
+                let mut known = cfg.steps.iter().map(Step::tag).collect::<Vec<_>>();
+                known.sort();
+                let known = known.join(", ");
+                eprintln!(
+                    "{PROG}: sweep: unknown --step tag '{tag}'. Known tags: {}",
+                    if known.is_empty() { "(none)" } else { &known }
+                );
+                return 2;
+            }
+        },
+        None => order,
+    };
+
+    let topology = limit_topology(machine_topology(), container_core_budget());
+    let initial_widths = match a.jobs.as_deref() {
+        Some(spec) => match parse_widths(spec) {
+            Ok(widths) => widths,
+            Err(error) => {
+                eprintln!("{PROG}: sweep: {error}");
+                return 2;
+            }
+        },
+        None => coarse_widths(topology),
+    };
+    let repeat = a.repeat.max(1);
+    let cgroups = match resolve_cgroups(
+        a.allow_cgroup_failure,
+        a.unsafe_no_cgroups,
+        None,
+        None,
+        None,
+    ) {
+        Ok(cgroups) => cgroups,
+        Err(code) => return code,
+    };
+    let (perf_dir, profile_source) = resolve_profile_dir(a.perf_dir.as_deref(), a.no_profile);
+    let git = git_sha();
+    let target_s = target.as_secs_f64();
+    let sweep_id = crate::perflog::new_run_id();
+    let explicit_widths = a.jobs.is_some();
+    let mut sample_number = 0usize;
+    let has_resizable = selected.iter().any(|index| {
+        let step = &cfg.steps[*index];
+        step.skip_reason.is_none()
+            && step_width_is_resizable(step, &cfg.default_jobs_flag, &cfg.default_jobs_env)
+    });
+
+    println!(
+        "{}",
+        c.bold(&format!(
+            "parallel-scaling sweep: {} node(s), target {:.3}s, topology {}/{} physical/logical",
+            selected.len(),
+            target_s,
+            topology.physical_cores,
+            topology.logical_cpus,
+        ))
+    );
+
+    let sweep_start = Instant::now();
+    let mut pass = 1usize;
+    let completed_passes = loop {
+        let grid = cumulative_width_grid(&initial_widths, pass);
+        let grid_text = grid
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        println!(
+            "sweep pass {pass} starting: cumulative widths [{}]{}",
+            grid_text,
+            if pass == 1 {
+                " (mandatory minimum pass)"
+            } else {
+                ""
+            }
+        );
+        let pass_start = Instant::now();
+
+        for index in &selected {
+            let base = &cfg.steps[*index];
+            let tag = base.tag();
+            if base.skip_reason.is_some() {
+                if pass == 1 {
+                    println!(
+                        "sweep: {tag}: intentionally skipped by the DAG; no process was started"
+                    );
+                }
+                continue;
+            }
+            if !step_width_is_resizable(base, &cfg.default_jobs_flag, &cfg.default_jobs_env) {
+                if pass != 1 {
+                    continue;
+                }
+                let max_cpus = crate::model::effective_cpu_count(base, cfg.default_step_cpu_count)
+                    .unwrap_or(topology.logical_cpus)
+                    .max(1);
+                if max_cpus > topology.logical_cpus {
+                    println!(
+                        "sweep: {tag}: fixed configured width {max_cpus} exceeds the effective {}-CPU budget; skipping",
+                        topology.logical_cpus,
+                    );
+                    continue;
+                }
+                println!(
+                    "sweep: {tag}: no jobs_flag/jobs_env width channel; characterizing its configured width once (width {max_cpus})"
+                );
+                sample_number += 1;
+                let meta = SweepProfileMeta {
+                    sweep_id: sweep_id.clone(),
+                    pass,
+                    sample: sample_number,
+                    repeat: 1,
+                    width_source: "fixed".to_string(),
+                    workload_digest: workload_digest(
+                        base,
+                        &cfg.default_jobs_flag,
+                        &cfg.default_jobs_env,
+                    ),
+                    target_s,
+                    topology,
+                };
+                let measure = run_isolated_step(
+                    base,
+                    &cfg,
+                    None,
+                    max_cpus,
+                    1,
+                    &cgroups,
+                    perf_dir.as_deref(),
+                    &git,
+                    a.verbosity,
+                    Some(&meta),
+                );
+                if !measure.ok {
+                    eprintln!(
+                        "{PROG}: sweep: step '{tag}' FAILED at its configured width; aborting the sweep"
+                    );
+                    if let Some(dir) = perf_dir.as_deref() {
+                        report_profile_written(dir, profile_source);
+                    }
+                    return 1;
+                }
+                print_fixed_sweep_measure(&tag, measure, c);
+                continue;
+            }
+
+            let mut measures = Vec::with_capacity(grid.len());
+            for jobs in &grid {
+                let mut best: Option<SweepMeasure> = None;
+                let width_source =
+                    target_width_source(*jobs, &initial_widths, topology, explicit_widths);
+                for repeat_number in 1..=repeat {
+                    sample_number += 1;
+                    let meta = SweepProfileMeta {
+                        sweep_id: sweep_id.clone(),
+                        pass,
+                        sample: sample_number,
+                        repeat: repeat_number,
+                        width_source: width_source.clone(),
+                        workload_digest: workload_digest(
+                            base,
+                            &cfg.default_jobs_flag,
+                            &cfg.default_jobs_env,
+                        ),
+                        target_s,
+                        topology,
+                    };
+                    let measure = run_isolated_step(
+                        base,
+                        &cfg,
+                        Some(*jobs),
+                        *jobs,
+                        1,
+                        &cgroups,
+                        perf_dir.as_deref(),
+                        &git,
+                        a.verbosity,
+                        Some(&meta),
+                    );
+                    if !measure.ok {
+                        eprintln!(
+                            "{PROG}: sweep: step '{tag}' FAILED at -j{jobs} in pass {pass}; aborting the sweep"
+                        );
+                        if let Some(dir) = perf_dir.as_deref() {
+                            report_profile_written(dir, profile_source);
+                        }
+                        return 1;
+                    }
+                    best = Some(match best {
+                        Some(previous) if previous.wall_s <= measure.wall_s => previous,
+                        _ => measure,
+                    });
+                }
+                measures.push((*jobs, best.expect("repeat >= 1")));
+            }
+            print_sweep_table(&tag, grid[0], &measures, c);
+        }
+
+        let pass_elapsed = pass_start.elapsed();
+        let total_elapsed = sweep_start.elapsed();
+        println!(
+            "sweep pass {pass} complete in {:.3}s; total elapsed {:.3}s / target {:.3}s",
+            pass_elapsed.as_secs_f64(),
+            total_elapsed.as_secs_f64(),
+            target_s,
+        );
+        if pass == 1 {
+            println!(
+                "minimum pass elapsed {:.3}s; target {:.3}s; overrun {:.3}s",
+                pass_elapsed.as_secs_f64(),
+                target_s,
+                (pass_elapsed.as_secs_f64() - target_s).max(0.0),
+            );
+        }
+
+        if total_elapsed >= target || !has_resizable {
+            break pass;
+        }
+        pass += 1;
+    };
+
+    let elapsed_s = sweep_start.elapsed().as_secs_f64();
+    let overrun_s = (elapsed_s - target_s).max(0.0);
+    println!(
+        "target-time sweep complete: {completed_passes} pass(es), {sample_number} sample(s), elapsed {:.3}s, target {:.3}s, overrun {:.3}s",
+        elapsed_s, target_s, overrun_s,
+    );
+    if !has_resizable {
+        println!(
+            "sweep: no runnable selected node has a jobs_flag/jobs_env width channel; fixed nodes were handled once"
+        );
+    }
+    if let Some(dir) = perf_dir.as_deref() {
+        report_profile_written(dir, profile_source);
+        refresh_scaling_model(dir, &cfg);
     }
     0
 }
@@ -2673,6 +3199,7 @@ struct PlanArgs {
     perf_dir: Option<String>,
     no_profile_feedback: bool,
     max_mem: Option<String>,
+    max_steps: Option<i64>,
 }
 
 fn parse_plan_args(rest: &[String]) -> Result<PlanArgs, String> {
@@ -2683,6 +3210,7 @@ fn parse_plan_args(rest: &[String]) -> Result<PlanArgs, String> {
         perf_dir: None,
         no_profile_feedback: false,
         max_mem: None,
+        max_steps: None,
     };
     let mut i = 0;
     while i < rest.len() {
@@ -2716,6 +3244,12 @@ fn parse_plan_args(rest: &[String]) -> Result<PlanArgs, String> {
             "--perf-dir" => a.perf_dir = Some(take_value(inline, &mut i)?),
             "--no-profile-feedback" => a.no_profile_feedback = true,
             "--max-mem" => a.max_mem = Some(take_value(inline, &mut i)?),
+            "--max-steps" => {
+                a.max_steps = Some(parse_positive_i64(
+                    &take_value(inline, &mut i)?,
+                    "--max-steps",
+                )?)
+            }
             other => return Err(format!("unrecognized argument: {other}")),
         }
         i += 1;
@@ -2748,6 +3282,7 @@ fn cmd_plan(a: &PlanArgs) -> i32 {
         planner,
         core_budget,
         mem_budget,
+        a.max_steps,
     );
     if a.format == "json" {
         println!("{}", plan_to_json(&plan));
@@ -2954,6 +3489,7 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
     let planner = Planner::from_value(&a.planner).unwrap_or(Planner::GreedyLpt);
     let feedback_dir = resolve_feedback_dir(a.perf_dir.as_deref(), a.no_profile_feedback);
     let (core_budget, mem_budget) = planning_budgets(planner, a.max_mem.as_deref(), Some(max_cpus));
+    let planning_max_steps = Some(a.max_steps.unwrap_or(max_cpus));
 
     // Profile-artifact SYNC: parse the backend once; DOWNLOAD seeds the planner, UPLOAD (after the
     // run) publishes this run's samples. A malformed spec fails fast; a backend I/O failure degrades
@@ -2981,6 +3517,7 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
         do_download && !a.no_profile_feedback,
         core_budget,
         mem_budget,
+        planning_max_steps,
     )
     .unwrap_or_else(|| {
         build_feedback_plan(
@@ -2989,6 +3526,7 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
             planner,
             core_budget,
             mem_budget,
+            planning_max_steps,
         )
     });
     if plan
@@ -3086,6 +3624,7 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
         });
 
     let (perf_dir, source) = resolve_profile_dir(a.perf_dir.as_deref(), a.no_profile);
+    let profile_run_id = perf_dir.as_ref().map(|_| crate::perflog::new_run_id());
     let git = git_sha();
     let window = perf_dir
         .as_deref()
@@ -3133,14 +3672,12 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
                 max_steps,
             );
         }
-        // The whole run's rows are appended in this one call, so a freshly minted run_id
-        // (`None`) groups exactly this execution.
         append_step_profiles(
             Path::new(d),
             &result.step_profile_rows,
             &git,
             max_steps,
-            None,
+            profile_run_id.as_deref(),
             "unverified",
             "local",
             None,
@@ -3150,7 +3687,7 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
 
     if do_upload {
         if let Some(b) = backend.as_deref() {
-            sync_upload(b, &result.step_profile_rows);
+            sync_upload(b, &result.step_profile_rows, profile_run_id.as_deref());
         }
     }
 
@@ -3669,14 +4206,23 @@ fn cmd_summary_merge(args: &[String]) -> i32 {
 }
 
 fn cmd_summary_plan(args: &[String]) -> i32 {
-    let (flags, positionals) =
-        match parse_flags(args, &["summary", "dag", "planner", "max-mem", "format"]) {
-            Ok(x) => x,
-            Err(e) => {
-                eprintln!("{PROG} summary plan: error: {e}");
-                return 2;
-            }
-        };
+    let (flags, positionals) = match parse_flags(
+        args,
+        &[
+            "summary",
+            "dag",
+            "planner",
+            "max-mem",
+            "max-steps",
+            "format",
+        ],
+    ) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("{PROG} summary plan: error: {e}");
+            return 2;
+        }
+    };
     if let Err(error) = reject_summary_positionals(&positionals) {
         eprintln!("{PROG} summary plan: error: {error}");
         return 2;
@@ -3737,7 +4283,17 @@ fn cmd_summary_plan(args: &[String]) -> i32 {
     };
     let (core_budget, mem_budget) =
         planning_budgets(planner, flags.get("max-mem").map(|s| s.as_str()), None);
-    let plan = build_plan_from_summary(&cfg, &summary, planner, core_budget, mem_budget);
+    let max_steps = match flags.get("max-steps") {
+        Some(raw) => match parse_positive_i64(raw, "--max-steps") {
+            Ok(value) => Some(value),
+            Err(error) => {
+                eprintln!("{PROG} summary plan: error: {error}");
+                return 2;
+            }
+        },
+        None => None,
+    };
+    let plan = build_plan_from_summary(&cfg, &summary, planner, core_budget, mem_budget, max_steps);
     if output_format == "json" {
         println!("{}", plan_to_json(&plan));
     } else {
@@ -3850,6 +4406,26 @@ mod tests {
         assert!(CGROUP_SETUP_ENVIRONMENT_ERROR.starts_with("ENVIRONMENT:"));
         assert!(CGROUP_SETUP_ENVIRONMENT_ERROR.contains("no DAG node started"));
         assert!(CGROUP_SETUP_ENVIRONMENT_ERROR.contains("no product build started"));
+    }
+
+    #[test]
+    fn sync_upload_reuses_the_local_execution_identity() {
+        let rows = vec![
+            BTreeMap::from([("step".to_string(), "g.a".to_string())]),
+            BTreeMap::from([("step".to_string(), "g.a".to_string())]),
+        ];
+        let stamped = rows_with_observation_ids(&rows, "batch");
+        assert_eq!(stamped[0]["observation_id"], "batch");
+        assert_eq!(stamped[1]["observation_id"], "batch");
+
+        let rows = vec![BTreeMap::from([
+            ("step".to_string(), "g.a".to_string()),
+            ("run_id".to_string(), "persisted".to_string()),
+        ])];
+        assert_eq!(
+            rows_with_observation_ids(&rows, "fallback")[0]["observation_id"],
+            "persisted"
+        );
     }
 
     #[test]
@@ -4411,6 +4987,16 @@ mod tests {
     }
 
     #[test]
+    fn plan_parser_accepts_a_positive_max_steps_ceiling() {
+        let parsed = parse_plan_args(&["--max-steps=3".into()]).unwrap();
+        assert_eq!(parsed.max_steps, Some(3));
+        assert_eq!(
+            parse_plan_args(&["--max-steps=0".into()]).err().as_deref(),
+            Some("--max-steps: must be >= 1")
+        );
+    }
+
+    #[test]
     fn run_refuses_an_unrewritable_width_before_cgroup_setup() {
         let mut cfg = tiny();
         cfg.steps[0].hint.preferred_inner_jobs = Some(8);
@@ -4436,6 +5022,7 @@ mod tests {
             dag: Some(path.display().to_string()),
             step: Some("build.app".to_string()),
             jobs: Some("1..2".to_string()),
+            target_time: None,
             repeat: 1,
             perf_dir: None,
             no_profile: true,
@@ -4447,6 +5034,12 @@ mod tests {
 
         assert_eq!(cmd_sweep(&args, &palette), 2);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sweep_profile_enforcement_tracks_cgroup_manager_presence() {
+        assert_eq!(sweep_enforcement_kind(true), "cgroup-v2");
+        assert_eq!(sweep_enforcement_kind(false), "unboxed");
     }
 
     #[test]
@@ -4468,7 +5061,14 @@ mod tests {
             (
                 summary_plan_help(&palette),
                 "summary plan",
-                &["--summary", "--dag", "--planner", "--max-mem", "--format"][..],
+                &[
+                    "--summary",
+                    "--dag",
+                    "--planner",
+                    "--max-mem",
+                    "--max-steps",
+                    "--format",
+                ][..],
                 &["--perf-dir", "--out", "--reservoir-cap"][..],
             ),
             (

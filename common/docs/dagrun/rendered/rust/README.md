@@ -205,26 +205,53 @@ number unless you say otherwise. The long
 spelling of `-j` is `--max-cpus`; migrate the 0.13 `run --jobs` spelling to it.
 A hidden compatibility alias keeps existing 0.13 scripts working but is not
 public run vocabulary; differing simultaneous values conflict and are rejected.
-`sweep --jobs RANGE` remains the width-range option for a per-step speedup
-experiment. A known step `cmdtype` supplies the runner's exact width arguments;
-a simple command receives them at the end, while a compound command puts an
-unquoted `$DAGRUN_EXTRA_ARGS` where they belong. A compound command without that
-placement is refused. `-j3` is one shell word;
+`sweep --jobs RANGE` remains the width-range option for a single-step speedup
+experiment. `sweep --target-time 10m` instead walks one node at a time
+in stable topological order and completes as many whole cumulative passes as
+fit the soft allowance. Pass 1 always finishes; later passes bisect the existing
+width gaps and rerun the retained anchor widths. `--step` and `--jobs` are
+optional limits in target mode. Because widths and passes deliberately rerun a
+node in the same working tree, benchmark commands must be repeatable (or the
+caller must restore their inputs and outputs between invocations). A known step `cmdtype` supplies the runner's
+exact width arguments; a simple command receives them at the end, while a
+compound command puts an unquoted `$DAGRUN_EXTRA_ARGS` where they belong. A
+compound command without that placement is refused. `-j3` is one shell word;
 `--jobs 3` is two, and quoting the variable would turn those two arguments into
 one, so dagrun refuses that double-quoted multi-word form; single quotes prevent
-expansion and are also refused. The valid values are
-`unknown` (default), `make`, `cargo-build`, `cargo-test`, `cargo-nextest`,
+expansion and are also refused. The valid values are `unknown` (default),
+`make`, `cargo-build`, `cargo-test`, `cargo-nextest`,
 `generic-dash-j-command`, and `generic-with-flag`. The last requires a
 step-level `jobs_flag`. Under `unknown`, `DAGRUN_EXTRA_ARGS` is absent and the
 existing `jobs_flag`/`jobs_env` rules apply. `default_jobs_env` supplies the
 environment channel inherited by steps, and `DAGRUN_JOBS_ENV` supplies that
-default when the document omits it.
+default when the document omits it. Empty effective channels prevent rewriting.
+When paired with a positive declared width, that width is self-managed and the
+run refuses it if it exceeds the total budget.
 
-The current planners do not jointly optimize inner width, co-running load, and
-memory. Greedy-LPT and critical-path choose only dispatch order. CPA chooses
-per-step widths from isolated speedup curves, but its no-overcommit makespan is
-a planning reference; runtime overlap is still governed by `--max-steps` and
-may oversubscribe the outer CPU budget.
+Greedy-LPT and critical-path choose only dispatch order. CPA chooses per-step
+widths from isolated speedup curves and checks the largest dependency/resource-
+reachable memory footprint. With `--max-mem`, it compares each feasible overlap
+ceiling down to serial execution and selects the widths/overlap with the smallest
+no-overcommit modeled makespan. It does not model how co-running work changes
+either curve; its reference makespan explains allocation, while the live runtime
+may oversubscribe the outer CPU quota.
+
+Runs and sweeps auto-append raw CSV measurements to `./.dagrun/profiles/`
+relative to the current directory. `--perf-dir` overrides that location,
+`DAGRUN_PROFILE_DIR` is the secondary override, and `--no-profile` disables
+writes; the command always reports the files it appended. The raw store, not
+the authored DAG, is the source of learned scaling data. Every successful
+profiling-enabled sweep atomically refreshes a deterministic machine/container-specific
+`scaling_model_*.json` sidecar beside it; that cache can be rebuilt at any time.
+Sweep rows and the sidecar carry a command-shape digest, and summaries retain
+separate reservoirs per digest, so identified old command data is never mixed
+into the current curve (blank pre-digest rows are a compatibility fallback only).
+Its economic plateau is the narrowest measured width within 10% of the best
+eligible wall time, normally excluding widths that
+consume more than 1.5x the baseline CPU seconds. CPA uses measured CPU seconds
+for work area when present (`p * wall` otherwise) and trusts an exact-width
+memory peak only after three uncensored samples at that width; capped peaks are
+retained as lower bounds.
 
 ## Attributable test-runner timeouts
 

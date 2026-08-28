@@ -124,8 +124,11 @@ def test_git_backend_retry_on_conflict_does_not_clobber(tmp_path: Path) -> None:
     ours = sync.GitBranchBackend(url, "profile-data", before_push=inject_conflict)
     merged = ours.publish(_delta("g.ours", 1.0))
     # The returned merged summary and the branch must contain BOTH steps.
-    steps = {step for (step, _inner) in merged.buckets}
+    steps = {step for (step, _inner, _workload) in merged.buckets}
     assert steps == {"g.concurrent", "g.ours"}
     final = sync.GitBranchBackend(url, "profile-data").download(MID, CC)
-    assert {step for (step, _inner) in final.buckets} == {"g.concurrent", "g.ours"}
+    assert {step for (step, _inner, _workload) in final.buckets} == {
+        "g.concurrent",
+        "g.ours",
+    }
     assert injected["done"]  # the conflict path actually fired

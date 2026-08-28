@@ -12,7 +12,7 @@ def test_summarize_remains_library_only_and_filters_ambient_rows(tmp_path: Path)
     """Preserve the public helper without recreating an undeclared command surface."""
     profile = tmp_path / "profiles.csv"
     profile.write_text(
-        "step,inner_jobs,ambient_bucket,elapsed_s,effective_cores,memory_peak_bytes\n"
+        "step,inner_jobs,ambient_bucket,elapsed_s,effective_cores,peak_bytes\n"
         "build.unit,2,quiet,4.0,1.5,100\n"
         "build.unit,2,quiet,2.0,2.0,120\n"
         "build.unit,2,busy,20.0,1.0,500\n",
@@ -47,6 +47,7 @@ def test_summarize_reads_the_column_the_store_actually_writes() -> None:
         analyze.COL_INNER_JOBS,
         analyze.COL_AMBIENT,
         analyze.COL_EFFECTIVE_CORES,
+        analyze.COL_MEMORY_PEAK_BYTES,
     ):
         assert column in perflog.STEP_PROFILE_COLUMNS
 
@@ -63,6 +64,7 @@ def test_summarize_returns_rows_for_a_store_shaped_csv(tmp_path: Path) -> None:
         cells[index["inner_jobs"]] = "2"
         cells[index["elapsed_s"]] = elapsed
         cells[index["effective_cores"]] = "1.5"
+        cells[index["peak_bytes"]] = "120"
         cells[index["ambient_bucket"]] = "quiet"
         rows.append(",".join(cells))
     profile.write_text(header + "\n" + "\n".join(rows) + "\n", encoding="utf-8")
@@ -72,3 +74,4 @@ def test_summarize_returns_rows_for_a_store_shaped_csv(tmp_path: Path) -> None:
     assert summary[0]["step"] == "build.unit"
     assert summary[0]["samples"] == 2
     assert summary[0]["duration_median_s"] == 3.0
+    assert summary[0]["memory_peak_max_bytes"] == 120

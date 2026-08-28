@@ -20,6 +20,11 @@ fn scaled_for_width_i64(cap: i64, inner_jobs: i64) -> i64 {
     scaled.clamp(i64::MIN as i128, i64::MAX as i128) as i64
 }
 
+fn scaled_between_widths_i64(cap: i64, inner_jobs: i64, baseline_jobs: i64) -> i64 {
+    let scaled = (cap as i128 * inner_jobs as i128) / baseline_jobs as i128;
+    scaled.clamp(i64::MIN as i128, i64::MAX as i128) as i64
+}
+
 /// Resolve the inner-cgroup memory cap for a step.
 ///
 /// An explicit hard cap wins. Otherwise the RSS baseline is multiplied by `mem_cap_factor`; a step
@@ -70,6 +75,19 @@ pub(crate) fn step_mem_cap_for_inner_jobs_optional(
             if step.hint.hard_mem_max_bytes.is_none_or(|value| value <= 0)
                 && step_classification(step) == StepClass::CpuBound =>
         {
+            if let Some(measured_width) = step
+                .hint
+                .rss_baseline_inner_jobs
+                .filter(|measured_width| *measured_width > 0)
+            {
+                // An empirical M(p) already describes the complete step at `measured_width`.
+                // Keep it unchanged at that (or a narrower) width and extrapolate only if a later
+                // caller widens beyond the measured point.
+                if jobs <= measured_width {
+                    return Some(cap);
+                }
+                return Some(cap.max(scaled_between_widths_i64(cap, jobs, measured_width)));
+            }
             // Exact integer arithmetic, truncated toward zero and saturated to i64. Python uses
             // the same operation, avoiding binary64 drift above 2^53.
             let scaled = scaled_for_width_i64(cap, jobs);
@@ -938,6 +956,46 @@ mod tests {
             fail_fast_family: None,
         };
         assert_eq!(step_mem_cap_bytes(&s, 1.25, None), Some(9 * GIB));
+    }
+
+    #[test]
+    fn exact_width_baseline_is_not_scaled_twice() {
+        let mut hint = ResourceHint {
+            rss_baseline_bytes: Some(3 * GIB),
+            rss_baseline_inner_jobs: Some(8),
+            classification: StepClass::CpuBound,
+            ..Default::default()
+        };
+        let step = Step {
+            group: "g".into(),
+            job: "measured".into(),
+            desc: String::new(),
+            description: String::new(),
+            cmd: "true".into(),
+            cmdtype: crate::model::CmdType::Unknown,
+            deps: vec![],
+            env: std::collections::BTreeMap::new(),
+            hint: hint.clone(),
+            networkonly: false,
+            engine_only: false,
+            timeout: 1800,
+            cpu_timeout: 0,
+            jobs_flag: None,
+            jobs_env: None,
+            skip_reason: None,
+            write_domains: None,
+            write_domain_guarantee: None,
+            explains: Vec::new(),
+            fail_fast_family: None,
+        };
+        assert_eq!(step_mem_cap_for_inner_jobs(&step, Some(8), 1.0), 3 * GIB);
+        assert_eq!(step_mem_cap_for_inner_jobs(&step, Some(4), 1.0), 3 * GIB);
+        assert_eq!(step_mem_cap_for_inner_jobs(&step, Some(16), 1.0), 6 * GIB);
+
+        hint.hard_mem_max_bytes = Some(5 * GIB);
+        let mut hard = step;
+        hard.hint = hint;
+        assert_eq!(step_mem_cap_for_inner_jobs(&hard, Some(16), 1.0), 5 * GIB);
     }
 
     #[test]

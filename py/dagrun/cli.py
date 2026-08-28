@@ -47,6 +47,7 @@ from dagrun.estimates import (
     load_step_speedups,
     plan_to_json,
     plan_to_text,
+    write_scaling_model,
 )
 from dagrun.memory_feedback import (
     MemoryAdmission,
@@ -73,12 +74,13 @@ from dagrun.model import (
     DagConfig,
     ResourceHint,
     Step,
+    effective_cpu_count,
     resolve_cpu_timeout_multiplier,
     step_classification,
     step_width_is_resizable,
 )
 from dagrun.profile_enrich import container_core_budget
-from dagrun.protocols import CgroupManager, MetricsSink, StepOutcome
+from dagrun.protocols import CgroupManager, MetricsSink, RunWindow, StepOutcome
 from dagrun.reservation import Reservation
 from dagrun.scheduler import (
     _self_managed_width_error,
@@ -87,6 +89,17 @@ from dagrun.scheduler import (
     run_dag_limited,
 )
 from dagrun.sizing import jobs_for_budget, parse_size, transitive_deps
+from dagrun.sweep import (
+    CpuTopology,
+    detect_cpu_topology,
+    labeled_width_grid_for_pass,
+    limit_topology,
+    parse_target_duration,
+    parse_widths,
+    stable_topological_steps,
+    workload_digest,
+    width_grid_for_pass,
+)
 from dagrun.viz import to_ascii, to_dot
 
 PROG = "dagrun"
@@ -643,8 +656,8 @@ def build_parser() -> argparse.ArgumentParser:
     sweep_p = sub.add_parser(
         "sweep",
         allow_abbrev=False,
-        help="parallel-speedup sweep: run ONE step at inner -j1..-jN and print a timing table",
-        description="parallel-speedup sweep: run ONE step at inner -j1..-jN and print a timing table",
+        help="profile parallel scaling for one step or a whole DAG",
+        description="profile parallel scaling for one step or a whole DAG",
     )
     sweep_p.add_argument(
         "--dag",
@@ -654,16 +667,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sweep_p.add_argument(
         "--step",
-        required=True,
         metavar="TAG",
-        help="the single 'group.job' step to sweep (must exist in the DAG)",
+        help="limit the sweep to one 'group.job' step (legacy mode requires this)",
     )
     sweep_p.add_argument(
         "--jobs",
-        required=True,
         metavar="RANGE",
-        help="inner-parallelism widths to sweep: 'LO..HI' (e.g. 1..8) or a bare 'N' meaning 1..N. "
-        "Each width is passed into the step through cmdtype, jobs_flag, and/or jobs_env.",
+        help="explicit inner-parallelism widths: 'LO..HI' (e.g. 1..8) or a bare 'N' meaning "
+        "1..N. Target mode also accepts comma lists and refines their gaps; omitting it selects "
+        "an automatic powers-of-two/physical/logical sweep. Without --target-time this and "
+        "--step are required. Each width is delivered through cmdtype, jobs_flag, and/or jobs_env.",
+    )
+    sweep_p.add_argument(
+        "--target-time",
+        metavar="DURATION",
+        default=None,
+        help="soft wall-time target for a multi-pass sweep. Pass 1 always completes; each later "
+        "pass starts only while time remains, and a started pass is never killed.",
     )
     sweep_p.add_argument(
         "--repeat",
@@ -728,6 +748,14 @@ def build_parser() -> argparse.ArgumentParser:
         "the other planners)",
     )
     plan_p.add_argument(
+        "--max-steps",
+        type=_positive_i64,
+        default=None,
+        metavar="N",
+        help="maximum active steps whose reachable concurrent memory CPA must fit "
+        "(default: the CPA core budget)",
+    )
+    plan_p.add_argument(
         "--format",
         choices=["text", "json"],
         default="text",
@@ -790,7 +818,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=_positive_i64,
         default=DEFAULT_RESERVOIR_K,
         metavar="K",
-        help=f"max samples kept per (step, inner_jobs) bucket (default {DEFAULT_RESERVOIR_K})",
+        help="max samples kept per (step, inner_jobs, workload_digest) bucket "
+        f"(default {DEFAULT_RESERVOIR_K})",
     )
 
     sb_merge = summary_sub.add_parser(
@@ -803,7 +832,8 @@ def build_parser() -> argparse.ArgumentParser:
     sb_merge.add_argument("--out", metavar="FILE", default=None, help="write JSON here (else stdout)")
     sb_merge.add_argument(
         "--reservoir-cap", type=_positive_i64, default=DEFAULT_RESERVOIR_K, metavar="K",
-        help=f"max samples per bucket after merge (default {DEFAULT_RESERVOIR_K})",
+        help="max samples per workload-specific bucket after merge "
+        f"(default {DEFAULT_RESERVOIR_K})",
     )
 
     sb_plan = summary_sub.add_parser(
@@ -822,6 +852,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="dispatch-ordering planner (see `plan --help`)",
     )
     sb_plan.add_argument("--max-mem", metavar="SPEC", default=None, help="RAM budget for cpa planner")
+    sb_plan.add_argument(
+        "--max-steps",
+        type=_positive_i64,
+        default=None,
+        metavar="N",
+        help="maximum active steps whose concurrent memory the cpa planner must fit",
+    )
     sb_plan.add_argument(
         "--format", choices=["text", "json"], default="text", help="output format (default text)"
     )
@@ -1104,6 +1141,7 @@ def _build_feedback_plan(
     *,
     core_budget: int | None = None,
     mem_budget: int | None = None,
+    max_steps: int | None = None,
 ) -> Plan:
     """Load the profile store (when feedback is on) and build the plan for ``planner``.
 
@@ -1115,8 +1153,18 @@ def _build_feedback_plan(
     """
     if feedback_dir is not None:
         machine_id, container_class = feedback_identity()
-        samples = load_step_samples(feedback_dir, machine_id, container_class)
-        speedups = load_step_speedups(feedback_dir, machine_id, container_class)
+        workloads = {
+            step.tag: workload_digest(
+                step, cfg.default_jobs_flag, cfg.default_jobs_env
+            )
+            for step in cfg.steps
+        }
+        samples = load_step_samples(
+            feedback_dir, machine_id, container_class, workloads
+        )
+        speedups = load_step_speedups(
+            feedback_dir, machine_id, container_class, workloads
+        )
     else:
         samples = {}
         speedups = {}
@@ -1127,6 +1175,7 @@ def _build_feedback_plan(
         speedups=speedups,
         core_budget=core_budget,
         mem_budget=mem_budget,
+        max_steps=max_steps,
     )
 
 
@@ -1156,13 +1205,20 @@ def _build_plan_from_summary(
     *,
     core_budget: int | None = None,
     mem_budget: int | None = None,
+    max_steps: int | None = None,
 ) -> Plan:
     """Build a plan whose learned estimates come from the mergeable SUMMARY (rather than a CSV
     store). The reader half of the sync feature: the estimates are recomputed from the summary's
     reservoirs via the same estimator core the CSV path uses, so a summary and the store it came
     from plan identically (until a bucket is subsampled)."""
-    samples = summarylib.step_samples_from_summary(summary)
-    speedups = summarylib.step_speedups_from_summary(summary)
+    workloads = {
+        step.tag: workload_digest(step, cfg.default_jobs_flag, cfg.default_jobs_env)
+        for step in cfg.steps
+    }
+    samples = summarylib.step_samples_from_summary(summary, workloads)
+    speedups = summarylib.step_speedups_from_summary(
+        summary, workload_digests=workloads
+    )
     return build_plan(
         cfg,
         samples,
@@ -1170,6 +1226,7 @@ def _build_plan_from_summary(
         speedups=speedups,
         core_budget=core_budget,
         mem_budget=mem_budget,
+        max_steps=max_steps,
     )
 
 
@@ -1206,6 +1263,7 @@ def _sync_seed_plan(
     *,
     core_budget: int | None,
     mem_budget: int | None,
+    max_steps: int | None = None,
 ) -> Plan | None:
     """DOWNLOAD the shared summary, MERGE it with this machine's local store, and build the plan from
     the result. Returns the seeded plan, or ``None`` to fall back to the normal CSV-feedback plan
@@ -1235,21 +1293,49 @@ def _sync_seed_plan(
         file=sys.stderr,
     )
     return _build_plan_from_summary(
-        cfg, seed, planner, core_budget=core_budget, mem_budget=mem_budget
+        cfg,
+        seed,
+        planner,
+        core_budget=core_budget,
+        mem_budget=mem_budget,
+        max_steps=max_steps,
     )
 
 
+def _rows_with_observation_ids(
+    rows: Sequence[Mapping[str, object]], run_id: str
+) -> list[dict[str, str]]:
+    """Stamp raw scheduler rows with the execution identity used by their local CSV copies.
+
+    A DAG executes a tag at most once, and summary deduplication is per ``(step, width)`` bucket, so
+    the local store's run id is also the stable observation id for that bucket. Reusing it here is
+    what lets a downloaded upload deduplicate against the same row read from local history.
+    """
+
+    identified: list[dict[str, str]] = []
+    for row in _rows_to_str(rows):
+        observation_id = row.get("observation_id") or row.get("run_id") or run_id
+        identified.append({**row, "observation_id": observation_id})
+    return identified
+
+
 def _sync_upload(
-    backend: synclib.SyncBackend, rows: Sequence[Mapping[str, object]]
+    backend: synclib.SyncBackend,
+    rows: Sequence[Mapping[str, object]],
+    *,
+    local_run_id: str | None = None,
 ) -> None:
     """Merge THIS run's per-step samples into the shared summary and publish them via ``backend``.
     Degrades LOUDLY on failure (a warning) so the run's own exit code is preserved but the skip is
     never silent (No Silent Failure)."""
     machine_id, container_class = feedback_identity()
     from dagrun.estimates import _affinity_width
+    from dagrun.perflog import new_run_id
 
+    observation_run_id = local_run_id or new_run_id()
+    upload_rows = _rows_with_observation_ids(rows, observation_run_id)
     delta = summarylib.summary_from_rows(
-        _rows_to_str(rows), machine_id, container_class, _affinity_width(container_class)
+        upload_rows, machine_id, container_class, _affinity_width(container_class)
     )
     try:
         merged = backend.publish(delta)
@@ -1288,6 +1374,39 @@ def _report_profile_written(perf_dir: str, source: str) -> None:
         )
     for path in written:
         print(f"  {path}", file=sys.stderr)
+
+
+def _refresh_scaling_model(perf_dir: str, cfg: DagConfig) -> None:
+    """Refresh the derived model sidecar from the authoritative raw profile CSV."""
+
+    from dagrun import perflog
+
+    machine_id = perflog.machine_id()
+    container_class = perflog.container_class()
+    try:
+        workloads = {
+            step.tag: workload_digest(
+                step, cfg.default_jobs_flag, cfg.default_jobs_env
+            )
+            for step in cfg.steps
+        }
+        speedups = load_step_speedups(
+            perf_dir, machine_id, container_class, workloads
+        )
+        path = write_scaling_model(
+            perf_dir, machine_id, container_class, speedups, workloads
+        )
+    except (OSError, UnicodeError) as exc:
+        print(
+            f"{PROG}: WARNING could not refresh derived scaling model under {perf_dir}: {exc}",
+            file=sys.stderr,
+        )
+        return
+    print(
+        f"{PROG}: derived scaling model refreshed at {path} "
+        "(rebuildable from the profile CSVs)",
+        file=sys.stderr,
+    )
 
 
 # --------------------------------------------------------------------------- selected steps
@@ -1683,6 +1802,55 @@ class _SweepMeasure:
     ok: bool
 
 
+class _SweepMetricsSink:
+    """Add sweep provenance to rows before delegating to the ordinary CSV sink."""
+
+    def __init__(self, sink: MetricsSink, metadata: Mapping[str, object]) -> None:
+        self._sink = sink
+        self._metadata = dict(metadata)
+
+    def start_run_window(self) -> RunWindow:
+        return self._sink.start_run_window()
+
+    def record_step_profiles(
+        self, rows: Sequence[Mapping[str, object]], *, jobs: int
+    ) -> str | None:
+        enriched = [{**row, **self._metadata} for row in rows]
+        return self._sink.record_step_profiles(enriched, jobs=jobs)
+
+
+class _SweepCpuMetricsSink:
+    """Fill unboxed sweep CPU columns from the same RUSAGE_CHILDREN window shown in the table.
+
+    Boxed rows already carry cgroup-derived user/system seconds and retain those more precise
+    values. The wrapper samples before delegating, so profile I/O itself is not charged to the
+    child-process CPU measurement.
+    """
+
+    def __init__(self, sink: MetricsSink, started: resource.struct_rusage) -> None:
+        self._sink = sink
+        self._started = started
+
+    def start_run_window(self) -> RunWindow:
+        return self._sink.start_run_window()
+
+    def record_step_profiles(
+        self, rows: Sequence[Mapping[str, object]], *, jobs: int
+    ) -> str | None:
+        finished = resource.getrusage(resource.RUSAGE_CHILDREN)
+        user_s = round(max(finished.ru_utime - self._started.ru_utime, 0.0), 3)
+        sys_s = round(max(finished.ru_stime - self._started.ru_stime, 0.0), 3)
+        enriched: list[dict[str, object]] = []
+        for row in rows:
+            copied = dict(row)
+            if copied.get("user_s") in (None, ""):
+                copied["user_s"] = user_s
+            if copied.get("sys_s") in (None, ""):
+                copied["sys_s"] = sys_s
+            enriched.append(copied)
+        return self._sink.record_step_profiles(enriched, jobs=jobs)
+
+
 def _parse_jobs_range(raw: str) -> tuple[int, int]:
     """Parse a sweep width range: ``"LO..HI"`` or a bare ``"N"`` (meaning ``1..N``).
 
@@ -1715,6 +1883,8 @@ def _run_single_step(
     cgroups: CgroupManager | None,
     metrics: MetricsSink | None,
     verbosity: int,
+    *,
+    vary_width: bool = True,
 ) -> _SweepMeasure:
     """Run ONE step at a fixed inner-parallelism width and measure it.
 
@@ -1723,24 +1893,26 @@ def _run_single_step(
     one step in isolation). CPU (user/sys) is measured from ``RUSAGE_CHILDREN`` deltas around the
     run; wall from the step's own recorded elapsed time; peak RSS from the step cgroup
     (``memory.peak``) when boxing is active."""
-    step = dataclasses.replace(
-        base_step,
-        deps=[],
-        hint=dataclasses.replace(base_step.hint, preferred_inner_jobs=inner_jobs),
-    )
+    step = dataclasses.replace(base_step, deps=[])
+    if vary_width:
+        step = dataclasses.replace(
+            step,
+            hint=dataclasses.replace(base_step.hint, preferred_inner_jobs=inner_jobs),
+        )
     one = dataclasses.replace(cfg, steps=(step,))
     ru0 = resource.getrusage(resource.RUSAGE_CHILDREN)
-    wall_start = time.time()
+    persisted_metrics = _SweepCpuMetricsSink(metrics, ru0) if metrics is not None else None
+    wall_start = time.monotonic()
     result = run_dag_limited(
         one,
         max_steps=1,
         max_cpus=inner_jobs,
         cgroups=cgroups,
-        metrics=metrics,
+        metrics=persisted_metrics,
         keep_going=False,
         verbosity=verbosity,
     )
-    wall_measured = time.time() - wall_start
+    wall_measured = time.monotonic() - wall_start
     ru1 = resource.getrusage(resource.RUSAGE_CHILDREN)
     user_s = max(ru1.ru_utime - ru0.ru_utime, 0.0)
     sys_s = max(ru1.ru_stime - ru0.ru_stime, 0.0)
@@ -1749,10 +1921,16 @@ def _run_single_step(
     if result.step_profile_rows:
         row = result.step_profile_rows[0]
         elapsed = row.get("elapsed_s")
-        if isinstance(elapsed, (int, float)):
+        if isinstance(elapsed, (int, float)) and not isinstance(elapsed, bool):
             wall_s = float(elapsed)
+        row_user = row.get("user_s")
+        if isinstance(row_user, (int, float)) and not isinstance(row_user, bool):
+            user_s = float(row_user)
+        row_sys = row.get("sys_s")
+        if isinstance(row_sys, (int, float)) and not isinstance(row_sys, bool):
+            sys_s = float(row_sys)
         peak = row.get("peak_bytes")
-        if isinstance(peak, int):
+        if isinstance(peak, int) and not isinstance(peak, bool):
             rss = peak
     return _SweepMeasure(wall_s=wall_s, user_s=user_s, sys_s=sys_s, rss_hwm=rss, ok=result.ok)
 
@@ -1795,19 +1973,61 @@ def _cmd_pin_run(ns: argparse.Namespace) -> int:
         reservation.release()
 
 
-def _cmd_sweep(ns: argparse.Namespace, c: Palette) -> int:
-    """Per-step parallel-speedup sweep (Feature B)."""
-    dag_arg = ns.dag if isinstance(ns.dag, str) else None
-    if dag_arg is None:
-        print(f"{PROG}: sweep: --dag FILE is required", file=sys.stderr)
-        return 2
-    try:
-        cfg = _load(dag_arg)
-    except (OSError, DagJsonError) as exc:
-        print(f"{PROG}: {exc}", file=sys.stderr)
-        return 2
+def _effective_sweep_topology() -> CpuTopology:
+    """Topology available to a sweep, bounded by the effective cgroup CPU budget."""
 
-    step_tag = str(ns.step)
+    topology = limit_topology(detect_cpu_topology(), container_core_budget())
+    if topology.physical_core_count is None:
+        # Match the Rust/runtime policy: when sysfs cannot prove an SMT boundary, use the logical
+        # width rather than inventing a ratio. The pure discovery API retains ``None`` so callers
+        # can still distinguish unknown topology from a measured one.
+        return CpuTopology(
+            allowed_logical_cpus=topology.allowed_logical_cpus,
+            physical_core_count=topology.logical_thread_count,
+        )
+    return topology
+
+
+def _fixed_step_width(step: Step, cfg: DagConfig, topology: CpuTopology) -> int:
+    """Best honest width label for a step whose guest parallelism cannot be rewritten."""
+
+    return effective_cpu_count(step, cfg.default_step_cpu_count) or topology.logical_thread_count
+
+
+def _sweep_sink(
+    perf_dir: str | None,
+    git_sha: str,
+    metadata: Mapping[str, object],
+    cgroups: CgroupManager | None,
+) -> MetricsSink | None:
+    """Create a fresh per-execution sink carrying graph-sweep provenance."""
+
+    if perf_dir is None:
+        return None
+    from dagrun.perflog import CsvMetricsSink
+
+    sink = CsvMetricsSink(
+        perf_dir,
+        git_sha=git_sha,
+        enforcement_kind="cgroup-v2" if cgroups is not None else "unboxed",
+        runner_name="sweep",
+    )
+    return sink if not metadata else _SweepMetricsSink(sink, metadata)
+
+
+def _run_legacy_sweep(
+    cfg: DagConfig,
+    step_tag: str,
+    jobs_spec: str,
+    repeat: int,
+    cgroups: CgroupManager | None,
+    perf_dir: str | None,
+    sweep_git_sha: str,
+    verbosity: int,
+    c: Palette,
+) -> int:
+    """The original one-step dense-range command, kept byte-compatible in normal output."""
+
     by_tag = cfg.by_tag()
     if step_tag not in by_tag:
         known = ", ".join(sorted(by_tag)) or "(none)"
@@ -1817,11 +2037,10 @@ def _cmd_sweep(ns: argparse.Namespace, c: Palette) -> int:
         )
         return 2
     try:
-        lo, hi = _parse_jobs_range(str(ns.jobs))
+        lo, hi = _parse_jobs_range(jobs_spec)
     except ValueError as exc:
         print(f"{PROG}: sweep: {exc}", file=sys.stderr)
         return 2
-    repeat = max(1, int(ns.repeat))
     base_step = by_tag[step_tag]
     if not step_width_is_resizable(
         base_step, cfg.default_jobs_flag, cfg.default_jobs_env
@@ -1834,40 +2053,17 @@ def _cmd_sweep(ns: argparse.Namespace, c: Palette) -> int:
         )
         return 2
 
-    # Cgroup boxing is ON by default here too (so the sweep measures under real boxing).
-    cgroups, code = _resolve_cgroup_manager(
-        bool(ns.allow_cgroup_failure), bool(getattr(ns, "unsafe_no_cgroups", False))
-    )
-    if code != 0:
-        return code
-
-    perf_dir, source = _resolve_profile_dir(ns.perf_dir, bool(ns.no_profile))
-    sweep_git_sha = _git_sha() if perf_dir is not None else ""
-
-    def _sink_for_one_iteration() -> MetricsSink | None:
-        """A FRESH sink — and therefore a fresh ``run_id`` — for each sweep iteration.
-
-        Every iteration below is its own DAG execution: its own :func:`run_dag_limited`, its
-        own Runner, and its own monotonic origin from which ``started_offset_s`` restarts at
-        zero. One sink shared across the sweep would stamp all of those rows with ONE
-        ``run_id``, and the documented reconstruction ("two rows of the same run_id overlap iff
-        their [started, finished] intervals do") would then report a strictly sequential sweep
-        as fully concurrent. This also keeps the Python sweep at parity with the Rust build,
-        which mints per call.
-        """
-        if perf_dir is None:
-            return None
-        from dagrun.perflog import CsvMetricsSink
-
-        return CsvMetricsSink(perf_dir, git_sha=sweep_git_sha)
-
-    verbosity = int(ns.verbosity)
     measures: list[tuple[int, _SweepMeasure]] = []
     for jobs in range(lo, hi + 1):
         best: _SweepMeasure | None = None
         for _ in range(repeat):
             m = _run_single_step(
-                base_step, cfg, jobs, cgroups, _sink_for_one_iteration(), verbosity
+                base_step,
+                cfg,
+                jobs,
+                cgroups,
+                _sweep_sink(perf_dir, sweep_git_sha, {}, cgroups),
+                verbosity,
             )
             if not m.ok:
                 print(
@@ -1881,9 +2077,344 @@ def _cmd_sweep(ns: argparse.Namespace, c: Palette) -> int:
         measures.append((jobs, best))
 
     _print_sweep_table(step_tag, lo, measures, c)
+    return 0
+
+
+def _print_fixed_sweep_measure(step_tag: str, measure: _SweepMeasure, c: Palette) -> None:
+    """Print the one-row table used for a node whose guest width cannot be rewritten."""
+
+    headers = ["jobs", "wall_s", "user_s", "sys_s", "rss_hwm", "speedup"]
+    table = [
+        [
+            "fixed",
+            f"{measure.wall_s:.3f}",
+            f"{measure.user_s:.3f}",
+            f"{measure.sys_s:.3f}",
+            _human_bytes(measure.rss_hwm),
+            "-",
+        ]
+    ]
+    print(c.bold(f"parallel-speedup sweep: {step_tag}"))
+    print(_render_table(headers, table, c))
+
+
+def _run_target_sweep(
+    cfg: DagConfig,
+    *,
+    step_tag: str | None,
+    jobs_spec: str | None,
+    target_s: float,
+    repeat: int,
+    cgroups: CgroupManager | None,
+    perf_dir: str | None,
+    sweep_git_sha: str,
+    verbosity: int,
+    c: Palette,
+) -> int:
+    """Run a graph-wide, soft-target, cumulative multi-pass scaling sweep."""
+
+    try:
+        ordered = stable_topological_steps(cfg.steps)
+    except ValueError as exc:
+        print(f"{PROG}: sweep: {exc}", file=sys.stderr)
+        return 2
+    by_tag = cfg.by_tag()
+    if step_tag is not None:
+        if step_tag not in by_tag:
+            known = ", ".join(sorted(by_tag)) or "(none)"
+            print(
+                f"{PROG}: sweep: unknown --step tag {step_tag!r}. Known tags: {known}",
+                file=sys.stderr,
+            )
+            return 2
+        ordered = (by_tag[step_tag],)
+
+    topology = _effective_sweep_topology()
+    physical_cores = topology.physical_core_count or topology.logical_thread_count
+    if jobs_spec is None:
+        initial_points = labeled_width_grid_for_pass(topology, 1)
+        initial_widths = tuple(point.inner_jobs for point in initial_points)
+        initial_sources = {point.inner_jobs: point.source_label for point in initial_points}
+    else:
+        try:
+            initial_widths = parse_widths(jobs_spec)
+        except ValueError as exc:
+            print(f"{PROG}: sweep: {exc}", file=sys.stderr)
+            return 2
+        initial_sources = {width: "explicit" for width in initial_widths}
+
+    from dagrun.perflog import new_run_id
+
+    sweep_id = new_run_id()
+    sample_number = 0
+    has_resizable = any(
+        step.skip_reason is None
+        and step_width_is_resizable(step, cfg.default_jobs_flag, cfg.default_jobs_env)
+        for step in ordered
+    )
+    print(
+        c.bold(
+            f"parallel-scaling sweep: {len(ordered)} node(s), target {target_s:.3f}s, "
+            f"topology {physical_cores}/{topology.logical_thread_count} physical/logical"
+        )
+    )
+
+    sweep_started = time.monotonic()
+    pass_number = 1
+    while True:
+        grid = width_grid_for_pass(initial_widths, pass_number)
+        grid_text = ",".join(str(width) for width in grid)
+        print(
+            f"sweep pass {pass_number} starting: cumulative widths [{grid_text}]"
+            + (" (mandatory minimum pass)" if pass_number == 1 else "")
+        )
+        pass_started = time.monotonic()
+
+        for step in ordered:
+            if step.skip_reason is not None:
+                if pass_number == 1:
+                    print(
+                        f"sweep: {step.tag}: intentionally skipped by the DAG; "
+                        "no process was started"
+                    )
+                continue
+            resizable = step_width_is_resizable(
+                step, cfg.default_jobs_flag, cfg.default_jobs_env
+            )
+            if not resizable:
+                if pass_number != 1:
+                    continue
+                fixed_width = _fixed_step_width(step, cfg, topology)
+                if fixed_width > topology.logical_thread_count:
+                    print(
+                        f"sweep: {step.tag}: fixed configured width {fixed_width} exceeds "
+                        f"the effective {topology.logical_thread_count}-CPU budget; skipping"
+                    )
+                    continue
+                print(
+                    f"sweep: {step.tag}: no jobs_flag/jobs_env width channel; characterizing "
+                    f"its configured width once (width {fixed_width})"
+                )
+                sample_number += 1
+                metadata: dict[str, object] = {
+                    "sweep_mode": "target-time",
+                    "sweep_id": sweep_id,
+                    "sweep_pass": pass_number,
+                    "sweep_sample": sample_number,
+                    "sweep_repeat": 1,
+                    "sweep_width_source": "fixed",
+                    "workload_digest": workload_digest(
+                        step, cfg.default_jobs_flag, cfg.default_jobs_env
+                    ),
+                    "sweep_target_s": f"{target_s:.6f}",
+                    "sweep_physical_cores": physical_cores,
+                    "sweep_logical_cpus": topology.logical_thread_count,
+                }
+                measure = _run_single_step(
+                    step,
+                    cfg,
+                    fixed_width,
+                    cgroups,
+                    _sweep_sink(perf_dir, sweep_git_sha, metadata, cgroups),
+                    verbosity,
+                    vary_width=False,
+                )
+                if not measure.ok:
+                    print(
+                        f"{PROG}: sweep: step {step.tag!r} FAILED at its configured width; "
+                        "aborting the sweep",
+                        file=sys.stderr,
+                    )
+                    return 1
+                _print_fixed_sweep_measure(step.tag, measure, c)
+                continue
+
+            measures: list[tuple[int, _SweepMeasure]] = []
+            for jobs in grid:
+                best: _SweepMeasure | None = None
+                width_source = initial_sources.get(jobs, "midpoint")
+                for repeat_number in range(1, repeat + 1):
+                    sample_number += 1
+                    metadata = {
+                        "sweep_mode": "target-time",
+                        "sweep_id": sweep_id,
+                        "sweep_pass": pass_number,
+                        "sweep_sample": sample_number,
+                        "sweep_repeat": repeat_number,
+                        "sweep_width_source": width_source,
+                        "workload_digest": workload_digest(
+                            step, cfg.default_jobs_flag, cfg.default_jobs_env
+                        ),
+                        "sweep_target_s": f"{target_s:.6f}",
+                        "sweep_physical_cores": physical_cores,
+                        "sweep_logical_cpus": topology.logical_thread_count,
+                    }
+                    measure = _run_single_step(
+                        step,
+                        cfg,
+                        jobs,
+                        cgroups,
+                        _sweep_sink(perf_dir, sweep_git_sha, metadata, cgroups),
+                        verbosity,
+                    )
+                    if not measure.ok:
+                        print(
+                            f"{PROG}: sweep: step {step.tag!r} FAILED at -j{jobs} in pass "
+                            f"{pass_number}; aborting the sweep",
+                            file=sys.stderr,
+                        )
+                        return 1
+                    if best is None or measure.wall_s < best.wall_s:
+                        best = measure
+                assert best is not None
+                measures.append((jobs, best))
+            _print_sweep_table(step.tag, grid[0], measures, c)
+
+        pass_elapsed = time.monotonic() - pass_started
+        total_elapsed = time.monotonic() - sweep_started
+        print(
+            f"sweep pass {pass_number} complete in {pass_elapsed:.3f}s; total elapsed "
+            f"{total_elapsed:.3f}s / target {target_s:.3f}s"
+        )
+        if pass_number == 1:
+            print(
+                f"minimum pass elapsed {pass_elapsed:.3f}s; target {target_s:.3f}s; "
+                f"overrun {max(0.0, pass_elapsed - target_s):.3f}s"
+            )
+
+        if total_elapsed >= target_s or not has_resizable:
+            completed_passes = pass_number
+            break
+        pass_number += 1
+
+    elapsed = time.monotonic() - sweep_started
+    print(
+        f"target-time sweep complete: {completed_passes} pass(es), {sample_number} sample(s), "
+        f"elapsed {elapsed:.3f}s, target {target_s:.3f}s, "
+        f"overrun {max(0.0, elapsed - target_s):.3f}s"
+    )
+    if not has_resizable:
+        print(
+            "sweep: no runnable selected node has a jobs_flag/jobs_env width channel; "
+            "fixed nodes were handled once"
+        )
+    return 0
+
+
+def _cmd_sweep(ns: argparse.Namespace, c: Palette) -> int:
+    """Parallel-speedup sweep: legacy one-step mode or target-time graph mode."""
+    dag_arg = ns.dag if isinstance(ns.dag, str) else None
+    if dag_arg is None:
+        print(f"{PROG}: sweep: --dag FILE is required", file=sys.stderr)
+        return 2
+    target_raw = ns.target_time if isinstance(ns.target_time, str) else None
+    step_tag = ns.step if isinstance(ns.step, str) else None
+    jobs_spec = ns.jobs if isinstance(ns.jobs, str) else None
+    if target_raw is None and (step_tag is None or jobs_spec is None):
+        print(
+            f"{PROG}: sweep: without --target-time, --step and --jobs are required",
+            file=sys.stderr,
+        )
+        return 2
+    target_s: float | None = None
+    if target_raw is not None:
+        try:
+            target_s = parse_target_duration(target_raw)
+        except ValueError as exc:
+            print(f"{PROG}: sweep: {exc}", file=sys.stderr)
+            return 2
+    try:
+        cfg = _load(dag_arg)
+    except (OSError, DagJsonError) as exc:
+        print(f"{PROG}: {exc}", file=sys.stderr)
+        return 2
+    repeat = max(1, int(ns.repeat))
+
+    # Reject every usage/configuration error before cgroup setup or profile reporting. Besides
+    # matching the Rust CLI, this prevents an invalid invocation from claiming old store files as
+    # outputs of a sweep that never started.
+    if target_s is None:
+        assert step_tag is not None and jobs_spec is not None
+        try:
+            _parse_jobs_range(jobs_spec)
+        except ValueError as exc:
+            print(f"{PROG}: sweep: {exc}", file=sys.stderr)
+            return 2
+        by_tag = cfg.by_tag()
+        if step_tag not in by_tag:
+            known = ", ".join(sorted(by_tag)) or "(none)"
+            print(
+                f"{PROG}: sweep: unknown --step tag {step_tag!r}. Known tags: {known}",
+                file=sys.stderr,
+            )
+            return 2
+        if not step_width_is_resizable(
+            by_tag[step_tag], cfg.default_jobs_flag, cfg.default_jobs_env
+        ):
+            print(
+                f"{PROG}: sweep: step {step_tag!r} offers no width channel, so --jobs cannot "
+                "change guest parallelism; set jobs_flag to the guest's worker-count option or "
+                "jobs_env/default_jobs_env to its worker-count environment variable",
+                file=sys.stderr,
+            )
+            return 2
+    else:
+        try:
+            stable_topological_steps(cfg.steps)
+            if jobs_spec is not None:
+                parse_widths(jobs_spec)
+        except ValueError as exc:
+            print(f"{PROG}: sweep: {exc}", file=sys.stderr)
+            return 2
+        if step_tag is not None and step_tag not in cfg.by_tag():
+            known = ", ".join(sorted(cfg.by_tag())) or "(none)"
+            print(
+                f"{PROG}: sweep: unknown --step tag {step_tag!r}. Known tags: {known}",
+                file=sys.stderr,
+            )
+            return 2
+
+    # Cgroup boxing is ON by default here too (so the sweep measures under real boxing).
+    cgroups, code = _resolve_cgroup_manager(
+        bool(ns.allow_cgroup_failure), bool(getattr(ns, "unsafe_no_cgroups", False))
+    )
+    if code != 0:
+        return code
+
+    perf_dir, source = _resolve_profile_dir(ns.perf_dir, bool(ns.no_profile))
+    sweep_git_sha = _git_sha() if perf_dir is not None else ""
+    verbosity = int(ns.verbosity)
+    if target_s is None:
+        assert step_tag is not None and jobs_spec is not None
+        code = _run_legacy_sweep(
+            cfg,
+            step_tag,
+            jobs_spec,
+            repeat,
+            cgroups,
+            perf_dir,
+            sweep_git_sha,
+            verbosity,
+            c,
+        )
+    else:
+        code = _run_target_sweep(
+            cfg,
+            step_tag=step_tag,
+            jobs_spec=jobs_spec,
+            target_s=target_s,
+            repeat=repeat,
+            cgroups=cgroups,
+            perf_dir=perf_dir,
+            sweep_git_sha=sweep_git_sha,
+            verbosity=verbosity,
+            c=c,
+        )
     if perf_dir is not None:
         _report_profile_written(perf_dir, source)
-    return 0
+        if code == 0:
+            _refresh_scaling_model(perf_dir, cfg)
+    return code
 
 
 def _print_sweep_table(
@@ -2365,7 +2896,12 @@ def _cmd_summary_plan(ns: argparse.Namespace) -> int:
     max_mem = ns.max_mem if isinstance(ns.max_mem, str) and ns.max_mem else None
     core_budget, mem_budget = _planning_budgets(planner, max_mem)
     plan = _build_plan_from_summary(
-        cfg, summary, planner, core_budget=core_budget, mem_budget=mem_budget
+        cfg,
+        summary,
+        planner,
+        core_budget=core_budget,
+        mem_budget=mem_budget,
+        max_steps=(int(ns.max_steps) if isinstance(ns.max_steps, int) else None),
     )
     if str(ns.format) == "json":
         print(plan_to_json(plan))
@@ -2406,7 +2942,12 @@ def _cmd_plan(ns: argparse.Namespace) -> int:
     max_mem = ns.max_mem if isinstance(ns.max_mem, str) and ns.max_mem else None
     core_budget, mem_budget = _planning_budgets(planner, max_mem)
     plan = _build_feedback_plan(
-        cfg, feedback_dir, planner, core_budget=core_budget, mem_budget=mem_budget
+        cfg,
+        feedback_dir,
+        planner,
+        core_budget=core_budget,
+        mem_budget=mem_budget,
+        max_steps=(int(ns.max_steps) if isinstance(ns.max_steps, int) else None),
     )
     if str(ns.format) == "json":
         print(plan_to_json(plan))
@@ -2749,6 +3290,9 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
     feedback_dir = _resolve_feedback_dir(ns.perf_dir, bool(ns.no_profile_feedback))
     max_mem = ns.max_mem if isinstance(ns.max_mem, str) and ns.max_mem else None
     core_budget, mem_budget = _planning_budgets(planner, max_mem, max_cpus)
+    planning_max_steps = (
+        int(ns.max_steps) if isinstance(ns.max_steps, int) else max_cpus
+    )
 
     # Profile-artifact SYNC (close the ephemeral-CI feedback loop): parse the backend once; the
     # DOWNLOAD half seeds the planner from the shared summary, the UPLOAD half publishes this run's
@@ -2770,13 +3314,20 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
 
     seed_plan = _sync_seed_plan(
         cfg, backend, feedback_dir, planner, do_download and not bool(ns.no_profile_feedback),
-        core_budget=core_budget, mem_budget=mem_budget,
+        core_budget=core_budget,
+        mem_budget=mem_budget,
+        max_steps=planning_max_steps,
     )
     if seed_plan is not None:
         plan = seed_plan
     else:
         plan = _build_feedback_plan(
-            cfg, feedback_dir, planner, core_budget=core_budget, mem_budget=mem_budget
+            cfg,
+            feedback_dir,
+            planner,
+            core_budget=core_budget,
+            mem_budget=mem_budget,
+            max_steps=planning_max_steps,
         )
     if plan.allocation is not None and plan.allocation.stop_reason == "infeasible-memory":
         print(
@@ -2858,10 +3409,13 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
 
     perf_dir, source = _resolve_profile_dir(ns.perf_dir, bool(ns.no_profile))
     metrics: MetricsSink | None = None
+    profile_run_id: str | None = None
     if perf_dir is not None:
         from dagrun.perflog import CsvMetricsSink
 
-        metrics = CsvMetricsSink(perf_dir, git_sha=_git_sha())
+        csv_metrics = CsvMetricsSink(perf_dir, git_sha=_git_sha())
+        metrics = csv_metrics
+        profile_run_id = csv_metrics.run_id
 
     # --stress implies --keep-going: a failing copy must not cancel, nor prevent the launch of,
     # its siblings — or the per-copy ratio (the whole point) becomes a partial measurement.
@@ -2893,7 +3447,7 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
     if perf_dir is not None:
         _report_profile_written(perf_dir, source)
     if do_upload and backend is not None:
-        _sync_upload(backend, result.step_profile_rows)
+        _sync_upload(backend, result.step_profile_rows, local_run_id=profile_run_id)
     # --stress: print the per-copy PASS/FAIL ratio (the finding) to stdout.
     if stress_active:
         _print_stress_report(

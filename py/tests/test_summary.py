@@ -19,14 +19,25 @@ MID = "m"
 CC = "affinity8_cpu-max-max"
 
 
-def _row(step: str, inner: int, elapsed: float, peak: int, *, pct_other: float = 0.0) -> dict[str, str]:
-    return {
+def _row(
+    step: str,
+    inner: int,
+    elapsed: float,
+    peak: int,
+    *,
+    pct_other: float = 0.0,
+    workload_digest: str = "",
+) -> dict[str, str]:
+    row = {
         "step": step,
         "inner_jobs": str(inner),
         "elapsed_s": f"{elapsed:.3f}",
         "peak_bytes": str(peak),
         "pct_other": f"{pct_other:.3f}",
     }
+    if workload_digest:
+        row["workload_digest"] = workload_digest
+    return row
 
 
 def test_serialization_roundtrip_is_stable() -> None:
@@ -96,6 +107,43 @@ def test_merge_is_bounded_across_many_runs() -> None:
     assert total <= buckets * k
 
 
+def test_reservoirs_are_partitioned_by_workload_before_subsampling() -> None:
+    rows = [
+        _row("g.a", 1, float(index + 100), 1000, workload_digest="old")
+        for index in range(100)
+    ]
+    rows += [
+        _row("g.a", 1, 10.0, 2000, workload_digest="new"),
+        _row("g.a", 2, 5.0, 3000, workload_digest="new"),
+    ]
+    summary = S.summary_from_rows(rows, MID, CC, 8, reservoir_cap=2)
+
+    # The old cohort cannot consume the current cohort's two-sample reservoir. Selection happens
+    # after bounded storage without losing either current width.
+    assert S.summary_stats(summary) == (3, 4, 2)
+    model = S.step_speedups_from_summary(
+        summary, workload_digests={"g.a": "new"}
+    )["g.a"]
+    assert [level.wall_s for level in model.levels] == [10.0, 5.0]
+
+
+def test_version_one_summary_is_read_as_blank_workload_and_rewritten_as_v2() -> None:
+    old = (
+        '{"version": 1, "machine_id": "m", "container_class": "c", '
+        '"buckets": [{"step": "g.a", "inner_jobs": 1, "samples": '
+        '[{"observation_id": "one", "workload_digest": "ignored-v1-extension", '
+        '"elapsed_s": "2.000", '
+        '"contention": "0.000", "cpu_s": null, "effective_cores": null, '
+        '"throttled_s": null, "peak_bytes": 1000}]}]}'
+    )
+    parsed = S.from_json(old)
+    rendered = S.to_json(parsed)
+    assert parsed.version == S.SUMMARY_VERSION == 2
+    assert '"version": 2' in rendered
+    assert '"workload_digest": ""' in rendered
+    assert S.step_samples_from_summary(parsed)["g.a"].est_duration_s == 2.0
+
+
 def test_reservoir_does_not_badly_bias_median_on_skewed_set() -> None:
     """A skewed set (mostly 5.0 with a minority of 50.0 outliers) far larger than the reservoir:
     the subsampled summary's robust median must stay near the true robust median (self-review c)."""
@@ -109,6 +157,17 @@ def test_reservoir_does_not_badly_bias_median_on_skewed_set() -> None:
     # The subsample keeps the majority value's dominance, so the MAD-trimmed median stays ~5.0.
     assert 4.5 <= got.est_duration_s <= 5.5
     assert abs(got.est_duration_s - raw.est_duration_s) <= 0.5
+
+
+def test_reservoir_ranks_observations_not_distinct_values() -> None:
+    """A minority value must not fill the reservoir merely because its content hash sorts first."""
+    rows = [_row("g.a", 1, 5.0, 1000) for _ in range(936)]
+    rows += [_row("g.a", 1, 50.0, 1000) for _ in range(64)]
+    raw = step_samples_from_buckets(bucketize_rows(rows, 8))["g.a"]
+    summ = S.summary_from_rows(rows, MID, CC, 8, reservoir_cap=64)
+    got = S.step_samples_from_summary(summ)["g.a"]
+    assert raw.est_duration_s == 5.0
+    assert got.est_duration_s == 5.0
 
 
 def test_from_json_rejects_unknown_version() -> None:

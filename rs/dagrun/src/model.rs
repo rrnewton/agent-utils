@@ -251,6 +251,10 @@ pub struct ResourceHint {
     pub est_duration_s: f64,
     /// Estimated peak resident memory (bytes). `None` excludes the step from the memory model.
     pub rss_baseline_bytes: Option<i64>,
+    /// Width at which `rss_baseline_bytes` was measured exactly. Planner-derived transient
+    /// provenance only: DAG readers/writers deliberately do not expose it. When present, sizing
+    /// must not apply the fallback width heuristic a second time at the same width.
+    pub rss_baseline_inner_jobs: Option<i64>,
     /// Explicit hard per-step memory cap (bytes); overrides the derived cap when set.
     pub hard_mem_max_bytes: Option<i64>,
     /// Scheduling classification for the step.

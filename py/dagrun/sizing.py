@@ -62,6 +62,13 @@ def _scaled_for_width_i64(cap: int, inner_jobs: int) -> int:
     return _clamp_i64(scaled)
 
 
+def _scaled_between_widths_i64(cap: int, inner_jobs: int, baseline_jobs: int) -> int:
+    """Exact truncating ``cap * inner_jobs / baseline_jobs`` with an i64-saturated result."""
+    product = cap * inner_jobs
+    scaled = product // baseline_jobs if product >= 0 else -((-product) // baseline_jobs)
+    return _clamp_i64(scaled)
+
+
 def step_mem_cap_bytes(
     step: Step, *, mem_cap_factor: float, default_cap_bytes: int | None = None
 ) -> int | None:
@@ -126,6 +133,14 @@ def _step_mem_cap_for_inner_jobs(
         or step_classification(step) is not StepClass.CPU_BOUND
     ):
         return cap
+    measured_width = step.hint.rss_baseline_inner_jobs
+    if measured_width is not None and measured_width > 0:
+        # An empirical M(p) already describes the complete step at ``measured_width``. Keep that
+        # cap unchanged at the measured (or a narrower) width; only extrapolate if a caller later
+        # widens the step beyond the point the planner installed.
+        if inner_jobs <= measured_width:
+            return cap
+        return max(cap, _scaled_between_widths_i64(cap, inner_jobs, measured_width))
     return max(cap, _scaled_for_width_i64(cap, inner_jobs))
 
 

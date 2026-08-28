@@ -1,9 +1,11 @@
 # `examples/` — runnable dagrun DAGs
 
-Six small, self-contained DAG files you can run immediately, each demonstrating one core idea.
-Every command is `sleep`/`echo`/pure-shell only, so a whole example finishes in a few seconds and
-needs no build tools installed. Each example also carries `description` fields (a top-level one for
-the whole DAG and one per node) — free-form documentation that never affects scheduling.
+Seven small, self-contained DAGs you can run immediately, each demonstrating one core idea. The
+first six use `sleep`/`echo`/pure shell and finish in a few seconds. Example 07 is an intentionally
+CPU-intensive, standard-library-only Python scaling benchmark; start with its reduced-work smoke
+command before spending a larger target allowance. Each example also carries `description` fields (a
+top-level one for the whole DAG and one per node) — free-form documentation that never affects
+scheduling.
 
 Two of them (`02-diamond` and `04-memory-aware`) additionally ship a **side-by-side YAML edition**
 (`.yaml`) that loads to the *exact same DAG* as its `.json` twin — a "literate" version with inline
@@ -171,6 +173,55 @@ tool prints exactly where it appended. Drop `--allow-cgroup-failure` on a Linux 
 systemd user session to get real per-step boxing, which also fills in the `rss_hwm` (peak memory)
 column from each step's cgroup. Override the location with `--perf-dir DIR` or
 `$DAGRUN_PROFILE_DIR`, or turn logging off with `--no-profile`. Consider gitignoring `./.dagrun/`.
+
+## 7. `07-graph-scaling-sweep.yaml` — target-time scaling across a DAG
+
+This three-node chain exercises the graph-wide sweep rather than one hand-picked step:
+
+- `scale.parallel` divides a fixed amount of work across every requested worker and should scale
+  close to linearly before process overhead dominates;
+- `scale.four-core` uses at most four workers, so its useful curve should plateau near four even
+  when the sweep offers much wider settings; and
+- `scale.sequential` performs the useful work on one worker, then makes extra requested workers do
+  interfering work. Wider settings should increase CPU work and memory without improving the
+  useful serial wall time.
+
+All three commands accept `--jobs N` through the `generic-with-flag` cmdtype and its explicit
+`jobs_flag`. The nodes are chained so stable topological order is visible, but the sweep clears each
+node's dependency edges for its individual measurement and runs no second DAG node beside it.
+
+Begin with a cheap mandatory-pass smoke run. A zero target still completes pass 1, and the explicit
+list keeps that pass small:
+
+```sh
+DAGRUN_SYNTH_WORK=1000000 dagrun sweep \
+  --dag examples/07-graph-scaling-sweep.yaml \
+  --target-time 0 --jobs 1,2,4 --allow-cgroup-failure --no-profile
+```
+
+The smoke command disables profile writes because its reduced work size is a different workload;
+mixing those rows into the full benchmark's model would make the dataset internally inconsistent.
+
+Then collect a denser dataset under real cgroup boxing on a suitable Linux host:
+
+```sh
+dagrun sweep --dag examples/07-graph-scaling-sweep.yaml --target-time 10m
+```
+
+Without `--jobs`, pass 1 uses powers of two through physical cores, then exact physical-core and
+logical-thread counts. Every later pass reruns its cumulative grid and inserts integer midpoints in
+all remaining gaps. The allowance is checked only between passes: no pass is killed after it starts,
+so the first pass can overrun a small target and reports by how much. Use `--step scale.four-core`
+to isolate one node, or `--repeat K` to increase replication within each pass.
+The fixture is intentionally repeatable; real commands used this way must likewise redo equivalent
+work at every width instead of becoming incremental/no-op runs after their first invocation.
+
+The raw rows land in `./.dagrun/profiles/` by default and carry sweep/pass/repeat/width provenance,
+CPU work, wall time, and width-specific memory peaks. The fitted model remains outside the authored
+YAML and can be rebuilt from those CSVs; each successful profiling-enabled sweep
+refreshes the machine/container sidecar named
+`scaling_model_<machine_id>_<container_class>.json`. Command-shape digests keep identified older
+workloads out of the current curve and are retained as separate reservoirs in portable summaries.
 
 ## See also
 

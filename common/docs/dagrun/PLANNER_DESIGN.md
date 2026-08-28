@@ -44,8 +44,10 @@ last step finishing — subject to five constraints that all coexist on the one 
    `--cores K` cpuset feature.
 3. **Per-step memory caps.** Each step has a modeled peak memory footprint; the worst-case sum over
    any set of steps that can co-run must fit a RAM budget. The reachable-concurrent-set model
-   (`schedulable_peak_mem_bytes`) accounts for a CPU-bound step's cap growing with
-   its width (`step_mem_cap_for_inner_jobs`), so **widening a step costs memory**.
+   (`schedulable_peak_mem_bytes`) uses an exact-width measured peak when sufficiently replicated,
+   otherwise the conservative width-scaled fallback. Exact-width evidence must be uncensored; a
+   peak reached under an active ceiling is only a lower bound. Memory is therefore a function of
+   width, not one scalar silently reused at every allocation.
 4. **An active-step ceiling.** `run --max-steps S` independently bounds how many DAG nodes may be
    active. It defaults to `P`; `--max-mem` may derive a tighter ceiling.
 5. **Named scarce-resource semaphores.** Arbitrary caller-named capacities in `DagConfig.resource_caps`
@@ -58,17 +60,18 @@ The planner composes three parts:
   step, a `StepSpeedup` with one `SpeedupLevel` per measured width — carrying the robust
   (contention-discounted, outlier-trimmed) `wall_s`, the **total CPU-seconds** `cpu_s = user_s + sys_s`
   (a *work-conservation* signal), `effective_cores`, `throttled_s`, and the `speedup` versus the
-  smallest measured width. It also computes a **per-step** `recommended_inner_jobs` — the best width
-  before that one step's own diminishing-returns knee.
+  smallest measured width. It also computes a **per-step** `recommended_inner_jobs`: the narrowest
+  width within 10% of the best eligible measured wall, normally excluding widths whose CPU work is
+  more than 1.5 times the baseline width's work.
 - **The list scheduler.** `Runner` is a greedy ready-set list scheduler: it launches
   every ready step (deps met, below `--max-steps`, and with named resources free) in
   a caller-supplied dispatch order, and `--planner critical-path` supplies a
   *critical-path-first* order (highest bottom-level first). This is exactly the "list-scheduling"
   back half of a two-phase moldable scheduler.
-- **The allocator.** It picks each step's width `p_i` from isolated measured curves, then hands those
-  widths and the allocation-aware ordering to the list scheduler. Unlike an isolated per-step knee,
-  the allocation accounts for the DAG's critical path and a no-overcommit area model. It does not
-  account for the exact sibling set or slowdown when runtime widths overlap.
+- **The allocator.** It picks each step's width `p_i` from isolated measured curves, then hands
+  those widths and the allocation-aware ordering to the list scheduler. Unlike an isolated
+  per-step plateau, the allocation accounts for the DAG's critical path and a no-overcommit area
+  model. It does not account for the exact sibling set or slowdown when runtime widths overlap.
 
 ## 2. The makespan lower bound that drives everything
 
@@ -78,9 +81,12 @@ bounds (Graham 1969; Brent 1974):
 - **The critical-path (span) bound.** `T >= T_CP`, where `T_CP` is the length of the longest chain of
   dependent steps, each weighted by its chosen wall time `T_i(p_i)`. You cannot finish faster than
   the longest dependency chain, no matter how many cores you have.
-- **The work/area bound.** `T >= A / P`, where the **area** `A = sum_i p_i * T_i(p_i)` is the total
-  core-seconds of work at the chosen widths, and `P` is the core budget. You cannot finish faster
-  than the total work spread perfectly across `P` cores.
+- **The work/area bound.** `T >= A / P`, where each step contributes measured CPU service
+  `C_i(p_i) = user_s + sys_s` when that signal is available. Older or unboxed samples without CPU
+  accounting conservatively contribute `p_i * T_i(p_i)` instead. Thus
+  `A = sum_i C_i(p_i)` is the best available estimate of total core-seconds of work at the chosen
+  widths, and `P` is the core budget. You cannot finish faster than the total work spread perfectly
+  across `P` cores.
 
 So `T >= max(T_CP, A/P)`. Brent's theorem is the matching upper direction: a greedy (list) schedule
 achieves `T <= T_1/P + T_inf` — within a factor ~2 of the max of the two terms (Graham's `2 - 1/P`
@@ -91,8 +97,10 @@ algorithm has the shape it does:
 
 - Widening one step (raising `p_i`) **shrinks `T_i(p_i)`**, which can shorten `T_CP` — good, *if that
   step is on the critical path*.
-- But widening **grows the area** `A` (you spend `p_i * T_i(p_i)` core-seconds, and real curves are
-  sub-linear, so `p_i * T_i(p_i)` *rises* with `p_i`), which **raises `A/P`** — bad.
+- But widening commonly **grows the measured CPU area** `A`: synchronization, scheduling, cache,
+  and redundant-work costs increase `user_s + sys_s` even as wall time falls. Where direct CPU
+  measurements are unavailable, the conservative `p_i * T_i(p_i)` fallback captures the same
+  pressure. A larger `A` raises `A/P` — bad.
 
 The two terms pull in opposite directions. The optimum of the two-term bound sits where they
 **balance**: `T_CP ~= A/P`. Below that point the critical path dominates and you should spend cores to
@@ -113,13 +121,24 @@ Classic moldable scheduling assumes an *analytic* speedup function `T_i(p)`:
   saturating speedup curve. Downey's model is the canonical *parametric* stand-in when you have no
   measurements: near-linear up to `~A`, then a knee, then a plateau.
 
-**We do not need to assume a model — we measure the curve.** `load_step_speedups()` gives `T_i(p)` as
-a set of real, robust, contention-discounted points at the widths we have actually run
+**We do not need to assume an analytic model — we measure the curve.**
+`load_step_speedups()` gives `T_i(p)` as a set of real, robust,
+contention-discounted points at the widths we have actually run
 (`SpeedupLevel.wall_s`), plus the total-work signal `cpu_s`. The literature's analytic models exist
 to *approximate* exactly the object we have empirically. This is our single biggest deviation from
-the textbook (see §6) and it is a strength: the concavity, the knee location, and the
+the textbook (see §6) and it is a strength: the concavity, the plateau location, and the
 work-conservation break are observed, not assumed. Amdahl and Downey remain useful as sanity checks
-on measured-curve shape; the allocator does not synthesize missing measurements from either model.
+on measured-curve shape; the allocator does not synthesize missing wall points from either model.
+
+The plateau definition is global and grid-invariant. Among measured widths within the core budget,
+prefer widths whose CPU work is no more than `1.5x` the baseline width's CPU work, find the best
+wall time in that eligible set, and choose the **narrowest** width no more than 10% slower than that
+best.
+For example, 7.2x speedup at eight workers is within 10% of a best-observed 7.9x at 64, so eight is
+the economic recommendation. Inserting a new midpoint cannot change this merely by changing two
+adjacent ratios. If CPU accounting is absent, that width is not penalized on invented data; if the
+CPU filter would remove every within-budget point, the within-budget curve remains usable rather
+than disappearing.
 
 ### 3.2 The area/critical-path allocation lineage
 
@@ -187,18 +206,43 @@ The planner uses a **CPA-style critical-path / area-balancing moldable allocator
 ceiling `P` as hard constraints on allocation. Runtime overlap is opportunistic rather than part of
 the allocator's model.
 
-No current planner jointly searches inner width, overlap, memory, and load. Greedy-LPT and
-critical-path choose only ready-step order from scalar estimates. CPA chooses widths from per-step
-curves measured at particular widths, but profile rows do not identify the exact sibling set and
+Greedy-LPT and critical-path choose only ready-step order from scalar estimates. CPA jointly
+searches measured inner widths and memory-feasible active-step ceilings, but it still evaluates
+those choices with isolated per-step curves. Profile rows do not identify the exact sibling set and
 aggregate requested width that overlapped each sample. A future contention-aware planner needs that
-context (plus width-specific memory and CPU-demand estimates) before it can decide whether two
-wide steps should share `P` or run separately.
+context (plus width-specific CPU-demand estimates) to predict how two simultaneously active wide
+steps share `P`; the current no-overcommit reference can choose serial versus concurrent capacity,
+but cannot predict co-run interference or phase complementarity.
+
+### 4.1 Raw dataset and derived sidecar
+
+The authored DAG contains policy and portable hints, never a machine-specific fitted curve. Raw
+per-step CSV rows under the profile store are the source of truth and are partitioned by machine and
+container identity. They retain raw and contention-adjusted wall evidence, CPU work, achieved
+parallelism, throttling, memory peaks, and the sweep provenance needed to distinguish passes and
+repeats.
+
+Each sweep row carries a stable digest of the step command, command type, width-injection channel,
+and environment. Planning selects the current DAG's digest cohort exclusively once one exists;
+identified rows from another command shape are never blended into it. Blank rows written before
+digest tracking are used only while no exact cohort exists. Portable summary schema 2 makes the
+digest part of each bounded `(step, width, digest)` reservoir, preventing a stale cohort from
+evicting current samples during per-width subsampling; schema 1 is migrated as blank-digest data.
+
+`load_step_speedups` rebuilds the model from those rows. After a successful
+profiling-enabled sweep, `write_scaling_model` atomically refreshes the
+deterministic JSON form outside the DAG at
+`scaling_model_<machine_id>_<container_class>.json`; it is an inspectable,
+replaceable cache, not a second source of policy. Its schema records the plateau
+tolerance, CPU-work-growth guard, memory replication threshold,
+recommended and regression widths, and every fitted level. Deleting it loses no measurement: the
+raw CSV can recreate it. Each saved step also names the selected workload digest.
 
 It has two phases (the Turek-Wolf-Yu / Ludwig-Tiwari structure):
 
 - **Phase 1 — allocation:** a CPA-derived gradient loop picks each step's width `p_i`,
   snapping to the widths we have actually measured, balancing `T_CP` against `A/P` and stopping at
-  each step's work-conservation knee or when a constraint binds.
+  each step's economic plateau or when a constraint binds.
 - **Phase 2 — dispatch ordering:** recompute bottom-levels using the *allocated* weights
   `T_i(p_i)` and order ready steps by bottom-level (our `critical-path` planner). The live scheduler
   then admits ready work under `--max-steps`, dependencies, and named-resource gates; the outer CPU
@@ -206,12 +250,12 @@ It has two phases (the Turek-Wolf-Yu / Ludwig-Tiwari structure):
 
 ### Why this over the alternatives
 
-- **vs. per-step greedy-knee.** `recommended_inner_jobs` optimizes each step *in isolation* — best
-  wall before its own knee, capped at `P`. That is a useful choice for one step but is DAG-blind and
+- **vs. per-step greedy-plateau.** `recommended_inner_jobs` optimizes each step *in isolation* — the
+  narrowest economic near-best wall, capped at `P`. That is useful for one step but is DAG-blind and
   machine-blind: an off-path scaling step can receive a wide allocation that does not shorten the
   makespan, and independently chosen widths can collectively exceed `P`. CPA spends cores where they
-  shorten the whole-DAG critical path. The measured knee remains the upper bound when a curve exists;
-  a curveless step stays rigid at its configured hint or one core (see §5).
+  shorten the whole-DAG critical path. The measured plateau remains the upper bound when a curve
+  exists; a curveless step stays rigid at its configured hint or one core (see §5).
 - **vs. pure two-phase (Turek-Wolf-Yu / Ludwig-Tiwari).** Their guarantees assume **independent**
   tasks; our DAG has precedence, so the bound does not transfer, and their allotment search (binary-
   search a makespan, solve a knapsack-like allotment) is heavier and assumes analytic work functions.
@@ -219,9 +263,9 @@ It has two phases (the Turek-Wolf-Yu / Ludwig-Tiwari structure):
   O(cheap) allocation loop that reads straight off our measured curves. We keep their architecture and
   drop their independence assumption.
 - **vs. MCPA in full.** MCPA's concurrency-awareness is genuinely useful at small `P`, but it needs
-  a model of what co-runs and how sharing changes each task. The current planner keeps CPA's simpler
-  global CP/area loop and a per-step `p_i <= P` ceiling; it does not claim MCPA-style overlap
-  optimization.
+  a model of what co-runs and how sharing changes each task. The current planner compares
+  memory-feasible active-step ceilings around CPA's global CP/area loop, but it does not claim
+  MCPA-style co-run slowdown modeling.
 - **vs. Jansen-Zhang / Jansen FPTAS.** Constant-factor-optimal but LP-based, complex, and reliant on
   analytic monotone work functions — overkill for tens-of-steps CI DAGs and hard to make deterministic
   and dependency-light. We cite them as the theory that says our objective is the right one.
@@ -247,6 +291,8 @@ behavioral differential compares plan output byte-for-byte.
   recommendations.
 - `mem_budget: int | None` — the RAM budget (as `--max-mem` already supplies to `jobs_for_budget`);
   `None` disables the memory constraint on allocation.
+- `S: int | None` — the requested `--max-steps` ceiling. CPA may model a smaller overlap when the
+  joint reachable footprint does not fit `mem_budget`, but never a larger one.
 
 ### 5.2 Per-step admissible widths and the measured wall function
 
@@ -261,15 +307,18 @@ For each step `i`, define its **admissible width set** `W_i`:
   otherwise `W_i` contains that declared width. With no positive declared width, the configured
   default is only a runner/cgroup cap (not a hidden guest worker count) and may be tightened to
   `P`. CPA never pretends it can
-  resize a command that opted out of both injection channels, and `sweep` rejects such a step. Pure CPA
-  planning retains an over-budget fixed width and reports `infeasible-fixed-width`; its modeled
+  resize a command that opted out of both injection channels. The legacy `sweep --step --jobs`
+  form rejects such a step; a target-time graph sweep characterizes a fitting configured width once
+  and visibly skips one wider than the effective machine budget. Pure CPA planning retains an
+  over-budget fixed width and reports `infeasible-fixed-width`; its modeled
   makespan is infinity and no `alloc_inner_jobs` is published for that self-managed step. If the
   learned curve contains an exact level at the fixed width, its measured wall is used; otherwise
   the scalar resolved estimate remains the weight and the curve is diagnostic only.
 - If `i` has a measured curve, begin with the measured widths no greater than
   `speedup.recommended_inner_jobs`, then keep those no greater than `P`. This reuses the
-  work-conservation knee (marginal wall gain `>= 1.15x` and total-CPU-seconds growth `<= 1.5x`) so
-  the allocator cannot widen past the useful measurements. If every measured width exceeds `P`,
+  global economic plateau (wall within 10% of the best eligible point and total CPU seconds
+  normally no more than `1.5x` baseline) so the allocator cannot widen past the useful
+  measurements. If every measured width exceeds `P`,
   that curve is unavailable at this budget; the step remains rigid at its authored width (or one),
   capped to `P`, using the scalar estimate rather than claiming an unexecutable measured point.
 - If `i` has **no** measured curve, `W_i = { w_i }`, where `w_i` is the positive
@@ -287,8 +336,9 @@ let `next(p_i)` be the next-larger admissible width, or `None` if `p_i` is alrea
 
 Set `p_i := min(W_i)` for every step — i.e. the **narrowest** admissible width (usually 1). This is
 CPA's "start everyone at one processor" seed. Rationale: starting minimal and *growing* toward the
-balance point makes the loop monotone (area only rises) and the stop condition well-defined; it also
-makes the result independent of any prior allocation state (determinism).
+balance point makes each allocation index monotone and the loop finite; it also makes the result
+independent of prior allocation state. Measured CPU work can move either way between noisy width
+points, so the implementation does not claim the numeric area itself is monotone.
 
 ### 5.4 Derived quantities (recomputed each iteration)
 
@@ -298,7 +348,9 @@ makes the result independent of any prior allocation state (determinism).
 - **Critical path and its length `T_CP`.** The existing `_critical_path` over those bottom-levels
   (start at the max bottom-level, follow max-bottom-level successors; ties by tag ascending). `T_CP`
   is the length; `CP` is the set of steps on it.
-- **Area and the area term.** `A = sum_i p_i * T_i(p_i)`; `T_A = A / P`.
+- **Area and the area term.** Let `C_i(p_i)` be the robust measured `user_s + sys_s` at the exact
+  width when present, else the conservative fallback `p_i * T_i(p_i)`. Then
+  `A = sum_i C_i(p_i)` and `T_A = A / P`. Intentional skips contribute zero.
 
 ### 5.5 The gradient step (which step to widen, and by how much)
 
@@ -311,12 +363,13 @@ constraints:
    the **actual** wall reduction from the next width and the cores it costs:
 
    ```
-   delta_wall(i) = T_i(p_i) - T_i(next(p_i))          # measured, >= 0 (knee-truncated => monotone)
+   delta_wall(i) = T_i(p_i) - T_i(next(p_i))          # measured signed wall change
    delta_cores(i) = next(p_i) - p_i                    # > 0
-   gain(i) = delta_wall(i) / delta_cores(i)            # wall reduction per added core
+   gain(i) = delta_wall(i) / delta_cores(i)            # signed wall change per added core
    ```
 
-   `gain` is the reduction-per-added-core. It uses the real measured drop, which is *strictly more
+   `gain` is reduction-per-added-core and can be negative for a locally noisy or regressing next
+   point. It uses the real measured change, which is *strictly more
    accurate* than CPA's original `T_i(p_i)/p_i` proxy (that proxy assumes near-linear speedup; we have
    the curve, so we use it).
 3. **Constraint filter — a candidate is admissible only if widening it keeps every constraint
@@ -332,22 +385,34 @@ A tentative widening `p_i -> next(p_i)` is rejected unless **all** hold:
 
 - **Total core budget.** A tentative wider point must not exceed `P`: `next(p_i) <= P`. There is no
   wider-than-budget escape or "run alone" exception.
-- **Per-step memory cap grows with width.** Recompute the tentative step's width-aware cap using
-  `step_mem_cap_for_inner_jobs` (a CPU-bound step's cap scales `~ cap * p / 4`) and the same
-  learned-or-authored RSS value that plan application will hand to runtime. Reject a widening when
-  that one-step footprint, after `outer_mem_safety_factor` and `mem_cap_floor_bytes`, exceeds
-  `mem_budget`. This prevents an individually impossible allocation. CPA does not jointly choose
-  width and overlap: after plan application, ordinary `jobs_for_budget` derives `--max-steps` from
-  the complete concurrent footprint, so two individually legal heavy steps may still be serialized.
-  Hard-cap-only, default-capped, and selected `engine_only` steps participate; intentional skips do
-  not. `mem_budget` comes from `--max-mem`; absent, the memory constraint is off. Exact
+- **Memory response is exact-width when sufficiently replicated.** At a measured width
+  with at least three **uncensored** peak observations, use that width's nearest-rank
+  90th-percentile `memory.peak` directly as `M_i(p)`. A capped peak remains a lower bound and can
+  raise the requirement, but is never treated as exact demand. The measurement already describes
+  that width, so it carries width provenance and is not multiplied by the fallback width heuristic
+  again. With fewer than three exact peaks, or no exact-width point, fall back to the ordinary
+  pooled/profile or authored RSS baseline and
+  `step_mem_cap_for_inner_jobs` (a CPU-bound fallback stays flat through four workers and then
+  scales approximately as `base * p / 4`). An authored `hard_mem_max_bytes` remains authoritative.
+  Before widening, compute the largest dependency- and resource-compatible concurrent footprint
+  at the candidate widths. `--max-steps` is a ceiling, not a required overlap. With a memory budget,
+  run the fixed-overlap CPA gradient once for every ceiling from the requested maximum down to one,
+  discard candidates whose narrow seed cannot fit, and score each survivor with the deterministic
+  no-overcommit reference schedule. Select the smallest modeled makespan; exact ties retain the
+  larger overlap. This prevents a barely feasible many-step seed from trapping every task at a
+  narrow width when fewer, wider concurrent tasks finish sooner. If no one-step seed fits, the
+  allocation is infeasible. Hard-cap-only, default-capped, and selected `engine_only` steps
+  participate; intentional skips do not. `mem_budget` comes from `--max-mem`; absent, the memory
+  constraint is off and only the requested ceiling is evaluated. Exact
   dependency/resource-compatible subset enumeration in the later active-step sizing pass is capped
   at 100,000 candidates; wider searches conservatively sum the largest caps.
 - **Named-resource feasibility is unchanged by width** (widths do not change `hint.resources`), so
   named-resource caps never *block a widening*. They still serialize live steps that demand the
   same resource, but CPA does not model that serialization in its area term.
-- **Knee already enforced** by `W_i` truncation (§5.2): the work-conservation guard cannot be
-  exceeded because those widths are not admissible in the first place.
+- **Economic plateau already enforced** by `W_i` truncation (§5.2): widths above the recommended
+  point are not admissible. The CPU-work filter normally bounds that recommendation; when it would
+  remove every within-budget point, the within-budget set is retained rather than erasing all
+  evidence.
 
 ### 5.7 Handing allotments to the runtime
 
@@ -377,11 +442,11 @@ which outcome will occur.
 
 ### 5.8 Stop conditions (any one ends the loop)
 
-- **Balance reached:** `T_CP <= T_A`. The critical path no longer dominates; further widening only
-  grows area. (CPA's native termination.) The planner reports this stop reason as `balanced`.
-- **No admissible candidate:** every critical-path step is already at its knee-truncated max width, at
-  `P`, or blocked by the memory budget. Additional cores cannot help the current critical path. The
-  planner distinguishes three sub-cases in the reported stop reason: `knee-exhausted` (no
+- **Balance reached:** `T_CP <= T_A`. The critical path no longer dominates the two-term bound, so
+  this CPA loop has no reason to widen further. The planner reports this stop reason as `balanced`.
+- **No admissible candidate:** every critical-path step is already at its plateau-truncated max
+  width, at `P`, or blocked by the memory budget. Additional cores cannot help the current critical
+  path. The planner distinguishes three sub-cases in the reported stop reason: `knee-exhausted` (no
   critical-path step has any wider admissible width left — including the per-step `P` cap, which is
   enforced by construction via the `W_i` truncation in §5.2), and `mem-capped` / `core-capped` (a
   wider width exists but every candidate was rejected by the memory budget / the core cap this
@@ -400,8 +465,8 @@ which outcome will occur.
   step starts. The low-level allocator returns its typed infeasibility error instead of an
   executable-looking width map.
 
-Because every applied step strictly increases some `p_i` within a finite `W_i`, and area is monotone
-non-decreasing, the loop runs at most `sum_i (|W_i| - 1)` iterations — trivially bounded for CI DAGs.
+Because every applied step strictly increases some `p_i` within a finite `W_i`, the loop runs at
+most `sum_i (|W_i| - 1)` iterations — trivially bounded even when measured CPU area is not monotone.
 
 ### 5.9 Cross-implementation determinism
 
@@ -440,7 +505,7 @@ ambient budget because it must allocate widths.
 1. **Empirical curves, not analytic models.** CPA/Jansen assume an analytic `T_i(p)` (Amdahl- or
    Downey-shaped, monotone, concave). We read `T_i(p)` from the **measured** profile store. We
    therefore (a) evaluate `T_i` only at measured widths — no interpolation/extrapolation, so an
-   allocation is always backed by a real measurement; and (b) get the knee and the work-conservation
+   allocation is always backed by a real measurement; and (b) get the plateau and work-conservation
    break *observed*, not assumed. A step with too few samples remains rigid instead of receiving a
    synthetic curve.
 2. **Single machine, inner-jobs, cgroup-boxed — not a distributed multiprocessor.** The "processors"
@@ -450,15 +515,17 @@ ambient budget because it must allocate widths.
    The outer CPU quota enforces aggregate bandwidth, but the planner does not model contention
    between a particular set of overlapping steps.
 3. **Two extra constraint classes the textbook omits.** Standard moldable scheduling constrains only
-   processors. We additionally constrain **per-step memory** (and, crucially, memory that *grows with
-   width* for CPU-bound steps) and **named scarce-resource semaphores**. Both can *block a widening*
+   processors. We additionally constrain **per-step memory** (and, crucially, an empirical or
+   conservatively scaled memory response at each width) and **named scarce-resource semaphores**.
+   Both can *block a widening*
    or *bound achievable concurrency* — first-class inputs to the allocator, not afterthoughts.
-4. **A work-conservation (efficiency) stop, not just a wall-time stop.** Textbook CPA stops on the
-   pure `T_CP <= T_A` balance. We *additionally* refuse to widen past each step's measured
-   work-conservation knee (`cpu_s` growth `> 1.5x` between widths = stop), because on a shared machine
-   burning extra core-seconds for a marginal wall gain steals cores from *other* concurrent steps and
-   degrades the whole DAG. This efficiency guard is enforced by construction (knee-truncated admissible
-   widths, §5.2) and is not part of classical CPA.
+4. **A work-conservation (efficiency) filter, not just a wall-time optimum.** Textbook CPA stops on
+   the pure `T_CP <= T_A` balance. We normally exclude a width from the per-step economic plateau
+   when its measured `cpu_s` exceeds `1.5x` the baseline width's CPU work, because on a shared
+   machine burning extra core-seconds for a marginal wall gain steals capacity from other useful
+   work. The allocator's area term also uses measured CPU seconds directly, falling back to
+   `p*T(p)` only when they are unavailable. This measured-work treatment is not part of classical
+   CPA.
 5. **Determinism as a hard requirement.** The classical algorithms are described over reals with
    arbitrary tie-breaking. Both implementations require **bit-for-bit** identical decisions, so
    operations use canonical ordering and a total tag tie-break (§5.9).
@@ -469,10 +536,12 @@ ambient budget because it must allocate widths.
   plateau, and a memory-heavy step. The harness compares widths, order, modeled values, and stop
   reason across implementations.
 - **Unit tests.** Tests cover a balanced linear chain, plateau avoidance, memory-blocked widening,
-  opportunistic runtime overcommit, rigid curveless steps, infeasible self-managed widths, plan-application
-  refusal preservation, and allocator idempotence.
-- **Directional benchmarks.** Representative caller-owned DAGs can compare `greedy-lpt`, per-step
-  knee allocation, and CPA under controlled resource contention.
+  opportunistic runtime overcommit, rigid curveless steps, infeasible self-managed widths,
+  plan-application refusal preservation, and allocator idempotence.
+- **Synthetic graph benchmark.** `examples/07-graph-scaling-sweep.yaml` contains an embarrassingly
+  parallel node, a node that saturates at four workers, and a sequential node whose extra workers
+  add interference. Every command accepts the generic `--jobs` channel, so the full target-time
+  sweep exercises topology order, plateau detection, CPU-work growth, and width-specific memory.
 - **Selection.** `cpa` is explicit; the default remains `greedy-lpt`. `--no-profile-feedback`
   removes measured curves, so curveless steps remain rigid.
 
@@ -518,6 +587,9 @@ Load-bearing citations; web-confirmed where noted.
 ## 9. Implementation map
 
 - Curves: `load_step_speedups`, `StepSpeedup`, `SpeedupLevel`, and `_build_step_speedup`.
+- Sweep design: `stable_topological_steps`, topology discovery, cumulative width grids, and
+  `workload_digest` in `sweep.py` / `sweep.rs`.
+- Derived model cache: `scaling_model_to_json`, `scaling_model_path`, and `write_scaling_model`.
 - Order and bottom-levels: `_bottom_levels`, `_critical_path`, `_plan_order`, and
   `Planner.CRITICAL_PATH`.
 - Memory: `schedulable_peak_mem_bytes`, `step_mem_cap_for_inner_jobs`, and `jobs_for_budget`.

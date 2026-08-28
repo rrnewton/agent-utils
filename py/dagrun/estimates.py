@@ -48,6 +48,7 @@ __all__ = [
     "feedback_identity",
     "sample_from_row",
     "bucketize_rows",
+    "buckets_for_workloads",
     "step_samples_from_buckets",
     "step_speedups_from_buckets",
     "load_step_samples",
@@ -57,6 +58,9 @@ __all__ = [
     "apply_plan_to_config",
     "plan_to_json",
     "plan_to_text",
+    "scaling_model_path",
+    "scaling_model_to_json",
+    "write_scaling_model",
     "row_is_measurement",
 ]
 
@@ -156,7 +160,14 @@ class Sample:
       ``None``.
     * ``effective_cores`` / ``throttled_s`` — achieved parallelism and throttling at this width, or
       ``None``.
-    * ``peak_bytes`` — peak resident bytes for the memory model, or ``None``.
+    * ``peak_bytes`` — the raw recorded peak retained for pooled compatibility feedback.
+    * ``uncensored_peak_bytes`` — a peak proven usable as an exact-width estimate (rows without
+      provenance retain the compatibility treatment).
+    * ``peak_floor_bytes`` — a censored peak usable only as a lower bound.
+    * ``observation_id`` — stable identity used only by bounded summary sampling/merge. Ordinary
+      estimators ignore it.
+    * ``workload_digest`` — stable identity for the command shape measured by a sweep. Empty for
+      pre-digest rows; planners use it to avoid combining incompatible curves.
     """
 
     elapsed_s: float | None
@@ -165,6 +176,10 @@ class Sample:
     effective_cores: float | None
     throttled_s: float | None
     peak_bytes: int | None
+    uncensored_peak_bytes: int | None = None
+    peak_floor_bytes: int | None = None
+    observation_id: str = ""
+    workload_digest: str = ""
 
     def intrinsic_s(self) -> float | None:
         """The contention-discounted (intrinsic / uncontended) wall the estimator medians, or
@@ -409,6 +424,29 @@ def sample_from_row(row: Mapping[str, str], affinity_width: int | None) -> Sampl
     throttled_s = throttled if (throttled is not None and throttled >= 0.0) else None
     peak = _parse_int(row.get("peak_bytes"))
     peak_bytes = peak if (peak is not None and peak >= 0) else None
+    uncensored_peak_bytes = peak_bytes
+    peak_floor_bytes: int | None = None
+    if peak_bytes is not None:
+        # Old stores predate memory-cap/event provenance. Preserve their historical behavior, but
+        # when a modern row carries that schema accept its peak only if the censoring classifier can
+        # prove the measurement was unconstrained. Censored/unknown peaks remain available to the
+        # dedicated memory-feedback path as floors; they are not exact M(p) observations.
+        provenance_columns = (
+            "memory_max_bytes",
+            "memory_events_high",
+            "memory_events_max",
+            "memory_events_oom",
+            "memory_events_oom_kill",
+        )
+        if any(column in row for column in provenance_columns):
+            from dagrun.memory_feedback import Censoring, peak_observation_from_row
+
+            verdict = peak_observation_from_row(row).verdict
+            if verdict is Censoring.CENSORED:
+                peak_floor_bytes = peak_bytes
+                uncensored_peak_bytes = None
+            elif verdict is not Censoring.UNCENSORED:
+                uncensored_peak_bytes = None
     return Sample(
         elapsed_s=elapsed_s,
         contention=_contention_fraction(row, affinity_width),
@@ -416,6 +454,10 @@ def sample_from_row(row: Mapping[str, str], affinity_width: int | None) -> Sampl
         effective_cores=effective_cores,
         throttled_s=throttled_s,
         peak_bytes=peak_bytes,
+        uncensored_peak_bytes=uncensored_peak_bytes,
+        peak_floor_bytes=peak_floor_bytes,
+        observation_id=(row.get("observation_id") or row.get("run_id") or ""),
+        workload_digest=(row.get("workload_digest") or "").strip(),
     )
 
 
@@ -490,6 +532,42 @@ def bucketize_rows(
     return buckets
 
 
+def buckets_for_workloads(
+    buckets: Mapping[BucketKey, Sequence[Sample]],
+    workload_digests: Mapping[str, str] | None,
+) -> dict[BucketKey, list[Sample]]:
+    """Select the cohort matching the current DAG without mixing command revisions.
+
+    As soon as any sample for a step matches its expected non-empty digest, only exact matches for
+    that step remain eligible. Until then, blank pre-digest samples are a compatibility fallback;
+    samples carrying a different non-empty digest are never blended into either cohort. Steps not
+    present in ``workload_digests`` are unchanged.
+    """
+
+    expected = workload_digests or {}
+    if not expected:
+        return {key: list(samples) for key, samples in buckets.items()}
+    matched_steps = {
+        step
+        for (step, _inner), samples in buckets.items()
+        if (wanted := expected.get(step)) is not None
+        and any(sample.workload_digest == wanted for sample in samples)
+    }
+    selected: dict[BucketKey, list[Sample]] = {}
+    for key, samples in buckets.items():
+        step = key[0]
+        wanted = expected.get(step)
+        if wanted is None:
+            kept = list(samples)
+        elif step in matched_steps:
+            kept = [sample for sample in samples if sample.workload_digest == wanted]
+        else:
+            kept = [sample for sample in samples if not sample.workload_digest]
+        if kept:
+            selected[key] = kept
+    return selected
+
+
 def step_samples_from_buckets(buckets: Mapping[BucketKey, Sequence[Sample]]) -> dict[str, StepSamples]:
     """Aggregate per-``(step, inner_jobs)`` sample buckets into per-step robust estimates.
 
@@ -522,7 +600,10 @@ def step_samples_from_buckets(buckets: Mapping[BucketKey, Sequence[Sample]]) -> 
 
 
 def load_step_samples(
-    profile_dir: str | Path, machine_id: str, container_class: str
+    profile_dir: str | Path,
+    machine_id: str,
+    container_class: str,
+    workload_digests: Mapping[str, str] | None = None,
 ) -> dict[str, StepSamples]:
     """Read the per-step profile CSV for ``(machine_id, container_class)`` under ``profile_dir``
     and aggregate the recorded samples per step into robust estimates.
@@ -537,21 +618,30 @@ def load_step_samples(
     if loaded is None:
         return {}
     rows, affinity_width = loaded
-    return step_samples_from_buckets(bucketize_rows(rows, affinity_width))
+    buckets = bucketize_rows(rows, affinity_width)
+    return step_samples_from_buckets(buckets_for_workloads(buckets, workload_digests))
 
 
 # --------------------------------------------------------------------------- speedup model
 
-#: A level must be at least this many times faster than the PREVIOUS (fewer-thread) level to make
-#: the extra threads worthwhile; below this the marginal speedup has plateaued (a knee).
-_SPEEDUP_MIN_MARGINAL_GAIN = 1.15
-#: If total CPU-seconds (user+sys) grow by more than this factor between two consecutive levels the
-#: step is doing materially more total work per added thread (sub-linear scaling / contention), a
-#: work-conservation signal to stop adding threads even if the wall still nudged down.
+#: The economic plateau is the NARROWEST measured width whose wall is within this fraction of the
+#: best measured wall. This definition is deliberately global rather than adjacent-grid based:
+#: inserting a midpoint such as 48 between 32 and 64 must not move the recommendation merely
+#: because two neighboring ratios changed. Ten percent gives the intended result for a curve such
+#: as 7.2x at 8 threads versus 7.9x at 64: 8 is already within 10% of the best wall while consuming
+#: one eighth of the advertised width.
+_PLATEAU_WALL_TOLERANCE = 0.10
+#: If total CPU-seconds (user+sys) grow by more than this factor relative to the BASELINE width, the
+#: point is not an economic plateau candidate. It may remain useful diagnostically (and is retained
+#: in the curve), but spending >50% more CPU work for the wall-time gain should not become the
+#: default recommendation when other productive work can use the machine.
 _SPEEDUP_MAX_WORK_GROWTH = 1.5
 #: A step needs at least this many DISTINCT inner_jobs levels (with wall data) to model a curve;
 #: fewer and there is nothing to say about speedup vs. parallelism.
 _SPEEDUP_MIN_LEVELS = 2
+#: A width-specific memory response must have enough repeats to be more than a one-off peak before
+#: it replaces the conservative authored/pooled fallback in allocation.
+_MEMORY_MIN_SAMPLES_PER_LEVEL = 3
 #: A wider level must be at least this much SLOWER than the fastest measured level before it can be
 #: called a regression. Paired with the dispersion test in :func:`_regression_inner_jobs`; neither
 #: check is sufficient alone.
@@ -627,23 +717,30 @@ class SpeedupLevel:
     throttled_s: float | None
     #: ``wall(baseline) / wall(this)`` — the measured speedup vs. the smallest width.
     speedup: float
+    #: High-percentile measured cgroup ``memory.peak`` at this width. This is the empirical
+    #: memory-response point M(p), kept per width rather than pooled across unrelated widths.
+    peak_bytes: int | None = None
+    peak_samples: int = 0
+    #: Largest censored peak observed at this width. It is not an estimate of the maximum, but the
+    #: planner may never model demand below this proven lower bound.
+    peak_floor_bytes: int | None = None
+    peak_floor_samples: int = 0
 
 
 @dataclass(frozen=True)
 class StepSpeedup:
     """A step's fitted speedup curve across inner_jobs widths, plus the recommended width.
 
-    ``recommended_inner_jobs`` is the best wall time still within diminishing-returns AND the core
-    budget: the loop advances the recommendation to a wider level only while that level is
-    materially faster than the previous one (:data:`_SPEEDUP_MIN_MARGINAL_GAIN`) and does not blow
-    up total CPU-seconds (:data:`_SPEEDUP_MAX_WORK_GROWTH`), stopping at the knee.
+    ``recommended_inner_jobs`` is the NARROWEST width within
+    :data:`_PLATEAU_WALL_TOLERANCE` of the best measured wall, subject to the core budget and the
+    global work-inflation guard (:data:`_SPEEDUP_MAX_WORK_GROWTH`). This is grid-invariant: adding a
+    midpoint measurement cannot move the plateau merely by changing an adjacent ratio.
 
     A PLATEAU AND A CLIFF ARE DIFFERENT THINGS and the recommendation alone cannot tell them apart.
-    A curve that flattens above the knee and a curve that becomes 2.4x SLOWER above the knee both
-    stop the walk at the same width and yield the same ``recommended_inner_jobs``. The
-    recommendation is safe either way -- the walk stops at the first level that fails to improve, so
-    it can never advance past a degradation -- but "safe" is not "visible", and an operator widening
-    a step by hand needs to know a cliff is there. ``regression_inner_jobs`` names it.
+    A curve that flattens above the plateau and a curve that becomes 2.4x SLOWER above it can yield
+    the same ``recommended_inner_jobs``. The recommendation chooses the narrow economic point, but
+    "safe" is not "visible", and an operator widening a step by hand still needs to know a cliff is
+    there. ``regression_inner_jobs`` names it.
     """
 
     step: str
@@ -679,6 +776,10 @@ class LevelAggregate:
     cpu_s: float | None
     effective_cores: float | None
     throttled_s: float | None
+    peak_bytes: int | None
+    peak_samples: int
+    peak_floor_bytes: int | None
+    peak_floor_samples: int
 
 
 def _build_step_speedup(
@@ -691,12 +792,9 @@ def _build_step_speedup(
     baseline_j = raw_levels[0].inner_jobs
     baseline_wall = raw_levels[0].wall_s
     levels: list[SpeedupLevel] = []
-    recommended = baseline_j
-    still_scaling = True
-    prev_wall = baseline_wall
-    prev_cpu = raw_levels[0].cpu_s
+    baseline_cpu = raw_levels[0].cpu_s
     eff_by_j: dict[int, float | None] = {}
-    for idx, aggregate in enumerate(raw_levels):
+    for aggregate in raw_levels:
         j, wall, cpu, eff = (
             aggregate.inner_jobs,
             aggregate.wall_s,
@@ -715,26 +813,35 @@ def _build_step_speedup(
                 cpu_s=cpu,
                 effective_cores=eff,
                 throttled_s=aggregate.throttled_s,
+                peak_bytes=aggregate.peak_bytes,
+                peak_samples=aggregate.peak_samples,
+                peak_floor_bytes=aggregate.peak_floor_bytes,
+                peak_floor_samples=aggregate.peak_floor_samples,
                 speedup=speedup,
             )
         )
         eff_by_j[j] = eff
-        if idx > 0 and still_scaling:
-            gain = prev_wall / wall if wall > 0.0 else 1.0
-            work_growth = (
-                cpu / prev_cpu if (cpu is not None and prev_cpu is not None and prev_cpu > 0.0) else None
-            )
-            within_budget = core_budget is None or j <= core_budget
-            if (
-                gain >= _SPEEDUP_MIN_MARGINAL_GAIN
-                and (work_growth is None or work_growth <= _SPEEDUP_MAX_WORK_GROWTH)
-                and within_budget
-            ):
-                recommended = j
-            else:
-                still_scaling = False
-        prev_wall = wall
-        prev_cpu = cpu
+    within_budget = [
+        level
+        for level in levels
+        if core_budget is None or level.inner_jobs <= core_budget
+    ]
+    economic = [
+        level
+        for level in within_budget
+        if (
+            level.cpu_s is None
+            or baseline_cpu is None
+            or baseline_cpu <= 0.0
+            or level.cpu_s / baseline_cpu <= _SPEEDUP_MAX_WORK_GROWTH
+        )
+    ]
+    candidates = economic or within_budget or levels
+    best_wall = min(level.wall_s for level in candidates)
+    plateau_limit = best_wall * (1.0 + _PLATEAU_WALL_TOLERANCE)
+    recommended = min(
+        level.inner_jobs for level in candidates if level.wall_s <= plateau_limit
+    )
     return StepSpeedup(
         step=step,
         baseline_inner_jobs=baseline_j,
@@ -761,6 +868,8 @@ def step_speedups_from_buckets(
     cpus: dict[BucketKey, list[float]] = {}
     effs: dict[BucketKey, list[float]] = {}
     thrs: dict[BucketKey, list[float]] = {}
+    peaks: dict[BucketKey, list[int]] = {}
+    peak_floors: dict[BucketKey, list[int]] = {}
     for (step, inner), samples in buckets.items():
         if inner <= 0:
             continue
@@ -777,6 +886,10 @@ def step_speedups_from_buckets(
                 effs.setdefault(key, []).append(sample.effective_cores)
             if sample.throttled_s is not None:
                 thrs.setdefault(key, []).append(sample.throttled_s)
+            if sample.uncensored_peak_bytes is not None:
+                peaks.setdefault(key, []).append(sample.uncensored_peak_bytes)
+            if sample.peak_floor_bytes is not None:
+                peak_floors.setdefault(key, []).append(sample.peak_floor_bytes)
     by_step: dict[str, list[int]] = {}
     for step, inner in walls:
         by_step.setdefault(step, []).append(inner)
@@ -793,6 +906,8 @@ def step_speedups_from_buckets(
             cpu_samples = cpus.get(key)
             eff_samples = effs.get(key)
             thr_samples = thrs.get(key)
+            peak_samples = peaks.get(key)
+            floor_samples = peak_floors.get(key)
             raw_levels.append(
                 LevelAggregate(
                     inner_jobs=inner,
@@ -804,6 +919,10 @@ def step_speedups_from_buckets(
                     cpu_s=_robust_median(cpu_samples) if cpu_samples else None,
                     effective_cores=_robust_median(eff_samples) if eff_samples else None,
                     throttled_s=_robust_median(thr_samples) if thr_samples else None,
+                    peak_bytes=_high_percentile(peak_samples) if peak_samples else None,
+                    peak_samples=len(peak_samples) if peak_samples else 0,
+                    peak_floor_bytes=max(floor_samples) if floor_samples else None,
+                    peak_floor_samples=len(floor_samples) if floor_samples else 0,
                 )
             )
         result[step] = _build_step_speedup(step, raw_levels, core_budget)
@@ -811,7 +930,10 @@ def step_speedups_from_buckets(
 
 
 def load_step_speedups(
-    profile_dir: str | Path, machine_id: str, container_class: str
+    profile_dir: str | Path,
+    machine_id: str,
+    container_class: str,
+    workload_digests: Mapping[str, str] | None = None,
 ) -> dict[str, StepSpeedup]:
     """Model each step's PARALLEL-SPEEDUP curve from its samples ACROSS inner_jobs widths.
 
@@ -819,8 +941,9 @@ def load_step_speedups(
     ``(step, inner_jobs)``, and for each width derives a robust (MAD-trimmed median),
     contention-discounted wall time plus the work-conservation signal (median total CPU-seconds
     ``user_s`` + ``sys_s``), achieved ``effective_cores``, and ``throttled_s``. From those it fits
-    the per-step speedup(inner_jobs) curve and a RECOMMENDED width (best wall within the knee and
-    the machine's core budget, the affinity width parsed from ``container_class``).
+    the per-step speedup(inner_jobs) curve and a RECOMMENDED width (the narrowest point within 10%
+    of the best eligible wall, subject to CPU-work growth and the machine's core budget, with the
+    affinity width parsed from ``container_class``).
 
     Only steps with at least :data:`_SPEEDUP_MIN_LEVELS` distinct widths (with wall data) get a
     model; the rest are absent (the caller shows no speedup curve for them). Never raises on a
@@ -830,7 +953,10 @@ def load_step_speedups(
     if loaded is None:
         return {}
     rows, affinity_width = loaded
-    return step_speedups_from_buckets(bucketize_rows(rows, affinity_width), affinity_width)
+    buckets = bucketize_rows(rows, affinity_width)
+    return step_speedups_from_buckets(
+        buckets_for_workloads(buckets, workload_digests), affinity_width
+    )
 
 
 # --------------------------------------------------------------------------- planner
@@ -854,6 +980,10 @@ class PlanEntry:
     #: ordering-only planners and self-managed commands whose empty jobs flag prevents rewriting.
     #: Run-level ``-j`` is the outer bandwidth/per-step ceiling, not an admission reservation.
     alloc_inner_jobs: int | None = None
+    #: Width at which ``rss_estimate_bytes`` is an empirical M(p), rather than a pooled/scalar
+    #: baseline. Applied configs carry this transient provenance into runtime memory sizing so the
+    #: exact-width observation is not scaled by the legacy width heuristic a second time.
+    rss_estimate_inner_jobs: int | None = None
 
 
 @dataclass(frozen=True)
@@ -867,7 +997,8 @@ class Allocation:
     values explain allocation rather than predict contended execution."""
 
     core_budget: int
-    #: Total core-seconds Σ p_i·T_i(p_i) at the allocated widths.
+    #: Total modeled CPU service Σ C_i(p_i) at the allocated widths. A measured ``cpu_s`` wins;
+    #: ``p_i * T_i(p_i)`` is the conservative fallback when the profile lacks CPU counters.
     area_s: float
     #: The area lower-bound term ``area / P`` (= ``T_A``).
     area_bound_s: float
@@ -881,6 +1012,9 @@ class Allocation:
     #: One of ``balanced`` / ``knee-exhausted`` / ``core-capped`` / ``mem-capped`` /
     #: ``fixed-point`` / ``infeasible-fixed-width`` / ``infeasible-memory``.
     stop_reason: str
+    #: Active-step overlap CPA could sustain under the memory budget (bounded by the requested
+    #: max-steps ceiling). The reference makespan uses this same concurrency.
+    modeled_max_steps: int = 1
 
 
 @dataclass(frozen=True)
@@ -1091,26 +1225,43 @@ def _speedup_within_budget(
     at or below ``P`` is unavailable for this run and is omitted from the plan.
     """
     budget = max(1, core_budget)
-    measured = [level.inner_jobs for level in speedup.levels if level.inner_jobs <= budget]
+    measured = [level for level in speedup.levels if level.inner_jobs <= budget]
     if not measured:
         return None
-    recommended = min(speedup.recommended_inner_jobs, max(measured))
-    effective = next(
-        (
-            level.effective_cores
-            for level in speedup.levels
-            if level.inner_jobs == recommended
-        ),
-        None,
+    # Re-fit from the points this run can actually execute. Merely clamping a recommendation fitted
+    # against wider points can select a local regression (for example T={1:100,2:50,4:70,8:10}
+    # under P=4 would incorrectly recommend 4 instead of 2).
+    aggregates = tuple(
+        LevelAggregate(
+            inner_jobs=level.inner_jobs,
+            samples=level.samples,
+            wall_s=level.wall_s,
+            raw_wall_s=level.raw_wall_s,
+            wall_min_s=level.wall_min_s,
+            wall_max_s=level.wall_max_s,
+            cpu_s=level.cpu_s,
+            effective_cores=level.effective_cores,
+            throttled_s=level.throttled_s,
+            peak_bytes=level.peak_bytes,
+            peak_samples=level.peak_samples,
+            peak_floor_bytes=level.peak_floor_bytes,
+            peak_floor_samples=level.peak_floor_samples,
+        )
+        for level in measured
     )
-    regression = speedup.regression_inner_jobs
-    if regression is not None and regression > budget:
-        regression = None
-    return replace(
-        speedup,
-        recommended_inner_jobs=recommended,
-        measured_effective_cores=effective,
-        regression_inner_jobs=regression,
+    fitted = _build_step_speedup(speedup.step, aggregates, None)
+    # Keep above-budget measurements visible for diagnostics; only the recommendation/regression
+    # and achieved-core marker are re-fitted to the executable subset.
+    return replace(fitted, levels=speedup.levels)
+
+
+def _cpu_work_eligible(level: SpeedupLevel, baseline_cpu: float | None) -> bool:
+    """Whether one width satisfies the same CPU-work guard used by plateau fitting."""
+    return (
+        level.cpu_s is None
+        or baseline_cpu is None
+        or baseline_cpu <= 0.0
+        or level.cpu_s / baseline_cpu <= _SPEEDUP_MAX_WORK_GROWTH
     )
 
 
@@ -1165,7 +1316,13 @@ def _cpa_admissible(
             continue
         sp = speedups.get(tag)
         if sp is not None and sp.levels:
-            knee_ok = [lvl for lvl in sp.levels if lvl.inner_jobs <= sp.recommended_inner_jobs]
+            baseline_cpu = sp.levels[0].cpu_s
+            knee_ok = [
+                lvl
+                for lvl in sp.levels
+                if lvl.inner_jobs <= sp.recommended_inner_jobs
+                and _cpu_work_eligible(lvl, baseline_cpu)
+            ]
             within_budget = [lvl for lvl in knee_ok if lvl.inner_jobs <= core_budget]
             if within_budget:
                 admissible[tag] = sorted(lvl.inner_jobs for lvl in within_budget)
@@ -1200,43 +1357,147 @@ def _cpa_next_width(widths: Sequence[int], current: int) -> int | None:
     return None
 
 
-def _cpa_footprint(cfg: DagConfig, widths: Mapping[str, int]) -> int:
-    """Largest single-step footprint at the given widths, including outer safety/floor policy.
+def _cpu_work_at(
+    speedups: Mapping[str, StepSpeedup], tag: str, width: int, wall_s: float
+) -> float:
+    """Modeled CPU service ``C_i(p)`` for one allocated point.
 
-    CPA checks whether each width is individually feasible. Post-plan ``jobs_for_budget`` owns the
-    aggregate-overlap decision and may derive ``max_steps=1`` for several individually feasible
-    wide steps; CPA does not jointly optimize width against overlap.
+    The boxed profile's user+system CPU seconds are the direct work-conservation measurement and
+    therefore the right capacity term for a runtime whose width is a quota, not a reservation.
+    Older/unboxed rows may lack it; ``p*T(p)`` remains a conservative fallback in that case.
     """
-    active = tuple(step for step in cfg.steps if step.skip_reason is None)
-    active_cfg = replace(cfg, steps=active, resource_caps=dict(cfg.resource_caps))
-    peak, _ = schedulable_peak_mem_bytes(active_cfg, 1, widths=widths)
+    speedup = speedups.get(tag)
+    if speedup is not None:
+        level = next((level for level in speedup.levels if level.inner_jobs == width), None)
+        if level is not None and level.cpu_s is not None:
+            return level.cpu_s
+    return width * wall_s
+
+
+def _memory_evidence_at(
+    speedups: Mapping[str, StepSpeedup], tag: str, width: int
+) -> tuple[int | None, int | None]:
+    """Return ``(exact_M_p, censored_floor)`` for one measured width.
+
+    ``exact_M_p`` exists only after the replication threshold and is raised by a censored floor.
+    A floor without exact evidence remains separate: replacing the ordinary fallback by a smaller
+    lower bound would turn incomplete evidence into an unsafe upper-bound claim.
+    """
+    speedup = speedups.get(tag)
+    if speedup is None:
+        return None, None
+    level = next((point for point in speedup.levels if point.inner_jobs == width), None)
+    if level is None:
+        return None, None
+    exact = (
+        level.peak_bytes
+        if level.peak_bytes is not None
+        and level.peak_samples >= _MEMORY_MIN_SAMPLES_PER_LEVEL
+        else None
+    )
+    if exact is not None and level.peak_floor_bytes is not None:
+        exact = max(exact, level.peak_floor_bytes)
+    return exact, level.peak_floor_bytes
+
+
+def _modeled_memory_at(
+    speedups: Mapping[str, StepSpeedup],
+    tag: str,
+    width: int,
+    fallback: int | None,
+) -> tuple[int | None, bool]:
+    """The displayed/applied memory value and whether it is exact at ``width``."""
+    exact, floor = _memory_evidence_at(speedups, tag, width)
+    if exact is not None:
+        return exact, True
+    candidates = [value for value in (fallback, floor) if value is not None]
+    return (max(candidates), False) if candidates else (None, False)
+
+
+def _cpa_footprint(
+    cfg: DagConfig,
+    widths: Mapping[str, int],
+    speedups: Mapping[str, StepSpeedup],
+    max_steps: int,
+) -> int:
+    """Largest reachable concurrent footprint at the widths and active-step ceiling.
+
+    A per-width measured ``memory.peak`` point wins over the old width-collapsed baseline. The
+    Exact-width provenance prevents the legacy ``base * p/4`` placeholder from scaling an
+    already-at-p measurement a second time. An authored hard cap still wins in
+    :func:`step_mem_cap_bytes`. Dependency/resource constraints and ``max_steps`` bound the set that
+    can actually overlap, matching the runtime memory admission model.
+    """
+    active: list[Step] = []
+    for step in cfg.steps:
+        if step.skip_reason is not None:
+            # Keep the node in the dependency graph; schedulable_peak_mem_bytes excludes it from
+            # candidates but transitive dependency discovery still needs every referenced tag.
+            active.append(step)
+            continue
+        exact, floor = _memory_evidence_at(speedups, step.tag, widths[step.tag])
+        if exact is None and floor is None:
+            active.append(step)
+            continue
+        if exact is None:
+            # A censored peak is only a lower bound. Raise the ordinary baseline to that floor but
+            # retain fallback width scaling; marking it exact could replace a larger conservative
+            # estimate by an unsafe smaller number.
+            assert floor is not None
+            baseline = max(step.hint.rss_baseline_bytes or 0, floor)
+            active.append(
+                replace(
+                    step,
+                    hint=replace(
+                        step.hint,
+                        rss_baseline_bytes=baseline,
+                        rss_baseline_inner_jobs=None,
+                    ),
+                    deps=list(step.deps),
+                    env=dict(step.env),
+                )
+            )
+            continue
+        active.append(
+            replace(
+                step,
+                hint=replace(
+                    step.hint,
+                    rss_baseline_bytes=exact,
+                    rss_baseline_inner_jobs=widths[step.tag],
+                ),
+                deps=list(step.deps),
+                env=dict(step.env),
+            )
+        )
+    active_cfg = replace(cfg, steps=tuple(active), resource_caps=dict(cfg.resource_caps))
+    peak, _ = schedulable_peak_mem_bytes(active_cfg, max(1, max_steps), widths=widths)
     return _outer_mem_footprint_bytes(active_cfg, peak)
 
 
-def _cpa_allocate(
+def _cpa_allocate_at_overlap(
     cfg: DagConfig,
     speedups: Mapping[str, StepSpeedup],
-    est: Mapping[str, float],
+    admissible: Mapping[str, Sequence[int]],
+    wall: Mapping[str, Mapping[int, float]],
+    successors: Mapping[str, list[str]],
     core_budget: int,
     mem_budget: int | None,
-) -> tuple[dict[str, int], dict[str, list[int]], dict[str, dict[int, float]], str]:
-    """The CPA gradient loop (PLANNER_DESIGN.md §5.3-5.8): seed every step at ``min(W_i)`` then,
-    while the critical path exceeds the per-core area, widen the critical-path step with the
-    greatest MEASURED wall-reduction-per-added-core (ties by smallest tag) subject to the core and
-    memory constraints, until the terms balance or nothing can widen.
+    modeled_max_steps: int,
+) -> tuple[dict[str, int], str] | None:
+    """Run the CPA gradient at one FIXED active-step overlap.
 
-    Returns ``(widths, admissible, wall, stop_reason)`` — deterministic across builds (identical
-    float ops in cfg order, integer core arithmetic, total tag tie-break)."""
-    P = core_budget if core_budget > 0 else 1
-    admissible, wall = _cpa_admissible(cfg, speedups, est, P)
+    ``None`` means even the narrow seed cannot fit the memory budget at this overlap.  Keeping the
+    overlap fixed inside this helper makes each result a comparable candidate for
+    :func:`_cpa_allocate`; otherwise accepting the first feasible seed can strand CPA at a wide-
+    concurrency, narrow-width local optimum.
+    """
+    P = max(1, core_budget)
     widths: dict[str, int] = {step.tag: admissible[step.tag][0] for step in cfg.steps}
-    successors = _successors(cfg)
-    if _infeasible_fixed_widths(cfg, widths, P):
-        return widths, admissible, wall, _CPA_INFEASIBLE_FIXED_WIDTH
     if mem_budget is not None and not _memory_footprint_fits(
-        _cpa_footprint(cfg, widths), mem_budget
+        _cpa_footprint(cfg, widths, speedups, modeled_max_steps), mem_budget
     ):
-        return widths, admissible, wall, _CPA_INFEASIBLE_MEMORY
+        return None
     stop_reason = _CPA_FIXED_POINT
     # Each applied widening strictly increases some p_i within a finite W_i, so the loop is bounded
     # by Σ(|W_i|-1); +2 headroom lets the final balance/exhaustion check run.
@@ -1245,9 +1506,10 @@ def _cpa_allocate(
         weight = {step.tag: wall[step.tag][widths[step.tag]] for step in cfg.steps}
         bottom = _bottom_levels(cfg, weight, successors)
         cp, t_cp = _critical_path(cfg, bottom, successors)
-        area = 0.0
-        for step in cfg.steps:
-            area += widths[step.tag] * weight[step.tag]
+        area = sum(
+            _cpu_work_at(speedups, step.tag, widths[step.tag], weight[step.tag])
+            for step in cfg.steps
+        )
         t_a = area / P
         if t_cp <= t_a:
             stop_reason = _CPA_BALANCED
@@ -1264,29 +1526,117 @@ def _cpa_allocate(
         best_tag: str | None = None
         best_gain = 0.0
         blocked_mem = False
+        positive_candidate = False
         # Iterate tag-ascending and keep the FIRST maximum, so ties resolve to the smallest tag.
         for tag in sorted(widenable):
             nxt = _cpa_next_width(admissible[tag], widths[tag])
             assert nxt is not None
             if nxt > P:
                 continue  # defensive per-step ceiling; admissible curves are already truncated
+            cur = widths[tag]
+            gain = (wall[tag][cur] - wall[tag][nxt]) / (nxt - cur)
+            if gain <= 0.0:
+                continue
+            positive_candidate = True
             if mem_budget is not None:
                 tentative = dict(widths)
                 tentative[tag] = nxt
-                if not _memory_footprint_fits(_cpa_footprint(cfg, tentative), mem_budget):
+                if not _memory_footprint_fits(
+                    _cpa_footprint(cfg, tentative, speedups, modeled_max_steps), mem_budget
+                ):
                     blocked_mem = True
                     continue
-            cur = widths[tag]
-            gain = (wall[tag][cur] - wall[tag][nxt]) / (nxt - cur)
             if best_tag is None or gain > best_gain:
                 best_tag, best_gain = tag, gain
         if best_tag is None:
-            stop_reason = _CPA_MEM_CAPPED if blocked_mem else _CPA_CORE_CAPPED
+            if blocked_mem and positive_candidate:
+                stop_reason = _CPA_MEM_CAPPED
+            else:
+                stop_reason = _CPA_KNEE_EXHAUSTED
             break
         nxt = _cpa_next_width(admissible[best_tag], widths[best_tag])
         assert nxt is not None
         widths[best_tag] = nxt
-    return widths, admissible, wall, stop_reason
+    return widths, stop_reason
+
+
+def _cpa_candidate_makespan(
+    cfg: DagConfig,
+    widths: Mapping[str, int],
+    wall: Mapping[str, Mapping[int, float]],
+    successors: Mapping[str, list[str]],
+    core_budget: int,
+    modeled_max_steps: int,
+) -> float:
+    """Score one fixed-overlap allocation with the plan's deterministic reference schedule."""
+    weight = {step.tag: wall[step.tag][widths[step.tag]] for step in cfg.steps}
+    bottom = _bottom_levels(cfg, weight, successors)
+    order = _plan_order(cfg, Planner.CRITICAL_PATH, weight, bottom)
+    return _cpa_simulate_makespan(
+        cfg, widths, weight, order, max(1, core_budget), modeled_max_steps
+    )
+
+
+def _cpa_allocate(
+    cfg: DagConfig,
+    speedups: Mapping[str, StepSpeedup],
+    est: Mapping[str, float],
+    core_budget: int,
+    mem_budget: int | None,
+    max_steps: int,
+) -> tuple[dict[str, int], dict[str, list[int]], dict[str, dict[int, float]], str, int]:
+    """Choose the best fixed-overlap CPA allocation up to the active-step ceiling.
+
+    For each feasible ``modeled_max_steps`` value, run the ordinary monotone CPA gradient with
+    that overlap fixed, then score its deterministic no-overcommit reference schedule.  The least
+    modeled makespan wins; iteration from the ceiling down and replacement only on a STRICT
+    improvement retain the larger overlap on an exact tie.  This joint search avoids the local
+    optimum where a barely feasible wide-overlap seed prevents useful widths that would finish
+    sooner with fewer concurrent steps.
+
+    Returns ``(widths, admissible, wall, stop_reason, modeled_max_steps)`` — deterministic across
+    builds (identical float ops in cfg order, integer core arithmetic, total tag tie-break)."""
+    P = max(1, core_budget)
+    admissible, wall = _cpa_admissible(cfg, speedups, est, P)
+    seed: dict[str, int] = {step.tag: admissible[step.tag][0] for step in cfg.steps}
+    successors = _successors(cfg)
+    ceiling = max(1, max_steps)
+    if _infeasible_fixed_widths(cfg, seed, P):
+        return seed, admissible, wall, _CPA_INFEASIBLE_FIXED_WIDTH, ceiling
+
+    # Without a memory constraint the gradient result is independent of modeled overlap, and the
+    # reference makespan cannot improve by reducing its concurrency ceiling. Avoid repeating the
+    # identical allocation for every value (the usual default ceiling is the machine width).
+    overlaps = (ceiling,) if mem_budget is None else range(ceiling, 0, -1)
+    best: tuple[dict[str, int], str, int] | None = None
+    best_makespan = math.inf
+    for modeled_max_steps in overlaps:
+        candidate = _cpa_allocate_at_overlap(
+            cfg,
+            speedups,
+            admissible,
+            wall,
+            successors,
+            P,
+            mem_budget,
+            modeled_max_steps,
+        )
+        if candidate is None:
+            continue
+        widths, stop_reason = candidate
+        makespan = _cpa_candidate_makespan(
+            cfg, widths, wall, successors, P, modeled_max_steps
+        )
+        if best is None or makespan < best_makespan:
+            best = widths, stop_reason, modeled_max_steps
+            best_makespan = makespan
+
+    if best is None:
+        # Footprint is monotone in the overlap ceiling, so no feasible candidate means a single
+        # runnable step at its narrowest admissible width exceeds the memory budget.
+        return seed, admissible, wall, _CPA_INFEASIBLE_MEMORY, 1
+    widths, stop_reason, modeled_max_steps = best
+    return widths, admissible, wall, stop_reason, modeled_max_steps
 
 
 def allocate_widths(
@@ -1295,6 +1645,7 @@ def allocate_widths(
     est: Mapping[str, float],
     core_budget: int,
     mem_budget: int | None = None,
+    max_steps: int | None = None,
 ) -> dict[str, int]:
     """The pure CPA allocator: pick each step's inner-jobs width to balance the critical path
     against the per-core area over the measured speedup curves, subject to the core budget ``P``
@@ -1304,8 +1655,9 @@ def allocate_widths(
     unlike :func:`build_plan`, this low-level API has no plan summary in which to carry an
     infeasibility stop reason. See PLANNER_DESIGN.md and :func:`_cpa_allocate`.
     """
-    widths, _admissible, _wall, reason = _cpa_allocate(
-        cfg, speedups, est, core_budget, mem_budget
+    active_budget = max(1, max_steps if max_steps is not None else max(1, core_budget))
+    widths, _admissible, _wall, reason, _modeled_max_steps = _cpa_allocate(
+        cfg, speedups, est, core_budget, mem_budget, active_budget
     )
     if reason == _CPA_INFEASIBLE_FIXED_WIDTH:
         raise InfeasibleAllocationError(
@@ -1316,7 +1668,7 @@ def allocate_widths(
         raise InfeasibleAllocationError(
             core_budget,
             mem_budget=mem_budget,
-            memory_footprint=_cpa_footprint(cfg, widths),
+            memory_footprint=_cpa_footprint(cfg, widths, speedups, 1),
         )
     return widths
 
@@ -1327,6 +1679,7 @@ def _cpa_simulate_makespan(
     weight: Mapping[str, float],
     order: Sequence[str],
     core_budget: int,
+    max_steps: int,
 ) -> float:
     """A deterministic no-overcommit reference schedule of the allocated widths.
 
@@ -1353,6 +1706,8 @@ def _cpa_simulate_makespan(
             for tag in order:
                 if tag not in pending:
                     continue
+                if len(running) >= max(1, max_steps):
+                    break
                 step = by_tag[tag]
                 if not all(d in done for d in step.deps):
                     continue
@@ -1389,10 +1744,12 @@ def _build_cpa_plan(
     successors: Mapping[str, list[str]],
     core_budget: int | None,
     mem_budget: int | None,
+    max_steps: int | None,
 ) -> Plan:
     """Two-phase CPA plan: allocate widths (phase 1), then critical-path list-schedule at the
     allocated weights ``T_i(p_i)`` (phase 2). See PLANNER_DESIGN.md §4."""
     P = core_budget if (core_budget is not None and core_budget > 0) else 1
+    active_budget = max(1, max_steps if max_steps is not None else P)
     bounded_speedups: dict[str, StepSpeedup] = {}
     by_tag = cfg.by_tag()
     for tag, speedup in speedups.items():
@@ -1416,7 +1773,11 @@ def _build_cpa_plan(
         memory_steps.append(
             replace(
                 step,
-                hint=replace(step.hint, rss_baseline_bytes=rss),
+                hint=replace(
+                    step.hint,
+                    rss_baseline_bytes=rss,
+                    rss_baseline_inner_jobs=None,
+                ),
                 deps=list(step.deps),
                 env=dict(step.env),
             )
@@ -1424,22 +1785,23 @@ def _build_cpa_plan(
     memory_cfg = replace(
         cfg, steps=tuple(memory_steps), resource_caps=dict(cfg.resource_caps)
     )
-    widths, _admissible, wall, stop_reason = _cpa_allocate(
-        memory_cfg, bounded_speedups, est, P, mem_budget
+    widths, _admissible, wall, stop_reason, modeled_max_steps = _cpa_allocate(
+        memory_cfg, bounded_speedups, est, P, mem_budget, active_budget
     )
     weight = {step.tag: wall[step.tag][widths[step.tag]] for step in cfg.steps}
     bottom = _bottom_levels(cfg, weight, successors)
     critical, t_cp = _critical_path(cfg, bottom, successors)
     order = _plan_order(cfg, Planner.CRITICAL_PATH, weight, bottom)
-    area = 0.0
-    for step in cfg.steps:
-        area += widths[step.tag] * weight[step.tag]
+    area = sum(
+        _cpu_work_at(bounded_speedups, step.tag, widths[step.tag], weight[step.tag])
+        for step in cfg.steps
+    )
     t_a = area / P
     lower_bound = t_cp if t_cp >= t_a else t_a
     modeled = (
         math.inf
         if stop_reason in {_CPA_INFEASIBLE_FIXED_WIDTH, _CPA_INFEASIBLE_MEMORY}
-        else _cpa_simulate_makespan(cfg, widths, weight, order, P)
+        else _cpa_simulate_makespan(cfg, widths, weight, order, P, modeled_max_steps)
     )
     allocation = Allocation(
         core_budget=P,
@@ -1449,6 +1811,7 @@ def _build_cpa_plan(
         lower_bound_s=lower_bound,
         modeled_makespan_s=modeled,
         stop_reason=stop_reason,
+        modeled_max_steps=modeled_max_steps,
     )
     entries: list[PlanEntry] = []
     for step in cfg.steps:
@@ -1464,13 +1827,19 @@ def _build_cpa_plan(
             else None
         )
         uses_curve = curve_level is not None
+        modeled_rss, rss_is_exact = _modeled_memory_at(
+            bounded_speedups, tag, widths[tag], r[2]
+        )
+        _exact, floor = _memory_evidence_at(bounded_speedups, tag, widths[tag])
+        modeled_rss_source = "store" if rss_is_exact or floor is not None else r[3]
         entries.append(
             PlanEntry(
                 tag=tag,
                 est_duration_s=weight[tag],
                 est_source="store" if uses_curve else r[1],
-                rss_estimate_bytes=r[2],
-                rss_source=r[3],
+                rss_estimate_bytes=modeled_rss,
+                rss_source=modeled_rss_source,
+                rss_estimate_inner_jobs=(widths[tag] if rss_is_exact else None),
                 bottom_level_s=bottom[tag],
                 samples=curve_level.samples if curve_level is not None else r[4],
                 speedup=None if step.skip_reason is not None else bounded_speedups.get(tag),
@@ -1507,6 +1876,7 @@ def build_plan(
     speedups: Mapping[str, StepSpeedup] | None = None,
     core_budget: int | None = None,
     mem_budget: int | None = None,
+    max_steps: int | None = None,
 ) -> Plan:
     """Resolve every step's estimate (store-over-hint-over-default) and build the plan for
     ``planner``: the per-step resolved estimates, the critical path, and the dispatch order.
@@ -1533,7 +1903,16 @@ def build_plan(
         est[step.tag] = r[0]
     successors = _successors(cfg)
     if planner is Planner.CPA:
-        return _build_cpa_plan(cfg, resolved, est, speedups, successors, core_budget, mem_budget)
+        return _build_cpa_plan(
+            cfg,
+            resolved,
+            est,
+            speedups,
+            successors,
+            core_budget,
+            mem_budget,
+            max_steps,
+        )
     display_speedups = speedups
     if core_budget is not None:
         display_speedups = {
@@ -1541,24 +1920,54 @@ def build_plan(
             for tag, speedup in speedups.items()
             if (bounded := _speedup_within_budget(speedup, core_budget)) is not None
         }
-    bottom = _bottom_levels(cfg, est, successors)
-    critical, length = _critical_path(cfg, bottom, successors)
-    order = _plan_order(cfg, planner, est, bottom)
-    entries = tuple(
-        PlanEntry(
-            tag=step.tag,
-            est_duration_s=resolved[step.tag][0],
-            est_source=resolved[step.tag][1],
-            rss_estimate_bytes=resolved[step.tag][2],
-            rss_source=resolved[step.tag][3],
-            bottom_level_s=bottom[step.tag],
-            samples=resolved[step.tag][4],
-            speedup=(
-                None if step.skip_reason is not None else display_speedups.get(step.tag)
-            ),
+    level_by_tag: dict[str, SpeedupLevel] = {}
+    modeled_est = dict(est)
+    for step in cfg.steps:
+        speedup = display_speedups.get(step.tag)
+        effective = effective_cpu_count(step, cfg.default_step_cpu_count)
+        if speedup is None or effective is None:
+            continue
+        level = next(
+            (point for point in speedup.levels if point.inner_jobs == effective), None
         )
-        for step in cfg.steps
-    )
+        if level is not None:
+            level_by_tag[step.tag] = level
+            modeled_est[step.tag] = level.wall_s
+    bottom = _bottom_levels(cfg, modeled_est, successors)
+    critical, length = _critical_path(cfg, bottom, successors)
+    order = _plan_order(cfg, planner, modeled_est, bottom)
+    entries_list: list[PlanEntry] = []
+    for step in cfg.steps:
+        r = resolved[step.tag]
+        speedup = None if step.skip_reason is not None else display_speedups.get(step.tag)
+        level = level_by_tag.get(step.tag)
+        effective = effective_cpu_count(step, cfg.default_step_cpu_count)
+        width_memory, rss_is_exact = (
+            _modeled_memory_at(display_speedups, step.tag, effective, r[2])
+            if effective is not None
+            else (r[2], False)
+        )
+        _exact, floor = (
+            _memory_evidence_at(display_speedups, step.tag, effective)
+            if effective is not None
+            else (None, None)
+        )
+        entries_list.append(
+            PlanEntry(
+                tag=step.tag,
+                est_duration_s=level.wall_s if level is not None else r[0],
+                est_source="store" if level is not None else r[1],
+                rss_estimate_bytes=width_memory,
+                rss_source="store" if rss_is_exact or floor is not None else r[3],
+                rss_estimate_inner_jobs=(
+                    effective if rss_is_exact else None
+                ),
+                bottom_level_s=bottom[step.tag],
+                samples=level.samples if level is not None else r[4],
+                speedup=speedup,
+            )
+        )
+    entries = tuple(entries_list)
     return Plan(
         planner=planner,
         order=tuple(order),
@@ -1616,6 +2025,9 @@ def apply_plan_to_config(cfg: DagConfig, plan: Plan) -> DagConfig:
             resources=step.hint.resources,
             est_duration_s=entry.est_duration_s,
             rss_baseline_bytes=rss,
+            rss_baseline_inner_jobs=(
+                entry.rss_estimate_inner_jobs if entry.rss_source == "store" else None
+            ),
             hard_mem_max_bytes=step.hint.hard_mem_max_bytes,
             classification=step.hint.classification,
             preferred_inner_jobs=inner,
@@ -1659,8 +2071,10 @@ def _opt_int_json(value: int | None) -> str:
     return "null" if value is None else str(value)
 
 
-def _speedup_level_json(level: SpeedupLevel) -> str:
+def _speedup_level_json(level: SpeedupLevel, baseline_inner_jobs: int) -> str:
     """One speedup-curve level as a single-line JSON object (byte-identical across builds)."""
+    width_ratio = level.inner_jobs / max(1, baseline_inner_jobs)
+    parallel_efficiency = level.speedup / width_ratio if width_ratio > 0.0 else 0.0
     return (
         f'{{"inner_jobs": {level.inner_jobs}, "wall_s": "{_fmt_secs(level.wall_s)}", '
         f'"raw_wall_s": {_opt_secs_json(level.raw_wall_s)}, '
@@ -1668,7 +2082,13 @@ def _speedup_level_json(level: SpeedupLevel) -> str:
         f'"wall_max_s": {_opt_secs_json(level.wall_max_s)}, '
         f'"speedup": "{_fmt_secs(level.speedup)}", "cpu_s": {_opt_secs_json(level.cpu_s)}, '
         f'"effective_cores": {_opt_secs_json(level.effective_cores)}, '
-        f'"throttled_s": {_opt_secs_json(level.throttled_s)}, "samples": {level.samples}}}'
+        f'"throttled_s": {_opt_secs_json(level.throttled_s)}, '
+        f'"peak_bytes": {_opt_int_json(level.peak_bytes)}, '
+        f'"peak_samples": {level.peak_samples}, '
+        f'"peak_floor_bytes": {_opt_int_json(level.peak_floor_bytes)}, '
+        f'"peak_floor_samples": {level.peak_floor_samples}, '
+        f'"parallel_efficiency": "{_fmt_secs(parallel_efficiency)}", '
+        f'"samples": {level.samples}}}'
     )
 
 
@@ -1678,7 +2098,10 @@ def _speedup_to_json(speedup: "StepSpeedup | None") -> str:
     ``\"speedup\": `` at the step object's 6-space field indent."""
     if speedup is None:
         return "null"
-    levels = ",\n".join(f"          {_speedup_level_json(level)}" for level in speedup.levels)
+    levels = ",\n".join(
+        f"          {_speedup_level_json(level, speedup.baseline_inner_jobs)}"
+        for level in speedup.levels
+    )
     return (
         "{\n"
         f'        "baseline_inner_jobs": {speedup.baseline_inner_jobs},\n'
@@ -1692,6 +2115,82 @@ def _speedup_to_json(speedup: "StepSpeedup | None") -> str:
     )
 
 
+def scaling_model_path(
+    profile_dir: str | Path, machine_id: str, container_class: str
+) -> Path:
+    """Path of the rebuildable, machine/container-specific scaling-model sidecar."""
+    return Path(profile_dir) / f"scaling_model_{machine_id}_{container_class}.json"
+
+
+def scaling_model_to_json(
+    machine_id: str,
+    container_class: str,
+    speedups: Mapping[str, StepSpeedup],
+    workload_digests: Mapping[str, str] | None = None,
+) -> str:
+    """Serialize the fitted empirical scaling model as deterministic JSON.
+
+    The authored DAG remains portable policy. This sidecar is an inspectable, rebuildable cache of
+    the machine-specific model derived from the raw CSV/portable summary; planners continue to use
+    the same fitting functions, so the saved explanation and live decisions cannot drift.
+    """
+    steps: list[str] = []
+    workloads = workload_digests or {}
+    for tag in sorted(speedups):
+        speedup = speedups[tag]
+        levels = ",\n".join(
+            f"        {_speedup_level_json(level, speedup.baseline_inner_jobs)}"
+            for level in speedup.levels
+        )
+        steps.append(
+            "    {\n"
+            f'      "step": {_json_str(tag)},\n'
+            f'      "workload_digest": {_json_str(workloads.get(tag, ""))},\n'
+            f'      "baseline_inner_jobs": {speedup.baseline_inner_jobs},\n'
+            f'      "recommended_inner_jobs": {speedup.recommended_inner_jobs},\n'
+            f'      "regression_inner_jobs": {_opt_int_json(speedup.regression_inner_jobs)},\n'
+            '      "levels": [\n'
+            f"{levels}\n"
+            "      ]\n"
+            "    }"
+        )
+    body = ",\n".join(steps)
+    return (
+        "{\n"
+        '  "schema": 2,\n'
+        f'  "machine_id": {_json_str(machine_id)},\n'
+        f'  "container_class": {_json_str(container_class)},\n'
+        '  "plateau_wall_tolerance": "0.100",\n'
+        f'  "max_cpu_work_growth": "{_fmt_secs(_SPEEDUP_MAX_WORK_GROWTH)}",\n'
+        f'  "memory_min_samples_per_width": {_MEMORY_MIN_SAMPLES_PER_LEVEL},\n'
+        '  "steps": [\n'
+        f"{body}\n"
+        "  ]\n"
+        "}\n"
+    )
+
+
+def write_scaling_model(
+    profile_dir: str | Path,
+    machine_id: str,
+    container_class: str,
+    speedups: Mapping[str, StepSpeedup],
+    workload_digests: Mapping[str, str] | None = None,
+) -> Path:
+    """Atomically refresh the derived scaling-model sidecar and return its path."""
+    path = scaling_model_path(profile_dir, machine_id, container_class)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(
+        scaling_model_to_json(
+            machine_id, container_class, speedups, workload_digests
+        ),
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
+    return path
+
+
 def _allocation_to_json(alloc: "Allocation | None") -> str:
     """The ``"allocation"`` field value in the plan JSON: ``null`` (non-CPA planners) or a nested
     object with the core budget, area / critical-path terms, makespan lower bound + modeled
@@ -1702,6 +2201,7 @@ def _allocation_to_json(alloc: "Allocation | None") -> str:
         "{\n"
         f'    "stop_reason": {_json_str(alloc.stop_reason)},\n'
         f'    "core_budget": {alloc.core_budget},\n'
+        f'    "modeled_max_steps": {alloc.modeled_max_steps},\n'
         f'    "area_s": "{_fmt_secs(alloc.area_s)}",\n'
         f'    "area_bound_s": "{_fmt_secs(alloc.area_bound_s)}",\n'
         f'    "critical_path_s": "{_fmt_secs(alloc.critical_path_s)}",\n'
@@ -1872,6 +2372,7 @@ def _allocation_text_lines(plan: Plan) -> list[str]:
         return []
     return [
         f"allocator (cpa): {alloc.stop_reason}; P={alloc.core_budget} cores; "
+        f"modeled-max-steps={alloc.modeled_max_steps}; "
         f"critical-path={_fmt_secs(alloc.critical_path_s)}s, "
         f"area/P={_fmt_secs(alloc.area_bound_s)}s, "
         f"lower-bound={_fmt_secs(alloc.lower_bound_s)}s, "
@@ -1901,6 +2402,9 @@ def _speedup_text_lines(plan: Plan) -> list[str]:
         "regress_at",
         "eff_cores",
         "speedup@rec",
+        "par_eff@rec",
+        "cpu_growth@rec",
+        "memory@rec",
         "wall@rec discounted/raw",
         "curve(inner_jobs->speedup)",
     ]
@@ -1921,6 +2425,20 @@ def _speedup_text_lines(plan: Plan) -> list[str]:
             (lvl for lvl in speedup.levels if lvl.inner_jobs == speedup.recommended_inner_jobs),
             None,
         )
+        baseline = speedup.levels[0]
+        par_eff = (
+            at_rec.speedup / (at_rec.inner_jobs / speedup.baseline_inner_jobs)
+            if at_rec is not None and at_rec.inner_jobs > 0
+            else 0.0
+        )
+        cpu_growth = (
+            at_rec.cpu_s / baseline.cpu_s
+            if at_rec is not None
+            and at_rec.cpu_s is not None
+            and baseline.cpu_s is not None
+            and baseline.cpu_s > 0.0
+            else None
+        )
         # Both terms, always: the left number is discounted (modelled), the right one measured.
         if at_rec is None:
             walls = "-"
@@ -1938,6 +2456,9 @@ def _speedup_text_lines(plan: Plan) -> list[str]:
                 regress,
                 eff,
                 f"{knee:.2f}x",
+                f"{par_eff:.2f}",
+                "-" if cpu_growth is None else f"{cpu_growth:.2f}x",
+                _human_bytes(None if at_rec is None else at_rec.peak_bytes),
                 walls,
                 curve,
             ]
@@ -1955,8 +2476,8 @@ def _speedup_text_lines(plan: Plan) -> list[str]:
 
     out = [
         "",
-        "parallel-speedup model (recommended inner_jobs = best wall within the knee + core budget; "
-        "speedup@rec = speedup at that width):",
+        "parallel-speedup model (recommended inner_jobs = narrowest width within 10% of the best "
+        "wall, subject to CPU-work + core budgets):",
         fmt(headers),
         "  ".join("-" * w for w in widths),
     ]

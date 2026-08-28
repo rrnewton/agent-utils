@@ -1,6 +1,6 @@
 """Bounded, mergeable summaries of execution profiles.
 
-Each step-width bucket retains a deterministic sample reservoir. Summary merging is
+Each step-width-workload bucket retains a deterministic sample reservoir. Summary merging is
 commutative and associative, so distributed runs can accumulate useful planning history
 without an ever-growing raw profile store.
 """
@@ -21,6 +21,7 @@ from dagrun.estimates import (
     _affinity_width,
     _fmt_secs,
     _json_str,
+    buckets_for_workloads,
     bucketize_rows,
     step_samples_from_buckets,
     step_speedups_from_buckets,
@@ -32,6 +33,7 @@ __all__ = [
     "DEFAULT_MAX_BUCKETS",
     "SummaryError",
     "Summary",
+    "SummaryBucketKey",
     "empty",
     "summary_from_rows",
     "merge",
@@ -43,19 +45,21 @@ __all__ = [
     "summary_stats",
 ]
 
-#: On-disk schema version. Bumped only on an incompatible sample/bucket shape change; a reader
-#: refuses a version it does not understand (No Silent Failure) rather than mis-parsing it.
-SUMMARY_VERSION = 1
+#: On-disk schema version. Version 2 partitions reservoirs by workload digest so an old command's
+#: samples cannot evict the current command's curve. Version 1 remains readable and is normalized
+#: to version 2 in memory; unknown versions fail closed.
+SUMMARY_VERSION = 2
 
-#: Default reservoir size K: the maximum number of samples kept per ``(step, inner_jobs)`` bucket.
+#: Default reservoir size K: the maximum samples kept per ``(step, inner_jobs, workload)`` bucket.
 #: A merge unions two buckets then subsamples back to K, so a bucket never exceeds K regardless of
 #: how many runs contributed. 64 keeps the robust median / p90 / speedup curve statistically stable
 #: while bounding the summary at a few KB per bucket.
 DEFAULT_RESERVOIR_K = 64
 
 #: Hard cap on the number of buckets, so a pathological caller inventing unbounded step names cannot
-#: make the summary grow without bound. Real workloads have far fewer buckets (steps × widths); this
-#: only ever bites synthetic abuse. Buckets over the cap are dropped by the same content-derived
+#: make the summary grow without bound. Real workloads have far fewer buckets (steps × widths ×
+#: retained command cohorts); this only ever bites synthetic abuse. Buckets over the cap are dropped
+#: by the same content-derived
 #: stable order used for sample subsampling, so the surviving set is deterministic across builds.
 DEFAULT_MAX_BUCKETS = 4096
 
@@ -70,6 +74,11 @@ class SummaryError(Exception):
     """A summary document was malformed, carried an unknown version, or had a mismatched identity."""
 
 
+#: A summary reservoir is workload-specific. Raw estimator buckets remain ``(step, inner_jobs)``;
+#: selection converts back to that shape only after choosing one compatible cohort per step.
+SummaryBucketKey = tuple[str, int, str]
+
+
 @dataclass(frozen=True)
 class Summary:
     """A bounded, mergeable profile summary for ONE ``(machine_id, container_class)`` identity.
@@ -79,8 +88,8 @@ class Summary:
     applied within a homogeneous identity, and the speedup core budget is recovered from the
     ``container_class`` exactly as :func:`~dagrun.estimates.load_step_speedups` does.
 
-    ``buckets`` maps each ``(step, inner_jobs)`` bucket to its reservoir (a tuple of up to K
-    :class:`~dagrun.estimates.Sample`). The tuple order is not significant — every
+    ``buckets`` maps each ``(step, inner_jobs, workload_digest)`` bucket to its reservoir (a tuple
+    of up to K :class:`~dagrun.estimates.Sample`). The tuple order is not significant — every
     consumer that cares (serialization, merge) re-derives the canonical content order — but a
     freshly built / merged summary already stores each reservoir in that canonical order.
     """
@@ -88,7 +97,7 @@ class Summary:
     version: int
     machine_id: str
     container_class: str
-    buckets: Mapping[BucketKey, tuple[Sample, ...]]
+    buckets: Mapping[SummaryBucketKey, tuple[Sample, ...]]
 
 
 # --------------------------------------------------------------------------- content hashing
@@ -114,47 +123,66 @@ def _sample_canonical(sample: Sample) -> str:
     string; ``contention`` is always present; the rest are ``null`` when absent."""
     return (
         "{"
+        f'"observation_id": {_json_str(sample.observation_id)}, '
+        f'"workload_digest": {_json_str(sample.workload_digest)}, '
         f'"elapsed_s": {_opt_secs_json(sample.elapsed_s)}, '
         f'"contention": "{_fmt_secs(sample.contention)}", '
         f'"cpu_s": {_opt_secs_json(sample.cpu_s)}, '
         f'"effective_cores": {_opt_secs_json(sample.effective_cores)}, '
         f'"throttled_s": {_opt_secs_json(sample.throttled_s)}, '
-        f'"peak_bytes": {"null" if sample.peak_bytes is None else str(sample.peak_bytes)}'
+        f'"peak_bytes": {"null" if sample.peak_bytes is None else str(sample.peak_bytes)}, '
+        f'"uncensored_peak_bytes": '
+        f'{"null" if sample.uncensored_peak_bytes is None else str(sample.uncensored_peak_bytes)}, '
+        f'"peak_floor_bytes": '
+        f'{"null" if sample.peak_floor_bytes is None else str(sample.peak_floor_bytes)}'
         "}"
     )
 
 
 def _sample_sort_key(sample: Sample) -> tuple[int, str]:
-    """The stable, content-derived sort key ``(fnv_hash, canonical_json)`` a reservoir is ordered /
-    subsampled by. The canonical JSON is pure ASCII (digits, ``.``, ``-``, structural chars, and
-    ``null``), so Python's code-point string order equals Rust's UTF-8 byte order — the tie-break is
-    identical across builds."""
+    """The stable observation-derived rank ``(fnv_hash, canonical_json)`` for a reservoir.
+
+    New rows carry a unique observation id, so repeated equal-valued observations each retain their
+    proper chance of entering the reservoir. Legacy samples without an id fall back to canonical
+    content. The canonical JSON tie-break has identical ordering in both implementations."""
     canon = _sample_canonical(sample)
-    return (_fnv1a_64(canon.encode("utf-8")), canon)
+    identity = sample.observation_id or canon
+    return (_fnv1a_64(identity.encode("utf-8")), canon)
 
 
 def _ordered(samples: Sequence[Sample], cap: int | None) -> tuple[Sample, ...]:
-    """Return ``samples`` in canonical content order, optionally truncated to the first ``cap``.
+    """Return deterministic bottom-k order, optionally truncated to ``cap`` observations.
 
-    Sorting by :func:`_sample_sort_key` is the deterministic subsample: the smallest-``cap`` samples
-    by the content hash. Because the order is a fixed total order on sample CONTENT, taking the
-    first ``cap`` of a union is commutative and associative — the mergeable-summary property."""
-    ordered = sorted(samples, key=_sample_sort_key)
+    The rank is a fixed total order on observation identities, so taking the first ``cap`` of a
+    union is commutative and associative — the mergeable-summary property."""
+    # The same run may arrive through local history and a downloaded summary. Deduplicate a known
+    # observation id before bottom-k selection, choosing the canonical-smaller payload if corrupt
+    # inputs disagree so merge remains commutative. Empty legacy ids remain distinct.
+    known: dict[str, Sample] = {}
+    legacy: list[Sample] = []
+    for sample in samples:
+        if not sample.observation_id:
+            legacy.append(sample)
+            continue
+        previous = known.get(sample.observation_id)
+        if previous is None or _sample_canonical(sample) < _sample_canonical(previous):
+            known[sample.observation_id] = sample
+    ordered = sorted([*known.values(), *legacy], key=_sample_sort_key)
     if cap is not None and len(ordered) > cap:
         ordered = ordered[:cap]
     return tuple(ordered)
 
 
-def _bucket_sort_key(key: BucketKey) -> tuple[int, str]:
+def _bucket_sort_key(key: SummaryBucketKey) -> tuple[int, str]:
     """The content-derived stable order buckets are dropped by when over :data:`DEFAULT_MAX_BUCKETS`
-    (same FNV-1a scheme as samples, over a canonical ``step:inner`` rendering)."""
-    canon = f"{_json_str(key[0])}:{key[1]}"
+    (same FNV-1a scheme as samples, over a canonical ``step:inner:workload`` rendering)."""
+    canon = f"{_json_str(key[0])}:{key[1]}:{_json_str(key[2])}"
     return (_fnv1a_64(canon.encode("utf-8")), canon)
 
 
 def _cap_buckets(
-    buckets: Mapping[BucketKey, tuple[Sample, ...]], max_buckets: int
-) -> dict[BucketKey, tuple[Sample, ...]]:
+    buckets: Mapping[SummaryBucketKey, tuple[Sample, ...]], max_buckets: int
+) -> dict[SummaryBucketKey, tuple[Sample, ...]]:
     """Drop buckets beyond ``max_buckets`` by the content-derived stable order, so the surviving set
     is deterministic across builds. A no-op for a normal workload (far fewer buckets than the cap)."""
     if len(buckets) <= max_buckets:
@@ -187,10 +215,22 @@ def summary_from_rows(
     max_buckets: int = DEFAULT_MAX_BUCKETS,
 ) -> Summary:
     """Build a bounded summary from raw profile ``rows`` (a CSV store's rows, or this run's per-step
-    profile rows stringified). Each ``(step, inner_jobs)`` reservoir is subsampled to
+    profile rows stringified). Each ``(step, inner_jobs, workload_digest)`` reservoir is subsampled to
     ``reservoir_cap``; the whole summary is capped at ``max_buckets`` buckets."""
-    raw = bucketize_rows(rows, affinity_width)
-    capped = {key: _ordered(samples, reservoir_cap) for key, samples in raw.items()}
+    identified: list[Mapping[str, str]] = []
+    for index, row in enumerate(rows):
+        if row.get("observation_id") or row.get("run_id"):
+            identified.append(row)
+            continue
+        material = "\0".join(f"{key}={row[key]}" for key in sorted(row))
+        generated = f"legacy-{_fnv1a_64(material.encode('utf-8')):016x}-{index:016x}"
+        identified.append({**row, "observation_id": generated})
+    raw = bucketize_rows(identified, affinity_width)
+    partitioned: dict[SummaryBucketKey, list[Sample]] = {}
+    for (step, inner), samples in raw.items():
+        for sample in samples:
+            partitioned.setdefault((step, inner, sample.workload_digest), []).append(sample)
+    capped = {key: _ordered(samples, reservoir_cap) for key, samples in partitioned.items()}
     return Summary(
         version=SUMMARY_VERSION,
         machine_id=machine_id,
@@ -219,7 +259,7 @@ def merge(
             f"cannot merge summaries of different identities: "
             f"{a.machine_id}/{a.container_class} vs {b.machine_id}/{b.container_class}"
         )
-    merged: dict[BucketKey, tuple[Sample, ...]] = {}
+    merged: dict[SummaryBucketKey, tuple[Sample, ...]] = {}
     for key in set(a.buckets) | set(b.buckets):
         combined = list(a.buckets.get(key, ())) + list(b.buckets.get(key, ()))
         merged[key] = _ordered(combined, reservoir_cap)
@@ -253,7 +293,7 @@ def merge_all(
 def to_json(summary: Summary) -> str:
     """Canonical, byte-identical (py<->rs) JSON for a summary (2-space indent).
 
-    Buckets are sorted by ``(step, inner_jobs)``; each reservoir's samples are emitted in the
+    Buckets are sorted by ``(step, inner_jobs, workload_digest)``; each reservoir's samples are emitted in the
     canonical content order (:func:`_ordered`). Floats are fixed 3-decimal strings, so the output
     depends only on the shared fixed-precision formatting — never on float ``repr``."""
     lines: list[str] = [
@@ -269,12 +309,13 @@ def to_json(summary: Summary) -> str:
         return "\n".join(lines)
     lines.append('  "buckets": [')
     bucket_blocks: list[str] = []
-    for step, inner in keys:
-        samples = _ordered(summary.buckets[(step, inner)], None)
+    for step, inner, workload in keys:
+        samples = _ordered(summary.buckets[(step, inner, workload)], None)
         block = [
             "    {",
             f'      "step": {_json_str(step)},',
             f'      "inner_jobs": {inner},',
+            f'      "workload_digest": {_json_str(workload)},',
         ]
         if not samples:
             block.append('      "samples": []')
@@ -346,15 +387,34 @@ def _req_int(m: Mapping[str, object], key: str, where: str) -> int:
     return value
 
 
-def _sample_from_obj(obj: object, where: str) -> Sample:
+def _sample_from_obj(obj: object, where: str, default_workload_digest: str = "") -> Sample:
     m = _as_obj(obj, where)
+    observation_id = m.get("observation_id", "")
+    if not isinstance(observation_id, str):
+        raise SummaryError(f"invalid summary: {where}.observation_id must be a string")
+    workload_digest = m.get("workload_digest", default_workload_digest)
+    if not isinstance(workload_digest, str):
+        raise SummaryError(f"invalid summary: {where}.workload_digest must be a string")
+    peak_bytes = _opt_int(m, "peak_bytes", where)
+    # Version-1 summaries written before censoring provenance existed treated every peak as exact.
+    # Preserve that behavior only when the new field is absent; an explicit null means modern
+    # provenance classified the raw peak as censored or unknown.
+    uncensored_peak = (
+        _opt_int(m, "uncensored_peak_bytes", where)
+        if "uncensored_peak_bytes" in m
+        else peak_bytes
+    )
     return Sample(
         elapsed_s=_opt_secs(m, "elapsed_s", where),
         contention=_opt_secs(m, "contention", where) or 0.0,
         cpu_s=_opt_secs(m, "cpu_s", where),
         effective_cores=_opt_secs(m, "effective_cores", where),
         throttled_s=_opt_secs(m, "throttled_s", where),
-        peak_bytes=_opt_int(m, "peak_bytes", where),
+        peak_bytes=peak_bytes,
+        uncensored_peak_bytes=uncensored_peak,
+        peak_floor_bytes=_opt_int(m, "peak_floor_bytes", where),
+        observation_id=observation_id,
+        workload_digest=workload_digest,
     )
 
 
@@ -366,54 +426,99 @@ def from_json(text: str) -> Summary:
         raise SummaryError(f"invalid summary JSON: {exc}") from exc
     doc = _as_obj(raw, "summary")
     version = _req_int(doc, "version", "summary")
-    if version != SUMMARY_VERSION:
+    if version not in (1, SUMMARY_VERSION):
         raise SummaryError(
-            f"unsupported summary version {version} (this build understands {SUMMARY_VERSION})"
+            f"unsupported summary version {version} (this build understands 1 and {SUMMARY_VERSION})"
         )
     machine_id = _req_str(doc, "machine_id", "summary")
     container_class = _req_str(doc, "container_class", "summary")
     buckets_raw = doc.get("buckets", [])
     if not isinstance(buckets_raw, list):
         raise SummaryError("invalid summary: buckets must be a list")
-    buckets: dict[BucketKey, tuple[Sample, ...]] = {}
+    bucket_lists: dict[SummaryBucketKey, list[Sample]] = {}
     for i, bucket_obj in enumerate(buckets_raw):
         where = f"buckets[{i}]"
         bucket = _as_obj(bucket_obj, where)
         step = _req_str(bucket, "step", where)
         inner = _req_int(bucket, "inner_jobs", where)
+        workload = _req_str(bucket, "workload_digest", where) if version >= 2 else ""
         samples_raw = bucket.get("samples", [])
         if not isinstance(samples_raw, list):
             raise SummaryError(f"invalid summary: {where}.samples must be a list")
-        samples = tuple(
-            _sample_from_obj(s, f"{where}.samples[{j}]") for j, s in enumerate(samples_raw)
-        )
-        buckets[(step, inner)] = samples
+        samples = [
+            _sample_from_obj(s, f"{where}.samples[{j}]", workload)
+            for j, s in enumerate(samples_raw)
+        ]
+        if version == 1:
+            # Schema 1 had no workload identity. Treat even an unknown extension field as blank so
+            # migration is deterministic and matches the documented compatibility cohort.
+            samples = [
+                Sample(
+                    elapsed_s=sample.elapsed_s,
+                    contention=sample.contention,
+                    cpu_s=sample.cpu_s,
+                    effective_cores=sample.effective_cores,
+                    throttled_s=sample.throttled_s,
+                    peak_bytes=sample.peak_bytes,
+                    uncensored_peak_bytes=sample.uncensored_peak_bytes,
+                    peak_floor_bytes=sample.peak_floor_bytes,
+                    observation_id=sample.observation_id,
+                    workload_digest="",
+                )
+                for sample in samples
+            ]
+        if version >= 2 and any(sample.workload_digest != workload for sample in samples):
+            raise SummaryError(
+                f"invalid summary: {where} sample workload_digest does not match its bucket"
+            )
+        if samples:
+            for sample in samples:
+                bucket_lists.setdefault((step, inner, sample.workload_digest), []).append(sample)
+        else:
+            bucket_lists.setdefault((step, inner, workload), [])
     return Summary(
-        version=version,
+        version=SUMMARY_VERSION,
         machine_id=machine_id,
         container_class=container_class,
-        buckets=buckets,
+        buckets={key: _ordered(samples, None) for key, samples in bucket_lists.items()},
     )
 
 
 # --------------------------------------------------------------------------- estimate recompute
 
 
-def step_samples_from_summary(summary: Summary) -> dict[str, StepSamples]:
+def _estimator_buckets(
+    summary: Summary, workload_digests: Mapping[str, str] | None
+) -> dict[BucketKey, list[Sample]]:
+    """Select one workload cohort per step, then collapse summary keys for the estimators."""
+
+    combined: dict[BucketKey, list[Sample]] = {}
+    for (step, inner, _workload), samples in summary.buckets.items():
+        combined.setdefault((step, inner), []).extend(samples)
+    return buckets_for_workloads(combined, workload_digests)
+
+
+def step_samples_from_summary(
+    summary: Summary, workload_digests: Mapping[str, str] | None = None
+) -> dict[str, StepSamples]:
     """Recompute the per-step duration + memory estimates from a summary's reservoirs, via the SAME
     estimator core the CSV reader uses (:func:`~dagrun.estimates.step_samples_from_buckets`)."""
-    return step_samples_from_buckets(summary.buckets)
+    return step_samples_from_buckets(_estimator_buckets(summary, workload_digests))
 
 
 def step_speedups_from_summary(
-    summary: Summary, core_budget: int | None = None
+    summary: Summary,
+    core_budget: int | None = None,
+    workload_digests: Mapping[str, str] | None = None,
 ) -> dict[str, StepSpeedup]:
     """Recompute the per-step parallel-speedup curves from a summary's reservoirs. ``core_budget``
     defaults to the affinity width parsed from the summary's ``container_class`` — exactly what
     :func:`~dagrun.estimates.load_step_speedups` uses — so a summary reproduces the CSV
     reader's recommendations."""
     budget = core_budget if core_budget is not None else _affinity_width(summary.container_class)
-    return step_speedups_from_buckets(summary.buckets, budget)
+    return step_speedups_from_buckets(
+        _estimator_buckets(summary, workload_digests), budget
+    )
 
 
 def summary_stats(summary: Summary) -> tuple[int, int, int]:

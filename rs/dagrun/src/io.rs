@@ -529,6 +529,8 @@ fn hint_from(value: Option<&Value>, where_: &str) -> Result<ResourceHint, DagJso
         resources: opt_str_int_map(obj, "resources", where_)?,
         est_duration_s: opt_float(obj, "est_duration_s", 0.0)?,
         rss_baseline_bytes: opt_int_or_none(obj, "rss_baseline_bytes")?,
+        // Planner-only provenance. It is intentionally not part of the authored DAG schema.
+        rss_baseline_inner_jobs: None,
         hard_mem_max_bytes: opt_int_or_none(obj, "hard_mem_max_bytes")?,
         classification,
         preferred_inner_jobs: opt_int_or_none(obj, "preferred_inner_jobs")?,

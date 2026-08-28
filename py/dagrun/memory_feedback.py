@@ -533,10 +533,19 @@ def apply_memory_admissions(
         else:
             new_steps.append(step)
             continue
-        if baseline == step.hint.rss_baseline_bytes:
+        if (
+            baseline == step.hint.rss_baseline_bytes
+            and step.hint.rss_baseline_inner_jobs is None
+        ):
             new_steps.append(step)
             continue
-        new_hint = replace(step.hint, rss_baseline_bytes=baseline)
+        # This estimator is width-independent. Clear any exact-width provenance installed by a
+        # prior scaling plan so the runtime does not mistake this replacement for M(p).
+        new_hint = replace(
+            step.hint,
+            rss_baseline_bytes=baseline,
+            rss_baseline_inner_jobs=None,
+        )
         new_steps.append(
             replace(step, hint=new_hint, deps=list(step.deps), env=dict(step.env))
         )

@@ -750,7 +750,7 @@ mod tests {
         let ours = GitBranchBackend::new(url.clone(), "profile-data", ".").with_before_push(hook);
         let merged = pub_delta(&ours, "g.ours", 1.0);
         let steps: std::collections::BTreeSet<String> =
-            merged.buckets.keys().map(|(s, _)| s.clone()).collect();
+            merged.buckets.keys().map(|(s, _, _)| s.clone()).collect();
         assert_eq!(
             steps,
             ["g.concurrent".to_string(), "g.ours".to_string()]
@@ -762,7 +762,7 @@ mod tests {
             .download(MID, CC)
             .unwrap();
         let final_steps: std::collections::BTreeSet<String> =
-            final_.buckets.keys().map(|(s, _)| s.clone()).collect();
+            final_.buckets.keys().map(|(s, _, _)| s.clone()).collect();
         assert_eq!(final_steps.len(), 2);
         let _ = fs::remove_dir_all(&dir);
     }

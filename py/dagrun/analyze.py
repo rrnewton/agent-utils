@@ -29,8 +29,10 @@ COL_AMBIENT = "ambient_bucket"
 COL_DURATION_S = "elapsed_s"
 #: Measured effective cores kept busy by the step.
 COL_EFFECTIVE_CORES = "effective_cores"
-#: Measured peak resident memory in bytes.
-COL_MEMORY_PEAK_BYTES = "memory_peak_bytes"
+#: Measured cgroup memory high-water mark in bytes. This MUST match the writer's ``peak_bytes``
+#: column; the older ``memory_peak_bytes`` spelling never existed in the profile schema and made
+#: every analysis summary silently omit memory.
+COL_MEMORY_PEAK_BYTES = "peak_bytes"
 
 #: Sentinel ambient value that disables filtering.
 AMBIENT_ALL = "all"

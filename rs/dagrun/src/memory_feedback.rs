@@ -553,11 +553,16 @@ pub fn apply_memory_admissions(
                     None => return step.clone(),
                 },
             };
-            if baseline == step.hint.rss_baseline_bytes {
+            if baseline == step.hint.rss_baseline_bytes
+                && step.hint.rss_baseline_inner_jobs.is_none()
+            {
                 return step.clone();
             }
             let mut out = step.clone();
             out.hint.rss_baseline_bytes = baseline;
+            // This estimator is width-independent. Clear exact-width provenance from a prior
+            // scaling plan so runtime sizing does not mistake this replacement for M(p).
+            out.hint.rss_baseline_inner_jobs = None;
             out
         })
         .collect();

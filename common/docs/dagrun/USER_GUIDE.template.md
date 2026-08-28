@@ -325,9 +325,12 @@ exceeds the run budget, the run is refused before any DAG step process is
 created because silently throttling (for example) a hardcoded `make -j32`
 inside `--max-cpus 16` would oversubscribe and mislabel its memory/profile data.
 File-backed runs reject before cgroup setup; a stdin DAG may already have
-entered its outer scope before it can be read and validated. A sweep likewise
-requires at least one effective width channel, since otherwise changing
-`sweep --jobs` would not change the guest.
+entered its outer scope before it can be read and validated. The single-step
+sweep likewise refuses a step with no effective width channel,
+since changing `sweep --jobs` would not change the guest. A graph-wide
+target-time sweep handles such a fixed node explicitly instead: it characterizes
+the configured width once when that width fits the effective CPU budget, or
+visibly skips it when it cannot run honestly on this machine.
 
 The runner cannot infer hidden concurrency that a command does not declare. An
 arbitrary guest may still create more threads than `--max-cpus`; outer
@@ -607,15 +610,124 @@ a graph, so prefer this to a hand-rolled loop.
 
 ## Profiles, sweeps, and portable summaries
 
-Runs append resource samples to `./.dagrun/profiles/` by default. Override the
-directory with `--perf-dir` or `DAGRUN_PROFILE_DIR`; disable writes with
-`--no-profile`. `--profile` prints the current run's per-step table.
+Runs and sweeps append raw resource samples to `./.dagrun/profiles/` by default,
+relative to the process's current working directory. The write-location
+precedence is `--perf-dir DIR`, then `DAGRUN_PROFILE_DIR`, then the default.
+`--no-profile` disables writes. Reading is independent: use
+`--no-profile-feedback` when a plan must ignore an existing store. Every writer
+prints the exact CSV paths it appended, so profiling is never silent. The store
+is machine-local measurement data and should normally be ignored by source
+control.
 
-Measure one step across inner widths with:
+The original one-step dense sweep remains available:
 
 ```sh
 dagrun sweep --dag pipeline.yaml --step build.app --jobs 1..8
 ```
+
+For a graph-wide experiment, give a soft target allowance:
+
+```sh
+dagrun sweep --dag pipeline.yaml --target-time 10m
+```
+
+`--target-time` accepts a bare number of seconds or an `ms`, `s`, `m`, or `h`
+suffix. It is an allowance, not a timeout: pass 1 always completes, even when it
+runs past the target, and reports both its elapsed time and overrun. A later
+pass starts only while elapsed time is still below the target; after it starts,
+the entire pass is atomic and is never killed for crossing the target.
+
+Within each pass, nodes run **one at a time** in stable topological order, so a
+node's measurements are not contaminated by another DAG node running beside
+it. Pass 1 uses powers of two through the process-visible physical-core count,
+then the exact physical-core and logical-thread counts. CPU affinity and Linux
+sysfs provide that topology, tightened by any effective cgroup CPU quota. On a
+158-core / 316-thread machine, the grid is therefore
+`1,2,4,8,16,32,64,128,158,316`. Pass 2 keeps every one of those widths and adds
+the integer midpoint of each remaining gap (including 48 between 32 and 64);
+later passes repeat that cumulative bisection. Re-running the anchors gives the
+model replication as well as denser coverage.
+
+In target mode, `--step TAG` optionally limits the experiment to one node and
+`--jobs` optionally replaces the automatic first grid. It accepts the established
+`LO..HI` and bare `N` forms, plus an explicit comma list such as `1,2,4,8`.
+`--repeat K` repeats every width within every pass: every sample is persisted,
+while the displayed width row keeps the fastest wall time. A target of zero is
+useful for a mandatory-pass-only smoke run. Intentionally omitted nodes are
+reported without spawning; fixed/self-managed nodes are characterized only
+once as described above. A failed width aborts the sweep with a nonzero result;
+already-written raw rows remain, but the derived sidecar is refreshed only
+after a successful sweep.
+
+A sweep deliberately invokes each resizable command many times in the same
+working tree. The command must therefore be repeatable: it should perform the
+same work from the same inputs at every width, rather than turning later samples
+into incremental or no-op runs. If a workload mutates its inputs or outputs,
+restore them outside dagrun before starting the sweep or benchmark a clean,
+repeatable wrapper. Dagrun cannot infer a safe reset command for arbitrary DAG
+work and will not delete build products on the user's behalf.
+
+Each sample keeps the ordinary wall time, user and system CPU time, peak RSS,
+effective cores, throttling, ambient-load and pressure signals when the host
+can supply them. Target sweeps also stamp `sweep_mode`, `sweep_id`,
+`sweep_pass`, `sweep_sample`, `sweep_repeat`, `sweep_width_source`,
+`sweep_target_s`, `sweep_physical_cores`, `sweep_logical_cpus`, and a stable
+`workload_digest`, so repeated and refined measurements remain attributable.
+Planning selects the digest for the command shape currently in the DAG. Once an
+exact match exists for a step, rows carrying another non-empty digest are never
+mixed into that curve; before then, blank rows from stores created before digest
+tracking remain a compatibility fallback.
+
+### Dataset versus model
+
+The raw per-step CSV is the source of truth. The authored DAG remains portable
+policy: measured speedup and memory curves are **not written back into it**.
+The planner rebuilds a machine/container-specific model from the raw store. A
+successful profiling-enabled sweep atomically refreshes its deterministic
+derived sidecar beside the CSV as
+`scaling_model_<machine_id>_<container_class>.json`; it is an
+inspectable cache, not an authored input, and can always be deleted and rebuilt
+from the dataset. The sidecar records the selected workload digest. Portable
+summary schema 2 partitions its bounded reservoirs by `(step, width, digest)`,
+so a stale cohort cannot consume the current cohort's per-width sample budget;
+schema-1 summaries remain readable as blank-digest compatibility data.
+
+For every step and measured width, the model retains robust wall time (both raw
+and contention-discounted), total CPU seconds, achieved effective cores,
+throttling, and a width-specific memory peak. A curve requires at least two
+distinct positive widths. The recommended economic plateau is the **narrowest
+measured width within 10% of the best eligible measured wall time**, not an
+adjacent-ratio heuristic, so adding a midpoint does not move the answer merely
+by changing its neighbors. Widths whose measured CPU seconds exceed 1.5 times
+the baseline width's CPU seconds are normally excluded from plateau candidates;
+missing CPU data does not fabricate a penalty. A separately reported
+`regression_inner_jobs` requires both more than a 5% slowdown versus the fastest
+width and non-overlapping observed wall-time ranges, distinguishing a real
+cliff from a flat, noisy plateau.
+
+CPA uses measured `user_s + sys_s` as a width's CPU-work area when available.
+For older or unboxed rows without that signal it conservatively falls back to
+`inner_jobs * modeled_wall_s`. Memory is also width-specific: the exact-width
+90th-percentile peak becomes `M(p)` after at least three **uncensored** peak
+samples at that width. A peak observed at an active memory ceiling is retained
+only as a lower bound, never mistaken for exact demand. Until enough exact
+evidence exists, allocation falls back to the ordinary pooled/profile or
+authored RSS estimate and the conservative width-scaling rule; an authored hard
+cap still wins. Exact `M(p)` carries its measurement width into runtime sizing,
+so it is not multiplied by the old width heuristic a second time.
+
+For a 32-core example, CPA can compare A at eight workers plus B at twenty-four
+against both CPU capacity and their joint `M_A(8) + M_B(24)` footprint. Its
+`--max-steps` input is an upper bound, not a demand: when the requested overlap
+is memory-constrained, the model runs the fixed-overlap allocation at every
+ceiling down to serial execution and chooses the candidate with the smallest
+no-overcommit modeled makespan (ties retain more overlap). Only when no serial
+seed fits does it declare memory infeasible. Among feasible measured widths it
+spends the next cores where the positive critical-path wall reduction per added
+core is largest, while excluding CPU-work-inefficient points. Thus a poorly
+scaling task does not automatically receive either more or fewer cores;
+dependency criticality, marginal wall benefit, work inflation, memory, and the
+serial-versus-concurrent tradeoff together decide.
 
 The `summary` command builds, merges, inspects, and plans from bounded portable
 profile summaries. `run --profile-sync BACKEND` can download a shared summary
@@ -804,7 +916,7 @@ coordinate at all — and none of these mismatches announces itself:
 | `plan` | Show estimates, critical path, widths, and order without running. |
 | `list` / `ascii` / `dot` | Inspect or visualize the graph. |
 | `json` / `yaml` | Validate and convert the DAG. |
-| `sweep` | Measure one step across inner job widths. |
+| `sweep` | Measure one step or a whole DAG across inner job widths and target-time passes. |
 | `summary` | Build, merge, inspect, or consume portable profile summaries. |
 | `pin-run` | Reserve disjoint cores and run one command tree. |
 | `capabilities` | Print the enforcement-capability manifest. |

@@ -11,33 +11,39 @@
 // INERT on ephemeral CI (each runner starts with an empty store). This module is the artifact a
 // pluggable backend ([`crate::sync`]) uploads at end-of-run and downloads at start-of-run:
 //
-// * For each `(step, inner_jobs)` bucket it keeps a RESERVOIR of up to [`DEFAULT_RESERVOIR_K`]
-//   [`Sample`]s (exactly the fields the estimator + speedup model consume). Bucket count is bounded
-//   by the workload and hard-capped at [`DEFAULT_MAX_BUCKETS`], so the summary is CONSTANT-SIZED.
+// * For each `(step, inner_jobs, workload_digest)` bucket it keeps a RESERVOIR of up to
+//   [`DEFAULT_RESERVOIR_K`] [`Sample`]s (exactly the fields the estimator + speedup model consume).
+//   Separating command revisions before sampling prevents stale data from evicting the current
+//   cohort. Bucket count is hard-capped at [`DEFAULT_MAX_BUCKETS`].
 // * [`merge`] unions two summaries' reservoirs per bucket and subsamples back to K by a
 //   CONTENT-derived stable order (an FNV-1a hash of each sample's canonical serialization, then take
 //   the first K) — deterministic, COMMUTATIVE, and ASSOCIATIVE, and identical across builds.
 // * Estimates are recomputed FROM the reservoirs via the same estimator core the CSV reader uses,
 //   so a summary that has not subsampled a bucket yields byte-identical estimates to the raw rows.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use serde_json::Value;
 
 use crate::estimates::{
-    affinity_width, bucketize_rows, fmt_secs, load_store, step_samples_from_buckets,
-    step_speedups_from_buckets, BucketKey, Sample, StepSamples, StepSpeedup,
+    affinity_width, bucketize_rows, buckets_for_workloads, fmt_secs, load_store,
+    step_samples_from_buckets, step_speedups_from_buckets, BucketKey, Sample, StepSamples,
+    StepSpeedup,
 };
 use crate::io::json_str;
 
 /// On-disk schema version (bumped only on an incompatible shape change; an unknown version is
 /// refused rather than mis-parsed).
-pub const SUMMARY_VERSION: i64 = 1;
-/// Default reservoir size K: max samples kept per `(step, inner_jobs)` bucket.
+pub const SUMMARY_VERSION: i64 = 2;
+/// Default reservoir size K: max samples kept per `(step, inner_jobs, workload_digest)` bucket.
 pub const DEFAULT_RESERVOIR_K: usize = 64;
 /// Hard cap on the number of buckets (defensive constant-size guarantee).
 pub const DEFAULT_MAX_BUCKETS: usize = 4096;
+
+/// Summary reservoir identity. The workload digest is deliberately part of the key so an old
+/// command revision cannot evict samples from the current revision before planner selection.
+pub type SummaryBucketKey = (String, i64, String);
 
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x100000001b3;
@@ -66,8 +72,8 @@ pub struct Summary {
     pub machine_id: String,
     /// Stable CPU-affinity and quota class used to select compatible samples.
     pub container_class: String,
-    /// Bounded sample reservoirs keyed by step tag and inner-job width.
-    pub buckets: HashMap<BucketKey, Vec<Sample>>,
+    /// Bounded sample reservoirs keyed by step tag, inner-job width, and workload digest.
+    pub buckets: HashMap<SummaryBucketKey, Vec<Sample>>,
 }
 
 // --------------------------------------------------------------------------- content hashing
@@ -92,7 +98,9 @@ fn opt_secs_json(value: Option<f64>) -> String {
 // to the subsample hash (so they can never drift). Mirrors Python's `_sample_canonical`.
 fn sample_canonical(sample: &Sample) -> String {
     format!(
-        "{{\"elapsed_s\": {}, \"contention\": \"{}\", \"cpu_s\": {}, \"effective_cores\": {}, \"throttled_s\": {}, \"peak_bytes\": {}}}",
+        "{{\"observation_id\": {}, \"workload_digest\": {}, \"elapsed_s\": {}, \"contention\": \"{}\", \"cpu_s\": {}, \"effective_cores\": {}, \"throttled_s\": {}, \"peak_bytes\": {}, \"uncensored_peak_bytes\": {}, \"peak_floor_bytes\": {}}}",
+        json_str(&sample.observation_id),
+        json_str(&sample.workload_digest),
         opt_secs_json(sample.elapsed_s),
         fmt_secs(sample.contention),
         opt_secs_json(sample.cpu_s),
@@ -102,24 +110,51 @@ fn sample_canonical(sample: &Sample) -> String {
             None => "null".to_string(),
             Some(p) => p.to_string(),
         },
+        match sample.uncensored_peak_bytes {
+            None => "null".to_string(),
+            Some(p) => p.to_string(),
+        },
+        match sample.peak_floor_bytes {
+            None => "null".to_string(),
+            Some(p) => p.to_string(),
+        },
     )
 }
 
-// The stable content-derived sort key `(fnv_hash, canonical_json)` for a sample. The canonical JSON
-// is pure ASCII, so Rust's `String` byte order equals Python's code-point order (identical
-// tie-break). Mirrors Python's `_sample_sort_key`.
+// The stable observation-derived rank `(fnv_hash, canonical_json)` for a sample. New observations
+// have unique ids; legacy samples fall back to canonical content. The canonical JSON tie-break has
+// identical ordering in both implementations. Mirrors Python's `_sample_sort_key`.
 fn sample_sort_key(sample: &Sample) -> (u64, String) {
     let canon = sample_canonical(sample);
-    (fnv1a_64(canon.as_bytes()), canon)
+    let identity = if sample.observation_id.is_empty() {
+        canon.as_bytes()
+    } else {
+        sample.observation_id.as_bytes()
+    };
+    (fnv1a_64(identity), canon)
 }
 
-// Return `samples` in canonical content order, optionally truncated to the first `cap`. This is the
-// deterministic subsample: the smallest-`cap` samples by content hash — a fixed total order on
-// content, so first-`cap`-of-union is commutative + associative. Mirrors Python's `_ordered`.
+// Return deterministic bottom-k order, optionally truncated to the first `cap` observations.
+// Because the rank is a fixed total order on observation identities, first-cap-of-union remains
+// commutative + associative. Mirrors Python's `_ordered`.
 fn ordered(samples: &[Sample], cap: Option<usize>) -> Vec<Sample> {
-    let mut with_keys: Vec<((u64, String), Sample)> = samples
-        .iter()
-        .map(|s| (sample_sort_key(s), s.clone()))
+    let mut known: BTreeMap<String, Sample> = BTreeMap::new();
+    let mut legacy: Vec<Sample> = Vec::new();
+    for sample in samples {
+        if sample.observation_id.is_empty() {
+            legacy.push(sample.clone());
+            continue;
+        }
+        match known.get(&sample.observation_id) {
+            Some(previous) if sample_canonical(previous) <= sample_canonical(sample) => {}
+            _ => {
+                known.insert(sample.observation_id.clone(), sample.clone());
+            }
+        }
+    }
+    let combined = known.into_values().chain(legacy);
+    let mut with_keys: Vec<((u64, String), Sample)> = combined
+        .map(|sample| (sample_sort_key(&sample), sample))
         .collect();
     with_keys.sort_by(|a, b| a.0.cmp(&b.0));
     let take = match cap {
@@ -129,24 +164,24 @@ fn ordered(samples: &[Sample], cap: Option<usize>) -> Vec<Sample> {
     with_keys.into_iter().take(take).map(|(_, s)| s).collect()
 }
 
-fn bucket_sort_key(key: &BucketKey) -> (u64, String) {
-    let canon = format!("{}:{}", json_str(&key.0), key.1);
+fn bucket_sort_key(key: &SummaryBucketKey) -> (u64, String) {
+    let canon = format!("{}:{}:{}", json_str(&key.0), key.1, json_str(&key.2));
     (fnv1a_64(canon.as_bytes()), canon)
 }
 
 // Drop buckets beyond `max_buckets` by the content-derived stable order. A no-op for a normal
 // workload. Mirrors Python's `_cap_buckets`.
 fn cap_buckets(
-    buckets: HashMap<BucketKey, Vec<Sample>>,
+    buckets: HashMap<SummaryBucketKey, Vec<Sample>>,
     max_buckets: usize,
-) -> HashMap<BucketKey, Vec<Sample>> {
+) -> HashMap<SummaryBucketKey, Vec<Sample>> {
     if buckets.len() <= max_buckets {
         return buckets;
     }
-    let mut keys: Vec<BucketKey> = buckets.keys().cloned().collect();
+    let mut keys: Vec<SummaryBucketKey> = buckets.keys().cloned().collect();
     keys.sort_by_key(bucket_sort_key);
     keys.truncate(max_buckets);
-    let mut out: HashMap<BucketKey, Vec<Sample>> = HashMap::new();
+    let mut out: HashMap<SummaryBucketKey, Vec<Sample>> = HashMap::new();
     for key in keys {
         if let Some(v) = buckets.get(&key) {
             out.insert(key, v.clone());
@@ -176,9 +211,44 @@ pub fn summary_from_rows(
     reservoir_cap: usize,
     max_buckets: usize,
 ) -> Summary {
-    let raw = bucketize_rows(rows, affinity);
-    let mut capped: HashMap<BucketKey, Vec<Sample>> = HashMap::new();
-    for (key, samples) in raw {
+    let identified: Vec<HashMap<String, String>> = rows
+        .iter()
+        .enumerate()
+        .map(|(index, row)| {
+            if row
+                .get("observation_id")
+                .is_some_and(|value| !value.is_empty())
+                || row.get("run_id").is_some_and(|value| !value.is_empty())
+            {
+                return row.clone();
+            }
+            let mut fields: Vec<(&String, &String)> = row.iter().collect();
+            fields.sort_by(|a, b| a.0.cmp(b.0));
+            let material = fields
+                .into_iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect::<Vec<_>>()
+                .join("\0");
+            let mut identified = row.clone();
+            identified.insert(
+                "observation_id".to_string(),
+                format!("legacy-{:016x}-{index:016x}", fnv1a_64(material.as_bytes())),
+            );
+            identified
+        })
+        .collect();
+    let raw = bucketize_rows(&identified, affinity);
+    let mut partitioned: HashMap<SummaryBucketKey, Vec<Sample>> = HashMap::new();
+    for ((step, inner_jobs), samples) in raw {
+        for sample in samples {
+            partitioned
+                .entry((step.clone(), inner_jobs, sample.workload_digest.clone()))
+                .or_default()
+                .push(sample);
+        }
+    }
+    let mut capped: HashMap<SummaryBucketKey, Vec<Sample>> = HashMap::new();
+    for (key, samples) in partitioned {
         capped.insert(key, ordered(&samples, Some(reservoir_cap)));
     }
     Summary {
@@ -226,10 +296,10 @@ pub fn merge(
             a.machine_id, a.container_class, b.machine_id, b.container_class
         ));
     }
-    let mut keys: std::collections::BTreeSet<BucketKey> = std::collections::BTreeSet::new();
+    let mut keys: std::collections::BTreeSet<SummaryBucketKey> = std::collections::BTreeSet::new();
     keys.extend(a.buckets.keys().cloned());
     keys.extend(b.buckets.keys().cloned());
-    let mut merged: HashMap<BucketKey, Vec<Sample>> = HashMap::new();
+    let mut merged: HashMap<SummaryBucketKey, Vec<Sample>> = HashMap::new();
     for key in keys {
         let mut combined: Vec<Sample> = Vec::new();
         if let Some(v) = a.buckets.get(&key) {
@@ -279,7 +349,7 @@ pub fn to_json(summary: &Summary) -> String {
             json_str(&summary.container_class)
         ),
     ];
-    let mut keys: Vec<BucketKey> = summary.buckets.keys().cloned().collect();
+    let mut keys: Vec<SummaryBucketKey> = summary.buckets.keys().cloned().collect();
     keys.sort();
     if keys.is_empty() {
         lines.push("  \"buckets\": []".to_string());
@@ -288,12 +358,16 @@ pub fn to_json(summary: &Summary) -> String {
     }
     lines.push("  \"buckets\": [".to_string());
     let mut blocks: Vec<String> = Vec::with_capacity(keys.len());
-    for (step, inner) in &keys {
-        let samples = ordered(&summary.buckets[&(step.clone(), *inner)], None);
+    for (step, inner, workload_digest) in &keys {
+        let samples = ordered(
+            &summary.buckets[&(step.clone(), *inner, workload_digest.clone())],
+            None,
+        );
         let mut block: Vec<String> = vec![
             "    {".to_string(),
             format!("      \"step\": {},", json_str(step)),
             format!("      \"inner_jobs\": {},", inner),
+            format!("      \"workload_digest\": {},", json_str(workload_digest)),
         ];
         if samples.is_empty() {
             block.push("      \"samples\": []".to_string());
@@ -405,9 +479,9 @@ pub fn from_json(text: &str) -> Result<Summary, SummaryError> {
         .map_err(|e| SummaryError(format!("invalid summary JSON: {e}")))?;
     let doc = as_obj(&raw, "summary")?;
     let version = req_int(doc, "version", "summary")?;
-    if version != SUMMARY_VERSION {
+    if version != 1 && version != SUMMARY_VERSION {
         return err(format!(
-            "unsupported summary version {version} (this build understands {SUMMARY_VERSION})"
+            "unsupported summary version {version} (this build understands 1 and {SUMMARY_VERSION})"
         ));
     }
     let machine_id = req_str(doc, "machine_id", "summary")?;
@@ -419,12 +493,17 @@ pub fn from_json(text: &str) -> Result<Summary, SummaryError> {
             .ok_or_else(|| SummaryError("invalid summary: buckets must be a list".to_string()))?
             .as_slice(),
     };
-    let mut buckets: HashMap<BucketKey, Vec<Sample>> = HashMap::new();
+    let mut buckets: HashMap<SummaryBucketKey, Vec<Sample>> = HashMap::new();
     for (i, bucket_val) in arr.iter().enumerate() {
         let where_ = format!("buckets[{i}]");
         let bucket = as_obj(bucket_val, &where_)?;
         let step = req_str(bucket, "step", &where_)?;
         let inner = req_int(bucket, "inner_jobs", &where_)?;
+        let bucket_workload_digest = if version == 1 {
+            String::new()
+        } else {
+            req_str(bucket, "workload_digest", &where_)?
+        };
         let samples_arr: &[Value] = match bucket.get("samples") {
             None => &[],
             Some(v) => v
@@ -438,19 +517,71 @@ pub fn from_json(text: &str) -> Result<Summary, SummaryError> {
         for (j, sample_val) in samples_arr.iter().enumerate() {
             let sw = format!("{where_}.samples[{j}]");
             let sm = as_obj(sample_val, &sw)?;
+            let observation_id = match sm.get("observation_id") {
+                None => String::new(),
+                Some(value) => value.as_str().map(str::to_string).ok_or_else(|| {
+                    SummaryError(format!(
+                        "invalid summary: {sw}.observation_id must be a string"
+                    ))
+                })?,
+            };
+            let workload_digest = match sm.get("workload_digest") {
+                None => bucket_workload_digest.clone(),
+                Some(value) => value.as_str().map(str::to_string).ok_or_else(|| {
+                    SummaryError(format!(
+                        "invalid summary: {sw}.workload_digest must be a string"
+                    ))
+                })?,
+            };
+            let peak_bytes = opt_int(sm, "peak_bytes", &sw)?;
+            let uncensored_peak_bytes = if sm.contains_key("uncensored_peak_bytes") {
+                opt_int(sm, "uncensored_peak_bytes", &sw)?
+            } else {
+                // Version-1 summaries predate censoring provenance and historically treated every
+                // peak as exact. Preserve that behavior when upgrading them in memory.
+                peak_bytes
+            };
             samples.push(Sample {
                 elapsed_s: opt_secs(sm, "elapsed_s", &sw)?,
                 contention: opt_secs(sm, "contention", &sw)?.unwrap_or(0.0),
                 cpu_s: opt_secs(sm, "cpu_s", &sw)?,
                 effective_cores: opt_secs(sm, "effective_cores", &sw)?,
                 throttled_s: opt_secs(sm, "throttled_s", &sw)?,
-                peak_bytes: opt_int(sm, "peak_bytes", &sw)?,
+                peak_bytes,
+                uncensored_peak_bytes,
+                peak_floor_bytes: opt_int(sm, "peak_floor_bytes", &sw)?,
+                observation_id,
+                workload_digest: if version == 1 {
+                    String::new()
+                } else {
+                    workload_digest
+                },
             });
         }
-        buckets.insert((step, inner), samples);
+        if version >= 2
+            && samples
+                .iter()
+                .any(|sample| sample.workload_digest != bucket_workload_digest)
+        {
+            return err(format!(
+                "invalid summary: {where_} sample workload_digest does not match its bucket"
+            ));
+        }
+        if samples.is_empty() {
+            buckets
+                .entry((step, inner, bucket_workload_digest))
+                .or_default();
+        } else {
+            for sample in samples {
+                buckets
+                    .entry((step.clone(), inner, sample.workload_digest.clone()))
+                    .or_default()
+                    .push(sample);
+            }
+        }
     }
     Ok(Summary {
-        version,
+        version: SUMMARY_VERSION,
         machine_id,
         container_class,
         buckets,
@@ -459,9 +590,34 @@ pub fn from_json(text: &str) -> Result<Summary, SummaryError> {
 
 // --------------------------------------------------------------------------- estimate recompute
 
+/// Collapse summary keys back to the raw estimator's `(step, inner_jobs)` shape, then select one
+/// workload cohort per step. Partitioning happened before reservoir sampling, so stale revisions
+/// cannot evict the current cohort.
+fn estimator_buckets(
+    summary: &Summary,
+    expected: &HashMap<String, String>,
+) -> HashMap<BucketKey, Vec<Sample>> {
+    let mut combined: HashMap<BucketKey, Vec<Sample>> = HashMap::new();
+    for ((step, inner, _digest), samples) in &summary.buckets {
+        combined
+            .entry((step.clone(), *inner))
+            .or_default()
+            .extend(samples.iter().cloned());
+    }
+    buckets_for_workloads(&combined, expected)
+}
+
 /// Recompute per-step duration and memory estimates from summary reservoirs.
 pub fn step_samples_from_summary(summary: &Summary) -> HashMap<String, StepSamples> {
-    step_samples_from_buckets(&summary.buckets)
+    step_samples_from_buckets(&estimator_buckets(summary, &HashMap::new()))
+}
+
+/// Recompute scalar estimates for only the expected workload cohorts.
+pub(crate) fn step_samples_from_summary_for_workloads(
+    summary: &Summary,
+    expected: &HashMap<String, String>,
+) -> HashMap<String, StepSamples> {
+    step_samples_from_buckets(&estimator_buckets(summary, expected))
 }
 
 /// Recompute per-step speedup curves from a summary's reservoirs; `core_budget` defaults to the
@@ -471,7 +627,17 @@ pub fn step_speedups_from_summary(
     core_budget: Option<i64>,
 ) -> HashMap<String, StepSpeedup> {
     let budget = core_budget.or_else(|| affinity_width(&summary.container_class));
-    step_speedups_from_buckets(&summary.buckets, budget)
+    step_speedups_from_buckets(&estimator_buckets(summary, &HashMap::new()), budget)
+}
+
+/// Recompute speedup curves for only the expected workload cohorts.
+pub(crate) fn step_speedups_from_summary_for_workloads(
+    summary: &Summary,
+    core_budget: Option<i64>,
+    expected: &HashMap<String, String>,
+) -> HashMap<String, StepSpeedup> {
+    let budget = core_budget.or_else(|| affinity_width(&summary.container_class));
+    step_speedups_from_buckets(&estimator_buckets(summary, expected), budget)
 }
 
 /// Return `(bucket_count, total_samples, largest_bucket_samples)`.
@@ -523,6 +689,77 @@ mod tests {
         assert_eq!(to_json(&reparsed), js);
         assert!(js.contains("\"elapsed_s\": \"20.000\""));
         assert!(js.contains("\"contention\": \"0.600\""));
+        assert!(js.contains("\"version\": 2"));
+        assert!(js.contains("\"workload_digest\": \"\""));
+    }
+
+    #[test]
+    fn workload_revisions_have_independent_reservoirs_before_selection() {
+        let mut old = row("g.a", 1, 100.0, 1000, 0.0);
+        old.insert("workload_digest".to_string(), "old".to_string());
+        old.insert("observation_id".to_string(), "old-1".to_string());
+        let mut current = row("g.a", 1, 1.0, 2000, 0.0);
+        current.insert("workload_digest".to_string(), "current".to_string());
+        current.insert("observation_id".to_string(), "current-1".to_string());
+
+        let summary = build(&[old, current], 1);
+        assert_eq!(summary.buckets.len(), 2);
+        assert_eq!(summary_stats(&summary), (2, 2, 1));
+
+        let selected = step_samples_from_summary_for_workloads(
+            &summary,
+            &HashMap::from([("g.a".to_string(), "current".to_string())]),
+        );
+        assert_eq!(selected["g.a"].samples, 1);
+        assert_eq!(selected["g.a"].est_duration_s, Some(1.0));
+        assert_eq!(selected["g.a"].rss_estimate_bytes, Some(2000));
+    }
+
+    #[test]
+    fn version_one_summary_upgrades_to_blank_workload_and_legacy_exact_peak() {
+        let text = r#"{
+  "version": 1,
+  "machine_id": "m",
+  "container_class": "affinity8_cpu-max-max",
+  "buckets": [
+    {
+      "step": "g.a",
+      "inner_jobs": 1,
+      "samples": [
+        {"elapsed_s": "1.000", "contention": "0.000", "peak_bytes": 123}
+      ]
+    }
+  ]
+}"#;
+        let summary = from_json(text).expect("v1 remains readable");
+        assert_eq!(summary.version, SUMMARY_VERSION);
+        let samples = &summary.buckets[&("g.a".to_string(), 1, String::new())];
+        assert_eq!(samples[0].workload_digest, "");
+        assert_eq!(samples[0].uncensored_peak_bytes, Some(123));
+        assert!(to_json(&summary).contains("\"version\": 2"));
+    }
+
+    #[test]
+    fn version_two_rejects_sample_and_bucket_workload_mismatch() {
+        let text = r#"{
+  "version": 2,
+  "machine_id": "m",
+  "container_class": "affinity8_cpu-max-max",
+  "buckets": [
+    {
+      "step": "g.a",
+      "inner_jobs": 1,
+      "workload_digest": "current",
+      "samples": [
+        {"workload_digest": "old", "contention": "0.000"}
+      ]
+    }
+  ]
+}"#;
+        assert!(from_json(text)
+            .unwrap_err()
+            .0
+            .contains("sample workload_digest does not match its bucket"));
     }
 
     #[test]
@@ -624,6 +861,22 @@ mod tests {
         let raw_est = raw["g.a"].est_duration_s.unwrap();
         assert!((4.5..=5.5).contains(&est), "est {est} out of range");
         assert!((est - raw_est).abs() <= 0.5);
+    }
+
+    #[test]
+    fn reservoir_ranks_observations_not_distinct_values() {
+        let mut rows = Vec::new();
+        for _ in 0..936 {
+            rows.push(row("g.a", 1, 5.0, 1000, 0.0));
+        }
+        for _ in 0..64 {
+            rows.push(row("g.a", 1, 50.0, 1000, 0.0));
+        }
+        let raw = step_samples_from_buckets(&bucketize_rows(&rows, Some(8)));
+        let summary = build(&rows, 64);
+        let got = step_samples_from_summary(&summary);
+        assert_eq!(raw["g.a"].est_duration_s, Some(5.0));
+        assert_eq!(got["g.a"].est_duration_s, Some(5.0));
     }
 
     #[test]

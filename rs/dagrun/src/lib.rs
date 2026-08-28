@@ -36,6 +36,7 @@ pub mod resource_caps;
 pub mod scheduler;
 pub mod sizing;
 pub mod summary;
+pub mod sweep;
 pub mod sync;
 pub mod viz;
 
@@ -59,11 +60,13 @@ pub use cgroup::{
     FORCE_ATTEMPT_ENV,
 };
 pub use estimates::{
-    allocate_widths, apply_plan_to_config, bucketize_rows, build_plan, feedback_identity,
-    load_step_samples, load_step_speedups, plan_to_json, plan_to_text, sample_from_row,
-    step_samples_from_buckets, step_speedups_from_buckets, Allocation, BucketKey,
-    InfeasibleAllocationError, Plan, PlanEntry, Planner, Sample, SpeedupLevel, StepSamples,
-    StepSpeedup, DEFAULT_MIN_SAMPLES,
+    allocate_widths, allocate_widths_with_max_steps, apply_plan_to_config, bucketize_rows,
+    build_plan, build_plan_with_max_steps, feedback_identity, load_step_samples,
+    load_step_speedups, plan_to_json, plan_to_text, sample_from_row, scaling_model_path,
+    scaling_model_to_json, scaling_model_to_json_for_workloads, step_samples_from_buckets,
+    step_speedups_from_buckets, write_scaling_model, write_scaling_model_for_workloads, Allocation,
+    BucketKey, InfeasibleAllocationError, Plan, PlanEntry, Planner, Sample, SpeedupLevel,
+    StepSamples, StepSpeedup, DEFAULT_MIN_SAMPLES,
 };
 pub use io::{
     dag_from_json, dag_from_value, dag_from_yaml, dag_to_json, dag_to_yaml, DagJsonError,
@@ -101,6 +104,11 @@ pub use sizing::{
     box_mem_budget_bytes, cgroup_mem_max_bytes, jobs_footprint_bytes, jobs_for_budget,
     mem_available_bytes, parse_size, schedulable_peak_mem_bytes, schedulable_peak_mem_bytes_widths,
     step_mem_cap_bytes, step_mem_cap_for_inner_jobs, stress_copy_footprint_bytes, transitive_deps,
+};
+pub use sweep::{
+    affinity_cpus_from_status, coarse_widths, cumulative_width_grid, limit_topology,
+    machine_topology, parse_cpu_list, parse_target_duration, parse_widths, refine_width_grid,
+    stable_topological_order, workload_digest, MachineTopology,
 };
 pub use viz::{to_ascii, to_dot};
 

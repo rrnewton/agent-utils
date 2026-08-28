@@ -52,6 +52,9 @@ from dagrun.estimates import (
     load_step_speedups,
     plan_to_json,
     plan_to_text,
+    scaling_model_path,
+    scaling_model_to_json,
+    write_scaling_model,
 )
 from dagrun.io import (
     DagJsonError,
@@ -239,6 +242,9 @@ __all__ = [
     "apply_plan_to_config",
     "plan_to_json",
     "plan_to_text",
+    "scaling_model_path",
+    "scaling_model_to_json",
+    "write_scaling_model",
     # serialization
     "dag_from_json",
     "dag_from_yaml",

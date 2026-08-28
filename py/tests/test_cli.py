@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
+import csv
 import io
 import json
 import shlex
@@ -11,16 +12,21 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import cast
 
 import pytest
 
 from dagrun import __version__
+import dagrun.cli as cli
 from dagrun.cli import (
     CGROUP_SETUP_ENVIRONMENT_ERROR,
     PROG,
     _load_userguide,
     main,
 )
+from dagrun.model import DagConfig, Step
+from dagrun.protocols import CgroupManager, MetricsSink
+from dagrun.sweep import CpuTopology
 
 _DEMO = '{"steps": [{"group": "g", "job": "j", "cmd": "true", "deps": []}]}'
 
@@ -629,7 +635,24 @@ def test_sweep_prints_table_and_writes_store() -> None:
         assert "parallel-speedup sweep: g.j" in out
         for column in ("jobs", "wall_s", "user_s", "sys_s", "rss_hwm", "speedup(vs j1)"):
             assert column in out
-        assert list(store.glob("*.csv")), "sweep should append to the profile store"
+        profile = next(store.glob("step_profiles_*.csv"))
+        with profile.open(newline="", encoding="utf-8") as source:
+            rows = list(csv.DictReader(source))
+        assert rows
+        assert {row["enforcement_kind"] for row in rows} == {"unboxed"}
+        assert {row["runner_name"] for row in rows} == {"sweep"}
+
+
+def test_sweep_sink_labels_a_present_cgroup_manager_as_cgroup_v2(tmp_path: Path) -> None:
+    # The sink only needs manager presence to describe how the enclosing scheduler run is boxed;
+    # it does not call the manager itself.
+    manager = cast(CgroupManager, object())
+
+    sink = cli._sweep_sink(str(tmp_path), "deadbee", {}, manager)
+
+    assert sink is not None
+    assert getattr(sink, "enforcement_kind") == "cgroup-v2"
+    assert getattr(sink, "runner_name") == "sweep"
 
 
 def test_sweep_unknown_step_exits_2() -> None:
@@ -654,6 +677,378 @@ def test_sweep_bad_range_exits_2() -> None:
         )
         assert rc == 2
         assert "invalid --jobs range" in err
+
+
+@pytest.mark.parametrize(
+    "extra",
+    (
+        ["--step", "g.j", "--jobs", "abc"],
+        ["--target-time", "0", "--jobs", "1,,2"],
+    ),
+)
+def test_sweep_usage_errors_precede_cgroup_and_profile_setup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, extra: list[str]
+) -> None:
+    dag = tmp_path / "dag.json"
+    dag.write_text(
+        '{"steps": [{"group": "g", "job": "j", "cmd": "true", '
+        '"jobs_flag": "--workers="}]}',
+        encoding="utf-8",
+    )
+
+    def unexpected(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("usage validation must run before environment/profile setup")
+
+    monkeypatch.setattr(cli, "_resolve_cgroup_manager", unexpected)
+    monkeypatch.setattr(cli, "_resolve_profile_dir", unexpected)
+
+    rc, _, err = _capture(["sweep", "--dag", str(dag), *extra])
+
+    assert rc == 2
+    assert "invalid --jobs" in err
+
+
+def test_legacy_sweep_still_requires_step_and_jobs() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        dag = _demo_path(tmp)
+        rc, _, err = _capture(["sweep", "--dag", dag, "--no-profile"])
+    assert rc == 2
+    assert "without --target-time, --step and --jobs are required" in err
+
+
+def test_runtime_sweep_topology_falls_back_to_logical_when_physical_is_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "detect_cpu_topology",
+        lambda: CpuTopology(tuple(range(6)), physical_core_count=None),
+    )
+    monkeypatch.setattr(cli, "container_core_budget", lambda: 4)
+
+    topology = cli._effective_sweep_topology()
+
+    assert topology.logical_thread_count == 4
+    assert topology.physical_core_count == 4
+
+
+def test_target_sweep_completes_pass_one_in_topological_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A zero target still runs the entire mandatory first pass, one node at a time."""
+    dag = tmp_path / "dag.json"
+    dag.write_text(
+        json.dumps(
+            {
+                "steps": [
+                    {
+                        "group": "g",
+                        "job": "leaf",
+                        "cmd": "true",
+                        "deps": ["g.root"],
+                        "jobs_flag": "--workers=",
+                    },
+                    {
+                        "group": "g",
+                        "job": "root",
+                        "cmd": "true",
+                        "jobs_flag": "--workers=",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls: list[tuple[str, int, bool]] = []
+
+    def fake_run(
+        step: Step,
+        cfg: DagConfig,
+        inner_jobs: int,
+        cgroups: CgroupManager | None,
+        metrics: MetricsSink | None,
+        verbosity: int,
+        *,
+        vary_width: bool = True,
+    ) -> cli._SweepMeasure:
+        del cfg, cgroups, metrics, verbosity
+        calls.append((step.tag, inner_jobs, vary_width))
+        return cli._SweepMeasure(1.0, 1.0, 0.0, 1024, True)
+
+    monkeypatch.setattr(cli, "_run_single_step", fake_run)
+    monkeypatch.setattr(
+        cli,
+        "_effective_sweep_topology",
+        lambda: CpuTopology(tuple(range(4)), physical_core_count=2),
+    )
+    monkeypatch.setattr(cli, "_resolve_cgroup_manager", lambda *_args, **_kwargs: (None, 0))
+
+    rc, out, err = _capture(
+        ["sweep", "--dag", str(dag), "--target-time", "0", "--no-profile"]
+    )
+
+    assert rc == 0
+    assert calls == [
+        ("g.root", 1, True),
+        ("g.root", 2, True),
+        ("g.root", 4, True),
+        ("g.leaf", 1, True),
+        ("g.leaf", 2, True),
+        ("g.leaf", 4, True),
+    ]
+    assert "parallel-scaling sweep: 2 node(s), target 0.000s" in out
+    assert "sweep pass 1 starting: cumulative widths [1,2,4] (mandatory minimum pass)" in out
+    assert "target-time sweep complete: 1 pass(es), 6 sample(s)" in out
+    assert "overrun " in out
+    assert err == ""
+
+
+def test_target_sweep_starts_a_second_cumulative_pass_and_finishes_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The target is checked between passes; a started refinement pass is atomic."""
+    dag = tmp_path / "dag.json"
+    dag.write_text(
+        '{"steps": [{"group": "g", "job": "j", "cmd": "true", '
+        '"cmdtype": "generic-with-flag", "jobs_flag": "--workers="}]}',
+        encoding="utf-8",
+    )
+    calls: list[int] = []
+
+    def fake_run(
+        step: Step,
+        cfg: DagConfig,
+        inner_jobs: int,
+        cgroups: CgroupManager | None,
+        metrics: MetricsSink | None,
+        verbosity: int,
+        *,
+        vary_width: bool = True,
+    ) -> cli._SweepMeasure:
+        del step, cfg, cgroups, metrics, verbosity, vary_width
+        calls.append(inner_jobs)
+        return cli._SweepMeasure(1.0, 1.0, 0.0, None, True)
+
+    ticks = iter((0.0, 0.0, 0.5, 0.5, 0.5, 2.0, 2.0, 2.0))
+    monkeypatch.setattr(cli, "_run_single_step", fake_run)
+    monkeypatch.setattr("dagrun.cli.time.monotonic", lambda: next(ticks))
+    monkeypatch.setattr(
+        cli,
+        "_effective_sweep_topology",
+        lambda: CpuTopology(tuple(range(4)), physical_core_count=2),
+    )
+    monkeypatch.setattr(cli, "_resolve_cgroup_manager", lambda *_args, **_kwargs: (None, 0))
+
+    rc, out, err = _capture(
+        ["sweep", "--dag", str(dag), "--target-time", "1", "--no-profile"]
+    )
+
+    assert rc == 0
+    assert calls == [1, 2, 4, 1, 2, 3, 4]
+    assert "sweep pass 2 starting: cumulative widths [1,2,3,4]" in out
+    assert "target-time sweep complete: 2 pass(es), 7 sample(s)" in out
+    assert "overrun 1.000s" in out
+    assert err == ""
+
+
+def test_target_sweep_characterizes_a_fixed_node_only_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dag = tmp_path / "dag.json"
+    dag.write_text(
+        json.dumps(
+            {
+                "steps": [
+                    {
+                        "group": "g",
+                        "job": "fixed",
+                        "cmd": "true",
+                        "jobs_flag": "",
+                        "hint": {"preferred_inner_jobs": 2},
+                    },
+                    {
+                        "group": "g",
+                        "job": "scaling",
+                        "cmd": "true",
+                        "deps": ["g.fixed"],
+                        "jobs_flag": "--workers=",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls: list[tuple[str, int, bool]] = []
+
+    def fake_run(
+        step: Step,
+        cfg: DagConfig,
+        inner_jobs: int,
+        cgroups: CgroupManager | None,
+        metrics: MetricsSink | None,
+        verbosity: int,
+        *,
+        vary_width: bool = True,
+    ) -> cli._SweepMeasure:
+        del cfg, cgroups, metrics, verbosity
+        calls.append((step.tag, inner_jobs, vary_width))
+        return cli._SweepMeasure(1.0, 1.0, 0.0, None, True)
+
+    ticks = iter((0.0, 0.0, 0.5, 0.5, 0.5, 2.0, 2.0, 2.0))
+    monkeypatch.setattr(cli, "_run_single_step", fake_run)
+    monkeypatch.setattr("dagrun.cli.time.monotonic", lambda: next(ticks))
+    monkeypatch.setattr(
+        cli,
+        "_effective_sweep_topology",
+        lambda: CpuTopology(tuple(range(4)), physical_core_count=2),
+    )
+    monkeypatch.setattr(cli, "_resolve_cgroup_manager", lambda *_args, **_kwargs: (None, 0))
+
+    rc, out, err = _capture(
+        ["sweep", "--dag", str(dag), "--target-time", "1", "--no-profile"]
+    )
+
+    assert rc == 0
+    assert calls == [
+        ("g.fixed", 2, False),
+        ("g.scaling", 1, True),
+        ("g.scaling", 2, True),
+        ("g.scaling", 4, True),
+        ("g.scaling", 1, True),
+        ("g.scaling", 2, True),
+        ("g.scaling", 3, True),
+        ("g.scaling", 4, True),
+    ]
+    assert "characterizing its configured width once (width 2)" in out
+    assert err == ""
+
+
+def test_target_sweep_persists_pass_metadata(tmp_path: Path) -> None:
+    dag = tmp_path / "dag.json"
+    dag.write_text(
+        '{"steps": [{"group": "g", "job": "j", "cmd": "true", '
+        '"cmdtype": "generic-with-flag", "jobs_flag": "--workers="}]}',
+        encoding="utf-8",
+    )
+    store = tmp_path / "profiles"
+
+    rc, _, err = _capture(
+        [
+            "sweep",
+            "--dag",
+            str(dag),
+            "--target-time",
+            "0",
+            "--jobs",
+            "1,2",
+            "--perf-dir",
+            str(store),
+            "--unsafe-no-cgroups",
+        ]
+    )
+
+    assert rc == 0, err
+    profile = next(store.glob("step_profiles_*.csv"))
+    with profile.open(newline="", encoding="utf-8") as source:
+        rows = list(csv.DictReader(source))
+    assert len(rows) == 2
+    assert rows[0]["sweep_id"]
+    assert rows[0]["sweep_pass"] == "1"
+    assert rows[0]["sweep_sample"] == "1"
+    assert rows[0]["sweep_width_source"] == "explicit"
+    assert rows[0]["sweep_mode"] == "target-time"
+    assert int(rows[0]["sweep_physical_cores"]) >= 1
+    assert int(rows[0]["sweep_logical_cpus"]) >= 1
+    assert len(rows[0]["workload_digest"]) == 16
+    assert all(row["user_s"] != "" for row in rows)
+    assert all(row["sys_s"] != "" for row in rows)
+    assert {row["enforcement_kind"] for row in rows} == {"unboxed"}
+    assert {row["runner_name"] for row in rows} == {"sweep"}
+    models = list(store.glob("scaling_model_*.json"))
+    assert len(models) == 1
+    saved_model = json.loads(models[0].read_text(encoding="utf-8"))
+    assert saved_model["schema"] == 2
+    assert saved_model["steps"][0]["step"] == "g.j"
+    assert saved_model["steps"][0]["workload_digest"] == rows[0]["workload_digest"]
+
+
+def test_target_sweep_refines_sparse_explicit_widths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dag = tmp_path / "dag.json"
+    dag.write_text(
+        '{"steps": [{"group": "g", "job": "j", "cmd": "true", '
+        '"jobs_flag": "--workers="}]}',
+        encoding="utf-8",
+    )
+    calls: list[int] = []
+
+    def fake_run(
+        step: Step,
+        cfg: DagConfig,
+        inner_jobs: int,
+        cgroups: CgroupManager | None,
+        metrics: MetricsSink | None,
+        verbosity: int,
+        *,
+        vary_width: bool = True,
+    ) -> cli._SweepMeasure:
+        del step, cfg, cgroups, metrics, verbosity, vary_width
+        calls.append(inner_jobs)
+        return cli._SweepMeasure(1.0, 1.0, 0.0, None, True)
+
+    ticks = iter((0.0, 0.0, 0.5, 0.5, 0.5, 2.0, 2.0, 2.0))
+    monkeypatch.setattr(cli, "_run_single_step", fake_run)
+    monkeypatch.setattr("dagrun.cli.time.monotonic", lambda: next(ticks))
+    monkeypatch.setattr(
+        cli,
+        "_effective_sweep_topology",
+        lambda: CpuTopology(tuple(range(8)), physical_core_count=4),
+    )
+    monkeypatch.setattr(cli, "_resolve_cgroup_manager", lambda *_args, **_kwargs: (None, 0))
+
+    rc, out, err = _capture(
+        [
+            "sweep",
+            "--dag",
+            str(dag),
+            "--target-time",
+            "1",
+            "--jobs",
+            "1,4",
+            "--no-profile",
+        ]
+    )
+
+    assert rc == 0
+    assert calls == [1, 4, 1, 2, 4]
+    assert "cumulative widths [1,2,4]" in out
+    assert err == ""
+
+
+def test_sync_upload_rows_reuse_the_local_run_identity() -> None:
+    rows = [{"step": "g.a"}, {"step": "g.a"}]
+
+    stamped = cli._rows_with_observation_ids(rows, "run-local")
+
+    assert stamped[0]["observation_id"] == "run-local"
+    assert stamped[1]["observation_id"] == "run-local"
+
+
+def test_sync_uploaded_and_local_copies_deduplicate() -> None:
+    from dagrun import summary as summarylib
+
+    raw = {"step": "g.a", "inner_jobs": "2", "elapsed_s": "1.0"}
+    local = summarylib.summary_from_rows(
+        [{**raw, "run_id": "run-local"}], "m", "c", None
+    )
+    uploaded = summarylib.summary_from_rows(
+        cli._rows_with_observation_ids([raw], "run-local"), "m", "c", None
+    )
+
+    merged = summarylib.merge(local, uploaded)
+
+    assert summarylib.summary_stats(merged) == (1, 1, 1)
 
 
 def test_version_via_module() -> None:
