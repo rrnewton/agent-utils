@@ -30,6 +30,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufReader, IsTerminal, Read};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::panic::AssertUnwindSafe;
+use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -3751,6 +3752,63 @@ pub fn run_dag_boxed_deadline_limited_with_cpu(
     run_timeout_s: Option<i64>,
     run_cpu_budget: Option<RunCpuBudget>,
 ) -> RunResult {
+    let resource_caps_path = std::env::var_os(crate::resource_caps::PATH_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    run_dag_boxed_deadline_limited_with_cpu_and_resource_caps(
+        cfg,
+        max_steps,
+        max_cpus,
+        keep_going,
+        verbosity,
+        cgroups,
+        order,
+        run_timeout_s,
+        run_cpu_budget,
+        resource_caps_path,
+    )
+}
+
+/// Deadline-aware boxed run with an explicit shared `resource_caps` state path.
+#[allow(clippy::too_many_arguments)]
+pub fn run_dag_boxed_deadline_limited_with_resource_caps(
+    cfg: &DagConfig,
+    max_steps: i64,
+    max_cpus: i64,
+    keep_going: bool,
+    verbosity: i64,
+    cgroups: BoxedCgroups,
+    order: Option<Vec<String>>,
+    run_timeout_s: Option<i64>,
+    resource_caps_path: Option<PathBuf>,
+) -> RunResult {
+    run_dag_boxed_deadline_limited_with_cpu_and_resource_caps(
+        cfg,
+        max_steps,
+        max_cpus,
+        keep_going,
+        verbosity,
+        cgroups,
+        order,
+        run_timeout_s,
+        None,
+        resource_caps_path,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_dag_boxed_deadline_limited_with_cpu_and_resource_caps(
+    cfg: &DagConfig,
+    max_steps: i64,
+    max_cpus: i64,
+    keep_going: bool,
+    verbosity: i64,
+    cgroups: BoxedCgroups,
+    order: Option<Vec<String>>,
+    run_timeout_s: Option<i64>,
+    run_cpu_budget: Option<RunCpuBudget>,
+    resource_caps_path: Option<PathBuf>,
+) -> RunResult {
     // FIRST, before anything walks the graph. The loader already refuses these, so this is the
     // door a LIBRARY caller comes through with a hand-built DagConfig -- and a cycle reaching the
     // planner is not a bad report, it is a stack-overflow abort (core dump) in this edition and a
@@ -3889,27 +3947,36 @@ pub fn run_dag_boxed_deadline_limited_with_cpu(
             eprintln!("[scheduler] \u{26a0} {notice}");
         }
     }
-    let resource_coordinator = match ResourceCoordinator::from_env(&cfg.resource_caps) {
-        Ok(coordinator) => coordinator,
-        Err(error) => {
-            eprintln!(
-                "[scheduler] ERROR: REFUSING to run before any node starts: resource_caps shared state is unusable: {error}"
-            );
-            return RunResult {
-                ok: false,
-                wall_s: 0.0,
-                outcomes: Vec::new(),
-                skipped: Vec::new(),
-                not_launched: Vec::new(),
-                intentional_skips: Vec::new(),
-                step_profile_rows: Vec::new(),
-                run_timed_out: false,
-                run_cpu_timed_out: false,
-                run_cpu_accounting_failed: false,
-                max_concurrent_steps: 0,
-            };
-        }
+    let resource_coordinator = match resource_caps_path {
+        Some(path) => match ResourceCoordinator::new(path, cfg.resource_caps.clone()) {
+            Ok(coordinator) => Some(coordinator),
+            Err(error) => {
+                eprintln!(
+                    "[scheduler] ERROR: REFUSING to run before any node starts: resource_caps shared state is unusable: {error}"
+                );
+                return RunResult {
+                    ok: false,
+                    wall_s: 0.0,
+                    outcomes: Vec::new(),
+                    skipped: Vec::new(),
+                    not_launched: Vec::new(),
+                    intentional_skips: Vec::new(),
+                    step_profile_rows: Vec::new(),
+                    run_timed_out: false,
+                    run_cpu_timed_out: false,
+                    run_cpu_accounting_failed: false,
+                    max_concurrent_steps: 0,
+                };
+            }
+        },
+        None => None,
     };
+    if let Some(coordinator) = &resource_coordinator {
+        eprintln!(
+            "[scheduler] resource_caps shared across scheduler processes: {}",
+            coordinator.path().display()
+        );
+    }
     let runner = Runner::new(
         cfg,
         max_steps,

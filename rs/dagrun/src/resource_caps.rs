@@ -1,7 +1,7 @@
 //! Cross-process enforcement for the existing named `resource_caps`.
 //!
 //! A scheduler process already prevents its own steps from exceeding the declared capacities.
-//! When `DAGRUN_RESOURCE_CAPS_PATH` is set, this module applies the same counts across every
+//! When a run supplies a shared state path, this module applies the same counts across every
 //! scheduler process using that path. Requests wait in ticket order, are granted atomically across
 //! all resources a step needs, and are reclaimed after a process dies.
 
@@ -246,7 +246,12 @@ fn load(path: &Path) -> Result<Ledger, String> {
         .open(path)
     {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Ledger::default()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(format!(
+                "configured resource_caps state {} does not exist",
+                path.display()
+            ))
+        }
         Err(error) => {
             return Err(format!(
                 "open resource_caps state {}: {error}",
@@ -610,12 +615,11 @@ impl Coordinator {
 
     /// Construct a coordinator over an explicit path.
     pub fn new(path: PathBuf, capacities: BTreeMap<String, i64>) -> Result<Self, String> {
-        if capacities.is_empty() {
-            return Ok(Self {
-                path,
-                capacities,
-                pending: Mutex::new(HashMap::new()),
-            });
+        if !path.exists() && !path.is_symlink() {
+            return Err(format!(
+                "configured resource_caps state {} does not exist",
+                path.display()
+            ));
         }
         for (name, capacity) in &capacities {
             if name.is_empty() || *capacity < 0 {
@@ -646,6 +650,11 @@ impl Coordinator {
             capacities,
             pending: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// The configured shared state path, for startup disclosure.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Try to admit one step without starting its wall timer while it waits.
@@ -739,10 +748,27 @@ mod tests {
         let _ = fs::remove_file(format!("{}.lock", path.display()));
     }
 
+    fn initialize(path: &Path) {
+        store(path, &Ledger::default()).unwrap();
+    }
+
+    #[test]
+    fn missing_configured_state_is_refused() {
+        let path = temp_path("missing");
+        cleanup(&path);
+        let error = Coordinator::new(path.clone(), BTreeMap::from([("guest".into(), 1)]))
+            .err()
+            .expect("a configured missing file must be refused");
+        assert!(error.contains("does not exist"), "{error}");
+        assert!(!path.exists());
+        cleanup(&path);
+    }
+
     #[test]
     fn second_request_waits_until_the_first_releases() {
         let path = temp_path("wait");
         cleanup(&path);
+        initialize(&path);
         let caps = BTreeMap::from([("guest".to_string(), 1)]);
         let first = Coordinator::new(path.clone(), caps.clone()).unwrap();
         let second = Coordinator::new(path.clone(), caps).unwrap();
@@ -850,6 +876,7 @@ mod tests {
     fn conflicting_live_capacities_are_refused() {
         let path = temp_path("capacity");
         cleanup(&path);
+        initialize(&path);
         let one = Coordinator::new(path.clone(), BTreeMap::from([("guest".into(), 1)])).unwrap();
         let demand = BTreeMap::from([("guest".into(), 1)]);
         let Acquire::Granted { reservation, .. } = one.try_acquire("a", &demand).unwrap() else {
@@ -867,6 +894,7 @@ mod tests {
     fn capacity_counts_apply_across_requests_not_only_at_one() {
         let path = temp_path("counted-capacity");
         cleanup(&path);
+        initialize(&path);
         let caps = BTreeMap::from([("guest".to_string(), 8)]);
         let first = Coordinator::new(path.clone(), caps.clone()).unwrap();
         let second = Coordinator::new(path.clone(), caps.clone()).unwrap();

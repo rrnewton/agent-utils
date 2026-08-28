@@ -87,7 +87,24 @@ impl Fixture {
         let _ = std::fs::remove_file(self.dir.join("release"));
     }
 
+    fn initialize_state(path: &Path) {
+        std::fs::write(path, br#"{"next_ticket":0,"requests":[]}"#).unwrap();
+    }
+
     fn spawn(&self, dag: &Path, resource_caps_path: Option<&Path>) -> Child {
+        let mut command = self.command(dag);
+        if let Some(path) = resource_caps_path {
+            command.args(["--resource-caps-path", path.to_str().unwrap()]);
+        }
+        command.spawn().unwrap()
+    }
+
+    fn spawn_with_environment(&self, dag: &Path, resource_caps_path: &Path) -> Child {
+        let mut command = self.command(dag);
+        command.env(PATH_ENV, resource_caps_path).spawn().unwrap()
+    }
+
+    fn command(&self, dag: &Path) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_dagrun"));
         command
             .args([
@@ -104,10 +121,7 @@ impl Fixture {
             .env_remove(PATH_ENV)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        if let Some(path) = resource_caps_path {
-            command.env(PATH_ENV, path);
-        }
-        command.spawn().unwrap()
+        command
     }
 
     fn wait_for_first_read(&self) {
@@ -166,6 +180,7 @@ fn two_processes_collide_without_the_fix_and_wait_with_it() {
     // though its total process wall time includes the first process's critical section.
     fixture.reset();
     let ledger = fixture.dir.join("resource-caps.json");
+    Fixture::initialize_state(&ledger);
     let first = fixture.spawn(&fixture.holder_dag, Some(&ledger));
     fixture.wait_for_first_read();
     let second_started = Instant::now();
@@ -192,7 +207,11 @@ fn two_processes_collide_without_the_fix_and_wait_with_it() {
     let second_text = text(&second);
     assert!(
         second_text.contains("WAIT resource_caps guest=1")
-            && second_text.contains("READY resource_caps after"),
+            && second_text.contains("READY resource_caps after")
+            && second_text.contains(&format!(
+                "resource_caps shared across scheduler processes: {}",
+                ledger.display()
+            )),
         "the collision was not observed and handled:\n{second_text}"
     );
     assert!(
@@ -223,5 +242,68 @@ fn malformed_shared_state_is_refused_before_the_command_runs() {
         std::fs::read_to_string(fixture.dir.join("observations")).unwrap(),
         "",
         "the command ran despite malformed shared state"
+    );
+}
+
+#[test]
+fn missing_configured_state_is_refused_before_the_command_runs() {
+    let fixture = Fixture::new();
+    fixture.reset();
+    let ledger = fixture.dir.join("missing-resource-caps.json");
+
+    let output = fixture
+        .spawn(&fixture.writer_dag, Some(&ledger))
+        .wait_with_output()
+        .unwrap();
+    let output_text = text(&output);
+    assert!(!output.status.success(), "{output_text}");
+    assert!(
+        output_text.contains("REFUSING to run before any node starts")
+            && output_text.contains("does not exist"),
+        "the absent configured state was not refused by name:\n{output_text}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.dir.join("observations")).unwrap(),
+        "",
+        "the command ran despite an absent configured state file"
+    );
+    assert!(!ledger.exists(), "the missing state was silently created");
+}
+
+#[test]
+fn environment_path_is_supported_and_an_explicit_flag_wins() {
+    let fixture = Fixture::new();
+    fixture.reset();
+    let environment_ledger = fixture.dir.join("environment-resource-caps.json");
+    Fixture::initialize_state(&environment_ledger);
+    let environment = fixture
+        .spawn_with_environment(&fixture.writer_dag, &environment_ledger)
+        .wait_with_output()
+        .unwrap();
+    let environment_text = text(&environment);
+    assert!(environment.status.success(), "{environment_text}");
+    assert!(
+        environment_text.contains(&environment_ledger.display().to_string()),
+        "the environment-selected path was not disclosed:\n{environment_text}"
+    );
+
+    fixture.reset();
+    let flag_ledger = fixture.dir.join("flag-resource-caps.json");
+    Fixture::initialize_state(&flag_ledger);
+    let missing_environment_ledger = fixture.dir.join("missing-environment.json");
+    let mut command = fixture.command(&fixture.writer_dag);
+    let flag = command
+        .args(["--resource-caps-path", flag_ledger.to_str().unwrap()])
+        .env(PATH_ENV, &missing_environment_ledger);
+    let explicit = flag.output().unwrap();
+    let explicit_text = text(&explicit);
+    assert!(explicit.status.success(), "{explicit_text}");
+    assert!(
+        explicit_text.contains(&flag_ledger.display().to_string()),
+        "the flag-selected path was not disclosed:\n{explicit_text}"
+    );
+    assert!(
+        !missing_environment_ledger.exists(),
+        "the environment path was used even though the flag was present"
     );
 }

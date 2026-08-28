@@ -28,7 +28,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{IsTerminal, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -56,8 +56,8 @@ use crate::model::{
 use crate::perflog::{append_step_profiles, child_cpu_seconds, PerfWindow};
 use crate::profile_enrich::container_core_budget;
 use crate::scheduler::{
-    cap_config_max_cpus, nested_run_refusal, run_dag_boxed_deadline_limited, run_dag_boxed_limited,
-    validate_max_cpus_rewrite, BoxedCgroups,
+    cap_config_max_cpus, nested_run_refusal, run_dag_boxed_deadline_limited_with_resource_caps,
+    run_dag_boxed_limited, validate_max_cpus_rewrite, BoxedCgroups,
 };
 use crate::sizing::{
     box_mem_budget_bytes, cpu_count, jobs_for_budget, parse_size, stress_control_floor_bytes,
@@ -370,6 +370,7 @@ fn run_help(c: &Palette) -> String {
             ("--no-color", "suppress ANSI colour in failure output. The searchable DAGRUN STEP ERROR marker still prints: it is what a plain log is grepped for. Colour is also off automatically when NO_COLOR is set or stdout is not a terminal"),
             ("--run-timeout SECONDS", "OUTER wall budget for the WHOLE run; cuts in-flight steps and still reports"),
             ("--admission [WAIT_S]", "HOST-WIDE memory admission (opt-in): reserve --max-mem against a durable ledger every runner on the host shares. GRANT / QUEUE (says how many holders are ahead) / REFUSE (says the number to ask for). WAIT_S = how long to wait while queued (default 0 = report and exit 4; at most 86400). Requires --max-mem"),
+            ("--resource-caps-path FILE", "make resource_caps apply across runner processes through this existing state file; otherwise caps are process-local. $DAGRUN_RESOURCE_CAPS_PATH is the secondary route and the flag wins"),
             ("--allow-cgroup-failure", "if cgroup boxing is unavailable, run UNBOXED with a warning instead of erroring"),
             ("--unsafe-no-cgroups", "DELIBERATELY skip cgroup boxing entirely (unsafe)"),
             ("--allow-unwise-nest-dagruns", "allow a reviewed temporary nested dagrun exception; flatten the caller instead"),
@@ -944,6 +945,7 @@ struct RunArgs {
     /// Host-wide memory admission (opt-in). `None` = off; `Some(wait_s)` = on, waiting that long
     /// while QUEUED.
     admission: Option<f64>,
+    resource_caps_path: Option<String>,
     allow_cgroup_failure: bool,
     unsafe_no_cgroups: bool,
     allow_unwise_nest_dagruns: bool,
@@ -1008,6 +1010,7 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
         keep_going: false,
         run_timeout: env_run_timeout(),
         admission: None,
+        resource_caps_path: None,
         allow_cgroup_failure: false,
         unsafe_no_cgroups: false,
         allow_unwise_nest_dagruns: false,
@@ -1154,6 +1157,13 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
                     ));
                 }
                 a.admission = Some(parsed);
+            }
+            "--resource-caps-path" => {
+                let path = take_value(inline, &mut i)?;
+                if path.is_empty() {
+                    return Err("--resource-caps-path requires a non-empty path".to_string());
+                }
+                a.resource_caps_path = Some(path);
             }
             "--allow-cgroup-failure" => a.allow_cgroup_failure = true,
             "--unsafe-no-cgroups" => a.unsafe_no_cgroups = true,
@@ -3062,6 +3072,15 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
         return 2;
     }
     let verbosity = if a.quiet { 0 } else { a.verbosity };
+    let resource_caps_path = a
+        .resource_caps_path
+        .as_ref()
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os(crate::resource_caps::PATH_ENV)
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        });
 
     let (perf_dir, source) = resolve_profile_dir(a.perf_dir.as_deref(), a.no_profile);
     let git = git_sha();
@@ -3069,7 +3088,7 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
         .as_deref()
         .map(|d| PerfWindow::start(Path::new(d), &git));
 
-    let result = run_dag_boxed_deadline_limited(
+    let result = run_dag_boxed_deadline_limited_with_resource_caps(
         cfg,
         max_steps,
         max_cpus,
@@ -3078,6 +3097,7 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
         cgroups,
         Some(plan.order.clone()),
         a.run_timeout,
+        resource_caps_path,
     );
     let passed = result.outcomes.iter().filter(|o| o.ok).count();
     let failed = result
@@ -4050,6 +4070,7 @@ mod tests {
             // `run` owns admission; `box` does not take it, and a help entry filed under the
             // wrong subcommand advertises a flag that subcommand will reject.
             "--admission",
+            "--resource-caps-path",
         ] {
             assert!(help.contains(flag), "missing {flag} from run help");
         }
@@ -4063,10 +4084,30 @@ mod tests {
         assert!(help.contains("maximum width of any one runner-controlled step"));
         assert!(help.contains("every dependency they require"));
         assert!(help.contains("run only the named steps"));
+        assert!(help.contains("$DAGRUN_RESOURCE_CAPS_PATH"));
 
         let sweep = sweep_help(&palette);
         assert!(sweep.contains("--jobs RANGE"));
         assert!(!sweep.contains("--max-cpus"));
+    }
+
+    #[test]
+    fn resource_caps_path_flag_is_explicit_and_non_empty() {
+        let parsed = parse_run_args(&[
+            "--resource-caps-path".into(),
+            "/tmp/resource-caps.json".into(),
+        ])
+        .unwrap();
+        assert_eq!(
+            parsed.resource_caps_path.as_deref(),
+            Some("/tmp/resource-caps.json")
+        );
+        assert_eq!(
+            parse_run_args(&["--resource-caps-path=".into()])
+                .err()
+                .as_deref(),
+            Some("--resource-caps-path requires a non-empty path")
+        );
     }
 
     #[test]
