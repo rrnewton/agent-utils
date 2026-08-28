@@ -6,6 +6,7 @@ import concurrent.futures
 import contextlib
 import io
 import json
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -79,6 +80,7 @@ def test_run_help_lists_flags_and_cores_pinning() -> None:
         "--ignore-selected-deps",
         "--planner",
         "--keep-going",
+        "--allow-unwise-nest-dagruns",
     ):
         assert flag in out, flag
     assert "--jobs" not in out
@@ -250,6 +252,69 @@ def test_run_exit_codes() -> None:
         bad = Path(tmp) / "bad.json"
         bad.write_text('{"steps": [{"group": "g", "job": "j", "cmd": "false"}]}', encoding="utf-8")
         assert _capture(["run", "--dag", str(bad), "-q", _ACF])[0] == 1
+
+
+def test_nested_run_refuses_by_outer_run_and_override_is_explicit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    marker = tmp_path / "seen-outer-run"
+    dag = tmp_path / "inner.json"
+    dag.write_text(
+        json.dumps(
+            {
+                "steps": [
+                    {
+                        "group": "g",
+                        "job": "j",
+                        "cmd": f"printf '%s' \"$DAGRUN_OUTER_RUN\" > {shlex.quote(str(marker))}",
+                        # Runner policy must replace a manifest-authored value on this key.
+                        "env": {"DAGRUN_OUTER_RUN": "forged"},
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("DAGRUN_OUTER_RUN", "--dag outer.json")
+    rc, out, err = _capture(["run", "--dag", "/does/not/need/to/exist.json"])
+    assert rc == 2
+    assert out == ""
+    assert "refusing nested invocation" in err
+    assert "--dag outer.json" in err
+    assert "--allow-unwise-nest-dagruns" in err
+    assert "No such file" not in err
+
+    rc, _, err = _capture(
+        [
+            "run",
+            "--dag",
+            str(dag),
+            "--allow-unwise-nest-dagruns",
+            "--unsafe-no-cgroups",
+            "--no-profile",
+            "--no-profile-feedback",
+            "-q",
+        ]
+    )
+    assert rc == 0, err
+    assert marker.read_text(encoding="utf-8") == "g.j"
+
+    marker.unlink()
+    monkeypatch.delenv("DAGRUN_OUTER_RUN")
+    rc, _, err = _capture(
+        [
+            "run",
+            "--dag",
+            str(dag),
+            "--unsafe-no-cgroups",
+            "--no-profile",
+            "--no-profile-feedback",
+            "-q",
+        ]
+    )
+    assert rc == 0, err
+    assert marker.read_text(encoding="utf-8") == "g.j"
 
 
 def test_missing_and_malformed_dag_exit_2() -> None:

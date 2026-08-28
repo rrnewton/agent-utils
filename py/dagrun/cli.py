@@ -83,6 +83,7 @@ from dagrun.reservation import Reservation
 from dagrun.scheduler import (
     _self_managed_width_error,
     cap_config_max_cpus,
+    nested_run_refusal,
     run_dag_limited,
 )
 from dagrun.sizing import jobs_for_budget, parse_size, transitive_deps
@@ -596,6 +597,12 @@ def build_parser() -> argparse.ArgumentParser:
         "memory/CPU/pids caps). The word 'unsafe' is intentional friction: unlike "
         "--allow-cgroup-failure (a capability fallback), this is an explicit opt-out that is "
         "logged loudly and should be reviewed. Use only when you have a specific reason not to box.",
+    )
+    run_p.add_argument(
+        "--allow-unwise-nest-dagruns",
+        action="store_true",
+        help="allow this run even when it was launched from a dagrun step; this is an explicit "
+        "exception for a known nested caller and should be removed by flattening that caller",
     )
     run_p.add_argument(
         "--small-default-cap",
@@ -2941,6 +2948,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if dag_arg is None:
         print(f"{PROG}: {command}: --dag FILE is required", file=sys.stderr)
         return 2
+    if command == "run":
+        refusal = nested_run_refusal(bool(ns.allow_unwise_nest_dagruns))
+        if refusal is not None:
+            print(f"{PROG}: run: {refusal}", file=sys.stderr)
+            return 2
     # A boxed run re-execs itself inside systemd. When the DAG comes from stdin, that re-exec must
     # happen BEFORE this process consumes the pipe; otherwise the child sees EOF and reports
     # invalid JSON. The in-scope child skips this block, reads stdin once, and _run performs the

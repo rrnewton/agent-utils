@@ -44,6 +44,10 @@ Containment is required by default. On a machine where cgroup-v2 delegation is
 intentionally unavailable, add `--allow-cgroup-failure` to accept a visibly
 unboxed run.
 
+A `run` launched from one of another run's steps is refused and names the outer
+run. Use `--allow-unwise-nest-dagruns` only for a reviewed temporary exception;
+prefer flattening the caller into one DAG.
+
 Useful discovery commands:
 
 ```sh

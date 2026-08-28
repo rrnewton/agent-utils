@@ -4931,7 +4931,7 @@ def compare_cli_schema(py: list[str], rs: list[str], rep: Report) -> None:
             "--profile-sync-direction", "--keep-going", "--run-timeout",
             "--admission",
             "--allow-cgroup-failure",
-            "--unsafe-no-cgroups", "--small-default-cap", "--quiet",
+            "--unsafe-no-cgroups", "--allow-unwise-nest-dagruns", "--small-default-cap", "--quiet",
         ),
         "box": (
             "--mem", "--timeout", "--cores", "--label", "--perf-dir",

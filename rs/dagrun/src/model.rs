@@ -335,6 +335,11 @@ fn normalize_jobs_env(raw: &str, source: &str) -> Result<String, String> {
             "{source}={name:?} is not a valid environment variable name"
         ));
     }
+    if matches!(name, "DAGRUN_OUTER_RUN" | "DAGRUN_STEP") {
+        return Err(format!(
+            "{source}={name:?} is reserved by dagrun and cannot carry a step's worker count"
+        ));
+    }
     Ok(name.to_string())
 }
 
@@ -1552,6 +1557,14 @@ mod tests {
             step_width_is_resizable(&cfg.steps[0], &cfg.default_jobs_flag, &cfg.default_jobs_env)
         })
         .is_err());
+        for reserved in ["DAGRUN_OUTER_RUN", "DAGRUN_STEP"] {
+            cfg.default_jobs_env = reserved.to_string();
+            cfg.steps.clear();
+            assert!(
+                validate_jobs_env_config(&cfg).is_err(),
+                "runner-owned environment name {reserved} was accepted as a jobs channel"
+            );
+        }
     }
 
     #[test]

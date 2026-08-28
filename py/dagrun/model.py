@@ -275,6 +275,7 @@ def effective_jobs_flag(step: Step, default_jobs_flag: str) -> str:
 
 
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_RUNNER_ENV_NAMES = frozenset({"DAGRUN_OUTER_RUN", "DAGRUN_STEP"})
 
 
 def resolve_jobs_env(
@@ -298,6 +299,10 @@ def resolve_jobs_env(
     if not _ENV_NAME_RE.fullmatch(raw):
         raise ValueError(
             f"{JOBS_ENV_ENV}={raw!r} is not a valid environment variable name"
+        )
+    if raw in _RUNNER_ENV_NAMES:
+        raise ValueError(
+            f"{JOBS_ENV_ENV}={raw!r} is reserved by dagrun and cannot carry a step's worker count"
         )
     return raw
 

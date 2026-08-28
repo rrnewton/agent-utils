@@ -55,6 +55,24 @@ use crate::proccpu::{subtree_cpu_seconds, CPU_SOURCE_CGROUP, CPU_SOURCE_PROCFS};
 use crate::profile_enrich::{resolve_effective_inner_jobs, step_enrichment_columns};
 use crate::resource_caps::{Acquire as SharedResourceAcquire, Coordinator as ResourceCoordinator};
 
+/// The outer DAG step that launched this process. A second scheduler in that process tree must
+/// refuse by default instead of competing with its parent while reporting a whole inner graph as
+/// one outer step. Runner policy overwrites a manifest-provided value at spawn.
+pub const OUTER_RUN_ENV: &str = "DAGRUN_OUTER_RUN";
+
+/// Return the refusal for a scheduler front door launched from an outer DAG step, if any.
+pub fn nested_run_refusal(allow_unwise_nest_dagruns: bool) -> Option<String> {
+    let outer_run = std::env::var_os(OUTER_RUN_ENV)?;
+    if allow_unwise_nest_dagruns {
+        return None;
+    }
+    Some(format!(
+        "refusing nested invocation from outer run step {:?}; pass \
+         --allow-unwise-nest-dagruns only for a reviewed temporary exception",
+        outer_run.to_string_lossy()
+    ))
+}
+
 /// A per-step measurement row (column -> value), matching the perflog step-profile schema.
 type ProfileRow = BTreeMap<String, String>;
 
@@ -2767,6 +2785,9 @@ fn run_step(ctx: StepCtx) {
         // Runner authority wins over a DAG-supplied value on the same channel.
         cmd.env(name, value);
     }
+    // Runner authority also wins over the configurable jobs-env channel. The tag identifies
+    // which outer node launched a nested scheduler; DAGRUN_STEP remains the ownership token.
+    cmd.env(OUTER_RUN_ENV, &tag);
     cmd.env(STEP_NONCE_ENV, &nonce);
     cmd.env_remove(TEST_COUNTS_PATH_ENV);
     if let Some(path) = &test_counts_path {

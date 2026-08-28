@@ -56,7 +56,7 @@ use crate::model::{
 use crate::perflog::{append_step_profiles, child_cpu_seconds, PerfWindow};
 use crate::profile_enrich::container_core_budget;
 use crate::scheduler::{
-    cap_config_max_cpus, run_dag_boxed_deadline_limited, run_dag_boxed_limited,
+    cap_config_max_cpus, nested_run_refusal, run_dag_boxed_deadline_limited, run_dag_boxed_limited,
     validate_max_cpus_rewrite, BoxedCgroups,
 };
 use crate::sizing::{
@@ -372,6 +372,7 @@ fn run_help(c: &Palette) -> String {
             ("--admission [WAIT_S]", "HOST-WIDE memory admission (opt-in): reserve --max-mem against a durable ledger every runner on the host shares. GRANT / QUEUE (says how many holders are ahead) / REFUSE (says the number to ask for). WAIT_S = how long to wait while queued (default 0 = report and exit 4; at most 86400). Requires --max-mem"),
             ("--allow-cgroup-failure", "if cgroup boxing is unavailable, run UNBOXED with a warning instead of erroring"),
             ("--unsafe-no-cgroups", "DELIBERATELY skip cgroup boxing entirely (unsafe)"),
+            ("--allow-unwise-nest-dagruns", "allow a reviewed temporary nested dagrun exception; flatten the caller instead"),
             ("--small-default-cap", "compatibility no-op (small caps are already on by default)"),
             (
                 "--cpu-timeout-multiplier FACTOR",
@@ -945,6 +946,7 @@ struct RunArgs {
     admission: Option<f64>,
     allow_cgroup_failure: bool,
     unsafe_no_cgroups: bool,
+    allow_unwise_nest_dagruns: bool,
     small_default_cap: bool,
     cpu_timeout_multiplier: Option<f64>,
     verbosity: i64,
@@ -1008,6 +1010,7 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
         admission: None,
         allow_cgroup_failure: false,
         unsafe_no_cgroups: false,
+        allow_unwise_nest_dagruns: false,
         small_default_cap: false,
         cpu_timeout_multiplier: None,
         verbosity: 1,
@@ -1154,6 +1157,7 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
             }
             "--allow-cgroup-failure" => a.allow_cgroup_failure = true,
             "--unsafe-no-cgroups" => a.unsafe_no_cgroups = true,
+            "--allow-unwise-nest-dagruns" => a.allow_unwise_nest_dagruns = true,
             "--small-default-cap" => a.small_default_cap = true,
             "--cpu-timeout-multiplier" => {
                 let v = take_value(inline, &mut i)?;
@@ -3305,6 +3309,10 @@ pub fn run(argv: &[String]) -> i32 {
                     return 2;
                 }
             };
+            if let Some(refusal) = nested_run_refusal(a.allow_unwise_nest_dagruns) {
+                eprintln!("{PROG}: run: {refusal}");
+                return 2;
+            }
             // A boxed run re-execs inside systemd. Do that before consuming a stdin DAG so the
             // in-scope child receives the untouched pipe. Explicit unboxed and direct-cgroup
             // modes do not re-exec, so they continue to load stdin directly.

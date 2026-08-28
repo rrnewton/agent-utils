@@ -82,10 +82,28 @@ from dagrun.teardown import (
     reap_many,
 )
 
+#: The outer DAG step that launched this process. A second scheduler in that process tree must
+#: refuse by default instead of competing with its parent while reporting a whole inner graph as
+#: one outer step. The scheduler overwrites manifest-provided values when spawning each step.
+OUTER_RUN_ENV = "DAGRUN_OUTER_RUN"
+
+
+def nested_run_refusal(allow_unwise_nest_dagruns: bool) -> str | None:
+    """Return the refusal for a scheduler launched from an outer DAG step, if any."""
+    outer_run = os.environ.get(OUTER_RUN_ENV)
+    if outer_run is None or allow_unwise_nest_dagruns:
+        return None
+    return (
+        f"refusing nested invocation from outer run step {outer_run!r}; "
+        "pass --allow-unwise-nest-dagruns only for a reviewed temporary exception"
+    )
+
 __all__ = [
+    "OUTER_RUN_ENV",
     "Runner",
     "cap_config_max_cpus",
     "cap_config_cpu_jobs",
+    "nested_run_refusal",
     "run_dag",
     "run_dag_limited",
 ]
@@ -1241,14 +1259,17 @@ class Runner:
         self._emit(f"[{step.tag}] ▶ START  {step.desc}")
         env = dict(os.environ)
         env.update(step.env)
-        nonce = mint_step_nonce()
-        # Runner authority wins over a DAG-supplied environment value.
-        env[STEP_NONCE_ENV] = nonce
         inner_jobs = preferred_inner_jobs(step)
         # Deliver the width through this machine's env channel when it has one. Empty overlay
         # when the host configured none, so behaviour is unchanged where nothing is set.
         jobs_env = env_with_inner_jobs(step, self.cfg.default_jobs_env, inner_jobs)
         env.update(jobs_env)
+        # Runner authority wins over both DAG-supplied values and the configurable jobs-env
+        # channel. The step tag identifies which outer node launched a nested scheduler; the
+        # DAGRUN_STEP nonce remains dedicated to process-tree ownership and teardown.
+        env[OUTER_RUN_ENV] = step.tag
+        nonce = mint_step_nonce()
+        env[STEP_NONCE_ENV] = nonce
         cpu_count = effective_cpu_count(step, self.cfg.default_step_cpu_count)
         # SMALL default caps for an undeclared step (the forcing function): fall back to the
         # DAG's tight 1-GiB memory.max / 1-core cpu.max / 10-s CPU-time floor when the step

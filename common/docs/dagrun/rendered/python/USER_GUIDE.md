@@ -399,6 +399,13 @@ In 0.15, legal per-step widths no longer consume additive scheduler tokens:
 bandwidth. Library callers that relied on 0.14's width-sum serialization should
 use `max_steps`, named resources, or their own admission policy explicitly.
 
+Dagrun refuses a `run` launched from inside another run's step. The outer scheduler sets
+`DAGRUN_OUTER_RUN` to the step's `group.job` tag, so the refusal names the outer step that launched
+it. This catches a second scheduler competing with its own parent for the same machine and
+reporting an inner graph as though it were one outer step. A reviewed temporary exception may
+pass `--allow-unwise-nest-dagruns`; the inner scheduler replaces the inherited marker with each of
+its own step tags for any deeper descendant. Prefer flattening the caller into one DAG.
+
 Per-step wall and CPU timeouts, memory limits, process-tree teardown, and OOM
 attribution are enforced inside nested cgroups when the host supplies cgroup v2
 and a delegated systemd user scope. If that capability is missing, the default

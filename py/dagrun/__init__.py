@@ -98,9 +98,11 @@ from dagrun.protocols import (
     StepOutcome,
 )
 from dagrun.scheduler import (
+    OUTER_RUN_ENV,
     Runner,
     cap_config_cpu_jobs,
     cap_config_max_cpus,
+    nested_run_refusal,
     run_dag,
     run_dag_limited,
     steps_violating_run_timeout,
@@ -170,6 +172,8 @@ __all__ = [
     "run_dag_limited",
     "cap_config_max_cpus",
     "cap_config_cpu_jobs",
+    "nested_run_refusal",
+    "OUTER_RUN_ENV",
     "steps_violating_run_timeout",
     "Runner",
     "RunResult",
