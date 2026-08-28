@@ -3224,11 +3224,16 @@ fn run_step(ctx: StepCtx) {
             let body = std::panic::catch_unwind(AssertUnwindSafe(move || {
                 // One-shot, so an unmeasurable budget is stated once per step, not once per tick.
                 let mut unmeasurable_warned = false;
-                let mut next_monitor = mstart
+                // Match the Python runner and the pre-time-series Rust cadence: guard and trace
+                // deadlines begin when the monitor itself is live, not at the earlier process
+                // spawn timestamp. Anchoring them to `mstart` can make the first guard tick early
+                // enough to race a short-lived process-group escape at its completion boundary.
+                let schedule_start = Instant::now();
+                let mut next_monitor = schedule_start
                     .checked_add(MONITOR_INTERVAL)
                     .unwrap_or_else(Instant::now);
                 let mut next_trace =
-                    trace_interval.and_then(|interval| mstart.checked_add(interval));
+                    trace_interval.and_then(|interval| schedule_start.checked_add(interval));
                 loop {
                     let deadline = next_trace.map_or(next_monitor, |trace| trace.min(next_monitor));
                     let wait = deadline.saturating_duration_since(Instant::now());
