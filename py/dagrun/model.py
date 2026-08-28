@@ -268,6 +268,9 @@ class Step:
     # instead of reconstructing the lane and category from ``cmd``. Kept after the established
     # positional fields so existing programmatic Step(...) calls retain their argument meaning.
     manifest: DagManifest | None = None
+    # Exact Cargo integration-test binary targets executed by this step. ``None`` preserves
+    # historical graphs; a present list is checked against the command by the registration audit.
+    integration_test_binaries: list[str] | None = None
 
     def explains_a_failure_in(self, failed: Container[str]) -> bool:
         """Whether this step is exempt from eager-exit given the set of tags that FAILED.
