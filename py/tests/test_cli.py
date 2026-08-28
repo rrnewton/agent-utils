@@ -1669,8 +1669,17 @@ def test_unboxed_run_enforces_a_lower_bound_and_exposes_its_escape() -> None:
                     "job": "escape",
                     "desc": "leave the measured group",
                     "cmd": (
-                        "setsid --wait python3 -c 'import time\n"
-                        "t=time.time()\nwhile time.time()-t<4: pass'"
+                        "python3 -c 'import os,time\n"
+                        "pid=os.fork()\n"
+                        "if pid == 0:\n"
+                        " os.setsid()\n"
+                        " if os.fork() == 0:\n"
+                        "  end=time.time()+4\n"
+                        "  while time.time()<end: pass\n"
+                        "  os._exit(0)\n"
+                        " os._exit(0)\n"
+                        "os.waitpid(pid,0)\n"
+                        "time.sleep(5)'"
                     ),
                     "cpu_timeout": 1,
                     "timeout": 30,

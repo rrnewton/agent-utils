@@ -36,9 +36,11 @@ const MULTI_BREACH_DAG: &str = r#"{"steps": [
 ]}"#;
 
 /// The known limit that keeps the public capability false: a child that leaves the process group
-/// can consume CPU outside this lower-bound measurement.
+/// can consume CPU outside this lower-bound measurement. Double-fork it away from the in-group
+/// parent: `setsid --wait` is not a stable discriminator because wait(2) eventually rolls the
+/// escaped child's CPU into the waiting parent's `cutime` just before both exit.
 const ESCAPEE_DAG: &str = r#"{"steps": [{"group": "cpu", "job": "escape", "desc": "leave the measured group",
-  "cmd": "setsid --wait python3 -c \"import time\nt=time.time()\nwhile time.time()-t<4: pass\"", "cpu_timeout": 1, "timeout": 30}]}"#;
+  "cmd": "python3 -c \"import os,time\npid=os.fork()\nif pid == 0:\n os.setsid()\n if os.fork() == 0:\n  end=time.time()+4\n  while time.time()<end: pass\n  os._exit(0)\n os._exit(0)\nos.waitpid(pid,0)\ntime.sleep(5)\"", "cpu_timeout": 1, "timeout": 30}]}"#;
 
 fn write_dag(dir: &PathBuf, name: &str, body: &str) -> PathBuf {
     std::fs::create_dir_all(dir).unwrap();
