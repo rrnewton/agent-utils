@@ -2,98 +2,136 @@
 
 ## What a slot contains
 
-A slot is one durable registry row plus one directory under the configured worktrees directory. A
-slot can contain one or more linked Git worktrees. Each checkout records its source repository,
-branch, starting commit, configured remote name, remote identity, landed ref, current commit, and
-the remote refs that contain that commit at handoff.
+A slot is an append-only history plus a directory of linked Git worktrees. An `agent` slot holds
+authored work and must be salvaged before reclaim. A `validate` slot is disposable by construction;
+its logs and result records must live outside the checkout, so reclaim does not salvage it.
 
-The source repositories stay outside the managed worktrees directory. `wrkslots` treats the managed
-directory as opaque: do not move its entries or edit `ACTIVE.*`, `ARCHIVED.*`, or journal files by
-hand.
+Use `worktrees/slots/<slot>/` for live agent slots and `worktrees/validate/<slot>/` for validation
+slots. Source repositories stay outside both directories. `ACTIVE.*` and `ARCHIVED.*` are readable
+compatibility views derived from `EVENTS.*`; do not edit any of them or a journal by hand.
+
+Each checkout record carries its source repository, branch, starting commit, configured remote,
+remote identity, landed ref, current commit, and remote containment evidence. Each slot records its
+type, task and purpose, owner process identity, coordinator history, heartbeat time, and time-to-live.
 
 ## Normal lifecycle
 
-1. `init` creates the configuration and empty machine shard. It registers the project command used
-   to determine whether an agent is dead, alive, or unverifiable.
-2. `create` verifies each source repository and configured remote, creates a new branch and linked
-   worktree, and durably records the coordinator and optional owner process generations.
-3. `heartbeat` refreshes diagnosis data for the exact recorded owner generation.
-4. `finish` runs while the owner is still alive. It requires clean Git state, fetches the configured
-   remote, proves that every checkout commit is published and contained by the configured landed
-   ref, then records validation evidence and the coordinator continuation. It does not delete.
-5. `remove` is coordinator-only. It requires the registered running check to report dead, the owner
-   process generation to be absent, and the live-process and Git safety checks to succeed.
-6. `recover` resumes an interrupted create or removal from its durable journal.
+1. `init` creates configuration, an empty machine history, the managed directories, and a
+   project-local command symlink. It records the project command that distinguishes dead, alive,
+   and unverifiable owners.
+2. The coordinator runs `create --slot-type agent --coordinator-authorized` for authored work, or
+   `create --slot-type validate --coordinator-authorized` for disposable validation. The flag is a
+   reminder and recorded provenance, not a permission boundary between same-user processes.
+3. The exact owner runs `heartbeat` to renew the slot while work continues.
+4. An owner that has clean, published work may run `finish` to record validation and continuation
+   evidence. A departed owner is not required to return: later reclaim can salvage from the recorded
+   checkout state.
+5. Any later participant may run `remove`. Reclaim proceeds only when the heartbeat time-to-live is
+   expired, the registered running command reports dead, the exact owner process identity is dead,
+   and process, mount, Git, and path checks agree. Unknown evidence refuses; it is not treated as
+   free. `--validate-complete` lets the exact live owner remove its completed validation slot, or
+   lets a later participant remove it after proven owner death without waiting out the heartbeat.
+   Process-use, path, and Git checks still run.
+6. Before removing an agent slot, `remove` publishes unpushed commits and tracked, untracked, and
+   ignored files outside configured regenerable cache paths to the recorded remote. It records and
+   rechecks the exact remote ref and commit before deletion. A validate slot skips this step.
+7. `recover` lets any later participant complete an interrupted create or removal from the durable
+   history. It is not tied to the participant that began the operation.
 
-Run `wrkslots quickstart` for copyable commands and `wrkslots COMMAND --help` for the exact inputs
-and effects of one operation.
+Run `wrkslots quickstart` for copyable commands and `wrkslots COMMAND --help` for exact effects and
+inputs.
 
-A configuration written by an older build makes normal commands refuse. `init --repair` can add
-compatible configuration fields, upgrade the exact empty schema-1 active and archive files, and
-replace the repository command symlink written before packaging. It refuses populated, malformed,
-or other unsupported state rather than reporting an empty or partial slot list.
+## Creation is coordinator-owned guidance
 
-## Registered running command
+`create`, `register`, and `import-existing --apply` require both `--slot-type` and
+`--coordinator-authorized`. Omitting either refuses before any worktree or lifecycle record changes
+and tells the caller to ask the coordinator. This prevents accidental self-allocation; it does not
+pretend that same-user processes have different operating-system permissions.
 
-`init --liveness-command PATH` records an executable path relative to the project root. During
-removal, wrkslots invokes it with the recorded agent name as its only positional argument and
-provides `WRKSLOTS_PROJECT_ROOT`, `WRKSLOTS_SLOT`, `WRKSLOTS_AGENT`, `WRKSLOTS_MACHINE`, generation,
-owner PID/start/boot/cgroup fields, and other recorded identity fields in the environment.
+`--coordinator-authorized` on `remove`, `recover`, and `read-handoff` is optional. When supplied it
+is recorded as provenance. It cannot gate helping, because the original coordinator may disappear.
 
-The exit status is authority:
+By default every command refuses if either managed directory contains a worktree without an active
+wrkslots record. During a deliberate migration, put the global
+`--allow-existing-unregistered-worktrees` flag before the command. The requested operation then
+touches only registered slots and prints how many unregistered directories it retained. It never
+uses that flag as permission to inspect, select, or remove one of them. Run
+`wrkslots audit --format json` and import each live slot only after verifying its process evidence.
+
+`wrkslots audit --gate` is the read-only coordinator reminder. It exits 1 for reclaimable,
+interrupted, or unregistered slots; exits 2 when an expired slot cannot be classified because
+evidence is unavailable; and exits 0 only when neither condition exists. The output names the
+affected slots and the next command. It never converts an unknown result into permission to remove.
+
+## Time-to-live and process evidence
+
+`init --heartbeat-ttl-seconds SECONDS` records the default copied into every new slot. `heartbeat`
+updates the durable renewal time only for the exact owner process generation. Expiry is one required
+reclaim fact, never the whole decision.
+
+The registered running command receives the agent name as its only positional argument and receives
+`WRKSLOTS_PROJECT_ROOT`, `WRKSLOTS_SLOT`, `WRKSLOTS_AGENT`, `WRKSLOTS_MACHINE`, generation, and owner
+identity fields in the environment. `WRKSLOTS_SLOT_TYPE` and `WRKSLOTS_TASK` let a project-owned
+command consult validation-run evidence without guessing from a path. Its exit status means:
 
 - `0`: the registered mechanism verified the agent is dead;
 - `1`: the agent is alive;
 - `2`: the mechanism cannot determine the answer;
-- anything else: the check failed and removal refuses.
+- anything else: the check failed.
 
-Heartbeat expiry, directory mtimes, and apparent inactivity never replace this result. They are
-diagnostic signals for a coordinator or human.
+Only `0` satisfies that reclaim condition. The exact recorded process generation must independently
+be dead, and the full process-use scan must find no cwd, executable, root, descriptor, mapping,
+cgroup, or mount use. If the liveness source is degraded or stale, return `2`; unknown ownership is
+not a free slot.
 
-## Git remotes
+A slot imported from an older state file with no recorded owner identity cannot currently satisfy the owner-death condition,
+even after its heartbeat expires. `recover-unbound-owner` can record what was inspected but does not
+turn unavailable process evidence into proof of death. Preserve such a slot until an evidence-based
+migration path exists.
 
-For each `--repo NAME=PATH`, `create` defaults to the repository's configured `origin`. Supply
-`--remote NAME=REMOTE` to choose another configured remote. The remote must have exactly one fetch
-URL. Supply `--remote-url NAME=URL` when the caller must verify that exact URL during provisioning;
-otherwise wrkslots reads the configured URL. In both cases it records a SHA-256 identity and
-requires the URL to remain unchanged through handoff and removal.
+## HANDOFF.md
 
-## Recovery
+An agent slot may contain an untracked `HANDOFF.md` beside its checkouts. Its absence says nothing
+about liveness. If it exists, reclaim refuses until `wrkslots read-handoff SLOT --coordinator-pid
+PID` prints its exact UTF-8 contents and appends the contents and digest to the slot history. A
+changed handoff must be read again. The recorded bytes remain in the history after the slot is
+removed.
 
-Every operation that can leave multiple durable effects writes a journal first and updates it after
-each completed step. A crash therefore produces a named recovery state rather than an inferred one.
-Ordinary mutation commands refuse while a journal exists.
+## Git remotes and salvage
 
-Recovery validates the journal's machine, slot, process generation, paths, Git registrations, and
-registry rows before continuing. Repeating recovery is safe. A mismatch preserves all remaining
-paths for inspection.
+For each `--repo NAME=PATH`, `create` uses the configured `origin` by default. Supply
+`--remote NAME=REMOTE` to choose another configured remote and `--remote-url NAME=URL` when the
+caller must verify its exact fetch URL. Wrkslots records a SHA-256 identity and refuses if the URL
+changes.
+
+For a dirty or unpushed agent checkout, reclaim constructs a commit without changing the checkout's
+ordinary index or branch. It includes tracked, untracked, and ignored files except configured cache
+paths, pushes the commit to `refs/heads/salvage/<machine>/<slot>/...`, reads that exact ref back, and
+records the result. If the checkout was already clean and published, the existing remote containment
+is recorded instead. A failed or unverifiable push preserves the checkout.
+
+Initialized Git submodules are checked separately against the corresponding source repository's
+remote URL. Each nested repository gets its own salvage commit and remote readback, so an
+uncommitted file inside a submodule cannot disappear behind an outer gitlink that did not move.
+
+## Recovery and compatibility views
+
+Every mutation appends a numbered, hash-linked JSON event before refreshing the readable ACTIVE,
+ARCHIVED, hold, or journal view. Readers derive state from the event history whenever it exists, so
+a stale compatibility view cannot override later evidence. A complete event left at an atomic-write
+temporary path can be promoted by `recover --discard-partial`; malformed or ambiguous files refuse.
+
+Create and removal journals contain the exact paths, Git identities, completed steps, salvage
+receipts, and remaining work. If the mutable journal view is missing, `recover` reconstructs the
+pending operation from the append-only history. Recovery rechecks every destructive precondition;
+it does not trust the earlier participant's conclusion.
 
 ## Test scenarios
 
-The source package includes deterministic and stress tests under `tests/`:
+The source package includes deterministic and stress tests for concurrent creation, owner and
+time-to-live disagreement, unavailable liveness, dirty and unpublished salvage, ignored-file
+capture, validate deletion without salvage, unread handoffs, process use, path fencing, interrupted
+operations, hash-chain corruption, missing compatibility views, and later-participant recovery.
 
-- happy path: coordinator creates, assigns an agent process tree, work is committed and pushed,
-  handoff is recorded, and the coordinator removes the slot;
-- forgotten cleanup: the agent exits and the lease ages while the clean published slot remains;
-- agent death with dirty files or unpublished commits: cleanup refuses and preserves the work;
-- concurrent coordinators and agents issuing conflicting lifecycle commands;
-- process use through cwd, open descriptors, mapped files, executables, and descendants;
-- real process killing at journal transitions followed by recovery;
-- cross-shard duplicate and unrelated-slot preservation checks.
-
-The default test run uses compressed durations. The standalone stress runner accepts a seed, worker
-count, and duration and writes a replayable JSONL trace when an invariant fails.
-
-The mock processes use the same observable parent/child shape as the coding-agent sessions on the
-development host: a coordinator starts a launcher, the launcher starts the agent engine, and the
-engine starts command processes. The harness registers the engine as owner, invokes owner-only
-commands from descendants of that engine, and uses real signals to kill either the engine or its
-whole process tree.
-
-## Filesystem timestamps
-
-A directory mtime changes when entries immediately inside that directory are added, removed, or
-renamed. It is not the newest mtime of every descendant, including on btrfs. Determining the exact
-newest mtime in an arbitrary existing tree therefore requires walking the tree unless another
-component has maintained an index or change log. Wrkslots treats timestamps only as diagnosis and
-does not use them as removal authority.
+The default test run uses a PID namespace for tests that only need isolated process evidence and
+runs four host-visible process tests separately. This changes test cost, not coverage or assertions.

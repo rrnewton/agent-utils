@@ -243,7 +243,7 @@ class AgentTree:
         self.slot = slot
         self.agent = agent
         self.trace = trace
-        self.checkout = project.root / "worktrees" / slot / "product"
+        self.checkout = project.root / "worktrees" / "slots" / slot / "product"
         self.control = project.root / "controls" / agent
         self.control.mkdir(parents=True)
         self.ready = self.control / "ready.json"
@@ -327,13 +327,27 @@ class AgentTree:
             )
         return result
 
-    def run(self, *argv: str, expected: int | Sequence[int] = 0) -> dict[str, object]:
-        return self.request({"action": "exec", "argv": list(argv)}, expected=expected)
+    def run(
+        self,
+        *argv: str,
+        expected: int | Sequence[int] = 0,
+        timeout: float = 30,
+    ) -> dict[str, object]:
+        return self.request(
+            {"action": "exec", "argv": list(argv)},
+            expected=expected,
+            timeout=timeout,
+        )
 
     def write(self, relative: str, content: str) -> None:
         self.request({"action": "write", "path": relative, "content": content})
 
     def wrkslots(self, *args: str, expected: int | Sequence[int] = 0) -> dict[str, object]:
+        # Eight workers deliberately serialize append-only mutations through one
+        # project lock. The test is about safe convergence under contention, not
+        # a ten-second acquisition SLA; the dedicated lock tests retain the
+        # bounded-refusal assertion. Keep the request timeout above this wait so
+        # the mock agent can return the command's own diagnostic.
         return self.run(
             sys.executable,
             "-m",
@@ -343,9 +357,10 @@ class AgentTree:
             "--machine",
             MACHINE,
             "--wait-lock",
-            "10",
+            "30",
             *args,
             expected=expected,
+            timeout=45,
         )
 
     def stop(self) -> None:
@@ -368,6 +383,11 @@ class AgentTree:
         )
 
     def terminate_tree(self) -> None:
+        command_pid = _integer(self.info.get("command_pid"), "command PID")
+        try:
+            os.kill(command_pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
         if self.launcher.poll() is None:
             self.launcher.terminate()
             try:
@@ -375,6 +395,29 @@ class AgentTree:
             except subprocess.TimeoutExpired:
                 self.launcher.kill()
                 self.launcher.wait(timeout=10)
+        def command_is_running() -> bool:
+            try:
+                text = Path("/proc", str(command_pid), "stat").read_text(
+                    encoding="ascii"
+                )
+            except FileNotFoundError:
+                return False
+            close = text.rfind(")")
+            return text[close + 2 : close + 3] not in {"Z", "X"}
+
+        deadline = time.monotonic() + 10
+        while command_is_running() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if command_is_running():
+            try:
+                os.kill(command_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            deadline = time.monotonic() + 10
+            while command_is_running() and time.monotonic() < deadline:
+                time.sleep(0.02)
+        if command_is_running():
+            raise HarnessFailure(f"command process {command_pid} did not stop")
         self.trace.add("agent-tree-terminated", agent=self.agent, slot=self.slot)
 
 
@@ -383,6 +426,9 @@ def _create_unbound(project: TestProject, slot: str, agent: str, trace: Trace) -
         project,
         "create",
         slot,
+        "--slot-type",
+        "agent",
+        "--coordinator-authorized",
         "--agent",
         agent,
         "--task",
@@ -473,28 +519,41 @@ def _state(project: TestProject) -> dict[str, object]:
 
 
 def _record_owner_cgroup_ended(project: TestProject, slot: str) -> None:
-    path = project.root / "worktrees" / f"ACTIVE.{MACHINE}.json"
-    value = _state(project)
-    slots = value.get("slots")
-    if not isinstance(slots, list):
-        raise HarnessFailure("active state slots are not a list")
-    for item in slots:
-        if not isinstance(item, dict) or item.get("slot") != slot:
-            continue
-        owner = item.get("owner")
-        if not isinstance(owner, dict):
-            raise HarnessFailure(f"slot {slot} has no recorded owner")
-        owner["cgroup_path"] = f"/wrkslots-e2e-ended/{slot}"
-        path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        return
-    raise HarnessFailure(f"slot {slot} is absent from active state")
+    program = """
+import dataclasses
+import sys
+from wrkslots import cli
+
+root, machine, slot = sys.argv[1:]
+config = cli._load_config(root, machine)
+state = cli._load_active(config)
+record = cli._find_record(state, slot)
+if record.owner is None:
+    raise SystemExit(f"slot {slot} has no recorded owner")
+owner = dataclasses.replace(
+    record.owner,
+    cgroup_path=f"/wrkslots-e2e-ended/{slot}",
+)
+updated = dataclasses.replace(record, owner=owner)
+cli._write_active_state(
+    config,
+    cli._replace_record(state, updated),
+    action="test-owner-cgroup-ended",
+    slot=slot,
+)
+"""
+    _run(
+        [sys.executable, "-c", program, str(project.root), MACHINE, slot],
+        cwd=project.root,
+        env=project.environment,
+    )
 
 
 def _assert_present(project: TestProject, slot: str) -> None:
     slots = _state(project).get("slots")
     if not isinstance(slots, list) or slot not in {item.get("slot") for item in slots if isinstance(item, dict)}:
         raise HarnessFailure(f"slot {slot} is absent from active state")
-    if not (project.root / "worktrees" / slot / "product").is_dir():
+    if not (project.root / "worktrees" / "slots" / slot / "product").is_dir():
         raise HarnessFailure(f"slot {slot} lost its checkout path")
 
 
@@ -502,7 +561,7 @@ def _assert_removed(project: TestProject, slot: str) -> None:
     slots = _state(project).get("slots")
     if not isinstance(slots, list) or slot in {item.get("slot") for item in slots if isinstance(item, dict)}:
         raise HarnessFailure(f"slot {slot} remains active after removal")
-    if (project.root / "worktrees" / slot).exists():
+    if (project.root / "worktrees" / "slots" / slot).exists():
         raise HarnessFailure(f"slot {slot} path remains after removal")
     registered = _git(
         project.repository,
@@ -511,7 +570,7 @@ def _assert_removed(project: TestProject, slot: str) -> None:
         "--porcelain",
         env=project.environment,
     ).stdout
-    if f"/worktrees/{slot}/" in registered:
+    if f"/worktrees/slots/{slot}/" in registered:
         raise HarnessFailure(f"slot {slot} remains registered with Git")
 
 
@@ -524,6 +583,7 @@ def _happy_path(base: Path, trace: Trace) -> None:
         _do_and_land_work(project, tree, trace)
         _finish(tree)
         tree.stop()
+        time.sleep(2.1)
         removal = _remove(project, "happy", trace, expected=(0, 3))
         if removal.returncode == 3:
             if "remains in recorded owner cgroup" not in removal.stderr:
@@ -559,7 +619,7 @@ def _forgotten_clean(base: Path, trace: Trace) -> None:
 
 
 def _abandoned_work(base: Path, trace: Trace, *, unpublished_commit: bool) -> None:
-    project = _make_project(base, trace)
+    project = _make_project(base, trace, ttl_seconds=1)
     slot = "unpublished" if unpublished_commit else "dirty"
     agent = f"codex-{slot}"
     _create_unbound(project, slot, agent, trace)
@@ -588,10 +648,20 @@ def _abandoned_work(base: Path, trace: Trace, *, unpublished_commit: bool) -> No
         tree.kill_engine()
         time.sleep(0.1)
         tree.terminate_tree()
-        refused = _remove(project, slot, trace, expected=3)
-        if "handoff" not in refused.stderr.lower():
-            raise HarnessFailure(f"abandoned {slot} refusal did not identify the missing handoff")
-        _assert_present(project, slot)
+        time.sleep(1.1)
+        _record_owner_cgroup_ended(project, slot)
+        _remove(project, slot, trace)
+        _assert_removed(project, slot)
+        refs = _git(
+            project.remote,
+            "for-each-ref",
+            "--format=%(refname)",
+            f"refs/heads/salvage/{MACHINE}/{slot}",
+            env=project.environment,
+            trace=trace,
+        ).stdout
+        if not refs.strip():
+            raise HarnessFailure(f"abandoned {slot} work was removed without remote salvage")
     finally:
         tree.terminate_tree()
 

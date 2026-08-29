@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import configparser
 import contextlib
 import dataclasses
 import datetime as dt
@@ -19,6 +20,7 @@ import socket
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence, Set as AbstractSet
@@ -52,6 +54,8 @@ REMOTE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 GIB = 1024**3
 HOLD_SCHEMA = 1
+EVENT_SCHEMA = 1
+SLOT_TYPES = ("agent", "validate")
 
 
 class Refusal(RuntimeError):
@@ -131,6 +135,7 @@ class ActiveRecord:
     agent: str
     task: str
     purpose: str
+    slot_type: str
     machine: str
     generation: int
     created_at: str
@@ -225,6 +230,28 @@ def _validate_remote(value: str) -> str:
     return value
 
 
+def _require_coordinator_authorized(args: argparse.Namespace, action: str) -> None:
+    if getattr(args, "coordinator_authorized", False):
+        return
+    raise Refusal(
+        f"{action} is coordinator-owned. state: REFUSED -- no worktree or lifecycle "
+        "record was changed. remedy: ask the coordinator to perform the operation; a "
+        "coordinator-delegated wrapper may rerun it with --coordinator-authorized"
+    )
+
+
+def _require_slot_type(args: argparse.Namespace, action: str) -> str:
+    value = getattr(args, "slot_type", None)
+    if isinstance(value, str) and value in SLOT_TYPES:
+        return value
+    raise Refusal(
+        f"{action} must record whether this is an agent or validate slot. state: REFUSED "
+        "-- no worktree or lifecycle record was changed. remedy: rerun with "
+        "--slot-type agent for authored work, or --slot-type validate for a disposable "
+        "validation checkout whose evidence lives outside the slot"
+    )
+
+
 def _validate_ref(value: str, label: str) -> str:
     if not value or value.startswith("-") or any(ch.isspace() for ch in value):
         raise Refusal(f"invalid {label} {value!r}")
@@ -253,6 +280,12 @@ def _validate_layout(value: str) -> str:
     if value not in {"nested", "flat"}:
         raise Refusal(f"invalid layout {value!r}; expected 'nested' or 'flat'")
     return value
+
+
+def _control_directory_for(worktrees: Path, layout: str) -> Path:
+    if worktrees.name == "slots":
+        return worktrees.parent
+    return worktrees if layout == "nested" else worktrees.parent
 
 
 def _validate_cache_glob(value: str) -> str:
@@ -701,6 +734,7 @@ def _config_is_authoritative_candidate(root: Path, config_path: Path) -> bool:
         or any(control.glob("ACTIVE.*.json"))
         or any(control.glob("ARCHIVED.*.json"))
         or any(control.glob("ACTIVE.*.journal"))
+        or any(control.glob("EVENTS.*"))
     )
 
 
@@ -767,7 +801,7 @@ def _load_config(explicit_root: str | None, machine_override: str | None) -> Con
     layout = _validate_layout(
         _as_str(raw.get("layout", "nested"), "configuration.layout")
     )
-    control = worktrees if layout == "nested" else worktrees.parent
+    control = _control_directory_for(worktrees, layout)
     if not control.is_dir() or control.is_symlink():
         raise StateError(f"configured control directory is missing or unsafe: {control}")
     remote = _validate_remote(
@@ -906,7 +940,7 @@ def _hold_path(config: Config, slot: str, machine: str | None = None) -> Path:
     return config.control / f"HOLD.{len(selected)}.{selected}.{slot}.json"
 
 
-def _load_hold(
+def _load_hold_snapshot(
     config: Config, slot: str, machine: str | None = None
 ) -> dict[str, object] | None:
     selected = machine or config.machine
@@ -925,6 +959,34 @@ def _load_hold(
     if not _as_str(raw["reason"], "slot hold.reason").strip():
         raise StateError(f"slot hold has an empty reason: {path}")
     return dict(raw)
+
+
+def _load_hold(
+    config: Config, slot: str, machine: str | None = None
+) -> dict[str, object] | None:
+    selected = machine or config.machine
+    events = _load_events(config, selected)
+    if not events:
+        return _load_hold_snapshot(config, slot, selected)
+    hold: dict[str, object] | None = None
+    for event in events:
+        payload = _as_mapping(event["payload"], "append-only event.payload")
+        if event.get("kind") == "state-imported":
+            for item in _as_list(payload.get("holds", []), "imported holds"):
+                candidate = dict(_as_mapping(item, "imported hold"))
+                if candidate.get("slot") == slot:
+                    hold = candidate
+        elif payload.get("slot") == slot and event.get("kind") == "slot-held":
+            hold = {
+                "schema": HOLD_SCHEMA,
+                "machine": selected,
+                "slot": slot,
+                "held_at": event["recorded_at"],
+                "reason": payload.get("reason"),
+            }
+        elif payload.get("slot") == slot and event.get("kind") == "slot-hold-released":
+            hold = None
+    return hold
 
 
 def _assert_not_held(config: Config, record: ActiveRecord) -> None:
@@ -1209,7 +1271,19 @@ def _handoff_from_obj(value: object, label: str) -> Handoff | None:
 
 
 def _checkout_to_obj(checkout: Checkout) -> dict[str, object]:
-    return dataclasses.asdict(checkout)
+    return {
+        "name": checkout.name,
+        "path": checkout.path,
+        "repository": checkout.repository,
+        "branch": checkout.branch,
+        "start_point": checkout.start_point,
+        "remote": checkout.remote,
+        "remote_url_sha256": checkout.remote_url_sha256,
+        "landed_ref": checkout.landed_ref,
+        "head": checkout.head,
+        "containing_remote_refs": list(checkout.containing_remote_refs),
+        "vcs": checkout.vcs,
+    }
 
 
 def _checkout_from_obj(value: object, label: str) -> Checkout:
@@ -1277,6 +1351,7 @@ def _record_to_obj(record: ActiveRecord) -> dict[str, object]:
         "agent": record.agent,
         "task": record.task,
         "purpose": record.purpose,
+        "slot_type": record.slot_type,
         "machine": record.machine,
         "generation": record.generation,
         "created_at": record.created_at,
@@ -1292,7 +1367,7 @@ def _record_to_obj(record: ActiveRecord) -> dict[str, object]:
 
 def _record_from_obj(value: object, label: str) -> ActiveRecord:
     raw = _as_mapping(value, label)
-    fields = {
+    required_fields = {
         "slot",
         "agent",
         "task",
@@ -1308,7 +1383,7 @@ def _record_from_obj(value: object, label: str) -> ActiveRecord:
         "handoff",
         "checkouts",
     }
-    _exact_keys(raw, fields, set(), label)
+    _exact_keys(raw, required_fields, {"slot_type"}, label)
     checkouts = tuple(
         _checkout_from_obj(item, f"{label}.checkouts[{index}]")
         for index, item in enumerate(_as_list(raw["checkouts"], f"{label}.checkouts"))
@@ -1323,6 +1398,7 @@ def _record_from_obj(value: object, label: str) -> ActiveRecord:
         agent=_as_str(raw["agent"], f"{label}.agent"),
         task=_as_str(raw["task"], f"{label}.task"),
         purpose=_as_str(raw["purpose"], f"{label}.purpose"),
+        slot_type=_as_str(raw.get("slot_type", "agent"), f"{label}.slot_type"),
         machine=_as_str(raw["machine"], f"{label}.machine"),
         generation=_as_int(raw["generation"], f"{label}.generation", minimum=1),
         created_at=_as_str(raw["created_at"], f"{label}.created_at"),
@@ -1348,6 +1424,10 @@ def _record_from_obj(value: object, label: str) -> ActiveRecord:
     _validate_name(record.machine, "machine")
     if not record.task or not record.purpose:
         raise StateError(f"{label} has an empty task or purpose")
+    if record.slot_type not in SLOT_TYPES:
+        raise StateError(
+            f"{label}.slot_type must be one of {', '.join(SLOT_TYPES)}"
+        )
     _parse_timestamp(record.created_at, f"{label}.created_at")
     _parse_timestamp(record.heartbeat_at, f"{label}.heartbeat_at")
     if not record.checkouts:
@@ -1360,13 +1440,13 @@ def _record_from_obj(value: object, label: str) -> ActiveRecord:
     return record
 
 
-def _load_active(config: Config, machine: str | None = None) -> ActiveState:
-    selected = machine or config.machine
-    path = _active_path(config, selected)
-    raw = _as_mapping(_read_json(path, "active state"), "active state")
+def _active_from_obj(
+    config: Config, value: object, selected: str, label: str
+) -> ActiveState:
+    raw = _as_mapping(value, label)
     _exact_keys(raw, {"schema", "machine", "revision", "slots"}, set(), "active state")
     if _as_int(raw["schema"], "active state.schema") != SCHEMA:
-        raise StateError(f"unsupported active state schema in {path}")
+        raise StateError(f"unsupported active state schema in {label}")
     actual_machine = _as_str(raw["machine"], "active state.machine")
     if actual_machine != selected:
         raise StateError(
@@ -1377,11 +1457,11 @@ def _load_active(config: Config, machine: str | None = None) -> ActiveState:
         for index, item in enumerate(_as_list(raw["slots"], "active state.slots"))
     )
     slot_names = [item.slot for item in slots]
-    agents = [item.agent for item in slots]
+    agents = [item.agent for item in slots if item.slot_type == "agent"]
     if len(slot_names) != len(set(slot_names)):
-        raise StateError(f"duplicate slot in {path}")
+        raise StateError(f"duplicate slot in {label}")
     if len(agents) != len(set(agents)):
-        raise StateError(f"one agent owns more than one active slot in {path}")
+        raise StateError(f"one agent owns more than one active slot in {label}")
     for record in slots:
         if record.machine != selected:
             raise StateError(
@@ -1395,6 +1475,12 @@ def _load_active(config: Config, machine: str | None = None) -> ActiveState:
     )
 
 
+def _load_active_snapshot(config: Config, machine: str | None = None) -> ActiveState:
+    selected = machine or config.machine
+    path = _active_path(config, selected)
+    return _active_from_obj(config, _read_json(path, "active state"), selected, str(path))
+
+
 def _active_to_obj(state: ActiveState) -> dict[str, object]:
     return {
         "schema": SCHEMA,
@@ -1404,13 +1490,13 @@ def _active_to_obj(state: ActiveState) -> dict[str, object]:
     }
 
 
-def _load_archive(config: Config, machine: str | None = None) -> ArchiveState:
-    selected = machine or config.machine
-    path = _archive_path(config, selected)
-    raw = _as_mapping(_read_json(path, "archive state"), "archive state")
+def _archive_from_obj(
+    config: Config, value: object, selected: str, label_prefix: str
+) -> ArchiveState:
+    raw = _as_mapping(value, label_prefix)
     _exact_keys(raw, {"schema", "machine", "revision", "records"}, set(), "archive state")
     if _as_int(raw["schema"], "archive state.schema") != SCHEMA:
-        raise StateError(f"unsupported archive state schema in {path}")
+        raise StateError(f"unsupported archive state schema in {label_prefix}")
     actual_machine = _as_str(raw["machine"], "archive state.machine")
     if actual_machine != selected:
         raise StateError(
@@ -1440,14 +1526,14 @@ def _load_archive(config: Config, machine: str | None = None) -> ArchiveState:
             "continuation",
             "checkouts",
         }
-        _exact_keys(mapping, fields, set(), label)
+        _exact_keys(mapping, fields, {"slot_type", "salvage"}, label)
         archive_id = _as_str(mapping["archive_id"], f"{label}.archive_id")
         if archive_id in archive_ids:
-            raise StateError(f"duplicate archive_id in {path}: {archive_id}")
+            raise StateError(f"duplicate archive_id in {label_prefix}: {archive_id}")
         archive_ids.add(archive_id)
         slot = _validate_name(_as_str(mapping["slot"], f"{label}.slot"), "archived slot")
         if slot in archived_slots:
-            raise StateError(f"duplicate archived slot in {path}: {slot}")
+            raise StateError(f"duplicate archived slot in {label_prefix}: {slot}")
         archived_slots.add(slot)
         agent = _validate_name(
             _as_str(mapping["agent"], f"{label}.agent"), "archived agent"
@@ -1456,6 +1542,13 @@ def _load_archive(config: Config, machine: str | None = None) -> ArchiveState:
             mapping["purpose"], f"{label}.purpose"
         ):
             raise StateError(f"{label} has an empty task or purpose")
+        slot_type = _as_str(mapping.get("slot_type", "agent"), f"{label}.slot_type")
+        if slot_type not in SLOT_TYPES:
+            raise StateError(f"{label}.slot_type must be one of {', '.join(SLOT_TYPES)}")
+        for salvage_index, salvage in enumerate(
+            _as_list(mapping.get("salvage", []), f"{label}.salvage")
+        ):
+            _as_mapping(salvage, f"{label}.salvage[{salvage_index}]")
         record_machine = _as_str(mapping["machine"], f"{label}.machine")
         if record_machine != selected:
             raise StateError(
@@ -1498,7 +1591,9 @@ def _load_archive(config: Config, machine: str | None = None) -> ArchiveState:
         if config.layout == "flat" and len(checkouts) != 1:
             raise StateError(f"{label} has multiple checkouts under flat layout")
         for checkout in checkouts:
-            expected, _destination = _checkout_path(config, slot, checkout.name)
+            expected, _destination = _checkout_path(
+                config, slot, checkout.name, slot_type
+            )
             if checkout.path != expected:
                 raise StateError(
                     f"{label} checkout {checkout.name} path escaped its archived slot"
@@ -1515,9 +1610,23 @@ def _load_archive(config: Config, machine: str | None = None) -> ArchiveState:
     )
 
 
+def _load_archive_snapshot(config: Config, machine: str | None = None) -> ArchiveState:
+    selected = machine or config.machine
+    path = _archive_path(config, selected)
+    return _archive_from_obj(
+        config, _read_json(path, "archive state"), selected, str(path)
+    )
+
+
 def _ensure_state_shard(config: Config) -> None:
     active = _active_path(config)
     archive = _archive_path(config)
+    derived = _states_from_events(config, config.machine)
+    if derived is not None:
+        active_state, archive_state = derived
+        _atomic_write_json(active, _active_to_obj(active_state))
+        _atomic_write_json(archive, _archive_to_obj(archive_state))
+        return
     active_exists = active.exists() or active.is_symlink()
     archive_exists = archive.exists() or archive.is_symlink()
     if active_exists != archive_exists:
@@ -1539,13 +1648,16 @@ def _ensure_state_shard(config: Config) -> None:
             _atomic_write_json(
                 active, _active_to_obj(ActiveState(config.machine, 0, ()))
             )
+        _ensure_event_log(config)
         return
     if active_exists:
         _load_active(config)
         _load_archive(config)
+        _ensure_event_log(config)
         return
     _atomic_write_json(active, _active_to_obj(ActiveState(config.machine, 0, ())))
     _atomic_write_json(archive, _archive_to_obj(ArchiveState(config.machine, 0, ())))
+    _ensure_event_log(config)
 
 
 def _archive_to_obj(state: ArchiveState) -> dict[str, object]:
@@ -1555,6 +1667,481 @@ def _archive_to_obj(state: ArchiveState) -> dict[str, object]:
         "revision": state.revision,
         "records": list(state.records),
     }
+
+
+def _event_directory(config: Config, machine: str | None = None) -> Path:
+    selected = machine or config.machine
+    _validate_name(selected, "machine")
+    return config.control / f"EVENTS.{selected}"
+
+
+def _event_digest(value: Mapping[str, object]) -> str:
+    encoded = json.dumps(
+        dict(value), sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _event_files(directory: Path) -> list[Path]:
+    if not directory.exists():
+        return []
+    if directory.is_symlink() or not directory.is_dir():
+        raise StateError(f"append-only event log is not a real directory: {directory}")
+    entries = tuple(directory.iterdir())
+    complete_pattern = re.compile(r"[0-9]{20}\.json")
+    partial_pattern = re.compile(r"[0-9]{20}\.json\.tmp\..+")
+    unexpected = sorted(
+        entry
+        for entry in entries
+        if complete_pattern.fullmatch(entry.name) is None
+        and partial_pattern.fullmatch(entry.name) is None
+    )
+    if unexpected:
+        raise StateError(
+            f"append-only event log contains an unexpected entry: {unexpected[0]}; "
+            "preserve it and run 'wrkslots doctor' before changing slot state"
+        )
+    return sorted(entry for entry in entries if complete_pattern.fullmatch(entry.name))
+
+
+def _event_from_path(
+    path: Path,
+    machine: str,
+    expected_sequence: int,
+    previous: str,
+    *,
+    require_filename: bool = True,
+) -> dict[str, object]:
+    if require_filename and path.name != f"{expected_sequence:020d}.json":
+        raise StateError(
+            f"append-only event log has a sequence gap at {path}; "
+            "preserve the log and run 'wrkslots doctor'"
+        )
+    raw = dict(_as_mapping(_read_json(path, "append-only event"), "append-only event"))
+    _exact_keys(
+        raw,
+        {
+            "schema",
+            "machine",
+            "sequence",
+            "previous_sha256",
+            "recorded_at",
+            "kind",
+            "payload",
+            "sha256",
+        },
+        set(),
+        "append-only event",
+    )
+    if _as_int(raw["schema"], "append-only event.schema") != EVENT_SCHEMA:
+        raise StateError(f"unsupported append-only event schema in {path}")
+    if _as_str(raw["machine"], "append-only event.machine") != machine:
+        raise StateError(f"append-only event belongs to another machine: {path}")
+    if _as_int(raw["sequence"], "append-only event.sequence") != expected_sequence:
+        raise StateError(f"append-only event sequence does not match its filename: {path}")
+    if _as_str(raw["previous_sha256"], "append-only event.previous_sha256") != previous:
+        raise StateError(f"append-only event hash chain is broken at {path}")
+    _parse_timestamp(
+        _as_str(raw["recorded_at"], "append-only event.recorded_at"),
+        "append-only event.recorded_at",
+    )
+    _as_str(raw["kind"], "append-only event.kind")
+    _as_mapping(raw["payload"], "append-only event.payload")
+    recorded_digest = _as_str(raw["sha256"], "append-only event.sha256")
+    core = {key: value for key, value in raw.items() if key != "sha256"}
+    if recorded_digest != _event_digest(core):
+        raise StateError(f"append-only event digest does not match its content: {path}")
+    return raw
+
+
+def _load_event_paths(
+    paths: Sequence[Path], machine: str
+) -> tuple[dict[str, object], ...]:
+    events: list[dict[str, object]] = []
+    previous = "0" * 64
+    for expected_sequence, path in enumerate(paths, start=1):
+        raw = _event_from_path(path, machine, expected_sequence, previous)
+        previous = _as_str(raw["sha256"], "append-only event.sha256")
+        events.append(raw)
+    return tuple(events)
+
+
+def _load_events(config: Config, machine: str | None = None) -> tuple[dict[str, object], ...]:
+    selected = machine or config.machine
+    directory = _event_directory(config, selected)
+    return _load_event_paths(_event_files(directory), selected)
+
+
+def _write_event_file(
+    config: Config, machine: str, kind: str, payload: Mapping[str, object]
+) -> dict[str, object]:
+    directory = _event_directory(config, machine)
+    if directory.exists() and (directory.is_symlink() or not directory.is_dir()):
+        raise StateError(f"append-only event log is not a real directory: {directory}")
+    created = not directory.exists()
+    directory.mkdir(mode=0o755, parents=True, exist_ok=True)
+    if created:
+        _fsync_directory(directory.parent)
+    events = _load_events(config, machine)
+    sequence = len(events) + 1
+    previous = "0" * 64 if not events else _as_str(
+        events[-1]["sha256"], "append-only event.sha256"
+    )
+    core: dict[str, object] = {
+        "schema": EVENT_SCHEMA,
+        "machine": machine,
+        "sequence": sequence,
+        "previous_sha256": previous,
+        "recorded_at": _utc_now(),
+        "kind": kind,
+        "payload": dict(payload),
+    }
+    event = {**core, "sha256": _event_digest(core)}
+    path = directory / f"{sequence:020d}.json"
+    if path.exists() or path.is_symlink():
+        raise StateError(f"append-only event already exists and will not be replaced: {path}")
+    _atomic_write_json(path, event)
+    return event
+
+
+def _ensure_event_log(config: Config, machine: str | None = None) -> None:
+    selected = machine or config.machine
+    if _event_files(_event_directory(config, selected)):
+        return
+    active = _load_active_snapshot(config, selected)
+    archive = _load_archive_snapshot(config, selected)
+    holds = [
+        hold
+        for record in active.slots
+        if (hold := _load_hold_snapshot(config, record.slot, selected)) is not None
+    ]
+    _write_event_file(
+        config,
+        selected,
+        "state-imported",
+        {
+            "active": _active_to_obj(active),
+            "archive": _archive_to_obj(archive),
+            "holds": holds,
+        },
+    )
+
+
+def _states_from_events(
+    config: Config, machine: str
+) -> tuple[ActiveState, ArchiveState] | None:
+    events = _load_events(config, machine)
+    if not events:
+        return None
+    active: ActiveState | None = None
+    archive: ArchiveState | None = None
+    for event in events:
+        payload = _as_mapping(event["payload"], "append-only event.payload")
+        kind = _as_str(event["kind"], "append-only event.kind")
+        if kind == "state-imported":
+            if active is not None or archive is not None:
+                raise StateError("append-only event log imports state more than once")
+            active = _active_from_obj(
+                config,
+                payload.get("active"),
+                machine,
+                "append-only imported active state",
+            )
+            archive = _archive_from_obj(
+                config,
+                payload.get("archive"),
+                machine,
+                "append-only imported archive state",
+            )
+        elif kind == "active-state-recorded":
+            if active is None:
+                raise StateError("append-only event records active state before its import")
+            _exact_keys(
+                payload,
+                {
+                    "action",
+                    "slot",
+                    "previous_revision",
+                    "revision",
+                    "previous_record_sha256",
+                    "record",
+                    "evidence",
+                },
+                set(),
+                "append-only active-record event",
+            )
+            slot = _as_str(payload["slot"], "append-only active-record event.slot")
+            _validate_name(slot, "slot")
+            previous_revision = _as_int(
+                payload["previous_revision"],
+                "append-only active-record event.previous_revision",
+                minimum=0,
+            )
+            revision = _as_int(
+                payload["revision"],
+                "append-only active-record event.revision",
+                minimum=1,
+            )
+            if previous_revision != active.revision or revision != active.revision + 1:
+                raise StateError(
+                    "append-only active-record event revision does not continue "
+                    f"the derived state for slot {slot}"
+                )
+            current = next((item for item in active.slots if item.slot == slot), None)
+            previous_digest = (
+                None if current is None else _event_digest(_record_to_obj(current))
+            )
+            if payload["previous_record_sha256"] != previous_digest:
+                raise StateError(
+                    "append-only active-record event does not match the prior record "
+                    f"for slot {slot}"
+                )
+            raw_record = payload["record"]
+            if raw_record is None:
+                if current is None:
+                    raise StateError(
+                        f"append-only active-record event removes absent slot {slot}"
+                    )
+                slots = tuple(item for item in active.slots if item.slot != slot)
+            else:
+                record = _record_from_obj(
+                    raw_record, "append-only active-record event.record"
+                )
+                if record.slot != slot or record.machine != machine:
+                    raise StateError(
+                        "append-only active-record event record identity does not "
+                        f"match slot {slot} on machine {machine}"
+                    )
+                slots = (
+                    (*active.slots, record)
+                    if current is None
+                    else tuple(record if item.slot == slot else item for item in active.slots)
+                )
+            active = _active_from_obj(
+                config,
+                {
+                    "schema": SCHEMA,
+                    "machine": machine,
+                    "revision": revision,
+                    "slots": [_record_to_obj(item) for item in slots],
+                },
+                machine,
+                "append-only derived active state",
+            )
+        elif kind == "archive-state-recorded":
+            if archive is None:
+                raise StateError("append-only event records archive state before its import")
+            _exact_keys(
+                payload,
+                {
+                    "action",
+                    "slot",
+                    "previous_revision",
+                    "revision",
+                    "record",
+                    "evidence",
+                },
+                set(),
+                "append-only archive-record event",
+            )
+            previous_revision = _as_int(
+                payload["previous_revision"],
+                "append-only archive-record event.previous_revision",
+                minimum=0,
+            )
+            revision = _as_int(
+                payload["revision"],
+                "append-only archive-record event.revision",
+                minimum=1,
+            )
+            if previous_revision != archive.revision or revision != archive.revision + 1:
+                raise StateError(
+                    "append-only archive-record event revision does not continue "
+                    "the derived archive"
+                )
+            archive_record = dict(
+                _as_mapping(payload["record"], "append-only archive-record event.record")
+            )
+            slot = _as_str(payload["slot"], "append-only archive-record event.slot")
+            if archive_record.get("slot") != slot:
+                raise StateError(
+                    "append-only archive-record event record identity does not "
+                    f"match slot {slot}"
+                )
+            archive = _archive_from_obj(
+                config,
+                {
+                    "schema": SCHEMA,
+                    "machine": machine,
+                    "revision": revision,
+                    "records": [*archive.records, archive_record],
+                },
+                machine,
+                "append-only derived archive state",
+            )
+    if active is None or archive is None:
+        raise StateError("append-only event log has no complete imported state")
+    return active, archive
+
+
+def _load_active(config: Config, machine: str | None = None) -> ActiveState:
+    selected = machine or config.machine
+    states = _states_from_events(config, selected)
+    return _load_active_snapshot(config, selected) if states is None else states[0]
+
+
+def _load_archive(config: Config, machine: str | None = None) -> ArchiveState:
+    selected = machine or config.machine
+    states = _states_from_events(config, selected)
+    return _load_archive_snapshot(config, selected) if states is None else states[1]
+
+
+def _write_active_state(
+    config: Config,
+    state: ActiveState,
+    *,
+    action: str,
+    slot: str,
+    evidence: Mapping[str, object] | None = None,
+) -> None:
+    _ensure_event_log(config, state.machine)
+    previous = _load_active(config, state.machine)
+    if state.revision != previous.revision + 1:
+        raise StateError(
+            "active state revision must advance exactly once before it is recorded"
+        )
+    previous_by_slot = {item.slot: item for item in previous.slots}
+    current_by_slot = {item.slot: item for item in state.slots}
+    changed = {
+        name
+        for name in previous_by_slot.keys() | current_by_slot.keys()
+        if previous_by_slot.get(name) != current_by_slot.get(name)
+    }
+    previous_record = previous_by_slot.get(slot)
+    current_record = current_by_slot.get(slot)
+    if changed not in ({slot}, set()) or (
+        not changed and (previous_record is None or current_record is None)
+    ):
+        raise StateError(
+            "active state mutation must affect only its named slot; "
+            f"expected {slot!r}, changed {sorted(changed)!r}"
+        )
+    _write_event_file(
+        config,
+        state.machine,
+        "active-state-recorded",
+        {
+            "action": action,
+            "slot": slot,
+            "previous_revision": previous.revision,
+            "revision": state.revision,
+            "previous_record_sha256": (
+                None
+                if previous_record is None
+                else _event_digest(_record_to_obj(previous_record))
+            ),
+            "record": (
+                None if current_record is None else _record_to_obj(current_record)
+            ),
+            "evidence": dict(evidence or {}),
+        },
+    )
+    _atomic_write_json(_active_path(config, state.machine), _active_to_obj(state))
+
+
+def _write_archive_state(
+    config: Config,
+    state: ArchiveState,
+    *,
+    action: str,
+    slot: str,
+    evidence: Mapping[str, object] | None = None,
+) -> None:
+    _ensure_event_log(config, state.machine)
+    previous = _load_archive(config, state.machine)
+    if state.revision != previous.revision + 1:
+        raise StateError(
+            "archive state revision must advance exactly once before it is recorded"
+        )
+    if (
+        len(state.records) != len(previous.records) + 1
+        or tuple(state.records[:-1]) != previous.records
+    ):
+        raise StateError("archive mutation must append exactly one record")
+    record = dict(state.records[-1])
+    if record.get("slot") != slot:
+        raise StateError("archive mutation record does not match its named slot")
+    _write_event_file(
+        config,
+        state.machine,
+        "archive-state-recorded",
+        {
+            "action": action,
+            "slot": slot,
+            "previous_revision": previous.revision,
+            "revision": state.revision,
+            "record": record,
+            "evidence": dict(evidence or {}),
+        },
+    )
+    _atomic_write_json(_archive_path(config, state.machine), _archive_to_obj(state))
+
+
+def _write_journal(config: Config, payload: Mapping[str, object]) -> None:
+    _ensure_event_log(config)
+    _write_event_file(
+        config,
+        config.machine,
+        "operation-progress-recorded",
+        {
+            "slot": payload.get("slot"),
+            "operation": payload.get("kind"),
+            "journal": dict(payload),
+        },
+    )
+    _atomic_write_json(_journal_path(config), dict(payload))
+
+
+def _clear_journal(config: Config, payload: Mapping[str, object]) -> None:
+    _ensure_event_log(config)
+    _write_event_file(
+        config,
+        config.machine,
+        "operation-completed",
+        {"slot": payload.get("slot"), "operation": payload.get("kind")},
+    )
+    path = _journal_path(config)
+    if path.exists() or path.is_symlink():
+        _remove_control_file(path)
+
+
+def _pending_operation_from_events(
+    config: Config, machine: str
+) -> Mapping[str, object] | None:
+    pending: Mapping[str, object] | None = None
+    for event in _load_events(config, machine):
+        kind = _as_str(event["kind"], "append-only event.kind")
+        payload = _as_mapping(event["payload"], "append-only event.payload")
+        if kind == "operation-progress-recorded":
+            pending = _as_mapping(payload.get("journal"), "append-only operation journal")
+        elif kind == "operation-completed" and pending is not None:
+            if (
+                payload.get("slot") == pending.get("slot")
+                and payload.get("operation") == pending.get("kind")
+            ):
+                pending = None
+    return pending
+
+
+def _recorded_handoff_digest(config: Config, record: ActiveRecord) -> str | None:
+    digest: str | None = None
+    for event in _load_events(config, record.machine):
+        if event.get("kind") != "handoff-read":
+            continue
+        payload = _as_mapping(event["payload"], "handoff-read event payload")
+        if payload.get("slot") == record.slot and payload.get("generation") == record.generation:
+            digest = _as_str(payload.get("sha256"), "handoff-read event sha256")
+    return digest
 
 
 def _empty_state_repair_payload(
@@ -1659,17 +2246,29 @@ def _archive_files(config: Config) -> list[tuple[str, Path]]:
     return result
 
 
-def _load_all_active(config: Config) -> list[ActiveState]:
-    state_files = _state_files(config)
-    archive_files = _archive_files(config)
-    state_machines = {machine for machine, _path in state_files}
-    archive_machines = {machine for machine, _path in archive_files}
-    if state_machines != archive_machines:
+def _state_machines(config: Config) -> tuple[str, ...]:
+    active = {machine for machine, _path in _state_files(config)}
+    archive = {machine for machine, _path in _archive_files(config)}
+    events: set[str] = set()
+    pattern = re.compile(r"^EVENTS\.(?P<machine>[A-Za-z0-9][A-Za-z0-9._-]{0,63})$")
+    for path in sorted(config.control.glob("EVENTS.*")):
+        match = pattern.fullmatch(path.name)
+        if match is None:
+            raise StateError(f"unexpected append-only event directory name: {path}")
+        if path.is_symlink() or not path.is_dir():
+            raise StateError(f"append-only event log is not a real directory: {path}")
+        events.add(match.group("machine"))
+    missing_pairs = (active ^ archive) - events
+    if missing_pairs:
         raise StateError(
-            "ACTIVE and ARCHIVED machine shards differ: "
-            f"active={sorted(state_machines)} archived={sorted(archive_machines)}"
+            "ACTIVE and ARCHIVED machine shards differ without append-only history: "
+            f"active={sorted(active)} archived={sorted(archive)} events={sorted(events)}"
         )
-    states = [_load_active(config, machine) for machine, _path in state_files]
+    return tuple(sorted(active | archive | events))
+
+
+def _load_all_active(config: Config) -> list[ActiveState]:
+    states = [_load_active(config, machine) for machine in _state_machines(config)]
     global_slots: dict[str, str] = {}
     global_agents: dict[str, str] = {}
     for state in states:
@@ -1679,18 +2278,17 @@ def _load_all_active(config: Config) -> list[ActiveState]:
                 raise StateError(
                     f"slot {record.slot!r} is active in both {previous_slot} and {state.machine}"
                 )
-            previous_agent = global_agents.setdefault(record.agent, record.slot)
-            if previous_agent != record.slot:
-                raise StateError(
-                    f"agent {record.agent!r} owns both {previous_agent} and {record.slot}"
-                )
+            if record.slot_type == "agent":
+                previous_agent = global_agents.setdefault(record.agent, record.slot)
+                if previous_agent != record.slot:
+                    raise StateError(
+                        f"agent {record.agent!r} owns both {previous_agent} and {record.slot}"
+                    )
     return states
 
 
 def _load_all_archives(config: Config) -> list[ArchiveState]:
-    archives = [
-        _load_archive(config, machine) for machine, _path in _archive_files(config)
-    ]
+    archives = [_load_archive(config, machine) for machine in _state_machines(config)]
     slots: dict[str, str] = {}
     for archive in archives:
         for record in archive.records:
@@ -1760,9 +2358,12 @@ def _assert_registry_storage_consistent(
     allowed_unregistered_slot: str | None = None,
     *,
     allow_unregistered_migration_slots: bool = False,
-) -> None:
+) -> tuple[str, ...]:
     records = [record for state in states for record in state.slots]
-    expected_slots = {record.slot for record in records}
+    expected_slots = {
+        slot_type: {record.slot for record in records if record.slot_type == slot_type}
+        for slot_type in SLOT_TYPES
+    }
     for record in records:
         _assert_slot_contents(config, record)
         vcs = _GitVcs()
@@ -1770,17 +2371,68 @@ def _assert_registry_storage_consistent(
             path = _stored_path(config, checkout.path, "checkout path")
             _relative, repository = _repository_path(config, checkout.repository)
             vcs.verify_existing_worktree(repository, path)
-    actual_slots = {
-        entry.name
-        for entry in config.worktrees.iterdir()
-        if entry.is_dir() and not entry.is_symlink()
-    }
-    unexpected = sorted(actual_slots - expected_slots)
+    unexpected: list[str] = []
+    for slot_type, root in _slot_roots(config).items():
+        if not root.exists():
+            continue
+        if root.is_symlink() or not root.is_dir():
+            raise StateError(f"managed {slot_type} slots directory is unsafe: {root}")
+        actual_slots = {
+            entry.name
+            for entry in root.iterdir()
+            if entry.is_dir()
+            and not entry.is_symlink()
+            and not entry.name.startswith("EVENTS.")
+            and not (
+                slot_type == "agent"
+                and entry == _validate_slots_directory(config)
+            )
+        }
+        unexpected.extend(
+            f"{slot_type}:{slot}" for slot in sorted(actual_slots - expected_slots[slot_type])
+        )
     if allowed_unregistered_slot is not None:
-        unexpected = [slot for slot in unexpected if slot != allowed_unregistered_slot]
+        unexpected = [
+            value
+            for value in unexpected
+            if value.split(":", 1)[1] != allowed_unregistered_slot
+        ]
     if unexpected and not allow_unregistered_migration_slots:
         raise StateError(
-            f"managed worktrees directory has a directory without an active row: {unexpected[0]}"
+            "managed worktrees directory has a directory without an active row: "
+            f"{unexpected[0]}. state: REFUSED -- no registered slot or unregistered "
+            "directory was changed. remedy: run 'wrkslots audit --format json', then "
+            "import each live slot from verified process evidence; during that deliberate "
+            "migration, put --allow-existing-unregistered-worktrees before the command"
+        )
+    return tuple(unexpected)
+
+
+def _assert_command_registry_storage(
+    config: Config,
+    states: Sequence[ActiveState],
+    args: argparse.Namespace,
+    *,
+    allowed_unregistered_slot: str | None = None,
+    migration_operation: bool = False,
+) -> None:
+    allow = bool(
+        migration_operation
+        or getattr(args, "allow_existing_unregistered_worktrees", False)
+    )
+    unexpected = _assert_registry_storage_consistent(
+        config,
+        states,
+        allowed_unregistered_slot=allowed_unregistered_slot,
+        allow_unregistered_migration_slots=allow,
+    )
+    if unexpected and allow:
+        print(
+            f"WARNING: {len(unexpected)} existing unregistered worktree directories "
+            "remain outside wrkslots records. state: RETAINED -- this command will not "
+            "inspect, select, or remove them. remedy: run 'wrkslots audit --format json' "
+            "and import each live slot from verified process evidence",
+            file=sys.stderr,
         )
 
 
@@ -1840,7 +2492,9 @@ def _delete_record(state: ActiveState, slot: str) -> ActiveState:
 def _append_record(state: ActiveState, record: ActiveRecord) -> ActiveState:
     if any(item.slot == record.slot for item in state.slots):
         raise Refusal(f"slot {record.slot!r} is already active")
-    if any(item.agent == record.agent for item in state.slots):
+    if record.slot_type == "agent" and any(
+        item.slot_type == "agent" and item.agent == record.agent for item in state.slots
+    ):
         raise Refusal(f"agent {record.agent!r} already owns an active slot")
     return ActiveState(state.machine, state.revision + 1, (*state.slots, record))
 
@@ -1854,6 +2508,8 @@ class _GitVcs:
         args: Sequence[str],
         *,
         check: bool = True,
+        input_text: str | None = None,
+        env_overrides: Mapping[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         env = {
             key: value
@@ -1865,6 +2521,8 @@ class _GitVcs:
         env["GIT_CONFIG_GLOBAL"] = "/dev/null"
         env["GIT_CONFIG_SYSTEM"] = "/dev/null"
         env["GIT_NO_REPLACE_OBJECTS"] = "1"
+        if env_overrides:
+            env.update(env_overrides)
         try:
             completed = subprocess.run(
                 [
@@ -1880,6 +2538,7 @@ class _GitVcs:
                 capture_output=True,
                 check=False,
                 env=env,
+                input=input_text,
             )
         except OSError as exc:
             raise Refusal(f"cannot execute Git: {exc}") from exc
@@ -2028,6 +2687,26 @@ class _GitVcs:
                     paths.append(path)
         return tuple(dict.fromkeys(paths))
 
+    def initialized_submodules(self, checkout: Path) -> tuple[str, ...]:
+        result = self._run(
+            checkout,
+            [
+                "submodule",
+                "foreach",
+                "--quiet",
+                "--recursive",
+                'printf "%s\\n" "$displaypath"',
+            ],
+        )
+        paths = tuple(line for line in result.stdout.splitlines() if line)
+        for path in paths:
+            candidate = Path(path)
+            if candidate.is_absolute() or ".." in candidate.parts:
+                raise Refusal(
+                    f"Git reported an unsafe initialized submodule path: {path!r}"
+                )
+        return tuple(dict.fromkeys(paths))
+
     def assert_ordinary_index(self, checkout: Path) -> None:
         assume = self._run(checkout, ["ls-files", "-v"])
         for line in assume.stdout.splitlines():
@@ -2170,8 +2849,55 @@ class _GitVcs:
             )
         return result.returncode == 0
 
-    def remove_worktree(self, repository: Path, checkout: Path) -> None:
-        self._run(repository, ["worktree", "remove", "--", str(checkout)])
+    def remove_worktree(
+        self, repository: Path, checkout: Path, *, force: bool = False
+    ) -> None:
+        args = ["worktree", "remove"]
+        if force:
+            args.append("--force")
+        args.extend(("--", str(checkout)))
+        self._run(repository, args)
+
+    def remote_ref_sha(self, checkout: Path, remote: str, ref: str) -> str | None:
+        _validate_remote(remote)
+        _validate_full_ref(ref, "remote salvage ref")
+        result = self._run(
+            checkout, ["ls-remote", "--refs", remote, ref], check=False
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip()
+            raise Refusal(
+                f"cannot read remote {remote!r} salvage ref {ref}"
+                + (f": {detail}" if detail else "")
+            )
+        lines = [line.split() for line in result.stdout.splitlines() if line.strip()]
+        if not lines:
+            return None
+        if len(lines) != 1 or len(lines[0]) != 2 or lines[0][1] != ref:
+            raise Refusal(f"remote returned ambiguous content for salvage ref {ref}")
+        sha = lines[0][0]
+        if not SHA_RE.fullmatch(sha):
+            raise Refusal(f"remote salvage ref {ref} did not resolve to one full commit")
+        return sha
+
+    def push_salvage(
+        self, checkout: Path, remote: str, commit: str, ref: str
+    ) -> None:
+        existing = self.remote_ref_sha(checkout, remote, ref)
+        if existing is not None:
+            if existing != commit:
+                raise Refusal(
+                    f"remote salvage ref {ref} already names {existing}, not {commit}; "
+                    "preserve the checkout and choose a different recorded destination"
+                )
+            return
+        self._run(checkout, ["push", remote, f"{commit}:{ref}"])
+        observed = self.remote_ref_sha(checkout, remote, ref)
+        if observed != commit:
+            raise Refusal(
+                f"salvage push did not leave {ref} at {commit}; remote reports "
+                f"{observed or 'no ref'}. Preserve the checkout and retry"
+            )
 
     def delete_branch_at(self, repository: Path, branch: str, expected_head: str) -> None:
         if not self.branch_exists(repository, branch):
@@ -2189,6 +2915,68 @@ class _GitVcs:
         if checkout.absolute() not in self.listed_worktrees(repository):
             raise Refusal(f"Git did not repair worktree registration for {checkout}")
 
+    def repair_nested_repository(self, checkout: Path) -> None:
+        git_file = checkout / ".git"
+        if git_file.is_symlink() or not git_file.is_file():
+            raise Refusal(f"nested repository has no safe .git file: {git_file}")
+        try:
+            value = git_file.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError) as exc:
+            raise Refusal(f"cannot read nested repository identity {git_file}: {exc}") from exc
+        prefix = "gitdir: "
+        if not value.startswith(prefix) or "\n" in value:
+            raise Refusal(f"nested repository has an invalid .git file: {git_file}")
+        raw = Path(value.removeprefix(prefix))
+        admin = raw if raw.is_absolute() else checkout / raw
+        try:
+            admin = admin.resolve(strict=True)
+        except OSError as exc:
+            raise Refusal(f"nested repository Git directory is unavailable: {admin}: {exc}") from exc
+        if admin.is_symlink() or not admin.is_dir():
+            raise Refusal(f"nested repository Git directory is unsafe: {admin}")
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith("GIT_")
+        }
+        environment.update(
+            {
+                "LC_ALL": "C",
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": "/dev/null",
+                "GIT_CONFIG_SYSTEM": "/dev/null",
+                "GIT_NO_REPLACE_OBJECTS": "1",
+            }
+        )
+        try:
+            completed = subprocess.run(
+                [
+                    "git",
+                    "--no-replace-objects",
+                    "-c",
+                    "core.useReplaceRefs=false",
+                    f"--git-dir={admin}",
+                    f"--work-tree={checkout}",
+                    "config",
+                    "core.worktree",
+                    str(checkout),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+                env=environment,
+            )
+        except OSError as exc:
+            raise Refusal(f"cannot execute Git while repairing {checkout}: {exc}") from exc
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout).strip()
+            raise Refusal(
+                f"Git refused nested repository repair for {checkout}"
+                + (f": {detail}" if detail else "")
+            )
+        if self.repository_root(checkout) != checkout.absolute():
+            raise Refusal(f"Git did not repair nested repository worktree {checkout}")
+
 
 def _repository_path(config: Config, raw: str) -> tuple[str, Path]:
     candidate = Path(raw)
@@ -2201,7 +2989,7 @@ def _repository_path(config: Config, raw: str) -> tuple[str, Path]:
     _ensure_no_symlink_components(config.root, absolute, "repository")
     if not absolute.is_dir() or absolute.is_symlink():
         raise Refusal(f"repository does not exist or is unsafe: {absolute}")
-    if _path_is_within(absolute, config.worktrees):
+    if _path_is_within(absolute, _managed_worktrees_root(config)):
         raise Refusal(
             f"source repository must be outside the managed worktrees directory: {absolute}"
         )
@@ -2209,10 +2997,34 @@ def _repository_path(config: Config, raw: str) -> tuple[str, Path]:
     return relative, absolute
 
 
-def _checkout_path(config: Config, slot: str, name: str) -> tuple[str, Path]:
+def _managed_worktrees_root(config: Config) -> Path:
+    return config.worktrees.parent if config.worktrees.name == "slots" else config.worktrees
+
+
+def _validate_slots_directory(config: Config) -> Path:
+    return _managed_worktrees_root(config) / "validate"
+
+
+def _slot_roots(config: Config) -> dict[str, Path]:
+    return {
+        "agent": config.worktrees,
+        "validate": _validate_slots_directory(config),
+    }
+
+
+def _slot_directory(config: Config, slot: str, slot_type: str = "agent") -> Path:
+    _validate_name(slot, "slot")
+    if slot_type not in SLOT_TYPES:
+        raise Refusal(f"slot type must be one of {', '.join(SLOT_TYPES)}")
+    return _slot_roots(config)[slot_type] / slot
+
+
+def _checkout_path(
+    config: Config, slot: str, name: str, slot_type: str = "agent"
+) -> tuple[str, Path]:
     _validate_name(slot, "slot")
     _validate_name(name, "checkout name")
-    slot_path = config.worktrees / slot
+    slot_path = _slot_directory(config, slot, slot_type)
     destination = slot_path if config.layout == "flat" else slot_path / name
     _ensure_no_symlink_components(config.root, destination, "checkout")
     relative = destination.relative_to(config.root).as_posix()
@@ -2345,7 +3157,9 @@ def _registered_liveness_state(config: Config, record: ActiveRecord) -> tuple[st
         "PATH": "/usr/bin:/bin",
         "WRKSLOTS_PROJECT_ROOT": str(config.root),
         "WRKSLOTS_SLOT": record.slot,
+        "WRKSLOTS_SLOT_TYPE": record.slot_type,
         "WRKSLOTS_AGENT": record.agent,
+        "WRKSLOTS_TASK": record.task,
         "WRKSLOTS_MACHINE": record.machine,
         "WRKSLOTS_GENERATION": str(record.generation),
         "WRKSLOTS_OWNER_PID": "" if record.owner is None else str(record.owner.pid),
@@ -2388,8 +3202,16 @@ def _assert_registered_liveness(config: Config, record: ActiveRecord) -> None:
     if state == "dead":
         return
     if state == "alive":
-        raise Refusal(f"registered liveness authority reports owner alive: {detail}")
-    raise Refusal(f"registered liveness authority is unverifiable: {detail}")
+        raise Refusal(
+            f"registered liveness authority reports owner alive: {detail}. state: "
+            "REFUSED -- no checkout was salvaged or removed. remedy: let the owner "
+            "finish or stop, then rerun remove after the time-to-live expires"
+        )
+    raise Refusal(
+        f"registered liveness authority is unverifiable: {detail}. state: REFUSED -- "
+        "no checkout was salvaged or removed; unknown ownership is not a free slot. "
+        "remedy: refresh or repair the configured liveness source, then rerun remove"
+    )
 
 
 def _process_state(identity: ProcessIdentity | None) -> tuple[str, str]:
@@ -2428,7 +3250,9 @@ def _link_target(path: Path) -> Path | None:
     except FileNotFoundError:
         return None
     except PermissionError as exc:
-        raise Refusal(f"process use is indeterminate because {path} is unreadable: {exc}") from exc
+        raise Refusal(
+            f"process use is indeterminate because {path} is unreadable: {exc}"
+        ) from exc
     except OSError as exc:
         if exc.errno == errno.EINVAL:
             return None
@@ -2586,7 +3410,13 @@ def _unrelated_lsof_warnings(stderr: str, slot_path: Path) -> bool:
     return True
 
 
-def _assert_slot_unused(slot_path: Path, record: ActiveRecord | None = None) -> None:
+def _assert_slot_unused(
+    slot_path: Path,
+    record: ActiveRecord | None = None,
+    *,
+    use_lsof: bool = True,
+    ignore_invoking_ancestry: bool = False,
+) -> None:
     try:
         current_directory = Path.cwd().resolve(strict=True)
     except OSError as exc:
@@ -2604,7 +3434,7 @@ def _assert_slot_unused(slot_path: Path, record: ActiveRecord | None = None) -> 
         None,
     )
     direct_use_proven_absent = False
-    if lsof is not None:
+    if lsof is not None and use_lsof:
         try:
             completed = subprocess.run(
                 [str(lsof), "-nP", "-Fpcfn", "+D", str(slot_path)],
@@ -2613,7 +3443,9 @@ def _assert_slot_unused(slot_path: Path, record: ActiveRecord | None = None) -> 
                 check=False,
             )
         except OSError as exc:
-            raise Refusal(f"process use is indeterminate because lsof failed: {exc}") from exc
+            raise Refusal(
+                f"process use is indeterminate because lsof failed: {exc}"
+            ) from exc
         if not _unrelated_lsof_warnings(completed.stderr, slot_path):
             raise Refusal(
                 "process use is indeterminate because lsof reported: "
@@ -2641,10 +3473,18 @@ def _assert_slot_unused(slot_path: Path, record: ActiveRecord | None = None) -> 
     except OSError as exc:
         raise Refusal(f"cannot inspect live processes: {exc}") from exc
     current_pid = os.getpid()
+    invoking_ancestry: set[int] = set()
+    if ignore_invoking_ancestry:
+        ancestor: int | None = current_pid
+        for _ in range(256):
+            if ancestor is None or ancestor in invoking_ancestry:
+                break
+            invoking_ancestry.add(ancestor)
+            ancestor = _read_process_parent(ancestor)
     inspected_mount_namespaces: set[str] = set()
     for pid_dir in sorted(pid_dirs, key=lambda item: int(item.name)):
         pid = int(pid_dir.name)
-        if pid == current_pid:
+        if pid == current_pid or pid in invoking_ancestry:
             continue
         uid = _process_uid(pid_dir)
         if uid is None:
@@ -2660,15 +3500,26 @@ def _assert_slot_unused(slot_path: Path, record: ActiveRecord | None = None) -> 
                 raise Refusal(
                     f"live process {pid} remains in recorded owner cgroup {cgroup}"
                 )
-        if direct_use_proven_absent:
-            mount_namespace = _mount_namespace(pid_dir)
-            if mount_namespace is None or mount_namespace in inspected_mount_namespaces:
-                uses = []
+        try:
+            if direct_use_proven_absent:
+                mount_namespace = _mount_namespace(pid_dir)
+                if mount_namespace is None or mount_namespace in inspected_mount_namespaces:
+                    uses = []
+                else:
+                    uses = _process_mounts_slot(pid_dir, slot_path)
+                    inspected_mount_namespaces.add(mount_namespace)
             else:
-                uses = _process_mounts_slot(pid_dir, slot_path)
-                inspected_mount_namespaces.add(mount_namespace)
-        else:
-            uses = _process_uses_slot(pid_dir, slot_path)
+                uses = _process_uses_slot(pid_dir, slot_path)
+        except Refusal:
+            if not use_lsof:
+                _assert_slot_unused(
+                    slot_path,
+                    record,
+                    use_lsof=True,
+                    ignore_invoking_ancestry=ignore_invoking_ancestry,
+                )
+                return
+            raise
         if uses:
             raise Refusal(
                 f"live process {pid} uses slot {slot_path}: {uses[0]}; stop it and retry"
@@ -2692,7 +3543,7 @@ def _heartbeat_diagnosis(record: ActiveRecord) -> tuple[float, bool]:
 
 
 def _assert_record_paths(config: Config, record: ActiveRecord) -> None:
-    expected_slot = config.worktrees / record.slot
+    expected_slot = _slot_directory(config, record.slot, record.slot_type)
     _ensure_no_symlink_components(config.root, expected_slot, "slot")
     if config.layout == "flat" and len(record.checkouts) != 1:
         raise StateError(f"slot {record.slot} has multiple checkouts under flat layout")
@@ -2701,7 +3552,9 @@ def _assert_record_paths(config: Config, record: ActiveRecord) -> None:
             raise StateError(
                 f"slot {record.slot} checkout {checkout.name} differs from configured authority"
             )
-        expected_relative, expected_absolute = _checkout_path(config, record.slot, checkout.name)
+        expected_relative, expected_absolute = _checkout_path(
+            config, record.slot, checkout.name, record.slot_type
+        )
         if checkout.path != expected_relative:
             raise StateError(
                 f"slot {record.slot} checkout {checkout.name} path does not match its slot: "
@@ -2857,7 +3710,13 @@ def _assert_checkout_safe(
         )
     vcs.assert_ordinary_history(path)
     vcs.assert_ordinary_index(path)
-    _assert_cache_policy_untracked(config, checkout, vcs)
+    _assert_cache_policy_untracked_path(
+        config,
+        checkout.name,
+        path,
+        vcs,
+        _cache_globs_for(config, checkout.name),
+    )
     status = vcs.status(path, _cache_globs_for(config, checkout.name))
     if status:
         first = status.splitlines()[0]
@@ -2893,26 +3752,374 @@ def _assert_checkout_safe(
     )
 
 
+def _salvage_pathspecs(config: Config, checkout_name: str) -> list[str]:
+    pathspecs = ["."]
+    for pattern in _cache_globs_for(config, checkout_name):
+        pathspecs.append(f":(exclude,glob){pattern}")
+        pathspecs.append(f":(exclude,glob){pattern}/**")
+    return pathspecs
+
+
+def _salvage_candidate(
+    config: Config,
+    record: ActiveRecord,
+    checkout: Checkout,
+    vcs: _GitVcs,
+    *,
+    path_override: Path | None = None,
+    allow_detached: bool = False,
+    verify_repository_membership: bool = True,
+) -> tuple[str, str, str, bool]:
+    """Return HEAD, status digest, durable commit candidate, and dirty state.
+
+    A temporary index captures tracked, untracked, and ignored files outside the
+    configured regenerable caches. It never changes the checkout's branch or
+    ordinary index, so a failed push leaves the author's tree untouched.
+    """
+
+    path = path_override or _stored_path(config, checkout.path, "checkout path")
+    _relative, repository = _repository_path(config, checkout.repository)
+    if verify_repository_membership:
+        head = vcs.verify_existing_worktree(repository, path)
+    else:
+        if vcs.repository_root(path) != path.absolute():
+            raise Refusal(f"nested repository is not rooted at its recorded path: {path}")
+        head = vcs.head(path)
+    if allow_detached:
+        branch_result = vcs._run(
+            path, ["symbolic-ref", "--quiet", "--short", "HEAD"], check=False
+        )
+        if branch_result.returncode not in (0, 1):
+            raise Refusal(f"cannot determine branch state for checkout {checkout.name}")
+    else:
+        branch = vcs.branch(path)
+        if branch != checkout.branch:
+            raise Refusal(
+                f"checkout {checkout.name} branch changed: expected {checkout.branch}, "
+                f"found {branch}; preserve it and update the recorded checkout before reclaim"
+            )
+    operations = vcs.operation_paths(path)
+    if operations:
+        raise Refusal(
+            f"checkout {checkout.name} has an unfinished Git operation at {operations[0]}; "
+            "complete or abort that Git operation before reclaim"
+        )
+    vcs.assert_ordinary_history(path)
+    vcs.assert_ordinary_index(path)
+    _assert_cache_policy_untracked_path(
+        config,
+        checkout.name,
+        path,
+        vcs,
+        _cache_globs_for(config, checkout.name),
+    )
+    if vcs.remote_url_sha256(path, checkout.remote) != checkout.remote_url_sha256:
+        raise Refusal(
+            f"checkout {checkout.name} remote {checkout.remote} URL changed; restore the "
+            "recorded remote before reclaim so salvage cannot be sent elsewhere"
+        )
+    status = vcs.status(path, _cache_globs_for(config, checkout.name))
+    status_digest = hashlib.sha256(status.encode("utf-8")).hexdigest()
+    if not status:
+        return head, status_digest, head, False
+
+    with tempfile.TemporaryDirectory(prefix="wrkslots-salvage-") as temporary:
+        index = str(Path(temporary) / "index")
+        env = {"GIT_INDEX_FILE": index}
+        vcs._run(path, ["read-tree", "HEAD"], env_overrides=env)
+        pathspecs = _salvage_pathspecs(config, checkout.name)
+        vcs._run(path, ["add", "-u", "--", *pathspecs], env_overrides=env)
+        untracked = vcs._run(
+            path,
+            [
+                "ls-files",
+                "--others",
+                "--exclude-standard",
+                "-z",
+                "--",
+                *pathspecs,
+            ],
+            env_overrides=env,
+        ).stdout
+        if untracked:
+            vcs._run(
+                path,
+                ["add", "--pathspec-from-file=-", "--pathspec-file-nul"],
+                input_text=untracked,
+                env_overrides=env,
+            )
+        ignored = vcs._run(
+            path,
+            [
+                "ls-files",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "-z",
+                "--",
+                *pathspecs,
+            ],
+            env_overrides=env,
+        ).stdout
+        if ignored:
+            vcs._run(
+                path,
+                ["add", "-f", "--pathspec-from-file=-", "--pathspec-file-nul"],
+                input_text=ignored,
+                env_overrides=env,
+            )
+        tree = vcs._run(path, ["write-tree"], env_overrides=env).stdout.strip()
+        if not SHA_RE.fullmatch(tree):
+            raise Refusal(f"salvage tree for checkout {checkout.name} is not a full Git object")
+        message = (
+            f"Salvage {record.slot}/{checkout.name} after recorded owner exit\n\n"
+            f"task: {record.task}\n"
+            f"source-head: {head}\n"
+        )
+        identity = {
+            "GIT_AUTHOR_NAME": "wrkslots salvage",
+            "GIT_AUTHOR_EMAIL": "wrkslots@localhost",
+            "GIT_AUTHOR_DATE": record.heartbeat_at,
+            "GIT_COMMITTER_NAME": "wrkslots salvage",
+            "GIT_COMMITTER_EMAIL": "wrkslots@localhost",
+            "GIT_COMMITTER_DATE": record.heartbeat_at,
+        }
+        commit = vcs._run(
+            path,
+            ["commit-tree", tree, "-p", head],
+            input_text=message,
+            env_overrides=identity,
+        ).stdout.strip()
+    if not SHA_RE.fullmatch(commit):
+        raise Refusal(f"salvage commit for checkout {checkout.name} is not a full Git object")
+    return head, status_digest, commit, True
+
+
+def _submodule_salvage_checkouts(
+    config: Config,
+    checkout: Checkout,
+    vcs: _GitVcs,
+    *,
+    path_override: Path | None = None,
+) -> tuple[tuple[Checkout, Path], ...]:
+    checkout_path = path_override or _stored_path(
+        config, checkout.path, "checkout path"
+    )
+    _repository_relative, source_repository = _repository_path(
+        config, checkout.repository
+    )
+    result: list[tuple[Checkout, Path]] = []
+    for relative_value in vcs.initialized_submodules(checkout_path):
+        relative = Path(relative_value)
+        managed = checkout_path / relative
+        source = source_repository / relative
+        _ensure_no_symlink_components(checkout_path, managed, "submodule checkout")
+        _ensure_no_symlink_components(config.root, source, "source submodule")
+        if not source.is_dir() or source.is_symlink():
+            raise Refusal(
+                f"source submodule is unavailable for {checkout.name}/{relative_value}: "
+                f"{source}. Preserve the slot until its remote authority can be established"
+            )
+        if vcs.repository_root(source) != source.absolute():
+            raise Refusal(f"source submodule is not a Git root: {source}")
+        remote = config.default_remote
+        authorized_remote = vcs.remote_url_sha256(source, remote)
+        if vcs.remote_url_sha256(managed, remote) != authorized_remote:
+            raise Refusal(
+                f"submodule {checkout.name}/{relative_value} remote {remote} differs "
+                "from its configured source; preserve the slot for inspection"
+            )
+        head = vcs.head(managed)
+        stored_path = (Path(checkout.path) / relative).as_posix()
+        source_relative = source.relative_to(config.root).as_posix()
+        result.append(
+            (
+                Checkout(
+                    name=f"{checkout.name}/{relative_value}",
+                    path=stored_path,
+                    repository=source_relative,
+                    branch="",
+                    start_point=head,
+                    remote=remote,
+                    remote_url_sha256=authorized_remote,
+                    landed_ref=_landed_ref_for_remote(config, remote),
+                    head=head,
+                ),
+                managed,
+            )
+        )
+    return tuple(result)
+
+
+def _salvage_one_checkout(
+    config: Config,
+    record: ActiveRecord,
+    checkout: Checkout,
+    vcs: _GitVcs,
+    *,
+    path_override: Path | None = None,
+    allow_detached: bool = False,
+) -> dict[str, object]:
+    path = path_override or _stored_path(config, checkout.path, "checkout path")
+    head, status_digest, commit, dirty = _salvage_candidate(
+        config,
+        record,
+        checkout,
+        vcs,
+        path_override=path,
+        allow_detached=allow_detached,
+        verify_repository_membership=not allow_detached,
+    )
+    vcs.fetch_remote(path, checkout.remote, checkout.landed_ref)
+    if vcs.remote_url_sha256(path, checkout.remote) != checkout.remote_url_sha256:
+        raise Refusal(
+            f"checkout {checkout.name} remote {checkout.remote} URL changed during fetch; "
+            "preserve the checkout and restore the recorded remote"
+        )
+    containing = vcs.remote_refs_containing(path, checkout.remote, head)
+    if not dirty and containing:
+        return {
+            "checkout": checkout.name,
+            "source_head": head,
+            "salvage_commit": commit,
+            "status_sha256": status_digest,
+            "disposition": "already-published",
+            "remote_ref": None,
+            "containing_remote_refs": list(containing),
+        }
+    salvage_name = checkout.name.replace("/", "-")
+    salvage_ref = (
+        f"refs/heads/salvage/{record.machine}/{record.slot}/"
+        f"{salvage_name}-{record.generation}-{commit[:12]}"
+    )
+    _validate_full_ref(salvage_ref, "salvage ref")
+    vcs.push_salvage(path, checkout.remote, commit, salvage_ref)
+    return {
+        "checkout": checkout.name,
+        "source_head": head,
+        "salvage_commit": commit,
+        "status_sha256": status_digest,
+        "disposition": "salvaged",
+        "remote_ref": salvage_ref,
+        "containing_remote_refs": [],
+    }
+
+
+def _salvage_agent_slot(
+    config: Config, record: ActiveRecord, vcs: _GitVcs
+) -> tuple[dict[str, object], ...]:
+    receipts: list[dict[str, object]] = []
+    for checkout in record.checkouts:
+        receipts.append(_salvage_one_checkout(config, record, checkout, vcs))
+        for submodule, path in _submodule_salvage_checkouts(config, checkout, vcs):
+            receipts.append(
+                _salvage_one_checkout(
+                    config,
+                    record,
+                    submodule,
+                    vcs,
+                    path_override=path,
+                    allow_detached=True,
+                )
+            )
+    return tuple(receipts)
+
+
+def _assert_salvage_still_matches(
+    config: Config,
+    record: ActiveRecord,
+    receipts: Sequence[Mapping[str, object]],
+    vcs: _GitVcs,
+    *,
+    paths: Mapping[str, Path] | None = None,
+) -> None:
+    by_name = {
+        _as_str(value.get("checkout"), "salvage receipt.checkout"): value
+        for value in receipts
+    }
+    targets: list[tuple[Checkout, Path, bool]] = []
+    for checkout in record.checkouts:
+        path = (
+            _stored_path(config, checkout.path, "checkout path")
+            if paths is None
+            else paths[checkout.name]
+        )
+        targets.append((checkout, path, False))
+        targets.extend(
+            (submodule, submodule_path, True)
+            for submodule, submodule_path in _submodule_salvage_checkouts(
+                config, checkout, vcs, path_override=path
+            )
+        )
+    if set(by_name) != {checkout.name for checkout, _path, _detached in targets}:
+        raise StateError("salvage receipts do not name every recorded checkout exactly once")
+    for checkout, path, allow_detached in targets:
+        receipt = by_name[checkout.name]
+        head, status_digest, commit, _dirty = _salvage_candidate(
+            config,
+            record,
+            checkout,
+            vcs,
+            path_override=path,
+            allow_detached=allow_detached,
+            verify_repository_membership=not allow_detached,
+        )
+        expected = (
+            _as_str(receipt.get("source_head"), "salvage receipt.source_head"),
+            _as_str(receipt.get("status_sha256"), "salvage receipt.status_sha256"),
+            _as_str(receipt.get("salvage_commit"), "salvage receipt.salvage_commit"),
+        )
+        if (head, status_digest, commit) != expected:
+            raise Refusal(
+                f"checkout {checkout.name} changed after salvage; preserve it and rerun remove "
+                "so the changed state is published before deletion"
+            )
+        disposition = _as_str(
+            receipt.get("disposition"), "salvage receipt.disposition"
+        )
+        if disposition == "salvaged":
+            remote_ref = _as_str(receipt.get("remote_ref"), "salvage receipt.remote_ref")
+            if vcs.remote_ref_sha(path, checkout.remote, remote_ref) != commit:
+                raise Refusal(
+                    f"remote salvage ref {remote_ref} no longer contains {commit}; "
+                    "preserve the checkout and restore the remote evidence before deletion"
+                )
+        elif disposition == "already-published":
+            vcs.fetch_remote(path, checkout.remote, checkout.landed_ref)
+            if not vcs.remote_refs_containing(path, checkout.remote, head):
+                raise Refusal(
+                    f"checkout {checkout.name} is no longer present on its recorded remote; "
+                    "preserve it and rerun remove to publish salvage"
+                )
+        else:
+            raise StateError(f"unknown salvage disposition {disposition!r}")
+
+
 def _assert_slot_contents(config: Config, record: ActiveRecord) -> Path:
-    slot_path = config.worktrees / record.slot
+    slot_path = _slot_directory(config, record.slot, record.slot_type)
     if not slot_path.is_dir() or slot_path.is_symlink():
         raise Refusal(f"slot directory is missing or unsafe: {slot_path}")
     if config.layout == "flat":
         if len(record.checkouts) != 1:
             raise StateError(f"slot {record.slot} has multiple checkouts under flat layout")
         checkout = record.checkouts[0]
-        expected_path, _destination = _checkout_path(config, record.slot, checkout.name)
+        expected_path, _destination = _checkout_path(
+            config, record.slot, checkout.name, record.slot_type
+        )
         if checkout.path != expected_path:
             raise StateError(
                 f"slot {record.slot} checkout path does not equal the flat slot root"
             )
         return slot_path
     expected_names = {checkout.name for checkout in record.checkouts}
+    allowed_names = set(expected_names)
+    if record.slot_type == "agent":
+        allowed_names.add("HANDOFF.md")
     try:
         actual = {entry.name for entry in slot_path.iterdir()}
     except OSError as exc:
         raise Refusal(f"cannot inspect slot directory {slot_path}: {exc}") from exc
-    extras = sorted(actual - expected_names)
+    extras = sorted(actual - allowed_names)
     missing = sorted(expected_names - actual)
     if extras or missing:
         details: list[str] = []
@@ -2922,6 +4129,36 @@ def _assert_slot_contents(config: Config, record: ActiveRecord) -> Path:
             details.append(f"missing checkouts {', '.join(missing)}")
         raise Refusal(f"slot directory does not match its record: {'; '.join(details)}")
     return slot_path
+
+
+def _assert_handoff_read(config: Config, record: ActiveRecord, slot_path: Path) -> None:
+    if record.slot_type != "agent":
+        return
+    handoff = slot_path / "HANDOFF.md"
+    if not handoff.exists() and not handoff.is_symlink():
+        return
+    if handoff.is_symlink() or not handoff.is_file():
+        raise Refusal(
+            f"slot {record.slot} has an unsafe HANDOFF.md. state: REFUSED -- no checkout "
+            "was salvaged or removed. remedy: replace it with a regular file inside the slot, "
+            "then run 'wrkslots read-handoff' before retrying remove"
+        )
+    try:
+        contents = handoff.read_bytes()
+    except OSError as exc:
+        raise Refusal(
+            f"slot {record.slot} HANDOFF.md could not be read: {exc}. state: REFUSED -- "
+            "no checkout was salvaged or removed. remedy: make the file readable, run "
+            "'wrkslots read-handoff', then retry remove"
+        ) from exc
+    digest = hashlib.sha256(contents).hexdigest()
+    if _recorded_handoff_digest(config, record) != digest:
+        raise Refusal(
+            f"slot {record.slot} contains an unread HANDOFF.md. state: REFUSED -- no "
+            "checkout was salvaged or removed. remedy: run 'wrkslots read-handoff "
+            f"{record.slot} --coordinator-authorized --coordinator-pid <current-coordinator-pid>' "
+            "and read its output, then retry remove"
+        )
 
 
 def _handoff_preconditions(
@@ -2958,10 +4195,70 @@ def _remove_preconditions(
     return slot_path, final_checkouts
 
 
+def _reclaim_preconditions(
+    config: Config,
+    record: ActiveRecord,
+    salvage: Sequence[Mapping[str, object]],
+    vcs: _GitVcs,
+    *,
+    allow_live_validate_owner: bool = False,
+) -> tuple[Path, tuple[Checkout, ...]]:
+    _assert_record_paths(config, record)
+    slot_path = _assert_slot_contents(config, record)
+    _assert_handoff_read(config, record, slot_path)
+    _assert_slot_unused(
+        slot_path,
+        None if allow_live_validate_owner and record.slot_type == "validate" else record,
+        use_lsof=not (allow_live_validate_owner and record.slot_type == "validate"),
+        ignore_invoking_ancestry=(
+            allow_live_validate_owner and record.slot_type == "validate"
+        ),
+    )
+    final: list[Checkout] = []
+    for checkout in record.checkouts:
+        path = _stored_path(config, checkout.path, "checkout path")
+        _relative, repository = _repository_path(config, checkout.repository)
+        head = vcs.verify_existing_worktree(repository, path)
+        branch = vcs.branch(path)
+        if branch != checkout.branch:
+            raise Refusal(
+                f"checkout {checkout.name} branch changed: expected {checkout.branch}, "
+                f"found {branch}; preserve it and update the record before reclaim"
+            )
+        if record.slot_type == "agent":
+            operations = vcs.operation_paths(path)
+            if operations:
+                raise Refusal(
+                    f"checkout {checkout.name} has an unfinished Git operation at "
+                    f"{operations[0]}; complete or abort it before reclaim"
+                )
+            vcs.assert_ordinary_history(path)
+            vcs.assert_ordinary_index(path)
+        if vcs.remote_url_sha256(path, checkout.remote) != checkout.remote_url_sha256:
+            raise Refusal(
+                f"checkout {checkout.name} remote {checkout.remote} URL changed; "
+                "restore the recorded remote before reclaim"
+            )
+        final.append(dataclasses.replace(checkout, head=head))
+    if record.slot_type == "validate":
+        if salvage:
+            raise StateError("validate slot unexpectedly records salvage evidence")
+    elif salvage:
+        _assert_salvage_still_matches(config, record, salvage, vcs)
+    elif record.handoff is not None:
+        return _remove_preconditions(config, record, vcs)
+    else:
+        raise StateError("agent slot reclaim has neither salvage nor an owner handoff")
+    return slot_path, tuple(final)
+
+
 def _refuse_partial_state(config: Config) -> None:
     leftovers = sorted(config.control.glob("ACTIVE.*.json.tmp.*"))
     leftovers += sorted(config.control.glob("ARCHIVED.*.json.tmp.*"))
     leftovers += sorted(config.control.glob("ACTIVE.*.journal.tmp.*"))
+    for event_directory in sorted(config.control.glob("EVENTS.*")):
+        if event_directory.is_dir() and not event_directory.is_symlink():
+            leftovers += sorted(event_directory.glob("*.json.tmp.*"))
     if leftovers:
         raise StateError(
             f"partial atomic update found: {leftovers[0]}; preserve it and use 'wrkslots recover'"
@@ -2969,7 +4266,14 @@ def _refuse_partial_state(config: Config) -> None:
 
 
 def _outstanding_journals(config: Config) -> list[Path]:
-    return sorted(config.control.glob("ACTIVE.*.journal"))
+    paths = {path for path in config.control.glob("ACTIVE.*.journal")}
+    for directory in config.control.glob("EVENTS.*"):
+        if not directory.is_dir() or directory.is_symlink():
+            continue
+        machine = directory.name.removeprefix("EVENTS.")
+        if _pending_operation_from_events(config, machine) is not None:
+            paths.add(_journal_path(config, machine))
+    return sorted(paths)
 
 
 def _assert_no_journal(config: Config) -> None:
@@ -2989,7 +4293,16 @@ def _load_journal(config: Config) -> tuple[Path, Mapping[str, object]]:
             "multiple interrupted mutations are present; inspect every journal before continuing"
         )
     path = journals[0]
-    raw = _as_mapping(_read_json(path, "recovery journal"), "recovery journal")
+    if path.exists() or path.is_symlink():
+        raw = _as_mapping(_read_json(path, "recovery journal"), "recovery journal")
+    else:
+        machine = path.name.removeprefix("ACTIVE.").removesuffix(".journal")
+        pending = _pending_operation_from_events(config, machine)
+        if pending is None:
+            raise StateError(
+                f"append-only log names no pending operation for missing journal {path}"
+            )
+        raw = pending
     return path, raw
 
 
@@ -3162,10 +4475,8 @@ def _cmd_init(args: argparse.Namespace) -> int:
                     )
                     existing_layout = existing.get("layout", "nested")
                     if existing_layout in {"nested", "flat"}:
-                        existing_control = (
-                            existing_worktrees_path
-                            if existing_layout == "nested"
-                            else existing_worktrees_path.parent
+                        existing_control = _control_directory_for(
+                            existing_worktrees_path, existing_layout
                         )
                         journals = sorted(existing_control.glob("ACTIVE.*.journal"))
                         if journals:
@@ -3211,6 +4522,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
             _atomic_write_json(
                 archive_path, _archive_to_obj(ArchiveState(machine, 0, ()))
             )
+        _ensure_event_log(config)
         link = control / "wrkslots"
         executable = Path(__file__).with_name("__main__.py").resolve()
         relative_target = Path(os.path.relpath(executable, start=control))
@@ -3255,6 +4567,11 @@ def _create_plan(config: Config, args: argparse.Namespace, vcs: _GitVcs) -> tupl
         raise Refusal("create requires at least one --repo NAME=PATH")
     if config.layout == "flat" and len(repositories) != 1:
         raise Refusal("flat layout requires exactly one repository per slot")
+    if args.slot_type == "validate" and not branches:
+        branches = {
+            name: f"wrkslots/validate/{config.machine}/{args.slot}/{name}"
+            for name in repositories
+        }
     if set(branches) != set(repositories):
         missing = sorted(set(repositories) - set(branches))
         extra = sorted(set(branches) - set(repositories))
@@ -3297,7 +4614,8 @@ def _create_plan(config: Config, args: argparse.Namespace, vcs: _GitVcs) -> tupl
             if authorized_url is None
             else vcs.assert_remote_url(repository, remote, authorized_url)
         )
-        vcs.fetch_remote(repository, remote, landed_ref)
+        if args.slot_type != "validate" or name not in starts:
+            vcs.fetch_remote(repository, remote, landed_ref)
         verified_remote_url_sha256 = (
             vcs.remote_url_sha256(repository, remote)
             if authorized_url is None
@@ -3308,7 +4626,9 @@ def _create_plan(config: Config, args: argparse.Namespace, vcs: _GitVcs) -> tupl
         start = vcs.verify_ref(
             repository, starts.get(name, landed_ref), "start point"
         )
-        destination_relative, destination = _checkout_path(config, args.slot, name)
+        destination_relative, destination = _checkout_path(
+            config, args.slot, name, args.slot_type
+        )
         if destination.exists() or destination.is_symlink():
             raise Refusal(f"checkout destination already exists: {destination}")
         planned.append(
@@ -3362,7 +4682,7 @@ def _free_bytes(path: Path) -> int:
 
 
 def _disk_status(config: Config) -> dict[str, object]:
-    free = _free_bytes(config.worktrees)
+    free = _free_bytes(_managed_worktrees_root(config))
     advisory = config.disk_advisory_bytes
     provisioning = config.disk_provisioning_floor_bytes
     emergency = config.disk_emergency_bytes
@@ -3425,13 +4745,19 @@ def _assert_create_disk_space(config: Config, override: bool) -> None:
         )
 
 
-def _assert_agent_and_slot_free(config: Config, slot: str, agent: str) -> None:
+def _assert_agent_and_slot_free(
+    config: Config, slot: str, agent: str, slot_type: str
+) -> None:
     states = _load_all_active(config)
     for state in states:
         for record in state.slots:
             if record.slot == slot:
                 raise Refusal(f"slot {slot!r} is already active on {state.machine}")
-            if record.agent == agent:
+            if (
+                slot_type == "agent"
+                and record.slot_type == "agent"
+                and record.agent == agent
+            ):
                 raise Refusal(
                     f"agent {agent!r} already owns slot {record.slot!r} on {state.machine}"
                 )
@@ -3464,6 +4790,7 @@ def _create_journal_payload(
         "agent": args.agent,
         "task": args.task,
         "purpose": args.purpose,
+        "slot_type": args.slot_type,
         "created_at": created_at,
         "heartbeat_at": heartbeat_at,
         "heartbeat_ttl_seconds": config.heartbeat_ttl_seconds,
@@ -3502,7 +4829,7 @@ def _run_post_provision_hooks(
             "status": "running",
         }
         journal["hook_failure"] = attempt
-        _atomic_write_json(journal_path, journal)
+        _write_journal(config, journal)
         env = os.environ.copy()
         env.update(
             {
@@ -3513,7 +4840,8 @@ def _run_post_provision_hooks(
             }
         )
         print(
-            f"post-provision hook {step + 1}/{total} checkout={checkout.name}: {command}"
+            f"post-provision hook {step + 1}/{total} checkout={checkout.name}: {command}",
+            file=sys.stderr,
         )
         try:
             completed = subprocess.run(
@@ -3528,7 +4856,7 @@ def _run_post_provision_hooks(
             attempt["status"] = "failed-to-start"
             attempt["detail"] = str(exc)
             journal["hook_failure"] = attempt
-            _atomic_write_json(journal_path, journal)
+            _write_journal(config, journal)
             raise Refusal(
                 f"post-provision hook {hook_index + 1} for checkout {checkout.name} "
                 f"could not start: {exc}; slot was left for inspection with journal "
@@ -3538,7 +4866,7 @@ def _run_post_provision_hooks(
             attempt["status"] = "failed"
             attempt["returncode"] = completed.returncode
             journal["hook_failure"] = attempt
-            _atomic_write_json(journal_path, journal)
+            _write_journal(config, journal)
             if completed.stdout:
                 print("post-provision hook stdout:", file=sys.stderr)
                 print(completed.stdout, end="" if completed.stdout.endswith("\n") else "\n", file=sys.stderr)
@@ -3552,11 +4880,13 @@ def _run_post_provision_hooks(
             )
         journal["hook_progress"] = step + 1
         journal["hook_failure"] = None
-        _atomic_write_json(journal_path, journal)
+        _write_journal(config, journal)
     return total
 
 
 def _cmd_create(args: argparse.Namespace) -> int:
+    _require_coordinator_authorized(args, "worktree creation")
+    args.slot_type = _require_slot_type(args, "worktree creation")
     config = _load_config(args.project_root, args.machine)
     _validate_name(args.slot, "slot")
     _validate_name(args.agent, "agent")
@@ -3575,13 +4905,14 @@ def _cmd_create(args: argparse.Namespace) -> int:
         _refuse_partial_state(config)
         _assert_no_journal(config)
         states, archives = _validate_global_state(config)
-        _assert_registry_storage_consistent(config, states)
+        _assert_command_registry_storage(config, states, args)
         before = _global_rows(states, archives)
         _ensure_state_shard(config)
         state = _load_active(config)
-        _assert_agent_and_slot_free(config, args.slot, args.agent)
+        _assert_agent_and_slot_free(config, args.slot, args.agent, args.slot_type)
         _assert_create_disk_space(config, args.override_disk_floor)
-        slot_path = config.worktrees / args.slot
+        slot_path = _slot_directory(config, args.slot, args.slot_type)
+        slot_path.parent.mkdir(parents=True, exist_ok=True)
         if slot_path.exists() or slot_path.is_symlink():
             raise Refusal(f"slot path already exists: {slot_path}")
         plan = _create_plan(config, args, vcs)
@@ -3589,8 +4920,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
         heartbeat_at = created_at
         journal_path = _journal_path(config)
         created: list[Checkout] = []
-        _atomic_write_json(
-            journal_path,
+        _write_journal(
+            config,
             _create_journal_payload(
                 config,
                 args,
@@ -3605,7 +4936,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
         )
         if config.layout == "nested":
             slot_path.mkdir(mode=0o755)
-            _fsync_directory(config.worktrees)
+            _fsync_directory(slot_path.parent)
         for item in plan:
             _relative, repository = _repository_path(config, item.repository)
             destination = _stored_path(config, item.destination, "checkout destination")
@@ -3622,8 +4953,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 head=head,
             )
             created.append(checkout)
-            _atomic_write_json(
-                journal_path,
+            _write_journal(
+                config,
                 _create_journal_payload(
                     config,
                     args,
@@ -3673,8 +5004,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
             )
         _assert_caller_process(confirmed_coordinator, "coordinator")
         heartbeat_at = _utc_now()
-        _atomic_write_json(
-            journal_path,
+        _write_journal(
+            config,
             _create_journal_payload(
                 config,
                 args,
@@ -3692,6 +5023,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             agent=args.agent,
             task=args.task,
             purpose=args.purpose,
+            slot_type=args.slot_type,
             machine=config.machine,
             generation=1,
             created_at=created_at,
@@ -3704,21 +5036,65 @@ def _cmd_create(args: argparse.Namespace) -> int:
             checkouts=tuple(created),
         )
         state = _append_record(state, record)
-        _atomic_write_json(_active_path(config), _active_to_obj(state))
+        _write_active_state(
+            config,
+            state,
+            action="slot-created",
+            slot=record.slot,
+            evidence={
+                "slot_type": record.slot_type,
+                "coordinator_authorized": True,
+                "coordinator": _identity_to_obj(coordinator_lease),
+            },
+        )
         _interrupt_for_test("after-active-write")
-        _remove_control_file(journal_path)
+        _clear_journal(
+            config,
+            _as_mapping(_read_json(journal_path, "create journal"), "create journal"),
+        )
         after_states, after_archives = _validate_global_state(config)
         _assert_only_slot_changed(
             before,
             _global_rows(after_states, after_archives),
             args.slot,
         )
-    print(
-        f"created slot={record.slot} agent={record.agent} generation={record.generation} "
-        f"checkouts={len(record.checkouts)}"
-    )
-    if owner is None:
-        print("owner_process=unbound; run 'wrkslots adopt' before heartbeat or finish")
+    if args.format == "json":
+        print(
+            json.dumps(
+                {
+                    "slot": record.slot,
+                    "slot_type": record.slot_type,
+                    "agent": record.agent,
+                    "generation": record.generation,
+                    "owner_process": "unbound" if owner is None else "bound",
+                    "checkouts": [
+                        {
+                            "name": checkout.name,
+                            "path": str(
+                                _stored_path(config, checkout.path, "checkout path")
+                            ),
+                            "head": checkout.head,
+                        }
+                        for checkout in record.checkouts
+                    ],
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+    else:
+        print(
+            f"created slot={record.slot} agent={record.agent} generation={record.generation} "
+            f"checkouts={len(record.checkouts)}"
+        )
+        for checkout in record.checkouts:
+            print(
+                f"checkout={checkout.name} "
+                f"path={_stored_path(config, checkout.path, 'checkout path')} "
+                f"head={checkout.head}"
+            )
+        if owner is None:
+            print("owner_process=unbound; run 'wrkslots adopt' before heartbeat or finish")
     return 0
 
 
@@ -3742,7 +5118,9 @@ def _existing_checkouts(
     checkouts: list[Checkout] = []
     for name, raw_repository in repositories.items():
         repository_relative, repository = _repository_path(config, raw_repository)
-        destination_relative, destination = _checkout_path(config, args.slot, name)
+        destination_relative, destination = _checkout_path(
+            config, args.slot, name, args.slot_type
+        )
         if not destination.is_dir() or destination.is_symlink():
             raise Refusal(f"existing checkout is missing or unsafe: {destination}")
         head = vcs.verify_existing_worktree(repository, destination)
@@ -3796,6 +5174,7 @@ def _register_existing(
             agent=args.agent,
             task=args.task,
             purpose=args.purpose,
+            slot_type=args.slot_type,
             machine=config.machine,
             generation=1,
             created_at=_utc_now(),
@@ -3825,6 +5204,7 @@ def _register_existing(
         agent=args.agent,
         task=args.task,
         purpose=args.purpose,
+        slot_type=args.slot_type,
         machine=config.machine,
         generation=1,
         created_at=now,
@@ -3841,6 +5221,8 @@ def _register_existing(
 def _cmd_register(
     args: argparse.Namespace, *, allow_unregistered_migration_slots: bool = False
 ) -> int:
+    _require_coordinator_authorized(args, "worktree registration")
+    args.slot_type = _require_slot_type(args, "worktree registration")
     config = _load_config(args.project_root, args.machine)
     owner = _capture_caller_process(args.owner_pid, "owner")
     coordinator_lease = _capture_caller_process(
@@ -3850,20 +5232,31 @@ def _cmd_register(
         _refuse_partial_state(config)
         _assert_no_journal(config)
         states, archives = _validate_global_state(config)
-        _assert_registry_storage_consistent(
+        _assert_command_registry_storage(
             config,
             states,
+            args,
             allowed_unregistered_slot=args.slot,
-            allow_unregistered_migration_slots=allow_unregistered_migration_slots,
+            migration_operation=allow_unregistered_migration_slots,
         )
         before = _global_rows(states, archives)
         _ensure_state_shard(config)
         state = _load_active(config)
-        _assert_agent_and_slot_free(config, args.slot, args.agent)
+        _assert_agent_and_slot_free(config, args.slot, args.agent, args.slot_type)
         record = _register_existing(
             config, args, owner, coordinator_lease
         )
-        _atomic_write_json(_active_path(config), _active_to_obj(_append_record(state, record)))
+        _write_active_state(
+            config,
+            _append_record(state, record),
+            action="slot-registered",
+            slot=record.slot,
+            evidence={
+                "slot_type": record.slot_type,
+                "coordinator_authorized": True,
+                "coordinator": _identity_to_obj(coordinator_lease),
+            },
+        )
         after_states, after_archives = _validate_global_state(config)
         _assert_only_slot_changed(
             before,
@@ -3878,6 +5271,7 @@ def _cmd_register(
 
 
 def _cmd_import_existing(args: argparse.Namespace) -> int:
+    args.slot_type = _require_slot_type(args, "worktree import")
     config = _load_config(args.project_root, args.machine)
     vcs = _GitVcs()
     _validate_name(args.slot, "slot")
@@ -3893,6 +5287,7 @@ def _cmd_import_existing(args: argparse.Namespace) -> int:
     if not args.apply:
         print("dry-run: no state changed; add --apply --verified-live --owner-pid PID to register")
         return 0
+    _require_coordinator_authorized(args, "worktree import --apply")
     if args.owner_pid is None or args.coordinator_pid is None or not args.verified_live:
         raise Refusal(
             "--apply requires --verified-live, --owner-pid, and --coordinator-pid"
@@ -3940,7 +5335,7 @@ def _cmd_adopt(args: argparse.Namespace) -> int:
         _refuse_partial_state(config)
         _assert_no_journal(config)
         states, archives = _validate_global_state(config)
-        _assert_registry_storage_consistent(config, states)
+        _assert_command_registry_storage(config, states, args)
         before = _global_rows(states, archives)
         state = _load_active(config)
         record = _find_record(state, args.slot)
@@ -3971,8 +5366,12 @@ def _cmd_adopt(args: argparse.Namespace) -> int:
             owner=owner,
             heartbeat_at=now,
         )
-        _atomic_write_json(
-            _active_path(config), _active_to_obj(_replace_record(state, adopted))
+        _write_active_state(
+            config,
+            _replace_record(state, adopted),
+            action="owner-bound",
+            slot=adopted.slot,
+            evidence={"owner": _identity_to_obj(owner)},
         )
         after_states, after_archives = _validate_global_state(config)
         _assert_only_slot_changed(
@@ -4001,13 +5400,12 @@ def _cmd_recover_unbound_owner(args: argparse.Namespace) -> int:
         _refuse_partial_state(config)
         _assert_no_journal(config)
         states, archives = _validate_global_state(config)
-        _assert_registry_storage_consistent(config, states)
+        _assert_command_registry_storage(config, states, args)
         before = _global_rows(states, archives)
         state = _load_active(config)
         record = _find_record(state, args.slot)
         _expected_generation(record, args.expected_generation)
-        if coordinator != record.coordinator_lease:
-            raise Refusal("coordinator recovery requires the recorded coordinator process")
+        _assert_caller_process(coordinator, "coordinator")
         if record.owner is not None:
             raise Refusal(
                 f"slot {record.slot} has a historical owner; coordinator recovery cannot replace it"
@@ -4018,7 +5416,7 @@ def _cmd_recover_unbound_owner(args: argparse.Namespace) -> int:
         )
         continuation = (
             f"wrkslots remove {record.slot} --coordinator-pid "
-            f"{record.coordinator_lease.pid} --expected-generation {record.generation}"
+            f"<current-coordinator-pid> --expected-generation {record.generation}"
         )
         updated = dataclasses.replace(
             record,
@@ -4031,8 +5429,12 @@ def _cmd_recover_unbound_owner(args: argparse.Namespace) -> int:
                 continuation=continuation,
             ),
         )
-        _atomic_write_json(
-            _active_path(config), _active_to_obj(_replace_record(state, updated))
+        _write_active_state(
+            config,
+            _replace_record(state, updated),
+            action="owner-recovery-recorded",
+            slot=updated.slot,
+            evidence={"note": args.recovery_note},
         )
         after_states, after_archives = _validate_global_state(config)
         _assert_only_slot_changed(
@@ -4056,14 +5458,18 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
         _refuse_partial_state(config)
         _assert_no_journal(config)
         states, archives = _validate_global_state(config)
-        _assert_registry_storage_consistent(config, states)
+        _assert_command_registry_storage(config, states, args)
         before = _global_rows(states, archives)
         state = _load_active(config)
         record = _find_record(state, args.slot)
         _assert_owner_auth(record, args.agent, owner, args.expected_generation)
         updated = dataclasses.replace(record, heartbeat_at=_utc_now())
-        _atomic_write_json(
-            _active_path(config), _active_to_obj(_replace_record(state, updated))
+        _write_active_state(
+            config,
+            _replace_record(state, updated),
+            action="ttl-renewed",
+            slot=updated.slot,
+            evidence={"heartbeat_at": updated.heartbeat_at},
         )
         after_states, after_archives = _validate_global_state(config)
         _assert_only_slot_changed(
@@ -4087,7 +5493,7 @@ def _cmd_hold(args: argparse.Namespace) -> int:
         _refuse_partial_state(config)
         _assert_no_journal(config)
         states, _archives = _validate_global_state(config)
-        _assert_registry_storage_consistent(config, states)
+        _assert_command_registry_storage(config, states, args)
         record = _find_record(_load_active(config), args.slot)
         path = _hold_path(config, record.slot, record.machine)
         existing = _load_hold(config, record.slot, record.machine)
@@ -4099,6 +5505,13 @@ def _cmd_hold(args: argparse.Namespace) -> int:
                 )
             print(f"already held slot={record.slot} reason={reason}")
             return 0
+        _ensure_event_log(config, record.machine)
+        _write_event_file(
+            config,
+            record.machine,
+            "slot-held",
+            {"slot": record.slot, "generation": record.generation, "reason": reason},
+        )
         _atomic_write_json(
             path,
             {
@@ -4120,13 +5533,80 @@ def _cmd_unhold(args: argparse.Namespace) -> int:
         _refuse_partial_state(config)
         _assert_no_journal(config)
         states, _archives = _validate_global_state(config)
-        _assert_registry_storage_consistent(config, states)
+        _assert_command_registry_storage(config, states, args)
         record = _find_record(_load_active(config), args.slot)
         path = _hold_path(config, record.slot, record.machine)
         if _load_hold(config, record.slot, record.machine) is None:
             raise Refusal(f"slot {record.slot} is not held")
+        _ensure_event_log(config, record.machine)
+        _write_event_file(
+            config,
+            record.machine,
+            "slot-hold-released",
+            {"slot": record.slot, "generation": record.generation},
+        )
         _remove_control_file(path)
     print(f"released hold slot={record.slot}")
+    return 0
+
+
+def _cmd_read_handoff(args: argparse.Namespace) -> int:
+    config = _load_config(args.project_root, args.machine)
+    _validate_name(args.slot, "slot")
+    reader = _capture_caller_process(args.coordinator_pid, "coordinator")
+    _assert_caller_process(reader, "coordinator")
+    with _mutation_locks(config, args.wait_lock):
+        _refuse_partial_state(config)
+        _assert_no_journal(config)
+        states, _archives = _validate_global_state(config)
+        _assert_command_registry_storage(config, states, args)
+        record = _find_record(_load_active(config), args.slot)
+        if record.slot_type != "agent":
+            raise Refusal(
+                f"slot {record.slot} has type validate and cannot carry an agent handoff. "
+                "state: REFUSED -- no event was recorded. remedy: inspect its run evidence "
+                "under the project's validation evidence directory"
+            )
+        handoff = _slot_directory(config, record.slot, record.slot_type) / "HANDOFF.md"
+        if not handoff.exists() and not handoff.is_symlink():
+            raise Refusal(
+                f"slot {record.slot} has no HANDOFF.md. state: REFUSED -- no read was "
+                "recorded. remedy: continue the reclaim checks; absence of a handoff is not "
+                "evidence that the owner is dead"
+            )
+        if handoff.is_symlink() or not handoff.is_file():
+            raise Refusal(
+                f"slot {record.slot} HANDOFF.md is not a regular file. state: REFUSED -- "
+                "no read was recorded. remedy: preserve the slot and replace the unsafe path "
+                "with the original handoff file before retrying"
+            )
+        try:
+            contents = handoff.read_bytes()
+            rendered = contents.decode("utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise Refusal(
+                f"slot {record.slot} HANDOFF.md cannot be read as UTF-8: {exc}. state: "
+                "REFUSED -- no read was recorded. remedy: preserve and repair the handoff file"
+            ) from exc
+        print(f"--- {handoff} ---")
+        print(rendered, end="" if rendered.endswith("\n") else "\n")
+        print(f"--- end {handoff} ---")
+        digest = hashlib.sha256(contents).hexdigest()
+        _ensure_event_log(config, record.machine)
+        _write_event_file(
+            config,
+            record.machine,
+            "handoff-read",
+            {
+                "slot": record.slot,
+                "generation": record.generation,
+                "sha256": digest,
+                "contents_utf8": rendered,
+                "reader": _identity_to_obj(reader),
+                "coordinator_authorized": bool(args.coordinator_authorized),
+            },
+        )
+    print(f"recorded HANDOFF.md read slot={record.slot} sha256={digest}")
     return 0
 
 
@@ -4290,6 +5770,9 @@ def _journal_cache_slot(config: Config, machine: str | None = None) -> CacheSlot
         _as_str(raw.get("slot"), "cache recovery journal.slot"), "slot"
     )
     if kind == "create":
+        slot_type = _as_str(
+            raw.get("slot_type", "agent"), "cache recovery journal.slot_type"
+        )
         checkouts = tuple(
             _checkout_from_obj(item, f"cache recovery journal.created[{index}]")
             for index, item in enumerate(
@@ -4298,6 +5781,7 @@ def _journal_cache_slot(config: Config, machine: str | None = None) -> CacheSlot
         )
     elif kind == "finish":
         record = _record_from_obj(raw.get("record"), "cache recovery journal.record")
+        slot_type = record.slot_type
         if record.slot != slot or record.machine != selected_machine:
             raise StateError("finish journal cache record does not match its shard or slot")
         _assert_record_paths(config, record)
@@ -4319,7 +5803,9 @@ def _journal_cache_slot(config: Config, machine: str | None = None) -> CacheSlot
     vcs = _GitVcs()
     present: list[Checkout] = []
     for checkout in checkouts:
-        expected, destination = _checkout_path(config, slot, checkout.name)
+        expected, destination = _checkout_path(
+            config, slot, checkout.name, slot_type
+        )
         if checkout.path != expected:
             raise StateError(
                 f"cache recovery journal checkout {checkout.name} escapes slot {slot}"
@@ -4634,7 +6120,13 @@ def _cmd_clean_caches(args: argparse.Namespace) -> int:
             cache_slots[journal_slot.slot] = journal_slot
         malformed_slots: dict[str, str] = {}
         for entry in sorted(config.worktrees.iterdir(), key=lambda path: path.name):
-            if not entry.is_dir() or entry.is_symlink() or entry.name in registered_slots:
+            if (
+                not entry.is_dir()
+                or entry.is_symlink()
+                or entry.name.startswith("EVENTS.")
+                or entry == _validate_slots_directory(config)
+                or entry.name in registered_slots
+            ):
                 continue
             try:
                 _validate_name(entry.name, "unregistered slot")
@@ -4767,9 +6259,10 @@ def _cmd_clean_caches(args: argparse.Namespace) -> int:
 def _audit_record(config: Config, record: ActiveRecord) -> tuple[dict[str, object], bool]:
     owner_state, owner_detail = _process_state(record.owner)
     liveness_state, liveness_detail = _registered_liveness_state(config, record)
+    heartbeat_age, heartbeat_expired = _heartbeat_diagnosis(record)
     agent_running = not (
         liveness_state == "dead"
-        and (owner_state == "dead" or record.owner is None)
+        and owner_state == "dead"
     )
     hold = _load_hold(config, record.slot, record.machine)
     cache_bytes = 0
@@ -4787,43 +6280,61 @@ def _audit_record(config: Config, record: ActiveRecord) -> tuple[dict[str, objec
                 "slot": record.slot,
                 "machine": record.machine,
                 "agent": record.agent,
+                "slot_type": record.slot_type,
                 "verdict": "HELD",
                 "reasons": [_as_str(hold["reason"], "slot hold.reason")],
                 "owner_state": owner_state,
                 "liveness_state": liveness_state,
+                "heartbeat_age_seconds": int(heartbeat_age),
+                "heartbeat_expired": heartbeat_expired,
                 "cache_bytes": cache_bytes,
                 "cache_error": cache_error,
             },
             agent_running,
         )
     reasons: list[str] = []
-    if record.handoff is None:
-        reasons.append("no owner-alive handoff is recorded")
+    if not heartbeat_expired:
+        reasons.append(
+            f"heartbeat age {int(heartbeat_age)}s has not exceeded the "
+            f"{record.heartbeat_ttl_seconds}s time-to-live"
+        )
     if liveness_state != "dead":
         reasons.append(f"liveness is {liveness_state}: {liveness_detail}")
-    if record.owner is None and record.coordinator_recovery_note is None:
-        reasons.append("no owner generation or coordinator recovery evidence is recorded")
-    elif record.owner is not None and owner_state != "dead":
+    if record.owner is None:
+        reasons.append("no owner process generation is recorded, so death is unknown")
+    elif owner_state != "dead":
         reasons.append(f"recorded owner is {owner_state}: {owner_detail}")
-    slot_path = config.worktrees / record.slot
-    final_checkouts: tuple[Checkout, ...] | None = None
+    slot_path = _slot_directory(config, record.slot, record.slot_type)
     try:
-        _slot_path, final_checkouts = _handoff_preconditions(
-            config, record, _GitVcs(), refresh_remote=False
-        )
+        _assert_record_paths(config, record)
+        _assert_slot_contents(config, record)
+        _assert_handoff_read(config, record, slot_path)
+        vcs = _GitVcs()
+        for checkout in record.checkouts:
+            path = _stored_path(config, checkout.path, "checkout path")
+            repository = _repository_path(config, checkout.repository)[1]
+            vcs.verify_existing_worktree(repository, path)
+            if vcs.branch(path) != checkout.branch:
+                raise Refusal(f"checkout {checkout.name} branch changed")
+            if record.slot_type == "agent":
+                operations = vcs.operation_paths(path)
+                if operations:
+                    raise Refusal(
+                        f"checkout {checkout.name} has an unfinished Git operation: "
+                        f"{operations[0]}"
+                    )
+                vcs.assert_ordinary_history(path)
+                vcs.assert_ordinary_index(path)
+                _assert_cache_policy_untracked(config, checkout, vcs)
+            if vcs.remote_url_sha256(path, checkout.remote) != checkout.remote_url_sha256:
+                raise Refusal(f"checkout {checkout.name} remote URL changed")
     except Refusal as exc:
         reasons.append(str(exc))
     if (
-        record.handoff is not None
-        and final_checkouts is not None
-        and final_checkouts != record.checkouts
-    ):
-        reasons.append("checkout changed after its recorded handoff")
-    if (
-        record.handoff is not None
+        heartbeat_expired
         and liveness_state == "dead"
-        and (record.owner is None or owner_state == "dead")
-        and final_checkouts == record.checkouts
+        and owner_state == "dead"
+        and not reasons
     ):
         try:
             _assert_slot_unused(slot_path, record)
@@ -4837,10 +6348,13 @@ def _audit_record(config: Config, record: ActiveRecord) -> tuple[dict[str, objec
             "slot": record.slot,
             "machine": record.machine,
             "agent": record.agent,
+            "slot_type": record.slot_type,
             "verdict": "DELETABLE" if not reasons else "BLOCKED",
             "reasons": reasons,
             "owner_state": owner_state,
             "liveness_state": liveness_state,
+            "heartbeat_age_seconds": int(heartbeat_age),
+            "heartbeat_expired": heartbeat_expired,
             "cache_bytes": cache_bytes,
             "cache_error": cache_error,
         },
@@ -4871,34 +6385,43 @@ def _cmd_audit(args: argparse.Namespace) -> int:
                 row["verdict"] = "BLOCKED"
             rows.append(row)
             running_agent_count += int(running)
-        try:
-            on_disk = {
-                entry.name
-                for entry in config.worktrees.iterdir()
-                if entry.is_dir() and not entry.is_symlink()
-            }
-        except OSError as exc:
-            raise Refusal(f"cannot enumerate worktree slots in {config.worktrees}: {exc}") from exc
-        registered = {record.slot for record in records}
-        for slot in sorted(on_disk - registered):
+        on_disk: set[tuple[str, str]] = set()
+        for slot_type, root in _slot_roots(config).items():
+            if not root.exists():
+                continue
+            try:
+                on_disk.update(
+                    (slot_type, entry.name)
+                    for entry in root.iterdir()
+                    if entry.is_dir()
+                    and not entry.is_symlink()
+                    and not entry.name.startswith("EVENTS.")
+                    and not (slot_type == "agent" and entry == _validate_slots_directory(config))
+                )
+            except OSError as exc:
+                raise Refusal(f"cannot enumerate worktree slots in {root}: {exc}") from exc
+        registered = {(record.slot_type, record.slot) for record in records}
+        for slot_type, slot in sorted(on_disk - registered):
             journal_slot = journal_slots.get(slot)
             cache_bytes = 0
             cache_error: str | None = None
-            try:
-                unregistered = (
-                    journal_slot
-                    if journal_slot is not None
-                    else CacheSlot(slot, config.machine, (), "unregistered")
-                )
-                cache_bytes = sum(
-                    _allocated_cache_bytes(config, cache)
-                    for cache in _cache_slot_directories(config, unregistered)
-                )
-            except Refusal as exc:
-                cache_error = str(exc)
+            if slot_type == "agent":
+                try:
+                    unregistered = (
+                        journal_slot
+                        if journal_slot is not None
+                        else CacheSlot(slot, config.machine, (), "unregistered")
+                    )
+                    cache_bytes = sum(
+                        _allocated_cache_bytes(config, cache)
+                        for cache in _cache_slot_directories(config, unregistered)
+                    )
+                except Refusal as exc:
+                    cache_error = str(exc)
             rows.append(
                 {
                     "slot": slot,
+                    "slot_type": slot_type,
                     "machine": None if journal_slot is None else journal_slot.machine,
                     "agent": None,
                     "verdict": "BLOCKED",
@@ -4921,11 +6444,15 @@ def _cmd_audit(args: argparse.Namespace) -> int:
                 }
             )
         for journal_slot in sorted(journal_slots.values(), key=lambda item: item.slot):
-            if journal_slot.slot in registered or journal_slot.slot in on_disk:
+            if any(
+                slot == journal_slot.slot
+                for _slot_type, slot in registered | on_disk
+            ):
                 continue
             rows.append(
                 {
                     "slot": journal_slot.slot,
+                    "slot_type": None,
                     "machine": journal_slot.machine,
                     "agent": None,
                     "verdict": "BLOCKED",
@@ -4942,11 +6469,66 @@ def _cmd_audit(args: argparse.Namespace) -> int:
         worktree_count = len(on_disk)
         disk = _disk_status(config)
     sorted_rows = sorted(rows, key=lambda row: str(row["slot"]))
+    attention = [
+        row
+        for row in sorted_rows
+        if row["verdict"] == "DELETABLE"
+        or row["owner_state"] == "unregistered"
+        or any(
+            str(reason).startswith("interrupted ")
+            for reason in _as_list(row["reasons"], "audit row.reasons")
+        )
+    ]
+    unknown = [
+        row
+        for row in sorted_rows
+        if row["verdict"] == "BLOCKED"
+        and row.get("heartbeat_expired") is True
+        and (
+            row["owner_state"] not in ("live", "dead")
+            or row["liveness_state"] not in ("alive", "dead")
+            or row["cache_error"] is not None
+            or any(
+                token in str(reason).lower()
+                for reason in _as_list(row["reasons"], "audit row.reasons")
+                for token in ("cannot", "failed", "unavailable", "unknown")
+            )
+        )
+    ]
+    attention_ids = {(str(row["slot"]), str(row["machine"])) for row in attention}
+    unknown = [
+        row
+        for row in unknown
+        if (str(row["slot"]), str(row["machine"])) not in attention_ids
+    ]
+    attention_names = [str(row["slot"]) for row in attention]
+    unknown_names = [str(row["slot"]) for row in unknown]
+    if attention_names:
+        gate_state = "actionable"
+        summary = (
+            f"{len(attention_names)} worktree slot(s) need coordinator attention: "
+            + ", ".join(attention_names)
+        )
+    elif unknown_names:
+        gate_state = "unknown"
+        summary = (
+            f"could not determine reclaim state for {len(unknown_names)} worktree "
+            "slot(s): " + ", ".join(unknown_names)
+        )
+    else:
+        gate_state = "ok"
+        summary = "no worktree slot currently needs coordinator attention"
     payload = {
         "schema": SCHEMA,
         "worktree_count": worktree_count,
         "running_agent_count": running_agent_count,
         "leak": worktree_count > running_agent_count,
+        "attention_count": len(attention_names),
+        "attention_slots": attention_names,
+        "unknown_count": len(unknown_names),
+        "unknown_slots": unknown_names,
+        "state": gate_state,
+        "summary": summary,
         "remote_refs_refreshed": False,
         "disk": disk,
         "slots": sorted_rows,
@@ -4966,7 +6548,26 @@ def _cmd_audit(args: argparse.Namespace) -> int:
             if row["cache_error"] is not None:
                 detail += f"; cache inspection: {row['cache_error']}"
             print(f"{row['verdict']}: {row['slot']}: {detail}")
-    return 0
+        if args.gate:
+            print(f"state={gate_state}")
+            print(f"summary={summary}")
+            if attention_names:
+                print(
+                    "ACTION: run 'wrkslots audit --format json' for exact evidence; "
+                    "use 'wrkslots recover' for interrupted operations, import live "
+                    "unregistered slots, and run 'wrkslots remove' only for a slot "
+                    "reported DELETABLE"
+                )
+            elif unknown_names:
+                print(
+                    "ACTION: restore the unavailable liveness or process evidence and "
+                    "rerun 'wrkslots audit --gate'; do not remove an UNKNOWN slot"
+                )
+    if not args.gate:
+        return 0
+    if attention_names:
+        return 1
+    return 2 if unknown_names else 0
 
 
 def _cmd_unpushed(args: argparse.Namespace) -> int:
@@ -4976,7 +6577,7 @@ def _cmd_unpushed(args: argparse.Namespace) -> int:
     with _locked(config.control / "ACTIVE", exclusive=False, wait_seconds=args.wait_lock):
         _refuse_partial_state(config)
         states, _archives = _validate_global_state(config)
-        _assert_registry_storage_consistent(config, states)
+        _assert_command_registry_storage(config, states, args)
         records = [
             record
             for state in states
@@ -5088,15 +6689,15 @@ def _slot_findings(config: Config, states: Sequence[ActiveState]) -> list[dict[s
             {"kind": kind, "slot": slot, "machine": machine, "detail": detail}
         )
 
-    expected: set[str] = set()
+    expected: dict[str, set[str]] = {slot_type: set() for slot_type in SLOT_TYPES}
     for state in states:
         for record in state.slots:
-            expected.add(record.slot)
+            expected[record.slot_type].add(record.slot)
             try:
                 _load_hold(config, record.slot, record.machine)
             except Refusal as exc:
                 note("invalid-hold", record.slot, state.machine, str(exc))
-            slot_path = config.worktrees / record.slot
+            slot_path = _slot_directory(config, record.slot, record.slot_type)
             if not slot_path.is_dir() or slot_path.is_symlink():
                 note(
                     "row-without-directory",
@@ -5123,7 +6724,11 @@ def _slot_findings(config: Config, states: Sequence[ActiveState]) -> list[dict[s
                     )
                     continue
                 want = {checkout.name for checkout in record.checkouts}
+                if record.slot_type == "agent":
+                    want.add("HANDOFF.md")
                 for name in sorted(want - actual):
+                    if name == "HANDOFF.md":
+                        continue
                     note(
                         "missing-checkout", record.slot, state.machine,
                         f"record names checkout {name!r} but it is not in the slot",
@@ -5141,20 +6746,28 @@ def _slot_findings(config: Config, states: Sequence[ActiveState]) -> list[dict[s
                     "is held by a row whose owner has exited",
                 )
 
-    try:
-        on_disk = {
-            entry.name
-            for entry in config.worktrees.iterdir()
-            if entry.is_dir() and not entry.is_symlink()
-        }
-    except OSError as exc:
-        note("worktrees-unreadable", None, None, f"cannot enumerate {config.worktrees}: {exc}")
-        on_disk = set()
-    for name in sorted(on_disk - expected):
-        note(
-            "directory-without-row", name, None,
-            f"{config.worktrees / name} exists but no active row claims it",
-        )
+    for slot_type, root in _slot_roots(config).items():
+        try:
+            on_disk = {
+                entry.name
+                for entry in root.iterdir()
+                if entry.is_dir()
+                and not entry.is_symlink()
+                and not entry.name.startswith("EVENTS.")
+                and not (slot_type == "agent" and entry == _validate_slots_directory(config))
+            }
+        except FileNotFoundError:
+            on_disk = set()
+        except OSError as exc:
+            note("worktrees-unreadable", None, None, f"cannot enumerate {root}: {exc}")
+            on_disk = set()
+        for name in sorted(on_disk - expected[slot_type]):
+            note(
+                "directory-without-row",
+                name,
+                None,
+                f"{root / name} exists but no active {slot_type} row claims it",
+            )
 
     for path in _outstanding_journals(config):
         note("unfinished-journal", None, None, f"recovery required: {path.name}")
@@ -5165,6 +6778,9 @@ def _slot_findings(config: Config, states: Sequence[ActiveState]) -> list[dict[s
     leftovers = sorted(config.control.glob("ACTIVE.*.json.tmp.*"))
     leftovers += sorted(config.control.glob("ARCHIVED.*.json.tmp.*"))
     leftovers += sorted(config.control.glob("ACTIVE.*.journal.tmp.*"))
+    for event_directory in sorted(config.control.glob("EVENTS.*")):
+        if event_directory.is_dir() and not event_directory.is_symlink():
+            leftovers += sorted(event_directory.glob("*.json.tmp.*"))
     for path in leftovers:
         note(
             "partial-atomic-update", None, None,
@@ -5211,6 +6827,10 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
                     "control_dir": str(config.control),
                     "layout": config.layout,
                     "machines": [state.machine for state in states],
+                    "event_counts": {
+                        state.machine: len(_load_events(config, state.machine))
+                        for state in states
+                    },
                     "active": rows,
                     "max_active_slots": cap,
                     "findings": findings,
@@ -5248,7 +6868,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
     ):
         _refuse_partial_state(config)
         all_states, _archives = _validate_global_state(config)
-        _assert_registry_storage_consistent(config, all_states)
+        _assert_command_registry_storage(config, all_states, args)
         states = (
             all_states
             if args.all_machines
@@ -5282,7 +6902,8 @@ def _cmd_status(args: argparse.Namespace) -> int:
     print(
         f"project={config.root} worktrees={config.worktrees} control={config.control} "
         f"layout={config.layout} "
-        f"active={len(records)} journals={len(journals)}"
+        f"active={len(records)} journals={len(journals)} "
+        f"events={sum(len(_load_events(config, state.machine)) for state in states)}"
     )
     if journals:
         for journal in journals:
@@ -5291,7 +6912,8 @@ def _cmd_status(args: argparse.Namespace) -> int:
         owner_state = _as_str(value["owner_state"], "status owner_state")
         expired = value["heartbeat_expired"] is True
         print(
-            f"{value['machine']}/{value['slot']}: agent={value['agent']} task={value['task']} "
+            f"{value['machine']}/{value['slot']}: type={value['slot_type']} "
+            f"agent={value['agent']} task={value['task']} "
             f"generation={value['generation']} owner={owner_state} "
             f"heartbeat_age={value['heartbeat_age_seconds']}s expired={'yes' if expired else 'no'} "
             f"held={'yes' if value['held'] is True else 'no'}"
@@ -5308,12 +6930,14 @@ def _finish_journal_payload(
     finished_at: str,
     removed: Sequence[str],
     phase: str,
+    salvage: Sequence[Mapping[str, object]] = (),
+    validate_complete: bool = False,
 ) -> dict[str, object]:
     archive_id = f"{config.machine}:{record.slot}:{record.generation}:{finished_at}"
+    slot_parent = _slot_directory(config, record.slot, record.slot_type).parent
     fenced = (
-        config.worktrees
+        slot_parent
         / f".{record.slot}.fenced.{record.generation}.{uuid.uuid4().hex}"
-        / record.slot
     )
     return {
         "schema": SCHEMA,
@@ -5327,6 +6951,8 @@ def _finish_journal_payload(
         "phase": phase,
         "fenced": fenced.relative_to(config.root).as_posix(),
         "removed": list(removed),
+        "salvage": [dict(item) for item in salvage],
+        "validate_complete": validate_complete,
         "record": _record_to_obj(record),
     }
 
@@ -5335,13 +6961,14 @@ def _archive_entry(
     journal: Mapping[str, object], record: ActiveRecord
 ) -> dict[str, object]:
     if record.handoff is None:
-        raise StateError("cannot archive a slot without its owner-alive handoff")
+        raise StateError("cannot archive a slot without durable reclaim evidence")
     return {
         "archive_id": _as_str(journal["archive_id"], "journal.archive_id"),
         "slot": record.slot,
         "agent": record.agent,
         "task": record.task,
         "purpose": record.purpose,
+        "slot_type": record.slot_type,
         "machine": record.machine,
         "generation": record.generation,
         "created_at": record.created_at,
@@ -5352,6 +6979,10 @@ def _archive_entry(
         "validation": list(record.handoff.validation),
         "limitations": list(record.handoff.limitations),
         "continuation": record.handoff.continuation,
+        "salvage": [
+            dict(_as_mapping(item, "finish journal.salvage entry"))
+            for item in _as_list(journal.get("salvage", []), "finish journal.salvage")
+        ],
         "checkouts": [_checkout_to_obj(item) for item in record.checkouts],
     }
 
@@ -5366,13 +6997,20 @@ def _append_archive_once(
                 raise StateError(
                     f"archive_id {archive_id!r} already exists with different content"
                 )
+            _atomic_write_json(_archive_path(config), _archive_to_obj(archive))
             return archive
     updated = ArchiveState(
         machine=archive.machine,
         revision=archive.revision + 1,
         records=(*archive.records, entry),
     )
-    _atomic_write_json(_archive_path(config), _archive_to_obj(updated))
+    _write_archive_state(
+        config,
+        updated,
+        action="slot-archived",
+        slot=_as_str(entry["slot"], "archive entry slot"),
+        evidence={"archive_id": archive_id},
+    )
     return updated
 
 
@@ -5386,12 +7024,12 @@ def _finish_fenced_slot(
     )
     del relative
     prefix = f".{record.slot}.fenced.{record.generation}."
+    slot_parent = _slot_directory(config, record.slot, record.slot_type).parent
     if (
-        fenced.name != record.slot
-        or fenced.parent.parent != config.worktrees
-        or not fenced.parent.name.startswith(prefix)
-        or len(fenced.parent.name) != len(prefix) + 32
-        or not re.fullmatch(r"[0-9a-f]{32}", fenced.parent.name.removeprefix(prefix))
+        fenced.parent != slot_parent
+        or not fenced.name.startswith(prefix)
+        or len(fenced.name) != len(prefix) + 32
+        or not re.fullmatch(r"[0-9a-f]{32}", fenced.name.removeprefix(prefix))
     ):
         raise StateError("finish journal fenced path does not match its slot generation")
     return fenced
@@ -5418,12 +7056,56 @@ def _repair_checkout_at_slot(
     return path
 
 
+def _declared_initialized_submodules(checkout: Path) -> tuple[Path, ...]:
+    found: list[Path] = []
+
+    def visit(repository: Path) -> None:
+        modules = repository / ".gitmodules"
+        if not modules.exists() and not modules.is_symlink():
+            return
+        if modules.is_symlink() or not modules.is_file():
+            raise Refusal(f"nested repository has an unsafe .gitmodules file: {modules}")
+        parser = configparser.RawConfigParser(interpolation=None, strict=True)
+        try:
+            with modules.open("r", encoding="utf-8") as handle:
+                parser.read_file(handle)
+        except (OSError, UnicodeError, configparser.Error) as exc:
+            raise Refusal(f"cannot read nested repository declarations {modules}: {exc}") from exc
+        for section in parser.sections():
+            if not section.startswith('submodule "') or not parser.has_option(section, "path"):
+                continue
+            raw = parser.get(section, "path")
+            relative = Path(raw)
+            if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+                raise Refusal(f"unsafe submodule path {raw!r} in {modules}")
+            nested = repository / relative
+            _ensure_no_symlink_components(repository, nested, "nested repository")
+            if not nested.exists() and not nested.is_symlink():
+                continue
+            if nested.is_symlink() or not nested.is_dir():
+                raise Refusal(f"nested repository path is unsafe: {nested}")
+            git_file = nested / ".git"
+            if not git_file.exists() and not git_file.is_symlink():
+                continue
+            found.append(nested)
+            visit(nested)
+
+    visit(checkout)
+    return tuple(found)
+
+
+def _repair_nested_repositories(checkout: Path, vcs: _GitVcs) -> None:
+    for nested in _declared_initialized_submodules(checkout):
+        vcs.repair_nested_repository(nested)
+
+
 def _repair_registration_at_slot(
     config: Config, checkout: Checkout, slot_path: Path, vcs: _GitVcs
 ) -> Path:
     _moved, path = _checkout_at_slot(config, checkout, slot_path)
     _relative, repository = _repository_path(config, checkout.repository)
     vcs.repair_worktree(repository, path)
+    _repair_nested_repositories(path, vcs)
     return path
 
 
@@ -5435,13 +7117,7 @@ def _remove_fenced_directory(config: Config, fenced_slot: Path) -> None:
             raise Refusal(
                 f"fenced slot directory is not empty after Git removal: {fenced_slot}: {exc}"
             ) from exc
-    try:
-        fenced_slot.parent.rmdir()
-    except FileNotFoundError:
-        pass
-    except OSError as exc:
-        raise Refusal(f"cannot remove fenced slot parent {fenced_slot.parent}: {exc}") from exc
-    _fsync_directory(config.worktrees)
+    _fsync_directory(fenced_slot.parent)
 
 
 def _rollback_path_fence(
@@ -5456,7 +7132,7 @@ def _rollback_path_fence(
     }
     if removed:
         raise Refusal("cannot roll back a path fence after a checkout was removed")
-    original = config.worktrees / record.slot
+    original = _slot_directory(config, record.slot, record.slot_type)
     fenced = _finish_fenced_slot(config, record, journal)
     if original.exists() or original.is_symlink():
         raise Refusal(f"canonical slot reappeared before path-fence rollback: {original}")
@@ -5464,15 +7140,19 @@ def _rollback_path_fence(
         raise Refusal(f"fenced slot is missing or unsafe during rollback: {fenced}")
     try:
         os.rename(fenced, original)
-        _fsync_directory(config.worktrees)
+        _fsync_directory(original.parent)
     except OSError as exc:
         raise Refusal(f"cannot restore path fence {fenced} to {original}: {exc}") from exc
     journal["phase"] = "prepared"
-    _atomic_write_json(_journal_path(config), journal)
+    _write_journal(config, journal)
     for checkout in record.checkouts:
-        _repair_checkout_at_slot(config, checkout, original, vcs)
+        # Rollback preserves the checkout; it does not authorize deletion. Repair
+        # Git's path registration without requiring the content to still match the
+        # pre-fence snapshot, because a changed checkout is exactly what must be
+        # returned to its canonical path for inspection.
+        _repair_registration_at_slot(config, checkout, original, vcs)
     _remove_fenced_directory(config, fenced)
-    _remove_control_file(_journal_path(config))
+    _clear_journal(config, journal)
 
 
 def _begin_or_resume_path_fence(
@@ -5480,8 +7160,10 @@ def _begin_or_resume_path_fence(
     record: ActiveRecord,
     journal: dict[str, object],
     vcs: _GitVcs,
+    *,
+    allow_live_validate_owner: bool = False,
 ) -> tuple[dict[str, object], Path]:
-    original = config.worktrees / record.slot
+    original = _slot_directory(config, record.slot, record.slot_type)
     fenced = _finish_fenced_slot(config, record, journal)
     original_present = original.exists() or original.is_symlink()
     fenced_present = fenced.exists() or fenced.is_symlink()
@@ -5491,28 +7173,25 @@ def _begin_or_resume_path_fence(
         removed = _as_list(journal["removed"], "journal.removed")
         if removed:
             raise StateError("finish journal records removals while the canonical slot still exists")
-        _assert_slot_contents(config, record)
-        for checkout in record.checkouts:
-            current = _assert_checkout_safe(config, checkout, vcs)
-            if current != checkout:
-                raise Refusal(
-                    f"checkout {checkout.name} changed after finish was prepared; preserve it for inspection"
-                )
-        _assert_slot_unused(original, record)
-        try:
-            fenced.parent.mkdir(mode=0o700)
-            _fsync_directory(config.worktrees)
-        except FileExistsError:
-            if not fenced.parent.is_dir() or fenced.parent.is_symlink():
-                raise Refusal(f"fenced slot parent is unsafe: {fenced.parent}")
-            if any(fenced.parent.iterdir()):
-                raise Refusal(f"fenced slot parent is not empty: {fenced.parent}")
-        except OSError as exc:
-            raise Refusal(f"cannot prepare fenced slot parent {fenced.parent}: {exc}") from exc
+        salvage = tuple(
+            _as_mapping(item, "finish journal.salvage entry")
+            for item in _as_list(journal.get("salvage", []), "finish journal.salvage")
+        )
+        _slot_path, current_checkouts = _reclaim_preconditions(
+            config,
+            record,
+            salvage,
+            vcs,
+            allow_live_validate_owner=allow_live_validate_owner,
+        )
+        if current_checkouts != record.checkouts:
+            raise Refusal(
+                f"slot {record.slot} changed after reclaim was prepared; preserve it and "
+                "rerun remove so the changed state is recorded"
+            )
         try:
             os.rename(original, fenced)
-            _fsync_directory(config.worktrees)
-            _fsync_directory(fenced.parent)
+            _fsync_directory(original.parent)
         except OSError as exc:
             raise Refusal(f"cannot establish path fence {original} -> {fenced}: {exc}") from exc
         _interrupt_for_test("after-path-fence-before-journal")
@@ -5528,7 +7207,7 @@ def _begin_or_resume_path_fence(
         if path.exists() or path.is_symlink():
             _repair_registration_at_slot(config, checkout, fenced, vcs)
     journal["phase"] = "fenced"
-    _atomic_write_json(_journal_path(config), journal)
+    _write_journal(config, journal)
     _interrupt_for_test("after-path-fence")
     return journal, fenced
 
@@ -5538,13 +7217,21 @@ def _finish_remove_paths(
     record: ActiveRecord,
     journal: dict[str, object],
     vcs: _GitVcs,
+    *,
+    allow_live_validate_owner: bool = False,
 ) -> dict[str, object]:
     removed_values = _as_list(journal["removed"], "journal.removed")
     removed = {_as_str(item, "journal.removed item") for item in removed_values}
     all_names = {item.name for item in record.checkouts}
     if not removed <= all_names:
         raise StateError("finish journal names a checkout that is not in the active record")
-    journal, fenced_slot = _begin_or_resume_path_fence(config, record, journal, vcs)
+    journal, fenced_slot = _begin_or_resume_path_fence(
+        config,
+        record,
+        journal,
+        vcs,
+        allow_live_validate_owner=allow_live_validate_owner,
+    )
     present: list[Checkout] = []
     missing_after_remove: list[Checkout] = []
     for checkout in record.checkouts:
@@ -5565,9 +7252,13 @@ def _finish_remove_paths(
             )
         missing_after_remove.append(checkout)
     if missing_after_remove:
+        if record.slot_type == "validate":
+            for checkout in missing_after_remove:
+                _relative, repository = _repository_path(config, checkout.repository)
+                vcs.delete_branch_at(repository, checkout.branch, checkout.head)
         removed.update(item.name for item in missing_after_remove)
         journal["removed"] = sorted(removed)
-        _atomic_write_json(_journal_path(config), journal)
+        _write_journal(config, journal)
     remaining = tuple(present)
     if remaining:
         if not fenced_slot.is_dir() or fenced_slot.is_symlink():
@@ -5578,6 +7269,8 @@ def _finish_remove_paths(
             except OSError as exc:
                 raise Refusal(f"cannot inspect fenced slot {fenced_slot}: {exc}") from exc
             expected = {item.name for item in remaining}
+            if record.slot_type == "agent" and (fenced_slot / "HANDOFF.md").is_file():
+                expected.add("HANDOFF.md")
             if actual != expected:
                 raise Refusal(
                     f"fenced slot contents changed: expected {sorted(expected)}, "
@@ -5587,11 +7280,44 @@ def _finish_remove_paths(
             raise StateError("flat-layout removal has more than one remaining checkout")
         try:
             moved_checkouts: list[Checkout] = []
+            moved_paths: dict[str, Path] = {}
+            salvage = tuple(
+                _as_mapping(item, "finish journal.salvage entry")
+                for item in _as_list(journal.get("salvage", []), "finish journal.salvage")
+            )
             for checkout in remaining:
-                moved, _path = _checkout_at_slot(config, checkout, fenced_slot)
-                _repair_checkout_at_slot(config, checkout, fenced_slot, vcs)
+                moved, moved_path = _checkout_at_slot(config, checkout, fenced_slot)
+                if record.slot_type == "validate" or salvage:
+                    _repair_registration_at_slot(config, checkout, fenced_slot, vcs)
+                    head = vcs.verify_existing_worktree(
+                        _repository_path(config, checkout.repository)[1], moved_path
+                    )
+                    if head != checkout.head or vcs.branch(moved_path) != checkout.branch:
+                        raise Refusal(
+                            f"fenced checkout {checkout.name} changed after reclaim was "
+                            "prepared; preserve it and rerun remove"
+                        )
+                else:
+                    _repair_checkout_at_slot(config, checkout, fenced_slot, vcs)
                 moved_checkouts.append(moved)
-            _assert_slot_unused(fenced_slot, record)
+                moved_paths[checkout.name] = moved_path
+            _assert_handoff_read(config, record, fenced_slot)
+            if record.slot_type == "agent" and salvage:
+                _assert_salvage_still_matches(
+                    config, record, salvage, vcs, paths=moved_paths
+                )
+            _assert_slot_unused(
+                fenced_slot,
+                None
+                if allow_live_validate_owner and record.slot_type == "validate"
+                else record,
+                use_lsof=not (
+                    allow_live_validate_owner and record.slot_type == "validate"
+                ),
+                ignore_invoking_ancestry=(
+                    allow_live_validate_owner and record.slot_type == "validate"
+                ),
+            )
             for checkout in moved_checkouts:
                 for cache in _cache_directories_for_checkout(config, checkout):
                     _remove_cache_directory(config, cache)
@@ -5604,20 +7330,67 @@ def _finish_remove_paths(
                         f"{exc}; path-fence rollback failed: {rollback}; run 'wrkslots recover'"
                     ) from rollback
             raise
-    elif fenced_slot.exists() and any(fenced_slot.iterdir()):
-        raise Refusal(f"finished fenced slot contains unexpected files: {fenced_slot}")
+    elif fenced_slot.exists():
+        remaining_entries = {entry.name for entry in fenced_slot.iterdir()}
+        allowed = {"HANDOFF.md"} if record.slot_type == "agent" else set()
+        unexpected = sorted(remaining_entries - allowed)
+        if unexpected:
+            raise Refusal(
+                f"finished fenced slot contains unexpected entry: {unexpected[0]}"
+            )
     for checkout in remaining:
         _relative, repository = _repository_path(config, checkout.repository)
         _moved, path = _checkout_at_slot(config, checkout, fenced_slot)
-        vcs.remove_worktree(repository, path)
+        vcs.remove_worktree(
+            repository,
+            path,
+            force=record.slot_type == "validate" or bool(journal.get("salvage")),
+        )
         _interrupt_for_test("after-remove-before-journal")
+        if record.slot_type == "validate":
+            vcs.delete_branch_at(repository, checkout.branch, checkout.head)
         removed.add(checkout.name)
         journal["removed"] = sorted(removed)
-        _atomic_write_json(_journal_path(config), journal)
+        _write_journal(config, journal)
         _interrupt_for_test("after-remove-worktree")
+    if config.layout == "nested" and record.slot_type == "agent":
+        handoff = fenced_slot / "HANDOFF.md"
+        if handoff.exists() or handoff.is_symlink():
+            if handoff.is_symlink() or not handoff.is_file():
+                raise Refusal(
+                    f"fenced HANDOFF.md became unsafe: {handoff}; preserve the fenced slot "
+                    "and run 'wrkslots recover'"
+                )
+            try:
+                contents = handoff.read_bytes()
+            except OSError as exc:
+                raise Refusal(
+                    f"cannot reread fenced HANDOFF.md before removal: {handoff}: {exc}"
+                ) from exc
+            digest = hashlib.sha256(contents).hexdigest()
+            if _recorded_handoff_digest(config, record) != digest:
+                raise Refusal(
+                    f"fenced HANDOFF.md changed after it was read: {handoff}; preserve the "
+                    "slot and rerun 'wrkslots read-handoff' before recovery"
+                )
+            try:
+                handoff.unlink()
+                _fsync_directory(fenced_slot)
+            except OSError as exc:
+                raise Refusal(f"cannot remove recorded HANDOFF.md {handoff}: {exc}") from exc
+            _write_event_file(
+                config,
+                record.machine,
+                "handoff-removed",
+                {
+                    "slot": record.slot,
+                    "generation": record.generation,
+                    "sha256": digest,
+                },
+            )
     _remove_fenced_directory(config, fenced_slot)
     journal["phase"] = "removed"
-    _atomic_write_json(_journal_path(config), journal)
+    _write_journal(config, journal)
     return journal
 
 
@@ -5627,15 +7400,15 @@ def _assert_physical_slot_removed(
     vcs: _GitVcs,
     journal: Mapping[str, object],
 ) -> None:
-    slot_path = config.worktrees / record.slot
+    slot_path = _slot_directory(config, record.slot, record.slot_type)
     fenced_slot = _finish_fenced_slot(config, record, journal)
     if slot_path.exists() or slot_path.is_symlink():
         raise Refusal(
             f"cannot archive slot {record.slot}: physical slot still exists at {slot_path}"
         )
-    if fenced_slot.exists() or fenced_slot.is_symlink() or fenced_slot.parent.exists():
+    if fenced_slot.exists() or fenced_slot.is_symlink():
         raise Refusal(
-            f"cannot archive slot {record.slot}: fenced storage still exists at {fenced_slot.parent}"
+            f"cannot archive slot {record.slot}: fenced storage still exists at {fenced_slot}"
         )
     for checkout in record.checkouts:
         path = _stored_path(config, checkout.path, "checkout path")
@@ -5669,8 +7442,14 @@ def _finish_state_update(
     _interrupt_for_test("after-archive-before-active")
     if current is not None:
         updated_state = _delete_record(state, record.slot)
-        _atomic_write_json(_active_path(config), _active_to_obj(updated_state))
-    _remove_control_file(_journal_path(config))
+        _write_active_state(
+            config,
+            updated_state,
+            action="slot-removed",
+            slot=record.slot,
+            evidence={"archive_id": entry["archive_id"]},
+        )
+    _clear_journal(config, journal)
 
 
 def _begin_finish(
@@ -5680,14 +7459,28 @@ def _begin_finish(
     *,
     mode: str,
     actor: str,
+    salvage: Sequence[Mapping[str, object]] = (),
+    validate_complete: bool = False,
+    allow_live_validate_owner: bool = False,
 ) -> None:
     vcs = _GitVcs()
     _load_archive(config)
     _assert_not_held(config, record)
-    _slot_path, final_checkouts = _remove_preconditions(config, record, vcs)
+    _slot_path, final_checkouts = _reclaim_preconditions(
+        config,
+        record,
+        salvage,
+        vcs,
+        allow_live_validate_owner=allow_live_validate_owner,
+    )
     final_record = dataclasses.replace(record, checkouts=final_checkouts)
     state = _replace_record(state, final_record)
-    _atomic_write_json(_active_path(config), _active_to_obj(state))
+    _write_active_state(
+        config,
+        state,
+        action="checkout-evidence-refreshed",
+        slot=record.slot,
+    )
     finished_at = _utc_now()
     journal = _finish_journal_payload(
         config,
@@ -5697,10 +7490,31 @@ def _begin_finish(
         finished_at=finished_at,
         removed=(),
         phase="prepared",
+        salvage=salvage,
+        validate_complete=validate_complete,
     )
-    _atomic_write_json(_journal_path(config), journal)
+    _write_journal(config, journal)
     _interrupt_for_test("after-finish-journal")
-    journal = _finish_remove_paths(config, final_record, journal, vcs)
+    try:
+        journal = _finish_remove_paths(
+            config,
+            final_record,
+            journal,
+            vcs,
+            allow_live_validate_owner=allow_live_validate_owner,
+        )
+    except Refusal:
+        canonical = _slot_directory(config, final_record.slot, final_record.slot_type)
+        fenced = _finish_fenced_slot(config, final_record, journal)
+        if (
+            canonical.is_dir()
+            and not canonical.is_symlink()
+            and not fenced.exists()
+            and not fenced.is_symlink()
+            and not _as_list(journal["removed"], "journal.removed")
+        ):
+            _clear_journal(config, journal)
+        raise
     _finish_state_update(config, state, final_record, journal)
 
 
@@ -5719,7 +7533,7 @@ def _cmd_finish(args: argparse.Namespace) -> int:
         _refuse_partial_state(config)
         _assert_no_journal(config)
         states, archives = _validate_global_state(config)
-        _assert_registry_storage_consistent(config, states)
+        _assert_command_registry_storage(config, states, args)
         before = _global_rows(states, archives)
         state = _load_active(config)
         record = _find_record(state, args.slot)
@@ -5731,7 +7545,7 @@ def _cmd_finish(args: argparse.Namespace) -> int:
         )
         continuation = (
             f"wrkslots remove {record.slot} --coordinator-pid "
-            f"{record.coordinator_lease.pid} --expected-generation {record.generation}"
+            f"<current-coordinator-pid> --expected-generation {record.generation}"
         )
         updated = dataclasses.replace(
             record,
@@ -5743,8 +7557,12 @@ def _cmd_finish(args: argparse.Namespace) -> int:
                 continuation=continuation,
             ),
         )
-        _atomic_write_json(
-            _active_path(config), _active_to_obj(_replace_record(state, updated))
+        _write_active_state(
+            config,
+            _replace_record(state, updated),
+            action="handoff-recorded",
+            slot=updated.slot,
+            evidence={"validation": list(validation)},
         )
         _interrupt_for_test("after-handoff-write")
         after_states, after_archives = _validate_global_state(config)
@@ -5769,31 +7587,137 @@ def _cmd_remove(args: argparse.Namespace) -> int:
         _refuse_partial_state(config)
         _assert_no_journal(config)
         states, archives = _validate_global_state(config)
-        _assert_registry_storage_consistent(config, states)
+        _assert_command_registry_storage(config, states, args)
         before = _global_rows(states, archives)
         state = _load_active(config)
         record = _find_record(state, args.slot)
         _expected_generation(record, args.expected_generation)
-        if coordinator != record.coordinator_lease:
-            raise Refusal(
-                f"coordinator process generation mismatch for slot {record.slot}"
-            )
         _assert_caller_process(coordinator, "coordinator")
-        if record.handoff is None:
-            raise Refusal(f"slot {record.slot} has no recorded handoff")
-        _assert_not_held(config, record)
-        _assert_registered_liveness(config, record)
-        owner_state, detail = _process_state(record.owner)
-        if record.owner is None and record.coordinator_recovery_note is None:
+        if args.validate_complete and record.slot_type != "validate":
             raise Refusal(
-                f"slot {record.slot} has no owner lease and no coordinator recovery evidence"
+                "--validate-complete applies only to a slot created with --slot-type validate. "
+                "state: REFUSED -- no checkout was salvaged or removed. remedy: omit the flag "
+                "and satisfy the ordinary agent-slot reclaim conditions"
             )
-        if record.owner is not None and owner_state != "dead":
+        _assert_not_held(config, record)
+        age, expired = _heartbeat_diagnosis(record)
+        owner_state, detail = _process_state(record.owner)
+        live_validate_owner = bool(
+            args.validate_complete
+            and owner_state == "live"
+            and record.owner == coordinator
+        )
+        if live_validate_owner:
+            _assert_caller_process(coordinator, "validate owner")
+        else:
+            _assert_registered_liveness(config, record)
+        if not expired and not args.validate_complete:
+            remaining = max(1, record.heartbeat_ttl_seconds - int(age))
+            raise Refusal(
+                f"slot {record.slot} heartbeat is {int(age)}s old and its "
+                f"{record.heartbeat_ttl_seconds}s time-to-live has not expired. state: "
+                "REFUSED -- no checkout was salvaged or removed. remedy: wait at least "
+                f"{remaining}s without renewal before retrying remove; if the owner is still "
+                "working, have it run 'wrkslots heartbeat' instead"
+            )
+        if record.owner is None:
+            raise Refusal(
+                f"slot {record.slot} has no recorded owner process, so owner death is unknown. "
+                "state: REFUSED -- no checkout was salvaged or removed. remedy: preserve this "
+                "slot until an evidence-based migration can establish its historical owner; "
+                "heartbeat expiry alone cannot do that"
+            )
+        if owner_state != "dead" and not live_validate_owner:
             raise Refusal(
                 f"remove requires a proven-dead recorded owner; owner is {owner_state}: {detail}. "
-                "TTL expiry is only a reason to inspect"
+                "state: REFUSED -- no checkout was salvaged or removed. remedy: wait for the "
+                "exact owner process to exit and for the time-to-live to remain expired; if "
+                "process evidence is unavailable, repair that evidence rather than treating the "
+                "slot as free"
             )
-        _begin_finish(config, state, record, mode="remove", actor="coordinator")
+        slot_path = _assert_slot_contents(config, record)
+        _assert_handoff_read(config, record, slot_path)
+        _assert_slot_unused(
+            slot_path,
+            None if live_validate_owner else record,
+            use_lsof=not live_validate_owner,
+            ignore_invoking_ancestry=live_validate_owner,
+        )
+        _ensure_event_log(config, record.machine)
+        _write_event_file(
+            config,
+            record.machine,
+            "reclaim-started",
+            {
+                "slot": record.slot,
+                "generation": record.generation,
+                "actor": _identity_to_obj(coordinator),
+                "coordinator_authorized": bool(args.coordinator_authorized),
+                "owner_state": owner_state,
+                "registered_liveness": "dead",
+                "heartbeat_age_seconds": int(age),
+                "heartbeat_ttl_seconds": record.heartbeat_ttl_seconds,
+                "validate_complete": bool(args.validate_complete),
+                "live_validate_owner": live_validate_owner,
+            },
+        )
+        salvage: tuple[dict[str, object], ...]
+        evidence: tuple[str, ...]
+        if record.slot_type == "validate":
+            salvage = ()
+            evidence = (
+                "slot type validate: authored work is excluded by construction, so salvage was not run",
+            )
+        else:
+            salvage = _salvage_agent_slot(config, record, _GitVcs())
+            evidence = tuple(
+                f"checkout {item['checkout']}: {item['disposition']} commit "
+                f"{item['salvage_commit']}"
+                + (
+                    f" at {item['remote_ref']}"
+                    if item.get("remote_ref") is not None
+                    else " on an existing remote ref"
+                )
+                for item in salvage
+            )
+        if record.handoff is None:
+            continuation = (
+                f"wrkslots remove {record.slot} --coordinator-pid <current-coordinator-pid> "
+                f"--expected-generation {record.generation}"
+            )
+            record = dataclasses.replace(
+                record,
+                handoff=Handoff(
+                    recorded_at=_utc_now(),
+                    validation=evidence,
+                    limitations=(),
+                    continuation=continuation,
+                ),
+            )
+            state = _replace_record(state, record)
+            _write_active_state(
+                config,
+                state,
+                action="reclaim-evidence-recorded",
+                slot=record.slot,
+                evidence={
+                    "actor": _identity_to_obj(coordinator),
+                    "coordinator_authorized": bool(args.coordinator_authorized),
+                    "owner_state": owner_state,
+                    "heartbeat_age_seconds": int(age),
+                    "salvage": list(salvage),
+                },
+            )
+        _begin_finish(
+            config,
+            state,
+            record,
+            mode="remove",
+            actor="coordinator",
+            salvage=salvage,
+            validate_complete=bool(args.validate_complete),
+            allow_live_validate_owner=live_validate_owner,
+        )
         after_states, after_archives = _validate_global_state(config)
         _assert_only_slot_changed(
             before,
@@ -5808,6 +7732,9 @@ def _recover_partial_updates(config: Config, discard: bool) -> bool:
     leftovers = sorted(config.control.glob("ACTIVE.*.json.tmp.*"))
     leftovers += sorted(config.control.glob("ARCHIVED.*.json.tmp.*"))
     leftovers += sorted(config.control.glob("ACTIVE.*.journal.tmp.*"))
+    for event_directory in sorted(config.control.glob("EVENTS.*")):
+        if event_directory.is_dir() and not event_directory.is_symlink():
+            leftovers += sorted(event_directory.glob("*.json.tmp.*"))
     if not leftovers:
         return False
     if not discard:
@@ -5823,6 +7750,60 @@ def _recover_partial_updates(config: Config, discard: bool) -> bool:
         if not separator:
             raise StateError(f"unrecognized partial state filename: {leftover}")
         target = leftover.parent / target_name
+        event_directory_match = re.fullmatch(
+            r"EVENTS\.([A-Za-z0-9][A-Za-z0-9._-]{0,63})", leftover.parent.name
+        )
+        event_name_match = re.fullmatch(r"([0-9]{20})\.json", target.name)
+        if event_directory_match is not None and event_name_match is not None:
+            machine = event_directory_match.group(1)
+            same_target = sorted(leftover.parent.glob(f"{target.name}.tmp.*"))
+            if len(same_target) != 1:
+                raise StateError(
+                    f"cannot recover append-only event {target.name}: multiple temp files exist"
+                )
+            durable_paths = sorted(
+                entry
+                for entry in leftover.parent.iterdir()
+                if re.fullmatch(r"[0-9]{20}\.json", entry.name)
+            )
+            durable_events = _load_event_paths(durable_paths, machine)
+            if target.exists() or target.is_symlink():
+                if target.is_symlink() or not target.is_file():
+                    raise StateError(
+                        f"cannot discard {leftover}: durable event is unsafe: {target}"
+                    )
+                leftover.unlink()
+                _fsync_directory(leftover.parent)
+                print(
+                    f"discarded incomplete append-only event {leftover.name}; "
+                    f"kept durable {target.name}"
+                )
+                continue
+            expected_sequence = len(durable_events) + 1
+            if int(event_name_match.group(1)) != expected_sequence:
+                raise StateError(
+                    f"cannot recover append-only event {target.name}: expected sequence "
+                    f"{expected_sequence:020d}"
+                )
+            previous = (
+                "0" * 64
+                if not durable_events
+                else _as_str(
+                    durable_events[-1]["sha256"], "append-only event.sha256"
+                )
+            )
+            _event_from_path(
+                leftover,
+                machine,
+                expected_sequence,
+                previous,
+                require_filename=False,
+            )
+            os.replace(leftover, target)
+            _fsync_directory(target.parent)
+            _load_events(config, machine)
+            print(f"recovered append-only event {target.name} from {leftover.name}")
+            continue
         active_match = re.fullmatch(
             r"ACTIVE\.([A-Za-z0-9][A-Za-z0-9._-]{0,63})\.json", target.name
         )
@@ -5861,9 +7842,29 @@ def _recover_partial_updates(config: Config, discard: bool) -> bool:
                 f"cannot discard {leftover}: last durable state is unsafe: {target}"
             )
         if active_match is not None:
-            _load_active(config, active_match.group(1))
+            machine = active_match.group(1)
+            state = _load_active(config, machine)
+            if _load_events(config, machine):
+                leftover.unlink()
+                _fsync_directory(leftover.parent)
+                _atomic_write_json(target, _active_to_obj(state))
+                print(
+                    f"discarded incomplete atomic update {leftover.name}; refreshed "
+                    f"{target.name} from the append-only log"
+                )
+                continue
         elif archive_match is not None:
-            _load_archive(config, archive_match.group(1))
+            machine = archive_match.group(1)
+            archive_state = _load_archive(config, machine)
+            if _load_events(config, machine):
+                leftover.unlink()
+                _fsync_directory(leftover.parent)
+                _atomic_write_json(target, _archive_to_obj(archive_state))
+                print(
+                    f"discarded incomplete atomic update {leftover.name}; refreshed "
+                    f"{target.name} from the append-only log"
+                )
+                continue
         elif target.name.endswith(".journal"):
             raise StateError(
                 f"cannot automatically discard journal update {leftover}; "
@@ -5881,10 +7882,11 @@ def _abort_create(
     config: Config,
     journal_path: Path,
     slot: str,
+    slot_type: str,
     plan: Sequence[PlannedCheckout],
     recorded_created: Sequence[Checkout],
 ) -> None:
-    slot_path = config.worktrees / slot
+    slot_path = _slot_directory(config, slot, slot_type)
     vcs = _GitVcs()
     recorded_by_name = {checkout.name: checkout for checkout in recorded_created}
     if config.layout == "nested" and slot_path.exists():
@@ -6007,7 +8009,7 @@ def _abort_create(
             for cache in caches:
                 _remove_cache_directory(config, cache)
             vcs.remove_worktree(repository, destination)
-            _fsync_directory(config.worktrees)
+            _fsync_directory(slot_path.parent)
     for item, repository, _destination, expected_head, _present, _checkout, _caches in preflight:
         vcs.delete_branch_at(repository, item.branch, expected_head)
     if slot_path.exists():
@@ -6015,8 +8017,11 @@ def _abort_create(
             slot_path.rmdir()
         except OSError as exc:
             raise Refusal(f"cannot remove aborted slot directory {slot_path}: {exc}") from exc
-        _fsync_directory(config.worktrees)
-    _remove_control_file(journal_path)
+        _fsync_directory(slot_path.parent)
+    _clear_journal(
+        config,
+        _as_mapping(_read_json(journal_path, "create journal"), "create journal"),
+    )
     print(f"aborted incomplete create slot={slot}; removed provisional worktrees and branches")
 
 
@@ -6025,6 +8030,7 @@ def _recover_create(
     path: Path,
     raw: Mapping[str, object],
     state: ActiveState,
+    recovery_actor: ProcessIdentity,
     *,
     retry_running_hook: bool,
     abort_create: bool,
@@ -6046,6 +8052,7 @@ def _recover_create(
         "created",
     }
     optional = {
+        "slot_type",
         "post_provision_hooks",
         "hook_progress",
         "hook_failure",
@@ -6061,6 +8068,11 @@ def _recover_create(
     agent = _as_str(raw["agent"], "create journal.agent")
     _validate_name(slot, "slot")
     _validate_name(agent, "agent")
+    slot_type = _as_str(raw.get("slot_type", "agent"), "create journal.slot_type")
+    if slot_type not in SLOT_TYPES:
+        raise StateError(
+            f"create journal.slot_type must be one of {', '.join(SLOT_TYPES)}"
+        )
     plan = tuple(
         _planned_from_obj(item, f"create journal.planned[{index}]")
         for index, item in enumerate(
@@ -6170,7 +8182,9 @@ def _recover_create(
             raise StateError("failed-to-start create hook has invalid completion details")
     planned_by_name = {item.name: item for item in plan}
     for item in plan:
-        expected_destination, _destination = _checkout_path(config, slot, item.name)
+        expected_destination, _destination = _checkout_path(
+            config, slot, item.name, slot_type
+        )
         if item.destination != expected_destination:
             raise StateError(
                 f"create journal destination for {item.name} does not match slot {slot}"
@@ -6254,6 +8268,7 @@ def _recover_create(
             agent=agent,
             task=task,
             purpose=purpose,
+            slot_type=slot_type,
             machine=config.machine,
             generation=1,
             created_at=created_at,
@@ -6278,19 +8293,19 @@ def _recover_create(
                 raise Refusal(
                     f"create recovery found changed HEAD for {checkout.name}; preserve it for inspection"
                 )
-        _remove_control_file(path)
+        _clear_journal(config, raw)
         print(f"recovered create: active state was durable; cleared journal for {slot}")
         return
     if abort_create:
-        _abort_create(config, path, slot, plan, recorded_created)
+        _abort_create(config, path, slot, slot_type, plan, recorded_created)
         return
-    _assert_agent_and_slot_free(config, slot, agent)
-    slot_path = config.worktrees / slot
+    _assert_agent_and_slot_free(config, slot, agent, slot_type)
+    slot_path = _slot_directory(config, slot, slot_type)
     if slot_path.exists() and (not slot_path.is_dir() or slot_path.is_symlink()):
         raise Refusal(f"create recovery found an unsafe slot path: {slot_path}")
     if not slot_path.exists() and config.layout == "nested":
         slot_path.mkdir(mode=0o755)
-        _fsync_directory(config.worktrees)
+        _fsync_directory(slot_path.parent)
     vcs = _GitVcs()
     created: list[Checkout] = []
     for item in plan:
@@ -6335,7 +8350,7 @@ def _recover_create(
         created.append(checkout)
         updated_journal = dict(raw)
         updated_journal["created"] = [_checkout_to_obj(value) for value in created]
-        _atomic_write_json(path, updated_journal)
+        _write_journal(config, updated_journal)
     if config.layout == "nested":
         actual = {entry.name for entry in slot_path.iterdir()}
         expected = {item.name for item in plan}
@@ -6350,7 +8365,7 @@ def _recover_create(
     updated_journal["hook_progress"] = hook_progress
     updated_journal["hook_failure"] = None
     updated_journal["failure_policy"] = "leave-for-inspection"
-    _atomic_write_json(path, updated_journal)
+    _write_journal(config, updated_journal)
     hook_progress = _run_post_provision_hooks(
         config,
         created,
@@ -6367,6 +8382,7 @@ def _recover_create(
         agent=agent,
         task=task,
         purpose=purpose,
+        slot_type=slot_type,
         machine=config.machine,
         generation=1,
         created_at=created_at,
@@ -6378,10 +8394,18 @@ def _recover_create(
         handoff=None,
         checkouts=tuple(created),
     )
-    _atomic_write_json(
-        _active_path(config), _active_to_obj(_append_record(state, record))
+    _write_active_state(
+        config,
+        _append_record(state, record),
+        action="slot-created-by-recovery",
+        slot=record.slot,
+        evidence={
+            "slot_type": record.slot_type,
+            "original_coordinator": _identity_to_obj(coordinator_lease),
+            "recovery_actor": _identity_to_obj(recovery_actor),
+        },
     )
-    _remove_control_file(path)
+    _clear_journal(config, updated_journal)
     print(f"recovered create: registered slot={slot} checkouts={len(created)}")
 
 
@@ -6406,7 +8430,7 @@ def _recover_finish(
         "removed",
         "record",
     }
-    _exact_keys(raw, required, set(), "finish journal")
+    _exact_keys(raw, required, {"salvage", "validate_complete"}, "finish journal")
     if path != _journal_path(config):
         raise StateError(f"finish journal filename does not match machine {config.machine}")
     record = _record_from_obj(raw["record"], "finish journal.record")
@@ -6435,6 +8459,33 @@ def _recover_finish(
         raise StateError("finish journal contains duplicate removed checkout names")
     if not set(removed_names) <= {checkout.name for checkout in record.checkouts}:
         raise StateError("finish journal names an unknown removed checkout")
+    salvage = tuple(
+        _as_mapping(item, f"finish journal.salvage[{index}]")
+        for index, item in enumerate(
+            _as_list(raw.get("salvage", []), "finish journal.salvage")
+        )
+    )
+    if record.slot_type == "validate" and salvage:
+        raise StateError("validate finish journal must not contain salvage evidence")
+    validate_complete = raw.get("validate_complete", False)
+    if not isinstance(validate_complete, bool):
+        raise StateError("finish journal.validate_complete must be boolean")
+    if validate_complete and record.slot_type != "validate":
+        raise StateError("agent finish journal cannot claim validate completion")
+    if record.slot_type == "agent" and salvage:
+        names = {
+            _as_str(item.get("checkout"), "finish journal.salvage checkout")
+            for item in salvage
+        }
+        top_level = {checkout.name for checkout in record.checkouts}
+        if not top_level <= names or any(
+            not any(name == top or name.startswith(f"{top}/") for top in top_level)
+            for name in names
+        ):
+            raise StateError(
+                "finish journal salvage does not cover every checkout or names an "
+                "unrelated nested repository"
+            )
     current = next((item for item in state.slots if item.slot == record.slot), None)
     archive = _load_archive(config)
     archive_id = _as_str(raw["archive_id"], "finish journal.archive_id")
@@ -6447,33 +8498,51 @@ def _recover_finish(
         if not _json_equal(matching_entry, expected_entry):
             raise StateError("durable archive entry differs from the finish journal")
         _assert_physical_slot_removed(config, record, _GitVcs(), raw)
-        _remove_control_file(path)
+        _atomic_write_json(_archive_path(config), _archive_to_obj(archive))
+        _clear_journal(config, raw)
         print(f"recovered finish: cleared completed journal for {record.slot}")
         return
     if current is None:
         raise StateError("finish journal has neither its active record nor a durable archive entry")
     if _record_to_obj(current) != _record_to_obj(record):
         raise StateError("finish journal record does not exactly match ACTIVE")
-    if coordinator != current.coordinator_lease:
-        raise Refusal(
-            f"coordinator process generation mismatch for slot {current.slot}"
-        )
     _assert_caller_process(coordinator, "coordinator")
     _assert_not_held(config, current)
-    _assert_registered_liveness(config, current)
+    age, expired = _heartbeat_diagnosis(current)
     owner_state, detail = _process_state(current.owner)
-    if current.owner is None and current.coordinator_recovery_note is None:
+    live_validate_owner = bool(
+        validate_complete
+        and owner_state == "live"
+        and current.owner == coordinator
+    )
+    if live_validate_owner:
+        _assert_caller_process(coordinator, "validate owner")
+    else:
+        _assert_registered_liveness(config, current)
+    if not expired and not validate_complete:
         raise Refusal(
-            f"slot {current.slot} has no owner lease and no coordinator recovery evidence"
+            f"slot {current.slot} time-to-live is no longer expired after renewal; "
+            "preserve it and do not resume deletion"
         )
-    if current.owner is not None and owner_state != "dead":
+    if current.owner is None:
+        raise Refusal(
+            f"slot {current.slot} has no recorded owner process, so owner death is unknown; "
+            "preserve it rather than completing deletion"
+        )
+    if owner_state != "dead" and not live_validate_owner:
         raise Refusal(f"recorded owner is {owner_state}: {detail}")
     journal = dict(raw)
     phase = _as_str(journal["phase"], "finish journal.phase")
     if phase not in ("prepared", "fenced", "removed"):
         raise StateError(f"unknown finish journal phase {phase!r}")
     if phase in ("prepared", "fenced"):
-        journal = _finish_remove_paths(config, record, journal, _GitVcs())
+        journal = _finish_remove_paths(
+            config,
+            record,
+            journal,
+            _GitVcs(),
+            allow_live_validate_owner=live_validate_owner,
+        )
     else:
         if set(removed_names) != {checkout.name for checkout in record.checkouts}:
             raise StateError("removed finish phase does not name every checkout")
@@ -6482,16 +8551,327 @@ def _recover_finish(
     print(f"recovered finish: archived and removed slot={record.slot}")
 
 
+def _legacy_validate_recovery_inputs(
+    config: Config, raw: Mapping[str, object]
+) -> tuple[Path, Path, Path, str]:
+    required = {
+        "schema",
+        "kind",
+        "machine",
+        "slot",
+        "phase",
+        "checkout",
+        "repository",
+        "completed_record",
+        "completed_record_sha256",
+        "head",
+        "actor",
+        "coordinator_authorized",
+    }
+    _exact_keys(raw, required, set(), "legacy validate removal journal")
+    if _as_int(raw["schema"], "legacy validate removal journal.schema") != SCHEMA:
+        raise StateError("unsupported legacy validate removal journal schema")
+    if _as_str(raw["kind"], "legacy validate removal journal.kind") != "legacy-validate-remove":
+        raise StateError("legacy validate removal journal has the wrong operation kind")
+    if _as_str(raw["machine"], "legacy validate removal journal.machine") != config.machine:
+        raise StateError("legacy validate removal journal belongs to a different machine")
+    slot = _validate_name(
+        _as_str(raw["slot"], "legacy validate removal journal.slot"), "slot"
+    )
+    checkout_relative, checkout = _relative_inside(
+        config.root,
+        _as_str(raw["checkout"], "legacy validate removal journal.checkout"),
+        "legacy validation checkout",
+    )
+    if (
+        Path(checkout_relative).parent != Path("ignored")
+        or checkout.name != slot
+        or not slot.startswith("validate-fresh-")
+    ):
+        raise Refusal(
+            "legacy validation cleanup accepts only an exact ignored/validate-fresh-* "
+            "checkout. state: REFUSED -- no checkout was removed. remedy: pass the "
+            "project-relative checkout recorded by the completed validation handle"
+        )
+    repository_relative, repository = _repository_path(
+        config,
+        _as_str(raw["repository"], "legacy validate removal journal.repository"),
+    )
+    del repository_relative
+    record_relative, record_path = _relative_inside(
+        config.root,
+        _as_str(raw["completed_record"], "legacy validate removal journal.completed_record"),
+        "completed validation record",
+    )
+    if (
+        Path(record_relative).parent != Path("ignored/validate/runs")
+        or record_path.suffix != ".json"
+    ):
+        raise Refusal(
+            "completed validation evidence must be an exact JSON record under "
+            "ignored/validate/runs. state: REFUSED -- no checkout was removed. "
+            "remedy: pass the durable run-record path used by validate-run"
+        )
+    expected_digest = _as_str(
+        raw["completed_record_sha256"],
+        "legacy validate removal journal.completed_record_sha256",
+    )
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_digest):
+        raise StateError("legacy validate removal journal has an invalid record digest")
+    try:
+        record_contents = record_path.read_bytes()
+    except OSError as exc:
+        raise Refusal(
+            f"cannot read completed validation record {record_path}: {exc}. state: "
+            "REFUSED -- no checkout was removed. remedy: restore the durable record "
+            "byte-for-byte and rerun wrkslots recover"
+        ) from exc
+    observed_digest = hashlib.sha256(record_contents).hexdigest()
+    if observed_digest != expected_digest:
+        raise Refusal(
+            f"completed validation record changed after cleanup was prepared: {record_path}. "
+            "state: REFUSED -- no checkout was removed. remedy: preserve the checkout and "
+            "inspect the record change before retrying"
+        )
+    try:
+        record_value = json.loads(record_contents)
+    except json.JSONDecodeError as exc:
+        raise Refusal(f"completed validation record is not valid JSON: {record_path}: {exc}") from exc
+    record = _as_mapping(record_value, "completed validation record")
+    recorded_checkout = record.get("checkout")
+    if not isinstance(recorded_checkout, str) or Path(recorded_checkout).resolve() != checkout:
+        raise Refusal(
+            "completed validation record does not name this exact checkout. state: "
+            "REFUSED -- no checkout was removed. remedy: pass the matching run record "
+            "or retain the checkout for inspection"
+        )
+    if record.get("temporary_checkout") is False:
+        raise Refusal(
+            "completed validation record says this was not a temporary checkout. state: "
+            "REFUSED -- no checkout was removed. remedy: retain it; only validation-created "
+            "temporary checkouts use this recovery path"
+        )
+    expected_exits = {"PASSED": 0, "FAILED": 1, "COULD_NOT_RUN": 75}
+    final_status = record.get("final_validate_status")
+    if (
+        record.get("state") != "completed"
+        or final_status not in expected_exits
+        or record.get("exit_code") != expected_exits[final_status]
+    ):
+        raise Refusal(
+            "validation record does not contain an evidenced completed result. state: "
+            "REFUSED -- no checkout was removed. remedy: let validate-run finish recording "
+            "the result, or retain the checkout while the outcome is unknown"
+        )
+    head = _as_str(raw["head"], "legacy validate removal journal.head")
+    if not SHA_RE.fullmatch(head):
+        raise StateError("legacy validate removal journal has an invalid checkout HEAD")
+    return checkout, repository, record_path, head
+
+
+def _legacy_validate_journal(
+    config: Config,
+    args: argparse.Namespace,
+    coordinator: ProcessIdentity,
+) -> dict[str, object]:
+    checkout_relative, checkout = _relative_inside(
+        config.root, args.legacy_validate_checkout, "legacy validation checkout"
+    )
+    record_relative, record_path = _relative_inside(
+        config.root, args.completed_record, "completed validation record"
+    )
+    repository_relative, repository = _repository_path(config, args.repository)
+    if not checkout.is_dir() or checkout.is_symlink():
+        raise Refusal(
+            f"legacy validation checkout is absent or unsafe: {checkout}. state: "
+            "REFUSED -- no lifecycle record was changed. remedy: inspect the durable "
+            "validation record; if Git already removed the checkout, prune its stale "
+            "registration explicitly before retrying"
+        )
+    _ensure_no_mount_components(config.root, checkout, "legacy validation checkout")
+    _assert_no_mountinfo_crossing(checkout, checkout, "legacy validation checkout")
+    if (checkout / "HANDOFF.md").exists() or (checkout / "HANDOFF.md").is_symlink():
+        raise Refusal(
+            f"legacy validation checkout contains HANDOFF.md: {checkout / 'HANDOFF.md'}. "
+            "state: REFUSED -- no checkout was removed. remedy: have a participant read "
+            "and preserve the handoff before deciding how to recover this directory"
+        )
+    vcs = _GitVcs()
+    head = vcs.verify_existing_worktree(repository, checkout)
+    try:
+        record_contents = record_path.read_bytes()
+    except OSError as exc:
+        raise Refusal(f"cannot read completed validation record {record_path}: {exc}") from exc
+    journal: dict[str, object] = {
+        "schema": SCHEMA,
+        "kind": "legacy-validate-remove",
+        "machine": config.machine,
+        "slot": checkout.name,
+        "phase": "prepared",
+        "checkout": checkout_relative,
+        "repository": repository_relative,
+        "completed_record": record_relative,
+        "completed_record_sha256": hashlib.sha256(record_contents).hexdigest(),
+        "head": head,
+        "actor": _identity_to_obj(coordinator),
+        "coordinator_authorized": bool(args.coordinator_authorized),
+    }
+    _legacy_validate_recovery_inputs(config, journal)
+    _assert_slot_unused(checkout)
+    return journal
+
+
+def _recover_legacy_validate_remove(
+    config: Config,
+    path: Path,
+    raw: Mapping[str, object],
+    coordinator: ProcessIdentity,
+) -> None:
+    if path != _journal_path(config):
+        raise StateError(
+            f"legacy validate removal journal filename does not match machine {config.machine}"
+        )
+    _assert_caller_process(coordinator, "coordinator")
+    checkout, repository, record_path, head = _legacy_validate_recovery_inputs(config, raw)
+    phase = _as_str(raw["phase"], "legacy validate removal journal.phase")
+    if phase not in ("prepared", "removed"):
+        raise StateError(f"unknown legacy validate removal phase {phase!r}")
+    vcs = _GitVcs()
+    listed = vcs.listed_worktrees(repository)
+    if checkout.exists() or checkout.is_symlink():
+        if phase == "removed":
+            raise Refusal(
+                f"legacy validation checkout reappeared after removal was recorded: {checkout}. "
+                "state: REFUSED -- no further deletion ran. remedy: preserve it and inspect "
+                "the repository registration before retrying"
+            )
+        if checkout.is_symlink() or not checkout.is_dir():
+            raise Refusal(f"legacy validation checkout became unsafe: {checkout}")
+        _ensure_no_mount_components(config.root, checkout, "legacy validation checkout")
+        _assert_no_mountinfo_crossing(checkout, checkout, "legacy validation checkout")
+        if (checkout / "HANDOFF.md").exists() or (checkout / "HANDOFF.md").is_symlink():
+            raise Refusal(
+                f"legacy validation checkout gained HANDOFF.md: {checkout / 'HANDOFF.md'}; "
+                "preserve it and do not resume deletion"
+            )
+        observed_head = vcs.verify_existing_worktree(repository, checkout)
+        if observed_head != head:
+            raise Refusal(
+                f"legacy validation checkout HEAD changed from {head} to {observed_head}; "
+                "preserve it and do not resume deletion"
+            )
+        _assert_slot_unused(checkout)
+        vcs.remove_worktree(repository, checkout, force=True)
+        _interrupt_for_test("after-legacy-validate-remove")
+        listed = vcs.listed_worktrees(repository)
+    if checkout.absolute() in listed:
+        raise Refusal(
+            f"Git still registers removed legacy validation checkout {checkout}. state: "
+            "REFUSED -- cleanup is incomplete. remedy: inspect the registration and rerun "
+            "wrkslots recover; do not report the checkout removed"
+        )
+    if checkout.exists() or checkout.is_symlink():
+        raise Refusal(
+            f"legacy validation checkout still exists after Git removal: {checkout}. state: "
+            "REFUSED -- cleanup is incomplete. remedy: preserve the directory and inspect "
+            "why Git left it before rerunning recovery"
+        )
+    journal = dict(raw)
+    if phase != "removed":
+        journal["phase"] = "removed"
+        _write_journal(config, journal)
+    _write_event_file(
+        config,
+        config.machine,
+        "legacy-validate-checkout-removed",
+        {
+            "slot": raw["slot"],
+            "checkout": raw["checkout"],
+            "repository": raw["repository"],
+            "completed_record": raw["completed_record"],
+            "completed_record_sha256": raw["completed_record_sha256"],
+            "head": head,
+            "recovery_actor": _identity_to_obj(coordinator),
+        },
+    )
+    _clear_journal(config, journal)
+    print(
+        f"recovered completed legacy validation checkout={checkout} "
+        f"record={record_path}"
+    )
+
+
 def _cmd_recover(args: argparse.Namespace) -> int:
     config = _load_config(args.project_root, args.machine)
     coordinator = _capture_caller_process(args.coordinator_pid, "coordinator")
     with _mutation_locks(config, args.wait_lock):
         recovered_partial = _recover_partial_updates(config, args.discard_partial)
         if recovered_partial and not _outstanding_journals(config):
+            _ensure_event_log(config)
+            _write_event_file(
+                config,
+                config.machine,
+                "partial-updates-recovered",
+                {
+                    "actor": _identity_to_obj(coordinator),
+                    "coordinator_authorized": bool(args.coordinator_authorized),
+                },
+            )
             states, _archives = _validate_global_state(config)
-            _assert_registry_storage_consistent(config, states)
+            _assert_command_registry_storage(config, states, args)
             return 0
-        path, raw = _load_journal(config)
+        requested_legacy = any(
+            value is not None
+            for value in (
+                args.legacy_validate_checkout,
+                args.completed_record,
+                args.repository,
+            )
+        )
+        if requested_legacy:
+            if not all(
+                value is not None
+                for value in (
+                    args.legacy_validate_checkout,
+                    args.completed_record,
+                    args.repository,
+                )
+            ):
+                raise Refusal(
+                    "legacy validation cleanup requires --legacy-validate-checkout, "
+                    "--completed-record, and --repository together. state: REFUSED -- "
+                    "no checkout or lifecycle record was changed. remedy: supply all three "
+                    "project-relative paths from the completed validate-run record"
+                )
+            if _outstanding_journals(config):
+                raise Refusal(
+                    "an interrupted mutation is already recorded. state: REFUSED -- the new "
+                    "legacy validation cleanup did not start. remedy: rerun 'wrkslots recover "
+                    "--coordinator-pid PID' without legacy cleanup flags to finish the recorded "
+                    "operation first"
+                )
+            states, archives = _validate_global_state(config)
+            _assert_command_registry_storage(config, states, args)
+            before = _global_rows(states, archives)
+            journal = _legacy_validate_journal(config, args, coordinator)
+            _write_journal(config, journal)
+            _interrupt_for_test("after-legacy-validate-journal")
+            path = _journal_path(config)
+            raw: Mapping[str, object] = journal
+        else:
+            path, raw = _load_journal(config)
+        _ensure_event_log(config)
+        _write_event_file(
+            config,
+            config.machine,
+            "recovery-started",
+            {
+                "slot": raw.get("slot"),
+                "operation": raw.get("kind"),
+                "actor": _identity_to_obj(coordinator),
+                "coordinator_authorized": bool(args.coordinator_authorized),
+            },
+        )
         if _as_int(raw.get("schema"), "journal.schema") != SCHEMA:
             raise StateError("unsupported recovery journal schema")
         machine = _as_str(raw.get("machine"), "journal.machine")
@@ -6507,16 +8887,13 @@ def _cmd_recover(args: argparse.Namespace) -> int:
         before = _global_rows(states, archives)
         state = _load_active(config)
         if kind == "create":
-            journal_coordinator = _identity_from_obj(
-                raw.get("coordinator_lease"), "create journal.coordinator_lease"
-            )
-            if journal_coordinator != coordinator:
-                raise Refusal("create recovery requires the recorded coordinator process")
+            _assert_caller_process(coordinator, "coordinator")
             _recover_create(
                 config,
                 path,
                 raw,
                 state,
+                coordinator,
                 retry_running_hook=args.retry_running_hook,
                 abort_create=args.abort_create,
             )
@@ -6526,15 +8903,24 @@ def _cmd_recover(args: argparse.Namespace) -> int:
                     "--retry-running-hook and --abort-create apply only to create journals"
                 )
             _recover_finish(config, path, raw, state, coordinator)
+        elif kind == "legacy-validate-remove":
+            if args.retry_running_hook or args.abort_create:
+                raise Refusal(
+                    "--retry-running-hook and --abort-create apply only to create journals"
+                )
+            _recover_legacy_validate_remove(config, path, raw, coordinator)
         else:
             raise StateError(f"unknown recovery journal kind {kind!r}")
         after_states, after_archives = _validate_global_state(config)
-        slot = _as_str(raw.get("slot"), "journal.slot")
-        _assert_only_slot_changed(
-            before,
-            _global_rows(after_states, after_archives),
-            slot,
-        )
+        after = _global_rows(after_states, after_archives)
+        if kind == "legacy-validate-remove":
+            if after != before:
+                raise StateError(
+                    "legacy validation cleanup changed the registered slot state"
+                )
+        else:
+            slot = _as_str(raw.get("slot"), "journal.slot")
+            _assert_only_slot_changed(before, after, slot)
     return 0
 
 
@@ -6574,18 +8960,19 @@ def _add_repo_options(parser: argparse.ArgumentParser) -> None:
 
 
 _QUICKSTART = """\
-wrkslots manages one durable Git worktree slot for one coding agent.
+wrkslots manages durable agent and validation worktree slots.
 
 1. Initialize the project once. The running command is project-owned and is called with the agent
    name. It must return 0 for dead, 1 for alive, or 2 when it cannot determine the answer.
 
-     wrkslots init . --liveness-command tools/agent-liveness.py
+     wrkslots init . --worktrees-dir worktrees/slots --liveness-command tools/agent-liveness.py
 
 2. Create a new linked worktree and branch from an existing source repository. The repository's
    configured origin is used by default; add --remote product=upstream to choose another remote,
    and add --remote-url product=URL when the caller must verify its fetch URL.
 
      wrkslots create slot01 \\
+       --slot-type agent --coordinator-authorized \\
        --agent codex-1 --task task-123 --purpose "fix parser" \\
        --coordinator-pid "$COORDINATOR_PID" --owner-pid "$OWNER_PID" \\
        --repo product=product --branch product=codex/fix-parser
@@ -6595,21 +8982,22 @@ wrkslots manages one durable Git worktree slot for one coding agent.
      wrkslots heartbeat slot01 \\
        --agent codex-1 --owner-pid "$OWNER_PID" --expected-generation 1
 
-4. Before exiting, the owner records a clean, published handoff. This retains the slot.
+4. Before exiting, the owner may record a clean, published handoff. This retains the slot.
 
      wrkslots finish slot01 \\
        --agent codex-1 --owner-pid "$OWNER_PID" --expected-generation 1 \\
        --validation "make test: pass"
 
-5. After the registered running command verifies the agent is dead, the recorded coordinator may
-   remove the slot. Heartbeat expiry and old mtimes never authorize removal.
+5. After the registered running command and exact process identity prove the owner dead, and the
+   recorded time-to-live expires without renewal, any later coordinator may remove the slot.
+   Agent slots publish dirty and unpushed work first; validate slots skip salvage.
 
      wrkslots remove slot01 \\
-       --coordinator-pid "$COORDINATOR_PID" --expected-generation 1
+       --coordinator-pid "$CURRENT_COORDINATOR_PID" --expected-generation 1
 
 If a create or removal is interrupted, preserve all paths and run:
 
-     wrkslots recover --coordinator-pid "$COORDINATOR_PID"
+     wrkslots recover --coordinator-pid "$CURRENT_COORDINATOR_PID"
 
 Use `wrkslots COMMAND --help` for the exact effects and inputs of one command.
 """
@@ -6632,37 +9020,39 @@ clean-caches without --only or --yes. unpushed refreshes remote-tracking refs
 but does not mutate registry state.
 Mutating: init, create, register, import-existing --apply, adopt,
 recover-unbound-owner, heartbeat, hold, unhold, clean-caches deletion, finish,
-remove, and recover. Registry mutations take a state lock and atomically replace
-the affected machine shard.
+read-handoff, remove, and recover. Registry mutations take a state lock and append
+hash-linked events. ACTIVE and ARCHIVED are compatibility views derived from those events.
 Each slot binds an agent identity, coordinator process generation, and one or more linked Git
-worktrees to durable machine-sharded state. Removal fails closed unless the registered running
-command, process evidence, Git state, and recovery journal all agree that deletion is safe.
+worktrees to durable machine-sharded state. Removal fails closed unless the time-to-live,
+registered running command, process evidence, Git state, salvage evidence, and recovery journal
+all agree that deletion is safe.
 """
     epilog = """Lifecycle:
   wrkslots quickstart
-  wrkslots init . --liveness-command tools/agent-liveness.py
-  wrkslots create slot01 --agent codex-1 --task task-123 --purpose "fix parser" \\
+  wrkslots init . --worktrees-dir worktrees/slots --liveness-command tools/agent-liveness.py
+  wrkslots create slot01 --slot-type agent --coordinator-authorized \\
+    --agent codex-1 --task task-123 --purpose "fix parser" \\
     --repo product=product --branch product=codex/fix-parser \\
     --coordinator-pid PID --owner-pid PID
   wrkslots heartbeat slot01 --agent codex-1 --owner-pid PID --expected-generation 1
   wrkslots finish slot01 --agent codex-1 --owner-pid PID --expected-generation 1 \\
     --validation "exact command and result"
 
-finish proves clean index/tracked/untracked/ignored state outside configured
-regenerable cache paths, no unfinished Git
-operation, remote durability, exact landed ancestry, and path identity, then
-records the owner-alive handoff while retaining physical storage. remove is
-coordinator-only and proceeds only after the registered liveness command
-returns rc 0, the recorded owner process generation is dead, and independent
-process/cgroup/mount checks prove the slot unused. rc 1 and rc 2 both refuse.
-A stale heartbeat or expired TTL is diagnostic only.
+finish proves clean index/tracked/untracked/ignored state outside configured regenerable cache
+paths, no unfinished Git operation, remote durability, exact landed ancestry, and path identity,
+then records the owner-alive handoff while retaining physical storage. Any later participant may
+run remove. It proceeds only after the heartbeat TTL expires, the registered liveness command
+returns rc 0, the exact owner process generation is dead, and independent process/cgroup/mount
+checks prove the slot unused. rc 1, rc 2, and unavailable evidence all refuse.
 
-Any failed precondition leaves every worktree in place. If a process stops
-during create or remove, later mutations refuse and 'wrkslots recover' resumes
-from the durable journal. Never edit ACTIVE.*, ARCHIVED.*, or a journal by hand.
+Any failed precondition leaves every worktree in place. If a process stops during create or
+remove, later mutations refuse and 'wrkslots recover' resumes from the append-only history and
+its journal compatibility view. Never edit EVENTS.*, ACTIVE.*, ARCHIVED.*, or a journal by hand.
 
-Global options (--project-root, --machine, --wait-lock) precede the command.
-Exit status: 0 success, 2 command-line usage, 3 fail-closed refusal.
+Global options (--project-root, --machine, --wait-lock,
+--allow-existing-unregistered-worktrees) precede the command.
+Exit status: 0 success/no gate finding, 1 audit gate action, 2 command-line
+usage or audit gate unknown, 3 fail-closed refusal.
 """
     parser = argparse.ArgumentParser(
         prog="wrkslots",
@@ -6690,6 +9080,15 @@ Exit status: 0 success, 2 command-line usage, 3 fail-closed refusal.
         default=0.0,
         metavar="SECONDS",
         help="wait up to this many seconds for a state lock (default: fail immediately)",
+    )
+    parser.add_argument(
+        "--allow-existing-unregistered-worktrees",
+        action="store_true",
+        help=(
+            "permit operations on registered slots while retaining and warning about "
+            "pre-existing worktree directories that have no wrkslots record; never treats "
+            "those directories as free or authorizes their removal"
+        ),
     )
     subparsers = parser.add_subparsers(dest="command", metavar="COMMAND")
 
@@ -6724,9 +9123,12 @@ Exit status: 0 success, 2 command-line usage, 3 fail-closed refusal.
     )
     init.add_argument(
         "--worktrees-dir",
-        default="worktrees",
+        default="worktrees/slots",
         metavar="PATH",
-        help="managed slot directory relative to the project root (default: worktrees)",
+        help=(
+            "managed agent-slot directory relative to the project root; validation slots use "
+            "the sibling worktrees/validate directory (default: worktrees/slots)"
+        ),
     )
     init.add_argument(
         "--default-remote",
@@ -6745,7 +9147,10 @@ Exit status: 0 success, 2 command-line usage, 3 fail-closed refusal.
         type=int,
         default=3600,
         metavar="SECONDS",
-        help="age after which status diagnoses a heartbeat as expired; never deletion authority (default: 3600)",
+        help=(
+            "age after which an unrenewed heartbeat satisfies one reclaim condition; owner and "
+            "liveness evidence must independently agree (default: 3600)"
+        ),
     )
     init.add_argument(
         "--layout",
@@ -6841,6 +9246,15 @@ Exit status: 0 success, 2 command-line usage, 3 fail-closed refusal.
         help="show leak counts and DELETABLE/BLOCKED/HELD verdicts",
     )
     audit.add_argument("--format", choices=("human", "json"), default="human")
+    audit.add_argument(
+        "--gate",
+        action="store_true",
+        help=(
+            "exit 1 when a DELETABLE slot, interrupted operation, or unregistered "
+            "directory needs coordinator attention; exit 2 when an expired slot's "
+            "evidence is unavailable; blocked live evidence is retained without a finding"
+        ),
+    )
     audit.set_defaults(handler=_cmd_audit)
 
     unpushed = subparsers.add_parser(
@@ -6870,6 +9284,19 @@ Exit status: 0 success, 2 command-line usage, 3 fail-closed refusal.
         formatter_class=_HelpFormatter,
     )
     create.add_argument("slot", help="new slot name, such as slot01")
+    create.add_argument(
+        "--slot-type",
+        choices=SLOT_TYPES,
+        help="agent preserves authored work before reclaim; validate never salvages",
+    )
+    create.add_argument(
+        "--coordinator-authorized",
+        action="store_true",
+        help=(
+            "confirm that the coordinator assigned this slot; agents should ask the "
+            "coordinator instead of passing this flag on their own"
+        ),
+    )
     create.add_argument("--agent", required=True, metavar="AGENT", help="registered agent name")
     create.add_argument("--task", required=True, metavar="TASK", help="task or work-item identifier")
     create.add_argument("--purpose", required=True, metavar="TEXT", help="short human-readable reason for the slot")
@@ -6890,9 +9317,11 @@ Exit status: 0 success, 2 command-line usage, 3 fail-closed refusal.
     create.add_argument(
         "--branch",
         action="append",
-        required=True,
         metavar="NAME=BRANCH",
-        help="new local branch for one checkout (repeat once per --repo)",
+        help=(
+            "new local branch for one checkout (required once per --repo for agent slots; "
+            "validate slots generate private branches when omitted)"
+        ),
     )
     create.add_argument(
         "--start",
@@ -6905,6 +9334,7 @@ Exit status: 0 success, 2 command-line usage, 3 fail-closed refusal.
         action="store_true",
         help="allow create below the provisioning floor, but never below the emergency floor",
     )
+    create.add_argument("--format", choices=("human", "json"), default="human")
     create.set_defaults(handler=_cmd_create)
 
     register = subparsers.add_parser(
@@ -6918,6 +9348,14 @@ Exit status: 0 success, 2 command-line usage, 3 fail-closed refusal.
         formatter_class=_HelpFormatter,
     )
     register.add_argument("slot", help="existing managed slot name")
+    register.add_argument(
+        "--slot-type", choices=SLOT_TYPES,
+        help="type recorded at registration; it controls whether reclaim must salvage",
+    )
+    register.add_argument(
+        "--coordinator-authorized", action="store_true",
+        help="confirm that the coordinator authorized this registration",
+    )
     register.add_argument("--agent", required=True, metavar="AGENT", help="registered agent name")
     register.add_argument("--task", required=True, metavar="TASK", help="task or work-item identifier")
     register.add_argument("--purpose", required=True, metavar="TEXT", help="short human-readable reason for the slot")
@@ -6943,6 +9381,14 @@ Exit status: 0 success, 2 command-line usage, 3 fail-closed refusal.
         formatter_class=_HelpFormatter,
     )
     import_existing.add_argument("slot", help="existing managed slot name")
+    import_existing.add_argument(
+        "--slot-type", choices=SLOT_TYPES,
+        help="type to print or record; it controls whether reclaim must salvage",
+    )
+    import_existing.add_argument(
+        "--coordinator-authorized", action="store_true",
+        help="confirm that the coordinator authorized this import",
+    )
     import_existing.add_argument("--agent", required=True, metavar="AGENT", help="agent name to record")
     import_existing.add_argument("--task", required=True, metavar="TASK", help="task or work-item identifier")
     import_existing.add_argument("--purpose", required=True, metavar="TEXT", help="short human-readable reason for the slot")
@@ -6974,8 +9420,8 @@ Exit status: 0 success, 2 command-line usage, 3 fail-closed refusal.
         help="record coordinator recovery evidence without replacing historical ownership",
         description=(
             "Record explicit coordinator evidence for a historical slot that has no usable owner "
-            "lease. This does not invent or replace an owner identity, and it does not remove the "
-            "slot."
+            "lease. This does not invent or replace an owner identity, prove owner death, make the "
+            "slot reclaimable, or remove it."
         ),
         formatter_class=_HelpFormatter,
     )
@@ -6992,7 +9438,7 @@ Exit status: 0 success, 2 command-line usage, 3 fail-closed refusal.
         help="refresh diagnosis data for the exact owner",
         description=(
             "Refresh the heartbeat only when the caller, agent, PID, and process start identity "
-            "still match the recorded owner. Expiry is diagnostic and never permits removal."
+            "still match the recorded owner. Expiry is necessary for reclaim but never sufficient."
         ),
         formatter_class=_HelpFormatter,
     )
@@ -7018,6 +9464,25 @@ Exit status: 0 success, 2 command-line usage, 3 fail-closed refusal.
     )
     unhold.add_argument("slot")
     unhold.set_defaults(handler=_cmd_unhold)
+
+    read_handoff = subparsers.add_parser(
+        "read-handoff",
+        description=(
+            "print an agent slot's HANDOFF.md and append its exact digest to the slot history; "
+            "remove refuses while the current file has not been read"
+        ),
+        help="print HANDOFF.md and record that its exact content was read",
+    )
+    read_handoff.add_argument("slot")
+    read_handoff.add_argument(
+        "--coordinator-authorized", action="store_true",
+        help="record coordinator authorization as optional read provenance",
+    )
+    read_handoff.add_argument(
+        "--coordinator-pid", type=int, required=True, metavar="PID",
+        help="live current coordinator PID recorded with the read event",
+    )
+    read_handoff.set_defaults(handler=_cmd_read_handoff)
 
     clean_caches = subparsers.add_parser(
         "clean-caches",
@@ -7056,16 +9521,34 @@ Exit status: 0 success, 2 command-line usage, 3 fail-closed refusal.
 
     remove = subparsers.add_parser(
         "remove",
-        help="remove a handed-off slot after proving its owner dead",
+        help="salvage when required and remove a reclaimable slot",
         description=(
-            "Coordinator-only physical removal. Requires a completed handoff, the registered "
-            "running command to return dead, the exact owner process generation to be absent, and "
-            "independent process, mount, Git, and path checks to agree. Ambiguity refuses."
+            "Physical removal that any later participant may complete from durable state. Requires "
+            "the heartbeat TTL to be expired, the registered running command to return dead, the "
+            "exact owner process generation to be absent, and independent process, mount, Git, "
+            "and path checks to agree. Agent slots are salvaged to their recorded remote first; "
+            "validate slots skip salvage. Ambiguity refuses."
         ),
         formatter_class=_HelpFormatter,
     )
-    remove.add_argument("slot", help="finished active slot name")
-    remove.add_argument("--coordinator-pid", type=int, required=True, metavar="PID", help="recorded live coordinator PID")
+    remove.add_argument("slot", help="active slot name whose reclaim conditions are satisfied")
+    remove.add_argument(
+        "--coordinator-authorized", action="store_true",
+        help=(
+            "record that this cleanup was coordinator-authorized; optional provenance only, "
+            "never a gate on helping an abandoned operation"
+        ),
+    )
+    remove.add_argument(
+        "--validate-complete",
+        action="store_true",
+        help=(
+            "remove a completed validate slot immediately when the current caller is its exact "
+            "owner, or after owner death without waiting for TTL; process-use, path, and Git "
+            "checks remain"
+        ),
+    )
+    remove.add_argument("--coordinator-pid", type=int, required=True, metavar="PID", help="live current coordinator PID recorded with the operation")
     remove.add_argument("--expected-generation", type=int, required=True, metavar="N", help="current slot generation")
     remove.set_defaults(handler=_cmd_remove)
 
@@ -7073,17 +9556,42 @@ Exit status: 0 success, 2 command-line usage, 3 fail-closed refusal.
         "recover",
         help="resume an interrupted mutation from its journal",
         description=(
-            "Validate and resume one durable create or removal journal. Recovery is bound to the "
-            "recorded coordinator and machine and refuses mismatched registry, path, process, or "
-            "Git evidence. Do not edit a journal by hand."
+            "Validate and resume one durable create or removal from append-only history and its "
+            "journal compatibility view. Any later participant may help; mismatched registry, "
+            "path, process, or Git evidence refuses. Do not edit the history or journal by hand."
         ),
         formatter_class=_HelpFormatter,
     )
-    recover.add_argument("--coordinator-pid", type=int, required=True, metavar="PID", help="recorded live coordinator PID")
+    recover.add_argument("--coordinator-pid", type=int, required=True, metavar="PID", help="live current coordinator PID recorded with recovery")
+    recover.add_argument(
+        "--coordinator-authorized", action="store_true",
+        help="record coordinator authorization as optional recovery provenance",
+    )
     recover.add_argument(
         "--discard-partial",
         action="store_true",
         help="discard an incomplete temp write only when its prior durable file is valid",
+    )
+    recover.add_argument(
+        "--legacy-validate-checkout",
+        metavar="PATH",
+        help=(
+            "project-relative ignored/validate-fresh-* worktree from the historical layout; "
+            "requires --completed-record and --repository"
+        ),
+    )
+    recover.add_argument(
+        "--completed-record",
+        metavar="PATH",
+        help=(
+            "project-relative ignored/validate/runs/*.json record proving the historical "
+            "validation completed"
+        ),
+    )
+    recover.add_argument(
+        "--repository",
+        metavar="PATH",
+        help="project-relative source repository that owns the historical Git worktree",
     )
     create_recovery = recover.add_mutually_exclusive_group()
     create_recovery.add_argument(

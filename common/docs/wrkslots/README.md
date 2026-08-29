@@ -1,13 +1,17 @@
 # wrkslots
 
-`wrkslots` manages Git worktree slots used by coordinators and coding agents. It records who owns
-each slot, keeps machine-sharded durable state, refuses ambiguous deletion, and resumes interrupted
-operations from journals.
+`wrkslots` is the single lifecycle interface for Git worktrees used by coordinators, coding agents,
+and disposable validation. It records typed ownership and renewal evidence in an append-only,
+hash-linked history, salvages agent work before reclaim, and lets any later participant finish an
+operation whose original participant disappeared.
 
-The tool is intentionally conservative. A heartbeat timeout or old filesystem timestamp is useful
-diagnosis, but neither authorizes deletion. Physical removal requires the registered coordinator,
-the configured running check, process-generation evidence, clean and published Git state, and
-absence of live process use.
+It is deliberately fail-closed. Reclaim requires the recorded time-to-live to expire, the project
+liveness command to report dead, the exact owner process identity to be dead, and process, mount,
+Git, and path checks to agree. Unavailable evidence refuses. `agent` slots publish dirty and
+unpushed work, including initialized Git submodules, before deletion; `validate` slots skip salvage because their evidence must live
+outside the disposable checkout. `remove --validate-complete` lets the exact owner clean up a
+completed validation slot immediately, or lets a later participant skip only the heartbeat wait
+after owner death.
 
 ## Install
 
@@ -15,23 +19,15 @@ absence of live process use.
 python3 -m pip install ./py/wrkslots
 ```
 
-Python 3.10 or newer and Git are required. Linux `/proc` is required for the complete live-process
-safety checks.
+Python 3.10 or newer, Git, and Linux `/proc` are required.
 
 ## Quick start
 
-Run the built-in tutorial first:
-
 ```sh
-wrkslots quickstart
-```
+wrkslots init . --worktrees-dir worktrees/slots \
+  --liveness-command tools/agent-liveness.py
 
-A normal lifecycle is:
-
-```sh
-wrkslots init . --liveness-command tools/agent-liveness.py
-
-wrkslots create slot01 \
+wrkslots create slot01 --slot-type agent --coordinator-authorized \
   --agent codex-1 --task task-123 --purpose "fix parser" \
   --coordinator-pid "$COORDINATOR_PID" --owner-pid "$OWNER_PID" \
   --repo product=product --branch product=codex/fix-parser
@@ -39,39 +35,42 @@ wrkslots create slot01 \
 wrkslots heartbeat slot01 \
   --agent codex-1 --owner-pid "$OWNER_PID" --expected-generation 1
 
-wrkslots finish slot01 \
-  --agent codex-1 --owner-pid "$OWNER_PID" --expected-generation 1 \
-  --validation "make test: pass"
-
 wrkslots remove slot01 \
-  --coordinator-pid "$COORDINATOR_PID" --expected-generation 1
+  --coordinator-pid "$CURRENT_COORDINATOR_PID" --expected-generation 1
 ```
 
-`create` uses an existing source repository and its configured `origin` remote by default. Use
-`--remote NAME=REMOTE` when a checkout should use a different configured remote. Add
-`--remote-url NAME=URL` when the caller must verify that remote's exact fetch URL; otherwise
-wrkslots records the configured URL. It creates a new linked worktree and local branch; it never
-reclaims another slot to satisfy an allocation.
+Creation requires `--coordinator-authorized` as a readable reminder, not as a claimed permission
+boundary. The same-user processes can bypass any such convention. Removal and recovery accept that
+flag only as optional provenance so a departed coordinator cannot strand an operation.
 
-If a command reports an interrupted journal, preserve the paths and run:
+The strict default refuses while a managed directory contains worktrees that have no wrkslots
+record. During a deliberate migration, place the global
+`--allow-existing-unregistered-worktrees` flag before the command. The command retains those
+directories and acts only on registered slots; use `wrkslots audit --format json` to inventory what
+still needs evidence-based import.
+
+If a command reports an interrupted operation, preserve the paths and run:
 
 ```sh
-wrkslots recover --coordinator-pid "$COORDINATOR_PID"
+wrkslots recover --coordinator-pid "$CURRENT_COORDINATOR_PID"
 ```
+
+Run `wrkslots quickstart`, `wrkslots COMMAND --help`, or `wrkslots --userguide` for the complete
+contract.
+
+For a periodic coordinator reminder, `wrkslots audit --gate` returns 1 when a slot is ready for
+reclaim or an interrupted/unregistered slot needs attention, 2 when expired-slot evidence is
+unavailable, and 0 when no action is currently indicated. It never removes anything.
 
 ## Development and stress testing
 
-From this directory:
-
 ```sh
-python3 -m pytest -q
+make test TEST_SUITE=python
 python3 tests/e2e_stress.py --seed 1 --workers 8 --seconds 20
 ```
 
-The stress harness creates only temporary local repositories and bare remotes. It uses real child
-process trees, Git worktrees, concurrent CLI commands, controlled process death, and invariant
-checks. A failure prints the seed and retains a replay trace. Wall time also includes the real host
-process-use scans; compressed leases do not bypass or shorten those checks.
+The lifecycle suite uses a PID namespace where possible to retain real process checks without
+repeatedly scanning every process on a shared host. The four tests that require host-visible child
+PIDs still run outside that namespace. Coverage and assertions are identical.
 
-See [USER_GUIDE.md](USER_GUIDE.md) for the command model, durable state, recovery behavior, and
-test scenarios.
+See [USER_GUIDE.md](USER_GUIDE.md) and [RELATED_WORK.md](RELATED_WORK.md).

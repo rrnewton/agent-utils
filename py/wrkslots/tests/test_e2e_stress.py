@@ -9,8 +9,34 @@ from pathlib import Path
 
 def test_real_process_and_git_invariants() -> None:
     runner = Path(__file__).with_name("e2e_stress.py")
+    command = [
+        sys.executable,
+        str(runner),
+        "--seed",
+        "7",
+        "--workers",
+        "2",
+        "--seconds",
+        "0.15",
+    ]
+    namespace = subprocess.run(
+        ["unshare", "--user", "--map-root-user", "--pid", "--fork", "--mount-proc", "true"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if namespace.returncode == 0:
+        command = [
+            "unshare",
+            "--user",
+            "--map-root-user",
+            "--pid",
+            "--fork",
+            "--mount-proc",
+            *command,
+        ]
     completed = subprocess.run(
-        [sys.executable, str(runner), "--seed", "7", "--workers", "2", "--seconds", "0.15"],
+        command,
         text=True,
         capture_output=True,
         check=False,
