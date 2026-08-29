@@ -49,6 +49,12 @@ record. During a deliberate migration, place the global
 directories and acts only on registered slots; use `wrkslots audit --format json` to inventory what
 still needs evidence-based import.
 
+`import-existing --from-state-file worktree-state.json --source-host-id ID` admits a slot whose
+owner has already exited from an exact version 3 source row. It preserves the row and source-file
+digest, starts a fresh heartbeat time-to-live, and records the complete candidate ACTIVE row before
+publication so `recover` can finish after the original participant disappears. Rows without an
+owner sidecar refuse rather than turning unavailable ownership into permission to delete.
+
 If a command reports an interrupted operation, preserve the paths and run:
 
 ```sh

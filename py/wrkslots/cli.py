@@ -56,6 +56,11 @@ GIB = 1024**3
 HOLD_SCHEMA = 1
 EVENT_SCHEMA = 1
 SLOT_TYPES = ("agent", "validate")
+HISTORICAL_ACTIVE_STATUSES = frozenset(
+    {"active", "lease-quarantined", "owner-lease-revoked", "release-requested"}
+)
+HISTORICAL_TASK_NOT_RECORDED = "no task recorded in worktree-state.json"
+HISTORICAL_PURPOSE_NOT_RECORDED = "no purpose recorded in worktree-state.json"
 
 
 class Refusal(RuntimeError):
@@ -128,6 +133,31 @@ class Handoff:
 
 
 @dataclasses.dataclass(frozen=True)
+class _ImportSource:
+    """Exact historical row retained when an older slot enters this registry."""
+
+    format: str
+    path: str
+    file_sha256: str
+    row_sha256: str
+    status: str
+    row: dict[str, object]
+
+
+@dataclasses.dataclass(frozen=True)
+class _HistoricalImport:
+    """Validated inputs recovered from one older registry row."""
+
+    agent: str
+    task: str
+    purpose: str
+    created_at: str
+    owner: ProcessIdentity
+    checkouts: tuple[Checkout, ...]
+    source: _ImportSource
+
+
+@dataclasses.dataclass(frozen=True)
 class ActiveRecord:
     """One active slot row in a machine state file."""
 
@@ -146,6 +176,8 @@ class ActiveRecord:
     coordinator_recovery_note: str | None
     handoff: Handoff | None
     checkouts: tuple[Checkout, ...]
+    layout: str | None = None
+    import_source: _ImportSource | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1270,6 +1302,52 @@ def _handoff_from_obj(value: object, label: str) -> Handoff | None:
     return Handoff(recorded_at, validation, limitations, continuation)
 
 
+def _import_source_to_obj(source: _ImportSource | None) -> object:
+    if source is None:
+        return None
+    return {
+        "format": source.format,
+        "path": source.path,
+        "file_sha256": source.file_sha256,
+        "row_sha256": source.row_sha256,
+        "status": source.status,
+        "row": dict(source.row),
+    }
+
+
+def _import_source_from_obj(value: object, label: str) -> _ImportSource | None:
+    if value is None:
+        return None
+    raw = _as_mapping(value, label)
+    _exact_keys(
+        raw,
+        {"format", "path", "file_sha256", "row_sha256", "status", "row"},
+        set(),
+        label,
+    )
+    source_format = _as_str(raw["format"], f"{label}.format")
+    if source_format != "worktree-state-v3":
+        raise StateError(f"{label}.format is unsupported: {source_format!r}")
+    path = _as_str(raw["path"], f"{label}.path")
+    if Path(path).is_absolute() or not Path(path).parts or ".." in Path(path).parts:
+        raise StateError(f"{label}.path must be project-relative")
+    file_sha256 = _as_str(raw["file_sha256"], f"{label}.file_sha256")
+    row_sha256 = _as_str(raw["row_sha256"], f"{label}.row_sha256")
+    if not re.fullmatch(r"[0-9a-f]{64}", file_sha256) or not re.fullmatch(
+        r"[0-9a-f]{64}", row_sha256
+    ):
+        raise StateError(f"{label} digests must be lowercase SHA-256 values")
+    status = _as_str(raw["status"], f"{label}.status")
+    if status not in HISTORICAL_ACTIVE_STATUSES:
+        raise StateError(f"{label}.status is not an active historical state")
+    row = dict(_as_mapping(raw["row"], f"{label}.row"))
+    if _event_digest(row) != row_sha256:
+        raise StateError(f"{label}.row digest does not match its content")
+    if row.get("status") != status:
+        raise StateError(f"{label}.status does not match its source row")
+    return _ImportSource(source_format, path, file_sha256, row_sha256, status, row)
+
+
 def _checkout_to_obj(checkout: Checkout) -> dict[str, object]:
     return {
         "name": checkout.name,
@@ -1346,7 +1424,7 @@ def _checkout_from_obj(value: object, label: str) -> Checkout:
 
 
 def _record_to_obj(record: ActiveRecord) -> dict[str, object]:
-    return {
+    value: dict[str, object] = {
         "slot": record.slot,
         "agent": record.agent,
         "task": record.task,
@@ -1363,6 +1441,11 @@ def _record_to_obj(record: ActiveRecord) -> dict[str, object]:
         "handoff": _handoff_to_obj(record.handoff),
         "checkouts": [_checkout_to_obj(item) for item in record.checkouts],
     }
+    if record.layout is not None:
+        value["layout"] = record.layout
+    if record.import_source is not None:
+        value["import_source"] = _import_source_to_obj(record.import_source)
+    return value
 
 
 def _record_from_obj(value: object, label: str) -> ActiveRecord:
@@ -1383,7 +1466,7 @@ def _record_from_obj(value: object, label: str) -> ActiveRecord:
         "handoff",
         "checkouts",
     }
-    _exact_keys(raw, required_fields, {"slot_type"}, label)
+    _exact_keys(raw, required_fields, {"slot_type", "layout", "import_source"}, label)
     checkouts = tuple(
         _checkout_from_obj(item, f"{label}.checkouts[{index}]")
         for index, item in enumerate(_as_list(raw["checkouts"], f"{label}.checkouts"))
@@ -1418,6 +1501,14 @@ def _record_from_obj(value: object, label: str) -> ActiveRecord:
         ),
         handoff=_handoff_from_obj(raw["handoff"], f"{label}.handoff"),
         checkouts=checkouts,
+        layout=(
+            None
+            if "layout" not in raw
+            else _validate_layout(_as_str(raw["layout"], f"{label}.layout"))
+        ),
+        import_source=_import_source_from_obj(
+            raw.get("import_source"), f"{label}.import_source"
+        ),
     )
     _validate_name(record.slot, "slot")
     _validate_name(record.agent, "agent")
@@ -1430,14 +1521,61 @@ def _record_from_obj(value: object, label: str) -> ActiveRecord:
         )
     _parse_timestamp(record.created_at, f"{label}.created_at")
     _parse_timestamp(record.heartbeat_at, f"{label}.heartbeat_at")
-    if not record.checkouts:
+    if not record.checkouts and record.import_source is None:
         raise StateError(f"{label} has no checkouts")
+    if not record.checkouts and record.layout != "nested":
+        raise StateError(
+            f"{label} has no checkouts but is not a historical nested slot"
+        )
     if record.coordinator_recovery_note is not None and record.owner is not None:
         raise StateError(f"{label} has coordinator recovery evidence for a bound owner")
     names = [item.name for item in record.checkouts]
     if len(names) != len(set(names)):
         raise StateError(f"{label} has duplicate checkout names")
+    if record.import_source is not None:
+        _assert_import_source_matches_record(record, label)
     return record
+
+
+def _assert_import_source_matches_record(record: ActiveRecord, label: str) -> None:
+    source = record.import_source
+    assert source is not None
+    if record.slot_type != "agent" or record.layout != "nested" or record.owner is None:
+        raise StateError(
+            f"{label} historical import must be a nested agent slot with an exact owner"
+        )
+    row = source.row
+    expected_task, expected_purpose = _historical_task_and_purpose(
+        row, f"{label}.import_source.row", record.agent
+    )
+    if expected_task != record.task or expected_purpose != record.purpose:
+        raise StateError(f"{label} differs from its historical task or purpose")
+    if row.get("allocated") != record.created_at:
+        raise StateError(f"{label} differs from its historical allocation time")
+    sidecar = _as_mapping(
+        row.get("owner_sidecar"), f"{label}.import_source.row.owner_sidecar"
+    )
+    expected_owner = (
+        sidecar.get("supervisor_pid"),
+        sidecar.get("start_ticks"),
+        sidecar.get("boot_id"),
+        sidecar.get("cgroup_path"),
+    )
+    actual_owner = (
+        record.owner.pid,
+        record.owner.start_ticks,
+        record.owner.boot_id,
+        record.owner.cgroup_path,
+    )
+    if expected_owner != actual_owner:
+        raise StateError(f"{label} owner differs from its historical owner_sidecar")
+    if sidecar.get("slot") != record.slot or sidecar.get("agent") != record.agent:
+        raise StateError(f"{label} identity differs from its historical owner_sidecar")
+    for checkout in record.checkouts:
+        if row.get(f"{checkout.name}_path") != checkout.path:
+            raise StateError(
+                f"{label} checkout {checkout.name} differs from its historical path"
+            )
 
 
 def _active_from_obj(
@@ -1457,7 +1595,11 @@ def _active_from_obj(
         for index, item in enumerate(_as_list(raw["slots"], "active state.slots"))
     )
     slot_names = [item.slot for item in slots]
-    agents = [item.agent for item in slots if item.slot_type == "agent"]
+    agents = [
+        item.agent
+        for item in slots
+        if item.slot_type == "agent" and item.import_source is None
+    ]
     if len(slot_names) != len(set(slot_names)):
         raise StateError(f"duplicate slot in {label}")
     if len(agents) != len(set(agents)):
@@ -1526,7 +1668,12 @@ def _archive_from_obj(
             "continuation",
             "checkouts",
         }
-        _exact_keys(mapping, fields, {"slot_type", "salvage"}, label)
+        _exact_keys(
+            mapping,
+            fields,
+            {"slot_type", "salvage", "layout", "import_source"},
+            label,
+        )
         archive_id = _as_str(mapping["archive_id"], f"{label}.archive_id")
         if archive_id in archive_ids:
             raise StateError(f"duplicate archive_id in {label_prefix}: {archive_id}")
@@ -1545,6 +1692,14 @@ def _archive_from_obj(
         slot_type = _as_str(mapping.get("slot_type", "agent"), f"{label}.slot_type")
         if slot_type not in SLOT_TYPES:
             raise StateError(f"{label}.slot_type must be one of {', '.join(SLOT_TYPES)}")
+        record_layout = (
+            config.layout
+            if "layout" not in mapping
+            else _validate_layout(_as_str(mapping["layout"], f"{label}.layout"))
+        )
+        import_source = _import_source_from_obj(
+            mapping.get("import_source"), f"{label}.import_source"
+        )
         for salvage_index, salvage in enumerate(
             _as_list(mapping.get("salvage", []), f"{label}.salvage")
         ):
@@ -1586,13 +1741,33 @@ def _archive_from_obj(
                 _as_list(mapping["checkouts"], f"{label}.checkouts")
             )
         )
-        if not checkouts or len({checkout.name for checkout in checkouts}) != len(checkouts):
-            raise StateError(f"{label} has no checkouts or duplicate checkout names")
-        if config.layout == "flat" and len(checkouts) != 1:
+        if len({checkout.name for checkout in checkouts}) != len(checkouts):
+            raise StateError(f"{label} has duplicate checkout names")
+        if not checkouts and (import_source is None or record_layout != "nested"):
+            raise StateError(f"{label} has no checkouts")
+        if record_layout == "flat" and len(checkouts) != 1:
             raise StateError(f"{label} has multiple checkouts under flat layout")
+        if import_source is not None:
+            source_row = import_source.row
+            source_owner = _as_mapping(
+                source_row.get("owner_sidecar"),
+                f"{label}.import_source.row.owner_sidecar",
+            )
+            source_task, source_purpose = _historical_task_and_purpose(
+                source_row, f"{label}.import_source.row", agent
+            )
+            if (
+                record_layout != "nested"
+                or source_task != mapping["task"]
+                or source_purpose != mapping["purpose"]
+                or source_row.get("allocated") != mapping["created_at"]
+                or source_owner.get("slot") != slot
+                or source_owner.get("agent") != agent
+            ):
+                raise StateError(f"{label} differs from its historical source row")
         for checkout in checkouts:
-            expected, _destination = _checkout_path(
-                config, slot, checkout.name, slot_type
+            expected, _destination = _checkout_path_for_layout(
+                config, slot, checkout.name, slot_type, record_layout
             )
             if checkout.path != expected:
                 raise StateError(
@@ -2278,7 +2453,7 @@ def _load_all_active(config: Config) -> list[ActiveState]:
                 raise StateError(
                     f"slot {record.slot!r} is active in both {previous_slot} and {state.machine}"
                 )
-            if record.slot_type == "agent":
+            if record.slot_type == "agent" and record.import_source is None:
                 previous_agent = global_agents.setdefault(record.agent, record.slot)
                 if previous_agent != record.slot:
                     raise StateError(
@@ -2492,8 +2667,11 @@ def _delete_record(state: ActiveState, slot: str) -> ActiveState:
 def _append_record(state: ActiveState, record: ActiveRecord) -> ActiveState:
     if any(item.slot == record.slot for item in state.slots):
         raise Refusal(f"slot {record.slot!r} is already active")
-    if record.slot_type == "agent" and any(
-        item.slot_type == "agent" and item.agent == record.agent for item in state.slots
+    if record.slot_type == "agent" and record.import_source is None and any(
+        item.slot_type == "agent"
+        and item.import_source is None
+        and item.agent == record.agent
+        for item in state.slots
     ):
         raise Refusal(f"agent {record.agent!r} already owns an active slot")
     return ActiveState(state.machine, state.revision + 1, (*state.slots, record))
@@ -3022,13 +3200,30 @@ def _slot_directory(config: Config, slot: str, slot_type: str = "agent") -> Path
 def _checkout_path(
     config: Config, slot: str, name: str, slot_type: str = "agent"
 ) -> tuple[str, Path]:
+    return _checkout_path_for_layout(
+        config, slot, name, slot_type, config.layout
+    )
+
+
+def _checkout_path_for_layout(
+    config: Config,
+    slot: str,
+    name: str,
+    slot_type: str,
+    layout: str,
+) -> tuple[str, Path]:
     _validate_name(slot, "slot")
     _validate_name(name, "checkout name")
+    _validate_layout(layout)
     slot_path = _slot_directory(config, slot, slot_type)
-    destination = slot_path if config.layout == "flat" else slot_path / name
+    destination = slot_path if layout == "flat" else slot_path / name
     _ensure_no_symlink_components(config.root, destination, "checkout")
     relative = destination.relative_to(config.root).as_posix()
     return relative, destination
+
+
+def _record_layout(config: Config, record: ActiveRecord) -> str:
+    return config.layout if record.layout is None else record.layout
 
 
 def _stored_path(config: Config, raw: str, label: str) -> Path:
@@ -3545,15 +3740,16 @@ def _heartbeat_diagnosis(record: ActiveRecord) -> tuple[float, bool]:
 def _assert_record_paths(config: Config, record: ActiveRecord) -> None:
     expected_slot = _slot_directory(config, record.slot, record.slot_type)
     _ensure_no_symlink_components(config.root, expected_slot, "slot")
-    if config.layout == "flat" and len(record.checkouts) != 1:
+    layout = _record_layout(config, record)
+    if layout == "flat" and len(record.checkouts) != 1:
         raise StateError(f"slot {record.slot} has multiple checkouts under flat layout")
     for checkout in record.checkouts:
         if checkout.landed_ref != _landed_ref_for_remote(config, checkout.remote):
             raise StateError(
                 f"slot {record.slot} checkout {checkout.name} differs from configured authority"
             )
-        expected_relative, expected_absolute = _checkout_path(
-            config, record.slot, checkout.name, record.slot_type
+        expected_relative, expected_absolute = _checkout_path_for_layout(
+            config, record.slot, checkout.name, record.slot_type, layout
         )
         if checkout.path != expected_relative:
             raise StateError(
@@ -4096,24 +4292,40 @@ def _assert_salvage_still_matches(
 
 
 def _assert_slot_contents(config: Config, record: ActiveRecord) -> Path:
-    slot_path = _slot_directory(config, record.slot, record.slot_type)
+    return _assert_slot_contents_values(
+        config,
+        record.slot,
+        record.slot_type,
+        _record_layout(config, record),
+        record.checkouts,
+    )
+
+
+def _assert_slot_contents_values(
+    config: Config,
+    slot: str,
+    slot_type: str,
+    layout: str,
+    checkouts: Sequence[Checkout],
+) -> Path:
+    slot_path = _slot_directory(config, slot, slot_type)
     if not slot_path.is_dir() or slot_path.is_symlink():
         raise Refusal(f"slot directory is missing or unsafe: {slot_path}")
-    if config.layout == "flat":
-        if len(record.checkouts) != 1:
-            raise StateError(f"slot {record.slot} has multiple checkouts under flat layout")
-        checkout = record.checkouts[0]
-        expected_path, _destination = _checkout_path(
-            config, record.slot, checkout.name, record.slot_type
+    if layout == "flat":
+        if len(checkouts) != 1:
+            raise StateError(f"slot {slot} does not have exactly one checkout under flat layout")
+        checkout = checkouts[0]
+        expected_path, _destination = _checkout_path_for_layout(
+            config, slot, checkout.name, slot_type, layout
         )
         if checkout.path != expected_path:
             raise StateError(
-                f"slot {record.slot} checkout path does not equal the flat slot root"
+                f"slot {slot} checkout path does not equal the flat slot root"
             )
         return slot_path
-    expected_names = {checkout.name for checkout in record.checkouts}
+    expected_names = {checkout.name for checkout in checkouts}
     allowed_names = set(expected_names)
-    if record.slot_type == "agent":
+    if slot_type == "agent":
         allowed_names.add("HANDOFF.md")
     try:
         actual = {entry.name for entry in slot_path.iterdir()}
@@ -4746,7 +4958,12 @@ def _assert_create_disk_space(config: Config, override: bool) -> None:
 
 
 def _assert_agent_and_slot_free(
-    config: Config, slot: str, agent: str, slot_type: str
+    config: Config,
+    slot: str,
+    agent: str,
+    slot_type: str,
+    *,
+    enforce_cap: bool = True,
 ) -> None:
     states = _load_all_active(config)
     for state in states:
@@ -4756,12 +4973,14 @@ def _assert_agent_and_slot_free(
             if (
                 slot_type == "agent"
                 and record.slot_type == "agent"
+                and record.import_source is None
                 and record.agent == agent
             ):
                 raise Refusal(
                     f"agent {agent!r} already owns slot {record.slot!r} on {state.machine}"
                 )
-    _assert_active_slot_cap(config, states)
+    if enforce_cap:
+        _assert_active_slot_cap(config, states)
     for archive in _load_all_archives(config):
         for archived_record in archive.records:
             if archived_record.get("slot") == slot:
@@ -5098,6 +5317,393 @@ def _cmd_create(args: argparse.Namespace) -> int:
     return 0
 
 
+def _historical_source_row(
+    config: Config, args: argparse.Namespace
+) -> tuple[_ImportSource, Mapping[str, object], ProcessIdentity, str, str, str, str]:
+    source_relative, source_path = _relative_inside(
+        config.root, args.from_state_file, "historical state file"
+    )
+    _refuse_symlink(source_path, "historical state file")
+    try:
+        source_bytes = source_path.read_bytes()
+        source_value: object = json.loads(source_bytes.decode("utf-8"))
+    except FileNotFoundError as exc:
+        raise Refusal(
+            f"historical state file is missing: {source_path}. state: REFUSED -- "
+            "no import journal or active row was written. remedy: restore the exact "
+            "source file and rerun import-existing"
+        ) from exc
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise Refusal(
+            f"cannot read historical state file {source_path}: {exc}. state: REFUSED -- "
+            "no import journal or active row was written. remedy: preserve and repair "
+            "the source file, then rerun import-existing"
+        ) from exc
+    source = _as_mapping(source_value, "historical state file")
+    _exact_keys(
+        source,
+        {"version", "updated", "slots", "lease_history"},
+        set(),
+        "historical state file",
+    )
+    if _as_int(source["version"], "historical state file.version") != 3:
+        raise Refusal(
+            "historical state file has an unsupported version. state: REFUSED -- "
+            "no import journal or active row was written. remedy: use a version 3 "
+            "worktree-state.json source or add a separately reviewed converter"
+        )
+    _parse_timestamp(
+        _as_str(source["updated"], "historical state file.updated"),
+        "historical state file.updated",
+    )
+    slots = _as_mapping(source["slots"], "historical state file.slots")
+    if args.slot not in slots:
+        raise Refusal(
+            f"historical state file has no row for slot {args.slot}. state: REFUSED -- "
+            "no import journal or active row was written. remedy: select a slot named "
+            "by the source file rather than reconstructing one from disk"
+        )
+    row = _as_mapping(slots[args.slot], f"historical slot {args.slot}")
+    status = _as_str(row.get("status"), f"historical slot {args.slot}.status")
+    if status == "released":
+        raise Refusal(
+            f"historical slot {args.slot} is recorded released. state: REFUSED -- "
+            "no active row was written because import-existing only admits storage "
+            "that still exists. remedy: retain this source row as history; if its path "
+            "exists, investigate the registry disagreement before importing anything"
+        )
+    if status not in HISTORICAL_ACTIVE_STATUSES:
+        raise Refusal(
+            f"historical slot {args.slot} has unsupported status {status!r}. state: "
+            "REFUSED -- no import journal or active row was written. remedy: preserve "
+            "the row and add explicit handling for that status before retrying"
+        )
+    sidecar_value = row.get("owner_sidecar")
+    if sidecar_value is None:
+        raise Refusal(
+            f"historical slot {args.slot} has no owner_sidecar. state: REFUSED -- no "
+            "import journal or active row was written because owner death would remain "
+            "unknowable. remedy: leave the slot unregistered and include it in the "
+            "migration remainder unless a source with exact PID, start ticks, boot ID, "
+            "and cgroup is found"
+        )
+    sidecar = _as_mapping(sidecar_value, f"historical slot {args.slot}.owner_sidecar")
+    _exact_keys(
+        sidecar,
+        {
+            "schema_version",
+            "slot",
+            "agent",
+            "task",
+            "recorded_at",
+            "source",
+            "supervisor_pid",
+            "boot_id",
+            "start_ticks",
+            "cgroup_path",
+            "generation",
+        },
+        {"tmux_pane_id", "lease"},
+        f"historical slot {args.slot}.owner_sidecar",
+    )
+    if _as_int(sidecar["schema_version"], "historical owner schema") != 1:
+        raise Refusal(
+            f"historical slot {args.slot} has an unsupported owner_sidecar schema. "
+            "state: REFUSED -- no import journal or active row was written. remedy: "
+            "preserve the row and add explicit handling for that schema before retrying"
+        )
+    _parse_timestamp(
+        _as_str(sidecar["recorded_at"], "historical owner recorded_at"),
+        "historical owner recorded_at",
+    )
+    if not _as_str(sidecar["source"], "historical owner source"):
+        raise Refusal(
+            f"historical slot {args.slot} owner_sidecar has no source. state: REFUSED -- "
+            "no import journal or active row was written. remedy: preserve and repair "
+            "the source row before retrying"
+        )
+    sidecar_slot = _as_str(sidecar["slot"], "historical owner slot")
+    if sidecar_slot != args.slot:
+        raise Refusal(
+            f"historical owner_sidecar names slot {sidecar_slot}, not {args.slot}. state: "
+            "REFUSED -- no import journal or active row was written. remedy: repair the "
+            "source inconsistency before retrying"
+        )
+    if args.source_host_id is None:
+        raise Refusal(
+            "historical owner_sidecar has no stable host identity. state: REFUSED -- no "
+            "import journal or active row was written. remedy: on the host that produced "
+            "the source registry, pass --source-host-id with its /etc/machine-id value"
+        )
+    current_host_id = _host_id()
+    if args.source_host_id != current_host_id:
+        raise Refusal(
+            f"--source-host-id does not match this host. state: REFUSED -- no import "
+            "journal or active row was written because a foreign process record cannot "
+            "prove local owner death. remedy: run the import on the source host or leave "
+            "the row in the migration remainder"
+        )
+    owner = _identity_from_obj(
+        {
+            "pid": sidecar["supervisor_pid"],
+            "start_ticks": sidecar["start_ticks"],
+            "boot_id": sidecar["boot_id"],
+            "host_id": current_host_id,
+            "cgroup_path": sidecar["cgroup_path"],
+        },
+        f"historical slot {args.slot}.owner",
+    )
+    assert owner is not None
+    owner_state, owner_detail = _process_state(owner)
+    if owner_state == "live":
+        raise Refusal(
+            f"historical slot {args.slot} still has its recorded owner alive: "
+            f"{owner_detail}. state: REFUSED -- no import journal or active row was "
+            "written. remedy: have that owner use ordinary import-existing with "
+            "--verified-live and --owner-pid, or wait for this exact process generation "
+            "to exit before retrying the historical import"
+        )
+    if owner_state != "dead":
+        raise Refusal(
+            f"historical slot {args.slot} owner death is indeterminate: {owner_detail}. "
+            "state: REFUSED -- no import journal or active row was written; unavailable "
+            "process evidence is not proof of death. remedy: restore process evidence on "
+            "the source host or leave the row in the migration remainder"
+        )
+    expected_generation = f"{owner.boot_id}:{owner.pid}:{owner.start_ticks}"
+    if sidecar.get("generation") is not None and sidecar.get("generation") != expected_generation:
+        raise Refusal(
+            f"historical slot {args.slot} owner generation disagrees with its process "
+            "fields. state: REFUSED -- no import journal or active row was written. "
+            "remedy: preserve and repair the source row before retrying"
+    )
+    agent = _validate_name(_as_str(sidecar["agent"], "historical owner agent"), "agent")
+    try:
+        task, purpose = _historical_task_and_purpose(
+            row, f"historical slot {args.slot}", agent
+        )
+    except StateError as exc:
+        raise Refusal(
+            f"historical slot {args.slot} has invalid task or purpose evidence: "
+            f"{exc}. state: "
+            "REFUSED -- no import journal or active row was written. remedy: repair the "
+            "source inconsistency before retrying"
+        ) from exc
+    created_at = _as_str(row.get("allocated"), f"historical slot {args.slot}.allocated")
+    _parse_timestamp(created_at, f"historical slot {args.slot}.allocated")
+    import_source = _ImportSource(
+        format="worktree-state-v3",
+        path=source_relative,
+        file_sha256=hashlib.sha256(source_bytes).hexdigest(),
+        row_sha256=_event_digest(row),
+        status=status,
+        row=dict(row),
+    )
+    return import_source, row, owner, agent, task, purpose, created_at
+
+
+def _historical_task_and_purpose(
+    row: Mapping[str, object], label: str, agent: str
+) -> tuple[str, str]:
+    sidecar = _as_mapping(row.get("owner_sidecar"), f"{label}.owner_sidecar")
+    agents = [
+        _as_mapping(item, f"{label}.agents[{index}]")
+        for index, item in enumerate(_as_list(row.get("agents"), f"{label}.agents"))
+    ]
+    writable = [
+        item
+        for item in agents
+        if item.get("name") == agent and item.get("read_only") is False
+    ]
+    if not writable:
+        raise StateError(f"{label} does not list owner {agent} as a writable agent")
+    task_values: list[str] = []
+    for task_label, value in (
+        (f"{label}.task", row.get("task")),
+        (f"{label}.owner_sidecar.task", sidecar.get("task")),
+    ):
+        if value is None:
+            task_values.append("")
+            continue
+        task_values.append(_as_str(value, task_label))
+    writable_tasks = {
+        _as_str(item.get("task"), f"{label}.writable_agent[{index}].task")
+        for index, item in enumerate(writable)
+        if item.get("task") is not None
+    }
+    writable_tasks.discard("")
+    if len(writable_tasks) > 1:
+        raise StateError(f"{label} records conflicting writable-agent task values")
+    row_task, owner_task = task_values
+    task = (
+        row_task
+        or owner_task
+        or next(iter(writable_tasks), HISTORICAL_TASK_NOT_RECORDED)
+    )
+    raw_purpose = row.get("purpose")
+    purpose = (
+        HISTORICAL_PURPOSE_NOT_RECORDED
+        if raw_purpose is None
+        else _as_str(raw_purpose, f"{label}.purpose")
+    )
+    if not purpose:
+        purpose = HISTORICAL_PURPOSE_NOT_RECORDED
+    return task, purpose
+
+
+def _historical_checkouts(
+    config: Config,
+    args: argparse.Namespace,
+    row: Mapping[str, object],
+    vcs: _GitVcs,
+) -> tuple[Checkout, ...]:
+    repositories = _assignments(args.repo, "repository")
+    remotes = _assignments(args.remote, "remote")
+    remote_urls = _assignments(args.remote_url, "trusted remote URL")
+    source_paths: dict[str, tuple[str, Path]] = {}
+    for key, value in row.items():
+        if not key.endswith("_path"):
+            continue
+        name = _validate_name(key.removesuffix("_path"), "historical checkout name")
+        raw_path = _as_str(value, f"historical slot {args.slot}.{key}")
+        if raw_path == "-":
+            continue
+        relative, destination = _relative_inside(
+            config.root, raw_path, f"historical checkout {name} path"
+        )
+        expected, expected_path = _checkout_path_for_layout(
+            config, args.slot, name, args.slot_type, "nested"
+        )
+        if relative != expected or destination != expected_path:
+            raise Refusal(
+                f"historical checkout {name} path {raw_path!r} is not the nested path "
+                f"{expected!r} for slot {args.slot}. state: REFUSED -- no import journal "
+                "or active row was written. remedy: repair the source row or move the "
+                "checkout through a separately reviewed operation before retrying"
+            )
+        source_paths[name] = (relative, destination)
+    if not source_paths:
+        raise Refusal(
+            f"historical slot {args.slot} has no NAME_path fields. state: REFUSED -- "
+            "no import journal or active row was written. remedy: preserve and repair "
+            "the source row before retrying"
+        )
+    unknown_repositories = sorted(set(repositories) - set(source_paths))
+    if unknown_repositories:
+        raise Refusal(
+            "repository supplied for checkout absent from the historical row: "
+            + ", ".join(unknown_repositories)
+        )
+    for mapping, label in (
+        (remotes, "remote"),
+        (remote_urls, "trusted remote URL"),
+    ):
+        unknown = sorted(set(mapping) - set(repositories))
+        if unknown:
+            raise Refusal(f"{label} supplied for unknown repository: {', '.join(unknown)}")
+    present_without_repository = sorted(
+        name
+        for name, (_relative, destination) in source_paths.items()
+        if (destination.exists() or destination.is_symlink()) and name not in repositories
+    )
+    if present_without_repository:
+        rendered = " ".join(
+            f"--repo {name}=<source-repository>" for name in present_without_repository
+        )
+        raise Refusal(
+            "historical slot contains checkout paths with no repository mapping: "
+            f"{', '.join(present_without_repository)}. state: REFUSED -- no import "
+            "journal or active row was written. remedy: rerun with {rendered}"
+        )
+    checkouts: list[Checkout] = []
+    for name, raw_repository in sorted(repositories.items()):
+        relative, destination = source_paths[name]
+        repository_relative, repository = _repository_path(config, raw_repository)
+        if not destination.exists() and not destination.is_symlink():
+            if destination.absolute() in vcs.listed_worktrees(repository):
+                raise Refusal(
+                    f"historical checkout {name} is missing but Git still registers "
+                    f"{destination}. state: REFUSED -- no import journal or active row "
+                    "was written. remedy: repair the Git worktree registration before retrying"
+                )
+            continue
+        if destination.is_symlink() or not destination.is_dir():
+            raise Refusal(
+                f"historical checkout is unsafe: {destination}. state: REFUSED -- no "
+                "import journal or active row was written. remedy: preserve and inspect "
+                "the path before retrying"
+            )
+        head = vcs.verify_existing_worktree(repository, destination)
+        branch = vcs.branch(destination)
+        remote = _validate_remote(remotes.get(name, config.default_remote))
+        authorized_url = remote_urls.get(name)
+        remote_url_sha256 = (
+            vcs.remote_url_sha256(destination, remote)
+            if authorized_url is None
+            else vcs.assert_remote_url(destination, remote, authorized_url)
+        )
+        checkouts.append(
+            Checkout(
+                name=name,
+                path=relative,
+                repository=repository_relative,
+                branch=branch,
+                start_point=head,
+                remote=remote,
+                remote_url_sha256=remote_url_sha256,
+                landed_ref=_landed_ref_for_remote(config, remote),
+                head=head,
+            )
+        )
+    return tuple(checkouts)
+
+
+def _historical_import_inputs(
+    config: Config, args: argparse.Namespace, vcs: _GitVcs
+) -> _HistoricalImport:
+    if args.slot_type != "agent":
+        raise Refusal(
+            "--from-state-file describes historical agent slots only. state: REFUSED -- "
+            "no import journal or active row was written. remedy: use ordinary "
+            "import-existing for a live validate slot"
+        )
+    if args.owner_pid is not None or args.verified_live:
+        raise Refusal(
+            "--owner-pid and --verified-live describe current ownership, not a historical "
+            "source row. state: REFUSED -- no import journal or active row was written. "
+            "remedy: drop them when using --from-state-file"
+        )
+    if any(value is not None for value in (args.agent, args.task, args.purpose)):
+        raise Refusal(
+            "--agent, --task, and --purpose are owned by the historical source row. "
+            "state: REFUSED -- no import journal or active row was written. remedy: drop "
+            "those flags or repair the source row before retrying"
+        )
+    source, row, owner, agent, task, purpose, created_at = _historical_source_row(
+        config, args
+    )
+    checkouts = _historical_checkouts(config, args, row, vcs)
+    try:
+        _assert_slot_contents_values(
+            config, args.slot, args.slot_type, "nested", checkouts
+        )
+    except Refusal as exc:
+        raise Refusal(
+            f"historical slot {args.slot} does not match the source row: {exc}. state: "
+            "REFUSED -- no import journal or active row was written. remedy: preserve "
+            "the source and slot, reconcile their paths and contents, then rerun the dry run"
+        ) from exc
+    return _HistoricalImport(
+        agent=agent,
+        task=task,
+        purpose=purpose,
+        created_at=created_at,
+        owner=owner,
+        checkouts=checkouts,
+        source=source,
+    )
+
+
 def _existing_checkouts(
     config: Config, args: argparse.Namespace, vcs: _GitVcs
 ) -> tuple[Checkout, ...]:
@@ -5270,29 +5876,209 @@ def _cmd_register(
     return 0
 
 
+def _import_journal_payload(record: ActiveRecord) -> dict[str, object]:
+    return {
+        "schema": SCHEMA,
+        "kind": "import-existing",
+        "machine": record.machine,
+        "slot": record.slot,
+        "record": _record_to_obj(record),
+    }
+
+
+def _verify_import_record(
+    config: Config, record: ActiveRecord, vcs: _GitVcs
+) -> None:
+    _assert_record_paths(config, record)
+    _assert_slot_contents(config, record)
+    for checkout in record.checkouts:
+        _assert_checkout_identity_unchanged(config, checkout, vcs)
+
+
+def _publish_import(
+    config: Config,
+    state: ActiveState,
+    record: ActiveRecord,
+    *,
+    coordinator_authorized: bool,
+) -> None:
+    journal = _import_journal_payload(record)
+    _write_journal(config, journal)
+    _interrupt_for_test("after-import-journal")
+    _verify_import_record(config, record, _GitVcs())
+    _write_active_state(
+        config,
+        _append_record(state, record),
+        action="slot-imported",
+        slot=record.slot,
+        evidence={
+            "slot_type": record.slot_type,
+            "coordinator_authorized": coordinator_authorized,
+            "coordinator": _identity_to_obj(record.coordinator_lease),
+            "import_source": _import_source_to_obj(record.import_source),
+        },
+    )
+    _interrupt_for_test("after-import-active-write")
+    _clear_journal(config, journal)
+
+
 def _cmd_import_existing(args: argparse.Namespace) -> int:
     args.slot_type = _require_slot_type(args, "worktree import")
     config = _load_config(args.project_root, args.machine)
     vcs = _GitVcs()
     _validate_name(args.slot, "slot")
-    checkouts = _existing_checkouts(config, args, vcs)
+    historical = (
+        None
+        if args.from_state_file is None
+        else _historical_import_inputs(config, args, vcs)
+    )
+    if historical is None:
+        if args.source_host_id is not None:
+            raise Refusal(
+                "--source-host-id applies only with --from-state-file. state: REFUSED -- "
+                "no import journal or active row was written. remedy: drop the flag or "
+                "supply the historical state file it describes"
+            )
+        if any(value is None for value in (args.agent, args.task, args.purpose)):
+            raise Refusal(
+                "live import requires --agent, --task, and --purpose. state: REFUSED -- "
+                "no import journal or active row was written. remedy: supply all three, "
+                "or use --from-state-file to take them from a historical row"
+            )
+        assert args.agent is not None
+        assert args.task is not None
+        assert args.purpose is not None
+        checkouts = _existing_checkouts(config, args, vcs)
+        agent = args.agent
+        task = args.task
+        purpose = args.purpose
+        source = None
+    else:
+        checkouts = historical.checkouts
+        agent = historical.agent
+        task = historical.task
+        purpose = historical.purpose
+        source = historical.source
     print(
         f"verified existing slot={args.slot} checkouts={len(checkouts)} "
         f"machine={config.machine}"
     )
+    if source is not None:
+        print(
+            f"  source={source.path} status={source.status} "
+            f"row_sha256={source.row_sha256}"
+        )
     for checkout in checkouts:
         print(
             f"  {checkout.name}: path={checkout.path} branch={checkout.branch} head={checkout.head}"
         )
     if not args.apply:
-        print("dry-run: no state changed; add --apply --verified-live --owner-pid PID to register")
+        if historical is None:
+            print(
+                "dry-run: no state changed; add --apply --verified-live --owner-pid PID "
+                "--coordinator-pid PID --coordinator-authorized to register"
+            )
+        else:
+            print(
+                "dry-run: no state changed; add --apply --coordinator-pid PID "
+                "--coordinator-authorized to record the exact historical row and begin "
+                "a fresh heartbeat time-to-live"
+            )
         return 0
     _require_coordinator_authorized(args, "worktree import --apply")
-    if args.owner_pid is None or args.coordinator_pid is None or not args.verified_live:
+    if args.coordinator_pid is None:
         raise Refusal(
-            "--apply requires --verified-live, --owner-pid, and --coordinator-pid"
+            "--apply requires --coordinator-pid. state: REFUSED -- no import journal "
+            "or active row was written. remedy: pass the live invoking coordinator PID"
         )
-    return _cmd_register(args, allow_unregistered_migration_slots=True)
+    if historical is None and (args.owner_pid is None or not args.verified_live):
+        raise Refusal(
+            "live --apply requires --verified-live and --owner-pid. state: REFUSED -- "
+            "no import journal or active row was written. remedy: supply both for the "
+            "current owner, or use --from-state-file for a recorded historical owner"
+        )
+    if historical is None:
+        assert args.owner_pid is not None
+    coordinator_lease = _capture_caller_process(
+        args.coordinator_pid, "coordinator"
+    )
+    with _mutation_locks(config, args.wait_lock):
+        _refuse_partial_state(config)
+        _assert_no_journal(config)
+        states, archives = _validate_global_state(config)
+        _assert_command_registry_storage(
+            config,
+            states,
+            args,
+            allowed_unregistered_slot=args.slot,
+            migration_operation=True,
+        )
+        before = _global_rows(states, archives)
+        _ensure_state_shard(config)
+        state = _load_active(config)
+        if historical is not None:
+            current_historical = _historical_import_inputs(config, args, vcs)
+            if current_historical != historical:
+                raise Refusal(
+                    "historical source row or checkout identity changed while import was "
+                    "starting. state: REFUSED -- no import journal or active row was "
+                    "written. remedy: inspect the new source and rerun the dry run before "
+                    "applying it"
+                )
+            historical = current_historical
+        _assert_agent_and_slot_free(
+            config, args.slot, agent, args.slot_type, enforce_cap=False
+        )
+        if historical is None:
+            owner = _capture_caller_process(args.owner_pid, "owner")
+            record = _register_existing(config, args, owner, coordinator_lease)
+        else:
+            now = _utc_now()
+            record = ActiveRecord(
+                slot=args.slot,
+                agent=historical.agent,
+                task=historical.task,
+                purpose=historical.purpose,
+                slot_type=args.slot_type,
+                machine=config.machine,
+                generation=1,
+                created_at=historical.created_at,
+                heartbeat_at=now,
+                heartbeat_ttl_seconds=config.heartbeat_ttl_seconds,
+                owner=historical.owner,
+                coordinator_lease=coordinator_lease,
+                coordinator_recovery_note=None,
+                handoff=None,
+                checkouts=historical.checkouts,
+                layout="nested",
+                import_source=historical.source,
+            )
+            _verify_import_record(config, record, vcs)
+        confirmed_coordinator = _read_process_identity(coordinator_lease.pid)
+        if confirmed_coordinator != coordinator_lease:
+            raise Refusal(
+                "coordinator process generation changed during import. state: REFUSED -- "
+                "no import journal or active row was written. remedy: rerun with the "
+                "current invoking coordinator PID"
+            )
+        _assert_caller_process(confirmed_coordinator, "coordinator")
+        _publish_import(
+            config,
+            state,
+            record,
+            coordinator_authorized=True,
+        )
+        after_states, after_archives = _validate_global_state(config)
+        _assert_only_slot_changed(
+            before,
+            _global_rows(after_states, after_archives),
+            args.slot,
+        )
+    print(
+        f"registered slot={record.slot} agent={record.agent} generation=1 "
+        f"checkouts={len(record.checkouts)}"
+    )
+    return 0
 
 
 def _expected_generation(record: ActiveRecord, expected: int) -> None:
@@ -5779,18 +6565,24 @@ def _journal_cache_slot(config: Config, machine: str | None = None) -> CacheSlot
                 _as_list(raw.get("created"), "cache recovery journal.created")
             )
         )
-    elif kind == "finish":
+    elif kind in {"import-existing", "finish"}:
         record = _record_from_obj(raw.get("record"), "cache recovery journal.record")
         slot_type = record.slot_type
         if record.slot != slot or record.machine != selected_machine:
-            raise StateError("finish journal cache record does not match its shard or slot")
-        _assert_record_paths(config, record)
-        removed = {
-            _as_str(item, f"cache recovery journal.removed[{index}]")
-            for index, item in enumerate(
-                _as_list(raw.get("removed"), "cache recovery journal.removed")
+            raise StateError(
+                f"{kind} journal cache record does not match its shard or slot"
             )
-        }
+        _assert_record_paths(config, record)
+        removed = (
+            {
+                _as_str(item, f"cache recovery journal.removed[{index}]")
+                for index, item in enumerate(
+                    _as_list(raw.get("removed"), "cache recovery journal.removed")
+                )
+            }
+            if kind == "finish"
+            else set()
+        )
         if not removed <= {checkout.name for checkout in record.checkouts}:
             raise StateError("finish journal cache record names an unknown removed checkout")
         checkouts = tuple(
@@ -5798,13 +6590,18 @@ def _journal_cache_slot(config: Config, machine: str | None = None) -> CacheSlot
         )
     else:
         raise StateError(f"unsupported cache recovery journal kind {kind!r}")
-    if config.layout == "flat" and len(checkouts) > 1:
+    journal_layout = (
+        _record_layout(config, record)
+        if kind in {"import-existing", "finish"}
+        else config.layout
+    )
+    if journal_layout == "flat" and len(checkouts) > 1:
         raise StateError("flat-layout create journal records multiple checkouts")
     vcs = _GitVcs()
     present: list[Checkout] = []
     for checkout in checkouts:
-        expected, destination = _checkout_path(
-            config, slot, checkout.name, slot_type
+        expected, destination = _checkout_path_for_layout(
+            config, slot, checkout.name, slot_type, journal_layout
         )
         if checkout.path != expected:
             raise StateError(
@@ -6706,7 +7503,8 @@ def _slot_findings(config: Config, states: Sequence[ActiveState]) -> list[dict[s
                     f"active row but no slot directory at {slot_path}",
                 )
                 continue
-            if config.layout == "flat":
+            record_layout = _record_layout(config, record)
+            if record_layout == "flat":
                 if len(record.checkouts) != 1:
                     note(
                         "flat-layout-cardinality",
@@ -6962,7 +7760,7 @@ def _archive_entry(
 ) -> dict[str, object]:
     if record.handoff is None:
         raise StateError("cannot archive a slot without durable reclaim evidence")
-    return {
+    value: dict[str, object] = {
         "archive_id": _as_str(journal["archive_id"], "journal.archive_id"),
         "slot": record.slot,
         "agent": record.agent,
@@ -6985,6 +7783,11 @@ def _archive_entry(
         ],
         "checkouts": [_checkout_to_obj(item) for item in record.checkouts],
     }
+    if record.layout is not None:
+        value["layout"] = record.layout
+    if record.import_source is not None:
+        value["import_source"] = _import_source_to_obj(record.import_source)
+    return value
 
 
 def _append_archive_once(
@@ -7036,18 +7839,26 @@ def _finish_fenced_slot(
 
 
 def _checkout_at_slot(
-    config: Config, checkout: Checkout, slot_path: Path
+    config: Config, record: ActiveRecord, checkout: Checkout, slot_path: Path
 ) -> tuple[Checkout, Path]:
-    path = slot_path if config.layout == "flat" else slot_path / checkout.name
+    path = (
+        slot_path
+        if _record_layout(config, record) == "flat"
+        else slot_path / checkout.name
+    )
     relative = path.relative_to(config.root).as_posix()
     return dataclasses.replace(checkout, path=relative), path
 
 
 def _repair_checkout_at_slot(
-    config: Config, checkout: Checkout, slot_path: Path, vcs: _GitVcs
+    config: Config,
+    record: ActiveRecord,
+    checkout: Checkout,
+    slot_path: Path,
+    vcs: _GitVcs,
 ) -> Path:
-    moved, path = _checkout_at_slot(config, checkout, slot_path)
-    _repair_registration_at_slot(config, checkout, slot_path, vcs)
+    moved, path = _checkout_at_slot(config, record, checkout, slot_path)
+    _repair_registration_at_slot(config, record, checkout, slot_path, vcs)
     current = _assert_checkout_safe(config, moved, vcs)
     if dataclasses.replace(current, path=checkout.path) != checkout:
         raise Refusal(
@@ -7100,9 +7911,13 @@ def _repair_nested_repositories(checkout: Path, vcs: _GitVcs) -> None:
 
 
 def _repair_registration_at_slot(
-    config: Config, checkout: Checkout, slot_path: Path, vcs: _GitVcs
+    config: Config,
+    record: ActiveRecord,
+    checkout: Checkout,
+    slot_path: Path,
+    vcs: _GitVcs,
 ) -> Path:
-    _moved, path = _checkout_at_slot(config, checkout, slot_path)
+    _moved, path = _checkout_at_slot(config, record, checkout, slot_path)
     _relative, repository = _repository_path(config, checkout.repository)
     vcs.repair_worktree(repository, path)
     _repair_nested_repositories(path, vcs)
@@ -7150,7 +7965,7 @@ def _rollback_path_fence(
         # Git's path registration without requiring the content to still match the
         # pre-fence snapshot, because a changed checkout is exactly what must be
         # returned to its canonical path for inspection.
-        _repair_registration_at_slot(config, checkout, original, vcs)
+        _repair_registration_at_slot(config, record, checkout, original, vcs)
     _remove_fenced_directory(config, fenced)
     _clear_journal(config, journal)
 
@@ -7203,9 +8018,9 @@ def _begin_or_resume_path_fence(
     if original.exists() or original.is_symlink():
         raise Refusal(f"canonical slot still exists after path fence: {original}")
     for checkout in record.checkouts:
-        _moved, path = _checkout_at_slot(config, checkout, fenced)
+        _moved, path = _checkout_at_slot(config, record, checkout, fenced)
         if path.exists() or path.is_symlink():
-            _repair_registration_at_slot(config, checkout, fenced, vcs)
+            _repair_registration_at_slot(config, record, checkout, fenced, vcs)
     journal["phase"] = "fenced"
     _write_journal(config, journal)
     _interrupt_for_test("after-path-fence")
@@ -7237,7 +8052,7 @@ def _finish_remove_paths(
     for checkout in record.checkouts:
         if checkout.name in removed:
             continue
-        _moved, path = _checkout_at_slot(config, checkout, fenced_slot)
+        _moved, path = _checkout_at_slot(config, record, checkout, fenced_slot)
         if path.is_symlink():
             raise Refusal(f"interrupted fenced checkout became a symlink: {path}")
         if path.exists():
@@ -7263,7 +8078,7 @@ def _finish_remove_paths(
     if remaining:
         if not fenced_slot.is_dir() or fenced_slot.is_symlink():
             raise Refusal(f"fenced slot is missing or unsafe: {fenced_slot}")
-        if config.layout == "nested":
+        if _record_layout(config, record) == "nested":
             try:
                 actual = {entry.name for entry in fenced_slot.iterdir()}
             except OSError as exc:
@@ -7286,9 +8101,13 @@ def _finish_remove_paths(
                 for item in _as_list(journal.get("salvage", []), "finish journal.salvage")
             )
             for checkout in remaining:
-                moved, moved_path = _checkout_at_slot(config, checkout, fenced_slot)
+                moved, moved_path = _checkout_at_slot(
+                    config, record, checkout, fenced_slot
+                )
                 if record.slot_type == "validate" or salvage:
-                    _repair_registration_at_slot(config, checkout, fenced_slot, vcs)
+                    _repair_registration_at_slot(
+                        config, record, checkout, fenced_slot, vcs
+                    )
                     head = vcs.verify_existing_worktree(
                         _repository_path(config, checkout.repository)[1], moved_path
                     )
@@ -7298,7 +8117,9 @@ def _finish_remove_paths(
                             "prepared; preserve it and rerun remove"
                         )
                 else:
-                    _repair_checkout_at_slot(config, checkout, fenced_slot, vcs)
+                    _repair_checkout_at_slot(
+                        config, record, checkout, fenced_slot, vcs
+                    )
                 moved_checkouts.append(moved)
                 moved_paths[checkout.name] = moved_path
             _assert_handoff_read(config, record, fenced_slot)
@@ -7340,7 +8161,7 @@ def _finish_remove_paths(
             )
     for checkout in remaining:
         _relative, repository = _repository_path(config, checkout.repository)
-        _moved, path = _checkout_at_slot(config, checkout, fenced_slot)
+        _moved, path = _checkout_at_slot(config, record, checkout, fenced_slot)
         vcs.remove_worktree(
             repository,
             path,
@@ -7353,7 +8174,7 @@ def _finish_remove_paths(
         journal["removed"] = sorted(removed)
         _write_journal(config, journal)
         _interrupt_for_test("after-remove-worktree")
-    if config.layout == "nested" and record.slot_type == "agent":
+    if _record_layout(config, record) == "nested" and record.slot_type == "agent":
         handoff = fenced_slot / "HANDOFF.md"
         if handoff.exists() or handoff.is_symlink():
             if handoff.is_symlink() or not handoff.is_file():
@@ -7417,7 +8238,9 @@ def _assert_physical_slot_removed(
                 f"cannot archive slot {record.slot}: checkout still exists at {path}"
             )
         _relative, repository = _repository_path(config, checkout.repository)
-        _moved, fenced_path = _checkout_at_slot(config, checkout, fenced_slot)
+        _moved, fenced_path = _checkout_at_slot(
+            config, record, checkout, fenced_slot
+        )
         listed = vcs.listed_worktrees(repository)
         if path.absolute() in listed or fenced_path.absolute() in listed:
             raise Refusal(
@@ -7667,6 +8490,12 @@ def _cmd_remove(args: argparse.Namespace) -> int:
             salvage = ()
             evidence = (
                 "slot type validate: authored work is excluded by construction, so salvage was not run",
+            )
+        elif not record.checkouts and record.import_source is not None:
+            salvage = ()
+            evidence = (
+                "historical agent slot contains no checkout and its exact contents were "
+                "verified before deletion, so there was no checkout to salvage",
             )
         else:
             salvage = _salvage_agent_slot(config, record, _GitVcs())
@@ -8409,6 +9238,58 @@ def _recover_create(
     print(f"recovered create: registered slot={slot} checkouts={len(created)}")
 
 
+def _recover_import_existing(
+    config: Config,
+    path: Path,
+    raw: Mapping[str, object],
+    state: ActiveState,
+    recovery_actor: ProcessIdentity,
+) -> None:
+    _exact_keys(
+        raw,
+        {"schema", "kind", "machine", "slot", "record"},
+        set(),
+        "import journal",
+    )
+    machine = _as_str(raw["machine"], "import journal.machine")
+    if machine != config.machine or path != _journal_path(config, machine):
+        raise StateError(
+            f"import journal filename does not match machine {config.machine}"
+        )
+    slot = _validate_name(_as_str(raw["slot"], "import journal.slot"), "slot")
+    record = _record_from_obj(raw["record"], "import journal.record")
+    if record.slot != slot or record.machine != machine:
+        raise StateError("import journal record does not match its shard or slot")
+    existing = next((item for item in state.slots if item.slot == slot), None)
+    if existing is not None:
+        if _record_to_obj(existing) != _record_to_obj(record):
+            raise StateError(
+                f"import journal for slot {slot} does not match its durable ACTIVE row"
+            )
+        _verify_import_record(config, existing, _GitVcs())
+        _clear_journal(config, raw)
+        print(f"recovered import: active state was durable; cleared journal for {slot}")
+        return
+    _assert_agent_and_slot_free(
+        config, slot, record.agent, record.slot_type, enforce_cap=False
+    )
+    _verify_import_record(config, record, _GitVcs())
+    _write_active_state(
+        config,
+        _append_record(state, record),
+        action="slot-imported-by-recovery",
+        slot=slot,
+        evidence={
+            "slot_type": record.slot_type,
+            "original_coordinator": _identity_to_obj(record.coordinator_lease),
+            "recovery_actor": _identity_to_obj(recovery_actor),
+            "import_source": _import_source_to_obj(record.import_source),
+        },
+    )
+    _clear_journal(config, raw)
+    print(f"recovered import: registered slot={slot} checkouts={len(record.checkouts)}")
+
+
 def _recover_finish(
     config: Config,
     path: Path,
@@ -8897,6 +9778,12 @@ def _cmd_recover(args: argparse.Namespace) -> int:
                 retry_running_hook=args.retry_running_hook,
                 abort_create=args.abort_create,
             )
+        elif kind == "import-existing":
+            if args.retry_running_hook or args.abort_create:
+                raise Refusal(
+                    "--retry-running-hook and --abort-create apply only to create journals"
+                )
+            _recover_import_existing(config, path, raw, state, coordinator)
         elif kind == "finish":
             if args.retry_running_hook or args.abort_create:
                 raise Refusal(
@@ -8936,7 +9823,7 @@ def _add_repo_options(parser: argparse.ArgumentParser) -> None:
         metavar="NAME=PATH",
         help=(
             "source Git repository relative to the project root; NAME labels the checkout "
-            "and must match --branch (repeat once per checkout)"
+            "and must match the other NAME=VALUE options (repeat once per checkout)"
         ),
     )
     parser.add_argument(
@@ -9375,8 +10262,11 @@ usage or audit gate unknown, 3 fail-closed refusal.
         help="verify an existing slot and print the registration; dry-run by default",
         description=(
             "Inspect worktrees already present under a slot path and print the registry row that "
-            "would describe them. The default is read-only. --apply requires the same explicit "
-            "live-owner evidence as register."
+            "would describe them. The default is read-only. A live import requires the same "
+            "explicit owner evidence as register. --from-state-file instead reads one exact "
+            "version 3 historical row, including its recorded process generation, and begins a "
+            "fresh heartbeat time-to-live without treating prior quarantine or release state as "
+            "permission to delete. Applied imports are journaled and recoverable."
         ),
         formatter_class=_HelpFormatter,
     )
@@ -9389,12 +10279,28 @@ usage or audit gate unknown, 3 fail-closed refusal.
         "--coordinator-authorized", action="store_true",
         help="confirm that the coordinator authorized this import",
     )
-    import_existing.add_argument("--agent", required=True, metavar="AGENT", help="agent name to record")
-    import_existing.add_argument("--task", required=True, metavar="TASK", help="task or work-item identifier")
-    import_existing.add_argument("--purpose", required=True, metavar="TEXT", help="short human-readable reason for the slot")
+    import_existing.add_argument("--agent", metavar="AGENT", help="live agent name; historical import reads it from the source row")
+    import_existing.add_argument("--task", metavar="TASK", help="live task identifier; historical import reads it from the source row")
+    import_existing.add_argument("--purpose", metavar="TEXT", help="live purpose; historical import reads it from the source row")
     import_existing.add_argument("--owner-pid", type=int, metavar="PID", help="live owner PID; required with --apply")
     import_existing.add_argument("--coordinator-pid", type=int, metavar="PID", help="live coordinator PID; required with --apply")
     import_existing.add_argument("--verified-live", action="store_true", help="confirm the existing worktrees are live; required with --apply")
+    import_existing.add_argument(
+        "--from-state-file",
+        metavar="PATH",
+        help=(
+            "project-relative version 3 worktree-state.json whose exact row supplies "
+            "historical owner, task, purpose, and checkout-path evidence"
+        ),
+    )
+    import_existing.add_argument(
+        "--source-host-id",
+        metavar="ID",
+        help=(
+            "stable /etc/machine-id of the host that produced --from-state-file; "
+            "required because the older owner_sidecar did not record it"
+        ),
+    )
     import_existing.add_argument("--apply", action="store_true", help="write the verified row instead of only printing it")
     _add_repo_options(import_existing)
     import_existing.set_defaults(handler=_cmd_import_existing)

@@ -88,6 +88,32 @@ def raw_command(
     )
 
 
+def self_coordinator_command(
+    project: Path,
+    *args: str,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    argv = [
+        sys.executable,
+        "-m",
+        "wrkslots",
+        "--project-root",
+        str(project),
+        *args,
+    ]
+    launcher = (
+        "import os, sys; argv = sys.argv[1:] + "
+        "['--coordinator-pid', str(os.getpid())]; os.execv(argv[0], argv)"
+    )
+    return subprocess.run(
+        [sys.executable, "-c", launcher, *argv],
+        text=True,
+        capture_output=True,
+        check=False,
+        env=source_environment(env),
+    )
+
+
 def terminate_process(process: subprocess.Popen[str]) -> None:
     """Stop one fixture process even when PID-namespace SIGTERM is delayed."""
     if process.poll() is not None:
@@ -436,6 +462,74 @@ def set_owner_other_machine(project: Path, machine: str = "testhost") -> None:
         action="test-owner-other-machine",
         slot=record.slot,
     )
+
+
+def write_historical_state(
+    project: Path,
+    slot: str,
+    *,
+    checkout_names: tuple[str, ...] = ("product",),
+    include_owner: bool = True,
+    status: str = "lease-quarantined",
+    task: str | None = "task-old",
+    owner_task: str | None = "task-old",
+    purpose: str | None = "historical fixture",
+    live_owner: bool = False,
+) -> Path:
+    identity = wrkslots._read_process_identity(os.getpid())
+    recorded_at = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=2)).isoformat(
+        timespec="seconds"
+    )
+    row: dict[str, object] = {
+        "agents": [
+            {
+                "name": "codex-old",
+                "read_only": False,
+                "task": owner_task,
+            }
+        ],
+        "allocated": recorded_at,
+        "purpose": purpose,
+        "status": status,
+        "task": task,
+        "updated": recorded_at,
+    }
+    for name in checkout_names:
+        row[f"{name}_branch"] = "codex/old"
+        row[f"{name}_path"] = f"worktrees/slots/{slot}/{name}"
+    if include_owner:
+        boot_id = identity.boot_id if live_owner else "historical-boot"
+        row["owner_sidecar"] = {
+            "schema_version": 1,
+            "slot": slot,
+            "agent": "codex-old",
+            "task": owner_task,
+            "recorded_at": recorded_at,
+            "source": "test-owner-record-v1",
+            "supervisor_pid": identity.pid,
+            "boot_id": boot_id,
+            "start_ticks": identity.start_ticks,
+            "cgroup_path": (
+                identity.cgroup_path if live_owner else "/wrkslots-test-finished"
+            ),
+            "generation": f"{boot_id}:{identity.pid}:{identity.start_ticks}",
+        }
+    path = project / "worktree-state.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 3,
+                "updated": recorded_at,
+                "slots": {slot: row},
+                "lease_history": [],
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return path
 
 
 def set_original_coordinator_dead(project: Path, machine: str = "testhost") -> None:
@@ -2634,6 +2728,7 @@ def test_import_existing_is_dry_run_then_registers_verified_live_slot(
 
     assert dry_run.returncode == 0, dry_run.stderr
     assert "dry-run: no state changed" in dry_run.stdout
+    assert "--coordinator-pid PID --coordinator-authorized" in dry_run.stdout
     assert active_slots(project) == []
     applied = command(
         project,
@@ -2703,6 +2798,405 @@ def test_import_existing_can_register_multiple_flat_cutover_stragglers(
         assert isinstance(row, dict)
         imported_slots.append(row["slot"])
     assert imported_slots == ["slot01", "slot02"]
+
+
+def test_historical_import_records_nested_slot_and_salvages_before_removal(
+    tmp_path: Path,
+) -> None:
+    project, repository, remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    slot = "old-slot"
+    tree = slots_directory(project) / slot / "product"
+    tree.parent.mkdir()
+    git(repository, "worktree", "add", "-b", "codex/old", str(tree), "origin/main")
+    source = write_historical_state(
+        project,
+        slot,
+        task="current-row-task",
+        owner_task="owner-start-task",
+    )
+    host_id = wrkslots._host_id()
+
+    dry_run = command(
+        project,
+        "import-existing",
+        slot,
+        "--from-state-file",
+        source.name,
+        "--source-host-id",
+        host_id,
+        "--repo",
+        "product=repo",
+    )
+
+    assert dry_run.returncode == 0, dry_run.stderr
+    assert "dry-run: no state changed" in dry_run.stdout
+    assert "--coordinator-pid PID --coordinator-authorized" in dry_run.stdout
+    assert active_slots(project) == []
+    applied = command(
+        project,
+        "import-existing",
+        slot,
+        "--from-state-file",
+        source.name,
+        "--source-host-id",
+        host_id,
+        "--repo",
+        "product=repo",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--apply",
+    )
+    assert applied.returncode == 0, applied.stderr
+    row = active_slots(project)[0]
+    assert isinstance(row, dict)
+    assert row["layout"] == "nested"
+    assert row["task"] == "current-row-task"
+    assert row["owner"]["boot_id"] == "historical-boot"
+    assert row["import_source"]["path"] == source.name
+    assert row["import_source"]["row"] == json.loads(
+        source.read_text(encoding="utf-8")
+    )["slots"][slot]
+    audited = command(project, "audit", "--format", "json")
+    assert audited.returncode == 0, audited.stderr
+    audit_row = json.loads(audited.stdout)["slots"][0]
+    assert audit_row["slot"] == slot
+    assert audit_row["owner_state"] == "dead"
+    assert audit_row["verdict"] == "BLOCKED"
+    assert audit_row["heartbeat_expired"] is False
+
+    (tree / "uncommitted.txt").write_text("preserve me\n", encoding="utf-8")
+    expire_heartbeat(project)
+    set_liveness(project, "dead")
+    removed = remove(project, slot)
+    assert removed.returncode == 0, removed.stderr
+    assert not tree.parent.exists()
+    archive = json.loads(
+        (control_directory(project) / "ARCHIVED.testhost.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    archived = archive["records"][0]
+    assert archived["layout"] == "nested"
+    assert archived["import_source"]["row_sha256"] == row["import_source"]["row_sha256"]
+    assert archived["salvage"][0]["disposition"] == "salvaged"
+    salvage_ref = archived["salvage"][0]["remote_ref"]
+    assert git(remote, "rev-parse", salvage_ref).returncode == 0
+
+
+def test_historical_empty_slot_enters_registry_and_removes_without_guessing(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    slot = "old-empty"
+    slot_path = slots_directory(project) / slot
+    slot_path.mkdir()
+    source = write_historical_state(project, slot, task=None, purpose=None)
+
+    imported = command(
+        project,
+        "import-existing",
+        slot,
+        "--from-state-file",
+        source.name,
+        "--source-host-id",
+        wrkslots._host_id(),
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--apply",
+    )
+
+    assert imported.returncode == 0, imported.stderr
+    row = active_slots(project)[0]
+    assert isinstance(row, dict)
+    assert row["checkouts"] == []
+    assert row["layout"] == "nested"
+    assert row["task"] == "task-old"
+    assert row["purpose"] == "no purpose recorded in worktree-state.json"
+    expire_heartbeat(project)
+    set_liveness(project, "dead")
+    removed = remove(project, slot)
+    assert removed.returncode == 0, removed.stderr
+    assert not slot_path.exists()
+    archive = json.loads(
+        (control_directory(project) / "ARCHIVED.testhost.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    archived = archive["records"][0]
+    assert archived["checkouts"] == []
+    assert archived["salvage"] == []
+    assert archived["validation"] == [
+        "historical agent slot contains no checkout and its exact contents were "
+        "verified before deletion, so there was no checkout to salvage"
+    ]
+
+
+def test_historical_import_without_owner_sidecar_refuses_before_journal(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    slot = "old-unknown-owner"
+    slot_path = slots_directory(project) / slot
+    slot_path.mkdir()
+    source = write_historical_state(project, slot, include_owner=False)
+
+    refused = command(
+        project,
+        "import-existing",
+        slot,
+        "--from-state-file",
+        source.name,
+        "--source-host-id",
+        wrkslots._host_id(),
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--apply",
+    )
+
+    assert refused.returncode == 3
+    assert "has no owner_sidecar" in refused.stderr
+    assert "owner death would remain unknowable" in refused.stderr
+    assert "include it in the migration remainder" in refused.stderr
+    assert active_slots(project) == []
+    assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
+    assert slot_path.is_dir()
+
+
+def test_historical_import_refuses_a_still_live_recorded_owner(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    slot = "old-live"
+    slot_path = slots_directory(project) / slot
+    slot_path.mkdir()
+    source = write_historical_state(project, slot, live_owner=True)
+
+    refused = command(
+        project,
+        "import-existing",
+        slot,
+        "--from-state-file",
+        source.name,
+        "--source-host-id",
+        wrkslots._host_id(),
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--apply",
+    )
+
+    assert refused.returncode == 3
+    assert "still has its recorded owner alive" in refused.stderr
+    assert "ordinary import-existing with --verified-live and --owner-pid" in refused.stderr
+    assert "no import journal or active row was written" in refused.stderr
+    assert active_slots(project) == []
+    assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
+    assert slot_path.is_dir()
+
+
+def test_historical_import_does_not_turn_an_absent_source_row_into_active_storage(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    slot = "old-absent"
+    source = write_historical_state(project, slot)
+
+    refused = command(
+        project,
+        "import-existing",
+        slot,
+        "--from-state-file",
+        source.name,
+        "--source-host-id",
+        wrkslots._host_id(),
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--apply",
+    )
+
+    assert refused.returncode == 3
+    assert "slot directory is missing or unsafe" in refused.stderr
+    assert "no import journal or active row was written" in refused.stderr
+    assert active_slots(project) == []
+    assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
+
+
+def test_historical_import_bypasses_cap_but_counts_against_later_create(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    update_configuration(project, max_active_slots=1)
+    slot = "old-cap"
+    (slots_directory(project) / slot).mkdir()
+    source = write_historical_state(
+        project,
+        slot,
+        task=None,
+        owner_task="",
+    )
+    imported = command(
+        project,
+        "import-existing",
+        slot,
+        "--from-state-file",
+        source.name,
+        "--source-host-id",
+        wrkslots._host_id(),
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--apply",
+    )
+    assert imported.returncode == 0, imported.stderr
+
+    refused = create(
+        project,
+        slot="slot02",
+        agent="codex-2",
+        branch="codex/two",
+    )
+
+    assert refused.returncode == 3
+    assert "max_active_slots=1" in refused.stderr
+    rows = active_slots(project)
+    assert len(rows) == 1
+    row = rows[0]
+    assert isinstance(row, dict)
+    assert row["slot"] == slot
+    assert row["task"] == "no task recorded in worktree-state.json"
+    assert not (slots_directory(project) / "slot02").exists()
+
+
+def test_historical_owner_name_is_provenance_not_a_live_assignment(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    for slot in ("old-first", "old-second"):
+        (slots_directory(project) / slot).mkdir()
+        source = write_historical_state(project, slot)
+        imported = command(
+            project,
+            "import-existing",
+            slot,
+            "--from-state-file",
+            source.name,
+            "--source-host-id",
+            wrkslots._host_id(),
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--apply",
+        )
+        assert imported.returncode == 0, imported.stderr
+
+    current = create(
+        project,
+        slot="current",
+        agent="codex-old",
+        branch="codex/current",
+    )
+    assert current.returncode == 0, current.stderr
+    duplicate_current = create(
+        project,
+        slot="current-two",
+        agent="codex-old",
+        branch="codex/current-two",
+    )
+    assert duplicate_current.returncode == 3
+    assert "already owns slot 'current' on testhost" in duplicate_current.stderr
+    rows = active_slots(project)
+    assert all(isinstance(row, dict) for row in rows)
+    assert sorted(row["slot"] for row in rows if isinstance(row, dict)) == [
+        "current",
+        "old-first",
+        "old-second",
+    ]
+
+
+def test_interrupted_historical_import_is_recovered_by_a_later_participant(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    slot = "old-interrupted"
+    slot_path = slots_directory(project) / slot
+    slot_path.mkdir()
+    source = write_historical_state(project, slot)
+    interrupted = self_coordinator_command(
+        project,
+        "import-existing",
+        slot,
+        "--slot-type",
+        "agent",
+        "--coordinator-authorized",
+        "--from-state-file",
+        source.name,
+        "--source-host-id",
+        wrkslots._host_id(),
+        "--apply",
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-import-journal"},
+    )
+
+    assert interrupted.returncode == 86
+    assert active_slots(project) == []
+    journal = control_directory(project) / "ACTIVE.testhost.journal"
+    journal_row = json.loads(journal.read_text(encoding="utf-8"))["record"]
+    original_coordinator_pid = journal_row["coordinator_lease"]["pid"]
+    assert original_coordinator_pid != os.getpid()
+    source.unlink()
+    journal.unlink()
+
+    recovered = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+    )
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert "recovered import: registered slot=old-interrupted" in recovered.stdout
+    row = active_slots(project)[0]
+    assert isinstance(row, dict)
+    assert row["import_source"]["row"] == journal_row["import_source"]["row"]
+    events = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in sorted((control_directory(project) / "EVENTS.testhost").glob("*.json"))
+    ]
+    recovery = [event for event in events if event["kind"] == "active-state-recorded"][-1]
+    evidence = recovery["payload"]["evidence"]
+    assert evidence["original_coordinator"]["pid"] == original_coordinator_pid
+    assert evidence["recovery_actor"]["pid"] == os.getpid()
+    assert not journal.exists()
+    assert not source.exists()
+    assert slot_path.is_dir()
 
 
 def test_register_refuses_owner_generation_change_before_publication(
@@ -3275,7 +3769,7 @@ def test_repair_updates_the_pre_packaging_control_symlink(tmp_path: Path) -> Non
         check=False,
     )
     assert old_command.returncode == 0, old_command.stderr
-    assert old_command.stdout.strip() == "wrkslots 0.5.0"
+    assert old_command.stdout.strip() == "wrkslots 0.6.0"
 
     repaired = _repair(project)
 

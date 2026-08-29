@@ -84,10 +84,10 @@ be dead, and the full process-use scan must find no cwd, executable, root, descr
 cgroup, or mount use. If the liveness source is degraded or stale, return `2`; unknown ownership is
 not a free slot.
 
-A slot imported from an older state file with no recorded owner identity cannot currently satisfy the owner-death condition,
-even after its heartbeat expires. `recover-unbound-owner` can record what was inspected but does not
-turn unavailable process evidence into proof of death. Preserve such a slot until an evidence-based
-migration path exists.
+A slot imported from an older state file with no recorded owner identity cannot satisfy the
+owner-death condition, even after its heartbeat expires. `recover-unbound-owner` can record what was
+inspected but does not turn unavailable process evidence into proof of death. Preserve such a slot
+and name it in the migration remainder rather than inventing an owner.
 
 ## HANDOFF.md
 
@@ -113,6 +113,45 @@ is recorded instead. A failed or unverifiable push preserves the checkout.
 Initialized Git submodules are checked separately against the corresponding source repository's
 remote URL. Each nested repository gets its own salvage commit and remote readback, so an
 uncommitted file inside a submodule cannot disappear behind an outer gitlink that did not move.
+
+## Import older slots
+
+For a live slot already at its final managed path, run `import-existing` first as a dry run, then
+repeat with `--apply --verified-live`, its live `--owner-pid`, and the current
+`--coordinator-pid`.
+
+For a slot whose owner has exited, use the older version 3 `worktree-state.json` as evidence instead
+of reconstructing ownership from the directory. Run `import-existing SLOT --from-state-file
+worktree-state.json --source-host-id ID` as a dry run, then add `--apply` and the current
+`--coordinator-pid`. The source row supplies the agent, task, purpose, allocation time, checkout
+paths, and exact owner process generation. Because the older owner sidecar omitted the stable host
+identity, `ID` must be the current source host's `/etc/machine-id`; a mismatch refuses. The imported
+row starts a fresh heartbeat time-to-live. Its prior `active`, `lease-quarantined`,
+`owner-lease-revoked`, or `release-requested` status is retained as evidence, never treated as
+permission to remove. If the older row omitted its task or purpose, the active record says that the
+field was not recorded; it does not invent what the slot held, and the exact source row remains
+attached. The slot row's current task is used when present; the owner sidecar is only the fallback
+when that row field is absent, because the sidecar describes the owner process at binding time.
+Likewise, its agent name is retained as provenance rather than treated as a current assignment:
+several older rows may name the same agent, and those rows do not prevent that name from owning one
+new live slot. The ordinary registry still refuses two live assignments for one agent. A
+source-file import also refuses while its exact recorded owner process is still live; that owner
+must use the ordinary live import path instead.
+
+Name each source row's checkout repositories with `--repo NAME=PATH`; `NAME` is the prefix of its
+`NAME_path` field. A source row with nested paths remains nested even when newly created slots use the
+flat layout. An empty residual slot directory can be imported with no `--repo`: its exact source row
+is retained, and removal later verifies that the directory contains no checkout before recording
+that there was nothing to salvage. A present checkout without a matching `--repo` refuses and
+prints the missing flags. A row with no owner sidecar also refuses before writing a journal or
+active row, because its owner death cannot be established.
+
+Every applied import writes the complete candidate row to the append-only operation history before
+publishing it in ACTIVE. If the importer exits after that write, any later participant runs
+`wrkslots recover --coordinator-pid PID`; recovery does not reread the older state file or depend on
+the original coordinator. Other unregistered slot directories are retained while the selected slot
+is verified. Source rows whose physical directories are already absent remain in the older
+file as history rather than being fabricated as active storage.
 
 ## Recovery and compatibility views
 
