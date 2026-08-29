@@ -1514,8 +1514,8 @@ pub struct StepOutcome {
     /// `None` means no recognizable test-runner banner, distinct from `Some(0)`.
     pub executed_tests: Option<u64>,
     /// Tests that passed according to the producer-owned structured result.
-    /// Historical schema-1 count records and presentation-only output leave
-    /// this `None`; consumers must not reconstruct an exact count from prose.
+    /// Schema-1 count records and presentation-only output leave this `None`;
+    /// consumers must not reconstruct an exact count from prose.
     pub passed_tests: Option<u64>,
     /// Tests filtered according to the same complete captured output.
     pub filtered_tests: Option<u64>,
