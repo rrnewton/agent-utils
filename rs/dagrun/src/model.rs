@@ -1513,6 +1513,10 @@ pub struct StepOutcome {
     /// Tests executed according to the step's complete captured runner output.
     /// `None` means no recognizable test-runner banner, distinct from `Some(0)`.
     pub executed_tests: Option<u64>,
+    /// Tests that passed according to the producer-owned structured result.
+    /// Historical schema-1 count records and presentation-only output leave
+    /// this `None`; consumers must not reconstruct an exact count from prose.
+    pub passed_tests: Option<u64>,
     /// Tests filtered according to the same complete captured output.
     pub filtered_tests: Option<u64>,
     /// Child process exit code; negative for a Unix signal; `None` if never collected.
@@ -1542,6 +1546,7 @@ impl StepOutcome {
         summary: String,
         returncode: Option<i64>,
         executed_tests: Option<u64>,
+        passed_tests: Option<u64>,
         filtered_tests: Option<u64>,
     ) -> Self {
         StepOutcome {
@@ -1550,6 +1555,7 @@ impl StepOutcome {
             duration_s,
             summary,
             executed_tests,
+            passed_tests,
             filtered_tests,
             returncode,
             oomed: false,
@@ -1579,6 +1585,7 @@ impl StepOutcome {
         cpu_timeout_platform: &str,
         aborted: bool,
         executed_tests: Option<u64>,
+        passed_tests: Option<u64>,
         filtered_tests: Option<u64>,
     ) -> Self {
         let reason = step_failure_reason(
@@ -1604,6 +1611,7 @@ impl StepOutcome {
             duration_s,
             summary,
             executed_tests,
+            passed_tests,
             filtered_tests,
             returncode,
             oomed,
@@ -1622,6 +1630,7 @@ impl StepOutcome {
         summary: String,
         returncode: Option<i64>,
         executed_tests: Option<u64>,
+        passed_tests: Option<u64>,
         filtered_tests: Option<u64>,
     ) -> Self {
         StepOutcome {
@@ -1630,6 +1639,7 @@ impl StepOutcome {
             duration_s,
             summary,
             executed_tests,
+            passed_tests,
             filtered_tests,
             returncode,
             oomed: false,
@@ -1957,6 +1967,7 @@ mod tests {
             DEFAULT_CPU_TIMEOUT_MULTIPLIER,
             "",
             false,
+            None,
             None,
             None,
         );

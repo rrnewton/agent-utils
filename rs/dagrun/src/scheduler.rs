@@ -1178,6 +1178,7 @@ fn publish_supervisor_failure(
                 duration_s: elapsed_s,
                 summary,
                 executed_tests: None,
+                passed_tests: None,
                 filtered_tests: None,
                 returncode: None,
                 oomed: false,
@@ -2437,6 +2438,7 @@ fn last_line(bytes: &[u8]) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CapturedTestCounts {
     executed: Option<u64>,
+    passed: Option<u64>,
     filtered: Option<u64>,
 }
 
@@ -2490,6 +2492,7 @@ fn captured_test_counts(bytes: &[u8]) -> CapturedTestCounts {
     if overflow {
         return CapturedTestCounts {
             executed: None,
+            passed: None,
             filtered: None,
         };
     }
@@ -2503,6 +2506,9 @@ fn captured_test_counts(bytes: &[u8]) -> CapturedTestCounts {
         } else {
             None
         },
+        // This compatibility parser reads presentation text. Only the
+        // producer-owned structured record may supply an exact passed count.
+        passed: None,
         filtered: filtered_seen.then_some(filtered_total),
     }
 }
@@ -2520,17 +2526,26 @@ fn read_structured_test_counts(path: &std::path::Path) -> Option<CapturedTestCou
     let bytes = std::fs::read(path).ok()?;
     let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
     let object = value.as_object()?;
-    if object.len() != 3 || object.get("schema").and_then(serde_json::Value::as_u64) != Some(1) {
-        return None;
-    }
+    let schema = object.get("schema").and_then(serde_json::Value::as_u64)?;
     let executed = object
         .get("executed_tests")
         .and_then(serde_json::Value::as_u64)?;
     let filtered = object
         .get("filtered_tests")
         .and_then(serde_json::Value::as_u64)?;
+    let passed = match schema {
+        1 if object.len() == 3 => None,
+        2 if object.len() == 4 => {
+            let passed = object
+                .get("passed_tests")
+                .and_then(serde_json::Value::as_u64)?;
+            Some((passed <= executed).then_some(passed)?)
+        }
+        _ => return None,
+    };
     Some(CapturedTestCounts {
         executed: Some(executed),
+        passed,
         filtered: Some(filtered),
     })
 }
@@ -2546,6 +2561,7 @@ fn resolved_test_counts(
     if structured_required {
         CapturedTestCounts {
             executed: None,
+            passed: None,
             filtered: None,
         }
     } else {
@@ -2873,6 +2889,7 @@ fn run_step(ctx: StepCtx) {
                         false,
                         None,
                         None,
+                        None,
                     ),
                 );
                 trip_fail_fast(&mut sh, &cgroups, keep_going, &tag);
@@ -3045,6 +3062,7 @@ fn run_step(ctx: StepCtx) {
                 cpu_timeout_multiplier,
                 &cpu_timeout_platform,
                 false,
+                None,
                 None,
                 None,
             );
@@ -3675,6 +3693,7 @@ fn run_step(ctx: StepCtx) {
                 summary.clone(),
                 returncode,
                 test_counts.executed,
+                test_counts.passed,
                 test_counts.filtered,
             )
         } else if ok {
@@ -3684,6 +3703,7 @@ fn run_step(ctx: StepCtx) {
                 summary.clone(),
                 returncode,
                 test_counts.executed,
+                test_counts.passed,
                 test_counts.filtered,
             )
         } else {
@@ -3703,6 +3723,7 @@ fn run_step(ctx: StepCtx) {
                 &cpu_timeout_platform,
                 false,
                 test_counts.executed,
+                test_counts.passed,
                 test_counts.filtered,
             )
         };
@@ -4446,6 +4467,7 @@ mod tests {
             counts,
             CapturedTestCounts {
                 executed: Some(5),
+                passed: None,
                 filtered: Some(11)
             }
         );
@@ -4457,6 +4479,7 @@ mod tests {
             fallback,
             CapturedTestCounts {
                 executed: Some(9),
+                passed: None,
                 filtered: Some(2)
             }
         );
@@ -4470,6 +4493,7 @@ mod tests {
             ),
             CapturedTestCounts {
                 executed: Some(0),
+                passed: None,
                 filtered: Some(0)
             }
         );
@@ -4477,6 +4501,7 @@ mod tests {
             captured_test_counts(b"build completed successfully\n"),
             CapturedTestCounts {
                 executed: None,
+                passed: None,
                 filtered: None
             }
         );
@@ -4491,7 +4516,7 @@ mod tests {
         ));
         std::fs::write(
             &path,
-            br#"{"schema":1,"executed_tests":7,"filtered_tests":11}"#,
+            br#"{"schema":2,"executed_tests":7,"passed_tests":5,"filtered_tests":11}"#,
         )
         .unwrap();
         let printed = b"running 999 tests\ntest result: ok. 999 passed; 0 failed; 0 filtered out\n";
@@ -4499,6 +4524,7 @@ mod tests {
             resolved_test_counts(true, Some(&path), printed),
             CapturedTestCounts {
                 executed: Some(7),
+                passed: Some(5),
                 filtered: Some(11)
             }
         );
@@ -4507,6 +4533,7 @@ mod tests {
             resolved_test_counts(true, None, printed),
             CapturedTestCounts {
                 executed: None,
+                passed: None,
                 filtered: None
             },
             "a printed banner must not create receipt evidence in structured mode"
@@ -4515,10 +4542,49 @@ mod tests {
             resolved_test_counts(false, None, printed),
             CapturedTestCounts {
                 executed: Some(999),
+                passed: None,
                 filtered: Some(0)
             },
             "clients that have not opted in retain the compatibility parser"
         );
+    }
+
+    #[test]
+    fn structured_count_versions_keep_historical_rows_readable_and_current_rows_exact() {
+        let path = std::env::temp_dir().join(format!(
+            "dagrun-structured-count-versions-{}-{}.json",
+            std::process::id(),
+            TEST_COUNTS_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+
+        std::fs::write(
+            &path,
+            br#"{"schema":1,"executed_tests":7,"filtered_tests":11}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_structured_test_counts(&path),
+            Some(CapturedTestCounts {
+                executed: Some(7),
+                passed: None,
+                filtered: Some(11),
+            }),
+            "historical schema-1 counts stay readable without inventing passed_tests"
+        );
+
+        for malformed in [
+            br#"{"schema":2,"executed_tests":7,"filtered_tests":11}"#.as_slice(),
+            br#"{"schema":2,"executed_tests":7,"passed_tests":8,"filtered_tests":11}"#.as_slice(),
+            br#"{"schema":2,"executed_tests":7,"passed_tests":"5","filtered_tests":11}"#.as_slice(),
+        ] {
+            std::fs::write(&path, malformed).unwrap();
+            assert_eq!(
+                read_structured_test_counts(&path),
+                None,
+                "a current record without a valid exact passed count must be refused"
+            );
+        }
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -5007,8 +5073,12 @@ mod tests {
         assert!(res.ok);
         let counted = res.outcomes.iter().find(|o| o.tag == "g.counted").unwrap();
         assert_eq!(
-            (counted.executed_tests, counted.filtered_tests),
-            (Some(3), Some(5))
+            (
+                counted.executed_tests,
+                counted.passed_tests,
+                counted.filtered_tests
+            ),
+            (Some(3), None, Some(5))
         );
         let bannerless = res
             .outcomes
@@ -5016,8 +5086,12 @@ mod tests {
             .find(|o| o.tag == "g.bannerless")
             .unwrap();
         assert_eq!(
-            (bannerless.executed_tests, bannerless.filtered_tests),
-            (None, None)
+            (
+                bannerless.executed_tests,
+                bannerless.passed_tests,
+                bannerless.filtered_tests
+            ),
+            (None, None, None)
         );
     }
 
@@ -7033,7 +7107,7 @@ mod tests {
             let mut sh = lock_shared(&runner.shared);
             sh.done.insert(
                 fine.tag(),
-                StepOutcome::passed(fine.tag(), 0.1, String::new(), Some(0), None, None),
+                StepOutcome::passed(fine.tag(), 0.1, String::new(), Some(0), None, None, None),
             );
         }
         let handle = thread::spawn(|| {});
@@ -7103,7 +7177,7 @@ mod tests {
             let mut sh = lock_shared(&runner.shared);
             sh.done.insert(
                 late.tag(),
-                StepOutcome::passed(late.tag(), 0.1, String::new(), Some(0), None, None),
+                StepOutcome::passed(late.tag(), 0.1, String::new(), Some(0), None, None, None),
             );
         }
         let published = publish_supervisor_failure(
