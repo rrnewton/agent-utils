@@ -25,6 +25,17 @@ on:
     - cron: '17 4 * * *'
   workflow_dispatch:
 
+# The notifier CREATES AN ISSUE, and the default token cannot.
+#
+# Measured on the 2026-08-30 run: `Contents: read, Metadata: read, Packages: read`, and the create
+# came back `HttpError: Resource not accessible by integration`. So this failed three nights running
+# and told nobody — the one job whose whole purpose is to be noticed was the one that could not
+# speak. Narrowest grant that fixes it; `contents: read` is stated rather than inherited so adding
+# a write later has to be deliberate.
+permissions:
+  contents: read
+  issues: write
+
 jobs:
   everything:
     runs-on: ubuntu-latest
@@ -42,6 +53,18 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+
+      # THE CONTRACT NEEDS THESE AND THE RUNNER SHIPS NONE OF THEM.
+      #
+      # `./setup py` runs a strict mypy pass, so `make validate-all` died SIX SECONDS in with
+      # "py: mypy not installed" on every run since this workflow landed. A red nightly that had
+      # said nothing about main's health for three nights, and — because the notifier was also
+      # broken — said it to nobody. The per-tool workflows each install their own tooling, which
+      # is exactly why they were green while this was not.
+      #
+      # `types-PyYAML` because PyYAML ships no stubs and mypy --strict refuses without them.
+      - name: install the tooling the contract runs on
+        run: python -m pip install --upgrade mypy pytest pyyaml types-PyYAML
 
       # The timeline's browser checks drive a real Chromium, so the runner needs the browser and
       # the suite's dependencies before `validate-all` reaches them. Named as its own step so a

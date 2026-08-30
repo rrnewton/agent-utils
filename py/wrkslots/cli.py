@@ -4686,7 +4686,10 @@ def _cmd_init(args: argparse.Namespace) -> int:
                         root, existing_worktrees, "existing worktrees directory"
                     )
                     existing_layout = existing.get("layout", "nested")
-                    if existing_layout in {"nested", "flat"}:
+                    # `isinstance` FIRST: a membership test against a set of strings tells mypy
+                    # nothing about the type, and this value comes off a decoded record as
+                    # `object`. Nothing changes at runtime — a non-string was never in that set.
+                    if isinstance(existing_layout, str) and existing_layout in {"nested", "flat"}:
                         existing_control = _control_directory_for(
                             existing_worktrees_path, existing_layout
                         )
@@ -9536,6 +9539,10 @@ def _legacy_validate_recovery_inputs(
     final_status = record.get("final_validate_status")
     if (
         record.get("state") != "completed"
+        # Narrows `final_status` for the index below, which reads it out of a decoded record and so
+        # sees `object`. Placed before the membership test rather than after it because only the
+        # isinstance narrows; the runtime answer is unchanged, since a non-string was never a key.
+        or not isinstance(final_status, str)
         or final_status not in expected_exits
         or record.get("exit_code") != expected_exits[final_status]
     ):
