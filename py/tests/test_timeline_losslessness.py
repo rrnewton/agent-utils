@@ -955,3 +955,43 @@ def test_blanking_every_message_fails_the_gate(tmp_path: Path) -> None:
     assert timeline_main(
         ["audit-losslessness", "--require-lossless", "--output", str(archive)]
     ) == 1
+
+
+def test_a_payload_manifest_written_before_the_rename_is_still_read(tmp_path: Path) -> None:
+    """`payloads/manifest.json` carries `"tool"`, and every one on disk predates the rename.
+
+    This was a total ingestion outage, not a cosmetic slip: all twelve teams failed `normalize`
+    with "invalid payload manifest" against files whose bytes were entirely valid.
+
+    It was missed because the rename's sweep for stored identifiers grepped the PUBLISHED
+    archive -- and the payload store had just been relocated out of it into `<output>.build`. The
+    lesson generalises past this one file: a rename must sweep the build store and the snapshot
+    store as well as the directory that ships.
+    """
+
+    from wrkviz.payloads import load_payload_manifest
+
+    root = tmp_path / "payloads"
+    root.mkdir()
+    (root / "manifest.json").write_text(
+        '{"schema_version": 1, "tool": "agent-team-timeline", "records": 0,'
+        ' "text_bytes": 0, "shards": []}\n',
+        encoding="utf-8",
+    )
+    manifest = load_payload_manifest(root)
+    assert manifest is not None, "a pre-rename payload manifest must still load"
+
+    # Current spelling too, and a foreign one still refused -- leniency about the rename is not
+    # leniency about whose manifest this is.
+    (root / "manifest.json").write_text(
+        '{"schema_version": 1, "tool": "wrkviz", "records": 0, "text_bytes": 0, "shards": []}\n',
+        encoding="utf-8",
+    )
+    assert load_payload_manifest(root) is not None
+    (root / "manifest.json").write_text(
+        '{"schema_version": 1, "tool": "something-else", "records": 0,'
+        ' "text_bytes": 0, "shards": []}\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="invalid payload manifest"):
+        load_payload_manifest(root)

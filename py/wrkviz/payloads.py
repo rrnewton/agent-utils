@@ -62,6 +62,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from wrkviz.archive import (
+    ARCHIVE_MARKER_TOOL,
+    LEGACY_ARCHIVE_MARKER_TOOL,
     JsonValue,
     as_int,
     as_object,
@@ -140,7 +142,7 @@ class PayloadManifest:
 
         return {
             "schema_version": PAYLOAD_SCHEMA_VERSION,
-            "tool": "wrkviz",
+            "tool": ARCHIVE_MARKER_TOOL,
             "records": self.records,
             "text_bytes": self.text_bytes,
             "shards": [shard.to_json_obj() for shard in self.shards],
@@ -339,9 +341,18 @@ def load_payload_manifest(root: Path) -> PayloadManifest | None:
     if path.is_symlink() or not path.is_file():
         return None
     obj = as_object(read_json(path), str(path))
+    # BOTH spellings of `tool`, because this manifest is written into the build store and every
+    # one already on disk predates the rename. Accepting only the current name made all twelve
+    # teams fail `normalize` with "invalid payload manifest" -- a total ingestion outage from a
+    # spelling change, on a file whose bytes were perfectly valid.
+    #
+    # This is the same class of mistake the rename already fixed four times over, and it was
+    # missed for a specific reason worth recording: the sweep for stored identifiers grepped the
+    # PUBLISHED archive, and the payload store had just been moved out of it into `<output>.build`.
+    # A rename must sweep the build store and the snapshot store too, not only what ships.
     if (
         obj.get("schema_version") != PAYLOAD_SCHEMA_VERSION
-        or obj.get("tool") != "wrkviz"
+        or obj.get("tool") not in (ARCHIVE_MARKER_TOOL, LEGACY_ARCHIVE_MARKER_TOOL)
     ):
         raise ValueError(f"invalid payload manifest at {path}")
     raw_shards = obj.get("shards")
