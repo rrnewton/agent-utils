@@ -15,7 +15,9 @@
 //! create/write it is a visible warning (No Silent Failure), never a silent skip.
 
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -389,8 +391,7 @@ fn clk_tck() -> i64 {
     100
 }
 
-// ISO-8601 UTC timestamp `YYYY-MM-DDTHH:MM:SS` (Python emits local time; the column value is not
-// cross-compared, only the schema is, so UTC is fine and dependency-free).
+// Canonical RFC-3339 UTC timestamp `YYYY-MM-DDTHH:MM:SSZ`, matching the Python writer.
 fn timestamp() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -400,7 +401,7 @@ fn timestamp() -> String {
     let rem = secs.rem_euclid(86_400);
     let (hh, mm, ss) = (rem / 3600, (rem % 3600) / 60, rem % 60);
     let (y, m, d) = civil_from_days(days);
-    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}")
+    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
 }
 
 /// Howard Hinnant's days-from-civil inverse (days since 1970-01-01 -> (year, month, day)).
@@ -440,10 +441,11 @@ fn csv_field(value: &str) -> String {
     }
 }
 
-pub(crate) fn parse_csv_line(line: &str) -> Vec<String> {
-    let mut out = Vec::new();
+pub(crate) fn parse_csv_records(text: &str) -> Vec<Vec<String>> {
+    let mut records = Vec::new();
+    let mut record = Vec::new();
     let mut field = String::new();
-    let mut chars = line.chars().peekable();
+    let mut chars = text.chars().peekable();
     let mut in_quotes = false;
     while let Some(c) = chars.next() {
         if in_quotes {
@@ -459,14 +461,45 @@ pub(crate) fn parse_csv_line(line: &str) -> Vec<String> {
             }
         } else if c == '"' {
             in_quotes = true;
-        } else if c == ',' {
-            out.push(std::mem::take(&mut field));
         } else {
-            field.push(c);
+            match c {
+                ',' => record.push(std::mem::take(&mut field)),
+                '\n' => {
+                    record.push(std::mem::take(&mut field));
+                    if record.len() != 1 || !record[0].is_empty() {
+                        records.push(std::mem::take(&mut record));
+                    } else {
+                        record.clear();
+                    }
+                }
+                '\r' => {
+                    if chars.peek() == Some(&'\n') {
+                        chars.next();
+                    }
+                    record.push(std::mem::take(&mut field));
+                    if record.len() != 1 || !record[0].is_empty() {
+                        records.push(std::mem::take(&mut record));
+                    } else {
+                        record.clear();
+                    }
+                }
+                _ => field.push(c),
+            }
         }
     }
-    out.push(field);
-    out
+    if !field.is_empty() || !record.is_empty() {
+        record.push(field);
+        records.push(record);
+    }
+    records
+}
+
+#[cfg(test)]
+pub(crate) fn parse_csv_line(line: &str) -> Vec<String> {
+    parse_csv_records(line)
+        .into_iter()
+        .next()
+        .unwrap_or_default()
 }
 
 fn write_row(out: &mut String, header: &[String], row: &BTreeMap<String, String>) {
@@ -485,7 +518,11 @@ fn append_rows_merging_header(
     rows: &[BTreeMap<String, String>],
     fieldnames: &[String],
 ) -> std::io::Result<()> {
-    let existing = fs::read_to_string(csv_path).ok();
+    let existing = match fs::read_to_string(csv_path) {
+        Ok(text) => Some(text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
     let is_new = existing.as_deref().map(str::is_empty).unwrap_or(true);
     if is_new {
         let mut out = String::new();
@@ -504,71 +541,93 @@ fn append_rows_merging_header(
         return fs::write(csv_path, out);
     }
     let text = existing.unwrap();
-    let mut lines = text.lines();
-    let old_header: Vec<String> = lines.next().map(parse_csv_line).unwrap_or_default();
+    let records = parse_csv_records(&text);
+    let old_header: Vec<String> = records.first().cloned().unwrap_or_default();
     let mut widened = old_header.clone();
     for col in fieldnames {
         if !widened.contains(col) {
             widened.push(col.clone());
         }
     }
-    let mut out = String::new();
-    out.push_str(
-        &widened
-            .iter()
-            .map(|h| csv_field(h))
-            .collect::<Vec<_>>()
-            .join(","),
-    );
-    out.push('\n');
     if widened != old_header {
+        let mut out = String::new();
+        out.push_str(
+            &widened
+                .iter()
+                .map(|h| csv_field(h))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        out.push('\n');
         // Re-project old rows onto the widened header so older rows keep their columns.
-        for line in lines {
-            if line.is_empty() {
-                continue;
-            }
-            let cells = parse_csv_line(line);
+        for cells in records.into_iter().skip(1) {
             let old_row: BTreeMap<String, String> = old_header.iter().cloned().zip(cells).collect();
             write_row(&mut out, &widened, &old_row);
         }
-    } else {
-        // Header unchanged: keep the existing body verbatim.
-        for line in lines {
-            if !line.is_empty() {
-                out.push_str(line);
-                out.push('\n');
-            }
+        for row in rows {
+            write_row(&mut out, &widened, row);
         }
+        let temporary = csv_path.with_extension(format!("csv.{}.tmp", std::process::id()));
+        fs::write(&temporary, out)?;
+        fs::rename(temporary, csv_path)
+    } else {
+        // Ordinary appends never rewrite the historical dataset. Besides being cheaper, this
+        // avoids turning an interrupted metrics write into loss of every earlier sample.
+        let mut out = String::new();
+        for row in rows {
+            write_row(&mut out, &widened, row);
+        }
+        let mut file = OpenOptions::new().append(true).open(csv_path)?;
+        file.write_all(out.as_bytes())
     }
-    for row in rows {
-        write_row(&mut out, &widened, row);
-    }
-    fs::write(csv_path, out)
 }
 
-/// Best-effort per-file advisory lock via a `.lock` sidecar (create_new spin), so concurrent runs
-/// on one machine do not interleave. Falls through (unlocked) after a bounded wait rather than
-/// blocking a run on metrics.
-fn with_file_lock<F: FnOnce()>(csv_path: &Path, f: F) {
-    let lock = PathBuf::from(format!("{}.lock", csv_path.display()));
-    let mut held = false;
-    for _ in 0..200 {
-        match fs::OpenOptions::new()
+/// One persistent advisory lock shared by every compatible profile-store writer.
+pub(crate) struct ProfileFileLock {
+    file: fs::File,
+}
+
+impl ProfileFileLock {
+    /// Lock the stable sidecar inode under a hidden `.locks` directory.
+    ///
+    /// Unlinking a held lock would let a racing process create and lock a different inode while
+    /// this critical section is still live, so the zero-byte coordination file is retained.
+    pub(crate) fn acquire(data_path: &Path) -> std::io::Result<Self> {
+        let parent = data_path.parent().unwrap_or_else(|| Path::new("."));
+        let lock_dir = parent.join(".locks");
+        fs::create_dir_all(&lock_dir)?;
+        let name = data_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("profile.data");
+        let lock_path = lock_dir.join(format!("{name}.lock"));
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
             .write(true)
-            .create_new(true)
-            .open(&lock)
-        {
-            Ok(_) => {
-                held = true;
-                break;
-            }
-            Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+            .open(lock_path)?;
+        // SAFETY: `flock` operates on this live descriptor and retains no pointer.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(std::io::Error::last_os_error());
         }
+        Ok(Self { file })
     }
-    f();
-    if held {
-        let _ = fs::remove_file(&lock);
+}
+
+impl Drop for ProfileFileLock {
+    fn drop(&mut self) {
+        // SAFETY: `flock` operates on this live descriptor and retains no pointer.
+        let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
     }
+}
+
+fn with_file_lock<F>(csv_path: &Path, f: F) -> std::io::Result<()>
+where
+    F: FnOnce() -> std::io::Result<()>,
+{
+    let _lock = ProfileFileLock::acquire(csv_path)?;
+    f()
 }
 
 /// Append per-step measurement `rows` to a machine/container-specific CSV. Returns the path, or
@@ -638,14 +697,15 @@ pub fn append_step_profiles(
     let mut fieldnames: Vec<String> = STEP_PROFILE_COLUMNS.iter().map(|s| s.to_string()).collect();
     fieldnames.extend(extra);
 
-    let mut result = Some(path.clone());
-    with_file_lock(&path, || {
-        if let Err(e) = append_rows_merging_header(&path, &full_rows, &fieldnames) {
-            eprintln!("[perflog] step-profile write failed ({e})");
-            result = None;
+    match with_file_lock(&path, || {
+        append_rows_merging_header(&path, &full_rows, &fieldnames)
+    }) {
+        Ok(()) => Some(path),
+        Err(error) => {
+            eprintln!("[perflog] step-profile write failed ({error})");
+            None
         }
-    });
-    result
+    }
 }
 
 /// Write one execution's opt-in per-step time series to
@@ -723,14 +783,15 @@ pub fn append_step_timeseries(
         .collect();
     columns.extend(extra);
 
-    let mut result = Some(path.clone());
-    with_file_lock(&path, || {
-        if let Err(error) = append_rows_merging_header(&path, &full_rows, &columns) {
+    match with_file_lock(&path, || {
+        append_rows_merging_header(&path, &full_rows, &columns)
+    }) {
+        Ok(()) => Some(path),
+        Err(error) => {
             eprintln!("[perflog] time-series write failed ({error})");
-            result = None;
+            None
         }
-    });
-    result
+    }
 }
 
 /// A started whole-run measurement bracket; [`PerfWindow::finish`] appends one summary row.
@@ -806,16 +867,15 @@ impl PerfWindow {
         let dir = ensure_dir(&self.output_dir)?;
         let path = dir.join(whole_run_csv_name(&self.machine_id));
         let fieldnames: Vec<String> = CSV_COLUMNS.iter().map(|s| s.to_string()).collect();
-        let mut result_path = Some(path.clone());
-        with_file_lock(&path, || {
-            if let Err(e) =
-                append_rows_merging_header(&path, std::slice::from_ref(&row), &fieldnames)
-            {
-                eprintln!("[perflog] whole-run row skipped ({e})");
-                result_path = None;
+        match with_file_lock(&path, || {
+            append_rows_merging_header(&path, std::slice::from_ref(&row), &fieldnames)
+        }) {
+            Ok(()) => Some(path),
+            Err(error) => {
+                eprintln!("[perflog] whole-run row skipped ({error})");
+                None
             }
-        });
-        result_path
+        }
     }
 }
 
@@ -832,9 +892,46 @@ mod tests {
     #[test]
     fn timestamp_shape() {
         let ts = timestamp();
-        assert_eq!(ts.len(), 19);
+        assert_eq!(ts.len(), 20);
         assert_eq!(&ts[4..5], "-");
         assert_eq!(&ts[10..11], "T");
+        assert!(ts.ends_with('Z'));
+    }
+
+    #[test]
+    fn csv_parser_and_appender_preserve_quoted_multiline_fields() {
+        let parsed = parse_csv_records("a,b\nx,\"line 1\nline 2\"\n");
+        assert_eq!(
+            parsed,
+            vec![
+                vec!["a".to_string(), "b".to_string()],
+                vec!["x".to_string(), "line 1\nline 2".to_string()],
+            ]
+        );
+
+        let dir = std::env::temp_dir().join(format!(
+            "dagrun_csv_multiline_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rows.csv");
+        fs::write(&path, "a,b\nx,\"line 1\nline 2\"\n").unwrap();
+        let row = BTreeMap::from([
+            ("a".to_string(), "y".to_string()),
+            ("b".to_string(), "last".to_string()),
+        ]);
+        append_rows_merging_header(&path, &[row], &["a".into(), "b".into()]).unwrap();
+        assert_eq!(
+            parse_csv_records(&fs::read_to_string(&path).unwrap()),
+            vec![
+                vec!["a".to_string(), "b".to_string()],
+                vec!["x".to_string(), "line 1\nline 2".to_string()],
+                vec!["y".to_string(), "last".to_string()],
+            ]
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -857,6 +954,15 @@ mod tests {
         assert!(header.contains("ok,timed_out,cpu_timed_out,oom_kills"));
         assert!(header.trim_end().ends_with("cpu.usage_usec"));
         assert!(text.lines().nth(1).unwrap().contains("g.j"));
+        assert!(
+            dir.join(".locks")
+                .join(format!(
+                    "{}.lock",
+                    path.file_name().unwrap().to_string_lossy()
+                ))
+                .is_file(),
+            "the stable cross-language flock inode must be retained"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -967,6 +1073,7 @@ mod tests {
         assert_eq!(written["run_id"], "run789");
         assert_eq!(written["sample_kind"], "start");
         assert_eq!(written["sweep_id"], "sweep-1");
+        assert!(dir.join("traces/.locks/run789.csv.lock").is_file());
         let _ = fs::remove_dir_all(&dir);
     }
 

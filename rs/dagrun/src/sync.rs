@@ -23,6 +23,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::perflog::ProfileFileLock;
 use crate::summary::{self, Summary};
 
 /// A sync backend could not complete an upload/download; raised LOUDLY so the caller degrades
@@ -68,8 +69,8 @@ pub trait SyncBackend {
 // --------------------------------------------------------------------------- local directory
 
 /// Store the summary as a file in a local directory (`local:<dir>`). `publish` is a read-merge-write
-/// serialized by a best-effort `O_EXCL` lock file so concurrent local runs do not lose a
-/// contribution.
+/// serialized by the persistent profile-store `flock` protocol, so concurrent local runs do
+/// not lose a contribution.
 pub struct LocalDirBackend {
     root: PathBuf,
 }
@@ -119,8 +120,12 @@ impl SyncBackend for LocalDirBackend {
             ))
         })?;
         let path = self.path(&delta.machine_id, &delta.container_class);
-        let lock_path = path.with_extension("json.lock");
-        let _lock = LockFile::acquire(&lock_path);
+        let _lock = ProfileFileLock::acquire(&path).map_err(|error| {
+            SyncError(format!(
+                "local backend: cannot lock {}: {error}",
+                path.display()
+            ))
+        })?;
         let base = self.download(&delta.machine_id, &delta.container_class)?;
         let merged = summary::merge(&base, delta, reservoir_cap, max_buckets)
             .map_err(|e| SyncError(format!("local backend: {e}")))?;
@@ -130,46 +135,6 @@ impl SyncBackend for LocalDirBackend {
         fs::rename(&tmp, &path)
             .map_err(|e| SyncError(format!("local backend: rename failed: {e}")))?;
         Ok(merged)
-    }
-}
-
-/// A best-effort cross-process lock via `O_EXCL` create, spinning briefly then proceeding (so a stale
-/// lock never wedges a run). Released (unlinked) on drop.
-struct LockFile {
-    path: PathBuf,
-    held: bool,
-}
-
-impl LockFile {
-    fn acquire(path: &Path) -> Self {
-        for _ in 0..200 {
-            match fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(path)
-            {
-                Ok(_) => {
-                    return Self {
-                        path: path.to_path_buf(),
-                        held: true,
-                    }
-                }
-                Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
-            }
-        }
-        // Proceed best-effort after ~2s rather than wedging (matches the degrade-not-fail posture).
-        Self {
-            path: path.to_path_buf(),
-            held: false,
-        }
-    }
-}
-
-impl Drop for LockFile {
-    fn drop(&mut self) {
-        if self.held {
-            let _ = fs::remove_file(&self.path);
-        }
     }
 }
 

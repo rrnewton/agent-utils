@@ -71,11 +71,14 @@ spelling of `-j` is `--max-cpus`; migrate the 0.13 `run --jobs` spelling to it.
 A hidden compatibility alias keeps existing 0.13 scripts working but is not
 public run vocabulary; differing simultaneous values conflict and are rejected.
 `sweep --jobs RANGE` remains the width-range option for a single-step speedup
-experiment. `sweep --target-time 10m` instead walks one node at a time
+experiment: a bare `--jobs 8` means the dense set `1..8`, not one run at width
+8. `sweep --target-time 10m` instead walks one node at a time
 in stable topological order and completes as many whole cumulative passes as
 fit the soft allowance. Pass 1 always finishes; later passes bisect the existing
 width gaps and rerun the retained anchor widths. `--step` and `--jobs` are
-optional limits in target mode. Because widths and passes deliberately rerun a
+optional limits in target mode. With no `--jobs`, pass 1 uses powers of two
+through the physical-core count and then the exact physical-core and logical-
+thread counts (for 158/316: `1,2,4,8,16,32,64,128,158,316`). Because widths and passes deliberately rerun a
 node in the same working tree, benchmark commands must be repeatable (or the
 caller must restore their inputs and outputs between invocations). A known step `cmdtype` supplies the runner's
 exact width arguments; a simple command receives them at the end, while a
@@ -102,9 +105,14 @@ either curve; its reference makespan explains allocation, while the live runtime
 may oversubscribe the outer CPU quota.
 
 Runs and sweeps auto-append raw CSV measurements to `./.dagrun/profiles/`
-relative to the current directory. `--perf-dir` overrides that location,
+relative to the current directory. Sweeps call this `--output-dir` (with
+`--perf-dir` retained as an alias); other commands use `--perf-dir`.
 `DAGRUN_PROFILE_DIR` is the secondary override, and `--no-profile` disables
-writes; the command always reports the files it appended. The raw store, not
+writes. These options do not redirect terminal or child output. The command
+always reports the artifacts it writes: whole-run and per-step CSVs, the
+successful sweep's refreshed `scaling_model_*.json` and standalone interactive
+`profile_report.html`, and optional time-series CSVs under `traces/`. Use
+`--report-html FILE` to relocate the report or `--no-report` to omit it. The raw store, not
 the authored DAG, is the source of learned scaling data. Every successful
 profiling-enabled sweep atomically refreshes a deterministic machine/container-specific
 `scaling_model_*.json` sidecar beside it; that cache can be rebuilt at any time.
@@ -113,9 +121,24 @@ For a view of parallelism within a step, `run` and `sweep` accept the opt-in
 cgroup-v2 containment and writes CPU/thread traces under
 `<profile-dir>/traces/<run_id>.csv`; those high-volume rows are diagnostic data,
 not independent trials consumed by the scaling estimator.
+The HTML report combines observations across commits, offers last-N-commit and
+environment/workload filters, sizes DAG nodes by CPU time, and drills into each
+step's speedup, memory, CPU-efficiency, and interval-parallelism plots.
+
+For deeper diagnosis, `sweep --perf-record [--perf-window DURATION]` and
+repeatable `--wprof-window DURATION` run separate profiler-instrumented trials
+at the economic sweet-spot width selected from the ordinary sweep. These
+opt-in trials are never fed back into the scaling model. In target-time mode
+they run after mandatory pass 1 and count against the allowance before another
+refinement pass starts. `--profiler-sudo` is the only way dagrun adds `sudo -n`;
+privilege escalation is never automatic. Private manifests and artifacts live
+under `<output-dir>/captures/`.
 Sweep rows and the sidecar carry a command-shape digest, and summaries retain
 separate reservoirs per digest, so identified old command data is never mixed
 into the current curve (blank pre-digest rows are a compatibility fallback only).
+Every dagrun distribution uses the same explicit append-only profile schema
+rather than serializing implementation-specific objects, so measurements remain
+portable across compatible installations and future modeling tools.
 Its economic plateau is the narrowest measured width within 10% of the best
 eligible wall time, normally excluding widths that
 consume more than 1.5x the baseline CPU seconds. CPA uses measured CPU seconds

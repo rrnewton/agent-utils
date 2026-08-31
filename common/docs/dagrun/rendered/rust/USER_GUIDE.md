@@ -653,19 +653,44 @@ a graph, so prefer this to a hand-rolled loop.
 ## Profiles, sweeps, and portable summaries
 
 Runs and sweeps append raw resource samples to `./.dagrun/profiles/` by default,
-relative to the process's current working directory. The write-location
-precedence is `--perf-dir DIR`, then `DAGRUN_PROFILE_DIR`, then the default.
-`--no-profile` disables writes. Reading is independent: use
+relative to the process's current working directory. For `sweep`, the primary
+spelling is `--output-dir DIR`; the older `--perf-dir DIR` spelling remains an
+alias. Other commands use `--perf-dir`. An explicit directory wins over
+`DAGRUN_PROFILE_DIR`, which wins over the default. These flags change only the
+artifact-store location: they do **not** redirect the sweep table, diagnostics,
+or child-process output. `--no-profile` disables profile-store writes. Reading is independent: use
 `--no-profile-feedback` when a plan must ignore an existing store. Every writer
-prints the exact CSV paths it appended, so profiling is never silent. The store
-is machine-local measurement data and should normally be ignored by source
-control.
+prints the paths it wrote, so profiling is never silent. A sweep's store can
+contain:
 
-The original one-step dense sweep remains available:
+- `<machine_id>.csv`, the whole-trial rows;
+- `step_profiles_<machine_id>_<container_class>.csv`, the raw per-step samples;
+- `scaling_model_<machine_id>_<container_class>.json`, the derived model refreshed
+  after a successful sweep; and
+- `profile_report.html`, a standalone interactive history explorer refreshed
+  after a successful sweep;
+- `traces/<run_id>.csv` when `--profile-timeseries` is enabled; and
+- private `captures/*/manifest.json` plus profiler artifacts when an expensive
+  `perf` or `wprof` capture is requested.
+
+Hidden `.locks/` directories contain persistent zero-byte advisory-lock files;
+they coordinate concurrent writers and are not profiling records.
+
+The store is machine-local measurement data and should normally be ignored by
+source control.
+
+### Single-step dense mode
+
+Without `--target-time`, both `--step` and `--jobs` are required:
 
 ```sh
 dagrun sweep --dag pipeline.yaml --step build.app --jobs 1..8
 ```
+
+Here `--jobs 8` means **eight distinct trials**, at widths 1 through 8; it does
+not mean one trial at width 8. `LO..HI` is likewise inclusive.
+
+### Graph-wide target-time mode
 
 For a graph-wide experiment, give a soft target allowance:
 
@@ -681,7 +706,8 @@ the entire pass is atomic and is never killed for crossing the target.
 
 Within each pass, nodes run **one at a time** in stable topological order, so a
 node's measurements are not contaminated by another DAG node running beside
-it. Pass 1 uses powers of two through the process-visible physical-core count,
+it. Dependencies choose this visitation order; they are not rerun beside the
+node being measured. Pass 1 uses powers of two through the process-visible physical-core count,
 then the exact physical-core and logical-thread counts. CPU affinity and Linux
 sysfs provide that topology, tightened by any effective cgroup CPU quota. On a
 158-core / 316-thread machine, the grid is therefore
@@ -692,7 +718,9 @@ model replication as well as denser coverage.
 
 In target mode, `--step TAG` optionally limits the experiment to one node and
 `--jobs` optionally replaces the automatic first grid. It accepts the established
-`LO..HI` and bare `N` forms, plus an explicit comma list such as `1,2,4,8`.
+`LO..HI` and bare `N` forms, plus comma/range lists such as `1,2,4,8` or
+`1,2,4..8`. A bare `--jobs 316` requests every width from 1 through 316; omit
+`--jobs` to get the sparse topology grid instead.
 `--repeat K` repeats every width within every pass: every sample is persisted,
 while the displayed width row keeps the fastest wall time. A target of zero is
 useful for a mandatory-pass-only smoke run. Intentionally omitted nodes are
@@ -700,6 +728,20 @@ reported without spawning; fixed/self-managed nodes are characterized only
 once as described above. A failed width aborts the sweep with a nonzero result;
 already-written raw rows remain, but the derived sidecar is refreshed only
 after a successful sweep.
+
+Every successful profiling-enabled sweep refreshes the standalone interactive
+report at `<output-dir>/profile_report.html`. Use `--report-html FILE` to place
+that HTML elsewhere, or `--no-report` to retain the CSV/model outputs without
+building the report. The page embeds its data and code, so it can be opened
+directly without a web server or network access. It provides:
+
+- a Graphviz-style DAG whose node area is proportional to CPU time;
+- click-through step detail;
+- speedup, memory-response, and CPU-work-efficiency scatterplots with fitted
+  per-width lines;
+- filters for machine/container, workload revision, all commits, or the latest
+  N commits; and
+- interval parallelism plots when time-series rows are present.
 
 A sweep deliberately invokes each resizable command many times in the same
 working tree. The command must therefore be repeatable: it should perform the
@@ -720,6 +762,24 @@ exact match exists for a step, rows carrying another non-empty digest are never
 mixed into that curve; before then, blank rows from stores created before digest
 tracking remain a compatibility fallback.
 
+### Portable profile compatibility
+
+The on-disk store uses one append-only, column-named CSV contract. Compatible
+dagrun installations can append data and rebuild estimates from rows written by
+one another. New columns are appended, unknown columns are preserved or ignored
+as appropriate, and missing cells remain “measurement unavailable” rather than
+being coerced to zero. New records use the same UTC timestamp, lowercase
+boolean, numeric, quoting, and LF line-ending conventions.
+
+This is an explicit wire format, not automatic serialization of in-memory
+objects. Each implementation converts its native measurement/model types to the
+shared schema and validates that contract with compatibility tests.
+Portable summary JSON and derived scaling-model JSON likewise use explicit,
+deterministic schemas. Profiler-capture manifests use the shared
+`dagrun-profile-capture-v1` JSON schema and explicitly mark their instrumented
+trials as excluded from the model. The raw per-step CSV remains the authoritative
+longitudinal dataset; `scaling_model_*.json` is a rebuildable cache.
+
 ### Parallelism over time
 
 Aggregate wall and CPU time can hide a sequential startup or shutdown phase.
@@ -728,7 +788,7 @@ step's cgroup CPU counters and descendant thread count during its lifetime:
 
 ```sh
 dagrun sweep --dag pipeline.yaml --step build.app --jobs 1..8 \
-  --profile-timeseries 250ms --perf-dir /tmp/dagrun-build-study
+  --profile-timeseries 250ms --output-dir /tmp/dagrun-build-study
 ```
 
 The interval accepts 50ms through 10s, including the ordinary `ms`, `s`, `m`,
@@ -747,6 +807,33 @@ These higher-volume rows are written separately as
 provenance follows the fixed trace columns. Traces diagnose phase behavior but
 are not treated as independent trials by the duration, memory, or scaling
 estimators; the aggregate `step_profiles_*.csv` rows remain their dataset.
+
+### Opt-in perf and wprof captures
+
+Expensive profilers run only when requested. Dagrun first completes the normal,
+uninstrumented sweep and fits the economic plateau from **that invocation's**
+samples. It then runs a fresh isolated copy of each selected resizable step at
+that width, so profiler overhead never contaminates the ordinary scaling model:
+
+```sh
+dagrun sweep --dag pipeline.yaml --target-time 10m \
+  --perf-record --perf-window 400ms \
+  --wprof-window 400ms --wprof-window 400ms
+```
+
+`--perf-window DURATION` implies `--perf-record`; without an explicit window,
+perf records the centered 80% of the expected step duration. Each repeated
+`--wprof-window` requests another independent centered capture. Short steps have
+their windows clipped so the profiler still avoids the first and last 10% when
+possible. `--profiler-sudo` explicitly prefixes profiler commands with
+`sudo -n`; privilege escalation is never automatic.
+
+In target-time mode these requested captures run immediately after mandatory
+pass 1. Their elapsed time counts against the overall allowance before dagrun
+decides whether to begin a refinement pass. A capture that has started is not
+killed merely because the allowance expires. Tool preflight or capture failure
+is loud and nonzero, while the private failure manifest and diagnostics remain
+available under `captures/`.
 
 ### Dataset versus model
 

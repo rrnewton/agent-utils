@@ -11,6 +11,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import cast
 
@@ -26,6 +27,16 @@ from dagrun.cli import (
 )
 from dagrun.model import DagConfig, Step
 from dagrun.protocols import CgroupManager, MetricsSink
+from dagrun.profile_capture import (
+    CaptureConfig,
+    CaptureKind,
+    CaptureManifest,
+    CaptureState,
+    CaptureWindow,
+    IsolatedTrialRequest,
+    IsolatedTrialResult,
+    ProfileCaptureError,
+)
 from dagrun.sweep import CpuTopology
 
 _DEMO = '{"steps": [{"group": "g", "job": "j", "cmd": "true", "deps": []}]}'
@@ -119,6 +130,13 @@ def test_run_help_has_no_rust_binary_mention() -> None:
     assert "rs/target" not in low
     assert "rust binary" not in low
 
+    _, top, _ = _capture_help(["--help"])
+    assert "rust" not in top.lower()
+    normalized = " ".join(top.split())
+    assert "sweep: --output-dir" in normalized
+    assert "--perf-dir as an alias" in normalized
+    assert "other commands: --perf-dir" in normalized
+
 
 @pytest.mark.parametrize("command", ["run", "pin-run"])
 def test_core_count_must_be_positive_usage_error(command: str) -> None:
@@ -147,6 +165,50 @@ def test_subcommand_help_exits_zero_and_lists_flags(sub: str, expected: str) -> 
     code, out, _ = _capture_help([sub, "--help"])
     assert code == 0
     assert expected in out
+
+
+def test_sweep_help_explains_modes_widths_and_profile_artifacts() -> None:
+    code, out, _ = _capture_help(["sweep", "--help"])
+    normalized = " ".join(out.lower().split())
+
+    assert code == 0
+    for phrase in (
+        "single-step dense mode",
+        "target-time graph mode",
+        "one at a time in stable topological order",
+        "pass 1 always completes",
+        "every started pass finishes",
+        "powers of two through the physical-core count",
+        "physical-core and logical-thread counts",
+        "1,2,4,8,16,32,64,128,158,316",
+        "integer midpoints",
+        "cmdtype, jobs_flag, and/or jobs_env",
+        "./.dagrun/profiles/",
+        "does not redirect terminal or child-process output",
+        "scaling_model_*.json",
+        "profile_report.html",
+        "traces/<run_id>.csv",
+        "persist every sample and show the fastest wall time",
+        "-vv streams child stdout/stderr",
+        "separate perf-record trial",
+        "not added to the scaling model",
+        "acknowledged fifo control interface",
+        "repeatable",
+        "typically 300ms..500ms",
+        "sudo -n",
+        "this sweep's own uninstrumented data",
+        "under captures/",
+    ):
+        assert phrase in normalized
+    assert "--output-dir" in out
+    assert "--report-html" in out
+    assert "--no-report" in out
+    assert "--perf-record" in out
+    assert "--perf-window" in out
+    assert "--wprof-window" in out
+    assert "--profiler-sudo" in out
+    assert "backward-compatible alias for --output-dir" in normalized
+    assert "--max-cpus" not in out
 
 
 def test_summary_top_help_describes_local_plan_and_single_input_merge() -> None:
@@ -422,7 +484,7 @@ def test_run_perf_dir_writes_csv() -> None:
         assert csvs, "expected at least one perf CSV to be written"
         assert any(p.stat().st_size > 0 for p in csvs)
         assert "perf CSVs written under" in err
-        # No stray flock sidecar left behind in the user's --perf-dir.
+        # Lock coordination stays in the hidden .locks directory, not beside data files.
         assert not list(perf.glob("*.lock"))
 
 
@@ -708,6 +770,103 @@ def test_sweep_usage_errors_precede_cgroup_and_profile_setup(
     assert "invalid --jobs" in err
 
 
+@pytest.mark.parametrize(
+    ("extra", "message"),
+    (
+        (["--no-profile", "--report-html", "report.html"], "cannot be combined with --no-profile"),
+        (["--no-report", "--report-html", "report.html"], "cannot be combined with --no-report"),
+        (["--output-dir", "one", "--perf-dir", "two"], "--output-dir and --perf-dir disagree"),
+    ),
+)
+def test_sweep_report_output_conflicts_are_usage_errors_before_setup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    extra: list[str],
+    message: str,
+) -> None:
+    dag = tmp_path / "dag.json"
+    dag.write_text(
+        '{"steps": [{"group": "g", "job": "j", "cmd": "true", '
+        '"jobs_flag": "--workers="}]}',
+        encoding="utf-8",
+    )
+
+    def unexpected(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("report/output validation must precede cgroup setup")
+
+    monkeypatch.setattr(cli, "_resolve_cgroup_manager", unexpected)
+    rc, _, err = _capture(
+        ["sweep", "--dag", str(dag), "--step", "g.j", "--jobs", "1", *extra]
+    )
+
+    assert rc == 2
+    assert message in err
+
+
+@pytest.mark.parametrize(
+    ("extra", "message"),
+    (
+        (
+            ["--wprof-window", "300ms", "--wprof-window", "400ms"],
+            "durations must match",
+        ),
+        (["--perf-window", "0"], "duration must be greater than zero"),
+        (["--profiler-sudo"], "requires --perf-record"),
+        (
+            ["--perf-record", "--no-profile"],
+            "profiler capture options cannot be combined with --no-profile",
+        ),
+    ),
+)
+def test_sweep_profiler_usage_errors_precede_cgroup_setup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    extra: list[str],
+    message: str,
+) -> None:
+    dag = tmp_path / "dag.json"
+    dag.write_text(
+        '{"steps": [{"group": "g", "job": "j", "cmd": "true", '
+        '"jobs_flag": "--workers="}]}',
+        encoding="utf-8",
+    )
+
+    def unexpected(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("profiler validation must precede cgroup setup")
+
+    monkeypatch.setattr(cli, "_resolve_cgroup_manager", unexpected)
+    rc, _, err = _capture(
+        ["sweep", "--dag", str(dag), "--step", "g.j", "--jobs", "1", *extra]
+    )
+
+    assert rc == 2
+    assert message in err
+
+
+def test_repeated_equivalent_wprof_windows_request_separate_trials() -> None:
+    ns = cli.build_parser().parse_args(
+        [
+            "sweep",
+            "--dag",
+            "dag.json",
+            "--step",
+            "g.j",
+            "--jobs",
+            "1..2",
+            "--wprof-window",
+            "400ms",
+            "--wprof-window",
+            "0.4s",
+        ]
+    )
+
+    request = cli._parse_profiler_request(ns)
+
+    assert request.wprof_windows == 2
+    assert request.wprof_window_s == pytest.approx(0.4)
+    assert not request.capture_perf
+
+
 def test_legacy_sweep_still_requires_step_and_jobs() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         dag = _demo_path(tmp)
@@ -853,6 +1012,393 @@ def test_target_sweep_starts_a_second_cumulative_pass_and_finishes_it(
     assert err == ""
 
 
+def test_legacy_profiler_capture_uses_current_sweep_sweet_spot_and_no_metrics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dag = tmp_path / "dag.json"
+    dag.write_text(
+        '{"steps": [{"group": "g", "job": "j", "cmd": "echo build", '
+        '"cmdtype": "generic-with-flag", "jobs_flag": "--workers="}]}',
+        encoding="utf-8",
+    )
+    ordinary_widths: list[int] = []
+    instrumented: list[tuple[int, str, MetricsSink | None, float | None]] = []
+
+    def fake_run(
+        step: Step,
+        cfg: DagConfig,
+        inner_jobs: int,
+        cgroups: CgroupManager | None,
+        metrics: MetricsSink | None,
+        verbosity: int,
+        *,
+        vary_width: bool = True,
+        profile_timeseries_interval_s: float | None = None,
+    ) -> cli._SweepMeasure:
+        del cfg, cgroups, verbosity, vary_width
+        if metrics is None:
+            instrumented.append(
+                (inner_jobs, step.cmd, metrics, profile_timeseries_interval_s)
+            )
+        else:
+            ordinary_widths.append(inner_jobs)
+        walls = {1: 10.0, 2: 5.0, 3: 4.8}
+        return cli._SweepMeasure(
+            walls[inner_jobs], 9.0, 1.0, 1024, True, returncode=0
+        )
+
+    def fake_capture(
+        selection: object,
+        config: CaptureConfig,
+        run_trial: object,
+    ) -> CaptureManifest:
+        from dagrun.profile_capture import RunIsolatedTrial, SweetSpotSelection
+
+        assert isinstance(selection, SweetSpotSelection)
+        assert selection.inner_jobs == 2
+        assert selection.expected_wall_s == pytest.approx(5.0)
+        assert selection.source == "scaling-model-economic-plateau"
+        assert config.capture_perf
+        assert config.perf_window_s == pytest.approx(0.02)
+        assert config.sudo == ("sudo", "-n")
+        callback = cast(RunIsolatedTrial, run_trial)
+        result = callback(
+            IsolatedTrialRequest(
+                trial_id="perf-001",
+                step="g.j",
+                inner_jobs=2,
+                kind=CaptureKind.PERF,
+                output_dir=tmp_path,
+                expected_wall_s=5.0,
+                window=CaptureWindow(0.02, 2.49, 0.02, False),
+                argv_prefix=("sudo", "-n", "fake-perf", "record", "--"),
+            )
+        )
+        assert isinstance(result, IsolatedTrialResult)
+        assert result.ok
+        return CaptureManifest(
+            path=tmp_path / "manifest.json",
+            capture_id="capture-test",
+            state=CaptureState.COMPLETE,
+            created_at="2026-01-01T00:00:00Z",
+            finished_at="2026-01-01T00:00:01Z",
+            selection=selection,
+            preflight=(),
+            trials=(),
+            errors=(),
+        )
+
+    monkeypatch.setattr(cli, "_run_single_step", fake_run)
+    monkeypatch.setattr(cli, "capture_at_sweet_spot", fake_capture)
+    monkeypatch.setattr(cli, "_resolve_cgroup_manager", lambda *_args, **_kwargs: (None, 0))
+    monkeypatch.setattr(cli, "_report_profile_written", lambda *_args: None)
+    monkeypatch.setattr(cli, "_refresh_scaling_model", lambda *_args: None)
+    monkeypatch.setattr(cli, "_refresh_profile_report", lambda *_args: None)
+
+    rc, out, err = _capture(
+        [
+            "sweep",
+            "--dag",
+            str(dag),
+            "--step",
+            "g.j",
+            "--jobs",
+            "1..3",
+            "--output-dir",
+            str(tmp_path / "profiles"),
+            "--perf-window",
+            "20ms",
+            "--profiler-sudo",
+        ]
+    )
+
+    assert rc == 0, err
+    assert ordinary_widths == [1, 2, 3]
+    assert len(instrumented) == 1
+    width, command, metrics, trace_interval = instrumented[0]
+    assert width == 2
+    assert metrics is None
+    assert trace_interval is None
+    assert "sudo -n fake-perf record --" in command
+    assert "guest-launch-ready.fifo" in command
+    assert "guest-launch-release.fifo" in command
+    assert command.index("fake-perf record --") < command.index("guest-launch-ready.fifo")
+    assert "echo build --workers=2" in command
+    assert "sweet-spot width 2" in out
+    assert f"profiler capture manifest: {tmp_path / 'manifest.json'}" in out
+
+
+def test_single_step_measure_preserves_exact_child_returncode() -> None:
+    step = Step("g", "status", "", "exit 37")
+    measure = cli._run_single_step(
+        step,
+        DagConfig(steps=(step,)),
+        1,
+        None,
+        None,
+        0,
+        vary_width=False,
+    )
+
+    assert not measure.ok
+    assert measure.returncode == 37
+
+
+def test_target_profiler_capture_runs_after_pass_one_and_consumes_target_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dag = tmp_path / "dag.json"
+    dag.write_text(
+        '{"steps": [{"group": "g", "job": "j", "cmd": "true", '
+        '"jobs_flag": "--workers="}]}',
+        encoding="utf-8",
+    )
+    clock = [0.0]
+    widths: list[int] = []
+    captures: list[tuple[str, tuple[int, ...]]] = []
+
+    def fake_run(
+        step: Step,
+        cfg: DagConfig,
+        inner_jobs: int,
+        cgroups: CgroupManager | None,
+        metrics: MetricsSink | None,
+        verbosity: int,
+        *,
+        vary_width: bool = True,
+        profile_timeseries_interval_s: float | None = None,
+    ) -> cli._SweepMeasure:
+        del step, cfg, cgroups, metrics, verbosity, vary_width, profile_timeseries_interval_s
+        widths.append(inner_jobs)
+        clock[0] += 0.1
+        return cli._SweepMeasure(1.0, 1.0, 0.0, None, True)
+
+    def fake_captures(
+        cfg: DagConfig,
+        step_samples: Sequence[
+            tuple[Step, Mapping[int, Sequence[cli._SweepMeasure]]]
+        ],
+        config: CaptureConfig,
+        cgroups: CgroupManager | None,
+        sweep_git_sha: str,
+        verbosity: int,
+    ) -> int:
+        del cfg, cgroups, sweep_git_sha, verbosity
+        assert config.capture_perf
+        assert len(step_samples) == 1
+        step, samples = step_samples[0]
+        captures.append((step.tag, tuple(samples)))
+        clock[0] += 0.6
+        return 0
+
+    monkeypatch.setattr(cli, "_run_single_step", fake_run)
+    monkeypatch.setattr(cli, "_run_profiler_captures", fake_captures)
+    monkeypatch.setattr("dagrun.cli.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        cli,
+        "_effective_sweep_topology",
+        lambda: CpuTopology(tuple(range(4)), physical_core_count=2),
+    )
+    monkeypatch.setattr(cli, "_resolve_cgroup_manager", lambda *_args, **_kwargs: (None, 0))
+    monkeypatch.setattr(cli, "_report_profile_written", lambda *_args: None)
+    monkeypatch.setattr(cli, "_refresh_scaling_model", lambda *_args: None)
+    monkeypatch.setattr(cli, "_refresh_profile_report", lambda *_args: None)
+
+    rc, out, err = _capture(
+        [
+            "sweep",
+            "--dag",
+            str(dag),
+            "--target-time",
+            "0.5",
+            "--jobs",
+            "1,4",
+            "--output-dir",
+            str(tmp_path / "profiles"),
+            "--perf-record",
+        ]
+    )
+
+    assert rc == 0, err
+    assert widths == [1, 4]
+    assert captures == [("g.j", (1, 4))]
+    assert "target-time sweep complete: 1 pass(es), 2 sample(s)" in out
+    assert "elapsed 0.800s, target 0.500s, overrun 0.300s" in out
+
+
+def test_target_profiler_capture_includes_a_fixed_width_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dag = tmp_path / "dag.json"
+    dag.write_text(
+        '{"steps": [{"group": "g", "job": "fixed", "cmd": "true", '
+        '"jobs_flag": "", "hint": {"preferred_inner_jobs": 2}}]}',
+        encoding="utf-8",
+    )
+    captured: list[tuple[str, tuple[int, ...]]] = []
+
+    def fake_run(
+        step: Step,
+        cfg: DagConfig,
+        inner_jobs: int,
+        cgroups: CgroupManager | None,
+        metrics: MetricsSink | None,
+        verbosity: int,
+        *,
+        vary_width: bool = True,
+        profile_timeseries_interval_s: float | None = None,
+    ) -> cli._SweepMeasure:
+        del step, cfg, cgroups, metrics, verbosity, profile_timeseries_interval_s
+        assert not vary_width
+        assert inner_jobs == 2
+        return cli._SweepMeasure(1.0, 0.8, 0.1, 1024, True)
+
+    def fake_captures(
+        cfg: DagConfig,
+        step_samples: Sequence[
+            tuple[Step, Mapping[int, Sequence[cli._SweepMeasure]]]
+        ],
+        config: CaptureConfig,
+        cgroups: CgroupManager | None,
+        sweep_git_sha: str,
+        verbosity: int,
+    ) -> int:
+        del cfg, config, cgroups, sweep_git_sha, verbosity
+        step, samples = step_samples[0]
+        captured.append((step.tag, tuple(samples)))
+        return 0
+
+    monkeypatch.setattr(cli, "_run_single_step", fake_run)
+    monkeypatch.setattr(cli, "_run_profiler_captures", fake_captures)
+    monkeypatch.setattr(cli, "_resolve_cgroup_manager", lambda *_args, **_kwargs: (None, 0))
+    monkeypatch.setattr(cli, "_report_profile_written", lambda *_args: None)
+    monkeypatch.setattr(cli, "_refresh_scaling_model", lambda *_args: None)
+    monkeypatch.setattr(cli, "_refresh_profile_report", lambda *_args: None)
+
+    rc, _, err = _capture(
+        [
+            "sweep",
+            "--dag",
+            str(dag),
+            "--target-time",
+            "0",
+            "--output-dir",
+            str(tmp_path / "profiles"),
+            "--perf-record",
+        ]
+    )
+
+    assert rc == 0, err
+    assert captured == [("g.fixed", (2,))]
+
+
+def test_profiler_failure_is_loud_nonzero_and_names_retained_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    step = Step("g", "j", "", "true", jobs_flag="--workers=")
+    cfg = DagConfig(steps=(step,))
+    manifest_path = tmp_path / "captures" / "failed" / "manifest.json"
+    manifest_path.parent.mkdir(parents=True)
+    manifest_path.write_text("{}\n", encoding="utf-8")
+
+    def fail_capture(
+        selection: object,
+        config: CaptureConfig,
+        run_trial: object,
+    ) -> CaptureManifest:
+        from dagrun.profile_capture import SweetSpotSelection
+
+        del config, run_trial
+        assert isinstance(selection, SweetSpotSelection)
+        manifest = CaptureManifest(
+            path=manifest_path,
+            capture_id="failed",
+            state=CaptureState.FAILED,
+            created_at="2026-01-01T00:00:00Z",
+            finished_at="2026-01-01T00:00:01Z",
+            selection=selection,
+            preflight=(),
+            trials=(),
+            errors=("wprof denied",),
+        )
+        raise ProfileCaptureError("wprof denied", manifest)
+
+    monkeypatch.setattr(cli, "capture_at_sweet_spot", fail_capture)
+    code = cli._run_profiler_captures(
+        cfg,
+        ((step, {1: (cli._SweepMeasure(1.0, 1.0, 0.0, None, True),)}),),
+        CaptureConfig(output_dir=tmp_path, capture_perf=True),
+        None,
+        "deadbeef",
+        0,
+    )
+
+    captured = capsys.readouterr()
+    assert code == cli._SWEEP_CAPTURE_FAILURE
+    assert "profiler capture FAILED" in captured.err
+    assert str(manifest_path) in captured.err
+    assert manifest_path.exists()
+
+
+def test_capture_failure_still_refreshes_model_and_report_before_public_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dag = tmp_path / "dag.json"
+    dag.write_text(
+        '{"steps": [{"group": "g", "job": "j", "cmd": "true", '
+        '"jobs_flag": "--workers="}]}',
+        encoding="utf-8",
+    )
+    store = tmp_path / "profiles"
+    manifest = store / "captures" / "failed" / "manifest.json"
+    refreshed: list[str] = []
+
+    def failed_sweep(*args: object, **kwargs: object) -> int:
+        del args, kwargs
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text("{}\n", encoding="utf-8")
+        return cli._SWEEP_CAPTURE_FAILURE
+
+    def refresh_model(perf_dir: str, cfg: DagConfig) -> None:
+        del cfg
+        assert Path(perf_dir) == store
+        assert manifest.exists()
+        refreshed.append("model")
+
+    def refresh_report(
+        perf_dir: str, cfg: DagConfig, dag_label: str, report_html: str | None
+    ) -> bool:
+        del cfg, dag_label, report_html
+        assert Path(perf_dir) == store
+        assert manifest.exists()
+        refreshed.append("report")
+        return True
+
+    monkeypatch.setattr(cli, "_run_legacy_sweep", failed_sweep)
+    monkeypatch.setattr(cli, "_resolve_cgroup_manager", lambda *_args, **_kwargs: (None, 0))
+    monkeypatch.setattr(cli, "_report_profile_written", lambda *_args: None)
+    monkeypatch.setattr(cli, "_refresh_scaling_model", refresh_model)
+    monkeypatch.setattr(cli, "_refresh_profile_report", refresh_report)
+
+    rc, _, _ = _capture(
+        [
+            "sweep",
+            "--dag",
+            str(dag),
+            "--step",
+            "g.j",
+            "--jobs",
+            "1..2",
+            "--output-dir",
+            str(store),
+            "--perf-record",
+        ]
+    )
+
+    assert rc == 1
+    assert refreshed == ["model", "report"]
+
+
 def test_target_sweep_characterizes_a_fixed_node_only_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -973,6 +1519,136 @@ def test_target_sweep_persists_pass_metadata(tmp_path: Path) -> None:
     assert saved_model["schema"] == 2
     assert saved_model["steps"][0]["step"] == "g.j"
     assert saved_model["steps"][0]["workload_digest"] == rows[0]["workload_digest"]
+    report = store / "profile_report.html"
+    assert report.is_file()
+    assert 'id="dagrun-report-data"' in report.read_text(encoding="utf-8")
+    assert f"interactive profile report refreshed at {report}" in err
+
+
+def test_sweep_output_dir_report_override_and_opt_out(tmp_path: Path) -> None:
+    dag = tmp_path / "dag.json"
+    dag.write_text(
+        '{"steps": [{"group": "g", "job": "j", "cmd": "true", '
+        '"jobs_flag": "--workers="}]}',
+        encoding="utf-8",
+    )
+    store = tmp_path / "artifacts"
+    custom = tmp_path / "reports" / "latest.html"
+
+    rc, _, err = _capture(
+        [
+            "sweep",
+            "--dag",
+            str(dag),
+            "--step",
+            "g.j",
+            "--jobs",
+            "1",
+            "--output-dir",
+            str(store),
+            "--report-html",
+            str(custom),
+            "--unsafe-no-cgroups",
+        ]
+    )
+    assert rc == 0, err
+    assert custom.is_file()
+    assert not (store / "profile_report.html").exists()
+    assert "profile artifacts written under" in err
+    assert f"interactive profile report refreshed at {custom}" in err
+
+    no_report_store = tmp_path / "no-report"
+    rc, _, err = _capture(
+        [
+            "sweep",
+            "--dag",
+            str(dag),
+            "--step",
+            "g.j",
+            "--jobs",
+            "1",
+            "--output-dir",
+            str(no_report_store),
+            "--no-report",
+            "--unsafe-no-cgroups",
+        ]
+    )
+    assert rc == 0, err
+    assert next(no_report_store.glob("step_profiles_*.csv")).is_file()
+    assert not (no_report_store / "profile_report.html").exists()
+    assert "interactive profile report refreshed" not in err
+
+
+def test_explicit_report_collision_fails_after_preserving_measurements(
+    tmp_path: Path,
+) -> None:
+    dag = tmp_path / "dag.json"
+    dag.write_text(
+        '{"steps": [{"group": "g", "job": "j", "cmd": "true", '
+        '"jobs_flag": "--workers="}]}',
+        encoding="utf-8",
+    )
+    original = dag.read_bytes()
+    store = tmp_path / "artifacts"
+
+    rc, _, err = _capture(
+        [
+            "sweep",
+            "--dag",
+            str(dag),
+            "--step",
+            "g.j",
+            "--jobs",
+            "1",
+            "--output-dir",
+            str(store),
+            "--report-html",
+            str(dag),
+            "--unsafe-no-cgroups",
+        ]
+    )
+
+    assert rc == 1
+    assert dag.read_bytes() == original
+    assert next(store.glob("step_profiles_*.csv")).is_file()
+    assert "WARNING could not refresh interactive profile report" in err
+    assert "report output resolves to DAG input" in err
+    assert "interactive profile report refreshed at" not in err
+
+
+def test_default_report_collision_warns_without_failing_sweep(tmp_path: Path) -> None:
+    dag = tmp_path / "dag.json"
+    dag.write_text(
+        '{"steps": [{"group": "g", "job": "j", "cmd": "true", '
+        '"jobs_flag": "--workers="}]}',
+        encoding="utf-8",
+    )
+    store = tmp_path / "artifacts"
+    store.mkdir()
+    report = store / "profile_report.html"
+    report.write_bytes(b"do not overwrite")
+
+    rc, _, err = _capture(
+        [
+            "sweep",
+            "--dag",
+            str(dag),
+            "--step",
+            "g.j",
+            "--jobs",
+            "1",
+            "--output-dir",
+            str(store),
+            "--unsafe-no-cgroups",
+        ]
+    )
+
+    assert rc == 0
+    assert report.read_bytes() == b"do not overwrite"
+    assert next(store.glob("step_profiles_*.csv")).is_file()
+    assert "WARNING could not refresh interactive profile report" in err
+    assert "without dagrun report marker" in err
+    assert "interactive profile report refreshed at" not in err
 
 
 def test_target_sweep_refines_sparse_explicit_widths(

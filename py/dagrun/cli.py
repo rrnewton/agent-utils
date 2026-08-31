@@ -25,6 +25,7 @@ import math
 import os
 import resource
 import shlex
+import statistics
 import subprocess
 import sys
 import time
@@ -40,6 +41,7 @@ from dagrun import sync as synclib
 from dagrun.estimates import (
     Plan,
     Planner,
+    Sample,
     apply_plan_to_config,
     build_plan,
     feedback_identity,
@@ -47,6 +49,7 @@ from dagrun.estimates import (
     load_step_speedups,
     plan_to_json,
     plan_to_text,
+    step_speedups_from_buckets,
     write_scaling_model,
 )
 from dagrun.memory_feedback import (
@@ -71,13 +74,26 @@ from dagrun.model import (
     DEFAULT_SMALL_MEM_CAP_BYTES,
     DEFAULT_STEP_TIMEOUT,
     JOBS_ENV_ENV,
+    CmdType,
     DagConfig,
     ResourceHint,
     Step,
+    cmdtype_env_with_inner_jobs,
+    command_with_inner_jobs,
     effective_cpu_count,
+    env_with_inner_jobs,
     resolve_cpu_timeout_multiplier,
     step_classification,
     step_width_is_resizable,
+)
+from dagrun.profile_capture import (
+    CaptureConfig,
+    IsolatedTrialRequest,
+    IsolatedTrialResult,
+    ProfileCaptureError,
+    SweetSpotSelection,
+    capture_at_sweet_spot,
+    select_sweet_spot,
 )
 from dagrun.profile_enrich import container_core_budget
 from dagrun.protocols import CgroupManager, MetricsSink, RunWindow, StepOutcome
@@ -215,7 +231,7 @@ def _epilog(c: Palette) -> str:
         f"  {ex(f'{PROG} ascii --dag dag.json')}             {c.dim('# quick ASCII view of the graph')}\n"
         f"  {ex(f'{PROG} dot --dag dag.json | dot -Tsvg -o dag.svg')}\n\n"
         f"{c.dim('Profiling data auto-logs to ./.dagrun/profiles/ by default')}\n"
-        f"{c.dim(f'(override with --perf-dir or ${PROFILE_DIR_ENV}; disable with --no-profile).')}"
+        f"{c.dim(f'(sweep: --output-dir, with --perf-dir as an alias; other commands: --perf-dir; ${PROFILE_DIR_ENV} also overrides; --no-profile disables).')}"
     )
 
 
@@ -687,8 +703,35 @@ def build_parser() -> argparse.ArgumentParser:
     sweep_p = sub.add_parser(
         "sweep",
         allow_abbrev=False,
-        help="profile parallel scaling for one step or a whole DAG",
-        description="profile parallel scaling for one step or a whole DAG",
+        formatter_class=_ColorHelp,
+        help="measure parallel scaling for one step or a whole DAG",
+        description="""Measure each selected step in isolation across inner-worker widths.
+
+Two modes:
+  Single-step dense mode (no --target-time): --step and --jobs are required.
+  Target-time graph mode: visit selected nodes one at a time in stable topological
+  order. Pass 1 always completes. A later pass starts only while time remains,
+  and every started pass finishes even if that overruns the allowance.
+
+Dependencies determine the visitation order; they are not run beside the measured
+step. Each width is delivered through cmdtype, jobs_flag, and/or jobs_env.
+
+Automatic widths (target-time mode with no --jobs):
+  Pass 1 uses powers of two through the physical-core count, then the exact
+  physical-core and logical-thread counts, limited by CPU affinity/cgroup quota.
+  Example: 158 physical cores / 316 threads ->
+  1,2,4,8,16,32,64,128,158,316.
+  Later passes add integer midpoints of remaining gaps (for example, 48 between
+  32 and 64) and rerun every width in the cumulative grid.
+
+Output:
+  Progress and speedup tables remain on the terminal. Profiling artifacts append
+  to ./.dagrun/profiles/ by default. --output-dir changes only that artifact-store
+  location; it does not redirect terminal or child-process output. A successful
+  profiled sweep also refreshes profile_report.html there. Opt-in perf/wprof
+  captures first select each measured step's sweet spot from this sweep's own
+  uninstrumented data, then run separate trials under captures/; those trials
+  never feed back into the scaling model.""",
     )
     sweep_p.add_argument(
         "--dag",
@@ -699,61 +742,117 @@ def build_parser() -> argparse.ArgumentParser:
     sweep_p.add_argument(
         "--step",
         metavar="TAG",
-        help="limit the sweep to one 'group.job' step (legacy mode requires this)",
+        help="measure only this 'group.job' step; required without --target-time, optional otherwise",
     )
     sweep_p.add_argument(
         "--jobs",
-        metavar="RANGE",
-        help="explicit inner-parallelism widths: 'LO..HI' (e.g. 1..8) or a bare 'N' meaning "
-        "1..N. Target mode also accepts comma lists and refines their gaps; omitting it selects "
-        "an automatic powers-of-two/physical/logical sweep. Without --target-time this and "
-        "--step are required. Each width is delivered through cmdtype, jobs_flag, and/or jobs_env.",
+        metavar="WIDTHS",
+        help="initial inner-parallelism widths: bare N means every width 1..N; LO..HI is an "
+        "inclusive dense range. Target mode also accepts sparse comma/range lists such as "
+        "1,2,4,8 or 1,2,4..8. Omit only in target mode to use the topology grid described above.",
     )
     sweep_p.add_argument(
         "--target-time",
         metavar="DURATION",
         default=None,
-        help="soft wall-time target for a multi-pass sweep. Pass 1 always completes; each later "
-        "pass starts only while time remains, and a started pass is never killed.",
+        help="select graph-wide multi-pass mode with this soft wall-time allowance (bare seconds "
+        "or ms/s/m/h suffix). Pass 1 and every started pass finish; this is not a timeout.",
     )
     sweep_p.add_argument(
         "--repeat",
         type=int,
         default=1,
         metavar="K",
-        help="run each width K times and keep the fastest wall time (default: 1)",
+        help="run every width K times; persist every sample and show the fastest wall time "
+        "in the terminal table (default: 1)",
+    )
+    sweep_p.add_argument(
+        "--output-dir",
+        metavar="DIR",
+        default=None,
+        help="artifact directory: append profile CSVs, refresh scaling_model_*.json and the "
+        "interactive profile_report.html, place time-series traces under DIR/traces/, and place "
+        "perf/wprof sessions under DIR/captures/. "
+        f"Overrides ${PROFILE_DIR_ENV} and ./.dagrun/profiles/; does not redirect terminal output.",
     )
     sweep_p.add_argument(
         "--perf-dir",
         metavar="DIR",
         default=None,
-        help="append sweep profile CSVs into DIR (overrides the default profile store and "
-        f"${PROFILE_DIR_ENV})",
+        help="backward-compatible alias for --output-dir",
     )
     sweep_p.add_argument(
         "--no-profile",
         action="store_true",
-        help="disable the default auto-logging profile store for this sweep",
+        help="write no local profile CSVs, scaling-model sidecar, interactive HTML report, "
+        "time-series trace, or profiler capture",
+    )
+    sweep_p.add_argument(
+        "--report-html",
+        metavar="FILE",
+        default=None,
+        help="write the interactive historical profile report to FILE after a successful sweep "
+        "(default: <profile-dir>/profile_report.html); failure at an explicitly requested FILE "
+        "makes the sweep unsuccessful after preserving its measurements",
+    )
+    sweep_p.add_argument(
+        "--no-report",
+        action="store_true",
+        help="keep profile CSV/model writes but do not refresh the interactive HTML report",
     )
     sweep_p.add_argument(
         "--profile-timeseries",
         metavar="DURATION",
         default=None,
-        help="OPT-IN: sample each boxed sweep trial's cgroup CPU use over time at this interval "
-        "(50ms..10s) and write a trace CSV under the profile directory",
+        help="OPT-IN: sample each trial's cgroup CPU/thread activity every DURATION "
+        "(50ms..10s); requires active cgroup-v2 and writes traces/<run_id>.csv in the profile store",
+    )
+    sweep_p.add_argument(
+        "--perf-record",
+        action="store_true",
+        help="OPT-IN: after the uninstrumented sweep selects a step's sweet-spot width, run one "
+        "separate perf-record trial there; this trial is not added to the scaling model",
+    )
+    sweep_p.add_argument(
+        "--perf-window",
+        metavar="DURATION",
+        default=None,
+        help="record only this centered hot interval through perf's acknowledged FIFO control "
+        "interface (implies --perf-record; bare seconds or ms/s/m/h suffix)",
+    )
+    sweep_p.add_argument(
+        "--wprof-window",
+        metavar="DURATION",
+        action="append",
+        default=None,
+        help="OPT-IN, repeatable: run one separate sweet-spot trial with a centered wprof window "
+        "of this duration (typically 300ms..500ms); repeated durations must currently match",
+    )
+    sweep_p.add_argument(
+        "--profiler-sudo",
+        action="store_true",
+        help="run requested perf/wprof tools through explicit non-interactive 'sudo -n'; dagrun "
+        "never escalates profiler privileges unless this flag is present",
     )
     sweep_p.add_argument(
         "--allow-cgroup-failure",
         action="store_true",
-        help="run UNBOXED (with a warning) instead of erroring when cgroup-v2 boxing is unavailable",
+        help="run UNBOXED with a warning when cgroup-v2 is unavailable; cgroup CPU, memory, "
+        "throttling, and time-series evidence will be unavailable",
     )
     sweep_p.add_argument(
         "--unsafe-no-cgroups",
         action="store_true",
-        help="DELIBERATELY skip cgroup boxing entirely (logged loudly); an explicit reviewable "
-        "opt-out, distinct from --allow-cgroup-failure's capability fallback",
+        help="DELIBERATELY run unboxed even when cgroup-v2 is available; profiling is less complete "
+        "and --profile-timeseries cannot be used",
     )
-    sweep_p.add_argument("-v", dest="verbosity", action="count", default=0, help="-v: stream child output")
+    sweep_p.add_argument(
+        "-v",
+        dest="verbosity",
+        action="count",
+        default=0,
+        help="-v shows each trial's captured final line; -vv streams child stdout/stderr",
+    )
 
     plan_p = sub.add_parser(
         "plan",
@@ -1014,8 +1113,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser(
         "capabilities",
         allow_abbrev=False,
-        help="print the machine-readable enforcement-capability manifest (cross-checked vs Rust)",
-        description="print the machine-readable enforcement-capability manifest (cross-checked vs Rust)",
+        help="print the machine-readable enforcement-capability manifest",
+        description="print the machine-readable enforcement-capability manifest",
     )
     return parser
 
@@ -1401,7 +1500,9 @@ def _report_profile_written(perf_dir: str, source: str) -> None:
     if not written:
         print(f"{PROG}: WARNING no profile CSVs were written under {perf_dir}", file=sys.stderr)
         return
-    if source == "--perf-dir":
+    if source == "--output-dir":
+        print(f"{PROG}: profile artifacts written under {perf_dir}:", file=sys.stderr)
+    elif source == "--perf-dir":
         print(f"{PROG}: perf CSVs written under {perf_dir}:", file=sys.stderr)
     else:
         origin = "default profile store" if source == "default" else f"profile store ({source})"
@@ -1445,6 +1546,46 @@ def _refresh_scaling_model(perf_dir: str, cfg: DagConfig) -> None:
         "(rebuildable from the profile CSVs)",
         file=sys.stderr,
     )
+
+
+def _refresh_profile_report(
+    perf_dir: str, cfg: DagConfig, dag_label: str, report_html: str | None
+) -> bool:
+    """Refresh the standalone history explorer from the authoritative profile store."""
+    from dagrun.profile_report import (
+        PROFILE_REPORT_FILENAME,
+        ReportDataError,
+        generate_report_for_config,
+    )
+
+    output_path = (
+        Path(report_html) if report_html is not None else Path(perf_dir) / PROFILE_REPORT_FILENAME
+    )
+    try:
+        data = generate_report_for_config(
+            Path(perf_dir),
+            cfg,
+            output_path,
+            dag_label=dag_label,
+            title="dagrun profile history",
+        )
+    except (OSError, UnicodeError, ReportDataError) as exc:
+        print(
+            f"{PROG}: WARNING could not refresh interactive profile report at "
+            f"{output_path}: {exc}",
+            file=sys.stderr,
+        )
+        return False
+    records = data.get("records")
+    traces = data.get("traces")
+    record_count = len(records) if isinstance(records, list) else 0
+    trace_count = len(traces) if isinstance(traces, list) else 0
+    print(
+        f"{PROG}: interactive profile report refreshed at {output_path} "
+        f"({record_count} aggregate sample(s), {trace_count} time-series run(s))",
+        file=sys.stderr,
+    )
+    return True
 
 
 # --------------------------------------------------------------------------- selected steps
@@ -1829,6 +1970,9 @@ def _print_profile_table(rows: Sequence[Mapping[str, object]], c: Palette) -> No
 
 
 # --------------------------------------------------------------------------- sweep
+_SWEEP_CAPTURE_FAILURE = 5  # internal only; _cmd_sweep maps it to the public failure status 1
+
+
 @dataclasses.dataclass(frozen=True)
 class _SweepMeasure:
     """One measured single-step run at a given inner-parallelism width."""
@@ -1838,6 +1982,86 @@ class _SweepMeasure:
     sys_s: float
     rss_hwm: int | None
     ok: bool
+    returncode: int | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class _ProfilerRequest:
+    """Validated profiler flags, before the profile-store path is resolved."""
+
+    capture_perf: bool
+    perf_window_s: float | None
+    wprof_windows: int
+    wprof_window_s: float
+    sudo: tuple[str, ...]
+
+    @property
+    def enabled(self) -> bool:
+        return self.capture_perf or self.wprof_windows > 0
+
+    def config(self, output_dir: str) -> CaptureConfig:
+        return CaptureConfig(
+            output_dir=Path(output_dir),
+            capture_perf=self.capture_perf,
+            perf_window_s=self.perf_window_s,
+            wprof_windows=self.wprof_windows,
+            wprof_window_s=self.wprof_window_s,
+            sudo=self.sudo,
+        )
+
+
+def _parse_profiler_duration(raw: str, option: str) -> float:
+    try:
+        seconds = parse_target_duration(raw)
+    except ValueError:
+        raise ValueError(
+            f"invalid {option} {raw!r}: expected a positive duration with an optional "
+            "ms/s/m/h suffix"
+        ) from None
+    if seconds <= 0.0:
+        raise ValueError(f"invalid {option} {raw!r}: duration must be greater than zero")
+    return seconds
+
+
+def _parse_profiler_request(ns: argparse.Namespace) -> _ProfilerRequest:
+    perf_value = getattr(ns, "perf_window", None)
+    perf_raw = perf_value if isinstance(perf_value, str) else None
+    perf_window_s = (
+        None if perf_raw is None else _parse_profiler_duration(perf_raw, "--perf-window")
+    )
+
+    values = getattr(ns, "wprof_window", [])
+    wprof_raws: list[str] = []
+    if isinstance(values, list):
+        for value in values:
+            if not isinstance(value, str):
+                raise ValueError("invalid --wprof-window value")
+            wprof_raws.append(value)
+    elif values:
+        raise ValueError("invalid --wprof-window value")
+    wprof_durations = [
+        _parse_profiler_duration(raw, "--wprof-window") for raw in wprof_raws
+    ]
+    if wprof_durations and any(
+        not math.isclose(value, wprof_durations[0], rel_tol=0.0, abs_tol=1e-12)
+        for value in wprof_durations[1:]
+    ):
+        raise ValueError(
+            "repeated --wprof-window durations must match; each occurrence requests another "
+            "separate trial"
+        )
+
+    capture_perf = bool(getattr(ns, "perf_record", False)) or perf_window_s is not None
+    profiler_sudo = bool(getattr(ns, "profiler_sudo", False))
+    if profiler_sudo and not capture_perf and not wprof_durations:
+        raise ValueError("--profiler-sudo requires --perf-record, --perf-window, or --wprof-window")
+    return _ProfilerRequest(
+        capture_perf=capture_perf,
+        perf_window_s=perf_window_s,
+        wprof_windows=len(wprof_durations),
+        wprof_window_s=wprof_durations[0] if wprof_durations else 0.4,
+        sudo=("sudo", "-n") if profiler_sudo else (),
+    )
 
 
 class _SweepMetricsSink:
@@ -1983,7 +2207,15 @@ def _run_single_step(
         peak = row.get("peak_bytes")
         if isinstance(peak, int) and not isinstance(peak, bool):
             rss = peak
-    return _SweepMeasure(wall_s=wall_s, user_s=user_s, sys_s=sys_s, rss_hwm=rss, ok=result.ok)
+    returncode = result.outcomes[0].returncode if len(result.outcomes) == 1 else None
+    return _SweepMeasure(
+        wall_s=wall_s,
+        user_s=user_s,
+        sys_s=sys_s,
+        rss_hwm=rss,
+        ok=result.ok,
+        returncode=returncode,
+    )
 
 
 def _cmd_pin_run(ns: argparse.Namespace) -> int:
@@ -2066,6 +2298,169 @@ def _sweep_sink(
     return sink if not metadata else _SweepMetricsSink(sink, metadata)
 
 
+def _current_sweep_selection(
+    step: Step,
+    cfg: DagConfig,
+    samples_by_width: Mapping[int, Sequence[_SweepMeasure]],
+    git_sha: str,
+) -> SweetSpotSelection:
+    """Fit a capture width from only this invocation's uninstrumented observations."""
+
+    digest = workload_digest(step, cfg.default_jobs_flag, cfg.default_jobs_env)
+    buckets = {
+        (step.tag, width): tuple(
+            Sample(
+                elapsed_s=sample.wall_s,
+                contention=0.0,
+                cpu_s=sample.user_s + sample.sys_s,
+                effective_cores=(
+                    (sample.user_s + sample.sys_s) / sample.wall_s
+                    if sample.wall_s > 0.0
+                    else None
+                ),
+                throttled_s=None,
+                peak_bytes=sample.rss_hwm,
+                workload_digest=digest,
+            )
+            for sample in width_samples
+        )
+        for width, width_samples in samples_by_width.items()
+        if width_samples
+    }
+    core_budget = max((width for _, width in buckets), default=0)
+    models = step_speedups_from_buckets(
+        buckets, core_budget=core_budget if core_budget > 0 else None
+    )
+    model = models.get(step.tag)
+    if model is not None:
+        return select_sweet_spot(model, workload_digest=digest, git_sha=git_sha)
+
+    # The model intentionally requires two distinct widths. A one-point explicit sweep can still
+    # be profiled honestly: its only measured width is the only evidence-backed choice, but name
+    # that fallback rather than pretending a plateau was fitted.
+    if len(buckets) == 1:
+        (_, width), measurements = next(iter(buckets.items()))
+        walls = [sample.elapsed_s for sample in measurements if sample.elapsed_s is not None]
+        if not walls:
+            raise ValueError(f"step {step.tag!r} has no positive wall measurement")
+        wall = statistics.median(walls)
+        if wall <= 0.0:
+            raise ValueError(f"step {step.tag!r} has no positive wall measurement")
+        return SweetSpotSelection(
+            step=step.tag,
+            workload_digest=digest,
+            inner_jobs=width,
+            expected_wall_s=wall,
+            baseline_inner_jobs=width,
+            speedup=1.0,
+            model_wall_s=wall,
+            raw_wall_s=wall,
+            source="single-measured-width",
+            git_sha=git_sha,
+        )
+    raise ValueError(f"step {step.tag!r} has insufficient valid sweep data for profiler capture")
+
+
+def _profiled_step(base_step: Step, cfg: DagConfig, request: IsolatedTrialRequest) -> Step:
+    """Wrap one width-resolved guest with its profiler and exact launch handshake.
+
+    The handshake lives inside perf's command, after its ``--`` separator, rather than around the
+    outer perf/sudo wrapper.  It therefore timestamps the actual guest after scheduler/cgroup and
+    profiler setup, then blocks until the capture controller has anchored its monotonic clock.
+    """
+
+    guest_command = command_with_inner_jobs(
+        base_step, cfg.default_jobs_flag, request.inner_jobs
+    )
+    inner_env = dict(request.env)
+    inner_env.update(
+        env_with_inner_jobs(base_step, cfg.default_jobs_env, request.inner_jobs)
+    )
+    inner_env.update(cmdtype_env_with_inner_jobs(base_step, request.inner_jobs))
+    ready_path = shlex.quote(str(request.guest_launch_ready_path))
+    release_path = shlex.quote(str(request.guest_launch_release_path))
+    guest_command = (
+        f"if ! printf '%s\\n' \"$$\" > {ready_path}; then\n"
+        "  echo 'dagrun: profiler guest-launch notification failed' >&2\n"
+        "  exit 125\n"
+        "fi\n"
+        f"if ! IFS= read -r _ < {release_path}; then\n"
+        "  echo 'dagrun: profiler guest-launch release failed' >&2\n"
+        "  exit 125\n"
+        "fi\n"
+        f"{guest_command}"
+    )
+    argv = list(request.argv_prefix)
+    if inner_env:
+        argv.append("env")
+        argv.extend(f"{name}={value}" for name, value in sorted(inner_env.items()))
+    argv.extend(("bash", "-c", guest_command))
+    # The guest width is already rendered inside the profiler wrapper. Neutralize scheduler-side
+    # argv/env injection so the profiler, rather than the guest, cannot accidentally receive a
+    # second jobs flag at the end of the wrapper command.
+    return dataclasses.replace(
+        base_step,
+        cmd=shlex.join(argv),
+        cmdtype=CmdType.UNKNOWN,
+        jobs_flag="",
+        jobs_env="",
+    )
+
+
+def _run_profiler_captures(
+    cfg: DagConfig,
+    step_samples: Sequence[tuple[Step, Mapping[int, Sequence[_SweepMeasure]]]],
+    capture_config: CaptureConfig,
+    cgroups: CgroupManager | None,
+    sweep_git_sha: str,
+    verbosity: int,
+) -> int:
+    """Run one post-sweep capture session per measured step, never persisting its trials."""
+
+    for step, samples_by_width in step_samples:
+        try:
+            selection = _current_sweep_selection(
+                step, cfg, samples_by_width, sweep_git_sha
+            )
+        except ValueError as exc:
+            print(f"{PROG}: sweep: profiler capture selection failed: {exc}", file=sys.stderr)
+            return _SWEEP_CAPTURE_FAILURE
+        print(
+            f"sweep: {step.tag}: profiler capture at sweet-spot width "
+            f"{selection.inner_jobs} (expected wall {selection.expected_wall_s:.3f}s)"
+        )
+
+        def run_trial(request: IsolatedTrialRequest) -> IsolatedTrialResult:
+            if request.step != step.tag or request.inner_jobs != selection.inner_jobs:
+                raise ValueError("profiler callback received a mismatched step or width")
+            instrumented_step = _profiled_step(step, cfg, request)
+            measure = _run_single_step(
+                instrumented_step,
+                cfg,
+                request.inner_jobs,
+                cgroups,
+                None,
+                verbosity,
+                profile_timeseries_interval_s=None,
+            )
+            return IsolatedTrialResult(
+                returncode=measure.returncode,
+                wall_s=measure.wall_s,
+                detail="" if measure.ok else "instrumented step failed",
+            )
+
+        try:
+            manifest = capture_at_sweet_spot(selection, capture_config, run_trial)
+        except ProfileCaptureError as exc:
+            print(f"{PROG}: sweep: profiler capture FAILED: {exc}", file=sys.stderr)
+            return _SWEEP_CAPTURE_FAILURE
+        except (OSError, ValueError) as exc:
+            print(f"{PROG}: sweep: profiler capture FAILED: {exc}", file=sys.stderr)
+            return _SWEEP_CAPTURE_FAILURE
+        print(f"sweep: {step.tag}: profiler capture manifest: {manifest.path}")
+    return 0
+
+
 def _run_legacy_sweep(
     cfg: DagConfig,
     step_tag: str,
@@ -2077,6 +2472,7 @@ def _run_legacy_sweep(
     verbosity: int,
     c: Palette,
     profile_timeseries_interval_s: float | None = None,
+    capture_config: CaptureConfig | None = None,
 ) -> int:
     """The original one-step dense-range command, kept byte-compatible in normal output."""
 
@@ -2106,6 +2502,7 @@ def _run_legacy_sweep(
         return 2
 
     measures: list[tuple[int, _SweepMeasure]] = []
+    samples_by_width: dict[int, list[_SweepMeasure]] = {}
     for jobs in range(lo, hi + 1):
         best: _SweepMeasure | None = None
         for _ in range(repeat):
@@ -2124,12 +2521,22 @@ def _run_legacy_sweep(
                     file=sys.stderr,
                 )
                 return 1
+            samples_by_width.setdefault(jobs, []).append(m)
             if best is None or m.wall_s < best.wall_s:
                 best = m
         assert best is not None
         measures.append((jobs, best))
 
     _print_sweep_table(step_tag, lo, measures, c)
+    if capture_config is not None:
+        return _run_profiler_captures(
+            cfg,
+            ((base_step, samples_by_width),),
+            capture_config,
+            cgroups,
+            sweep_git_sha,
+            verbosity,
+        )
     return 0
 
 
@@ -2164,6 +2571,7 @@ def _run_target_sweep(
     verbosity: int,
     c: Palette,
     profile_timeseries_interval_s: float | None = None,
+    capture_config: CaptureConfig | None = None,
 ) -> int:
     """Run a graph-wide, soft-target, cumulative multi-pass scaling sweep."""
 
@@ -2215,6 +2623,7 @@ def _run_target_sweep(
 
     sweep_started = time.monotonic()
     pass_number = 1
+    pass_one_samples: dict[str, dict[int, list[_SweepMeasure]]] = {}
     while True:
         grid = width_grid_for_pass(initial_widths, pass_number)
         grid_text = ",".join(str(width) for width in grid)
@@ -2281,6 +2690,10 @@ def _run_target_sweep(
                         file=sys.stderr,
                     )
                     return 1
+                if pass_number == 1:
+                    pass_one_samples.setdefault(step.tag, {}).setdefault(
+                        fixed_width, []
+                    ).append(measure)
                 _print_fixed_sweep_measure(step.tag, measure, c)
                 continue
 
@@ -2320,11 +2733,32 @@ def _run_target_sweep(
                             file=sys.stderr,
                         )
                         return 1
+                    if pass_number == 1:
+                        pass_one_samples.setdefault(step.tag, {}).setdefault(jobs, []).append(
+                            measure
+                        )
                     if best is None or measure.wall_s < best.wall_s:
                         best = measure
                 assert best is not None
                 measures.append((jobs, best))
             _print_sweep_table(step.tag, grid[0], measures, c)
+
+        if pass_number == 1 and capture_config is not None:
+            capture_steps = tuple(
+                (step, pass_one_samples[step.tag])
+                for step in ordered
+                if step.tag in pass_one_samples
+            )
+            capture_code = _run_profiler_captures(
+                cfg,
+                capture_steps,
+                capture_config,
+                cgroups,
+                sweep_git_sha,
+                verbosity,
+            )
+            if capture_code != 0:
+                return capture_code
 
         pass_elapsed = time.monotonic() - pass_started
         total_elapsed = time.monotonic() - sweep_started
@@ -2366,6 +2800,53 @@ def _cmd_sweep(ns: argparse.Namespace, c: Palette) -> int:
     target_raw = ns.target_time if isinstance(ns.target_time, str) else None
     step_tag = ns.step if isinstance(ns.step, str) else None
     jobs_spec = ns.jobs if isinstance(ns.jobs, str) else None
+    output_dir_arg = ns.output_dir if isinstance(ns.output_dir, str) else None
+    legacy_perf_dir_arg = ns.perf_dir if isinstance(ns.perf_dir, str) else None
+    report_html = ns.report_html if isinstance(ns.report_html, str) else None
+    no_report = bool(ns.no_report)
+    try:
+        profiler_request = _parse_profiler_request(ns)
+    except ValueError as exc:
+        print(f"{PROG}: sweep: {exc}", file=sys.stderr)
+        return 2
+    if output_dir_arg is not None and not output_dir_arg.strip():
+        print(f"{PROG}: sweep: --output-dir must not be empty", file=sys.stderr)
+        return 2
+    if legacy_perf_dir_arg is not None and not legacy_perf_dir_arg.strip():
+        print(f"{PROG}: sweep: --perf-dir must not be empty", file=sys.stderr)
+        return 2
+    if (
+        output_dir_arg is not None
+        and legacy_perf_dir_arg is not None
+        and output_dir_arg != legacy_perf_dir_arg
+    ):
+        print(
+            f"{PROG}: sweep: --output-dir and --perf-dir disagree",
+            file=sys.stderr,
+        )
+        return 2
+    if report_html is not None and not report_html.strip():
+        print(f"{PROG}: sweep: --report-html must not be empty", file=sys.stderr)
+        return 2
+    if report_html is not None and bool(ns.no_profile):
+        print(
+            f"{PROG}: sweep: --report-html cannot be combined with --no-profile",
+            file=sys.stderr,
+        )
+        return 2
+    if report_html is not None and no_report:
+        print(
+            f"{PROG}: sweep: --report-html cannot be combined with --no-report",
+            file=sys.stderr,
+        )
+        return 2
+    if profiler_request.enabled and bool(ns.no_profile):
+        print(
+            f"{PROG}: sweep: profiler capture options cannot be combined with --no-profile; "
+            "captures need an output directory",
+            file=sys.stderr,
+        )
+        return 2
     timeseries_value = getattr(ns, "profile_timeseries", None)
     timeseries_raw = timeseries_value if isinstance(timeseries_value, str) else None
     if timeseries_raw is not None and bool(ns.no_profile):
@@ -2459,8 +2940,16 @@ def _cmd_sweep(ns: argparse.Namespace, c: Palette) -> int:
         )
         return 3
 
-    perf_dir, source = _resolve_profile_dir(ns.perf_dir, bool(ns.no_profile))
+    explicit_profile_dir = output_dir_arg or legacy_perf_dir_arg
+    perf_dir, source = _resolve_profile_dir(explicit_profile_dir, bool(ns.no_profile))
+    if output_dir_arg is not None:
+        source = "--output-dir"
     sweep_git_sha = _git_sha() if perf_dir is not None else ""
+    capture_config = (
+        profiler_request.config(perf_dir)
+        if profiler_request.enabled and perf_dir is not None
+        else None
+    )
     verbosity = int(ns.verbosity)
     if target_s is None:
         assert step_tag is not None and jobs_spec is not None
@@ -2475,6 +2964,7 @@ def _cmd_sweep(ns: argparse.Namespace, c: Palette) -> int:
             verbosity,
             c,
             profile_timeseries_interval_s,
+            capture_config,
         )
     else:
         code = _run_target_sweep(
@@ -2489,12 +2979,18 @@ def _cmd_sweep(ns: argparse.Namespace, c: Palette) -> int:
             verbosity=verbosity,
             c=c,
             profile_timeseries_interval_s=profile_timeseries_interval_s,
+            capture_config=capture_config,
         )
+    capture_failed = code == _SWEEP_CAPTURE_FAILURE
+    explicit_report_failed = False
     if perf_dir is not None:
         _report_profile_written(perf_dir, source)
-        if code == 0:
+        if code == 0 or capture_failed:
             _refresh_scaling_model(perf_dir, cfg)
-    return code
+            if not no_report:
+                report_ok = _refresh_profile_report(perf_dir, cfg, dag_arg, report_html)
+                explicit_report_failed = report_html is not None and not report_ok
+    return 1 if capture_failed or explicit_report_failed else code
 
 
 def _print_sweep_table(

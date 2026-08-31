@@ -43,7 +43,8 @@ use crate::cgroup::{
 use crate::estimates::{
     apply_plan_to_config, build_plan_with_max_steps, feedback_identity,
     load_step_samples_for_workloads, load_step_speedups_for_workloads, plan_to_json, plan_to_text,
-    write_scaling_model_for_workloads, Plan, Planner, DEFAULT_MIN_SAMPLES,
+    step_speedups_from_buckets, write_scaling_model_for_workloads, BucketKey, Plan, Planner,
+    Sample, StepSpeedup, DEFAULT_MIN_SAMPLES,
 };
 use crate::io::{dag_from_json, dag_from_yaml, dag_to_json, dag_to_yaml, DagJsonError};
 use crate::memory_feedback::{
@@ -55,7 +56,12 @@ use crate::model::{
     DEFAULT_STEP_TIMEOUT, JOBS_ENV_ENV,
 };
 use crate::perflog::{append_step_profiles, append_step_timeseries, child_cpu_seconds, PerfWindow};
+use crate::profile_capture::{
+    capture_at_sweet_spot, select_capture_sweet_spot, CaptureConfig, IsolatedTrialRequest,
+    IsolatedTrialResult, RunIsolatedTrial, SweetSpotSelection,
+};
 use crate::profile_enrich::container_core_budget;
+use crate::profile_report;
 use crate::scheduler::{
     cap_config_max_cpus, nested_run_refusal,
     run_dag_boxed_deadline_limited_with_resource_caps_and_timeseries,
@@ -188,7 +194,8 @@ fn help_text(c: &Palette) -> String {
         e5 = ex(&format!("{PROG} ascii --dag dag.json")),
         profiling = c.dim(
             "Profiling data auto-logs to ./.dagrun/profiles/ by default\n \
-             (override with --perf-dir or $DAGRUN_PROFILE_DIR; disable with --no-profile)."
+             (sweep: --output-dir, with --perf-dir as an alias; other commands: --perf-dir; \
+             $DAGRUN_PROFILE_DIR also overrides; --no-profile disables)."
         ),
     )
 }
@@ -225,7 +232,7 @@ yaml: --dag also accepts .yaml/.yml (isomorphic to JSON; allows comments + multi
 - learned est_duration / rss from the profile store override the DAG hints at plan time\n    (disable with --no-profile-feedback; inspect with the plan subcommand / --show-plan)\n  \
 - a failing step fails the run (exit 1) and, by default, eager-cancels in-flight steps\n    ({keepgoing} continues launching independent ready steps; failed dependents are skipped)\n  \
 - {maxmem} derives a conservative model-based active-step ceiling from RAM hints\n\n\
-{note}  cgroup-v2 per-step boxing is ON by default; {acf} downgrades to a best-effort\n        unboxed run. {perfdir} writes per-step + whole-run resource-usage CSVs.\n\n\
+{note}  cgroup-v2 per-step boxing is ON by default; {acf} downgrades to a best-effort\n        unboxed run. Sweeps use {outputdir} ({perfalias} is an alias); other commands use\n        {perfdir} for profiling artifacts.\n\n\
 {exits}  0 = all steps passed | 1 = a step failed | 2 = bad usage / bad DAG file | 3 = cgroup\n           boxing required but unavailable (use {acf})\n",
         banner = banner(c),
         i1 = h("1. Install"),
@@ -247,8 +254,9 @@ yaml: --dag also accepts .yaml/.yml (isomorphic to JSON; allows comments + multi
         store = h("Where profiling data lands (by default)"),
         store_dir = k("./.dagrun/profiles/   (created on demand, relative to CWD)"),
         store_note = c.dim(
-            "Every run and sweep AUTO-LOGS resource-usage CSVs here; override with --perf-dir or \
-             $DAGRUN_PROFILE_DIR, disable with --no-profile. The tool prints where it \
+            "Every run and sweep AUTO-LOGS resource-usage CSVs here; sweep overrides with \
+             --output-dir (--perf-dir alias), while other commands use --perf-dir; \
+             $DAGRUN_PROFILE_DIR is the shared fallback. Disable with --no-profile. The tool prints where it \
              appended (never silent). Consider gitignoring ./.dagrun/."
         ),
         planning = h("Smarter planning: learned estimates + the critical-path planner"),
@@ -285,6 +293,8 @@ yaml: --dag also accepts .yaml/.yml (isomorphic to JSON; allows comments + multi
         maxcpus = k("--max-cpus"),
         maxmem = k("run --max-mem 8G"),
         acf = k("--allow-cgroup-failure"),
+        outputdir = k("sweep --output-dir DIR"),
+        perfalias = k("--perf-dir"),
         perfdir = k("run --perf-dir DIR"),
         note = h("Note"),
         exits = h("Exit codes"),
@@ -341,7 +351,15 @@ fn render_subcommand_help(
     );
     for (flag, desc) in flags {
         let padded = format!("{flag:<width$}");
-        out.push_str(&format!("  {}  {desc}\n", c.cyan(&padded)));
+        let mut lines = desc.lines();
+        out.push_str(&format!(
+            "  {}  {}\n",
+            c.cyan(&padded),
+            lines.next().unwrap_or_default()
+        ));
+        for line in lines {
+            out.push_str(&format!("  {:width$}  {line}\n", ""));
+        }
     }
     out
 }
@@ -397,22 +415,58 @@ fn run_help(c: &Palette) -> String {
 }
 
 fn sweep_help(c: &Palette) -> String {
+    let summary = r#"Measure each selected step in isolation across inner-worker widths.
+
+Two modes:
+  Single-step dense mode (no --target-time): --step and --jobs are required.
+  Target-time graph mode: visit selected nodes one at a time in stable topological
+  order. Pass 1 always completes. A later pass starts only while time remains,
+  and every started pass finishes even if that overruns the allowance.
+
+Dependencies determine the visitation order; they are not run beside the measured
+step. Each width is delivered through cmdtype, jobs_flag, and/or jobs_env.
+
+Automatic widths (target-time mode with no --jobs):
+  Pass 1 uses powers of two through the physical-core count, then the exact
+  physical-core and logical-thread counts, limited by CPU affinity/cgroup quota.
+  Example: 158 physical cores / 316 threads ->
+  1,2,4,8,16,32,64,128,158,316.
+  Later passes add integer midpoints of remaining gaps (for example, 48 between
+  32 and 64) and rerun every width in the cumulative grid.
+
+Output:
+  Progress and speedup tables remain on the terminal. Profiling artifacts append
+  to ./.dagrun/profiles/ by default, including a standalone interactive
+  profile_report.html. --output-dir changes only that artifact-store location;
+  it does not redirect terminal or child-process output.
+
+Expensive profiler captures are opt-in and run only after the ordinary sweep has
+selected an economic plateau width. They are fresh isolated executions at that
+width and never enter the scaling model. In target-time mode they run after pass
+1; their elapsed time counts against the allowance before refinement is considered."#;
     render_subcommand_help(
         c,
-        "sweep --dag FILE [--target-time DURATION] [--step TAG] [--jobs RANGE] [options]",
-        "Profile parallel scaling for one step or a whole DAG (wall/user/sys/rss + speedup table).",
+        "sweep --dag FILE [--target-time DURATION] [--step TAG] [--jobs WIDTHS] [options]",
+        summary,
         &[
-            ("--dag FILE", "DAG file ('-' = stdin) [required]"),
-            ("--step TAG", "limit the sweep to one group.job step (required in legacy mode)"),
-            ("--jobs RANGE", "inner widths: LO..HI or bare N (= 1..N); target mode also accepts comma lists and defaults to machine topology"),
-            ("--target-time DURATION", "soft multi-pass allowance (ms/s/m/h suffix accepted): pass 1 and every started pass finish"),
-            ("--repeat K", "run each width K times and keep the fastest (default: 1)"),
-            ("--perf-dir DIR", "write the sweep's resource-usage CSVs into DIR"),
-            ("--profile-timeseries DURATION", "opt-in cgroup CPU/thread trace interval (50ms..10s); writes traces/<run_id>.csv"),
-            ("--no-profile", "disable the default auto-logging profile store"),
-            ("--allow-cgroup-failure", "if cgroup boxing is unavailable, run UNBOXED with a warning"),
-            ("--unsafe-no-cgroups", "DELIBERATELY skip cgroup boxing entirely (unsafe)"),
-            ("-v", "stream child output (repeatable)"),
+            ("--dag FILE", "DAG file ('-' = stdin); .yaml/.yml load as YAML, otherwise JSON [required]"),
+            ("--step TAG", "measure only this group.job step; required without --target-time, optional otherwise"),
+            ("--jobs WIDTHS", "initial inner-parallelism widths: bare N means every width 1..N; LO..HI is an inclusive dense range.\nTarget mode also accepts sparse comma/range lists such as 1,2,4,8 or 1,2,4..8.\nOmit only in target mode to use the topology grid described above."),
+            ("--target-time DURATION", "select graph-wide multi-pass mode with this soft wall-time allowance (bare seconds or ms/s/m/h suffix).\nPass 1 and every started pass finish; this is not a timeout."),
+            ("--repeat K", "run every width K times; persist every sample and show the fastest wall time\nin the terminal table (default: 1)"),
+            ("--output-dir DIR", "sweep artifact directory: append whole-run and per-step CSVs, refresh\nscaling_model_*.json and profile_report.html after success, and place opt-in traces\nand profiler captures below DIR. Overrides $DAGRUN_PROFILE_DIR and ./.dagrun/profiles/."),
+            ("--perf-dir DIR", "backward-compatible alias for --output-dir; it does not mean perf(1)\nand does not redirect terminal or child-process output"),
+            ("--report-html FILE", "write the standalone interactive report to FILE instead of\n<output-dir>/profile_report.html; failure at an explicitly requested FILE makes the sweep\nunsuccessful after preserving its measurements"),
+            ("--no-report", "do not generate the interactive HTML report after this sweep"),
+            ("--profile-timeseries DURATION", "OPT-IN: sample each trial's cgroup CPU/thread activity every DURATION\n(50ms..10s); requires active cgroup-v2 and writes traces/<run_id>.csv in the profile store"),
+            ("--perf-record", "OPT-IN: after the uninstrumented sweep, run one separate perf-record trial\nat each selected step's economic plateau width"),
+            ("--perf-window DURATION", "record only a centred perf window of this duration; implies --perf-record.\nWithout it, perf records the centred 80% of the expected trial wall time"),
+            ("--wprof-window DURATION", "OPT-IN, repeatable: run one separate centred wprof capture per occurrence.\nRepeated occurrences currently must use the same positive duration"),
+            ("--profiler-sudo", "explicitly prefix perf/wprof with 'sudo -n'; privilege escalation is never automatic"),
+            ("--no-profile", "write no local profile CSVs, model, report, time-series trace, or profiler capture"),
+            ("--allow-cgroup-failure", "run UNBOXED with a warning when cgroup-v2 is unavailable; cgroup CPU, memory,\nthrottling, and time-series evidence will be unavailable"),
+            ("--unsafe-no-cgroups", "DELIBERATELY run unboxed even when cgroup-v2 is available; profiling is less complete\nand --profile-timeseries cannot be used"),
+            ("-v", "-v shows each trial's captured final line; -vv streams child stdout/stderr"),
             ("-h, --help", "show this help and exit"),
         ],
     )
@@ -949,6 +1003,20 @@ fn parse_profile_timeseries_duration(raw: &str) -> Result<Duration, String> {
     if !(MIN_PROFILE_TIMESERIES_INTERVAL..=MAX_PROFILE_TIMESERIES_INTERVAL).contains(&duration) {
         return Err(format!(
             "invalid --profile-timeseries '{raw}': duration must be between 50ms and 10s"
+        ));
+    }
+    Ok(duration)
+}
+
+fn parse_profiler_window_duration(raw: &str, flag: &str) -> Result<Duration, String> {
+    let duration = parse_target_duration(raw).map_err(|_| {
+        format!(
+            "invalid {flag} '{raw}': expected a positive duration with an optional ms/s/m/h suffix"
+        )
+    })?;
+    if duration.is_zero() {
+        return Err(format!(
+            "invalid {flag} '{raw}': duration must be greater than zero"
         ));
     }
     Ok(duration)
@@ -2015,7 +2083,9 @@ fn report_profile_written(perf_dir: &str, source: &str) {
         eprintln!("{PROG}: WARNING no profile CSVs were written under {perf_dir}");
         return;
     }
-    if source == "--perf-dir" {
+    if source == "--output-dir" {
+        eprintln!("{PROG}: profile artifacts written under {perf_dir}:");
+    } else if source == "--perf-dir" {
         eprintln!("{PROG}: perf CSVs written under {perf_dir}:");
     } else {
         let origin = match source {
@@ -2508,6 +2578,7 @@ struct SweepMeasure {
     sys_s: f64,
     rss_hwm: Option<i64>,
     ok: bool,
+    returncode: Option<i32>,
 }
 
 /// Provenance attached to rows produced by a target-time sweep. These are dynamic profile columns:
@@ -2522,6 +2593,302 @@ struct SweepProfileMeta {
     workload_digest: String,
     target_s: f64,
     topology: MachineTopology,
+}
+
+type CurrentSweepSamples = HashMap<String, Vec<(i64, SweepMeasure)>>;
+
+fn remember_sweep_sample(
+    samples: &mut CurrentSweepSamples,
+    step: &str,
+    inner_jobs: i64,
+    measure: SweepMeasure,
+) {
+    samples
+        .entry(step.to_string())
+        .or_default()
+        .push((inner_jobs, measure));
+}
+
+/// Fit capture widths from this invocation's uninstrumented samples only. Accumulated rows remain
+/// valuable for the durable model, but must not silently choose where an explicitly requested
+/// follow-up profiler run lands today.
+fn current_sweep_speedups(samples: &CurrentSweepSamples) -> HashMap<String, StepSpeedup> {
+    let mut buckets: HashMap<BucketKey, Vec<Sample>> = HashMap::new();
+    for (step, observations) in samples {
+        for (index, (inner_jobs, measure)) in observations.iter().enumerate() {
+            let cpu_s = measure.user_s + measure.sys_s;
+            buckets
+                .entry((step.clone(), *inner_jobs))
+                .or_default()
+                .push(Sample {
+                    elapsed_s: Some(measure.wall_s),
+                    contention: 0.0,
+                    cpu_s: Some(cpu_s),
+                    effective_cores: (measure.wall_s > 0.0).then_some(cpu_s / measure.wall_s),
+                    throttled_s: None,
+                    peak_bytes: measure.rss_hwm,
+                    uncensored_peak_bytes: measure.rss_hwm,
+                    peak_floor_bytes: None,
+                    observation_id: format!("current-sweep:{step}:{inner_jobs}:{index}"),
+                    workload_digest: String::new(),
+                });
+        }
+    }
+    let core_budget = buckets.keys().map(|(_, width)| *width).max();
+    step_speedups_from_buckets(&buckets, core_budget)
+}
+
+fn median(mut values: Vec<f64>) -> Option<f64> {
+    values.retain(|value| value.is_finite() && *value > 0.0);
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(f64::total_cmp);
+    let middle = values.len() / 2;
+    Some(if values.len() % 2 == 0 {
+        (values[middle - 1] + values[middle]) / 2.0
+    } else {
+        values[middle]
+    })
+}
+
+fn current_sweep_selection(
+    base: &Step,
+    cfg: &DagConfig,
+    observations: &[(i64, SweepMeasure)],
+    git: &str,
+) -> Result<SweetSpotSelection, String> {
+    let tag = base.tag();
+    let one_step = HashMap::from([(tag.clone(), observations.to_vec())]);
+    let speedups = current_sweep_speedups(&one_step);
+    let digest = workload_digest(base, &cfg.default_jobs_flag, &cfg.default_jobs_env);
+    if let Some(speedup) = speedups.get(&tag) {
+        return select_capture_sweet_spot(speedup, &digest, git);
+    }
+
+    let widths = observations
+        .iter()
+        .filter(|(width, measure)| *width > 0 && measure.wall_s.is_finite() && measure.wall_s > 0.0)
+        .map(|(width, _)| *width)
+        .collect::<HashSet<_>>();
+    if widths.len() == 1 {
+        let width = *widths.iter().next().expect("one width was checked");
+        let wall_s = median(
+            observations
+                .iter()
+                .filter(|(candidate, _)| *candidate == width)
+                .map(|(_, measure)| measure.wall_s)
+                .collect(),
+        )
+        .ok_or_else(|| format!("step '{tag}' has no positive wall measurement"))?;
+        return Ok(SweetSpotSelection {
+            step: tag,
+            workload_digest: digest,
+            inner_jobs: width,
+            expected_wall_s: wall_s,
+            baseline_inner_jobs: width,
+            speedup: 1.0,
+            model_wall_s: wall_s,
+            raw_wall_s: Some(wall_s),
+            source: "single-measured-width".to_string(),
+            git_sha: git.to_string(),
+        });
+    }
+    Err(format!(
+        "step '{tag}' has insufficient valid sweep data for profiler capture"
+    ))
+}
+
+fn sweep_capture_requested(args: &SweepArgs) -> bool {
+    args.perf_record || !args.wprof_windows.is_empty()
+}
+
+fn capture_config(args: &SweepArgs, output_dir: &str) -> CaptureConfig {
+    let mut config = CaptureConfig::new(output_dir);
+    config.capture_perf = args.perf_record;
+    config.perf_window_s = args.perf_window.map(|duration| duration.as_secs_f64());
+    config.wprof_windows = i64::try_from(args.wprof_windows.len()).unwrap_or(i64::MAX);
+    if let Some(duration) = args.wprof_windows.first() {
+        config.wprof_window_s = duration.as_secs_f64();
+    }
+    if args.profiler_sudo {
+        config.sudo = vec!["sudo".to_string(), "-n".to_string()];
+    }
+    config
+}
+
+/// Produce the exact guest command before placing a profiler executable in front of it. The
+/// scheduler normally injects cmdtype/jobs channels immediately before spawn; the wrapper must
+/// materialize those channels first or an appended `--jobs` would accidentally target perf.
+fn profiler_wrapped_step(base: &Step, cfg: &DagConfig, request: &IsolatedTrialRequest) -> Step {
+    let width = Some(request.inner_jobs);
+    let guest_command = crate::model::command_with_inner_jobs(base, &cfg.default_jobs_flag, width);
+    let ready_path = box_shell_quote(&request.guest_launch_ready_path().to_string_lossy());
+    let release_path = box_shell_quote(&request.guest_launch_release_path().to_string_lossy());
+    let guest_command = format!(
+        "if ! printf '%s\\n' \"$$\" > {ready_path}; then\n  \
+         echo 'dagrun: profiler guest-launch notification failed' >&2\n  exit 125\nfi\n\
+         if ! IFS= read -r _ < {release_path}; then\n  \
+         echo 'dagrun: profiler guest-launch release failed' >&2\n  exit 125\nfi\n\
+         {guest_command}"
+    );
+    let mut injected = request.env.clone();
+    if let Some((name, value)) =
+        crate::model::env_with_inner_jobs(base, &cfg.default_jobs_env, width)
+    {
+        injected.insert(name, value);
+    }
+    if let Some((name, value)) = crate::model::cmdtype_env_with_inner_jobs(base, width) {
+        injected.insert(name, value);
+    }
+
+    let mut argv = request.argv_prefix.clone();
+    if !injected.is_empty() {
+        argv.push("env".to_string());
+        argv.extend(
+            injected
+                .into_iter()
+                .map(|(name, value)| format!("{name}={value}")),
+        );
+    }
+    argv.extend(["bash".to_string(), "-c".to_string(), guest_command]);
+
+    let mut wrapped = base.clone();
+    wrapped.cmd = argv
+        .iter()
+        .map(|part| box_shell_quote(part))
+        .collect::<Vec<_>>()
+        .join(" ");
+    wrapped.cmdtype = crate::model::CmdType::Unknown;
+    wrapped.jobs_flag = Some(String::new());
+    wrapped.jobs_env = Some(String::new());
+    wrapped.hint.preferred_inner_jobs = Some(request.inner_jobs);
+    wrapped
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_profiler_trial(
+    base: &Step,
+    cfg: &DagConfig,
+    selected_inner_jobs: i64,
+    request: &IsolatedTrialRequest,
+    cgroups: &BoxedCgroups,
+    git: &str,
+    verbosity: i64,
+) -> Result<IsolatedTrialResult, String> {
+    if request.include_in_model {
+        return Err("profiler trial unexpectedly requested model inclusion".to_string());
+    }
+    if request.step != base.tag() || request.inner_jobs != selected_inner_jobs {
+        return Err("profiler callback received a mismatched step or width".to_string());
+    }
+    let step = profiler_wrapped_step(base, cfg, request);
+    let measure = run_isolated_step(
+        &step,
+        cfg,
+        Some(request.inner_jobs),
+        request.inner_jobs,
+        1,
+        cgroups,
+        None,
+        git,
+        verbosity,
+        None,
+        None,
+    );
+    Ok(IsolatedTrialResult {
+        returncode: measure.returncode.unwrap_or(if measure.ok { 0 } else { 1 }),
+        wall_s: measure.wall_s,
+        detail: if measure.ok {
+            String::new()
+        } else {
+            format!(
+                "step '{}' failed under {}",
+                request.step,
+                request.kind.value()
+            )
+        },
+    })
+}
+
+struct SweepProfilerRunner<'a> {
+    base: &'a Step,
+    cfg: &'a DagConfig,
+    cgroups: &'a BoxedCgroups,
+    git: &'a str,
+    verbosity: i64,
+    selected_inner_jobs: i64,
+}
+
+impl RunIsolatedTrial for SweepProfilerRunner<'_> {
+    fn run_isolated_trial(
+        &mut self,
+        request: &IsolatedTrialRequest,
+    ) -> Result<IsolatedTrialResult, String> {
+        run_profiler_trial(
+            self.base,
+            self.cfg,
+            self.selected_inner_jobs,
+            request,
+            self.cgroups,
+            self.git,
+            self.verbosity,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_requested_sweep_captures(
+    args: &SweepArgs,
+    cfg: &DagConfig,
+    selected: &[usize],
+    samples: &CurrentSweepSamples,
+    cgroups: &BoxedCgroups,
+    output_dir: &str,
+    git: &str,
+) -> Result<Vec<PathBuf>, String> {
+    if !sweep_capture_requested(args) {
+        return Ok(Vec::new());
+    }
+    let config = capture_config(args, output_dir);
+    let mut manifests = Vec::new();
+    for index in selected {
+        let base = &cfg.steps[*index];
+        if base.skip_reason.is_some() {
+            continue;
+        }
+        let tag = base.tag();
+        let Some(observations) = samples.get(&tag) else {
+            // A fixed step can be deliberately omitted when its configured width exceeds the
+            // effective machine budget. No process ran, so there is no evidence-backed capture
+            // width and nothing to profile.
+            continue;
+        };
+        let selection = current_sweep_selection(base, cfg, observations, git)?;
+        println!(
+            "sweep: {tag}: profiler capture at sweet-spot width {} (expected wall {:.3}s)",
+            selection.inner_jobs, selection.expected_wall_s,
+        );
+        let runner = SweepProfilerRunner {
+            base,
+            cfg,
+            cgroups,
+            git,
+            verbosity: args.verbosity,
+            selected_inner_jobs: selection.inner_jobs,
+        };
+        match capture_at_sweet_spot(&selection, &config, runner) {
+            Ok(manifest) => {
+                println!(
+                    "sweep: {tag}: profiler capture manifest: {}",
+                    manifest.path.display()
+                );
+                manifests.push(manifest.path);
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(manifests)
 }
 
 /// Parse a sweep width range: `"LO..HI"` or a bare `"N"` (meaning `1..N`).
@@ -2706,12 +3073,18 @@ fn run_isolated_step(
     let rss_hwm = row
         .and_then(|r| r.get("peak_bytes"))
         .and_then(|s| s.parse::<i64>().ok());
+    let returncode = result
+        .outcomes
+        .first()
+        .and_then(|outcome| outcome.returncode)
+        .and_then(|returncode| i32::try_from(returncode).ok());
     SweepMeasure {
         wall_s,
         user_s: measured_user_s,
         sys_s: measured_sys_s,
         rss_hwm,
         ok: result.ok,
+        returncode,
     }
 }
 
@@ -2810,15 +3183,23 @@ fn target_width_source(
     sources.join("+")
 }
 
+#[derive(Debug)]
 struct SweepArgs {
     dag: Option<String>,
     step: Option<String>,
     jobs: Option<String>,
     target_time: Option<String>,
     repeat: i64,
+    output_dir: Option<String>,
     perf_dir: Option<String>,
     no_profile: bool,
+    report_html: Option<String>,
+    no_report: bool,
     profile_timeseries: Option<Duration>,
+    perf_record: bool,
+    perf_window: Option<Duration>,
+    wprof_windows: Vec<Duration>,
+    profiler_sudo: bool,
     allow_cgroup_failure: bool,
     unsafe_no_cgroups: bool,
     verbosity: i64,
@@ -2831,9 +3212,16 @@ fn parse_sweep_args(rest: &[String]) -> Result<SweepArgs, String> {
         jobs: None,
         target_time: None,
         repeat: 1,
+        output_dir: None,
         perf_dir: None,
         no_profile: false,
+        report_html: None,
+        no_report: false,
         profile_timeseries: None,
+        perf_record: false,
+        perf_window: None,
+        wprof_windows: Vec::new(),
+        profiler_sudo: false,
         allow_cgroup_failure: false,
         unsafe_no_cgroups: false,
         verbosity: 0,
@@ -2866,15 +3254,37 @@ fn parse_sweep_args(rest: &[String]) -> Result<SweepArgs, String> {
                     .parse::<i64>()
                     .map_err(|_| format!("--repeat: invalid int value: '{v}'"))?;
             }
+            "--output-dir" => a.output_dir = Some(take_value(inline, &mut i)?),
             "--perf-dir" => a.perf_dir = Some(take_value(inline, &mut i)?),
             "--no-profile" => a.no_profile = true,
+            "--report-html" => a.report_html = Some(take_value(inline, &mut i)?),
+            "--no-report" => a.no_report = true,
             "--profile-timeseries" => {
                 let value = take_value(inline, &mut i)?;
                 a.profile_timeseries = Some(parse_profile_timeseries_duration(&value)?);
             }
+            "--perf-record" => a.perf_record = true,
+            "--perf-window" => {
+                let value = take_value(inline, &mut i)?;
+                a.perf_window = Some(parse_profiler_window_duration(&value, "--perf-window")?);
+                a.perf_record = true;
+            }
+            "--wprof-window" => {
+                let value = take_value(inline, &mut i)?;
+                a.wprof_windows
+                    .push(parse_profiler_window_duration(&value, "--wprof-window")?);
+            }
+            "--profiler-sudo" => a.profiler_sudo = true,
             "--allow-cgroup-failure" => a.allow_cgroup_failure = true,
             "--unsafe-no-cgroups" => a.unsafe_no_cgroups = true,
             "-v" => a.verbosity += 1,
+            compact
+                if compact.strip_prefix('-').is_some_and(|letters| {
+                    letters.len() > 1 && letters.bytes().all(|b| b == b'v')
+                }) =>
+            {
+                a.verbosity += i64::try_from(compact.len() - 1).unwrap_or(i64::MAX);
+            }
             other => return Err(format!("unrecognized argument: {other}")),
         }
         i += 1;
@@ -2882,7 +3292,94 @@ fn parse_sweep_args(rest: &[String]) -> Result<SweepArgs, String> {
     if a.no_profile && a.profile_timeseries.is_some() {
         return Err("--profile-timeseries cannot be combined with --no-profile".to_string());
     }
+    if a.output_dir
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty())
+    {
+        return Err("--output-dir must not be empty".to_string());
+    }
+    if a.perf_dir
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty())
+    {
+        return Err("--perf-dir must not be empty".to_string());
+    }
+    if let (Some(output), Some(perf)) = (&a.output_dir, &a.perf_dir) {
+        if output != perf {
+            return Err("--output-dir and --perf-dir disagree".to_string());
+        }
+    }
+    if a.report_html
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty())
+    {
+        return Err("--report-html must not be empty".to_string());
+    }
+    if a.no_profile && a.report_html.is_some() {
+        return Err("--report-html cannot be combined with --no-profile".to_string());
+    }
+    if a.no_report && a.report_html.is_some() {
+        return Err("--report-html cannot be combined with --no-report".to_string());
+    }
+    if a.no_profile && (a.perf_record || !a.wprof_windows.is_empty()) {
+        return Err(
+            "profiler capture options cannot be combined with --no-profile; captures need an output directory"
+                .to_string(),
+        );
+    }
+    if a.profiler_sudo && !a.perf_record && a.wprof_windows.is_empty() {
+        return Err(
+            "--profiler-sudo requires --perf-record, --perf-window, or --wprof-window".to_string(),
+        );
+    }
+    if let Some(first) = a.wprof_windows.first() {
+        if a.wprof_windows.iter().any(|duration| duration != first) {
+            return Err(
+                "repeated --wprof-window durations must match; each occurrence requests another separate trial"
+                    .to_string(),
+            );
+        }
+    }
     Ok(a)
+}
+
+fn refresh_sweep_report(
+    perf_dir: &str,
+    cfg: &DagConfig,
+    dag_arg: &str,
+    report_html: Option<&str>,
+    no_report: bool,
+) -> bool {
+    if no_report {
+        return true;
+    }
+    let output = report_html
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(perf_dir).join(profile_report::PROFILE_REPORT_FILENAME));
+    match profile_report::generate_report(
+        cfg,
+        Path::new(dag_arg),
+        Path::new(perf_dir),
+        &output,
+        "dagrun profile history",
+    ) {
+        Ok(summary) => {
+            eprintln!(
+                "{PROG}: interactive profile report refreshed at {} ({} aggregate sample(s), {} time-series run(s))",
+                output.display(),
+                summary.aggregate_samples,
+                summary.trace_series,
+            );
+            true
+        }
+        Err(error) => {
+            eprintln!(
+                "{PROG}: WARNING could not refresh interactive profile report at {}: {error}",
+                output.display(),
+            );
+            false
+        }
+    }
 }
 
 /// Per-step parallel-speedup sweep (Feature B).
@@ -2938,12 +3435,12 @@ fn cmd_sweep(a: &SweepArgs, c: &Palette) -> i32 {
         }
     };
     let repeat = a.repeat.max(1);
-    let base = cfg
+    let base_index = cfg
         .steps
         .iter()
-        .find(|s| s.tag() == step_tag)
-        .expect("tag presence checked above")
-        .clone();
+        .position(|s| s.tag() == step_tag)
+        .expect("tag presence checked above");
+    let base = cfg.steps[base_index].clone();
     if !step_width_is_resizable(&base, &cfg.default_jobs_flag, &cfg.default_jobs_env) {
         eprintln!(
             "{PROG}: sweep: step '{step_tag}' offers no width channel, so --jobs cannot change \
@@ -2967,10 +3464,15 @@ fn cmd_sweep(a: &SweepArgs, c: &Palette) -> i32 {
     if let Err(code) = require_timeseries_cgroups("sweep", a.profile_timeseries, &cgroups) {
         return code;
     }
-    let (perf_dir, source) = resolve_profile_dir(a.perf_dir.as_deref(), a.no_profile);
+    let explicit_profile_dir = a.output_dir.as_deref().or(a.perf_dir.as_deref());
+    let (perf_dir, mut source) = resolve_profile_dir(explicit_profile_dir, a.no_profile);
+    if a.output_dir.is_some() {
+        source = "--output-dir";
+    }
     let git = git_sha();
 
     let mut measures: Vec<(i64, SweepMeasure)> = Vec::new();
+    let mut capture_samples = CurrentSweepSamples::new();
     for jobs in lo..=hi {
         let mut best: Option<SweepMeasure> = None;
         for _ in 0..repeat {
@@ -2993,6 +3495,7 @@ fn cmd_sweep(a: &SweepArgs, c: &Palette) -> i32 {
                 }
                 return 1;
             }
+            remember_sweep_sample(&mut capture_samples, &step_tag, jobs, m);
             best = Some(match best {
                 Some(b) if b.wall_s <= m.wall_s => b,
                 _ => m,
@@ -3002,9 +3505,40 @@ fn cmd_sweep(a: &SweepArgs, c: &Palette) -> i32 {
     }
 
     print_sweep_table(&step_tag, lo, &measures, c);
+    if sweep_capture_requested(a) {
+        let output_dir = perf_dir
+            .as_deref()
+            .expect("capture flags require an enabled profile directory");
+        if let Err(error) = run_requested_sweep_captures(
+            a,
+            &cfg,
+            &[base_index],
+            &capture_samples,
+            &cgroups,
+            output_dir,
+            &git,
+        ) {
+            eprintln!("{PROG}: sweep: profiler capture FAILED: {error}");
+            report_profile_written(output_dir, source);
+            refresh_scaling_model(output_dir, &cfg);
+            refresh_sweep_report(
+                output_dir,
+                &cfg,
+                &dag_arg,
+                a.report_html.as_deref(),
+                a.no_report,
+            );
+            return 1;
+        }
+    }
     if let Some(d) = perf_dir.as_deref() {
         report_profile_written(d, source);
         refresh_scaling_model(d, &cfg);
+        let report_ok =
+            refresh_sweep_report(d, &cfg, &dag_arg, a.report_html.as_deref(), a.no_report);
+        if a.report_html.is_some() && !report_ok {
+            return 1;
+        }
     }
     0
 }
@@ -3087,12 +3621,17 @@ fn cmd_target_time_sweep(a: &SweepArgs, c: &Palette) -> i32 {
     if let Err(code) = require_timeseries_cgroups("sweep", a.profile_timeseries, &cgroups) {
         return code;
     }
-    let (perf_dir, profile_source) = resolve_profile_dir(a.perf_dir.as_deref(), a.no_profile);
+    let explicit_profile_dir = a.output_dir.as_deref().or(a.perf_dir.as_deref());
+    let (perf_dir, mut profile_source) = resolve_profile_dir(explicit_profile_dir, a.no_profile);
+    if a.output_dir.is_some() {
+        profile_source = "--output-dir";
+    }
     let git = git_sha();
     let target_s = target.as_secs_f64();
     let sweep_id = crate::perflog::new_run_id();
     let explicit_widths = a.jobs.is_some();
     let mut sample_number = 0usize;
+    let mut capture_samples = CurrentSweepSamples::new();
     let has_resizable = selected.iter().any(|index| {
         let step = &cfg.steps[*index];
         step.skip_reason.is_none()
@@ -3195,6 +3734,7 @@ fn cmd_target_time_sweep(a: &SweepArgs, c: &Palette) -> i32 {
                     }
                     return 1;
                 }
+                remember_sweep_sample(&mut capture_samples, &tag, max_cpus, measure);
                 print_fixed_sweep_measure(&tag, measure, c);
                 continue;
             }
@@ -3242,6 +3782,9 @@ fn cmd_target_time_sweep(a: &SweepArgs, c: &Palette) -> i32 {
                         }
                         return 1;
                     }
+                    if pass == 1 {
+                        remember_sweep_sample(&mut capture_samples, &tag, *jobs, measure);
+                    }
                     best = Some(match best {
                         Some(previous) if previous.wall_s <= measure.wall_s => previous,
                         _ => measure,
@@ -3250,6 +3793,33 @@ fn cmd_target_time_sweep(a: &SweepArgs, c: &Palette) -> i32 {
                 measures.push((*jobs, best.expect("repeat >= 1")));
             }
             print_sweep_table(&tag, grid[0], &measures, c);
+        }
+
+        if pass == 1 && sweep_capture_requested(a) {
+            let output_dir = perf_dir
+                .as_deref()
+                .expect("capture flags require an enabled profile directory");
+            if let Err(error) = run_requested_sweep_captures(
+                a,
+                &cfg,
+                &selected,
+                &capture_samples,
+                &cgroups,
+                output_dir,
+                &git,
+            ) {
+                eprintln!("{PROG}: sweep: profiler capture FAILED: {error}");
+                report_profile_written(output_dir, profile_source);
+                refresh_scaling_model(output_dir, &cfg);
+                refresh_sweep_report(
+                    output_dir,
+                    &cfg,
+                    dag_arg,
+                    a.report_html.as_deref(),
+                    a.no_report,
+                );
+                return 1;
+            }
         }
 
         let pass_elapsed = pass_start.elapsed();
@@ -3289,6 +3859,11 @@ fn cmd_target_time_sweep(a: &SweepArgs, c: &Palette) -> i32 {
     if let Some(dir) = perf_dir.as_deref() {
         report_profile_written(dir, profile_source);
         refresh_scaling_model(dir, &cfg);
+        let report_ok =
+            refresh_sweep_report(dir, &cfg, dag_arg, a.report_html.as_deref(), a.no_report);
+        if a.report_html.is_some() && !report_ok {
+            return 1;
+        }
     }
     0
 }
@@ -4807,11 +5382,203 @@ mod tests {
         }
         assert!(help.contains("$DAGRUN_EXTRA_ARGS"));
 
-        let sweep = sweep_help(&palette);
-        assert!(sweep.contains("--jobs RANGE"));
-        assert!(!sweep.contains("--max-cpus"));
         assert!(help.contains("--profile-timeseries"));
-        assert!(sweep.contains("--profile-timeseries"));
+    }
+
+    #[test]
+    fn sweep_help_explains_modes_widths_and_profile_artifacts() {
+        let help = sweep_help(&Palette { enabled: false });
+        let normalized = help
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase();
+        for phrase in [
+            "single-step dense mode",
+            "target-time graph mode",
+            "one at a time in stable topological order",
+            "pass 1 always completes",
+            "every started pass finishes",
+            "powers of two through the physical-core count",
+            "physical-core and logical-thread counts",
+            "1,2,4,8,16,32,64,128,158,316",
+            "integer midpoints",
+            "cmdtype, jobs_flag, and/or jobs_env",
+            "./.dagrun/profiles/",
+            "does not redirect terminal or child-process output",
+            "scaling_model_*.json",
+            "traces/<run_id>.csv",
+            "persist every sample and show the fastest wall time",
+            "-vv streams child stdout/stderr",
+        ] {
+            assert!(
+                normalized.contains(phrase),
+                "missing {phrase:?} from sweep help"
+            );
+        }
+        assert!(help.contains("--jobs WIDTHS"));
+        assert!(help.contains("--output-dir DIR"));
+        assert!(help.contains("--report-html FILE"));
+        assert!(help.contains("--no-report"));
+        assert!(normalized.contains("backward-compatible alias for --output-dir"));
+        assert!(help.contains("--profile-timeseries"));
+        assert!(help.contains("--perf-record"));
+        assert!(help.contains("--perf-window DURATION"));
+        assert!(help.contains("--wprof-window DURATION"));
+        assert!(help.contains("--profiler-sudo"));
+        assert!(normalized.contains("never enter the scaling model"));
+        assert!(!help.contains("--max-cpus"));
+    }
+
+    #[test]
+    fn sweep_report_output_flags_validate_before_execution() {
+        assert!(parse_sweep_args(&["--output-dir=   ".into()]).is_err());
+        assert!(parse_sweep_args(&["--report-html=\t".into()]).is_err());
+        assert_eq!(
+            parse_sweep_args(&["--output-dir=one".into(), "--perf-dir=two".into(),])
+                .err()
+                .as_deref(),
+            Some("--output-dir and --perf-dir disagree")
+        );
+        assert_eq!(
+            parse_sweep_args(&["--no-profile".into(), "--report-html=report.html".into(),])
+                .err()
+                .as_deref(),
+            Some("--report-html cannot be combined with --no-profile")
+        );
+        assert_eq!(
+            parse_sweep_args(&["--no-report".into(), "--report-html=report.html".into(),])
+                .err()
+                .as_deref(),
+            Some("--report-html cannot be combined with --no-report")
+        );
+        let args = parse_sweep_args(&[
+            "--output-dir=artifacts".into(),
+            "--perf-dir=artifacts".into(),
+        ])
+        .unwrap();
+        assert_eq!(args.output_dir.as_deref(), Some("artifacts"));
+        assert_eq!(args.perf_dir.as_deref(), Some("artifacts"));
+    }
+
+    #[test]
+    fn sweep_profiler_flags_are_opt_in_and_validate_before_execution() {
+        let args = parse_sweep_args(&[
+            "--perf-window=350ms".into(),
+            "--wprof-window=400ms".into(),
+            "--wprof-window=400ms".into(),
+            "--profiler-sudo".into(),
+        ])
+        .unwrap();
+        assert!(args.perf_record);
+        assert_eq!(args.perf_window, Some(Duration::from_millis(350)));
+        assert_eq!(
+            args.wprof_windows,
+            [Duration::from_millis(400), Duration::from_millis(400)]
+        );
+        assert!(args.profiler_sudo);
+
+        let differing =
+            parse_sweep_args(&["--wprof-window=300ms".into(), "--wprof-window=500ms".into()])
+                .unwrap_err();
+        assert!(differing.contains("durations must match"));
+        let disabled =
+            parse_sweep_args(&["--perf-record".into(), "--no-profile".into()]).unwrap_err();
+        assert!(disabled.contains("cannot be combined with --no-profile"));
+        assert!(parse_sweep_args(&["--profiler-sudo".into()]).is_err());
+        assert!(parse_sweep_args(&["--perf-window=0".into()]).is_err());
+    }
+
+    #[test]
+    fn profiler_capture_width_is_fit_only_from_current_sweep_samples() {
+        let measure = |wall_s: f64, cpu_s: f64| SweepMeasure {
+            wall_s,
+            user_s: cpu_s,
+            sys_s: 0.0,
+            rss_hwm: Some(1024),
+            ok: true,
+            returncode: Some(0),
+        };
+        let samples = HashMap::from([(
+            "build.app".to_string(),
+            vec![
+                (1, measure(10.0, 10.0)),
+                (4, measure(2.5, 10.5)),
+                // Faster, but more than the model's 1.5x CPU-work guard permits.
+                (8, measure(2.4, 16.0)),
+            ],
+        )]);
+        let model = current_sweep_speedups(&samples);
+        assert_eq!(model["build.app"].recommended_inner_jobs, 4);
+    }
+
+    #[test]
+    fn one_width_sweep_has_an_explicit_capture_fallback() {
+        let mut cfg = tiny();
+        cfg.steps.truncate(1);
+        let observations = vec![
+            (
+                6,
+                SweepMeasure {
+                    wall_s: 3.0,
+                    user_s: 5.0,
+                    sys_s: 1.0,
+                    rss_hwm: None,
+                    ok: true,
+                    returncode: Some(0),
+                },
+            ),
+            (
+                6,
+                SweepMeasure {
+                    wall_s: 5.0,
+                    user_s: 6.0,
+                    sys_s: 1.0,
+                    rss_hwm: None,
+                    ok: true,
+                    returncode: Some(0),
+                },
+            ),
+        ];
+        let selection =
+            current_sweep_selection(&cfg.steps[0], &cfg, &observations, "deadbeef").unwrap();
+        assert_eq!(selection.inner_jobs, 6);
+        assert_eq!(selection.expected_wall_s, 4.0);
+        assert_eq!(selection.source, "single-measured-width");
+    }
+
+    #[test]
+    fn perf_wrapper_keeps_the_width_on_the_guest_command() {
+        let mut cfg = tiny();
+        cfg.steps.truncate(1);
+        cfg.steps[0].cmd = "cargo build".to_string();
+        cfg.steps[0].cmdtype = crate::model::CmdType::CargoBuild;
+        cfg.steps[0].jobs_flag = None;
+        cfg.steps[0].jobs_env = None;
+        let request = IsolatedTrialRequest {
+            trial_id: "perf-001".to_string(),
+            step: "build.app".to_string(),
+            inner_jobs: 8,
+            kind: crate::profile_capture::CaptureKind::Perf,
+            output_dir: PathBuf::from("/tmp/capture"),
+            expected_wall_s: 1.0,
+            window: crate::profile_capture::centered_capture_window(1.0, 0.4).unwrap(),
+            argv_prefix: vec!["perf".to_string(), "record".to_string(), "--".to_string()],
+            env: BTreeMap::new(),
+            guest_launch: crate::profile_capture::GuestLaunchSignal::default(),
+            include_in_model: false,
+        };
+        let wrapped = profiler_wrapped_step(&cfg.steps[0], &cfg, &request);
+        assert!(wrapped
+            .cmd
+            .starts_with("'perf' 'record' '--' 'env' 'DAGRUN_EXTRA_ARGS=--jobs 8' 'bash' '-c'"));
+        assert!(wrapped.cmd.contains("guest-launch-ready.fifo"));
+        assert!(wrapped.cmd.contains("guest-launch-release.fifo"));
+        assert!(wrapped.cmd.contains("cargo build --jobs 8"));
+        assert_eq!(wrapped.cmdtype, crate::model::CmdType::Unknown);
+        assert_eq!(wrapped.jobs_flag.as_deref(), Some(""));
+        assert_eq!(wrapped.jobs_env.as_deref(), Some(""));
+        assert_eq!(wrapped.hint.preferred_inner_jobs, Some(8));
     }
 
     #[test]
@@ -4954,6 +5721,109 @@ mod tests {
         assert_eq!(cmd_sweep(&args, &Palette { enabled: false }), 3);
         assert!(!marker.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn successful_profiled_sweep_writes_interactive_report_by_default() {
+        let root = std::env::temp_dir().join(format!(
+            "dagrun_sweep_report_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let dag = root.join("dag.json");
+        let output = root.join("artifacts");
+        std::fs::write(
+            &dag,
+            r#"{"steps":[{"group":"g","job":"j","cmd":"true","cmdtype":"generic-with-flag","jobs_flag":"--workers="}]}"#,
+        )
+        .unwrap();
+        let args = parse_sweep_args(&[
+            format!("--dag={}", dag.display()),
+            "--step=g.j".into(),
+            "--jobs=1".into(),
+            "--unsafe-no-cgroups".into(),
+            format!("--output-dir={}", output.display()),
+        ])
+        .unwrap();
+
+        assert_eq!(cmd_sweep(&args, &Palette { enabled: false }), 0);
+        let report = output.join(profile_report::PROFILE_REPORT_FILENAME);
+        let html = std::fs::read_to_string(&report).unwrap();
+        assert!(html.contains("id=\"dagrun-report-data\""));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn explicit_report_collision_fails_after_preserving_measurements() {
+        let root = std::env::temp_dir().join(format!(
+            "dagrun_sweep_report_collision_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let dag = root.join("dag.json");
+        let output = root.join("artifacts");
+        let original = r#"{"steps":[{"group":"g","job":"j","cmd":"true","cmdtype":"generic-with-flag","jobs_flag":"--workers="}]}"#;
+        std::fs::write(&dag, original).unwrap();
+        let args = parse_sweep_args(&[
+            format!("--dag={}", dag.display()),
+            "--step=g.j".into(),
+            "--jobs=1".into(),
+            "--unsafe-no-cgroups".into(),
+            format!("--output-dir={}", output.display()),
+            format!("--report-html={}", dag.display()),
+        ])
+        .unwrap();
+
+        assert_eq!(cmd_sweep(&args, &Palette { enabled: false }), 1);
+        assert_eq!(std::fs::read_to_string(&dag).unwrap(), original);
+        assert!(std::fs::read_dir(&output).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("step_profiles_")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn default_report_collision_warns_without_failing_sweep() {
+        let root = std::env::temp_dir().join(format!(
+            "dagrun_sweep_default_report_collision_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let dag = root.join("dag.json");
+        let output = root.join("artifacts");
+        std::fs::create_dir_all(&output).unwrap();
+        std::fs::write(
+            &dag,
+            r#"{"steps":[{"group":"g","job":"j","cmd":"true","cmdtype":"generic-with-flag","jobs_flag":"--workers="}]}"#,
+        )
+        .unwrap();
+        let report = output.join(profile_report::PROFILE_REPORT_FILENAME);
+        std::fs::write(&report, b"do not overwrite").unwrap();
+        let args = parse_sweep_args(&[
+            format!("--dag={}", dag.display()),
+            "--step=g.j".into(),
+            "--jobs=1".into(),
+            "--unsafe-no-cgroups".into(),
+            format!("--output-dir={}", output.display()),
+        ])
+        .unwrap();
+
+        assert_eq!(cmd_sweep(&args, &Palette { enabled: false }), 0);
+        assert_eq!(std::fs::read(&report).unwrap(), b"do not overwrite");
+        assert!(std::fs::read_dir(&output).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("step_profiles_")));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -5295,9 +6165,16 @@ mod tests {
             jobs: Some("1..2".to_string()),
             target_time: None,
             repeat: 1,
+            output_dir: None,
             perf_dir: None,
             no_profile: true,
+            report_html: None,
+            no_report: false,
             profile_timeseries: None,
+            perf_record: false,
+            perf_window: None,
+            wprof_windows: Vec::new(),
+            profiler_sudo: false,
             allow_cgroup_failure: false,
             unsafe_no_cgroups: false,
             verbosity: 0,

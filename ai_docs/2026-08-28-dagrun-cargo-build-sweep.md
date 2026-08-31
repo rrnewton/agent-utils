@@ -20,6 +20,9 @@ to use it.
 
 ## Artifacts
 
+- [Interactive standalone report](assets/2026-08-28-dagrun-cargo-build-sweep/interactive-report.html)
+  with commit/environment/workload filters, DAG drill-down, scaling plots, and all 27 interval
+  traces
 - [Speedup chart](assets/2026-08-28-dagrun-cargo-build-sweep/cargo-build-speedup.svg)
   and [plotted values](assets/2026-08-28-dagrun-cargo-build-sweep/cargo-build-speedup.csv)
 - [Recommended-width j16 timeline](assets/2026-08-28-dagrun-cargo-build-sweep/cargo-build-parallelism-j16.svg)
@@ -47,8 +50,9 @@ limits the whole step cgroup to N cores.
 Each of the 27 trials used a newly created, empty `CARGO_TARGET_DIR`. Incremental compilation was
 disabled; Cargo ran `--release --locked --offline` for `x86_64-unknown-linux-gnu`; inherited
 compiler-wrapper, target-dir, job-count, and Rust flags were removed. The Cargo registry/source
-cache and operating-system page cache were deliberately warm, so this is a clean compilation
-benchmark, not a cold download or cold-disk benchmark.
+cache and operating-system page cache were deliberately warm. Every dependency needed by dagrun
+was therefore compiled again in every trial, but crates were not downloaded again. This is a clean
+compilation benchmark, not a cold download or cold-disk benchmark.
 
 The command was:
 
@@ -60,7 +64,7 @@ DAGRUN_CARGO_SWEEP_ROOT=/tmp/dagrun-cargo-build-sweep.oOOOqVZc/targets \
   --target-time 0 \
   --repeat 3 \
   --profile-timeseries 250ms \
-  --perf-dir /tmp/dagrun-cargo-build-sweep.oOOOqVZc/profiles
+  --output-dir /tmp/dagrun-cargo-build-sweep.oOOOqVZc/profiles
 ```
 
 `--target-time 0` requests no optional refinement pass, but the mandatory first pass still runs to

@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 
 use crate::io::json_str;
 use crate::model::{effective_cpu_count, step_width_is_resizable, DagConfig, ResourceHint, Step};
-use crate::perflog::{container_class, machine_id, parse_csv_line};
+use crate::perflog::{container_class, machine_id, parse_csv_records};
 use crate::sizing::{
     memory_footprint_fits, outer_mem_footprint_bytes, schedulable_peak_mem_bytes_widths,
 };
@@ -544,17 +544,13 @@ pub(crate) fn load_store(
     let path = profile_dir.join(format!("step_profiles_{machine_id}_{container_class}.csv"));
     let text = std::fs::read_to_string(&path).ok()?;
     let affinity = affinity_width(container_class);
-    let mut lines = text.lines();
-    let header: Vec<String> = match lines.next() {
-        Some(h) => parse_csv_line(h),
+    let records = parse_csv_records(&text);
+    let header: Vec<String> = match records.first() {
+        Some(header) => header.clone(),
         None => return Some((Vec::new(), affinity)),
     };
     let mut rows: Vec<HashMap<String, String>> = Vec::new();
-    for line in lines {
-        if line.is_empty() {
-            continue;
-        }
-        let cells = parse_csv_line(line);
+    for cells in records.into_iter().skip(1) {
         let row: HashMap<String, String> = header
             .iter()
             .enumerate()

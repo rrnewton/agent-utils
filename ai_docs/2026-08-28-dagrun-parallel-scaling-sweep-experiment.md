@@ -74,14 +74,16 @@ Each persisted step sample contains the ordinary run telemetry plus sweep identi
 Rows now record `runner_name=sweep` and report `enforcement_kind=cgroup-v2` only when a cgroup
 manager actually boxed the sample; deliberately unboxed sweeps say `unboxed`.
 
-The optional, high-volume `perf record` and hot-window `wprof` capture proposed during design are
-not part of this change. They remain a separate opt-in extension because they require a process
-lifetime sampling hook, artifact-size policy, and explicit tool-availability/failure semantics.
+The optional, high-volume modes are deliberately separate from the ordinary measurements.
+`--profile-timeseries DURATION` records cgroup CPU/thread activity in `traces/<run_id>.csv`.
+After the uninstrumented sweep chooses a useful plateau width, `--perf-record` (optionally with
+`--perf-window DURATION`) and repeatable `--wprof-window DURATION` run additional trials at that
+width and retain their manifests and artifacts under `captures/`. Instrumented trials never feed
+back into the scaling model.
 
-> **Later update (2026-08-28).** Dagrun now has an opt-in cgroup CPU/thread lifetime sampler:
-> `run` and `sweep` accept `--profile-timeseries DURATION` and write separate
-> `traces/<run_id>.csv` files. This supplies the sampling hook and exposes within-step parallelism;
-> `perf record` and hot-window `wprof` capture remain unimplemented.
+Every successful profiled sweep also refreshes a standalone interactive
+`profile_report.html`. It combines the DAG, historical and current scaling curves, resource
+response, within-step time series, and links to the optional capture artifacts.
 
 ### Storage policy
 
@@ -89,7 +91,7 @@ Profiles are written by default under `./.dagrun/profiles/`, relative to the cal
 directory. Write-location precedence is:
 
 1. `--no-profile` disables local writes;
-2. `--perf-dir DIR`;
+2. `--output-dir DIR` (`--perf-dir DIR` is a backward-compatible alias);
 3. `DAGRUN_PROFILE_DIR`;
 4. `./.dagrun/profiles/`.
 
@@ -183,7 +185,7 @@ DAGRUN_SYNTH_WORK=10000000 rs/target/release/dagrun sweep \
   --dag examples/07-graph-scaling-sweep.yaml \
   --target-time 0 \
   --repeat 3 \
-  --perf-dir /tmp/dagrun-scaling-paper-full.pMCnnH
+  --output-dir /tmp/dagrun-scaling-paper-full.pMCnnH
 ```
 
 The temporary store contained 81 rows: three steps times nine widths times three repeats. Every row
@@ -199,6 +201,10 @@ Artifact checksums (the machine-local files are deliberately not committed):
 | Whole-run CSV | `5d469ab9017e3001028cb64d20d579e37c5a2f4efc85cfb562dca9313386685a` |
 | Raw per-step CSV | `33cc3c2a5a86978d917e1a2c6e5aba9ff9d4c502f8b2a04f34f3ae817cdc17bd` |
 | Derived model JSON | `7fa63747d2db21d1e261ae05b33776129ad26536284ff7b816a98861a9943d12` |
+
+The retained dataset is also available as a
+[standalone interactive report](assets/2026-08-28-dagrun-parallel-scaling-sweep/interactive-report.html)
+with the CPU-weighted DAG and per-step scaling drill-down.
 
 ## Results
 
@@ -322,7 +328,8 @@ current critical path enough to outweigh the area pressure and stays within the 
 - The synthetic process-pool benchmark exposes scheduler and process-start costs as well as pure
   compute scaling. That is useful for end-to-end job sizing, but it is not a microarchitectural
   kernel benchmark.
-- Optional `perf`/`wprof` artifacts are not collected in this implementation.
+- This historical run did not request the now-available opt-in `perf`/`wprof`
+  follow-up captures.
 
 ## Reproduction and acceptance criteria
 
@@ -333,7 +340,7 @@ DAGRUN_SYNTH_WORK=10000000 dagrun sweep \
   --dag examples/07-graph-scaling-sweep.yaml \
   --target-time 0 \
   --repeat 3 \
-  --perf-dir /tmp/dagrun-scaling-study
+  --output-dir /tmp/dagrun-scaling-study
 ```
 
 Inspect the raw rows and rebuildable sidecar under that directory. A valid reproduction should

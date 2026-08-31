@@ -30,7 +30,9 @@ pub mod memory_feedback;
 pub mod model;
 pub mod perflog;
 pub mod proccpu;
+pub mod profile_capture;
 pub mod profile_enrich;
+pub mod profile_report;
 pub mod reservation;
 pub mod resource_caps;
 pub mod scheduler;
@@ -91,8 +93,19 @@ pub use model::{
 pub use perflog::{
     append_step_profiles, append_step_timeseries, PerfWindow, STEP_TIMESERIES_COLUMNS,
 };
+pub use profile_capture::{
+    capture_at_sweet_spot, centered_capture_window, preflight_capture_tools,
+    select_capture_sweet_spot, CaptureArtifact, CaptureConfig, CaptureKind, CaptureManifest,
+    CaptureState, CaptureTrialRecord, CaptureWindow, GuestLaunch, GuestLaunchSignal,
+    IsolatedTrialRequest, IsolatedTrialResult, ProfileCaptureError, RunIsolatedTrial,
+    SweetSpotSelection, ToolPreflight, DEFAULT_WPROF_WINDOW_S, PROFILE_CAPTURE_MANIFEST_SCHEMA,
+};
 pub use profile_enrich::{
     container_core_budget, resolve_effective_inner_jobs, step_enrichment_columns,
+};
+pub use profile_report::{
+    build_report_data, generate_report, generate_report_from_path, load_report_dag, render_report,
+    write_profile_report, ProfileReportError, ProfileReportSummary, PROFILE_REPORT_FILENAME,
 };
 pub use reservation::{acquire as reserve_cores, held_cores, reclaim_dead, Reservation};
 #[allow(deprecated)]

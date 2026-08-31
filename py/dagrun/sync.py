@@ -20,7 +20,6 @@ Backends
 
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import shutil
@@ -31,6 +30,7 @@ from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 from dagrun import summary as summarylib
+from dagrun.perflog import _profile_file_lock
 from dagrun.summary import (
     DEFAULT_MAX_BUCKETS,
     DEFAULT_RESERVOIR_K,
@@ -103,8 +103,8 @@ class SyncBackend(Protocol):
 class LocalDirBackend:
     """Store the summary as a file in a local directory (``local:<dir>``).
 
-    ``publish`` is an atomic read-merge-write under an ``flock`` sidecar (the same serialization the
-    CSV writer uses), so concurrent local runs never lose a contribution."""
+    ``publish`` is an atomic read-merge-write under the same persistent ``flock`` sidecar protocol
+    as the profile store, so concurrent compatible runs never lose a contribution."""
 
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root)
@@ -139,9 +139,7 @@ class LocalDirBackend:
         except OSError as exc:
             raise SyncError(f"local backend: cannot create {self.root}: {exc}") from exc
         path = self._path(delta.machine_id, delta.container_class)
-        lock_path = path.with_suffix(path.suffix + ".lock")
-        with open(lock_path, "w") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+        with _profile_file_lock(path):
             base = self.download(delta.machine_id, delta.container_class)
             merged = summarylib.merge(
                 base, delta, reservoir_cap=reservoir_cap, max_buckets=max_buckets
@@ -149,10 +147,6 @@ class LocalDirBackend:
             tmp = path.with_suffix(path.suffix + ".tmp")
             tmp.write_text(summarylib.to_json(merged), encoding="utf-8")
             os.replace(tmp, path)
-            try:
-                lock_path.unlink()
-            except OSError:
-                pass
         return merged
 
 

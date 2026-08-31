@@ -12,7 +12,10 @@ from dagrun import perflog
 
 import csv
 import tempfile
+import time
 from pathlib import Path
+
+import pytest
 
 from dagrun import DagConfig, Step, run_dag, run_dag_limited
 from dagrun.perflog import (
@@ -39,6 +42,22 @@ def _tiny_dag() -> DagConfig:
             Step("lint", "fmt", "format check", "true"),
         )
     )
+
+
+def test_profile_timestamp_uses_utc(monkeypatch: pytest.MonkeyPatch) -> None:
+    sentinel = object()
+    seen: list[object | None] = []
+
+    monkeypatch.setattr(time, "gmtime", lambda: sentinel)
+
+    def fake_strftime(fmt: str, value: object | None = None) -> str:
+        assert fmt == "%Y-%m-%dT%H:%M:%SZ"
+        seen.append(value)
+        return "2026-08-31T12:34:56Z"
+
+    monkeypatch.setattr(time, "strftime", fake_strftime)
+    assert perflog._timestamp() == "2026-08-31T12:34:56Z"
+    assert seen == [sentinel]
 
 
 def test_csv_metrics_sink_writes_per_step_and_whole_run() -> None:
@@ -74,8 +93,17 @@ def test_csv_metrics_sink_writes_per_step_and_whole_run() -> None:
         assert whole_rows[0]["result"] == "pass"
         assert whole_rows[0]["n_steps"] == "3"
 
-        # The flock sidecar must not be left behind as stray output.
-        assert not list(Path(d).glob("*.lock")), "a stray *.lock file was left in --perf-dir"
+        # Stable hidden lock inodes are shared with the Rust writer. They stay out of the visible
+        # profile-artifact namespace and must not use the old racy `*.csv.lock` location.
+        assert not list(Path(d).glob("*.lock"))
+        assert (Path(d) / ".locks" / f"{step_csv.name}.lock").is_file()
+        assert (Path(d) / ".locks" / f"{whole_run_csv.name}.lock").is_file()
+
+        # New rows use the canonical Rust-compatible scalar spellings. Readers remain tolerant of
+        # historical Python rows that used title-case booleans or shorter decimals.
+        assert all(row["ok"] == "true" for row in rows)
+        assert all(row["timed_out"] == "false" for row in rows)
+        assert all(len(row["elapsed_s"].partition(".")[2]) == 3 for row in rows)
 
 
 def test_independent_cpu_budget_keeps_legacy_jobs_columns_as_max_steps() -> None:

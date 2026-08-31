@@ -45,7 +45,14 @@ asserts:
   byte-identical HEADER rows and the SAME line-ending style. Data rows (timestamps, elapsed, git
   SHA) legitimately differ and are not compared. The dynamic cgroup ``cpu.*`` columns only appear
   under boxing (out of scope for the unboxed differential); their alphabetical ordering is pinned
-  by each build's own perflog tests.
+  by each build's own perflog tests. Each reader also builds byte-identical typed summaries from
+  the other implementation's freshly emitted store, and simultaneous mixed-language writers must
+  preserve every expected whole-run and per-step row.
+* The opt-in time-series TRACE has one cross-language schema and encoding: on hosts that can box a
+  step, a one-width sweep under each build writes the same fixed columns plus the same sorted sweep
+  provenance tail. Volatile timestamps, run ids, counters and timings are shape-normalized, while
+  field precision, blank-vs-present semantics, sample ordering and stable provenance are compared.
+  Hosts without the required cgroup-v2 scope take the same loud capability-skip path.
 * The ``sweep`` ``--jobs`` error text (malformed range / not-an-integer) matches across builds, and
   a step with an empty effective ``jobs_flag`` is refused because its guest width cannot vary.
 * The profile-store FEEDBACK loop + ``--planner`` agree (``compare_plan_feedback``): against a FIXED
@@ -54,6 +61,12 @@ asserts:
   all match); the ``critical-path`` order differs from ``greedy-lpt`` (the planner really reorders);
   the hint-only ``--no-profile-feedback`` plan is also identical; and the ``--max-mem`` sizing fed by
   the store's rss estimates matches across builds and throttles below the CPU count.
+* The deterministic ``scaling_model_*.json`` sidecar rebuilt from one fixed raw profile store is
+  byte-identical across builds, including workload digests and the trailing newline.
+* The standalone interactive sweep report embeds the same schema-1 historical dataset in both
+  builds when generated from the same raw rows. Presentation markup may evolve independently;
+  the graph, samples, filters, fitted-input data, traces, and profiler-capture manifests may not
+  diverge.
 * The remaining ``run`` comparisons pass ``--no-profile`` (no store WRITE into the harness CWD) and
   ``--no-profile-feedback`` (no store READ / hint refinement), so the base scheduling behavior under
   test stays hermetic and hint-only; feedback parity is asserted separately (above).
@@ -83,6 +96,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -330,6 +344,11 @@ def _env(extra: Mapping[str, str] | None = None) -> dict[str, str]:
     env.pop("CARGO_BUILD_JOBS", None)
     env.pop("DAGRUN_OPERATOR_BUILD_JOBS", None)
     env.pop("DAGRUN_JOBS_ENV", None)
+    # Profile identity overrides belong only to the fixtures that set them explicitly. Ambient
+    # values could make a writer emit one filename while a reader searches another and let an
+    # interoperability check pass vacuously on two empty summaries.
+    env.pop("DAGRUN_MACHINE_ID", None)
+    env.pop("DAGRUN_CONTAINER_CLASS", None)
     # The retired spelling must not make a differential case accidentally pass.
     env.pop("SAFE_CI_DAG_RUNNER_JOBS_ENV", None)
     if extra:
@@ -2726,6 +2745,129 @@ def compare_profile_store(py: list[str], rs: list[str], rep: Report) -> None:
             else:
                 rep.ok(sub)
 
+        # The compatibility promise is stronger than matching headers: either reader must be able
+        # to ingest a store emitted by either writer and reduce it to the same typed summary. This
+        # protects historical data when deployments switch implementations.
+        commands = {"py": py, "rs": rs}
+        for producer, store in (("py", py_dir), ("rs", rs_dir)):
+            summaries = {
+                reader: run(command, ("summary", "build", "--perf-dir", store))
+                for reader, command in commands.items()
+            }
+            label = f"profile-store:{producer}-writer-cross-read"
+            if any(outcome.returncode != 0 for outcome in summaries.values()):
+                rep.bad(label, f"py={summaries['py']}\nrs={summaries['rs']}")
+            elif summaries["py"].stdout != summaries["rs"].stdout:
+                rep.bad(
+                    label,
+                    "readers derived different summaries from the same emitted store\n"
+                    f"--- py ---\n{summaries['py'].stdout}\n"
+                    f"--- rs ---\n{summaries['rs'].stdout}",
+                )
+            else:
+                try:
+                    document = json.loads(summaries["py"].stdout)
+                    buckets = document.get("buckets", [])
+                    tags = {
+                        bucket.get("step")
+                        for bucket in buckets
+                        if isinstance(bucket, dict)
+                    }
+                    samples = sum(
+                        len(bucket.get("samples", []))
+                        for bucket in buckets
+                        if isinstance(bucket, dict)
+                        and isinstance(bucket.get("samples"), list)
+                    )
+                except (json.JSONDecodeError, AttributeError, TypeError):
+                    tags, samples = set(), 0
+                if tags != {"g.a", "g.b"} or samples != 2:
+                    rep.bad(
+                        label,
+                        f"cross-read summary was vacuous or incomplete: tags={tags!r}, "
+                        f"samples={samples}",
+                    )
+                else:
+                    rep.ok(label)
+
+
+def compare_mixed_profile_writers(py: list[str], rs: list[str], rep: Report) -> None:
+    """Exercise simultaneous Python/Rust writers against one shared local profile store."""
+
+    dag = (
+        '{"steps":['
+        '{"group":"g","job":"a","cmd":"true"},'
+        '{"group":"g","job":"b","cmd":"true"},'
+        '{"group":"g","job":"c","cmd":"true"}'
+        "]}"
+    )
+    with tempfile.TemporaryDirectory(prefix="dagrun-mixed-profile-") as tmp:
+        dag_path = os.path.join(tmp, "dag.json")
+        Path(dag_path).write_text(dag, encoding="utf-8")
+        store = os.path.join(tmp, "store")
+        args = (
+            "run",
+            "--dag",
+            dag_path,
+            "--perf-dir",
+            store,
+            NOFB,
+            "--unsafe-no-cgroups",
+            "--max-steps",
+            "1",
+            "-q",
+        )
+        commands = (py, rs, py, rs)
+        with ThreadPoolExecutor(max_workers=len(commands)) as executor:
+            outcomes = list(executor.map(lambda command: run(command, args), commands))
+        if any(outcome.returncode != 0 for outcome in outcomes):
+            rep.bad(
+                "profile-store:mixed-concurrent-writers",
+                "\n".join(f"run {index}: {outcome}" for index, outcome in enumerate(outcomes)),
+            )
+            return
+
+        step_paths = sorted(Path(store).glob("step_profiles_*.csv"))
+        whole_paths = sorted(
+            path
+            for path in Path(store).glob("*.csv")
+            if not path.name.startswith("step_profiles_")
+        )
+        try:
+            if len(step_paths) != 1 or len(whole_paths) != 1:
+                raise ValueError(
+                    f"expected one step and one whole-run CSV, got {step_paths!r}, {whole_paths!r}"
+                )
+            with step_paths[0].open(newline="", encoding="utf-8") as handle:
+                step_rows = list(csv.DictReader(handle))
+            with whole_paths[0].open(newline="", encoding="utf-8") as handle:
+                whole_rows = list(csv.DictReader(handle))
+        except (OSError, ValueError, csv.Error) as error:
+            rep.bad("profile-store:mixed-concurrent-writers", str(error))
+            return
+        if len(step_rows) != 12 or len(whole_rows) != 4:
+            rep.bad(
+                "profile-store:mixed-concurrent-writers",
+                f"lost rows: step={len(step_rows)}/12 whole={len(whole_rows)}/4",
+            )
+            return
+
+        summaries = {
+            "py": run(py, ("summary", "build", "--perf-dir", store)),
+            "rs": run(rs, ("summary", "build", "--perf-dir", store)),
+        }
+        if (
+            any(outcome.returncode != 0 for outcome in summaries.values())
+            or summaries["py"].stdout != summaries["rs"].stdout
+        ):
+            rep.bad(
+                "profile-store:mixed-concurrent-writers",
+                f"mixed store did not cross-read identically\npy={summaries['py']}\n"
+                f"rs={summaries['rs']}",
+            )
+        else:
+            rep.ok("profile-store:mixed-concurrent-writers")
+
 
 # --------------------------------------------------------------------- profile run identity
 
@@ -2809,6 +2951,264 @@ def compare_profile_run_identity(py: list[str], rs: list[str], rep: Report) -> N
                 )
             else:
                 rep.ok(label)
+
+
+# --------------------------------------------------------------------- profile time-series trace
+
+
+_TRACE_COLUMNS = (
+    "timestamp",
+    "machine_id",
+    "container_class",
+    "git_sha",
+    "outer_jobs",
+    "profile_base_sha",
+    "enforcement_kind",
+    "runner_name",
+    "run_id",
+    "step",
+    "inner_jobs",
+    "sample_index",
+    "sample_kind",
+    "elapsed_s",
+    "interval_s",
+    "cpu_usage_s",
+    "user_s",
+    "sys_s",
+    "effective_cores",
+    "user_cores",
+    "system_cores",
+    "throttled_s",
+    "interval_throttled_s",
+    "thread_count",
+)
+
+_TRACE_SWEEP_COLUMNS = (
+    "sweep_id",
+    "sweep_logical_cpus",
+    "sweep_mode",
+    "sweep_pass",
+    "sweep_physical_cores",
+    "sweep_repeat",
+    "sweep_sample",
+    "sweep_target_s",
+    "sweep_width_source",
+    "workload_digest",
+)
+
+_TRACE_SECONDS6 = frozenset(
+    {
+        "elapsed_s",
+        "interval_s",
+        "cpu_usage_s",
+        "user_s",
+        "sys_s",
+        "throttled_s",
+        "interval_throttled_s",
+    }
+)
+_TRACE_CORES4 = frozenset({"effective_cores", "user_cores", "system_cores"})
+_TRACE_FIXED_DECIMAL_RE = {
+    4: re.compile(r"^[0-9]+\.[0-9]{4}$"),
+    6: re.compile(r"^[0-9]+\.[0-9]{6}$"),
+}
+_TRACE_TIMESTAMP_RE = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+)
+
+
+def _only_trace_path(directory: str) -> Path:
+    traces = Path(directory) / "traces"
+    paths = sorted(path for path in traces.glob("*.csv") if path.is_file())
+    if len(paths) != 1:
+        raise ValueError(f"expected one trace CSV under {traces}, found {paths}")
+    return paths[0]
+
+
+def _trace_cell(row: Mapping[str, str | None], column: str, row_number: int) -> str:
+    value = row.get(column)
+    if value is None:
+        raise ValueError(f"trace row {row_number} has no {column!r} cell")
+    return value
+
+
+def _normalized_trace_csv(path: Path) -> tuple[str, tuple[str, ...], tuple[tuple[str, ...], ...]]:
+    """Validate one sweep trace and erase only values that are inherently run-specific.
+
+    The returned rows retain stable provenance and blank-vs-present structure. Decimal values are
+    replaced by precision tokens only after their exact fixed-width encoding has been checked, so
+    two executions need not consume identical CPU time to prove that their CSV contracts match.
+    """
+
+    raw = path.read_bytes()
+    eol = "CRLF" if b"\r\n" in raw else ("LF" if b"\n" in raw else "none")
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        header = tuple(reader.fieldnames or ())
+        rows = list(reader)
+    expected_header = (*_TRACE_COLUMNS, *_TRACE_SWEEP_COLUMNS)
+    if header != expected_header:
+        raise ValueError(f"trace header differs: expected {expected_header!r}, got {header!r}")
+    if eol != "LF":
+        raise ValueError(f"trace must use LF line endings, got {eol}")
+    if len(rows) < 3:
+        raise ValueError(f"trace needs start, periodic and final rows, got {len(rows)}")
+
+    kinds = [_trace_cell(row, "sample_kind", number) for number, row in enumerate(rows, start=2)]
+    if kinds[0] != "start" or kinds[-1] != "final" or any(
+        kind != "periodic" for kind in kinds[1:-1]
+    ):
+        raise ValueError(f"trace sample order is not start/periodic*/final: {kinds!r}")
+    indices = [
+        int(_trace_cell(row, "sample_index", number))
+        for number, row in enumerate(rows, start=2)
+    ]
+    if indices != list(range(len(rows))):
+        raise ValueError(f"trace sample indices are not contiguous from zero: {indices!r}")
+    for row_number, row in enumerate(rows, start=2):
+        for column in _TRACE_SECONDS6:
+            value = _trace_cell(row, column, row_number)
+            if value and _TRACE_FIXED_DECIMAL_RE[6].fullmatch(value) is None:
+                raise ValueError(
+                    f"trace row {row_number} {column} must be blank or fixed to 6 decimals, "
+                    f"got {value!r}"
+                )
+        for column in _TRACE_CORES4:
+            value = _trace_cell(row, column, row_number)
+            if value and _TRACE_FIXED_DECIMAL_RE[4].fullmatch(value) is None:
+                raise ValueError(
+                    f"trace row {row_number} {column} must be blank or fixed to 4 decimals, "
+                    f"got {value!r}"
+                )
+        thread_count = _trace_cell(row, "thread_count", row_number)
+        if thread_count and (not thread_count.isascii() or not thread_count.isdigit()):
+            raise ValueError(
+                f"trace row {row_number} thread_count must be blank or an integer, "
+                f"got {thread_count!r}"
+            )
+    elapsed = [
+        float(_trace_cell(row, "elapsed_s", number))
+        for number, row in enumerate(rows, start=2)
+    ]
+    if any(current <= previous for previous, current in zip(elapsed, elapsed[1:])):
+        raise ValueError(f"trace elapsed times are not strictly increasing: {elapsed!r}")
+
+    timestamps = {
+        _trace_cell(row, "timestamp", number) for number, row in enumerate(rows, start=2)
+    }
+    if len(timestamps) != 1 or not _TRACE_TIMESTAMP_RE.fullmatch(next(iter(timestamps))):
+        raise ValueError(f"trace batch timestamp is not one ISO second value: {timestamps!r}")
+    run_ids = {_trace_cell(row, "run_id", number) for number, row in enumerate(rows, start=2)}
+    if len(run_ids) != 1 or not next(iter(run_ids)):
+        raise ValueError(f"trace rows do not share one non-empty run_id: {run_ids!r}")
+    if path.stem != next(iter(run_ids)):
+        raise ValueError(f"trace filename {path.stem!r} does not match row run_id {run_ids!r}")
+    sweep_ids = {
+        _trace_cell(row, "sweep_id", number) for number, row in enumerate(rows, start=2)
+    }
+    if len(sweep_ids) != 1 or not next(iter(sweep_ids)):
+        raise ValueError(f"trace rows do not share one non-empty sweep_id: {sweep_ids!r}")
+
+    representatives = (rows[0], rows[kinds.index("periodic")], rows[-1])
+    normalized: list[tuple[str, ...]] = []
+    for row_number, row in enumerate(representatives, start=1):
+        cells: list[str] = []
+        for column in header:
+            value = _trace_cell(row, column, row_number)
+            if column == "timestamp":
+                cells.append("<timestamp>")
+            elif column in {"run_id", "sweep_id"}:
+                cells.append(f"<{column}>")
+            elif column == "sample_index":
+                cells.append("<sample_index>")
+            elif column in _TRACE_SECONDS6:
+                cells.append("<seconds6>" if value else "")
+            elif column in _TRACE_CORES4:
+                cells.append("<cores4>" if value else "")
+            elif column == "thread_count":
+                cells.append("<integer>" if value else "")
+            else:
+                cells.append(value)
+        normalized.append(tuple(cells))
+    return eol, header, tuple(normalized)
+
+
+def compare_profile_timeseries_trace(py: list[str], rs: list[str], rep: Report) -> None:
+    """Compare one real boxed sweep trace after normalizing only volatile measurements."""
+
+    with tempfile.TemporaryDirectory(prefix="dagrun-trace-cross-") as tmp:
+        dag_path = os.path.join(tmp, "trace.json")
+        Path(dag_path).write_text(
+            json.dumps(
+                {
+                    "steps": [
+                        {
+                            "group": "g",
+                            "job": "trace",
+                            "cmd": "sleep 0.30; true $DAGRUN_EXTRA_ARGS",
+                            "cmdtype": "generic-dash-j-command",
+                            "timeout": 30,
+                            "cpu_timeout": 30,
+                            "hint": {"hard_mem_max_bytes": 268435456},
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        stores = {name: os.path.join(tmp, name) for name in ("py", "rs")}
+
+        def args_for(store: str) -> tuple[str, ...]:
+            return (
+                "sweep",
+                "--dag",
+                dag_path,
+                "--target-time",
+                "0",
+                "--jobs",
+                "1",
+                "--profile-timeseries",
+                "50ms",
+                "--perf-dir",
+                store,
+            )
+        extra = {"DAGRUN_NO_STEP_LOGS": "1", "DAGRUN_FORCE_SCOPE_ATTEMPT": "1"}
+        outcomes = {
+            "py": run(py, args_for(stores["py"]), extra),
+            "rs": run(rs, args_for(stores["rs"]), extra),
+        }
+        unavailable = {
+            name: _boxing_capability_unavailable(outcome) for name, outcome in outcomes.items()
+        }
+        if all(unavailable.values()):
+            print(
+                "cross[dagrun]: SKIP time-series trace differential: "
+                "cgroup-v2 + a working systemd --user scope are unavailable"
+            )
+            rep.ok("profile-timeseries:capability-unavailable")
+            return
+        if any(unavailable.values()) or any(outcome.returncode != 0 for outcome in outcomes.values()):
+            rep.bad(
+                "profile-timeseries",
+                f"py={outcomes['py']}\nrs={outcomes['rs']}",
+            )
+            return
+        try:
+            normalized = {
+                name: _normalized_trace_csv(_only_trace_path(store))
+                for name, store in stores.items()
+            }
+        except (OSError, ValueError, csv.Error) as error:
+            rep.bad("profile-timeseries", str(error))
+            return
+        if normalized["py"] != normalized["rs"]:
+            rep.bad(
+                "profile-timeseries",
+                "normalized trace CSV differs\n"
+                f"--- py ---\n{normalized['py']!r}\n--- rs ---\n{normalized['rs']!r}",
+            )
+        else:
+            rep.ok("profile-timeseries:schema-and-encoding")
 
 
 # --------------------------------------------------------------------------- plan feedback
@@ -3173,6 +3573,359 @@ def _speedup_store_csv() -> str:
     for j, wall in ((1, "16.0"), (2, "8.0"), (4, "4.0"), (8, "2.0"), (16, "1.0")):
         rows.append(_speedup_row("p.bud", j, wall, "", "16.0", "0.1", "0.0"))
     return _SPEEDUP_HEADER + "".join(rows)
+
+
+def _only_prefixed_file(directory: str, prefix: str, suffix: str) -> Path:
+    paths = sorted(
+        path
+        for path in Path(directory).iterdir()
+        if path.is_file() and path.name.startswith(prefix) and path.name.endswith(suffix)
+    )
+    if len(paths) != 1:
+        raise ValueError(
+            f"expected one {prefix}*{suffix} file under {directory}, found {paths}"
+        )
+    return paths[0]
+
+
+def _write_report_capture_fixtures(store: str) -> None:
+    """Add valid, malformed, and removed-step captures to a report-parity store."""
+
+    capture = Path(store) / "captures" / "capture-001"
+    artifact = capture / "perf-001" / "perf data#1.data"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(b"PERFILE2")
+    manifest: dict[str, object] = {
+        "schema": "dagrun-profile-capture-v1",
+        "capture_id": "capture-001",
+        "state": "complete",
+        "machine_id": "capture-machine",
+        "container_class": "capture-container",
+        "created_at": "2026-07-26T10:01:00Z",
+        "finished_at": "2026-07-26T10:01:03Z",
+        "artifact_root": ".",
+        "selection": {
+            "step": "p.lin",
+            "workload_digest": "",
+            "inner_jobs": 4,
+            "expected_wall_s": 2.0,
+            "speedup": 4.0,
+            "git_sha": "abc",
+        },
+        "preflight": [],
+        "trials": [
+            {
+                "trial_id": "perf-001",
+                "kind": "perf",
+                "state": "complete",
+                "inner_jobs": 4,
+                "started_at": "2026-07-26T10:01:00Z",
+                "finished_at": "2026-07-26T10:01:03Z",
+                "measured_wall_s": 2.1,
+                "workload_returncode": 0,
+                "profiler_returncode": 0,
+                "included_in_model": False,
+                "artifacts": [
+                    {
+                        "role": "perf-data",
+                        "path": "perf-001/perf data#1.data",
+                        "size_bytes": 8,
+                        "mode": "0o600",
+                    },
+                    {
+                        "role": "perf-log",
+                        "path": "perf-001/missing.log",
+                        "size_bytes": 0,
+                        "mode": "0o600",
+                    },
+                ],
+                "error": "",
+            }
+        ],
+        "errors": [],
+    }
+    (capture / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    malformed = Path(store) / "captures" / "bad-json"
+    malformed.mkdir()
+    (malformed / "manifest.json").write_text("{not json", encoding="utf-8")
+
+    legacy = Path(store) / "captures" / "legacy-capture"
+    legacy.mkdir()
+    legacy_manifest = dict(manifest)
+    legacy_manifest.pop("machine_id")
+    legacy_manifest.pop("container_class")
+    legacy_manifest["capture_id"] = "legacy-capture"
+    legacy_manifest["created_at"] = "2026-07-26T10:02:00Z"
+    (legacy / "manifest.json").write_text(
+        json.dumps(legacy_manifest), encoding="utf-8"
+    )
+
+    removed = Path(store) / "captures" / "removed-step"
+    removed.mkdir()
+    removed_manifest = dict(manifest)
+    removed_manifest["capture_id"] = "removed-step"
+    selection = manifest["selection"]
+    assert isinstance(selection, dict)
+    removed_manifest["selection"] = {**selection, "step": "old.removed"}
+    (removed / "manifest.json").write_text(
+        json.dumps(removed_manifest), encoding="utf-8"
+    )
+
+
+def compare_scaling_model_sidecar(py: list[str], rs: list[str], rep: Report) -> None:
+    """Rebuild the saved scaling model from identical raw rows and compare its exact bytes.
+
+    A deliberately skipped target-sweep node triggers the ordinary post-sweep refresh without
+    appending a timing-dependent sample. A tiny unboxed seed run first discovers each engine's
+    real machine/container filename; the generated profile is then replaced with the same fixed
+    synthetic store used by :func:`compare_speedup_model`.
+    """
+
+    with tempfile.TemporaryDirectory(prefix="dagrun-scaling-model-cross-") as tmp:
+        seed_dag = os.path.join(tmp, "seed.json")
+        Path(seed_dag).write_text(
+            '{"steps":[{"group":"seed","job":"identity","cmd":"true"}]}',
+            encoding="utf-8",
+        )
+        stores = {name: os.path.join(tmp, name) for name in ("py", "rs")}
+        commands = {"py": py, "rs": rs}
+        for name, command in commands.items():
+            outcome = run(
+                command,
+                (
+                    "run",
+                    "--dag",
+                    seed_dag,
+                    "--perf-dir",
+                    stores[name],
+                    NOFB,
+                    "--unsafe-no-cgroups",
+                    "-q",
+                ),
+            )
+            if outcome.returncode != 0:
+                rep.bad(
+                    "scaling-model-sidecar",
+                    f"{name} identity seed failed: {outcome}",
+                )
+                return
+        try:
+            profile_paths = {
+                name: _only_prefixed_file(store, "step_profiles_", ".csv")
+                for name, store in stores.items()
+            }
+        except (OSError, ValueError) as error:
+            rep.bad("scaling-model-sidecar", str(error))
+            return
+        if profile_paths["py"].name != profile_paths["rs"].name:
+            rep.bad(
+                "scaling-model-sidecar",
+                "profile identities differ before model refresh: "
+                f"py={profile_paths['py'].name!r} rs={profile_paths['rs'].name!r}",
+            )
+            return
+        for path in profile_paths.values():
+            path.write_text(_speedup_store_csv(), encoding="utf-8")
+        for store in stores.values():
+            _write_report_capture_fixtures(store)
+
+        raw_steps = _SPEEDUP_DAG.get("steps")
+        if not isinstance(raw_steps, list):
+            rep.bad("scaling-model-sidecar", "internal speedup fixture has no step list")
+            return
+        refresh_dag = os.path.join(tmp, "refresh.json")
+        Path(refresh_dag).write_text(
+            json.dumps(
+                {
+                    **_SPEEDUP_DAG,
+                    "steps": [
+                        *raw_steps,
+                        {
+                            "group": "refresh",
+                            "job": "only",
+                            "cmd": "true",
+                            "skip_reason": "empty-manifest-bucket",
+                        },
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        for name, command in commands.items():
+            outcome = run(
+                command,
+                (
+                    "sweep",
+                    "--dag",
+                    refresh_dag,
+                    "--step",
+                    "refresh.only",
+                    "--target-time",
+                    "0",
+                    "--perf-dir",
+                    stores[name],
+                    "--unsafe-no-cgroups",
+                ),
+            )
+            if outcome.returncode != 0:
+                rep.bad(
+                    "scaling-model-sidecar",
+                    f"{name} refresh failed: {outcome}",
+                )
+                return
+        try:
+            model_paths = {
+                name: _only_prefixed_file(store, "scaling_model_", ".json")
+                for name, store in stores.items()
+            }
+            encoded = {name: path.read_bytes() for name, path in model_paths.items()}
+        except (OSError, ValueError) as error:
+            rep.bad("scaling-model-sidecar", str(error))
+            return
+        if model_paths["py"].name != model_paths["rs"].name:
+            rep.bad(
+                "scaling-model-sidecar",
+                f"model filenames differ: py={model_paths['py'].name!r} "
+                f"rs={model_paths['rs'].name!r}",
+            )
+        elif encoded["py"] != encoded["rs"]:
+            rep.bad(
+                "scaling-model-sidecar",
+                "model JSON is not byte-identical\n"
+                f"--- py ---\n{encoded['py'].decode(errors='replace')}\n"
+                f"--- rs ---\n{encoded['rs'].decode(errors='replace')}",
+            )
+        elif not encoded["py"].endswith(b"\n"):
+            rep.bad("scaling-model-sidecar", "model JSON lacks its canonical trailing newline")
+        else:
+            try:
+                document = json.loads(encoded["py"])
+                steps = document.get("steps", []) if isinstance(document, dict) else []
+                schema = document.get("schema") if isinstance(document, dict) else None
+                tags = [
+                    step.get("step")
+                    for step in steps
+                    if isinstance(step, dict) and isinstance(step.get("step"), str)
+                ]
+                digests = [
+                    step.get("workload_digest")
+                    for step in steps
+                    if isinstance(step, dict)
+                ]
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                schema, tags, digests = None, [], []
+            expected_tags = ["p.bud", "p.knee", "p.lin", "p.plat"]
+            if schema != 2 or tags != expected_tags or len(digests) != 4 or any(
+                not isinstance(digest, str) or not digest for digest in digests
+            ):
+                rep.bad(
+                    "scaling-model-sidecar",
+                    f"unexpected model schema/steps/workload digests: schema={schema!r} "
+                    f"tags={tags!r} digests={digests!r}",
+                )
+            else:
+                rep.ok("scaling-model-sidecar:byte-identical")
+
+        report_payloads: dict[str, object] = {}
+        for name, store in stores.items():
+            report_path = Path(store) / "profile_report.html"
+            try:
+                document = report_path.read_text(encoding="utf-8")
+            except OSError as error:
+                rep.bad("profile-report:shared-payload", f"{name} report missing: {error}")
+                return
+            match = re.search(
+                r'<script id="dagrun-report-data" type="application/json">(.*?)</script>',
+                document,
+                re.DOTALL,
+            )
+            if match is None:
+                rep.bad(
+                    "profile-report:shared-payload",
+                    f"{name} report has no embedded dagrun-report-data payload",
+                )
+                return
+            try:
+                payload = json.loads(match.group(1))
+            except json.JSONDecodeError as error:
+                rep.bad(
+                    "profile-report:shared-payload",
+                    f"{name} report payload is invalid JSON: {error}",
+                )
+                return
+            if not isinstance(payload, dict):
+                rep.bad(
+                    "profile-report:shared-payload",
+                    f"{name} report payload is not an object",
+                )
+                return
+            # The stores intentionally live in different temp directories; this display-only
+            # field is therefore the sole expected difference for identical source data.
+            payload["profile_dir"] = "<profile-store>"
+            report_payloads[name] = payload
+        if report_payloads.get("py") != report_payloads.get("rs"):
+            rep.bad(
+                "profile-report:shared-payload",
+                "embedded report data differs\n"
+                f"--- py ---\n{json.dumps(report_payloads.get('py'), indent=2, sort_keys=True)}\n"
+                f"--- rs ---\n{json.dumps(report_payloads.get('rs'), indent=2, sort_keys=True)}",
+            )
+        else:
+            shared = report_payloads.get("py")
+            captures = shared.get("captures") if isinstance(shared, dict) else None
+            environments = (
+                shared.get("environments") if isinstance(shared, dict) else None
+            )
+            warnings = shared.get("warnings") if isinstance(shared, dict) else None
+            expected_warnings = [
+                "Ignored malformed capture manifest captures/bad-json/manifest.json.",
+                "Ignored capture manifest captures/removed-step/manifest.json for step "
+                "'old.removed', which is absent from the supplied DAG.",
+            ]
+            captures_by_id = (
+                {
+                    capture.get("capture_id"): capture
+                    for capture in captures
+                    if isinstance(capture, dict)
+                }
+                if isinstance(captures, list)
+                else {}
+            )
+            capture = captures_by_id.get("capture-001")
+            legacy = captures_by_id.get("legacy-capture")
+            artifact = (
+                capture["trials"][0]["artifacts"][0]
+                if isinstance(capture, dict)
+                else None
+            )
+            if (
+                len(captures_by_id) != 2
+                or not isinstance(capture, dict)
+                or capture.get("environment")
+                != "capture-machine␟capture-container"
+                or not isinstance(legacy, dict)
+                or legacy.get("environment") != ""
+                or not isinstance(artifact, dict)
+                or artifact.get("href")
+                != "captures/capture-001/perf-001/perf%20data%231.data"
+                or artifact.get("exists") is not True
+                or not isinstance(environments, list)
+                or not any(
+                    isinstance(environment, dict)
+                    and environment.get("key")
+                    == "capture-machine␟capture-container"
+                    for environment in environments
+                )
+                or warnings != expected_warnings
+            ):
+                rep.bad(
+                    "profile-report:shared-payload",
+                    "capture-manifest data was absent or not canonical: "
+                    f"captures={captures!r} warnings={warnings!r}",
+                )
+                return
+            rep.ok("profile-report:shared-payload")
 
 
 def compare_speedup_model(py: list[str], rs: list[str], rep: Report) -> None:
@@ -4252,6 +5005,101 @@ def compare_sweep_errors(py: list[str], rs: list[str], rep: Report) -> None:
             )
 
 
+def compare_sweep_report_collisions(py: list[str], rs: list[str], rep: Report) -> None:
+    """Report destinations must never destroy DAG/profile data, in either implementation."""
+
+    with tempfile.TemporaryDirectory(prefix="sweep-report-collision-cross-") as tmp:
+        dag = os.path.join(tmp, "dag.json")
+        dag_source = (
+            '{"steps":[{"group":"g","job":"j","cmd":"true",'
+            '"jobs_flag":"--workers="}]}'
+        )
+        Path(dag).write_text(dag_source, encoding="utf-8")
+        commands = {"py": py, "rs": rs}
+
+        explicit: dict[str, Outcome] = {}
+        explicit_stores = {
+            name: os.path.join(tmp, f"explicit-{name}") for name in commands
+        }
+        for name, command in commands.items():
+            explicit[name] = run(
+                command,
+                (
+                    "sweep",
+                    "--dag",
+                    dag,
+                    "--step",
+                    "g.j",
+                    "--jobs",
+                    "1",
+                    "--output-dir",
+                    explicit_stores[name],
+                    "--report-html",
+                    dag,
+                    "--unsafe-no-cgroups",
+                ),
+            )
+        explicit_preserved = all(
+            list(Path(store).glob("step_profiles_*.csv"))
+            for store in explicit_stores.values()
+        )
+        if (
+            all(outcome.returncode == 1 for outcome in explicit.values())
+            and all(
+                "report output resolves to DAG input" in outcome.stderr
+                for outcome in explicit.values()
+            )
+            and Path(dag).read_text(encoding="utf-8") == dag_source
+            and explicit_preserved
+        ):
+            rep.ok("sweep-report:explicit-collision-fails-after-persist")
+        else:
+            rep.bad(
+                "sweep-report:explicit-collision-fails-after-persist",
+                f"py={explicit['py']}\nrs={explicit['rs']}\n"
+                f"dag={Path(dag).read_text(encoding='utf-8')!r} "
+                f"profiles-preserved={explicit_preserved}",
+            )
+
+        defaults: dict[str, Outcome] = {}
+        default_reports: dict[str, Path] = {}
+        for name, command in commands.items():
+            store = Path(tmp) / f"default-{name}"
+            store.mkdir()
+            report = store / "profile_report.html"
+            report.write_bytes(b"do not overwrite")
+            default_reports[name] = report
+            defaults[name] = run(
+                command,
+                (
+                    "sweep",
+                    "--dag",
+                    dag,
+                    "--step",
+                    "g.j",
+                    "--jobs",
+                    "1",
+                    "--output-dir",
+                    str(store),
+                    "--unsafe-no-cgroups",
+                ),
+            )
+        if (
+            all(outcome.returncode == 0 for outcome in defaults.values())
+            and all(
+                "without dagrun report marker" in outcome.stderr
+                for outcome in defaults.values()
+            )
+            and all(report.read_bytes() == b"do not overwrite" for report in default_reports.values())
+        ):
+            rep.ok("sweep-report:default-collision-is-warning")
+        else:
+            rep.bad(
+                "sweep-report:default-collision-is-warning",
+                f"py={defaults['py']}\nrs={defaults['rs']}\nreports={default_reports}",
+            )
+
+
 def _sweep_widths(text: str) -> set[int]:
     """Return widths from well-formed six-column sweep result rows."""
 
@@ -4969,6 +5817,77 @@ def compare_summary_sync(py: list[str], rs: list[str], rep: Report) -> None:
     )
 
 
+def compare_mixed_local_summary_publishers(
+    py: list[str], rs: list[str], rep: Report
+) -> None:
+    """Prove the local summary backend's lock preserves simultaneous mixed-engine uploads."""
+
+    dag = (
+        '{"steps":['
+        '{"group":"g","job":"a","cmd":"true"},'
+        '{"group":"g","job":"b","cmd":"true"},'
+        '{"group":"g","job":"c","cmd":"true"}'
+        "]}"
+    )
+    with tempfile.TemporaryDirectory(prefix="dagrun-mixed-summary-") as tmp:
+        dag_path = os.path.join(tmp, "dag.json")
+        Path(dag_path).write_text(dag, encoding="utf-8")
+        shared = os.path.join(tmp, "shared")
+        args = (
+            "run",
+            "--dag",
+            dag_path,
+            "--no-profile",
+            NOFB,
+            "--profile-sync",
+            f"local:{shared}",
+            "--profile-sync-direction",
+            "upload",
+            "--unsafe-no-cgroups",
+            "--max-steps",
+            "1",
+            "-q",
+        )
+        commands = (py, rs, py, rs)
+        with ThreadPoolExecutor(max_workers=len(commands)) as executor:
+            outcomes = list(executor.map(lambda command: run(command, args), commands))
+        if any(outcome.returncode != 0 for outcome in outcomes):
+            rep.bad(
+                "summary-sync:mixed-concurrent-publishers",
+                "\n".join(f"run {index}: {outcome}" for index, outcome in enumerate(outcomes)),
+            )
+            return
+        summaries = sorted(Path(shared).glob("summary_*.json"))
+        if len(summaries) != 1:
+            rep.bad(
+                "summary-sync:mixed-concurrent-publishers",
+                f"expected one summary, found {summaries!r}",
+            )
+            return
+        path = str(summaries[0])
+        stats = {
+            "py": run(py, ("summary", "stats", path)),
+            "rs": run(rs, ("summary", "stats", path)),
+        }
+        document = json.loads(summaries[0].read_text(encoding="utf-8"))
+        sample_count = sum(
+            len(bucket.get("samples", []))
+            for bucket in document.get("buckets", [])
+            if isinstance(bucket, dict) and isinstance(bucket.get("samples"), list)
+        )
+        if (
+            sample_count != 12
+            or any(outcome.returncode != 0 for outcome in stats.values())
+            or stats["py"].stdout != stats["rs"].stdout
+        ):
+            rep.bad(
+                "summary-sync:mixed-concurrent-publishers",
+                f"samples={sample_count}/12\npy={stats['py']}\nrs={stats['rs']}",
+            )
+        else:
+            rep.ok("summary-sync:mixed-concurrent-publishers")
+
+
 INVOCATIONS: tuple[Invocation, ...] = (
     Invocation("version", ("--version",)),
     Invocation("help", ("--help",)),
@@ -5022,6 +5941,7 @@ def compare_cli_schema(py: list[str], rs: list[str], rep: Report) -> None:
             "--max-mem",
             "--selected", "--ignore-selected-deps",
             "--args", "--stress", "--perf-dir", "--no-profile", "--profile", "--planner",
+            "--profile-timeseries",
             "--show-plan", "--no-profile-feedback", "--profile-memory-feedback",
             "--profile-sync",
             "--profile-sync-direction", "--keep-going", "--run-timeout",
@@ -5034,7 +5954,10 @@ def compare_cli_schema(py: list[str], rs: list[str], rep: Report) -> None:
             "--allow-cgroup-failure", "--quiet",
         ),
         "sweep": (
-            "--dag", "--step", "--jobs", "--repeat", "--perf-dir", "--no-profile",
+            "--dag", "--step", "--jobs", "--target-time", "--repeat", "--output-dir",
+            "--perf-dir", "--no-profile", "--report-html", "--no-report",
+            "--profile-timeseries", "--perf-record", "--perf-window", "--wprof-window",
+            "--profiler-sudo",
             "--allow-cgroup-failure", "--unsafe-no-cgroups",
         ),
         "plan": ("--dag", "--planner", "--max-mem", "--format", "--perf-dir", "--no-profile-feedback"),
@@ -5097,6 +6020,34 @@ def compare_cli_schema(py: list[str], rs: list[str], rep: Report) -> None:
             )
         else:
             rep.ok(f"cli-schema:{engine}/summary-top")
+        sweep_help = run(command, ("sweep", "--help"))
+        normalized_sweep_help = " ".join(sweep_help.stdout.lower().split())
+        sweep_contract = (
+            "single-step dense mode",
+            "target-time graph mode",
+            "one at a time in stable topological order",
+            "pass 1 always completes",
+            "every started pass finishes",
+            "powers of two through the physical-core count",
+            "physical-core and logical-thread counts",
+            "integer midpoints",
+            "scaling_model_*.json",
+            "profile_report.html",
+            "traces/<run_id>.csv",
+            "backward-compatible alias for --output-dir",
+            "does not redirect terminal or child-process output",
+        )
+        missing_sweep_phrases = [
+            phrase for phrase in sweep_contract if phrase not in normalized_sweep_help
+        ]
+        if sweep_help.returncode != 0 or missing_sweep_phrases:
+            rep.bad(
+                f"cli-schema:{engine}/sweep-explanation",
+                f"exit={sweep_help.returncode}; missing phrases={missing_sweep_phrases}\n"
+                f"{sweep_help.stdout}",
+            )
+        else:
+            rep.ok(f"cli-schema:{engine}/sweep-explanation")
         for subcommand, flags in command_flags.items():
             outcome = run(command, (subcommand, "--help"))
             missing = [flag for flag in flags if flag not in outcome.stdout]
@@ -6212,16 +7163,21 @@ def compare_dagrun(rand_count: int, seed: int) -> int:
     compare_run_timeout(py, rs, rep)
     compare_spawn_failure(py, rs, rep)
     compare_profile_store(py, rs, rep)
+    compare_mixed_profile_writers(py, rs, rep)
     compare_profile_run_identity(py, rs, rep)
+    compare_profile_timeseries_trace(py, rs, rep)
     compare_plan_feedback(py, rs, rep)
     compare_hostile_numeric_cells(py, rs, rep)
     compare_speedup_model(py, rs, rep)
+    compare_scaling_model_sidecar(py, rs, rep)
     compare_cpa_planner(py, rs, rep)
     compare_memory_hardening(py, rs, rep)
     compare_memory_feedback(py, rs, rep)
     compare_summary_sync(py, rs, rep)
+    compare_mixed_local_summary_publishers(py, rs, rep)
     compare_sweep_success(py, rs, rep)
     compare_sweep_errors(py, rs, rep)
+    compare_sweep_report_collisions(py, rs, rep)
     compare_args_stress(py, rs, rep)
     compare_run_parallel_limits(py, rs, rep)
     compare_boxed_cpu_bandwidth(py, rs, rep)

@@ -384,7 +384,7 @@ def _load_store(
     if not path.is_file():
         return None
     rows: list[dict[str, str]] = []
-    with path.open(newline="") as handle:
+    with path.open(newline="", encoding="utf-8") as handle:
         for raw in csv.DictReader(handle):
             rows.append(
                 {k: (v if isinstance(v, str) else "") for k, v in raw.items() if isinstance(k, str)}

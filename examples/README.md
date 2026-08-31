@@ -172,7 +172,9 @@ Every `run` and `sweep` above **auto-logs** resource-usage CSVs to the default p
 `./.dagrun/profiles/` (relative to your current directory) — you do not need `--perf-dir`. The
 tool prints exactly where it appended. Drop `--allow-cgroup-failure` on a Linux host with a
 systemd user session to get real per-step boxing, which also fills in the `peak_bytes` (peak memory)
-column from each step's cgroup. Override the location with `--perf-dir DIR` or
+column from each step's cgroup. A successful sweep also writes the standalone interactive site
+`./.dagrun/profiles/profile_report.html`. Override the sweep artifact location with
+`--output-dir DIR` (`--perf-dir` remains an alias) or
 `$DAGRUN_PROFILE_DIR`, or turn logging off with `--no-profile`. Consider gitignoring `./.dagrun/`.
 
 ## 7. `07-graph-scaling-sweep.yaml` — target-time scaling across a DAG
@@ -223,6 +225,9 @@ YAML and can be rebuilt from those CSVs; each successful profiling-enabled sweep
 refreshes the machine/container sidecar named
 `scaling_model_<machine_id>_<container_class>.json`. Command-shape digests keep identified older
 workloads out of the current curve and are retained as separate reservoirs in portable summaries.
+Open `./.dagrun/profiles/profile_report.html` to explore the DAG and drill into its historical
+speedup, memory, CPU-efficiency, and optional interval traces. Use `--report-html FILE` to choose
+another path or `--no-report` to skip the HTML refresh.
 
 ## 8. `08-dagrun-clean-build-sweep.yaml` — a real clean-build scaling sweep
 
@@ -246,7 +251,7 @@ DAGRUN_CARGO_SWEEP_ROOT="$study_root/targets" dagrun sweep \
   --target-time 0 \
   --repeat 3 \
   --profile-timeseries 250ms \
-  --perf-dir "$study_root/profiles"
+  --output-dir "$study_root/profiles"
 ```
 
 A zero target completes the mandatory automatic topology pass and starts no refinement pass. The
@@ -254,7 +259,8 @@ aggregate rows and `scaling_model_*.json` describe speedup, CPU work, and memory
 sample also writes `profiles/traces/<run_id>.csv`, whose interval effective-core and thread-count
 series can reveal sequential startup/shutdown regions hidden by whole-step averages. This benchmark
 can consume substantial time and disk space; remove `study_root` only after preserving any reports
-or raw evidence you need.
+or raw evidence you need. The same run writes `profiles/profile_report.html`, which combines the
+speedup curves and interval traces in one interactive page.
 
 ## See also
 
