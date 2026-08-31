@@ -1,0 +1,51 @@
+name: py-pr-landing-planner
+
+# Only run when the Python side of this tool (its package, tests, or shared docs) changes.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'py/pyproject.toml'
+      - 'py/pr_landing_planner/**'
+      - 'py/tests/test_planner_*.py'
+      - 'common/docs/pr-landing-planner/**'
+      - 'scripts/embed_userguides.py'
+      - '.github/workflows/py-pr-landing-planner.yml'
+  pull_request:
+    paths:
+      - 'py/pyproject.toml'
+      - 'py/pr_landing_planner/**'
+      - 'py/tests/test_planner_*.py'
+      - 'common/docs/pr-landing-planner/**'
+      - 'scripts/embed_userguides.py'
+      - '.github/workflows/py-pr-landing-planner.yml'
+
+jobs:
+  py:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: py
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install tooling
+        # pyyaml is a runtime dep (YAML fixtures / flaky-signature files); types-PyYAML supplies the
+        # stubs mypy --strict needs (PyYAML ships none).
+        run: python -m pip install --upgrade mypy pytest pyyaml types-PyYAML
+      - name: Embedded user guides in sync with source
+        working-directory: .
+        run: python scripts/embed_userguides.py --check
+      - name: mypy (strict, no explicit Any)
+        run: python -m mypy .
+      - name: pytest (pr-landing-planner)
+        run: python -m pytest -q tests/test_planner_*.py
+      - name: smoke --version
+        run: python -m pr_landing_planner --version
+      - name: smoke plan against the bundled fixture (all three formats)
+        run: |
+          python -m pr_landing_planner plan --fixture pr_landing_planner/examples/pr-landing-demo.yaml --flaky-signatures pr_landing_planner/examples/flaky-signatures.yaml --format human
+          python -m pr_landing_planner plan --fixture pr_landing_planner/examples/pr-landing-demo.yaml --flaky-signatures pr_landing_planner/examples/flaky-signatures.yaml --format json > /dev/null
+          python -m pr_landing_planner plan --fixture pr_landing_planner/examples/pr-landing-demo.yaml --flaky-signatures pr_landing_planner/examples/flaky-signatures.yaml --format actions

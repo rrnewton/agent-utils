@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "herdr-run"
+version = "0.2.0"
+description = "Run allowlisted commands and durably message interactive agents through Herdr panes."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Ryan Newton" }]
+keywords = ["agents", "sandbox", "terminal", "herdr", "allowlist"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Operating System :: POSIX :: Linux",
+]
+# Imported lazily so bootstrap help still diagnoses a damaged installation cleanly.
+dependencies = ["pyyaml>=6"]
+
+[project.optional-dependencies]
+dev = ["mypy", "pytest", "types-PyYAML"]
+
+[project.urls]
+Repository = "https://github.com/rrnewton/agent-utils"
+Issues = "https://github.com/rrnewton/agent-utils/issues"
+
+[project.scripts]
+herdr-run = "herdr_run.cli:main"
+herdr-agent = "herdr_run.agent_cli:main"
+
+[tool.setuptools]
+packages = ["herdr_run"]
+package-dir = { herdr_run = "." }
+include-package-data = false
+
+[tool.setuptools.package-data]
+herdr_run = ["py.typed", "README.md", "USER_GUIDE.md", "QUICKSTART.md", "AGENT_USER_GUIDE.md", "config_template.yaml"]

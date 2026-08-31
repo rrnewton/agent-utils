@@ -1,0 +1,123 @@
+# gent-talk's test suites, as a DAG that dagrun can box.
+#
+# WHY THIS EXISTS
+#
+# `make validate` runs these steps one after another, unboxed, with no ceiling on what any of them
+# may consume. That was tolerable while every suite was cheap. It stopped being tolerable the day a
+# screenshot server was found still running SIX DAYS after the run that started it, holding a port,
+# reparented to init, with its own configuration directory long deleted. A run that cannot bound
+# what it starts cannot clean up after what it starts.
+#
+# dagrun is this repository's own answer to exactly that: per-step wall and CPU timeouts, memory
+# limits, and process-tree teardown enforced inside nested cgroups. A step that hangs is reaped
+# with its whole descendant tree, whether or not the step remembered to trap a signal.
+#
+# WHAT THE SHAPE SAYS
+#
+# The three cheap checks are independent of each other and of the build, so they run concurrently
+# and one failing does not hide the other two. Everything that needs a compiled binary hangs off
+# `build.release`, which is stated once rather than paid for per step.
+#
+# THE BROWSER CAP IS THE POINT OF THE `resource_caps` BLOCK. Playwright is the only genuinely
+# expensive thing here — a real Chromium per run — and two of them at once on a laptop is how a
+# test suite becomes the reason the laptop is unusable. `browser: 1` is a semaphore: any number of
+# steps may DECLARE the resource, and at most one holds it at a time.
+#
+# HOW TO RUN IT
+#
+#   dagrun run --dag gent-talk/tests.dag.yaml
+#
+# from the repository root, which is the working directory every `cmd` below assumes. `make
+# validate-boxed` in gent-talk/ is the same thing with the paths already right.
+
+description: gent-talk fmt, lint, unit, page and screenshot suites, boxed
+
+resource_caps:
+  # A real browser. One at a time, however many steps ask for it.
+  browser: 1
+
+steps:
+  # ---- the cheap gates, which need nothing built ------------------------------------------------
+  - group: check
+    job: fmt
+    desc: rustfmt, in check mode
+    cmd: cd gent-talk && cargo fmt --all -- --check
+    cpu_timeout: 60
+    hint:
+      est_duration_s: 5
+      classification: light
+      rss_baseline_bytes: 268435456
+
+  - group: check
+    job: clippy
+    desc: clippy over every target, warnings denied
+    cmd: cd gent-talk && cargo clippy --all-targets --locked -- -D warnings
+    cpu_timeout: 900
+    hint:
+      est_duration_s: 120
+      classification: cpu-bound
+      # Clippy holds the whole crate graph. This is the step most likely to be the memory high
+      # water mark of the run, and the one worth a real number rather than a default.
+      rss_baseline_bytes: 3221225472
+
+  # The page suites on their own, straight through node. They need no cargo build at all, so they
+  # are the first thing that can go red on a web/ change -- seconds, not minutes.
+  - group: check
+    job: page
+    desc: both served pages' suites, against the fake DOM
+    cmd: cd gent-talk && node --test tests/js/*.test.mjs
+    cpu_timeout: 300
+    hint:
+      est_duration_s: 20
+      classification: cpu-bound
+      rss_baseline_bytes: 1073741824
+
+  # ---- the build everything else needs ----------------------------------------------------------
+  - group: build
+    job: release
+    desc: the release binary the server-shaped suites run against
+    cmd: cd gent-talk && cargo build --release --locked
+    cpu_timeout: 1800
+    hint:
+      est_duration_s: 240
+      classification: cpu-bound
+      rss_baseline_bytes: 4294967296
+
+  # ---- suites that need it ----------------------------------------------------------------------
+  #
+  # `cargo test` runs the Rust tests AND both page suites through their own harnesses. The overlap
+  # with `check.page` above is deliberate and cheap: that one exists to fail fast on a web/ change
+  # without waiting for a compile, this one proves the harnesses still drive them.
+  - group: test
+    job: unit
+    desc: the Rust suites, and the page suites through their harnesses
+    cmd: cd gent-talk && cargo test --release --locked
+    deps: [build.release]
+    cpu_timeout: 1800
+    hint:
+      est_duration_s: 180
+      classification: cpu-bound
+      rss_baseline_bytes: 3221225472
+
+  # THE ONE THAT LEAKED. It starts a real server and drives a real Chromium at it. Boxed, its
+  # descendants are reaped with it whether or not the script's own trap fires -- which is the whole
+  # reason this file exists, because for six days that trap did not.
+  - group: shots
+    job: screenshots
+    desc: the screenshot harness — a real server and a real browser
+    cmd: cd gent-talk && ./scripts/run.sh screenshots --theme dark
+    deps: [build.release]
+    # Wall, not only CPU: a browser waiting on a page that never loads burns no CPU at all, so a
+    # CPU budget alone would let it hang until the run timeout. This is the hang backstop.
+    timeout: 900
+    cpu_timeout: 600
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 120
+      # latency-bound, not cpu-bound: most of its wall time is waiting for a page to settle, and
+      # telling the scheduler otherwise makes it reserve cores it will not use.
+      classification: latency-bound
+      rss_baseline_bytes: 4294967296
+      # A browser is the one thing here that can genuinely run away. Cap it rather than discover
+      # the ceiling by watching the machine swap.
+      hard_mem_max_bytes: 6442450944

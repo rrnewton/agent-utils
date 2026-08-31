@@ -1,0 +1,41 @@
+name: py-dagrun
+
+# Only run when the Python side of this tool (or its shared docs) changes.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'py/pyproject.toml'
+      - 'py/dagrun/**'
+      - 'py/tests/**'
+      - 'common/docs/dagrun/**'
+      - '.github/workflows/py-dagrun.yml'
+  pull_request:
+    paths:
+      - 'py/pyproject.toml'
+      - 'py/dagrun/**'
+      - 'py/tests/**'
+      - 'common/docs/dagrun/**'
+      - '.github/workflows/py-dagrun.yml'
+
+jobs:
+  py:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: py
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install tooling
+        # pyyaml is a runtime dep (YAML interchange); types-PyYAML supplies the stubs mypy --strict
+        # needs (PyYAML ships none).
+        run: python -m pip install --upgrade mypy pytest pyyaml types-PyYAML
+      - name: mypy (strict, no explicit Any)
+        run: python -m mypy .
+      - name: pytest
+        run: python -m pytest -q
+      - name: smoke --version
+        run: python -m dagrun --version

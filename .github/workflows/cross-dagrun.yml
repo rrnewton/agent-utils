@@ -1,0 +1,132 @@
+name: repository-ci
+
+# Authoritative repository gate. Run for every change so edits to the Makefile,
+# setup driver, workflows, or a new utility cannot bypass the repository's own
+# build/test contract. The focused workflows remain useful diagnostics.
+#
+# `paths-ignore` is deliberately TINY, and its semantics are what make it safe:
+# GitHub skips the run only when EVERY changed file matches, so a commit that
+# touches one workspace file alongside a hundred ignored ones still runs the
+# whole gate. Nothing can opt out by being bundled with something else.
+#
+# Only two things are listed, and each is here because this gate provably
+# cannot observe it:
+#
+#   * `gent-talk/**` is outside the Rust workspace, has no Python package, is
+#     in neither `make check` nor `make test`, and is covered end to end by its
+#     own `gent-talk.yml`. Building the workspace tells you nothing about it.
+#   * prose directories ship in no distribution and are embedded nowhere.
+#
+# `AGENTS.md`, the Makefile, `setup`, `scripts/**` and every workflow are
+# deliberately NOT ignored. The same mapping, with the same reasoning, is
+# enforced locally by `scripts/validate.py`; keep the two in step.
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'gent-talk/**'
+      - 'ai_docs/**'
+      - 'reviews/**'
+      - 'skills/**'
+  pull_request:
+    paths-ignore:
+      - 'gent-talk/**'
+      - 'ai_docs/**'
+      - 'reviews/**'
+      - 'skills/**'
+  workflow_dispatch:
+
+# Keep checkout's temporary `git init` deterministic and quiet. Without this,
+# Git emits a default-branch warning before the repository config exists.
+env:
+  GIT_CONFIG_COUNT: '1'
+  GIT_CONFIG_KEY_0: init.defaultBranch
+  GIT_CONFIG_VALUE_0: main
+
+jobs:
+  rust-msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - name: check the declared Rust 1.85 MSRV
+        run: cargo check --locked --workspace --all-targets --manifest-path rs/Cargo.toml
+      - name: test all targets on the declared MSRV
+        run: cargo test --locked --workspace --all-targets --manifest-path rs/Cargo.toml
+      - name: verify registry artifacts on the declared MSRV
+        run: python3 scripts/check_rust_packages.py
+
+  tests-python:
+    # Carry the selected suite with the repository-owned test target. The union of this job and
+    # tests-rust is exactly the default `make test` contract, while each runner reports its own
+    # nonzero executed count instead of losing both results when one runner disappears.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: install test dependencies
+        run: python -m pip install --upgrade 'setuptools>=77' pytest pyyaml
+      - name: repository tests (nonzero Python suite)
+        run: make test TEST_SUITE=python
+
+  tests-rust:
+    # Release-mode process-tree and resource-cap tests run serially so their process-group teardown
+    # and deliberate memory pressure cannot overlap. The suite condition is explicit in the log.
+    runs-on: ubuntu-latest
+    env:
+      RUST_TEST_THREADS: '1'
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: repository tests (nonzero Rust suite)
+        run: make test TEST_SUITE=rust
+
+  cross:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: install python deps
+        # PyYAML is a workspace runtime dep; Playwright and websockets are optional gent-talk
+        # runtime deps. All three must be installed for the repository-wide strict mypy gate.
+        run: python -m pip install --upgrade 'setuptools>=77' mypy 'playwright>=1.40' pytest pyyaml types-PyYAML 'websockets>=12'
+      - name: embedded user guides in sync with their single source
+        # Run before `make both`, whose setup step refreshes rendered targets and links.
+        run: python scripts/embed_userguides.py --check
+      - name: rustfmt
+        run: cargo fmt --all --manifest-path rs/Cargo.toml -- --check
+      - name: build both implementations
+        run: make both
+      - name: global strict Python typing (no typing.Any)
+        run: make mypy
+      - name: repository checks
+        run: make check
+      - name: mypy the differential harness
+        run: python -m mypy cross/differential.py
+      - name: all paired behavioral differentials
+        run: make cross
+      - name: independently installable package artifacts
+        run: make check-packages
+
+  python-minimum:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.10'
+      - name: install minimum-runtime test tooling
+        run: python -m pip install --upgrade 'setuptools>=77' pytest pyyaml
+      - name: dependency-free startup contract
+        run: make check-deps
+      - name: tests on declared minimum Python
+        run: cd py && python -m pytest -q
+      - name: wheel and sdist contract on declared minimum Python
+        run: make check-python-packages

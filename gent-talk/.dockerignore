@@ -1,0 +1,4 @@
+target/
+*.toml.local
+gent-talk.toml
+.git/

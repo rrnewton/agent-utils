@@ -1,0 +1,152 @@
+name: nightly (everything)
+
+# WHY A NIGHTLY, WHEN EVERY TOOL ALREADY HAS ITS OWN WORKFLOW
+#
+# The per-tool workflows are path-routed: a change under `gent-talk/` runs gent-talk's gate and
+# nothing else, which is what makes this repository behave like a collection of independent tools
+# rather than one monolith that takes twenty minutes to tell you about a typo.
+#
+# Path routing has one blind spot, and it is not hypothetical here: the tools DEPEND on each other.
+# gent-talk's CI is chosen by `gent-talk/**`, so a change to `rs/dagrun/` that breaks a consumer
+# runs dagrun's suite and never gent-talk's. Each workflow is green, main is broken, and nobody
+# learns until the next change to the consumer -- which then looks like the culprit.
+#
+# So this runs the ENTIRE contract, on a schedule, with no path filter and nothing selected. It is
+# the only job in this repository that can observe a cross-tool break, and its failure means "main
+# is broken", not "your change is broken".
+#
+# It is deliberately NOT on push: on every commit it would be the twenty-minute monolith the split
+# exists to avoid, and on a busy day it would be running more often than it finishes.
+
+on:
+  schedule:
+    # 04:17 UTC. Not on the hour: GitHub's scheduler is busiest exactly then, and a nightly that
+    # queues for forty minutes reports yesterday's tree as this morning's news.
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+
+# The notifier CREATES AN ISSUE, and the default token cannot.
+#
+# Measured on the 2026-08-30 run: `Contents: read, Metadata: read, Packages: read`, and the create
+# came back `HttpError: Resource not accessible by integration`. So this failed three nights running
+# and told nobody — the one job whose whole purpose is to be noticed was the one that could not
+# speak. Narrowest grant that fixes it; `contents: read` is stated rather than inherited so adding
+# a write later has to be deliberate.
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  everything:
+    runs-on: ubuntu-latest
+    # The whole contract, not a selection. If this is routinely hitting the limit, that is a signal
+    # about the contract rather than a number to raise.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # THE CONTRACT NEEDS THESE AND THE RUNNER SHIPS NONE OF THEM.
+      #
+      # `./setup py` runs a strict mypy pass, so `make validate-all` died SIX SECONDS in with
+      # "py: mypy not installed" on every run since this workflow landed. A red nightly that had
+      # said nothing about main's health for three nights, and — because the notifier was also
+      # broken — said it to nobody. The per-tool workflows each install their own tooling, which
+      # is exactly why they were green while this was not.
+      #
+      # `types-PyYAML` because PyYAML ships no stubs and mypy --strict refuses without them.
+      - name: install the tooling the contract runs on
+        run: python -m pip install --upgrade mypy pytest pyyaml types-PyYAML
+
+      # The timeline's browser checks drive a real Chromium, so the runner needs the browser and
+      # the suite's dependencies before `validate-all` reaches them. Named as its own step so a
+      # download failure reads as a download failure rather than as a test failure.
+      - name: browser for the timeline suite
+        working-directory: py/tests/js/browser
+        run: |
+          # `npm install`, not `npm ci`: this directory deliberately tracks no lockfile and no
+          # node_modules (see its README), so there is nothing for `ci` to install from.
+          npm install --no-audit --no-fund
+          npx playwright install --with-deps chromium
+
+      # `--all` rather than the selector: selection is a convenience for the edit-run loop, and
+      # this job exists precisely to run what selection would have skipped.
+      #
+      # BOX_FLAGS lets the boxed steps degrade instead of refusing. A hosted runner may not
+      # delegate a cgroup, and `dagrun` hard-fails rather than pretending to enforce a bound it
+      # cannot -- which is right locally and wrong here, where the alternative is not running the
+      # test at all. The degradation is partial, not total: `dagrun capabilities` reports
+      # `wall_timeout` available uncontained, so the ceiling that catches a hang still holds and
+      # only the memory/CPU bound is lost, which the runner enforces its own way.
+      - name: the entire repository contract
+        env:
+          BOX_FLAGS: --allow-cgroup-failure
+        run: make validate-all
+
+      # Same reasoning as the per-push workflow: the gate is a completely-broken detector, so the
+      # value of the nightly run is the SERIES, and a series has to be kept to be a series.
+      - name: keep the benchmark measurements
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: timeline-redraw-benchmark-nightly-${{ github.run_id }}
+          path: py/tests/js/browser/benchmark-report.txt
+          if-no-files-found: ignore
+          retention-days: 90
+
+      # gent-talk is outside the Rust workspace and outside `make validate-all`'s workspace half,
+      # so its own gate is named here as well. Its Makefile is the same one a developer runs.
+      - name: gent-talk
+        working-directory: gent-talk
+        run: make validate
+
+      # A failure here is about MAIN, not about a pull request, so it has to reach somebody. An
+      # issue rather than a silent red tick on a page nobody opens in the morning.
+      - name: say so, on main, where it will be seen
+        if: failure() && github.event_name == 'schedule'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = `nightly-all: the full contract failed on main`;
+            // One open issue, not one per night: a nightly that has been red for a week should be
+            // a single thread with a week of comments, not seven issues nobody closes.
+            const { data: open } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'nightly',
+            });
+            const body = [
+              `[github-actions] The nightly full-contract run failed on \`main\`.`,
+              ``,
+              `Commit: ${context.sha}`,
+              `Run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              ``,
+              `This job is the only one that can see a CROSS-TOOL break: the per-tool workflows are`,
+              `path-routed, so a change to one tool never runs a dependent tool's suite. A failure`,
+              `here usually means main is broken by an interaction, not by the last commit.`,
+            ].join('\n');
+            if (open.length > 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: open[0].number,
+                body,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                labels: ['nightly'],
+                body,
+              });
+            }
