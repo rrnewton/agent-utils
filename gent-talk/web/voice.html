@@ -473,6 +473,24 @@
 
             <section class="settings-group">
               <div class="group-head">
+                <h2>Combining messages</h2>
+                <button class="help-link" id="help-link-combining" type="button" data-help="combining" aria-label="About combining messages" title="What this does">?</button>
+              </div>
+              <!--
+                ON by default. An agent writing past Discord's length limit has its post split in
+                two, and the second half continues mid-word a fraction of a second later. Drawn as
+                two rows that is unreadable; drawn as one it is the message that was written.
+                Display only — nothing here changes which messages exist.
+              -->
+              <label class="toggle">
+                <input id="combine-messages" type="checkbox" checked />
+                Show messages sent seconds apart as one
+              </label>
+              <p class="hint">Same author, within five seconds. Turn it off to see the raw rows.</p>
+            </section>
+
+            <section class="settings-group">
+              <div class="group-head">
                 <h2>Text size</h2>
               </div>
               <!--
@@ -769,6 +787,31 @@
                 <strong>Hide archived</strong>. It is not an archive: nothing is recorded on the
                 server, there is nothing to undo, and turning it off brings every one of them
                 straight back. Nothing here changes anything in Discord.
+              </p>
+            </article>
+
+            <article id="help-combining" class="help-entry">
+              <h2>Combining messages</h2>
+              <p class="hint">
+                Discord refuses a message past a fixed length, so a client sending a long one
+                <strong>splits it in two</strong>. The second half begins mid-sentence — often
+                mid-word — and lands a fraction of a second after the first. With this on, messages
+                from the <strong>same author within five seconds</strong> of each other are drawn as
+                one, with a line break between them. A person almost never sends twice that fast.
+              </p>
+              <p class="hint">
+                It is <strong>display only</strong>. Nothing is merged anywhere else: each part is
+                still its own Discord message with its own id, and this app still holds them that
+                way. Marking a combined row as dealt with marks <strong>every</strong> message in
+                it, reading it aloud reads all of it, and a row counts as dealt with only when all
+                of its messages are — so a half-archived row shows as still waiting rather than
+                hiding something you have not seen. A <strong>reply</strong> goes to the first
+                message of the group, which is the one the rest is a continuation of.
+              </p>
+              <p class="hint">
+                Turn it off to see the channel exactly as Discord has it, one row per message. That
+                is worth doing when you are checking whether a specific message exists — press and
+                hold a row to see every id it is showing.
               </p>
             </article>
 

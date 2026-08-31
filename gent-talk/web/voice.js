@@ -30,6 +30,7 @@ const MSG_SCALE_KEY = "gent-talk.voice.msg-scale";
 const READ_SPEED_KEY = "gent-talk.voice.read-speed";
 const MARK_OWN_KEY = "gent-talk.voice.mark-own-read";
 const MARKER_KEY = "gent-talk.voice.place-marker";
+const COMBINE_KEY = "gent-talk.voice.combine";
 
 const el = (id) => document.getElementById(id);
 
@@ -247,6 +248,7 @@ const HELP_TOPICS = [
   "identities",
   "channel-alias",
   "mark-own",
+  "combining",
   "reading-width",
   "resuming",
   "live-messages",
@@ -3573,8 +3575,11 @@ function renderChannelRows() {
   // loop that is applying it.
   let learned = false;
   for (const row of rows) {
-    const parent = row.getAttribute("data-reply-to");
-    if (parent) {
+    // EVERY pointer the row carries, not only its own: a message combined into a row still
+    // answered whatever it answered. See `data-answers` in `discordNode`.
+    for (const parent of String(row.getAttribute("data-answers") || "")
+      .split(" ")
+      .filter(Boolean)) {
       answered.add(parent);
     }
     learned =
@@ -3594,9 +3599,11 @@ function renderChannelRows() {
   advanceMarkerPastRead();
   for (const row of rows) {
     const id = row.getAttribute("data-id") || "";
+    // Every message the row stands for. One of them on an ordinary row; see the combining note.
+    const ids = idsOf(row);
     // DIMS, never hides. See the note at the head of this section: this is derived from what
     // happens to be loaded, and evidence that admits it is incomplete must not remove anything.
-    row.setAttribute("data-replied", answered.has(id) ? "true" : "false");
+    row.setAttribute("data-replied", ids.some((one) => answered.has(one)) ? "true" : "false");
     // The speaker treatment, on the same pass and from the same census. `me` and `coder` are drawn
     // as the transcript's two speakers; see web/voice.css.
     row.setAttribute(
@@ -3611,7 +3618,10 @@ function renderChannelRows() {
     // might be incomplete — but a channel view that removed the row would leave the reader no way
     // to see what they had archived, and no way to change their mind about it.
     const who = row.getAttribute("data-who");
-    const isArchived = archivedIds.has(id);
+    // EVERY constituent, or not at all. A row half of whose messages have been archived shows as
+    // UNREAD: the other reading files an unseen message away behind one the reader has dealt with,
+    // and the whole point of the archive is that it says what is left.
+    const isArchived = ids.length > 0 && ids.every((one) => archivedIds.has(one));
     row.setAttribute("data-archived", isArchived ? "true" : "false");
     // Separate from the declared archive: this one is implied, carries no undo, and disappears
     // the moment the setting is turned off.
@@ -3624,7 +3634,9 @@ function renderChannelRows() {
     // reader can still change their mind about, and it is the only thing on screen during a wait
     // that is entirely somebody else's network.
     row.setAttribute("data-pending", pendingRead === id ? "true" : "false");
-    row.setAttribute("data-marked", placeMarker === id ? "true" : "false");
+    // The marker is set on a row and lands on its first id, but a re-read can regroup: a marker
+    // kept on what has since become a trailing constituent still means this row.
+    row.setAttribute("data-marked", ids.includes(placeMarker) ? "true" : "false");
     // IS THIS MESSAGE ITSELF AN ANSWER? The opposite direction from `data-replied`, and the more
     // reliable one: that is derived from whatever happens to be loaded and misses an answer
     // further back than the window, whereas the pointer for this is ON the message. Correct
@@ -3749,7 +3761,9 @@ function advanceMarkerPastRead() {
     return;
   }
   const rows = [...el("discord-log").children];
-  const at = rows.findIndex((li) => li.getAttribute("data-id") === placeMarker);
+  // ANY constituent, because the marker names a Discord message and combining can have put that
+  // message inside a row whose identity is a different one.
+  const at = rows.findIndex((li) => idsOf(li).includes(placeMarker));
   // Not loaded: the marker is further back than the window, and guessing where it should go from
   // a list that does not contain it would move it somewhere nobody chose.
   if (at < 0) {
@@ -3759,11 +3773,17 @@ function advanceMarkerPastRead() {
   // them, so the attributes still describe the previous render -- and the case that matters most
   // is the one immediately after a dismissal, where they would say the message is still unread and
   // the marker would refuse to move past the thing the reader just dealt with.
-  const dealtWith = (li) =>
-    readAlready(
-      li.getAttribute("data-id") || "",
-      bucketFor(li.getAttribute("data-author-id"), li.getAttribute("data-author-bot") === "true")
+  //
+  // ...and EVERY message the row stands for has to be dealt with before the marker may step over
+  // it, for the same reason a half-archived row is drawn as unread.
+  const dealtWith = (li) => {
+    const who = bucketFor(
+      li.getAttribute("data-author-id"),
+      li.getAttribute("data-author-bot") === "true"
     );
+    const ids = idsOf(li);
+    return ids.length > 0 && ids.every((one) => readAlready(one, who));
+  };
   let i = at;
   while (i < rows.length && dealtWith(rows[i])) {
     i += 1;
@@ -3800,7 +3820,8 @@ function jumpToMarker() {
   setStatus("back where you left off.");
 }
 
-function toggleMessageDetails(li, message) {
+function toggleMessageDetails(li, messages) {
+  const message = messages[0];
   const open = childByClass(li, "msg-details");
   if (open) {
     li.removeChild(open);
@@ -3816,7 +3837,11 @@ function toggleMessageDetails(li, message) {
   when.textContent = fullLocalTime(message);
   const id = document.createElement("div");
   id.className = "msg-id";
-  id.textContent = `id ${message.id}`;
+  // EVERY id, on a row that is showing more than one message. This sheet is the answer to "does
+  // that message really exist", and a combined row that named only its first constituent would
+  // make the second unreachable by exactly the affordance built to reach it — while also hiding
+  // the fact that the row is two messages at all.
+  id.textContent = `id ${messages.map((m) => String(m.id)).join(" + ")}`;
   // KEEPING YOUR PLACE lives here rather than on a gesture of its own. Press-and-hold already
   // opens this sheet, and a second long-press meaning something different from the first would be
   // a gesture nobody could discover and everybody would trigger by accident.
@@ -4001,7 +4026,7 @@ function stopReading() {
     }
     return;
   }
-  const { audio, url } = nowPlaying;
+  const { audio, urls } = nowPlaying;
   nowPlaying = null;
   try {
     audio.pause();
@@ -4009,9 +4034,12 @@ function stopReading() {
     // A player that will not pause is not a reason to leave the page in a reading state.
   }
   // The object URL holds the audio alive until it is revoked, and this mode fetches one per
-  // message: not revoking is a leak that grows with the length of the backlog.
-  if (url && typeof URL !== "undefined" && URL.revokeObjectURL) {
-    URL.revokeObjectURL(url);
+  // message: not revoking is a leak that grows with the length of the backlog. ALL of them on a
+  // combined row, including the parts that had not been reached — they were all fetched.
+  for (const url of urls) {
+    if (url && typeof URL !== "undefined" && URL.revokeObjectURL) {
+      URL.revokeObjectURL(url);
+    }
   }
   renderChannelRows();
 }
@@ -4042,20 +4070,33 @@ async function fetchSpeech(channel, id) {
 }
 
 /**
- * Read one message aloud, and archive it when the audio finishes.
+ * Read one ROW aloud, and archive everything in it when the audio finishes.
  *
  * Tapping the message that is already playing STOPS it, so the same gesture is its own cancel and
  * the reader is never stuck listening to something they have finished with.
+ *
+ * A COMBINED ROW IS READ WHOLE, in parts, in order. The server speaks one Discord message per
+ * request — it reads the message's OWN text and will not be handed a string, which is what stops
+ * this route from becoming a way to spend the operator's vendor balance on anything at all — so a
+ * row of two messages is two requests played back to back. Both are fetched before either is
+ * played: a gap in the middle of what the reader hears as one message, while the second half is
+ * synthesised, is exactly the seam this feature exists to remove.
+ *
+ * @param {Array<string>} ids the row's Discord ids, oldest first.
  */
-async function readAloud(id) {
+async function readAloud(ids) {
+  const parts = ids.map(String);
+  // THE ROW'S IDENTITY is its first message, everywhere: the highlight, the pending mark and the
+  // ticket all key on it, so that "which row is speaking" is one question with one answer.
+  const id = parts[0];
   // A SECOND TAP IS AN ABORT, whether or not the audio has started. Pending counts: the wait is
   // where a mis-tap is noticed — the message is long, the reader realises they did not want it,
   // and the only thing they can do is tap the thing they just tapped. Checking `nowPlaying` alone
   // made that start a SECOND read instead of cancelling the first.
-  const already = (nowPlaying !== null && nowPlaying.id === id) || pendingRead === String(id);
+  const already = (nowPlaying !== null && nowPlaying.id === id) || pendingRead === id;
   // Also cancels anything still being fetched, so a double tap cannot end in two players.
   stopReading();
-  if (already) {
+  if (already || parts.length === 0) {
     return;
   }
   const channel = el("discord-channel").value;
@@ -4065,12 +4106,12 @@ async function readAloud(id) {
   const ticket = readingTicket;
   // BEFORE the await, and this is the point: everything below is remote, and the reader is owed an
   // answer now rather than when ElevenLabs is finished.
-  pendingRead = String(id);
+  pendingRead = id;
   setReadState("working");
   renderChannelRows();
-  let blob;
+  let blobs;
   try {
-    blob = await fetchSpeech(channel, id);
+    blobs = await Promise.all(parts.map((part) => fetchSpeech(channel, part)));
   } catch (error) {
     if (ticket === readingTicket) {
       pendingRead = null;
@@ -4093,28 +4134,48 @@ async function readAloud(id) {
   }
   // The wait is over: it is being READ now, not merely asked for.
   pendingRead = null;
-  const url = URL.createObjectURL(blob);
-  const audio = new Audio(url);
-  nowPlaying = { id, audio, url };
-  audio.addEventListener("ended", () => {
-    // Only if THIS is still the read in progress. The reader may have tapped another message while
-    // this was finishing, and archiving on a stale `ended` would file away the wrong one.
-    if (ticket !== readingTicket || nowPlaying === null || nowPlaying.id !== id) {
-      return;
-    }
-    stopReading();
-    guardQuietly(() => dismissMessages({ messages: [String(id)] }))();
-  });
-  audio.addEventListener("error", () => {
-    if (ticket !== readingTicket) {
-      return;
-    }
-    stopReading();
-    setStatus("that message could not be played.");
+  const urls = blobs.map((blob) => URL.createObjectURL(blob));
+  const players = urls.map((url) => new Audio(url));
+  nowPlaying = { id, audio: players[0], urls };
+  players.forEach((audio, at) => {
+    audio.addEventListener("ended", () => {
+      // Only if THIS is still the read in progress. The reader may have tapped another message
+      // while this was finishing, and archiving on a stale `ended` would file away the wrong one.
+      if (ticket !== readingTicket || nowPlaying === null || nowPlaying.id !== id) {
+        return;
+      }
+      const next = players[at + 1];
+      if (next) {
+        // Still the same row being read, so nothing on screen changes: only the player does.
+        nowPlaying = { ...nowPlaying, audio: next };
+        // `play()` answers with a promise a browser is allowed to reject, and this one is not
+        // awaited by anybody — an unhandled rejection here would take the next part down silently
+        // and leave the row lit with nothing coming.
+        const started = next.play();
+        if (started && typeof started.catch === "function") {
+          started.catch(() => {
+            stopReading();
+            setStatus("that message could not be played.");
+          });
+        }
+        return;
+      }
+      stopReading();
+      // EVERY constituent. A row read to the end is a row the reader has heard all of, and
+      // archiving only the first would leave its own tail in the queue.
+      guardQuietly(() => dismissMessages({ messages: parts }))();
+    });
+    audio.addEventListener("error", () => {
+      if (ticket !== readingTicket) {
+        return;
+      }
+      stopReading();
+      setStatus("that message could not be played.");
+    });
   });
   setReadState("ready");
   renderChannelRows();
-  await audio.play();
+  await players[0].play();
 }
 
 /**
@@ -4145,7 +4206,8 @@ function tapRow(li, fold) {
     // IN READING MODE A TAP IS A REQUEST TO HEAR IT, not to fold it. One gesture, two meanings,
     // decided by a mode the reader turned on deliberately and can see in the control bar.
     if (readingMode) {
-      guardQuietly(() => readAloud(li.getAttribute("data-id")))();
+      // EVERY message the row is showing, so a combined row is heard whole rather than half.
+      guardQuietly(() => readAloud(idsOf(li)))();
       return;
     }
     // A SHORT message has no fold control, and that is fine: it is already whole. The handler is
@@ -4172,8 +4234,8 @@ const HOLD_MS = 450;
  */
 let suppressNextRowClick = false;
 
-function swipeable(li, message) {
-  const id = String(message.id);
+function swipeable(li, messages) {
+  const ids = messages.map((m) => String(m.id));
   let startX = 0;
   let startY = 0;
   let dragging = false;
@@ -4210,7 +4272,7 @@ function swipeable(li, message) {
       holdTimer = null;
       reset();
       suppressNextRowClick = true;
-      toggleMessageDetails(li, message);
+      toggleMessageDetails(li, messages);
     }, HOLD_MS);
   });
 
@@ -4261,7 +4323,7 @@ function swipeable(li, message) {
       // A swipe on an ALREADY archived row puts it back, so the gesture is its own undo on the row
       // the reader is looking at. Symmetric deliberately: a gesture that only ever went one way
       // would make the greyed rows a trap.
-      guardQuietly(() => toggleArchived(id))();
+      guardQuietly(() => toggleArchived(ids))();
     }
   };
 
@@ -4318,7 +4380,164 @@ function fullLocalTime(message) {
   });
 }
 
-function discordNode(message) {
+// --- two messages that are really one -----------------------------------------------------------
+//
+// A coding agent writes past Discord's 2000-character limit and its client splits the post in two.
+// The second half continues mid-sentence — often mid-WORD — and arrives a fraction of a second
+// after the first. Read as two rows it is unreadable, and worse, it doubles the length of a backlog
+// that this view exists to let somebody work through.
+//
+// So the two are DRAWN as one. Only drawn: everything below the render is untouched, and that is
+// the load-bearing decision here rather than a nicety.
+//
+//   * THE DATA MODEL STAYS ONE-TO-ONE with Discord. The server knows nothing about this, no
+//     combined id is ever invented, and no id this file made up can reach a route — every id sent
+//     anywhere is one Discord really issued. A row simply carries a LIST of them (`data-ids`)
+//     instead of one, and every act on the row is performed on the whole list.
+//   * THE RULE IS TEMPORAL AND NOTHING ELSE. Consecutive, same author, and within
+//     `GLOM_WINDOW_MS` of the PREVIOUS message in the group — not of the group's start, so a
+//     genuine burst of five chatty messages joins the same way a split one does, which is the
+//     honest reading of "these were sent as one act". Nothing here parses English: no split-word
+//     detection, no capitalisation test, no length ratio. Those were deliberately deferred, and
+//     the reason to defer them is that each one can be WRONG about a message, whereas a clock
+//     cannot be wrong about when a message was sent.
+//   * A HUMAN ALMOST NEVER SENDS TWICE IN FIVE SECONDS, which is what makes the window safe. When
+//     they do, the two lines are shown together and nothing has been lost — they are still two
+//     rows' worth of text, in order, one after the other.
+//
+// The three places this gets DELICATE, all of them because they key off identity:
+//
+//   * READ STATE IS THE `every`, NOT THE `some`. A row is shown as dealt with only when every
+//     message in it is. A group that somehow ends up half-read shows as UNREAD, because the other
+//     way round hides a message nobody has seen behind one they have.
+//   * AN ACT ON THE ROW IS AN ACT ON ALL OF IT. Archive, unarchive, read aloud, the bulk clear:
+//     each one takes `data-ids` and not `data-id`, or the trailing overflow is left behind in the
+//     queue with nothing on screen able to reach it.
+//   * A REPLY GOES TO THE FIRST. The group is a primary message with a tail, and Discord will
+//     thread the answer under whichever id it is given; the first is the one a reader means.
+
+/** How close two messages have to be to be shown as one. */
+const GLOM_WINDOW_MS = 5000;
+
+/** What goes between two combined messages, so the seam is a line break and not a run-on. */
+const GLOM_SEPARATOR = "\n";
+
+/**
+ * Is the combining on? ON unless the reader has turned it off — see `storedCombineMessages`.
+ *
+ * A setting rather than a fixed behaviour because the view's other purpose is being able to point
+ * at a REAL message, and a reader chasing "did that message exist" wants the rows exactly as
+ * Discord has them.
+ */
+let combineMessages = true;
+
+function applyCombineMessages(on) {
+  combineMessages = Boolean(on);
+  el("combine-messages").checked = combineMessages;
+  try {
+    localStorage.setItem(COMBINE_KEY, combineMessages ? "1" : "0");
+  } catch (_error) {
+    // A browser that refuses storage still honours the choice for this session.
+  }
+}
+
+/** What was stored. ABSENT MEANS ON: the default is the behaviour, not merely the initial value. */
+function storedCombineMessages() {
+  return localStorage.getItem(COMBINE_KEY) !== "0";
+}
+
+/**
+ * Does `message` belong with the one before it?
+ *
+ * A missing or unparseable timestamp is a NO. Guessing that two messages were sent together when
+ * the page cannot tell when either was sent would be combining on no evidence at all.
+ */
+function joinsGroup(previous, message) {
+  if (!combineMessages || !previous) {
+    return false;
+  }
+  if (String(previous.author_id || "") !== String(message.author_id || "")) {
+    return false;
+  }
+  const before = messageDate(previous);
+  const after = messageDate(message);
+  if (before === null || after === null) {
+    return false;
+  }
+  const gap = after.getTime() - before.getTime();
+  return gap >= 0 && gap <= GLOM_WINDOW_MS;
+}
+
+/**
+ * A list of messages, oldest first, as the list of ROWS to draw.
+ *
+ * Every message appears exactly once, in order, in exactly one group — so the row count changes
+ * and nothing else does.
+ */
+function glom(messages) {
+  const groups = [];
+  for (const message of messages) {
+    const last = groups[groups.length - 1];
+    if (last && joinsGroup(last[last.length - 1], message)) {
+      last.push(message);
+    } else {
+      groups.push([message]);
+    }
+  }
+  return groups;
+}
+
+/**
+ * The messages a rendered row stands for, oldest first.
+ *
+ * Held ON the element, because the row already is this page's record of what it is showing and a
+ * second map keyed by id would have to be kept in step with a list three different reads rebuild.
+ */
+const rowMessages = (row) => (row && row.messages) || [];
+
+/**
+ * Every Discord id a row stands for, oldest first.
+ *
+ * Read from the ATTRIBUTE rather than from `rowMessages`, because that is the idiom every other
+ * derivation in `renderChannelRows` follows and because it keeps the grouping visible in the
+ * document rather than only in a property a debugger has to be told about. `discordNode` writes
+ * both from the same array, so they cannot disagree.
+ */
+const idsOf = (row) =>
+  String((row && row.getAttribute("data-ids")) || "")
+    .split(" ")
+    .filter(Boolean);
+
+/** What a combined row DISPLAYS: the constituents, in order, separated by a line break. */
+const combinedContent = (messages) =>
+  messages
+    .map((m) => String(m.content === null || m.content === undefined ? "" : m.content))
+    .join(GLOM_SEPARATOR);
+
+/**
+ * Redraw the channel list from the messages already on screen, under the current grouping.
+ *
+ * What the setting needs and a re-read cannot give it: turning combining on or off must not cost a
+ * round trip, must not lose the walk-back the reader has done, and must not move them. Everything
+ * needed is already here — the rows carry their own messages — so this is a regroup, not a fetch.
+ */
+function regroupChannelRows() {
+  const list = el("discord-log");
+  const messages = [...list.children].flatMap(rowMessages);
+  preservingScroll(() => {
+    list.replaceChildren(...glom(messages).map(discordNode));
+    renderChannelRows();
+  });
+  renderScrollTools();
+}
+
+/**
+ * One ROW: one message, or several drawn as one. Takes a group, never a bare message.
+ *
+ * @param {Array<object>} messages the row's constituents, oldest first, at least one.
+ */
+function discordNode(messages) {
+  const message = messages[0];
   const li = document.createElement("li");
   // `#56 message-hover-highlight`. A class of its own rather than styling `#discord-log li`
   // directly: the treatment must not be able to reach `#transcript` rows, and the behavioural
@@ -4328,13 +4547,33 @@ function discordNode(message) {
   // The newest page and the older walk both put rows in the same list, and telling one from the
   // other is a comparison of snowflakes.
   li.setAttribute("data-id", String(message.id));
+  // ...and EVERY message it stands for, which is the same thing on an ordinary row and the whole
+  // of the combining on a glommed one. Every act performed on the row reads this rather than
+  // `data-id`; see the section note above.
+  li.setAttribute("data-ids", messages.map((m) => String(m.id)).join(" "));
+  // The message objects themselves, for the two things attributes cannot carry: deciding whether
+  // an arriving message joins this row, and redrawing the list when the setting is flipped.
+  li.messages = messages;
   // The reply pointer, on the row, as the ATTRIBUTE the inbox pass reads. It lives here rather
   // than in a side map because the row is already the page's record of which message this is, and
   // a second structure keyed by id would have to be kept in step with a list that is rebuilt from
   // three different places. Absent when this message answers nothing.
+  //
+  // `data-reply-to` is the ROW'S OWN, which is the first constituent's — that is the row's
+  // identity, and it decides whether the row is drawn as an answer. `data-answers` is every
+  // pointer the row carries, which is what the census of "who has been answered" needs: a message
+  // combined into this row still answered whatever it answered, and reading only the first would
+  // quietly stop dimming that question.
   if (message.reply_to) {
     li.setAttribute("data-reply-to", String(message.reply_to));
   }
+  li.setAttribute(
+    "data-answers",
+    messages
+      .map((m) => (m.reply_to ? String(m.reply_to) : ""))
+      .filter(Boolean)
+      .join(" ")
+  );
   // WHO, as the snowflake, so the speaker pass has something stable to key on. The display name
   // rides along only so Settings can show a recognisable label beside the id; nothing is ever
   // decided from it, because it is chosen by whoever owns the account.
@@ -4375,7 +4614,12 @@ function discordNode(message) {
   meta.append(author, stamp);
   const body = document.createElement("div");
   body.className = "body";
-  renderMarkdownInto(body, message.content);
+  // THE COMBINED TEXT, and it is the only thing the reader sees of the grouping. A line break
+  // between the parts rather than nothing: the second half of a split post begins mid-sentence,
+  // and running the two together with no seam would read as one mangled sentence instead of two
+  // halves of one message.
+  const content = combinedContent(messages);
+  renderMarkdownInto(body, content);
   li.append(meta, body);
   // The SAME call the voice transcript makes, on the same arguments, so the two lists cannot end
   // up with two idioms for the one behaviour. `#47 scrollback-stability`. The one extra argument
@@ -4383,7 +4627,15 @@ function discordNode(message) {
   // has none to give, so it gets no summary line and the two lists still share one definition of
   // "long enough to fold".
   // EVERY row, foldable or not. See `tapRow`.
-  tapRow(li, foldable(li, meta, body, message.content, String(message.id)));
+  //
+  // Measured on the COMBINED text, because that is what the row is showing: a pair of messages
+  // each just under the fold threshold is a wall of text once they are drawn as one.
+  //
+  // The summary is keyed under the FIRST id, and that is a known limit rather than an oversight:
+  // the server summarises one message, so a glommed row's summary describes its primary message
+  // and not the trailing overflow. The overflow is the tail of a sentence the primary already
+  // said, which is the case the summary loses least by missing.
+  tapRow(li, foldable(li, meta, body, content, String(message.id)));
   // `#51 reply-view`. Every raw message can be answered, and the affordance is on the row rather
   // than in a menu — Discord's own idiom, and the thing that makes a reply a REPLY rather than a
   // loose message.
@@ -4397,9 +4649,12 @@ function discordNode(message) {
   reply.setAttribute("type", "button");
   reply.setAttribute("title", "Reply to this message");
   reply.textContent = "Reply";
-  // A closure over the message OBJECT, not over its id: an id would be looked up again later
+  // A closure over the message OBJECTS, not over their ids: an id would be looked up again later
   // against a list that the next poll may have replaced.
-  reply.addEventListener("click", () => openReply(message));
+  //
+  // THE ANSWER GOES TO THE FIRST CONSTITUENT. A glommed row is a primary message with a tail
+  // hanging off it, and threading a reply under the tail would put the answer under a fragment.
+  reply.addEventListener("click", () => openReply(messages));
   meta.append(reply);
   // `#50 todo-view`. The non-gestural way to say "dealt with", and the one a keyboard can reach.
   // On EVERY channel row rather than only on rows built while the mode is on: the mode is a
@@ -4416,15 +4671,17 @@ function discordNode(message) {
   // the reader is exactly the row that may need putting back — and hiding its only
   // keyboard-reachable control would leave the swipe as the sole way in, which is the one thing
   // this section refuses to do. `renderChannelRows` decides which of the two acts it offers.
-  done.addEventListener("click", () =>
-    guardQuietly(() => toggleArchived(String(message.id)))()
-  );
+  //
+  // EVERY constituent, not the row's identity: archiving a row that leaves half of itself in the
+  // queue is the failure mode a display-layer grouping has to be built against.
+  const ids = messages.map((m) => String(m.id));
+  done.addEventListener("click", () => guardQuietly(() => toggleArchived(ids))());
   meta.append(done);
   // `#84 reply-aware-dismissal`. THE SWIPE `#50` deferred, and it drives the same act the Done button does
   // rather than a second notion of "dealt with": one dismissal, recorded on the server, reachable
   // by gesture OR by a control a keyboard can get to. That ordering was `#50`'s condition for the
   // gesture layer and it still holds — the gesture is a second way in, never the only one.
-  swipeable(li, message);
+  swipeable(li, messages);
   return li;
 }
 
@@ -4565,11 +4822,17 @@ function applyNewestPage(payload) {
   const list = el("discord-log");
   const messages = payload.messages || [];
   const oldest = messages.length ? messages[0].id : null;
+  // Compared on the row's NEWEST constituent, so a combined row is kept only when the whole of it
+  // is older than this page — otherwise a message would be on screen twice, once in each row.
+  const newestOf = (li) => {
+    const ids = idsOf(li);
+    return ids.length > 0 ? ids[ids.length - 1] : li.getAttribute("data-id");
+  };
   const kept =
     payload.has_more === true && oldest
-      ? [...list.children].filter((li) => snowflakeOlder(li.getAttribute("data-id"), oldest))
+      ? [...list.children].filter((li) => snowflakeOlder(newestOf(li), oldest))
       : [];
-  list.replaceChildren(...kept, ...messages.map(discordNode));
+  list.replaceChildren(...kept, ...glom(messages).map(discordNode));
   // The archive BEFORE the derivation that reads it. `kept` rows were already on screen and their
   // ids are still in the set from the read that brought them, so a reset here would un-grey them.
   noteArchived(payload, kept.length === 0);
@@ -4608,7 +4871,7 @@ async function loadOlder() {
         `?limit=${DISCORD_PAGE_LIMIT}&before=${encodeURIComponent(discordOlderCursor)}`
     );
     const list = el("discord-log");
-    const arriving = (payload.messages || []).map(discordNode);
+    const arriving = glom(payload.messages || []).map(discordNode);
     // The step is OVER before the anchored mutation, so that every consequence of it — the rows,
     // the summary and the control's final state — is one change of height rather than three. The
     // block below is synchronous, so there is no window in which a second step could start.
@@ -5119,7 +5382,7 @@ async function loadTodo(options) {
       ? served.filter((m) => bucketFor(m.author_id, m.author_is_bot) !== "me")
       : served;
     const list = el("discord-log");
-    list.replaceChildren(...messages.map(discordNode));
+    list.replaceChildren(...glom(messages).map(discordNode));
     // The walk back belongs to the UNFILTERED channel. Leaving a cursor armed here would let a
     // scroll to the top prepend unfiltered rows into a filtered list.
     discordMoreAbove = false;
@@ -5201,7 +5464,20 @@ function todoSummary() {
  * Outside the mode this is an ordinary append, because nothing on screen is claiming a count.
  */
 function appendChannelRow(message) {
-  el("discord-log").append(discordNode(message));
+  const list = el("discord-log");
+  // A LIVE ARRIVAL CAN JOIN THE ROW ABOVE IT, and it has to be given the chance: the second half
+  // of a split post usually arrives over the stream a fraction of a second after the first, so
+  // appending it unconditionally would leave exactly the pair this feature exists for as two rows
+  // until the next poll happened to redraw them together.
+  const rows = [...list.children];
+  const last = rows[rows.length - 1];
+  const held = rowMessages(last);
+  if (held.length > 0 && joinsGroup(held[held.length - 1], message)) {
+    // The row is REBUILT rather than edited: one constructor for a row, wherever it came from.
+    list.replaceChildren(...rows.slice(0, -1), discordNode([...held, message]));
+  } else {
+    list.append(discordNode([message]));
+  }
   // `#84 reply-aware-dismissal`. Re-derive the row states with the new row in place. It is here, in the one
   // appender, rather than at each of its callers: an arriving message can be the ANSWER to
   // something already on screen, so the row that changes is not necessarily the one just added.
@@ -5228,11 +5504,15 @@ function appendChannelRow(message) {
  * Both the swipe and the row's button come through here, so the two cannot drift into two notions
  * of what the gesture means.
  */
-async function toggleArchived(id) {
-  if (archivedIds.has(String(id))) {
-    await restoreMessages([String(id)]);
+async function toggleArchived(ids) {
+  const all = ids.map(String);
+  // The row's own reading of itself, and it has to be the SAME `every` the row is drawn with:
+  // a half-archived row shows as unread, so the act it offers is Done, and Done must archive the
+  // part that is still outstanding rather than putting the whole row back.
+  if (all.length > 0 && all.every((id) => archivedIds.has(id))) {
+    await restoreMessages(all);
   } else {
-    await dismissMessages({ messages: [String(id)] });
+    await dismissMessages({ messages: all });
   }
 }
 
@@ -5326,9 +5606,12 @@ async function clearBacklog() {
   if (rows.length === 0) {
     return;
   }
+  // MESSAGES, not rows: what the server is about to clear is Discord messages, and a combined row
+  // is more than one of them. A count of rows would promise to clear fewer than it did.
+  const messages = rows.flatMap(idsOf);
   if (!backlogIsArmed()) {
     armBacklog();
-    setStatus(`Tap again to clear ${rows.length} — undo will be offered afterwards.`);
+    setStatus(`Tap again to clear ${messages.length} — undo will be offered afterwards.`);
     return;
   }
   disarmBacklog();
@@ -5340,8 +5623,12 @@ async function clearBacklog() {
   // which, for a client reading a smaller page than the server's default, means clearing messages
   // that were never on screen. The limit is what makes "everything above this row" mean the rows
   // the reader was actually looking at.
+  //
+  // The boundary is the NEWEST message on screen, which on a combined bottom row is its LAST
+  // constituent rather than the id the row is filed under. Sending the row's identity would stop
+  // the sweep one message short and leave the trailing overflow in the queue.
   await dismissMessages({
-    through: rows[rows.length - 1].getAttribute("data-id"),
+    through: messages[messages.length - 1],
     limit: DISCORD_PAGE_LIMIT,
   });
 }
@@ -5440,8 +5727,15 @@ function rememberDraft() {
   }
 }
 
-/** Open the reply screen on one specific message. */
-function openReply(message) {
+/**
+ * Open the reply screen on one specific row.
+ *
+ * THE ANSWER GOES TO THE FIRST CONSTITUENT, and the meta line says which id that is. The quoted
+ * text above it is the whole row, because that is what the reader tapped Reply on — showing only
+ * the primary would read as the app having lost the rest of the message.
+ */
+function openReply(messages) {
+  const message = messages[0];
   replyTarget = message;
   // BEFORE the screen changes: once #screen-main is hidden nothing in it has a rectangle, so the
   // anchor has to be taken while the reader can still see it.
@@ -5450,7 +5744,7 @@ function openReply(message) {
   target.replaceChildren();
   // The same renderer the channel list uses. Untrusted text, so the same guarantee: every fragment
   // is an element built here with textContent, and there is no second path.
-  renderMarkdownInto(target, message.content);
+  renderMarkdownInto(target, combinedContent(messages));
   el("reply-target-meta").textContent = `${
     message.author_is_bot ? `${message.author} (bot)` : String(message.author)
   } · id ${message.id}`;
@@ -6052,7 +6346,9 @@ function receiveLiveMessage(message, selfPosted, replayed) {
   }
   const list = el("discord-log");
   const id = String(message.id);
-  const already = [...list.children].some((li) => li.getAttribute("data-id") === id);
+  // Against EVERY id on screen: a message already combined into a row is on screen, and a dedupe
+  // that only looked at row identities would add a second copy of it.
+  const already = [...list.children].some((li) => idsOf(li).includes(id));
   if (already) {
     return;
   }
@@ -6489,6 +6785,7 @@ applyReadingWidth(storedReadingWidth());
 applyMsgScale(storedMsgScale());
 applyReadSpeed(storedReadSpeed());
 applyMarkOwnRead(storedMarkOwnRead());
+applyCombineMessages(storedCombineMessages());
 loadPlaceMarker();
 el("reading-width").addEventListener("input", () => readingWidthChanged(el("reading-width").value));
 el("msg-scale").addEventListener("input", () => msgScaleChanged(el("msg-scale").value));
@@ -6523,6 +6820,19 @@ el("mark-own-read").addEventListener("change", () => {
   if (todoMode) {
     guardQuietly(() => loadTodo({ keepPosition: true, ownAct: true }))();
   }
+});
+
+el("combine-messages").addEventListener("change", () => {
+  applyCombineMessages(el("combine-messages").checked);
+  // REDRAWN FROM WHAT IS ALREADY HERE, not re-read: the rows carry their own messages, so the
+  // setting costs no round trip and cannot lose a walk back through the channel. `renderChannelRows`
+  // alone would not do — the grouping decides how many ROWS there are, which is a rebuild.
+  regroupChannelRows();
+  setStatus(
+    el("combine-messages").checked
+      ? "messages sent seconds apart are shown as one."
+      : "every Discord message is shown as its own row."
+  );
 });
 
 el("jump-marker").addEventListener("click", jumpToMarker);

@@ -1749,6 +1749,12 @@ const TUNING_BANDS = {
   MAX_READ_SPEED: [110, 400,
     "the fastest. Past about double, the audio outruns being able to follow it, and the reader " +
     "taps again rather than listening"],
+  GLOM_WINDOW_MS: [500, 30000,
+    "how close two messages have to be to be drawn as one. The whole safety of the rule is that a " +
+    "PERSON does not send twice inside it: at half a minute two genuinely separate remarks by the " +
+    "same author are silently welded together and the second one can be archived by a tap aimed " +
+    "at the first, and below about half a second the split halves of one long post — which is the " +
+    "case this exists for — arrive too far apart to be caught"],
   HOLD_MS: [250, 1500,
     "how long a finger rests before the row shows who sent it and when. Below about a quarter of " +
     "a second an ordinary tap becomes a hold and the message stops folding; past a second and a " +
@@ -4778,14 +4784,33 @@ test("AT THE BOTTOM THE HEADER COSTS NO ROW AT ALL", async () => {
   assert.equal(page.el("topbar").hidden, false, "the bar moved to a header that is not shown");
 });
 
+/**
+ * How far apart two messages this builder makes are, unless a test says otherwise.
+ *
+ * A MINUTE, and this used to be zero: every `message()` carried the same hard-coded timestamp, so
+ * any two of them were sent at the same instant by the same author. That was harmless until the
+ * channel view started drawing messages sent within `GLOM_WINDOW_MS` of each other as one row, at
+ * which point a fixture of "two messages" was silently a fixture of ONE — the class of failure
+ * where a test cannot exercise the thing it is about.
+ *
+ * So the default is far outside the window: a test that builds two messages gets two rows, which
+ * is what every test written before combining existed meant by it. The tests about combining pass
+ * their own timestamps, deliberately close together, and say so.
+ */
+const MESSAGE_SPACING_MS = 60000;
+const MESSAGE_EPOCH = Date.parse("2026-08-19T04:31:00.000Z");
+let messagesBuilt = 0;
+
 function message(overrides) {
+  const at = new Date(MESSAGE_EPOCH + messagesBuilt * MESSAGE_SPACING_MS);
+  messagesBuilt += 1;
   return {
     id: "1122334455667788990",
     channel_id: CHANNEL.id,
     author: "ci-bot",
     author_id: "1000000000000000001",
     author_is_bot: true,
-    timestamp: "2026-08-19T04:31:00.000Z",
+    timestamp: at.toISOString(),
     content: "hello",
     ...overrides,
   };
@@ -11862,4 +11887,519 @@ test("NOTHING THE AGENT SENDS DOWN THE SOCKET CAN RENAME A CHANNEL", async () =>
   // the socket rather than about the route being unreachable at all.
   await renameFrom(page, CHANNEL.id, "the build channel");
   assert.deepStrictEqual(page.aliasCalls, ['PUT {"alias":"the build channel"}']);
+});
+
+// --- two messages that are really one -----------------------------------------------------------
+//
+// The owner's report: an agent writes past Discord's length limit, its client splits the post, and
+// the second half continues mid-word a fraction of a second after the first. Read as two rows it is
+// unreadable. So the channel view DRAWS them as one — and only draws, which is the half these
+// tests exist to hold: every id that leaves this page is still a real Discord id, and every act on
+// a combined row reaches every message in it.
+
+/** How close the page draws two messages as one, read from the page rather than restated here. */
+const GLOM_WINDOW_MS = sourceConstant("GLOM_WINDOW_MS");
+
+/**
+ * A post Discord split in two: one author, well inside the window.
+ *
+ * A FIXTURE THAT CAN EXERCISE THE THING: two messages, the same author, and timestamps close
+ * enough to be combined. Any one of the three missing and the rows stay separate for a reason that
+ * has nothing to do with what the test is about.
+ */
+function splitPost(first, second) {
+  return [
+    message({
+      id: "1000000000000000001",
+      content: "the overnight run finished and the runner is",
+      timestamp: "2026-08-19T04:31:00.000Z",
+      ...first,
+    }),
+    message({
+      id: "1000000000000000002",
+      content: "back up again.",
+      timestamp: "2026-08-19T04:31:01.500Z",
+      ...second,
+    }),
+  ];
+}
+
+/** The rendered lines of one row's body, which is where the seam between two halves shows. */
+const bodyLines = (li) =>
+  li
+    .descendants()
+    .find((node) => node.hasClass("body"))
+    .children.map((node) => node.text());
+
+test("A POST DISCORD SPLIT IN TWO IS DRAWN AS ONE ROW, with a line break at the seam", async () => {
+  const page = newPage();
+  await signIn(page);
+  const rows = await showDiscord(page, splitPost());
+
+  assert.equal(rows.length, 1, "the two halves of one post are still two rows");
+  // DRAWN, not merely grouped. The seam is a rendered line break: without it the second half runs
+  // on from the first as one mangled sentence, which is the complaint rather than the fix.
+  assert.deepEqual(bodyLines(rows[0]), [
+    "the overnight run finished and the runner is",
+    "back up again.",
+  ]);
+  // ...and the row is honest about what it is standing for.
+  assert.equal(
+    rows[0].getAttribute("data-ids"),
+    "1000000000000000001 1000000000000000002",
+    "the row does not say which messages it is showing"
+  );
+  assert.equal(
+    rows[0].getAttribute("data-id"),
+    "1000000000000000001",
+    "the row is filed under something other than its first message"
+  );
+});
+
+test("...and messages FURTHER APART than the window stay two rows", async () => {
+  // The negative control. Without it "everything is one row" would satisfy the test above.
+  const page = newPage();
+  await signIn(page);
+  const apart = new Date(Date.parse("2026-08-19T04:31:00.000Z") + GLOM_WINDOW_MS + 1000);
+  const rows = await showDiscord(
+    page,
+    splitPost(undefined, { timestamp: apart.toISOString() })
+  );
+
+  assert.equal(
+    rows.length,
+    2,
+    `messages ${GLOM_WINDOW_MS + 1000}ms apart were combined, which is past the window`
+  );
+});
+
+test("...and two messages seconds apart from DIFFERENT AUTHORS stay two rows", async () => {
+  // The other half of the rule, and the one that matters most: two people answering at once is a
+  // conversation, and welding it into one row would attribute one person's words to the other.
+  const page = newPage();
+  await signIn(page);
+  const rows = await showDiscord(
+    page,
+    splitPost(undefined, { author: "alice", author_id: "30", author_is_bot: false })
+  );
+
+  assert.equal(rows.length, 2, "two authors were drawn as one speaker");
+});
+
+test("MARKING A COMBINED ROW AS DEALT WITH ARCHIVES EVERY MESSAGE IN IT", async () => {
+  // The failure this is against: the row greys, the reader moves on, and the trailing half is
+  // still in the queue with nothing on screen able to reach it.
+  const page = newPage();
+  await signIn(page);
+  const rows = await showDiscord(page, splitPost());
+
+  await doneButton(rows[0]).click();
+  await page.settle();
+
+  assert.deepEqual(page.dismissCalls, [
+    { messages: ["1000000000000000001", "1000000000000000002"] },
+  ]);
+  assert.equal(rowState(page, 0).archived, "true", "the row did not grey once it was dealt with");
+  // ...and the same control puts the WHOLE row back.
+  await doneButton(row(page, 0)).click();
+  await page.settle();
+  assert.deepEqual(page.restoreCalls, [
+    { messages: ["1000000000000000001", "1000000000000000002"] },
+  ]);
+});
+
+test("...and so does a SWIPE, which is the other way into the same act", async () => {
+  // The gesture is a second way in, never the only one, and it must not be a second NOTION of
+  // dealt with either: a swipe that left half the row in the queue would be silently different
+  // from the button beside it.
+  const page = newPage();
+  await signIn(page);
+  const rows = await showDiscord(page, splitPost());
+  const commit = sourceConstant("SWIPE_COMMIT_PX") + 10;
+  const li = rows[0];
+  const touch = (x) => ({ pointerId: 1, pointerType: "touch", clientX: x, clientY: 40 });
+
+  await li.dispatch("pointerdown", touch(300));
+  await li.dispatch("pointermove", touch(300 - commit));
+  await li.dispatch("pointerup", touch(300 - commit));
+  await page.settle();
+
+  assert.deepEqual(page.dismissCalls, [
+    { messages: ["1000000000000000001", "1000000000000000002"] },
+  ]);
+});
+
+test("A HALF-ARCHIVED COMBINED ROW SHOWS AS UNREAD, and Done finishes it rather than undoing it", async () => {
+  // The case the owner flagged: read state can disagree inside a group, and the two readings are
+  // not equally safe. Showing it as read hides a message nobody has seen behind one they have.
+  const page = newPage();
+  await signIn(page);
+  page.dealtWith.add("1000000000000000001");
+  const rows = await showDiscord(page, splitPost());
+
+  assert.equal(rows.length, 1, "the fixture is not exercising a combined row at all");
+  assert.equal(
+    rowState(page, 0).archived,
+    "false",
+    "half the row has never been seen and it is drawn as dealt with"
+  );
+
+  // The act the row offers is therefore Done, and Done must archive the OUTSTANDING half rather
+  // than putting the archived one back.
+  await doneButton(rows[0]).click();
+  await page.settle();
+  assert.deepEqual(page.restoreCalls, [], "finishing a half-read row un-archived it instead");
+  assert.equal(rowState(page, 0).archived, "true", "the row never settles into being dealt with");
+});
+
+test("A REPLY TO A COMBINED ROW GOES TO THE FIRST MESSAGE'S REAL DISCORD ID", async () => {
+  // The other one the owner flagged. Discord threads the answer under whichever id it is given,
+  // and the group is a primary message with a tail: an answer threaded under the tail is filed
+  // under a fragment.
+  const page = newPage();
+  await signIn(page);
+  const rows = await showDiscord(page, splitPost());
+
+  await replyButton(rows[0]).click();
+  assert.equal(page.screen(), "reply");
+  // What is quoted is the whole row, because that is what the reader tapped Reply on.
+  assert.match(page.el("reply-target").text(), /back up again/, "the quoted message is truncated");
+  assert.match(
+    page.el("reply-target-meta").textContent,
+    /id 1000000000000000001$/,
+    "the screen names an id other than the one the answer will thread under"
+  );
+
+  page.el("reply-text").value = "thanks";
+  await page.el("reply-send").click();
+  await page.settle();
+
+  assert.equal(page.repliesPosted.length, 1);
+  assert.equal(
+    page.repliesPosted[0].body.reply_to,
+    "1000000000000000001",
+    "the reply was threaded under the trailing overflow rather than the message"
+  );
+});
+
+test("READING A COMBINED ROW ALOUD READS ALL OF IT, and archives it only when the last part ends", async () => {
+  const page = newPage();
+  await signIn(page);
+  const rows = await inReadingMode(page, splitPost());
+
+  await rows[0].dispatch("click", {});
+  await page.settle();
+
+  // Both parts fetched, in order — the server speaks one message per request, so the combined
+  // text is two requests played back to back.
+  assert.deepEqual(
+    page.speakCalls,
+    ["1000000000000000001", "1000000000000000002"],
+    "the row was read half-way and the reader heard a sentence stop mid-word"
+  );
+  assert.equal(page.players.length, 2, "one player for two parts");
+  assert.equal(page.players[0].playCount, 1, "the first part never played");
+  assert.equal(page.players[1].playCount, 0, "both parts played over each other");
+
+  await page.players[0].end();
+  await page.settle();
+  assert.equal(page.players[1].playCount, 1, "the second part never followed the first");
+  assert.deepEqual(page.dismissCalls, [], "the row was filed away with half of it unheard");
+  assert.equal(rowState(page, 0).reading, "true", "the row stopped saying it was speaking");
+
+  await page.players[1].end();
+  await page.settle();
+  assert.deepEqual(page.dismissCalls, [
+    { messages: ["1000000000000000001", "1000000000000000002"] },
+  ]);
+  assert.equal(rowState(page, 0).reading, "false", "the row still claims to be playing");
+});
+
+test("...and stopping a combined read part-way releases EVERY audio URL it fetched", async () => {
+  const page = newPage();
+  await signIn(page);
+  const rows = await inReadingMode(page, splitPost());
+
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  await rows[0].dispatch("click", {});
+  await page.settle();
+
+  assert.equal(page.players[0].paused, true, "a second tap did not stop the audio");
+  assert.equal(
+    page.revokedUrls.length,
+    2,
+    "the part that was fetched but never reached was leaked"
+  );
+  assert.deepEqual(page.dismissCalls, [], "stopping halfway filed the row away");
+});
+
+test("COMBINING IS ON BY DEFAULT, and the switch redraws the rows without re-reading the channel", async () => {
+  const page = newPage();
+  await signIn(page);
+  assert.equal(page.el("combine-messages").checked, true, "the default is not on");
+  const rows = await showDiscord(page, splitPost());
+  assert.equal(rows.length, 1);
+  const reads = page.pageReads;
+
+  await page.el("combine-messages").setChecked(false);
+  await page.settle();
+
+  const raw = page.el("discord-log").children;
+  assert.equal(raw.length, 2, "turning it off did not put the raw Discord rows back");
+  assert.deepEqual(shownIds(page), ["1000000000000000001", "1000000000000000002"]);
+  assert.equal(page.pageReads, reads, "flipping a display switch cost a round trip to the server");
+  assert.equal(page.storage.get("gent-talk.voice.combine"), "0", "the choice was not kept");
+
+  await page.el("combine-messages").setChecked(true);
+  await page.settle();
+  assert.equal(page.el("discord-log").children.length, 1, "turning it back on did not re-combine");
+
+  // ...and the choice survives a reload, which is what makes it a setting rather than a mode.
+  await page.el("combine-messages").setChecked(false);
+  const again = newPage(page.storage);
+  await signIn(again);
+  assert.equal(again.el("combine-messages").checked, false, "the switch came back on by itself");
+  assert.equal((await showDiscord(again, splitPost())).length, 2, "the rows combined anyway");
+});
+
+test("A MESSAGE ARRIVING SECONDS AFTER THE LAST JOINS ITS ROW, without moving the reader", async () => {
+  // The live half. Split posts arrive over the stream far more often than they are first seen in a
+  // poll, so an appender that could not join would leave exactly the pair this feature is for as
+  // two rows until something else happened to redraw them.
+  const page = newPage();
+  const channel = tallChannel();
+  const stream = await withLiveChannel(page, channel);
+  const area = page.el("scroll-area");
+  const parked = parkMidway(page);
+  assert.ok(parked > 0, "the fixture is not tall enough to have a place to lose");
+  const before = page.el("discord-log").children.length;
+
+  const previous = channel[channel.length - 1];
+  const overflow = message({
+    id: "9000000000000000001",
+    content: "and the rest of that sentence.",
+    timestamp: new Date(Date.parse(previous.timestamp) + 1500).toISOString(),
+  });
+  await deliver(page, stream, sseMessage(overflow));
+
+  const rows = page.el("discord-log").children;
+  assert.equal(rows.length, before, "the trailing half arrived as a row of its own");
+  const last = rows[rows.length - 1];
+  assert.match(last.text(), /and the rest of that sentence/, "the arriving text is not on screen");
+  assert.equal(
+    last.getAttribute("data-ids").split(" ").includes("9000000000000000001"),
+    true,
+    "the row it joined does not admit to holding it"
+  );
+  // "New events, new messages. None of that should move our place."
+  assert.equal(area.scrollTop, parked, "a message joining a row dragged the reader");
+  assert.equal(page.el("jump-newest").hidden, false, "nothing said a message had arrived");
+
+  // ...and the same message arriving twice does not double it, even though the row it belongs to
+  // is not filed under its id.
+  await deliver(page, stream, sseMessage(overflow));
+  assert.equal(page.el("discord-log").children.length, before, "a combined message arrived twice");
+  // ...and it is not silently absorbed into the same row a SECOND time, which is what a dedupe
+  // that only compared row identities would do: the row count would not move and the text would
+  // simply be there twice.
+  const everyId = [...page.el("discord-log").children].flatMap((li) =>
+    li.getAttribute("data-ids").split(" ")
+  );
+  assert.equal(
+    everyId.filter((one) => one === "9000000000000000001").length,
+    1,
+    "the arriving message was combined into the row twice"
+  );
+});
+
+test("THE KEPT PLACE DOES NOT STEP OVER A ROW THAT IS ONLY HALF DEALT WITH", async () => {
+  // The marker means "the oldest thing I still have to deal with". A row with one unarchived
+  // message in it is still something to deal with, so the marker must not walk past it.
+  const page = newPage();
+  await signIn(page);
+  const later = message({
+    id: "1000000000000000003",
+    content: "a separate thing entirely",
+    timestamp: "2026-08-19T04:40:00.000Z",
+  });
+  const rows = await showDiscord(page, [...splitPost(), later]);
+  assert.equal(rows.length, 2, "the fixture is not exercising a combined row");
+
+  await hold(page, rows[0]);
+  await rows[0].descendants().find((n) => n.text() === "Keep my place here").click();
+  await page.settle();
+  assert.equal(
+    page.storage.get("gent-talk.voice.place-marker"),
+    "1000000000000000001",
+    "the kept place is not a real Discord id"
+  );
+
+  // Only the FIRST half archived: the row is still waiting, so the marker stays on it.
+  page.dealtWith.add("1000000000000000001");
+  await reReadChannel(page);
+  assert.equal(rowState(page, 0).marked, "true", "the place stepped over an unread message");
+  assert.equal(rowState(page, 1).marked, "false");
+
+  // ...and once the whole row is dealt with, it moves on.
+  page.dealtWith.add("1000000000000000002");
+  await reReadChannel(page);
+  assert.equal(rowState(page, 1).marked, "true", "the place never followed the reader down");
+  assert.equal(page.storage.get("gent-talk.voice.place-marker"), "1000000000000000003");
+});
+
+test("THE BULK CLEAR'S BOUNDARY IS THE NEWEST MESSAGE ON SCREEN, not the last row's identity", async () => {
+  // `through` is resolved by the server against its own ordering, and the boundary is INCLUDED.
+  // Sending a combined bottom row's identity stops the sweep one message short and leaves the
+  // trailing overflow in the queue — which is the one thing bankruptcy must not do.
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, splitPost());
+  await turnTodoOn(page);
+
+  await page.el("clear-backlog").click();
+  // The count it warns with is in MESSAGES, because that is what is about to be cleared.
+  assert.match(page.el("status").textContent, /clear 2\b/, "the warning counted rows, not messages");
+  await page.el("clear-backlog").click();
+  await page.settle();
+
+  assert.equal(page.dismissCalls.length, 1);
+  assert.equal(
+    page.dismissCalls[0].through,
+    "1000000000000000002",
+    "the sweep stopped short of the trailing half of the bottom row"
+  );
+  assert.equal(shownIds(page).length, 0, "something was left in the queue");
+});
+
+test("PRESS AND HOLD ON A COMBINED ROW NAMES EVERY ID IT IS SHOWING", async () => {
+  // The sheet is the answer to "does that message really exist", and this view exists because the
+  // agent has described messages that did not. A combined row naming only its first constituent
+  // makes the second unreachable by exactly the affordance built to reach it.
+  const page = newPage();
+  await signIn(page);
+  const rows = await showDiscord(page, splitPost());
+
+  await hold(page, rows[0]);
+
+  const shown = rows[0].descendants().find((n) => n.className === "msg-id");
+  assert.ok(shown, "the details sheet does not name an id at all");
+  assert.match(shown.text(), /1000000000000000001/);
+  assert.match(shown.text(), /1000000000000000002/, "the trailing half of the row is unnamed");
+});
+
+test("a message COMBINED INTO A ROW still dims the question it answered", async () => {
+  // `data-replied` is a census over every reply pointer in the list. Reading only each row's
+  // identity would quietly stop dimming a question whose answer happened to be combined.
+  const page = newPage();
+  await signIn(page);
+  const rows = await showDiscord(page, [
+    message({
+      id: "1000000000000000001",
+      author: "alice",
+      author_id: "30",
+      author_is_bot: false,
+      content: "is the runner wedged?",
+      timestamp: "2026-08-19T04:31:00.000Z",
+    }),
+    message({
+      id: "1000000000000000002",
+      content: "yes — I restarted it and it is",
+      timestamp: "2026-08-19T04:35:00.000Z",
+    }),
+    message({
+      id: "1000000000000000003",
+      content: "back up now.",
+      reply_to: "1000000000000000001",
+      timestamp: "2026-08-19T04:35:01.000Z",
+    }),
+  ]);
+
+  assert.equal(rows.length, 2, "the fixture is not exercising a combined answer");
+  assert.equal(
+    rowState(page, 0).replied,
+    "true",
+    "the question stopped being dimmed because its answer was combined into a row"
+  );
+});
+
+test("a row is FOLDED on its combined length, and stays open across the poll", async () => {
+  // Two halves each comfortably short enough to need no fold, whose combination is a wall of text.
+  // Deciding foldability on the first alone leaves the reader with the row this feature exists to
+  // prevent: everything, unclamped, on every line of the list.
+  const page = newPage();
+  await signIn(page);
+  const half = "a sentence about the overnight run. ".repeat(
+    Math.ceil(COLLAPSE_OVER_CHARS / 2 / 36)
+  );
+  assert.ok(half.length <= COLLAPSE_OVER_CHARS, "each half is long enough to fold on its own");
+  assert.ok(half.length * 2 > COLLAPSE_OVER_CHARS, "the two halves together are not long enough");
+  const rows = await showDiscord(
+    page,
+    splitPost({ content: `first: ${half}` }, { content: `second: ${half}` })
+  );
+
+  assert.equal(rows.length, 1);
+  assert.ok(foldButton(rows[0]), "a combined wall of text got no fold control");
+  assert.equal(rows[0].getAttribute("data-collapsed"), "true", "it arrived open");
+
+  await rows[0].dispatch("click", {});
+  assert.equal(row(page, 0).getAttribute("data-collapsed"), "false", "the tap did not open it");
+  await reReadChannel(page);
+  assert.equal(
+    row(page, 0).getAttribute("data-collapsed"),
+    "false",
+    "the poll folded the combined row under the reader"
+  );
+});
+
+test("NO ID THIS PAGE INVENTED EVER REACHES THE SERVER OR THE STORE", async () => {
+  // The whole posture of the feature in one assertion. Combining is a rendering decision; the
+  // model underneath stays one-to-one with Discord, so every id on the wire and every id written
+  // down has to be one Discord really issued.
+  const page = newPage();
+  await signIn(page);
+  const real = new Set(["1000000000000000001", "1000000000000000002"]);
+  const rows = await inReadingMode(page, splitPost());
+
+  // FIRST, while the row is still outstanding: the marker legitimately walks forward past
+  // everything dealt with, so reading it back after the read-aloud would be reading whatever it
+  // advanced onto rather than what the reader chose.
+  await hold(page, rows[0]);
+  await rows[0].descendants().find((n) => n.text() === "Keep my place here").click();
+  await page.settle();
+  assert.equal(
+    page.storage.get("gent-talk.voice.place-marker"),
+    "1000000000000000001",
+    "a combined id was written to storage"
+  );
+
+  // A press-and-hold ends in a `pointerup` and the browser fires a `click` behind it, which the
+  // page swallows so the gesture is not also read as a tap. So the first click here is that one.
+  await row(page, 0).dispatch("click", {});
+  await row(page, 0).dispatch("click", {});
+  await page.settle();
+  await page.players[0].end();
+  await page.players[1].end();
+  await page.settle();
+  await replyButton(row(page, 0)).click();
+  page.el("reply-text").value = "noted";
+  await page.el("reply-send").click();
+  await page.settle();
+
+  const sent = [
+    ...page.speakCalls,
+    ...page.dismissCalls.flatMap((call) => call.messages || []),
+    ...page.repliesPosted.map((call) => call.body.reply_to),
+  ];
+  assert.ok(sent.length >= 5, `nothing was exercised: ${JSON.stringify(sent)}`);
+  for (const id of sent) {
+    assert.ok(real.has(String(id)), `the page sent ${id}, which is not a Discord message id`);
+  }
+  // ...and whatever the marker has since advanced onto is still ONE id and not a made-up pair.
+  assert.doesNotMatch(
+    String(page.storage.get("gent-talk.voice.place-marker")),
+    /[ +,]/,
+    "a combined id reached storage"
+  );
 });
