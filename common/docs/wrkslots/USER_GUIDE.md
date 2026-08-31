@@ -104,10 +104,13 @@ For each `--repo NAME=PATH`, `create` uses the configured `origin` by default. S
 caller must verify its exact fetch URL. Wrkslots records a SHA-256 identity and refuses if the URL
 changes.
 
-A relative repository path is resolved from the configured project root, not from the caller's
-current directory. The resolved repository may be outside the project root, including a sibling
-repository; wrkslots stores that path absolutely. Worktree destinations remain confined to the
-configured managed worktrees directory.
+A repository path is resolved from the configured project root, not from the caller's current
+directory, and must be relative. Use an ordinary path inside the project root, or path components of
+the form `../NAME` for one direct sibling repository. This is a normalized-path rule rather than a
+byte-for-byte spelling requirement, but every other raw `..` traversal, every absolute path, and
+every path with a symlink component is refused. Wrkslots stores the normalized relative path,
+including `../NAME` for a sibling. Worktree destinations remain confined to the configured managed
+worktrees directory.
 
 For a dirty or unpushed agent checkout, reclaim constructs a commit without changing the checkout's
 ordinary index or branch. It includes tracked, untracked, and ignored files except configured cache

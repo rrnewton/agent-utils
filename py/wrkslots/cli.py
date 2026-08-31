@@ -2548,7 +2548,7 @@ def _assert_registry_storage_consistent(
         vcs = _GitVcs()
         for checkout in record.checkouts:
             path = _stored_path(config, checkout.path, "checkout path")
-            _relative, repository = _repository_path(config, checkout.repository)
+            _relative, repository = _stored_repository_path(config, checkout.repository)
             vcs.verify_existing_worktree(repository, path)
     unexpected: list[str] = []
     for slot_type, root in _slot_roots(config).items():
@@ -3174,9 +3174,13 @@ class _GitVcs:
             raise Refusal(f"Git did not repair nested repository worktree {checkout}")
 
 
-def _repository_path(config: Config, raw: str) -> tuple[str, Path]:
-    candidate = Path(raw)
-    unresolved = candidate if candidate.is_absolute() else config.root / candidate
+def _resolved_repository_path(
+    config: Config,
+    stored: str,
+    unresolved: Path,
+    allowed_root: Path,
+) -> tuple[str, Path]:
+    _ensure_no_symlink_components(allowed_root, unresolved, "repository")
     try:
         absolute = unresolved.resolve(strict=True)
     except OSError as exc:
@@ -3190,13 +3194,62 @@ def _repository_path(config: Config, raw: str) -> tuple[str, Path]:
         raise Refusal(
             f"source repository must be outside the managed worktrees directory: {absolute}"
         )
-    try:
-        relative = absolute.relative_to(config.root)
-    except ValueError:
-        stored = str(absolute)
-    else:
-        stored = "." if relative == Path(".") else relative.as_posix()
     return stored, absolute
+
+
+def _repository_path(config: Config, raw: str) -> tuple[str, Path]:
+    candidate = Path(raw)
+    if candidate.is_absolute():
+        raise Refusal(
+            f"repository path must be relative to {config.root}: {raw!r}; "
+            "use a path inside the project root or ../NAME components for one direct sibling"
+        )
+    parts = candidate.parts
+    is_direct_sibling = (
+        len(parts) == 2 and parts[0] == ".." and parts[1] not in {".", ".."}
+    )
+    if ".." in parts and not is_direct_sibling:
+        raise Refusal(
+            f"repository path must stay inside {config.root} or name one direct sibling "
+            f"with path components '../NAME'; other parent traversal is refused: {raw!r}"
+        )
+    normalized = Path(os.path.normpath(str(candidate)))
+    if not normalized.parts:
+        normalized = Path(".")
+    if is_direct_sibling:
+        stored = normalized.as_posix()
+        unresolved = config.root.parent / parts[1]
+        if unresolved == config.root:
+            raise Refusal(
+                f"repository path {raw!r} aliases the project root; use '.' instead"
+            )
+        allowed_root = config.root.parent
+    else:
+        stored = "." if normalized == Path(".") else normalized.as_posix()
+        unresolved = config.root / normalized
+        allowed_root = config.root
+    return _resolved_repository_path(config, stored, unresolved, allowed_root)
+
+
+def _stored_repository_path(config: Config, raw: str) -> tuple[str, Path]:
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        return _repository_path(config, raw)
+    if raw != os.path.normpath(raw):
+        raise Refusal(
+            f"stored absolute repository path is not canonical: {raw!r}"
+        )
+    if (
+        candidate in {config.root, config.root.parent}
+        or not candidate.name
+        or candidate.parent != config.root.parent
+    ):
+        raise Refusal(
+            "stored absolute repository path must name one direct sibling of the project "
+            f"root, not the project root or another external path: {raw!r}"
+        )
+    stored = (Path("..") / candidate.name).as_posix()
+    return _resolved_repository_path(config, stored, candidate, config.root.parent)
 
 
 def _managed_worktrees_root(config: Config) -> Path:
@@ -3828,14 +3881,14 @@ def _assert_record_paths(config: Config, record: ActiveRecord) -> None:
         actual = _stored_path(config, checkout.path, "checkout path")
         if actual != expected_absolute:
             raise StateError(f"slot {record.slot} checkout path identity changed")
-        _repository_path(config, checkout.repository)
+        _stored_repository_path(config, checkout.repository)
 
 
 def _assert_checkout_identity_unchanged(
     config: Config, checkout: Checkout, vcs: _GitVcs
 ) -> None:
     path = _stored_path(config, checkout.path, "checkout path")
-    _relative, repository = _repository_path(config, checkout.repository)
+    _relative, repository = _stored_repository_path(config, checkout.repository)
     head = vcs.verify_existing_worktree(repository, path)
     branch = vcs.branch(path)
     remote_url_sha256 = vcs.remote_url_sha256(path, checkout.remote)
@@ -3961,7 +4014,7 @@ def _assert_checkout_safe(
     refresh_remote: bool = True,
 ) -> Checkout:
     path = _stored_path(config, checkout.path, "checkout path")
-    _relative, repository = _repository_path(config, checkout.repository)
+    _relative, repository = _stored_repository_path(config, checkout.repository)
     head = vcs.verify_existing_worktree(repository, path)
     branch = vcs.branch(path)
     if branch != checkout.branch:
@@ -4043,7 +4096,7 @@ def _salvage_candidate(
     """
 
     path = path_override or _stored_path(config, checkout.path, "checkout path")
-    _relative, repository = _repository_path(config, checkout.repository)
+    _relative, repository = _stored_repository_path(config, checkout.repository)
     if verify_repository_membership:
         head = vcs.verify_existing_worktree(repository, path)
     else:
@@ -4170,7 +4223,7 @@ def _submodule_salvage_checkouts(
     checkout_path = path_override or _stored_path(
         config, checkout.path, "checkout path"
     )
-    _repository_relative, source_repository = _repository_path(
+    _repository_relative, source_repository = _stored_repository_path(
         config, checkout.repository
     )
     result: list[tuple[Checkout, Path]] = []
@@ -4498,7 +4551,7 @@ def _reclaim_preconditions(
     final: list[Checkout] = []
     for checkout in record.checkouts:
         path = _stored_path(config, checkout.path, "checkout path")
-        _relative, repository = _repository_path(config, checkout.repository)
+        _relative, repository = _stored_repository_path(config, checkout.repository)
         head = vcs.verify_existing_worktree(repository, path)
         branch = vcs.branch(path)
         if branch != checkout.branch:
@@ -5229,7 +5282,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             slot_path.mkdir(mode=0o755)
             _fsync_directory(slot_path.parent)
         for item in plan:
-            _relative, repository = _repository_path(config, item.repository)
+            _relative, repository = _stored_repository_path(config, item.repository)
             destination = _stored_path(config, item.destination, "checkout destination")
             head = vcs.add_worktree(repository, destination, item.branch, item.start_point)
             checkout = Checkout(
@@ -6538,7 +6591,7 @@ def _cache_directories_for_checkout(
 ) -> tuple[CacheDirectory, ...]:
     checkout_path = _stored_path(config, checkout.path, "checkout path")
     vcs = _GitVcs()
-    _relative, repository = _repository_path(config, checkout.repository)
+    _relative, repository = _stored_repository_path(config, checkout.repository)
     return _cache_directories_for_path(
         config,
         checkout_path,
@@ -6680,7 +6733,7 @@ def _journal_cache_slot(config: Config, machine: str | None = None) -> CacheSlot
             raise StateError(
                 f"cache recovery journal checkout {checkout.name} escapes slot {slot}"
             )
-        _relative, repository = _repository_path(config, checkout.repository)
+        _relative, repository = _stored_repository_path(config, checkout.repository)
         if not destination.exists() and not destination.is_symlink():
             if destination.absolute() in vcs.listed_worktrees(repository):
                 raise Refusal(
@@ -7182,7 +7235,7 @@ def _audit_record(config: Config, record: ActiveRecord) -> tuple[dict[str, objec
         vcs = _GitVcs()
         for checkout in record.checkouts:
             path = _stored_path(config, checkout.path, "checkout path")
-            repository = _repository_path(config, checkout.repository)[1]
+            repository = _stored_repository_path(config, checkout.repository)[1]
             vcs.verify_existing_worktree(repository, path)
             if vcs.branch(path) != checkout.branch:
                 raise Refusal(f"checkout {checkout.name} branch changed")
@@ -7461,7 +7514,7 @@ def _cmd_unpushed(args: argparse.Namespace) -> int:
             for checkout in record.checkouts:
                 path = _stored_path(config, checkout.path, "checkout path")
                 head = vcs.verify_existing_worktree(
-                    _repository_path(config, checkout.repository)[1], path
+                    _stored_repository_path(config, checkout.repository)[1], path
                 )
                 branch = vcs.branch(path)
                 if branch != checkout.branch:
@@ -7991,7 +8044,7 @@ def _repair_registration_at_slot(
     vcs: _GitVcs,
 ) -> Path:
     _moved, path = _checkout_at_slot(config, record, checkout, slot_path)
-    _relative, repository = _repository_path(config, checkout.repository)
+    _relative, repository = _stored_repository_path(config, checkout.repository)
     vcs.repair_worktree(repository, path)
     _repair_nested_repositories(path, vcs)
     return path
@@ -8131,7 +8184,7 @@ def _finish_remove_paths(
         if path.exists():
             present.append(checkout)
             continue
-        _relative, repository = _repository_path(config, checkout.repository)
+        _relative, repository = _stored_repository_path(config, checkout.repository)
         canonical = _stored_path(config, checkout.path, "checkout path")
         listed = vcs.listed_worktrees(repository)
         if path.absolute() in listed or canonical.absolute() in listed:
@@ -8142,7 +8195,7 @@ def _finish_remove_paths(
     if missing_after_remove:
         if record.slot_type == "validate":
             for checkout in missing_after_remove:
-                _relative, repository = _repository_path(config, checkout.repository)
+                _relative, repository = _stored_repository_path(config, checkout.repository)
                 vcs.delete_branch_at(repository, checkout.branch, checkout.head)
         removed.update(item.name for item in missing_after_remove)
         journal["removed"] = sorted(removed)
@@ -8182,7 +8235,7 @@ def _finish_remove_paths(
                         config, record, checkout, fenced_slot, vcs
                     )
                     head = vcs.verify_existing_worktree(
-                        _repository_path(config, checkout.repository)[1], moved_path
+                        _stored_repository_path(config, checkout.repository)[1], moved_path
                     )
                     if head != checkout.head or vcs.branch(moved_path) != checkout.branch:
                         raise Refusal(
@@ -8233,7 +8286,7 @@ def _finish_remove_paths(
                 f"finished fenced slot contains unexpected entry: {unexpected[0]}"
             )
     for checkout in remaining:
-        _relative, repository = _repository_path(config, checkout.repository)
+        _relative, repository = _stored_repository_path(config, checkout.repository)
         _moved, path = _checkout_at_slot(config, record, checkout, fenced_slot)
         vcs.remove_worktree(
             repository,
@@ -8310,7 +8363,7 @@ def _assert_physical_slot_removed(
             raise Refusal(
                 f"cannot archive slot {record.slot}: checkout still exists at {path}"
             )
-        _relative, repository = _repository_path(config, checkout.repository)
+        _relative, repository = _stored_repository_path(config, checkout.repository)
         _moved, fenced_path = _checkout_at_slot(
             config, record, checkout, fenced_slot
         )
@@ -8817,7 +8870,7 @@ def _abort_create(
         ]
     ] = []
     for item in plan:
-        _relative, repository = _repository_path(config, item.repository)
+        _relative, repository = _stored_repository_path(config, item.repository)
         destination = _stored_path(config, item.destination, "checkout destination")
         recorded = recorded_by_name.get(item.name)
         expected_head = item.start_point if recorded is None else recorded.head
@@ -9091,8 +9144,13 @@ def _recover_create(
             raise StateError(
                 f"create journal destination for {item.name} does not match slot {slot}"
             )
-        normalized_repository, _repository = _repository_path(config, item.repository)
-        if item.repository != normalized_repository:
+        normalized_repository, _repository = _stored_repository_path(
+            config, item.repository
+        )
+        if (
+            not Path(item.repository).is_absolute()
+            and item.repository != normalized_repository
+        ):
             raise StateError(
                 f"create journal repository for {item.name} is not canonical"
             )
@@ -9188,7 +9246,7 @@ def _recover_create(
             raise StateError("create journal does not exactly match its durable ACTIVE record")
         _assert_record_paths(config, existing_record)
         for checkout in existing_record.checkouts:
-            _relative, repository = _repository_path(config, checkout.repository)
+            _relative, repository = _stored_repository_path(config, checkout.repository)
             destination = _stored_path(config, checkout.path, "checkout path")
             head = _GitVcs().verify_existing_worktree(repository, destination)
             if head != checkout.head:
@@ -9212,7 +9270,7 @@ def _recover_create(
     created: list[Checkout] = []
     for item in plan:
         destination = _stored_path(config, item.destination, "checkout destination")
-        _relative, repository = _repository_path(config, item.repository)
+        _relative, repository = _stored_repository_path(config, item.repository)
         if destination.exists() or destination.is_symlink():
             if destination.is_symlink() or not destination.is_dir():
                 raise Refusal(f"create recovery found an unsafe destination: {destination}")
@@ -9547,7 +9605,7 @@ def _legacy_validate_recovery_inputs(
             "checkout. state: REFUSED -- no checkout was removed. remedy: pass the "
             "project-relative checkout recorded by the completed validation handle"
         )
-    repository_relative, repository = _repository_path(
+    repository_relative, repository = _stored_repository_path(
         config,
         _as_str(raw["repository"], "legacy validate removal journal.repository"),
     )
@@ -9899,9 +9957,10 @@ def _add_repo_options(parser: argparse.ArgumentParser) -> None:
         action="append",
         metavar="NAME=PATH",
         help=(
-            "source Git repository path, resolved relative to the project root when not "
-            "absolute; sibling repositories are allowed. NAME labels the checkout and must "
-            "match the other NAME=VALUE options (repeat once per checkout)"
+            "relative source Git repository path inside the project root, or ../NAME path "
+            "components for one direct sibling; absolute paths, other parent traversal, "
+            "and symlink components are refused. NAME labels the checkout and must match the "
+            "other NAME=VALUE options (repeat once per checkout)"
         ),
     )
     parser.add_argument(
