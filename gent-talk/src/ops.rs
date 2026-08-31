@@ -46,6 +46,25 @@ pub enum OpError {
     )]
     InvalidRange,
     /// Discord itself failed, or refused the request before it was sent.
+    /// Some parts of a split message reached Discord and the rest did not.
+    ///
+    /// A DISTINCT variant rather than a `Discord` error, because the two call for opposite things
+    /// from the caller. A plain failure means "nothing happened, send it again". This means "half
+    /// of it is in the channel and cannot be unsent" — sending the whole thing again would post
+    /// the first half twice. `unsent` is the remainder, and once the caller has cleared their
+    /// draft it is the only copy of that text in existence, so it travels with the error rather
+    /// than being reconstructable from it.
+    #[error("posted {posted} part(s) and then failed: {cause}")]
+    PartiallyPosted {
+        /// How many parts Discord accepted before the failure.
+        posted: usize,
+        /// The text that did NOT reach Discord, ready to be sent on its own.
+        unsent: String,
+        /// Why the next part failed.
+        cause: String,
+    },
+
+    /// Discord itself failed, or refused the request before it was sent.
     #[error(transparent)]
     Discord(#[from] DiscordError),
     /// The durable state store failed, or is not configured at all.
@@ -67,6 +86,7 @@ impl OpError {
             Self::ChannelNotWritable => "channel_not_writable",
             Self::InvalidCursor => "invalid_cursor",
             Self::InvalidRange => "invalid_range",
+            Self::PartiallyPosted { .. } => "partially_posted",
             Self::Discord(DiscordError::Refused(_)) => "refused",
             Self::Discord(_) => "discord_error",
             Self::Store(inner) => inner.code(),
@@ -632,23 +652,55 @@ pub async fn reply(
     channel_id: &str,
     text: &str,
     reply_to: Option<&str>,
-) -> Result<(ChannelInfo, Message), OpError> {
+) -> Result<(ChannelInfo, Message, Vec<Message>), OpError> {
     let info = allowed(state, channel_id).await?;
     if !info.writable {
         return Err(OpError::ChannelNotWritable);
     }
     let reply_to = reply_to.map(|id| MessageId(id.to_owned()));
-    let mut posted = state
-        .discord
-        .post_message(&info.id, text, reply_to.as_ref())
-        .await?;
-    stamp(state, std::slice::from_mut(&mut posted));
-    // Remember that WE posted this, before anything can observe it. `#44 live-push`: the poller
-    // will see this message a few seconds from now, and relaying it into the live conversation
-    // would make the agent hear its own reply as new information — which it would then answer.
-    // See [`crate::live::LiveEvent::self_posted`].
-    state.live.note_self_posted(&posted.id);
-    Ok((info, posted))
+
+    // LONGER THAN DISCORD ACCEPTS IS NOT A REFUSAL ANY MORE. A reply somebody typed on a phone came
+    // back as an error and stayed stuck in the box; coding agents posting into the channel already
+    // split their own long messages. See `crate::discord::split`.
+    let parts = crate::discord::split::split_for_discord(text);
+    if parts.is_empty() {
+        return Err(OpError::Discord(DiscordError::Refused(
+            "message content is empty".to_owned(),
+        )));
+    }
+
+    let mut posted: Vec<Message> = Vec::new();
+    for (index, part) in parts.iter().enumerate() {
+        // Only the FIRST part answers the message. Discord threads a reply from one message, and
+        // pointing every part at the same parent would render as several separate answers to the
+        // same thing rather than as one answer that ran long.
+        let parent = if index == 0 { reply_to.as_ref() } else { None };
+        match state.discord.post_message(&info.id, part, parent).await {
+            Ok(mut one) => {
+                stamp(state, std::slice::from_mut(&mut one));
+                // Remember that WE posted this, before anything can observe it. `#44 live-push`:
+                // the poller will see it in a few seconds, and relaying it into the live
+                // conversation would make the agent hear its own reply as new information.
+                state.live.note_self_posted(&one.id);
+                posted.push(one);
+            }
+            Err(cause) => {
+                // PART OF IT IS ALREADY IN THE CHANNEL and cannot be unsent. Reporting a plain
+                // failure here would be a lie the reader acts on: they would send the whole thing
+                // again and post the first half twice. So the caller is told exactly how much
+                // landed AND handed back the text that did not, which is the only copy of it left
+                // once their draft is cleared.
+                let unsent: String = parts[index..].join("");
+                return Err(OpError::PartiallyPosted {
+                    posted: posted.len(),
+                    unsent,
+                    cause: cause.to_string(),
+                });
+            }
+        }
+    }
+    let first = posted.first().cloned().expect("at least one part posted");
+    Ok((info, first, posted))
 }
 
 /// Attach to a channel's live feed. Read scope.
@@ -1163,7 +1215,7 @@ mod tests {
     #[tokio::test]
     async fn a_writable_channel_actually_posts_what_was_asked_for() {
         let (state, fake) = testing::state();
-        let (info, posted) = reply(&state, WRITE_CHANNEL, "shipped it", None)
+        let (info, posted, _parts) = reply(&state, WRITE_CHANNEL, "shipped it", None)
             .await
             .expect("the writable channel accepts a post");
         assert_eq!(info.id.as_str(), WRITE_CHANNEL);

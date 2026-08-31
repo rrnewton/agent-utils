@@ -5994,6 +5994,76 @@ test("A TURN ARRIVING WHILE YOU READ THE CHANNEL SAYS SO WHEN YOU COME BACK", as
   );
 });
 
+test("A REPLY THAT ONLY HALF POSTED KEEPS THE REST OF YOUR TEXT", async () => {
+  // The server splits a long reply and can get halfway. It answers 207 for that — which `fetch`
+  // reports as `ok`, so a page that only checked `response.ok` would treat it as success, clear
+  // the draft, and destroy the only copy of the remainder. Sending again would then post the first
+  // half twice.
+  const page = newPage();
+  await signIn(page);
+  const rows = await showDiscord(page, [message({ id: "1000000000000000001" })]);
+  await replyButton(rows[0]).click();
+  await page.settle();
+
+  const typed = "first half. second half.";
+  page.el("reply-text").value = typed;
+  await page.el("reply-text").dispatch("input", {});
+
+  page.replyResponse = async () =>
+    json(207, {
+      error: "partially_posted",
+      detail: "discord returned HTTP 500",
+      posted: 1,
+      unsent: "second half.",
+    });
+
+  await page.el("reply-send").click();
+  await page.settle();
+
+  // The remainder is in the box AND written down, and the finished half is not repeated in either.
+  assert.equal(page.el("reply-text").value, "second half.", "the unsent text was thrown away");
+  const kept = JSON.parse(page.storage.get("gent-talk.voice.drafts") || "{}");
+  assert.equal(
+    kept["1000000000000000001"],
+    "second half.",
+    "the draft was cleared, so a reload would lose what never posted"
+  );
+  // Still on the reply screen, with the reason.
+  assert.match(page.el("reply-state").text(), /1 part/i);
+  assert.match(page.el("reply-state").text(), /still in the box/i);
+});
+
+test("...and a reply that fully posted clears the draft and shows every part", async () => {
+  const page = newPage();
+  await signIn(page);
+  const rows = await showDiscord(page, [message({ id: "1000000000000000001" })]);
+  const before = page.el("discord-log").children.length;
+  await replyButton(rows[0]).click();
+  await page.settle();
+  page.el("reply-text").value = "all of it";
+  await page.el("reply-text").dispatch("input", {});
+
+  page.replyResponse = async () =>
+    json(200, {
+      posted: message({ id: "9000000000000000001", content: "part one" }),
+      parts: [
+        message({ id: "9000000000000000001", content: "part one" }),
+        message({ id: "9000000000000000002", content: "part two" }),
+      ],
+    });
+
+  await page.el("reply-send").click();
+  await page.settle();
+
+  assert.equal(
+    page.el("discord-log").children.length,
+    before + 2,
+    "only one part of a split reply reached the channel view"
+  );
+  const kept = JSON.parse(page.storage.get("gent-talk.voice.drafts") || "{}");
+  assert.equal(kept["1000000000000000001"], undefined, "a fully sent reply left its draft behind");
+});
+
 test("the channel spends its width on words, not on insets", async () => {
   // 15% of a 393-pixel phone, on every row, bought what the speaker COLOUR now buys.
   const mine = cssBlock('#discord-log li.discord-message[data-who="me"]');

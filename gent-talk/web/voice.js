@@ -5495,17 +5495,37 @@ async function sendReply() {
       method: "POST",
       body: { text, reply_to: target.id },
     });
+    // A LONG REPLY IS SPLIT, and it can get halfway. The server answers 207 for that, which
+    // `fetch` reports as `ok` — so this has to be checked BEFORE anything is cleared. Treating it
+    // as success would clear a draft whose remainder is the only copy of that text in existence,
+    // and re-sending the whole thing would post the first half twice.
+    if (payload && payload.error === "partially_posted") {
+      // The draft becomes exactly what did NOT arrive, written down before the box is touched.
+      drafts.set(target.id, payload.unsent || "");
+      persistDrafts();
+      el("reply-text").value = payload.unsent || "";
+      const landed = Number(payload.posted) || 0;
+      el("reply-state").textContent =
+        `Only ${landed} part${landed === 1 ? "" : "s"} went through: ` +
+        `${redact(String(payload.detail || "the rest failed"))}. ` +
+        "What is left is still in the box — send it again to post the remainder.";
+      return;
+    }
     if (payload && payload.posted) {
       // The account Discord recorded this reply under is THIS BRIDGE'S OWN, and it is the one
       // account whose messages are the owner's words. Learned here, for free, from a reply he was
       // sending anyway — no `/users/@me` call and no name matching. `#85 voice-desktop-review`.
       noteSelfAuthor(payload.posted.author_id);
-      // Through the same appender as a live arrival: the reply is in the window from now on, so
-      // the next `/todo` read will count it, and a list that counted it one read later would
-      // disagree with itself in between. `appendChannelRow` also re-derives the row states, which
-      // is what dims the message just answered on the spot rather than at the next poll.
-      appendChannelRow(payload.posted);
+      // EVERY part, through the same appender as a live arrival: the reply is in the window from
+      // now on, so the next `/todo` read will count it, and a list that counted it one read later
+      // would disagree with itself in between. `appendChannelRow` also re-derives the row states,
+      // which is what dims the message just answered on the spot rather than at the next poll.
+      for (const part of payload.parts || [payload.posted]) {
+        appendChannelRow(part);
+      }
     }
+    // Cleared LAST, and only here: every path that did not fully succeed returns above with the
+    // text still written down.
     drafts.delete(target.id);
     persistDrafts();
     el("reply-text").value = "";

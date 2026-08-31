@@ -143,6 +143,11 @@ impl From<OpError> for ApiError {
                 StatusCode::BAD_REQUEST
             }
             OpError::ChannelNotWritable => StatusCode::FORBIDDEN,
+            // A fallback only: the reply route handles this itself, because an `ApiError` body
+            // carries a code and prose and this case has to carry the UNSENT TEXT. Reaching here
+            // would mean some other caller grew a split path without deciding what to do with the
+            // remainder, so it is a loud upstream failure rather than a quiet 500.
+            OpError::PartiallyPosted { .. } => StatusCode::BAD_GATEWAY,
             OpError::Discord(inner) => return Self::from(inner),
             OpError::Store(inner) => return Self::from(inner),
             OpError::Summarizer(inner) => {
@@ -754,8 +759,30 @@ pub struct ReplyRequest {
 /// The result of posting.
 #[derive(Debug, Serialize)]
 pub struct ReplyResponse {
-    /// The message as Discord accepted it.
+    /// The FIRST message as Discord accepted it.
+    ///
+    /// Kept as it was, and kept first: a long reply is one answer that ran over, so the part that
+    /// carries the reply pointer is the one a caller means by "the message I posted".
     pub posted: Message,
+    /// Every part, in order. One element for a reply that fitted.
+    pub parts: Vec<Message>,
+}
+
+/// What came back when a split reply got halfway.
+#[derive(Debug, Serialize)]
+pub struct PartialReplyResponse {
+    /// Stable machine-readable code, matching [`ApiErrorBody`] so one branch can read either.
+    pub error: &'static str,
+    /// Why the next part failed.
+    pub detail: String,
+    /// How many parts Discord accepted.
+    pub posted: usize,
+    /// The text that did NOT reach Discord.
+    ///
+    /// THE ONLY COPY. The caller is about to clear a draft on the strength of this answer, so the
+    /// remainder travels in the body rather than being something they must reconstruct by
+    /// re-splitting the original the same way this server did.
+    pub unsent: String,
 }
 
 /// `POST /api/v1/channels/{channel_id}/reply` — the only route that speaks in the owner's name.
@@ -764,16 +791,36 @@ pub async fn reply(
     headers: HeaderMap,
     Path(channel_id): Path<String>,
     Json(request): Json<ReplyRequest>,
-) -> Result<Json<ReplyResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     require(&headers, &state, Scope::Write)?;
-    let (_channel, posted) = ops::reply(
+    match ops::reply(
         &state,
         &channel_id,
         &request.text,
         request.reply_to.as_deref(),
     )
-    .await?;
-    Ok(Json(ReplyResponse { posted }))
+    .await
+    {
+        Ok((_channel, posted, parts)) => Ok(Json(ReplyResponse { posted, parts }).into_response()),
+        // 207, not 200 and not 502. A machine caller reading only the status must not conclude
+        // "sent" — nor "nothing happened", which would have them send the whole thing again and
+        // post the first half twice. Multi-Status says exactly what is true: look inside.
+        Err(OpError::PartiallyPosted {
+            posted,
+            unsent,
+            cause,
+        }) => Ok((
+            StatusCode::MULTI_STATUS,
+            Json(PartialReplyResponse {
+                error: "partially_posted",
+                detail: cause,
+                posted,
+                unsent,
+            }),
+        )
+            .into_response()),
+        Err(other) => Err(other.into()),
+    }
 }
 
 /// A slow-path question for the coding agents.

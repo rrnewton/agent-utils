@@ -7,6 +7,7 @@
 pub mod fake;
 pub mod http;
 pub mod ratelimit;
+pub mod split;
 
 use std::time::Duration;
 

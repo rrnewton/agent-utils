@@ -644,7 +644,7 @@ async fn run_post(state: &AppState, args: &Value) -> Result<String, OpError> {
     let channel_id = arg_str(args, "channel_id").unwrap_or_default();
     let text = arg_str(args, "text").unwrap_or_default();
     let reply_to = arg_str(args, "reply_to");
-    let (info, posted) = ops::reply(state, &channel_id, &text, reply_to.as_deref()).await?;
+    let (info, posted, _parts) = ops::reply(state, &channel_id, &text, reply_to.as_deref()).await?;
     Ok(format!(
         "Posted to {} (id {}) as message {}.",
         info.display_name(),

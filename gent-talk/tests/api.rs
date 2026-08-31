@@ -1987,6 +1987,102 @@ async fn what_is_read_aloud_is_the_speakable_text_and_not_the_raw_markdown() {
 }
 
 #[tokio::test]
+async fn a_reply_longer_than_discord_accepts_is_split_rather_than_refused() {
+    // A reply typed on a phone used to come back as an error and stay stuck in the box, because
+    // this server refused over 2000 characters one layer before Discord would have. Coding agents
+    // posting INTO the channel already split their own long messages.
+    let harness = harness();
+    seed_lead_channel(&harness);
+
+    // Paragraphs, so there are real boundaries to cut at, and comfortably over the limit.
+    let paragraph = "the mac runner went offline mid-deploy and the arm64 job never reported.\n\n";
+    let text = paragraph.repeat(40);
+    assert!(
+        text.chars().count() > 2000,
+        "the fixture is not long enough to split"
+    );
+
+    let (status, payload) = call(
+        &harness,
+        "POST",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/reply"),
+        Some(WRITE_TOKEN),
+        Some(serde_json::json!({ "text": text })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+
+    let parts = payload["parts"].as_array().expect("parts");
+    assert!(
+        parts.len() > 1,
+        "a message over the limit was posted as one"
+    );
+    // `posted` stays the FIRST part, so a caller that only knew about the old shape still works.
+    assert_eq!(payload["posted"]["id"], parts[0]["id"]);
+
+    // NOTHING THE READER TYPED WAS LOST. This is the property the whole change turns on, asserted
+    // against what Discord actually received rather than against the splitter in isolation.
+    let rejoined: String = parts
+        .iter()
+        .map(|m| m["content"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        rejoined, text,
+        "the channel did not receive the message that was typed"
+    );
+
+    for part in parts {
+        let content = part["content"].as_str().unwrap_or_default();
+        assert!(
+            content.chars().count() <= 2000,
+            "a part is still over the limit"
+        );
+        assert!(
+            !content.trim().is_empty(),
+            "an empty part would have been refused"
+        );
+    }
+}
+
+#[tokio::test]
+async fn only_the_first_part_of_a_split_reply_answers_the_message() {
+    // Discord threads a reply from one message. Pointing every part at the same parent renders as
+    // several separate answers to the same thing, rather than as one answer that ran long.
+    let harness = harness();
+    let channel = ChannelId(WRITE_CHANNEL.to_owned());
+    let target = harness
+        .discord
+        .seed(&channel, "codex-eng", "what happened?")
+        .0;
+
+    let text = "a".repeat(2500);
+    let (status, payload) = call(
+        &harness,
+        "POST",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/reply"),
+        Some(WRITE_TOKEN),
+        Some(serde_json::json!({ "text": text, "reply_to": target })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+
+    let parts = payload["parts"].as_array().expect("parts");
+    assert!(parts.len() > 1, "the fixture did not split");
+    assert_eq!(
+        parts[0]["reply_to"],
+        serde_json::json!(target),
+        "the answer lost its thread"
+    );
+    for later in &parts[1..] {
+        assert_eq!(
+            later["reply_to"],
+            serde_json::Value::Null,
+            "a continuation was posted as a second answer to the same message"
+        );
+    }
+}
+
+#[tokio::test]
 async fn reading_aloud_needs_read_scope() {
     let (harness, _store, ids) = todo_harness();
     let (status, payload) = call(
