@@ -3370,6 +3370,11 @@ def _capture_caller_process(pid: int, label: str) -> ProcessIdentity:
     return identity
 
 
+def _capture_registration_owner(pid: int) -> ProcessIdentity:
+    """Capture an owner now; registration verifies its authority before publication."""
+    return _read_process_identity(pid)
+
+
 def _assert_process_descends_from(
     process: ProcessIdentity, ancestor: ProcessIdentity, label: str
 ) -> None:
@@ -5898,7 +5903,7 @@ def _cmd_register(
     _require_coordinator_authorized(args, "worktree registration")
     args.slot_type = _require_slot_type(args, "worktree registration")
     config = _load_config(args.project_root, args.machine)
-    owner = _read_process_identity(args.owner_pid)
+    owner = _capture_registration_owner(args.owner_pid)
     coordinator_lease = _capture_caller_process(
         args.coordinator_pid, "coordinator"
     )
@@ -6098,7 +6103,7 @@ def _cmd_import_existing(args: argparse.Namespace) -> int:
             config, args.slot, agent, args.slot_type, enforce_cap=False
         )
         if historical is None:
-            owner = _read_process_identity(args.owner_pid)
+            owner = _capture_registration_owner(args.owner_pid)
             record = _register_existing(config, args, owner, coordinator_lease)
         else:
             now = _utc_now()

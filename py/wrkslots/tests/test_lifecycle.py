@@ -3407,6 +3407,7 @@ def test_register_refuses_owner_generation_change_before_publication(
     monkeypatch.setattr(
         wrkslots, "_capture_caller_process", lambda _pid, _label: current
     )
+    monkeypatch.setattr(wrkslots, "_capture_registration_owner", lambda _pid: current)
     monkeypatch.setattr(wrkslots, "_assert_caller_process", lambda _identity, _label: None)
     monkeypatch.setattr(wrkslots, "_read_process_identity", lambda _pid: reused)
     returncode = wrkslots.main(
