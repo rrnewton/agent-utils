@@ -2922,9 +2922,231 @@ def test_import_existing_accepts_a_sibling_source_repository(
     assert isinstance(checkouts, list)
     imported = checkouts[0]
     assert isinstance(imported, dict)
-    assert imported["repository"] == str(sibling.resolve())
+    assert imported["repository"] == relative_sibling.as_posix()
     status = command(project, "status", "--slot", "slot01", "--format", "json")
     assert status.returncode == 0, status.stderr
+
+
+@pytest.mark.parametrize(
+    ("repository_spelling", "expected_error"),
+    (
+        ("absolute-sibling", "repository path must be relative"),
+        ("beyond-parent", "other parent traversal is refused"),
+        ("sibling-symlink", "repository crosses a symlink"),
+    ),
+)
+def test_import_existing_refuses_repository_paths_outside_the_sibling_boundary(
+    tmp_path: Path,
+    repository_spelling: str,
+    expected_error: str,
+) -> None:
+    project_parent = tmp_path / "project-parent"
+    project_parent.mkdir()
+    project, _unused_repository, remote = make_project(
+        project_parent,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    if repository_spelling == "beyond-parent":
+        repository = tmp_path / "external-repository"
+        raw_repository = Path("../..") / repository.name
+    else:
+        repository = project_parent / "sibling-repository"
+        raw_repository = repository
+    subprocess.run(
+        ["git", "clone", str(remote), str(repository)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    if repository_spelling == "sibling-symlink":
+        alias = project_parent / "sibling-alias"
+        alias.symlink_to(repository, target_is_directory=True)
+        raw_repository = Path("..") / alias.name
+    elif repository_spelling == "absolute-sibling":
+        raw_repository = repository.resolve()
+    marker = repository / "keep.txt"
+    marker.write_text("keep\n", encoding="utf-8")
+    tree = checkout(project)
+    tree.parent.mkdir(exist_ok=True)
+    git(
+        repository,
+        "worktree",
+        "add",
+        "-b",
+        f"codex/{repository_spelling}",
+        str(tree),
+        "origin/main",
+    )
+
+    refused = command(
+        project,
+        "import-existing",
+        "slot01",
+        "--agent",
+        "codex-1",
+        "--task",
+        f"task-{repository_spelling}",
+        "--purpose",
+        f"reject {repository_spelling}",
+        "--repo",
+        f"product={raw_repository}",
+    )
+
+    assert refused.returncode == 3
+    assert expected_error in refused.stderr
+    assert active_slots(project) == []
+    assert marker.read_text(encoding="utf-8") == "keep\n"
+    assert tree.is_dir()
+
+
+def test_repository_path_refuses_non_sibling_parent_forms_before_normalizing(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    config = wrkslots._load_config(str(project), "testhost")
+    alias = project / "link"
+    alias.symlink_to(tmp_path, target_is_directory=True)
+
+    with pytest.raises(wrkslots.Refusal, match="other parent traversal is refused"):
+        wrkslots._repository_path(config, "../..")
+    with pytest.raises(wrkslots.Refusal, match="aliases the project root"):
+        wrkslots._repository_path(config, f"../{project.name}")
+    with pytest.raises(wrkslots.Refusal, match="other parent traversal is refused"):
+        wrkslots._repository_path(config, f"{alias.name}/../{repository.name}")
+    root_level_config = replace(config, root=Path("/synthetic-project"))
+    with pytest.raises(
+        wrkslots.Refusal,
+        match="stored absolute repository path must name one direct sibling",
+    ):
+        wrkslots._stored_repository_path(root_level_config, "/")
+
+    assert alias.is_symlink()
+
+
+def test_legacy_absolute_sibling_active_record_remains_usable(
+    tmp_path: Path,
+) -> None:
+    project, _unused_repository, remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    sibling = tmp_path / "sibling-repository"
+    subprocess.run(
+        ["git", "clone", str(remote), str(sibling)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    tree = checkout(project)
+    tree.parent.mkdir(exist_ok=True)
+    git(sibling, "worktree", "add", "-b", "codex/imported", str(tree), "origin/main")
+    applied = command(
+        project,
+        "import-existing",
+        "slot01",
+        "--agent",
+        "codex-1",
+        "--task",
+        "task-import",
+        "--purpose",
+        "import sibling repository",
+        "--repo",
+        f"product=../{sibling.name}",
+        "--apply",
+        "--verified-live",
+        "--owner-pid",
+        str(os.getpid()),
+        "--coordinator-pid",
+        str(os.getpid()),
+    )
+    assert applied.returncode == 0, applied.stderr
+
+    config = wrkslots._load_config(str(project), "testhost")
+    state = wrkslots._load_active(config)
+    record = state.slots[0]
+    legacy_checkout = replace(
+        record.checkouts[0], repository=str(sibling.resolve())
+    )
+    legacy_record = replace(record, checkouts=(legacy_checkout,))
+    legacy_state = replace(state, slots=(legacy_record,))
+
+    wrkslots._assert_record_paths(config, legacy_record)
+    wrkslots._assert_registry_storage_consistent(config, [legacy_state])
+    normalized, resolved = wrkslots._stored_repository_path(
+        config, legacy_checkout.repository
+    )
+    assert normalized == f"../{sibling.name}"
+    assert resolved == sibling.resolve()
+
+
+def test_absolute_non_sibling_stored_repository_refuses(
+    tmp_path: Path,
+) -> None:
+    project_parent = tmp_path / "project-parent"
+    project_parent.mkdir()
+    project, _repository, remote = make_project(project_parent)
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    external = tmp_path / "external-repository"
+    subprocess.run(
+        ["git", "clone", str(remote), str(external)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    config = wrkslots._load_config(str(project), "testhost")
+    record = wrkslots._load_active(config).slots[0]
+    invalid_checkout = replace(
+        record.checkouts[0], repository=str(external.resolve())
+    )
+    invalid_record = replace(record, checkouts=(invalid_checkout,))
+
+    with pytest.raises(
+        wrkslots.Refusal,
+        match="stored absolute repository path must name one direct sibling",
+    ):
+        wrkslots._assert_record_paths(config, invalid_record)
+
+
+def test_recover_accepts_legacy_absolute_sibling_create_journal(
+    tmp_path: Path,
+) -> None:
+    project, _unused_repository, remote = make_project(tmp_path)
+    sibling = tmp_path / "sibling-repository"
+    subprocess.run(
+        ["git", "clone", str(remote), str(sibling)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    interrupted = create(
+        project,
+        repository_name=f"../{sibling.name}",
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"},
+    )
+    assert interrupted.returncode == 86
+    journal_path = control_directory(project) / "ACTIVE.testhost.journal"
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    legacy_repository = str(sibling.resolve())
+    journal["planned"][0]["repository"] = legacy_repository
+    journal["created"][0]["repository"] = legacy_repository
+    journal_path.write_text(json.dumps(journal, indent=2) + "\n", encoding="utf-8")
+
+    recovered = command(
+        project, "recover", "--coordinator-pid", str(os.getpid())
+    )
+
+    assert recovered.returncode == 0, recovered.stderr
+    row = active_slots(project)[0]
+    assert isinstance(row, dict)
+    checkouts = row["checkouts"]
+    assert isinstance(checkouts, list)
+    recovered_checkout = checkouts[0]
+    assert isinstance(recovered_checkout, dict)
+    assert recovered_checkout["repository"] == legacy_repository
+    assert not journal_path.exists()
 
 
 def test_every_refusal_prints_a_repair_command(
@@ -3443,7 +3665,9 @@ def test_register_refuses_owner_generation_change_before_publication(
 
 
 def test_path_escape_and_symlink_are_refused_without_touching_target(tmp_path: Path) -> None:
-    project, _repository, _remote = make_project(tmp_path)
+    project_parent = tmp_path / "project-parent"
+    project_parent.mkdir()
+    project, _repository, _remote = make_project(project_parent)
     outside = tmp_path / "outside"
     outside.mkdir()
     marker = outside / "keep.txt"
@@ -3466,13 +3690,14 @@ def test_path_escape_and_symlink_are_refused_without_touching_target(tmp_path: P
         "--coordinator-pid",
         str(os.getpid()),
         "--repo",
-        "product=../outside",
+        "product=../../outside",
         "--branch",
         "product=codex/escape",
     )
 
     assert symlink_refusal.returncode == 3
     assert escape_refusal.returncode == 3
+    assert "other parent traversal is refused" in escape_refusal.stderr
     assert marker.read_text(encoding="utf-8") == "keep\n"
     assert active_slots(project) == []
 

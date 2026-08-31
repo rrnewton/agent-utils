@@ -46,9 +46,12 @@ flag only as optional provenance so a departed coordinator cannot strand an oper
 `create` uses an existing source repository and its configured `origin` remote by default. Use
 `--remote NAME=REMOTE` when a checkout should use a different configured remote. Add
 `--remote-url NAME=URL` when the caller must verify that remote's exact fetch URL; otherwise
-wrkslots records the configured URL. Repository paths are resolved relative to the project root
-when they are not absolute, and may name sibling repositories outside that root. It creates a new
-linked worktree and local branch; it never reclaims another slot to satisfy an allocation.
+wrkslots records the configured URL. Repository paths must be relative: use an ordinary path inside
+the project root, or path components of the form `../NAME` for one direct sibling repository. This
+is a normalized-path rule rather than a byte-for-byte spelling requirement, but every other raw
+`..` traversal, every absolute path, and every path with a symlink component is refused. Accepted
+paths are stored in normalized relative form. It creates a new linked worktree and local branch; it
+never reclaims another slot to satisfy an allocation.
 
 To register a live slot that already exists on disk but has no active row, first inspect the exact
 arguments and then apply the registration with all ownership fields:

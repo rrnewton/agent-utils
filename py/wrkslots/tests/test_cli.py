@@ -70,7 +70,12 @@ def test_every_command_help_explains_effect_and_inputs() -> None:
     assert "--remote NAME=REMOTE" in create
     assert "expected fetch URL" in create
     assert "--remote-url NAME=URL" in create
-    assert "sibling repositories are allowed" in create
+    normalized_create = " ".join(create.split())
+    assert "or ../NAME path components for one direct sibling" in normalized_create
+    assert (
+        "absolute paths, other parent traversal, and symlink components are refused"
+        in normalized_create
+    )
 
     imported = _run("import-existing", "--help").stdout
     assert "--purpose 'continue task-123'" in imported
