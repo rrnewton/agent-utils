@@ -104,6 +104,11 @@ For each `--repo NAME=PATH`, `create` uses the configured `origin` by default. S
 caller must verify its exact fetch URL. Wrkslots records a SHA-256 identity and refuses if the URL
 changes.
 
+A relative repository path is resolved from the configured project root, not from the caller's
+current directory. The resolved repository may be outside the project root, including a sibling
+repository; wrkslots stores that path absolutely. Worktree destinations remain confined to the
+configured managed worktrees directory.
+
 For a dirty or unpushed agent checkout, reclaim constructs a commit without changing the checkout's
 ordinary index or branch. It includes tracked, untracked, and ignored files except configured cache
 paths, pushes the commit to `refs/heads/salvage/<machine>/<slot>/...`, reads that exact ref back, and
@@ -119,6 +124,14 @@ uncommitted file inside a submodule cannot disappear behind an outer gitlink tha
 For a live slot already at its final managed path, run `import-existing` first as a dry run, then
 repeat with `--apply --verified-live`, its live `--owner-pid`, and the current
 `--coordinator-pid`.
+
+```sh
+wrkslots import-existing slot01 --help
+wrkslots import-existing slot01 --slot-type agent --coordinator-authorized \
+  --agent codex-1 --task task-123 --purpose "continue task-123" \
+  --repo product=../product --apply --verified-live \
+  --owner-pid "$OWNER_PID" --coordinator-pid "$COORDINATOR_PID"
+```
 
 For a slot whose owner has exited, use the older version 3 `worktree-state.json` as evidence instead
 of reconstructing ownership from the directory. Run `import-existing SLOT --from-state-file

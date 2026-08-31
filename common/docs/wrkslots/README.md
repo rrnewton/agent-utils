@@ -43,6 +43,24 @@ Creation requires `--coordinator-authorized` as a readable reminder, not as a cl
 boundary. The same-user processes can bypass any such convention. Removal and recovery accept that
 flag only as optional provenance so a departed coordinator cannot strand an operation.
 
+`create` uses an existing source repository and its configured `origin` remote by default. Use
+`--remote NAME=REMOTE` when a checkout should use a different configured remote. Add
+`--remote-url NAME=URL` when the caller must verify that remote's exact fetch URL; otherwise
+wrkslots records the configured URL. Repository paths are resolved relative to the project root
+when they are not absolute, and may name sibling repositories outside that root. It creates a new
+linked worktree and local branch; it never reclaims another slot to satisfy an allocation.
+
+To register a live slot that already exists on disk but has no active row, first inspect the exact
+arguments and then apply the registration with all ownership fields:
+
+```sh
+wrkslots import-existing slot01 --help
+wrkslots import-existing slot01 --slot-type agent --coordinator-authorized \
+  --agent codex-1 --task task-123 --purpose "continue task-123" \
+  --repo product=../product --apply --verified-live \
+  --owner-pid "$OWNER_PID" --coordinator-pid "$COORDINATOR_PID"
+```
+
 The strict default refuses while a managed directory contains worktrees that have no wrkslots
 record. During a deliberate migration, place the global
 `--allow-existing-unregistered-worktrees` flag before the command. The command retains those

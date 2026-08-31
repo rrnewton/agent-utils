@@ -66,6 +66,10 @@ HISTORICAL_PURPOSE_NOT_RECORDED = "no purpose recorded in worktree-state.json"
 class Refusal(RuntimeError):
     """An expected fail-closed refusal with an actionable message."""
 
+    def __init__(self, message: str, *, remedy: str | None = None) -> None:
+        super().__init__(message)
+        self.remedy = remedy
+
 
 class StateError(Refusal):
     """A corrupt, partial, or incompatible state refusal."""
@@ -2573,12 +2577,26 @@ def _assert_registry_storage_consistent(
             if value.split(":", 1)[1] != allowed_unregistered_slot
         ]
     if unexpected and not allow_unregistered_migration_slots:
+        slot_type, slot = unexpected[0].split(":", 1)
+        if slot_type == "agent":
+            remedy = (
+                "run 'wrkslots audit --format json', then "
+                f"'wrkslots register {slot} --help' and register the live checkout "
+                "with --agent, --task, --purpose, --owner-pid, --coordinator-pid, "
+                "--verified-live, and --repo. Put --allow-existing-unregistered-worktrees "
+                "before unrelated commands only during deliberate migration; do not delete "
+                "the directory to repair bookkeeping"
+            )
+        else:
+            remedy = (
+                "run 'wrkslots audit --format json', then import the retained validation "
+                "state with 'wrkslots import-existing --help'"
+            )
         raise StateError(
             "managed worktrees directory has a directory without an active row: "
             f"{unexpected[0]}. state: REFUSED -- no registered slot or unregistered "
-            "directory was changed. remedy: run 'wrkslots audit --format json', then "
-            "import each live slot from verified process evidence; during that deliberate "
-            "migration, put --allow-existing-unregistered-worktrees before the command"
+            "directory was changed",
+            remedy=remedy,
         )
     return tuple(unexpected)
 
@@ -3158,21 +3176,27 @@ class _GitVcs:
 
 def _repository_path(config: Config, raw: str) -> tuple[str, Path]:
     candidate = Path(raw)
-    if candidate.is_absolute() or ".." in candidate.parts:
-        raise Refusal(f"repository path must be relative to {config.root}: {raw!r}")
-    normalized = Path(os.path.normpath(str(candidate)))
-    if not normalized.parts:
-        normalized = Path(".")
-    absolute = config.root / normalized
-    _ensure_no_symlink_components(config.root, absolute, "repository")
-    if not absolute.is_dir() or absolute.is_symlink():
+    unresolved = candidate if candidate.is_absolute() else config.root / candidate
+    try:
+        absolute = unresolved.resolve(strict=True)
+    except OSError as exc:
+        raise Refusal(
+            f"repository does not exist or cannot be resolved: {unresolved}",
+            remedy="pass --repo NAME=PATH with an existing Git worktree path",
+        ) from exc
+    if not absolute.is_dir():
         raise Refusal(f"repository does not exist or is unsafe: {absolute}")
     if _path_is_within(absolute, _managed_worktrees_root(config)):
         raise Refusal(
             f"source repository must be outside the managed worktrees directory: {absolute}"
         )
-    relative = "." if normalized == Path(".") else normalized.as_posix()
-    return relative, absolute
+    try:
+        relative = absolute.relative_to(config.root)
+    except ValueError:
+        stored = str(absolute)
+    else:
+        stored = "." if relative == Path(".") else relative.as_posix()
+    return stored, absolute
 
 
 def _managed_worktrees_root(config: Config) -> Path:
@@ -9829,8 +9853,9 @@ def _add_repo_options(parser: argparse.ArgumentParser) -> None:
         action="append",
         metavar="NAME=PATH",
         help=(
-            "source Git repository relative to the project root; NAME labels the checkout "
-            "and must match the other NAME=VALUE options (repeat once per checkout)"
+            "source Git repository path, resolved relative to the project root when not "
+            "absolute; sibling repositories are allowed. NAME labels the checkout and must "
+            "match the other NAME=VALUE options (repeat once per checkout)"
         ),
     )
     parser.add_argument(
@@ -10275,6 +10300,16 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "fresh heartbeat time-to-live without treating prior quarantine or release state as "
             "permission to delete. Applied imports are journaled and recoverable."
         ),
+        epilog=(
+            "Example dry run:\n"
+            "  wrkslots import-existing slot01 --slot-type agent --agent codex-1 --task task-123 "
+            "--purpose 'continue task-123' --repo product=../product\n"
+            "Apply after verifying the owner is live:\n"
+            "  wrkslots import-existing slot01 --slot-type agent --coordinator-authorized "
+            "--agent codex-1 --task task-123 "
+            "--purpose 'continue task-123' --repo product=../product --apply "
+            "--verified-live --owner-pid PID --coordinator-pid PID"
+        ),
         formatter_class=_HelpFormatter,
     )
     import_existing.add_argument("slot", help="existing managed slot name")
@@ -10521,6 +10556,28 @@ usage or audit gate unknown, 3 fail-closed refusal.
     return parser
 
 
+def _refusal_remedy(args: argparse.Namespace, error: Refusal) -> str:
+    command = getattr(args, "command", None)
+    instruction = error.remedy
+    message = str(error)
+    if instruction is None:
+        inline = re.search(r"(?:^|[.] )remedy: (.+)$", message, flags=re.IGNORECASE)
+        if inline is not None:
+            instruction = inline.group(1)
+    if instruction is not None:
+        if "wrkslots" in instruction or not isinstance(command, str) or not command:
+            return instruction
+        return (
+            f"{instruction}; then rerun 'wrkslots {command}' with the required arguments"
+        )
+    if isinstance(command, str) and command:
+        return (
+            f"run 'wrkslots {command} --help', correct the named condition, then rerun "
+            f"'wrkslots {command}' with the required arguments"
+        )
+    return "run 'wrkslots --help', correct the named condition, then rerun wrkslots"
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the command-line interface and return its process exit status."""
 
@@ -10558,6 +10615,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = handler(args)
     except Refusal as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)
+        print(f"REMEDY: {_refusal_remedy(args, exc)}", file=sys.stderr)
         return 3
     return int(result)
 

@@ -1106,9 +1106,13 @@ def test_lock_conflict_refuses_without_state_change(tmp_path: Path) -> None:
         refused = command(project, "status")
         assert refused.returncode == 3
         assert "state lock is busy" in refused.stderr
+        assert "REMEDY:" in refused.stderr
+        assert "wrkslots status --help" in refused.stderr
         assert (project / "worktrees" / "ACTIVE.testhost.json").read_bytes() == before
     finally:
         terminate_process(holder)
+    repaired = command(project, "status")
+    assert repaired.returncode == 0, repaired.stderr
 
 
 def test_different_machines_use_different_shards(tmp_path: Path) -> None:
@@ -2610,13 +2614,49 @@ def test_status_refuses_registry_directory_mismatch(
         git(repository, "worktree", "remove", "--force", str(checkout(project)))
         (project / "worktrees" / "slot01").rmdir()
     else:
-        (project / "worktrees" / "orphan").mkdir()
+        orphan = project / "worktrees" / "orphan" / "product"
+        orphan.parent.mkdir()
+        git(repository, "worktree", "add", "-b", "codex/orphan", str(orphan), "origin/main")
 
     refused = command(project, "status", "--all-machines")
 
     assert refused.returncode == 3
     expected = "slot directory is missing" if mismatch == "row-without-directory" else "directory without an active row"
     assert expected in refused.stderr
+    assert "REMEDY:" in refused.stderr
+    if mismatch == "directory-without-row":
+        assert "wrkslots register orphan --help" in refused.stderr
+        for required in (
+            "--agent",
+            "--task",
+            "--purpose",
+            "--owner-pid",
+            "--coordinator-pid",
+            "--verified-live",
+            "--repo",
+        ):
+            assert required in refused.stderr
+        repaired = command(
+            project,
+            "register",
+            "orphan",
+            "--agent",
+            "codex-orphan",
+            "--task",
+            "repair-registry",
+            "--purpose",
+            "restore the missing active row",
+            "--owner-pid",
+            str(os.getpid()),
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--verified-live",
+            "--repo",
+            "product=repo",
+        )
+        assert repaired.returncode == 0, repaired.stderr
+        status = command(project, "status", "--slot", "orphan")
+        assert status.returncode == 0, status.stderr
 
 
 def test_unbound_owner_remains_unreclaimable_after_recovery_note(
@@ -2751,6 +2791,79 @@ def test_import_existing_is_dry_run_then_registers_verified_live_slot(
     assert isinstance(imported, dict)
     assert imported["remote"] == "upstream"
     assert tree.is_dir()
+
+
+def test_import_existing_accepts_a_sibling_source_repository(
+    tmp_path: Path,
+) -> None:
+    project, _unused_repository, remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    sibling = tmp_path / "sibling-repository"
+    subprocess.run(
+        ["git", "clone", str(remote), str(sibling)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    tree = checkout(project)
+    tree.parent.mkdir(exist_ok=True)
+    git(sibling, "worktree", "add", "-b", "codex/imported", str(tree), "origin/main")
+
+    relative_sibling = Path("..") / sibling.name
+    common = (
+        "import-existing",
+        "slot01",
+        "--agent",
+        "codex-1",
+        "--task",
+        "task-import",
+        "--purpose",
+        "import sibling repository",
+        "--repo",
+        f"product={relative_sibling}",
+    )
+    dry_run = command(project, *common)
+    assert dry_run.returncode == 0, dry_run.stderr
+    assert "dry-run: no state changed" in dry_run.stdout
+
+    applied = command(
+        project,
+        *common,
+        "--apply",
+        "--verified-live",
+        "--owner-pid",
+        str(os.getpid()),
+        "--coordinator-pid",
+        str(os.getpid()),
+    )
+
+    assert applied.returncode == 0, applied.stderr
+    row = active_slots(project)[0]
+    assert isinstance(row, dict)
+    checkouts = row["checkouts"]
+    assert isinstance(checkouts, list)
+    imported = checkouts[0]
+    assert isinstance(imported, dict)
+    assert imported["repository"] == str(sibling.resolve())
+    status = command(project, "status", "--slot", "slot01", "--format", "json")
+    assert status.returncode == 0, status.stderr
+
+
+def test_every_refusal_prints_a_repair_command(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code = wrkslots.main(
+        ["--project-root", str(tmp_path / "missing-project"), "status"]
+    )
+    captured = capsys.readouterr()
+
+    assert code == 3
+    assert "REFUSED:" in captured.err
+    assert "REMEDY:" in captured.err
+    assert "wrkslots status --help" in captured.err
 
 
 def test_import_existing_can_register_multiple_flat_cutover_stragglers(

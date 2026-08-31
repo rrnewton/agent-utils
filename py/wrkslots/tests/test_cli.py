@@ -70,6 +70,12 @@ def test_every_command_help_explains_effect_and_inputs() -> None:
     assert "--remote NAME=REMOTE" in create
     assert "expected fetch URL" in create
     assert "--remote-url NAME=URL" in create
+    assert "sibling repositories are allowed" in create
+
+    imported = _run("import-existing", "--help").stdout
+    assert "--purpose 'continue task-123'" in imported
+    assert "--coordinator-pid PID" in imported
+    assert "--slot-type agent --coordinator-authorized" in imported
 
     init = _run("init", "--help").stdout
     assert "called as PATH AGENT" in init
