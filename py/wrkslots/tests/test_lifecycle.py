@@ -2793,6 +2793,81 @@ def test_import_existing_is_dry_run_then_registers_verified_live_slot(
     assert tree.is_dir()
 
 
+def test_import_existing_registers_coordinator_child_using_the_slot(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    tree = checkout(project)
+    tree.parent.mkdir()
+    git(repository, "worktree", "add", "-b", "codex/imported", str(tree), "origin/main")
+    owner = subprocess.Popen(["sleep", "60"], cwd=tree, text=True)
+    try:
+        applied = command(
+            project,
+            "import-existing",
+            "slot01",
+            "--agent",
+            "codex-1",
+            "--task",
+            "task-import",
+            "--purpose",
+            "import coordinator child",
+            "--repo",
+            "product=repo",
+            "--apply",
+            "--verified-live",
+            "--owner-pid",
+            str(owner.pid),
+            "--coordinator-pid",
+            str(os.getpid()),
+        )
+
+        assert applied.returncode == 0, applied.stderr
+        row = active_slots(project)[0]
+        assert isinstance(row, dict)
+        recorded_owner = row["owner"]
+        assert isinstance(recorded_owner, dict)
+        assert recorded_owner["pid"] == owner.pid
+    finally:
+        terminate_process(owner)
+
+
+def test_import_existing_refuses_coordinator_child_not_using_the_slot(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    tree = checkout(project)
+    tree.parent.mkdir()
+    git(repository, "worktree", "add", "-b", "codex/imported", str(tree), "origin/main")
+    owner = subprocess.Popen(["sleep", "60"], cwd=project, text=True)
+    try:
+        refused = command(
+            project,
+            "import-existing",
+            "slot01",
+            "--agent",
+            "codex-1",
+            "--task",
+            "task-import",
+            "--purpose",
+            "reject unrelated coordinator child",
+            "--repo",
+            "product=repo",
+            "--apply",
+            "--verified-live",
+            "--owner-pid",
+            str(owner.pid),
+            "--coordinator-pid",
+            str(os.getpid()),
+        )
+
+        assert refused.returncode == 3
+        assert "does not have its working directory inside slot" in refused.stderr
+        assert active_slots(project) == []
+    finally:
+        terminate_process(owner)
+
+
 def test_import_existing_accepts_a_sibling_source_repository(
     tmp_path: Path,
 ) -> None:

@@ -3370,6 +3370,46 @@ def _capture_caller_process(pid: int, label: str) -> ProcessIdentity:
     return identity
 
 
+def _assert_process_descends_from(
+    process: ProcessIdentity, ancestor: ProcessIdentity, label: str
+) -> None:
+    current: int | None = process.pid
+    seen: set[int] = set()
+    for _ in range(256):
+        if current is None or current in seen:
+            break
+        seen.add(current)
+        try:
+            candidate = _read_process_identity(current)
+        except Refusal:
+            candidate = None
+        if candidate == ancestor:
+            return
+        current = _read_process_parent(current)
+    raise Refusal(
+        f"{label} PID {process.pid} does not descend from coordinator PID "
+        f"{ancestor.pid}"
+    )
+
+
+def _assert_registration_owner_authorized(
+    owner: ProcessIdentity,
+    coordinator: ProcessIdentity,
+    slot_path: Path,
+) -> None:
+    try:
+        _assert_caller_process(owner, "owner")
+        return
+    except Refusal as caller_refusal:
+        _assert_process_descends_from(owner, coordinator, "owner")
+        uses = _process_uses_slot(Path("/proc") / str(owner.pid), slot_path)
+        if not any(item.startswith("cwd=") for item in uses):
+            raise Refusal(
+                f"owner PID {owner.pid} is outside the invoking process ancestry and "
+                f"does not have its working directory inside slot {slot_path}"
+            ) from caller_refusal
+
+
 def _registered_liveness_state(config: Config, record: ActiveRecord) -> tuple[str, str]:
     env = {
         "LC_ALL": "C",
@@ -5820,17 +5860,18 @@ def _register_existing(
             checkouts=checkouts,
         ),
     )
-    del slot_path
     for checkout in checkouts:
         _assert_checkout_identity_unchanged(config, checkout, vcs)
     confirmed_owner = _read_process_identity(owner.pid)
     if confirmed_owner != owner:
         raise Refusal("owner process generation changed during registration")
-    _assert_caller_process(confirmed_owner, "owner")
     confirmed_coordinator = _read_process_identity(coordinator_lease.pid)
     if confirmed_coordinator != coordinator_lease:
         raise Refusal("coordinator process generation changed during registration")
     _assert_caller_process(confirmed_coordinator, "coordinator")
+    _assert_registration_owner_authorized(
+        confirmed_owner, confirmed_coordinator, slot_path
+    )
     now = _utc_now()
     return ActiveRecord(
         slot=args.slot,
@@ -5857,7 +5898,7 @@ def _cmd_register(
     _require_coordinator_authorized(args, "worktree registration")
     args.slot_type = _require_slot_type(args, "worktree registration")
     config = _load_config(args.project_root, args.machine)
-    owner = _capture_caller_process(args.owner_pid, "owner")
+    owner = _read_process_identity(args.owner_pid)
     coordinator_lease = _capture_caller_process(
         args.coordinator_pid, "coordinator"
     )
@@ -6057,7 +6098,7 @@ def _cmd_import_existing(args: argparse.Namespace) -> int:
             config, args.slot, agent, args.slot_type, enforce_cap=False
         )
         if historical is None:
-            owner = _capture_caller_process(args.owner_pid, "owner")
+            owner = _read_process_identity(args.owner_pid)
             record = _register_existing(config, args, owner, coordinator_lease)
         else:
             now = _utc_now()
@@ -10262,7 +10303,9 @@ usage or audit gate unknown, 3 fail-closed refusal.
         description=(
             "Verify linked worktrees already present under the slot path and register their exact "
             "Git, coordinator, and owner identities. This command does not create or move paths. "
-            "Use only while the owner is demonstrably live."
+            "Use only while the owner is demonstrably live. The owner may be the invoking "
+            "process or another child of the invoking coordinator whose working directory is "
+            "inside the slot."
         ),
         formatter_class=_HelpFormatter,
     )
@@ -10295,10 +10338,12 @@ usage or audit gate unknown, 3 fail-closed refusal.
         description=(
             "Inspect worktrees already present under a slot path and print the registry row that "
             "would describe them. The default is read-only. A live import requires the same "
-            "explicit owner evidence as register. --from-state-file instead reads one exact "
-            "version 3 historical row, including its recorded process generation, and begins a "
-            "fresh heartbeat time-to-live without treating prior quarantine or release state as "
-            "permission to delete. Applied imports are journaled and recoverable."
+            "explicit owner evidence as register: another coordinator child is accepted only "
+            "while its working directory is inside the slot. --from-state-file instead reads "
+            "one exact version 3 historical row, including its recorded process generation, "
+            "and begins a fresh heartbeat time-to-live without treating prior quarantine or "
+            "release state as permission to delete. Applied imports are journaled and "
+            "recoverable."
         ),
         epilog=(
             "Example dry run:\n"

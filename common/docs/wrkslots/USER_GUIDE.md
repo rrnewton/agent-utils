@@ -123,7 +123,9 @@ uncommitted file inside a submodule cannot disappear behind an outer gitlink tha
 
 For a live slot already at its final managed path, run `import-existing` first as a dry run, then
 repeat with `--apply --verified-live`, its live `--owner-pid`, and the current
-`--coordinator-pid`.
+`--coordinator-pid`. The owner may be the invoking process. A coordinator repairing another live
+owner's slot must name an owner process that descends from that coordinator and whose working
+directory is inside the slot; liveness without that path evidence refuses.
 
 ```sh
 wrkslots import-existing slot01 --help
