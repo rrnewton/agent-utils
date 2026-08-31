@@ -1098,6 +1098,7 @@ pub async fn summarize_message(
     caller: crate::auth::Scope,
     channel_id: &str,
     message_id: &str,
+    also: &[String],
     limit: Option<u16>,
 ) -> Result<Summarised, OpError> {
     let window = messages(state, channel_id, limit).await?;
@@ -1106,7 +1107,34 @@ pub async fn summarize_message(
         .iter()
         .position(|m| m.id.as_str() == message_id)
         .ok_or(OpError::UnknownMessage)?;
-    let target = &window.messages[position];
+
+    // WHAT THE READER IS LOOKING AT, WHICH MAY BE SEVERAL MESSAGES.
+    //
+    // A post over Discord's length limit arrives as a message and a short trailing remainder, and
+    // the page draws those as one row. Summarising only the first would describe the part that
+    // stops mid-sentence and ignore the end of it — and the tail on its own is the least
+    // summarisable text in the channel, being the back half of a sentence whose front half is
+    // somewhere else. So the group is joined FIRST and summarised as the one piece of writing it
+    // was before Discord cut it up.
+    //
+    // The identity stays the first message's throughout: that is what the row is keyed by, what a
+    // reply threads from, and what the cache is filed under. Only the CONTENT is combined — and
+    // because the cache key hashes that content, a row that later groups differently is a
+    // different key rather than a stale hit.
+    let mut combined = window.messages[position].clone();
+    if !also.is_empty() {
+        let mut parts = vec![combined.content.clone()];
+        for id in also {
+            let extra = window
+                .messages
+                .iter()
+                .find(|m| m.id.as_str() == id.as_str())
+                .ok_or(OpError::UnknownMessage)?;
+            parts.push(extra.content.clone());
+        }
+        combined.content = parts.join("\n");
+    }
+    let target = &combined;
 
     if target.content.chars().count() < state.config.summaries.threshold_chars {
         return Ok(Summarised {

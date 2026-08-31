@@ -1437,7 +1437,14 @@ function newPage(store = new Map(), script = SCRIPT) {
       const wantsSummary =
         /^\/api\/v1\/channels\/([^/]+)\/messages\/([^/]+)\/summary(\?|$)/.exec(String(path));
       if (wantsSummary) {
-        page.summaryAsks.push({ channel: wantsSummary[1], message: wantsSummary[2] });
+        // `with` recorded too: a glommed row must summarise the whole group, and an ask that
+        // silently dropped the tail would otherwise look identical to a correct one here.
+        const withParam = /[?&]with=([^&]*)/.exec(String(path));
+        page.summaryAsks.push({
+          channel: wantsSummary[1],
+          message: wantsSummary[2],
+          with: withParam ? decodeURIComponent(withParam[1]).split(",") : [],
+        });
         return page.summaryResponse(wantsSummary[2]);
       }
       if (/\/stream(\?|$)/.test(String(path))) {
@@ -6509,14 +6516,25 @@ test("scrolling past a message asks for its summary ONCE, not once per scroll ev
   }
   await page.settle();
 
+  // PER MESSAGE, NOT PER EVENT — which is the actual claim, and the one that costs money when it
+  // breaks. This used to be written as "the total did not change", which was a proxy that held
+  // only because entering the mode instantly shrank every foldable row and so asked about all of
+  // them at once. Rows now keep their height until their own summary arrives, so the reachable set
+  // grows as they shrink and a scroll to the bottom can legitimately reveal one more row. That is
+  // a row being asked about for the first time, not a row being asked about again, and conflating
+  // the two would forbid the lookahead from working at all.
   assert.equal(
     page.summaryAsks.length,
-    before,
-    "twenty scroll events over the same rows issued fresh requests"
+    new Set(page.summaryAsks.map((ask) => ask.message)).size,
+    "some message was asked about more than once across twenty scroll events"
   );
   for (const id of new Set(page.summaryAsks.map((ask) => ask.message))) {
     assert.equal(asksFor(page, id), 1, `message ${id} was asked about more than once`);
   }
+  assert.ok(
+    page.summaryAsks.length < 20,
+    `twenty scroll events produced ${page.summaryAsks.length} requests, which is per-event`
+  );
 });
 
 test("the one-ask record is written BEFORE the request, not when the answer comes back", async () => {
@@ -6615,6 +6633,128 @@ test("a summarised row shows the summary in place of its opening lines, and More
   assert.equal(summaryLine(row).hidden, true, "the summary stayed up over the opened message");
   assert.equal(bodyOf(row).hidden, false, "opening a summarised row showed nothing");
   assert.match(bodyOf(row).text(), /overnight/, "the opened row is not the original message");
+});
+
+test("PRESSING SUMMARISE CHANGES NOTHING UNTIL A SUMMARY ACTUALLY ARRIVES", async () => {
+  // THE REPORTED BUG. Turning the mode on used to swap EVERY foldable row the instant it was
+  // pressed, before one answer had come back: the rendered markdown body was hidden and a bare
+  // "summarising…" put where it had been. On a phone that reads as "the control broke rendering
+  // across the whole view", and then — because a truncating backend returns a prefix of the same
+  // text — as "and the summaries never came". A row with nothing to show keeps its own message.
+  const page = newPage();
+  await signIn(page);
+  const rows = await showDiscord(page, [
+    message({ id: "7000000000000000024", content: longMessage("overnight") }),
+  ]);
+
+  // Hold the server's answer so the waiting state is a state the test can actually stand in. The
+  // predecessor of this test could not see the bug at all, because the fixture answered inside the
+  // same settle that pressed the button.
+  let release = null;
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  const answer = page.summaryResponse;
+  page.summaryResponse = async (id) => {
+    await held;
+    return answer(id);
+  };
+
+  await turnSummariesOn(page);
+  const row = rows[0];
+  assert.equal(
+    bodyOf(row).hidden,
+    false,
+    "pressing summarise hid the message before any summary existed"
+  );
+  assert.equal(summaryLine(row).hidden, true, "an empty summary line was put up over the message");
+  assert.equal(
+    row.getAttribute("data-summarised"),
+    "false",
+    "the row claimed to be showing a summary while it was still asking for one"
+  );
+  // The body is still the RENDERED message, not its markdown source: this is the thing the reader
+  // actually reported seeing change.
+  assert.match(bodyOf(row).text(), /overnight/, "the waiting row lost the message");
+
+  release();
+  await page.settle();
+  assert.equal(bodyOf(row).hidden, true, "the summary never replaced the message once it arrived");
+  assert.equal(summaryText(row), "a short line about 7000000000000000024");
+  assert.equal(
+    row.getAttribute("data-summarised"),
+    "true",
+    "a row showing a summary is not marked as one, so nothing can style it"
+  );
+});
+
+test("...and a row showing a summary is DRAWN differently from one showing the message", async () => {
+  // A summary is plain text where the message was markdown. Without a surface of its own, the only
+  // difference a reader can see between "a machine's one-line reading" and "the formatter gave up"
+  // is that the text got shorter — and the wrong reading is the one they reached for.
+  const page = newPage();
+  await signIn(page);
+  const rows = await showDiscord(page, [
+    message({ id: "7000000000000000025", content: longMessage("rollout") }),
+  ]);
+  await turnSummariesOn(page);
+  assert.equal(rows[0].getAttribute("data-summarised"), "true", "the fixture never summarised");
+
+  // Marked is not drawn. The rule has to EXIST and has to change the surface, or the attribute is
+  // a fact nobody can see — the failure this suite has hit before with an invisible highlight.
+  const drawn = cssBlock('#discord-log li.discord-message[data-summarised="true"]');
+  assert.ok(drawn, "nothing in the stylesheet draws a summarised row differently");
+  assert.match(drawn, /background:/, "a summarised row does not take a surface of its own");
+  assert.match(drawn, /border-left:/, "a summarised row has no mark down its edge");
+  // The coder's own tiles switch side borders OFF; the summary bar has to survive that rule.
+  assert.match(
+    cssBlock('#discord-log li.discord-message[data-who="coder"]'),
+    /border-left:\s*none/,
+    "the fixture for the rule this one has to override has changed"
+  );
+
+  // And the word that says so is not muted grey, which is what the eye is trained to skip.
+  const mark = cssBlock(".summary-mark");
+  assert.doesNotMatch(mark, /color:\s*var\(--muted\)/, "the summary label is still muted");
+  assert.match(mark, /color:\s*var\(--summary-ink\)/, "the summary label has no colour of its own");
+});
+
+test("A GLOMMED ROW IS SUMMARISED AS ONE PIECE OF WRITING, NOT AS ITS FIRST HALF", async () => {
+  // Combining has to happen BEFORE summarising. A post over Discord's limit arrives as a message
+  // plus a short remainder; summarising only the first describes the half that stops mid-sentence,
+  // and the remainder on its own is the least summarisable text in the channel — the back half of
+  // a sentence whose front half is somewhere else. One row, one summary, whole text.
+  const page = newPage();
+  await signIn(page);
+  const rows = await showDiscord(page, [
+    message({
+      id: "7000000000000000040",
+      content: longMessage("deploy"),
+      timestamp: "2026-08-31T10:00:00Z",
+    }),
+    message({
+      id: "7000000000000000041",
+      content: "…and the rest of that sentence.",
+      timestamp: "2026-08-31T10:00:02Z",
+    }),
+  ]);
+  assert.equal(rows.length, 1, "the fixture did not combine, so there is no group to summarise");
+
+  await turnSummariesOn(page);
+  const asks = page.summaryAsks.filter((ask) => ask.message === "7000000000000000040");
+  assert.equal(asks.length, 1, "the row's primary message was not summarised exactly once");
+  assert.deepEqual(
+    asks[0].with,
+    ["7000000000000000041"],
+    "the trailing overflow was not sent, so the server summarised half the row"
+  );
+  // And the tail is never asked about on its OWN: it is not a row, so a summary of it would be
+  // bought and then have nowhere to go.
+  assert.equal(
+    asksFor(page, "7000000000000000041"),
+    0,
+    "the overflow was summarised separately, which is the spend this avoids"
+  );
 });
 
 test("turning summary mode off puts the opening lines back without asking the server anything", async () => {
@@ -6771,16 +6911,33 @@ test("a summary is third-party text: it becomes characters, never elements", asy
   );
 });
 
+/** Make the summary route wait, so "asked for but not yet answered" is a state a test can hold. */
+function heldSummaries(page) {
+  let release = null;
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  const answer = page.summaryResponse;
+  page.summaryResponse = async (id) => {
+    await held;
+    return answer(id);
+  };
+  return () => release();
+}
+
 test("entering summary mode does not move the reader", async () => {
-  // Every row on screen changes height at once and a sentence appears ABOVE the list, which is
-  // exactly the mutation a browser's own scroll anchoring does not cover -- the same case as the
-  // fold control and the older-messages prepend, and it goes through the same helper.
+  // THE REFLOW MOVED, so this measures where it moved TO. Pressing the control no longer changes
+  // any row's height — a row keeps its own message until its own summary lands — so the mutation a
+  // browser's scroll anchoring cannot cover is now the ARRIVAL of those answers. Same helper, same
+  // guarantee, later instant. Both moments are checked, because "nothing moved" has to hold across
+  // the press as well, and after the change that is the easy half.
   const page = newPage();
   await signIn(page);
-  await showDiscord(page, tallChannel(20));
+  await showDiscord(page, tallChannel(40));
   const area = page.el("scroll-area");
-  area.scrollTop = Math.round(area.scrollHeight / 2);
+  area.scrollTop = Math.round(area.scrollHeight / 4);
   await area.dispatch("scroll");
+  const release = heldSummaries(page);
   const anchor = anchorRow(page);
   const before = anchor.getBoundingClientRect().top;
 
@@ -6788,6 +6945,17 @@ test("entering summary mode does not move the reader", async () => {
   assert.ok(
     Math.abs(anchor.getBoundingClientRect().top - before) <= 1,
     `the reader's line moved by ${anchor.getBoundingClientRect().top - before}px on entering the mode`
+  );
+
+  // Re-based deliberately, so the second claim is about the ARRIVAL alone. Carrying the original
+  // baseline forward would let the note's height and the rows' shrink cancel, and a sum of two
+  // opposite errors reads exactly like no error at all — see the negative control below.
+  const settled = anchor.getBoundingClientRect().top;
+  release();
+  await page.settle();
+  assert.ok(
+    Math.abs(anchor.getBoundingClientRect().top - settled) <= 1,
+    `the reader's line moved by ${anchor.getBoundingClientRect().top - settled}px when the summaries arrived`
   );
 });
 
@@ -6802,14 +6970,22 @@ test("...and the anchoring is real: the same page without it fails that test", a
     )
   );
   await signIn(page);
-  await showDiscord(page, tallChannel(20));
+  await showDiscord(page, tallChannel(40));
   const area = page.el("scroll-area");
-  area.scrollTop = Math.round(area.scrollHeight / 2);
+  area.scrollTop = Math.round(area.scrollHeight / 4);
   await area.dispatch("scroll");
+  const release = heldSummaries(page);
+
+  // The baseline is taken AFTER the press and BEFORE the answers, which is the only window where
+  // the row shrink is the sole thing happening. Measured across the press as well, the mode's own
+  // note appears above the list and grows the content by very nearly what the rows below it lose —
+  // the two cancelled, this control read zero, and it would have reported "anchoring is not needed"
+  // when what was true was "this fixture measures two opposite changes at once".
+  await turnSummariesOn(page);
   const anchor = anchorRow(page);
   const before = anchor.getBoundingClientRect().top;
-
-  await turnSummariesOn(page);
+  release();
+  await page.settle();
   assert.ok(
     Math.abs(anchor.getBoundingClientRect().top - before) > 1,
     "the unanchored page held the reader's position anyway, so the model cannot see this at all"
@@ -6852,7 +7028,17 @@ test("a background re-read of the channel does not re-buy the summaries it alrea
   page.expireTimers(DISCORD_POLL_MS);
   await page.settle();
   assert.equal(page.el("discord-log").children.length, 12, "the poll did not really re-read");
-  assert.equal(page.summaryAsks.length, paid, "the background poll bought every summary again");
+  // Every id asked about at most ONCE across the rebuild. Not "the total is unchanged": rows keep
+  // their height until their own summary lands, so a row that shrinks can bring the next one into
+  // reach, and that next row is a first ask rather than a repurchase. What would be the standing
+  // charge this test exists to forbid is the SAME id going out again, which is what is asserted.
+  for (const id of new Set(page.summaryAsks.map((ask) => ask.message))) {
+    assert.equal(asksFor(page, id), 1, `the poll bought message ${id} a second time`);
+  }
+  assert.ok(
+    page.summaryAsks.length >= paid,
+    "asks went DOWN across a poll, so this fixture is no longer measuring what it claims"
+  );
 });
 
 

@@ -2348,3 +2348,87 @@ async fn a_dismissal_that_names_both_ways_of_choosing_is_refused_rather_than_gue
         assert_eq!(payload["error"], "bad_request", "{body}: {payload}");
     }
 }
+
+/// The other ids in a glommed row survive the HTTP layer.
+///
+/// `ops` joining them is tested in `tests/summaries.rs`; what is tested HERE is the seam in front
+/// of it, which is exactly where a query parameter gets parsed and then quietly dropped. The two
+/// calls differ only in `with`, and the threshold sits between them: the head alone is short
+/// enough that the server declines to summarise it, and the head plus its overflow is not. A route
+/// that ignored the parameter would answer `below_threshold` to both.
+#[tokio::test]
+async fn the_other_messages_in_a_row_reach_the_summariser_through_the_route() {
+    let harness = harness();
+    let channel = ChannelId(WRITE_CHANNEL.to_owned());
+    // The configured threshold is 400 characters; this is comfortably under it on its own.
+    let head = "the arm64 job never reported anything at all. ".repeat(6);
+    assert!(
+        head.chars().count() < 400,
+        "fixture no longer straddles the threshold"
+    );
+    let tail = "and then the mac runner came back and reported everything at once. ".repeat(4);
+    assert!(
+        head.chars().count() + tail.chars().count() >= 400,
+        "fixture no longer straddles the threshold"
+    );
+    let first = harness.discord.seed(&channel, "codex-eng", &head).0;
+    let second = harness.discord.seed(&channel, "codex-eng", &tail).0;
+
+    let (status, alone) = call(
+        &harness,
+        "GET",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/messages/{first}/summary"),
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        alone["state"], "below_threshold",
+        "the head alone should be under the threshold: {alone}"
+    );
+
+    let (status, combined) = call(
+        &harness,
+        "GET",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/messages/{first}/summary?with={second}"),
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{combined}");
+    assert_ne!(
+        combined["state"], "below_threshold",
+        "the row's other message never reached the summariser: {combined}"
+    );
+    assert!(
+        combined["summary"].as_str().is_some_and(|s| !s.is_empty()),
+        "no summary came back for the combined row: {combined}"
+    );
+}
+
+/// An empty or trailing `with` means "no others" rather than "a message with no id".
+#[tokio::test]
+async fn an_empty_with_parameter_is_read_as_no_other_messages() {
+    let harness = harness();
+    let channel = ChannelId(WRITE_CHANNEL.to_owned());
+    let id = harness
+        .discord
+        .seed(
+            &channel,
+            "codex-eng",
+            &"a long line about the deploy. ".repeat(20),
+        )
+        .0;
+    for query in ["?with=", "?with=,"] {
+        let (status, payload) = call(
+            &harness,
+            "GET",
+            &format!("/api/v1/channels/{WRITE_CHANNEL}/messages/{id}/summary{query}"),
+            Some(READ_TOKEN),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{query} was refused: {payload}");
+    }
+}

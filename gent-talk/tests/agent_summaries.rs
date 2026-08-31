@@ -94,7 +94,7 @@ async fn a_summary_from_the_agent_comes_back_generated_and_says_how_long_it_took
     let (state, vendor, _discord) = server(PoolPolicy::default(), 2);
     let id = newest_ids(&state).await.pop().expect("a message");
 
-    let answer = ops::summarize_message(&state, Scope::Write, READ_CHANNEL, &id, None)
+    let answer = ops::summarize_message(&state, Scope::Write, READ_CHANNEL, &id, &[], None)
         .await
         .expect("the agent summarises");
     assert!(
@@ -119,12 +119,12 @@ async fn a_cache_hit_reports_no_latency_because_no_vendor_was_asked() {
     let (state, vendor, _discord) = server(PoolPolicy::default(), 2);
     let id = newest_ids(&state).await.pop().expect("a message");
 
-    let first = ops::summarize_message(&state, Scope::Write, READ_CHANNEL, &id, None)
+    let first = ops::summarize_message(&state, Scope::Write, READ_CHANNEL, &id, &[], None)
         .await
         .expect("summarises");
     assert!(first.generated_in_ms.is_some());
 
-    let second = ops::summarize_message(&state, Scope::Write, READ_CHANNEL, &id, None)
+    let second = ops::summarize_message(&state, Scope::Write, READ_CHANNEL, &id, &[], None)
         .await
         .expect("summarises");
     assert!(matches!(second.outcome, SummaryOutcome::Cached(_)));
@@ -184,7 +184,7 @@ async fn twenty_summaries_do_not_cost_twenty_conversations_nor_one() {
     // of nineteen other people's messages.
     let (state, vendor, _discord) = server(PoolPolicy::default(), 22);
     for id in newest_ids(&state).await {
-        ops::summarize_message(&state, Scope::Write, READ_CHANNEL, &id, None)
+        ops::summarize_message(&state, Scope::Write, READ_CHANNEL, &id, &[], None)
             .await
             .expect("summarises");
     }
@@ -318,7 +318,7 @@ async fn a_vendor_that_refuses_the_conversation_refuses_the_summary_by_name() {
     );
     let id = newest_ids(&state).await.pop().expect("a message");
 
-    let error = ops::summarize_message(&state, Scope::Write, READ_CHANNEL, &id, None)
+    let error = ops::summarize_message(&state, Scope::Write, READ_CHANNEL, &id, &[], None)
         .await
         .expect_err("a rejected key must not produce a summary");
     assert_eq!(error.code(), "summarizer_refused", "{error}");

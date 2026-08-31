@@ -472,6 +472,12 @@ pub struct LimitQuery {
     pub limit: Option<u16>,
     /// Width of a digest line, in characters.
     pub width: Option<u16>,
+    /// The OTHER messages drawn as part of the same row, comma-separated, oldest first.
+    ///
+    /// A post over Discord's length limit arrives as a message plus a short remainder and the page
+    /// draws them as one row; this is how it says so, so the summary describes the whole piece of
+    /// writing rather than the half that stops mid-sentence. Absent for an ordinary single row.
+    pub with: Option<String>,
 }
 
 /// Full-text scrollback.
@@ -1711,8 +1717,19 @@ pub async fn message_summary(
     // The granted scope, not the required one: a read token may be served FROM the cache but
     // never writes to it. See `ops::summarize_message`.
     let caller = require(&headers, &state, Scope::Read)?;
+    // Empty segments dropped rather than rejected: `with=` and a trailing comma both mean "no
+    // others", and refusing them would turn a harmless way of writing the URL into a 400.
+    let also: Vec<String> = query
+        .with
+        .as_deref()
+        .unwrap_or_default()
+        .split(',')
+        .filter(|part| !part.is_empty())
+        .map(str::to_owned)
+        .collect();
     let answer =
-        ops::summarize_message(&state, caller, &channel_id, &message_id, query.limit).await?;
+        ops::summarize_message(&state, caller, &channel_id, &message_id, &also, query.limit)
+            .await?;
     Ok(Json(MessageSummaryResponse {
         channel: answer.channel,
         message_id,

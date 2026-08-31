@@ -52,6 +52,14 @@
      off it — and it has to be judged in DARK, because a tint that reads on white is invisible on
      #1d2026, which is the theme the owner's devices are in. */
   --row-hover: #262c36;
+  /* `#49 cached-summaries`. The surface a row takes on while it is showing a SUMMARY instead of
+     the message. Teal, because the three speaker colours are blue, near-black and warm brown, and
+     a fourth variation on any of those would read as another kind of speaker rather than as a
+     different kind of CONTENT. Judged in dark first: the earlier reading highlight was a 14% tint
+     that turned out to be invisible on #1d2026, and this must not repeat that. */
+  --summary-bg: #14312f;
+  --summary-edge: #2f7d73;
+  --summary-ink: #6fd8c6;
   /* THE reading column, in characters. Only the desktop regime at the foot of this file consults
      it — a phone has no room for a column and no margin to put beside one — but it is declared
      here, with the other tokens, rather than inside the media query, so that web/voice.js can set
@@ -73,6 +81,9 @@
     --idle: #98a1b0;
     --paused: #5b48c4;
     --row-hover: #edf1f7;
+    --summary-bg: #e4f4f1;
+    --summary-edge: #4c9c91;
+    --summary-ink: #1d6b60;
   }
 }
 
@@ -1034,12 +1045,36 @@ body {
   align-items: baseline;
 }
 
+/*
+ * A SUMMARISED ROW MUST NOT LOOK LIKE A ROW WHOSE MARKDOWN BROKE.
+ *
+ * That was the whole of the reported bug. A summary is plain text where the message was markdown,
+ * so if the row keeps the colour it had, the only visible difference between "this is a machine's
+ * one-line reading" and "the formatter gave up" is that the text got shorter. Both readings were
+ * available and the wrong one is the one a reader reaches for.
+ *
+ * So the row changes SURFACE, not just content: its own tint, and a bar down the summarised edge.
+ * Applied to the row rather than to the note, and with the tint applied over every `data-who`
+ * colour, because the three speaker colours are what the reader is otherwise reading the row by.
+ */
+#discord-log li.discord-message[data-summarised="true"] {
+  background: var(--summary-bg);
+  border-color: var(--summary-edge);
+  /* The coder's tiles deliberately have no side borders. This one is the exception, because it is
+     the mark that says the row is not showing the message — it has to survive that rule. */
+  border-left: 3px solid var(--summary-edge);
+}
+
 .summary-mark {
   flex: 0 0 auto;
   font-size: 0.66rem;
   letter-spacing: 0.06em;
   text-transform: uppercase;
-  color: var(--muted);
+  /* NOT `--muted`. This is the one word telling the reader that what follows was written by a
+     machine about the message rather than by the author of it, and muted grey is what the eye is
+     trained to skip. */
+  color: var(--summary-ink);
+  font-weight: 600;
 }
 
 .summary-text {

@@ -632,8 +632,19 @@ function setFolded(entry, folded) {
   // `#49 cached-summaries`. A summary REPLACES the clamped opening lines; it never sits above
   // them. Two condensations of the same message stacked on one row is not a shorter row, and it
   // would make the fold control ambiguous about which of the two "More" opens.
-  const summarised = folded && summaryMode && entry.note !== null && entry.summaryState !== "none";
+  //
+  // ONLY when a summary is actually in hand — `ready`, not merely asked for. Turning the mode on
+  // used to swap every foldable row at once, before a single answer had come back: the markdown
+  // body was hidden and a bare "summarising…" put in its place, so pressing the control appeared
+  // to break rendering across the whole view and then never finish. A row with nothing to show
+  // yet is a row that has nothing to show, and it keeps its own rendered opening lines until the
+  // moment it does.
+  const summarised = folded && summaryMode && entry.note !== null && entry.summaryState === "ready";
   entry.body.hidden = summarised;
+  // What the STYLING keys off. A summary is not the message: it is a machine's reading of it, in
+  // plain text where the message was markdown, and the row has to say so on its own — without it,
+  // the only difference a reader can see is that the formatting stopped working.
+  entry.li.setAttribute("data-summarised", summarised ? "true" : "false");
   entry.body.className = folded ? "body clamped" : "body";
   if (entry.note) {
     entry.note.hidden = !summarised;
@@ -657,14 +668,14 @@ const isFolded = (entry) => entry.li.getAttribute("data-collapsed") === "true";
  * rather than beside it — "long enough to be worth folding" and "long enough to be worth
  * summarising" have to be the same sentence, or the page would grow a second definition of short.
  */
-function foldable(li, meta, body, text, messageId) {
+function foldable(li, meta, body, text, messageId, alsoIds = []) {
   if (String(text === null || text === undefined ? "" : text).length <= COLLAPSE_OVER_CHARS) {
     return null;
   }
   const fold = document.createElement("button");
   fold.className = "fold";
   fold.setAttribute("type", "button");
-  const entry = { li, body, fold, id: messageId || null, note: null, said: null };
+  const entry = { li, body, fold, id: messageId || null, also: alsoIds, note: null, said: null };
   if (entry.id) {
     entry.note = document.createElement("div");
     entry.note.className = "summary";
@@ -762,6 +773,8 @@ function applySummaryState(entry) {
   }
   const held = summaries.get(entry.id);
   if (held === undefined) {
+    // Nothing has come back yet. The text is staged so the row is ready the instant it does, but
+    // `setFolded` will not show it — a row still waiting keeps its rendered body. See there.
     entry.summaryState = "waiting";
     entry.said.textContent = SUMMARY_WAITING;
   } else if (held.text === null) {
@@ -863,19 +876,24 @@ function requestVisibleSummaries() {
     // response lands, and a record written on completion would let one row issue a request per
     // scroll event — the exact thing the issue names.
     summariesAsked.add(entry.id);
-    fetchSummary(entry.id);
+    fetchSummary(entry.id, entry.also);
   }
 }
 
-async function fetchSummary(id) {
+async function fetchSummary(id, alsoIds = []) {
   const channel = el("discord-channel").value;
   if (!channel) {
     return;
   }
+  // The rest of the glommed row, so the server summarises what the reader is actually looking at.
+  // Absent entirely for an ordinary single-message row, which keeps that URL exactly as it was.
+  const also = alsoIds.length
+    ? `?with=${encodeURIComponent(alsoIds.join(","))}`
+    : "";
   let payload = null;
   try {
     payload = await api(
-      `/api/v1/channels/${encodeURIComponent(channel)}/messages/${encodeURIComponent(id)}/summary`
+      `/api/v1/channels/${encodeURIComponent(channel)}/messages/${encodeURIComponent(id)}/summary${also}`
     );
   } catch (error) {
     summaryFailed(id, error.message);
@@ -4631,11 +4649,12 @@ function discordNode(messages) {
   // Measured on the COMBINED text, because that is what the row is showing: a pair of messages
   // each just under the fold threshold is a wall of text once they are drawn as one.
   //
-  // The summary is keyed under the FIRST id, and that is a known limit rather than an oversight:
-  // the server summarises one message, so a glommed row's summary describes its primary message
-  // and not the trailing overflow. The overflow is the tail of a sentence the primary already
-  // said, which is the case the summary loses least by missing.
-  tapRow(li, foldable(li, meta, body, content, String(message.id)));
+  // The summary is keyed under the FIRST id — that is the row's identity everywhere else too —
+  // but it DESCRIBES the whole group. The other ids ride along so the server can join them back
+  // into the one piece of writing they were before Discord's length limit cut them up; summarising
+  // the primary alone would describe the half that stops mid-sentence, and the tail alone is the
+  // least summarisable text in the channel.
+  tapRow(li, foldable(li, meta, body, content, String(message.id), messages.slice(1).map((m) => String(m.id))));
   // `#51 reply-view`. Every raw message can be answered, and the affordance is on the row rather
   // than in a menu — Discord's own idiom, and the thing that makes a reply a REPLY rather than a
   // loose message.
