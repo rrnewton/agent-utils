@@ -1169,9 +1169,10 @@ pub async fn summarize_message(
     let context = &window.messages[start..position];
     let request =
         crate::summarize::SummaryRequest::new(target, context, state.config.summaries.target_chars);
-    // Timed HERE rather than inside a backend, so the number means the same thing whichever
-    // summariser is configured and a deployment can compare them against each other. The backend
-    // is free to log a finer breakdown of its own; this is the one every backend reports.
+    // Timed HERE rather than inside the summariser, so the number is the WHOLE cost of answering
+    // — the vendor round trip plus everything this server does around it — rather than the part
+    // the vendor happens to report. That is the number a reader waiting for a row is living
+    // through, and it is what the page quotes back as a median.
     let began = std::time::Instant::now();
     let generated = state.summarizer.summarize(&request).await;
     let generated_in_ms = u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX);

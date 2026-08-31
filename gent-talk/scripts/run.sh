@@ -93,12 +93,19 @@
 #                  otherwise pass cheaply, or when the channel's latest message is too plain to
 #                  match on. It always writes one line to the channel. You do not need this to get
 #                  the escalation: that happens by itself when the cheap check fails.
-#   --screenshots  Photograph the /voice page in all thirty-four states that look different, so an
+#   --screenshots  Photograph the /voice page in all thirty-five states that look different, so an
 #                  agent can LOOK at the interface before the owner does. FREE and offline: no vendor
 #                  conversation, no microphone, no money. The conversation WebSocket is replaced by
 #                  a fake and the microphone is Chromium's built-in fake capture device, so the
 #                  live-call, muted and post-call states are reached without ElevenLabs ever being
 #                  contacted.
+#
+#                  The two SUMMARY states cannot use a page-local fake: a summary is a real
+#                  conversation with the ElevenLabs agent, so this also starts
+#                  gent-talk-mock-elevenlabs -- this repository's own loopback vendor -- on the two
+#                  ports above the server's, and points the throwaway config at it. One state gets
+#                  a working summariser; the other wedges the same mock and photographs the red
+#                  failed row. Still offline, still free, still nothing billed.
 #
 #                  Why it exists: the /voice page's own suite drives the real script and asserts
 #                  that the right properties sit on the right selectors, but it lays NOTHING out,
@@ -107,8 +114,9 @@
 #
 #                  It starts its OWN throwaway server, native (not a container), with
 #                  --fake-discord, on port 18091 by default — never 8080, and it refuses to use it.
-#                  It never touches the running gent-talk, or its config, or its logs. The server
-#                  is stopped again when the run ends, including on failure.
+#                  The mock vendor takes 18092 and 18093 beside it. It never touches the running
+#                  gent-talk, or its config, or its logs. BOTH processes are stopped again when the
+#                  run ends, including on failure.
 #
 #                  Each capture is checked: the expected state must actually be on screen before
 #                  the shutter opens, and the resulting image must not be blank or a single flat
@@ -350,6 +358,14 @@ fi
 #
 # Nothing here touches the owner's container. It publishes no port the deployment uses, builds no
 # image, stops nothing and starts no container.
+#
+# It now starts TWO processes, not one: the throwaway server, and gent-talk-mock-elevenlabs beside
+# it. That is not scope creep. Message summaries come from a conversation with an ElevenLabs agent
+# and from nothing else, so a run with no vendor behind it cannot photograph a summarised channel
+# at all -- it waits twenty seconds and reports the state as unreachable. The mock is this
+# repository's own loopback vendor: free, offline, bound to loopback, and holding a real
+# conversation over a real WebSocket, which also makes those two frames evidence about the real
+# socket client rather than about a page-local stub. Both processes are killed by the same trap.
 # ---------------------------------------------------------------------------------------------
 
 if [ "$SCREENSHOTS" = 1 ]; then
@@ -381,6 +397,32 @@ Screenshots would then be taken against whatever that is, not against the server
 starts. Stop it, or choose another port with --port."
     fi
 
+    # THE OFFLINE VENDOR, and it is no longer optional. Message summaries come from the ElevenLabs
+    # agent and from nothing else -- the extractive summariser that used to answer for free has
+    # been deleted -- so a throwaway server with no [elevenlabs] section cannot produce a single
+    # summary, and the state that photographs one would hang for twenty seconds and then report an
+    # unreachable page. gent-talk-mock-elevenlabs is this repository's own loopback vendor: a real
+    # mint endpoint and a real conversation WebSocket, free, offline, and answering canned prose.
+    #
+    # Two ports, derived from the one the caller chose rather than fixed, so `--port` still moves
+    # the whole run out of the way of anything else instead of half of it.
+    SHOTS_MOCK_HTTP_PORT=$((SHOTS_PORT + 1))
+    SHOTS_MOCK_WS_PORT=$((SHOTS_PORT + 2))
+    for shots_extra_port in "$SHOTS_MOCK_HTTP_PORT" "$SHOTS_MOCK_WS_PORT"; do
+        if [ "$shots_extra_port" = 8080 ] || [ "$shots_extra_port" = 18081 ]; then
+            die "--port $SHOTS_PORT puts the offline ElevenLabs mock on port $shots_extra_port,
+which is either the LIVE gent-talk (8080) or the unrelated gent-talk:ci container (18081). The
+mock takes the TWO PORTS ABOVE the one you chose, so choose one whose two successors are neither.
+Leave --port off to use 18091, 18092 and 18093, which are reserved for exactly this."
+        fi
+        if command -v ss >/dev/null 2>&1 &&
+            ss -ltn 2>/dev/null | grep -Eq "[:.]${shots_extra_port}[[:space:]]"; then
+            die "something is already listening on port $shots_extra_port, which is where the
+offline ElevenLabs mock has to bind (it takes the two ports above --port $SHOTS_PORT). Stop it, or
+choose another port with --port."
+        fi
+    done
+
     command -v cargo >/dev/null 2>&1 || die "--screenshots needs cargo, and it is not on PATH.
 The /voice page is compiled INTO the server binary (web/voice.html and web/voice.js are
 include_str! constants), so a stale binary serves last build's markup. Install Rust, or build
@@ -400,11 +442,17 @@ the binary yourself and re-run."
 
     SHOTS_TMP="$(mktemp -d)"
     SHOTS_PID=""
+    SHOTS_MOCK_PID=""
     shots_cleanup() {
-        if [ -n "$SHOTS_PID" ] && kill -0 "$SHOTS_PID" 2>/dev/null; then
-            kill "$SHOTS_PID" 2>/dev/null || true
-            wait "$SHOTS_PID" 2>/dev/null || true
-        fi
+        # BOTH processes, and the mock as carefully as the server. It holds two ports of its own,
+        # so an orphaned one makes the NEXT run refuse to start for a reason that names a port and
+        # not the run that leaked it -- which is exactly how the six-day orphan below was found.
+        for shots_leftover in "$SHOTS_PID" "$SHOTS_MOCK_PID"; do
+            if [ -n "$shots_leftover" ] && kill -0 "$shots_leftover" 2>/dev/null; then
+                kill "$shots_leftover" 2>/dev/null || true
+                wait "$shots_leftover" 2>/dev/null || true
+            fi
+        done
         rm -rf "$SHOTS_TMP"
     }
     # On failure too: a throwaway server left running would hold the port and the next run would
@@ -441,6 +489,24 @@ id = "$SHOTS_CHANNEL"
 label = "lead team"
 writable = true
 
+# Pointed at the offline mock started above, NOT at ElevenLabs. The agent id and key are the mock's
+# own published constants; they authenticate against an account nobody owns and mean nothing
+# anywhere else. This is what makes the summary states reachable at all: there is one summariser
+# now, it is a conversation with an agent, and without a vendor to hold it every long message comes
+# back as a failure.
+[elevenlabs]
+agent_id = "agent_mock00000000000000000000000"
+api_key = "xi-mock-api-key-not-a-real-one"
+api_base = "http://127.0.0.1:$SHOTS_MOCK_HTTP_PORT/v1"
+
+# Three seconds, not the default thirty, and it is the whole reason the FAILURE state is
+# photographable in under a minute: the state that pictures a red row wedges the mock so that it
+# answers nothing at all, and the deadline is what turns that into a failure the page can draw.
+# It is folded into the summary cache key like everything else here, which costs nothing on a
+# store that is deleted with the run.
+[summaries]
+reply_timeout_seconds = 3
+
 # Storage inside the throwaway directory, which is removed with it. The harness drives real calls
 # through a real server, so without this line either the run would have no durable state to
 # photograph, or -- worse, if it inherited a real path -- it would write the screenshot script's
@@ -457,13 +523,16 @@ EOF
     step "Screenshots of /voice — free, offline, no vendor conversation and no microphone."
     note "theme:     ${SHOTS_THEME:-dark} (dark by default — it is the theme the phone is in)"
     note "server:    throwaway, native, --fake-discord, 127.0.0.1:$SHOTS_PORT (never 8080)"
+    note "vendor:    gent-talk-mock-elevenlabs on 127.0.0.1:$SHOTS_MOCK_HTTP_PORT (mint + control)"
+    note "           and 127.0.0.1:$SHOTS_MOCK_WS_PORT (conversations). Offline; nothing is billed."
     note "output:    $SHOTS_OUT"
     note "the running gent-talk, its config and its logs are not touched."
 
     if [ "$DRY_RUN" = 1 ]; then
         note "(dry run) cargo build --release --manifest-path $GENT_TALK_DIR/Cargo.toml"
+        note "(dry run) $GENT_TALK_DIR/target/release/gent-talk-mock-elevenlabs --scenario no_tool_call --http-port $SHOTS_MOCK_HTTP_PORT --ws-port $SHOTS_MOCK_WS_PORT --bridge-base http://127.0.0.1:$SHOTS_PORT --bridge-token <write token>"
         note "(dry run) $GENT_TALK_DIR/target/release/gent-talk --config $SHOTS_TMP/gent-talk.toml --fake-discord"
-        note "(dry run) $SHOTS_SCRIPT --url http://127.0.0.1:$SHOTS_PORT --channel $SHOTS_CHANNEL --out $SHOTS_OUT --theme ${SHOTS_THEME:-dark}"
+        note "(dry run) $SHOTS_SCRIPT --url http://127.0.0.1:$SHOTS_PORT --channel $SHOTS_CHANNEL --out $SHOTS_OUT --theme ${SHOTS_THEME:-dark} --mock-control http://127.0.0.1:$SHOTS_MOCK_HTTP_PORT"
         note "(dry run) nothing was built, started, or photographed."
         exit 0
     fi
@@ -473,6 +542,51 @@ EOF
         || die "the build failed, so there is no binary serving today's web/ to photograph."
     SHOTS_BIN="$GENT_TALK_DIR/target/release/gent-talk"
     [ -x "$SHOTS_BIN" ] || die "the build reported success but $SHOTS_BIN is not there."
+    SHOTS_MOCK_BIN="$GENT_TALK_DIR/target/release/gent-talk-mock-elevenlabs"
+    [ -x "$SHOTS_MOCK_BIN" ] || die "the build reported success but $SHOTS_MOCK_BIN is not there.
+That binary is the offline ElevenLabs substitute, and the summary states cannot be photographed
+without it: summaries come from a conversation with an agent and from nothing else."
+
+    step "Starting the offline ElevenLabs mock"
+    # BEFORE the server, so the server's own configuration points at something that is already
+    # listening. It costs nothing either way -- gent-talk opens no vendor connection at startup --
+    # but a mock that failed to bind is then a failure with its own message rather than a summary
+    # state timing out four minutes later.
+    #
+    # `no_tool_call` is the scenario that answers canned prose without calling anything, so this
+    # needs no MCP traffic back to the bridge. --bridge-base and --bridge-token are still required
+    # by the binary, and are given the throwaway server and its throwaway token: the token is on a
+    # command line, which everything else here refuses to do, and that is acceptable only because
+    # this particular credential is invented per run and authenticates nothing that exists.
+    (
+        cd "$SHOTS_TMP" || exit 1
+        exec "$SHOTS_MOCK_BIN" \
+            --scenario no_tool_call \
+            --http-port "$SHOTS_MOCK_HTTP_PORT" \
+            --ws-port "$SHOTS_MOCK_WS_PORT" \
+            --bridge-base "http://127.0.0.1:$SHOTS_PORT" \
+            --bridge-token "$SHOTS_WRITE_TOKEN" \
+            > "$SHOTS_TMP/mock-elevenlabs.log" 2>&1
+    ) &
+    SHOTS_MOCK_PID=$!
+
+    SHOTS_MOCK_UP=0
+    for _ in $(seq 1 60); do
+        if ! kill -0 "$SHOTS_MOCK_PID" 2>/dev/null; then break; fi
+        if curl -fsS -o /dev/null "http://127.0.0.1:$SHOTS_MOCK_HTTP_PORT/_mock/trace" 2>/dev/null; then
+            SHOTS_MOCK_UP=1
+            break
+        fi
+        sleep 0.5
+    done
+    if [ "$SHOTS_MOCK_UP" != 1 ]; then
+        echo "" >&2
+        echo "--- offline ElevenLabs mock output ---" >&2
+        cat "$SHOTS_TMP/mock-elevenlabs.log" >&2 || true
+        die "the offline ElevenLabs mock never answered on 127.0.0.1:$SHOTS_MOCK_HTTP_PORT.
+Its output is above. Without it every summary state is unreachable."
+    fi
+    note "mock up on 127.0.0.1:$SHOTS_MOCK_HTTP_PORT (pid $SHOTS_MOCK_PID)"
 
     step "Starting the throwaway server"
     (
@@ -507,7 +621,8 @@ EOF
         --url "http://127.0.0.1:$SHOTS_PORT" \
         --channel "$SHOTS_CHANNEL" \
         --out "$SHOTS_OUT" \
-        --theme "${SHOTS_THEME:-dark}" || rc=$?
+        --theme "${SHOTS_THEME:-dark}" \
+        --mock-control "http://127.0.0.1:$SHOTS_MOCK_HTTP_PORT" || rc=$?
     if [ "$rc" -ne 0 ]; then
         echo "" >&2
         echo "The screenshot run FAILED (exit $rc). Nothing above is evidence about how the page" >&2

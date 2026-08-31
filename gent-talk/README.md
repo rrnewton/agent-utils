@@ -54,8 +54,8 @@ Two things are worth knowing before you begin, because they shape everything els
 | **Per-request access log** | **works.** One INFO line per HTTP request, per MCP JSON-RPC message, and per tool call. No credential ever, no channel text above DEBUG. |
 | Discord read + post behind a trait | **written, unit-tested; never run against live Discord** |
 | In-memory Discord for tests and `--fake-discord` | **works** |
-| Digest / summarization | **works**, extractive and deterministic (no model call) |
-| Summaries from the ElevenLabs agent (`summaries.backend = "elevenlabs_agent"`) | **written, unit- and integration-tested offline, NEVER RUN AGAINST LIVE ELEVENLABS.** Asks the configured conversational agent in text over its own WebSocket, on a pooled conversation recycled every eight summaries. The frames were read out of the vendor's SDK; the offline tests drive the real socket client against this repository's own mock, which was written from the same reading, so the two agree with each other and not yet with ElevenLabs. Off by default. |
+| Digest (`/digest`) | **works**, extractive and deterministic (no model call). This is the whole-channel digest, not the per-message summary below. |
+| Per-message summaries, from the ElevenLabs agent | **written, unit- and integration-tested offline, NEVER RUN AGAINST LIVE ELEVENLABS — and it is now the only summariser there is.** Asks the configured conversational agent in text over its own WebSocket, on a pooled conversation recycled every eight summaries. The frames were read out of the vendor's SDK; the offline tests drive the real socket client against this repository's own mock, which was written from the same reading, so the two agree with each other and not yet with ElevenLabs. The extractive truncating summariser that used to be the default has been **deleted**, so there is nothing to fall back to: a deployment without ElevenLabs credentials still starts, and shows every long message as a **failed** summary — a red row — instead of handing you its opening lines and calling that a summary. |
 | Semantic random access (`resolve`) | **works**, lexical ranking behind a `Ranker` trait |
 | Web app: text tab, digest, find-a-message, local speech | **works** |
 | **MCP over Streamable HTTP at `/mcp`** | **works.** Bearer-authenticated, stateless, seven tools, tested end to end. Never yet driven by a real ElevenLabs agent. |
@@ -584,8 +584,8 @@ code path the startup probe uses, which is itself in the same position — see *
 | Summary threshold | `summaries.threshold_chars` | — | below this nothing is summarised, default `400` |
 | Summary width | `summaries.target_chars` | — | default `160` |
 | Summary context | `summaries.context_messages` | — | preceding messages shown as context, default `3` |
-| Summary model | `summaries.model` | `GENT_TALK_SUMMARY_MODEL` | no backend reads it yet; it only moves the cache key |
-| Summariser | `summaries.backend` | `GENT_TALK_SUMMARY_BACKEND` | `extractive` (default) or `elevenlabs_agent`; an unknown name is refused, not defaulted |
+| Summary model | `summaries.model` | `GENT_TALK_SUMMARY_MODEL` | nothing reads it; it only moves the cache key |
+| Summariser | — | — | **not a setting.** Summaries always come from the ElevenLabs agent in `[elevenlabs]`. `summaries.backend` / `GENT_TALK_SUMMARY_BACKEND` were removed with the extractive summariser: `extractive` is now refused at startup by name, `elevenlabs_agent` starts with a loud warning that it selects nothing, and anything else is refused as unknown. Delete the line |
 | Agent conversation budget | `summaries.max_per_socket` | — | summaries one conversation serves before it is recycled, default `8`, minimum 1 |
 | Agent conversation idle close | `summaries.socket_idle_seconds` | — | default `30` |
 | Agent turn deadline | `summaries.reply_timeout_seconds` | — | one turn, and one opening handshake, default `30`, minimum 1 |
@@ -610,9 +610,9 @@ question is a fresh Discord fetch, and it stays that way. There is exactly one s
   overlay `#50 todo-view` is built on. Two snowflakes and an instant per row, and **no message
   text at all**; and
 * **cached summaries** — one short line per long message, filed under the policy that produced
-  it. This is the one entry NOT authored by this server: with the shipped extractive backend a
-  summary is literally the opening of somebody else's message, so it is a second at-rest copy of
-  third-party text and is treated as one everywhere below; and
+  it. This is the one entry NOT authored by this server: a summary is a model's paraphrase of
+  somebody else's message, written from that message and from the messages around it, so it is a
+  second at-rest copy of third-party text and is treated as one everywhere below; and
 * **channel aliases** — what THIS app calls a channel, one row per configured channel at most.
   Ours and local in the same sense the read marks are: never sent to Discord, renaming nothing
   there. See "What to call a channel". `#39 channel-alias`.
@@ -704,13 +704,31 @@ plus Discord text written by third parties.
 
 ### Cached summaries
 
-`src/summarize/` is a second trait over the same store. Two backends implement it, chosen by
-`summaries.backend`, and the server says which one is running at startup; every summary answer
-carries the backend name, so a page can never imply a model summary it did not get.
+`src/summarize/` is a second trait over the same store. **One** implementation ships — the
+conversational agent named in `[elevenlabs]`, asked in text — and there is no setting that chooses
+it, because there is nothing to choose between. The server says what is running at startup, and
+every summary answer carries the summariser's name, so a page can never imply a model summary it
+did not get.
 
-* **`extractive`** (the default) — truncation, no model, no network, no cost. A deployment that
-  has never heard of ElevenLabs works, and nothing starts costing money because somebody upgraded.
-* **`elevenlabs_agent`** — the configured conversational agent, asked in text. See below.
+There used to be a second one, `extractive`, and it was the default: truncation, no model, no
+network, no cost. It has been **deleted**. It never comprehended anything — what it returned was
+the opening of the message it claimed to summarise, which is exactly what a collapsed row already
+shows you — so it was an intermediate step, not a product.
+
+`summaries.backend` and `GENT_TALK_SUMMARY_BACKEND` no longer select anything, but both are still
+READ, so that a configuration naming the removed summariser is answered rather than ignored.
+`extractive` is refused at startup, by name, saying it was removed and what runs instead.
+`elevenlabs_agent` — which one release ago was the documented way to ask for real summaries, and is
+therefore sitting in live configuration files — still boots, with a loud warning that the key is
+dead and should be deleted; refusing it would stop those servers for no behavioural gain, since it
+names exactly what they now get anyway. Anything else is refused as unknown.
+
+The consequence is worth stating plainly rather than leaving to be found: **the ElevenLabs
+credentials are now load-bearing for summaries.** Without them there is no summariser at all. The
+server still starts and says so; `/summary` then answers `503 summarizer_not_configured`, and
+`/voice` states the reason once above the list and turns the rows it asked about red. It does not
+fall back to truncation, because a silent fallback is indistinguishable from the agent answering
+badly. Regeneration also now costs vendor calls where it previously cost nothing.
 
 What is actually load-bearing here is the **cache key**, because a cached derived value has one
 failure mode and it is silent. What decides what a summary says is the prompt, whatever else the
@@ -727,18 +745,25 @@ else. That matters for the agent backend, whose answers depend on *which agent* 
 writing, and it lives outside `[summaries]` entirely. It goes into `policy_input`, so repointing
 the deployment cannot serve the old agent's summaries.
 
-The version is deliberately legible (`v1-extractive-w3-c160-8f1b…`), because a stale entry is
+The version is deliberately legible (`v1-elevenlabs-agent-w3-c160-8f1b…`), because a stale entry is
 diagnosed by someone with a shell. It is FNV-1a and is **not** a security hash: it detects a
 configuration change, and nothing more.
+
+Deleting the extractive summariser moved that string three ways at once — the slug, the policy
+input, and the removal of the old `backend` term from the hash — so **the first start after this
+change empties the summaries table**. That is the sweep working, not a bug: re-serving an
+extractive prefix under an agent key is precisely the silent stale summary the version exists to
+prevent. The number swept is logged at INFO at startup and nothing else announces it.
 
 A summariser is a model being fed channel text, so the request goes through `src/untrusted.rs`
 exactly as the MCP path does — the instruction outside the fence, the message inside it. That is
 structural rather than a convention: `SummaryRequest` holds the built prompt in a private field
 and the only constructor builds it through `untrusted::fenced`, so a backend cannot be handed
 channel text that was never framed, and a test reads back what the summariser was actually given
-rather than rebuilding it. The shipped extractive backend uses neither the prompt nor the context
-— it talks to no model, so there is nothing to fence it against — and both ride along for the
-backend that replaces it. Being short is not an exemption.
+rather than rebuilding it. The fence is not decoration here: the summariser really is a model
+reading other people's text, so the instruction it is given and the surrounding messages it is
+given are two different kinds of input and are framed as two different kinds of input. Being short
+is not an exemption.
 
 A cached summary is a second at-rest copy of other people's text under the same file, with the
 same `0600`. It is bounded by the same retention, it goes with the rest on a purge, and it is
@@ -748,10 +773,12 @@ voice agent, and a durable write reachable from it is what the two-token split e
 
 ### Summaries from the ElevenLabs agent
 
-> **Nothing in this section has been run against live ElevenLabs.** The protocol was read out of
-> the vendor's SDK. Every offline test drives the real socket client against this repository's own
-> mock, which was written from the same reading — so the two agree with each other, not with the
-> vendor. The first real conversation is the experiment, and it is instrumented to be one.
+> **Nothing in this section has been run against live ElevenLabs**, and this section is now the
+> whole of message summarisation — there is no second summariser and no setting that selects one.
+> The protocol was read out of the vendor's SDK. Every offline test drives the real socket client
+> against this repository's own mock, which was written from the same reading — so the two agree
+> with each other, not with the vendor. The first real conversation is the experiment, and it is
+> instrumented to be one.
 
 There is no REST endpoint for "send this text to my agent, get text back". `simulate_conversation`
 looks like the missing one and is not: it is deprecated, and what it simulates is the *user*. The
@@ -1362,18 +1389,33 @@ Four properties, all of them about cost rather than about appearance, and all of
   exactly like a record written before the request. The forty-five-second background poll, which
   replaces every row on screen, also buys nothing a second time.
 - **Only what you are looking at.** Rows are asked about as they come near the viewport, so
-  nothing is spent on messages nobody scrolls to.
+  nothing is spent on messages nobody scrolls to. And when the server answers that it has **no
+  summariser configured at all**, the page stops asking entirely: that is a fact about the
+  deployment, not about the row, and one request settles it for the whole view rather than one
+  per row — each of which carries a Discord window fetch behind it.
 - **The page names the summariser it actually got**, quoting the server's own answer at the head
-  of the view. The shipped backend truncates — no model, no comprehension — and showing its output
-  without saying so would be claiming a reading nobody paid for. `web/voice.js` contains no
-  backend name of its own, which is asserted, because a constant here would outlive the deployment
-  it described.
+  of the view. Showing a model's paraphrase of somebody else's message without saying where it
+  came from would be claiming a reading the reader cannot check. `web/voice.js` contains no
+  summariser name of its own, which is asserted, because a constant here would outlive the
+  deployment it described.
 
 Two answers are deliberately different. `below_threshold` is the **server's** own, stricter
-threshold saying the message is short enough to read as it is: settled, never asked again, and the
-row keeps its opening lines. Anything else without usable text is a **failure**: the row falls back
-the same way, the strip says so once, the error panel is not raised for one row out of fifty — and
-leaving the mode and re-entering it retries it, because a failure is not a verdict.
+threshold saying the message is short enough to read as it is: settled, never asked again, the row
+keeps its opening lines, and it is **not** drawn as a failure. Anything else without usable text
+is a **failure**, and a failure is now visible: the row keeps the message — that is the one thing
+the reader still has — and is tinted **red**, with the words `summary failed` where the summary
+would have been and the reason on the row itself. The words matter as much as the colour, because
+a colour is not reachable by a screen reader.
+
+Red means "a summary was attempted for this row and it failed", whatever the reason — including a
+server with no ElevenLabs credentials, which is a failure the reader is entitled to see rather
+than a quiet sentence they will scroll past. Rows that were never asked about stay plain. Fifty
+failures produce **one** status message with a count, not fifty; the sticky error panel is not
+raised for a summary failure at all, because taking the channel away is a worse outcome than a red
+row; and the deployment-level reason is stated once above the list, where a permanent fact belongs
+rather than in a strip that fades after six seconds. Leaving the mode and re-entering it retries
+an ordinary failure, because a failure is not a verdict — but it does not re-fire one doomed
+request per row at a server that has already said it has no summariser.
 
 Entering the mode changes the height of every row on screen at once and adds a sentence above the
 list, which is the mutation browser scroll anchoring does not cover. It goes through the anchor
@@ -2401,7 +2443,7 @@ layout facts and a fixture with no layout engine has no opinion about them.
 scripts/run.sh --screenshots
 ```
 
-Photographs the `/voice` page in the thirty-four states that look different — signed out, idle, live
+Photographs the `/voice` page in the thirty-five states that look different — signed out, idle, live
 call, muted, the agent's voice silenced, just after a hang-up, the end-of-call seam with its
 disclosure open, the clear control armed, settings, the Discord view, a long transcript parked
 mid-scroll, that same list with one folded answer opened among the closed ones, the moment a turn
@@ -2416,7 +2458,9 @@ SERVER pushed it rather than because the page asked, a resumed call whose recons
 only partial and says so, the channel picker on the bar with the history walked back several
 pages, the channel pulled down past the point where letting go refreshes it, the channel with its
 collapsed rows summarised instead of clipped, the channel filtered to what has not been dealt
-with, and the bulk clear saying how many it is about to take — at four viewports: a tall phone, a
+with, the bulk clear saying how many it is about to take, and the same summary mode when the
+summariser FAILS — the row red, saying so in words, with the message still under it — at four
+viewports: a tall phone, a
 short phone, a small laptop window and a maximised desktop. It prints the absolute path of every
 image so an agent can open them directly.
 
@@ -2436,16 +2480,26 @@ page nobody actually looks at. Contrast between the two speakers is exactly what
 the swap. `--theme light` or `--theme both` when you want
 the other one.
 
-It costs nothing and needs no hardware. The conversation WebSocket is replaced before any page
-script runs, and the mint request to `/api/v1/signed-url` is answered locally, so the live-call
-states are reached without ElevenLabs being contacted. (That in-page wire fake is on its way out:
-`src/elevenlabs/mock/` is a real loopback vendor — a real mint endpoint and a real socket — and
-the cargo suite already uses it. Pointing this harness at it, so the photographed states depend on
-a real handshake rather than a page-local stub, is the remaining half of #57 elevenlabs-mock.)
-The microphone is Chromium's own fake capture device, so `getUserMedia`, the AudioContext and the
-real capture graph all still run. It
-stands up its own throwaway native server with `--fake-discord` on port 18091 and stops it again,
-including on failure — it refuses port 8080 by name, because that is the live deployment.
+It costs nothing and needs no hardware. For the **live-call** states the conversation WebSocket is
+replaced before any page script runs, and the mint request to `/api/v1/signed-url` is answered
+locally, so those are reached without ElevenLabs being contacted. The microphone is Chromium's own
+fake capture device, so `getUserMedia`, the AudioContext and the real capture graph all still run.
+
+For the two **summary** states there is no page-local stub at all, and there cannot be: summaries
+come from a conversation with the ElevenLabs agent and from nothing else, so a harness with no
+vendor behind it cannot photograph a summarised channel. `scripts/run.sh --screenshots` therefore
+starts `gent-talk-mock-elevenlabs` — this repository's own loopback vendor, a real mint endpoint
+and a real conversation socket — on the two ports above the server's, points the throwaway
+config's `elevenlabs.api_base` at it, and passes the harness `--mock-control` so the states can
+drive it. One asks for a working summariser and photographs the summarised channel; the other
+wedges the same mock so it answers nothing, and photographs the **red** failed row. Those two
+frames are therefore evidence about the real socket client and the real cache, not about a stub.
+That is most of the remaining half of `#57 elevenlabs-mock`; the live-call states are what is
+left. Both processes are stopped by the same trap, including on failure.
+
+It stands up its own throwaway native server with `--fake-discord` on port 18091 and stops it
+again, including on failure — it refuses port 8080 by name, because that is the live deployment,
+and it refuses a `--port` that would put the mock on 8080 or on the CI container's 18081.
 
 The two ways a screenshot harness lies are both closed, and both were verified by mutation:
 
@@ -2484,7 +2538,7 @@ transcript on screen" was a requirement nothing stated. The three transcript sta
 list they photograph, through one shared act, and `--self-test` checks that they still do.
 `#74 scroll-test-strength`.
 
-`scripts/screenshots.py --self-test` runs 48 controls for those checks offline, with no browser and
+`scripts/screenshots.py --self-test` runs 52 controls for those checks offline, with no browser and
 no server; `scripts/test-run-sh.sh` runs them as part of its own suite. Screenshots are written to
 the gitignored `debug/screenshots/` and are never committed. Playwright and its Chromium are the
 only requirement, and a missing one fails by name with the install command.
@@ -2502,7 +2556,8 @@ src/access.rs         the access log: what one line says, and what it must never
 src/model.rs          Message/Channel types, snowflake ordering
 src/discord/          the DiscordClient trait, the live HTTP client, the in-memory fake
 src/discord/ratelimit.rs  Retry-After, the X-RateLimit-* buckets, and the bounded wait-and-retry
-src/summary.rs        extractive digest lines
+src/summary.rs        the extractive digest/preview helper (NOT a summariser: it also flattens
+                      the agent's own reply)
 src/retrieval.rs      semantic random access, behind the Ranker trait
 src/untrusted.rs      the data-not-instructions boundary
 src/ops.rs            the operations both front doors share: allowlist, fetch, transform
@@ -2517,7 +2572,8 @@ src/mcp/mod.rs        the tool manifest and per-tool approval policy
 src/mcp/protocol.rs   JSON-RPC 2.0 and the MCP method set
 src/mcp/transport.rs  the Streamable HTTP endpoint at /mcp
 src/store/            the StateStore trait, the SQLite backend, the fake, the refusing one
-src/summarize/        the Summarizer trait, the extractive backend, the counting fake, the cache key
+src/summarize/        the Summarizer trait, the ElevenLabs agent summariser, the counting fake,
+                      the cache key
 src/agent_backend.rs  the slow-path seam
 src/http/             router, handlers, and the access-log middleware
 web/                  the phone app and the /voice page (plain HTML/CSS/JS, no framework, no build step)
@@ -2576,12 +2632,16 @@ Beyond the security list above:
   are unreachable; there is no pagination and no store.
 * Ranking is lexical. It matches words, not meaning, so a paraphrase with no shared words will miss.
   The `Ranker` trait is the replacement point.
-* Summarization is extractive truncation, not a model. It shortens; it does not comprehend. The
-  `Summarizer` trait, the policy-versioned cache and the `/summary` route are in place and
-  tested; **no model backend is wired to them yet**, so `summaries.model` is recorded in the
-  cache key and otherwise unused, and **no page requests a summary**. `#49 cached-summaries` is
-  therefore the server half of that issue and not the whole of it: the seam, the key, the
-  invalidation, the bounds and the sweep are done; the thing a person would see is not.
+* **The only summariser has never met live ElevenLabs, and it is now the default path.** Every
+  per-message summary is a real conversation with the configured agent; the extractive truncating
+  fallback is gone. What has been exercised is the socket client against this repository's own
+  mock, written from the same reading of the vendor's SDK — so the two agree with each other and
+  not yet with the vendor. Until somebody runs it for real, the summary feature is unproven on
+  every deployment, not just on the ones that opted in.
+* **A deployment with no ElevenLabs credentials shows every long row as failed.** It starts, it
+  warns, and it says so on the page — but the cache stays empty forever and there is no reduced
+  service to fall back on. `summaries.model` is still recorded in the cache key and read by
+  nothing, which is the last vestige of a selector that no longer exists.
 * No caching of channel content: every question is a fresh Discord fetch. Obeying `Retry-After`
   does not change that — it buys time, not quota, so a poll interval still spends one request per
   channel whether or not anybody is listening. That is why `discord.live_poll_seconds` still

@@ -2432,3 +2432,125 @@ async fn an_empty_with_parameter_is_read_as_no_other_messages() {
         assert_eq!(status, StatusCode::OK, "{query} was refused: {payload}");
     }
 }
+
+// --- what a failed summary looks like on the wire ------------------------------------------------
+//
+// The browser paints a row RED off exactly these two answers, so both the status and the machine
+// code are load-bearing contract rather than incidental. Nothing pinned either of them before:
+// every summary test above asserts on a summary that arrived.
+
+/// A summariser that cannot be reached answers 503 `summarizer_error`, not 200 with no summary.
+#[tokio::test]
+async fn a_summariser_that_fails_answers_503_with_a_machine_code_and_a_reason() {
+    let summarizer = Arc::new(gent_talk::summarize::fake::FakeSummarizer::new());
+    let (state, discord, _store) = gent_talk::testing::state_with_backend(
+        &gent_talk::testing::config_toml(),
+        Arc::clone(&summarizer) as Arc<dyn gent_talk::summarize::Summarizer>,
+    );
+    let harness = Harness {
+        router: router(state),
+        discord,
+        elevenlabs: None,
+    };
+    let id = harness
+        .discord
+        .seed(
+            &ChannelId(WRITE_CHANNEL.to_owned()),
+            "codex-eng",
+            &"the mac runner went offline mid-deploy and nothing reported. ".repeat(12),
+        )
+        .0;
+    let uri = format!("/api/v1/channels/{WRITE_CHANNEL}/messages/{id}/summary");
+
+    summarizer.fail_next("the model host is down");
+    let (status, payload) = call(&harness, "GET", &uri, Some(READ_TOKEN), None).await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a failed summary answered {status}; a 200 with no summary is indistinguishable from a \
+         message that was too short to need one: {payload}"
+    );
+    assert_eq!(
+        payload["error"], "summarizer_error",
+        "the page branches on this code, never on the prose: {payload}"
+    );
+    assert!(
+        payload["detail"]
+            .as_str()
+            .is_some_and(|d| !d.trim().is_empty()),
+        "a red row with no reason is the 'unavailable' this whole error taxonomy replaces: \
+         {payload}"
+    );
+    assert!(
+        payload["summary"].is_null(),
+        "a failure must not carry a summary field a caller could render: {payload}"
+    );
+
+    // THE CONTROL. `fail_next` is one-shot, so the very next ask succeeds — without this, the
+    // assertions above are satisfied by a route that can never answer at all, and by a page that
+    // would then be right to give up permanently.
+    let (status, payload) = call(&harness, "GET", &uri, Some(READ_TOKEN), None).await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    assert_eq!(payload["state"], "generated", "{payload}");
+}
+
+/// A deployment with no ElevenLabs credentials answers 503 `summarizer_not_configured`, by name.
+#[tokio::test]
+async fn an_unconfigured_summariser_answers_503_and_names_the_setting_to_add() {
+    // Built the way a real unconfigured deployment is: the SHIPPED summariser, over a vendor that
+    // is never dialled, on a configuration with no `[elevenlabs]` section. A `FakeSummarizer`
+    // hand-primed to return `NotConfigured` would assert the same JSON while proving nothing
+    // about whether an unconfigured server actually reaches that code.
+    let vendor = Arc::new(gent_talk::elevenlabs::fake::FakeElevenLabs::new());
+    let summarizer = gent_talk::summarize::summarizer_for(
+        &gent_talk::config::ElevenLabsConfig::default(),
+        &gent_talk::config::SummariesConfig::default(),
+        Arc::clone(&vendor) as Arc<dyn gent_talk::elevenlabs::TextChatProvider>,
+    );
+    let (state, discord, _store) = gent_talk::testing::state_with_backend(
+        &gent_talk::testing::config_toml_without_elevenlabs(),
+        summarizer,
+    );
+    let harness = Harness {
+        router: router(state),
+        discord,
+        elevenlabs: None,
+    };
+    let id = harness
+        .discord
+        .seed(
+            &ChannelId(WRITE_CHANNEL.to_owned()),
+            "codex-eng",
+            &"the mac runner went offline mid-deploy and nothing reported. ".repeat(12),
+        )
+        .0;
+
+    let (status, payload) = call(
+        &harness,
+        "GET",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/messages/{id}/summary"),
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "an unconfigured summariser answered {status}: {payload}"
+    );
+    assert_eq!(
+        payload["error"], "summarizer_not_configured",
+        "a deployment-level absence must be distinguishable from a vendor that failed once — the \
+         page stops asking on this code and keeps retrying on the other: {payload}"
+    );
+    assert!(
+        payload["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("elevenlabs.api_key")),
+        "the detail has to name the setting to add: {payload}"
+    );
+    assert!(
+        vendor.chats().is_empty(),
+        "an unconfigured server dialled the vendor anyway"
+    );
+}

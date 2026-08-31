@@ -188,10 +188,17 @@
               <!--
                 `#49 cached-summaries`. Present only while summary mode is on, and it says the one
                 thing the collapsed rows cannot say for themselves: WHO wrote the short line you
-                are reading. The shipped summariser truncates — no model, no network — and a page
-                that showed its output without naming it would be implying a comprehension nobody
-                paid for. The backend is quoted from the server's own answer rather than guessed
-                here, so it cannot describe a summariser this deployment does not run.
+                are reading. There IS a comprehension being paid for now — every one of those lines
+                is a model's paraphrase, bought per summary — so naming its author is the
+                difference between quoting a machine and appearing to quote the person. The backend
+                is quoted from the server's own answer rather than guessed here, so it cannot
+                describe a summariser this deployment does not run.
+
+                It carries the other standing fact too: a server with no summariser configured
+                cannot make ANY of these lines, which is a permanent condition and belongs in a
+                sentence that stays on screen rather than in a status pill that erases itself.
+                `data-unavailable` is what web/voice.css colours that case by; see there for why a
+                quiet grey hint was not enough.
               -->
               <p id="summary-note" class="hint" hidden></p>
 

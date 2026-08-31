@@ -1,12 +1,17 @@
 //! Turning one long channel message into one short line, behind a trait — and a cache key that
 //! knows when it has gone stale.
 //!
-//! [`crate::summary`] already condenses a message by truncating it. That is honest and it is
-//! free, but it does not comprehend: a wall of text becomes the first 160 characters of a wall of
-//! text. This module is the seam where something that *does* comprehend can be substituted, and
-//! the reason it exists as a trait rather than as a function is the same reason
-//! [`crate::store::StateStore`] does — the shipped implementation is not the interesting one, the
-//! ability to replace it without touching a call site is.
+//! There is ONE shipped summariser, [`agent::AgentSummarizer`], and it asks the deployment's
+//! ElevenLabs conversational agent. A truncating stand-in used to live here beside it and has been
+//! deleted: it comprehended nothing — a wall of text became the first 160 characters of a wall of
+//! text — and the page already shows a clamped prefix under the collapsed state, so it produced
+//! nothing the reader did not already have while making "summarised" mean two different things.
+//! Without ElevenLabs credentials there is therefore no summary at all: every request fails,
+//! loudly and by name, and the page paints those rows as failed. See [`summarizer_for`].
+//!
+//! The trait survives the deletion for the reason [`crate::store::StateStore`] does — a second
+//! backend must be substitutable without a call site changing, and the tests need one that counts
+//! (see [`fake::FakeSummarizer`]).
 //!
 //! # The trap this module exists to close
 //!
@@ -28,60 +33,44 @@
 //! held is structural rather than by convention: [`SummaryRequest`] has a PRIVATE `prompt` field
 //! and only [`SummaryRequest::new`] can fill it, so there is no way to construct the value a
 //! summariser is handed without building the prompt through [`crate::untrusted::fenced`] on the
-//! way. A backend that talks to a model sends [`SummaryRequest::prompt`]; a backend that does not
+//! way. The shipped backend sends [`SummaryRequest::prompt`]; the counting fake used by the tests
 //! ignores it. Either way the fence is not something a call site can forget. A summary is still
 //! third-party text when it comes back.
 
 pub mod agent;
-pub mod extractive;
 pub mod fake;
+
+use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::config::SummariesConfig;
+use crate::config::{ElevenLabsConfig, SummariesConfig};
+use crate::elevenlabs::TextChatProvider;
 use crate::model::Message;
 
-/// Which summariser a deployment has asked for.
+/// Build the summariser this server actually runs.
 ///
-/// Configuration rather than a compile-time choice, and **extractive is the default**: a
-/// deployment that has never heard of ElevenLabs must keep working, and paying a vendor for
-/// something truncation already does adequately is not a thing that should happen because someone
-/// upgraded.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Backend {
-    /// [`extractive::ExtractiveSummarizer`]: truncation, no model, no network, no cost.
-    #[default]
-    Extractive,
-    /// [`agent::AgentSummarizer`]: the configured ElevenLabs conversational agent, over its
-    /// text-only WebSocket.
-    ElevenLabsAgent,
-}
-
-impl Backend {
-    /// The name an operator writes in the configuration file.
-    #[must_use]
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Extractive => "extractive",
-            Self::ElevenLabsAgent => "elevenlabs_agent",
-        }
-    }
-
-    /// Every backend, so a refusal can list what it would have accepted.
-    #[must_use]
-    pub fn all() -> &'static [Self] {
-        &[Self::Extractive, Self::ElevenLabsAgent]
-    }
-
-    /// Parse a name, or `None`.
-    ///
-    /// Unknown names are refused rather than defaulted to extractive: a typo that silently
-    /// selected truncation would present as "the agent backend does not work", which is the most
-    /// expensive possible way to discover a spelling mistake.
-    #[must_use]
-    pub fn from_name(name: &str) -> Option<Self> {
-        Self::all().iter().copied().find(|b| b.name() == name)
-    }
+/// **The one construction point**, called by `main` and by the tests that have to reproduce what
+/// `main` built. There is no choice to make — the deployment's ElevenLabs agent is the only
+/// summariser — and the reason this is a function rather than three lines at the call site is the
+/// cache key: [`policy_version_for`] takes both of its halves off the summariser, so a test that
+/// rebuilt the summariser by hand and got one detail wrong would compute a key the binary never
+/// writes and then fail as though the sweep were broken.
+///
+/// Builds no connection and reads no credential, so a deployment with an empty `[elevenlabs]`
+/// section still starts. It fails per request instead, with
+/// [`SummaryError::NotConfigured`] naming the absent setting.
+#[must_use]
+pub fn summarizer_for(
+    elevenlabs: &ElevenLabsConfig,
+    summaries: &SummariesConfig,
+    chats: Arc<dyn TextChatProvider>,
+) -> Arc<dyn Summarizer> {
+    Arc::new(agent::AgentSummarizer::new(
+        chats,
+        elevenlabs.clone(),
+        agent::PoolPolicy::from_config(summaries),
+    ))
 }
 
 /// The framing every summariser is given.
@@ -194,18 +183,17 @@ pub trait Summarizer: Send + Sync {
     /// The slug this backend contributes to [`policy_version`].
     ///
     /// On the trait rather than beside the constructor because it used to be beside the
-    /// constructor, in `main`, where selecting a second backend meant remembering to change a
-    /// second line — and a cache key that still said `extractive` while a model was answering is
-    /// the silent-stale-summary failure with the labels swapped.
+    /// constructor, in `main`, where substituting a backend meant remembering to change a second
+    /// line — and a cache key naming a backend that is not the one answering is the
+    /// silent-stale-summary failure with the labels swapped.
     fn backend(&self) -> &'static str;
 
     /// Everything else this backend contributes to [`policy_version`].
     ///
-    /// The default is [`PROMPT`], which is all a backend that sends nothing else has to declare.
-    /// A backend with its own instructions, or whose answers depend on something outside
-    /// [`SummariesConfig`] — the identity of a remote agent, say — returns that here, because
-    /// otherwise changing it leaves every summary produced under the old one being served
-    /// forever.
+    /// The default is [`PROMPT`] alone, which today describes only the test fake: the shipped
+    /// backend has its own instructions and an agent identity that lives outside
+    /// [`SummariesConfig`], and it overrides this so that changing either one stops the old
+    /// summaries being served forever.
     fn policy_input(&self) -> &str {
         PROMPT
     }
@@ -228,7 +216,7 @@ pub trait Summarizer: Send + Sync {
 /// the fix is a real hash, not a longer FNV.
 ///
 /// Rendered readably on purpose: a stale entry on disk is diagnosed by looking at the path it is
-/// under, so `v1-extractive-w3-c160-8f1b...` has to be legible to a person with a shell.
+/// under, so `v1-elevenlabs-agent-w3-c160-8f1b...` has to be legible to a person with a shell.
 #[must_use]
 pub fn policy_version(config: &SummariesConfig, backend: &str) -> String {
     policy_version_of(PROMPT, config, backend)
@@ -260,7 +248,6 @@ pub fn policy_version_of(prompt: &str, config: &SummariesConfig, backend: &str) 
         &config.target_chars.to_string(),
         &config.context_messages.to_string(),
         &config.threshold_chars.to_string(),
-        config.backend.name(),
         // How many summaries share one conversation decides how much of the PREVIOUS summaries
         // the agent still has in front of it when it writes this one, so it changes the wording
         // — see `agent::DEFAULT_MAX_PER_SOCKET`. So does the idle timeout, which is the other way
@@ -317,8 +304,9 @@ mod tests {
         // The one test that stops the silent-stale-summary failure. Each case moves exactly one
         // input and requires the version to move with it; the list is exhaustive over
         // `SummariesConfig` on purpose, because a field added later without a line here is a
-        // field the cache cannot see.
-        let base = policy_version(&config(), "extractive");
+        // field the cache cannot see. (`SummariesConfig` no longer has a backend field: there is
+        // one summariser, and the slug it contributes is the separate `backend` case below.)
+        let base = policy_version(&config(), agent::BACKEND);
 
         let mut wider = config();
         wider.target_chars += 1;
@@ -328,8 +316,6 @@ mod tests {
         lower_threshold.threshold_chars += 1;
         let mut with_model = config();
         with_model.model = Some("some-model".to_owned());
-        let mut other_backend = config();
-        other_backend.backend = Backend::ElevenLabsAgent;
         let mut deeper_socket = config();
         deeper_socket.max_per_socket += 1;
         let mut longer_idle = config();
@@ -338,31 +324,27 @@ mod tests {
         longer_deadline.reply_timeout_seconds += 1;
 
         for (what, changed) in [
-            ("target_chars", policy_version(&wider, "extractive")),
+            ("target_chars", policy_version(&wider, agent::BACKEND)),
             (
                 "context_messages",
-                policy_version(&more_context, "extractive"),
+                policy_version(&more_context, agent::BACKEND),
             ),
             (
                 "threshold_chars",
-                policy_version(&lower_threshold, "extractive"),
+                policy_version(&lower_threshold, agent::BACKEND),
             ),
-            ("model", policy_version(&with_model, "extractive")),
-            (
-                "summaries.backend",
-                policy_version(&other_backend, "extractive"),
-            ),
+            ("model", policy_version(&with_model, agent::BACKEND)),
             (
                 "max_per_socket",
-                policy_version(&deeper_socket, "extractive"),
+                policy_version(&deeper_socket, agent::BACKEND),
             ),
             (
                 "socket_idle_seconds",
-                policy_version(&longer_idle, "extractive"),
+                policy_version(&longer_idle, agent::BACKEND),
             ),
             (
                 "reply_timeout_seconds",
-                policy_version(&longer_deadline, "extractive"),
+                policy_version(&longer_deadline, agent::BACKEND),
             ),
             ("backend", policy_version(&config(), "http")),
         ] {
@@ -380,13 +362,13 @@ mod tests {
         // dropped `PROMPT` would move for every OTHER change and still serve text produced under
         // an instruction that no longer exists.
         assert_ne!(
-            policy_version_of("say it in one line", &config(), "extractive"),
-            policy_version_of("say it in two lines", &config(), "extractive"),
+            policy_version_of("say it in one line", &config(), agent::BACKEND),
+            policy_version_of("say it in two lines", &config(), agent::BACKEND),
             "changing the instruction left the cache key unchanged"
         );
         assert_eq!(
-            policy_version_of(PROMPT, &config(), "extractive"),
-            policy_version(&config(), "extractive"),
+            policy_version_of(PROMPT, &config(), agent::BACKEND),
+            policy_version(&config(), agent::BACKEND),
             "the shipped version must be the one built from the shipped prompt"
         );
     }
@@ -396,15 +378,21 @@ mod tests {
         // The other half: a version that moved on its own would empty the cache on every restart
         // and make the whole mechanism a cost with no benefit.
         assert_eq!(
-            policy_version(&config(), "extractive"),
-            policy_version(&config(), "extractive")
+            policy_version(&config(), agent::BACKEND),
+            policy_version(&config(), agent::BACKEND)
         );
     }
 
     #[test]
     fn the_version_is_legible_to_someone_with_a_shell() {
-        let rendered = policy_version(&config(), "extractive");
-        assert!(rendered.starts_with("v1-extractive-w"), "{rendered}");
+        // The expected prefix is BUILT from the slug the backend supplies, never written out as a
+        // literal: a literal would keep passing after the rendered prefix and the hashed slug
+        // drifted apart, which is precisely the mismatch that makes a cache key unreadable.
+        let rendered = policy_version(&config(), agent::BACKEND);
+        assert!(
+            rendered.starts_with(&format!("v1-{}-w", agent::BACKEND)),
+            "{rendered}"
+        );
         assert!(
             rendered.contains(&format!("c{}", config().target_chars)),
             "{rendered}"
@@ -475,27 +463,32 @@ mod tests {
                 unreachable!("this one never runs")
             }
         }
+        /// The same slug, DIFFERENT instructions. The one that catches a `policy_version_for`
+        /// that folds in only the slug — which is the shape the whole cache key is prone to.
+        struct Quiet;
+        #[async_trait]
+        impl Summarizer for Quiet {
+            fn describe(&self) -> &'static str {
+                "a summariser with instructions of its own, but quieter"
+            }
+            fn backend(&self) -> &'static str {
+                "loud"
+            }
+            fn policy_input(&self) -> &str {
+                "whisper it"
+            }
+            async fn summarize(&self, _: &SummaryRequest<'_>) -> Result<String, SummaryError> {
+                unreachable!("this one never runs either")
+            }
+        }
         assert_eq!(
             policy_version_for(&config(), &Loud),
             policy_version_of("shout it", &config(), "loud")
         );
         assert_ne!(
             policy_version_for(&config(), &Loud),
-            policy_version_for(&config(), &extractive::ExtractiveSummarizer),
+            policy_version_for(&config(), &Quiet),
             "two backends with different instructions must not share a cache"
         );
-    }
-
-    #[test]
-    fn the_default_backend_is_the_one_that_needs_no_vendor() {
-        assert_eq!(Backend::default(), Backend::Extractive);
-        for backend in Backend::all() {
-            assert_eq!(Backend::from_name(backend.name()), Some(*backend));
-        }
-        // Refused rather than defaulted: a typo that silently selected truncation presents as
-        // "the agent backend does not work".
-        assert_eq!(Backend::from_name("elevenlabs-agent"), None);
-        assert_eq!(Backend::from_name("Extractive"), None);
-        assert_eq!(Backend::from_name(""), None);
     }
 }

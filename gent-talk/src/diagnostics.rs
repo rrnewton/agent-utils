@@ -295,6 +295,7 @@ pub async fn run(state: &AppState) -> DiagnosticsReport {
     );
     checks.push(voice);
 
+    checks.push(summaries(state));
     checks.push(storage(state, &deadline).await);
 
     let checks: Vec<CheckReport> = checks
@@ -446,6 +447,33 @@ fn elevenlabs_voice(state: &AppState, profile: Option<&AgentProfile>, agent: &Di
     Check::new("elevenlabs.voice", "Read-aloud voice", diagnosis)
 }
 
+/// Can this deployment summarise anything at all?
+///
+/// No vendor call of its own — the key and the agent already have rows above, and asking a third
+/// time would spend a request to learn the same thing. What this row adds is the CONSEQUENCE,
+/// which neither of those rows states: there is exactly one summariser and it is the ElevenLabs
+/// agent, so a deployment without credentials does not get shorter summaries, it gets none, and
+/// every long row on `/voice` shows as failed. Before the extractive backend was removed the
+/// honest answer here was "summaries still work, without a model", and a reader who remembers
+/// that needs to be told it changed.
+///
+/// [`crate::elevenlabs::credentials`] rather than `speech_key`: a summary needs the agent id as
+/// well as the account key, and read-aloud does not.
+fn summaries(state: &AppState) -> Check {
+    let diagnosis = match crate::elevenlabs::credentials(&state.config.elevenlabs) {
+        Err(SignedUrlError::NotConfigured(setting)) => Diagnosis::NotConfigured(setting),
+        // `credentials` returns exactly one variant on failure. Anything else is a change in that
+        // function, and calling it unconfigured would be a guess.
+        Err(other) => Diagnosis::Unintelligible(other.to_string()),
+        Ok(_) => Diagnosis::Confirmed(format!(
+            "summaries are produced by {}, under policy version {}",
+            state.summarizer.describe(),
+            state.summary_version
+        )),
+    };
+    Check::new("summaries", "Message summaries", diagnosis)
+}
+
 /// Can the durable store be written to? Without writing to it.
 async fn storage(state: &AppState, deadline: &Deadline) -> Check {
     let diagnosis = match within(deadline, state.store.check_writable()).await {
@@ -483,8 +511,73 @@ mod tests {
         let report = run(&state).await;
         assert!(report.ok, "{:#?}", report.checks);
         assert_eq!(report.failed, 0);
-        // One token check, two channels, key, agent, voice, storage.
-        assert_eq!(report.checks.len(), 7, "{:#?}", report.checks);
+        // One token check, two channels, key, agent, voice, summaries, storage.
+        assert_eq!(report.checks.len(), 8, "{:#?}", report.checks);
+    }
+
+    #[tokio::test]
+    async fn a_deployment_with_no_credentials_is_told_it_cannot_summarise_at_all() {
+        // The row exists because the consequence changed and nothing else in this report says so:
+        // there is one summariser, it is the ElevenLabs agent, and without credentials the answer
+        // is not "shorter summaries" but "no summaries, and every long row shows as failed".
+        let (state, _discord, _vendor) =
+            testing::state_from_toml(&testing::config_toml_without_elevenlabs());
+        let report = run(&state).await;
+        let row = report
+            .checks
+            .iter()
+            .find(|c| c.id == "summaries")
+            .unwrap_or_else(|| panic!("no summaries row at all: {:#?}", report.checks));
+        assert_eq!(row.status, Status::Fail, "{row:#?}");
+        assert!(
+            row.unconfigured,
+            "an absent setting must not be reported as a vendor that said no: {row:#?}"
+        );
+        assert!(
+            row.remedy
+                .as_deref()
+                .is_some_and(|r| r.contains("elevenlabs.api_key")),
+            "the remedy has to name the setting to add: {row:#?}"
+        );
+
+        // A key with NO AGENT. This is not the same absence: read-aloud works in this state, so a
+        // check written against `speech_key` — which is what the key row above uses — would call
+        // this green while every summary still failed. A summary needs an agent to ask.
+        let keyed = testing::config_toml_without_elevenlabs()
+            + "\n[elevenlabs]\napi_key = \"xi-a-key-with-nothing-to-ask\"\n";
+        let (state, _discord, _vendor) = testing::state_from_toml(&keyed);
+        let report = run(&state).await;
+        let row = report
+            .checks
+            .iter()
+            .find(|c| c.id == "summaries")
+            .expect("a summaries row");
+        assert_eq!(row.status, Status::Fail, "{row:#?}");
+        assert!(
+            row.remedy
+                .as_deref()
+                .is_some_and(|r| r.contains("elevenlabs.agent_id")),
+            "a key with no agent to ask cannot summarise, and the row has to name the agent id \
+             rather than the key that is already there: {row:#?}"
+        );
+
+        // THE CONTROL. The same row, on a wired deployment, passes and says which summariser —
+        // without it, "the row is red" is satisfied by a row that is always red.
+        let (wired, _discord) = testing::state();
+        let report = run(&wired).await;
+        let row = report
+            .checks
+            .iter()
+            .find(|c| c.id == "summaries")
+            .expect("a summaries row");
+        assert_eq!(row.status, Status::Pass, "{row:#?}");
+        assert!(
+            row.detail
+                .as_deref()
+                .is_some_and(|d| d.contains(wired.summarizer.describe())),
+            "a passing row still has to say WHICH summariser answers, in that summariser's own \
+             words: {row:#?}"
+        );
     }
 
     #[tokio::test]

@@ -329,3 +329,107 @@ async fn a_vendor_that_refuses_the_conversation_refuses_the_summary_by_name() {
         "the vendor quoted the key back and it survived into the error: {error}"
     );
 }
+
+#[tokio::test]
+async fn the_summariser_this_server_builds_is_the_agent_whether_or_not_it_is_configured() {
+    // "The ElevenLabs agent is the default" is otherwise an untested claim: every other test in
+    // this file hands `state_with_backend` an `AgentSummarizer` it built itself, which would keep
+    // passing if `main` quietly went back to shipping something else. This asks the ONE
+    // construction point `main` calls — `summarize::summarizer_for` — what it made.
+    let chats = || {
+        Arc::new(WebSocketTextChatProvider::new(Arc::new(
+            HttpElevenLabsClient::new().expect("client"),
+        )
+            as Arc<dyn SignedUrlProvider>)) as Arc<dyn TextChatProvider>
+    };
+    let wired_config = gent_talk::testing::config();
+    let wired_summarizer = gent_talk::summarize::summarizer_for(
+        &wired_config.elevenlabs,
+        &wired_config.summaries,
+        chats(),
+    );
+
+    // ...and the case that used to select the truncating backend: nothing configured at all. It
+    // must build the SAME summariser and fail per request, not fall back to something cheaper.
+    let bare_summarizer = gent_talk::summarize::summarizer_for(
+        &ElevenLabsConfig::default(),
+        &gent_talk::config::SummariesConfig::default(),
+        chats(),
+    );
+
+    for (which, summarizer) in [("wired", &wired_summarizer), ("bare", &bare_summarizer)] {
+        assert_eq!(
+            summarizer.describe(),
+            "the ElevenLabs conversational agent, over a pooled text-only WebSocket",
+            "the {which} deployment builds something other than the agent"
+        );
+        assert_eq!(
+            summarizer.backend(),
+            gent_talk::summarize::agent::BACKEND,
+            "the {which} deployment files its cache under another backend's slug"
+        );
+        assert!(
+            summarizer
+                .policy_input()
+                .contains(gent_talk::summarize::agent::PLAIN_TEXT_RULE),
+            "the {which} deployment's cache key does not fold in the agent's own instructions"
+        );
+    }
+
+    // Two deployments pointed at DIFFERENT agents must not share a cache, and that has to survive
+    // being built through this function rather than by hand — the identity enters the key inside
+    // `AgentSummarizer::new`, so a `summarizer_for` that dropped the config on the floor would
+    // still describe itself correctly above and quietly serve one agent's summaries for the other.
+    let mut elsewhere = wired_config.elevenlabs.clone();
+    elsewhere.agent_id = Some("agent_somewhere_else".to_owned());
+    let other = gent_talk::summarize::summarizer_for(&elsewhere, &wired_config.summaries, chats());
+    assert_ne!(
+        gent_talk::summarize::policy_version_for(
+            &wired_config.summaries,
+            wired_summarizer.as_ref()
+        ),
+        gent_talk::summarize::policy_version_for(&wired_config.summaries, other.as_ref()),
+        "the configured agent never reached the summariser this function built"
+    );
+}
+
+#[tokio::test]
+async fn the_pool_settings_reach_the_summariser_this_server_builds() {
+    // The OTHER argument `summarizer_for` could quietly drop. `summaries.max_per_socket` is folded
+    // into the cache key whatever happens, so a key comparison cannot see this: a
+    // `PoolPolicy::default()` slipped in here would leave the version moving correctly while the
+    // deployment's configured conversation budget did nothing. The only way to see it is to
+    // summarise and count conversations.
+    let vendor = Arc::new(FakeElevenLabs::new());
+    let settings = gent_talk::config::SummariesConfig {
+        max_per_socket: 2,
+        ..gent_talk::config::SummariesConfig::default()
+    };
+    assert_ne!(
+        settings.max_per_socket,
+        gent_talk::summarize::agent::DEFAULT_MAX_PER_SOCKET,
+        "this test is only meaningful while it asks for something other than the default"
+    );
+    let summarizer = gent_talk::summarize::summarizer_for(
+        &wired(),
+        &settings,
+        Arc::clone(&vendor) as Arc<dyn TextChatProvider>,
+    );
+    let (state, discord, _store) =
+        gent_talk::testing::state_with_backend(&gent_talk::testing::config_toml(), summarizer);
+    let channel = ChannelId(READ_CHANNEL.to_owned());
+    for n in 0..4 {
+        discord.seed(&channel, "codex-eng", &a_wall_of_text(&format!("pool{n}")));
+    }
+    for id in newest_ids(&state).await {
+        ops::summarize_message(&state, Scope::Write, READ_CHANNEL, &id, &[], None)
+            .await
+            .expect("summarises");
+    }
+    assert_eq!(
+        vendor.chats().len(),
+        2,
+        "four summaries at two per conversation must open two; the configured budget never \
+         reached the summariser this server built"
+    );
+}

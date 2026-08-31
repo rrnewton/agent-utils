@@ -131,8 +131,8 @@ async fn a_correctly_wired_deployment_reports_every_check_green() {
     let body = report(state).await;
     assert_eq!(body["ok"], true, "{body:#}");
     assert_eq!(body["failed"], 0, "{body:#}");
-    // Token, two channels, key, agent, voice, storage.
-    assert_eq!(body["checks"].as_array().expect("checks").len(), 7);
+    // Token, two channels, key, agent, voice, summaries, storage.
+    assert_eq!(body["checks"].as_array().expect("checks").len(), 8);
     for check in body["checks"].as_array().expect("checks") {
         assert_eq!(check["status"], "pass", "{check:#}");
         // A check that passed must say WHAT it established, or it cannot be told from one that

@@ -1,10 +1,18 @@
 //! Turning one verbose agent message into one speakable line.
 //!
-//! This is deliberately extractive and deterministic: no model call, no network, no cost. The
-//! related-work review found that a shipped product solved the same problem with a terse system
-//! prompt rather than a summarization pipeline, so the job here is only to make a channel
-//! *listing* short enough to be spoken. When the owner wants the real thing, he asks for the full
-//! message and gets it verbatim.
+//! **This is the digest-and-preview helper, not a summariser.** It is deliberately extractive and
+//! deterministic — it truncates and flattens, with no model call, no network and no cost — and
+//! that is all it claims: making a channel *listing* short enough to be spoken. Real
+//! comprehension lives in [`crate::summarize`], which asks the deployment's ElevenLabs agent.
+//!
+//! Do not delete this module along with the extractive *summariser* that was removed from
+//! [`crate::summarize`]. [`condense`] has three live callers, and one of them is
+//! [`crate::summarize::agent::plain`] — the thing that flattens the AGENT'S OWN reply before it
+//! reaches a page. Taking it away takes the shipped summariser's output flattener with it.
+//!
+//! The related-work review found that a shipped product solved the digest problem with a terse
+//! system prompt rather than a summarization pipeline. When the owner wants the real thing, he
+//! asks for the full message and gets it verbatim.
 
 use serde::Serialize;
 

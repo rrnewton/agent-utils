@@ -33,10 +33,12 @@ pub struct AppState {
     pub agent: Arc<dyn AgentBackend>,
     /// Turns one long channel message into one short line.
     ///
-    /// Behind a trait for the same reason the store is: the shipped implementation is extractive
-    /// truncation, and the point is that a model can replace it without a call site changing.
+    /// The shipped implementation asks the deployment's ElevenLabs conversational agent, so on a
+    /// server with no credentials every call fails by name and the page draws those rows as
+    /// failed. Behind a trait for the same reason the store is: a second backend must be
+    /// substitutable without a call site changing, and the tests need one that counts.
     /// [`crate::summarize::Summarizer::describe`] is reported to the caller so a page can never
-    /// imply a model summary it did not get.
+    /// imply a summary it did not get.
     pub summarizer: Arc<dyn Summarizer>,
     /// The policy every cached summary is filed under. Computed once at startup from
     /// [`crate::summarize::policy_version`], because recomputing it per request is how the two

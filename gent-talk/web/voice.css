@@ -60,6 +60,16 @@
   --summary-bg: #14312f;
   --summary-edge: #2f7d73;
   --summary-ink: #6fd8c6;
+  /* `#49 cached-summaries`. The surface a row takes on when its summary was ASKED FOR and did not
+     arrive. RED, and a red that exists nowhere else in this interface: `--warn` is orange and is
+     already spoken for twice over (the row being read aloud, and an armed Clear), so borrowing it
+     would make "this is speaking" and "this is broken" the same colour. Judged in dark first, on
+     #1d2026, for the same reason as the tint above — and it has to be told apart from the four
+     surfaces a channel row can already have (two speakers, third parties, and the summary teal),
+     not merely from the page background. */
+  --summary-fail-bg: #3a1a1e;
+  --summary-fail-edge: #a3454f;
+  --summary-fail-ink: #ff9aa2;
   /* THE reading column, in characters. Only the desktop regime at the foot of this file consults
      it — a phone has no room for a column and no margin to put beside one — but it is declared
      here, with the other tokens, rather than inside the media query, so that web/voice.js can set
@@ -84,6 +94,12 @@
     --summary-bg: #e4f4f1;
     --summary-edge: #4c9c91;
     --summary-ink: #1d6b60;
+    /* The failure tint, in light. Declared here as well and not left to the dark value, because a
+       token with only one scheme renders as nothing at all in the other one — which for THIS
+       token means a row that failed looks exactly like a row that did not. */
+    --summary-fail-bg: #fdeaec;
+    --summary-fail-edge: #c2555f;
+    --summary-fail-ink: #8f1d28;
   }
 }
 
@@ -1031,9 +1047,15 @@ body {
 /* ------------------------------------------------------------ summaries, in place of it ----- */
 /*
  * `#49 cached-summaries`. The other collapsed form: instead of the first three lines of a wall of
- * text, one short line about it. It occupies the same place on the row that `.body.clamped` does
- * and never sits beside it — web/voice.js hides one to show the other — so the row keeps the
- * uniform height that makes a long list scannable at all.
+ * text, one short line about it. When a summary ARRIVED it occupies the same place on the row that
+ * `.body.clamped` does and never sits beside it — web/voice.js hides one to show the other — so the
+ * row keeps the uniform height that makes a long list scannable at all.
+ *
+ * A row whose summary FAILED is the exception, and deliberately: it shows the note AND the message,
+ * because the message is the one thing the reader still has and taking it away to apologise would
+ * be a worse row than the one they had with the mode off. That row is therefore taller than its
+ * neighbours, which is why the failure arrives inside `preservingScroll` — see the scroll-anchoring
+ * tests, which measure exactly that added height.
  *
  * `.summary-mark` is not decoration. A short line where a message should be, with nothing saying
  * who wrote it, reads as the message; the mark is what stops the reader taking a machine's
@@ -1065,6 +1087,41 @@ body {
   border-left: 3px solid var(--summary-edge);
 }
 
+/*
+ * ...AND A ROW WHOSE SUMMARY DID NOT ARRIVE IS RED.
+ *
+ * The owner's ask, in one rule: a summary is now a paid round trip to a vendor, so a failure is a
+ * real event with a real cause, and the cell that failed should look like it. The row still shows
+ * its MESSAGE — nothing here hides the body — so this is a tint over content the reader can still
+ * use, not an error state standing in for one.
+ *
+ * Three things this rule has to survive, each of which silently un-draws it:
+ *
+ *   * THE COMPETING SURFACE. Declared AFTER `[data-summarised="true"]` above, and at the same
+ *     specificity, so source order decides. A failed row is never `data-summarised` today, but a
+ *     rule that depends on that staying true is a rule waiting to lose.
+ *   * THE COMPETING SIDE BORDER. `[data-who="coder"]` sets `border-left: none`, and the coding
+ *     agent writes most of a real backlog, so without the explicit bar here the mark down the edge
+ *     would be missing on exactly the rows that fail most.
+ *   * THE GREYSCALE. An archived or already-read row is `filter: grayscale(1)` at 42% opacity, and
+ *     a greyscaled red is a grey. `filter: none; opacity: 1` is what makes the failure visible on
+ *     a row the reader has filed — which is the case where they would otherwise never learn that
+ *     the money was spent and nothing came back.
+ */
+#discord-log li.discord-message[data-summary-failed="true"] {
+  background: var(--summary-fail-bg);
+  border-color: var(--summary-fail-edge);
+  border-left: 3px solid var(--summary-fail-edge);
+  filter: none;
+  opacity: 1;
+}
+
+/* The two words, in the failure's own ink. The tint says something is wrong at a glance; this is
+   the part a screen reader can say and a greyscale screenshot still carries. */
+#discord-log li.discord-message[data-summary-failed="true"] .summary-mark {
+  color: var(--summary-fail-ink);
+}
+
 .summary-mark {
   flex: 0 0 auto;
   font-size: 0.66rem;
@@ -1085,6 +1142,14 @@ body {
    on. Quiet, because it is a fact about the view rather than a message. */
 #summary-note {
   margin: 0 0 0.4rem;
+}
+
+/* ...except when what it is stating is that this server cannot summarise at all. That is the one
+   thing this line ever says that the reader has to ACT on, and the reported failure of its
+   predecessor is precisely that a quiet grey hint at the head of a view goes unread for weeks. */
+#summary-note[data-unavailable="true"] {
+  color: var(--summary-fail-ink);
+  font-weight: 600;
 }
 
 /* ---------------------------------------------------------------------- the to-do view ----- */

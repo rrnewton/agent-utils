@@ -75,11 +75,15 @@ impl Summarizer for FakeSummarizer {
         "an in-memory summariser that counts its calls"
     }
 
-    // Deliberately the extractive slug rather than one of its own: the cache tests substitute
-    // this for the shipped default and must exercise the SAME cache key, or every one of them
-    // would be testing a key no deployment ever writes.
+    // Deliberately the SHIPPED slug rather than one of its own: the cache tests substitute this
+    // for the real summariser, and a "fake" slug would move every key they exercise off the
+    // production prefix while leaving all of them green.
+    //
+    // It borrows the slug and not the whole key: this fake takes the DEFAULT `policy_input`, so
+    // the hash after the prefix is not the one a deployment writes. What the shipped key really
+    // is, is pinned by `policy_version_for`'s own tests and by the startup sweep test, not here.
     fn backend(&self) -> &'static str {
-        super::extractive::BACKEND
+        super::agent::BACKEND
     }
 
     async fn summarize(&self, request: &SummaryRequest<'_>) -> Result<String, SummaryError> {

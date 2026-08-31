@@ -1432,7 +1432,7 @@ mod tests {
             channel: ChannelId("1111111111".to_owned()),
             message: MessageId("1000000000000000200".to_owned()),
             content_hash: 0xdead_beef_dead_beef,
-            version: "v1-extractive-w3-c160-aaaa".to_owned(),
+            version: "v1-elevenlabs-agent-w3-c160-aaaa".to_owned(),
         };
         assert_eq!(store.cached_summary(&key).await.expect("miss"), None);
 
@@ -1457,7 +1457,7 @@ mod tests {
             "an edited message must not be served the old summary"
         );
         let repolicied = SummaryKey {
-            version: "v1-extractive-w3-c200-bbbb".to_owned(),
+            version: "v1-elevenlabs-agent-w3-c200-bbbb".to_owned(),
             ..key.clone()
         };
         assert_eq!(

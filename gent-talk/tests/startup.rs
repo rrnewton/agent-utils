@@ -14,6 +14,11 @@ use std::time::Duration;
 ///
 /// Port 1 is reserved and nothing listens on it, which makes "the request never reached Discord"
 /// the deterministic answer rather than a timing accident.
+///
+/// **There is deliberately no `[elevenlabs]` section.** That is not an omission for brevity: it
+/// is the bare deployment, and every test below runs against it, so a change that made the
+/// ElevenLabs summariser a startup requirement would take the whole file red rather than one
+/// assertion.
 fn config_text() -> String {
     r#"
 [server]
@@ -273,9 +278,25 @@ async fn starting_the_server_sweeps_summaries_from_a_policy_that_no_longer_appli
         .expect("temp dir")
         .join("sweep-state.sqlite3");
     let _ = std::fs::remove_file(&file);
-    let current = gent_talk::summarize::policy_version(
+    // Built the way `main` builds it — `summarizer_for` plus `policy_version_for` — and NOT as
+    // `policy_version(config, slug)`. The binary's key folds the agent's own policy input (the
+    // plain-text rule and `agent=(unset)`, since this configuration names no agent), so a bare
+    // slug would compile, would sweep the "still valid" control away, and would fail as though
+    // the sweep were too aggressive rather than as though the test had computed a key the binary
+    // never writes.
+    let summarizer = gent_talk::summarize::summarizer_for(
+        &gent_talk::config::ElevenLabsConfig::default(),
         &gent_talk::config::SummariesConfig::default(),
-        gent_talk::summarize::extractive::BACKEND,
+        std::sync::Arc::new(
+            gent_talk::elevenlabs::socket::WebSocketTextChatProvider::new(std::sync::Arc::new(
+                gent_talk::elevenlabs::http::HttpElevenLabsClient::new().expect("client"),
+            )
+                as std::sync::Arc<dyn gent_talk::elevenlabs::SignedUrlProvider>),
+        ),
+    );
+    let current = gent_talk::summarize::policy_version_for(
+        &gent_talk::config::SummariesConfig::default(),
+        summarizer.as_ref(),
     );
     let key = |version: &str| SummaryKey {
         channel: gent_talk::model::ChannelId("1111111111".to_owned()),
@@ -289,6 +310,10 @@ async fn starting_the_server_sweeps_summaries_from_a_policy_that_no_longer_appli
             gent_talk::store::Retention::default(),
         )
         .expect("open");
+        // KEPT as `v1-extractive-…` on purpose, and it is the one deliberate mention of the
+        // deleted backend left in this tree. It is precisely the key that backend wrote, so this
+        // test is an upgrade rehearsal: a real database carried across this change holds entries
+        // under exactly this prefix, and what has to happen to them is that they go.
         store
             .cache_summary(&key("v1-extractive-w3-c160-0000000000000000"), "stale")
             .await
@@ -332,4 +357,68 @@ async fn starting_the_server_sweeps_summaries_from_a_policy_that_no_longer_appli
         "the start swept away the entries it was supposed to keep:\n{output}"
     );
     let _ = std::fs::remove_file(&file);
+}
+
+/// The child's output with ANSI escapes removed.
+///
+/// `tracing_subscriber` colours its output even when stdout is a pipe, and the colouring lands
+/// BETWEEN a structured field's name and its value: `summaries_available` `ESC[0m` `ESC[2m` `=`
+/// `ESC[0m` `false`. So a naive `contains("name=value")` reads as absent when the field is
+/// present — and, far worse, passes on any PROSE in the same log that happens to spell the pair
+/// out, which is a test asserting on a sentence while believing it asserts on a value. Both
+/// halves of that really happened here.
+fn without_colour(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        // CSI: `ESC [ <params> <final byte in @..~>`. Anything else escape-ish is dropped whole,
+        // which is fine for a log nothing but a person reads.
+        if chars.next() == Some('[') {
+            for c in chars.by_ref() {
+                if ('\u{40}'..='\u{7e}').contains(&c) {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn a_deployment_with_no_elevenlabs_still_boots_and_says_summaries_will_fail() {
+    // The regression test for the whole shape of this change. There is now exactly one
+    // summariser and it needs a vendor, so the obvious way to implement "the agent is the
+    // default" is to require credentials at load — which would take every deployment that has
+    // only wired up Discord off the air, permanently, on an upgrade. `config_text()` has no
+    // `[elevenlabs]` section at all, and this asserts the server comes all the way up anyway.
+    //
+    // The second half is the reason it is not enough to assert it merely boots. A server that
+    // starts and then fails every summary in silence is the worst of the three outcomes: the
+    // reader sees red rows and has nothing to connect them to. So the banner has to be there,
+    // it has to say the summaries will fail, and it has to name the settings that fix it.
+    let config = write_config("no-elevenlabs");
+    let output = without_colour(&run_until_listening(&config, &[]));
+
+    assert!(
+        output.contains("gent-talk listening"),
+        "a deployment with no ElevenLabs credentials must still serve Discord:\n{output}"
+    );
+    assert!(
+        output.contains("EVERY summary will fail"),
+        "the server came up without saying that nothing can be summarised; the reader would see \
+         red rows with nothing to connect them to:\n{output}"
+    );
+    assert!(
+        output.contains("elevenlabs.api_key") && output.contains("elevenlabs.agent_id"),
+        "the banner has to name BOTH settings that turn summaries on:\n{output}"
+    );
+    assert!(
+        output.contains("summaries_available=false"),
+        "the backend line itself has to carry the verdict, so a reader who greps for it does not \
+         also have to find the warning above it:\n{output}"
+    );
 }

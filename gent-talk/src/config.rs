@@ -62,7 +62,11 @@ pub const ENV_REPLAY_TRANSPORT: &str = "GENT_TALK_REPLAY_TRANSPORT";
 /// Environment variable overriding the model a summariser is asked for.
 pub const ENV_SUMMARY_MODEL: &str = "GENT_TALK_SUMMARY_MODEL";
 
-/// Environment variable choosing which summariser runs. See [`crate::summarize::Backend`].
+/// Environment form of the DEPRECATED `summaries.backend` key.
+///
+/// Kept solely as a refusal seam. There is one summariser — see [`crate::summarize`] — so this
+/// selects nothing; it exists so that a deployment still setting it is told, by name, rather than
+/// having it silently ignored or reported as an unknown key.
 pub const ENV_SUMMARY_BACKEND: &str = "GENT_TALK_SUMMARY_BACKEND";
 
 /// Shortest API token this server will accept.
@@ -158,13 +162,18 @@ pub struct SummariesConfig {
     pub target_chars: usize,
     /// How many preceding messages ride along as context.
     pub context_messages: usize,
-    /// The model to ask, when a model backend is configured. `None` means the extractive default.
+    /// A model name, folded into the cache key and read by no backend.
+    ///
+    /// **Vestigial.** The shipped summariser asks a configured ElevenLabs agent, and WHICH model
+    /// that agent runs is a property of the agent, set in the vendor's dashboard, not something
+    /// this server can choose per request. Setting this therefore changes nothing about a summary
+    /// except that every previously cached one becomes unreachable. It is folded into
+    /// [`crate::summarize::policy_version`] anyway, under the rule that every field here is, and
+    /// it should probably be deleted rather than documented as a selector.
     pub model: Option<String>,
-    /// Which summariser runs. Extractive by default; see [`crate::summarize::Backend`].
-    pub backend: crate::summarize::Backend,
     /// How many summaries share one conversation with the agent before it is recycled.
     ///
-    /// Only the agent backend reads it, and it is here rather than beside that backend because it
+    /// It lives here rather than beside the summariser that reads it because it
     /// changes what a summary SAYS: a conversation carries every earlier summary in its context,
     /// so the answer to the eighth question is written in front of seven other people's messages.
     /// See [`crate::summarize::agent`] for the arithmetic behind the default.
@@ -182,7 +191,6 @@ impl Default for SummariesConfig {
             target_chars: crate::summary::DEFAULT_SUMMARY_CHARS,
             context_messages: DEFAULT_SUMMARY_CONTEXT_MESSAGES,
             model: None,
-            backend: crate::summarize::Backend::Extractive,
             max_per_socket: crate::summarize::agent::DEFAULT_MAX_PER_SOCKET,
             socket_idle_seconds: crate::summarize::agent::DEFAULT_SOCKET_IDLE_SECONDS,
             reply_timeout_seconds: crate::summarize::agent::DEFAULT_REPLY_TIMEOUT_SECONDS,
@@ -444,6 +452,9 @@ struct FileSummaries {
     target_chars: Option<usize>,
     context_messages: Option<usize>,
     model: Option<String>,
+    /// DEPRECATED and selects nothing. Still declared so that a configuration naming it gets the
+    /// refusal in [`summaries_config`] rather than `deny_unknown_fields`' "unknown field
+    /// `backend`", which reads as "this binary is too old" and sends the operator to a rollback.
     backend: Option<String>,
     max_per_socket: Option<usize>,
     socket_idle_seconds: Option<u64>,
@@ -767,6 +778,51 @@ fn replay_config(
     })
 }
 
+/// What `summaries.backend` does now that there is only one summariser.
+///
+/// Three outcomes, and the middle one is the reason this is not a blanket refusal:
+///
+/// * `"extractive"` — **refused.** That summariser was removed. Quietly promoting it to the agent
+///   would start paying a vendor, and start sending other people's channel text to one, on a
+///   deployment whose own configuration file says the opposite.
+/// * `"elevenlabs_agent"` — **accepted, loudly.** One release ago this was the documented way to
+///   ask for real summaries, so it is sitting in live configuration files right now, and refusing
+///   it would stop those servers booting for no behavioural gain: it names exactly what they get.
+///   A warning is not silent acceptance — the operator is told the key is dead and to delete it.
+/// * anything else — refused as an unknown value, saying the key is deprecated so the reply to
+///   "then what IS the right value?" is in the same sentence.
+fn deprecated_backend(raw: &str) -> Result<(), ConfigError> {
+    let refuse = |detail: String| ConfigError::Invalid {
+        field: "summaries.backend".to_owned(),
+        detail,
+    };
+    match raw.trim() {
+        "extractive" => Err(refuse(
+            "the extractive summariser was REMOVED. It truncated rather than comprehended, and \
+             the page already shows a clamped prefix without it. Summaries now always come from \
+             the ElevenLabs agent named in [elevenlabs]; a deployment with no credentials there \
+             shows every long message as failed rather than as truncated. Delete this line."
+                .to_owned(),
+        )),
+        "elevenlabs_agent" => {
+            tracing::warn!(
+                setting = "summaries.backend",
+                env = ENV_SUMMARY_BACKEND,
+                "summaries.backend IS DEPRECATED AND SELECTS NOTHING. It is being IGNORED. There \
+                 is one summariser — the ElevenLabs agent named in [elevenlabs] — and it is what \
+                 you get whether or not this key is present. Delete the line (and \
+                 GENT_TALK_SUMMARY_BACKEND, if it is set in the environment)."
+            );
+            Ok(())
+        }
+        other => Err(refuse(format!(
+            "{other:?} is not a summariser, and summaries.backend is DEPRECATED: it selects \
+             nothing. There is one summariser — the ElevenLabs agent named in [elevenlabs] — and \
+             it is what you get whether or not this key is present. Delete this line."
+        ))),
+    }
+}
+
 /// Resolve the `[summaries]` section.
 fn summaries_config(
     model_from_env: Option<&str>,
@@ -774,22 +830,22 @@ fn summaries_config(
     file: FileSummaries,
 ) -> Result<SummariesConfig, ConfigError> {
     let defaults = SummariesConfig::default();
-    let backend = match backend_from_env.map(str::to_owned).or(file.backend) {
-        Some(name) => {
-            let name = name.trim().to_owned();
-            crate::summarize::Backend::from_name(&name).ok_or_else(|| {
-                let known: Vec<&str> = crate::summarize::Backend::all()
-                    .iter()
-                    .map(|b| b.name())
-                    .collect();
-                ConfigError::Invalid {
-                    field: "summaries.backend".to_owned(),
-                    detail: format!("{name:?} is not a summariser. Use one of {known:?}."),
-                }
-            })?
-        }
-        None => defaults.backend,
-    };
+    // BOTH SOURCES, INDEPENDENTLY, AND THE FILE FIRST.
+    //
+    // Not `env.or(file)`. That is the right shape for a setting where one source OVERRIDES the
+    // other, and this is not one: neither form selects anything any more, so each is a separate
+    // statement that has to be answered on its own terms. Written as an override, a deployment
+    // with `GENT_TALK_SUMMARY_BACKEND=elevenlabs_agent` in the environment and the removed
+    // `backend = "extractive"` still in its file booted on the strength of the environment and was
+    // never told the file was wrong — which is verbatim the case this refusal exists to prevent.
+    //
+    // The file is judged first because it is the one a person edits and keeps.
+    if let Some(raw) = file.backend.as_deref() {
+        deprecated_backend(raw)?;
+    }
+    if let Some(raw) = backend_from_env {
+        deprecated_backend(raw)?;
+    }
     let summaries = SummariesConfig {
         threshold_chars: file.threshold_chars.unwrap_or(defaults.threshold_chars),
         target_chars: file.target_chars.unwrap_or(defaults.target_chars),
@@ -799,7 +855,6 @@ fn summaries_config(
             .or(file.model)
             .map(|m| m.trim().to_owned())
             .filter(|m| !m.is_empty()),
-        backend,
         max_per_socket: file.max_per_socket.unwrap_or(defaults.max_per_socket),
         socket_idle_seconds: file
             .socket_idle_seconds
@@ -1482,39 +1537,98 @@ writable = true
     }
 
     #[test]
-    fn the_summariser_is_the_one_that_needs_no_vendor_until_an_operator_says_otherwise() {
-        // A deployment that has never heard of ElevenLabs must keep working, and paying a vendor
-        // is not a thing that should start happening because somebody upgraded.
-        let cfg = Config::from_toml_and_env(FULL, &env(&[])).expect("valid config");
-        assert_eq!(cfg.summaries.backend, crate::summarize::Backend::Extractive);
+    fn a_configuration_that_still_names_the_removed_summariser_is_refused_by_name() {
+        // `deny_unknown_fields` would answer "unknown field `backend`", which reads as "this
+        // binary is too old" and sends the operator to a rollback. The field is kept declared
+        // precisely so this sentence can be said instead — and from BOTH sources, or
+        // GENT_TALK_SUMMARY_BACKEND=extractive is a silent no-op.
+        let named = |err: ConfigError| match err {
+            ConfigError::Invalid { field, detail } => {
+                assert_eq!(field, "summaries.backend");
+                assert!(
+                    detail.contains("REMOVED"),
+                    "the refusal has to say the summariser is gone, not merely that the value is \
+                     wrong: {detail}"
+                );
+                assert!(
+                    detail.contains("ElevenLabs"),
+                    "the refusal has to say what runs instead: {detail}"
+                );
+            }
+            other => panic!("unexpected error: {other}"),
+        };
 
-        let text = format!("{FULL}\n[summaries]\nbackend = \"elevenlabs_agent\"\n");
-        let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("valid config");
-        assert_eq!(
-            cfg.summaries.backend,
-            crate::summarize::Backend::ElevenLabsAgent
+        let text = format!("{FULL}\n[summaries]\nbackend = \"extractive\"\n");
+        named(Config::from_toml_and_env(&text, &env(&[])).expect_err("must refuse the file form"));
+        named(
+            Config::from_toml_and_env(FULL, &env(&[(ENV_SUMMARY_BACKEND, "extractive")]))
+                .expect_err("must refuse the environment form"),
         );
 
-        let cfg =
-            Config::from_toml_and_env(FULL, &env(&[(ENV_SUMMARY_BACKEND, "elevenlabs_agent")]))
-                .expect("valid config");
-        assert_eq!(
-            cfg.summaries.backend,
-            crate::summarize::Backend::ElevenLabsAgent
+        // AND NEITHER SOURCE CAN COVER FOR THE OTHER. Written as `env.or(file)` — the shape that
+        // is correct for a setting where one source overrides the other — the blessed environment
+        // spelling consumed the slot and the removed value in the FILE was never examined at all.
+        // That deployment booted with a generic deprecation warning and was never told the line it
+        // had actually written was refused, which is the exact outcome the refusal exists to
+        // prevent. Both orders, because either can be the one that short-circuits.
+        named(
+            Config::from_toml_and_env(&text, &env(&[(ENV_SUMMARY_BACKEND, "elevenlabs_agent")]))
+                .expect_err("a blessed environment value must not hide a removed file value"),
+        );
+        let blessed_file = format!("{FULL}\n[summaries]\nbackend = \"elevenlabs_agent\"\n");
+        named(
+            Config::from_toml_and_env(&blessed_file, &env(&[(ENV_SUMMARY_BACKEND, "extractive")]))
+                .expect_err("a blessed file value must not hide a removed environment value"),
         );
     }
 
     #[test]
-    fn a_misspelled_summariser_is_refused_and_the_refusal_lists_the_real_ones() {
-        // Defaulting a typo to extractive would present as "the agent backend does not work",
-        // which is the most expensive possible way to find a spelling mistake.
+    fn the_one_surviving_spelling_still_boots_and_is_told_it_selects_nothing() {
+        // `backend = "elevenlabs_agent"` was, one release ago, the documented way to ask for real
+        // summaries, so it is in live configuration files right now. Refusing it would stop those
+        // servers booting for no behavioural gain — they already get exactly what it names. What
+        // it must NOT do is be accepted in silence, which is how a dead setting survives for
+        // years.
+        let text = format!("{FULL}\n[summaries]\nbackend = \"elevenlabs_agent\"\n");
+        for source in [None, Some((ENV_SUMMARY_BACKEND, "elevenlabs_agent"))] {
+            let logs = crate::testing::LogCapture::info_only();
+            let cfg = match source {
+                None => Config::from_toml_and_env(&text, &env(&[])),
+                Some(pair) => Config::from_toml_and_env(FULL, &env(&[pair])),
+            }
+            .expect("a deployment that spelled it right must still boot");
+            assert_eq!(
+                cfg.summaries,
+                SummariesConfig::default(),
+                "the dead key must not perturb anything else in [summaries]"
+            );
+            let said = logs.text();
+            assert!(
+                said.contains("summaries.backend") && said.contains("DEPRECATED"),
+                "an ignored setting that says nothing is how a dead key survives for years: \
+                 {said:?}"
+            );
+            assert!(
+                said.contains("IGNORED"),
+                "the warning has to say the key had no effect, not merely that it is old: {said:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_summariser_is_refused_and_told_the_key_is_deprecated() {
+        // A typo is still refused rather than ignored — but the useful half of the answer is that
+        // there is nothing to spell correctly any more.
         let text = format!("{FULL}\n[summaries]\nbackend = \"elevenlabs-agent\"\n");
         let err = Config::from_toml_and_env(&text, &env(&[])).expect_err("must refuse");
         match &err {
             ConfigError::Invalid { field, detail } => {
                 assert_eq!(field, "summaries.backend");
-                assert!(detail.contains("elevenlabs_agent"), "{detail}");
-                assert!(detail.contains("extractive"), "{detail}");
+                assert!(detail.contains("DEPRECATED"), "{detail}");
+                assert!(
+                    detail.contains("elevenlabs-agent"),
+                    "the refusal has to quote what was actually written: {detail}"
+                );
             }
             other => panic!("unexpected error: {other}"),
         }

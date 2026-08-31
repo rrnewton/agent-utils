@@ -556,3 +556,20 @@ async fn the_combined_row_is_cached_under_the_text_it_actually_summarised() {
         "the same combined row was summarised twice"
     );
 }
+
+#[tokio::test]
+async fn the_cache_tests_exercise_the_key_a_real_deployment_writes() {
+    // Every assertion in this file runs through `FakeSummarizer`, which deliberately borrows the
+    // SHIPPED backend slug rather than inventing one. Point it anywhere else and all of them stay
+    // green while exercising a cache key no deployment ever writes — which is verbatim the
+    // silent-stale-summary failure the version string exists to prevent, and nothing else in this
+    // suite would notice. This is the one that does.
+    let server = new_server(400, 160, 3);
+    let prefix = format!("v1-{}-", gent_talk::summarize::agent::BACKEND);
+    assert!(
+        server.state.summary_version.starts_with(&prefix),
+        "these tests file summaries under {:?}, which does not start with the prefix a real \
+         deployment writes ({prefix})",
+        server.state.summary_version
+    );
+}

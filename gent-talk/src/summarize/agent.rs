@@ -461,8 +461,9 @@ pub fn instruction(request: &SummaryRequest<'_>) -> String {
 /// and mangling "the * operator" to fix a bullet that was already stripped is a worse outcome than
 /// the bullet.
 ///
-/// Reusing `condense` is the same choice [`super::extractive`] makes and for the same reason: two
-/// ideas of what "speakable" means is one too many.
+/// Reusing [`crate::summary::condense`] rather than reimplementing the code-and-link flattening it
+/// already does is deliberate: the digest line, the collapsed row preview and this summary all end
+/// up being read aloud, and two ideas of what "speakable" means is one too many.
 #[must_use]
 pub fn plain(reply: &str, max_chars: usize) -> String {
     let unmarked: Vec<String> = reply.lines().map(strip_line_markers).collect();
@@ -859,10 +860,13 @@ mod tests {
             super::super::policy_version_for(&config, &one),
             super::super::policy_version_for(&config, &two)
         );
+        // ...and the identity is in `policy_input`, not merely in the slug. `policy_version` folds
+        // the bare `PROMPT`, so a summariser whose extra policy input were dropped would land on
+        // exactly this string — which is the same summary being served for a different agent.
         assert_ne!(
             super::super::policy_version_for(&config, &one),
-            super::super::policy_version(&config, super::super::extractive::BACKEND),
-            "the agent backend must not share the extractive backend's cache"
+            super::super::policy_version_of(PROMPT, &config, BACKEND),
+            "the plain-text rule and the agent id are not reaching the cache key at all"
         );
     }
 }

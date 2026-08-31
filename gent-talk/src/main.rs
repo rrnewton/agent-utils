@@ -121,6 +121,12 @@ const SEEDED_BACKLOG: &[(&str, &str)] = &[
     // be exercised locally AT ALL — the seam existed, the endpoint answered, and nothing a
     // developer could see ever produced a summary. It is also the honest case: the message this
     // whole project exists for is the one you cannot skim at the roadside.
+    //
+    // NOTE that `--fake-discord` fakes DISCORD and not ElevenLabs, so on a machine with no
+    // credentials this row now comes back FAILED and red rather than truncated — the extractive
+    // summariser that used to answer it offline is gone. To see the summarised state locally,
+    // run the `gent-talk-mock-elevenlabs` binary and point `elevenlabs.api_base` at it; that is
+    // what `scripts/run.sh` does for the screenshot scenes.
     (
         "codex-eng",
         "seeded: long one, sorry. The cache-key rewrite is done and I want to write down what \
@@ -343,36 +349,34 @@ async fn main() -> anyhow::Result<()> {
     let elevenlabs_client =
         Arc::new(HttpElevenLabsClient::new().context("building the ElevenLabs client")?);
 
-    // Say WHICH summariser is running, and under which policy version. A page that reported
-    // "summarised" without this could imply a model answer produced by truncation, and the
-    // version is what a person with a shell greps the cache by when they suspect a stale entry.
-    let summarizer: Arc<dyn gent_talk::summarize::Summarizer> = match config.summaries.backend {
-        gent_talk::summarize::Backend::Extractive => {
-            Arc::new(gent_talk::summarize::extractive::ExtractiveSummarizer)
-        }
-        gent_talk::summarize::Backend::ElevenLabsAgent => {
-            // Selected but unconfigured is a warning here and a per-request refusal there, not a
-            // refusal to start: the Discord half of this server is useful on its own, and a
-            // deployment that mistyped a key should still come up far enough to say so.
-            if let Err(error) = gent_talk::elevenlabs::credentials(&config.elevenlabs) {
-                tracing::warn!(
-                    %error,
-                    "summaries.backend selects the ElevenLabs agent, but ElevenLabs is not fully \
-                     configured; every summary request will refuse with this exact message"
-                );
-            }
-            Arc::new(gent_talk::summarize::agent::AgentSummarizer::new(
-                Arc::new(
-                    gent_talk::elevenlabs::socket::WebSocketTextChatProvider::new(Arc::clone(
-                        &elevenlabs_client,
-                    )
-                        as Arc<dyn SignedUrlProvider>),
-                ),
-                config.elevenlabs.clone(),
-                gent_talk::summarize::agent::PoolPolicy::from_config(&config.summaries),
-            ))
-        }
-    };
+    // ONE summariser, built in ONE place — `summarize::summarizer_for`, which the tests call too,
+    // so nothing here can drift from what a test believes the binary built. Say which it is and
+    // under which policy version: the version is what a person with a shell greps the cache by
+    // when they suspect a stale entry.
+    let summarizer = gent_talk::summarize::summarizer_for(
+        &config.elevenlabs,
+        &config.summaries,
+        Arc::new(
+            gent_talk::elevenlabs::socket::WebSocketTextChatProvider::new(Arc::clone(
+                &elevenlabs_client,
+            )
+                as Arc<dyn SignedUrlProvider>),
+        ),
+    );
+    // Unconfigured is a warning here and a per-request refusal there, never a refusal to start:
+    // the Discord half of this server is useful on its own, and a deployment that mistyped a key
+    // should still come up far enough to say so. It is unconditional because there is no longer a
+    // summariser that needs no vendor — this IS the path that produces the failed rows.
+    let summaries_possible = gent_talk::elevenlabs::credentials(&config.elevenlabs);
+    if let Err(error) = &summaries_possible {
+        tracing::warn!(
+            %error,
+            "this deployment has NO ElevenLabs credentials, so EVERY summary will fail and /voice \
+             will draw those rows as failed. There is no summariser that needs no vendor: the \
+             extractive one was removed. Set elevenlabs.api_key and elevenlabs.agent_id to turn \
+             summaries on."
+        );
+    }
     let summary_version =
         gent_talk::summarize::policy_version_for(&config.summaries, summarizer.as_ref());
     tracing::info!(
@@ -380,9 +384,17 @@ async fn main() -> anyhow::Result<()> {
         version = summary_version,
         threshold_chars = config.summaries.threshold_chars,
         target_chars = config.summaries.target_chars,
+        // Said here as well as three lines above, because a reader who greps for the backend line
+        // should not also have to find the warning above it to learn that it cannot work.
+        summaries_available = summaries_possible.is_ok(),
+        // The prose deliberately does NOT repeat the field's rendered form. It used to say
+        // `summaries_available=false` in words, which meant a test asserting on that string
+        // passed while the field itself had been deleted — the assertion was reading the
+        // sentence, not the value.
         "summaries are produced by this backend under this policy version; every cached summary \
          is filed under the version, so changing any summary setting makes the old ones \
-         unreachable at once"
+         unreachable at once. When the field above is false, NOTHING is summarised and every long \
+         row shows as failed."
     );
     // The sweep. Without it a changed policy leaves the old entries on disk forever: unreachable,
     // invisible, and still a copy of other people's text at rest.

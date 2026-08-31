@@ -818,10 +818,22 @@ class Driver:
     """Walks one browser page through the scenes, capturing as it goes."""
 
     def __init__(
-        self, page: Page, base_url: str, token: str, out_dir: Path, profile: Profile, theme: Theme
+        self,
+        page: Page,
+        base_url: str,
+        token: str,
+        out_dir: Path,
+        profile: Profile,
+        theme: Theme,
+        mock_control: str = "",
     ) -> None:
         self.theme = theme
         self.page = page
+        # The offline ElevenLabs mock's `/_mock/` control plane, or "" when the run was not given
+        # one. Empty is not the same as "skip": the states that need it say so BY NAME rather than
+        # quietly not being captured, because a summary state that silently disappeared from a run
+        # is exactly the kind of missing evidence this harness exists to make impossible.
+        self.mock_control = mock_control.rstrip("/")
         # A page whose script threw on load still RENDERS: the markup is there, the sign-in screen
         # looks entirely plausible, and every control is inert. That is a photograph of a broken
         # page filed as a photograph of a working one, and it is a live hazard here -- web/voice.js
@@ -1584,8 +1596,107 @@ def _act_pull_armed(driver: Driver) -> None:
     driver.settle(250)
 
 
+def _mock_control(driver: Driver, state: str) -> str:
+    """The offline vendor's control plane, or an Unreachable state that says how to get one.
+
+    There is exactly ONE summariser now — a conversation with the configured ElevenLabs agent — so
+    the two summary states are the only ones in this walk that need a vendor at all. `scripts/run.sh
+    --screenshots` starts `gent-talk-mock-elevenlabs` and passes `--mock-control`; a run driven by
+    hand without it cannot reach these states, and must say so rather than photographing whatever
+    was on screen. It is deliberately not "skip": a summary state quietly missing from a run is the
+    absent evidence this whole harness exists to prevent.
+    """
+    if not driver.mock_control:
+        raise Unreachable(
+            state,
+            "the summariser can be driven, which needs the offline ElevenLabs mock's control plane",
+            "--mock-control was not given. Use scripts/run.sh --screenshots, which starts "
+            "gent-talk-mock-elevenlabs and passes it. Pointing this state at a real ElevenLabs "
+            "account would spend vendor minutes and could not be made to fail on demand.",
+        )
+    return driver.mock_control
+
+
+def _tell_the_mock(driver: Driver, state: str, scenario: str) -> None:
+    """Put the offline vendor into one of its scenarios, through `POST /_mock/scenario`.
+
+    Set by the state that needs it rather than once at the start of the run, and that is the point:
+    the walk visits a working summariser and then a wedged one, in that order, on every profile and
+    both themes. A scenario left over from the previous state would make one of the two pictures a
+    lie, and which one would depend on `--only`.
+    """
+    control = _mock_control(driver, state)
+    payload = json.dumps({"scenario": scenario}).encode("utf-8")
+    request = Request(  # noqa: S310 - a loopback URL this script built
+        f"{control}/_mock/scenario",
+        data=payload,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urlopen(request, timeout=10) as response:  # noqa: S310 - loopback
+            answered = response.read().decode("utf-8", "replace")
+    except HTTPError as error:
+        raise Unreachable(
+            state,
+            f"the offline vendor can be put into its {scenario!r} scenario",
+            f"the mock's control plane answered HTTP {error.code}",
+        ) from error
+    except URLError as error:
+        raise Unreachable(
+            state,
+            f"the offline vendor can be put into its {scenario!r} scenario",
+            f"nothing answered at {control}/_mock/scenario ({error})",
+        ) from error
+    # Read back, not merely "it answered 200": an unknown scenario name is a 400 above, but a
+    # RENAMED one that still parses would leave this state photographing the wrong vendor
+    # behaviour under a confident name.
+    if f'"{scenario}"' not in answered:
+        raise Unreachable(
+            state,
+            f"the offline vendor really is in its {scenario!r} scenario",
+            f"the control plane answered {answered.strip()[:200]!r}",
+        )
+
+
+def _forget_cached_summaries(driver: Driver, state: str) -> None:
+    """Empty the server's durable store, so the next summary is really generated.
+
+    A summary is CACHED under its policy version, and the profiles share one server: without this,
+    the failure state would be handed the answer the success state before it filed — the request
+    that is supposed to fail would never leave the server, and the state would be unreachable for a
+    reason that reads like a page bug. Purging the whole store rather than one row because there is
+    no route that forgets a single summary, and this state is the last of the walk.
+    """
+    request = Request(f"{driver.base_url}/api/v1/storage", method="DELETE")
+    request.add_header("Authorization", f"Bearer {driver.token}")
+    try:
+        with urlopen(request, timeout=10):  # noqa: S310 - a loopback URL this script built
+            return
+    except HTTPError as error:
+        # No store configured means there is no cache to defeat, which is this function's whole
+        # purpose. Anything else is a failure now rather than a confusing one in twenty seconds.
+        if error.code == 503:
+            return
+        raise Unreachable(
+            state,
+            "the cached summary from the state before this one can be cleared",
+            f"DELETE /api/v1/storage answered HTTP {error.code}",
+        ) from error
+    except URLError as error:
+        raise Unreachable(
+            state,
+            "the cached summary from the state before this one can be cleared",
+            f"could not reach {driver.base_url} ({error})",
+        ) from error
+
+
 def _act_summary_mode(driver: Driver) -> None:
     """`#49 cached-summaries`: the channel with the collapsed rows summarised instead of clipped."""
+    # A WORKING summariser: canned prose, no tool calls, no bridge traffic. Stated here rather than
+    # assumed from the mock's start-up flag, because the failure state below wedges the same mock
+    # and the walk runs once per profile per theme.
+    _tell_the_mock(driver, "32-channel-summarised", "no_tool_call")
     _act_open_channel(driver)
     # The row this picture is ABOUT, measured before anything changes. The seeded backlog has
     # exactly one message over the server's summarisation threshold and it is the newest, so it is
@@ -1612,6 +1723,72 @@ def _act_summary_mode(driver: Driver) -> None:
         "document.getElementById('summary-probe').getBoundingClientRect().height; "
         "return window.__summarisedHeight; })()"
     )
+    # The same comparison the expectation makes, made HERE as well, purely so the failure reads as
+    # the finding it is. The expectation's message can only quote its own JavaScript, and a reader
+    # who sees `__summarisedHeight > 0 && __summarisedHeight < __foldedHeight` in a traceback goes
+    # looking for a broken harness. The numbers, and where the extra height comes from, are what
+    # turn it into a report about the page. The expectation stays: it is what holds if this check
+    # is ever deleted.
+    folded = float(cast(float, driver.js("window.__foldedHeight")))
+    summarised = float(cast(float, driver.js("window.__summarisedHeight")))
+    if not 0 < summarised < folded:
+        lines = driver.js(
+            "(() => { const row = document.getElementById('summary-probe'); "
+            "const note = row.querySelector('.summary'); "
+            "const text = row.querySelector('.summary-text'); "
+            "return JSON.stringify({note: Math.round(note.getBoundingClientRect().height), "
+            "chars: (text.textContent || '').length, "
+            "markIsOwnLine: getComputedStyle(row.querySelector('.summary-mark')).display}); })()"
+        )
+        raise Unreachable(
+            "32-channel-summarised",
+            "the summarised row really is shorter than the clamped one it replaced",
+            f"clamped {folded:.0f}px, summarised {summarised:.0f}px, note {lines}. This is the "
+            "claim the whole mode rests on, and it is the page that is failing it, not the walk: "
+            "the SUMMARY mark takes a line of its own above the text, so a summary that wraps to "
+            "two lines already costs three, which is what the clamp gives the message itself. "
+            "Widen the row's budget, put the mark back on the line with the text, or lower "
+            "summaries.target_chars -- but do not relax this check, because it is the only thing "
+            "in the repository that can see the difference.",
+        )
+
+
+SUMMARY_FAILED_STATE = "35-channel-summary-failed"
+
+
+def _act_summary_failed(driver: Driver) -> None:
+    """Summary mode when the summariser FAILS: the row goes red and keeps the message.
+
+    There is one summariser and it talks to a vendor, so failure is now an ordinary operating state
+    rather than an exotic one — a wedged agent, a rejected key, or simply a deployment with no
+    ElevenLabs credentials at all. The owner asked for it to be VISIBLE, and this is the only thing
+    in the repository that can say whether it is: the page suite can assert an attribute and a
+    declaration, and neither of those is a colour anybody can see on a phone.
+
+    Driven with a real failure, not a stubbed response. The mock is wedged into `no_reply` — it
+    transcribes the question and says nothing, which is what a hung agent looks like from here —
+    and the server's own three-second turn deadline turns that into the 503 the page draws.
+    """
+    # Order matters: purge first, because the summary the state before this one filed would be
+    # served straight back out of the cache and nothing would fail.
+    _forget_cached_summaries(driver, SUMMARY_FAILED_STATE)
+    _tell_the_mock(driver, SUMMARY_FAILED_STATE, "no_reply")
+    _act_open_channel(driver)
+    driver.js(
+        "(() => { const rows = [...document.querySelectorAll('#discord-log li')].reverse(); "
+        "const row = rows.find((n) => n.getAttribute('data-collapsed') === 'true'); "
+        "row.id = 'summary-failed-probe'; "
+        "window.__failedProbeHeight = row.getBoundingClientRect().height; "
+        "return window.__failedProbeHeight; })()"
+    )
+    # Through the DOM for the same reason as the state above: a real click scrolls the floating
+    # chip into view and moves the list being photographed.
+    driver.js("(() => { document.getElementById('summarise').click(); })()")
+    driver.page.wait_for_function(
+        "() => !!document.querySelector('#discord-log li[data-summary-failed=\"true\"]')",
+        timeout=20_000,
+    )
+    driver.settle(300)
 
 
 def _act_todo_view(driver: Driver) -> None:
@@ -2923,9 +3100,10 @@ SCENES: tuple[Scene, ...] = (
                 "return row.querySelector('.body').offsetParent === null; })()",
             ),
             (
-                # Quoted from the server's own answer. The shipped summariser truncates, and a
-                # screen that showed short lines without naming their author would be implying a
-                # reading nobody paid for.
+                # Quoted from the server's own answer, never from a constant in the page. Every
+                # line on this screen was written by a model reading somebody else's message, and
+                # a screen that showed those lines without saying where they came from would be
+                # offering the reader a reading they cannot check.
                 "the view says which summariser produced them",
                 "/Summaries by .+/.test(window.__text('summary-note') || '')",
             ),
@@ -2987,6 +3165,73 @@ SCENES: tuple[Scene, ...] = (
             (
                 "and it is drawn as armed rather than merely relabelled",
                 "document.getElementById('clear-backlog').className.includes('armed')",
+            ),
+        ),
+    ),
+    # LAST IN THE WALK, and not by accident: it empties the server's durable store on the way in,
+    # so that the summary the state above cached is really regenerated and can really fail. Nothing
+    # after it in this profile would miss what it deletes, and the next profile purges anyway.
+    Scene(
+        name=SUMMARY_FAILED_STATE,
+        what="summary mode when the summariser fails: the row goes red, says so, and keeps the message",
+        act=_act_summary_failed,
+        expect=(
+            ("the Discord pane is up", "window.__visible('pane-discord')"),
+            (
+                "the control says the mode is on",
+                "document.getElementById('summarise').getAttribute('aria-pressed') === 'true'",
+            ),
+            (
+                "the row that was asked about is marked as failed",
+                "document.getElementById('summary-failed-probe')"
+                ".getAttribute('data-summary-failed') === 'true'",
+            ),
+            (
+                # THE claim, and the reason this is a picture rather than a fixture. The page suite
+                # can assert the attribute, and it can assert that voice.css declares a rule for
+                # it; whether the rule reaches the pixels — past the greyscale filter on archived
+                # rows, past a later declaration, past a palette that has no red in it — is a
+                # rendering fact, and this is the only thing in the repository that can see it. A
+                # state pinned to the attribute alone would be green with the whole stylesheet
+                # deleted.
+                "the failed row is really DRAWN differently from an ordinary one",
+                "(() => { const f = document.getElementById('summary-failed-probe'); "
+                "const rows = [...document.querySelectorAll('#discord-log li')]; "
+                "const other = rows.find((n) => n !== f); "
+                "if (!other) return false; "
+                "const a = getComputedStyle(f), b = getComputedStyle(other); "
+                "return a.backgroundColor !== b.backgroundColor && "
+                "parseFloat(a.borderLeftWidth) > 0; })()",
+            ),
+            (
+                # A colour is not reachable by a screen reader, is not reachable by a reader who
+                # cannot separate this red from the surface behind it, and does not survive being
+                # printed. The words are the statement; the tint is only the glance.
+                "it says so IN WORDS, not only in colour",
+                "/summary failed/i.test(document.getElementById('summary-failed-probe')"
+                ".querySelector('.summary-mark').textContent || '')",
+            ),
+            (
+                # The one thing the reader still has. Replacing a message with an apology is
+                # strictly worse than the row they would have had with the mode off, and the whole
+                # design of the failed row turns on not doing it.
+                "the message itself is still on screen, not replaced by the failure",
+                "(() => { const row = document.getElementById('summary-failed-probe'); "
+                "return row.querySelector('.body').offsetParent !== null; })()",
+            ),
+            (
+                # The owner asked for a pop-up as well as a colour. It counts, and it is transient
+                # on purpose — the standing sentence for a permanent fact lives in #summary-note.
+                "the strip says it once, in a sentence that counts",
+                "/could not be summarised/.test(window.__text('status-line') || '') && "
+                "window.__visible('status-line')",
+            ),
+            (
+                # The negative control that stops this state being satisfied by a page that shouts
+                # about everything: the sticky full-width panel is for a channel the reader cannot
+                # reach, and one unsummarised row out of fifty is not that.
+                "the sticky error panel is NOT raised for a summary failure",
+                "!window.__visible('error')",
             ),
         ),
     ),
@@ -3076,7 +3321,13 @@ def open_browser(playwright: Playwright) -> Browser:
 
 
 def run_captures(
-    url: str, token: str, channel: str, out_dir: Path, only: Iterable[str], themes: Iterable[Theme]
+    url: str,
+    token: str,
+    channel: str,
+    out_dir: Path,
+    only: Iterable[str],
+    themes: Iterable[Theme],
+    mock_control: str = "",
 ) -> list[tuple[str, Path, Verdict]]:
     try:
         from playwright.sync_api import sync_playwright
@@ -3150,7 +3401,7 @@ def run_captures(
                         ),
                     )
                     page = context.new_page()
-                    driver = Driver(page, url, token, out_dir, profile, theme)
+                    driver = Driver(page, url, token, out_dir, profile, theme, mock_control)
                     print(f"==> {theme} · {profile.name}: {profile.what}")
                     purge_stored_conversations()
                     for scene in scenes:
@@ -3509,6 +3760,15 @@ def check_state_controls() -> list[str]:
         # relabels itself and still does not say how much it is about to take.
         "33-todo-view": ("__dealtWith", "inbox-note"),
         "34-bankruptcy-armed": ("__backlog", "armed"),
+        # `#49 cached-summaries`, the other half. Pinned to THREE independent things, because each
+        # is separately deletable and each on its own is satisfiable by a defect:
+        #   `backgroundColor` — the row is really drawn differently. Pinning this state to
+        #     `data-summary-failed` alone would leave it green with voice.css emptied, which is the
+        #     entire failure it exists to catch.
+        #   `summary failed`  — it says so in words. A colour is not readable by a screen reader.
+        #   `.body`           — the message is still there. A red row that swallowed the message
+        #     would be worse than no summary mode at all, and it satisfies every colour check.
+        SUMMARY_FAILED_STATE: ("backgroundColor", "summary failed", ".body"),
     }
     for name, needles in required.items():
         required_scene = next((s for s in SCENES if s.name == name), None)
@@ -3592,6 +3852,53 @@ def check_standalone_scene_controls() -> list[str]:
                 "scroll-test-strength` recorded, and it reads as a page bug rather than as a "
                 "harness one."
             )
+    return problems
+
+
+def check_summary_scene_controls() -> list[str]:
+    """The two summary states share a vendor and a cache, and both sharings can go quietly wrong.
+
+    Neither failure is loud. A summarised state that inherited the wedged vendor from the state
+    before it would be UNREACHABLE, which at least says something — but a failed state that
+    inherited the CACHED summary would simply be served the old answer, never fail, and time out
+    twenty seconds later reporting the page. And a failed state that ran anywhere but last would
+    empty the store underneath whatever came after it.
+
+    So each of the three is asserted here, offline, against the source of the acts themselves.
+    """
+    problems: list[str] = []
+
+    summarised = inspect.getsource(_act_summary_mode)
+    if '_tell_the_mock(' not in summarised or '"no_tool_call"' not in summarised:
+        problems.append(
+            "32-channel-summarised no longer puts the offline vendor back into a scenario that "
+            "ANSWERS. It would then inherit whichever scenario ran last -- and the state after it "
+            "deliberately wedges the same mock, so on every profile but the first this state would "
+            "photograph a failure under the name of a success."
+        )
+
+    failed = inspect.getsource(_act_summary_failed)
+    if "_forget_cached_summaries(" not in failed:
+        problems.append(
+            f"{SUMMARY_FAILED_STATE} no longer clears the summary cache. The state before it files "
+            "a summary for the same message under the same policy version, so the request this "
+            "state needs to FAIL would be answered out of the store and never reach the "
+            "summariser at all."
+        )
+    if '"no_reply"' not in failed:
+        problems.append(
+            f"{SUMMARY_FAILED_STATE} no longer wedges the offline vendor, so nothing makes the "
+            "summary fail. A state that cannot reach a failure cannot photograph one."
+        )
+
+    if SCENES[-1].name != SUMMARY_FAILED_STATE:
+        problems.append(
+            f"{SUMMARY_FAILED_STATE} is no longer the last state in the walk. It empties the "
+            "server's durable store on the way in, so anything after it inherits a purged "
+            f"transcript -- and would fail for a reason that names neither state. It is "
+            f"'{SCENES[-1].name}' that now runs last."
+        )
+
     return problems
 
 
@@ -3838,6 +4145,10 @@ SELF_TEST_CHECKS = (
     "every desktop-class profile really reports a fine pointer",
     "a desktop-only scene names profiles that exist",
     "every state that exists on only some devices is still restricted to them",
+    "the summarised state resets the offline vendor rather than inheriting a wedged one",
+    "the failed-summary state clears the cache, so its request really reaches the summariser",
+    "the failed-summary state wedges the vendor, so the failure it photographs is real",
+    "the failed-summary state runs last, because it empties the store on its way in",
     "the missing-package error carries the pip install command",
     "the missing-browser error carries the browser install command",
     "removing viewport-fit=cover from the markup is reported",
@@ -3856,6 +4167,7 @@ def run_self_test(tmp: Path) -> int:
         + check_blank_gate_controls(tmp)
         + check_state_controls()
         + check_standalone_scene_controls()
+        + check_summary_scene_controls()
         + check_profile_controls()
         + check_theme_controls()
         + check_dependency_message_controls()
@@ -3900,6 +4212,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_THEME,
         help="which colour scheme to capture (default: dark — the owner's phone is dark, and "
         "contrast that reads on white can vanish on black)",
+    )
+    parser.add_argument(
+        "--mock-control",
+        default="",
+        metavar="URL",
+        help="origin of gent-talk-mock-elevenlabs' /_mock/ control plane, e.g. "
+        "http://127.0.0.1:18092. The two summary states need it: there is one summariser and it "
+        "holds a conversation with an agent, so a working one and a failing one both have to be "
+        "arranged. scripts/run.sh --screenshots starts the mock and passes this",
     )
     parser.add_argument(
         "--self-test",
@@ -3961,7 +4282,15 @@ def main(argv: list[str]) -> int:
 
     try:
         themes = THEMES if args.theme == "both" else (cast(Theme, args.theme),)
-        results = run_captures(args.url, token, args.channel or "", out_dir, args.only, themes)
+        results = run_captures(
+            args.url,
+            token,
+            args.channel or "",
+            out_dir,
+            args.only,
+            themes,
+            args.mock_control or "",
+        )
     except PlaywrightMissing as error:
         print(f"screenshots.py: {error}", file=sys.stderr)
         return EXIT_PLAYWRIGHT_MISSING

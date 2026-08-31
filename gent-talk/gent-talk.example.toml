@@ -111,6 +111,10 @@ writable = false
 # With either one unset, /api/v1/signed-url answers 503 and names the setting you are missing. It
 # never falls back to an unsigned URL, because that failure would surface later, in a browser, in
 # a car, as a conversation that silently will not start.
+#
+# These two now also decide whether MESSAGE SUMMARIES work at all: the summariser under [summaries]
+# is this same agent, so a deployment without them shows every long message as a failed summary.
+# See [summaries] below.
 # Environment: GENT_TALK_ELEVENLABS_AGENT_ID / GENT_TALK_ELEVENLABS_API_KEY
 #              GENT_TALK_ELEVENLABS_VOICE_ID
 #
@@ -135,8 +139,8 @@ writable = false
 [storage]
 # Durable state: the /voice conversation transcript, how far you have read in each channel,
 # and the cached summaries below. Everything else this server does is stateless — a channel is
-# never cached as a channel. A cached SUMMARY is: with the shipped extractive backend it is the
-# opening of somebody else's message, so it is a second at-rest copy of third-party text and is
+# never cached as a channel. A cached SUMMARY is: it is a model's paraphrase of somebody else's
+# message, written from that message, so it is a second at-rest copy of third-party text and is
 # bounded and purged as one.
 #
 # UNSET MEANS OFF, and off is honest: the routes that need a store answer 503
@@ -184,36 +188,39 @@ writable = false
 # target_chars = 160
 # context_messages = 3        # how many preceding messages ride along as context
 #
-# The model to ask. NOTE: no backend reads this yet — the agent backend below asks whichever model
-# the ElevenLabs agent is configured with — so today it does exactly one thing: it is folded into
-# the cache key, so setting it invalidates every summary produced without it.
+# The model to ask. NOTE: nothing reads this — the summariser asks whichever model the ElevenLabs
+# agent is configured with — so today it does exactly one thing: it is folded into the cache key,
+# so setting it invalidates every summary produced without it.
 # Environment: GENT_TALK_SUMMARY_MODEL
 # model = "..."
 
-# WHICH SUMMARISER RUNS.
+# THERE IS NO SUMMARISER TO CHOOSE, AND NO `backend` KEY. There used to be one: an "extractive"
+# summariser that truncated, cost nothing, and was the default. It has been DELETED. It never
+# comprehended anything — it handed you the opening of the message it claimed to summarise, which
+# the collapsed row already shows you — so it earned its keep only as a step on the way here.
 #
-#   "extractive"       (the default) truncation. No model, no network, no cost. A deployment that
-#                      has never heard of ElevenLabs works, and nothing starts costing money
-#                      because somebody upgraded.
-#   "elevenlabs_agent" the conversational agent named in [elevenlabs], asked in TEXT over its own
-#                      WebSocket with audio generation suppressed. Needs elevenlabs.agent_id and
-#                      elevenlabs.api_key; without them every summary request refuses by name
-#                      rather than falling back, because a silent fallback to truncation is
-#                      indistinguishable from the agent working badly.
+# Summaries now always come from the conversational agent named in [elevenlabs], asked in TEXT over
+# its own WebSocket with audio generation suppressed. That makes elevenlabs.agent_id and
+# elevenlabs.api_key load-bearing for summaries: WITHOUT THEM THERE IS NO SUMMARISER AT ALL. The
+# server still starts, and says so; every summary request then refuses by name, and the /voice page
+# draws those rows RED. It does not fall back to truncation, because a silent fallback is
+# indistinguishable from the agent working badly.
 #
-# The server says which one it is using at startup, and every summary answer carries the backend
-# name, so a page can never imply a model summary it did not get. Every answer also carries
-# generated_in_ms, so a deployment can see what a round trip to the agent actually costs without
-# instrumenting anything.
+# A configuration that still says `backend = "extractive"` is REFUSED at startup, by name, rather
+# than being ignored: an upgrade must not quietly change what your summaries are. `backend =
+# "elevenlabs_agent"` still starts and warns loudly that the key selects nothing. Delete the line.
 #
-# NOTHING IN THE AGENT BACKEND HAS BEEN RUN AGAINST LIVE ELEVENLABS. The protocol was read out of
-# the vendor's SDK and is exercised offline against this repository's own mock, which was written
-# from the same reading. The first real conversation is the experiment.
-# Environment: GENT_TALK_SUMMARY_BACKEND
-# backend = "extractive"
+# Every summary answer carries the summariser's name, so a page can never imply a model summary it
+# did not get, and generated_in_ms, so a deployment can see what a round trip to the agent actually
+# costs without instrumenting anything.
+#
+# NOTHING IN THE AGENT SUMMARISER HAS BEEN RUN AGAINST LIVE ELEVENLABS, and it is now the only
+# path. The protocol was read out of the vendor's SDK and is exercised offline against this
+# repository's own mock, which was written from the same reading. The first real conversation is
+# the experiment.
 
-# HOW THE AGENT'S CONVERSATION IS POOLED. Only "elevenlabs_agent" reads these, and both of the
-# first two are folded into the cache key because both change what a summary SAYS.
+# HOW THE SUMMARISER'S CONVERSATION IS POOLED. Both of the first two are folded into the cache key,
+# because both change what a summary SAYS.
 #
 # A ConvAI socket is a CONVERSATION: everything asked down one stays in the agent's context,
 # including its own previous answers, and there is no event that resets it. So a socket shared by
