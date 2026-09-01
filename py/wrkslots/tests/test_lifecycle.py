@@ -1104,6 +1104,153 @@ def test_recover_ownerless_validate_checkout_removes_clean_terminal_worktree(
     assert active_slots(project) == []
 
 
+def test_ownerless_validation_blocking_status_ignores_only_explicit_safe_roots() -> None:
+    status = (
+        "! ignored/\n"
+        "! ignored/run/output.log\n"
+        "! target/\n"
+        "! target/debug/program\n"
+    )
+
+    assert wrkslots._ownerless_validation_blocking_status(
+        status, ("ignored", "target")
+    ) == ""
+
+
+@pytest.mark.parametrize(
+    "record",
+    (
+        "1 tracked-change",
+        "2 renamed-tracked-path",
+        "u conflicted-tracked-path",
+        "? ordinary-untracked-path",
+        "? ignored/file",
+        "! scratch/",
+        "! ignored-other/",
+        "! target-other/",
+        "malformed-or-unknown-record",
+    ),
+)
+def test_ownerless_validation_blocking_status_preserves_every_other_record(
+    record: str,
+) -> None:
+    assert wrkslots._ownerless_validation_blocking_status(
+        f"{record}\n", ("target",)
+    ) == record
+
+
+def test_recover_ownerless_validate_checkout_allows_validation_owned_ignored_and_cache(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+        cache_globs=("target",),
+    )
+    (repository / ".gitignore").write_text("/ignored/\n/target/\n", encoding="utf-8")
+    git(repository, "add", ".gitignore")
+    git(repository, "commit", "-m", "ignore validation artifacts")
+    git(repository, "push", "origin", "main")
+    target = project / "worktrees" / "validate" / "review-checkout"
+    target.parent.mkdir(parents=True)
+    git(repository, "worktree", "add", "--detach", str(target), "origin/main")
+    (target / "ignored" / "run").mkdir(parents=True)
+    (target / "ignored" / "run" / "output.log").write_text(
+        "disposable\n", encoding="utf-8"
+    )
+    (target / "target" / "debug").mkdir(parents=True)
+    (target / "target" / "debug" / "program").write_text(
+        "disposable\n", encoding="utf-8"
+    )
+    status = wrkslots._GitVcs().status(target, ("target",))
+    assert set(status.splitlines()) == {"! ignored/", "! target/"}
+    record = prepare_terminal_validation_record(project, target, field="checkout")
+
+    recovered = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--ownerless-validate-checkout",
+        target.relative_to(project).as_posix(),
+        "--completed-record",
+        record.relative_to(project).as_posix(),
+        "--repository",
+        repository.relative_to(project).as_posix(),
+    )
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert not target.exists()
+
+
+def test_recover_ownerless_validate_checkout_refuses_tracked_change(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+        cache_globs=("target",),
+    )
+    target = project / "worktrees" / "validate" / "review-checkout"
+    target.parent.mkdir(parents=True)
+    git(repository, "worktree", "add", "--detach", str(target), "origin/main")
+    (target / "seed.txt").write_text("changed\n", encoding="utf-8")
+
+    refused = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--ownerless-validate-checkout",
+        target.relative_to(project).as_posix(),
+        "--repository",
+        repository.relative_to(project).as_posix(),
+        "--recovery-note",
+        "no retained run handle",
+    )
+
+    assert refused.returncode == 3
+    assert "validation checkout is dirty (1 " in refused.stderr
+    assert target.is_dir()
+
+
+def test_recover_ownerless_validate_checkout_refuses_handoff_before_cache_status(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+        cache_globs=("target",),
+    )
+    target = project / "worktrees" / "validate" / "review-checkout"
+    target.parent.mkdir(parents=True)
+    git(repository, "worktree", "add", "--detach", str(target), "origin/main")
+    (target / "target").mkdir()
+    (target / "target" / "cache").write_text("disposable\n", encoding="utf-8")
+    (target / "HANDOFF.md").write_text("preserve this\n", encoding="utf-8")
+
+    refused = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--ownerless-validate-checkout",
+        target.relative_to(project).as_posix(),
+        "--repository",
+        repository.relative_to(project).as_posix(),
+        "--recovery-note",
+        "no retained run handle",
+    )
+
+    assert refused.returncode == 3
+    assert "validation checkout contains HANDOFF.md" in refused.stderr
+    assert "validation checkout is dirty" not in refused.stderr
+    assert target.is_dir()
+
+
 def test_ownerless_checkout_refuses_remote_change_during_fetch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
