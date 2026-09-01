@@ -960,6 +960,64 @@ def test_recover_ownerless_validate_checkout_removes_clean_terminal_worktree(
     assert active_slots(project) == []
 
 
+def test_ownerless_checkout_refuses_remote_change_during_fetch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    target = project / "worktrees" / "validate" / "review-checkout"
+    target.parent.mkdir(parents=True)
+    git(repository, "worktree", "add", "--detach", str(target), "origin/main")
+    record = prepare_terminal_validation_record(project, target, field="checkout")
+    alternate = tmp_path / "alternate.git"
+    subprocess.run(
+        ["git", "init", "--bare", "--initial-branch=main", str(alternate)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    original_fetch = wrkslots._GitVcs.fetch_remote
+
+    def mutate_remote_after_fetch(
+        vcs: wrkslots._GitVcs,
+        checkout: Path,
+        remote: str,
+        landed_ref: str,
+    ) -> None:
+        original_fetch(vcs, checkout, remote, landed_ref)
+        git(checkout, "remote", "set-url", remote, str(alternate))
+
+    monkeypatch.setattr(wrkslots._GitVcs, "fetch_remote", mutate_remote_after_fetch)
+
+    returncode = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--ownerless-validate-checkout",
+            target.relative_to(project).as_posix(),
+            "--completed-record",
+            record.relative_to(project).as_posix(),
+            "--repository",
+            repository.relative_to(project).as_posix(),
+        ]
+    )
+
+    assert returncode == 3
+    assert "remote changed during recovery fetch" in capsys.readouterr().err
+    assert target.is_dir()
+    assert target.absolute() in wrkslots._GitVcs().listed_worktrees(repository)
+    assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
+
+
 def test_ownerless_recovery_accepts_nested_source_without_relaxing_import(
     tmp_path: Path,
 ) -> None:

@@ -9753,58 +9753,6 @@ def _legacy_validate_recovery_inputs(
     return checkout, repository, record_path, head
 
 
-def _legacy_validate_journal(
-    config: Config,
-    args: argparse.Namespace,
-    coordinator: ProcessIdentity,
-) -> dict[str, object]:
-    checkout_relative, checkout = _relative_inside(
-        config.root, args.legacy_validate_checkout, "legacy validation checkout"
-    )
-    record_relative, record_path = _relative_inside(
-        config.root, args.completed_record, "completed validation record"
-    )
-    repository_relative, repository = _repository_path(config, args.repository)
-    if not checkout.is_dir() or checkout.is_symlink():
-        raise Refusal(
-            f"legacy validation checkout is absent or unsafe: {checkout}. state: "
-            "REFUSED -- no lifecycle record was changed. remedy: inspect the durable "
-            "validation record; if Git already removed the checkout, prune its stale "
-            "registration explicitly before retrying"
-        )
-    _ensure_no_mount_components(config.root, checkout, "legacy validation checkout")
-    _assert_no_mountinfo_crossing(checkout, checkout, "legacy validation checkout")
-    if (checkout / "HANDOFF.md").exists() or (checkout / "HANDOFF.md").is_symlink():
-        raise Refusal(
-            f"legacy validation checkout contains HANDOFF.md: {checkout / 'HANDOFF.md'}. "
-            "state: REFUSED -- no checkout was removed. remedy: have a participant read "
-            "and preserve the handoff before deciding how to recover this directory"
-        )
-    vcs = _GitVcs()
-    head = vcs.verify_existing_worktree(repository, checkout)
-    try:
-        record_contents = record_path.read_bytes()
-    except OSError as exc:
-        raise Refusal(f"cannot read completed validation record {record_path}: {exc}") from exc
-    journal: dict[str, object] = {
-        "schema": SCHEMA,
-        "kind": "legacy-validate-remove",
-        "machine": config.machine,
-        "slot": checkout.name,
-        "phase": "prepared",
-        "checkout": checkout_relative,
-        "repository": repository_relative,
-        "completed_record": record_relative,
-        "completed_record_sha256": hashlib.sha256(record_contents).hexdigest(),
-        "head": head,
-        "actor": _identity_to_obj(coordinator),
-        "coordinator_authorized": bool(args.coordinator_authorized),
-    }
-    _legacy_validate_recovery_inputs(config, journal)
-    _assert_slot_unused(checkout)
-    return journal
-
-
 def _recover_legacy_validate_remove(
     config: Config,
     path: Path,
@@ -10027,6 +9975,8 @@ def _validation_checkout_facts(
     if expected_remote is not None and remote_digest != expected_remote:
         raise Refusal("validation checkout remote changed after recovery was authorized")
     vcs.fetch_remote(checkout, remote, landed_ref)
+    if vcs.remote_url_sha256(checkout, remote) != remote_digest:
+        raise Refusal("validation checkout remote changed during recovery fetch")
     if not vcs.remote_refs_containing(checkout, remote, head):
         raise Refusal(f"validation checkout HEAD {head} is not contained by remote {remote}")
     _assert_slot_unused(checkout)
