@@ -154,6 +154,8 @@ PROJECTS: tuple[Project, ...] = (
         distribution="wrkslots",
         package="wrkslots",
         commands=("wrkslots",),
+        # `validate-cargo-*` is a public managed-directory spelling.
+        doc_term_exemptions=("cargo",),
         resources=(
             "README.md",
             "USER_GUIDE.md",

@@ -602,6 +602,35 @@ def prepare_legacy_validate_checkout(
     return checkout_path, record_path
 
 
+def prepare_terminal_validation_record(
+    project: Path,
+    target: Path,
+    *,
+    field: str,
+    state: str = "completed",
+    name: str = "validate-ownerless",
+) -> Path:
+    record_path = project / "ignored" / "validate" / "runs" / f"{name}.json"
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    record_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "unit": f"{name}.service",
+                field: str(target),
+                "state": state,
+                "exit_code": 0 if state == "completed" else None,
+                "final_validate_status": "PASSED" if state == "completed" else None,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return record_path
+
+
 def test_init_is_idempotent_and_installs_relative_symlink(tmp_path: Path) -> None:
     project = tmp_path / "project"
     project.mkdir()
@@ -714,7 +743,7 @@ def test_recover_removes_only_evidenced_completed_legacy_validate_checkout(
     project, repository, _remote = make_project(tmp_path)
     checkout_path, record_path = prepare_legacy_validate_checkout(project, repository)
 
-    recovered = raw_command(
+    recovered = command(
         project,
         "recover",
         "--coordinator-pid",
@@ -728,13 +757,13 @@ def test_recover_removes_only_evidenced_completed_legacy_validate_checkout(
     )
 
     assert recovered.returncode == 0, recovered.stderr
-    assert "recovered completed legacy validation checkout" in recovered.stdout
+    assert "recovered ownerless validation checkout" in recovered.stdout
     assert not checkout_path.exists()
     assert checkout_path.absolute() not in wrkslots._GitVcs().listed_worktrees(repository)
     assert active_slots(project) == []
     config = wrkslots._load_config(str(project), "testhost")
     events = wrkslots._load_events(config)
-    assert any(event["kind"] == "legacy-validate-checkout-removed" for event in events)
+    assert any(event["kind"] == "ownerless-validate-path-removed" for event in events)
 
 
 def test_recover_refuses_legacy_validate_checkout_without_completed_result(
@@ -745,7 +774,7 @@ def test_recover_refuses_legacy_validate_checkout_without_completed_result(
         project, repository, state="running"
     )
 
-    refused = raw_command(
+    refused = command(
         project,
         "recover",
         "--coordinator-pid",
@@ -759,9 +788,9 @@ def test_recover_refuses_legacy_validate_checkout_without_completed_result(
     )
 
     assert refused.returncode == 3
-    assert "does not contain an evidenced completed result" in refused.stderr
-    assert "no checkout was removed" in refused.stderr
-    assert "let validate-run finish recording the result" in refused.stderr
+    assert "does not contain an evidenced terminal result" in refused.stderr
+    assert "no path was removed" in refused.stderr
+    assert "Let validate-run finish recording the result" in refused.stderr
     assert checkout_path.is_dir()
     assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
 
@@ -771,7 +800,7 @@ def test_recover_resumes_legacy_validate_removal_after_checkout_disappears(
 ) -> None:
     project, repository, _remote = make_project(tmp_path)
     checkout_path, record_path = prepare_legacy_validate_checkout(project, repository)
-    interrupted = raw_command(
+    interrupted = command(
         project,
         "recover",
         "--coordinator-pid",
@@ -782,7 +811,7 @@ def test_recover_resumes_legacy_validate_removal_after_checkout_disappears(
         record_path.relative_to(project).as_posix(),
         "--repository",
         repository.relative_to(project).as_posix(),
-        env={"WRKSLOTS_TEST_INTERRUPT": "after-legacy-validate-remove"},
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-ownerless-validate-remove"},
     )
     assert interrupted.returncode == 86
     assert not checkout_path.exists()
@@ -799,6 +828,821 @@ def test_recover_resumes_legacy_validate_removal_after_checkout_disappears(
     assert recovered.returncode == 0, recovered.stderr
     assert not journal.exists()
     assert active_slots(project) == []
+
+
+def test_recover_resumes_literal_preupgrade_legacy_journal_without_new_authority(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    checkout_path, record_path = prepare_legacy_validate_checkout(project, repository)
+    record = json.loads(record_path.read_text())
+    record["service_result_schema"] = 1
+    record_path.write_text(json.dumps(record), encoding="utf-8")
+    config = wrkslots._load_config(str(project), "testhost")
+    actor = wrkslots._capture_caller_process(os.getpid(), "test coordinator")
+    old_journal = {
+        "schema": wrkslots.SCHEMA,
+        "kind": "legacy-validate-remove",
+        "machine": "testhost",
+        "slot": checkout_path.name,
+        "phase": "prepared",
+        "checkout": checkout_path.relative_to(project).as_posix(),
+        "repository": repository.relative_to(project).as_posix(),
+        "completed_record": record_path.relative_to(project).as_posix(),
+        "completed_record_sha256": hashlib.sha256(record_path.read_bytes()).hexdigest(),
+        "head": git(checkout_path, "rev-parse", "HEAD").stdout.strip(),
+        "actor": wrkslots._identity_to_obj(actor),
+        "coordinator_authorized": False,
+    }
+    wrkslots._write_journal(config, old_journal)
+
+    recovered = raw_command(
+        project, "recover", "--coordinator-pid", str(os.getpid())
+    )
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert not checkout_path.exists()
+    assert checkout_path.absolute() not in wrkslots._GitVcs().listed_worktrees(repository)
+
+
+def test_preupgrade_legacy_journal_rechecks_handoff_before_removal(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    checkout_path, record_path = prepare_legacy_validate_checkout(project, repository)
+    config = wrkslots._load_config(str(project), "testhost")
+    actor = wrkslots._capture_caller_process(os.getpid(), "test coordinator")
+    old_journal = {
+        "schema": wrkslots.SCHEMA,
+        "kind": "legacy-validate-remove",
+        "machine": "testhost",
+        "slot": checkout_path.name,
+        "phase": "prepared",
+        "checkout": checkout_path.relative_to(project).as_posix(),
+        "repository": repository.relative_to(project).as_posix(),
+        "completed_record": record_path.relative_to(project).as_posix(),
+        "completed_record_sha256": hashlib.sha256(record_path.read_bytes()).hexdigest(),
+        "head": git(checkout_path, "rev-parse", "HEAD").stdout.strip(),
+        "actor": wrkslots._identity_to_obj(actor),
+        "coordinator_authorized": False,
+    }
+    wrkslots._write_journal(config, old_journal)
+    (checkout_path / "HANDOFF.md").write_text("preserve this\n", encoding="utf-8")
+
+    refused = raw_command(project, "recover", "--coordinator-pid", str(os.getpid()))
+
+    assert refused.returncode == 3
+    assert "gained HANDOFF.md" in refused.stderr
+    assert checkout_path.is_dir()
+
+
+def test_recover_ownerless_validate_checkout_requires_explicit_authority(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    target = project / "worktrees" / "validate" / "review-checkout"
+    target.parent.mkdir(parents=True)
+    git(repository, "worktree", "add", "--detach", str(target), "origin/main")
+    record = prepare_terminal_validation_record(project, target, field="checkout")
+
+    refused = raw_command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--ownerless-validate-checkout",
+        target.relative_to(project).as_posix(),
+        "--completed-record",
+        record.relative_to(project).as_posix(),
+        "--repository",
+        repository.relative_to(project).as_posix(),
+    )
+
+    assert refused.returncode == 3
+    assert "coordinator-authorized" in refused.stderr
+    assert target.is_dir()
+    assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
+
+
+def test_recover_ownerless_validate_checkout_removes_clean_terminal_worktree(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    target = project / "worktrees" / "validate" / "review-checkout"
+    target.parent.mkdir(parents=True)
+    git(repository, "worktree", "add", "--detach", str(target), "origin/main")
+    record = prepare_terminal_validation_record(project, target, field="checkout")
+
+    recovered = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--ownerless-validate-checkout",
+        target.relative_to(project).as_posix(),
+        "--completed-record",
+        record.relative_to(project).as_posix(),
+        "--repository",
+        repository.relative_to(project).as_posix(),
+    )
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert not target.exists()
+    assert target.absolute() not in wrkslots._GitVcs().listed_worktrees(repository)
+    assert active_slots(project) == []
+
+
+def test_ownerless_recovery_accepts_nested_source_without_relaxing_import(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    nested_source = project / "worktrees" / "slots" / "source-checkout"
+    nested_source.parent.mkdir(parents=True, exist_ok=True)
+    git(repository, "worktree", "add", "--detach", str(nested_source), "origin/main")
+    target = project / "worktrees" / "validate" / "review-checkout"
+    target.parent.mkdir(parents=True)
+    git(nested_source, "worktree", "add", "--detach", str(target), "origin/main")
+    record = prepare_terminal_validation_record(project, target, field="checkout")
+    config = wrkslots._load_config(str(project), "testhost")
+    with pytest.raises(wrkslots.Refusal, match="outside the managed worktrees"):
+        wrkslots._repository_path(
+            config, nested_source.relative_to(project).as_posix()
+        )
+
+    recovered = raw_command(
+        project,
+        "--allow-existing-unregistered-worktrees",
+        "recover",
+        "--coordinator-authorized",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--ownerless-validate-checkout",
+        target.relative_to(project).as_posix(),
+        "--completed-record",
+        record.relative_to(project).as_posix(),
+        "--repository",
+        nested_source.relative_to(project).as_posix(),
+    )
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert not target.exists()
+    assert nested_source.is_dir()
+    assert active_slots(project) == []
+
+
+def test_recover_ownerless_validate_checkout_refuses_live_or_authored_work(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    target = project / "worktrees" / "validate" / "review-checkout"
+    target.parent.mkdir(parents=True)
+    git(repository, "worktree", "add", "--detach", str(target), "origin/main")
+    (target / "authored.txt").write_text("preserve me\n", encoding="utf-8")
+
+    dirty = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--ownerless-validate-checkout",
+        target.relative_to(project).as_posix(),
+        "--repository",
+        repository.relative_to(project).as_posix(),
+        "--recovery-note",
+        "no retained run handle",
+    )
+
+    assert dirty.returncode == 3
+    assert "validation checkout is dirty" in dirty.stderr
+    assert target.is_dir()
+    (target / "authored.txt").unlink()
+
+    owner = subprocess.Popen(["sleep", "60"], cwd=target, text=True)
+    try:
+        live = command(
+            project,
+            "recover",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--ownerless-validate-checkout",
+            target.relative_to(project).as_posix(),
+            "--repository",
+            repository.relative_to(project).as_posix(),
+            "--recovery-note",
+            "no retained run handle",
+        )
+        assert live.returncode == 3
+        assert "uses slot" in live.stderr
+        assert target.is_dir()
+    finally:
+        terminate_process(owner)
+
+
+def test_ownerless_checkout_rejects_repository_inside_removal_target(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    target = project / "worktrees" / "validate" / "review-checkout"
+    target.parent.mkdir(parents=True)
+    git(repository, "worktree", "add", "--detach", str(target), "origin/main")
+    record = prepare_terminal_validation_record(project, target, field="checkout")
+
+    refused = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--ownerless-validate-checkout",
+        target.relative_to(project).as_posix(),
+        "--repository",
+        target.relative_to(project).as_posix(),
+        "--completed-record",
+        record.relative_to(project).as_posix(),
+    )
+
+    assert refused.returncode == 3
+    assert "repository must survive removal" in refused.stderr
+    assert target.is_dir()
+
+
+def test_ownerless_checkout_preserves_clean_unpublished_commit(tmp_path: Path) -> None:
+    project, repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    target = project / "worktrees" / "validate" / "review-checkout"
+    target.parent.mkdir(parents=True)
+    git(repository, "worktree", "add", "-b", "local-only", str(target), "origin/main")
+    (target / "local-only.txt").write_text("preserve me\n", encoding="utf-8")
+    git(target, "add", "local-only.txt")
+    git(target, "commit", "-m", "local-only fixture")
+
+    refused = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--ownerless-validate-checkout",
+        target.relative_to(project).as_posix(),
+        "--repository",
+        repository.relative_to(project).as_posix(),
+        "--recovery-note",
+        "the historical run handle is absent",
+    )
+
+    assert refused.returncode == 3
+    assert "not contained by remote origin" in refused.stderr
+    assert target.is_dir()
+    assert git(target, "status", "--porcelain").stdout == ""
+
+
+def test_recover_ownerless_validate_cargo_home_requires_terminal_or_manual_evidence(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    target = project / "worktrees" / "validate" / "validate-cargo-old"
+    target.mkdir(parents=True)
+    (target / "cache-entry").write_text("regenerable\n", encoding="utf-8")
+
+    missing = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--ownerless-validate-cargo-home",
+        target.relative_to(project).as_posix(),
+    )
+    assert missing.returncode == 3
+    assert "--recovery-note" in missing.stderr
+    assert target.is_dir()
+
+    record = prepare_terminal_validation_record(project, target, field="cargo_home")
+    recovered = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--ownerless-validate-cargo-home",
+        target.relative_to(project).as_posix(),
+        "--completed-record",
+        record.relative_to(project).as_posix(),
+    )
+    assert recovered.returncode == 0, recovered.stderr
+    assert not target.exists()
+    assert active_slots(project) == []
+
+
+def test_ownerless_cargo_home_allows_nested_git_cache_and_records_determination(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    target = project / "worktrees" / "validate" / "validate-cargo-nested"
+    nested_git = target / "git" / "checkouts" / "dependency" / ".git"
+    nested_git.mkdir(parents=True)
+    (nested_git / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    records = project / "ignored" / "validate" / "runs"
+    records.mkdir(parents=True)
+    (records / ".historical.json.lock").write_text("not JSON\n", encoding="utf-8")
+
+    recovered = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--ownerless-validate-cargo-home",
+        target.relative_to(project).as_posix(),
+        "--recovery-note",
+        "the historical run handle is absent",
+    )
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert not target.exists()
+    config = wrkslots._load_config(str(project), "testhost")
+    event = next(
+        item
+        for item in reversed(wrkslots._load_events(config))
+        if item["kind"] == "ownerless-validate-path-removed"
+    )
+    payload = wrkslots._as_mapping(event["payload"], "test removal event payload")
+    authorization = wrkslots._as_mapping(
+        payload["authorization"], "test removal authorization"
+    )
+    evidence = wrkslots._as_mapping(
+        authorization["evidence"], "test recovery evidence"
+    )
+    assert evidence["kind"] == "coordinator-determination"
+    assert evidence["note"] == "the historical run handle is absent"
+    assert evidence["no_retained_record"] is True
+    assert authorization["no_authored_work"] is True
+    assert authorization["no_live_use"] is True
+    assert authorization["path"] == target.relative_to(project).as_posix()
+    target_identity = wrkslots._as_list(
+        authorization["identity"], "test target identity"
+    )
+    actor = wrkslots._as_mapping(authorization["actor"], "test authorizing actor")
+    assert len(target_identity) == 3
+    assert actor["pid"] == os.getpid()
+
+
+def test_recordless_ownerless_cleanup_refuses_malformed_retained_record(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    target = project / "worktrees" / "validate" / "validate-cargo-malformed"
+    target.mkdir(parents=True)
+    records = project / "ignored" / "validate" / "runs"
+    records.mkdir(parents=True)
+    (records / "unreadable-purpose.json").write_text("{not-json\n", encoding="utf-8")
+
+    refused = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--ownerless-validate-cargo-home",
+        target.relative_to(project).as_posix(),
+        "--recovery-note",
+        "the historical run handle is absent",
+    )
+
+    assert refused.returncode == 3
+    assert "cannot prove retained record is unrelated" in refused.stderr
+    assert target.is_dir()
+
+
+def test_manual_ownerless_cleanup_cannot_override_matching_running_record(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    target = project / "worktrees" / "validate" / "validate-cargo-running"
+    target.mkdir(parents=True)
+    record = prepare_terminal_validation_record(
+        project, target, field="cargo_home", state="running"
+    )
+
+    refused = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--ownerless-validate-cargo-home",
+        target.relative_to(project).as_posix(),
+        "--recovery-note",
+        "ignore the retained row",
+    )
+
+    assert refused.returncode == 3
+    assert str(record) in refused.stderr
+    assert "--completed-record" in refused.stderr
+    assert target.is_dir()
+
+
+@pytest.mark.parametrize("state", ["killed", "not-run", "refused"])
+def test_ownerless_cleanup_accepts_noncompleted_terminal_record(
+    tmp_path: Path, state: str
+) -> None:
+    project, _repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    target = project / "worktrees" / "validate" / f"validate-cargo-{state}"
+    target.mkdir(parents=True)
+    record = prepare_terminal_validation_record(
+        project, target, field="cargo_home", state=state, name=f"validate-{state}"
+    )
+
+    recovered = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--ownerless-validate-cargo-home",
+        target.relative_to(project).as_posix(),
+        "--completed-record",
+        record.relative_to(project).as_posix(),
+    )
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert not target.exists()
+
+
+def test_ownerless_cleanup_refuses_unknown_record(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    target = project / "worktrees" / "validate" / "validate-cargo-unknown"
+    target.mkdir(parents=True)
+    record = prepare_terminal_validation_record(
+        project, target, field="cargo_home", state="unknown"
+    )
+
+    refused = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--ownerless-validate-cargo-home",
+        target.relative_to(project).as_posix(),
+        "--completed-record",
+        record.relative_to(project).as_posix(),
+    )
+
+    assert refused.returncode == 3
+    assert "does not contain an evidenced terminal result" in refused.stderr
+    assert target.is_dir()
+
+
+def test_ownerless_cleanup_accepts_current_pass_with_failed_writeback(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    target = project / "worktrees" / "validate" / "validate-cargo-writeback"
+    target.mkdir(parents=True)
+    record = prepare_terminal_validation_record(project, target, field="cargo_home")
+    value = json.loads(record.read_text())
+    value.update(
+        service_result_schema=3,
+        exit_code=75,
+        scorecard_writeback={"status": "failed", "error": "fixture refusal"},
+    )
+    record.write_text(json.dumps(value), encoding="utf-8")
+
+    recovered = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--ownerless-validate-cargo-home",
+        target.relative_to(project).as_posix(),
+        "--completed-record",
+        record.relative_to(project).as_posix(),
+    )
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert not target.exists()
+
+
+def test_ownerless_cleanup_rejects_non_authoritative_service_result_schema(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    target = project / "worktrees" / "validate" / "validate-cargo-schema-one"
+    target.mkdir(parents=True)
+    record = prepare_terminal_validation_record(project, target, field="cargo_home")
+    value = json.loads(record.read_text())
+    value["service_result_schema"] = 1
+    record.write_text(json.dumps(value), encoding="utf-8")
+
+    refused = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--ownerless-validate-cargo-home",
+        target.relative_to(project).as_posix(),
+        "--completed-record",
+        record.relative_to(project).as_posix(),
+    )
+
+    assert refused.returncode == 3
+    assert "does not contain an evidenced terminal result" in refused.stderr
+    assert target.is_dir()
+
+
+def test_ownerless_cleanup_refuses_replacement_after_journal_creation(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    target = project / "worktrees" / "validate" / "validate-cargo-replaced"
+    target.mkdir(parents=True)
+    record = prepare_terminal_validation_record(project, target, field="cargo_home")
+    interrupted = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--ownerless-validate-cargo-home",
+        target.relative_to(project).as_posix(),
+        "--completed-record",
+        record.relative_to(project).as_posix(),
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-ownerless-validate-journal"},
+    )
+    assert interrupted.returncode == 86
+    original = target.with_name("validate-cargo-replaced-original")
+    target.rename(original)
+    target.mkdir()
+
+    refused = raw_command(project, "recover", "--coordinator-pid", str(os.getpid()))
+
+    assert refused.returncode == 3
+    assert "identity changed" in refused.stderr
+    assert target.is_dir()
+    assert original.is_dir()
+
+
+def test_cache_removal_refuses_replacement_of_fenced_target(tmp_path: Path) -> None:
+    project, _repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    parent = project / "worktrees" / "validate"
+    target = parent / ".validate-cargo-fenced.ownerless-validate.fixture"
+    target.mkdir(parents=True)
+    target_identity = wrkslots._open_directory_identity(target, "test target")
+    parent_identity = wrkslots._open_directory_identity(parent, "test parent")
+    original = parent / "preserved-original"
+    target.rename(original)
+    target.mkdir()
+    (target / "replacement").write_text("preserve me\n", encoding="utf-8")
+
+    with pytest.raises(wrkslots.Refusal, match="identity changed before cleanup"):
+        wrkslots._remove_cache_directory(
+            wrkslots._load_config(str(project), "testhost"),
+            wrkslots.CacheDirectory(
+                path=target,
+                checkout_root=parent,
+                checkout_device=parent_identity[0],
+                checkout_inode=parent_identity[1],
+                checkout_mount_id=parent_identity[2],
+            ),
+            allow_git_metadata=True,
+            expected_identity=target_identity,
+        )
+
+    assert target.is_dir()
+    assert (target / "replacement").is_file()
+    assert original.is_dir()
+
+
+def test_ownerless_cleanup_resumes_after_fence_before_journal_update(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    target = project / "worktrees" / "validate" / "validate-cargo-fence-crash"
+    target.mkdir(parents=True)
+    (target / "cache-entry").write_text("regenerable\n", encoding="utf-8")
+    record = prepare_terminal_validation_record(project, target, field="cargo_home")
+    interrupted = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--ownerless-validate-cargo-home",
+        target.relative_to(project).as_posix(),
+        "--completed-record",
+        record.relative_to(project).as_posix(),
+        env={
+            "WRKSLOTS_TEST_INTERRUPT": "after-ownerless-validate-path-fence-before-journal"
+        },
+    )
+    assert interrupted.returncode == 86
+    journal = json.loads(
+        (control_directory(project) / "ACTIVE.testhost.journal").read_text()
+    )
+    fenced = project / journal["fenced"]
+    assert not target.exists()
+    assert fenced.is_dir()
+
+    resumed = raw_command(project, "recover", "--coordinator-pid", str(os.getpid()))
+
+    assert resumed.returncode == 0, resumed.stderr
+    assert not target.exists()
+    assert not fenced.exists()
+
+
+@pytest.mark.parametrize("target_kind", ["checkout", "cargo-home"])
+def test_ownerless_cleanup_rolls_back_when_process_enters_fenced_path(
+    tmp_path: Path, target_kind: str
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    target = project / "worktrees" / "validate" / (
+        "validate-fresh-race" if target_kind == "checkout" else "validate-cargo-race"
+    )
+    target.parent.mkdir(parents=True)
+    field = "checkout" if target_kind == "checkout" else "cargo_home"
+    args = [
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        (
+            "--ownerless-validate-checkout"
+            if target_kind == "checkout"
+            else "--ownerless-validate-cargo-home"
+        ),
+        target.relative_to(project).as_posix(),
+    ]
+    if target_kind == "checkout":
+        git(repository, "worktree", "add", "--detach", str(target), "origin/main")
+        args.extend(("--repository", repository.relative_to(project).as_posix()))
+    else:
+        target.mkdir()
+    record = prepare_terminal_validation_record(project, target, field=field)
+    args.extend(("--completed-record", record.relative_to(project).as_posix()))
+    interrupted = command(
+        project,
+        *args,
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-ownerless-validate-path-fence"},
+    )
+    assert interrupted.returncode == 86
+    journal_path = control_directory(project) / "ACTIVE.testhost.journal"
+    journal = json.loads(journal_path.read_text())
+    fenced = project / journal["fenced"]
+    holder = subprocess.Popen(["sleep", "60"], cwd=fenced, text=True)
+    try:
+        refused = raw_command(
+            project, "recover", "--coordinator-pid", str(os.getpid())
+        )
+        assert refused.returncode == 3
+        assert "uses slot" in refused.stderr
+        assert target.is_dir()
+        assert not fenced.exists()
+        assert not journal_path.exists()
+    finally:
+        terminate_process(holder)
+
+
+def test_ownerless_validate_recovery_resumes_without_reauthorizing(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    target = project / "worktrees" / "validate" / "validate-cargo-old"
+    target.mkdir(parents=True)
+    (target / "cache-entry").write_text("regenerable\n", encoding="utf-8")
+    record = prepare_terminal_validation_record(project, target, field="cargo_home")
+
+    interrupted = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--ownerless-validate-cargo-home",
+        target.relative_to(project).as_posix(),
+        "--completed-record",
+        record.relative_to(project).as_posix(),
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-ownerless-validate-remove"},
+    )
+    assert interrupted.returncode == 86
+    assert not target.exists()
+    journal = control_directory(project) / "ACTIVE.testhost.journal"
+    assert journal.is_file()
+    # The durable authorization already captured the record digest before the
+    # path was deleted.  Bookkeeping recovery must not become impossible if a
+    # later retention pass removes that external record.
+    record.unlink()
+
+    resumed = raw_command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+    )
+    assert resumed.returncode == 0, resumed.stderr
+    assert not journal.exists()
+
+
+def test_ownerless_recovery_does_not_make_status_tolerate_other_drift(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    target = project / "worktrees" / "validate" / "validate-cargo-target"
+    # The exact same basename under the agent root is unrelated.  The targeted
+    # validation-path exception must include slot type rather than silently
+    # suppressing both entries by name.
+    other = project / "worktrees" / "slots" / "validate-cargo-target"
+    target.mkdir(parents=True)
+    other.mkdir()
+
+    before = raw_command(project, "status")
+    assert before.returncode == 3
+    recovered = raw_command(
+        project,
+        "--allow-existing-unregistered-worktrees",
+        "recover",
+        "--coordinator-authorized",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--ownerless-validate-cargo-home",
+        target.relative_to(project).as_posix(),
+        "--recovery-note",
+        "no retained run handle",
+    )
+    assert recovered.returncode == 0, recovered.stderr
+    assert not target.exists()
+    assert other.is_dir()
+    after = raw_command(project, "status")
+    assert after.returncode == 3
+    assert "agent:validate-cargo-target" in after.stderr
 
 
 def test_create_without_slot_type_names_both_choices_and_changes_nothing(

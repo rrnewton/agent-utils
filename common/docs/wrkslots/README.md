@@ -40,8 +40,10 @@ wrkslots remove slot01 \
 ```
 
 Creation requires `--coordinator-authorized` as a readable reminder, not as a claimed permission
-boundary. The same-user processes can bypass any such convention. Removal and recovery accept that
-flag only as optional provenance so a departed coordinator cannot strand an operation.
+boundary. The same-user processes can bypass any such convention. Removal accepts the flag as
+optional provenance. Recovery requires it only when starting a new direct cleanup of an
+unregistered validation path; resuming the durable journal never depends on the original
+coordinator.
 
 `create` uses an existing source repository and its configured `origin` remote by default. Use
 `--remote NAME=REMOTE` when a checkout should use a different configured remote. Add
@@ -75,6 +77,15 @@ owner has already exited from an exact version 3 source row. It preserves the ro
 digest, starts a fresh heartbeat time-to-live, and records the complete candidate ACTIVE row before
 publication so `recover` can finish after the original participant disappears. Rows without an
 owner sidecar refuse rather than turning unavailable ownership into permission to delete.
+
+An unregistered validation checkout or `validate-cargo-*` directory with no recoverable owner is
+not imported with invented ownership. The coordinator uses `recover
+--coordinator-authorized` with an exact terminal run record, or with an explanation when no record
+survives. The tool records the exact path and filesystem identity and independently verifies that
+no retained record names it, no process uses it, and no authored work would be lost. Git worktrees
+must additionally be clean, ordinary, and remotely contained. Dirty, unpublished, in-use, or
+ambiguous paths are preserved, and ordinary `status` continues to refuse every remaining
+unregistered directory.
 
 If a command reports an interrupted operation, preserve the paths and run:
 

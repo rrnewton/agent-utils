@@ -7,8 +7,10 @@ authored work and must be salvaged before reclaim. A `validate` slot is disposab
 its logs and result records must live outside the checkout, so reclaim does not salvage it.
 
 Use `worktrees/slots/<slot>/` for live agent slots and `worktrees/validate/<slot>/` for validation
-slots. Source repositories stay outside both directories. `ACTIVE.*` and `ARCHIVED.*` are readable
-compatibility views derived from `EVENTS.*`; do not edit any of them or a journal by hand.
+slots. New-slot source repositories stay outside both directories. The recovery-only path may name
+an existing source worktree inside managed storage solely to prove a stranded checkout's Git common
+directory; it does not make that path valid for provisioning. `ACTIVE.*` and `ARCHIVED.*` are
+readable compatibility views derived from `EVENTS.*`; do not edit any of them or a journal by hand.
 
 Each checkout record carries its source repository, branch, starting commit, configured remote,
 remote identity, landed ref, current commit, and remote containment evidence. Each slot records its
@@ -48,8 +50,10 @@ inputs.
 and tells the caller to ask the coordinator. This prevents accidental self-allocation; it does not
 pretend that same-user processes have different operating-system permissions.
 
-`--coordinator-authorized` on `remove`, `recover`, and `read-handoff` is optional. When supplied it
-is recorded as provenance. It cannot gate helping, because the original coordinator may disappear.
+`--coordinator-authorized` on `remove` and `read-handoff` is optional provenance. It is required
+when `recover` starts a new cleanup for an unregistered validation path, because that operation has
+no ACTIVE row naming who allocated it. Resuming the durable journal does not require the original
+flag or coordinator; otherwise a departed coordinator could strand an interrupted cleanup.
 
 By default every command refuses if either managed directory contains a worktree without an active
 wrkslots record. During a deliberate migration, put the global
@@ -170,6 +174,40 @@ publishing it in ACTIVE. If the importer exits after that write, any later parti
 the original coordinator. Other unregistered slot directories are retained while the selected slot
 is verified. Source rows whose physical directories are already absent remain in the older
 file as history rather than being fabricated as active storage.
+
+## Recover ownerless validation paths
+
+Do not fabricate an ACTIVE owner for an unregistered validation path. `import-existing` remains the
+route for a demonstrably live owner or an exact owner generation from a retained row; `remove` remains the
+route for a registered row. An unregistered validation checkout or `validate-cargo-*` directory
+with no recoverable owner instead uses `recover` directly:
+
+```sh
+wrkslots recover --coordinator-authorized --coordinator-pid "$COORDINATOR_PID" \
+  --ownerless-validate-checkout worktrees/validate/validate-fresh-example \
+  --repository product --completed-record ignored/validate/runs/validate-example.json
+
+wrkslots recover --coordinator-authorized --coordinator-pid "$COORDINATOR_PID" \
+  --ownerless-validate-cargo-home worktrees/validate/validate-cargo-example \
+  --recovery-note "the retained run handle has no Cargo-home field"
+```
+
+The first form binds cleanup to an exact terminal run record. A recordless path requires a non-empty
+explanation, but prose is not authority: wrkslots records the exact slot type, path, filesystem
+identity, repository and commit where applicable, and its own positive determinations that no
+retained record names the path, no live process uses it, and no authored work would be lost. A
+checkout must be a clean linked worktree with ordinary Git state, no HANDOFF.md, and a HEAD contained
+by a freshly fetched remote ref. Cargo homes must have the exact configured parent and
+`validate-cargo-*` name and cannot be Git worktree roots. Both forms retain positive cwd,
+executable, root, descriptor, mapping, and mount checks. Any dirty, unpublished, in-use, or
+ambiguous path is preserved. The cleanup first renames the exact inode to a random same-parent path,
+rechecks every fact, then deletes only that fenced path. Any later participant may resume the
+journal with plain `recover --coordinator-pid PID`.
+
+This targeted route does not relax ordinary `status`: every other unregistered directory remains a
+hard refusal. During a larger deliberate migration, the global
+`--allow-existing-unregistered-worktrees` flag may accompany the exact cleanup command; it retains
+all other paths.
 
 ## Recovery and compatibility views
 

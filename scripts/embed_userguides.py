@@ -233,12 +233,16 @@ STANDALONE_DOCUMENTS: tuple[StandaloneDocument, ...] = (
         document="README",
         language="python",
         source="common/docs/wrkslots/README.md",
+        # `validate-cargo-*` is a managed directory spelling in wrkslots' public
+        # lifecycle contract, not a command for another implementation language.
+        exemptions=("target Cargo command",),
     ),
     StandaloneDocument(
         tool="wrkslots",
         document="USER_GUIDE",
         language="python",
         source="common/docs/wrkslots/USER_GUIDE.md",
+        exemptions=("target Cargo command",),
     ),
     StandaloneDocument(
         tool="parallel-experiment-runner",
