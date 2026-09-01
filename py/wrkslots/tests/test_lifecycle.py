@@ -533,6 +533,45 @@ def mark_owner_dead(
     )
 
 
+def mark_owner_dead_in_current_cgroup(
+    project: Path, machine: str = "testhost", *, expire: bool = True
+) -> None:
+    """Make owner identity provably dead while retaining its real shared cgroup."""
+    config = wrkslots._load_config(str(project), machine)
+    state = wrkslots._load_active(config)
+    record = state.slots[0]
+    assert record.owner is not None
+    heartbeat_at = record.heartbeat_at
+    if expire:
+        heartbeat_at = (
+            dt.datetime.now(dt.timezone.utc)
+            - dt.timedelta(seconds=record.heartbeat_ttl_seconds + 1)
+        ).isoformat(timespec="seconds")
+    updated = replace(
+        record,
+        owner=replace(record.owner, boot_id="finished-boot"),
+        heartbeat_at=heartbeat_at,
+    )
+    wrkslots._write_active_state(
+        config,
+        wrkslots._replace_record(state, updated),
+        action="test-owner-exited-in-shared-cgroup",
+        slot=record.slot,
+    )
+
+
+def replace_owner(project: Path, owner: wrkslots.ProcessIdentity) -> None:
+    config = wrkslots._load_config(str(project), "testhost")
+    state = wrkslots._load_active(config)
+    record = state.slots[0]
+    wrkslots._write_active_state(
+        config,
+        wrkslots._replace_record(state, replace(record, owner=owner)),
+        action="test-owner-replaced",
+        slot=record.slot,
+    )
+
+
 def expire_heartbeat(project: Path, machine: str = "testhost") -> None:
     config = wrkslots._load_config(str(project), machine)
     state = wrkslots._load_active(config)
@@ -3222,6 +3261,150 @@ def test_validate_slot_removes_dirty_checkout_without_salvage(tmp_path: Path) ->
     assert row["validation"] == [
         "slot type validate: authored work is excluded by construction, so salvage was not run"
     ]
+
+
+def test_validate_complete_removes_dead_owner_checkout_despite_shared_cgroup(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    made = create(project, slot_type="validate", branch=None)
+    assert made.returncode == 0, made.stderr
+    tree = checkout(project, slot_type="validate")
+    mark_owner_dead_in_current_cgroup(project)
+    set_liveness(project, "dead")
+
+    removed = command(
+        project,
+        "remove",
+        "slot01",
+        "--validate-complete",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+    )
+
+    assert removed.returncode == 0, removed.stderr
+    assert not tree.exists()
+    assert active_slots(project) == []
+
+
+def test_validate_complete_still_refuses_live_owner_from_shared_cgroup(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    made = create(project, slot_type="validate", branch=None)
+    assert made.returncode == 0, made.stderr
+    tree = checkout(project, slot_type="validate")
+    owner = subprocess.Popen(["sleep", "60"], cwd=tree, text=True)
+    try:
+        replace_owner(project, wrkslots._read_process_identity(owner.pid))
+        set_liveness(project, "dead")
+
+        refused = command(
+            project,
+            "remove",
+            "slot01",
+            "--validate-complete",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--expected-generation",
+            "1",
+        )
+
+        assert refused.returncode == 3
+        assert "requires a proven-dead recorded owner; owner is live" in refused.stderr
+        assert tree.is_dir()
+        assert active_slots(project)
+    finally:
+        terminate_process(owner)
+
+
+def test_validate_complete_still_refuses_live_path_use_after_owner_dies(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    made = create(project, slot_type="validate", branch=None)
+    assert made.returncode == 0, made.stderr
+    tree = checkout(project, slot_type="validate")
+    mark_owner_dead_in_current_cgroup(project)
+    set_liveness(project, "dead")
+    user = subprocess.Popen(["sleep", "60"], cwd=tree, text=True)
+    try:
+        refused = command(
+            project,
+            "remove",
+            "slot01",
+            "--validate-complete",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--expected-generation",
+            "1",
+        )
+
+        assert refused.returncode == 3
+        assert "live process" in refused.stderr
+        assert "uses slot" in refused.stderr
+        assert tree.is_dir()
+        assert active_slots(project)
+    finally:
+        terminate_process(user)
+
+
+def test_agent_remove_still_refuses_dead_owner_cgroup_with_live_process(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    tree = checkout(project)
+    commit_task(repository, tree, "codex/task")
+    handed_off = finish(project)
+    assert handed_off.returncode == 0, handed_off.stderr
+    mark_owner_dead_in_current_cgroup(project)
+    set_liveness(project, "dead")
+
+    refused = remove(project)
+
+    assert refused.returncode == 3
+    assert "remains in recorded owner cgroup" in refused.stderr
+    assert tree.is_dir()
+    assert active_slots(project)
+
+
+def test_recover_resumes_dead_validate_owner_cleanup_from_shared_cgroup(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    made = create(project, slot_type="validate", branch=None)
+    assert made.returncode == 0, made.stderr
+    tree = checkout(project, slot_type="validate")
+    mark_owner_dead_in_current_cgroup(project)
+    set_liveness(project, "dead")
+    interrupted = command(
+        project,
+        "remove",
+        "slot01",
+        "--validate-complete",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-finish-journal"},
+    )
+    assert interrupted.returncode == 86
+    assert tree.is_dir()
+
+    recovered = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+    )
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert not tree.exists()
+    assert active_slots(project) == []
 
 
 @pytest.mark.parametrize(
