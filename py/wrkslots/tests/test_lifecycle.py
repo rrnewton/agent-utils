@@ -3335,6 +3335,46 @@ def test_recursive_submodule_fixture_detects_shared_deinitialization(
     )
 
 
+def test_clean_agent_remove_with_recursive_submodules_preserves_peers_and_config(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    add_recursive_submodules(tmp_path, project, repository)
+    peer = project / "peer"
+    git(repository, "worktree", "add", "-b", "codex/peer", str(peer), "origin/main")
+    git(
+        peer,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "update",
+        "--init",
+        "--recursive",
+    )
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    target = checkout(project)
+    before = submodule_peer_snapshot(repository, peer)
+    handed_off = finish(project)
+    assert handed_off.returncode == 0, handed_off.stderr
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+
+    removed = remove(project)
+
+    assert removed.returncode == 0, removed.stderr
+    assert not target.exists()
+    assert submodule_peer_snapshot(repository, peer) == before
+    archive = json.loads(
+        (project / "worktrees" / "ARCHIVED.testhost.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert {
+        receipt["disposition"] for receipt in archive["records"][0]["salvage"]
+    } == {"already-published"}
+
+
 def test_validate_slot_removes_checkout_with_unfinished_git_operation(
     tmp_path: Path,
 ) -> None:
