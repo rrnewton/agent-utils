@@ -9983,6 +9983,21 @@ def _recordless_validation_evidence(
     return {"kind": "coordinator-determination", "note": note.strip(), "no_retained_record": True}
 
 
+def _ownerless_validation_blocking_status(
+    status: str, cache_globs: Sequence[str]
+) -> str:
+    """Keep every porcelain record except ignored paths under explicit safe roots."""
+
+    blocking: list[str] = []
+    for record in status.splitlines():
+        if record.startswith("! "):
+            path = record[2:]
+            if any(_cache_glob_contains_path(pattern, path) for pattern in cache_globs):
+                continue
+        blocking.append(record)
+    return "\n".join(blocking)
+
+
 def _validation_checkout_facts(
     config: Config,
     checkout: Path,
@@ -10008,7 +10023,9 @@ def _validation_checkout_facts(
     _assert_cache_policy_untracked_path(
         config, "ownerless-validation", checkout, vcs, config.cache_globs
     )
-    status = vcs.status(checkout, config.cache_globs)
+    status = _ownerless_validation_blocking_status(
+        vcs.status(checkout, config.cache_globs), ("ignored", *config.cache_globs)
+    )
     if status:
         raise Refusal(f"validation checkout is dirty ({status.splitlines()[0]}); preserve it")
     remote = config.default_remote
