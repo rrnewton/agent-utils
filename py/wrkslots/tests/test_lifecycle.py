@@ -239,6 +239,111 @@ def make_project(
     return project, repository, remote
 
 
+def add_recursive_submodules(
+    tmp_path: Path, project: Path, repository: Path
+) -> tuple[str, str]:
+    leaf_remote = tmp_path / "leaf.git"
+    leaf_source = tmp_path / "leaf-source"
+    component_remote = tmp_path / "component.git"
+    component_source = tmp_path / "component-source"
+    for remote, source in (
+        (leaf_remote, leaf_source),
+        (component_remote, component_source),
+    ):
+        subprocess.run(
+            ["git", "init", "--bare", "--initial-branch=main", str(remote)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "clone", str(remote), str(source)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        git(source, "config", "user.name", "Wrkslots Test")
+        git(source, "config", "user.email", "wrkslots@example.invalid")
+    (leaf_source / "leaf.txt").write_text("leaf sentinel\n", encoding="utf-8")
+    git(leaf_source, "add", "leaf.txt")
+    git(leaf_source, "commit", "-m", "leaf base")
+    git(leaf_source, "push", "-u", "origin", "main")
+    git(
+        component_source,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        str(leaf_remote),
+        "leaf",
+    )
+    (component_source / "component.txt").write_text(
+        "component sentinel\n", encoding="utf-8"
+    )
+    git(component_source, "add", ".gitmodules", "component.txt", "leaf")
+    git(component_source, "commit", "-m", "component with leaf")
+    git(component_source, "push", "-u", "origin", "main")
+    git(
+        repository,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        str(component_remote),
+        "component",
+    )
+    git(repository, "commit", "-am", "add recursive component")
+    git(repository, "push", "origin", "main")
+    update_configuration(
+        project,
+        post_provision_hooks=[
+            "git -c protocol.file.allow=always submodule update --init --recursive"
+        ],
+    )
+    git(
+        repository,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "update",
+        "--init",
+        "--recursive",
+    )
+    component_head = git(repository / "component", "rev-parse", "HEAD").stdout.strip()
+    leaf_head = git(repository / "component" / "leaf", "rev-parse", "HEAD").stdout.strip()
+    return component_head, leaf_head
+
+
+def submodule_peer_snapshot(repository: Path, peer: Path) -> tuple[object, ...]:
+    common = Path(
+        git(
+            repository,
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ).stdout.strip()
+    )
+    roots = (repository, peer)
+    statuses = tuple(git(root, "submodule", "status", "--recursive").stdout for root in roots)
+    assert statuses and all(status.strip() for status in statuses)
+    assert all(
+        not line.startswith("-")
+        for status in statuses
+        for line in status.splitlines()
+    )
+    return (
+        (common / "config").read_bytes(),
+        statuses,
+        tuple(git(root / "component", "rev-parse", "HEAD").stdout.strip() for root in roots),
+        tuple(
+            git(root / "component" / "leaf", "rev-parse", "HEAD").stdout.strip()
+            for root in roots
+        ),
+        tuple((root / "component" / "component.txt").read_bytes() for root in roots),
+        tuple((root / "component" / "leaf" / "leaf.txt").read_bytes() for root in roots),
+    )
+
+
 def create(
     project: Path,
     *,
@@ -3117,6 +3222,117 @@ def test_validate_slot_removes_dirty_checkout_without_salvage(tmp_path: Path) ->
     assert row["validation"] == [
         "slot type validate: authored work is excluded by construction, so salvage was not run"
     ]
+
+
+@pytest.mark.parametrize(
+    "interrupt",
+    (None, "after-path-fence-before-journal", "after-remove-before-journal"),
+)
+def test_validate_remove_with_recursive_submodules_preserves_peers_and_config(
+    tmp_path: Path, interrupt: str | None
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    component_head, leaf_head = add_recursive_submodules(tmp_path, project, repository)
+    peer = project / "peer"
+    git(repository, "worktree", "add", "-b", "codex/peer", str(peer), "origin/main")
+    git(
+        peer,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "update",
+        "--init",
+        "--recursive",
+    )
+    made = create(project, slot_type="validate", branch=None)
+    assert made.returncode == 0, made.stderr
+    target = checkout(project, slot_type="validate")
+    assert git(target / "component", "rev-parse", "HEAD").stdout.strip() == component_head
+    assert git(target / "component" / "leaf", "rev-parse", "HEAD").stdout.strip() == leaf_head
+    target_admin = tuple(
+        Path(git(path, "rev-parse", "--absolute-git-dir").stdout.strip())
+        for path in (target, target / "component", target / "component" / "leaf")
+    )
+    before = submodule_peer_snapshot(repository, peer)
+    orphan = slots_directory(project) / "unregistered-history" / "sentinel.txt"
+    orphan.parent.mkdir()
+    orphan.write_text("must remain\n", encoding="utf-8")
+    environment = {} if interrupt is None else {"WRKSLOTS_TEST_INTERRUPT": interrupt}
+
+    removed = raw_command(
+        project,
+        "--allow-existing-unregistered-worktrees",
+        "remove",
+        "slot01",
+        "--validate-complete",
+        "--coordinator-authorized",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        env=environment,
+    )
+
+    if interrupt is None:
+        assert removed.returncode == 0, removed.stderr
+    else:
+        assert removed.returncode == 86, removed.stderr
+        assert submodule_peer_snapshot(repository, peer) == before
+        assert orphan.read_text(encoding="utf-8") == "must remain\n"
+        recovered = raw_command(
+            project,
+            "--allow-existing-unregistered-worktrees",
+            "recover",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(os.getpid()),
+        )
+        assert recovered.returncode == 0, recovered.stderr
+
+    assert submodule_peer_snapshot(repository, peer) == before
+    assert orphan.read_text(encoding="utf-8") == "must remain\n"
+    assert not target.exists()
+    assert not any(target.parent.glob(".slot01.fenced.*"))
+    assert all(not path.exists() and not path.is_symlink() for path in target_admin)
+    listed = git(repository, "worktree", "list", "--porcelain").stdout
+    assert str(target) not in listed
+    assert ".slot01.fenced." not in listed
+
+
+def test_recursive_submodule_fixture_detects_shared_deinitialization(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    add_recursive_submodules(tmp_path, project, repository)
+    peer = project / "peer"
+    git(repository, "worktree", "add", "-b", "codex/peer", str(peer), "origin/main")
+    git(
+        peer,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "update",
+        "--init",
+        "--recursive",
+    )
+    common = Path(
+        git(
+            repository,
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ).stdout.strip()
+    )
+    config_before = (common / "config").read_bytes()
+    assert submodule_peer_snapshot(repository, peer)
+
+    git(peer, "submodule", "deinit", "--force", "--all")
+
+    assert (common / "config").read_bytes() != config_before
+    assert any(
+        line.startswith("-")
+        for line in git(repository, "submodule", "status", "--recursive").stdout.splitlines()
+    )
 
 
 def test_validate_slot_removes_checkout_with_unfinished_git_operation(

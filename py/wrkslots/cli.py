@@ -3066,6 +3066,11 @@ class _GitVcs:
     def remove_worktree(
         self, repository: Path, checkout: Path, *, force: bool = False
     ) -> None:
+        # Do not run `git submodule deinit` before removal. Submodule
+        # registration lives in the repository's common config, so deinitializing
+        # one linked worktree makes populated submodules in every peer appear
+        # uninitialized. `git worktree remove --force` removes only this
+        # worktree and its worktree-private nested repository administration.
         args = ["worktree", "remove"]
         if force:
             args.append("--force")
