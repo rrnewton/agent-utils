@@ -4564,6 +4564,7 @@ def _reclaim_preconditions(
     salvage: Sequence[Mapping[str, object]],
     vcs: _GitVcs,
     *,
+    validate_complete: bool = False,
     allow_live_validate_owner: bool = False,
 ) -> tuple[Path, tuple[Checkout, ...]]:
     _assert_record_paths(config, record)
@@ -4571,7 +4572,11 @@ def _reclaim_preconditions(
     _assert_handoff_read(config, record, slot_path)
     _assert_slot_unused(
         slot_path,
-        None if allow_live_validate_owner and record.slot_type == "validate" else record,
+        _record_for_slot_use_check(
+            record,
+            validate_complete=validate_complete,
+            allow_live_validate_owner=allow_live_validate_owner,
+        ),
         use_lsof=not (allow_live_validate_owner and record.slot_type == "validate"),
         ignore_invoking_ancestry=(
             allow_live_validate_owner and record.slot_type == "validate"
@@ -4613,6 +4618,25 @@ def _reclaim_preconditions(
     else:
         raise StateError("agent slot reclaim has neither salvage nor an owner handoff")
     return slot_path, tuple(final)
+
+
+def _record_for_slot_use_check(
+    record: ActiveRecord,
+    *,
+    validate_complete: bool,
+    allow_live_validate_owner: bool,
+) -> ActiveRecord | None:
+    if record.slot_type != "validate":
+        return record
+    if allow_live_validate_owner:
+        return None
+    if (
+        validate_complete
+        and record.owner is not None
+        and _process_state(record.owner)[0] == "dead"
+    ):
+        return None
+    return record
 
 
 def _refuse_partial_state(config: Config) -> None:
@@ -8175,6 +8199,7 @@ def _begin_or_resume_path_fence(
     journal: dict[str, object],
     vcs: _GitVcs,
     *,
+    validate_complete: bool = False,
     allow_live_validate_owner: bool = False,
 ) -> tuple[dict[str, object], Path]:
     original = _slot_directory(config, record.slot, record.slot_type)
@@ -8196,6 +8221,7 @@ def _begin_or_resume_path_fence(
             record,
             salvage,
             vcs,
+            validate_complete=validate_complete,
             allow_live_validate_owner=allow_live_validate_owner,
         )
         if current_checkouts != record.checkouts:
@@ -8232,6 +8258,7 @@ def _finish_remove_paths(
     journal: dict[str, object],
     vcs: _GitVcs,
     *,
+    validate_complete: bool = False,
     allow_live_validate_owner: bool = False,
 ) -> dict[str, object]:
     removed_values = _as_list(journal["removed"], "journal.removed")
@@ -8244,6 +8271,7 @@ def _finish_remove_paths(
         record,
         journal,
         vcs,
+        validate_complete=validate_complete,
         allow_live_validate_owner=allow_live_validate_owner,
     )
     present: list[Checkout] = []
@@ -8328,9 +8356,11 @@ def _finish_remove_paths(
                 )
             _assert_slot_unused(
                 fenced_slot,
-                None
-                if allow_live_validate_owner and record.slot_type == "validate"
-                else record,
+                _record_for_slot_use_check(
+                    record,
+                    validate_complete=validate_complete,
+                    allow_live_validate_owner=allow_live_validate_owner,
+                ),
                 use_lsof=not (
                     allow_live_validate_owner and record.slot_type == "validate"
                 ),
@@ -8493,6 +8523,7 @@ def _begin_finish(
         record,
         salvage,
         vcs,
+        validate_complete=validate_complete,
         allow_live_validate_owner=allow_live_validate_owner,
     )
     final_record = dataclasses.replace(record, checkouts=final_checkouts)
@@ -8523,6 +8554,7 @@ def _begin_finish(
             final_record,
             journal,
             vcs,
+            validate_complete=validate_complete,
             allow_live_validate_owner=allow_live_validate_owner,
         )
     except Refusal:
@@ -8661,7 +8693,11 @@ def _cmd_remove(args: argparse.Namespace) -> int:
         _assert_handoff_read(config, record, slot_path)
         _assert_slot_unused(
             slot_path,
-            None if live_validate_owner else record,
+            _record_for_slot_use_check(
+                record,
+                validate_complete=bool(args.validate_complete),
+                allow_live_validate_owner=live_validate_owner,
+            ),
             use_lsof=not live_validate_owner,
             ignore_invoking_ancestry=live_validate_owner,
         )
@@ -9626,6 +9662,7 @@ def _recover_finish(
             record,
             journal,
             _GitVcs(),
+            validate_complete=validate_complete,
             allow_live_validate_owner=live_validate_owner,
         )
     else:
