@@ -3498,6 +3498,179 @@ def test_validate_complete_still_refuses_live_path_use_after_owner_dies(
         terminate_process(user)
 
 
+def test_validate_batch_shares_census_removes_dead_and_retains_live(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    for slot in ("dead", "live-owner", "live-path"):
+        made = create(project, slot=slot, slot_type="validate", branch=None)
+        assert made.returncode == 0, made.stderr
+    config = wrkslots._load_config(str(project), "testhost")
+    for slot in ("dead", "live-path"):
+        state = wrkslots._load_active(config)
+        record = next(item for item in state.slots if item.slot == slot)
+        assert record.owner is not None
+        updated = replace(
+            record,
+            owner=replace(record.owner, boot_id="finished-boot"),
+        )
+        wrkslots._write_active_state(
+            config,
+            wrkslots._replace_record(state, updated),
+            action="test-owner-exited",
+            slot=slot,
+        )
+    set_liveness(project, "dead")
+    live_path = checkout(project, slot="live-path", slot_type="validate")
+    user = subprocess.Popen(["sleep", "60"], cwd=live_path, text=True)
+    real_capture = wrkslots._capture_process_use_census
+    capture_count = 0
+    real_assert_unused = wrkslots._assert_slot_unused
+    path_checks: list[tuple[bool, bool]] = []
+
+    def traced_capture() -> wrkslots._ProcessUseCensus:
+        nonlocal capture_count
+        capture_count += 1
+        return real_capture()
+
+    def traced_assert_unused(
+        slot_path: Path,
+        record: wrkslots.ActiveRecord | None = None,
+        *,
+        use_lsof: bool = True,
+        ignore_invoking_ancestry: bool = False,
+        census: wrkslots._ProcessUseCensus | None = None,
+        allow_lsof_fallback: bool = True,
+        fallback_census: wrkslots._ProcessUseCensus | None = None,
+    ) -> None:
+        path_checks.append((use_lsof, census is not None))
+        real_assert_unused(
+            slot_path,
+            record,
+            use_lsof=use_lsof,
+            ignore_invoking_ancestry=ignore_invoking_ancestry,
+            census=census,
+            allow_lsof_fallback=allow_lsof_fallback,
+            fallback_census=fallback_census,
+        )
+
+    monkeypatch.setattr(wrkslots, "_capture_process_use_census", traced_capture)
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", traced_assert_unused)
+    try:
+        rc = wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "remove-validate-batch",
+                "--coordinator-authorized",
+                "--coordinator-pid",
+                str(os.getpid()),
+                "--slot",
+                "live-owner=1",
+                "--slot",
+                "live-path=1",
+                "--slot",
+                "dead=1",
+                "--format",
+                "json",
+            ]
+        )
+    finally:
+        terminate_process(user)
+
+    assert rc == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["process_censuses"] == 1
+    assert report["removed"] == [
+        {"generation": 1, "slot": "dead"}
+    ], json.dumps(report, indent=2)
+    retained = {row["slot"]: row["reason"] for row in report["retained"]}
+    assert "owner is live" in retained["live-owner"]
+    assert "live process" in retained["live-path"]
+    assert "uses slot" in retained["live-path"]
+    assert not checkout(project, slot="dead", slot_type="validate").exists()
+    assert checkout(project, slot="live-owner", slot_type="validate").is_dir()
+    assert checkout(project, slot="live-path", slot_type="validate").is_dir()
+    assert capture_count == 1
+    assert path_checks
+    assert all(census or not use_lsof for use_lsof, census in path_checks)
+
+
+def test_validate_batch_rechecks_use_that_starts_after_shared_census(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    made = create(project, slot="late-use", slot_type="validate", branch=None)
+    assert made.returncode == 0, made.stderr
+    config = wrkslots._load_config(str(project), "testhost")
+    state = wrkslots._load_active(config)
+    record = state.slots[0]
+    assert record.owner is not None
+    wrkslots._write_active_state(
+        config,
+        wrkslots._replace_record(
+            state,
+            replace(record, owner=replace(record.owner, boot_id="finished-boot")),
+        ),
+        action="test-owner-exited",
+        slot=record.slot,
+    )
+    set_liveness(project, "dead")
+    tree = checkout(project, slot="late-use", slot_type="validate")
+    real_assert_unused = wrkslots._assert_slot_unused
+    late_user: subprocess.Popen[str] | None = None
+
+    def enter_after_census(
+        slot_path: Path,
+        active_record: wrkslots.ActiveRecord | None = None,
+        *,
+        use_lsof: bool = True,
+        ignore_invoking_ancestry: bool = False,
+        census: wrkslots._ProcessUseCensus | None = None,
+        allow_lsof_fallback: bool = True,
+        fallback_census: wrkslots._ProcessUseCensus | None = None,
+    ) -> None:
+        nonlocal late_user
+        real_assert_unused(
+            slot_path,
+            active_record,
+            use_lsof=use_lsof,
+            ignore_invoking_ancestry=ignore_invoking_ancestry,
+            census=census,
+            allow_lsof_fallback=allow_lsof_fallback,
+            fallback_census=fallback_census,
+        )
+        if census is not None and late_user is None:
+            late_user = subprocess.Popen(["sleep", "60"], cwd=tree, text=True)
+
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", enter_after_census)
+    try:
+        rc = wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "remove-validate-batch",
+                "--coordinator-authorized",
+                "--coordinator-pid",
+                str(os.getpid()),
+                "--slot",
+                "late-use=1",
+                "--format",
+                "json",
+            ]
+        )
+    finally:
+        if late_user is not None:
+            terminate_process(late_user)
+
+    assert rc == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["removed"] == []
+    assert len(report["retained"]) == 1
+    assert "live process" in report["retained"][0]["reason"]
+    assert tree.is_dir()
+
+
 def test_agent_remove_still_refuses_dead_owner_cgroup_with_live_process(
     tmp_path: Path,
 ) -> None:

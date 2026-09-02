@@ -61,6 +61,7 @@ HISTORICAL_ACTIVE_STATUSES = frozenset(
 )
 HISTORICAL_TASK_NOT_RECORDED = "no task recorded in worktree-state.json"
 HISTORICAL_PURPOSE_NOT_RECORDED = "no purpose recorded in worktree-state.json"
+VALIDATE_REMOVE_BATCH_LIMIT = 8
 
 
 class Refusal(RuntimeError):
@@ -107,6 +108,60 @@ class ProcessIdentity:
     boot_id: str
     host_id: str
     cgroup_path: str
+
+
+@dataclasses.dataclass(frozen=True)
+class _ProcessPathUse:
+    """One path reference observed in a point-in-time process census."""
+
+    pid: int
+    description: str
+    path: Path
+
+
+@dataclasses.dataclass(frozen=True)
+class _ProcessUseCensus:
+    """One shared lsof/procfs snapshot used to classify several slot paths."""
+
+    direct_uses: tuple[_ProcessPathUse, ...]
+    mount_uses: tuple[_ProcessPathUse, ...]
+    cgroups: tuple[tuple[int, str], ...]
+    lsof_stderr: str
+
+    def assert_slot_unused(
+        self,
+        slot_path: Path,
+        record: ActiveRecord | None,
+        *,
+        ignore_invoking_ancestry: bool,
+    ) -> None:
+        if not _unrelated_lsof_warnings(self.lsof_stderr, slot_path):
+            raise Refusal(
+                "process use is indeterminate because lsof reported: "
+                f"{self.lsof_stderr.strip().splitlines()[0]}"
+            )
+        ignored = {os.getpid()}
+        if ignore_invoking_ancestry:
+            ancestor: int | None = os.getpid()
+            for _ in range(256):
+                if ancestor is None or ancestor in ignored:
+                    break
+                ignored.add(ancestor)
+                ancestor = _read_process_parent(ancestor)
+        if record is not None and record.owner is not None:
+            for pid, cgroup in self.cgroups:
+                if pid not in ignored and cgroup == record.owner.cgroup_path:
+                    raise Refusal(
+                        f"live process {pid} remains in recorded owner cgroup {cgroup}"
+                    )
+        for use in (*self.direct_uses, *self.mount_uses):
+            if use.pid in ignored:
+                continue
+            if _path_is_within(use.path, slot_path):
+                raise Refusal(
+                    f"live process {use.pid} uses slot {slot_path}: "
+                    f"{use.description}={use.path}; stop it and retry"
+                )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -3756,12 +3811,134 @@ def _unrelated_lsof_warnings(stderr: str, slot_path: Path) -> bool:
     return True
 
 
+def _lsof_process_path_uses(stdout: str) -> tuple[_ProcessPathUse, ...]:
+    """Parse NUL-delimited lsof fields without treating filenames as lines."""
+    pid: int | None = None
+    uses: list[_ProcessPathUse] = []
+    for raw_field in stdout.split("\0"):
+        field = raw_field[1:] if raw_field.startswith("\n") else raw_field
+        if not field:
+            continue
+        if field.startswith("p") and field[1:].isdigit():
+            pid = int(field[1:])
+            continue
+        if not field.startswith("n") or pid is None:
+            continue
+        raw_path = field[1:].removesuffix(" (deleted)")
+        path = Path(raw_path)
+        if path.is_absolute():
+            uses.append(_ProcessPathUse(pid=pid, description="lsof", path=path))
+    return tuple(uses)
+
+
+def _process_mount_paths(pid_dir: Path) -> tuple[Path, ...]:
+    mountinfo_path = pid_dir / "mountinfo"
+    try:
+        mountinfo = mountinfo_path.read_text(
+            encoding="utf-8", errors="surrogateescape"
+        )
+    except FileNotFoundError:
+        return ()
+    except OSError as exc:
+        if exc.errno in (errno.ENOENT, errno.ESRCH, errno.EINVAL):
+            return ()
+        raise Refusal(
+            f"process use is indeterminate because {mountinfo_path} is unreadable: {exc}"
+        ) from exc
+    paths: list[Path] = []
+    for line in mountinfo.splitlines():
+        left, separator, right = line.partition(" - ")
+        if not separator:
+            continue
+        left_fields = left.split()
+        right_fields = right.split()
+        candidates = [
+            *(left_fields[index] for index in (3, 4) if len(left_fields) > index),
+            *(right_fields[index] for index in (1, 2) if len(right_fields) > index),
+        ]
+        for raw in candidates:
+            candidate = Path(raw.replace("\\040", " ").removesuffix(" (deleted)"))
+            if candidate.is_absolute():
+                paths.append(candidate)
+    return tuple(paths)
+
+
+def _capture_process_use_census() -> _ProcessUseCensus:
+    """Capture direct path, mount, and cgroup use once for a group of slots."""
+    lsof = next(
+        (
+            candidate
+            for candidate in (Path("/usr/bin/lsof"), Path("/usr/sbin/lsof"))
+            if candidate.is_file() and os.access(candidate, os.X_OK)
+        ),
+        None,
+    )
+    if lsof is None:
+        raise Refusal(
+            "cannot take a shared process-use census because lsof is unavailable"
+        )
+    try:
+        completed = subprocess.run(
+            [str(lsof), "-nP", "-F0pcfn"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except OSError as exc:
+        raise Refusal(
+            f"process use is indeterminate because lsof failed: {exc}"
+        ) from exc
+    if completed.returncode not in (0, 1):
+        raise Refusal(
+            f"process use is indeterminate because lsof exited {completed.returncode}"
+        )
+    try:
+        pid_dirs = sorted(
+            (path for path in Path("/proc").iterdir() if path.name.isdigit()),
+            key=lambda item: int(item.name),
+        )
+    except OSError as exc:
+        raise Refusal(f"cannot inspect live processes: {exc}") from exc
+    mount_namespaces: set[str] = set()
+    mount_uses: list[_ProcessPathUse] = []
+    cgroups: list[tuple[int, str]] = []
+    for pid_dir in pid_dirs:
+        pid = int(pid_dir.name)
+        uid = _process_uid(pid_dir)
+        if uid is None:
+            continue
+        try:
+            cgroup = _read_process_cgroup(pid_dir)
+        except Refusal as exc:
+            raise Refusal(
+                f"recorded cgroup use is indeterminate for PID {pid}: {exc}"
+            ) from exc
+        cgroups.append((pid, cgroup))
+        mount_namespace = _mount_namespace(pid_dir)
+        if mount_namespace is None or mount_namespace in mount_namespaces:
+            continue
+        for path in _process_mount_paths(pid_dir):
+            mount_uses.append(
+                _ProcessPathUse(pid=pid, description="mount", path=path)
+            )
+        mount_namespaces.add(mount_namespace)
+    return _ProcessUseCensus(
+        direct_uses=_lsof_process_path_uses(completed.stdout),
+        mount_uses=tuple(mount_uses),
+        cgroups=tuple(cgroups),
+        lsof_stderr=completed.stderr,
+    )
+
+
 def _assert_slot_unused(
     slot_path: Path,
     record: ActiveRecord | None = None,
     *,
     use_lsof: bool = True,
     ignore_invoking_ancestry: bool = False,
+    census: _ProcessUseCensus | None = None,
+    allow_lsof_fallback: bool = True,
+    fallback_census: _ProcessUseCensus | None = None,
 ) -> None:
     try:
         current_directory = Path.cwd().resolve(strict=True)
@@ -3771,6 +3948,13 @@ def _assert_slot_unused(
         raise Refusal(
             f"the wrkslots process is running from inside slot {slot_path}; change directory and retry"
         )
+    if census is not None:
+        census.assert_slot_unused(
+            slot_path,
+            record,
+            ignore_invoking_ancestry=ignore_invoking_ancestry,
+        )
+        return
     lsof = next(
         (
             candidate
@@ -3828,6 +4012,7 @@ def _assert_slot_unused(
             invoking_ancestry.add(ancestor)
             ancestor = _read_process_parent(ancestor)
     inspected_mount_namespaces: set[str] = set()
+    indeterminate_use: Refusal | None = None
     for pid_dir in sorted(pid_dirs, key=lambda item: int(item.name)):
         pid = int(pid_dir.name)
         if pid == current_pid or pid in invoking_ancestry:
@@ -3846,6 +4031,13 @@ def _assert_slot_unused(
                 raise Refusal(
                     f"live process {pid} remains in recorded owner cgroup {cgroup}"
                 )
+        # The procfs-only fast path is defined for the invoking uid.  Its shared
+        # lsof census supplies the cross-uid view; trying to open another uid's
+        # /proc/PID/fd merely converts an unrelated process into a permanent
+        # refusal.  The ordinary lsof path retains its historical cross-uid
+        # mount check below.
+        if not use_lsof and uid != os.getuid():
+            continue
         try:
             if direct_use_proven_absent:
                 mount_namespace = _mount_namespace(pid_dir)
@@ -3856,20 +4048,31 @@ def _assert_slot_unused(
                     inspected_mount_namespaces.add(mount_namespace)
             else:
                 uses = _process_uses_slot(pid_dir, slot_path)
-        except Refusal:
-            if not use_lsof:
-                _assert_slot_unused(
-                    slot_path,
-                    record,
-                    use_lsof=True,
-                    ignore_invoking_ancestry=ignore_invoking_ancestry,
-                )
-                return
-            raise
+        except Refusal as exc:
+            if indeterminate_use is None:
+                indeterminate_use = exc
+            continue
         if uses:
             raise Refusal(
                 f"live process {pid} uses slot {slot_path}: {uses[0]}; stop it and retry"
             )
+    if indeterminate_use is not None:
+        if not use_lsof and fallback_census is not None:
+            fallback_census.assert_slot_unused(
+                slot_path,
+                record,
+                ignore_invoking_ancestry=ignore_invoking_ancestry,
+            )
+            return
+        if not use_lsof and allow_lsof_fallback:
+            _assert_slot_unused(
+                slot_path,
+                record,
+                use_lsof=True,
+                ignore_invoking_ancestry=ignore_invoking_ancestry,
+            )
+            return
+        raise indeterminate_use
 
 
 def _parse_timestamp(value: str, label: str) -> dt.datetime:
@@ -4566,18 +4769,21 @@ def _reclaim_preconditions(
     *,
     validate_complete: bool = False,
     allow_live_validate_owner: bool = False,
+    process_census_fallback: _ProcessUseCensus | None = None,
 ) -> tuple[Path, tuple[Checkout, ...]]:
     _assert_record_paths(config, record)
     slot_path = _assert_slot_contents(config, record)
     _assert_handoff_read(config, record, slot_path)
+    use_check_record = _record_for_slot_use_check(
+        record,
+        validate_complete=validate_complete,
+        allow_live_validate_owner=allow_live_validate_owner,
+    )
     _assert_slot_unused(
         slot_path,
-        _record_for_slot_use_check(
-            record,
-            validate_complete=validate_complete,
-            allow_live_validate_owner=allow_live_validate_owner,
-        ),
-        use_lsof=not (allow_live_validate_owner and record.slot_type == "validate"),
+        use_check_record,
+        use_lsof=use_check_record is not None,
+        fallback_census=process_census_fallback,
         ignore_invoking_ancestry=(
             allow_live_validate_owner and record.slot_type == "validate"
         ),
@@ -7276,7 +7482,12 @@ def _cmd_clean_caches(args: argparse.Namespace) -> int:
     return 0
 
 
-def _audit_record(config: Config, record: ActiveRecord) -> tuple[dict[str, object], bool]:
+def _audit_record(
+    config: Config,
+    record: ActiveRecord,
+    *,
+    process_census: _ProcessUseCensus | None = None,
+) -> tuple[dict[str, object], bool]:
     owner_state, owner_detail = _process_state(record.owner)
     liveness_state, liveness_detail = _registered_liveness_state(config, record)
     heartbeat_age, heartbeat_expired = _heartbeat_diagnosis(record)
@@ -7357,7 +7568,15 @@ def _audit_record(config: Config, record: ActiveRecord) -> tuple[dict[str, objec
         and not reasons
     ):
         try:
-            _assert_slot_unused(slot_path, record)
+            _assert_slot_unused(
+                slot_path,
+                _record_for_slot_use_check(
+                    record,
+                    validate_complete=record.slot_type == "validate",
+                    allow_live_validate_owner=False,
+                ),
+                census=process_census,
+            )
         except Refusal as exc:
             reasons.append(str(exc))
             agent_running = True
@@ -7388,11 +7607,14 @@ def _cmd_audit(args: argparse.Namespace) -> int:
         _refuse_partial_state(config)
         states, _archives = _validate_global_state(config)
         records = [record for state in states for record in state.slots]
+        process_census = _capture_process_use_census() if records else None
         journal_slots = {slot.slot: slot for slot in _all_journal_cache_slots(config)}
         rows: list[dict[str, object]] = []
         running_agent_count = 0
         for record in records:
-            row, running = _audit_record(config, record)
+            row, running = _audit_record(
+                config, record, process_census=process_census
+            )
             journal_slot = journal_slots.get(record.slot)
             if journal_slot is not None:
                 reasons = row["reasons"]
@@ -8201,6 +8423,7 @@ def _begin_or_resume_path_fence(
     *,
     validate_complete: bool = False,
     allow_live_validate_owner: bool = False,
+    process_census_fallback: _ProcessUseCensus | None = None,
 ) -> tuple[dict[str, object], Path]:
     original = _slot_directory(config, record.slot, record.slot_type)
     fenced = _finish_fenced_slot(config, record, journal)
@@ -8223,6 +8446,7 @@ def _begin_or_resume_path_fence(
             vcs,
             validate_complete=validate_complete,
             allow_live_validate_owner=allow_live_validate_owner,
+            process_census_fallback=process_census_fallback,
         )
         if current_checkouts != record.checkouts:
             raise Refusal(
@@ -8260,6 +8484,7 @@ def _finish_remove_paths(
     *,
     validate_complete: bool = False,
     allow_live_validate_owner: bool = False,
+    process_census_fallback: _ProcessUseCensus | None = None,
 ) -> dict[str, object]:
     removed_values = _as_list(journal["removed"], "journal.removed")
     removed = {_as_str(item, "journal.removed item") for item in removed_values}
@@ -8273,6 +8498,7 @@ def _finish_remove_paths(
         vcs,
         validate_complete=validate_complete,
         allow_live_validate_owner=allow_live_validate_owner,
+        process_census_fallback=process_census_fallback,
     )
     present: list[Checkout] = []
     missing_after_remove: list[Checkout] = []
@@ -8354,16 +8580,16 @@ def _finish_remove_paths(
                 _assert_salvage_still_matches(
                     config, record, salvage, vcs, paths=moved_paths
                 )
+            use_check_record = _record_for_slot_use_check(
+                record,
+                validate_complete=validate_complete,
+                allow_live_validate_owner=allow_live_validate_owner,
+            )
             _assert_slot_unused(
                 fenced_slot,
-                _record_for_slot_use_check(
-                    record,
-                    validate_complete=validate_complete,
-                    allow_live_validate_owner=allow_live_validate_owner,
-                ),
-                use_lsof=not (
-                    allow_live_validate_owner and record.slot_type == "validate"
-                ),
+                use_check_record,
+                use_lsof=use_check_record is not None,
+                fallback_census=process_census_fallback,
                 ignore_invoking_ancestry=(
                     allow_live_validate_owner and record.slot_type == "validate"
                 ),
@@ -8514,6 +8740,7 @@ def _begin_finish(
     salvage: Sequence[Mapping[str, object]] = (),
     validate_complete: bool = False,
     allow_live_validate_owner: bool = False,
+    process_census_fallback: _ProcessUseCensus | None = None,
 ) -> None:
     vcs = _GitVcs()
     _load_archive(config)
@@ -8525,6 +8752,7 @@ def _begin_finish(
         vcs,
         validate_complete=validate_complete,
         allow_live_validate_owner=allow_live_validate_owner,
+        process_census_fallback=process_census_fallback,
     )
     final_record = dataclasses.replace(record, checkouts=final_checkouts)
     state = _replace_record(state, final_record)
@@ -8556,6 +8784,7 @@ def _begin_finish(
             vcs,
             validate_complete=validate_complete,
             allow_live_validate_owner=allow_live_validate_owner,
+            process_census_fallback=process_census_fallback,
         )
     except Refusal:
         canonical = _slot_directory(config, final_record.slot, final_record.slot_type)
@@ -8633,7 +8862,12 @@ def _cmd_finish(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_remove(args: argparse.Namespace) -> int:
+def _cmd_remove(
+    args: argparse.Namespace,
+    *,
+    process_census: _ProcessUseCensus | None = None,
+    emit: bool = True,
+) -> int:
     config = _load_config(args.project_root, args.machine)
     _validate_name(args.slot, "slot")
     coordinator = _capture_caller_process(args.coordinator_pid, "coordinator")
@@ -8700,6 +8934,7 @@ def _cmd_remove(args: argparse.Namespace) -> int:
             ),
             use_lsof=not live_validate_owner,
             ignore_invoking_ancestry=live_validate_owner,
+            census=process_census,
         )
         _ensure_event_log(config, record.machine)
         _write_event_file(
@@ -8781,6 +9016,7 @@ def _cmd_remove(args: argparse.Namespace) -> int:
             salvage=salvage,
             validate_complete=bool(args.validate_complete),
             allow_live_validate_owner=live_validate_owner,
+            process_census_fallback=process_census,
         )
         after_states, after_archives = _validate_global_state(config)
         _assert_only_slot_changed(
@@ -8788,7 +9024,86 @@ def _cmd_remove(args: argparse.Namespace) -> int:
             _global_rows(after_states, after_archives),
             args.slot,
         )
-    print(f"removed and archived slot={record.slot} generation={record.generation}")
+    if emit:
+        print(f"removed and archived slot={record.slot} generation={record.generation}")
+    return 0
+
+
+def _parse_validate_batch_slot(raw: str) -> tuple[str, int]:
+    slot, separator, generation_text = raw.partition("=")
+    if not separator:
+        raise Refusal(
+            f"invalid --slot {raw!r}; expected SLOT=GENERATION"
+        )
+    _validate_name(slot, "slot")
+    try:
+        generation = int(generation_text)
+    except ValueError as exc:
+        raise Refusal(
+            f"invalid generation in --slot {raw!r}; expected a positive integer"
+        ) from exc
+    if generation <= 0:
+        raise Refusal(
+            f"invalid generation in --slot {raw!r}; expected a positive integer"
+        )
+    return slot, generation
+
+
+def _cmd_remove_validate_batch(args: argparse.Namespace) -> int:
+    requested = tuple(_parse_validate_batch_slot(raw) for raw in args.slots)
+    if len(requested) > VALIDATE_REMOVE_BATCH_LIMIT:
+        raise Refusal(
+            f"remove-validate-batch accepts at most {VALIDATE_REMOVE_BATCH_LIMIT} slots; "
+            "run another bounded batch for the remainder"
+        )
+    if len({slot for slot, _generation in requested}) != len(requested):
+        raise Refusal("remove-validate-batch received the same slot more than once")
+    process_census = _capture_process_use_census()
+    removed: list[dict[str, object]] = []
+    retained: list[dict[str, object]] = []
+    for slot, generation in requested:
+        item_args = argparse.Namespace(**vars(args))
+        item_args.command = "remove"
+        item_args.slot = slot
+        item_args.expected_generation = generation
+        item_args.validate_complete = True
+        try:
+            config = _load_config(item_args.project_root, item_args.machine)
+            record = _find_record(_load_active(config), slot)
+            owner_state, owner_detail = _process_state(record.owner)
+            if owner_state != "dead":
+                raise Refusal(
+                    "batch validation cleanup requires a proven-dead recorded owner; "
+                    f"owner is {owner_state}: {owner_detail}"
+                )
+            _cmd_remove(
+                item_args,
+                process_census=process_census,
+                emit=False,
+            )
+        except Refusal as exc:
+            retained.append(
+                {"slot": slot, "generation": generation, "reason": str(exc)}
+            )
+        else:
+            removed.append({"slot": slot, "generation": generation})
+    payload = {
+        "schema": 1,
+        "batch_limit": VALIDATE_REMOVE_BATCH_LIMIT,
+        "process_censuses": 1,
+        "requested": len(requested),
+        "removed": removed,
+        "retained": retained,
+    }
+    if args.format == "json":
+        print(json.dumps(payload, sort_keys=True))
+    else:
+        print(
+            f"requested={len(requested)} removed={len(removed)} "
+            f"retained={len(retained)} process_censuses=1"
+        )
+        for row in retained:
+            print(f"RETAINED: {row['slot']} reason={row['reason']}")
     return 0
 
 
@@ -11222,6 +11537,45 @@ usage or audit gate unknown, 3 fail-closed refusal.
     remove.add_argument("--coordinator-pid", type=int, required=True, metavar="PID", help="live current coordinator PID recorded with the operation")
     remove.add_argument("--expected-generation", type=int, required=True, metavar="N", help="current slot generation")
     remove.set_defaults(handler=_cmd_remove)
+
+    remove_validate_batch = subparsers.add_parser(
+        "remove-validate-batch",
+        help="remove one bounded batch of completed validation slots",
+        description=(
+            "Capture one shared process/path census, then attempt at most eight completed "
+            "validation slots. Every slot must still have a proven-dead exact owner and pass "
+            "the ordinary registered-liveness, path-fence, mount, Git, and handoff checks. "
+            "Per-slot refusals are reported without preventing other requested slots from "
+            "being considered."
+        ),
+        formatter_class=_HelpFormatter,
+    )
+    remove_validate_batch.add_argument(
+        "--slot",
+        dest="slots",
+        action="append",
+        required=True,
+        metavar="SLOT=GENERATION",
+        help=(
+            "active validation slot and its expected generation; repeat up to eight times"
+        ),
+    )
+    remove_validate_batch.add_argument(
+        "--coordinator-authorized",
+        action="store_true",
+        help="record that this cleanup batch was coordinator-authorized",
+    )
+    remove_validate_batch.add_argument(
+        "--coordinator-pid",
+        type=int,
+        required=True,
+        metavar="PID",
+        help="live current coordinator PID recorded with each operation",
+    )
+    remove_validate_batch.add_argument(
+        "--format", choices=("human", "json"), default="human"
+    )
+    remove_validate_batch.set_defaults(handler=_cmd_remove_validate_batch)
 
     recover = subparsers.add_parser(
         "recover",
