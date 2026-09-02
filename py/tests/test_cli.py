@@ -94,6 +94,7 @@ def test_run_help_lists_flags_and_cores_pinning() -> None:
         "--max-cpus",
         "--cores",
         "--selected",
+        "--labels",
         "--ignore-selected-deps",
         "--planner",
         "--keep-going",
@@ -549,6 +550,45 @@ def test_run_selected_multiple_steps() -> None:
             "2 passed, 0 failed, 0 aborted, 0 intentionally skipped, "
             "0 dependency-skipped, 0 not launched"
         ) in err
+
+
+def test_run_labels_select_a_union_and_include_dependencies() -> None:
+    dag = (
+        '{"steps": ['
+        '{"group":"build","job":"app","cmd":"true"},'
+        '{"group":"test","job":"unit","cmd":"true","labels":["quick","full"],"deps":["build.app"]},'
+        '{"group":"test","job":"slow","cmd":"true","labels":["full"]},'
+        '{"group":"privileged","job":"host","cmd":"true","labels":["super"]}'
+        "]}"
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "dag.json"
+        path.write_text(dag, encoding="utf-8")
+        rc, _, err = _capture(["run", "--dag", str(path), "--labels", "quick,super", "-q", _ACF])
+        assert rc == 0
+        assert (
+            "3 passed, 0 failed, 0 aborted, 0 intentionally skipped, "
+            "0 dependency-skipped, 0 not launched"
+        ) in err
+
+        rc, _, err = _capture(["run", "--dag", str(path), "--labels", "test.unit", "-q", _ACF])
+        assert rc == 2
+        assert "unknown label(s): test.unit" in err
+        assert "Known labels: full, quick, super" in err
+
+
+def test_run_selected_and_labels_are_mutually_exclusive() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "dag.json"
+        path.write_text(
+            '{"steps":[{"group":"g","job":"j","cmd":"true","labels":["quick"]}]}',
+            encoding="utf-8",
+        )
+        rc, _, err = _capture(
+            ["run", "--dag", str(path), "--selected", "g.j", "--labels", "quick", "-q", _ACF]
+        )
+        assert rc == 2
+        assert "--selected and --labels cannot be combined" in err
 
 
 def test_keep_going_launches_later_independent_work_and_reports_full_accounting() -> None:

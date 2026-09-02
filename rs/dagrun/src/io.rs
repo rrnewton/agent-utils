@@ -146,7 +146,7 @@ fn err(msg: impl Into<String>) -> DagJsonError {
 /// `cmds`, `timeouts`, `env_vars`, `description` vs `desc`. Silently ignored, the instruction is
 /// simply not carried out and the document still says it was: the step runs with no timeout, no
 /// dependency, no environment, and nothing anywhere reports it.
-const STEP_KEYS: [&str; 23] = [
+const STEP_KEYS: [&str; 24] = [
     "cmd",
     "cmdtype",
     "cpu_timeout",
@@ -163,6 +163,7 @@ const STEP_KEYS: [&str; 23] = [
     "job",
     "jobs_env",
     "jobs_flag",
+    "labels",
     "networkonly",
     "skip_reason",
     "timeout",
@@ -437,6 +438,23 @@ fn opt_str_list(
     }
 }
 
+fn labels_from(
+    m: &serde_json::Map<String, Value>,
+    where_: &str,
+) -> Result<Vec<String>, DagJsonError> {
+    let labels = opt_str_list(m, "labels")?;
+    if labels.iter().any(|label| label.trim().is_empty()) {
+        return Err(err(format!("{where_}.labels: labels must be non-empty")));
+    }
+    let unique = labels.iter().collect::<std::collections::BTreeSet<_>>();
+    if unique.len() != labels.len() {
+        return Err(err(format!(
+            "{where_}.labels: duplicate labels are not allowed"
+        )));
+    }
+    Ok(labels)
+}
+
 fn present_str_list(
     m: &serde_json::Map<String, Value>,
     key: &str,
@@ -692,6 +710,7 @@ pub fn dag_from_value(raw: &Value) -> Result<DagConfig, DagJsonError> {
             job: req_str(sm, "job", &where_)?,
             desc: opt_str(sm, "desc", "")?,
             description: opt_str(sm, "description", "")?,
+            labels: labels_from(sm, &where_)?,
             cmd: req_str(sm, "cmd", &where_)?,
             cmdtype,
             manifest: manifest_from(sm.get("manifest"), &format!("{where_}.manifest"))?,
@@ -1085,6 +1104,12 @@ fn emit_step(s: &mut String, step: &Step, base: usize) {
         "\"description\": {},\n",
         json_str(&step.description)
     ));
+    if !step.labels.is_empty() {
+        s.push_str(&key);
+        s.push_str("\"labels\": ");
+        emit_str_list(s, &step.labels, base + 2);
+        s.push_str(",\n");
+    }
     s.push_str(&key);
     s.push_str(&format!("\"cmd\": {},\n", json_str(&step.cmd)));
     if step.cmdtype != CmdType::Unknown {
@@ -1301,7 +1326,7 @@ mod tests {
             "mem_cap_factor": 1.25,
             "outer_mem_safety_factor": 1.1, "default_jobs_flag": "--jobs=",
             "default_jobs_env": "DEFAULT_JOBS", "steps": [
-            {"group": "build", "job": "app", "desc": "compile",
+            {"group": "build", "job": "app", "desc": "compile", "labels": ["quick", "full"],
              "description": "line 1\nline 2 with \"quotes\" and \\backslash\\ and unicode é☃",
              "cmd": "make build",
              "jobs_flag": "-j%d", "jobs_env": "STEP_JOBS",
@@ -1330,6 +1355,8 @@ mod tests {
         assert_eq!(back.steps[0].hint.rss_baseline_bytes, Some(5368709120));
         assert_eq!(back.steps[0].jobs_flag.as_deref(), Some("-j%d"));
         assert_eq!(back.steps[0].jobs_env.as_deref(), Some("STEP_JOBS"));
+        assert_eq!(back.steps[0].labels, ["quick", "full"]);
+        assert!(back.steps[1].labels.is_empty());
         assert_eq!(back.steps[1].jobs_flag, None);
         assert_eq!(back.steps[1].jobs_env, None);
         assert_eq!(back.default_jobs_flag, "--jobs=");
@@ -1409,6 +1436,7 @@ steps:
         assert_eq!(step.tag(), "g.j");
         assert_eq!(step.desc, "");
         assert_eq!(step.description, "");
+        assert!(step.labels.is_empty());
         assert_eq!(cfg.description, "");
         assert!(step.deps.is_empty());
         assert!(step.env.is_empty());
@@ -1427,6 +1455,25 @@ steps:
         assert!(cfg.resource_caps.is_empty());
         assert_eq!(cfg.mem_cap_factor, 1.25);
         assert_eq!(cfg.default_jobs_flag, "-j");
+    }
+
+    #[test]
+    fn labels_refuse_malformed_values() {
+        for (labels, expected) in [
+            (r#""quick""#, "field 'labels' must be a list of strings"),
+            (
+                r#"["quick", 1]"#,
+                "field 'labels' must contain only strings",
+            ),
+            (r#"[""]"#, "labels must be non-empty"),
+            (r#"["quick", "quick"]"#, "duplicate labels are not allowed"),
+        ] {
+            let document = format!(
+                r#"{{"steps":[{{"group":"g","job":"j","cmd":"true","labels":{labels}}}]}}"#
+            );
+            let error = dag_from_json(&document).unwrap_err().to_string();
+            assert!(error.contains(expected), "{error}");
+        }
     }
 
     #[test]

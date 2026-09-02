@@ -34,6 +34,7 @@ def _cfg() -> DagConfig:
                 "compile",
                 "make build",
                 description=_HAIRY_DESC,
+                labels=["quick", "full"],
                 hint=ResourceHint(
                     est_duration_s=90.0,
                     rss_baseline_bytes=5 * 1024**3,
@@ -67,6 +68,8 @@ def test_roundtrip_is_stable() -> None:
     assert [s.tag for s in back.steps] == ["build.app", "e2e.smoke"]
     assert back.description == "the whole pipeline"
     assert back.steps[0].description == _HAIRY_DESC
+    assert back.steps[0].labels == ["quick", "full"]
+    assert back.steps[1].labels == []
     assert back.steps[1].description == ""  # default empty
     assert back.resource_caps == {"browser": 2}
     assert back.steps[0].hint.classification is StepClass.CPU_BOUND
@@ -81,6 +84,7 @@ def test_minimal_document_defaults() -> None:
     assert step.tag == "g.j"
     assert step.desc == "" and step.deps == [] and step.env == {}
     assert step.description == "" and cfg.description == ""  # default empty
+    assert step.labels == []
     assert step.timeout == 0  # the "derive it" sentinel, not "no bound"
     assert resolved_wall_timeout(step, cfg.default_step_timeout) == 1800
     assert step.cpu_timeout == 0  # CPU-time guard disabled by default
@@ -88,6 +92,24 @@ def test_minimal_document_defaults() -> None:
     assert step.manifest is None
     assert step.integration_test_binaries is None
     assert cfg.resource_caps == {} and cfg.mem_cap_factor == 1.25
+
+
+@pytest.mark.parametrize(
+    ("labels", "message"),
+    [
+        ('"quick"', "field 'labels' must be a list of strings"),
+        ('["quick", 1]', "field 'labels' must contain only strings"),
+        ('[""]', "labels must be non-empty"),
+        ('["quick", "quick"]', "duplicate labels are not allowed"),
+    ],
+)
+def test_labels_refuse_malformed_values(labels: str, message: str) -> None:
+    with pytest.raises(DagJsonError, match=message):
+        dag_from_json(
+            '{"steps":[{"group":"g","job":"j","cmd":"true","labels":'
+            + labels
+            + "}]}"
+        )
 
 
 def test_manifest_selection_roundtrips_and_refuses_malformed_values() -> None:

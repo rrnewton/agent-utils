@@ -296,7 +296,7 @@ def _quickstart(c: Palette) -> str:
   {c.dim(f'Use {k("--no-profile-feedback")} to ignore the store and plan from the DAG hints only.')}
 
 {h('DAG schema')}  {c.dim('(only group/job/cmd are required per step; everything else has defaults)')}
-  step:   group, job, desc, description, cmd, cmdtype, deps[], env{{}}, timeout, jobs_flag, jobs_env, networkonly, engine_only, hint{{}}
+  step:   group, job, desc, description, labels[], cmd, cmdtype, deps[], env{{}}, timeout, jobs_flag, jobs_env, networkonly, engine_only, hint{{}}
   hint:   resources{{name:int}}, est_duration_s, rss_baseline_bytes, hard_mem_max_bytes,
           classification("cpu-bound"|"latency-bound"|"light"), preferred_inner_jobs
   top:    description, resource_caps{{name:int}}, mem_cap_factor, mem_cap_floor_bytes,
@@ -517,6 +517,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="run the named step(s) and every dependency they require (comma-separated "
         "'group.job' tags). Errors if a named tag does not exist.",
+    )
+    run_p.add_argument(
+        "--labels",
+        metavar="LABEL[,LABEL...]",
+        default=None,
+        help="run every step carrying any named label, plus every dependency those steps require. "
+        "Labels are independent of 'group.job' step tags. Errors if a label does not exist.",
     )
     run_p.add_argument(
         "--ignore-selected-deps",
@@ -1629,6 +1636,19 @@ def _select_steps(
         if step.tag in selected
     )
     return dataclasses.replace(cfg, steps=new_steps)
+
+
+def _select_steps_by_labels(cfg: DagConfig, labels: Sequence[str]) -> DagConfig:
+    """Return every step carrying any requested label and its dependency ancestry."""
+    known = {label for step in cfg.steps for label in step.labels}
+    unknown = [label for label in labels if label not in known]
+    if unknown:
+        known_text = ", ".join(sorted(known)) or "(none)"
+        raise _SelectedError(
+            f"--labels: unknown label(s): {', '.join(unknown)}. Known labels: {known_text}"
+        )
+    tags = [step.tag for step in cfg.steps if any(label in step.labels for label in labels)]
+    return _select_steps(cfg, tags)
 
 
 # --------------------------------------------------------------------------- --args passthrough
@@ -3762,7 +3782,11 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
     # A selection includes its full dependency ancestry by default. Validate and select BEFORE
     # cgroup bring-up so a bad combination or tag fails fast (exit 2) without needing a scope.
     selected_raw = ns.selected if isinstance(ns.selected, str) else None
+    labels_raw = ns.labels if isinstance(ns.labels, str) else None
     ignore_selected_deps = bool(ns.ignore_selected_deps)
+    if selected_raw is not None and labels_raw is not None:
+        print(f"{PROG}: run: --selected and --labels cannot be combined", file=sys.stderr)
+        return 2
     if ignore_selected_deps and selected_raw is None:
         print(
             f"{PROG}: run: --ignore-selected-deps requires --selected",
@@ -3776,6 +3800,16 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
             return 2
         try:
             cfg = _select_steps(cfg, tags, ignore_selected_deps=ignore_selected_deps)
+        except _SelectedError as exc:
+            print(f"{PROG}: {exc}", file=sys.stderr)
+            return 2
+    elif labels_raw is not None:
+        labels = _parse_tag_list(labels_raw)
+        if not labels:
+            print(f"{PROG}: run: --labels requires at least one label", file=sys.stderr)
+            return 2
+        try:
+            cfg = _select_steps_by_labels(cfg, labels)
         except _SelectedError as exc:
             print(f"{PROG}: {exc}", file=sys.stderr)
             return 2

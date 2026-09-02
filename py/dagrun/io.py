@@ -222,6 +222,15 @@ def _opt_str_list(m: Mapping[str, object], key: str) -> list[str]:
     return out
 
 
+def _labels(m: Mapping[str, object], where: str) -> list[str]:
+    labels = _opt_str_list(m, "labels")
+    if any(not label.strip() for label in labels):
+        raise DagJsonError(f"{where}.labels: labels must be non-empty")
+    if len(labels) != len(set(labels)):
+        raise DagJsonError(f"{where}.labels: duplicate labels are not allowed")
+    return labels
+
+
 def _present_str_list(m: Mapping[str, object], key: str) -> list[str] | None:
     """Parse a presence-sensitive string list.
 
@@ -525,6 +534,7 @@ STEP_KEYS: frozenset[str] = frozenset(
         "job",
         "desc",
         "description",
+        "labels",
         "cmd",
         "cmdtype",
         "deps",
@@ -731,6 +741,7 @@ def _dag_from_obj(raw: object) -> DagConfig:
                 desc=_opt_str(sm, "desc", ""),
                 description=_opt_str(sm, "description", ""),
                 cmd=_req_str(sm, "cmd", where),
+                labels=_labels(sm, where),
                 manifest=_manifest_from(sm.get("manifest"), f"{where}.manifest"),
                 integration_test_binaries=_integration_test_binaries(sm),
                 cmdtype=_cmdtype_field(sm, where),
@@ -833,6 +844,7 @@ def _step_to_json(step: Step) -> dict[str, object]:
         "job": step.job,
         "desc": step.desc,
         "description": step.description,
+        "labels": list(step.labels),
         "cmd": step.cmd,
         "cmdtype": step.cmdtype.value,
         "manifest": (
@@ -870,6 +882,8 @@ def _step_to_json(step: Step) -> dict[str, object]:
         del obj["cpu_timeout"]
     if step.cmdtype is CmdType.UNKNOWN:
         del obj["cmdtype"]
+    if not step.labels:
+        del obj["labels"]
     if step.manifest is None:
         del obj["manifest"]
     if step.integration_test_binaries is None:

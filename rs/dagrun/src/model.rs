@@ -295,6 +295,8 @@ pub struct Step {
     /// label shown by `list`/`run` — `description` is free-form prose (often multi-line, e.g. a
     /// YAML block scalar) documenting WHY the step exists. It never affects scheduling.
     pub description: String,
+    /// Named subsets this step belongs to, independent of its unique `group.job` tag.
+    pub labels: Vec<String>,
     /// Shell command (`bash -c`), run from the run's working directory.
     pub cmd: String,
     /// Known command-line shape for delivering the admitted width.
@@ -1741,6 +1743,7 @@ mod tests {
             job: "smoke".into(),
             desc: String::new(),
             description: String::new(),
+            labels: Vec::new(),
             cmd: "true".into(),
             cmdtype: CmdType::Unknown,
             manifest: None,
@@ -1769,6 +1772,7 @@ mod tests {
             job: "j".into(),
             desc: String::new(),
             description: String::new(),
+            labels: Vec::new(),
             cmd: cmd.into(),
             cmdtype: CmdType::Unknown,
             manifest: None,
@@ -2026,6 +2030,7 @@ mod cpu_timeout_multiplier_tests {
             job: "j".into(),
             desc: "d".into(),
             description: String::new(),
+            labels: Vec::new(),
             cmd: "true".into(),
             cmdtype: CmdType::Unknown,
             manifest: None,
@@ -2199,6 +2204,7 @@ mod carry_tests {
             job: "j".into(),
             desc: "d".into(),
             description: String::new(),
+            labels: Vec::new(),
             cmd: "true".into(),
             cmdtype: CmdType::Unknown,
             manifest: None,

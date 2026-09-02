@@ -618,6 +618,7 @@ mod tests {
             job: job.into(),
             desc: String::new(),
             description: String::new(),
+            labels: Vec::new(),
             cmd: "true".into(),
             cmdtype: crate::model::CmdType::Unknown,
             manifest: None,

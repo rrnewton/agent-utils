@@ -46,6 +46,8 @@ fictitious executable width.
 ## A first DAG
 
 Each step is identified by a `group.job` tag. `deps` names predecessor tags.
+Optional `labels` place the step in named subsets without changing its identity
+or dependency edges.
 The optional `hint` object supplies estimates and limits; top-level
 `resource_caps` limits caller-defined scarce resources.
 
@@ -554,6 +556,27 @@ runs its full ancestry in dependency order:
 ```sh
 dagrun run --dag pipeline.yaml --selected test.unit
 ```
+
+`--labels` runs every step carrying any requested label, plus their complete
+dependency ancestry. Labels are independent of `group.job` tags, so a graph can
+commit its complete step population once and expose stable subsets without
+rewriting the document:
+
+```yaml
+- group: test
+  job: unit
+  labels: [quick, full]
+  cmd: make test
+  deps: [build.app]
+```
+
+```sh
+dagrun run --dag pipeline.yaml --labels quick
+dagrun run --dag pipeline.yaml --labels quick,super
+```
+
+Unknown labels are refused. `--labels` and `--selected` cannot be combined;
+use labels for declared subsets and tags for individual-step selection.
 
 When all prerequisite outputs are already present and must not be rebuilt,
 `--ignore-selected-deps` runs only the named tags and drops dependency edges to steps outside the

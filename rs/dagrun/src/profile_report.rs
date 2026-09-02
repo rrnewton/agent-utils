@@ -1669,6 +1669,7 @@ mod tests {
             job: job.to_string(),
             desc: format!("{tag} short"),
             description: format!("details for {tag}"),
+            labels: Vec::new(),
             cmd: "true".to_string(),
             cmdtype: CmdType::Unknown,
             deps: deps.iter().map(|value| value.to_string()).collect(),

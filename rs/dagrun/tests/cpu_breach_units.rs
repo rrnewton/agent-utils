@@ -118,6 +118,7 @@ fn sleeping_step() -> DagConfig {
         job: "spin".into(),
         desc: "burn".into(),
         description: String::new(),
+        labels: Vec::new(),
         cmd: "sleep 30".into(),
         cmdtype: dagrun::CmdType::Unknown,
         manifest: None,

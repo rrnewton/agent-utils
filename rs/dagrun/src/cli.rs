@@ -216,7 +216,7 @@ dagrun --help\n\n\
 {store}\n  {store_dir}\n  {store_note}\n\n\
 {planning}\n  {pl1}\n  {pl2}\n  {pl3}\n  {plan_note}\n\n\
 {schema}  {schema_note}\n  \
-step:   group, job, desc, description, cmd, cmdtype, manifest{{lane,category}}, deps[], env{{}}, timeout, jobs_flag, jobs_env, networkonly, engine_only, hint{{}}\n  \
+step:   group, job, desc, description, labels[], cmd, cmdtype, manifest{{lane,category}}, deps[], env{{}}, timeout, jobs_flag, jobs_env, networkonly, engine_only, hint{{}}\n  \
 hint:   resources{{name:int}}, est_duration_s, rss_baseline_bytes, hard_mem_max_bytes,\n          classification(\"cpu-bound\"|\"latency-bound\"|\"light\"), preferred_inner_jobs\n  \
 top:    description, resource_caps{{name:int}}, mem_cap_factor, mem_cap_floor_bytes,\n          outer_mem_safety_factor, default_step_timeout, default_jobs_flag, default_jobs_env\n  \
 desc = short label; description = long-form docs (often multi-line, great in YAML)\n  \
@@ -376,6 +376,7 @@ fn run_help(c: &Palette) -> String {
             ("--cores/--cpuset/--pin K", "hard CPU PINNING, opt-in: reserve K least-busy free cores and require an exact cgroup cpuset; fail closed when unavailable"),
             ("--max-mem SPEC", "RAM budget (e.g. 8G): becomes the outer scope's MemoryMax (it can tighten the derived host boundary, never widen it) and derives a conservative model-based --max-steps ceiling; with explicit --max-steps, the tighter value wins"),
             ("--selected TAG[,TAG...]", "run the named step(s) and every dependency they require"),
+            ("--labels LABEL[,LABEL...]", "run every step carrying any named label and every dependency they require; labels are independent of group.job tags"),
             ("--ignore-selected-deps", "valid only with --selected: run only the named steps and drop dependency edges outside the selection"),
             ("--args STRING", "replace the opt-in {args} token in selected step commands"),
             ("--stress N", "duplicate the graph into N disconnected components; --max-steps controls active copies, --max-cpus caps each width/shared bandwidth, and expansion is limited to 100,000 generated nodes"),
@@ -798,6 +799,7 @@ fn box_config(
             job: label.to_string(),
             desc: argv.join(" "),
             description: String::new(),
+            labels: Vec::new(),
             cmd,
             cmdtype: crate::model::CmdType::Unknown,
             manifest: None,
@@ -1030,6 +1032,7 @@ struct RunArgs {
     cores: Option<i64>,
     max_mem: Option<String>,
     selected: Option<String>,
+    labels: Option<String>,
     ignore_selected_deps: bool,
     passthrough_args: Option<String>,
     stress: i64,
@@ -1100,6 +1103,7 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
         cores: None,
         max_mem: None,
         selected: None,
+        labels: None,
         ignore_selected_deps: false,
         passthrough_args: None,
         stress: 1,
@@ -1179,6 +1183,7 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
             }
             "--max-mem" => a.max_mem = Some(take_value(inline, &mut i)?),
             "--selected" => a.selected = Some(take_value(inline, &mut i)?),
+            "--labels" => a.labels = Some(take_value(inline, &mut i)?),
             "--ignore-selected-deps" => {
                 if inline.is_some() {
                     return Err(format!("unrecognized argument: {arg}"));
@@ -2203,6 +2208,40 @@ fn select_steps(
         })
         .collect();
     Ok(new_cfg)
+}
+
+/// Return every step carrying any requested label and its dependency ancestry.
+fn select_steps_by_labels(cfg: &DagConfig, labels: &[String]) -> Result<DagConfig, String> {
+    let known: HashSet<String> = cfg
+        .steps
+        .iter()
+        .flat_map(|step| step.labels.iter().cloned())
+        .collect();
+    let unknown: Vec<String> = labels
+        .iter()
+        .filter(|label| !known.contains(*label))
+        .cloned()
+        .collect();
+    if !unknown.is_empty() {
+        let mut known = known.into_iter().collect::<Vec<_>>();
+        known.sort();
+        let known = if known.is_empty() {
+            "(none)".to_string()
+        } else {
+            known.join(", ")
+        };
+        return Err(format!(
+            "--labels: unknown label(s): {}. Known labels: {known}",
+            unknown.join(", ")
+        ));
+    }
+    let tags = cfg
+        .steps
+        .iter()
+        .filter(|step| labels.iter().any(|label| step.labels.contains(label)))
+        .map(Step::tag)
+        .collect::<Vec<_>>();
+    select_steps(cfg, &tags, false)
 }
 
 // --------------------------------------------------------------------------- --args / --stress
@@ -4043,6 +4082,10 @@ fn apply_admission(a: &RunArgs) -> Result<Option<crate::admission::MemoryReserva
 fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
     // A selection includes its full dependency ancestry by default. Validate and select BEFORE
     // cgroup bring-up so a bad combination or tag fails fast (exit 2) without needing a scope.
+    if a.selected.is_some() && a.labels.is_some() {
+        eprintln!("{PROG}: run: --selected and --labels cannot be combined");
+        return 2;
+    }
     if a.ignore_selected_deps && a.selected.is_none() {
         eprintln!("{PROG}: run: --ignore-selected-deps requires --selected");
         return 2;
@@ -4054,6 +4097,19 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
             return 2;
         }
         match select_steps(cfg, &tags, a.ignore_selected_deps) {
+            Ok(f) => Some(f),
+            Err(e) => {
+                eprintln!("{PROG}: {e}");
+                return 2;
+            }
+        }
+    } else if let Some(labels) = a.labels.as_deref() {
+        let labels = parse_tag_list(labels);
+        if labels.is_empty() {
+            eprintln!("{PROG}: run: --labels requires at least one label");
+            return 2;
+        }
+        match select_steps_by_labels(cfg, &labels) {
             Ok(f) => Some(f),
             Err(e) => {
                 eprintln!("{PROG}: {e}");
@@ -5168,6 +5224,36 @@ mod tests {
             ["test.unit"]
         );
         assert!(selected.steps[0].deps.is_empty());
+    }
+
+    #[test]
+    fn labels_select_a_union_and_include_dependency_ancestry() {
+        let cfg = dag_from_json(
+            r#"{"steps":[
+                {"group":"build","job":"app","cmd":"true"},
+                {"group":"test","job":"unit","cmd":"true","labels":["quick","full"],"deps":["build.app"]},
+                {"group":"test","job":"slow","cmd":"true","labels":["full"]},
+                {"group":"privileged","job":"host","cmd":"true","labels":["super"]}
+            ]}"#,
+        )
+        .unwrap();
+
+        let quick = select_steps_by_labels(&cfg, &["quick".into()]).unwrap();
+        assert_eq!(
+            quick.steps.iter().map(Step::tag).collect::<Vec<_>>(),
+            ["build.app", "test.unit"]
+        );
+        let union = select_steps_by_labels(&cfg, &["quick".into(), "super".into()]).unwrap();
+        assert_eq!(
+            union.steps.iter().map(Step::tag).collect::<Vec<_>>(),
+            ["build.app", "test.unit", "privileged.host"]
+        );
+        let error = select_steps_by_labels(&cfg, &["test.unit".into()]).unwrap_err();
+        assert!(error.contains("unknown label(s): test.unit"), "{error}");
+        assert!(
+            error.contains("Known labels: full, quick, super"),
+            "{error}"
+        );
     }
 
     /// A stress expansion is one of the two places the PRODUCT rebuilds a `DagConfig` around a

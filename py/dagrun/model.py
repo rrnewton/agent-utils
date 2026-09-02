@@ -205,6 +205,9 @@ class Step:
     # label shown by `list`/`run` — `description` is free-form prose (often multi-line, e.g. a
     # YAML block scalar) that documents WHY the step exists. It never affects scheduling.
     description: str = ""
+    # Selection labels are independent of the unique ``group.job`` tag. A step may belong to
+    # several named subsets without changing either its identity or its dependency edges.
+    labels: list[str] = field(default_factory=list)
     deps: list[str] = field(default_factory=list)  # tags ("group.job") this step depends on
     env: dict[str, str] = field(default_factory=dict)
     hint: ResourceHint = field(default_factory=ResourceHint)

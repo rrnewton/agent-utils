@@ -383,6 +383,7 @@ mod tests {
             job: job.to_string(),
             desc: tag.to_string(),
             description: String::new(),
+            labels: Vec::new(),
             cmd: "true".to_string(),
             manifest: None,
             integration_test_binaries: None,
