@@ -62,15 +62,19 @@ fn ci_action(node: &PrNode, freshness_max_behind: Option<i64>) -> (PrAction, Str
         );
     }
     if node.validation_evidence == ValidationEvidence::CleanValidateRecord {
-        let authority = match node.validation_authority {
-            ValidationAuthority::None => "exact fetched base",
-            other => other.as_str(),
-        };
+        if node.validation_authority == ValidationAuthority::None {
+            return (
+                PrAction::Wait,
+                "clean-validate-record has no consuming-workspace hard/soft-green authority"
+                    .to_owned(),
+            );
+        }
         return (
             PrAction::LandNow,
             format!(
-                "{} at exact head with {authority} authority; no merge-gate wait",
+                "{} at exact head with {} authority; no merge-gate wait",
                 node.validation_evidence.as_str(),
+                node.validation_authority.as_str(),
             ),
         );
     }
@@ -315,6 +319,7 @@ mod tests {
     fn fusion_table_respects_evidence_policy_and_freshness() {
         let mut evidence = green(1);
         evidence.validation_evidence = ValidationEvidence::CleanValidateRecord;
+        evidence.validation_authority = ValidationAuthority::HardGreen;
         evidence.ci = CiVerdict::default();
         let mut policy = green(2);
         policy.policy_class = PolicyClass::GatePolicy;
@@ -329,6 +334,14 @@ mod tests {
         strict_behind.commits_behind = 1;
         let (strict, _) = compute_plan(&[strict_behind], &[], &[], &[], Some(0), 2, false);
         assert_eq!(strict.per_pr_actions[0].action, PrAction::RebaseThenLand);
+
+        let mut unproven = green(5);
+        unproven.validation_evidence = ValidationEvidence::CleanValidateRecord;
+        let (unproven_plan, _) = compute_plan(&[unproven], &[], &[], &[], None, 2, false);
+        assert_eq!(unproven_plan.per_pr_actions[0].action, PrAction::Wait);
+        assert!(unproven_plan.per_pr_actions[0]
+            .why
+            .contains("no consuming-workspace hard/soft-green authority"));
     }
 
     #[test]

@@ -118,6 +118,7 @@ def test_clean_record_keeps_exact_head_and_delegates_older_base_to_authority() -
                     "head_sha": "stale-sha",
                     "base_sha": "base",
                     "validation_evidence": "clean-validate-record",
+                    "validation_authority": "hard-green",
                 }
             ]
         }
@@ -125,20 +126,37 @@ def test_clean_record_keeps_exact_head_and_delegates_older_base_to_authority() -
     with pytest.raises(ValueError, match="landing context is stale"):
         apply_landing_context([_node(1)], context)
 
-    unproven_base = parse_landing_context(
+    with pytest.raises(ValueError, match="requires explicit validation_authority"):
+        parse_landing_context(
+            {
+                "prs": [
+                    {
+                        "pr": 1,
+                        "head_sha": "sha-1",
+                        "base_sha": "base",
+                        "validation_evidence": "clean-validate-record",
+                    }
+                ]
+            }
+        )
+
+    hard_green = parse_landing_context(
         {
             "prs": [
                 {
                     "pr": 1,
                     "head_sha": "sha-1",
-                    "base_sha": "divergent-or-unproven-base",
+                    "base_sha": "base",
                     "validation_evidence": "clean-validate-record",
+                    "validation_authority": "hard-green",
                 }
             ]
         }
     )
-    with pytest.raises(ValueError, match="supplied no soft-green authority"):
-        apply_landing_context([_node(1)], unproven_base)
+    hard_green_node = apply_landing_context([_node(1)], hard_green)[0]
+    assert hard_green_node.validation_authority is ValidationAuthority.HARD_GREEN
+    hard_green_plan, _ = compute_plan([hard_green_node], [], [], [])
+    assert hard_green_plan.per_pr_actions[0].action is PrAction.LAND_NOW
 
     earlier_green = parse_landing_context(
         {
@@ -202,6 +220,7 @@ def test_local_evidence_bypasses_ci_wait_but_gate_policy_escalates() -> None:
                     "head_sha": "sha-1",
                     "base_sha": "base",
                     "validation_evidence": "clean-validate-record",
+                    "validation_authority": "hard-green",
                     "policy_class": "ci-hygiene",
                     "assigned_agent": "widget-ci",
                 },
@@ -210,6 +229,7 @@ def test_local_evidence_bypasses_ci_wait_but_gate_policy_escalates() -> None:
                     "head_sha": "sha-2",
                     "base_sha": "base",
                     "validation_evidence": "clean-validate-record",
+                    "validation_authority": "hard-green",
                     "policy_class": "gate-policy",
                 },
             ]

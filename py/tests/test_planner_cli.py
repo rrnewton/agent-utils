@@ -166,6 +166,7 @@ def test_plan_context_exact_head_bypasses_stale_gate(tmp_path: Path) -> None:
                         "head_sha": "sha-942",
                         "base_sha": "basesha-integration",
                         "validation_evidence": "clean-validate-record",
+                        "validation_authority": "hard-green",
                         "policy_class": "ci-hygiene",
                         "assigned_agent": "agent-a",
                     }
@@ -191,6 +192,7 @@ def test_plan_context_exact_head_bypasses_stale_gate(tmp_path: Path) -> None:
     decision = next(item for item in obj["plan"]["per_pr_actions"] if item["pr"] == 942)
     assert node["assigned_agent"] == "agent-a"
     assert node["validation_evidence"] == "clean-validate-record"
+    assert node["validation_authority"] == "hard-green"
     assert decision["action"] == "land-now"
     assert "no merge-gate wait" in decision["why"]
 

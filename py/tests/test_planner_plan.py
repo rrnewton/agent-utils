@@ -137,6 +137,14 @@ def test_main_advancing_does_not_invalidate_authorized_exact_head_evidence() -> 
     assert "soft-green authority" in decision.why
     assert "rebase" not in decision.why
 
+    unproven = dataclasses.replace(
+        validated, validation_authority=ValidationAuthority.NONE
+    )
+    unproven_plan, _ = compute_plan([unproven], [], [], [])
+    unproven_decision = unproven_plan.per_pr_actions[0]
+    assert unproven_decision.action is PrAction.WAIT
+    assert "no consuming-workspace hard/soft-green authority" in unproven_decision.why
+
 
 def test_held_actions() -> None:
     nodes = [_node(1), _node(2), _node(3)]
