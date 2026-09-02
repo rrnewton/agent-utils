@@ -1,7 +1,7 @@
 # A self-contained FakeHost fixture demonstrating every planner outcome, network-free.
 #   pr-landing-planner plan --fixture pr-landing-demo.yaml --flaky-signatures flaky-signatures.yaml
 #
-# Expected: #1043 land-now; #987 rebase-then-land (behind + conflicts with #942); #942
+# Expected: #1043 land-now; #987 land-now (behind + conflicts with #942); #942
 # refire-stale-gate; #1050 wait (evaluate-once race); #1049 refire-ci (flaky, WITH the signatures
 # file); #2001/#2002 escalate-runner-outage (systemic, >= outage-min-prs); #3001 held (draft);
 # #3002 held depends-on #3001 via base-ref stacking.
