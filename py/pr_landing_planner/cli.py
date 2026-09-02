@@ -145,7 +145,7 @@ def _banner(c: Palette) -> str:
         f"{c.bold(PROG)} {c.dim('v' + __version__)}\n"
         "A conflict-graph + CI-aware, ADVISORY pull-request landing planner. It builds the real\n"
         "merge-conflict graph over the open PRs, classifies each red CI into one of five failure\n"
-        "modes, exact head/base validation evidence, policy disposition, freshness + holds, and\n"
+        "modes, exact-head validation evidence, caller authority, freshness + holds, and\n"
         "mechanism overlaps, then recommends a per-PR action. It NEVER mutates a PR."
     )
 
@@ -176,7 +176,7 @@ def _quickstart(c: Palette) -> str:
     * which reds are REAL vs. benign (flaky / stale gate / evaluate-once race / runner outage),
     * how stale each green PR is (commits behind the base),
     * which PRs are held (draft / base-conflict / depends-on-held), and
-    * exact head/base local validation + CI evidence and gate-policy disposition,
+    * exact-head local validation + caller hard/soft-green authority and gate-policy disposition,
     * shared mechanism tags that require coordinator review, and
     * a recommended per-PR ACTION with an assigned agent, ordered priority -> size -> age.
   It is ADVISORY: it recommends; a landing skill / coordinator executes the mutations.
@@ -212,12 +212,12 @@ def _quickstart(c: Palette) -> str:
   --conflict-detector {{merge-tree,file-overlap}}   merge-tree (real conflicts) is the default
   --gate-check NAME                               required-check name (default: {DEFAULT_GATE_CHECK})
   --flaky-signatures FILE                         name/text regexes marking a red as flaky
-  --freshness-max-behind N                        a green PR >N commits behind => rebase-then-land
+  --freshness-max-behind N                        optional caller policy; otherwise base age is advisory
   --priority-source {{none,labels,command}}         ordering priority (default: none)
   --batch                                         also propose one green, conflict/dependency-free batch
   --archive-dir DIR / --no-archive                archive the plan JSON to disk (on by default for
                                                   live runs; path printed as a NOTE on stderr)
-  --landing-context FILE                          exact validation/review evidence / policy / agent
+  --landing-context FILE                          exact validation/review evidence / authority / policy / agent
 
 {h('Exit codes')}  0 = ok | 2 = bad usage / host or fixture error
 
@@ -370,12 +370,12 @@ def _build_result(ns: argparse.Namespace) -> PlanResult:
     )
     if priority.last_error is not None:
         raise ValueError(priority.last_error)
-    freshness = getattr(ns, "freshness_max_behind", 0)
+    freshness = getattr(ns, "freshness_max_behind", None)
     batch = bool(getattr(ns, "batch", False))
     outage_min = ns.outage_min_prs if isinstance(ns.outage_min_prs, int) else 2
     return assemble_result(
         graph,
-        freshness_max_behind=freshness if isinstance(freshness, int) else 0,
+        freshness_max_behind=freshness if isinstance(freshness, int) else None,
         outage_min_prs=outage_min,
         batch=batch,
     )
@@ -401,7 +401,7 @@ def _add_collect_flags(sp: argparse.ArgumentParser) -> None:
         default=None,
         metavar="FILE",
         help=(
-            "JSON/YAML exact head/base context for evidence, policy class, and assigned agent"
+            "JSON/YAML exact-head evidence, validation authority, policy class, and assigned agent"
         ),
     )
     sp.add_argument(
@@ -470,8 +470,8 @@ def build_parser() -> argparse.ArgumentParser:
     plan_p.add_argument(
         "--freshness-max-behind",
         type=_nonnegative_i64_arg,
-        default=0,
-        help="a green PR more than N commits behind base => rebase-then-land (default: 0)",
+        default=None,
+        help="optional caller policy: a green PR more than N commits behind => rebase-then-land",
     )
     plan_p.add_argument(
         "--priority-source",

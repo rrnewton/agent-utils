@@ -16,6 +16,7 @@ from pr_landing_planner.model import (
     CiState,
     PolicyClass,
     PrNode,
+    ValidationAuthority,
     ValidationEvidence,
 )
 
@@ -33,6 +34,7 @@ class LandingContext:
     base_sha: str = ""
     assigned_agent: str = ""
     validation_evidence: ValidationEvidence | None = None
+    validation_authority: ValidationAuthority | None = None
     review_pass_heads: tuple[tuple[str, str], ...] = ()
     policy_class: PolicyClass | None = None
 
@@ -68,12 +70,19 @@ def parse_landing_context(raw: object) -> tuple[LandingContext, ...]:
         seen.add(pr)
 
         evidence_raw = _str_field(obj, "validation_evidence")
+        authority_raw = _str_field(obj, "validation_authority")
         policy_raw = _str_field(obj, "policy_class")
         try:
             evidence = ValidationEvidence(evidence_raw) if evidence_raw else None
         except ValueError as exc:
             raise ValueError(
                 f"PR #{pr} has unknown validation_evidence {evidence_raw!r}"
+            ) from exc
+        try:
+            authority = ValidationAuthority(authority_raw) if authority_raw else None
+        except ValueError as exc:
+            raise ValueError(
+                f"PR #{pr} has unknown validation_authority {authority_raw!r}"
             ) from exc
         try:
             policy = PolicyClass(policy_raw) if policy_raw else None
@@ -89,6 +98,11 @@ def parse_landing_context(raw: object) -> tuple[LandingContext, ...]:
             raise ValueError(
                 f"PR #{pr} {evidence.value} evidence requires exact 'head_sha' "
                 "and 'base_sha'; revalidate and record both fetched identities"
+            )
+        if authority not in (None, ValidationAuthority.NONE) and evidence is not ValidationEvidence.CLEAN_VALIDATE_RECORD:
+            raise ValueError(
+                f"PR #{pr} {authority.value} validation_authority requires "
+                "validation_evidence 'clean-validate-record'"
             )
         raw_review_pass_heads = obj.get("review_pass_heads", {})
         if not isinstance(raw_review_pass_heads, dict):
@@ -114,6 +128,7 @@ def parse_landing_context(raw: object) -> tuple[LandingContext, ...]:
                 base_sha=base_sha,
                 assigned_agent=_str_field(obj, "assigned_agent"),
                 validation_evidence=evidence,
+                validation_authority=authority,
                 review_pass_heads=tuple(sorted(review_pass_heads)),
                 policy_class=policy,
             )
@@ -162,7 +177,7 @@ def _label_context(node: PrNode) -> PrNode:
 def apply_landing_context(
     nodes: Sequence[PrNode], contexts: Sequence[LandingContext]
 ) -> tuple[PrNode, ...]:
-    """Apply labels, then exact head/base context; fail closed on drift or unknown PRs."""
+    """Apply labels and caller authority; keep head binding exact and fail closed on drift."""
     by_context = {context.pr: context for context in contexts}
     node_numbers = {node.number for node in nodes}
     unknown = sorted(set(by_context) - node_numbers)
@@ -182,10 +197,15 @@ def apply_landing_context(
                 f"PR #{node.number} landing context is stale: "
                 f"context={context.head_sha}, current={node.head_sha}"
             )
-        if context.base_sha and context.base_sha != node.base_sha:
+        if (
+            context.base_sha
+            and context.base_sha != node.base_sha
+            and context.validation_authority is not ValidationAuthority.SOFT_GREEN
+        ):
             raise ValueError(
-                f"PR #{node.number} landing context base is stale: "
-                f"context={context.base_sha}, current={node.base_sha}; revalidate"
+                f"PR #{node.number} landing context base differs: "
+                f"context={context.base_sha}, current={node.base_sha}; "
+                "the consuming workspace supplied no soft-green authority"
             )
         out.append(
             replace(
@@ -195,6 +215,11 @@ def apply_landing_context(
                     context.validation_evidence
                     if context.validation_evidence is not None
                     else node.validation_evidence
+                ),
+                validation_authority=(
+                    context.validation_authority
+                    if context.validation_authority is not None
+                    else node.validation_authority
                 ),
                 review_pass_heads=context.review_pass_heads,
                 policy_class=(

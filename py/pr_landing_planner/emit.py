@@ -29,14 +29,14 @@ from pr_landing_planner.model import (
 ColorFn = Callable[[str, str], str]
 
 #: Why clustering saves *validate runs*, not just rebases. A clean validation record is keyed to the
-#: exact head and base SHAs. Landing moves the base and rebasing also changes the head, so serial
-#: draining invalidates queued evidence at every step. Landing a real-conflict cluster as one stack
-#: collapses that to one rebase and validation per cluster. Single source: reused by every renderer.
+#: exact head SHA. Rebasing changes that head and therefore requires new evidence; main advancing
+#: alone does not. Landing a real-conflict cluster as one stack avoids the same number of head-changing
+#: rebases and validation runs. Single source: reused by every renderer.
 VALIDATE_ECONOMICS_RATIONALE = (
-    "The clean-validate record is keyed to the exact head and base SHAs. Landing moves the base, "
-    "and rebasing also changes the head, so serial draining invalidates queued validation evidence "
-    "at every step (self-defeating). Landing each real-conflict cluster as ONE stack collapses that "
-    "to one rebase and one validate per cluster, so clustering avoids the same count of rebases "
+    "The clean-validate record is keyed to the exact head SHA. Rebasing changes that head and "
+    "therefore requires new validation evidence. A lagging ancestor is legitimate; requiring "
+    "the tip made the verdict a property of WHEN you looked rather than of the tree. Landing "
+    "each real-conflict cluster as ONE stack avoids the same count of head-changing rebases "
     "AND validate runs."
 )
 
@@ -81,6 +81,7 @@ def _node_obj(node: PrNode, held: bool) -> dict[str, object]:
         "labels": list(node.labels),
         "assigned_agent": node.assigned_agent or None,
         "validation_evidence": node.validation_evidence.value,
+        "validation_authority": node.validation_authority.value,
         "policy_class": node.policy_class.value,
         "review_decision": node.review_decision or None,
         "review_binding": review_binding(node)[0].value,

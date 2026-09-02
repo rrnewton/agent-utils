@@ -148,6 +148,39 @@ impl ValidationEvidence {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+/// Consuming-workspace decision about whether recorded validation authorizes landing.
+pub enum ValidationAuthority {
+    /// No hard/soft-green authorization was supplied.
+    #[default]
+    None,
+    /// The consuming workspace classified the evidence as hard green.
+    HardGreen,
+    /// The consuming workspace classified the evidence as soft green.
+    SoftGreen,
+}
+
+impl ValidationAuthority {
+    /// Return the stable machine-facing value.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::HardGreen => "hard-green",
+            Self::SoftGreen => "soft-green",
+        }
+    }
+
+    /// Parse a machine-facing validation-authority value.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "none" => Some(Self::None),
+            "hard-green" => Some(Self::HardGreen),
+            "soft-green" => Some(Self::SoftGreen),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 /// Binding state of required adversarial-review PASS receipts.
 pub enum ReviewBinding {
     /// No review-protocol label or receipt is present.
@@ -340,6 +373,8 @@ pub struct PrNode {
     pub assigned_agent: String,
     /// Validation evidence associated with this snapshot.
     pub validation_evidence: ValidationEvidence,
+    /// Consuming-workspace hard/soft-green authorization for that evidence.
+    pub validation_authority: ValidationAuthority,
     /// Caller-verified review lane to exact reviewed-head SHA receipts.
     pub review_pass_heads: BTreeMap<String, String>,
     /// Landing-policy classification.

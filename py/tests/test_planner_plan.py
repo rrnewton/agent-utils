@@ -16,6 +16,7 @@ from pr_landing_planner.model import (
     PrNode,
     PolicyClass,
     RedClass,
+    ValidationAuthority,
     ValidationEvidence,
 )
 from pr_landing_planner.plan import compute_plan
@@ -71,7 +72,7 @@ def test_fusion_table_actions() -> None:
     plan, _ = compute_plan(nodes, [], [], [])
     acts = plan.per_pr_actions
     assert _action(acts, 1) is PrAction.LAND_NOW
-    assert _action(acts, 2) is PrAction.REBASE_THEN_LAND
+    assert _action(acts, 2) is PrAction.LAND_NOW
     assert _action(acts, 3) is PrAction.REFIRE_STALE_GATE
     assert _action(acts, 4) is PrAction.REFIRE_CI
     assert _action(acts, 5) is PrAction.HOLD_FIX
@@ -124,16 +125,17 @@ def test_gate_policy_escalation_precedes_hold_state() -> None:
     assert plan.land_now == ()
 
 
-def test_rebase_invalidates_exact_head_validation_evidence() -> None:
+def test_main_advancing_does_not_invalidate_authorized_exact_head_evidence() -> None:
     validated = dataclasses.replace(
         _node(13, behind=2),
         validation_evidence=ValidationEvidence.CLEAN_VALIDATE_RECORD,
+        validation_authority=ValidationAuthority.SOFT_GREEN,
     )
     plan, _ = compute_plan([validated], [], [], [])
     decision = plan.per_pr_actions[0]
-    assert decision.action is PrAction.REBASE_THEN_LAND
-    assert "revalidate the new head" in decision.why
-    assert "without waiting" not in decision.why
+    assert decision.action is PrAction.LAND_NOW
+    assert "soft-green authority" in decision.why
+    assert "rebase" not in decision.why
 
 
 def test_held_actions() -> None:

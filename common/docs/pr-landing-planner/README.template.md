@@ -8,8 +8,9 @@ per-PR actions and parallel-safe groups.
 The planner reports recommendations. It never merges, rebases, labels, refires,
 or otherwise mutates a pull request.
 
-Landing evidence is fail-closed: required reviews must be satisfied, local
-validation records bind both fetched head and base SHAs, and dependency cycles
+Landing evidence is fail-closed: required reviews bind the exact fetched head,
+local validation records name the exact tested head and base, the consuming
+workspace supplies any hard/soft-green authorization after the base advances, and dependency cycles
 or non-landable predecessors cannot enter a batch.
 
 {{DISTRIBUTION}}

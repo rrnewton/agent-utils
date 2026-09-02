@@ -101,7 +101,7 @@ struct Options {
     gate_check: String,
     flaky_signatures: Option<PathBuf>,
     outage_min_prs: usize,
-    freshness_max_behind: i64,
+    freshness_max_behind: Option<i64>,
     priority_source: String,
     priority_label_pattern: String,
     priority_cmd: String,
@@ -132,7 +132,7 @@ impl Default for Options {
             gate_check: DEFAULT_GATE_CHECK.to_owned(),
             flaky_signatures: None,
             outage_min_prs: 2,
-            freshness_max_behind: 0,
+            freshness_max_behind: None,
             priority_source: "none".to_owned(),
             priority_label_pattern: DEFAULT_LABEL_PATTERN.to_owned(),
             priority_cmd: String::new(),
@@ -147,13 +147,13 @@ impl Default for Options {
 
 fn help() -> String {
     format!(
-        "{PROG} v{VERSION}\nA conflict-graph + CI-aware, advisory pull-request landing planner.\n\nUSAGE:\n  {PROG} <command> [OPTIONS]\n  {PROG} --userguide\n\nCOMMANDS:\n  plan        build the graph and print the fused landing plan\n  graph       print the conflict and ordering graph\n  clusters    print real-conflict stack landing lanes\n  status      print per-PR CI health\n  quickstart  print a self-contained getting-started guide\n\nCOMMON OPTIONS:\n  --repo OWNER/NAME          repository (required for live collection)\n  --base BRANCH              base branch (default: {DEFAULT_BASE})\n  --fixture FILE             deterministic JSON/YAML input instead of a live host\n  --format FORMAT            human/json; plan also supports actions\n  --git-dir DIR              local clone for live collection\n  --prs N,N                  restrict to PR numbers\n  --conflict-detector KIND   merge-tree or file-overlap\n  --gate-check NAME          required gate name (default: {DEFAULT_GATE_CHECK})\n  --landing-context FILE     exact head/base evidence, policy, and agent context\n  --flaky-signatures FILE    known flaky name/text regexes\n  --net-wrapper COMMAND      prefix live network commands\n  --gh-cmd PATH              gh-compatible executable\n\nPLAN OPTIONS:\n  --outage-min-prs N         minimum correlated failures for outage classification\n  --freshness-max-behind N   allowed commits behind the base branch\n  --priority-source SOURCE   none, labels, or command\n  --priority-label-pattern R label priority pattern (default: {DEFAULT_LABEL_PATTERN})\n  --priority-cmd COMMAND     command used by the command priority source\n  --batch                    emit a conflict/dependency-free root batch\n  --archive-dir DIR          directory for canonical JSON plan archives\n  --no-archive               disable the default live-run archive\n\nSTATUS OPTIONS:\n  --warn-threshold N         unhealthy-PR warning threshold (default: {DEFAULT_WARN_THRESHOLD})\n\nQUICKSTART OPTIONS:\n  --emit-demo                print the bundled deterministic fixture\n\nGENERAL OPTIONS:\n  -h, --help                 print help\n  --version                  print version\n  --userguide                print the complete embedded reference\n\nRun `{PROG} quickstart` for examples. The tool never mutates a PR."
+        "{PROG} v{VERSION}\nA conflict-graph + CI-aware, advisory pull-request landing planner.\n\nUSAGE:\n  {PROG} <command> [OPTIONS]\n  {PROG} --userguide\n\nCOMMANDS:\n  plan        build the graph and print the fused landing plan\n  graph       print the conflict and ordering graph\n  clusters    print real-conflict stack landing lanes\n  status      print per-PR CI health\n  quickstart  print a self-contained getting-started guide\n\nCOMMON OPTIONS:\n  --repo OWNER/NAME          repository (required for live collection)\n  --base BRANCH              base branch (default: {DEFAULT_BASE})\n  --fixture FILE             deterministic JSON/YAML input instead of a live host\n  --format FORMAT            human/json; plan also supports actions\n  --git-dir DIR              local clone for live collection\n  --prs N,N                  restrict to PR numbers\n  --conflict-detector KIND   merge-tree or file-overlap\n  --gate-check NAME          required gate name (default: {DEFAULT_GATE_CHECK})\n  --landing-context FILE     exact-head evidence, validation authority, policy, and agent context\n  --flaky-signatures FILE    known flaky name/text regexes\n  --net-wrapper COMMAND      prefix live network commands\n  --gh-cmd PATH              gh-compatible executable\n\nPLAN OPTIONS:\n  --outage-min-prs N         minimum correlated failures for outage classification\n  --freshness-max-behind N   optional caller policy; otherwise base age is advisory\n  --priority-source SOURCE   none, labels, or command\n  --priority-label-pattern R label priority pattern (default: {DEFAULT_LABEL_PATTERN})\n  --priority-cmd COMMAND     command used by the command priority source\n  --batch                    emit a conflict/dependency-free root batch\n  --archive-dir DIR          directory for canonical JSON plan archives\n  --no-archive               disable the default live-run archive\n\nSTATUS OPTIONS:\n  --warn-threshold N         unhealthy-PR warning threshold (default: {DEFAULT_WARN_THRESHOLD})\n\nQUICKSTART OPTIONS:\n  --emit-demo                print the bundled deterministic fixture\n\nGENERAL OPTIONS:\n  -h, --help                 print help\n  --version                  print version\n  --userguide                print the complete embedded reference\n\nRun `{PROG} quickstart` for examples. The tool never mutates a PR."
     )
 }
 
 fn quickstart() -> String {
     format!(
-        "{PROG} v{VERSION}\nA conflict-graph + CI-aware, ADVISORY pull-request landing planner.\n\nThe idea\n  Fuse real merge conflicts, exact head/base CI evidence, freshness, holds, priority, and semantic\n  mechanism overlaps into deterministic per-PR actions. The planner never changes a PR.\n\n1. Install\n  cargo install pr-landing-planner\n\n2. Try the bundled fixture (no repository or network)\n  {PROG} quickstart --emit-demo > demo.yaml\n  {PROG} plan --fixture demo.yaml\n\n3. Run against a live repository\n  {PROG} plan --repo OWNER/NAME --base main --git-dir /path/to/clone\n\nRed classifications\n  real -> hold-fix | flaky -> refire-ci | stale-required-check -> refire-stale-gate\n  evaluate-once-race -> wait | runner-outage -> escalate-runner-outage\n\nOutput\n  --format human | json | actions (plan only)\n  JSON is deterministic; actions starts with capturable key=value counts.\n\nUse `{PROG} --userguide` for all flags, fixture fields, and landing-context semantics.\n\nDemo fixture\n{DEMO_FIXTURE}"
+        "{PROG} v{VERSION}\nA conflict-graph + CI-aware, ADVISORY pull-request landing planner.\n\nThe idea\n  Fuse real merge conflicts, exact-head CI evidence, caller validation authority, freshness, holds,\n  priority, and semantic mechanism overlaps into deterministic per-PR actions. The planner never\n  changes a PR.\n\n1. Install\n  cargo install pr-landing-planner\n\n2. Try the bundled fixture (no repository or network)\n  {PROG} quickstart --emit-demo > demo.yaml\n  {PROG} plan --fixture demo.yaml\n\n3. Run against a live repository\n  {PROG} plan --repo OWNER/NAME --base main --git-dir /path/to/clone\n\nRed classifications\n  real -> hold-fix | flaky -> refire-ci | stale-required-check -> refire-stale-gate\n  evaluate-once-race -> wait | runner-outage -> escalate-runner-outage\n\nOutput\n  --format human | json | actions (plan only)\n  JSON is deterministic; actions starts with capturable key=value counts.\n\nUse `{PROG} --userguide` for all flags, fixture fields, and landing-context semantics.\n\nDemo fixture\n{DEMO_FIXTURE}"
     )
 }
 
@@ -231,7 +231,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
                 options.outage_min_prs = parse_nonnegative_usize(&value()?, flag)?
             }
             "--freshness-max-behind" => {
-                options.freshness_max_behind = parse_number(&value()?, flag)?
+                options.freshness_max_behind = Some(parse_number(&value()?, flag)?)
             }
             "--priority-source" => options.priority_source = value()?,
             "--priority-label-pattern" => options.priority_label_pattern = value()?,
@@ -262,7 +262,10 @@ fn parse_nonnegative_usize(value: &str, flag: &str) -> Result<usize, String> {
 }
 
 fn validate(options: &Options) -> Result<(), String> {
-    if options.freshness_max_behind < 0 {
+    if options
+        .freshness_max_behind
+        .is_some_and(|freshness| freshness < 0)
+    {
         return Err("--freshness-max-behind must be nonnegative".to_owned());
     }
     if options.gate_check.trim().is_empty() {

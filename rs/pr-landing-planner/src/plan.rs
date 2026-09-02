@@ -5,11 +5,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::graph::{build_stacks, held_reasons, partition_parallel_safe};
 use crate::model::{
     CiState, CollectedGraph, ConflictEdge, Diagnostics, HeldPr, OrderingEdge, Plan, PlanResult,
-    PolicyClass, PrAction, PrActionDecision, PrNode, RedClass, ValidationEvidence,
+    PolicyClass, PrAction, PrActionDecision, PrNode, RedClass, ValidationAuthority,
+    ValidationEvidence,
 };
 
-/// Default maximum number of base commits a directly landable PR may trail.
-pub const DEFAULT_FRESHNESS_MAX_BEHIND: i64 = 0;
+/// Default freshness policy. `None` leaves base age advisory unless the caller opts in.
+pub const DEFAULT_FRESHNESS_MAX_BEHIND: Option<i64> = None;
 
 fn held_action(reasons: &[String]) -> (PrAction, String) {
     if reasons.iter().any(|reason| reason == "ordering-cycle") {
@@ -52,7 +53,7 @@ fn held_action(reasons: &[String]) -> (PrAction, String) {
     (PrAction::Wait, format!("held: {}", reasons.join(", ")))
 }
 
-fn ci_action(node: &PrNode, freshness_max_behind: i64) -> (PrAction, String) {
+fn ci_action(node: &PrNode, freshness_max_behind: Option<i64>) -> (PrAction, String) {
     if node.policy_class == PolicyClass::GatePolicy {
         return (
             PrAction::EscalateGatePolicy,
@@ -61,21 +62,15 @@ fn ci_action(node: &PrNode, freshness_max_behind: i64) -> (PrAction, String) {
         );
     }
     if node.validation_evidence == ValidationEvidence::CleanValidateRecord {
-        if node.commits_behind > freshness_max_behind {
-            return (
-                PrAction::RebaseThenLand,
-                format!(
-                    "{} applies to the current head; rebase {} commit(s), then revalidate the new head before landing",
-                    node.validation_evidence.as_str(),
-                    node.commits_behind
-                ),
-            );
-        }
+        let authority = match node.validation_authority {
+            ValidationAuthority::None => "exact fetched base",
+            other => other.as_str(),
+        };
         return (
             PrAction::LandNow,
             format!(
-                "{} at exact head and base; no merge-gate wait",
-                node.validation_evidence.as_str()
+                "{} at exact head with {authority} authority; no merge-gate wait",
+                node.validation_evidence.as_str(),
             ),
         );
     }
@@ -107,7 +102,7 @@ fn ci_action(node: &PrNode, freshness_max_behind: i64) -> (PrAction, String) {
             "required gate passed; another CI check has NO_RESULT".to_owned(),
         );
     }
-    if node.commits_behind > freshness_max_behind {
+    if freshness_max_behind.is_some_and(|limit| node.commits_behind > limit) {
         return (
             PrAction::RebaseThenLand,
             format!("green but {} commit(s) behind base", node.commits_behind),
@@ -115,7 +110,7 @@ fn ci_action(node: &PrNode, freshness_max_behind: i64) -> (PrAction, String) {
     }
     (
         PrAction::LandNow,
-        "authoritative CI green, fresh, gate ok".to_owned(),
+        "authoritative CI green, gate ok".to_owned(),
     )
 }
 
@@ -152,7 +147,7 @@ pub fn compute_plan(
     conflict_edges: &[ConflictEdge],
     ordering_edges: &[OrderingEdge],
     held: &[HeldPr],
-    freshness_max_behind: i64,
+    freshness_max_behind: Option<i64>,
     outage_min_prs: usize,
     batch: bool,
 ) -> (Plan, Diagnostics) {
@@ -273,7 +268,7 @@ pub fn compute_plan(
 /// Derive stacks and holds, then compute a complete result from a collected graph.
 pub fn assemble_result(
     graph: CollectedGraph,
-    freshness_max_behind: i64,
+    freshness_max_behind: Option<i64>,
     outage_min_prs: usize,
     batch: bool,
 ) -> PlanResult {
@@ -325,10 +320,15 @@ mod tests {
         policy.policy_class = PolicyClass::GatePolicy;
         let mut behind = green(3);
         behind.commits_behind = 1;
-        let (plan, _) = compute_plan(&[evidence, policy, behind], &[], &[], &[], 0, 2, false);
+        let (plan, _) = compute_plan(&[evidence, policy, behind], &[], &[], &[], None, 2, false);
         assert_eq!(plan.per_pr_actions[0].action, PrAction::LandNow);
         assert_eq!(plan.per_pr_actions[1].action, PrAction::EscalateGatePolicy);
-        assert_eq!(plan.per_pr_actions[2].action, PrAction::RebaseThenLand);
+        assert_eq!(plan.per_pr_actions[2].action, PrAction::LandNow);
+
+        let mut strict_behind = green(4);
+        strict_behind.commits_behind = 1;
+        let (strict, _) = compute_plan(&[strict_behind], &[], &[], &[], Some(0), 2, false);
+        assert_eq!(strict.per_pr_actions[0].action, PrAction::RebaseThenLand);
     }
 
     #[test]
@@ -353,7 +353,7 @@ mod tests {
             },
             ..PrNode::default()
         };
-        let (plan, _) = compute_plan(&[missing, non_passing], &[], &[], &[], 0, 2, false);
+        let (plan, _) = compute_plan(&[missing, non_passing], &[], &[], &[], None, 2, false);
         assert_eq!(plan.per_pr_actions[0].action, PrAction::RefireCi);
         assert_eq!(plan.per_pr_actions[1].action, PrAction::RefireCi);
         assert!(plan.land_now.is_empty());
@@ -383,7 +383,7 @@ mod tests {
             &[],
             std::slice::from_ref(&edge),
             &[],
-            0,
+            None,
             2,
             true,
         );
@@ -406,7 +406,7 @@ mod tests {
                 reason: "base-ref".into(),
             }],
             &[],
-            0,
+            None,
             2,
             true,
         );
@@ -415,14 +415,14 @@ mod tests {
     }
 
     #[test]
-    fn gate_policy_escalates_even_when_held_and_rebase_invalidates_exact_evidence() {
+    fn gate_policy_escalates_and_main_advance_preserves_authorized_exact_head_evidence() {
         let mut policy = green(1);
         policy.policy_class = PolicyClass::GatePolicy;
         let held = HeldPr {
             pr: 1,
             reasons: vec!["draft".into()],
         };
-        let (policy_plan, _) = compute_plan(&[policy], &[], &[], &[held], 0, 2, false);
+        let (policy_plan, _) = compute_plan(&[policy], &[], &[], &[held], None, 2, false);
         assert_eq!(
             policy_plan.per_pr_actions[0].action,
             PrAction::EscalateGatePolicy
@@ -430,12 +430,13 @@ mod tests {
 
         let mut evidence = green(2);
         evidence.validation_evidence = ValidationEvidence::CleanValidateRecord;
+        evidence.validation_authority = ValidationAuthority::SoftGreen;
         evidence.commits_behind = 3;
-        let (evidence_plan, _) = compute_plan(&[evidence], &[], &[], &[], 0, 2, false);
+        let (evidence_plan, _) = compute_plan(&[evidence], &[], &[], &[], None, 2, false);
         let decision = &evidence_plan.per_pr_actions[0];
-        assert_eq!(decision.action, PrAction::RebaseThenLand);
-        assert!(decision.why.contains("revalidate the new head"));
-        assert!(!decision.why.contains("without waiting"));
+        assert_eq!(decision.action, PrAction::LandNow);
+        assert!(decision.why.contains("soft-green authority"));
+        assert!(!decision.why.contains("rebase"));
     }
 
     #[test]
@@ -489,7 +490,7 @@ mod tests {
             b: 10,
             paths: vec!["x".into()],
         }];
-        let (plan, diagnostics) = compute_plan(&nodes, &conflicts, &[], &[], 0, 2, true);
+        let (plan, diagnostics) = compute_plan(&nodes, &conflicts, &[], &[], None, 2, true);
         let actions: BTreeMap<_, _> = plan
             .per_pr_actions
             .iter()

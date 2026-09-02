@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
-use crate::model::{CiState, PolicyClass, PrNode, ValidationEvidence};
+use crate::model::{CiState, PolicyClass, PrNode, ValidationAuthority, ValidationEvidence};
 
 /// Label prefix carrying an assigned-agent identifier.
 pub const AGENT_PREFIX: &str = "agent:";
@@ -26,6 +26,8 @@ pub struct LandingContext {
     pub assigned_agent: String,
     /// Optional validation-evidence override.
     pub validation_evidence: Option<ValidationEvidence>,
+    /// Optional consuming-workspace hard/soft-green authorization.
+    pub validation_authority: Option<ValidationAuthority>,
     /// Caller-verified review lane to exact reviewed-head SHA receipts.
     pub review_pass_heads: BTreeMap<String, String>,
     /// Optional policy classification override.
@@ -75,6 +77,14 @@ pub fn parse_landing_context(raw: &Value) -> Result<Vec<LandingContext>, String>
                 format!("PR #{pr} has unknown validation_evidence {evidence_raw:?}")
             })?)
         };
+        let authority_raw = string("validation_authority");
+        let authority = if authority_raw.is_empty() {
+            None
+        } else {
+            Some(ValidationAuthority::parse(&authority_raw).ok_or_else(|| {
+                format!("PR #{pr} has unknown validation_authority {authority_raw:?}")
+            })?)
+        };
         let policy_raw = string("policy_class");
         let policy = if policy_raw.is_empty() {
             None
@@ -94,6 +104,14 @@ pub fn parse_landing_context(raw: &Value) -> Result<Vec<LandingContext>, String>
             return Err(format!(
                 "PR #{pr} {} evidence requires exact 'head_sha' and 'base_sha'; revalidate and record both fetched identities",
                 evidence.expect("matched local evidence").as_str()
+            ));
+        }
+        if !matches!(authority, None | Some(ValidationAuthority::None))
+            && evidence != Some(ValidationEvidence::CleanValidateRecord)
+        {
+            return Err(format!(
+                "PR #{pr} {} validation_authority requires validation_evidence 'clean-validate-record'",
+                authority.expect("matched validation authority").as_str()
             ));
         }
         let mut review_pass_heads = BTreeMap::new();
@@ -120,6 +138,7 @@ pub fn parse_landing_context(raw: &Value) -> Result<Vec<LandingContext>, String>
             base_sha,
             assigned_agent: string("assigned_agent"),
             validation_evidence: evidence,
+            validation_authority: authority,
             review_pass_heads,
             policy_class: policy,
         });
@@ -172,7 +191,7 @@ fn apply_labels(mut node: PrNode) -> Result<PrNode, String> {
     Ok(node)
 }
 
-/// Apply label-derived facts and caller context, rejecting unknown PRs or identity drift.
+/// Apply label-derived facts and caller authority, keeping head binding exact.
 pub fn apply_landing_context(
     nodes: Vec<PrNode>,
     contexts: &[LandingContext],
@@ -207,9 +226,12 @@ pub fn apply_landing_context(
                     node.number, context.head_sha, node.head_sha
                 ));
             }
-            if !context.base_sha.is_empty() && context.base_sha != node.base_sha {
+            if !context.base_sha.is_empty()
+                && context.base_sha != node.base_sha
+                && context.validation_authority != Some(ValidationAuthority::SoftGreen)
+            {
                 return Err(format!(
-                    "PR #{} landing context base is stale: context={}, current={}; revalidate",
+                    "PR #{} landing context base differs: context={}, current={}; the consuming workspace supplied no soft-green authority",
                     node.number, context.base_sha, node.base_sha
                 ));
             }
@@ -218,6 +240,9 @@ pub fn apply_landing_context(
             }
             if let Some(evidence) = context.validation_evidence {
                 node.validation_evidence = evidence;
+            }
+            if let Some(authority) = context.validation_authority {
+                node.validation_authority = authority;
             }
             node.review_pass_heads
                 .clone_from(&context.review_pass_heads);
@@ -233,7 +258,8 @@ pub fn apply_landing_context(
 mod tests {
     use super::*;
     use crate::graph::{held_reasons, review_binding};
-    use crate::model::ReviewBinding;
+    use crate::model::{PrAction, ReviewBinding};
+    use crate::plan::compute_plan;
     use serde_json::json;
 
     const REVIEWED_HEAD: &str = "92e1e0d0af65e50cd2991d4deaa25f726832fbf4";
@@ -251,7 +277,7 @@ mod tests {
     }
 
     #[test]
-    fn clean_records_are_exact_head_and_unknown_context_is_rejected() {
+    fn clean_records_keep_exact_head_and_delegate_older_base_to_authority() {
         let missing = json!({"prs":[{"pr":1,"validation_evidence":"clean-validate-record"}]});
         assert!(parse_landing_context(&missing)
             .unwrap_err()
@@ -266,12 +292,69 @@ mod tests {
                 .unwrap_err()
                 .contains("stale")
         );
+        let unproven_base = parse_landing_context(&json!({"prs":[{
+            "pr":1,
+            "head_sha":"current",
+            "base_sha":"divergent-or-unproven-base",
+            "validation_evidence":"clean-validate-record"
+        }]}))
+        .unwrap();
+        assert!(
+            apply_landing_context(vec![node(1, "current", &[])], &unproven_base)
+                .unwrap_err()
+                .contains("supplied no soft-green authority")
+        );
+        let earlier_green = parse_landing_context(&json!({"prs":[{
+            "pr":1,
+            "head_sha":"current",
+            "base_sha":"earlier-green-base",
+            "validation_evidence":"clean-validate-record",
+            "validation_authority":"soft-green"
+        }]}))
+        .unwrap();
+        let mut current = node(1, "current", &[]);
+        current.commits_behind = 5;
+        let authorized = apply_landing_context(vec![current], &earlier_green)
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            authorized.validation_authority,
+            ValidationAuthority::SoftGreen
+        );
+        let (plan, _) = compute_plan(&[authorized], &[], &[], &[], None, 2, false);
+        assert_eq!(plan.per_pr_actions[0].action, PrAction::LandNow);
+        let hard_green_on_other_base = parse_landing_context(&json!({"prs":[{
+            "pr":1,
+            "head_sha":"current",
+            "base_sha":"divergent-base",
+            "validation_evidence":"clean-validate-record",
+            "validation_authority":"hard-green"
+        }]}))
+        .unwrap();
+        assert!(
+            apply_landing_context(vec![node(1, "current", &[])], &hard_green_on_other_base)
+                .unwrap_err()
+                .contains("supplied no soft-green authority")
+        );
         let unknown = parse_landing_context(&json!({"prs":[{"pr":9}]})).unwrap();
         assert!(
             apply_landing_context(vec![node(1, "current", &[])], &unknown)
                 .unwrap_err()
                 .contains("absent")
         );
+    }
+
+    #[test]
+    fn validation_authority_requires_a_clean_record() {
+        let missing = json!({"prs":[{
+            "pr":1,
+            "head_sha":"head",
+            "base_sha":"base",
+            "validation_authority":"soft-green"
+        }]});
+        assert!(parse_landing_context(&missing)
+            .unwrap_err()
+            .contains("requires validation_evidence"));
     }
 
     #[test]
