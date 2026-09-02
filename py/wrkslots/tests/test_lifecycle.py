@@ -8309,6 +8309,7 @@ def run_ownerless_agent_recovery(
     remote_digest: str,
     *,
     apply: bool,
+    handoff_sha256: str | None = None,
 ) -> int:
     args = [
         "--project-root",
@@ -8326,6 +8327,8 @@ def run_ownerless_agent_recovery(
         "--remote-url-sha256",
         remote_digest,
     ]
+    if handoff_sha256 is not None:
+        args.extend(("--handoff-sha256", handoff_sha256))
     if apply:
         args.extend(
             (
@@ -8373,20 +8376,99 @@ def test_recover_ownerless_agent_worktree_salvages_dirty_tree_without_owner(
     assert git(remote, "show", f"{salvage_commit}:uncommitted.txt").stdout == "preserve me\n"
 
 
-def test_recover_ownerless_agent_worktree_refuses_handoff_and_identity_change(
+def test_recover_ownerless_agent_worktree_requires_read_handoff_and_preserves_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    project, repository, _remote = make_project(tmp_path)
+    project, repository, remote = make_project(tmp_path)
     target, head, remote_digest = prepare_ownerless_agent_worktree(project, repository)
     allow_test_host_for_ownerless_agent_recovery(monkeypatch)
     (target / "HANDOFF.md").write_text("unread\n", encoding="utf-8")
     assert run_ownerless_agent_recovery(
         project, target, head, remote_digest, apply=True
     ) == 3
-    assert "HANDOFF.md" in capsys.readouterr().err
+    error = capsys.readouterr().err
+    assert "unread HANDOFF.md" in error
+    assert "--handoff-sha256" in error
     assert target.exists()
 
-    (target / "HANDOFF.md").unlink()
+    handoff_digest = hashlib.sha256(b"unread\n").hexdigest()
+    assert run_ownerless_agent_recovery(
+        project,
+        target,
+        head,
+        remote_digest,
+        apply=True,
+        handoff_sha256=handoff_digest,
+    ) == 0
+    config = wrkslots._load_config(str(project), "testhost")
+    event = next(
+        value
+        for value in reversed(wrkslots._load_events(config))
+        if value["kind"] == "ownerless-agent-worktree-removed"
+    )
+    payload = wrkslots._as_mapping(event["payload"], "ownerless event payload")
+    authorization = wrkslots._as_mapping(
+        payload["authorization"], "ownerless authorization"
+    )
+    assert authorization["handoff_sha256"] == handoff_digest
+    receipt = wrkslots._as_mapping(
+        wrkslots._as_list(payload["salvage"], "ownerless salvage")[0],
+        "ownerless salvage receipt",
+    )
+    salvage_commit = git(
+        remote,
+        "rev-parse",
+        wrkslots._as_str(receipt["remote_ref"], "ownerless rescue ref"),
+    ).stdout.strip()
+    assert git(remote, "show", f"{salvage_commit}:HANDOFF.md").stdout == "unread\n"
+
+
+def test_recover_ownerless_agent_worktree_refuses_handoff_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    target, head, remote_digest = prepare_ownerless_agent_worktree(project, repository)
+    allow_test_host_for_ownerless_agent_recovery(monkeypatch)
+    (target / "HANDOFF.md").write_text("read me\n", encoding="utf-8")
+    digest = hashlib.sha256(b"read me\n").hexdigest()
+
+    class Interrupted(RuntimeError):
+        pass
+
+    def interrupt(point: str) -> None:
+        if point == "after-ownerless-agent-journal":
+            raise Interrupted
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", interrupt)
+    with pytest.raises(Interrupted):
+        run_ownerless_agent_recovery(
+            project,
+            target,
+            head,
+            remote_digest,
+            apply=True,
+            handoff_sha256=digest,
+        )
+    (target / "HANDOFF.md").write_text("changed\n", encoding="utf-8")
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _point: None)
+    assert run_ownerless_agent_recovery(
+        project,
+        target,
+        head,
+        remote_digest,
+        apply=True,
+        handoff_sha256=digest,
+    ) == 3
+    assert "HANDOFF.md changed" in capsys.readouterr().err
+    assert target.exists()
+
+
+def test_recover_ownerless_agent_worktree_refuses_identity_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    target, _head, remote_digest = prepare_ownerless_agent_worktree(project, repository)
+    allow_test_host_for_ownerless_agent_recovery(monkeypatch)
     assert run_ownerless_agent_recovery(
         project, target, "0" * 40, remote_digest, apply=False
     ) == 3

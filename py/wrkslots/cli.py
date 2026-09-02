@@ -411,6 +411,7 @@ class OwnerlessAgentAuthorization:
     branch: str
     remote: str
     remote_url_sha256: str
+    handoff_sha256: str | None
     recorded_at: str
 
 
@@ -11904,6 +11905,7 @@ def _ownerless_agent_authorization_from_obj(
             "branch",
             "remote",
             "remote_url_sha256",
+            "handoff_sha256",
             "recorded_at",
         },
         set(),
@@ -11922,6 +11924,14 @@ def _ownerless_agent_authorization_from_obj(
     digest = _as_str(raw["remote_url_sha256"], "ownerless agent remote digest")
     if not SHA_RE.fullmatch(head) or not DIGEST_RE.fullmatch(digest):
         raise StateError("ownerless agent Git identity is invalid")
+    handoff_raw = raw["handoff_sha256"]
+    handoff_digest = (
+        None
+        if handoff_raw is None
+        else _as_str(handoff_raw, "ownerless agent HANDOFF.md digest")
+    )
+    if handoff_digest is not None and not DIGEST_RE.fullmatch(handoff_digest):
+        raise StateError("ownerless agent HANDOFF.md digest is invalid")
     recorded_at = _as_str(raw["recorded_at"], "ownerless agent recorded_at")
     _parse_timestamp(recorded_at, "ownerless agent recorded_at")
     return OwnerlessAgentAuthorization(
@@ -11933,6 +11943,7 @@ def _ownerless_agent_authorization_from_obj(
         branch=_validate_ref(_as_str(raw["branch"], "ownerless agent branch"), "branch"),
         remote=_validate_remote(_as_str(raw["remote"], "ownerless agent remote")),
         remote_url_sha256=digest,
+        handoff_sha256=handoff_digest,
         recorded_at=recorded_at,
     )
 
@@ -11992,9 +12003,25 @@ def _ownerless_agent_facts(
     if expected_identity and _open_directory_identity(path, "ownerless agent worktree") != authorization.identity:
         raise Refusal("ownerless agent worktree identity changed")
     handoff = path / "HANDOFF.md"
-    if handoff.exists() or handoff.is_symlink():
+    if handoff.is_symlink():
+        raise Refusal(f"ownerless agent HANDOFF.md must not be a symlink: {handoff}")
+    observed_handoff = (
+        hashlib.sha256(
+            _read_bounded_regular_file(
+                handoff, "ownerless agent HANDOFF.md", 1024 * 1024
+            )
+        ).hexdigest()
+        if handoff.exists()
+        else None
+    )
+    if observed_handoff != authorization.handoff_sha256:
+        if authorization.handoff_sha256 is None:
+            raise Refusal(
+                "ownerless agent worktree contains unread HANDOFF.md; read it and "
+                f"rerun with --handoff-sha256 {observed_handoff}"
+            )
         raise Refusal(
-            f"ownerless agent worktree contains HANDOFF.md; it must remain until a verified reader records it"
+            "ownerless agent HANDOFF.md changed after it was read; preserve the worktree"
         )
     vcs = _GitVcs()
     head = vcs.verify_existing_worktree(repository, path)
@@ -12249,6 +12276,9 @@ def _cmd_recover_ownerless_agent_worktree(args: argparse.Namespace) -> int:
         digest = _as_str(args.remote_url_sha256, "ownerless agent remote digest")
         if not SHA_RE.fullmatch(head) or not DIGEST_RE.fullmatch(digest):
             raise Refusal("--head and --remote-url-sha256 must be full lowercase digests")
+        handoff_digest = args.handoff_sha256
+        if handoff_digest is not None and not DIGEST_RE.fullmatch(handoff_digest):
+            raise Refusal("--handoff-sha256 must be one lowercase SHA-256 digest")
         authorization = OwnerlessAgentAuthorization(
             path=relative,
             identity=_open_directory_identity(target, "ownerless agent worktree"),
@@ -12258,6 +12288,7 @@ def _cmd_recover_ownerless_agent_worktree(args: argparse.Namespace) -> int:
             branch=_validate_ref(args.branch, "branch"),
             remote=_validate_remote(args.remote),
             remote_url_sha256=digest,
+            handoff_sha256=handoff_digest,
             recorded_at=_utc_now(),
         )
         _ownerless_agent_facts(
@@ -16024,6 +16055,14 @@ usage or audit gate unknown, 3 fail-closed refusal.
     recover_ownerless_agent.add_argument("--remote", required=True, metavar="REMOTE")
     recover_ownerless_agent.add_argument(
         "--remote-url-sha256", required=True, metavar="SHA256"
+    )
+    recover_ownerless_agent.add_argument(
+        "--handoff-sha256",
+        metavar="SHA256",
+        help=(
+            "exact digest of HANDOFF.md after the coordinator has read it; required when "
+            "the worktree contains a handoff and rechecked before every destructive boundary"
+        ),
     )
     recover_ownerless_agent.add_argument("--apply", action="store_true")
     recover_ownerless_agent.add_argument(

@@ -99,7 +99,8 @@ ACTIVE identity, publishes and reads back every recorded commit, removes only ma
 registrations, and archives before removing the row. `recover-ownerless-agent-worktree` accepts one
 exact unregistered worktree and its complete Git identity, salvages authored and nested-repository
 work without assigning an owner, task, or handoff, then fences and removes it. A present HANDOFF.md
-always refuses. `recover-ownerless-agent-cache` relocates only its one explicitly supported cache
+requires its exact SHA-256 after the coordinator reads it; that content is rechecked and preserved
+with the worktree. `recover-ownerless-agent-cache` relocates only its one explicitly supported cache
 tree outside the managed slot root; it is not an exemption for arbitrary directories.
 
 If a command reports an interrupted operation, preserve the paths and run:

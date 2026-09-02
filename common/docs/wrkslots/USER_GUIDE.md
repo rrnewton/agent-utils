@@ -283,15 +283,18 @@ the exact path and the Git identities established during inspection:
 ```sh
 wrkslots recover-ownerless-agent-worktree worktrees/slots/example \
   --repository repo --head COMMIT --branch agent/example --remote origin \
-  --remote-url-sha256 SHA256
+  --remote-url-sha256 SHA256 [--handoff-sha256 SHA256]
 ```
 
 Repeat with `--apply --coordinator-authorized --coordinator-pid "$COORDINATOR_PID"` only after the
-plan agrees. The worktree must be one direct child of the managed agent root. The command refuses a
-HANDOFF.md, any live process or user unit reference, a path or inode change, non-ordinary Git state,
-or an ACTIVE/archive identity collision. Tracked, untracked, ignored files outside configured cache
-paths, and initialized nested repositories are committed to verified salvage refs before the exact
-inode is fenced and removed. Any later participant can resume the journal with ordinary `recover`.
+plan agrees. The worktree must be one direct child of the managed agent root. A HANDOFF.md requires
+the exact digest supplied after the coordinator reads it; the command rechecks it before every
+destructive boundary and preserves it through the same remote salvage path. An unread or changed
+handoff, any live process or user unit reference, a path or inode change, non-ordinary Git state, or
+an ACTIVE/archive identity collision refuses. Tracked, untracked, ignored files outside configured
+cache paths, and initialized nested repositories are committed to verified salvage refs before the
+exact inode is fenced and removed. Any later participant can resume the journal with ordinary
+`recover`.
 
 The `worktrees/slots/ignored` path is not an agent worktree. Only when it contains the command's
 one exact supported cache hierarchy can it be relocated intact outside the managed slot root:

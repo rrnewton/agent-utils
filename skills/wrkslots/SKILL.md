@@ -196,8 +196,10 @@ For a registered agent row whose directory is already absent, use
 `record_sha256`. It publishes and reads back every recorded checkout commit before removing an exact
 stale Git registration, then archives before changing ACTIVE. For a real unregistered agent
 worktree, use `recover-ownerless-agent-worktree` with its exact path, repository, HEAD, branch,
-remote, and remote URL digest. This path deliberately records no owner, task, or handoff and refuses
-any HANDOFF.md. The exact non-worktree `worktrees/slots/ignored` rust-script cache uses
+remote, and remote URL digest. This path deliberately records no owner, task, or handoff. If
+HANDOFF.md exists, read it and supply its exact `--handoff-sha256`; the command rechecks and
+preserves it, while an unread or changed handoff refuses. The exact non-worktree
+`worktrees/slots/ignored` rust-script cache uses
 `recover-ownerless-agent-cache`; it is relocated intact and is not a general directory exemption.
 
 ## Migrate an existing worktree manager
