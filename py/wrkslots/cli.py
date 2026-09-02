@@ -2339,11 +2339,18 @@ def _write_event_file(
     return _event_writer(config, machine).append(kind, payload)
 
 
-def _ensure_event_log(config: Config, machine: str | None = None) -> None:
+def _ensure_event_log(
+    config: Config,
+    machine: str | None = None,
+    *,
+    require_repository: bool = True,
+) -> None:
     selected = machine or config.machine
     if _event_files(_event_directory(config, selected)):
         return
-    active = _load_active_snapshot(config, selected)
+    active = _load_active_snapshot(
+        config, selected, require_repository=require_repository
+    )
     archive = _load_archive_snapshot(config, selected)
     holds = [
         hold
@@ -3732,6 +3739,43 @@ def _journal_inconsistencies(
     return tuple(findings)
 
 
+def _assert_record_storage_consistent(
+    config: Config,
+    record: ActiveRecord,
+    *,
+    vcs: _GitVcs | None = None,
+) -> None:
+    """Require the storage named by one authoritative record to be intact."""
+
+    _assert_slot_contents(config, record)
+    verifier = vcs or _GitVcs()
+    for checkout in record.checkouts:
+        path = _stored_path(config, checkout.path, "checkout path")
+        _relative, repository = _stored_repository_path(config, checkout.repository)
+        verifier.verify_existing_worktree(repository, path)
+
+
+def _assert_target_record_storage_consistent(
+    config: Config,
+    states: Sequence[ActiveState],
+    record: ActiveRecord,
+) -> None:
+    """Refuse physical or Git drift attributable to one requested record."""
+
+    findings = _registry_storage_inconsistencies(
+        config,
+        states,
+        tolerate_unavailable_repositories=True,
+    )
+    for finding in findings:
+        if (
+            finding.slot == record.slot
+            and finding.slot_type == record.slot_type
+            and finding.machine in {None, record.machine}
+        ):
+            raise StateError(finding.detail, remedy=finding.remedy)
+
+
 def _assert_registry_storage_consistent(
     config: Config,
     states: Sequence[ActiveState],
@@ -3744,13 +3788,9 @@ def _assert_registry_storage_consistent(
         slot_type: {record.slot for record in records if record.slot_type == slot_type}
         for slot_type in SLOT_TYPES
     }
+    vcs = _GitVcs()
     for record in records:
-        _assert_slot_contents(config, record)
-        vcs = _GitVcs()
-        for checkout in record.checkouts:
-            path = _stored_path(config, checkout.path, "checkout path")
-            _relative, repository = _stored_repository_path(config, checkout.repository)
-            vcs.verify_existing_worktree(repository, path)
+        _assert_record_storage_consistent(config, record, vcs=vcs)
     unexpected: list[str] = []
     for slot_type, root in _slot_roots(config).items():
         if not root.exists():
@@ -8037,15 +8077,18 @@ def _cmd_read_handoff(args: argparse.Namespace) -> int:
     with _mutation_locks(config, args.wait_lock):
         _refuse_partial_state(config)
         _assert_no_journal(config)
-        states, _archives = _validate_global_state(config)
-        _assert_command_registry_storage(config, states, args)
-        record = _find_record(_load_active(config), args.slot)
+        states, _archives = _validate_global_state(config, require_repository=False)
+        record = _find_record(
+            _load_active(config, require_repository=False),
+            args.slot,
+        )
         if record.slot_type != "agent":
             raise Refusal(
                 f"slot {record.slot} has type validate and cannot carry an agent handoff. "
                 "state: REFUSED -- no event was recorded. remedy: inspect its run evidence "
                 "under the project's validation evidence directory"
             )
+        _assert_target_record_storage_consistent(config, states, record)
         handoff = _slot_directory(config, record.slot, record.slot_type) / "HANDOFF.md"
         if not handoff.exists() and not handoff.is_symlink():
             raise Refusal(
@@ -8071,7 +8114,8 @@ def _cmd_read_handoff(args: argparse.Namespace) -> int:
         print(rendered, end="" if rendered.endswith("\n") else "\n")
         print(f"--- end {handoff} ---")
         digest = hashlib.sha256(contents).hexdigest()
-        _ensure_event_log(config, record.machine)
+        _assert_caller_process(reader, "coordinator")
+        _ensure_event_log(config, record.machine, require_repository=False)
         _write_event_file(
             config,
             record.machine,
