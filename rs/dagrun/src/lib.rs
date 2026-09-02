@@ -62,6 +62,7 @@ pub use cgroup::{
     CgroupManager, Cgroups, ContainmentEvidence, ContainmentProof, RunContainment, ScopeAttempt,
     FORCE_ATTEMPT_ENV,
 };
+pub use cli::select_steps_by_labels;
 pub use estimates::{
     allocate_widths, allocate_widths_with_max_steps, apply_plan_to_config, bucketize_rows,
     build_plan, build_plan_with_max_steps, feedback_identity, load_step_samples,

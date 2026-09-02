@@ -2211,7 +2211,7 @@ fn select_steps(
 }
 
 /// Return every step carrying any requested label and its dependency ancestry.
-fn select_steps_by_labels(cfg: &DagConfig, labels: &[String]) -> Result<DagConfig, String> {
+pub fn select_steps_by_labels(cfg: &DagConfig, labels: &[String]) -> Result<DagConfig, String> {
     let known: HashSet<String> = cfg
         .steps
         .iter()
