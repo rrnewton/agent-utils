@@ -22,6 +22,7 @@ from pr_landing_planner.model import (
     PrNode,
     RedClass,
     ReviewBinding,
+    ValidationAuthority,
     ValidationEvidence,
 )
 from pr_landing_planner.plan import assemble_result, compute_plan
@@ -99,7 +100,7 @@ def test_raw_local_label_is_cache_only_but_dereferenced_record_is_evidence() -> 
         )
 
 
-def test_clean_record_requires_and_checks_exact_head_and_base() -> None:
+def test_clean_record_keeps_exact_head_and_delegates_older_base_to_authority() -> None:
     with pytest.raises(ValueError, match="requires exact 'head_sha'.*'base_sha'"):
         parse_landing_context(
             {
@@ -124,20 +125,72 @@ def test_clean_record_requires_and_checks_exact_head_and_base() -> None:
     with pytest.raises(ValueError, match="landing context is stale"):
         apply_landing_context([_node(1)], context)
 
-    stale_base = parse_landing_context(
+    unproven_base = parse_landing_context(
         {
             "prs": [
                 {
                     "pr": 1,
                     "head_sha": "sha-1",
-                    "base_sha": "stale-base",
+                    "base_sha": "divergent-or-unproven-base",
                     "validation_evidence": "clean-validate-record",
                 }
             ]
         }
     )
-    with pytest.raises(ValueError, match="context base is stale.*revalidate"):
-        apply_landing_context([_node(1)], stale_base)
+    with pytest.raises(ValueError, match="supplied no soft-green authority"):
+        apply_landing_context([_node(1)], unproven_base)
+
+    earlier_green = parse_landing_context(
+        {
+            "prs": [
+                {
+                    "pr": 1,
+                    "head_sha": "sha-1",
+                    "base_sha": "earlier-green-base",
+                    "validation_evidence": "clean-validate-record",
+                    "validation_authority": "soft-green",
+                }
+            ]
+        }
+    )
+    authorized = apply_landing_context(
+        [replace(_node(1), commits_behind=5)], earlier_green
+    )[0]
+    assert authorized.validation_authority is ValidationAuthority.SOFT_GREEN
+    plan, _ = compute_plan([authorized], [], [], [])
+    assert plan.per_pr_actions[0].action is PrAction.LAND_NOW
+
+    hard_green_on_other_base = parse_landing_context(
+        {
+            "prs": [
+                {
+                    "pr": 1,
+                    "head_sha": "sha-1",
+                    "base_sha": "divergent-base",
+                    "validation_evidence": "clean-validate-record",
+                    "validation_authority": "hard-green",
+                }
+            ]
+        }
+    )
+    with pytest.raises(ValueError, match="supplied no soft-green authority"):
+        apply_landing_context([_node(1)], hard_green_on_other_base)
+
+
+def test_validation_authority_requires_a_clean_record() -> None:
+    with pytest.raises(ValueError, match="requires validation_evidence"):
+        parse_landing_context(
+            {
+                "prs": [
+                    {
+                        "pr": 1,
+                        "head_sha": "sha-1",
+                        "base_sha": "base",
+                        "validation_authority": "soft-green",
+                    }
+                ]
+            }
+        )
 
 
 def test_local_evidence_bypasses_ci_wait_but_gate_policy_escalates() -> None:
@@ -209,6 +262,7 @@ def test_json_schema_exposes_context_and_mechanism_overlap() -> None:
     )
     payload = json.loads(render_json(result))
     assert payload["nodes"][0]["validation_evidence"] == "none"
+    assert payload["nodes"][0]["validation_authority"] == "none"
     assert payload["nodes"][0]["review_binding"] == "not-required"
     assert payload["nodes"][0]["review_pass_heads"] == {}
     assert payload["mechanism_overlap_edges"] == [

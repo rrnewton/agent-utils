@@ -76,7 +76,9 @@ Common collection flags include:
 | `--gh-cmd COMMAND` | Alternate `gh` executable or wrapper. |
 
 Content-identity checks fail closed if the fetched head differs from host
-metadata or if caller evidence names a different fetched head or base.
+metadata or caller evidence names a different fetched head. A recorded base
+that differs from the fetched base is accepted only with explicit `soft-green`
+authority supplied by the consuming workspace.
 
 ## What the graph means
 
@@ -124,10 +126,11 @@ pr-landing-planner plan \
 `--outage-min-prs` controls how many simultaneous outage signatures establish
 a systemic outage.
 
-## Exact head/base landing context
+## Exact-head landing context and validation authority
 
 Some facts belong to the caller rather than the repository host: an assigned
-agent, exact head/base local validation, exact-head adversarial-review receipts,
+agent, the exact head and base tested by local validation, the consuming
+workspace's hard/soft-green decision, exact-head adversarial-review receipts,
 and whether a PR changes gate policy.
 Provide them with `--landing-context`:
 
@@ -138,6 +141,7 @@ prs:
     base_sha: fedcba9876543210
     assigned_agent: release-coordinator
     validation_evidence: clean-validate-record
+    validation_authority: soft-green
     review_pass_heads:
       codex: 0123456789abcdef0123456789abcdef01234567
       claude: 0123456789abcdef0123456789abcdef01234567
@@ -148,8 +152,13 @@ Accepted validation evidence is `none`, `authoritative-ci`,
 `locally-validated`, or `clean-validate-record`. Both local evidence values must
 come from caller-supplied dereferenced records naming the exact fetched head and
 base SHAs. A bare `locally-validated` label is only a cache hint and maps to
-`none`; a head-only record is incomplete and is rejected with a revalidation
-instruction. Accepted policy classes are `unclassified`,
+`none`; a head-only record is incomplete and is rejected. `validation_authority`
+accepts `hard-green` or `soft-green` only with a `clean-validate-record`. The
+recorded head must always equal the fetched PR head. When the recorded base no
+longer equals the fetched base, only explicit `soft-green` authority permits the
+planner to retain that evidence; absent authority and `hard-green` both refuse.
+The generic planner does not reconstruct ancestry or landability from mutable
+repository state. It accepts the consuming workspace's decision. Accepted policy classes are `unclassified`,
 `ci-hygiene`, and `gate-policy`; a gate-policy change is escalated rather than
 treated like routine hygiene. Unknown PRs, duplicate entries, and head drift
 are errors.
@@ -165,8 +174,11 @@ exact-head receipt. The JSON node reports `review_binding` and
 
 ## Freshness, holds, priority, and batching
 
-`--freshness-max-behind N` recommends a rebase when an otherwise landable PR is
-more than `N` commits behind. Draft state, missing approvals, conflicts,
+Base age is advisory by default. This follows the existing validation rule:
+"A lagging ancestor is legitimate; requiring the tip made the verdict a
+property of WHEN you looked rather than of the tree." An explicit `--freshness-max-behind
+N` asks the planner to recommend a rebase when a repository-host-green PR
+without caller-authorized validation is more than `N` commits behind. Draft state, missing approvals, conflicts,
 ordering constraints, CI state, and policy escalation can hold a PR.
 
 Priority defaults to deterministic size and age ordering. `--priority-source

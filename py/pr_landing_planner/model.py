@@ -78,7 +78,7 @@ class PrAction(Enum):
 
 
 class ValidationEvidence(Enum):
-    """Evidence that can satisfy a caller's landing precondition at exact head/base identities."""
+    """Evidence attached to an exact tested head and recorded base identity."""
 
     NONE = "none"
     AUTHORITATIVE_CI = "authoritative-ci"
@@ -86,6 +86,14 @@ class ValidationEvidence(Enum):
     # A bare label never produces this variant.
     LOCALLY_VALIDATED = "locally-validated"
     CLEAN_VALIDATE_RECORD = "clean-validate-record"
+
+
+class ValidationAuthority(Enum):
+    """Consuming-workspace decision about whether recorded validation authorizes landing."""
+
+    NONE = "none"
+    HARD_GREEN = "hard-green"
+    SOFT_GREEN = "soft-green"
 
 
 class ReviewBinding(Enum):
@@ -207,6 +215,7 @@ class PrNode:
     priority: int = 0
     assigned_agent: str = ""
     validation_evidence: ValidationEvidence = ValidationEvidence.NONE
+    validation_authority: ValidationAuthority = ValidationAuthority.NONE
     review_pass_heads: tuple[tuple[str, str], ...] = ()
     policy_class: PolicyClass = PolicyClass.UNCLASSIFIED
 

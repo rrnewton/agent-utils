@@ -8537,7 +8537,7 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
                                 actions[number] = action
         expected_actions = {
             1: "land-now",
-            2: "rebase-then-land",
+            2: "land-now",
             3: "refire-stale-gate",
             4: "wait",
             5: "hold-fix",
@@ -8655,6 +8655,14 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
                 "stale-base-context.json",
                 '{"prs":[{"pr":1,"head_sha":"sha-1","base_sha":"old-base","validation_evidence":"clean-validate-record"}]}',
             ),
+            (
+                "hard-green-other-base-context.json",
+                '{"prs":[{"pr":1,"head_sha":"sha-1","base_sha":"divergent-base","validation_evidence":"clean-validate-record","validation_authority":"hard-green"}]}',
+            ),
+            (
+                "authority-without-record-context.json",
+                '{"prs":[{"pr":1,"head_sha":"sha-1","base_sha":"old-base","validation_authority":"soft-green"}]}',
+            ),
         )
         for name, body in bad_contexts:
             path = os.path.join(tmp, name)
@@ -8667,6 +8675,53 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
                 rs,
                 ("plan", "--fixture", fixture_path, "--landing-context", path),
                 2,
+            )
+
+        soft_green_path = os.path.join(tmp, "soft-green-context.json")
+        with open(soft_green_path, "w", encoding="utf-8") as handle:
+            handle.write(
+                '{"prs":[{"pr":2,"head_sha":"sha-2","base_sha":"earlier-green-base",'
+                '"validation_evidence":"clean-validate-record",'
+                '"validation_authority":"soft-green"}]}'
+            )
+        soft_green_args = (
+            "plan",
+            "--fixture",
+            fixture_path,
+            "--landing-context",
+            soft_green_path,
+            "--format",
+            "json",
+        )
+        _record_exact(rep, "accept:soft-green-earlier-base", py, rs, soft_green_args)
+        soft_green = run(py, soft_green_args)
+        soft_green_ok, soft_green_payload = _parsed_json(soft_green.stdout)
+        soft_green_nodes = (
+            soft_green_payload.get("nodes")
+            if soft_green_ok and isinstance(soft_green_payload, dict)
+            else None
+        )
+        soft_green_plan = (
+            soft_green_payload.get("plan")
+            if soft_green_ok and isinstance(soft_green_payload, dict)
+            else None
+        )
+        authority_recorded = isinstance(soft_green_nodes, list) and any(
+            isinstance(node, dict)
+            and node.get("pr") == 2
+            and node.get("validation_authority") == "soft-green"
+            for node in soft_green_nodes
+        )
+        soft_green_landable = isinstance(soft_green_plan, dict) and 2 in soft_green_plan.get(
+            "land_now", []
+        )
+        if soft_green.returncode == 0 and authority_recorded and soft_green_landable:
+            rep.ok("accept:soft-green-authority-is-durable-and-landable")
+        else:
+            rep.bad(
+                "accept:soft-green-authority-is-durable-and-landable",
+                f"exit={soft_green.returncode}; authority={authority_recorded}; "
+                f"landable={soft_green_landable}",
             )
 
         for flag, value in (

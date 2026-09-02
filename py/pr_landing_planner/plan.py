@@ -10,15 +10,15 @@ Per-PR action assignment (the fusion table):
 * held (base-conflict)          -> ``rebase-then-land`` and revalidate
 * held (draft / review / dependency cycle / depends-on-held) -> ``wait``
 * gate-policy change            -> ``escalate-gate-policy``
-* exact head/base evidence      -> ``land-now`` (or rebase first), without a merge-gate wait
+* caller-authorized exact-head evidence -> ``land-now``, without a merge-gate wait
 * CI runner-outage              -> ``escalate-runner-outage``
 * CI evaluate-once race         -> ``wait`` (benign; treat as pending)
 * CI stale required check       -> ``refire-stale-gate``
 * CI flaky red                  -> ``refire-ci``
 * CI real red                   -> ``hold-fix``
 * CI no-result at required gate -> ``refire-ci``
-* CI green but behind base      -> ``rebase-then-land``
-* CI green, fresh, gate ok      -> ``land-now``
+* CI green beyond an explicit caller freshness limit -> ``rebase-then-land``
+* CI green, gate ok             -> ``land-now`` unless caller sets a freshness limit
 
 Ordering among actionable PRs follows the parallel-safe layering, which itself ranks by
 priority -> diff size -> age -> PR number.
@@ -43,10 +43,11 @@ from pr_landing_planner.model import (
     PrNode,
     PolicyClass,
     RedClass,
+    ValidationAuthority,
     ValidationEvidence,
 )
 
-DEFAULT_FRESHNESS_MAX_BEHIND = 0
+DEFAULT_FRESHNESS_MAX_BEHIND: int | None = None
 
 
 def _held_action(reasons: Sequence[str]) -> tuple[PrAction, str]:
@@ -71,7 +72,7 @@ def _held_action(reasons: Sequence[str]) -> tuple[PrAction, str]:
     return PrAction.WAIT, f"held: {', '.join(reasons)}"
 
 
-def _ci_action(node: PrNode, freshness_max_behind: int) -> tuple[PrAction, str]:
+def _ci_action(node: PrNode, freshness_max_behind: int | None) -> tuple[PrAction, str]:
     ci = node.ci
     red = ci.red_class
     if node.policy_class is PolicyClass.GATE_POLICY:
@@ -80,15 +81,13 @@ def _ci_action(node: PrNode, freshness_max_behind: int) -> tuple[PrAction, str]:
             "gate-policy change requires coordinator decision; validation evidence is not approval",
         )
     if node.validation_evidence is ValidationEvidence.CLEAN_VALIDATE_RECORD:
-        if node.commits_behind > freshness_max_behind:
-            return (
-                PrAction.REBASE_THEN_LAND,
-                f"{node.validation_evidence.value} applies to the current head; "
-                f"rebase {node.commits_behind} commit(s), then revalidate the new head before landing",
-            )
+        authority = node.validation_authority.value
+        if node.validation_authority is ValidationAuthority.NONE:
+            authority = "exact fetched base"
         return (
             PrAction.LAND_NOW,
-            f"{node.validation_evidence.value} at exact head and base; no merge-gate wait",
+            f"{node.validation_evidence.value} at exact head with {authority} authority; "
+            "no merge-gate wait",
         )
     if red is RedClass.RUNNER_OUTAGE:
         return PrAction.ESCALATE_RUNNER_OUTAGE, ci.detail
@@ -107,12 +106,12 @@ def _ci_action(node: PrNode, freshness_max_behind: int) -> tuple[PrAction, str]:
     if ci.raw_state is CiState.NO_RESULT:
         return PrAction.WAIT, "required gate passed; another CI check has NO_RESULT"
     # GREEN.
-    if node.commits_behind > freshness_max_behind:
+    if freshness_max_behind is not None and node.commits_behind > freshness_max_behind:
         return (
             PrAction.REBASE_THEN_LAND,
             f"green but {node.commits_behind} commit(s) behind base",
         )
-    return PrAction.LAND_NOW, "authoritative CI green, fresh, gate ok"
+    return PrAction.LAND_NOW, "authoritative CI green, gate ok"
 
 
 def _greedy_conflict_free(
@@ -133,7 +132,7 @@ def compute_plan(
     ordering_edges: Sequence[OrderingEdge],
     held: Sequence[HeldPr],
     *,
-    freshness_max_behind: int = DEFAULT_FRESHNESS_MAX_BEHIND,
+    freshness_max_behind: int | None = DEFAULT_FRESHNESS_MAX_BEHIND,
     outage_min_prs: int = 2,
     batch: bool = False,
 ) -> tuple[Plan, Diagnostics]:
@@ -250,7 +249,7 @@ def compute_plan(
 def assemble_result(
     graph: CollectedGraph,
     *,
-    freshness_max_behind: int = DEFAULT_FRESHNESS_MAX_BEHIND,
+    freshness_max_behind: int | None = DEFAULT_FRESHNESS_MAX_BEHIND,
     outage_min_prs: int = 2,
     batch: bool = False,
 ) -> PlanResult:

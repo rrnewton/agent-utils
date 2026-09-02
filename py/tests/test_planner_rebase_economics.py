@@ -1,11 +1,9 @@
-"""The plan's rebase/validate economics: clustering avoids rebases AND, because the validate record
-is keyed to the exact head and base SHAs, the SAME count of validate runs (1:1).
+"""The plan's rebase/validate economics: clustering avoids rebases and exact-head reruns.
 
 A rebase changes a PR's head SHA, which invalidates its locally-validated / clean-validate record and
-forces a fresh validate run. So serial draining of N conflicting PRs is self-defeating: each land
-rebases the rest and destroys their validation evidence. Landing a real-conflict cluster as ONE stack
-collapses that to one rebase (one validate) per cluster. These tests pin that the emitted plan JSON
-carries the economics and that the two counts move together.
+forces a fresh validate run. Main advancing alone does not. Landing a real-conflict cluster as ONE
+stack avoids head-changing rebases. These tests pin that the emitted plan JSON carries the economics
+and that the two counts move together.
 """
 
 from __future__ import annotations
@@ -57,7 +55,8 @@ def test_plan_json_carries_rebase_and_validate_economics() -> None:
     # 1:1 with rebases: a rebase changes the head SHA, invalidating that PR's validate record.
     assert econ["validate_runs_avoided_by_clustering"] == 1
     assert econ["rationale"] == VALIDATE_ECONOMICS_RATIONALE
-    assert "SHA" in econ["rationale"] and "self-defeating" in econ["rationale"]
+    assert "exact head SHA" in econ["rationale"]
+    assert "requiring the tip made the verdict a property of WHEN you looked" in econ["rationale"]
 
 
 def test_economics_counts_move_together_and_scale() -> None:

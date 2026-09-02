@@ -8,7 +8,7 @@ use crate::graph::{cluster_by_conflict, rebases_avoided, review_binding};
 use crate::model::{CiState, Cluster, HeldPr, PlanResult, PrAction, PrActionDecision, PrNode};
 
 /// Explanation emitted with the rebase and validation-run savings calculation.
-pub const VALIDATE_ECONOMICS_RATIONALE: &str = "The clean-validate record is keyed to the exact head and base SHAs. Landing moves the base, and rebasing also changes the head, so serial draining invalidates queued validation evidence at every step (self-defeating). Landing each real-conflict cluster as ONE stack collapses that to one rebase and one validate per cluster, so clustering avoids the same count of rebases AND validate runs.";
+pub const VALIDATE_ECONOMICS_RATIONALE: &str = "The clean-validate record is keyed to the exact head SHA. Rebasing changes that head and therefore requires new validation evidence. A lagging ancestor is legitimate; requiring the tip made the verdict a property of WHEN you looked rather than of the tree. Landing each real-conflict cluster as ONE stack avoids the same count of head-changing rebases AND validate runs.";
 
 fn economics(clusters: &[Cluster]) -> Value {
     let saved = rebases_avoided(clusters);
@@ -39,6 +39,7 @@ fn node_obj(node: &PrNode, held: bool) -> Value {
         "labels": node.labels,
         "assigned_agent": (!node.assigned_agent.is_empty()).then_some(node.assigned_agent.as_str()),
         "validation_evidence": node.validation_evidence.as_str(),
+        "validation_authority": node.validation_authority.as_str(),
         "policy_class": node.policy_class.as_str(),
         "review_decision": (!node.review_decision.is_empty()).then_some(node.review_decision.as_str()),
         "review_binding": review_binding(node).0.as_str(),

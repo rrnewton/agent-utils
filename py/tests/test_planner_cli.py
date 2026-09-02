@@ -77,7 +77,17 @@ def test_userguide_prints_embedded_guide() -> None:
 
 
 def test_plan_human_all_classes() -> None:
-    rc, out, _ = _capture(["plan", "--fixture", DEMO, "--flaky-signatures", FLAKY])
+    rc, out, _ = _capture(
+        [
+            "plan",
+            "--fixture",
+            DEMO,
+            "--flaky-signatures",
+            FLAKY,
+            "--freshness-max-behind",
+            "0",
+        ]
+    )
     assert rc == 0
     assert "land-now" in out
     assert "rebase-then-land" in out
@@ -186,7 +196,19 @@ def test_plan_context_exact_head_bypasses_stale_gate(tmp_path: Path) -> None:
 
 
 def test_plan_actions_has_capturable_summary_and_loud_lines() -> None:
-    rc, out, _ = _capture(["plan", "--fixture", DEMO, "--flaky-signatures", FLAKY, "--format", "actions"])
+    rc, out, _ = _capture(
+        [
+            "plan",
+            "--fixture",
+            DEMO,
+            "--flaky-signatures",
+            FLAKY,
+            "--freshness-max-behind",
+            "0",
+            "--format",
+            "actions",
+        ]
+    )
     assert rc == 0
     lines = out.splitlines()
     # Bare key=value summary lines (tick-hub `capture: true` lifts these).
