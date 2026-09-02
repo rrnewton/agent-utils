@@ -3924,6 +3924,189 @@ def test_unread_handoff_blocks_reclaim_until_its_exact_contents_are_read(
     ).hexdigest()
 
 
+def test_read_handoff_ignores_unrelated_absent_ownerless_row(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    handoff = checkout(project).parent / "HANDOFF.md"
+    contents = b"Continue from the exact recorded commit.\n"
+    handoff.write_bytes(contents)
+
+    unrelated_made = create(
+        project,
+        slot="unrelated",
+        agent="unrelated-agent",
+        branch="agent/unrelated",
+        bind_owner=False,
+    )
+    assert unrelated_made.returncode == 0, unrelated_made.stderr
+    config = wrkslots._load_config(str(project), "testhost")
+    unrelated = wrkslots._find_record(wrkslots._load_active(config), "unrelated")
+    shutil.rmtree(wrkslots._slot_directory(config, unrelated.slot, "agent"))
+    assert unrelated.owner is None
+    assert unrelated.checkouts[0].path in {
+        path.relative_to(project).as_posix()
+        for path in wrkslots._GitVcs().listed_worktrees(repository)
+    }
+    before = wrkslots._record_to_obj(unrelated)
+
+    read = raw_command(
+        project,
+        "read-handoff",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+    )
+
+    assert read.returncode == 0, read.stderr
+    assert "Continue from the exact recorded commit." in read.stdout
+    after = wrkslots._find_record(wrkslots._load_active(config), "unrelated")
+    assert wrkslots._record_to_obj(after) == before
+    events = wrkslots._load_events(config)
+    read_events = [event for event in events if event["kind"] == "handoff-read"]
+    assert len(read_events) == 1
+    payload = wrkslots._as_mapping(read_events[0]["payload"], "handoff read payload")
+    assert payload["slot"] == "slot01"
+    assert payload["sha256"] == hashlib.sha256(contents).hexdigest()
+
+
+def test_read_handoff_ignores_unrelated_unavailable_repository(
+    tmp_path: Path,
+) -> None:
+    project, _repository, remote = make_project(tmp_path)
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    handoff = checkout(project).parent / "HANDOFF.md"
+    contents = b"Do not let unrelated repository drift hide this handoff.\n"
+    handoff.write_bytes(contents)
+
+    unrelated_repository = project / "repo-unrelated"
+    subprocess.run(
+        ["git", "clone", str(remote), str(unrelated_repository)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    unrelated_made = create(
+        project,
+        slot="unrelated",
+        agent="unrelated-agent",
+        branch="agent/unrelated-repository",
+        repository_name="repo-unrelated",
+    )
+    assert unrelated_made.returncode == 0, unrelated_made.stderr
+    config = wrkslots._load_config(str(project), "testhost")
+    unrelated = wrkslots._find_record(wrkslots._load_active(config), "unrelated")
+    before = wrkslots._record_to_obj(unrelated)
+    shutil.rmtree(unrelated_repository)
+
+    read = raw_command(
+        project,
+        "read-handoff",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+    )
+
+    assert read.returncode == 0, read.stderr
+    assert contents.decode("utf-8").strip() in read.stdout
+    after = wrkslots._find_record(
+        wrkslots._load_active(config, require_repository=False),
+        "unrelated",
+    )
+    assert wrkslots._record_to_obj(after) == before
+    events = wrkslots._load_events(config)
+    read_events = [event for event in events if event["kind"] == "handoff-read"]
+    assert len(read_events) == 1
+    payload = wrkslots._as_mapping(read_events[0]["payload"], "handoff read payload")
+    assert payload["slot"] == "slot01"
+    assert payload["sha256"] == hashlib.sha256(contents).hexdigest()
+
+
+def test_read_handoff_refuses_extra_git_registration_for_target_slot(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    handoff = checkout(project).parent / "HANDOFF.md"
+    handoff.write_text("Preserve target-local Git drift.\n", encoding="utf-8")
+    stale = handoff.parent / "stale-checkout"
+    git(repository, "worktree", "add", "--detach", str(stale), "HEAD")
+    shutil.rmtree(stale)
+    assert stale.absolute() in wrkslots._GitVcs().listed_worktrees(repository)
+    config = wrkslots._load_config(str(project), "testhost")
+    before = wrkslots._global_rows(
+        [wrkslots._load_active(config)], [wrkslots._load_archive(config)]
+    )
+
+    read = raw_command(
+        project,
+        "read-handoff",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+    )
+
+    assert read.returncode == 3
+    assert "no active checkout row" in read.stderr
+    assert str(stale) in read.stderr
+    after = wrkslots._global_rows(
+        [wrkslots._load_active(config)], [wrkslots._load_archive(config)]
+    )
+    assert after == before
+    assert not any(
+        event["kind"] == "handoff-read" for event in wrkslots._load_events(config)
+    )
+
+
+@pytest.mark.parametrize("failure", ("missing", "symlink", "non-utf8", "target-missing"))
+def test_read_handoff_still_refuses_invalid_target(
+    tmp_path: Path, failure: str
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    config = wrkslots._load_config(str(project), "testhost")
+    slot_path = checkout(project).parent
+    handoff = slot_path / "HANDOFF.md"
+    if failure == "symlink":
+        target = tmp_path / "outside-handoff"
+        target.write_text("outside\n", encoding="utf-8")
+        handoff.symlink_to(target)
+    elif failure == "non-utf8":
+        handoff.write_bytes(b"\xff\xfe")
+    elif failure == "target-missing":
+        handoff.write_text("unreachable\n", encoding="utf-8")
+        shutil.rmtree(slot_path)
+
+    before = wrkslots._global_rows(
+        [wrkslots._load_active(config)], [wrkslots._load_archive(config)]
+    )
+    read = raw_command(
+        project,
+        "read-handoff",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+    )
+
+    assert read.returncode == 3
+    expected = {
+        "missing": "no read was recorded",
+        "symlink": "no read was recorded",
+        "non-utf8": "no read was recorded",
+        "target-missing": "active row but no slot directory",
+    }
+    assert expected[failure] in read.stderr
+    after = wrkslots._global_rows(
+        [wrkslots._load_active(config)], [wrkslots._load_archive(config)]
+    )
+    assert after == before
+
+
 def test_finished_slot_name_cannot_be_reused(tmp_path: Path) -> None:
     project, _repository, _remote = make_project(tmp_path)
     made = create(project)

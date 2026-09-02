@@ -62,8 +62,11 @@ source repositories named by readable rows; config does not contain a repository
 registrations it discovers there. `create` refuses an overlap with the requested name, slot
 path, checkout path, or Git registration. The exact selected source worktree is the sole ancestor
 exception when it contains the configured managed root. Create may proceed at a distinct target
-while printing every unrelated inconsistency it retained. Other lifecycle mutations refuse by default if either managed
-directory contains a worktree without an active wrkslots record. During a deliberate migration,
+while printing every unrelated inconsistency it retained. `read-handoff` validates the complete
+authoritative history and the requested slot's record, directory, and Git worktrees, but unrelated
+storage drift cannot withhold that slot's handoff; it records no change to unrelated rows. Other
+lifecycle mutations refuse by default if either managed directory contains a worktree without an
+active wrkslots record. During a deliberate migration,
 put the global `--allow-existing-unregistered-worktrees` flag before such a command. The requested
 operation then touches only registered slots and prints how many unregistered directories it
 retained. It never uses that flag as permission to inspect, select, or remove one of them. Run
