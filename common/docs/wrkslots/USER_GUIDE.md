@@ -209,6 +209,44 @@ hard refusal. During a larger deliberate migration, the global
 `--allow-existing-unregistered-worktrees` flag may accompany the exact cleanup command; it retains
 all other paths.
 
+## Recover registered validation rows with absent storage
+
+If external cleanup removed disposable validation directories without retiring their ACTIVE rows,
+generate an explicit bounded input from a fresh `wrkslots audit --format json`. Each registered row
+includes its canonical `record_sha256`; copy only the intended rows into this form:
+
+```json
+{"schema": 1, "rows": [{"machine": "host", "slot": "validate-fresh-example", "generation": 1, "record_sha256": "<64 lowercase hex digits>"}]}
+```
+
+Inspect the read-only plan first, then apply the exact same file:
+
+```sh
+wrkslots recover-absent-validate-rows --input /path/to/rows.json
+wrkslots recover-absent-validate-rows --input /path/to/rows.json --apply \
+  --coordinator-authorized --coordinator-pid "$COORDINATOR_PID"
+```
+
+The command refuses agent rows, changed generations or row digests, holds, any path or Git
+registration that still exists, unreadable handle/process/systemd evidence, and any live process or
+user service that may use the row. A retained run handle contributes its exact service unit and,
+when recorded, process generation to the present-tense liveness proof; its run state is not treated as a validation
+outcome. The configured agent-liveness probe is likewise not an ownership authority: an agent may
+restart elsewhere, while a validation may outlive the agent that launched it. The resource proof is
+the exact recorded owner generation, retained service identity when present, an all-process path and
+mount census, all user services/scopes/jobs, and absent Git and filesystem state.
+
+The whole batch is preflighted before writing. Recovery then appends one archive transition per row,
+records that durable prefix, and appends one ACTIVE-removal transition per row. A crash may expose a
+prefix, not a fictitious all-or-nothing update; the journal makes that prefix resumable and refreshes
+the compatibility snapshots before completion. Every archive keeps the established schema-2 shape,
+records physical storage as removed (its disposition at archive time), and states that the validation
+outcome remains unknown. Rerunning the same command or plain `wrkslots recover --coordinator-pid
+PID` resumes safely. Do not infer a validation result or run number from this registry repair.
+Cross-user process evidence uses passwordless `sudo -n` with fixed root-owned `find` and `grep`
+binaries and refuses if that read-only census is unavailable or incomplete. Use `--format json` when
+another tool needs the typed per-row outcome.
+
 ## Recovery and compatibility views
 
 Every mutation appends a numbered, hash-linked JSON event before refreshing the readable ACTIVE,

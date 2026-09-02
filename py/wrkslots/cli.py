@@ -15,7 +15,9 @@ import hashlib
 import json
 import os
 import re
+import selectors
 import shlex
+import signal
 import socket
 import stat
 import subprocess
@@ -52,6 +54,7 @@ _CONFIG_REPAIR_UPDATABLE = frozenset({"schema", "max_active_slots"})
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 REMOTE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 GIB = 1024**3
 HOLD_SCHEMA = 1
 EVENT_SCHEMA = 1
@@ -61,6 +64,12 @@ HISTORICAL_ACTIVE_STATUSES = frozenset(
 )
 HISTORICAL_TASK_NOT_RECORDED = "no task recorded in worktree-state.json"
 HISTORICAL_PURPOSE_NOT_RECORDED = "no purpose recorded in worktree-state.json"
+_RETAINED_HANDLE_COUNT_LIMIT = 4096
+_RETAINED_HANDLE_BYTES_LIMIT = 64 * 1024 * 1024
+_RETAINED_HANDLE_CENSUS_SECONDS = 30.0
+_MOUNTINFO_FILE_BYTES_LIMIT = 4 * 1024 * 1024
+_MOUNTINFO_CENSUS_BYTES_LIMIT = 64 * 1024 * 1024
+_ABSENT_PROCESS_CENSUS_SECONDS = 60.0
 
 
 class Refusal(RuntimeError):
@@ -73,6 +82,10 @@ class Refusal(RuntimeError):
 
 class StateError(Refusal):
     """A corrupt, partial, or incompatible state refusal."""
+
+
+class _ProcessEvidenceChanged(Refusal):
+    """A relevant PID generation changed while one liveness census ran."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -200,6 +213,11 @@ class ArchiveState:
     machine: str
     revision: int
     records: tuple[dict[str, object], ...]
+    absent_validate_recoveries: frozenset[tuple[str, int, str]] = dataclasses.field(
+        default_factory=frozenset,
+        compare=False,
+        repr=False,
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -252,6 +270,27 @@ class ValidationRecoveryAuthorization:
     head: str | None = None
     remote_url_sha256: str | None = None
     parent_identity: tuple[int, int, int] | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class AbsentValidateRow:
+    """Exact identity supplied for one validation row whose storage is absent."""
+
+    machine: str
+    slot: str
+    generation: int
+    record_sha256: str
+
+
+@dataclasses.dataclass(frozen=True)
+class _RetainedValidationHandle:
+    """Present-tense liveness identity retained by one validation launcher."""
+
+    path: Path
+    unit: str
+    pid: int | None
+    start_ticks: int | None
+    boot_id: str | None
 
 
 def _utc_now() -> str:
@@ -508,6 +547,44 @@ def _read_json(path: Path, label: str) -> object:
         raise StateError(f"missing {label}: {path}") from exc
     except (OSError, json.JSONDecodeError) as exc:
         raise StateError(f"cannot read {label} {path}: {exc}") from exc
+
+
+def _read_bounded_regular_file(path: Path, label: str, limit: int) -> bytes:
+    """Read one regular file without following a replacement symlink."""
+
+    # O_NONBLOCK is load-bearing even though regular files ignore it: if an
+    # attacker swaps the path to a FIFO between enumeration and open(), open
+    # must return so fstat() can reject the non-regular descriptor.
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    bound = "1 MiB" if limit == 1024 * 1024 else f"{limit}-byte"
+    try:
+        descriptor = os.open(path, flags)
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise Refusal(f"{label} is not a regular file: {path}")
+            if metadata.st_size > limit:
+                raise Refusal(f"{label} exceeds the {bound} safety bound: {path}")
+            chunks: list[bytes] = []
+            remaining = limit + 1
+            while remaining:
+                chunk = os.read(descriptor, min(remaining, 64 * 1024))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            contents = b"".join(chunks)
+        finally:
+            os.close(descriptor)
+    except Refusal:
+        raise
+    except OSError as exc:
+        raise Refusal(f"cannot read {label} {path}: {exc}") from exc
+    if len(contents) > limit:
+        raise Refusal(f"{label} exceeds the {bound} safety bound: {path}")
+    return contents
 
 
 def _refuse_symlink(path: Path, label: str) -> None:
@@ -1049,6 +1126,49 @@ def _assert_not_held(config: Config, record: ActiveRecord) -> None:
             f"slot {record.slot} is held: {_as_str(hold['reason'], 'slot hold.reason')}; "
             f"run 'wrkslots unhold {record.slot}' only when the hold is no longer needed"
         )
+
+
+def _assert_absent_validate_rows_not_held(config: Config, records: Sequence[ActiveRecord]) -> None:
+    slots = {record.slot for record in records}
+    events = _load_events(config, config.machine)
+    if not events:
+        for record in records:
+            hold_snapshot = _load_hold_snapshot(config, record.slot, record.machine)
+            if hold_snapshot is not None:
+                raise Refusal(
+                    f"slot {record.slot} is held: "
+                    f"{_as_str(hold_snapshot['reason'], 'slot hold.reason')}; run 'wrkslots "
+                    f"unhold {record.slot}' only when the hold is no longer needed"
+                )
+        return
+    holds: dict[str, Mapping[str, object]] = {}
+    for event in events:
+        payload = _as_mapping(event["payload"], "append-only event.payload")
+        kind = event.get("kind")
+        if kind == "state-imported":
+            for item in _as_list(payload.get("holds", []), "imported holds"):
+                hold = _as_mapping(item, "imported hold")
+                slot = hold.get("slot")
+                if isinstance(slot, str) and slot in slots:
+                    holds[slot] = hold
+        else:
+            slot = payload.get("slot")
+            if not isinstance(slot, str) or slot not in slots:
+                continue
+            if kind == "slot-held":
+                holds[slot] = {
+                    "reason": payload.get("reason"),
+                }
+            elif kind == "slot-hold-released":
+                holds.pop(slot, None)
+    for record in records:
+        selected_hold = holds.get(record.slot)
+        if selected_hold is not None:
+            raise Refusal(
+                f"slot {record.slot} is held: "
+                f"{_as_str(selected_hold.get('reason'), 'slot hold.reason')}; run 'wrkslots "
+                f"unhold {record.slot}' only when the hold is no longer needed"
+            )
 
 
 def _lock_path(subject: Path) -> Path:
@@ -1968,9 +2088,34 @@ def _load_events(config: Config, machine: str | None = None) -> tuple[dict[str, 
     return _load_event_paths(_event_files(directory), selected)
 
 
-def _write_event_file(
-    config: Config, machine: str, kind: str, payload: Mapping[str, object]
-) -> dict[str, object]:
+@dataclasses.dataclass
+class _EventWriter:
+    directory: Path
+    machine: str
+    sequence: int
+    previous_sha256: str
+
+    def append(self, kind: str, payload: Mapping[str, object]) -> dict[str, object]:
+        self.sequence += 1
+        core: dict[str, object] = {
+            "schema": EVENT_SCHEMA,
+            "machine": self.machine,
+            "sequence": self.sequence,
+            "previous_sha256": self.previous_sha256,
+            "recorded_at": _utc_now(),
+            "kind": kind,
+            "payload": dict(payload),
+        }
+        event = {**core, "sha256": _event_digest(core)}
+        path = self.directory / f"{self.sequence:020d}.json"
+        if path.exists() or path.is_symlink():
+            raise StateError(f"append-only event already exists and will not be replaced: {path}")
+        _atomic_write_json(path, event)
+        self.previous_sha256 = _as_str(event["sha256"], "append-only event.sha256")
+        return event
+
+
+def _event_writer(config: Config, machine: str) -> _EventWriter:
     directory = _event_directory(config, machine)
     if directory.exists() and (directory.is_symlink() or not directory.is_dir()):
         raise StateError(f"append-only event log is not a real directory: {directory}")
@@ -1979,25 +2124,20 @@ def _write_event_file(
     if created:
         _fsync_directory(directory.parent)
     events = _load_events(config, machine)
-    sequence = len(events) + 1
-    previous = "0" * 64 if not events else _as_str(
-        events[-1]["sha256"], "append-only event.sha256"
+    return _EventWriter(
+        directory=directory,
+        machine=machine,
+        sequence=len(events),
+        previous_sha256=(
+            "0" * 64 if not events else _as_str(events[-1]["sha256"], "append-only event.sha256")
+        ),
     )
-    core: dict[str, object] = {
-        "schema": EVENT_SCHEMA,
-        "machine": machine,
-        "sequence": sequence,
-        "previous_sha256": previous,
-        "recorded_at": _utc_now(),
-        "kind": kind,
-        "payload": dict(payload),
-    }
-    event = {**core, "sha256": _event_digest(core)}
-    path = directory / f"{sequence:020d}.json"
-    if path.exists() or path.is_symlink():
-        raise StateError(f"append-only event already exists and will not be replaced: {path}")
-    _atomic_write_json(path, event)
-    return event
+
+
+def _write_event_file(
+    config: Config, machine: str, kind: str, payload: Mapping[str, object]
+) -> dict[str, object]:
+    return _event_writer(config, machine).append(kind, payload)
 
 
 def _ensure_event_log(config: Config, machine: str | None = None) -> None:
@@ -2023,19 +2163,48 @@ def _ensure_event_log(config: Config, machine: str | None = None) -> None:
     )
 
 
+def _absent_validate_recovery_event_evidence(
+    value: object, label: str
+) -> tuple[str, str]:
+    """Parse the machine-readable identity carried by a recovery event."""
+
+    evidence = _as_mapping(value, label)
+    _exact_keys(
+        evidence,
+        {"archive_id", "source_record_sha256", "validation_outcome"},
+        set(),
+        label,
+    )
+    archive_id = _as_str(evidence["archive_id"], f"{label}.archive_id")
+    source_digest = _as_str(
+        evidence["source_record_sha256"], f"{label}.source_record_sha256"
+    )
+    if not DIGEST_RE.fullmatch(source_digest):
+        raise StateError(f"{label}.source_record_sha256 is not a SHA-256 digest")
+    if evidence["validation_outcome"] != "unknown":
+        raise StateError(f"{label}.validation_outcome must be unknown")
+    return archive_id, source_digest
+
+
 def _states_from_events(
     config: Config, machine: str
 ) -> tuple[ActiveState, ArchiveState] | None:
     events = _load_events(config, machine)
     if not events:
         return None
-    active: ActiveState | None = None
-    archive: ArchiveState | None = None
+    active_revision: int | None = None
+    active_records: dict[str, ActiveRecord] = {}
+    active_agents: dict[str, str] = {}
+    archive_revision: int | None = None
+    archive_records: list[dict[str, object]] = []
+    archive_ids: set[str] = set()
+    archived_slots: set[str] = set()
+    absent_validate_recoveries: set[tuple[str, int, str]] = set()
     for event in events:
         payload = _as_mapping(event["payload"], "append-only event.payload")
         kind = _as_str(event["kind"], "append-only event.kind")
         if kind == "state-imported":
-            if active is not None or archive is not None:
+            if active_revision is not None or archive_revision is not None:
                 raise StateError("append-only event log imports state more than once")
             active = _active_from_obj(
                 config,
@@ -2049,8 +2218,25 @@ def _states_from_events(
                 machine,
                 "append-only imported archive state",
             )
+            active_revision = active.revision
+            active_records = {record.slot: record for record in active.slots}
+            active_agents = {
+                record.agent: record.slot
+                for record in active.slots
+                if record.slot_type == "agent" and record.import_source is None
+            }
+            archive_revision = archive.revision
+            archive_records = [dict(record) for record in archive.records]
+            archive_ids = {
+                _as_str(record.get("archive_id"), "archive record archive_id")
+                for record in archive.records
+            }
+            archived_slots = {
+                _as_str(record.get("slot"), "archive record slot")
+                for record in archive.records
+            }
         elif kind == "active-state-recorded":
-            if active is None:
+            if active_revision is None:
                 raise StateError("append-only event records active state before its import")
             _exact_keys(
                 payload,
@@ -2068,6 +2254,9 @@ def _states_from_events(
             )
             slot = _as_str(payload["slot"], "append-only active-record event.slot")
             _validate_name(slot, "slot")
+            action = _as_str(
+                payload["action"], "append-only active-record event.action"
+            )
             previous_revision = _as_int(
                 payload["previous_revision"],
                 "append-only active-record event.previous_revision",
@@ -2078,12 +2267,12 @@ def _states_from_events(
                 "append-only active-record event.revision",
                 minimum=1,
             )
-            if previous_revision != active.revision or revision != active.revision + 1:
+            if previous_revision != active_revision or revision != active_revision + 1:
                 raise StateError(
                     "append-only active-record event revision does not continue "
                     f"the derived state for slot {slot}"
                 )
-            current = next((item for item in active.slots if item.slot == slot), None)
+            current = active_records.get(slot)
             previous_digest = (
                 None if current is None else _event_digest(_record_to_obj(current))
             )
@@ -2093,12 +2282,31 @@ def _states_from_events(
                     f"for slot {slot}"
                 )
             raw_record = payload["record"]
+            if action == "absent-validation-row-recovered":
+                if current is None or raw_record is not None:
+                    raise StateError(
+                        "absent-validation-row recovery event must remove one active row"
+                    )
+                archive_id, source_digest = _absent_validate_recovery_event_evidence(
+                    payload["evidence"], "append-only active recovery event.evidence"
+                )
+                if source_digest != previous_digest:
+                    raise StateError(
+                        "append-only active recovery evidence does not match its source record"
+                    )
+                expected_prefix = f"{machine}:{slot}:{current.generation}:"
+                if not archive_id.startswith(expected_prefix):
+                    raise StateError(
+                        "append-only active recovery evidence has a mismatched archive identity"
+                    )
             if raw_record is None:
                 if current is None:
                     raise StateError(
                         f"append-only active-record event removes absent slot {slot}"
                     )
-                slots = tuple(item for item in active.slots if item.slot != slot)
+                active_records.pop(slot)
+                if current.slot_type == "agent" and current.import_source is None:
+                    active_agents.pop(current.agent, None)
             else:
                 record = _record_from_obj(
                     raw_record, "append-only active-record event.record"
@@ -2108,24 +2316,20 @@ def _states_from_events(
                         "append-only active-record event record identity does not "
                         f"match slot {slot} on machine {machine}"
                     )
-                slots = (
-                    (*active.slots, record)
-                    if current is None
-                    else tuple(record if item.slot == slot else item for item in active.slots)
-                )
-            active = _active_from_obj(
-                config,
-                {
-                    "schema": SCHEMA,
-                    "machine": machine,
-                    "revision": revision,
-                    "slots": [_record_to_obj(item) for item in slots],
-                },
-                machine,
-                "append-only derived active state",
-            )
+                _assert_record_paths(config, record)
+                if current is not None and current.slot_type == "agent" and current.import_source is None:
+                    active_agents.pop(current.agent, None)
+                if record.slot_type == "agent" and record.import_source is None:
+                    conflict = active_agents.get(record.agent)
+                    if conflict is not None and conflict != slot:
+                        raise StateError(
+                            "append-only active-record event gives one agent more than one slot"
+                        )
+                    active_agents[record.agent] = slot
+                active_records[slot] = record
+            active_revision = revision
         elif kind == "archive-state-recorded":
-            if archive is None:
+            if archive_revision is None:
                 raise StateError("append-only event records archive state before its import")
             _exact_keys(
                 payload,
@@ -2150,7 +2354,7 @@ def _states_from_events(
                 "append-only archive-record event.revision",
                 minimum=1,
             )
-            if previous_revision != archive.revision or revision != archive.revision + 1:
+            if previous_revision != archive_revision or revision != archive_revision + 1:
                 raise StateError(
                     "append-only archive-record event revision does not continue "
                     "the derived archive"
@@ -2158,26 +2362,71 @@ def _states_from_events(
             archive_record = dict(
                 _as_mapping(payload["record"], "append-only archive-record event.record")
             )
+            action = _as_str(
+                payload["action"], "append-only archive-record event.action"
+            )
             slot = _as_str(payload["slot"], "append-only archive-record event.slot")
             if archive_record.get("slot") != slot:
                 raise StateError(
                     "append-only archive-record event record identity does not "
                     f"match slot {slot}"
                 )
-            archive = _archive_from_obj(
+            parsed = _archive_from_obj(
                 config,
                 {
                     "schema": SCHEMA,
                     "machine": machine,
-                    "revision": revision,
-                    "records": [*archive.records, archive_record],
+                    "revision": 1,
+                    "records": [archive_record],
                 },
                 machine,
                 "append-only derived archive state",
             )
-    if active is None or archive is None:
+            parsed_record = dict(parsed.records[0])
+            archive_id = _as_str(
+                parsed_record.get("archive_id"), "append-only archive record archive_id"
+            )
+            if action == "absent-validation-row-recovered":
+                evidence_archive_id, source_digest = (
+                    _absent_validate_recovery_event_evidence(
+                        payload["evidence"],
+                        "append-only archive recovery event.evidence",
+                    )
+                )
+                generation = _as_int(
+                    parsed_record.get("generation"),
+                    "append-only archive recovery record.generation",
+                    minimum=1,
+                )
+                if (
+                    parsed_record.get("machine") != machine
+                    or parsed_record.get("slot_type") != "validate"
+                    or parsed_record.get("physical_storage") != "removed"
+                    or evidence_archive_id != archive_id
+                ):
+                    raise StateError(
+                        "append-only archive recovery evidence does not match its record"
+                    )
+                absent_validate_recoveries.add((slot, generation, source_digest))
+            if archive_id in archive_ids:
+                raise StateError(f"duplicate archive_id in append-only events: {archive_id}")
+            if slot in archived_slots:
+                raise StateError(f"duplicate archived slot in append-only events: {slot}")
+            archive_ids.add(archive_id)
+            archived_slots.add(slot)
+            archive_records.append(parsed_record)
+            archive_revision = revision
+    if active_revision is None or archive_revision is None:
         raise StateError("append-only event log has no complete imported state")
-    return active, archive
+    return (
+        ActiveState(machine, active_revision, tuple(active_records.values())),
+        ArchiveState(
+            machine,
+            archive_revision,
+            tuple(archive_records),
+            frozenset(absent_validate_recoveries),
+        ),
+    )
 
 
 def _load_active(config: Config, machine: str | None = None) -> ActiveState:
@@ -2245,6 +2494,54 @@ def _write_active_state(
     _atomic_write_json(_active_path(config, state.machine), _active_to_obj(state))
 
 
+def _write_active_rows_removed(
+    config: Config,
+    state: ActiveState,
+    slots: Sequence[str],
+    *,
+    evidence_by_slot: Mapping[str, Mapping[str, object]] | None = None,
+    event_writer: _EventWriter | None = None,
+) -> ActiveState:
+    names = tuple(_validate_name(slot, "slot") for slot in slots)
+    if not names or len(names) != len(set(names)):
+        raise StateError("active-row batch removal requires unique slots")
+    current = {record.slot: record for record in state.slots}
+    missing = [slot for slot in names if slot not in current]
+    if missing:
+        raise StateError(f"cannot batch-remove missing slot {missing[0]}")
+    _ensure_event_log(config, state.machine)
+    previous = _load_active(config, state.machine)
+    if previous != state:
+        raise StateError("active state changed before batch removal")
+    writer = event_writer or _event_writer(config, state.machine)
+    revision = state.revision
+    for index, slot in enumerate(names, start=1):
+        previous_revision = revision
+        revision += 1
+        writer.append(
+            "active-state-recorded",
+            {
+                "action": "absent-validation-row-recovered",
+                "slot": slot,
+                "previous_revision": previous_revision,
+                "revision": revision,
+                "previous_record_sha256": _record_sha256(current[slot]),
+                "record": None,
+                "evidence": dict((evidence_by_slot or {}).get(slot, {})),
+            },
+        )
+        _interrupt_for_test(f"after-absent-validate-active-row-{index}")
+    removed = set(names)
+    updated = ActiveState(
+        state.machine,
+        revision,
+        tuple(record for record in state.slots if record.slot not in removed),
+    )
+    _interrupt_for_test("after-absent-validate-active-event")
+    _atomic_write_json(_active_path(config, state.machine), _active_to_obj(updated))
+    return updated
+
+
 def _write_archive_state(
     config: Config,
     state: ArchiveState,
@@ -2283,11 +2580,15 @@ def _write_archive_state(
     _atomic_write_json(_archive_path(config, state.machine), _archive_to_obj(state))
 
 
-def _write_journal(config: Config, payload: Mapping[str, object]) -> None:
+def _write_journal(
+    config: Config,
+    payload: Mapping[str, object],
+    *,
+    event_writer: _EventWriter | None = None,
+) -> None:
     _ensure_event_log(config)
-    _write_event_file(
-        config,
-        config.machine,
+    writer = event_writer or _event_writer(config, config.machine)
+    writer.append(
         "operation-progress-recorded",
         {
             "slot": payload.get("slot"),
@@ -2298,11 +2599,15 @@ def _write_journal(config: Config, payload: Mapping[str, object]) -> None:
     _atomic_write_json(_journal_path(config), dict(payload))
 
 
-def _clear_journal(config: Config, payload: Mapping[str, object]) -> None:
+def _clear_journal(
+    config: Config,
+    payload: Mapping[str, object],
+    *,
+    event_writer: _EventWriter | None = None,
+) -> None:
     _ensure_event_log(config)
-    _write_event_file(
-        config,
-        config.machine,
+    writer = event_writer or _event_writer(config, config.machine)
+    writer.append(
         "operation-completed",
         {"slot": payload.get("slot"), "operation": payload.get("kind")},
     )
@@ -3366,32 +3671,17 @@ def _host_id() -> str:
     raise Refusal(f"cannot establish the stable machine identity{detail}")
 
 
-def _read_process_identity(pid: int) -> ProcessIdentity:
+def _read_process_identity(pid: int, *, proc_root: Path = Path("/proc")) -> ProcessIdentity:
     if pid <= 0:
         raise Refusal("owner PID must be positive")
-    proc_root = Path("/proc")
-    try:
-        stat_text = (proc_root / str(pid) / "stat").read_text(encoding="ascii")
-    except FileNotFoundError as exc:
-        raise Refusal(f"owner PID {pid} is not live") from exc
-    except (OSError, UnicodeError) as exc:
-        raise Refusal(f"owner PID {pid} is indeterminate: {exc}") from exc
-    close = stat_text.rfind(")")
-    if close < 0:
-        raise Refusal(f"owner PID {pid} has an unreadable process generation")
-    fields = stat_text[close + 2 :].split()
-    if len(fields) <= 19:
-        raise Refusal(f"owner PID {pid} has an incomplete process generation")
-    try:
-        start_ticks = int(fields[19])
-    except ValueError as exc:
-        raise Refusal(f"owner PID {pid} has an invalid process generation") from exc
-    if start_ticks <= 0:
-        raise Refusal(f"owner PID {pid} has an invalid process generation")
-    cgroup_path = _read_process_cgroup(proc_root / str(pid))
+    pid_dir = proc_root / str(pid)
+    process_stat = _read_process_stat(pid_dir)
+    if process_stat is None:
+        raise Refusal(f"owner PID {pid} is not live")
+    cgroup_path = _read_process_cgroup(pid_dir)
     return ProcessIdentity(
         pid=pid,
-        start_ticks=start_ticks,
+        start_ticks=process_stat.start_ticks,
         boot_id=_boot_id(proc_root),
         host_id=_host_id(),
         cgroup_path=cgroup_path,
@@ -3661,37 +3951,47 @@ def _process_uses_slot(pid_dir: Path, slot_path: Path) -> list[str]:
     return uses
 
 
+def _parse_mountinfo_paths(text: str, label: str) -> tuple[tuple[Path, str], ...]:
+    references: list[tuple[Path, str]] = []
+    for line in text.splitlines():
+        left, separator, right = line.partition(" - ")
+        if not separator:
+            raise Refusal(f"{label} is malformed")
+        left_fields = left.split()
+        right_fields = right.split()
+        if len(left_fields) < 5 or len(right_fields) < 2:
+            raise Refusal(f"{label} is incomplete")
+        for raw in (left_fields[3], left_fields[4], right_fields[1]):
+            candidate = Path(
+                raw.replace("\\040", " ")
+                .replace("\\011", "\t")
+                .replace("\\012", "\n")
+                .replace("\\134", "\\")
+                .removesuffix(" (deleted)")
+            )
+            if candidate.is_absolute():
+                references.append((candidate, raw))
+    return tuple(references)
+
+
 def _process_mounts_slot(pid_dir: Path, slot_path: Path) -> list[str]:
-    uses: list[str] = []
     mountinfo_path = pid_dir / "mountinfo"
     try:
-        mountinfo = mountinfo_path.read_text(
-            encoding="utf-8", errors="surrogateescape"
-        )
+        mountinfo = mountinfo_path.read_text(encoding="utf-8", errors="surrogateescape")
     except FileNotFoundError:
-        mountinfo = ""
+        return []
     except OSError as exc:
         if exc.errno in (errno.ENOENT, errno.ESRCH, errno.EINVAL):
             return []
         raise Refusal(
             f"process use is indeterminate because {mountinfo_path} is unreadable: {exc}"
         ) from exc
-    for line in mountinfo.splitlines():
-        left, separator, right = line.partition(" - ")
-        if not separator:
-            continue
-        left_fields = left.split()
-        right_fields = right.split()
-        candidates = [
-            *(left_fields[index] for index in (3, 4) if len(left_fields) > index),
-            *(right_fields[index] for index in (1, 2) if len(right_fields) > index),
-        ]
-        for raw in candidates:
-            candidate = Path(raw.replace("\\040", " ").removesuffix(" (deleted)"))
-            if candidate.is_absolute() and _path_is_within(candidate, slot_path):
-                uses.append(f"mount={candidate}")
-                return uses
-    return uses
+    for candidate, _raw in _parse_mountinfo_paths(
+        mountinfo, f"process mount evidence for PID {pid_dir.name}"
+    ):
+        if _path_is_within(candidate, slot_path):
+            return [f"mount={candidate}"]
+    return []
 
 
 def _mount_namespace(pid_dir: Path) -> str | None:
@@ -7301,6 +7601,8 @@ def _audit_record(config: Config, record: ActiveRecord) -> tuple[dict[str, objec
                 "machine": record.machine,
                 "agent": record.agent,
                 "slot_type": record.slot_type,
+                "generation": record.generation,
+                "record_sha256": _event_digest(_record_to_obj(record)),
                 "verdict": "HELD",
                 "reasons": [_as_str(hold["reason"], "slot hold.reason")],
                 "owner_state": owner_state,
@@ -7369,6 +7671,8 @@ def _audit_record(config: Config, record: ActiveRecord) -> tuple[dict[str, objec
             "machine": record.machine,
             "agent": record.agent,
             "slot_type": record.slot_type,
+            "generation": record.generation,
+            "record_sha256": _event_digest(_record_to_obj(record)),
             "verdict": "DELETABLE" if not reasons else "BLOCKED",
             "reasons": reasons,
             "owner_state": owner_state,
@@ -7444,6 +7748,8 @@ def _cmd_audit(args: argparse.Namespace) -> int:
                     "slot_type": slot_type,
                     "machine": None if journal_slot is None else journal_slot.machine,
                     "agent": None,
+                    "generation": None,
+                    "record_sha256": None,
                     "verdict": "BLOCKED",
                     "reasons": [
                         (
@@ -7475,6 +7781,8 @@ def _cmd_audit(args: argparse.Namespace) -> int:
                     "slot_type": None,
                     "machine": journal_slot.machine,
                     "agent": None,
+                    "generation": None,
+                    "record_sha256": None,
                     "verdict": "BLOCKED",
                     "reasons": [
                         f"interrupted {journal_slot.state.replace('-', ' ')} requires "
@@ -9927,36 +10235,43 @@ def _terminal_validation_record(
         raise Refusal(f"terminal validation record does not name this exact {field}")
     if target_kind == "checkout" and record.get("temporary_checkout") is False:
         raise Refusal("terminal validation record says the checkout is not temporary")
-    state = record.get("state")
-    terminal = state in {"killed", "not-run", "refused"}
-    if state == "completed":
-        exits = {"PASSED": 0, "FAILED": 1, "COULD_NOT_RUN": 75}
-        status = record.get("final_validate_status")
-        expected_exit = exits.get(status) if isinstance(status, str) else None
-        schema = record.get("service_result_schema")
-        if schema in {1, 2}:
-            expected_exit = None
-        elif schema == 3:
-            writeback = record.get("scorecard_writeback")
-            failed = bool(
-                isinstance(writeback, dict)
-                and set(writeback) == {"status", "error"}
-                and writeback.get("status") == "failed"
-                and isinstance(writeback.get("error"), str)
-                and writeback["error"].strip()
-            )
-            complete = isinstance(writeback, dict) and writeback == {"status": "completed"}
-            if writeback is not None and not failed and not complete:
-                expected_exit = None
-            elif status == "PASSED" and failed:
-                expected_exit = 75
-        terminal = expected_exit is not None and record.get("exit_code") == expected_exit
-    if not terminal:
+    if not _validation_record_is_terminal(record):
         raise Refusal(
             "validation record does not contain an evidenced terminal result; no path was "
             "removed. Let validate-run finish recording the result or preserve the path"
         )
     return relative, digest
+
+
+def _validation_record_is_terminal(record: Mapping[str, object]) -> bool:
+    """Return whether one retained validation handle contains a typed terminal result."""
+
+    state = record.get("state")
+    if state in {"killed", "not-run", "refused"}:
+        return True
+    if state != "completed":
+        return False
+    exits = {"PASSED": 0, "FAILED": 1, "COULD_NOT_RUN": 75}
+    status = record.get("final_validate_status")
+    expected_exit = exits.get(status) if isinstance(status, str) else None
+    schema = record.get("service_result_schema")
+    if schema in {1, 2}:
+        expected_exit = None
+    elif schema == 3:
+        writeback = record.get("scorecard_writeback")
+        failed = bool(
+            isinstance(writeback, dict)
+            and set(writeback) == {"status", "error"}
+            and writeback.get("status") == "failed"
+            and isinstance(writeback.get("error"), str)
+            and writeback["error"].strip()
+        )
+        complete = isinstance(writeback, dict) and writeback == {"status": "completed"}
+        if writeback is not None and not failed and not complete:
+            expected_exit = None
+        elif status == "PASSED" and failed:
+            expected_exit = 75
+    return expected_exit is not None and record.get("exit_code") == expected_exit
 
 
 def _recordless_validation_evidence(
@@ -10399,6 +10714,1940 @@ def _recover_ownerless_validation(
     print(f"recovered ownerless validation {authorization.target_kind}={target}")
 
 
+def _record_sha256(record: ActiveRecord) -> str:
+    return _event_digest(_record_to_obj(record))
+
+
+def _read_absent_validate_rows_input(
+    config: Config, raw_path: str
+) -> tuple[str, tuple[AbsentValidateRow, ...]]:
+    candidate = Path(raw_path)
+    path = candidate if candidate.is_absolute() else config.root / candidate
+    limit = 1024 * 1024
+    contents = _read_bounded_regular_file(path, "absent-validation-row input", limit)
+    try:
+        raw = _as_mapping(json.loads(contents), "absent-validation-row input")
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise Refusal(f"absent-validation-row input is not valid JSON: {exc}") from exc
+    _exact_keys(raw, {"schema", "rows"}, set(), "absent-validation-row input")
+    if _as_int(raw["schema"], "absent-validation-row input.schema") != 1:
+        raise Refusal("absent-validation-row input schema must be 1")
+    raw_rows = _as_list(raw["rows"], "absent-validation-row input.rows")
+    if not raw_rows:
+        raise Refusal("absent-validation-row input must name at least one row")
+    if len(raw_rows) > 1024:
+        raise Refusal("absent-validation-row input names more than 1024 rows")
+    rows: list[AbsentValidateRow] = []
+    identities: set[tuple[str, str]] = set()
+    for index, value in enumerate(raw_rows):
+        label = f"absent-validation-row input.rows[{index}]"
+        row = _as_mapping(value, label)
+        _exact_keys(
+            row,
+            {"machine", "slot", "generation", "record_sha256"},
+            set(),
+            label,
+        )
+        machine = _validate_name(_as_str(row["machine"], f"{label}.machine"), "machine")
+        slot = _validate_name(_as_str(row["slot"], f"{label}.slot"), "slot")
+        generation = _as_int(row["generation"], f"{label}.generation", minimum=1)
+        digest = _as_str(row["record_sha256"], f"{label}.record_sha256")
+        if not DIGEST_RE.fullmatch(digest):
+            raise Refusal(f"{label}.record_sha256 must be one lowercase SHA-256 digest")
+        identity = (machine, slot)
+        if identity in identities:
+            raise Refusal(f"absent-validation-row input repeats {machine}/{slot}")
+        identities.add(identity)
+        rows.append(AbsentValidateRow(machine, slot, generation, digest))
+    return hashlib.sha256(contents).hexdigest(), tuple(rows)
+
+
+def _absent_validate_row_paths(config: Config, record: ActiveRecord) -> tuple[Path, ...]:
+    paths = [_slot_directory(config, record.slot, record.slot_type)]
+    paths.extend(
+        _stored_path(config, checkout.path, "validation checkout path")
+        for checkout in record.checkouts
+    )
+    return tuple(dict.fromkeys(path.absolute() for path in paths))
+
+
+def _assert_absent_validate_rows_storage(
+    config: Config, records: Sequence[ActiveRecord]
+) -> tuple[tuple[ActiveRecord, tuple[Path, ...]], ...]:
+    rows: list[tuple[ActiveRecord, tuple[Path, ...]]] = []
+    for record in records:
+        _assert_record_paths(config, record)
+        paths = _absent_validate_row_paths(config, record)
+        for path in paths:
+            if path.exists() or path.is_symlink():
+                raise Refusal(
+                    f"validation row {record.slot} still has physical storage at {path}"
+                )
+        rows.append((record, paths))
+
+    validate_root = _validate_slots_directory(config)
+    try:
+        siblings = tuple(validate_root.iterdir()) if validate_root.is_dir() else ()
+    except OSError as exc:
+        raise Refusal(f"cannot enumerate possible fenced validation paths: {exc}") from exc
+    records_by_slot = {record.slot: record for record in records}
+    for sibling in siblings:
+        name = sibling.name
+        matched_slot: str | None = None
+        if name.startswith("."):
+            for marker in (".fenced.", ".ownerless-validate."):
+                offset = 1
+                while (index := name.find(marker, offset)) >= 0:
+                    slot = name[1:index]
+                    candidate_record = records_by_slot.get(slot)
+                    suffix = name[index + len(marker) :]
+                    if candidate_record is not None and (
+                        marker == ".ownerless-validate."
+                        or suffix.startswith(f"{candidate_record.generation}.")
+                    ):
+                        matched_slot = slot
+                        break
+                    offset = index + 1
+                if matched_slot is not None:
+                    break
+        if matched_slot is not None:
+            raise Refusal(
+                f"validation row {matched_slot} has a possible fenced path: {sibling}"
+            )
+
+    vcs = _GitVcs()
+    repositories = {
+        repository
+        for record in records
+        for checkout in record.checkouts
+        for _stored, repository in (
+            _stored_repository_path(config, checkout.repository),
+        )
+    }
+    listed_by_repository = {
+        repository: set(vcs.listed_worktrees(repository))
+        for repository in repositories
+    }
+    for record in records:
+        for checkout in record.checkouts:
+            _stored, repository = _stored_repository_path(config, checkout.repository)
+            path = _stored_path(
+                config, checkout.path, "validation checkout path"
+            ).absolute()
+            if path in listed_by_repository[repository]:
+                raise Refusal(
+                    f"Git still registers absent validation checkout {checkout.name} "
+                    f"at {path}"
+                )
+    return tuple(rows)
+
+
+def _retained_handle_path(config: Config, value: str, label: str) -> Path:
+    if not value:
+        raise Refusal(f"{label} is empty")
+    raw = Path(value)
+    return Path(os.path.normpath(str(raw if raw.is_absolute() else config.root / raw)))
+
+
+def _retained_handles_for_absent_rows(
+    config: Config, rows: Sequence[tuple[ActiveRecord, tuple[Path, ...]]]
+) -> Mapping[str, tuple[_RetainedValidationHandle, ...]]:
+    handles = config.root / "ignored" / "validate" / "runs"
+    if handles.is_symlink() or (handles.exists() and not handles.is_dir()):
+        raise Refusal(f"retained validation handle directory is unsafe: {handles}")
+    targets: dict[Path, set[str]] = {}
+    for record, paths in rows:
+        for target in paths:
+            targets.setdefault(target, set()).add(record.slot)
+    matched: dict[str, list[_RetainedValidationHandle]] = {
+        record.slot: [] for record, _paths in rows
+    }
+    handle_paths: list[Path] = []
+    total_bytes = 0
+    deadline = time.monotonic() + _RETAINED_HANDLE_CENSUS_SECONDS
+    if handles.is_dir():
+        try:
+            with os.scandir(handles) as entries:
+                for directory_entry in entries:
+                    if time.monotonic() >= deadline:
+                        raise Refusal(
+                            "retained validation handle enumeration exceeded its time bound"
+                        )
+                    if not directory_entry.name.endswith(".json"):
+                        continue
+                    if len(handle_paths) >= _RETAINED_HANDLE_COUNT_LIMIT:
+                        raise Refusal(
+                            "retained validation handles exceed the file-count census bound"
+                        )
+                    metadata = directory_entry.stat(follow_symlinks=False)
+                    path = handles / directory_entry.name
+                    if not stat.S_ISREG(metadata.st_mode):
+                        raise Refusal(f"retained validation handle is unsafe: {path}")
+                    if metadata.st_size > 1024 * 1024:
+                        raise Refusal(
+                            f"retained validation handle exceeds the 1 MiB safety bound: {path}"
+                        )
+                    total_bytes += metadata.st_size
+                    if total_bytes > _RETAINED_HANDLE_BYTES_LIMIT:
+                        raise Refusal(
+                            "retained validation handles exceed the 64 MiB census bound"
+                        )
+                    handle_paths.append(path)
+        except Refusal:
+            raise
+        except OSError as exc:
+            raise Refusal(
+                f"cannot enumerate retained validation handles: {exc}"
+            ) from exc
+    if time.monotonic() >= deadline:
+        raise Refusal("retained validation handle enumeration exceeded its time bound")
+    handle_paths.sort()
+    if time.monotonic() >= deadline:
+        raise Refusal("retained validation handle enumeration exceeded its time bound")
+    total_bytes = 0
+    for path in handle_paths:
+        try:
+            contents = _read_bounded_regular_file(
+                path, "retained validation handle", 1024 * 1024
+            )
+            total_bytes += len(contents)
+            if total_bytes > _RETAINED_HANDLE_BYTES_LIMIT:
+                raise Refusal("retained validation handles exceed the 64 MiB census bound")
+            if time.monotonic() >= deadline:
+                raise Refusal(
+                    "retained validation handle census exceeded its time bound"
+                )
+            value = json.loads(contents)
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise Refusal(
+                f"cannot prove retained validation handle is unrelated: {path}: {exc}"
+            ) from exc
+        if not isinstance(value, dict):
+            raise Refusal(
+                f"cannot prove retained validation handle is unrelated: {path} is not an object"
+            )
+        related: set[str] = set()
+        for field in ("checkout", "source_checkout"):
+            raw = value.get(field)
+            if raw is None:
+                continue
+            if not isinstance(raw, str):
+                raise Refusal(
+                    f"cannot prove retained validation handle is unrelated: "
+                    f"{path} has a non-string {field}"
+                )
+            target = _retained_handle_path(config, raw, f"{path}.{field}")
+            related.update(targets.get(target, ()))
+        if not related:
+            continue
+        unit = value.get("unit")
+        if (
+            not isinstance(unit, str)
+            or not re.fullmatch(r"[A-Za-z0-9:_.@-]+\.(?:service|scope)", unit)
+            or path.name != f"{unit.removesuffix('.service').removesuffix('.scope')}.json"
+        ):
+            raise Refusal(
+                f"retained validation handle {path} has no matching exact unit identity"
+            )
+        raw_identity = value.get("process_identity")
+        pid: int | None = None
+        start_ticks: int | None = None
+        boot_id: str | None = None
+        if raw_identity is not None:
+            identity = _as_mapping(raw_identity, f"{path}.process_identity")
+            _exact_keys(
+                identity,
+                {"pid", "start_ticks", "boot_id"},
+                set(),
+                f"{path}.process_identity",
+            )
+            pid = _as_int(identity["pid"], f"{path}.process_identity.pid", minimum=1)
+            start_ticks = _as_int(
+                identity["start_ticks"],
+                f"{path}.process_identity.start_ticks",
+                minimum=1,
+            )
+            boot_id = _as_str(identity["boot_id"], f"{path}.process_identity.boot_id")
+            if not boot_id:
+                raise Refusal(f"retained validation handle {path} has an empty boot identity")
+        handle = _RetainedValidationHandle(path, unit, pid, start_ticks, boot_id)
+        for slot in related:
+            matched[slot].append(handle)
+    return {slot: tuple(values) for slot, values in matched.items()}
+
+
+def _matching_absent_validate_target(
+    observed: Path, targets: Mapping[Path, str]
+) -> tuple[Path, str] | None:
+    for candidate in (observed, *observed.parents):
+        slot = targets.get(candidate)
+        if slot is not None:
+            return candidate, slot
+    return None
+
+
+def _cgroup_matches(recorded: str, observed: str) -> bool:
+    prefix = recorded.rstrip("/") or "/"
+    descendant_prefix = prefix if prefix == "/" else f"{prefix}/"
+    return observed == prefix or observed.startswith(descendant_prefix)
+
+
+@dataclasses.dataclass(frozen=True)
+class _AbsentProcessObservation:
+    pid: int
+    start_ticks: int
+    cgroup_path: str
+    mount_namespace: str
+    kernel_thread: bool = False
+
+
+_PF_KTHREAD = 0x00200000
+
+
+@dataclasses.dataclass(frozen=True)
+class _ProcessStat:
+    start_ticks: int
+    flags: int
+
+
+def _read_process_stat(pid_dir: Path) -> _ProcessStat | None:
+    try:
+        stat_text = (pid_dir / "stat").read_text(encoding="ascii")
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeError) as exc:
+        raise Refusal(
+            f"process generation is indeterminate because {pid_dir / 'stat'} "
+            f"is unreadable: {exc}"
+        ) from exc
+    close = stat_text.rfind(")")
+    fields = stat_text[close + 2 :].split() if close >= 0 else []
+    try:
+        flags = int(fields[6])
+        ticks = int(fields[19])
+    except (IndexError, ValueError) as exc:
+        raise Refusal(f"process generation is invalid for PID {pid_dir.name}") from exc
+    if flags < 0 or ticks <= 0:
+        raise Refusal(f"process generation is invalid for PID {pid_dir.name}")
+    return _ProcessStat(start_ticks=ticks, flags=flags)
+
+
+def _process_start_ticks(pid_dir: Path) -> int | None:
+    process_stat = _read_process_stat(pid_dir)
+    return None if process_stat is None else process_stat.start_ticks
+
+
+def _process_is_zombie(pid_dir: Path) -> bool:
+    try:
+        status = (pid_dir / "status").read_text(encoding="ascii")
+    except FileNotFoundError:
+        return True
+    except (OSError, UnicodeError) as exc:
+        raise Refusal(
+            f"process state is indeterminate because {pid_dir / 'status'} is unreadable: {exc}"
+        ) from exc
+    state = next(
+        (line.split(maxsplit=1)[1] for line in status.splitlines() if line.startswith("State:")),
+        None,
+    )
+    if state is None:
+        raise Refusal(f"process state is missing for PID {pid_dir.name}")
+    return state.startswith(("Z", "X"))
+
+
+def _absent_validate_process_snapshot(
+    proc_root: Path = Path("/proc"),
+) -> tuple[_AbsentProcessObservation, ...]:
+    try:
+        pid_dirs = sorted(
+            (path for path in proc_root.iterdir() if path.name.isdigit()),
+            key=lambda path: int(path.name),
+        )
+    except OSError as exc:
+        raise Refusal(f"cannot enumerate live processes: {exc}") from exc
+    observations: list[_AbsentProcessObservation] = []
+    for pid_dir in pid_dirs:
+        generation = _read_process_stat(pid_dir)
+        if generation is None:
+            continue
+        try:
+            if _process_uid(pid_dir) is None:
+                continue
+            cgroup = _read_process_cgroup(pid_dir)
+            mount_namespace = _mount_namespace(pid_dir)
+        except Refusal:
+            if _process_start_ticks(pid_dir) is None:
+                continue
+            raise
+        if mount_namespace is None:
+            if _process_is_zombie(pid_dir):
+                continue
+            if _process_start_ticks(pid_dir) is None:
+                continue
+            raise Refusal(f"mount namespace is indeterminate for live PID {pid_dir.name}")
+        current_generation = _read_process_stat(pid_dir)
+        if current_generation is None:
+            continue
+        if current_generation.start_ticks != generation.start_ticks:
+            raise _ProcessEvidenceChanged(
+                f"process generation changed while reading PID {pid_dir.name}"
+            )
+        observations.append(
+            _AbsentProcessObservation(
+                pid=int(pid_dir.name),
+                start_ticks=generation.start_ticks,
+                cgroup_path=cgroup,
+                mount_namespace=mount_namespace,
+                kernel_thread=bool(generation.flags & _PF_KTHREAD),
+            )
+        )
+    return tuple(observations)
+
+
+def _mountinfo_path_references(
+    pid: int, budget: _ReadOnlyCommandBudget
+) -> tuple[tuple[Path, str], ...]:
+    path = Path("/proc") / str(pid) / "mountinfo"
+    try:
+        budget.remaining_seconds()
+        if budget.input_remaining <= 0:
+            raise Refusal("mountinfo census exhausted its operation-wide byte bound")
+        contents = _read_bounded_regular_file(
+            path,
+            f"mount evidence for PID {pid}",
+            min(_MOUNTINFO_FILE_BYTES_LIMIT, budget.input_remaining),
+        )
+        budget.reserve_input(len(contents))
+        budget.remaining_seconds()
+        text = contents.decode("utf-8", errors="surrogateescape")
+    except (OSError, UnicodeError) as exc:
+        raise Refusal(f"mount evidence is indeterminate for PID {pid}: {exc}") from exc
+    return _parse_mountinfo_paths(text, f"mount evidence for PID {pid}")
+
+
+def _absent_validate_mount_match(
+    processes: Sequence[_AbsentProcessObservation],
+    targets: Mapping[Path, str],
+    budget: _ReadOnlyCommandBudget | None = None,
+) -> tuple[int, str, str, str] | None:
+    selected_budget = budget or _ReadOnlyCommandBudget.start(
+        timeout_seconds=_ABSENT_PROCESS_CENSUS_SECONDS,
+        stdout_limit=16 * 1024 * 1024,
+        stderr_limit=64 * 1024,
+        input_limit=_MOUNTINFO_CENSUS_BYTES_LIMIT,
+    )
+    namespaces: dict[str, list[_AbsentProcessObservation]] = {}
+    for process in processes:
+        namespaces.setdefault(process.mount_namespace, []).append(process)
+    for representatives in namespaces.values():
+        selected: _AbsentProcessObservation | None = None
+        references: tuple[tuple[Path, str], ...] = ()
+        failures: list[tuple[_AbsentProcessObservation, Refusal]] = []
+        for process in representatives:
+            try:
+                candidate_references = _mountinfo_path_references(
+                    process.pid, selected_budget
+                )
+            except Refusal as exc:
+                failures.append((process, exc))
+                continue
+            if _process_start_ticks(Path("/proc") / str(process.pid)) != process.start_ticks:
+                continue
+            selected = process
+            references = candidate_references
+            break
+        if selected is None:
+            for process, failure in failures:
+                if _process_start_ticks(Path("/proc") / str(process.pid)) == process.start_ticks:
+                    raise failure
+            continue
+        for observed, detail in references:
+            matched = _matching_absent_validate_target(observed, targets)
+            if matched is not None:
+                _target, slot = matched
+                return selected.pid, slot, "mount", detail
+    return None
+
+
+def _root_owned_executable(path: Path, label: str) -> Path:
+    try:
+        resolved = path.resolve(strict=True)
+        metadata = resolved.stat()
+    except OSError as exc:
+        raise Refusal(f"{label} is unavailable: {exc}") from exc
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_mode & 0o022
+        or not os.access(resolved, os.X_OK)
+    ):
+        raise Refusal(f"{label} is not a root-owned, non-writable executable: {resolved}")
+    return resolved
+
+
+@dataclasses.dataclass
+class _ReadOnlyCommandBudget:
+    """One deadline and byte budget shared by every child in a census."""
+
+    deadline: float
+    stdout_remaining: int
+    stderr_remaining: int
+    input_remaining: int
+
+    @classmethod
+    def start(
+        cls,
+        *,
+        timeout_seconds: float,
+        stdout_limit: int,
+        stderr_limit: int,
+        input_limit: int = 16 * 1024 * 1024,
+    ) -> "_ReadOnlyCommandBudget":
+        return cls(
+            deadline=time.monotonic() + timeout_seconds,
+            stdout_remaining=stdout_limit,
+            stderr_remaining=stderr_limit,
+            input_remaining=input_limit,
+        )
+
+    def remaining_seconds(self) -> float:
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise Refusal("read-only census exceeded its operation-wide time bound")
+        return remaining
+
+    def reserve_input(self, size: int) -> None:
+        if size > self.input_remaining:
+            raise Refusal("read-only census exceeded its operation-wide input bound")
+        self.input_remaining -= size
+
+    def consume_output(self, stdout: bytes, stderr: bytes) -> None:
+        self.stdout_remaining -= len(stdout)
+        self.stderr_remaining -= len(stderr)
+        if self.stdout_remaining < 0 or self.stderr_remaining < 0:
+            raise Refusal("read-only census exceeded its operation-wide output bound")
+
+
+def _run_bounded_read_only_command(
+    command: Sequence[str],
+    *,
+    timeout_seconds: float = 60.0,
+    stdout_limit: int = 16 * 1024 * 1024,
+    stderr_limit: int = 64 * 1024,
+    env_overrides: Mapping[str, str] | None = None,
+    input_data: bytes | None = None,
+) -> tuple[int, bytes, bytes]:
+    if input_data is not None and len(input_data) > 1024 * 1024:
+        raise Refusal("privileged read-only census input exceeds 1 MiB")
+    environment = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"}
+    if env_overrides is not None:
+        environment.update(env_overrides)
+    try:
+        process = subprocess.Popen(
+            list(command),
+            stdin=subprocess.PIPE if input_data is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd="/",
+            env=environment,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        raise Refusal(f"cannot start privileged read-only census: {exc}") from exc
+    assert process.stdout is not None and process.stderr is not None
+    stdout_buffer = bytearray()
+    stderr_buffer = bytearray()
+    streams = {
+        process.stdout.fileno(): (
+            process.stdout,
+            stdout_buffer,
+            stdout_limit,
+            "stdout",
+        ),
+        process.stderr.fileno(): (
+            process.stderr,
+            stderr_buffer,
+            stderr_limit,
+            "stderr",
+        ),
+    }
+    selector = selectors.DefaultSelector()
+    for stream, _buffer, _limit, _label in streams.values():
+        os.set_blocking(stream.fileno(), False)
+        selector.register(stream, selectors.EVENT_READ)
+    input_offset = 0
+    if input_data is not None:
+        assert process.stdin is not None
+        os.set_blocking(process.stdin.fileno(), False)
+        selector.register(process.stdin, selectors.EVENT_WRITE)
+    deadline = time.monotonic() + timeout_seconds
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise Refusal(f"privileged read-only census exceeded {timeout_seconds:g}s")
+            ready = selector.select(min(remaining, 1.0))
+            if not ready and process.poll() is not None:
+                ready = [(key, selectors.EVENT_READ) for key in selector.get_map().values()]
+            for key, _mask in ready:
+                if process.stdin is not None and key.fileobj is process.stdin:
+                    assert input_data is not None
+                    try:
+                        written = os.write(
+                            key.fd, input_data[input_offset : input_offset + 64 * 1024]
+                        )
+                    except BlockingIOError:
+                        continue
+                    except BrokenPipeError:
+                        written = len(input_data) - input_offset
+                    input_offset += written
+                    if input_offset == len(input_data):
+                        selector.unregister(process.stdin)
+                        process.stdin.close()
+                    continue
+                stream, buffer, limit, label = streams[key.fd]
+                try:
+                    chunk = os.read(key.fd, 64 * 1024)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(stream)
+                    continue
+                buffer.extend(chunk)
+                if len(buffer) > limit:
+                    raise Refusal(f"privileged read-only census {label} exceeded {limit} bytes")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise Refusal(f"privileged read-only census exceeded {timeout_seconds:g}s")
+        returncode = process.wait(timeout=remaining)
+    except (Refusal, subprocess.TimeoutExpired) as exc:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
+        if isinstance(exc, subprocess.TimeoutExpired):
+            raise Refusal(f"privileged read-only census exceeded {timeout_seconds:g}s") from exc
+        raise
+    finally:
+        selector.close()
+        if process.stdin is not None and not process.stdin.closed:
+            process.stdin.close()
+        process.stdout.close()
+        process.stderr.close()
+    return returncode, bytes(stdout_buffer), bytes(stderr_buffer)
+
+
+def _run_root_owned_command(
+    program: Path,
+    arguments: Sequence[str],
+    *,
+    input_data: bytes | None = None,
+    budget: _ReadOnlyCommandBudget | None = None,
+) -> tuple[int, bytes, bytes]:
+    sudo = _root_owned_executable(Path("/usr/bin/sudo"), "sudo")
+    executable = _root_owned_executable(program, program.name)
+    command = [str(sudo), "-n", "-u", "root", "--", str(executable), *arguments]
+    if sum(len(os.fsencode(argument)) + 1 for argument in command) > 64 * 1024:
+        raise Refusal("privileged read-only census command exceeds the 64 KiB argv bound")
+    selected_budget = budget or _ReadOnlyCommandBudget.start(
+        timeout_seconds=60,
+        stdout_limit=16 * 1024 * 1024,
+        stderr_limit=64 * 1024,
+    )
+    selected_budget.reserve_input(0 if input_data is None else len(input_data))
+    stdout_limit = selected_budget.stdout_remaining
+    stderr_limit = selected_budget.stderr_remaining
+    if stdout_limit <= 0 or stderr_limit <= 0:
+        raise Refusal("read-only census exhausted its operation-wide output bound")
+    result = _run_bounded_read_only_command(
+        command,
+        timeout_seconds=selected_budget.remaining_seconds(),
+        stdout_limit=stdout_limit,
+        stderr_limit=stderr_limit,
+        input_data=input_data,
+    )
+    selected_budget.consume_output(result[1], result[2])
+    return result
+
+
+def _argument_batches(
+    prefix: Sequence[str],
+    items: Sequence[str],
+    suffix: Sequence[str],
+    *,
+    budget: int = 48 * 1024,
+) -> tuple[tuple[str, ...], ...]:
+    fixed = sum(len(os.fsencode(argument)) + 1 for argument in (*prefix, *suffix))
+    if fixed >= budget:
+        raise Refusal("privileged read-only census fixed arguments exceed the argv bound")
+    batches: list[tuple[str, ...]] = []
+    current: list[str] = []
+    used = fixed
+    for item in items:
+        size = len(os.fsencode(item)) + 1
+        if fixed + size > budget:
+            raise Refusal("one privileged read-only census argument exceeds the argv bound")
+        if current and used + size > budget:
+            batches.append((*prefix, *current, *suffix))
+            current = []
+            used = fixed
+        current.append(item)
+        used += size
+    if current:
+        batches.append((*prefix, *current, *suffix))
+    return tuple(batches)
+
+
+def _process_symlink_roots(
+    processes: Sequence[_AbsentProcessObservation],
+) -> tuple[str, ...]:
+    roots: list[str] = []
+    for process in processes:
+        base = Path("/proc") / str(process.pid)
+        roots.extend(str(base / name) for name in ("cwd", "root"))
+        # Linux intentionally exposes no /proc/PID/exe target for kernel threads.
+        # Omitting that one known-absent link avoids treating expected kernel state
+        # as an incomplete census; every userspace process must still expose it.
+        if not process.kernel_thread:
+            roots.append(str(base / "exe"))
+        roots.append(str(base / "fd"))
+    return tuple(roots)
+
+
+def _pid_from_proc_evidence(path: Path) -> int:
+    parts = path.parts
+    if len(parts) < 4 or parts[1] != "proc" or not parts[2].isdigit():
+        raise Refusal(f"privileged process evidence names an unexpected path: {path}")
+    return int(parts[2])
+
+
+_FIND_MISSING_RE = re.compile(
+    r"^/usr/bin/find: '/proc/(?P<pid>[0-9]+)(?:/[^']*)?': " r"No such file or directory$"
+)
+_GREP_MISSING_RE = re.compile(
+    r"^/usr/bin/grep: /proc/(?P<pid>[0-9]+)/maps: No such file or directory$"
+)
+
+
+def _process_generation_is_current(process: _AbsentProcessObservation) -> bool:
+    return _process_start_ticks(Path("/proc") / str(process.pid)) == process.start_ticks
+
+
+def _allow_only_vanished_process_diagnostics(
+    program: str,
+    returncode: int,
+    stderr: bytes,
+    processes: Mapping[int, _AbsentProcessObservation],
+) -> None:
+    if returncode == 0 and not stderr:
+        return
+    if program == "grep" and returncode == 1 and not stderr:
+        return
+    expected_error = 1 if program == "find" else 2
+    if returncode != expected_error:
+        raise Refusal(f"privileged {program} census refused with exit {returncode}")
+    if returncode == 0 or not stderr:
+        raise Refusal(
+            f"privileged {program} census returned exit {returncode} with "
+            "inconsistent diagnostics"
+        )
+    try:
+        lines = stderr.decode("ascii").splitlines()
+    except UnicodeError as exc:
+        raise Refusal(f"privileged {program} census diagnostics are undecodable") from exc
+    pattern = _FIND_MISSING_RE if program == "find" else _GREP_MISSING_RE
+    for line in lines:
+        match = pattern.fullmatch(line)
+        process = processes.get(int(match.group("pid"))) if match else None
+        if process is None or _process_generation_is_current(process):
+            raise Refusal(f"privileged {program} census produced diagnostics: {line}")
+
+
+def _absent_validate_find_match(
+    processes: Sequence[_AbsentProcessObservation],
+    targets: Mapping[Path, str],
+    budget: _ReadOnlyCommandBudget | None = None,
+) -> tuple[int, str, str, str] | None:
+    roots = _process_symlink_roots(processes)
+    if not roots:
+        return None
+    suffix = (
+        "-ignore_readdir_race",
+        "-maxdepth",
+        "1",
+        "-type",
+        "l",
+        "-printf",
+        "%p\\0%l\\0",
+    )
+    observed_by_pid = {process.pid: process for process in processes}
+    chunks: list[bytes] = []
+    for arguments in _argument_batches(("-P",), roots, suffix):
+        batch_pids = {
+            _pid_from_proc_evidence(Path(argument))
+            for argument in arguments[1 : len(arguments) - len(suffix)]
+        }
+        batch_processes = {
+            pid: observed_by_pid[pid] for pid in batch_pids if pid in observed_by_pid
+        }
+        returncode, stdout, stderr = _run_root_owned_command(
+            Path("/usr/bin/find"), arguments, budget=budget
+        )
+        _allow_only_vanished_process_diagnostics("find", returncode, stderr, batch_processes)
+        chunks.append(stdout)
+    output = b"".join(chunks)
+    fields = output.split(b"\0")
+    if fields and fields[-1] == b"":
+        fields.pop()
+    if len(fields) % 2:
+        raise Refusal("privileged find census returned a truncated record")
+    for index in range(0, len(fields), 2):
+        try:
+            evidence_path = Path(fields[index].decode("utf-8", errors="surrogateescape"))
+            raw_target = fields[index + 1].decode("utf-8", errors="surrogateescape")
+        except UnicodeError as exc:
+            raise Refusal(f"privileged find census is undecodable: {exc}") from exc
+        pid = _pid_from_proc_evidence(evidence_path)
+        process = observed_by_pid.get(pid)
+        if process is None:
+            raise Refusal(f"privileged find census returned an unexpected PID: {pid}")
+        observed = Path(os.path.normpath(raw_target.removesuffix(" (deleted)")))
+        matched = _matching_absent_validate_target(observed, targets)
+        if matched is None:
+            continue
+        if not _process_generation_is_current(process):
+            raise _ProcessEvidenceChanged(
+                f"PID {pid} generation changed during privileged find census"
+            )
+        _target, slot = matched
+        return pid, slot, "link", raw_target
+    return None
+
+
+def _absent_validate_maps_match(
+    processes: Sequence[_AbsentProcessObservation],
+    targets: Mapping[Path, str],
+    budget: _ReadOnlyCommandBudget | None = None,
+) -> tuple[int, str, str, str] | None:
+    files = [str(Path("/proc") / str(process.pid) / "maps") for process in processes]
+    if not files:
+        return None
+    patterns: list[str] = []
+    for target in sorted(targets, key=str):
+        text = str(target)
+        if "\n" in text or "\0" in text:
+            raise Refusal("validation paths containing line or NUL bytes cannot be probed")
+        patterns.append(text)
+    pattern_input = ("\n".join(patterns) + "\n").encode("utf-8")
+    observed_by_pid = {process.pid: process for process in processes}
+    chunks: list[bytes] = []
+    for arguments in _argument_batches(("-F", "-H", "-f", "-", "--"), files, ()):
+        batch_pids = {_pid_from_proc_evidence(Path(argument)) for argument in arguments[5:]}
+        batch_processes = {
+            pid: observed_by_pid[pid] for pid in batch_pids if pid in observed_by_pid
+        }
+        returncode, stdout, stderr = _run_root_owned_command(
+            Path("/usr/bin/grep"), arguments, input_data=pattern_input, budget=budget
+        )
+        if returncode not in {0, 1, 2}:
+            raise Refusal(f"privileged grep census refused with exit {returncode}")
+        _allow_only_vanished_process_diagnostics("grep", returncode, stderr, batch_processes)
+        chunks.append(stdout)
+    output = b"".join(chunks)
+    for raw_line in output.splitlines():
+        raw_path, separator, raw_mapping = raw_line.partition(b":")
+        if not separator:
+            raise Refusal("privileged grep census returned an unframed maps record")
+        try:
+            evidence_path = Path(raw_path.decode("ascii"))
+            mapping = raw_mapping.decode("utf-8", errors="surrogateescape")
+        except UnicodeError as exc:
+            raise Refusal(f"privileged grep census is undecodable: {exc}") from exc
+        fields = mapping.split(maxsplit=5)
+        if len(fields) != 6:
+            raise Refusal("privileged grep census returned a malformed maps record")
+        observed = Path(fields[5].removesuffix(" (deleted)"))
+        if not observed.is_absolute():
+            continue
+        matched = _matching_absent_validate_target(observed, targets)
+        if matched is not None:
+            pid = _pid_from_proc_evidence(evidence_path)
+            process = observed_by_pid.get(pid)
+            if process is None:
+                raise Refusal(f"privileged grep census returned an unexpected PID: {pid}")
+            if not _process_generation_is_current(process):
+                raise _ProcessEvidenceChanged(
+                    f"PID {pid} generation changed during privileged maps census"
+                )
+            _target, slot = matched
+            return pid, slot, "map", str(observed)
+    return None
+
+
+def _absent_validate_privileged_path_match(
+    processes: Sequence[_AbsentProcessObservation],
+    targets: Mapping[Path, str],
+    budget: _ReadOnlyCommandBudget | None = None,
+) -> tuple[int, str, str, str] | None:
+    return _absent_validate_find_match(processes, targets, budget) or _absent_validate_maps_match(
+        processes, targets, budget
+    )
+
+
+def _assert_absent_validate_processes_unrelated(
+    rows: Sequence[tuple[ActiveRecord, tuple[Path, ...]]],
+) -> tuple[_AbsentProcessObservation, ...]:
+    targets = {path: record.slot for record, row_paths in rows for path in row_paths}
+    budget = _ReadOnlyCommandBudget.start(
+        timeout_seconds=_ABSENT_PROCESS_CENSUS_SECONDS,
+        stdout_limit=16 * 1024 * 1024,
+        stderr_limit=64 * 1024,
+        input_limit=_MOUNTINFO_CENSUS_BYTES_LIMIT,
+    )
+    for attempt in range(3):
+        try:
+            processes = _absent_validate_process_snapshot()
+            match = _absent_validate_mount_match(processes, targets, budget)
+            if match is not None:
+                pid, slot, kind, detail = match
+                raise Refusal(
+                    f"live process {pid} may still use validation row {slot}: " f"{kind}={detail}"
+                )
+            match = _absent_validate_privileged_path_match(processes, targets, budget)
+        except _ProcessEvidenceChanged:
+            if attempt < 2:
+                continue
+            raise Refusal(
+                "relevant process evidence changed during three liveness attempts"
+            )
+        if match is not None:
+            pid, slot, kind, detail = match
+            observed = next((process for process in processes if process.pid == pid), None)
+            if observed is None or (
+                _process_start_ticks(Path("/proc") / str(pid)) != observed.start_ticks
+            ):
+                continue
+            raise Refusal(
+                f"live process {pid} may still use validation row {slot}: " f"{kind}={detail}"
+            )
+        return processes
+    raise Refusal(
+        "all-process liveness proof is indeterminate because relevant process "
+        "evidence changed during three attempts"
+    )
+
+
+def _run_user_systemctl(
+    arguments: Sequence[str], budget: _ReadOnlyCommandBudget
+) -> str:
+    systemctl = _root_owned_executable(Path("/usr/bin/systemctl"), "systemctl")
+    stdout_limit = budget.stdout_remaining
+    stderr_limit = budget.stderr_remaining
+    if stdout_limit <= 0 or stderr_limit <= 0:
+        raise Refusal("user-systemd census exhausted its operation-wide output bound")
+    returncode, stdout, stderr = _run_bounded_read_only_command(
+        [str(systemctl), "--user", *arguments],
+        timeout_seconds=budget.remaining_seconds(),
+        stdout_limit=stdout_limit,
+        stderr_limit=stderr_limit,
+        env_overrides=_user_bus_environment(),
+    )
+    budget.consume_output(stdout, stderr)
+    if returncode != 0:
+        detail = (stderr or stdout).decode("utf-8", errors="replace").strip().splitlines()
+        raise Refusal("cannot enumerate user-systemd state" + (f": {detail[0]}" if detail else ""))
+    if stderr:
+        raise Refusal(
+            "cannot enumerate user-systemd state: "
+            + stderr.decode("utf-8", errors="replace").splitlines()[0]
+        )
+    try:
+        return stdout.decode("utf-8")
+    except UnicodeError as exc:
+        raise Refusal(f"cannot decode user-systemd state: {exc}") from exc
+
+
+def _user_bus_environment() -> dict[str, str]:
+    uid = os.getuid()
+    expected = Path(f"/run/user/{uid}")
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime != str(expected):
+        raise Refusal(f"XDG_RUNTIME_DIR must be the current user's runtime directory {expected}")
+    try:
+        metadata = expected.lstat()
+    except OSError as exc:
+        raise Refusal(f"cannot inspect XDG_RUNTIME_DIR {expected}: {exc}") from exc
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != uid
+        or metadata.st_mode & 0o022
+    ):
+        raise Refusal(f"XDG_RUNTIME_DIR is not a private owned directory: {expected}")
+    result = {"XDG_RUNTIME_DIR": str(expected)}
+    address = os.environ.get("DBUS_SESSION_BUS_ADDRESS")
+    if address is None:
+        return result
+    prefix = "unix:path="
+    if not address.startswith(prefix) or any(token in address for token in (",", ";")):
+        raise Refusal("DBUS_SESSION_BUS_ADDRESS is not one local unix:path endpoint")
+    path = Path(address.removeprefix(prefix))
+    if not path.is_absolute() or path.parent != expected:
+        raise Refusal("DBUS_SESSION_BUS_ADDRESS is outside XDG_RUNTIME_DIR")
+    try:
+        socket_metadata = path.lstat()
+    except OSError as exc:
+        raise Refusal(f"cannot inspect DBUS_SESSION_BUS_ADDRESS socket {path}: {exc}") from exc
+    if not stat.S_ISSOCK(socket_metadata.st_mode) or socket_metadata.st_uid != uid:
+        raise Refusal("DBUS_SESSION_BUS_ADDRESS is not an owned unix socket")
+    result["DBUS_SESSION_BUS_ADDRESS"] = address
+    return result
+
+
+def _user_systemd_snapshot() -> tuple[Mapping[str, str], ...]:
+    budget = _ReadOnlyCommandBudget.start(
+        timeout_seconds=30,
+        stdout_limit=1024 * 1024,
+        stderr_limit=64 * 1024,
+    )
+    listed = _run_user_systemctl(
+        (
+            "list-units",
+            "--all",
+            "--type=service",
+            "--type=scope",
+            "--no-legend",
+            "--plain",
+            "--no-pager",
+        ),
+        budget,
+    )
+    units: list[str] = []
+    for line in listed.splitlines():
+        if not line.strip():
+            continue
+        unit = line.split(maxsplit=1)[0]
+        if not unit.endswith((".service", ".scope")) or any(
+            character.isspace() for character in unit
+        ):
+            raise Refusal(f"cannot parse user-systemd unit listing: {line!r}")
+        units.append(unit)
+    jobs_text = _run_user_systemctl(
+        ("list-jobs", "--all", "--no-legend", "--plain", "--no-pager"),
+        budget,
+    )
+    jobs: set[str] = set()
+    for line in jobs_text.splitlines():
+        if not line.strip() or line.strip() == "No jobs running.":
+            continue
+        fields = line.split()
+        if (
+            len(fields) < 2
+            or not fields[0].isdigit()
+            or not fields[1].endswith((".service", ".scope"))
+        ):
+            raise Refusal(f"cannot parse user-systemd job listing: {line!r}")
+        jobs.add(fields[1])
+    names = tuple(dict.fromkeys((*units, *sorted(jobs))))
+    if not names:
+        return ()
+    properties = (
+        "Id",
+        "LoadState",
+        "ActiveState",
+        "SubState",
+        "MainPID",
+        "ControlGroup",
+        "WorkingDirectory",
+        "ExecStart",
+        "ExecStartPre",
+        "ExecStartPost",
+        "ExecReload",
+        "ExecStop",
+        "ExecStopPost",
+        "Environment",
+        "EnvironmentFiles",
+        "RootDirectory",
+        "RootImage",
+        "BindPaths",
+        "BindReadOnlyPaths",
+        "ReadWritePaths",
+        "ReadOnlyPaths",
+        "InaccessiblePaths",
+        "RequiresMountsFor",
+        "StandardInput",
+        "StandardOutput",
+        "StandardError",
+    )
+    shown = _run_user_systemctl(
+        (
+            "show",
+            *names,
+            *(f"--property={name}" for name in properties),
+            "--no-pager",
+        ),
+        budget,
+    )
+    blocks = [block for block in shown.split("\n\n") if block.strip()]
+    parsed: dict[str, dict[str, str]] = {}
+    for block in blocks:
+        values: dict[str, str] = {}
+        for line in block.splitlines():
+            key, separator, value = line.partition("=")
+            if not separator or key in values:
+                raise Refusal(f"cannot parse user-systemd properties: {line!r}")
+            values[key] = value
+        if "Id" not in values:
+            raise Refusal("user-systemd property block has no unit identity")
+        for name in properties:
+            values.setdefault(name, "")
+        unit = values["Id"]
+        if unit in parsed or unit not in names:
+            raise Refusal(f"user-systemd returned an unexpected unit: {unit!r}")
+        values["PendingJob"] = "yes" if unit in jobs else "no"
+        parsed[unit] = values
+    if set(parsed) != set(names):
+        missing = sorted(set(names) - set(parsed))
+        raise Refusal(f"user-systemd state changed while it was enumerated: {missing[0]}")
+    return tuple(parsed[name] for name in names)
+
+
+def _assert_retained_handle_processes_dead(
+    bindings: Mapping[str, tuple[_RetainedValidationHandle, ...]],
+) -> None:
+    current_boot = _boot_id(Path("/proc"))
+    for slot, handles in bindings.items():
+        for handle in handles:
+            if handle.pid is None:
+                continue
+            assert handle.start_ticks is not None and handle.boot_id is not None
+            if handle.boot_id != current_boot:
+                continue
+            if _process_start_ticks(Path("/proc") / str(handle.pid)) == handle.start_ticks:
+                raise Refusal(
+                    f"retained validation handle {handle.path} has live exact process "
+                    f"generation {handle.pid} for row {slot}"
+                )
+
+
+def _assert_absent_validate_systemd_unrelated(
+    rows: Sequence[tuple[ActiveRecord, tuple[Path, ...]]],
+    bindings: Mapping[str, tuple[_RetainedValidationHandle, ...]],
+    processes: Sequence[_AbsentProcessObservation],
+) -> None:
+    snapshot = _user_systemd_snapshot()
+    by_name = {unit["Id"]: unit for unit in snapshot}
+    for slot, handles in bindings.items():
+        for handle in handles:
+            if any(
+                handle.unit in Path(process.cgroup_path).parts for process in processes
+            ):
+                raise Refusal(
+                    f"retained validation unit {handle.unit} still has a live cgroup "
+                    f"process for row {slot}"
+                )
+            unit = by_name.get(handle.unit)
+            if unit is None:
+                continue
+            active = unit["ActiveState"] not in {"inactive", "failed"}
+            queued = unit["PendingJob"] == "yes"
+            if active or queued:
+                raise Refusal(
+                    f"retained validation unit {handle.unit} may still use row {slot}"
+                )
+            control_group = unit["ControlGroup"].rstrip("/") or "/"
+            if control_group != "/" and any(
+                _cgroup_matches(control_group, process.cgroup_path) for process in processes
+            ):
+                raise Refusal(
+                    f"retained validation unit {handle.unit} still has a live process "
+                    f"for row {slot}"
+                )
+    for unit in snapshot:
+        active = unit["ActiveState"] not in {"inactive", "failed"}
+        queued = unit["PendingJob"] == "yes"
+        if not active and not queued:
+            continue
+        observed = "\n".join(unit.values())
+        for record, paths in rows:
+            for path in paths:
+                if str(path) in observed:
+                    raise Refusal(
+                        f"user-systemd unit {unit['Id']} names validation row "
+                        f"{record.slot} path {path}"
+                    )
+
+
+def _assert_absent_validate_owners_dead(records: Sequence[ActiveRecord]) -> None:
+    current_host = _host_id()
+    current_boot = _boot_id(Path("/proc"))
+    for record in records:
+        owner = record.owner
+        if owner is None:
+            raise Refusal(f"validation row {record.slot} has no exact owner process generation")
+        if owner.host_id != current_host:
+            raise Refusal(f"recorded owner host is indeterminate for validation row {record.slot}")
+        if owner.boot_id != current_boot:
+            continue
+        ticks = _process_start_ticks(Path("/proc") / str(owner.pid))
+        if ticks is None or ticks != owner.start_ticks:
+            continue
+        raise Refusal(
+            f"recorded owner PID {owner.pid} generation is still live for validation "
+            f"row {record.slot}"
+        )
+
+
+def _assert_absent_validate_rows_safe(config: Config, records: Sequence[ActiveRecord]) -> None:
+    if not records:
+        return
+    _assert_absent_validate_rows_not_held(config, records)
+    rows = _assert_absent_validate_rows_storage(config, records)
+    _assert_absent_validate_owners_dead(records)
+    bindings = _retained_handles_for_absent_rows(config, rows)
+    _assert_retained_handle_processes_dead(bindings)
+    processes = _assert_absent_validate_processes_unrelated(rows)
+    _assert_absent_validate_systemd_unrelated(rows, bindings, processes)
+
+
+def _absent_validate_archive_entry(
+    record: ActiveRecord,
+    item: AbsentValidateRow,
+    finished_at: str,
+) -> dict[str, object]:
+    value: dict[str, object] = {
+        "archive_id": f"{record.machine}:{record.slot}:{record.generation}:{finished_at}",
+        "slot": record.slot,
+        "agent": record.agent,
+        "task": record.task,
+        "purpose": record.purpose,
+        "slot_type": record.slot_type,
+        "machine": record.machine,
+        "generation": record.generation,
+        "created_at": record.created_at,
+        "finished_at": finished_at,
+        "mode": "remove",
+        "actor": "coordinator",
+        # `physical_storage` is the archive-time disposition, not a claim that
+        # this command performed the removal.  Keeping the established schema-2
+        # shape lets older fail-closed readers consume the repaired archive.
+        "physical_storage": "removed",
+        "validation": [
+            "registry reconciliation confirmed physical storage absent",
+            f"source ACTIVE record SHA-256: {item.record_sha256}",
+        ],
+        "limitations": ["validation outcome unknown"],
+        "continuation": "no storage remains; consult retained validation records by run identity",
+        "salvage": [],
+        "checkouts": [_checkout_to_obj(checkout) for checkout in record.checkouts],
+    }
+    if record.layout is not None:
+        value["layout"] = record.layout
+    if record.import_source is not None:
+        value["import_source"] = _import_source_to_obj(record.import_source)
+    return value
+
+
+def _absent_validate_recovery_evidence(
+    item: AbsentValidateRow, archived: Mapping[str, object]
+) -> dict[str, object]:
+    """Build the typed event evidence shared by archive and ACTIVE removal."""
+
+    return {
+        "archive_id": _as_str(
+            archived.get("archive_id"), "absent-validation-row archive_id"
+        ),
+        "source_record_sha256": item.record_sha256,
+        "validation_outcome": "unknown",
+    }
+
+
+def _archive_matches_absent_validate_row(
+    archive: ArchiveState,
+    archived: Mapping[str, object],
+    item: AbsentValidateRow,
+) -> bool:
+    return bool(
+        archive.machine == item.machine
+        and
+        archived.get("slot") == item.slot
+        and archived.get("machine") == item.machine
+        and archived.get("generation") == item.generation
+        and archived.get("slot_type") == "validate"
+        and archived.get("physical_storage") == "removed"
+        and (item.slot, item.generation, item.record_sha256)
+        in archive.absent_validate_recoveries
+    )
+
+
+def _append_absent_validate_archives(
+    config: Config,
+    state: ArchiveState,
+    additions_to_write: Sequence[tuple[AbsentValidateRow, Mapping[str, object]]],
+    writer: _EventWriter,
+) -> ArchiveState:
+    if not additions_to_write:
+        return state
+    records = [*state.records]
+    revision = state.revision
+    additions: list[tuple[AbsentValidateRow, dict[str, object], int, int]] = []
+    for item, raw_entry in additions_to_write:
+        entry = dict(raw_entry)
+        slot = _as_str(entry.get("slot"), "absent-validation-row archive slot")
+        if slot != item.slot:
+            raise StateError("absent-validation-row archive entry has mismatched input")
+        previous_revision = revision
+        revision += 1
+        records.append(entry)
+        additions.append((item, entry, previous_revision, revision))
+    updated = _archive_from_obj(
+        config,
+        {
+            "schema": SCHEMA,
+            "machine": state.machine,
+            "revision": revision,
+            "records": records,
+        },
+        state.machine,
+        "absent-validation-row derived archive",
+    )
+    recovery_identities = set(state.absent_validate_recoveries)
+    recovery_identities.update(
+        (item.slot, item.generation, item.record_sha256)
+        for item, _entry, _previous_revision, _next_revision in additions
+    )
+    updated = dataclasses.replace(
+        updated, absent_validate_recoveries=frozenset(recovery_identities)
+    )
+    for item, entry, previous_revision, next_revision in additions:
+        writer.append(
+            "archive-state-recorded",
+            {
+                "action": "absent-validation-row-recovered",
+                "slot": item.slot,
+                "previous_revision": previous_revision,
+                "revision": next_revision,
+                "record": entry,
+                "evidence": _absent_validate_recovery_evidence(item, entry),
+            },
+        )
+        _interrupt_for_test("after-absent-validate-archive")
+    return updated
+
+
+def _validate_absent_validate_row(record: ActiveRecord, item: AbsentValidateRow) -> None:
+    if record.slot_type != "validate":
+        raise Refusal(f"slot {item.slot} is not a validation row")
+    if record.machine != item.machine or record.generation != item.generation:
+        raise Refusal(f"validation row {item.machine}/{item.slot} generation changed")
+    digest = _record_sha256(record)
+    if digest != item.record_sha256:
+        raise Refusal(
+            f"validation row {item.machine}/{item.slot} changed: expected "
+            f"{item.record_sha256}, found {digest}"
+        )
+
+
+def _assert_absent_validate_row_is_local(record: ActiveRecord) -> None:
+    recorded = {record.coordinator_lease.host_id}
+    if record.owner is not None:
+        recorded.add(record.owner.host_id)
+    if "" in recorded or len(recorded) != 1:
+        raise Refusal(
+            f"validation row {record.machine}/{record.slot} has missing or mixed stable "
+            "host identities"
+        )
+    expected = next(iter(recorded))
+    current = _host_id()
+    if expected != current:
+        raise Refusal(
+            f"validation row {record.machine}/{record.slot} belongs to stable host "
+            f"{expected}, not current host {current}"
+        )
+
+
+def _absent_validate_rows_state(
+    config: Config,
+    items: Sequence[AbsentValidateRow],
+    *,
+    allow_exact_overlap: bool,
+) -> tuple[list[ActiveState], list[ArchiveState]]:
+    states = _load_all_active(config)
+    archives = _load_all_archives(config)
+    allowed = {(item.machine, item.slot): item for item in items}
+    active = {record.slot: (state.machine, record) for state in states for record in state.slots}
+    for archive in archives:
+        for archived in archive.records:
+            slot = _as_str(archived.get("slot"), "archive slot")
+            current = active.get(slot)
+            if current is None:
+                continue
+            active_machine, active_record = current
+            item = allowed.get((active_machine, slot))
+            if not (
+                allow_exact_overlap
+                and item is not None
+                and archive.machine == active_machine
+                and _archive_matches_absent_validate_row(archive, archived, item)
+            ):
+                raise StateError(
+                    f"slot {slot!r} is active on {active_machine} and archived on "
+                    f"{archive.machine}"
+                )
+            _validate_absent_validate_row(active_record, item)
+    return states, archives
+
+
+def _plan_absent_validate_rows(
+    config: Config,
+    items: Sequence[AbsentValidateRow],
+) -> tuple[tuple[AbsentValidateRow, ActiveRecord, dict[str, object]], ...]:
+    if any(item.machine != config.machine for item in items):
+        raise Refusal(
+            f"every input row must name selected machine {config.machine}; use --machine "
+            "for another shard"
+        )
+    states, archives = _absent_validate_rows_state(config, items, allow_exact_overlap=False)
+    active_by_identity = {
+        (state.machine, record.slot): record for state in states for record in state.slots
+    }
+    archived_by_identity = {
+        (archive.machine, _as_str(record.get("slot"), "archive slot")): (
+            archive,
+            record,
+        )
+        for archive in archives
+        for record in archive.records
+    }
+    planned: list[tuple[AbsentValidateRow, ActiveRecord, dict[str, object]]] = []
+    active_records: list[ActiveRecord] = []
+    for item in items:
+        identity = (item.machine, item.slot)
+        record = active_by_identity.get(identity)
+        archived_pair = archived_by_identity.get(identity)
+        if record is None:
+            if archived_pair is not None and _archive_matches_absent_validate_row(
+                archived_pair[0], archived_pair[1], item
+            ):
+                continue
+            raise Refusal(
+                f"validation row {item.machine}/{item.slot} is neither active nor an "
+                "exact prior absent-row recovery"
+            )
+        _validate_absent_validate_row(record, item)
+        _assert_absent_validate_row_is_local(record)
+        if archived_pair is not None:
+            raise StateError(f"validation row {item.slot} is both active and archived")
+        active_records.append(record)
+        finished_at = _utc_now()
+        planned.append((item, record, _absent_validate_archive_entry(record, item, finished_at)))
+    _assert_absent_validate_rows_safe(config, active_records)
+    return tuple(planned)
+
+
+def _already_recovered_absent_validate_keys(
+    archives: Sequence[ArchiveState], items: Sequence[AbsentValidateRow]
+) -> set[tuple[str, str, int]]:
+    """Return requested identities backed by an exact typed recovery event."""
+
+    requested = {(item.machine, item.slot): item for item in items}
+    recovered: set[tuple[str, str, int]] = set()
+    for archive in archives:
+        for archived in archive.records:
+            slot = _as_str(archived.get("slot"), "archive slot")
+            item = requested.get((archive.machine, slot))
+            if item is not None and _archive_matches_absent_validate_row(
+                archive, archived, item
+            ):
+                recovered.add((item.machine, item.slot, item.generation))
+    return recovered
+
+
+def _absent_validate_batch_journal(
+    config: Config,
+    input_sha256: str,
+    planned: Sequence[tuple[AbsentValidateRow, ActiveRecord, Mapping[str, object]]],
+    coordinator: ProcessIdentity,
+) -> dict[str, object]:
+    return {
+        "schema": SCHEMA,
+        "kind": "recover-absent-validate-rows",
+        "machine": config.machine,
+        "host_id": _host_id(),
+        "slot": "absent-validate-rows",
+        "input_sha256": input_sha256,
+        "cursor": 0,
+        "actor": _identity_to_obj(coordinator),
+        "items": [
+            {
+                "input": dataclasses.asdict(item),
+                "record": _record_to_obj(record),
+                "archive_entry": dict(archive_entry),
+            }
+            for item, record, archive_entry in planned
+        ],
+    }
+
+
+def _absent_validate_batch_items(
+    config: Config, raw: Mapping[str, object]
+) -> tuple[int, tuple[tuple[AbsentValidateRow, ActiveRecord, dict[str, object]], ...]]:
+    _exact_keys(
+        raw,
+        {
+            "schema",
+            "kind",
+            "machine",
+            "host_id",
+            "slot",
+            "input_sha256",
+            "cursor",
+            "actor",
+            "items",
+        },
+        set(),
+        "absent-validation-row journal",
+    )
+    if (
+        _as_int(raw["schema"], "absent-validation-row journal.schema") != SCHEMA
+        or raw["kind"] != "recover-absent-validate-rows"
+        or raw["machine"] != config.machine
+        or raw["slot"] != "absent-validate-rows"
+    ):
+        raise StateError("absent-validation-row journal identity is invalid")
+    input_digest = _as_str(raw["input_sha256"], "absent-validation-row journal.input_sha256")
+    if not DIGEST_RE.fullmatch(input_digest):
+        raise StateError("absent-validation-row journal input digest is invalid")
+    actor = _identity_from_obj(raw["actor"], "absent-validation-row journal.actor")
+    if actor is None:
+        raise StateError("absent-validation-row journal has no actor")
+    if not _as_str(raw["host_id"], "absent-validation-row journal.host_id"):
+        raise StateError("absent-validation-row journal has no stable host identity")
+    result: list[tuple[AbsentValidateRow, ActiveRecord, dict[str, object]]] = []
+    for index, value in enumerate(_as_list(raw["items"], "absent-validation-row journal.items")):
+        label = f"absent-validation-row journal.items[{index}]"
+        entry = _as_mapping(value, label)
+        _exact_keys(entry, {"input", "record", "archive_entry"}, set(), label)
+        input_raw = _as_mapping(entry["input"], f"{label}.input")
+        _exact_keys(
+            input_raw,
+            {"machine", "slot", "generation", "record_sha256"},
+            set(),
+            f"{label}.input",
+        )
+        item = AbsentValidateRow(
+            machine=_validate_name(
+                _as_str(input_raw["machine"], f"{label}.input.machine"), "machine"
+            ),
+            slot=_validate_name(_as_str(input_raw["slot"], f"{label}.input.slot"), "slot"),
+            generation=_as_int(input_raw["generation"], f"{label}.input.generation", minimum=1),
+            record_sha256=_as_str(input_raw["record_sha256"], f"{label}.input.record_sha256"),
+        )
+        if item.machine != config.machine or not DIGEST_RE.fullmatch(item.record_sha256):
+            raise StateError(f"{label}.input identity is invalid")
+        record = _record_from_obj(entry["record"], f"{label}.record")
+        _validate_absent_validate_row(record, item)
+        archive_entry = dict(_as_mapping(entry["archive_entry"], f"{label}.archive_entry"))
+        finished_at = _as_str(
+            archive_entry.get("finished_at"), f"{label}.archive_entry.finished_at"
+        )
+        _parse_timestamp(finished_at, f"{label}.archive_entry.finished_at")
+        expected = _absent_validate_archive_entry(record, item, finished_at)
+        if not _json_equal(archive_entry, expected):
+            raise StateError(f"{label}.archive_entry differs from its exact input row")
+        result.append((item, record, archive_entry))
+    if not result:
+        raise StateError("absent-validation-row journal has no items")
+    if len({(item.machine, item.slot) for item, _record, _entry in result}) != len(result):
+        raise StateError("absent-validation-row journal repeats a row")
+    cursor = _as_int(raw["cursor"], "absent-validation-row journal.cursor", minimum=0)
+    if cursor > len(result):
+        raise StateError("absent-validation-row journal cursor exceeds its item count")
+    return cursor, tuple(result)
+
+
+def _recover_absent_validate_rows(
+    config: Config,
+    path: Path,
+    raw: Mapping[str, object],
+    coordinator: ProcessIdentity,
+    *,
+    safety_prechecked: bool = False,
+) -> tuple[AbsentValidateRow, ...]:
+    if path != _journal_path(config):
+        raise StateError("absent-validation-row journal filename is invalid")
+    local_machine = _short_hostname()
+    if config.machine != local_machine:
+        raise Refusal(
+            f"absent validation rows belong to {config.machine}, but liveness evidence "
+            f"is local to {local_machine}; run this command on {config.machine}"
+        )
+    journal_host = _as_str(raw.get("host_id"), "absent-validation-row journal.host_id")
+    current_host = _host_id()
+    if journal_host != current_host:
+        raise Refusal(
+            "absent-validation-row journal belongs to another host identity; "
+            "resume it on the host that created it"
+        )
+    _assert_caller_process(coordinator, "coordinator")
+    cursor, items = _absent_validate_batch_items(config, raw)
+    journal = dict(raw)
+    states, archives = _absent_validate_rows_state(
+        config,
+        tuple(item for item, _record, _entry in items),
+        allow_exact_overlap=True,
+    )
+    active_state = next(state for state in states if state.machine == config.machine)
+    archive_state = next(state for state in archives if state.machine == config.machine)
+    active_by_slot = {record.slot: record for record in active_state.slots}
+    archived_by_slot = {
+        _as_str(entry.get("slot"), "archive slot"): (archive_state, entry)
+        for entry in archive_state.records
+    }
+    current_records: list[ActiveRecord] = []
+    archive_presence: list[bool] = []
+    for index, (item, recorded, archive_entry) in enumerate(items):
+        _assert_absent_validate_row_is_local(recorded)
+        current = active_by_slot.get(item.slot)
+        archived_pair = archived_by_slot.get(item.slot)
+        archived = None if archived_pair is None else archived_pair[1]
+        if current is not None:
+            _validate_absent_validate_row(current, item)
+            if _record_to_obj(current) != _record_to_obj(recorded):
+                raise StateError(f"validation row {item.slot} differs from its journal snapshot")
+        if archived_pair is not None and (
+            not _json_equal(archived_pair[1], archive_entry)
+            or not _archive_matches_absent_validate_row(
+                archived_pair[0], archived_pair[1], item
+            )
+        ):
+            raise StateError(
+                f"archive entry for {item.slot} differs from its typed journal identity"
+            )
+        if current is None and archived is None:
+            raise StateError(f"validation row {item.slot} disappeared without its archive entry")
+        archive_presence.append(archived is not None)
+        if current is not None:
+            current_records.append(current)
+    archived_prefix = next(
+        (index for index, present in enumerate(archive_presence) if not present),
+        len(archive_presence),
+    )
+    if any(archive_presence[archived_prefix:]):
+        raise StateError("absent-validation-row archives do not form a durable prefix")
+    if cursor > archived_prefix:
+        raise StateError("absent-validation-row journal cursor passed its durable archive prefix")
+    if archived_prefix < len(items) and len(current_records) != len(items):
+        raise StateError(
+            "absent-validation-row batch lost ACTIVE rows before all archives were durable"
+        )
+    presence = [item.slot in active_by_slot for item, _record, _entry in items]
+    first_present = next(
+        (index for index, present in enumerate(presence) if present), len(presence)
+    )
+    if any(not present for present in presence[first_present:]):
+        raise StateError("absent-validation-row ACTIVE removals do not form a durable prefix")
+    if not safety_prechecked and archived_prefix < len(items):
+        _assert_absent_validate_rows_safe(config, current_records)
+    before_states, before_archives = states, archives
+    target_slots = {item.slot for item, _record, _entry in items}
+    before = {
+        key: value
+        for key, value in _global_rows(before_states, before_archives).items()
+        if key[2] not in target_slots
+    }
+    writer = _event_writer(config, config.machine)
+    missing_archives = [
+        (item, entry) for item, _record, entry in items[archived_prefix:]
+    ]
+    if missing_archives:
+        archive_state = _append_absent_validate_archives(
+            config, archive_state, missing_archives, writer
+        )
+        for item, _record, archive_entry in items[archived_prefix:]:
+            archived_by_slot[item.slot] = (archive_state, archive_entry)
+    if cursor != len(items):
+        journal["cursor"] = len(items)
+        _write_journal(config, journal, event_writer=writer)
+        _interrupt_for_test("after-absent-validate-row")
+    _atomic_write_json(_archive_path(config, archive_state.machine), _archive_to_obj(archive_state))
+    remaining = [
+        record
+        for item, _recorded, _archive_entry in items
+        if (record := active_by_slot.get(item.slot)) is not None
+    ]
+    if remaining:
+        _assert_absent_validate_rows_safe(config, remaining)
+        active_state = _write_active_rows_removed(
+            config,
+            active_state,
+            tuple(record.slot for record in remaining),
+            evidence_by_slot={
+                item.slot: _absent_validate_recovery_evidence(item, entry)
+                for item, _record, entry in items
+            },
+            event_writer=writer,
+        )
+        _interrupt_for_test("after-absent-validate-active-delete")
+    # EVENTS is authoritative.  A crash can occur after either append-only
+    # transition and before its compatibility snapshot; rematerialize both
+    # views before declaring the journal complete.
+    _atomic_write_json(_archive_path(config, archive_state.machine), _archive_to_obj(archive_state))
+    _atomic_write_json(_active_path(config, active_state.machine), _active_to_obj(active_state))
+    states, archives = _validate_global_state(config)
+    active_by_identity = {
+        (state.machine, record.slot): record for state in states for record in state.slots
+    }
+    archived_by_identity = {
+        (archive.machine, _as_str(record.get("slot"), "archive slot")): (
+            archive,
+            record,
+        )
+        for archive in archives
+        for record in archive.records
+    }
+    for item, _record, archive_entry in items:
+        identity = (item.machine, item.slot)
+        if active_by_identity.get(identity) is not None:
+            raise StateError(f"absent-validation-row recovery retained {item.slot} in ACTIVE")
+        found_archive = archived_by_identity.get(identity)
+        if (
+            found_archive is None
+            or not _json_equal(found_archive[1], archive_entry)
+            or not _archive_matches_absent_validate_row(
+                found_archive[0], found_archive[1], item
+            )
+        ):
+            raise StateError(f"absent-validation-row recovery lost archive {item.slot}")
+    after = {
+        key: value
+        for key, value in _global_rows(states, archives).items()
+        if key[2] not in target_slots
+    }
+    if after != before:
+        raise StateError("absent-validation-row recovery changed an unrelated registry row")
+    _clear_journal(config, journal, event_writer=writer)
+    return tuple(item for item, _record, _entry in items)
+
+
+def _emit_absent_validate_outcomes(
+    rows: Sequence[tuple[AbsentValidateRow, str, str]], output_format: str
+) -> None:
+    output_rows: list[dict[str, object]] = [
+        {
+            "machine": item.machine,
+            "slot": item.slot,
+            "generation": item.generation,
+            "outcome": outcome,
+            "detail": detail,
+        }
+        for item, outcome, detail in rows
+    ]
+    payload: dict[str, object] = {
+        "schema": 1,
+        "rows": output_rows,
+    }
+    if output_format == "json":
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    for row in output_rows:
+        print(
+            f"ROW machine={row['machine']} slot={row['slot']} "
+            f"generation={row['generation']} outcome={row['outcome']} "
+            f"detail={json.dumps(row['detail'])}"
+        )
+
+
+def _cmd_recover_absent_validate_rows(args: argparse.Namespace) -> int:
+    config = _load_config(args.project_root, args.machine)
+    input_sha256, requested = _read_absent_validate_rows_input(config, args.input)
+    already_recovered_keys: set[tuple[str, str, int]] = set()
+    try:
+        local_machine = _short_hostname()
+        if config.machine != local_machine:
+            raise Refusal(
+                f"absent validation rows belong to {config.machine}, but liveness evidence "
+                f"is local to {local_machine}; run this command on {config.machine}"
+            )
+        if args.apply:
+            _require_coordinator_authorized(args, "absent validation row recovery")
+            if args.coordinator_pid is None:
+                raise Refusal("--apply requires --coordinator-pid")
+            coordinator = _capture_caller_process(args.coordinator_pid, "coordinator")
+        else:
+            coordinator = None
+        with _mutation_locks(config, args.wait_lock):
+            _refuse_partial_state(config)
+            journals = _outstanding_journals(config)
+            if journals:
+                if len(journals) != 1:
+                    raise StateError("multiple interrupted mutations require inspection")
+                path, raw = _load_journal(config)
+                if raw.get("kind") != "recover-absent-validate-rows":
+                    raise Refusal(
+                        f"another interrupted mutation is recorded in {path}; "
+                        "run wrkslots recover"
+                    )
+                if raw.get("input_sha256") != input_sha256:
+                    raise Refusal("absent-validation-row input differs from the interrupted batch")
+                _cursor, items = _absent_validate_batch_items(config, raw)
+                journal_keys = {
+                    (item.machine, item.slot, item.generation) for item, _record, _entry in items
+                }
+                already_recovered_keys = _already_recovered_absent_validate_keys(
+                    _load_all_archives(config), requested
+                )
+                unaccounted = [
+                    item
+                    for item in requested
+                    if (item.machine, item.slot, item.generation)
+                    not in journal_keys | already_recovered_keys
+                ]
+                if unaccounted:
+                    item = unaccounted[0]
+                    raise Refusal(
+                        f"validation row {item.machine}/{item.slot} is not in the "
+                        "interrupted batch and has no exact prior recovery"
+                    )
+                if not args.apply:
+                    _emit_absent_validate_outcomes(
+                        [
+                            (
+                                item,
+                                (
+                                    "planned"
+                                    if (item.machine, item.slot, item.generation) in journal_keys
+                                    else "already-recovered"
+                                ),
+                                (
+                                    "resume the recorded batch"
+                                    if (item.machine, item.slot, item.generation) in journal_keys
+                                    else "exact archive already exists"
+                                ),
+                            )
+                            for item in requested
+                        ],
+                        args.format,
+                    )
+                    return 0
+                assert coordinator is not None
+                _recover_absent_validate_rows(config, path, raw, coordinator)
+                _emit_absent_validate_outcomes(
+                    [
+                        (
+                            item,
+                            (
+                                "recovered"
+                                if (item.machine, item.slot, item.generation) in journal_keys
+                                else "already-recovered"
+                            ),
+                            (
+                                "archived with validation outcome unknown"
+                                if (item.machine, item.slot, item.generation) in journal_keys
+                                else "exact archive already existed"
+                            ),
+                        )
+                        for item in requested
+                    ],
+                    args.format,
+                )
+                return 0
+            states, archives = _validate_global_state(config)
+            before = _global_rows(states, archives)
+            already_recovered_keys = _already_recovered_absent_validate_keys(
+                archives, requested
+            )
+            planned = _plan_absent_validate_rows(config, requested)
+            planned_keys = {
+                (item.machine, item.slot, item.generation) for item, _record, _entry in planned
+            }
+            if not args.apply:
+                _emit_absent_validate_outcomes(
+                    [
+                        (
+                            item,
+                            (
+                                "planned"
+                                if (item.machine, item.slot, item.generation) in planned_keys
+                                else "already-recovered"
+                            ),
+                            (
+                                f"read-only plan input_sha256={input_sha256}"
+                                if (item.machine, item.slot, item.generation) in planned_keys
+                                else "exact archive already exists"
+                            ),
+                        )
+                        for item in requested
+                    ],
+                    args.format,
+                )
+                return 0
+            assert coordinator is not None
+            if planned:
+                journal = _absent_validate_batch_journal(config, input_sha256, planned, coordinator)
+                _write_journal(config, journal)
+                _interrupt_for_test("after-absent-validate-batch-journal")
+                _recover_absent_validate_rows(
+                    config,
+                    _journal_path(config),
+                    journal,
+                    coordinator,
+                    safety_prechecked=True,
+                )
+                after_states, after_archives = _validate_global_state(config)
+                target_slots = {item.slot for item in requested}
+                if {
+                    key: value
+                    for key, value in _global_rows(after_states, after_archives).items()
+                    if key[2] not in target_slots
+                } != {key: value for key, value in before.items() if key[2] not in target_slots}:
+                    raise StateError("absent-validation-row recovery changed an unrelated row")
+            _emit_absent_validate_outcomes(
+                [
+                    (
+                        item,
+                        (
+                            "recovered"
+                            if (item.machine, item.slot, item.generation) in planned_keys
+                            else "already-recovered"
+                        ),
+                        (
+                            "archived with validation outcome unknown"
+                            if (item.machine, item.slot, item.generation) in planned_keys
+                            else "exact archive already existed"
+                        ),
+                    )
+                    for item in requested
+                ],
+                args.format,
+            )
+    except Refusal as exc:
+        _emit_absent_validate_outcomes(
+            [
+                (
+                    item,
+                    (
+                        "already-recovered"
+                        if (item.machine, item.slot, item.generation)
+                        in already_recovered_keys
+                        else "refused"
+                    ),
+                    (
+                        "exact archive already exists"
+                        if (item.machine, item.slot, item.generation)
+                        in already_recovered_keys
+                        else str(exc)
+                    ),
+                )
+                for item in requested
+            ],
+            args.format,
+        )
+        raise
+    return 0
+
+
 def _cmd_recover(args: argparse.Namespace) -> int:
     config = _load_config(args.project_root, args.machine)
     coordinator = _capture_caller_process(args.coordinator_pid, "coordinator")
@@ -10506,6 +12755,13 @@ def _cmd_recover(args: argparse.Namespace) -> int:
         kind = _as_str(raw.get("kind"), "journal.kind")
         if kind == "finish":
             states, archives = _validate_global_state_for_finish_recovery(config, raw)
+        elif kind == "recover-absent-validate-rows":
+            _cursor, batch_items = _absent_validate_batch_items(config, raw)
+            states, archives = _absent_validate_rows_state(
+                config,
+                tuple(item for item, _record, _entry in batch_items),
+                allow_exact_overlap=True,
+            )
         else:
             states, archives = _validate_global_state(config)
         before = _global_rows(states, archives)
@@ -10545,15 +12801,39 @@ def _cmd_recover(args: argparse.Namespace) -> int:
                     "--retry-running-hook and --abort-create apply only to create journals"
                 )
             _recover_ownerless_validation(config, path, raw, coordinator)
+        elif kind == "recover-absent-validate-rows":
+            if args.retry_running_hook or args.abort_create:
+                raise Refusal(
+                    "--retry-running-hook and --abort-create apply only to create journals"
+                )
+            try:
+                recovered = _recover_absent_validate_rows(config, path, raw, coordinator)
+            except Refusal as exc:
+                _emit_absent_validate_outcomes(
+                    [(item, "refused", str(exc)) for item, _record, _entry in batch_items],
+                    "human",
+                )
+                raise
+            _emit_absent_validate_outcomes(
+                [
+                    (
+                        item,
+                        "recovered",
+                        "archived with validation outcome unknown",
+                    )
+                    for item in recovered
+                ],
+                "human",
+            )
         else:
             raise StateError(f"unknown recovery journal kind {kind!r}")
         after_states, after_archives = _validate_global_state(config)
         after = _global_rows(after_states, after_archives)
-        if kind in {"legacy-validate-remove", "ownerless-validate-remove"}:
+        if kind == "recover-absent-validate-rows":
+            pass
+        elif kind in {"legacy-validate-remove", "ownerless-validate-remove"}:
             if after != before:
-                raise StateError(
-                    "legacy validation cleanup changed the registered slot state"
-                )
+                raise StateError("legacy validation cleanup changed the registered slot state")
         else:
             slot = _as_str(raw.get("slot"), "journal.slot")
             _assert_only_slot_changed(before, after, slot)
@@ -10658,7 +12938,7 @@ clean-caches without --only or --yes. unpushed refreshes remote-tracking refs
 but does not mutate registry state.
 Mutating: init, create, register, import-existing --apply, adopt,
 recover-unbound-owner, heartbeat, hold, unhold, clean-caches deletion, finish,
-read-handoff, remove, and recover. Registry mutations take a state lock and append
+read-handoff, remove, recover-absent-validate-rows --apply, and recover. Registry mutations take a state lock and append
 hash-linked events. ACTIVE and ARCHIVED are compatibility views derived from those events.
 Each slot binds an agent identity, coordinator process generation, and one or more linked Git
 worktrees to durable machine-sharded state. Removal fails closed unless the time-to-live,
@@ -10936,8 +13216,15 @@ usage or audit gate unknown, 3 fail-closed refusal.
         ),
     )
     create.add_argument("--agent", required=True, metavar="AGENT", help="registered agent name")
-    create.add_argument("--task", required=True, metavar="TASK", help="task or work-item identifier")
-    create.add_argument("--purpose", required=True, metavar="TEXT", help="short human-readable reason for the slot")
+    create.add_argument(
+        "--task", required=True, metavar="TASK", help="task or work-item identifier"
+    )
+    create.add_argument(
+        "--purpose",
+        required=True,
+        metavar="TEXT",
+        help="short human-readable reason for the slot",
+    )
     create.add_argument(
         "--owner-pid",
         type=int,
@@ -10989,18 +13276,39 @@ usage or audit gate unknown, 3 fail-closed refusal.
     )
     register.add_argument("slot", help="existing managed slot name")
     register.add_argument(
-        "--slot-type", choices=SLOT_TYPES,
+        "--slot-type",
+        choices=SLOT_TYPES,
         help="type recorded at registration; it controls whether reclaim must salvage",
     )
     register.add_argument(
-        "--coordinator-authorized", action="store_true",
+        "--coordinator-authorized",
+        action="store_true",
         help="confirm that the coordinator authorized this registration",
     )
     register.add_argument("--agent", required=True, metavar="AGENT", help="registered agent name")
-    register.add_argument("--task", required=True, metavar="TASK", help="task or work-item identifier")
-    register.add_argument("--purpose", required=True, metavar="TEXT", help="short human-readable reason for the slot")
-    register.add_argument("--owner-pid", type=int, required=True, metavar="PID", help="live owner PID to bind")
-    register.add_argument("--coordinator-pid", type=int, required=True, metavar="PID", help="live coordinator PID to bind")
+    register.add_argument(
+        "--task", required=True, metavar="TASK", help="task or work-item identifier"
+    )
+    register.add_argument(
+        "--purpose",
+        required=True,
+        metavar="TEXT",
+        help="short human-readable reason for the slot",
+    )
+    register.add_argument(
+        "--owner-pid",
+        type=int,
+        required=True,
+        metavar="PID",
+        help="live owner PID to bind",
+    )
+    register.add_argument(
+        "--coordinator-pid",
+        type=int,
+        required=True,
+        metavar="PID",
+        help="live coordinator PID to bind",
+    )
     register.add_argument(
         "--verified-live",
         action="store_true",
@@ -11037,19 +13345,47 @@ usage or audit gate unknown, 3 fail-closed refusal.
     )
     import_existing.add_argument("slot", help="existing managed slot name")
     import_existing.add_argument(
-        "--slot-type", choices=SLOT_TYPES,
+        "--slot-type",
+        choices=SLOT_TYPES,
         help="type to print or record; it controls whether reclaim must salvage",
     )
     import_existing.add_argument(
-        "--coordinator-authorized", action="store_true",
+        "--coordinator-authorized",
+        action="store_true",
         help="confirm that the coordinator authorized this import",
     )
-    import_existing.add_argument("--agent", metavar="AGENT", help="live agent name; historical import reads it from the source row")
-    import_existing.add_argument("--task", metavar="TASK", help="live task identifier; historical import reads it from the source row")
-    import_existing.add_argument("--purpose", metavar="TEXT", help="live purpose; historical import reads it from the source row")
-    import_existing.add_argument("--owner-pid", type=int, metavar="PID", help="live owner PID; required with --apply")
-    import_existing.add_argument("--coordinator-pid", type=int, metavar="PID", help="live coordinator PID; required with --apply")
-    import_existing.add_argument("--verified-live", action="store_true", help="confirm the existing worktrees are live; required with --apply")
+    import_existing.add_argument(
+        "--agent",
+        metavar="AGENT",
+        help="live agent name; historical import reads it from the source row",
+    )
+    import_existing.add_argument(
+        "--task",
+        metavar="TASK",
+        help="live task identifier; historical import reads it from the source row",
+    )
+    import_existing.add_argument(
+        "--purpose",
+        metavar="TEXT",
+        help="live purpose; historical import reads it from the source row",
+    )
+    import_existing.add_argument(
+        "--owner-pid",
+        type=int,
+        metavar="PID",
+        help="live owner PID; required with --apply",
+    )
+    import_existing.add_argument(
+        "--coordinator-pid",
+        type=int,
+        metavar="PID",
+        help="live coordinator PID; required with --apply",
+    )
+    import_existing.add_argument(
+        "--verified-live",
+        action="store_true",
+        help="confirm the existing worktrees are live; required with --apply",
+    )
     import_existing.add_argument(
         "--from-state-file",
         metavar="PATH",
@@ -11066,7 +13402,11 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "required because the older owner_sidecar did not record it"
         ),
     )
-    import_existing.add_argument("--apply", action="store_true", help="write the verified row instead of only printing it")
+    import_existing.add_argument(
+        "--apply",
+        action="store_true",
+        help="write the verified row instead of only printing it",
+    )
     _add_repo_options(import_existing)
     import_existing.set_defaults(handler=_cmd_import_existing)
 
@@ -11081,9 +13421,26 @@ usage or audit gate unknown, 3 fail-closed refusal.
         formatter_class=_HelpFormatter,
     )
     adopt.add_argument("slot", help="active slot awaiting an owner")
-    adopt.add_argument("--agent", required=True, metavar="AGENT", help="agent name already recorded on the slot")
-    adopt.add_argument("--owner-pid", type=int, required=True, metavar="PID", help="live owner PID to bind")
-    adopt.add_argument("--expected-generation", type=int, required=True, metavar="N", help="current slot generation; refuses stale callers")
+    adopt.add_argument(
+        "--agent",
+        required=True,
+        metavar="AGENT",
+        help="agent name already recorded on the slot",
+    )
+    adopt.add_argument(
+        "--owner-pid",
+        type=int,
+        required=True,
+        metavar="PID",
+        help="live owner PID to bind",
+    )
+    adopt.add_argument(
+        "--expected-generation",
+        type=int,
+        required=True,
+        metavar="N",
+        help="current slot generation; refuses stale callers",
+    )
     adopt.set_defaults(handler=_cmd_adopt)
 
     recover_unbound = subparsers.add_parser(
@@ -11115,8 +13472,20 @@ usage or audit gate unknown, 3 fail-closed refusal.
     )
     heartbeat.add_argument("slot", help="active slot name")
     heartbeat.add_argument("--agent", required=True, metavar="AGENT", help="recorded agent name")
-    heartbeat.add_argument("--owner-pid", type=int, required=True, metavar="PID", help="recorded live owner PID")
-    heartbeat.add_argument("--expected-generation", type=int, required=True, metavar="N", help="current slot generation")
+    heartbeat.add_argument(
+        "--owner-pid",
+        type=int,
+        required=True,
+        metavar="PID",
+        help="recorded live owner PID",
+    )
+    heartbeat.add_argument(
+        "--expected-generation",
+        type=int,
+        required=True,
+        metavar="N",
+        help="current slot generation",
+    )
     heartbeat.set_defaults(handler=_cmd_heartbeat)
 
     hold = subparsers.add_parser(
@@ -11184,10 +13553,33 @@ usage or audit gate unknown, 3 fail-closed refusal.
     )
     finish.add_argument("slot", help="active slot name")
     finish.add_argument("--agent", required=True, metavar="AGENT", help="recorded agent name")
-    finish.add_argument("--owner-pid", type=int, required=True, metavar="PID", help="recorded live owner PID")
-    finish.add_argument("--expected-generation", type=int, required=True, metavar="N", help="current slot generation")
-    finish.add_argument("--validation", action="append", required=True, metavar="TEXT", help="command and result evidence (repeatable)")
-    finish.add_argument("--limitation", action="append", metavar="TEXT", help="known limitation to retain (repeatable)")
+    finish.add_argument(
+        "--owner-pid",
+        type=int,
+        required=True,
+        metavar="PID",
+        help="recorded live owner PID",
+    )
+    finish.add_argument(
+        "--expected-generation",
+        type=int,
+        required=True,
+        metavar="N",
+        help="current slot generation",
+    )
+    finish.add_argument(
+        "--validation",
+        action="append",
+        required=True,
+        metavar="TEXT",
+        help="command and result evidence (repeatable)",
+    )
+    finish.add_argument(
+        "--limitation",
+        action="append",
+        metavar="TEXT",
+        help="known limitation to retain (repeatable)",
+    )
     finish.set_defaults(handler=_cmd_finish)
 
     remove = subparsers.add_parser(
@@ -11219,9 +13611,67 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "checks remain"
         ),
     )
-    remove.add_argument("--coordinator-pid", type=int, required=True, metavar="PID", help="live current coordinator PID recorded with the operation")
-    remove.add_argument("--expected-generation", type=int, required=True, metavar="N", help="current slot generation")
+    remove.add_argument(
+        "--coordinator-pid",
+        type=int,
+        required=True,
+        metavar="PID",
+        help="live current coordinator PID recorded with the operation",
+    )
+    remove.add_argument(
+        "--expected-generation",
+        type=int,
+        required=True,
+        metavar="N",
+        help="current slot generation",
+    )
     remove.set_defaults(handler=_cmd_remove)
+
+    recover_absent = subparsers.add_parser(
+        "recover-absent-validate-rows",
+        help="archive exact validation rows whose physical storage is already absent",
+        description=(
+            "Read a bounded JSON list of exact machine, slot, generation, and active-record "
+            "SHA-256 identities. The default is a read-only plan. --apply first proves every "
+            "named validation path is absent and unregistered, every retained run service and "
+            "process generation is dead, and no process or user-systemd unit may still use it. It "
+            "then archives each row with validation outcome unknown before deleting ACTIVE. "
+            "One append-only batch journal makes interruption and replay safe."
+        ),
+        formatter_class=_HelpFormatter,
+    )
+    recover_absent.add_argument(
+        "--input",
+        required=True,
+        metavar="FILE",
+        help=(
+            "JSON object {schema:1, rows:[{machine,slot,generation,record_sha256}, ...]}; "
+            "audit --format json reports record_sha256 for each registered row"
+        ),
+    )
+    recover_absent.add_argument(
+        "--apply",
+        action="store_true",
+        help="perform the preflighted archive-and-delete transitions; default is read-only",
+    )
+    recover_absent.add_argument(
+        "--coordinator-authorized",
+        action="store_true",
+        help="confirm explicit coordinator authorization; required with --apply",
+    )
+    recover_absent.add_argument(
+        "--coordinator-pid",
+        type=int,
+        metavar="PID",
+        help="live current coordinator PID; required with --apply",
+    )
+    recover_absent.add_argument(
+        "--format",
+        choices=("human", "json"),
+        default="human",
+        help="typed per-row outcome format (default: human)",
+    )
+    recover_absent.set_defaults(handler=_cmd_recover_absent_validate_rows)
 
     recover = subparsers.add_parser(
         "recover",
