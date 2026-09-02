@@ -32,6 +32,85 @@ from wrkslots import __version__
 
 VERSION = __version__
 SCHEMA = 2
+_CREATE_JOURNAL_REQUIRED = frozenset(
+    {
+        "schema",
+        "kind",
+        "machine",
+        "slot",
+        "agent",
+        "task",
+        "purpose",
+        "created_at",
+        "heartbeat_at",
+        "heartbeat_ttl_seconds",
+        "owner",
+        "coordinator_lease",
+        "planned",
+        "created",
+    }
+)
+_CREATE_JOURNAL_OPTIONAL = frozenset(
+    {
+        "slot_type",
+        "post_provision_hooks",
+        "hook_progress",
+        "hook_failure",
+        "failure_policy",
+    }
+)
+_IMPORT_JOURNAL_REQUIRED = frozenset(
+    {"schema", "kind", "machine", "slot", "record"}
+)
+_FINISH_JOURNAL_REQUIRED = frozenset(
+    {
+        "schema",
+        "kind",
+        "machine",
+        "slot",
+        "mode",
+        "actor",
+        "finished_at",
+        "archive_id",
+        "phase",
+        "fenced",
+        "removed",
+        "record",
+    }
+)
+_FINISH_JOURNAL_OPTIONAL = frozenset({"salvage", "validate_complete"})
+_LEGACY_VALIDATE_JOURNAL_REQUIRED = frozenset(
+    {
+        "schema",
+        "kind",
+        "machine",
+        "slot",
+        "phase",
+        "checkout",
+        "repository",
+        "completed_record",
+        "completed_record_sha256",
+        "head",
+        "actor",
+        "coordinator_authorized",
+    }
+)
+_OWNERLESS_VALIDATE_JOURNAL_REQUIRED = frozenset(
+    {"schema", "kind", "machine", "slot", "phase", "fenced", "authorization"}
+)
+_ABSENT_VALIDATE_JOURNAL_REQUIRED = frozenset(
+    {
+        "schema",
+        "kind",
+        "machine",
+        "host_id",
+        "slot",
+        "input_sha256",
+        "cursor",
+        "actor",
+        "items",
+    }
+)
 CONFIG_NAME = ".wrkslots.yml"
 # Configuration keys that may be absent. Absent is a meaning, not a default to
 # be materialised: no `max_active_slots` key means allocation is uncapped.
@@ -614,16 +693,24 @@ def _refuse_symlink(path: Path, label: str) -> None:
         raise StateError(f"cannot inspect {label} {path}: {exc}") from exc
 
 
-def _relative_inside(root: Path, raw: str, label: str) -> tuple[str, Path]:
+def _relative_inside_reference(
+    root: Path, raw: str, label: str
+) -> tuple[str, Path]:
+    """Validate a stored relative identity without inspecting its storage."""
+
     candidate = Path(raw)
     if candidate.is_absolute() or not candidate.parts or ".." in candidate.parts:
         raise Refusal(f"{label} must be a relative path inside {root}: {raw!r}")
     lexical = Path(os.path.normpath(str(candidate)))
     if lexical == Path("."):
         raise Refusal(f"{label} must not be the project root")
-    absolute = root / lexical
+    return lexical.as_posix(), root / lexical
+
+
+def _relative_inside(root: Path, raw: str, label: str) -> tuple[str, Path]:
+    lexical, absolute = _relative_inside_reference(root, raw, label)
     _ensure_no_symlink_components(root, absolute, label)
-    return lexical.as_posix(), absolute
+    return lexical, absolute
 
 
 def _ensure_no_symlink_components(root: Path, path: Path, label: str) -> None:
@@ -1739,7 +1826,12 @@ def _assert_import_source_matches_record(record: ActiveRecord, label: str) -> No
 
 
 def _active_from_obj(
-    config: Config, value: object, selected: str, label: str
+    config: Config,
+    value: object,
+    selected: str,
+    label: str,
+    *,
+    require_repository: bool = True,
 ) -> ActiveState:
     raw = _as_mapping(value, label)
     _exact_keys(raw, {"schema", "machine", "revision", "slots"}, set(), "active state")
@@ -1769,7 +1861,9 @@ def _active_from_obj(
             raise StateError(
                 f"slot {record.slot} says machine {record.machine}, expected shard {selected}"
             )
-        _assert_record_paths(config, record)
+        _assert_record_paths(
+            config, record, require_repository=require_repository
+        )
     return ActiveState(
         machine=actual_machine,
         revision=_as_int(raw["revision"], "active state.revision"),
@@ -1777,10 +1871,20 @@ def _active_from_obj(
     )
 
 
-def _load_active_snapshot(config: Config, machine: str | None = None) -> ActiveState:
+def _load_active_snapshot(
+    config: Config,
+    machine: str | None = None,
+    *,
+    require_repository: bool = True,
+) -> ActiveState:
     selected = machine or config.machine
     path = _active_path(config, selected)
-    return _active_from_obj(config, _read_json(path, "active state"), selected, str(path))
+    value = _read_json(path, "active state")
+    if require_repository:
+        return _active_from_obj(config, value, selected, str(path))
+    return _active_from_obj(
+        config, value, selected, str(path), require_repository=False
+    )
 
 
 def _active_to_obj(state: ActiveState) -> dict[str, object]:
@@ -1926,9 +2030,11 @@ def _archive_from_obj(
             ):
                 raise StateError(f"{label} differs from its historical source row")
         for checkout in checkouts:
-            expected, _destination = _checkout_path_for_layout(
-                config, slot, checkout.name, slot_type, record_layout
+            slot_path = _slot_directory(config, slot, slot_type)
+            destination = (
+                slot_path if record_layout == "flat" else slot_path / checkout.name
             )
+            expected = destination.relative_to(config.root).as_posix()
             if checkout.path != expected:
                 raise StateError(
                     f"{label} checkout {checkout.name} path escaped its archived slot"
@@ -2206,7 +2312,10 @@ def _absent_validate_recovery_event_evidence(
 
 
 def _states_from_events(
-    config: Config, machine: str
+    config: Config,
+    machine: str,
+    *,
+    require_repository: bool = True,
 ) -> tuple[ActiveState, ArchiveState] | None:
     events = _load_events(config, machine)
     if not events:
@@ -2225,12 +2334,21 @@ def _states_from_events(
         if kind == "state-imported":
             if active_revision is not None or archive_revision is not None:
                 raise StateError("append-only event log imports state more than once")
-            active = _active_from_obj(
-                config,
-                payload.get("active"),
-                machine,
-                "append-only imported active state",
-            )
+            if require_repository:
+                active = _active_from_obj(
+                    config,
+                    payload.get("active"),
+                    machine,
+                    "append-only imported active state",
+                )
+            else:
+                active = _active_from_obj(
+                    config,
+                    payload.get("active"),
+                    machine,
+                    "append-only imported active state",
+                    require_repository=False,
+                )
             archive = _archive_from_obj(
                 config,
                 payload.get("archive"),
@@ -2335,7 +2453,9 @@ def _states_from_events(
                         "append-only active-record event record identity does not "
                         f"match slot {slot} on machine {machine}"
                     )
-                _assert_record_paths(config, record)
+                _assert_record_paths(
+                    config, record, require_repository=require_repository
+                )
                 if current is not None and current.slot_type == "agent" and current.import_source is None:
                     active_agents.pop(current.agent, None)
                 if record.slot_type == "agent" and record.import_source is None:
@@ -2448,15 +2568,35 @@ def _states_from_events(
     )
 
 
-def _load_active(config: Config, machine: str | None = None) -> ActiveState:
+def _load_active(
+    config: Config,
+    machine: str | None = None,
+    *,
+    require_repository: bool = True,
+) -> ActiveState:
     selected = machine or config.machine
-    states = _states_from_events(config, selected)
-    return _load_active_snapshot(config, selected) if states is None else states[0]
+    states = _states_from_events(
+        config, selected, require_repository=require_repository
+    )
+    return (
+        _load_active_snapshot(
+            config, selected, require_repository=require_repository
+        )
+        if states is None
+        else states[0]
+    )
 
 
-def _load_archive(config: Config, machine: str | None = None) -> ArchiveState:
+def _load_archive(
+    config: Config,
+    machine: str | None = None,
+    *,
+    require_repository: bool = True,
+) -> ArchiveState:
     selected = machine or config.machine
-    states = _states_from_events(config, selected)
+    states = _states_from_events(
+        config, selected, require_repository=require_repository
+    )
     return _load_archive_snapshot(config, selected) if states is None else states[1]
 
 
@@ -2787,8 +2927,13 @@ def _state_machines(config: Config) -> tuple[str, ...]:
     return tuple(sorted(active | archive | events))
 
 
-def _load_all_active(config: Config) -> list[ActiveState]:
-    states = [_load_active(config, machine) for machine in _state_machines(config)]
+def _load_all_active(
+    config: Config, *, require_repository: bool = True
+) -> list[ActiveState]:
+    states = [
+        _load_active(config, machine, require_repository=require_repository)
+        for machine in _state_machines(config)
+    ]
     global_slots: dict[str, str] = {}
     global_agents: dict[str, str] = {}
     for state in states:
@@ -2807,8 +2952,13 @@ def _load_all_active(config: Config) -> list[ActiveState]:
     return states
 
 
-def _load_all_archives(config: Config) -> list[ArchiveState]:
-    archives = [_load_archive(config, machine) for machine in _state_machines(config)]
+def _load_all_archives(
+    config: Config, *, require_repository: bool = True
+) -> list[ArchiveState]:
+    archives = [
+        _load_archive(config, machine, require_repository=require_repository)
+        for machine in _state_machines(config)
+    ]
     slots: dict[str, str] = {}
     for archive in archives:
         for record in archive.records:
@@ -2823,9 +2973,11 @@ def _load_all_archives(config: Config) -> list[ArchiveState]:
 
 def _validate_global_state(
     config: Config,
+    *,
+    require_repository: bool = True,
 ) -> tuple[list[ActiveState], list[ArchiveState]]:
-    states = _load_all_active(config)
-    archives = _load_all_archives(config)
+    states = _load_all_active(config, require_repository=require_repository)
+    archives = _load_all_archives(config, require_repository=require_repository)
     active_slots = {
         record.slot: state.machine for state in states for record in state.slots
     }
@@ -2873,7 +3025,11 @@ def _validate_global_state_for_finish_recovery(
 
 
 def _registry_storage_inconsistencies(
-    config: Config, states: Sequence[ActiveState]
+    config: Config,
+    states: Sequence[ActiveState],
+    *,
+    tolerate_unavailable_repositories: bool = False,
+    additional_repositories: Sequence[Path] = (),
 ) -> tuple[StorageInconsistency, ...]:
     """Describe storage drift without weakening authoritative state validation.
 
@@ -2911,6 +3067,9 @@ def _registry_storage_inconsistencies(
         )
 
     records = [record for state in states for record in state.slots]
+    record_by_slot_identity = {
+        (record.slot_type, record.slot): record for record in records
+    }
     expected = {
         slot_type: {record.slot for record in records if record.slot_type == slot_type}
         for slot_type in SLOT_TYPES
@@ -2918,11 +3077,15 @@ def _registry_storage_inconsistencies(
     vcs = _GitVcs()
     listed_by_repository: dict[Path, set[Path]] = {}
     common_by_repository: dict[Path, Path] = {}
+    listed_by_common: dict[Path, set[Path]] = {}
+    recorded_by_common: dict[Path, set[Path]] = {}
+    source_by_common: dict[Path, Path] = {}
 
     for record in sorted(records, key=lambda item: (item.machine, item.slot)):
         slot_path = _slot_directory(config, record.slot, record.slot_type)
         slot_present = slot_path.exists() or slot_path.is_symlink()
         slot_safe = slot_path.is_dir() and not slot_path.is_symlink()
+        slot_inspectable = slot_safe
         if not slot_safe:
             kind = "unsafe-slot-directory" if slot_present else "row-without-directory"
             detail = (
@@ -2944,6 +3107,7 @@ def _registry_storage_inconsistencies(
             try:
                 actual = {entry.name for entry in slot_path.iterdir()}
             except OSError as exc:
+                slot_inspectable = False
                 note(
                     "slot-unreadable",
                     "row",
@@ -2953,44 +3117,67 @@ def _registry_storage_inconsistencies(
                     slot_type=record.slot_type,
                     machine=record.machine,
                 )
-                actual = set()
-            wanted = {checkout.name for checkout in record.checkouts}
-            allowed = set(wanted)
-            if record.slot_type == "agent":
-                allowed.add("HANDOFF.md")
-            for name in sorted(wanted - actual):
-                note(
-                    "missing-checkout",
-                    "row",
-                    f"record names checkout {name!r} but it is not in {slot_path}",
-                    "preserve the row and repair or recover the named checkout before mutation",
-                    slot=record.slot,
-                    slot_type=record.slot_type,
-                    machine=record.machine,
-                    checkout=name,
-                )
-            for name in sorted(actual - allowed):
-                note(
-                    "unexpected-entry",
-                    "row",
-                    f"slot holds {name!r}, which its record does not name",
-                    "inspect and register or relocate the unexpected entry; do not delete it "
-                    "to make the registry look consistent",
-                    slot=record.slot,
-                    slot_type=record.slot_type,
-                    machine=record.machine,
-                    checkout=name,
-                )
+            else:
+                wanted = {checkout.name for checkout in record.checkouts}
+                allowed = set(wanted)
+                if record.slot_type == "agent":
+                    allowed.add("HANDOFF.md")
+                for name in sorted(wanted - actual):
+                    note(
+                        "missing-checkout",
+                        "row",
+                        f"record names checkout {name!r} but it is not in {slot_path}",
+                        "preserve the row and repair or recover the named checkout before mutation",
+                        slot=record.slot,
+                        slot_type=record.slot_type,
+                        machine=record.machine,
+                        checkout=name,
+                    )
+                for name in sorted(actual - allowed):
+                    note(
+                        "unexpected-entry",
+                        "row",
+                        f"slot holds {name!r}, which its record does not name",
+                        "inspect and register or relocate the unexpected entry; do not delete it "
+                        "to make the registry look consistent",
+                        slot=record.slot,
+                        slot_type=record.slot_type,
+                        machine=record.machine,
+                        checkout=name,
+                    )
 
         for checkout in record.checkouts:
-            path = _stored_path(config, checkout.path, "checkout path")
-            _relative, repository = _stored_repository_path(config, checkout.repository)
-            if repository not in listed_by_repository:
-                # A source that is not one readable Git repository is ambiguous
-                # authority, not row-local storage drift, so let either call
-                # refuse the whole operation.
-                common_by_repository[repository] = vcs.common_directory(repository)
-                listed_by_repository[repository] = vcs.listed_worktrees(repository)
+            path = _stored_path_reference(config, checkout.path, "checkout path")
+            try:
+                _relative, repository = _stored_repository_path(
+                    config, checkout.repository
+                )
+                if repository not in listed_by_repository:
+                    common_by_repository[repository] = vcs.common_directory(repository)
+                    listed_by_repository[repository] = vcs.listed_worktrees(repository)
+            except Refusal as exc:
+                if not tolerate_unavailable_repositories:
+                    raise
+                note(
+                    "repository-evidence-unavailable",
+                    "row",
+                    f"cannot inspect repository for checkout {checkout.name}: {exc}",
+                    "restore the recorded source repository, then rerun 'wrkslots status'; "
+                    "no mutation may rely on unavailable Git evidence",
+                    slot=record.slot,
+                    slot_type=record.slot_type,
+                    machine=record.machine,
+                    checkout=checkout.name,
+                )
+                continue
+            common = common_by_repository[repository]
+            source_by_common.setdefault(common, repository)
+            listed_by_common.setdefault(common, set()).update(
+                listed_by_repository[repository]
+            )
+            recorded_by_common.setdefault(common, set()).add(path.absolute())
+            if not slot_inspectable:
+                continue
             registered = path.absolute() in listed_by_repository[repository]
             present = path.exists() or path.is_symlink()
             if not present:
@@ -3036,6 +3223,7 @@ def _registry_storage_inconsistencies(
             try:
                 checkout_root = vcs.repository_root(path)
                 checkout_common = vcs.common_directory(path)
+                vcs.head(path)
             except Refusal as exc:
                 note(
                     "git-worktree-unreadable",
@@ -3061,6 +3249,56 @@ def _registry_storage_inconsistencies(
                     checkout=checkout.name,
                 )
 
+    for repository in additional_repositories:
+        if repository not in listed_by_repository:
+            common_by_repository[repository] = vcs.common_directory(repository)
+            listed_by_repository[repository] = vcs.listed_worktrees(repository)
+        common = common_by_repository[repository]
+        source_by_common.setdefault(common, repository)
+        listed_by_common.setdefault(common, set()).update(
+            listed_by_repository[repository]
+        )
+
+    slot_roots = sorted(
+        _slot_roots(config).items(), key=lambda item: len(item[1].parts), reverse=True
+    )
+    for common, registered_paths in sorted(listed_by_common.items()):
+        source = source_by_common[common]
+        for registered_path in sorted(
+            registered_paths - recorded_by_common.get(common, set())
+        ):
+            managed = next(
+                (
+                    (slot_type, root)
+                    for slot_type, root in slot_roots
+                    if _path_is_within(registered_path, root)
+                ),
+                None,
+            )
+            if managed is None:
+                continue
+            slot_type, root = managed
+            relative = registered_path.relative_to(root)
+            slot = relative.parts[0] if relative.parts else None
+            matched_record = (
+                record_by_slot_identity.get((slot_type, slot))
+                if slot is not None
+                else None
+            )
+            note(
+                "git-registration-without-row",
+                "row" if matched_record is not None else "directory",
+                f"source repository {source} (Git common directory {common}) registers "
+                f"{registered_path} inside the managed {slot_type} root, but no active "
+                "checkout row for that repository names it",
+                f"inspect 'git -C {source} worktree list --porcelain'; restore and register "
+                "the live slot or remove the stale Git registration before reusing any "
+                "overlapping path",
+                slot=slot,
+                slot_type=slot_type,
+                machine=None if matched_record is None else matched_record.machine,
+            )
+
     for slot_type, root in _slot_roots(config).items():
         if not root.exists() and not root.is_symlink():
             continue
@@ -3077,9 +3315,9 @@ def _registry_storage_inconsistencies(
             actual = {
                 entry.name
                 for entry in root.iterdir()
-                if entry.is_dir()
-                and not entry.is_symlink()
+                if (entry.is_dir() or entry.is_symlink())
                 and not entry.name.startswith("EVENTS.")
+                and entry != config.control / "wrkslots"
                 and not (
                     slot_type == "agent"
                     and entry == _validate_slots_directory(config)
@@ -3125,6 +3363,199 @@ def _registry_storage_inconsistencies(
     )
 
 
+def _validate_journal_shape(
+    config: Config, path: Path, raw: Mapping[str, object]
+) -> None:
+    """Validate durable journal structure without inspecting or mutating its targets."""
+
+    if _as_int(raw.get("schema"), "recovery journal.schema") != SCHEMA:
+        raise StateError("unsupported recovery journal schema")
+    machine = _as_str(raw.get("machine"), "recovery journal.machine")
+    if path != _journal_path(config, machine):
+        raise StateError("recovery journal filename does not match its machine")
+    kind = _as_str(raw.get("kind"), "recovery journal.kind")
+    slot = _validate_name(
+        _as_str(raw.get("slot"), "recovery journal.slot"), "slot"
+    )
+    if kind == "create":
+        _exact_keys(
+            raw, _CREATE_JOURNAL_REQUIRED, _CREATE_JOURNAL_OPTIONAL, "create journal"
+        )
+        _validate_name(_as_str(raw["agent"], "create journal.agent"), "agent")
+        if not _as_str(raw["task"], "create journal.task") or not _as_str(
+            raw["purpose"], "create journal.purpose"
+        ):
+            raise StateError("create journal has an empty task or purpose")
+        _parse_timestamp(
+            _as_str(raw["created_at"], "create journal.created_at"),
+            "create journal.created_at",
+        )
+        _parse_timestamp(
+            _as_str(raw["heartbeat_at"], "create journal.heartbeat_at"),
+            "create journal.heartbeat_at",
+        )
+        _as_int(
+            raw["heartbeat_ttl_seconds"],
+            "create journal.heartbeat_ttl_seconds",
+            minimum=1,
+        )
+        _identity_from_obj(raw["owner"], "create journal.owner")
+        if (
+            _identity_from_obj(
+                raw["coordinator_lease"], "create journal.coordinator_lease"
+            )
+            is None
+        ):
+            raise StateError("create journal has no coordinator lease")
+        planned = _as_list(raw["planned"], "create journal.planned")
+        created = _as_list(raw["created"], "create journal.created")
+        if not planned:
+            raise StateError("create journal contains no planned checkouts")
+        for index, item in enumerate(planned):
+            _planned_from_obj(item, f"create journal.planned[{index}]")
+        for index, item in enumerate(created):
+            _checkout_from_obj(item, f"create journal.created[{index}]")
+        slot_type = _as_str(raw.get("slot_type", "agent"), "create journal.slot_type")
+        if slot_type not in SLOT_TYPES:
+            raise StateError("create journal has an invalid slot type")
+        _as_int(raw.get("hook_progress", 0), "create journal.hook_progress")
+        hooks = _as_list(
+            raw.get("post_provision_hooks", []),
+            "create journal.post_provision_hooks",
+        )
+        for index, hook in enumerate(hooks):
+            _validate_hook(
+                _as_str(hook, f"create journal.post_provision_hooks[{index}]")
+            )
+        failure = raw.get("hook_failure")
+        if failure is not None:
+            _as_mapping(failure, "create journal.hook_failure")
+        if "failure_policy" in raw:
+            _as_str(raw["failure_policy"], "create journal.failure_policy")
+    elif kind == "import-existing":
+        _exact_keys(raw, _IMPORT_JOURNAL_REQUIRED, set(), "import journal")
+        record = _record_from_obj(raw["record"], "import journal.record")
+        if record.machine != machine or record.slot != slot:
+            raise StateError("import journal record does not match its shard or slot")
+    elif kind == "finish":
+        _exact_keys(
+            raw, _FINISH_JOURNAL_REQUIRED, _FINISH_JOURNAL_OPTIONAL, "finish journal"
+        )
+        record = _record_from_obj(raw["record"], "finish journal.record")
+        if record.machine != machine or record.slot != slot:
+            raise StateError("finish journal record does not match its shard or slot")
+        mode = _as_str(raw["mode"], "finish journal.mode")
+        actor = _as_str(raw["actor"], "finish journal.actor")
+        if mode != "remove" or actor != "coordinator":
+            raise StateError("finish journal actor does not match its operation")
+        finished_at = _as_str(raw["finished_at"], "finish journal.finished_at")
+        _parse_timestamp(finished_at, "finish journal.finished_at")
+        expected_archive_id = f"{machine}:{record.slot}:{record.generation}:{finished_at}"
+        if _as_str(raw["archive_id"], "finish journal.archive_id") != expected_archive_id:
+            raise StateError("finish journal archive_id does not match its record")
+        phase = _as_str(raw["phase"], "finish journal.phase")
+        if phase not in {"prepared", "fenced", "removed"}:
+            raise StateError(f"unknown finish journal phase {phase!r}")
+        _as_str(raw["fenced"], "finish journal.fenced")
+        for index, item in enumerate(_as_list(raw["removed"], "finish journal.removed")):
+            _as_str(item, f"finish journal.removed[{index}]")
+        for index, item in enumerate(
+            _as_list(raw.get("salvage", []), "finish journal.salvage")
+        ):
+            _as_mapping(item, f"finish journal.salvage[{index}]")
+        if "validate_complete" in raw and not isinstance(
+            raw["validate_complete"], bool
+        ):
+            raise StateError("finish journal.validate_complete must be boolean")
+    elif kind == "legacy-validate-remove":
+        _exact_keys(
+            raw,
+            _LEGACY_VALIDATE_JOURNAL_REQUIRED,
+            set(),
+            "legacy validate removal journal",
+        )
+        for field in (
+            "phase",
+            "checkout",
+            "repository",
+            "completed_record",
+            "completed_record_sha256",
+            "head",
+        ):
+            _as_str(raw[field], f"legacy validate removal journal.{field}")
+        if _identity_from_obj(raw["actor"], "legacy validate removal journal.actor") is None:
+            raise StateError("legacy validate removal journal has no actor")
+        if not isinstance(raw["coordinator_authorized"], bool):
+            raise StateError(
+                "legacy validate removal journal.coordinator_authorized must be boolean"
+            )
+    elif kind == "ownerless-validate-remove":
+        _exact_keys(
+            raw,
+            _OWNERLESS_VALIDATE_JOURNAL_REQUIRED,
+            set(),
+            "ownerless validation journal",
+        )
+        _as_str(raw["phase"], "ownerless validation journal.phase")
+        _as_str(raw["fenced"], "ownerless validation journal.fenced")
+        _validation_authorization_from_obj(raw["authorization"])
+    elif kind == "recover-absent-validate-rows":
+        _exact_keys(
+            raw,
+            _ABSENT_VALIDATE_JOURNAL_REQUIRED,
+            set(),
+            "absent-validation-row journal",
+        )
+        _absent_validate_batch_items(dataclasses.replace(config, machine=machine), raw)
+    else:
+        raise StateError(f"unsupported recovery journal kind {kind!r}")
+
+
+def _journal_inconsistencies(
+    config: Config, journals: Sequence[Path]
+) -> tuple[StorageInconsistency, ...]:
+    """Report unreadable standalone journals without withholding readable rows."""
+
+    findings: list[StorageInconsistency] = []
+    for path in journals:
+        machine = path.name.removeprefix("ACTIVE.").removesuffix(".journal")
+        try:
+            pending = _pending_operation_from_events(config, machine)
+            if path.exists() or path.is_symlink():
+                raw = _as_mapping(
+                    _read_json(path, "recovery journal"), "recovery journal"
+                )
+            elif pending is not None:
+                raw = pending
+            else:
+                raise StateError("journal has neither standalone nor append-only evidence")
+            _validate_journal_shape(config, path, raw)
+            if (
+                pending is not None
+                and (path.exists() or path.is_symlink())
+                and not _json_equal(raw, pending)
+            ):
+                raise StateError(
+                    "standalone recovery journal differs from append-only operation evidence"
+                )
+        except (Refusal, StateError) as exc:
+            findings.append(
+                StorageInconsistency(
+                    kind="journal-unreadable",
+                    scope="journal",
+                    slot=None,
+                    slot_type=None,
+                    machine=machine,
+                    checkout=None,
+                    detail=f"cannot trust outstanding journal {path}: {exc}",
+                    remedy="preserve the journal and append-only events; repair their exact "
+                    "disagreement before any lifecycle mutation",
+                )
+            )
+            continue
+    return tuple(findings)
+
+
 def _assert_registry_storage_consistent(
     config: Config,
     states: Sequence[ActiveState],
@@ -3153,9 +3584,9 @@ def _assert_registry_storage_consistent(
         actual_slots = {
             entry.name
             for entry in root.iterdir()
-            if entry.is_dir()
-            and not entry.is_symlink()
+            if (entry.is_dir() or entry.is_symlink())
             and not entry.name.startswith("EVENTS.")
+            and entry != config.control / "wrkslots"
             and not (
                 slot_type == "agent"
                 and entry == _validate_slots_directory(config)
@@ -3164,6 +3595,28 @@ def _assert_registry_storage_consistent(
         unexpected.extend(
             f"{slot_type}:{slot}" for slot in sorted(actual_slots - expected_slots[slot_type])
         )
+    registration_findings = tuple(
+        item
+        for item in _registry_storage_inconsistencies(config, states)
+        if item.kind == "git-registration-without-row"
+    )
+    for finding in registration_findings:
+        key = (
+            f"{finding.slot_type}:{finding.slot}"
+            if finding.slot_type is not None and finding.slot is not None
+            else None
+        )
+        is_migration_directory = key is not None and key in unexpected
+        is_allowed_target = (
+            key is not None
+            and allowed_unregistered_slot is not None
+            and key == f"{allowed_unregistered_slot[0]}:{allowed_unregistered_slot[1]}"
+        )
+        if is_migration_directory and (
+            allow_unregistered_migration_slots or is_allowed_target
+        ):
+            continue
+        raise StateError(finding.detail, remedy=finding.remedy)
     if allowed_unregistered_slot is not None:
         allowed_slot_type, allowed_slot = allowed_unregistered_slot
         unexpected = [
@@ -3837,25 +4290,65 @@ def _repository_path(
     )
 
 
-def _stored_repository_path(config: Config, raw: str) -> tuple[str, Path]:
+def _stored_repository_reference(
+    config: Config, raw: str
+) -> tuple[str, Path, Path]:
+    """Validate a stored repository identity without requiring it to exist."""
+
     candidate = Path(raw)
-    if not candidate.is_absolute():
-        return _repository_path(config, raw)
-    if raw != os.path.normpath(raw):
-        raise Refusal(
-            f"stored absolute repository path is not canonical: {raw!r}"
+    if candidate.is_absolute():
+        if raw != os.path.normpath(raw):
+            raise Refusal(
+                f"stored absolute repository path is not canonical: {raw!r}"
+            )
+        if (
+            candidate in {config.root, config.root.parent}
+            or not candidate.name
+            or candidate.parent != config.root.parent
+        ):
+            raise Refusal(
+                "stored absolute repository path must name one direct sibling of the project "
+                f"root, not the project root or another external path: {raw!r}"
+            )
+        stored = (Path("..") / candidate.name).as_posix()
+        unresolved = candidate
+        allowed_root = config.root.parent
+    else:
+        parts = candidate.parts
+        direct_sibling = (
+            len(parts) == 2 and parts[0] == ".." and parts[1] not in {".", ".."}
         )
-    if (
-        candidate in {config.root, config.root.parent}
-        or not candidate.name
-        or candidate.parent != config.root.parent
-    ):
+        if ".." in parts and not direct_sibling:
+            raise Refusal(
+                f"stored repository path must stay inside {config.root} or name one direct "
+                f"sibling with path components '../NAME': {raw!r}"
+            )
+        normalized = Path(os.path.normpath(str(candidate)))
+        if direct_sibling:
+            stored = normalized.as_posix()
+            unresolved = config.root.parent / parts[1]
+            allowed_root = config.root.parent
+            if unresolved == config.root:
+                raise Refusal(
+                    f"stored repository path {raw!r} aliases the project root; use '.' instead"
+                )
+        else:
+            stored = "." if normalized == Path(".") else normalized.as_posix()
+            unresolved = config.root / normalized
+            allowed_root = config.root
+    _ensure_no_symlink_components(allowed_root, unresolved, "repository")
+    if _path_is_within(unresolved, _managed_worktrees_root(config)):
         raise Refusal(
-            "stored absolute repository path must name one direct sibling of the project "
-            f"root, not the project root or another external path: {raw!r}"
+            f"source repository must be outside the managed worktrees directory: {unresolved}"
         )
-    stored = (Path("..") / candidate.name).as_posix()
-    return _resolved_repository_path(config, stored, candidate, config.root.parent)
+    return stored, unresolved, allowed_root
+
+
+def _stored_repository_path(config: Config, raw: str) -> tuple[str, Path]:
+    stored, unresolved, allowed_root = _stored_repository_reference(config, raw)
+    return _resolved_repository_path(
+        config, stored, unresolved, allowed_root
+    )
 
 
 def _managed_worktrees_root(config: Config) -> Path:
@@ -3912,6 +4405,11 @@ def _record_layout(config: Config, record: ActiveRecord) -> str:
 def _stored_path(config: Config, raw: str, label: str) -> Path:
     relative, absolute = _relative_inside(config.root, raw, label)
     del relative
+    return absolute
+
+
+def _stored_path_reference(config: Config, raw: str, label: str) -> Path:
+    _relative, absolute = _relative_inside_reference(config.root, raw, label)
     return absolute
 
 
@@ -4460,9 +4958,15 @@ def _heartbeat_diagnosis(record: ActiveRecord) -> tuple[float, bool]:
     return age, age > record.heartbeat_ttl_seconds
 
 
-def _assert_record_paths(config: Config, record: ActiveRecord) -> None:
+def _assert_record_paths(
+    config: Config,
+    record: ActiveRecord,
+    *,
+    require_repository: bool = True,
+) -> None:
     expected_slot = _slot_directory(config, record.slot, record.slot_type)
-    _ensure_no_symlink_components(config.root, expected_slot, "slot")
+    if require_repository:
+        _ensure_no_symlink_components(config.root, expected_slot, "slot")
     layout = _record_layout(config, record)
     if layout == "flat" and len(record.checkouts) != 1:
         raise StateError(f"slot {record.slot} has multiple checkouts under flat layout")
@@ -4471,18 +4975,31 @@ def _assert_record_paths(config: Config, record: ActiveRecord) -> None:
             raise StateError(
                 f"slot {record.slot} checkout {checkout.name} differs from configured authority"
             )
-        expected_relative, expected_absolute = _checkout_path_for_layout(
-            config, record.slot, checkout.name, record.slot_type, layout
-        )
+        if require_repository:
+            expected_relative, expected_absolute = _checkout_path_for_layout(
+                config, record.slot, checkout.name, record.slot_type, layout
+            )
+        else:
+            expected_absolute = (
+                expected_slot if layout == "flat" else expected_slot / checkout.name
+            )
+            expected_relative = expected_absolute.relative_to(config.root).as_posix()
         if checkout.path != expected_relative:
             raise StateError(
                 f"slot {record.slot} checkout {checkout.name} path does not match its slot: "
                 f"{checkout.path!r} != {expected_relative!r}"
             )
-        actual = _stored_path(config, checkout.path, "checkout path")
+        actual = (
+            _stored_path(config, checkout.path, "checkout path")
+            if require_repository
+            else _stored_path_reference(config, checkout.path, "checkout path")
+        )
         if actual != expected_absolute:
             raise StateError(f"slot {record.slot} checkout path identity changed")
-        _stored_repository_path(config, checkout.repository)
+        if require_repository:
+            _stored_repository_path(config, checkout.repository)
+        else:
+            _stored_repository_reference(config, checkout.repository)
 
 
 def _assert_checkout_identity_unchanged(
@@ -5786,14 +6303,22 @@ def _assert_create_target_clear(
     registrations = {
         repository: vcs.listed_worktrees(repository) for repository in repositories
     }
-    for item in plan:
-        destination = _stored_path(config, item.destination, "checkout destination")
-        for repository, worktrees in registrations.items():
-            if destination.absolute() in worktrees:
+    for repository, worktrees in registrations.items():
+        for registered in worktrees:
+            # The source worktree may contain the configured managed root (the
+            # documented `--repo NAME=.` case). It owns the linked worktree;
+            # it is not a stale target registration. Every other overlapping
+            # registration remains a collision.
+            if registered == repository.absolute():
+                continue
+            if _path_is_within(target_slot, registered) or _path_is_within(
+                registered, target_slot
+            ):
                 raise Refusal(
-                    f"Git still registers checkout destination {destination} in "
-                    f"repository {repository}; inspect 'git worktree list --porcelain' "
-                    "and repair or remove that exact stale registration before retrying"
+                    f"requested slot path {target_slot} overlaps Git-registered worktree "
+                    f"{registered} in repository {repository}; inspect "
+                    "'git worktree list --porcelain' and repair or remove that exact "
+                    "stale registration before retrying"
                 )
 
 
@@ -5957,7 +6482,6 @@ def _cmd_create(args: argparse.Namespace) -> int:
         _refuse_partial_state(config)
         _assert_no_journal(config)
         states, archives = _validate_global_state(config)
-        storage_inconsistencies = _registry_storage_inconsistencies(config, states)
         before = _global_rows(states, archives)
         _ensure_state_shard(config)
         state = _load_active(config)
@@ -5967,6 +6491,12 @@ def _cmd_create(args: argparse.Namespace) -> int:
         if slot_path.exists() or slot_path.is_symlink():
             raise Refusal(f"slot path already exists: {slot_path}")
         plan = _create_plan(config, args, vcs)
+        plan_repositories = tuple(
+            _stored_repository_path(config, item.repository)[1] for item in plan
+        )
+        storage_inconsistencies = _registry_storage_inconsistencies(
+            config, states, additional_repositories=plan_repositories
+        )
         _assert_create_target_clear(
             config, states, args.slot, args.slot_type, plan, vcs
         )
@@ -8370,7 +8900,10 @@ def _slot_findings(config: Config, states: Sequence[ActiveState]) -> list[dict[s
     """Every storage and operational diagnosis, without authorizing mutation."""
 
     findings = [
-        item.to_obj() for item in _registry_storage_inconsistencies(config, states)
+        item.to_obj()
+        for item in _registry_storage_inconsistencies(
+            config, states, tolerate_unavailable_repositories=True
+        )
     ]
 
     def note(kind: str, slot: str | None, machine: str | None, detail: str) -> None:
@@ -8436,13 +8969,24 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     with _locked(
         config.control / "ACTIVE", exclusive=False, wait_seconds=args.wait_lock
     ):
-        all_states, _archives = _validate_global_state(config)
+        all_states, _archives = _validate_global_state(
+            config, require_repository=False
+        )
         states = (
             all_states
             if args.all_machines
             else [state for state in all_states if state.machine == config.machine]
         )
-        findings = _slot_findings(config, states)
+        all_findings = _slot_findings(config, all_states)
+        findings = (
+            all_findings
+            if args.all_machines
+            else [
+                item
+                for item in all_findings
+                if item["machine"] is None or item["machine"] == config.machine
+            ]
+        )
         rows = [
             _status_record(config, record, tolerate_hold_error=True)
             for state in states
@@ -8499,9 +9043,11 @@ def _cmd_status(args: argparse.Namespace) -> int:
         config.control / "ACTIVE", exclusive=False, wait_seconds=args.wait_lock
     ):
         _refuse_partial_state(config)
-        all_states, _archives = _validate_global_state(config)
+        all_states, _archives = _validate_global_state(
+            config, require_repository=False
+        )
         storage_inconsistencies = _registry_storage_inconsistencies(
-            config, all_states
+            config, all_states, tolerate_unavailable_repositories=True
         )
         states = (
             all_states
@@ -8509,6 +9055,12 @@ def _cmd_status(args: argparse.Namespace) -> int:
             else [state for state in all_states if state.machine == config.machine]
         )
         journals = [path.name for path in _outstanding_journals(config)]
+        storage_inconsistencies = (
+            *storage_inconsistencies,
+            *_journal_inconsistencies(
+                config, [config.control / name for name in journals]
+            ),
+        )
         records = [
             _status_record(
                 config,
@@ -9735,30 +10287,9 @@ def _recover_create(
     retry_running_hook: bool,
     abort_create: bool,
 ) -> None:
-    required = {
-        "schema",
-        "kind",
-        "machine",
-        "slot",
-        "agent",
-        "task",
-        "purpose",
-        "created_at",
-        "heartbeat_at",
-        "heartbeat_ttl_seconds",
-        "owner",
-        "coordinator_lease",
-        "planned",
-        "created",
-    }
-    optional = {
-        "slot_type",
-        "post_provision_hooks",
-        "hook_progress",
-        "hook_failure",
-        "failure_policy",
-    }
-    _exact_keys(raw, required, optional, "create journal")
+    _exact_keys(
+        raw, _CREATE_JOURNAL_REQUIRED, _CREATE_JOURNAL_OPTIONAL, "create journal"
+    )
     machine = _as_str(raw["machine"], "create journal.machine")
     if machine != config.machine or path != _journal_path(config, machine):
         raise StateError(
@@ -10123,7 +10654,7 @@ def _recover_import_existing(
 ) -> None:
     _exact_keys(
         raw,
-        {"schema", "kind", "machine", "slot", "record"},
+        _IMPORT_JOURNAL_REQUIRED,
         set(),
         "import journal",
     )
@@ -10173,21 +10704,9 @@ def _recover_finish(
     state: ActiveState,
     coordinator: ProcessIdentity,
 ) -> None:
-    required = {
-        "schema",
-        "kind",
-        "machine",
-        "slot",
-        "mode",
-        "actor",
-        "finished_at",
-        "archive_id",
-        "phase",
-        "fenced",
-        "removed",
-        "record",
-    }
-    _exact_keys(raw, required, {"salvage", "validate_complete"}, "finish journal")
+    _exact_keys(
+        raw, _FINISH_JOURNAL_REQUIRED, _FINISH_JOURNAL_OPTIONAL, "finish journal"
+    )
     if path != _journal_path(config):
         raise StateError(f"finish journal filename does not match machine {config.machine}")
     record = _record_from_obj(raw["record"], "finish journal.record")
@@ -10312,21 +10831,12 @@ def _recover_finish(
 def _legacy_validate_recovery_inputs(
     config: Config, raw: Mapping[str, object]
 ) -> tuple[Path, Path, Path, str]:
-    required = {
-        "schema",
-        "kind",
-        "machine",
-        "slot",
-        "phase",
-        "checkout",
-        "repository",
-        "completed_record",
-        "completed_record_sha256",
-        "head",
-        "actor",
-        "coordinator_authorized",
-    }
-    _exact_keys(raw, required, set(), "legacy validate removal journal")
+    _exact_keys(
+        raw,
+        _LEGACY_VALIDATE_JOURNAL_REQUIRED,
+        set(),
+        "legacy validate removal journal",
+    )
     if _as_int(raw["schema"], "legacy validate removal journal.schema") != SCHEMA:
         raise StateError("unsupported legacy validate removal journal schema")
     if _as_str(raw["kind"], "legacy validate removal journal.kind") != "legacy-validate-remove":
@@ -10821,7 +11331,7 @@ def _ownerless_validation_inputs(
 ]:
     _exact_keys(
         raw,
-        {"schema", "kind", "machine", "slot", "phase", "fenced", "authorization"},
+        _OWNERLESS_VALIDATE_JOURNAL_REQUIRED,
         set(),
         "ownerless validation journal",
     )
@@ -12523,17 +13033,7 @@ def _absent_validate_batch_items(
 ) -> tuple[int, tuple[tuple[AbsentValidateRow, ActiveRecord, dict[str, object]], ...]]:
     _exact_keys(
         raw,
-        {
-            "schema",
-            "kind",
-            "machine",
-            "host_id",
-            "slot",
-            "input_sha256",
-            "cursor",
-            "actor",
-            "items",
-        },
+        _ABSENT_VALIDATE_JOURNAL_REQUIRED,
         set(),
         "absent-validation-row journal",
     )

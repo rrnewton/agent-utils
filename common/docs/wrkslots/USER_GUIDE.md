@@ -55,11 +55,18 @@ when `recover` starts a new cleanup for an unregistered validation path, because
 no ACTIVE row naming who allocated it. Resuming the durable journal does not require the original
 flag or coordinator; otherwise a departed coordinator could strand an interrupted cleanup.
 
-By default every command refuses if either managed directory contains a worktree without an active
-wrkslots record. During a deliberate migration, put the global
-`--allow-existing-unregistered-worktrees` flag before the command. The requested operation then
-touches only registered slots and prints how many unregistered directories it retained. It never
-uses that flag as permission to inspect, select, or remove one of them. Run
+`status` always returns the complete readable roster and reports each observable directory or
+Git-registration disagreement as a typed inconsistency. Git registrations are observable only for
+source repositories named by readable rows; config does not contain a repository inventory.
+`create --repo` supplies the requested repositories, so create also reports unrelated managed-root
+registrations it discovers there. `create` refuses an overlap with the requested name, slot
+path, checkout path, or Git registration. The exact selected source worktree is the sole ancestor
+exception when it contains the configured managed root. Create may proceed at a distinct target
+while printing every unrelated inconsistency it retained. Other lifecycle mutations refuse by default if either managed
+directory contains a worktree without an active wrkslots record. During a deliberate migration,
+put the global `--allow-existing-unregistered-worktrees` flag before such a command. The requested
+operation then touches only registered slots and prints how many unregistered directories it
+retained. It never uses that flag as permission to inspect, select, or remove one of them. Run
 `wrkslots audit --format json` and import each live slot only after verifying its process evidence.
 
 `wrkslots audit --gate` is the read-only coordinator reminder. It exits 1 for reclaimable,
@@ -204,8 +211,9 @@ ambiguous path is preserved. The cleanup first renames the exact inode to a rand
 rechecks every fact, then deletes only that fenced path. Any later participant may resume the
 journal with plain `recover --coordinator-pid PID`.
 
-This targeted route does not relax ordinary `status`: every other unregistered directory remains a
-hard refusal. During a larger deliberate migration, the global
+This targeted route does not hide anything from ordinary `status`: every other unregistered
+directory is returned as a typed inconsistency beside the full readable roster. Status is
+diagnosis, not permission to mutate. During a larger deliberate migration, the global
 `--allow-existing-unregistered-worktrees` flag may accompany the exact cleanup command; it retains
 all other paths.
 

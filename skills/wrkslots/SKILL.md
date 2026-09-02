@@ -76,6 +76,10 @@ worktrees/wrkslots create slot01 \
   --branch product=codex/fix-parser
 ```
 
+The selected source worktree may contain the configured managed root, as in `--repo product=.`
+above. That exact source root is not a target collision; any other Git-registered ancestor, the
+requested slot root itself, or a descendant is refused.
+
 Provisioning always starts with an empty per-checkout build cache; it never copies a donor cache.
 The first dependency build may therefore take many minutes instead of roughly one or two minutes,
 and per-slot cache storage is not shared by reflinks.
@@ -96,13 +100,20 @@ branch and HEAD and has no non-cache source changes; any disagreement preserves 
 
 ## Inspect, audit, and diagnose
 
-Use `status --all-machines` for ordinary read-only inspection. It reports outstanding journals;
-later lifecycle mutations refuse until recovery. A row without its directory, a directory without
-its row, duplicate cross-shard ownership, or corrupt state refuses. Heartbeat age and TTL expiry are
-diagnosis only and never authorize removal.
+Use `status --all-machines` for ordinary read-only inspection. It returns the full readable roster,
+reports outstanding journals, and emits every observable row/directory/Git-registration
+disagreement as a typed inconsistency with an overall inconsistent summary. Git registration
+inspection is limited to source repositories named by readable rows; configuration is not a
+repository inventory. Those findings do not make a row healthy and never authorize a mutation. A
+malformed standalone journal is one of those typed inconsistencies, so status still returns the
+readable roster; lifecycle mutations continue to refuse until the journal is repaired or recovered.
+Corrupt event/schema/hash state, duplicate cross-shard ownership, and an ambiguous stored
+repository identity remain global refusals. Heartbeat age and TTL expiry are diagnosis only and
+never authorize removal.
 
-Use `doctor` to list every registry/storage disagreement at once. It is diagnosis only, authorizes
-nothing, and exits 0 even when it finds problems.
+Use `doctor` for the diagnosis-oriented view of all registry/storage disagreements. Like `status`,
+it authorizes nothing and exits 0 when readable inconsistencies are found; unlike `status`, it is
+organized as findings rather than as the active roster.
 
 Use `audit [--format human|json]` for the lifecycle verdict view. It reports each slot as
 `DELETABLE`, `BLOCKED` with the collected reasons, or `HELD`, reports cache sizes, and raises the

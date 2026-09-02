@@ -66,11 +66,17 @@ wrkslots import-existing slot01 --slot-type agent --coordinator-authorized \
   --owner-pid "$OWNER_PID" --coordinator-pid "$COORDINATOR_PID"
 ```
 
-The strict default refuses while a managed directory contains worktrees that have no wrkslots
-record. During a deliberate migration, place the global
-`--allow-existing-unregistered-worktrees` flag before the command. The command retains those
-directories and acts only on registered slots; use `wrkslots audit --format json` to inventory what
-still needs evidence-based import.
+`status` is read-only: it returns the complete readable roster and reports every observable
+registry/storage disagreement as a typed inconsistency instead of withholding the roster. It can
+inspect Git registrations only for source repositories named by readable rows; a repository absent
+from the registry is not discoverable until a command such as `create --repo` supplies it. `create`
+refuses a name, path, or Git registration that overlaps its requested slot, except for the exact
+selected source worktree when that source contains the configured managed root. It may create at a
+distinct target while printing unrelated inconsistencies it retained. Other lifecycle mutations remain strict by
+default while a managed directory contains worktrees that have no wrkslots record. During a
+deliberate migration, place the global `--allow-existing-unregistered-worktrees` flag before such a
+command. The command retains those directories and acts only on registered slots; use `wrkslots
+audit --format json` to inventory what still needs evidence-based import.
 
 `import-existing --from-state-file worktree-state.json --source-host-id ID` admits a slot whose
 owner has already exited from an exact version 3 source row. It preserves the row and source-file
@@ -84,8 +90,9 @@ not imported with invented ownership. The coordinator uses `recover
 survives. The tool records the exact path and filesystem identity and independently verifies that
 no retained record names it, no process uses it, and no authored work would be lost. Git worktrees
 must additionally be clean, ordinary, and remotely contained. Dirty, unpublished, in-use, or
-ambiguous paths are preserved, and ordinary `status` continues to refuse every remaining
-unregistered directory.
+ambiguous paths are preserved. Ordinary `status` reports every remaining unregistered directory
+as an inconsistency and still returns the readable active roster; it does not authorize cleanup or
+make an inconsistent row healthy.
 
 If a command reports an interrupted operation, preserve the paths and run:
 
