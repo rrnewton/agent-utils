@@ -346,8 +346,19 @@ mod tests {
             authorized.validation_authority,
             ValidationAuthority::SoftGreen
         );
-        let (plan, _) = compute_plan(&[authorized], &[], &[], &[], None, 2, false);
-        assert_eq!(plan.per_pr_actions[0].action, PrAction::LandNow);
+        let (plan, _) = compute_plan(
+            &[authorized],
+            &[],
+            &[],
+            &[],
+            crate::plan::DEFAULT_FRESHNESS_MAX_BEHIND,
+            2,
+            false,
+        );
+        assert_eq!(plan.per_pr_actions[0].action, PrAction::RebaseThenLand);
+        assert!(plan.per_pr_actions[0]
+            .why
+            .contains("without pre-landing revalidation"));
         let hard_green_on_other_base = parse_landing_context(&json!({"prs":[{
             "pr":1,
             "head_sha":"current",

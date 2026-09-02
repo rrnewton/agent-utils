@@ -47,7 +47,7 @@ from pr_landing_planner.githubhost import GitHubHost, HostCommandError
 from pr_landing_planner.host import VcsHost
 from pr_landing_planner.landing_context import parse_landing_context
 from pr_landing_planner.model import DEFAULT_BASE, DEFAULT_GATE_CHECK, DEFAULT_REPO, PlanResult
-from pr_landing_planner.plan import assemble_result
+from pr_landing_planner.plan import DEFAULT_FRESHNESS_MAX_BEHIND, assemble_result
 from pr_landing_planner.priority import (
     DEFAULT_LABEL_PATTERN,
     NonePriority,
@@ -212,7 +212,7 @@ def _quickstart(c: Palette) -> str:
   --conflict-detector {{merge-tree,file-overlap}}   merge-tree (real conflicts) is the default
   --gate-check NAME                               required-check name (default: {DEFAULT_GATE_CHECK})
   --flaky-signatures FILE                         name/text regexes marking a red as flaky
-  --freshness-max-behind N                        optional caller policy; otherwise base age is advisory
+  --freshness-max-behind N                        caller override (default: 0; any behind branch rebases)
   --priority-source {{none,labels,command}}         ordering priority (default: none)
   --batch                                         also propose one green, conflict/dependency-free batch
   --archive-dir DIR / --no-archive                archive the plan JSON to disk (on by default for
@@ -370,12 +370,14 @@ def _build_result(ns: argparse.Namespace) -> PlanResult:
     )
     if priority.last_error is not None:
         raise ValueError(priority.last_error)
-    freshness = getattr(ns, "freshness_max_behind", None)
+    freshness = getattr(ns, "freshness_max_behind", DEFAULT_FRESHNESS_MAX_BEHIND)
     batch = bool(getattr(ns, "batch", False))
     outage_min = ns.outage_min_prs if isinstance(ns.outage_min_prs, int) else 2
     return assemble_result(
         graph,
-        freshness_max_behind=freshness if isinstance(freshness, int) else None,
+        freshness_max_behind=(
+            freshness if isinstance(freshness, int) else DEFAULT_FRESHNESS_MAX_BEHIND
+        ),
         outage_min_prs=outage_min,
         batch=batch,
     )
@@ -470,8 +472,8 @@ def build_parser() -> argparse.ArgumentParser:
     plan_p.add_argument(
         "--freshness-max-behind",
         type=_nonnegative_i64_arg,
-        default=None,
-        help="optional caller policy: a green PR more than N commits behind => rebase-then-land",
+        default=DEFAULT_FRESHNESS_MAX_BEHIND,
+        help="caller override (default: 0): a green PR more than N commits behind => rebase-then-land",
     )
     plan_p.add_argument(
         "--priority-source",

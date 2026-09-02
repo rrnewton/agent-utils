@@ -8,7 +8,7 @@ use crate::graph::{cluster_by_conflict, rebases_avoided, review_binding};
 use crate::model::{CiState, Cluster, HeldPr, PlanResult, PrAction, PrActionDecision, PrNode};
 
 /// Explanation emitted with the rebase and validation-run savings calculation.
-pub const VALIDATE_ECONOMICS_RATIONALE: &str = "The clean-validate record is keyed to the exact head SHA. Rebasing changes that head and therefore requires new validation evidence. A lagging ancestor is legitimate; requiring the tip made the verdict a property of WHEN you looked rather than of the tree. Landing each real-conflict cluster as ONE stack avoids the same count of head-changing rebases AND validate runs.";
+pub const VALIDATE_ECONOMICS_RATIONALE: &str = "A branch behind its fetched base must rebase before landing. The consuming workspace may authorize that rebase to retain soft-green without pre-landing revalidation; post-facto validation remains due. Landing each real-conflict cluster as ONE stack avoids the same count of repeated rebases and post-facto validate runs.";
 
 fn economics(clusters: &[Cluster]) -> Value {
     let saved = rebases_avoided(clusters);

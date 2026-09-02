@@ -105,6 +105,9 @@ def test_plan_json_is_valid_and_has_schema() -> None:
     assert obj["repository"] == "OWNER/NAME"
     assert set(obj["plan"]) >= {"parallel_safe_groups", "land_now", "order", "per_pr_actions"}
     assert 1043 in obj["plan"]["land_now"]
+    behind = next(item for item in obj["plan"]["per_pr_actions"] if item["pr"] == 987)
+    assert behind["action"] == "rebase-then-land"
+    assert "rebase before landing" in behind["why"]
     assert 1049 in obj["diagnostics"]["flaky_reds"]
     assert obj["diagnostics"]["outage_suspected"] is True
     # Deterministic: identical bytes on a second run.

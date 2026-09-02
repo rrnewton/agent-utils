@@ -154,12 +154,14 @@ exact-head receipt. The JSON node reports `review_binding` and
 
 ## Freshness, holds, priority, and batching
 
-Base age is advisory by default. This follows the existing validation rule:
-"A lagging ancestor is legitimate; requiring the tip made the verdict a
-property of WHEN you looked rather than of the tree." An explicit `--freshness-max-behind
-N` asks the planner to recommend a rebase when a repository-host-green PR
-without caller-authorized validation is more than `N` commits behind. Draft state, missing approvals, conflicts,
-ordering constraints, CI state, and policy escalation can hold a PR.
+A branch behind the fetched base must rebase before landing. The default
+`--freshness-max-behind 0` expresses that requirement; another value is an
+explicit caller override. A clean validation record with caller-supplied
+soft-green authority survives as validation evidence: the planner recommends
+the required rebase and landing without pre-landing revalidation, while
+post-facto validation remains due. The consuming workspace remains the sole
+authority for that landability decision. Draft state, missing approvals,
+conflicts, ordering constraints, CI state, and policy escalation can hold a PR.
 
 Priority defaults to deterministic size and age ordering. `--priority-source
 labels` reads a numeric label matching `--priority-label-pattern`; a configured

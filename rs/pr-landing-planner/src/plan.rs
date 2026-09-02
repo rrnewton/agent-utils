@@ -9,8 +9,8 @@ use crate::model::{
     ValidationEvidence,
 };
 
-/// Default freshness policy. `None` leaves base age advisory unless the caller opts in.
-pub const DEFAULT_FRESHNESS_MAX_BEHIND: Option<i64> = None;
+/// Default freshness policy. Any branch behind the fetched base must rebase before landing.
+pub const DEFAULT_FRESHNESS_MAX_BEHIND: Option<i64> = Some(0);
 
 fn held_action(reasons: &[String]) -> (PrAction, String) {
     if reasons.iter().any(|reason| reason == "ordering-cycle") {
@@ -45,7 +45,7 @@ fn held_action(reasons: &[String]) -> (PrAction, String) {
         return (
             PrAction::RebaseThenLand,
             format!(
-                "held: {} — rebase onto base, then revalidate before landing",
+                "held: {} — rebase onto base before landing; validation landability remains delegated to the consuming workspace",
                 reasons.join(", ")
             ),
         );
@@ -67,6 +67,17 @@ fn ci_action(node: &PrNode, freshness_max_behind: Option<i64>) -> (PrAction, Str
                 PrAction::Wait,
                 "clean-validate-record has no consuming-workspace hard/soft-green authority"
                     .to_owned(),
+            );
+        }
+        if freshness_max_behind.is_some_and(|limit| node.commits_behind > limit) {
+            return (
+                PrAction::RebaseThenLand,
+                format!(
+                    "{} at exact head with {} authority; rebase {} commit(s), then land without pre-landing revalidation; post-facto validation remains due",
+                    node.validation_evidence.as_str(),
+                    node.validation_authority.as_str(),
+                    node.commits_behind,
+                ),
             );
         }
         return (
@@ -109,7 +120,10 @@ fn ci_action(node: &PrNode, freshness_max_behind: Option<i64>) -> (PrAction, Str
     if freshness_max_behind.is_some_and(|limit| node.commits_behind > limit) {
         return (
             PrAction::RebaseThenLand,
-            format!("green but {} commit(s) behind base", node.commits_behind),
+            format!(
+                "authoritative CI green, gate ok, but {} commit(s) behind base; rebase before landing",
+                node.commits_behind
+            ),
         );
     }
     (
@@ -325,10 +339,18 @@ mod tests {
         policy.policy_class = PolicyClass::GatePolicy;
         let mut behind = green(3);
         behind.commits_behind = 1;
-        let (plan, _) = compute_plan(&[evidence, policy, behind], &[], &[], &[], None, 2, false);
+        let (plan, _) = compute_plan(
+            &[evidence, policy, behind],
+            &[],
+            &[],
+            &[],
+            DEFAULT_FRESHNESS_MAX_BEHIND,
+            2,
+            false,
+        );
         assert_eq!(plan.per_pr_actions[0].action, PrAction::LandNow);
         assert_eq!(plan.per_pr_actions[1].action, PrAction::EscalateGatePolicy);
-        assert_eq!(plan.per_pr_actions[2].action, PrAction::LandNow);
+        assert_eq!(plan.per_pr_actions[2].action, PrAction::RebaseThenLand);
 
         let mut strict_behind = green(4);
         strict_behind.commits_behind = 1;
@@ -428,7 +450,7 @@ mod tests {
     }
 
     #[test]
-    fn gate_policy_escalates_and_main_advance_preserves_authorized_exact_head_evidence() {
+    fn gate_policy_escalates_and_main_advance_requires_rebase_without_revalidation() {
         let mut policy = green(1);
         policy.policy_class = PolicyClass::GatePolicy;
         let held = HeldPr {
@@ -445,11 +467,35 @@ mod tests {
         evidence.validation_evidence = ValidationEvidence::CleanValidateRecord;
         evidence.validation_authority = ValidationAuthority::SoftGreen;
         evidence.commits_behind = 3;
-        let (evidence_plan, _) = compute_plan(&[evidence], &[], &[], &[], None, 2, false);
+        let (evidence_plan, _) = compute_plan(
+            &[evidence.clone()],
+            &[],
+            &[],
+            &[],
+            DEFAULT_FRESHNESS_MAX_BEHIND,
+            2,
+            false,
+        );
         let decision = &evidence_plan.per_pr_actions[0];
-        assert_eq!(decision.action, PrAction::LandNow);
+        assert_eq!(decision.action, PrAction::RebaseThenLand);
         assert!(decision.why.contains("soft-green authority"));
-        assert!(!decision.why.contains("rebase"));
+        assert!(decision.why.contains("rebase 3 commit(s), then land"));
+        assert!(decision.why.contains("without pre-landing revalidation"));
+        assert!(decision.why.contains("post-facto validation remains due"));
+
+        evidence.commits_behind = 0;
+        let (fresh_plan, _) = compute_plan(
+            &[evidence],
+            &[],
+            &[],
+            &[],
+            DEFAULT_FRESHNESS_MAX_BEHIND,
+            2,
+            false,
+        );
+        let fresh_decision = &fresh_plan.per_pr_actions[0];
+        assert_eq!(fresh_decision.action, PrAction::LandNow);
+        assert!(!fresh_decision.why.contains("rebase"));
     }
 
     #[test]

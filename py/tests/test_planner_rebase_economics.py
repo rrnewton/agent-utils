@@ -1,9 +1,9 @@
-"""The plan's rebase/validate economics: clustering avoids rebases and exact-head reruns.
+"""The plan's rebase/validate economics: clustering avoids rebases and post-facto runs.
 
-A rebase changes a PR's head SHA, which invalidates its locally-validated / clean-validate record and
-forces a fresh validate run. Main advancing alone does not. Landing a real-conflict cluster as ONE
-stack avoids head-changing rebases. These tests pin that the emitted plan JSON carries the economics
-and that the two counts move together.
+A branch behind the fetched base must rebase, while the consuming workspace may authorize its prior
+green evidence to carry as soft-green. Landing a real-conflict cluster as ONE stack avoids repeated
+rebases and their post-facto validation runs. These tests pin that the emitted plan JSON carries the
+economics and that the two counts move together.
 """
 
 from __future__ import annotations
@@ -46,17 +46,18 @@ def _graph(*conflict_pairs: tuple[int, int], numbers: tuple[int, ...]) -> Collec
 
 def test_plan_json_carries_rebase_and_validate_economics() -> None:
     # Two conflicting PRs (a cluster of 2) + one independent PR (singleton). Stacking the cluster
-    # avoids exactly one rebase — and therefore one validate run.
+    # avoids exactly one rebase — and therefore one post-facto validate run.
     result = assemble_result(_graph((1, 2), numbers=(1, 2, 3)))
     obj = json.loads(render_json(result))
     econ = obj["plan"]["rebase_economics"]
     assert econ["validate_record_keyed_to"] == "head_sha+base_sha"
     assert econ["rebases_avoided_by_clustering"] == 1
-    # 1:1 with rebases: a rebase changes the head SHA, invalidating that PR's validate record.
+    # 1:1 with rebases: each avoided landing also avoids its post-facto validate run.
     assert econ["validate_runs_avoided_by_clustering"] == 1
     assert econ["rationale"] == VALIDATE_ECONOMICS_RATIONALE
-    assert "exact head SHA" in econ["rationale"]
-    assert "requiring the tip made the verdict a property of WHEN you looked" in econ["rationale"]
+    assert "must rebase before landing" in econ["rationale"]
+    assert "without pre-landing revalidation" in econ["rationale"]
+    assert "post-facto validation remains due" in econ["rationale"]
 
 
 def test_economics_counts_move_together_and_scale() -> None:

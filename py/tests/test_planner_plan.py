@@ -72,7 +72,7 @@ def test_fusion_table_actions() -> None:
     plan, _ = compute_plan(nodes, [], [], [])
     acts = plan.per_pr_actions
     assert _action(acts, 1) is PrAction.LAND_NOW
-    assert _action(acts, 2) is PrAction.LAND_NOW
+    assert _action(acts, 2) is PrAction.REBASE_THEN_LAND
     assert _action(acts, 3) is PrAction.REFIRE_STALE_GATE
     assert _action(acts, 4) is PrAction.REFIRE_CI
     assert _action(acts, 5) is PrAction.HOLD_FIX
@@ -84,6 +84,8 @@ def test_fusion_table_actions() -> None:
 
 def test_freshness_threshold() -> None:
     nodes = [_node(1, behind=3)]
+    plan_default, _ = compute_plan(nodes, [], [], [])
+    assert _action(plan_default.per_pr_actions, 1) is PrAction.REBASE_THEN_LAND
     plan_strict, _ = compute_plan(nodes, [], [], [], freshness_max_behind=0)
     assert _action(plan_strict.per_pr_actions, 1) is PrAction.REBASE_THEN_LAND
     plan_loose, _ = compute_plan(nodes, [], [], [], freshness_max_behind=5)
@@ -125,7 +127,7 @@ def test_gate_policy_escalation_precedes_hold_state() -> None:
     assert plan.land_now == ()
 
 
-def test_main_advancing_does_not_invalidate_authorized_exact_head_evidence() -> None:
+def test_main_advancing_requires_rebase_without_prelanding_revalidation() -> None:
     validated = dataclasses.replace(
         _node(13, behind=2),
         validation_evidence=ValidationEvidence.CLEAN_VALIDATE_RECORD,
@@ -133,9 +135,14 @@ def test_main_advancing_does_not_invalidate_authorized_exact_head_evidence() -> 
     )
     plan, _ = compute_plan([validated], [], [], [])
     decision = plan.per_pr_actions[0]
-    assert decision.action is PrAction.LAND_NOW
+    assert decision.action is PrAction.REBASE_THEN_LAND
     assert "soft-green authority" in decision.why
-    assert "rebase" not in decision.why
+    assert "rebase 2 commit(s), then land" in decision.why
+    assert "without pre-landing revalidation" in decision.why
+    assert "post-facto validation remains due" in decision.why
+
+    fresh_plan, _ = compute_plan([dataclasses.replace(validated, commits_behind=0)], [], [], [])
+    assert fresh_plan.per_pr_actions[0].action is PrAction.LAND_NOW
 
     unproven = dataclasses.replace(
         validated, validation_authority=ValidationAuthority.NONE

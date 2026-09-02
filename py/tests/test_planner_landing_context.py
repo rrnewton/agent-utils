@@ -176,7 +176,9 @@ def test_clean_record_keeps_exact_head_and_delegates_older_base_to_authority() -
     )[0]
     assert authorized.validation_authority is ValidationAuthority.SOFT_GREEN
     plan, _ = compute_plan([authorized], [], [], [])
-    assert plan.per_pr_actions[0].action is PrAction.LAND_NOW
+    decision = plan.per_pr_actions[0]
+    assert decision.action is PrAction.REBASE_THEN_LAND
+    assert "without pre-landing revalidation" in decision.why
 
     hard_green_on_other_base = parse_landing_context(
         {

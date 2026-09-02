@@ -7,18 +7,18 @@ does exactly that, deterministically, from already-collected data.
 
 Per-PR action assignment (the fusion table):
 
-* held (base-conflict)          -> ``rebase-then-land`` and revalidate
+* held (base-conflict)          -> ``rebase-then-land``; caller decides validation landability
 * held (draft / review / dependency cycle / depends-on-held) -> ``wait``
 * gate-policy change            -> ``escalate-gate-policy``
-* caller-authorized exact-head evidence -> ``land-now``, without a merge-gate wait
+* caller-authorized exact-head evidence -> rebase if behind, then land without pre-landing revalidation
 * CI runner-outage              -> ``escalate-runner-outage``
 * CI evaluate-once race         -> ``wait`` (benign; treat as pending)
 * CI stale required check       -> ``refire-stale-gate``
 * CI flaky red                  -> ``refire-ci``
 * CI real red                   -> ``hold-fix``
 * CI no-result at required gate -> ``refire-ci``
-* CI green beyond an explicit caller freshness limit -> ``rebase-then-land``
-* CI green, gate ok             -> ``land-now`` unless caller sets a freshness limit
+* CI green but behind base      -> ``rebase-then-land`` by default
+* CI green, fresh, gate ok      -> ``land-now``
 
 Ordering among actionable PRs follows the parallel-safe layering, which itself ranks by
 priority -> diff size -> age -> PR number.
@@ -47,7 +47,7 @@ from pr_landing_planner.model import (
     ValidationEvidence,
 )
 
-DEFAULT_FRESHNESS_MAX_BEHIND: int | None = None
+DEFAULT_FRESHNESS_MAX_BEHIND: int | None = 0
 
 
 def _held_action(reasons: Sequence[str]) -> tuple[PrAction, str]:
@@ -67,7 +67,8 @@ def _held_action(reasons: Sequence[str]) -> tuple[PrAction, str]:
     if any(r in ("local-base-conflict", "github-base-conflicting") for r in reasons):
         return (
             PrAction.REBASE_THEN_LAND,
-            f"held: {', '.join(reasons)} — rebase onto base, then revalidate before landing",
+            f"held: {', '.join(reasons)} — rebase onto base before landing; "
+            "validation landability remains delegated to the consuming workspace",
         )
     return PrAction.WAIT, f"held: {', '.join(reasons)}"
 
@@ -85,6 +86,17 @@ def _ci_action(node: PrNode, freshness_max_behind: int | None) -> tuple[PrAction
             return (
                 PrAction.WAIT,
                 "clean-validate-record has no consuming-workspace hard/soft-green authority",
+            )
+        if (
+            freshness_max_behind is not None
+            and node.commits_behind > freshness_max_behind
+        ):
+            return (
+                PrAction.REBASE_THEN_LAND,
+                f"{node.validation_evidence.value} at exact head with "
+                f"{node.validation_authority.value} authority; rebase "
+                f"{node.commits_behind} commit(s), then land without pre-landing "
+                "revalidation; post-facto validation remains due",
             )
         return (
             PrAction.LAND_NOW,
@@ -112,7 +124,8 @@ def _ci_action(node: PrNode, freshness_max_behind: int | None) -> tuple[PrAction
     if freshness_max_behind is not None and node.commits_behind > freshness_max_behind:
         return (
             PrAction.REBASE_THEN_LAND,
-            f"green but {node.commits_behind} commit(s) behind base",
+            f"authoritative CI green, gate ok, but {node.commits_behind} commit(s) "
+            "behind base; rebase before landing",
         )
     return PrAction.LAND_NOW, "authoritative CI green, gate ok"
 

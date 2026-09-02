@@ -8538,7 +8538,7 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
                                 actions[number] = action
         expected_actions = {
             1: "land-now",
-            2: "land-now",
+            2: "rebase-then-land",
             3: "refire-stale-gate",
             4: "wait",
             5: "hold-fix",
@@ -8717,16 +8717,27 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
             and node.get("validation_authority") == "soft-green"
             for node in soft_green_nodes
         )
-        soft_green_landable = isinstance(soft_green_plan, dict) and 2 in soft_green_plan.get(
-            "land_now", []
+        soft_green_rebases_without_revalidation = (
+            isinstance(soft_green_plan, dict)
+            and any(
+                isinstance(decision, dict)
+                and decision.get("pr") == 2
+                and decision.get("action") == "rebase-then-land"
+                and "without pre-landing revalidation" in decision.get("why", "")
+                for decision in soft_green_plan.get("per_pr_actions", [])
+            )
         )
-        if soft_green.returncode == 0 and authority_recorded and soft_green_landable:
-            rep.ok("accept:soft-green-authority-is-durable-and-landable")
+        if (
+            soft_green.returncode == 0
+            and authority_recorded
+            and soft_green_rebases_without_revalidation
+        ):
+            rep.ok("accept:soft-green-authority-requires-rebase-without-revalidation")
         else:
             rep.bad(
-                "accept:soft-green-authority-is-durable-and-landable",
+                "accept:soft-green-authority-requires-rebase-without-revalidation",
                 f"exit={soft_green.returncode}; authority={authority_recorded}; "
-                f"landable={soft_green_landable}",
+                f"rebase_without_revalidation={soft_green_rebases_without_revalidation}",
             )
 
         hard_green_path = os.path.join(tmp, "hard-green-context.json")

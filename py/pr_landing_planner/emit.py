@@ -29,27 +29,26 @@ from pr_landing_planner.model import (
 ColorFn = Callable[[str, str], str]
 
 #: Why clustering saves *validate runs*, not just rebases. A clean validation record is keyed to the
-#: exact head SHA. Rebasing changes that head and therefore requires new evidence; main advancing
-#: alone does not. Landing a real-conflict cluster as one stack avoids the same number of head-changing
-#: rebases and validation runs. Single source: reused by every renderer.
+#: exact head SHA, while the consuming workspace may authorize a rebase to retain soft-green without
+#: pre-landing revalidation. Landing a real-conflict cluster as one stack avoids repeated rebases and
+#: their post-facto validation runs. Single source: reused by every renderer.
 VALIDATE_ECONOMICS_RATIONALE = (
-    "The clean-validate record is keyed to the exact head SHA. Rebasing changes that head and "
-    "therefore requires new validation evidence. A lagging ancestor is legitimate; requiring "
-    "the tip made the verdict a property of WHEN you looked rather than of the tree. Landing "
-    "each real-conflict cluster as ONE stack avoids the same count of head-changing rebases "
-    "AND validate runs."
+    "A branch behind its fetched base must rebase before landing. The consuming workspace may "
+    "authorize that rebase to retain soft-green without pre-landing revalidation; post-facto "
+    "validation remains due. Landing each real-conflict cluster as ONE stack avoids the same "
+    "count of repeated rebases and post-facto validate runs."
 )
 
 
 def _rebase_economics(clusters: Sequence[Cluster]) -> dict[str, object]:
-    """The rebase/validate economics of this plan: rebases avoided by clustering are ALSO the
-    validate runs avoided, because the validate record is SHA-keyed (see
+    """The rebase/validate economics of this plan: each landing avoided by clustering avoids
+    both its rebase and its post-facto validate run (see
     :data:`VALIDATE_ECONOMICS_RATIONALE`). Pure; deterministic."""
     saved = rebases_avoided(clusters)
     return {
         "validate_record_keyed_to": "head_sha+base_sha",
         "rebases_avoided_by_clustering": saved,
-        # 1:1 with rebases: a rebase changes the head SHA, which invalidates that PR's validate record.
+        # 1:1 with rebases: each avoided landing also avoids its post-facto validate run.
         "validate_runs_avoided_by_clustering": saved,
         "rationale": VALIDATE_ECONOMICS_RATIONALE,
     }
