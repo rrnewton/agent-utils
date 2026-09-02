@@ -255,6 +255,56 @@ Cross-user process evidence uses passwordless `sudo -n` with fixed root-owned `f
 binaries and refuses if that read-only census is unavailable or incomplete. Use `--format json` when
 another tool needs the typed per-row outcome.
 
+## Recover absent agent rows and ownerless agent worktrees
+
+Agent storage is never treated as disposable. For an exact ACTIVE agent row whose directory is
+already absent, take `machine`, `slot`, `generation`, and `record_sha256` from a fresh JSON audit and
+inspect the read-only plan before applying it:
+
+```sh
+wrkslots recover-absent-agent-row SLOT --expected-generation N \
+  --record-sha256 SHA256
+wrkslots recover-absent-agent-row SLOT --expected-generation N \
+  --record-sha256 SHA256 --apply --coordinator-authorized \
+  --coordinator-pid "$COORDINATOR_PID"
+```
+
+The command requires the registered liveness authority to report dead, requires any recorded exact
+owner generation to be dead, and performs the same full-host process, cgroup, mount, and user-systemd
+census used for absent validation rows. It does not claim the vanished working tree was clean. Every
+recorded checkout commit is pushed individually to a dedicated rescue ref and read back from the
+remote before the exact stale Git worktree registration is removed. The archive is durable before
+ACTIVE is changed and explicitly records that uncommitted, untracked, ignored, and HANDOFF contents
+could not be inspected because storage was already absent.
+
+An unregistered agent worktree is recovered without assigning it an owner, task, or handoff. Supply
+the exact path and the Git identities established during inspection:
+
+```sh
+wrkslots recover-ownerless-agent-worktree worktrees/slots/example \
+  --repository repo --head COMMIT --branch agent/example --remote origin \
+  --remote-url-sha256 SHA256
+```
+
+Repeat with `--apply --coordinator-authorized --coordinator-pid "$COORDINATOR_PID"` only after the
+plan agrees. The worktree must be one direct child of the managed agent root. The command refuses a
+HANDOFF.md, any live process or user unit reference, a path or inode change, non-ordinary Git state,
+or an ACTIVE/archive identity collision. Tracked, untracked, ignored files outside configured cache
+paths, and initialized nested repositories are committed to verified salvage refs before the exact
+inode is fenced and removed. Any later participant can resume the journal with ordinary `recover`.
+
+The `worktrees/slots/ignored` path is not an agent worktree. Only when it contains the command's
+one exact supported cache hierarchy can it be relocated intact outside the managed slot root:
+
+```sh
+wrkslots recover-ownerless-agent-cache
+wrkslots recover-ownerless-agent-cache --apply --coordinator-authorized \
+  --coordinator-pid "$COORDINATOR_PID"
+```
+
+This command accepts no arbitrary path, refuses symlinks, mounts, `.git`, `HANDOFF.md`, unexpected
+top-level content, live use, or an occupied destination, and journals the same-inode relocation.
+
 ## Recovery and compatibility views
 
 Every mutation appends a numbered, hash-linked JSON event before refreshing the readable ACTIVE,

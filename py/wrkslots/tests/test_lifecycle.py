@@ -8102,6 +8102,546 @@ def allow_test_host_for_absent_validate_recovery(
     monkeypatch.setattr(wrkslots, "_user_systemd_snapshot", lambda: ())
 
 
+def prepare_absent_agent_row(
+    project: Path, repository: Path, *, slot: str = "gone-agent"
+) -> wrkslots.ActiveRecord:
+    made = create(project, slot=slot, agent=f"agent-{slot}", branch=f"agent/{slot}")
+    assert made.returncode == 0, made.stderr
+    record = mark_recorded_owner_dead(project, slot)
+    slot_path = wrkslots._slot_directory(
+        wrkslots._load_config(str(project), "testhost"), slot, "agent"
+    )
+    checkout_path = wrkslots._stored_path(
+        wrkslots._load_config(str(project), "testhost"),
+        record.checkouts[0].path,
+        "test checkout",
+    )
+    shutil.rmtree(slot_path)
+    assert checkout_path.absolute() in wrkslots._GitVcs().listed_worktrees(repository)
+    return record
+
+
+def run_absent_agent_recovery(
+    project: Path, record: wrkslots.ActiveRecord, *, apply: bool
+) -> int:
+    args = [
+        "--project-root",
+        str(project),
+        "recover-absent-agent-row",
+        record.slot,
+        "--expected-generation",
+        str(record.generation),
+        "--record-sha256",
+        wrkslots._record_sha256(record),
+    ]
+    if apply:
+        args.extend(
+            (
+                "--apply",
+                "--coordinator-authorized",
+                "--coordinator-pid",
+                str(os.getpid()),
+            )
+        )
+    return wrkslots.main(args)
+
+
+def test_recover_absent_agent_row_preserves_commit_before_registry_repair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, repository, remote = make_project(tmp_path)
+    record = prepare_absent_agent_row(project, repository)
+    set_liveness(project, "dead")
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    assert run_absent_agent_recovery(project, record, apply=False) == 0
+    assert run_absent_agent_recovery(project, record, apply=True) == 0
+
+    config = wrkslots._load_config(str(project), "testhost")
+    assert not wrkslots._load_active(config).slots
+    archived = wrkslots._load_archive(config).records[-1]
+    assert archived["slot"] == record.slot
+    assert archived["limitations"] == [
+        "working-tree contents were absent before recovery; uncommitted, untracked, "
+        "ignored, and HANDOFF contents could not be inspected or salvaged"
+    ]
+    rescue_ref = wrkslots._absent_agent_rescue_ref(record, record.checkouts[0])
+    assert git(remote, "rev-parse", rescue_ref).stdout.strip() == record.checkouts[0].head
+    path = wrkslots._stored_path(config, record.checkouts[0].path, "test checkout")
+    assert wrkslots._GitVcs().worktree_registration(repository, path) is None
+    assert run_absent_agent_recovery(project, record, apply=True) == 0
+
+
+def test_recover_absent_agent_row_refuses_live_or_changed_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    record = prepare_absent_agent_row(project, repository)
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    set_liveness(project, "alive")
+    assert run_absent_agent_recovery(project, record, apply=False) == 3
+    assert "reports owner alive" in capsys.readouterr().err
+
+    set_liveness(project, "dead")
+    changed = replace(record, generation=record.generation + 1)
+    assert run_absent_agent_recovery(project, changed, apply=False) == 3
+    assert "generation changed" in capsys.readouterr().err
+
+
+def test_recover_absent_agent_row_accepts_no_owner_only_with_full_dead_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    made = create(
+        project,
+        slot="unbound-gone",
+        agent="agent-unbound-gone",
+        branch="agent/unbound-gone",
+        bind_owner=False,
+    )
+    assert made.returncode == 0, made.stderr
+    config = wrkslots._load_config(str(project), "testhost")
+    record = wrkslots._find_record(wrkslots._load_active(config), "unbound-gone")
+    assert record.owner is None
+    shutil.rmtree(wrkslots._slot_directory(config, record.slot, "agent"))
+    set_liveness(project, "dead")
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    assert run_absent_agent_recovery(project, record, apply=True) == 0
+    assert not wrkslots._load_active(config).slots
+
+
+def test_recover_absent_agent_row_remote_failure_changes_no_registry_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    record = prepare_absent_agent_row(project, repository)
+    set_liveness(project, "dead")
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    config = wrkslots._load_config(str(project), "testhost")
+    before = wrkslots._record_to_obj(wrkslots._load_active(config).slots[0])
+
+    def refuse_push(*_args: object, **_kwargs: object) -> None:
+        raise wrkslots.Refusal("remote unavailable")
+
+    monkeypatch.setattr(wrkslots._GitVcs, "push_salvage", refuse_push)
+    assert run_absent_agent_recovery(project, record, apply=True) == 3
+    after = wrkslots._record_to_obj(wrkslots._load_active(config).slots[0])
+    assert after == before
+    assert wrkslots._GitVcs().worktree_registration(
+        repository,
+        wrkslots._stored_path(config, record.checkouts[0].path, "test checkout"),
+    ) is not None
+
+
+@pytest.mark.parametrize(
+    "point",
+    (
+        "after-absent-agent-journal",
+        "after-absent-agent-rescue-ref",
+        "after-absent-agent-registration-remove",
+        "after-absent-agent-archive",
+        "after-absent-agent-active-delete",
+    ),
+)
+def test_recover_absent_agent_row_resumes_each_durable_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    point: str,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    record = prepare_absent_agent_row(project, repository)
+    set_liveness(project, "dead")
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    class Interrupted(RuntimeError):
+        pass
+
+    def interrupt(observed: str) -> None:
+        if observed == point:
+            raise Interrupted
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", interrupt)
+    with pytest.raises(Interrupted):
+        run_absent_agent_recovery(project, record, apply=True)
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _point: None)
+    assert (
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "recover",
+                "--coordinator-authorized",
+                "--coordinator-pid",
+                str(os.getpid()),
+            ]
+        )
+        == 0
+    )
+    config = wrkslots._load_config(str(project), "testhost")
+    assert not wrkslots._load_active(config).slots
+
+
+def prepare_ownerless_agent_worktree(
+    project: Path, repository: Path, *, slot: str = "ownerless"
+) -> tuple[Path, str, str]:
+    target = slots_directory(project) / slot
+    branch = f"agent/{slot}"
+    git(repository, "worktree", "add", "-b", branch, str(target), "HEAD")
+    head = git(target, "rev-parse", "HEAD").stdout.strip()
+    remote_digest = wrkslots._GitVcs().remote_url_sha256(target, "origin")
+    return target, head, remote_digest
+
+
+def allow_test_host_for_ownerless_agent_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(wrkslots, "_short_hostname", lambda: "testhost")
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(wrkslots, "_user_systemd_snapshot", lambda: ())
+
+
+def run_ownerless_agent_recovery(
+    project: Path,
+    target: Path,
+    head: str,
+    remote_digest: str,
+    *,
+    apply: bool,
+) -> int:
+    args = [
+        "--project-root",
+        str(project),
+        "recover-ownerless-agent-worktree",
+        target.relative_to(project).as_posix(),
+        "--repository",
+        "repo",
+        "--head",
+        head,
+        "--branch",
+        f"agent/{target.name}",
+        "--remote",
+        "origin",
+        "--remote-url-sha256",
+        remote_digest,
+    ]
+    if apply:
+        args.extend(
+            (
+                "--apply",
+                "--coordinator-authorized",
+                "--coordinator-pid",
+                str(os.getpid()),
+            )
+        )
+    return wrkslots.main(args)
+
+
+def test_recover_ownerless_agent_worktree_salvages_dirty_tree_without_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, repository, remote = make_project(tmp_path)
+    target, head, remote_digest = prepare_ownerless_agent_worktree(project, repository)
+    (target / "uncommitted.txt").write_text("preserve me\n", encoding="utf-8")
+    allow_test_host_for_ownerless_agent_recovery(monkeypatch)
+
+    assert run_ownerless_agent_recovery(
+        project, target, head, remote_digest, apply=False
+    ) == 0
+    assert run_ownerless_agent_recovery(
+        project, target, head, remote_digest, apply=True
+    ) == 0
+    assert not target.exists()
+    assert target.absolute() not in wrkslots._GitVcs().listed_worktrees(repository)
+
+    config = wrkslots._load_config(str(project), "testhost")
+    events = wrkslots._load_events(config)
+    event = next(
+        value for value in reversed(events) if value["kind"] == "ownerless-agent-worktree-removed"
+    )
+    payload = wrkslots._as_mapping(event["payload"], "ownerless event payload")
+    assert "owner" not in payload and "task" not in payload and "handoff" not in payload
+    receipt = wrkslots._as_mapping(
+        wrkslots._as_list(payload["salvage"], "ownerless salvage")[0],
+        "ownerless salvage receipt",
+    )
+    assert receipt["disposition"] == "salvaged"
+    rescue_ref = wrkslots._as_str(receipt["remote_ref"], "ownerless rescue ref")
+    salvage_commit = git(remote, "rev-parse", rescue_ref).stdout.strip()
+    assert salvage_commit == receipt["salvage_commit"]
+    assert git(remote, "show", f"{salvage_commit}:uncommitted.txt").stdout == "preserve me\n"
+
+
+def test_recover_ownerless_agent_worktree_refuses_handoff_and_identity_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    target, head, remote_digest = prepare_ownerless_agent_worktree(project, repository)
+    allow_test_host_for_ownerless_agent_recovery(monkeypatch)
+    (target / "HANDOFF.md").write_text("unread\n", encoding="utf-8")
+    assert run_ownerless_agent_recovery(
+        project, target, head, remote_digest, apply=True
+    ) == 3
+    assert "HANDOFF.md" in capsys.readouterr().err
+    assert target.exists()
+
+    (target / "HANDOFF.md").unlink()
+    assert run_ownerless_agent_recovery(
+        project, target, "0" * 40, remote_digest, apply=False
+    ) == 3
+    assert "HEAD or branch changed" in capsys.readouterr().err
+
+
+def test_recover_ownerless_agent_worktree_refuses_active_user_unit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    target, head, remote_digest = prepare_ownerless_agent_worktree(project, repository)
+    monkeypatch.setattr(wrkslots, "_short_hostname", lambda: "testhost")
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        wrkslots,
+        "_user_systemd_snapshot",
+        lambda: (
+            {
+                "Id": "agent.service",
+                "ActiveState": "active",
+                "PendingJob": "no",
+                "WorkingDirectory": str(target),
+            },
+        ),
+    )
+
+    assert run_ownerless_agent_recovery(
+        project, target, head, remote_digest, apply=False
+    ) == 3
+    assert "user-systemd unit agent.service" in capsys.readouterr().err
+    assert target.exists()
+
+
+def test_recover_ownerless_agent_worktree_refuses_inode_change_after_journal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    target, head, remote_digest = prepare_ownerless_agent_worktree(project, repository)
+    allow_test_host_for_ownerless_agent_recovery(monkeypatch)
+
+    class Interrupted(RuntimeError):
+        pass
+
+    monkeypatch.setattr(
+        wrkslots,
+        "_interrupt_for_test",
+        lambda point: (_ for _ in ()).throw(Interrupted())
+        if point == "after-ownerless-agent-journal"
+        else None,
+    )
+    with pytest.raises(Interrupted):
+        run_ownerless_agent_recovery(project, target, head, remote_digest, apply=True)
+    original = target.with_name("ownerless-original")
+    target.rename(original)
+    target.mkdir()
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _point: None)
+    assert (
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "recover",
+                "--coordinator-authorized",
+                "--coordinator-pid",
+                str(os.getpid()),
+            ]
+        )
+        == 3
+    )
+    assert "identity changed" in capsys.readouterr().err
+    assert original.exists() and target.exists()
+
+
+def test_recover_ownerless_agent_worktree_salvages_initialized_nested_repositories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    add_recursive_submodules(tmp_path, project, repository)
+    target, head, remote_digest = prepare_ownerless_agent_worktree(project, repository)
+    git(
+        target,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "update",
+        "--init",
+        "--recursive",
+    )
+    (target / "component" / "uncommitted.txt").write_text(
+        "nested component\n", encoding="utf-8"
+    )
+    (target / "component" / "leaf" / "uncommitted.txt").write_text(
+        "nested leaf\n", encoding="utf-8"
+    )
+    allow_test_host_for_ownerless_agent_recovery(monkeypatch)
+
+    assert run_ownerless_agent_recovery(
+        project, target, head, remote_digest, apply=True
+    ) == 0
+    events = wrkslots._load_events(wrkslots._load_config(str(project), "testhost"))
+    event = next(
+        value for value in reversed(events) if value["kind"] == "ownerless-agent-worktree-removed"
+    )
+    payload = wrkslots._as_mapping(event["payload"], "ownerless event payload")
+    receipts = [
+        wrkslots._as_mapping(value, "ownerless salvage receipt")
+        for value in wrkslots._as_list(payload["salvage"], "ownerless salvage")
+    ]
+    assert {receipt["checkout"] for receipt in receipts} == {
+        "worktree",
+        "worktree/component",
+        "worktree/component/leaf",
+    }
+    for receipt in receipts[1:]:
+        assert receipt["disposition"] == "salvaged"
+        assert receipt["remote_ref"] is not None
+
+
+@pytest.mark.parametrize(
+    "point",
+    (
+        "after-ownerless-agent-journal",
+        "after-ownerless-agent-salvage",
+        "after-ownerless-agent-fence-before-journal",
+        "after-ownerless-agent-fence",
+        "after-ownerless-agent-remove",
+    ),
+)
+def test_recover_ownerless_agent_worktree_resumes_each_durable_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, point: str
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    target, head, remote_digest = prepare_ownerless_agent_worktree(project, repository)
+    (target / "dirty.txt").write_text("durable\n", encoding="utf-8")
+    allow_test_host_for_ownerless_agent_recovery(monkeypatch)
+
+    class Interrupted(RuntimeError):
+        pass
+
+    def interrupt(observed: str) -> None:
+        if observed == point:
+            raise Interrupted
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", interrupt)
+    with pytest.raises(Interrupted):
+        run_ownerless_agent_recovery(project, target, head, remote_digest, apply=True)
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _point: None)
+    assert (
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "recover",
+                "--coordinator-authorized",
+                "--coordinator-pid",
+                str(os.getpid()),
+            ]
+        )
+        == 0
+    )
+    assert not target.exists()
+
+
+def prepare_ownerless_agent_cache(project: Path) -> Path:
+    source = slots_directory(project) / "ignored"
+    payload = source / "validate" / "cache" / "rust-script" / "projects" / "one"
+    payload.mkdir(parents=True)
+    (payload / "Cargo.toml").write_text("[package]\nname='cached'\n", encoding="utf-8")
+    return source
+
+
+def run_ownerless_agent_cache_recovery(project: Path, *, apply: bool) -> int:
+    args = ["--project-root", str(project), "recover-ownerless-agent-cache"]
+    if apply:
+        args.extend(
+            (
+                "--apply",
+                "--coordinator-authorized",
+                "--coordinator-pid",
+                str(os.getpid()),
+            )
+        )
+    return wrkslots.main(args)
+
+
+def test_recover_ownerless_agent_cache_relocates_exact_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    source = prepare_ownerless_agent_cache(project)
+    allow_test_host_for_ownerless_agent_recovery(monkeypatch)
+
+    assert run_ownerless_agent_cache_recovery(project, apply=False) == 0
+    assert run_ownerless_agent_cache_recovery(project, apply=True) == 0
+    destination = project / "ignored" / "validate" / "cache" / "wrkslots-agent-ignored"
+    assert not source.exists()
+    assert (destination / "validate/cache/rust-script/projects/one/Cargo.toml").is_file()
+
+
+def test_recover_ownerless_agent_cache_refuses_arbitrary_contents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    source = prepare_ownerless_agent_cache(project)
+    (source / "authored.txt").write_text("not cache\n", encoding="utf-8")
+    allow_test_host_for_ownerless_agent_recovery(monkeypatch)
+
+    assert run_ownerless_agent_cache_recovery(project, apply=True) == 3
+    assert "unexpected entry" in capsys.readouterr().err
+    assert source.exists()
+
+
+@pytest.mark.parametrize(
+    "point",
+    (
+        "after-ownerless-agent-cache-journal",
+        "after-ownerless-agent-cache-fence",
+        "after-ownerless-agent-cache-relocate",
+    ),
+)
+def test_recover_ownerless_agent_cache_resumes_each_durable_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, point: str
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    source = prepare_ownerless_agent_cache(project)
+    allow_test_host_for_ownerless_agent_recovery(monkeypatch)
+
+    class Interrupted(RuntimeError):
+        pass
+
+    def interrupt(observed: str) -> None:
+        if observed == point:
+            raise Interrupted
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", interrupt)
+    with pytest.raises(Interrupted):
+        run_ownerless_agent_cache_recovery(project, apply=True)
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _point: None)
+    assert (
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "recover",
+                "--coordinator-authorized",
+                "--coordinator-pid",
+                str(os.getpid()),
+            ]
+        )
+        == 0
+    )
+    destination = project / "ignored" / "validate" / "cache" / "wrkslots-agent-ignored"
+    assert not source.exists() and destination.is_dir()
+
+
 def test_recover_absent_validate_rows_handles_terminal_and_recordless_rows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

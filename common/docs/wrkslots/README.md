@@ -94,6 +94,14 @@ ambiguous paths are preserved. Ordinary `status` reports every remaining unregis
 as an inconsistency and still returns the readable active roster; it does not authorize cleanup or
 make an inconsistent row healthy.
 
+Agent drift has separate bounded recovery commands. `recover-absent-agent-row` accepts one exact
+ACTIVE identity, publishes and reads back every recorded commit, removes only matching stale Git
+registrations, and archives before removing the row. `recover-ownerless-agent-worktree` accepts one
+exact unregistered worktree and its complete Git identity, salvages authored and nested-repository
+work without assigning an owner, task, or handoff, then fences and removes it. A present HANDOFF.md
+always refuses. `recover-ownerless-agent-cache` relocates only its one explicitly supported cache
+tree outside the managed slot root; it is not an exemption for arbitrary directories.
+
 If a command reports an interrupted operation, preserve the paths and run:
 
 ```sh

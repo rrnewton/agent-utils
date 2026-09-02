@@ -191,6 +191,15 @@ the recovery note and validation evidence, and prepares the same post-exit remov
 Use `recover --coordinator-pid PID` whenever a create or removal journal exists. Preserve every path
 after a refusal and report the exact message.
 
+For a registered agent row whose directory is already absent, use
+`recover-absent-agent-row` with the fresh audit's exact machine-selected slot, generation, and
+`record_sha256`. It publishes and reads back every recorded checkout commit before removing an exact
+stale Git registration, then archives before changing ACTIVE. For a real unregistered agent
+worktree, use `recover-ownerless-agent-worktree` with its exact path, repository, HEAD, branch,
+remote, and remote URL digest. This path deliberately records no owner, task, or handoff and refuses
+any HANDOFF.md. The exact non-worktree `worktrees/slots/ignored` rust-script cache uses
+`recover-ownerless-agent-cache`; it is relocated intact and is not a general directory exemption.
+
 ## Migrate an existing worktree manager
 
 Cut over only from a quiescent, green repository with all intended work landed. Keep prior active

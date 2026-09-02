@@ -98,6 +98,33 @@ _LEGACY_VALIDATE_JOURNAL_REQUIRED = frozenset(
 _OWNERLESS_VALIDATE_JOURNAL_REQUIRED = frozenset(
     {"schema", "kind", "machine", "slot", "phase", "fenced", "authorization"}
 )
+_OWNERLESS_AGENT_JOURNAL_REQUIRED = frozenset(
+    {
+        "schema",
+        "kind",
+        "machine",
+        "slot",
+        "phase",
+        "fenced",
+        "authorization",
+        "salvage",
+    }
+)
+_OWNERLESS_AGENT_CACHE_JOURNAL_REQUIRED = frozenset(
+    {
+        "schema",
+        "kind",
+        "machine",
+        "host_id",
+        "slot",
+        "phase",
+        "source",
+        "destination",
+        "fenced",
+        "identity",
+        "actor",
+    }
+)
 _ABSENT_VALIDATE_JOURNAL_REQUIRED = frozenset(
     {
         "schema",
@@ -109,6 +136,22 @@ _ABSENT_VALIDATE_JOURNAL_REQUIRED = frozenset(
         "cursor",
         "actor",
         "items",
+    }
+)
+_ABSENT_AGENT_JOURNAL_REQUIRED = frozenset(
+    {
+        "schema",
+        "kind",
+        "machine",
+        "host_id",
+        "slot",
+        "phase",
+        "actor",
+        "input",
+        "record",
+        "preserved",
+        "removed",
+        "archive_entry",
     }
 )
 CONFIG_NAME = ".wrkslots.yml"
@@ -297,6 +340,11 @@ class ArchiveState:
         compare=False,
         repr=False,
     )
+    absent_agent_recoveries: frozenset[tuple[str, int, str]] = dataclasses.field(
+        default_factory=frozenset,
+        compare=False,
+        repr=False,
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -352,8 +400,33 @@ class ValidationRecoveryAuthorization:
 
 
 @dataclasses.dataclass(frozen=True)
+class OwnerlessAgentAuthorization:
+    """Exact facts authorizing removal of one unregistered agent worktree."""
+
+    path: str
+    identity: tuple[int, int, int]
+    actor: ProcessIdentity
+    repository: str
+    head: str
+    branch: str
+    remote: str
+    remote_url_sha256: str
+    recorded_at: str
+
+
+@dataclasses.dataclass(frozen=True)
 class AbsentValidateRow:
     """Exact identity supplied for one validation row whose storage is absent."""
+
+    machine: str
+    slot: str
+    generation: int
+    record_sha256: str
+
+
+@dataclasses.dataclass(frozen=True)
+class AbsentAgentRow:
+    """Exact identity supplied for one agent row whose storage is absent."""
 
     machine: str
     slot: str
@@ -2311,6 +2384,27 @@ def _absent_validate_recovery_event_evidence(
     return archive_id, source_digest
 
 
+def _absent_agent_recovery_event_evidence(
+    value: object, label: str
+) -> tuple[str, str]:
+    evidence = _as_mapping(value, label)
+    _exact_keys(
+        evidence,
+        {"archive_id", "source_record_sha256", "physical_storage"},
+        set(),
+        label,
+    )
+    archive_id = _as_str(evidence["archive_id"], f"{label}.archive_id")
+    source_digest = _as_str(
+        evidence["source_record_sha256"], f"{label}.source_record_sha256"
+    )
+    if not DIGEST_RE.fullmatch(source_digest):
+        raise StateError(f"{label}.source_record_sha256 is not a SHA-256 digest")
+    if evidence["physical_storage"] != "externally-absent":
+        raise StateError(f"{label}.physical_storage must be externally-absent")
+    return archive_id, source_digest
+
+
 def _states_from_events(
     config: Config,
     machine: str,
@@ -2328,6 +2422,7 @@ def _states_from_events(
     archive_ids: set[str] = set()
     archived_slots: set[str] = set()
     absent_validate_recoveries: set[tuple[str, int, str]] = set()
+    absent_agent_recoveries: set[tuple[str, int, str]] = set()
     for event in events:
         payload = _as_mapping(event["payload"], "append-only event.payload")
         kind = _as_str(event["kind"], "append-only event.kind")
@@ -2435,6 +2530,22 @@ def _states_from_events(
                 if not archive_id.startswith(expected_prefix):
                     raise StateError(
                         "append-only active recovery evidence has a mismatched archive identity"
+                    )
+            elif action == "absent-agent-row-recovered":
+                if current is None or current.slot_type != "agent" or raw_record is not None:
+                    raise StateError(
+                        "absent-agent-row recovery event must remove one active agent row"
+                    )
+                archive_id, source_digest = _absent_agent_recovery_event_evidence(
+                    payload["evidence"], "append-only active agent recovery evidence"
+                )
+                if source_digest != previous_digest:
+                    raise StateError(
+                        "append-only active agent recovery evidence does not match its source record"
+                    )
+                if not archive_id.startswith(f"{machine}:{slot}:{current.generation}:"):
+                    raise StateError(
+                        "append-only active agent recovery evidence has a mismatched archive identity"
                     )
             if raw_record is None:
                 if current is None:
@@ -2547,6 +2658,25 @@ def _states_from_events(
                         "append-only archive recovery evidence does not match its record"
                     )
                 absent_validate_recoveries.add((slot, generation, source_digest))
+            elif action == "absent-agent-row-recovered":
+                evidence_archive_id, source_digest = _absent_agent_recovery_event_evidence(
+                    payload["evidence"], "append-only archive agent recovery evidence"
+                )
+                generation = _as_int(
+                    parsed_record.get("generation"),
+                    "append-only archive agent recovery record.generation",
+                    minimum=1,
+                )
+                if (
+                    parsed_record.get("machine") != machine
+                    or parsed_record.get("slot_type") != "agent"
+                    or parsed_record.get("physical_storage") != "removed"
+                    or evidence_archive_id != archive_id
+                ):
+                    raise StateError(
+                        "append-only archive agent recovery evidence does not match its record"
+                    )
+                absent_agent_recoveries.add((slot, generation, source_digest))
             if archive_id in archive_ids:
                 raise StateError(f"duplicate archive_id in append-only events: {archive_id}")
             if slot in archived_slots:
@@ -2564,6 +2694,7 @@ def _states_from_events(
             archive_revision,
             tuple(archive_records),
             frozenset(absent_validate_recoveries),
+            frozenset(absent_agent_recoveries),
         ),
     )
 
@@ -3012,6 +3143,42 @@ def _validate_global_state_for_finish_recovery(
             active_machine, active_record = current
             if (
                 slot == recorded.slot
+                and active_machine == config.machine
+                and archive.machine == config.machine
+                and _record_to_obj(active_record) == _record_to_obj(recorded)
+                and _json_equal(archived, expected_entry)
+            ):
+                continue
+            raise StateError(
+                f"slot {slot!r} is active on {active_machine} and archived on {archive.machine}"
+            )
+    return states, archives
+
+
+def _validate_global_state_for_absent_agent_recovery(
+    config: Config, journal: Mapping[str, object]
+) -> tuple[list[ActiveState], list[ArchiveState]]:
+    """Allow only this journal's exact archive-before-ACTIVE overlap."""
+
+    states = _load_all_active(config)
+    archives = _load_all_archives(config)
+    item, recorded, _receipts, expected_entry = _absent_agent_journal_inputs(
+        config, journal
+    )
+    active = {
+        record.slot: (state.machine, record)
+        for state in states
+        for record in state.slots
+    }
+    for archive in archives:
+        for archived in archive.records:
+            slot = _as_str(archived.get("slot"), "archive slot")
+            current = active.get(slot)
+            if current is None:
+                continue
+            active_machine, active_record = current
+            if (
+                slot == item.slot
                 and active_machine == config.machine
                 and archive.machine == config.machine
                 and _record_to_obj(active_record) == _record_to_obj(recorded)
@@ -3499,6 +3666,12 @@ def _validate_journal_shape(
         _as_str(raw["phase"], "ownerless validation journal.phase")
         _as_str(raw["fenced"], "ownerless validation journal.fenced")
         _validation_authorization_from_obj(raw["authorization"])
+    elif kind == "ownerless-agent-remove":
+        _ownerless_agent_journal_inputs(dataclasses.replace(config, machine=machine), raw)
+    elif kind == "ownerless-agent-cache-relocate":
+        _ownerless_agent_cache_journal_inputs(
+            dataclasses.replace(config, machine=machine), raw
+        )
     elif kind == "recover-absent-validate-rows":
         _exact_keys(
             raw,
@@ -3507,6 +3680,8 @@ def _validate_journal_shape(
             "absent-validation-row journal",
         )
         _absent_validate_batch_items(dataclasses.replace(config, machine=machine), raw)
+    elif kind == "recover-absent-agent-row":
+        _absent_agent_journal_inputs(dataclasses.replace(config, machine=machine), raw)
     else:
         raise StateError(f"unsupported recovery journal kind {kind!r}")
 
@@ -3850,6 +4025,48 @@ class _GitVcs:
             if line.startswith("worktree "):
                 paths.add(Path(line.removeprefix("worktree ")).absolute())
         return paths
+
+    def worktree_registration(
+        self, repository: Path, checkout: Path
+    ) -> tuple[str, str | None] | None:
+        """Return the exact administrative HEAD and branch for one registered path."""
+
+        result = self._run(repository, ["worktree", "list", "--porcelain", "-z"])
+        fields = result.stdout.split("\x00")
+        if fields and fields[-1] == "":
+            fields.pop()
+        records: list[dict[str, str | None]] = []
+        current: dict[str, str | None] | None = None
+        for field in fields:
+            key, separator, value = field.partition(" ")
+            if key == "worktree":
+                if current is not None:
+                    records.append(current)
+                current = {"worktree": value}
+                continue
+            if current is None:
+                raise Refusal("Git worktree inventory starts without a worktree path")
+            if key in current:
+                raise Refusal(f"Git worktree inventory repeats field {key!r}")
+            current[key] = value if separator else None
+        if current is not None:
+            records.append(current)
+        target = checkout.absolute()
+        matches = [
+            record
+            for record in records
+            if Path(str(record.get("worktree"))).absolute() == target
+        ]
+        if len(matches) > 1:
+            raise Refusal(f"Git reports duplicate worktree registrations for {target}")
+        if not matches:
+            return None
+        record = matches[0]
+        head = record.get("HEAD")
+        if not isinstance(head, str) or not SHA_RE.fullmatch(head):
+            raise Refusal(f"Git worktree registration for {target} has no full HEAD")
+        branch = record.get("branch")
+        return head, branch
 
     def verify_existing_worktree(self, repository: Path, checkout: Path) -> str:
         source_common = self.common_directory(repository)
@@ -5198,13 +5415,15 @@ def _salvage_pathspecs(config: Config, checkout_name: str) -> list[str]:
 
 def _salvage_candidate(
     config: Config,
-    record: ActiveRecord,
+    record: ActiveRecord | None,
     checkout: Checkout,
     vcs: _GitVcs,
     *,
     path_override: Path | None = None,
     allow_detached: bool = False,
     verify_repository_membership: bool = True,
+    ownerless_slot: str | None = None,
+    ownerless_recorded_at: str | None = None,
 ) -> tuple[str, str, str, bool]:
     """Return HEAD, status digest, durable commit candidate, and dirty state.
 
@@ -5307,18 +5526,28 @@ def _salvage_candidate(
         tree = vcs._run(path, ["write-tree"], env_overrides=env).stdout.strip()
         if not SHA_RE.fullmatch(tree):
             raise Refusal(f"salvage tree for checkout {checkout.name} is not a full Git object")
-        message = (
-            f"Salvage {record.slot}/{checkout.name} after recorded owner exit\n\n"
-            f"task: {record.task}\n"
-            f"source-head: {head}\n"
-        )
+        if record is None:
+            if ownerless_slot is None or ownerless_recorded_at is None:
+                raise StateError("ownerless salvage lacks its slot and recorded time")
+            message = (
+                f"Salvage ownerless worktree {ownerless_slot}/{checkout.name}\n\n"
+                f"source-head: {head}\n"
+            )
+            recorded_at = ownerless_recorded_at
+        else:
+            message = (
+                f"Salvage {record.slot}/{checkout.name} after recorded owner exit\n\n"
+                f"task: {record.task}\n"
+                f"source-head: {head}\n"
+            )
+            recorded_at = record.heartbeat_at
         identity = {
             "GIT_AUTHOR_NAME": "wrkslots salvage",
             "GIT_AUTHOR_EMAIL": "wrkslots@localhost",
-            "GIT_AUTHOR_DATE": record.heartbeat_at,
+            "GIT_AUTHOR_DATE": recorded_at,
             "GIT_COMMITTER_NAME": "wrkslots salvage",
             "GIT_COMMITTER_EMAIL": "wrkslots@localhost",
-            "GIT_COMMITTER_DATE": record.heartbeat_at,
+            "GIT_COMMITTER_DATE": recorded_at,
         }
         commit = vcs._run(
             path,
@@ -5458,6 +5687,97 @@ def _salvage_agent_slot(
                     allow_detached=True,
                 )
             )
+    return tuple(receipts)
+
+
+def _salvage_ownerless_checkout(
+    config: Config,
+    slot: str,
+    recorded_at: str,
+    checkout: Checkout,
+    vcs: _GitVcs,
+    *,
+    path_override: Path | None = None,
+    allow_detached: bool = False,
+) -> dict[str, object]:
+    """Publish one ownerless checkout without asserting an owner, task, or handoff."""
+
+    path = path_override or _stored_path(config, checkout.path, "ownerless checkout path")
+    head, status_digest, commit, dirty = _salvage_candidate(
+        config,
+        None,
+        checkout,
+        vcs,
+        path_override=path,
+        allow_detached=allow_detached,
+        verify_repository_membership=not allow_detached,
+        ownerless_slot=slot,
+        ownerless_recorded_at=recorded_at,
+    )
+    vcs.fetch_remote(path, checkout.remote, checkout.landed_ref)
+    if vcs.remote_url_sha256(path, checkout.remote) != checkout.remote_url_sha256:
+        raise Refusal(
+            f"checkout {checkout.name} remote {checkout.remote} changed during salvage"
+        )
+    containing = vcs.remote_refs_containing(path, checkout.remote, head)
+    if not dirty and containing:
+        return {
+            "checkout": checkout.name,
+            "source_head": head,
+            "salvage_commit": commit,
+            "status_sha256": status_digest,
+            "disposition": "already-published",
+            "remote_ref": None,
+            "containing_remote_refs": list(containing),
+        }
+    salvage_name = checkout.name.replace("/", "-")
+    ref = f"refs/heads/salvage/{config.machine}/{slot}/{salvage_name}-{commit[:12]}"
+    _validate_full_ref(ref, "ownerless worktree salvage ref")
+    vcs.push_salvage(path, checkout.remote, commit, ref)
+    return {
+        "checkout": checkout.name,
+        "source_head": head,
+        "salvage_commit": commit,
+        "status_sha256": status_digest,
+        "disposition": "salvaged",
+        "remote_ref": ref,
+        "containing_remote_refs": [],
+    }
+
+
+def _salvage_ownerless_worktree(
+    config: Config,
+    authorization: OwnerlessAgentAuthorization,
+    checkout: Checkout,
+    vcs: _GitVcs,
+    *,
+    path_override: Path | None = None,
+) -> tuple[dict[str, object], ...]:
+    path = path_override or _stored_path(config, checkout.path, "ownerless checkout path")
+    receipts = [
+        _salvage_ownerless_checkout(
+            config,
+            Path(authorization.path).name,
+            authorization.recorded_at,
+            checkout,
+            vcs,
+            path_override=path,
+        )
+    ]
+    for submodule, submodule_path in _submodule_salvage_checkouts(
+        config, checkout, vcs, path_override=path
+    ):
+        receipts.append(
+            _salvage_ownerless_checkout(
+                config,
+                Path(authorization.path).name,
+                authorization.recorded_at,
+                submodule,
+                vcs,
+                path_override=submodule_path,
+                allow_detached=True,
+            )
+        )
     return tuple(receipts)
 
 
@@ -9202,7 +9522,12 @@ def _archive_entry(
 
 
 def _append_archive_once(
-    config: Config, archive: ArchiveState, entry: dict[str, object]
+    config: Config,
+    archive: ArchiveState,
+    entry: dict[str, object],
+    *,
+    action: str = "slot-archived",
+    evidence: Mapping[str, object] | None = None,
 ) -> ArchiveState:
     archive_id = _as_str(entry["archive_id"], "archive entry archive_id")
     for existing in archive.records:
@@ -9217,13 +9542,15 @@ def _append_archive_once(
         machine=archive.machine,
         revision=archive.revision + 1,
         records=(*archive.records, entry),
+        absent_validate_recoveries=archive.absent_validate_recoveries,
+        absent_agent_recoveries=archive.absent_agent_recoveries,
     )
     _write_archive_state(
         config,
         updated,
-        action="slot-archived",
+        action=action,
         slot=_as_str(entry["slot"], "archive entry slot"),
-        evidence={"archive_id": archive_id},
+        evidence={"archive_id": archive_id} if evidence is None else evidence,
     )
     return updated
 
@@ -11552,6 +11879,1127 @@ def _recover_ownerless_validation(
     print(f"recovered ownerless validation {authorization.target_kind}={target}")
 
 
+def _ownerless_agent_authorization_to_obj(
+    value: OwnerlessAgentAuthorization,
+) -> dict[str, object]:
+    return {
+        **dataclasses.asdict(value),
+        "identity": list(value.identity),
+        "actor": _identity_to_obj(value.actor),
+    }
+
+
+def _ownerless_agent_authorization_from_obj(
+    value: object,
+) -> OwnerlessAgentAuthorization:
+    raw = _as_mapping(value, "ownerless agent authorization")
+    _exact_keys(
+        raw,
+        {
+            "path",
+            "identity",
+            "actor",
+            "repository",
+            "head",
+            "branch",
+            "remote",
+            "remote_url_sha256",
+            "recorded_at",
+        },
+        set(),
+        "ownerless agent authorization",
+    )
+    identity = tuple(
+        _as_int(item, "ownerless agent directory identity")
+        for item in _as_list(raw["identity"], "ownerless agent directory identity")
+    )
+    if len(identity) != 3:
+        raise StateError("ownerless agent directory identity must have three fields")
+    actor = _identity_from_obj(raw["actor"], "ownerless agent recovery actor")
+    if actor is None:
+        raise StateError("ownerless agent recovery has no actor")
+    head = _as_str(raw["head"], "ownerless agent HEAD")
+    digest = _as_str(raw["remote_url_sha256"], "ownerless agent remote digest")
+    if not SHA_RE.fullmatch(head) or not DIGEST_RE.fullmatch(digest):
+        raise StateError("ownerless agent Git identity is invalid")
+    recorded_at = _as_str(raw["recorded_at"], "ownerless agent recorded_at")
+    _parse_timestamp(recorded_at, "ownerless agent recorded_at")
+    return OwnerlessAgentAuthorization(
+        path=_as_str(raw["path"], "ownerless agent path"),
+        identity=identity,
+        actor=actor,
+        repository=_as_str(raw["repository"], "ownerless agent repository"),
+        head=head,
+        branch=_validate_ref(_as_str(raw["branch"], "ownerless agent branch"), "branch"),
+        remote=_validate_remote(_as_str(raw["remote"], "ownerless agent remote")),
+        remote_url_sha256=digest,
+        recorded_at=recorded_at,
+    )
+
+
+def _ownerless_agent_target(config: Config, raw: str) -> tuple[str, Path]:
+    relative, target = _relative_inside(config.root, raw, "ownerless agent worktree")
+    root = _slot_roots(config)["agent"]
+    if target.parent != root or target.name == "ignored":
+        raise Refusal(
+            f"ownerless agent worktree must be one direct child of {root}, excluding ignored"
+        )
+    _validate_name(target.name, "ownerless agent worktree name")
+    return relative, target
+
+
+def _assert_unregistered_path_systemd_unrelated(path: Path) -> None:
+    for unit in _user_systemd_snapshot():
+        active = unit["ActiveState"] not in {"inactive", "failed"}
+        queued = unit["PendingJob"] == "yes"
+        if (active or queued) and str(path) in "\n".join(unit.values()):
+            raise Refusal(
+                f"user-systemd unit {unit['Id']} names ownerless worktree path {path}"
+            )
+
+
+def _ownerless_agent_checkout(
+    config: Config,
+    authorization: OwnerlessAgentAuthorization,
+    path: Path,
+    repository: Path,
+) -> Checkout:
+    return Checkout(
+        name="worktree",
+        path=path.relative_to(config.root).as_posix(),
+        repository=authorization.repository,
+        branch=authorization.branch,
+        start_point=authorization.head,
+        remote=authorization.remote,
+        remote_url_sha256=authorization.remote_url_sha256,
+        landed_ref=_landed_ref_for_remote(config, authorization.remote),
+        head=authorization.head,
+    )
+
+
+def _ownerless_agent_facts(
+    config: Config,
+    authorization: OwnerlessAgentAuthorization,
+    path: Path,
+    repository: Path,
+    *,
+    expected_identity: bool,
+) -> Checkout:
+    if path.is_symlink() or not path.is_dir():
+        raise Refusal(f"ownerless agent worktree is absent or unsafe: {path}")
+    _ensure_no_mount_components(path.parent, path, "ownerless agent worktree")
+    _assert_no_mountinfo_crossing(path, path, "ownerless agent worktree")
+    if expected_identity and _open_directory_identity(path, "ownerless agent worktree") != authorization.identity:
+        raise Refusal("ownerless agent worktree identity changed")
+    handoff = path / "HANDOFF.md"
+    if handoff.exists() or handoff.is_symlink():
+        raise Refusal(
+            f"ownerless agent worktree contains HANDOFF.md; it must remain until a verified reader records it"
+        )
+    vcs = _GitVcs()
+    head = vcs.verify_existing_worktree(repository, path)
+    branch = vcs.branch(path)
+    if head != authorization.head or branch != authorization.branch:
+        raise Refusal("ownerless agent worktree HEAD or branch changed")
+    vcs.assert_ordinary_history(path)
+    vcs.assert_ordinary_index(path)
+    if vcs.remote_url_sha256(path, authorization.remote) != authorization.remote_url_sha256:
+        raise Refusal("ownerless agent worktree remote changed")
+    _assert_slot_unused(path)
+    _assert_unregistered_path_systemd_unrelated(path)
+    return _ownerless_agent_checkout(config, authorization, path, repository)
+
+
+def _ownerless_agent_journal_inputs(
+    config: Config, raw: Mapping[str, object]
+) -> tuple[OwnerlessAgentAuthorization, Path, Path, Path | None, Path, tuple[Mapping[str, object], ...]]:
+    _exact_keys(raw, _OWNERLESS_AGENT_JOURNAL_REQUIRED, set(), "ownerless agent journal")
+    if (
+        _as_int(raw["schema"], "ownerless agent journal.schema") != SCHEMA
+        or raw["kind"] != "ownerless-agent-remove"
+        or raw["machine"] != config.machine
+    ):
+        raise StateError("ownerless agent journal identity is invalid")
+    authorization = _ownerless_agent_authorization_from_obj(raw["authorization"])
+    _relative, target = _ownerless_agent_target(config, authorization.path)
+    if raw["slot"] != target.name:
+        raise StateError("ownerless agent journal slot differs from its path")
+    _relative, fenced = _relative_inside(
+        config.root, _as_str(raw["fenced"], "ownerless agent fenced path"), "fenced path"
+    )
+    prefix = f".{target.name}.ownerless-agent."
+    if (
+        fenced.parent != target.parent
+        or not re.fullmatch(rf"{re.escape(prefix)}[0-9a-f]{{32}}", fenced.name)
+    ):
+        raise StateError("ownerless agent fenced path does not match its target")
+    phase = _as_str(raw["phase"], "ownerless agent journal.phase")
+    if phase not in {"prepared", "preserved", "fenced", "removed"}:
+        raise StateError(f"unknown ownerless agent phase {phase!r}")
+    target_present = target.exists() or target.is_symlink()
+    fenced_present = fenced.exists() or fenced.is_symlink()
+    if target_present and fenced_present:
+        raise Refusal("canonical and fenced ownerless agent paths both exist")
+    active = target if target_present else fenced if fenced_present else None
+    if phase == "removed" and active is not None:
+        raise Refusal("ownerless agent worktree reappeared after removal was recorded")
+    if active is not None and (
+        active.is_symlink()
+        or not active.is_dir()
+        or _open_directory_identity(active, "ownerless agent worktree") != authorization.identity
+    ):
+        raise Refusal("ownerless agent worktree identity changed; preserve it")
+    _stored, repository = _repository_path(
+        config, authorization.repository, allow_managed=True
+    )
+    if repository == target or _path_is_within(repository, target):
+        raise StateError("ownerless agent source repository is inside the removal target")
+    salvage = tuple(
+        _as_mapping(value, f"ownerless agent journal.salvage[{index}]")
+        for index, value in enumerate(_as_list(raw["salvage"], "ownerless agent journal.salvage"))
+    )
+    return authorization, target, fenced, active, repository, salvage
+
+
+def _assert_ownerless_agent_no_registry_collision(
+    config: Config, target: Path, states: Sequence[ActiveState], archives: Sequence[ArchiveState]
+) -> None:
+    for state in states:
+        for record in state.slots:
+            if record.slot == target.name:
+                raise Refusal(f"ownerless path name collides with active slot {record.slot}")
+            for checkout in record.checkouts:
+                recorded = _stored_path_reference(config, checkout.path, "recorded checkout path")
+                if recorded == target or _path_is_within(recorded, target) or _path_is_within(target, recorded):
+                    raise Refusal(f"ownerless path overlaps registered checkout {record.slot}/{checkout.name}")
+    for archive in archives:
+        for archive_record in archive.records:
+            if archive_record.get("slot") == target.name:
+                raise Refusal(f"ownerless path name collides with archived slot {target.name}")
+
+
+def _assert_ownerless_salvage_still_matches(
+    config: Config,
+    authorization: OwnerlessAgentAuthorization,
+    checkout: Checkout,
+    receipts: Sequence[Mapping[str, object]],
+    vcs: _GitVcs,
+    path: Path,
+) -> None:
+    candidates = [(checkout, path, False)]
+    candidates.extend(
+        (submodule, submodule_path, True)
+        for submodule, submodule_path in _submodule_salvage_checkouts(
+            config, checkout, vcs, path_override=path
+        )
+    )
+    if len(candidates) != len(receipts):
+        raise StateError("ownerless salvage receipts do not cover every checkout")
+    for (candidate, candidate_path, detached), receipt in zip(candidates, receipts):
+        if receipt.get("checkout") != candidate.name:
+            raise StateError("ownerless salvage receipt order changed")
+        head, status_digest, commit, _dirty = _salvage_candidate(
+            config,
+            None,
+            candidate,
+            vcs,
+            path_override=candidate_path,
+            allow_detached=detached,
+            verify_repository_membership=not detached,
+            ownerless_slot=Path(authorization.path).name,
+            ownerless_recorded_at=authorization.recorded_at,
+        )
+        if (head, status_digest, commit) != (
+            receipt.get("source_head"),
+            receipt.get("status_sha256"),
+            receipt.get("salvage_commit"),
+        ):
+            raise Refusal("ownerless worktree changed after salvage; preserve it")
+        if receipt.get("disposition") == "salvaged":
+            ref = _as_str(receipt.get("remote_ref"), "ownerless salvage ref")
+            if vcs.remote_ref_sha(candidate_path, candidate.remote, ref) != commit:
+                raise Refusal(f"remote salvage ref {ref} no longer preserves {commit}")
+        elif receipt.get("disposition") == "already-published":
+            vcs.fetch_remote(candidate_path, candidate.remote, candidate.landed_ref)
+            if not vcs.remote_refs_containing(candidate_path, candidate.remote, head):
+                raise Refusal(f"ownerless checkout {candidate.name} is no longer published")
+        else:
+            raise StateError("ownerless salvage receipt has unknown disposition")
+
+
+def _recover_ownerless_agent(
+    config: Config,
+    path: Path,
+    raw: Mapping[str, object],
+    coordinator: ProcessIdentity,
+) -> None:
+    if path != _journal_path(config):
+        raise StateError("ownerless agent journal filename is invalid")
+    _assert_caller_process(coordinator, "coordinator")
+    authorization, target, fenced, active, repository, salvage = (
+        _ownerless_agent_journal_inputs(config, raw)
+    )
+    if authorization.actor.host_id != _host_id():
+        raise Refusal("ownerless agent journal belongs to another host identity")
+    journal = dict(raw)
+    vcs = _GitVcs()
+    if active is not None:
+        if active == fenced:
+            vcs.repair_worktree(repository, fenced)
+            _repair_nested_repositories(fenced, vcs)
+        checkout = _ownerless_agent_facts(
+            config, authorization, active, repository, expected_identity=True
+        )
+        if not salvage:
+            salvage = _salvage_ownerless_worktree(
+                config, authorization, checkout, vcs, path_override=active
+            )
+            journal["salvage"] = [dict(value) for value in salvage]
+            journal["phase"] = "preserved"
+            _write_journal(config, journal)
+            _interrupt_for_test("after-ownerless-agent-salvage")
+        _assert_ownerless_salvage_still_matches(
+            config, authorization, checkout, salvage, vcs, active
+        )
+        if active == target:
+            os.rename(target, fenced)
+            _fsync_directory(target.parent)
+            if _open_directory_identity(fenced, "fenced ownerless agent worktree") != authorization.identity:
+                os.rename(fenced, target)
+                _fsync_directory(target.parent)
+                raise Refusal("ownerless agent worktree identity changed during fencing")
+            _interrupt_for_test("after-ownerless-agent-fence-before-journal")
+            vcs.repair_worktree(repository, fenced)
+            _repair_nested_repositories(fenced, vcs)
+            journal["phase"] = "fenced"
+            _write_journal(config, journal)
+            _interrupt_for_test("after-ownerless-agent-fence")
+            active = fenced
+            checkout = dataclasses.replace(
+                checkout, path=fenced.relative_to(config.root).as_posix()
+            )
+        _ownerless_agent_facts(
+            config, authorization, active, repository, expected_identity=True
+        )
+        _assert_unregistered_path_systemd_unrelated(target)
+        _assert_unregistered_path_systemd_unrelated(fenced)
+        _assert_ownerless_salvage_still_matches(
+            config, authorization, checkout, salvage, vcs, active
+        )
+        vcs.remove_worktree(repository, active, force=True)
+        journal["phase"] = "removed"
+        _write_journal(config, journal)
+        _interrupt_for_test("after-ownerless-agent-remove")
+    if target.exists() or target.is_symlink() or fenced.exists() or fenced.is_symlink():
+        raise Refusal("ownerless agent worktree still exists after removal")
+    if target.absolute() in vcs.listed_worktrees(repository) or fenced.absolute() in vcs.listed_worktrees(repository):
+        raise Refusal("Git still registers the removed ownerless agent worktree")
+    _write_event_file(
+        config,
+        config.machine,
+        "ownerless-agent-worktree-removed",
+        {
+            "slot": raw["slot"],
+            "authorization": _ownerless_agent_authorization_to_obj(authorization),
+            "salvage": [dict(value) for value in salvage],
+            "recovery_actor": _identity_to_obj(coordinator),
+        },
+    )
+    _clear_journal(config, journal)
+    print(f"recovered ownerless agent worktree={target}")
+
+
+def _cmd_recover_ownerless_agent_worktree(args: argparse.Namespace) -> int:
+    config = _load_config(args.project_root, args.machine)
+    if config.machine != _short_hostname():
+        raise Refusal("ownerless agent recovery must run on the worktree's machine")
+    if args.apply:
+        _require_coordinator_authorized(args, "ownerless agent worktree recovery")
+        if args.coordinator_pid is None:
+            raise Refusal("--apply requires --coordinator-pid")
+        coordinator = _capture_caller_process(args.coordinator_pid, "coordinator")
+    else:
+        coordinator = _read_process_identity(os.getpid())
+    with _mutation_locks(config, args.wait_lock):
+        _refuse_partial_state(config)
+        journals = _outstanding_journals(config)
+        if journals:
+            path, raw = _load_journal(config)
+            if raw.get("kind") != "ownerless-agent-remove":
+                raise Refusal(f"another interrupted mutation is recorded in {path}")
+            authorization, target, _fenced, _active, _repository, _salvage = (
+                _ownerless_agent_journal_inputs(config, raw)
+            )
+            if authorization.path != _ownerless_agent_target(config, args.path)[0]:
+                raise Refusal("requested ownerless path differs from the interrupted recovery")
+            if not args.apply:
+                print(f"WORKTREE path={target} outcome=planned detail=resume")
+                return 0
+            _recover_ownerless_agent(config, path, raw, coordinator)
+            return 0
+        states, archives = _validate_global_state(config)
+        relative, target = _ownerless_agent_target(config, args.path)
+        _assert_ownerless_agent_no_registry_collision(config, target, states, archives)
+        repository_relative, repository = _repository_path(
+            config, args.repository, allow_managed=True
+        )
+        if repository == target or _path_is_within(repository, target):
+            raise Refusal("ownerless agent source repository is inside the removal target")
+        head = _as_str(args.head, "ownerless agent HEAD")
+        digest = _as_str(args.remote_url_sha256, "ownerless agent remote digest")
+        if not SHA_RE.fullmatch(head) or not DIGEST_RE.fullmatch(digest):
+            raise Refusal("--head and --remote-url-sha256 must be full lowercase digests")
+        authorization = OwnerlessAgentAuthorization(
+            path=relative,
+            identity=_open_directory_identity(target, "ownerless agent worktree"),
+            actor=coordinator,
+            repository=repository_relative,
+            head=head,
+            branch=_validate_ref(args.branch, "branch"),
+            remote=_validate_remote(args.remote),
+            remote_url_sha256=digest,
+            recorded_at=_utc_now(),
+        )
+        _ownerless_agent_facts(
+            config, authorization, target, repository, expected_identity=True
+        )
+        if not args.apply:
+            print(f"WORKTREE path={target} outcome=planned detail=ownerless-agent")
+            return 0
+        journal = {
+            "schema": SCHEMA,
+            "kind": "ownerless-agent-remove",
+            "machine": config.machine,
+            "slot": target.name,
+            "phase": "prepared",
+            "fenced": (
+                target.with_name(f".{target.name}.ownerless-agent.{uuid.uuid4().hex}")
+                .relative_to(config.root)
+                .as_posix()
+            ),
+            "authorization": _ownerless_agent_authorization_to_obj(authorization),
+            "salvage": [],
+        }
+        _write_journal(config, journal)
+        _interrupt_for_test("after-ownerless-agent-journal")
+        before = _global_rows(states, archives)
+        _recover_ownerless_agent(config, _journal_path(config), journal, coordinator)
+        after_states, after_archives = _validate_global_state(config)
+        if _global_rows(after_states, after_archives) != before:
+            raise StateError("ownerless agent recovery changed registered slot state")
+    return 0
+
+
+def _ownerless_agent_cache_paths(config: Config) -> tuple[Path, Path]:
+    source = _slot_roots(config)["agent"] / "ignored"
+    destination = config.root / "ignored" / "validate" / "cache" / "wrkslots-agent-ignored"
+    return source, destination
+
+
+def _assert_ownerless_agent_cache_tree(path: Path) -> tuple[int, int, int]:
+    if path.is_symlink() or not path.is_dir():
+        raise Refusal(f"ownerless agent cache path is absent or unsafe: {path}")
+    _ensure_no_mount_components(path.parent, path, "ownerless agent cache path")
+    _assert_no_mountinfo_crossing(path, path, "ownerless agent cache path")
+    expected = path / "validate" / "cache" / "rust-script"
+    if not expected.is_dir() or expected.is_symlink():
+        raise Refusal(
+            "ownerless agent cache must contain the exact validate/cache/rust-script tree"
+        )
+    def walk_error(error: OSError) -> None:
+        raise Refusal(f"cannot enumerate ownerless agent cache: {error}")
+
+    for root, directories, files in os.walk(
+        path, topdown=True, onerror=walk_error, followlinks=False
+    ):
+        root_path = Path(root)
+        for name in (*directories, *files):
+            candidate = root_path / name
+            if candidate.is_symlink():
+                raise Refusal(f"ownerless agent cache contains a symlink: {candidate}")
+            if name in {".git", "HANDOFF.md"}:
+                raise Refusal(f"ownerless agent cache contains authored-work marker {candidate}")
+            try:
+                metadata = candidate.lstat()
+            except OSError as exc:
+                raise Refusal(f"cannot inspect ownerless agent cache entry {candidate}: {exc}") from exc
+            if not (stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode)):
+                raise Refusal(f"ownerless agent cache contains a special file: {candidate}")
+        if root_path == path and (set(directories) != {"validate"} or files):
+            raise Refusal("ownerless agent cache root contains an unexpected entry")
+        if root_path == path / "validate" and (set(directories) != {"cache"} or files):
+            raise Refusal("ownerless agent cache validate directory contains an unexpected entry")
+        if root_path == path / "validate" / "cache" and (
+            set(directories) != {"rust-script"} or files
+        ):
+            raise Refusal("ownerless agent cache cache directory contains an unexpected entry")
+    _assert_slot_unused(path)
+    _assert_unregistered_path_systemd_unrelated(path)
+    return _open_directory_identity(path, "ownerless agent cache path")
+
+
+def _ownerless_agent_cache_journal_inputs(
+    config: Config, raw: Mapping[str, object]
+) -> tuple[Path, Path, Path, Path | None, tuple[int, int, int]]:
+    _exact_keys(
+        raw,
+        _OWNERLESS_AGENT_CACHE_JOURNAL_REQUIRED,
+        set(),
+        "ownerless agent cache journal",
+    )
+    if (
+        _as_int(raw["schema"], "ownerless agent cache journal.schema") != SCHEMA
+        or raw["kind"] != "ownerless-agent-cache-relocate"
+        or raw["machine"] != config.machine
+        or raw["slot"] != "ignored"
+    ):
+        raise StateError("ownerless agent cache journal identity is invalid")
+    if _as_str(raw["host_id"], "ownerless agent cache host_id") != _host_id():
+        raise Refusal("ownerless agent cache journal belongs to another host identity")
+    expected_source, expected_destination = _ownerless_agent_cache_paths(config)
+    _relative, source = _relative_inside(
+        config.root, _as_str(raw["source"], "ownerless agent cache source"), "cache source"
+    )
+    _relative, destination = _relative_inside(
+        config.root,
+        _as_str(raw["destination"], "ownerless agent cache destination"),
+        "cache destination",
+    )
+    _relative, fenced = _relative_inside(
+        config.root, _as_str(raw["fenced"], "ownerless agent cache fence"), "cache fence"
+    )
+    if source != expected_source or destination != expected_destination:
+        raise StateError("ownerless agent cache journal names a non-canonical path")
+    prefix = ".ignored.ownerless-agent-cache."
+    if fenced.parent != source.parent or not re.fullmatch(
+        rf"{re.escape(prefix)}[0-9a-f]{{32}}", fenced.name
+    ):
+        raise StateError("ownerless agent cache fence is invalid")
+    identity = tuple(
+        _as_int(value, "ownerless agent cache identity")
+        for value in _as_list(raw["identity"], "ownerless agent cache identity")
+    )
+    if len(identity) != 3:
+        raise StateError("ownerless agent cache identity must have three fields")
+    if _identity_from_obj(raw["actor"], "ownerless agent cache actor") is None:
+        raise StateError("ownerless agent cache journal has no actor")
+    phase = _as_str(raw["phase"], "ownerless agent cache phase")
+    if phase not in {"prepared", "fenced", "relocated"}:
+        raise StateError(f"unknown ownerless agent cache phase {phase!r}")
+    present = [
+        candidate
+        for candidate in (source, fenced, destination)
+        if candidate.exists() or candidate.is_symlink()
+    ]
+    if len(present) > 1:
+        raise Refusal("more than one ownerless agent cache path exists; preserve all")
+    active = present[0] if present else None
+    if active is not None and (
+        active.is_symlink()
+        or not active.is_dir()
+        or _open_directory_identity(active, "ownerless agent cache") != identity
+    ):
+        raise Refusal("ownerless agent cache identity changed; preserve it")
+    if phase != "relocated" and active == destination:
+        phase = "relocated"
+    if phase == "relocated" and active != destination:
+        raise Refusal("relocated ownerless agent cache is missing from its destination")
+    return source, destination, fenced, active, identity
+
+
+def _recover_ownerless_agent_cache(
+    config: Config,
+    path: Path,
+    raw: Mapping[str, object],
+    coordinator: ProcessIdentity,
+) -> None:
+    if path != _journal_path(config):
+        raise StateError("ownerless agent cache journal filename is invalid")
+    _assert_caller_process(coordinator, "coordinator")
+    source, destination, fenced, active, _identity = (
+        _ownerless_agent_cache_journal_inputs(config, raw)
+    )
+    journal = dict(raw)
+    if active in {source, fenced}:
+        assert active is not None
+        _assert_ownerless_agent_cache_tree(active)
+        for candidate in (source, fenced, destination):
+            _assert_unregistered_path_systemd_unrelated(candidate)
+        if active == source:
+            os.rename(source, fenced)
+            _fsync_directory(source.parent)
+            if _open_directory_identity(fenced, "fenced ownerless agent cache") != _identity:
+                os.rename(fenced, source)
+                _fsync_directory(source.parent)
+                raise Refusal("ownerless agent cache identity changed during fencing")
+            journal["phase"] = "fenced"
+            _write_journal(config, journal)
+            _interrupt_for_test("after-ownerless-agent-cache-fence")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        _ensure_no_symlink_components(
+            config.root, destination.parent, "ownerless agent cache destination"
+        )
+        _fsync_directory(destination.parent)
+        if destination.exists() or destination.is_symlink():
+            raise Refusal(f"ownerless agent cache destination already exists: {destination}")
+        try:
+            os.rename(fenced, destination)
+        except OSError as exc:
+            if not source.exists() and fenced.is_dir() and not destination.exists():
+                os.rename(fenced, source)
+                _fsync_directory(source.parent)
+            raise Refusal(f"cannot relocate exact ownerless agent cache tree: {exc}") from exc
+        _fsync_directory(destination.parent)
+        journal["phase"] = "relocated"
+        _write_journal(config, journal)
+        _interrupt_for_test("after-ownerless-agent-cache-relocate")
+    source, destination, fenced, active, _identity = (
+        _ownerless_agent_cache_journal_inputs(config, journal)
+    )
+    if active != destination:
+        raise StateError("ownerless agent cache relocation did not reach its destination")
+    _assert_ownerless_agent_cache_tree(destination)
+    _write_event_file(
+        config,
+        config.machine,
+        "ownerless-agent-cache-relocated",
+        {
+            "slot": "ignored",
+            "source": source.relative_to(config.root).as_posix(),
+            "destination": destination.relative_to(config.root).as_posix(),
+            "identity": list(_identity),
+            "recovery_actor": _identity_to_obj(coordinator),
+        },
+    )
+    _clear_journal(config, journal)
+    print(f"relocated ownerless agent cache={source} destination={destination}")
+
+
+def _cmd_recover_ownerless_agent_cache(args: argparse.Namespace) -> int:
+    config = _load_config(args.project_root, args.machine)
+    if config.machine != _short_hostname():
+        raise Refusal("ownerless agent cache recovery must run on the cache's machine")
+    if args.apply:
+        _require_coordinator_authorized(args, "ownerless agent cache recovery")
+        if args.coordinator_pid is None:
+            raise Refusal("--apply requires --coordinator-pid")
+        coordinator = _capture_caller_process(args.coordinator_pid, "coordinator")
+    else:
+        coordinator = _read_process_identity(os.getpid())
+    with _mutation_locks(config, args.wait_lock):
+        _refuse_partial_state(config)
+        journals = _outstanding_journals(config)
+        if journals:
+            path, raw = _load_journal(config)
+            if raw.get("kind") != "ownerless-agent-cache-relocate":
+                raise Refusal(f"another interrupted mutation is recorded in {path}")
+            if not args.apply:
+                print("CACHE slot=ignored outcome=planned detail=resume")
+                return 0
+            _recover_ownerless_agent_cache(config, path, raw, coordinator)
+            return 0
+        states, archives = _validate_global_state(config)
+        source, destination = _ownerless_agent_cache_paths(config)
+        _assert_ownerless_agent_no_registry_collision(config, source, states, archives)
+        if destination.exists() or destination.is_symlink():
+            raise Refusal(f"ownerless agent cache destination already exists: {destination}")
+        identity = _assert_ownerless_agent_cache_tree(source)
+        if not args.apply:
+            print(f"CACHE slot=ignored outcome=planned destination={destination}")
+            return 0
+        journal = {
+            "schema": SCHEMA,
+            "kind": "ownerless-agent-cache-relocate",
+            "machine": config.machine,
+            "host_id": _host_id(),
+            "slot": "ignored",
+            "phase": "prepared",
+            "source": source.relative_to(config.root).as_posix(),
+            "destination": destination.relative_to(config.root).as_posix(),
+            "fenced": source.with_name(
+                f".ignored.ownerless-agent-cache.{uuid.uuid4().hex}"
+            ).relative_to(config.root).as_posix(),
+            "identity": list(identity),
+            "actor": _identity_to_obj(coordinator),
+        }
+        _write_journal(config, journal)
+        _interrupt_for_test("after-ownerless-agent-cache-journal")
+        before = _global_rows(states, archives)
+        _recover_ownerless_agent_cache(config, _journal_path(config), journal, coordinator)
+        after_states, after_archives = _validate_global_state(config)
+        if _global_rows(after_states, after_archives) != before:
+            raise StateError("ownerless agent cache recovery changed registered slot state")
+    return 0
+
+
+def _absent_agent_row_identity(raw: object, label: str) -> AbsentAgentRow:
+    value = _as_mapping(raw, label)
+    _exact_keys(
+        value,
+        {"machine", "slot", "generation", "record_sha256"},
+        set(),
+        label,
+    )
+    digest = _as_str(value["record_sha256"], f"{label}.record_sha256")
+    if not DIGEST_RE.fullmatch(digest):
+        raise Refusal(f"{label}.record_sha256 must be one lowercase SHA-256 digest")
+    return AbsentAgentRow(
+        machine=_validate_name(_as_str(value["machine"], f"{label}.machine"), "machine"),
+        slot=_validate_name(_as_str(value["slot"], f"{label}.slot"), "slot"),
+        generation=_as_int(value["generation"], f"{label}.generation", minimum=1),
+        record_sha256=digest,
+    )
+
+
+def _validate_absent_agent_row(record: ActiveRecord, item: AbsentAgentRow) -> None:
+    if record.slot_type != "agent":
+        raise Refusal(f"slot {item.slot} is not an agent row")
+    if record.machine != item.machine or record.generation != item.generation:
+        raise Refusal(f"agent row {item.machine}/{item.slot} generation changed")
+    observed = _record_sha256(record)
+    if observed != item.record_sha256:
+        raise Refusal(
+            f"agent row {item.machine}/{item.slot} changed: expected "
+            f"{item.record_sha256}, found {observed}"
+        )
+
+
+def _assert_absent_agent_storage(
+    config: Config, record: ActiveRecord
+) -> tuple[Path, ...]:
+    _assert_record_paths(config, record)
+    paths = _absent_validate_row_paths(config, record)
+    for path in paths:
+        if path.exists() or path.is_symlink():
+            raise Refusal(f"agent row {record.slot} still has physical storage at {path}")
+    root = _slot_roots(config)["agent"]
+    try:
+        siblings = tuple(root.iterdir()) if root.is_dir() else ()
+    except OSError as exc:
+        raise Refusal(f"cannot enumerate possible fenced agent paths: {exc}") from exc
+    prefixes = (
+        f".{record.slot}.fenced.{record.generation}.",
+        f".{record.slot}.ownerless-agent.",
+    )
+    for sibling in siblings:
+        if any(sibling.name.startswith(prefix) for prefix in prefixes):
+            raise Refusal(f"agent row {record.slot} has a possible fenced path: {sibling}")
+    return paths
+
+
+def _assert_absent_agent_liveness(
+    config: Config, record: ActiveRecord, paths: Sequence[Path]
+) -> None:
+    _assert_absent_validate_row_is_local(record)
+    _assert_registered_liveness(config, record)
+    if record.owner is not None:
+        owner_state, detail = _process_state(record.owner)
+        if owner_state != "dead":
+            raise Refusal(
+                f"recorded owner for agent row {record.slot} is {owner_state}: {detail}"
+            )
+    rows = ((record, tuple(paths)),)
+    processes = _assert_absent_validate_processes_unrelated(rows)
+    if record.owner is not None:
+        for process in processes:
+            if _cgroup_matches(record.owner.cgroup_path, process.cgroup_path):
+                raise Refusal(
+                    f"live process {process.pid} remains in recorded owner cgroup "
+                    f"{record.owner.cgroup_path} for agent row {record.slot}"
+                )
+    _assert_absent_validate_systemd_unrelated(rows, {record.slot: ()}, processes)
+
+
+def _absent_agent_rescue_ref(record: ActiveRecord, checkout: Checkout) -> str:
+    name = checkout.name.replace("/", "-")
+    ref = (
+        f"refs/heads/rescue/wrkslots/{record.machine}/{record.slot}/"
+        f"{name}-{record.generation}-{checkout.head[:12]}"
+    )
+    _validate_full_ref(ref, "agent-row rescue ref")
+    return ref
+
+
+def _absent_agent_checkout_receipts(
+    config: Config, record: ActiveRecord, vcs: _GitVcs
+) -> tuple[dict[str, object], ...]:
+    for checkout in record.checkouts:
+        _stored, repository = _stored_repository_path(config, checkout.repository)
+        if vcs.remote_url_sha256(repository, checkout.remote) != checkout.remote_url_sha256:
+            raise Refusal(
+                f"source repository remote changed for absent checkout {checkout.name}"
+            )
+        if vcs.verify_ref(repository, checkout.head, "recorded checkout HEAD") != checkout.head:
+            raise Refusal(f"recorded commit object is unavailable for {checkout.name}")
+        path = _stored_path(config, checkout.path, "agent checkout path").absolute()
+        registration = vcs.worktree_registration(repository, path)
+        if registration is not None:
+            head, branch = registration
+            if head != checkout.head:
+                raise Refusal(
+                    f"Git registration HEAD for absent checkout {checkout.name} changed "
+                    f"from {checkout.head} to {head}"
+                )
+            expected_branch = f"refs/heads/{checkout.branch}"
+            if branch != expected_branch:
+                raise Refusal(
+                    f"Git registration branch for absent checkout {checkout.name} changed: "
+                    f"expected {expected_branch}, found {branch or 'detached'}"
+                )
+    return _absent_agent_planned_receipts(record)
+
+
+def _absent_agent_planned_receipts(
+    record: ActiveRecord,
+) -> tuple[dict[str, object], ...]:
+    return tuple(
+        {
+            "checkout": checkout.name,
+            "source_head": checkout.head,
+            "salvage_commit": checkout.head,
+            "status_sha256": None,
+            "disposition": "salvaged",
+            "remote_ref": _absent_agent_rescue_ref(record, checkout),
+            "containing_remote_refs": [],
+            "working_tree_contents": "unknown-storage-absent-before-recovery",
+        }
+        for checkout in record.checkouts
+    )
+
+
+def _absent_agent_archive_entry(
+    record: ActiveRecord,
+    item: AbsentAgentRow,
+    finished_at: str,
+    receipts: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
+    return {
+        "archive_id": f"{record.machine}:{record.slot}:{record.generation}:{finished_at}",
+        "slot": record.slot,
+        "agent": record.agent,
+        "task": record.task,
+        "purpose": record.purpose,
+        "slot_type": "agent",
+        "machine": record.machine,
+        "generation": record.generation,
+        "created_at": record.created_at,
+        "finished_at": finished_at,
+        "mode": "remove",
+        "actor": "coordinator",
+        "physical_storage": "removed",
+        "validation": [
+            "registry reconciliation confirmed physical storage externally absent",
+            f"source ACTIVE record SHA-256: {item.record_sha256}",
+            *(
+                f"checkout {receipt['checkout']}: remote rescue ref "
+                f"{receipt['remote_ref']} read back at {receipt['salvage_commit']}"
+                for receipt in receipts
+            ),
+        ],
+        "limitations": [
+            "working-tree contents were absent before recovery; uncommitted, untracked, "
+            "ignored, and HANDOFF contents could not be inspected or salvaged"
+        ],
+        "continuation": "physical storage was already absent; inspect the verified rescue refs",
+        "salvage": [dict(receipt) for receipt in receipts],
+        "checkouts": [_checkout_to_obj(checkout) for checkout in record.checkouts],
+        **({"layout": record.layout} if record.layout is not None else {}),
+        **(
+            {"import_source": _import_source_to_obj(record.import_source)}
+            if record.import_source is not None
+            else {}
+        ),
+    }
+
+
+def _archive_matches_absent_agent_row(
+    archive: ArchiveState, archived: Mapping[str, object], item: AbsentAgentRow
+) -> bool:
+    validation = archived.get("validation")
+    return bool(
+        archive.machine == item.machine
+        and archived.get("slot") == item.slot
+        and archived.get("machine") == item.machine
+        and archived.get("generation") == item.generation
+        and archived.get("slot_type") == "agent"
+        and archived.get("physical_storage") == "removed"
+        and isinstance(validation, list)
+        and f"source ACTIVE record SHA-256: {item.record_sha256}" in validation
+        and (item.slot, item.generation, item.record_sha256)
+        in archive.absent_agent_recoveries
+    )
+
+
+def _absent_agent_event_evidence(
+    item: AbsentAgentRow, archive_entry: Mapping[str, object]
+) -> dict[str, object]:
+    return {
+        "archive_id": _as_str(archive_entry.get("archive_id"), "absent-agent archive_id"),
+        "source_record_sha256": item.record_sha256,
+        "physical_storage": "externally-absent",
+    }
+
+
+def _absent_agent_journal_inputs(
+    config: Config, raw: Mapping[str, object]
+) -> tuple[AbsentAgentRow, ActiveRecord, tuple[Mapping[str, object], ...], dict[str, object]]:
+    _exact_keys(raw, _ABSENT_AGENT_JOURNAL_REQUIRED, set(), "absent-agent-row journal")
+    if (
+        _as_int(raw["schema"], "absent-agent-row journal.schema") != SCHEMA
+        or raw["kind"] != "recover-absent-agent-row"
+        or raw["machine"] != config.machine
+    ):
+        raise StateError("absent-agent-row journal identity is invalid")
+    item = _absent_agent_row_identity(raw["input"], "absent-agent-row journal.input")
+    if item.machine != config.machine or raw["slot"] != item.slot:
+        raise StateError("absent-agent-row journal row identity is invalid")
+    if not _as_str(raw["host_id"], "absent-agent-row journal.host_id"):
+        raise StateError("absent-agent-row journal has no stable host identity")
+    if _identity_from_obj(raw["actor"], "absent-agent-row journal.actor") is None:
+        raise StateError("absent-agent-row journal has no actor")
+    phase = _as_str(raw["phase"], "absent-agent-row journal.phase")
+    if phase not in {"prepared", "preserved", "registrations-removed"}:
+        raise StateError(f"unknown absent-agent-row phase {phase!r}")
+    record = _record_from_obj(raw["record"], "absent-agent-row journal.record")
+    _validate_absent_agent_row(record, item)
+    receipts = tuple(
+        _as_mapping(value, f"absent-agent-row journal.preserved[{index}]")
+        for index, value in enumerate(_as_list(raw["preserved"], "absent-agent-row journal.preserved"))
+    )
+    removed = tuple(
+        _as_str(value, f"absent-agent-row journal.removed[{index}]")
+        for index, value in enumerate(_as_list(raw["removed"], "absent-agent-row journal.removed"))
+    )
+    names = {checkout.name for checkout in record.checkouts}
+    if len(receipts) > len(record.checkouts) or len(removed) > len(record.checkouts):
+        raise StateError("absent-agent-row journal progress exceeds its checkout count")
+    if {str(value.get("checkout")) for value in receipts} - names or set(removed) - names:
+        raise StateError("absent-agent-row journal names an unrelated checkout")
+    archive_entry = dict(
+        _as_mapping(raw["archive_entry"], "absent-agent-row journal.archive_entry")
+    )
+    expected_receipts = _absent_agent_planned_receipts(record)
+    finished_at = _as_str(archive_entry.get("finished_at"), "absent-agent archive.finished_at")
+    _parse_timestamp(finished_at, "absent-agent archive.finished_at")
+    expected_archive = _absent_agent_archive_entry(
+        record, item, finished_at, expected_receipts
+    )
+    if not _json_equal(archive_entry, expected_archive):
+        raise StateError("absent-agent-row archive entry differs from its exact inputs")
+    for index, receipt in enumerate(receipts):
+        if not _json_equal(receipt, expected_receipts[index]):
+            raise StateError("absent-agent-row preserved receipts are not a durable prefix")
+    if tuple(removed) != tuple(checkout.name for checkout in record.checkouts[: len(removed)]):
+        raise StateError("absent-agent-row removed registrations are not a durable prefix")
+    if phase in {"preserved", "registrations-removed"} and len(receipts) != len(
+        record.checkouts
+    ):
+        raise StateError("absent-agent-row journal phase precedes complete remote preservation")
+    if phase == "registrations-removed" and len(removed) != len(record.checkouts):
+        raise StateError("absent-agent-row journal phase precedes complete registration removal")
+    return item, record, expected_receipts, archive_entry
+
+
+def _assert_absent_agent_safe(config: Config, record: ActiveRecord) -> tuple[Path, ...]:
+    _assert_absent_validate_rows_not_held(config, (record,))
+    paths = _assert_absent_agent_storage(config, record)
+    _assert_absent_agent_liveness(config, record, paths)
+    _absent_agent_checkout_receipts(config, record, _GitVcs())
+    return paths
+
+
+def _recover_absent_agent_row(
+    config: Config,
+    path: Path,
+    raw: Mapping[str, object],
+    coordinator: ProcessIdentity,
+) -> None:
+    if path != _journal_path(config):
+        raise StateError("absent-agent-row journal filename is invalid")
+    if raw.get("host_id") != _host_id():
+        raise Refusal("absent-agent-row journal belongs to another host identity")
+    _assert_caller_process(coordinator, "coordinator")
+    item, recorded, planned, archive_entry = _absent_agent_journal_inputs(config, raw)
+    state = _load_active(config)
+    current = next((row for row in state.slots if row.slot == item.slot), None)
+    archive = _load_archive(config)
+    archived = next(
+        (row for row in archive.records if row.get("archive_id") == archive_entry["archive_id"]),
+        None,
+    )
+    if current is None:
+        if archived is None or not _json_equal(archived, archive_entry):
+            raise StateError("absent agent row disappeared without its exact archive")
+        _clear_journal(config, raw)
+        print(f"recovered absent agent row={item.slot}")
+        return
+    if _record_to_obj(current) != _record_to_obj(recorded):
+        raise StateError(f"agent row {item.slot} differs from its journal snapshot")
+    _assert_absent_agent_safe(config, current)
+    journal = dict(raw)
+    preserved = [
+        dict(_as_mapping(value, f"preserved[{index}]"))
+        for index, value in enumerate(_as_list(journal["preserved"], "preserved"))
+    ]
+    vcs = _GitVcs()
+    for checkout, receipt in zip(recorded.checkouts[len(preserved) :], planned[len(preserved) :]):
+        _stored, repository = _stored_repository_path(config, checkout.repository)
+        vcs.push_salvage(
+            repository,
+            checkout.remote,
+            checkout.head,
+            _as_str(receipt["remote_ref"], "agent-row rescue ref"),
+        )
+        preserved.append(dict(receipt))
+        journal["preserved"] = preserved
+        _write_journal(config, journal)
+        _interrupt_for_test("after-absent-agent-rescue-ref")
+    for checkout, receipt in zip(recorded.checkouts, planned):
+        remote_ref = _as_str(receipt["remote_ref"], "agent-row rescue ref")
+        _stored, repository = _stored_repository_path(config, checkout.repository)
+        if vcs.remote_ref_sha(repository, checkout.remote, remote_ref) != checkout.head:
+            raise Refusal(f"remote rescue ref for {checkout.name} no longer preserves its HEAD")
+    journal["phase"] = "preserved"
+    _write_journal(config, journal)
+    removed = [str(value) for value in _as_list(journal["removed"], "removed")]
+    for checkout in recorded.checkouts[len(removed) :]:
+        _stored, repository = _stored_repository_path(config, checkout.repository)
+        checkout_path = _stored_path(config, checkout.path, "agent checkout path").absolute()
+        registration = vcs.worktree_registration(repository, checkout_path)
+        if registration is not None:
+            head, branch = registration
+            if head != checkout.head or branch != f"refs/heads/{checkout.branch}":
+                raise Refusal(f"Git registration changed for absent checkout {checkout.name}")
+            vcs.remove_worktree(repository, checkout_path, force=True)
+        if vcs.worktree_registration(repository, checkout_path) is not None:
+            raise Refusal(f"Git still registers absent checkout {checkout.name}")
+        removed.append(checkout.name)
+        journal["removed"] = removed
+        _write_journal(config, journal)
+        _interrupt_for_test("after-absent-agent-registration-remove")
+    journal["phase"] = "registrations-removed"
+    _write_journal(config, journal)
+    _assert_absent_agent_safe(config, current)
+    if archived is None:
+        archive = _append_archive_once(
+            config,
+            archive,
+            archive_entry,
+            action="absent-agent-row-recovered",
+            evidence=_absent_agent_event_evidence(item, archive_entry),
+        )
+        _interrupt_for_test("after-absent-agent-archive")
+    elif not _json_equal(archived, archive_entry):
+        raise StateError("durable absent-agent archive differs from its journal")
+    state = _load_active(config)
+    current = next((row for row in state.slots if row.slot == item.slot), None)
+    if current is not None:
+        _validate_absent_agent_row(current, item)
+        _write_active_state(
+            config,
+            _delete_record(state, item.slot),
+            action="absent-agent-row-recovered",
+            slot=item.slot,
+            evidence=_absent_agent_event_evidence(item, archive_entry),
+        )
+        _interrupt_for_test("after-absent-agent-active-delete")
+    _clear_journal(config, journal)
+    print(f"recovered absent agent row={item.slot}")
+
+
+def _cmd_recover_absent_agent_row(args: argparse.Namespace) -> int:
+    config = _load_config(args.project_root, args.machine)
+    item = AbsentAgentRow(
+        machine=config.machine,
+        slot=_validate_name(args.slot, "slot"),
+        generation=args.expected_generation,
+        record_sha256=args.record_sha256,
+    )
+    if not DIGEST_RE.fullmatch(item.record_sha256):
+        raise Refusal("--record-sha256 must be one lowercase SHA-256 digest")
+    if config.machine != _short_hostname():
+        raise Refusal("absent agent row recovery must run on the row's machine")
+    if args.apply:
+        _require_coordinator_authorized(args, "absent agent row recovery")
+        if args.coordinator_pid is None:
+            raise Refusal("--apply requires --coordinator-pid")
+        coordinator = _capture_caller_process(args.coordinator_pid, "coordinator")
+    else:
+        coordinator = None
+    with _mutation_locks(config, args.wait_lock):
+        _refuse_partial_state(config)
+        if _outstanding_journals(config):
+            path, raw = _load_journal(config)
+            if raw.get("kind") != "recover-absent-agent-row":
+                raise Refusal(f"another interrupted mutation is recorded in {path}")
+            journal_item, _record, _planned, _archive = _absent_agent_journal_inputs(config, raw)
+            if journal_item != item:
+                raise Refusal("requested agent row differs from the interrupted recovery")
+            if not args.apply:
+                print(f"ROW machine={item.machine} slot={item.slot} outcome=planned detail=resume")
+                return 0
+            assert coordinator is not None
+            _recover_absent_agent_row(config, path, raw, coordinator)
+            return 0
+        states, archives = _validate_global_state(config)
+        before = _global_rows(states, archives)
+        state = next(value for value in states if value.machine == config.machine)
+        record = next((value for value in state.slots if value.slot == item.slot), None)
+        if record is None:
+            matching = [
+                archived
+                for archive in archives
+                for archived in archive.records
+                if archived.get("slot") == item.slot
+            ]
+            if len(matching) == 1 and any(
+                _archive_matches_absent_agent_row(archive, matching[0], item)
+                for archive in archives
+                if archive.machine == item.machine
+            ):
+                print(
+                    f"ROW machine={item.machine} slot={item.slot} "
+                    f"generation={item.generation} outcome=already-recovered"
+                )
+                return 0
+            raise Refusal(
+                f"agent row {item.machine}/{item.slot} is neither active nor an exact prior recovery"
+            )
+        _validate_absent_agent_row(record, item)
+        _assert_absent_agent_safe(config, record)
+        if not args.apply:
+            print(
+                f"ROW machine={item.machine} slot={item.slot} generation={item.generation} "
+                "outcome=planned detail=physical-storage-absent"
+            )
+            return 0
+        assert coordinator is not None
+        receipts = _absent_agent_checkout_receipts(config, record, _GitVcs())
+        finished_at = _utc_now()
+        journal = {
+            "schema": SCHEMA,
+            "kind": "recover-absent-agent-row",
+            "machine": config.machine,
+            "host_id": _host_id(),
+            "slot": item.slot,
+            "phase": "prepared",
+            "actor": _identity_to_obj(coordinator),
+            "input": dataclasses.asdict(item),
+            "record": _record_to_obj(record),
+            "preserved": [],
+            "removed": [],
+            "archive_entry": _absent_agent_archive_entry(
+                record, item, finished_at, receipts
+            ),
+        }
+        _write_journal(config, journal)
+        _interrupt_for_test("after-absent-agent-journal")
+        _recover_absent_agent_row(config, _journal_path(config), journal, coordinator)
+        after_states, after_archives = _validate_global_state(config)
+        _assert_only_slot_changed(before, _global_rows(after_states, after_archives), item.slot)
+    return 0
+
+
 def _record_sha256(record: ActiveRecord) -> str:
     return _event_digest(_record_to_obj(record))
 
@@ -12856,7 +14304,9 @@ def _append_absent_validate_archives(
         for item, _entry, _previous_revision, _next_revision in additions
     )
     updated = dataclasses.replace(
-        updated, absent_validate_recoveries=frozenset(recovery_identities)
+        updated,
+        absent_validate_recoveries=frozenset(recovery_identities),
+        absent_agent_recoveries=state.absent_agent_recoveries,
     )
     for item, entry, previous_revision, next_revision in additions:
         writer.append(
@@ -13590,6 +15040,10 @@ def _cmd_recover(args: argparse.Namespace) -> int:
                 tuple(item for item, _record, _entry in batch_items),
                 allow_exact_overlap=True,
             )
+        elif kind == "recover-absent-agent-row":
+            states, archives = _validate_global_state_for_absent_agent_recovery(
+                config, raw
+            )
         else:
             states, archives = _validate_global_state(config)
         before = _global_rows(states, archives)
@@ -13629,6 +15083,18 @@ def _cmd_recover(args: argparse.Namespace) -> int:
                     "--retry-running-hook and --abort-create apply only to create journals"
                 )
             _recover_ownerless_validation(config, path, raw, coordinator)
+        elif kind == "ownerless-agent-remove":
+            if args.retry_running_hook or args.abort_create:
+                raise Refusal(
+                    "--retry-running-hook and --abort-create apply only to create journals"
+                )
+            _recover_ownerless_agent(config, path, raw, coordinator)
+        elif kind == "ownerless-agent-cache-relocate":
+            if args.retry_running_hook or args.abort_create:
+                raise Refusal(
+                    "--retry-running-hook and --abort-create apply only to create journals"
+                )
+            _recover_ownerless_agent_cache(config, path, raw, coordinator)
         elif kind == "recover-absent-validate-rows":
             if args.retry_running_hook or args.abort_create:
                 raise Refusal(
@@ -13653,15 +15119,26 @@ def _cmd_recover(args: argparse.Namespace) -> int:
                 ],
                 "human",
             )
+        elif kind == "recover-absent-agent-row":
+            if args.retry_running_hook or args.abort_create:
+                raise Refusal(
+                    "--retry-running-hook and --abort-create apply only to create journals"
+                )
+            _recover_absent_agent_row(config, path, raw, coordinator)
         else:
             raise StateError(f"unknown recovery journal kind {kind!r}")
         after_states, after_archives = _validate_global_state(config)
         after = _global_rows(after_states, after_archives)
         if kind == "recover-absent-validate-rows":
             pass
-        elif kind in {"legacy-validate-remove", "ownerless-validate-remove"}:
+        elif kind in {
+            "legacy-validate-remove",
+            "ownerless-validate-remove",
+            "ownerless-agent-remove",
+            "ownerless-agent-cache-relocate",
+        }:
             if after != before:
-                raise StateError("legacy validation cleanup changed the registered slot state")
+                raise StateError("ownerless cleanup changed the registered slot state")
         else:
             slot = _as_str(raw.get("slot"), "journal.slot")
             _assert_only_slot_changed(before, after, slot)
@@ -14500,6 +15977,84 @@ usage or audit gate unknown, 3 fail-closed refusal.
         help="typed per-row outcome format (default: human)",
     )
     recover_absent.set_defaults(handler=_cmd_recover_absent_validate_rows)
+
+    recover_absent_agent = subparsers.add_parser(
+        "recover-absent-agent-row",
+        help="preserve and archive one exact agent row whose storage is absent",
+        description=(
+            "Bind one machine, slot, generation, and ACTIVE-record SHA-256. The default "
+            "is a read-only plan. --apply proves registered and operating-system liveness, "
+            "pushes every recorded checkout HEAD to an individual rescue ref and reads it "
+            "back, removes only exact stale Git worktree registrations, archives the absent "
+            "storage and its limitations, and only then removes the ACTIVE row."
+        ),
+        formatter_class=_HelpFormatter,
+    )
+    recover_absent_agent.add_argument("slot", help="exact active agent slot name")
+    recover_absent_agent.add_argument(
+        "--expected-generation", type=int, required=True, metavar="N"
+    )
+    recover_absent_agent.add_argument(
+        "--record-sha256", required=True, metavar="SHA256"
+    )
+    recover_absent_agent.add_argument("--apply", action="store_true")
+    recover_absent_agent.add_argument(
+        "--coordinator-authorized", action="store_true"
+    )
+    recover_absent_agent.add_argument(
+        "--coordinator-pid", type=int, metavar="PID"
+    )
+    recover_absent_agent.set_defaults(handler=_cmd_recover_absent_agent_row)
+
+    recover_ownerless_agent = subparsers.add_parser(
+        "recover-ownerless-agent-worktree",
+        help="salvage and remove one exact unregistered agent worktree",
+        description=(
+            "Bind an exact direct child of the managed agent directory to its filesystem "
+            "and Git identities without assigning an owner, task, or handoff. The default "
+            "is read-only. --apply salvages authored work and initialized nested repositories "
+            "to verified remote refs before fencing and removing only that worktree."
+        ),
+        formatter_class=_HelpFormatter,
+    )
+    recover_ownerless_agent.add_argument("path", metavar="PATH")
+    recover_ownerless_agent.add_argument("--repository", required=True, metavar="PATH")
+    recover_ownerless_agent.add_argument("--head", required=True, metavar="SHA")
+    recover_ownerless_agent.add_argument("--branch", required=True, metavar="BRANCH")
+    recover_ownerless_agent.add_argument("--remote", required=True, metavar="REMOTE")
+    recover_ownerless_agent.add_argument(
+        "--remote-url-sha256", required=True, metavar="SHA256"
+    )
+    recover_ownerless_agent.add_argument("--apply", action="store_true")
+    recover_ownerless_agent.add_argument(
+        "--coordinator-authorized", action="store_true"
+    )
+    recover_ownerless_agent.add_argument(
+        "--coordinator-pid", type=int, metavar="PID"
+    )
+    recover_ownerless_agent.set_defaults(
+        handler=_cmd_recover_ownerless_agent_worktree
+    )
+
+    recover_ownerless_cache = subparsers.add_parser(
+        "recover-ownerless-agent-cache",
+        help="relocate the exact misclassified ignored cache tree",
+        description=(
+            "Handle only worktrees/slots/ignored when it contains exactly the non-worktree "
+            "validate/cache/rust-script hierarchy. The default is read-only. --apply fences "
+            "the inode and relocates the complete tree outside the managed slot root without "
+            "deleting its contents. Arbitrary paths are not accepted."
+        ),
+        formatter_class=_HelpFormatter,
+    )
+    recover_ownerless_cache.add_argument("--apply", action="store_true")
+    recover_ownerless_cache.add_argument(
+        "--coordinator-authorized", action="store_true"
+    )
+    recover_ownerless_cache.add_argument(
+        "--coordinator-pid", type=int, metavar="PID"
+    )
+    recover_ownerless_cache.set_defaults(handler=_cmd_recover_ownerless_agent_cache)
 
     recover = subparsers.add_parser(
         "recover",
