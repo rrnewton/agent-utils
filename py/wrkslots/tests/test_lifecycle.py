@@ -11,6 +11,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -2159,7 +2160,9 @@ def test_event_history_is_append_only_and_hash_chained(tmp_path: Path) -> None:
     assert refused.stdout == ""
 
 
-def test_status_derives_state_when_compatibility_views_are_missing(tmp_path: Path) -> None:
+def test_status_derives_state_when_compatibility_views_are_missing(
+    tmp_path: Path,
+) -> None:
     project, _repository, _remote = make_project(tmp_path)
     made = create(project)
     assert made.returncode == 0, made.stderr
@@ -2841,7 +2844,9 @@ def test_finish_refuses_local_only_commit_without_deleting(tmp_path: Path) -> No
     assert len(active_slots(project)) == 1
 
 
-def test_forged_local_remote_tracking_refs_do_not_prove_publication(tmp_path: Path) -> None:
+def test_forged_local_remote_tracking_refs_do_not_prove_publication(
+    tmp_path: Path,
+) -> None:
     project, _repository, _remote = make_project(tmp_path)
     made = create(project)
     assert made.returncode == 0, made.stderr
@@ -2962,7 +2967,9 @@ def test_create_fetches_remote_before_selecting_default_start(tmp_path: Path) ->
     assert git(checkout(project), "rev-parse", "HEAD").stdout.strip() == advanced
 
 
-def test_create_defaults_to_origin_and_accepts_a_configured_remote_name(tmp_path: Path) -> None:
+def test_create_defaults_to_origin_and_accepts_a_configured_remote_name(
+    tmp_path: Path,
+) -> None:
     project, _repository, _remote = make_project(tmp_path)
 
     defaulted = create(project, slot="slot01", branch="codex/default-origin")
@@ -3103,7 +3110,9 @@ def test_ignored_file_is_preserved_by_finish_refusal(tmp_path: Path) -> None:
     assert len(active_slots(project)) == 1
 
 
-def test_finish_refuses_unfinished_git_operation_without_deleting(tmp_path: Path) -> None:
+def test_finish_refuses_unfinished_git_operation_without_deleting(
+    tmp_path: Path,
+) -> None:
     project, _repository, _remote = make_project(tmp_path)
     made = create(project)
     assert made.returncode == 0, made.stderr
@@ -3271,10 +3280,14 @@ def test_agent_reclaim_pushes_unpushed_commits_and_uncommitted_files(
     salvage_commit = receipt["salvage_commit"]
     remote_ref = receipt["remote_ref"]
     assert git(remote, "rev-parse", remote_ref).stdout.strip() == salvage_commit
-    names = set(
-        git(remote, "ls-tree", "-r", "--name-only", salvage_commit).stdout.splitlines()
-    )
-    assert {".gitignore", "ignored.txt", "local.txt", "seed.txt", "untracked.txt"} <= names
+    names = set(git(remote, "ls-tree", "-r", "--name-only", salvage_commit).stdout.splitlines())
+    assert {
+        ".gitignore",
+        "ignored.txt",
+        "local.txt",
+        "seed.txt",
+        "untracked.txt",
+    } <= names
     assert "target/build-output" not in names
     assert git(remote, "show", f"{salvage_commit}:seed.txt").stdout == "dirty tracked file\n"
     events = wrkslots._load_events(wrkslots._load_config(str(project), "testhost"))
@@ -3762,7 +3775,9 @@ def test_one_agent_may_own_multiple_concurrent_validate_slots(tmp_path: Path) ->
     assert {record["agent"] for record in records} == {"codex-1"}
 
 
-def test_later_participant_finishes_interrupted_validate_removal(tmp_path: Path) -> None:
+def test_later_participant_finishes_interrupted_validate_removal(
+    tmp_path: Path,
+) -> None:
     project, _repository, _remote = make_project(tmp_path)
     made = create(project, slot_type="validate", branch=None)
     assert made.returncode == 0, made.stderr
@@ -4076,7 +4091,12 @@ def test_cross_shard_duplicate_refuses_before_deletion(tmp_path: Path) -> None:
     )
     (project / "worktrees" / "ARCHIVED.machine-b.json").write_text(
         json.dumps(
-            {"schema": wrkslots.SCHEMA, "machine": "machine-b", "revision": 0, "records": []},
+            {
+                "schema": wrkslots.SCHEMA,
+                "machine": "machine-b",
+                "revision": 0,
+                "records": [],
+            },
             indent=2,
         )
         + "\n",
@@ -4104,7 +4124,15 @@ def test_status_refuses_registry_directory_mismatch(
     else:
         orphan = project / "worktrees" / "orphan" / "product"
         orphan.parent.mkdir()
-        git(repository, "worktree", "add", "-b", "codex/orphan", str(orphan), "origin/main")
+        git(
+            repository,
+            "worktree",
+            "add",
+            "-b",
+            "codex/orphan",
+            str(orphan),
+            "origin/main",
+        )
 
     refused = command(project, "status", "--all-machines")
 
@@ -4662,8 +4690,19 @@ def test_import_existing_can_register_multiple_flat_cutover_stragglers(
     remote_url = git(repository, "remote", "get-url", "origin").stdout.strip()
     slots = project / "worktrees" / "slots"
     slots.mkdir(exist_ok=True)
-    for slot, branch in (("slot01", "codex/import-one"), ("slot02", "codex/import-two")):
-        git(repository, "worktree", "add", "-b", branch, str(slots / slot), "origin/main")
+    for slot, branch in (
+        ("slot01", "codex/import-one"),
+        ("slot02", "codex/import-two"),
+    ):
+        git(
+            repository,
+            "worktree",
+            "add",
+            "-b",
+            branch,
+            str(slots / slot),
+            "origin/main",
+        )
 
     for index, (slot, _branch) in enumerate(
         (("slot01", "codex/import-one"), ("slot02", "codex/import-two")), start=1
@@ -5152,7 +5191,9 @@ def test_register_refuses_owner_generation_change_before_publication(
     assert tree.is_dir()
 
 
-def test_path_escape_and_symlink_are_refused_without_touching_target(tmp_path: Path) -> None:
+def test_path_escape_and_symlink_are_refused_without_touching_target(
+    tmp_path: Path,
+) -> None:
     project_parent = tmp_path / "project-parent"
     project_parent.mkdir()
     project, _repository, _remote = make_project(project_parent)
@@ -5347,7 +5388,9 @@ def test_doctor_reports_an_interrupted_append_only_event_write(tmp_path: Path) -
     )
 
 
-def test_corrupt_archive_view_does_not_override_append_only_history(tmp_path: Path) -> None:
+def test_corrupt_archive_view_does_not_override_append_only_history(
+    tmp_path: Path,
+) -> None:
     project, _repository, _remote = make_project(tmp_path)
     made = create(project)
     assert made.returncode == 0, made.stderr
@@ -5540,7 +5583,9 @@ def remove_event_history_to_simulate_older_build(
     shutil.rmtree(project / "worktrees" / f"EVENTS.{machine}")
 
 
-def test_configuration_from_an_older_build_is_dead_until_repaired(tmp_path: Path) -> None:
+def test_configuration_from_an_older_build_is_dead_until_repaired(
+    tmp_path: Path,
+) -> None:
     """A config missing a field this build requires must not be a one-way door.
 
     Before the repair path existed this state was terminal: every command
@@ -7190,3 +7235,1561 @@ def test_unpushed_distinguishes_absent_and_rewritten_same_named_remote(
     )
     assert wrong_branch.returncode == 3
     assert "branch changed" in wrong_branch.stderr
+
+
+def mark_recorded_owner_dead(project: Path, slot: str) -> wrkslots.ActiveRecord:
+    config = wrkslots._load_config(str(project), "testhost")
+    state = wrkslots._load_active(config)
+    record = wrkslots._find_record(state, slot)
+    assert record.owner is not None
+    updated = replace(record, owner=replace(record.owner, pid=2_147_483_647))
+    wrkslots._write_active_state(
+        config,
+        wrkslots._replace_record(state, updated),
+        action="test-owner-exited",
+        slot=slot,
+    )
+    return updated
+
+
+def prepare_absent_validate_row(
+    project: Path,
+    repository: Path,
+    *,
+    slot: str,
+    agent: str,
+    unregister: bool = True,
+) -> wrkslots.ActiveRecord:
+    made = create(
+        project,
+        slot=slot,
+        agent=agent,
+        branch=None,
+        slot_type="validate",
+    )
+    assert made.returncode == 0, made.stderr
+    record = mark_recorded_owner_dead(project, slot)
+    make_validate_row_absent(project, repository, record, unregister=unregister)
+    return record
+
+
+def make_validate_row_absent(
+    project: Path,
+    repository: Path,
+    record: wrkslots.ActiveRecord,
+    *,
+    unregister: bool = True,
+) -> None:
+    config = wrkslots._load_config(str(project), "testhost")
+    checkout_path = wrkslots._stored_path(config, record.checkouts[0].path, "test checkout")
+    if unregister:
+        git(repository, "worktree", "remove", "--force", "--", str(checkout_path))
+    else:
+        shutil.rmtree(checkout_path)
+    slot_path = wrkslots._slot_directory(config, record.slot, "validate")
+    if slot_path.exists():
+        slot_path.rmdir()
+
+
+def write_absent_validate_input(project: Path, records: list[wrkslots.ActiveRecord]) -> Path:
+    path = project / "absent-validate-rows.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "rows": [
+                    {
+                        "machine": record.machine,
+                        "slot": record.slot,
+                        "generation": record.generation,
+                        "record_sha256": wrkslots._record_sha256(record),
+                    }
+                    for record in records
+                ],
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def run_absent_validate_recovery(
+    project: Path,
+    input_path: Path,
+    *,
+    apply: bool,
+    output_format: str = "human",
+) -> int:
+    args = [
+        "--project-root",
+        str(project),
+        "recover-absent-validate-rows",
+        "--input",
+        str(input_path),
+        "--format",
+        output_format,
+    ]
+    if apply:
+        args.extend(
+            (
+                "--apply",
+                "--coordinator-authorized",
+                "--coordinator-pid",
+                str(os.getpid()),
+            )
+        )
+    return wrkslots.main(args)
+
+
+def allow_test_host_for_absent_validate_recovery(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    set_liveness(project, "dead")
+    monkeypatch.setattr(wrkslots, "_short_hostname", lambda: "testhost")
+    monkeypatch.setattr(wrkslots, "_absent_validate_process_snapshot", lambda: ())
+    monkeypatch.setattr(
+        wrkslots,
+        "_absent_validate_privileged_path_match",
+        lambda _processes, _targets, _budget=None: None,
+    )
+    monkeypatch.setattr(wrkslots, "_user_systemd_snapshot", lambda: ())
+
+
+def test_recover_absent_validate_rows_handles_terminal_and_recordless_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    terminal_made = create(
+        project,
+        slot="terminal",
+        agent="validate-a",
+        branch=None,
+        slot_type="validate",
+    )
+    assert terminal_made.returncode == 0, terminal_made.stderr
+    recordless_made = create(
+        project,
+        slot="recordless",
+        agent="validate-b",
+        branch=None,
+        slot_type="validate",
+    )
+    assert recordless_made.returncode == 0, recordless_made.stderr
+    kept = create(
+        project,
+        slot="kept",
+        agent="validate-c",
+        branch=None,
+        slot_type="validate",
+    )
+    assert kept.returncode == 0, kept.stderr
+    config = wrkslots._load_config(str(project), "testhost")
+    terminal = mark_recorded_owner_dead(project, "terminal")
+    recordless = mark_recorded_owner_dead(project, "recordless")
+    make_validate_row_absent(project, repository, terminal)
+    make_validate_row_absent(project, repository, recordless)
+    kept_before = wrkslots._record_to_obj(
+        wrkslots._find_record(wrkslots._load_active(config), "kept")
+    )
+    terminal_checkout = wrkslots._stored_path(
+        config, terminal.checkouts[0].path, "terminal checkout"
+    )
+    prepare_terminal_validation_record(
+        project, terminal_checkout, field="checkout", name="terminal"
+    )
+    input_path = write_absent_validate_input(project, [terminal, recordless])
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    assert run_absent_validate_recovery(project, input_path, apply=False, output_format="json") == 0
+    planned = json.loads(capsys.readouterr().out)
+    assert [row["outcome"] for row in planned["rows"]] == ["planned", "planned"]
+    assert run_absent_validate_recovery(project, input_path, apply=True, output_format="json") == 0
+    recovered_outcomes = json.loads(capsys.readouterr().out)
+    assert [row["outcome"] for row in recovered_outcomes["rows"]] == [
+        "recovered",
+        "recovered",
+    ]
+
+    state = wrkslots._load_active(config)
+    assert [record.slot for record in state.slots] == ["kept"]
+    assert wrkslots._record_to_obj(state.slots[0]) == kept_before
+    archive = wrkslots._load_archive(config)
+    recovered = {str(record["slot"]): record for record in archive.records}
+    assert set(recovered) == {"terminal", "recordless"}
+    assert all(record["physical_storage"] == "removed" for record in recovered.values())
+    assert all(
+        "validation outcome unknown"
+        in wrkslots._as_list(record["limitations"], "archive limitations")
+        for record in recovered.values()
+    )
+    assert all("recovery" not in record for record in recovered.values())
+    assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
+
+    assert run_absent_validate_recovery(project, input_path, apply=True, output_format="json") == 0
+    replay = json.loads(capsys.readouterr().out)
+    assert [row["outcome"] for row in replay["rows"]] == [
+        "already-recovered",
+        "already-recovered",
+    ]
+
+
+def test_audit_row_round_trips_as_absent_validate_input(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    made = create(project, slot="audited", agent="validate-a", branch=None, slot_type="validate")
+    assert made.returncode == 0, made.stderr
+    assert wrkslots.main(["--project-root", str(project), "audit", "--format", "json"]) == 0
+    audit = json.loads(capsys.readouterr().out)
+    row = next(item for item in audit["slots"] if item["slot"] == "audited")
+    assert isinstance(row["generation"], int)
+    assert len(row["record_sha256"]) == 64
+    input_path = project / "round-trip.json"
+    input_path.write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "rows": [
+                    {
+                        key: row[key]
+                        for key in (
+                            "machine",
+                            "slot",
+                            "generation",
+                            "record_sha256",
+                        )
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = wrkslots._load_config(str(project), "testhost")
+    _digest, parsed = wrkslots._read_absent_validate_rows_input(config, str(input_path))
+    assert parsed == (
+        wrkslots.AbsentValidateRow("testhost", "audited", row["generation"], row["record_sha256"]),
+    )
+
+    input_path.write_bytes(b" " * (1024 * 1024 + 1))
+    with pytest.raises(wrkslots.Refusal, match="exceeds the 1 MiB safety bound"):
+        wrkslots._read_absent_validate_rows_input(config, str(input_path))
+
+
+def test_bounded_regular_file_refuses_fifo_without_blocking(tmp_path: Path) -> None:
+    fifo = tmp_path / "retained-handle.json"
+    os.mkfifo(fifo)
+    script = (
+        "from pathlib import Path\n"
+        "from wrkslots import cli\n"
+        "try:\n"
+        f"    cli._read_bounded_regular_file(Path({str(fifo)!r}), 'test FIFO', 1024)\n"
+        "except cli.Refusal:\n"
+        "    raise SystemExit(0)\n"
+        "raise SystemExit(1)\n"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        env=source_environment(),
+        capture_output=True,
+        text=True,
+        timeout=2,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_bounded_regular_file_refuses_path_swapped_to_fifo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "retained-handle.json"
+    target.write_text("{}", encoding="utf-8")
+    original_open = os.open
+    observed_flags: list[int] = []
+
+    def swap_then_open(path: os.PathLike[str] | str, flags: int, mode: int = 0o777) -> int:
+        observed_flags.append(flags)
+        target.unlink()
+        os.mkfifo(target)
+        monkeypatch.setattr(os, "open", original_open)
+        return original_open(path, flags, mode)
+
+    monkeypatch.setattr(os, "open", swap_then_open)
+    with pytest.raises(wrkslots.Refusal, match="not a regular file"):
+        wrkslots._read_bounded_regular_file(target, "swapped handle", 1024)
+    assert observed_flags[0] & os.O_NONBLOCK
+
+
+def test_absent_storage_archive_preserves_schema_two_shape(tmp_path: Path) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    made = create(
+        project,
+        slot="validate-row",
+        agent="validate-a",
+        branch=None,
+        slot_type="validate",
+    )
+    assert made.returncode == 0, made.stderr
+    config = wrkslots._load_config(str(project), "testhost")
+    record = wrkslots._find_record(wrkslots._load_active(config), "validate-row")
+    item = wrkslots.AbsentValidateRow(
+        record.machine, record.slot, record.generation, wrkslots._record_sha256(record)
+    )
+    entry = wrkslots._absent_validate_archive_entry(record, item, "2026-09-02T00:00:00+00:00")
+    assert set(entry) == {
+        "archive_id",
+        "slot",
+        "agent",
+        "task",
+        "purpose",
+        "slot_type",
+        "machine",
+        "generation",
+        "created_at",
+        "finished_at",
+        "mode",
+        "actor",
+        "physical_storage",
+        "validation",
+        "limitations",
+        "continuation",
+        "salvage",
+        "checkouts",
+    }
+    assert entry["slot_type"] == "validate"
+    assert entry["physical_storage"] == "removed"
+    assert "recovery" not in entry
+    assert (
+        f"source ACTIVE record SHA-256: {item.record_sha256}"
+        in wrkslots._as_list(entry["validation"], "archive validation")
+    )
+    parsed = wrkslots._archive_from_obj(
+        config,
+        {
+            "schema": wrkslots.SCHEMA,
+            "machine": "testhost",
+            "revision": 1,
+            "records": [entry],
+        },
+        "testhost",
+        "test archive",
+    )
+    assert parsed.records == (entry,)
+
+
+def test_recovery_replay_rejects_archive_with_only_mimicking_prose(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    record = prepare_absent_validate_row(
+        project, repository, slot="prose-only", agent="validate-a"
+    )
+    config = wrkslots._load_config(str(project), "testhost")
+    item = wrkslots.AbsentValidateRow(
+        record.machine,
+        record.slot,
+        record.generation,
+        wrkslots._record_sha256(record),
+    )
+    entry = wrkslots._absent_validate_archive_entry(
+        record, item, "2026-09-02T00:00:00+00:00"
+    )
+    archive = wrkslots._load_archive(config)
+    wrkslots._write_archive_state(
+        config,
+        wrkslots.ArchiveState(
+            archive.machine,
+            archive.revision + 1,
+            (*archive.records, entry),
+        ),
+        action="slot-archived",
+        slot=record.slot,
+        evidence={"archive_id": entry["archive_id"]},
+    )
+    active = wrkslots._load_active(config)
+    wrkslots._write_active_state(
+        config,
+        wrkslots._delete_record(active, record.slot),
+        action="test-remove-prose-only-row",
+        slot=record.slot,
+    )
+    input_path = write_absent_validate_input(project, [record])
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    assert run_absent_validate_recovery(project, input_path, apply=False) == 3
+    assert "exact prior absent-row recovery" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "point",
+    (
+        "after-absent-validate-batch-journal",
+        "after-absent-validate-archive",
+        "after-absent-validate-row",
+        "after-absent-validate-active-row-1",
+        "after-absent-validate-active-event",
+        "after-absent-validate-active-delete",
+    ),
+)
+def test_absent_validate_batch_resumes_each_durable_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, point: str
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    first_made = create(
+        project,
+        slot="gone-a",
+        agent="validate-a",
+        branch=None,
+        slot_type="validate",
+    )
+    assert first_made.returncode == 0, first_made.stderr
+    second_made = create(
+        project,
+        slot="gone-b",
+        agent="validate-b",
+        branch=None,
+        slot_type="validate",
+    )
+    assert second_made.returncode == 0, second_made.stderr
+    config = wrkslots._load_config(str(project), "testhost")
+    records = [
+        mark_recorded_owner_dead(project, "gone-a"),
+        mark_recorded_owner_dead(project, "gone-b"),
+    ]
+    for record in records:
+        make_validate_row_absent(project, repository, record)
+    input_path = write_absent_validate_input(project, records)
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    class Interrupted(RuntimeError):
+        pass
+
+    def interrupt(observed: str) -> None:
+        if observed == point:
+            raise Interrupted
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", interrupt)
+    with pytest.raises(Interrupted):
+        run_absent_validate_recovery(project, input_path, apply=True)
+    assert (control_directory(project) / "ACTIVE.testhost.journal").is_file()
+    if point == "after-absent-validate-active-event":
+        assert len(wrkslots._load_active_snapshot(config).slots) == 2
+        assert wrkslots._load_active(config).slots == ()
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _point: None)
+    assert run_absent_validate_recovery(project, input_path, apply=True) == 0
+    assert active_slots(project) == []
+    assert wrkslots._load_active_snapshot(config).slots == ()
+    assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
+
+
+def test_absent_validate_recovery_parses_event_history_in_bounded_passes_at_127_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    seed = prepare_absent_validate_row(
+        project, repository, slot="scale-seed", agent="validate-scale"
+    )
+    config = wrkslots._load_config(str(project), "testhost")
+    records: list[wrkslots.ActiveRecord] = []
+    for index in range(127):
+        slot = f"scale-{index:03d}"
+        checkout = replace(
+            seed.checkouts[0],
+            path=seed.checkouts[0].path.replace(seed.slot, slot),
+            branch=seed.checkouts[0].branch.replace(seed.slot, slot),
+        )
+        records.append(
+            replace(
+                seed,
+                slot=slot,
+                agent=f"validate-{index:03d}",
+                task=f"scale-{index:03d}",
+                purpose="bounded recovery scale control",
+                checkouts=(checkout,),
+            )
+        )
+    event_directory = wrkslots._event_directory(config)
+    shutil.rmtree(event_directory)
+    wrkslots._atomic_write_json(
+        wrkslots._active_path(config),
+        wrkslots._active_to_obj(wrkslots.ActiveState("testhost", 1, tuple(records))),
+    )
+    wrkslots._atomic_write_json(
+        wrkslots._archive_path(config),
+        wrkslots._archive_to_obj(wrkslots.ArchiveState("testhost", 0, ())),
+    )
+    input_path = write_absent_validate_input(project, records)
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    original_load_events = wrkslots._load_events
+    original_listed_worktrees = wrkslots._GitVcs.listed_worktrees
+    original_archive_from_obj = wrkslots._archive_from_obj
+    original_active_from_obj = wrkslots._active_from_obj
+    loads = 0
+    worktree_listings = 0
+    archive_rows_parsed = 0
+    active_rows_parsed = 0
+
+    def counted_load_events(
+        cfg: wrkslots.Config, machine: str | None = None
+    ) -> tuple[dict[str, object], ...]:
+        nonlocal loads
+        loads += 1
+        return original_load_events(cfg, machine)
+
+    monkeypatch.setattr(wrkslots, "_load_events", counted_load_events)
+
+    def counted_listed_worktrees(
+        vcs: wrkslots._GitVcs, repository_path: Path
+    ) -> set[Path]:
+        nonlocal worktree_listings
+        worktree_listings += 1
+        return original_listed_worktrees(vcs, repository_path)
+
+    monkeypatch.setattr(wrkslots._GitVcs, "listed_worktrees", counted_listed_worktrees)
+
+    def counted_archive_from_obj(
+        cfg: wrkslots.Config, value: object, selected: str, label: str
+    ) -> wrkslots.ArchiveState:
+        nonlocal archive_rows_parsed
+        raw = wrkslots._as_mapping(value, "counted archive")
+        archive_rows_parsed += len(wrkslots._as_list(raw["records"], "counted records"))
+        return original_archive_from_obj(cfg, value, selected, label)
+
+    def counted_active_from_obj(
+        cfg: wrkslots.Config, value: object, selected: str, label: str
+    ) -> wrkslots.ActiveState:
+        nonlocal active_rows_parsed
+        raw = wrkslots._as_mapping(value, "counted active")
+        active_rows_parsed += len(wrkslots._as_list(raw["slots"], "counted slots"))
+        return original_active_from_obj(cfg, value, selected, label)
+
+    monkeypatch.setattr(wrkslots, "_archive_from_obj", counted_archive_from_obj)
+    monkeypatch.setattr(wrkslots, "_active_from_obj", counted_active_from_obj)
+
+    assert run_absent_validate_recovery(project, input_path, apply=True, output_format="json") == 0
+    outcomes = json.loads(capsys.readouterr().out)["rows"]
+    assert len(outcomes) == 127
+    assert {row["outcome"] for row in outcomes} == {"recovered"}
+    assert wrkslots._load_active_snapshot(config).slots == ()
+    assert len(wrkslots._load_archive_snapshot(config).records) == 127
+    assert loads <= 16
+    assert worktree_listings <= 2
+    assert archive_rows_parsed <= 24 * len(records)
+    assert active_rows_parsed <= 24 * len(records)
+    events = original_load_events(config)
+    assert sum(event["kind"] == "operation-progress-recorded" for event in events) == 2
+    assert sum(event["kind"] == "archive-state-recorded" for event in events) == len(records)
+    assert sum(event["kind"] == "active-state-recorded" for event in events) == len(records)
+    archive_events = [
+        wrkslots._as_mapping(event["payload"], "archive event")
+        for event in events
+        if event["kind"] == "archive-state-recorded"
+    ]
+    assert all(event["action"] == "absent-validation-row-recovered" for event in archive_events)
+    assert all(
+        set(wrkslots._as_mapping(event["evidence"], "archive evidence"))
+        == {"archive_id", "source_record_sha256", "validation_outcome"}
+        for event in archive_events
+    )
+    removal_events = [
+        wrkslots._as_mapping(event["payload"], "removal event")
+        for event in events
+        if event["kind"] == "active-state-recorded"
+    ]
+    assert all(
+        set(wrkslots._as_mapping(event["evidence"], "removal evidence"))
+        == {"archive_id", "source_record_sha256", "validation_outcome"}
+        for event in removal_events
+    )
+
+
+@pytest.mark.parametrize("change", ("generation", "digest"))
+def test_absent_validate_recovery_refuses_wrong_row_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    change: str,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    record = prepare_absent_validate_row(project, repository, slot="gone", agent="validate-a")
+    input_path = write_absent_validate_input(project, [record])
+    value = json.loads(input_path.read_text(encoding="utf-8"))
+    row = value["rows"][0]
+    if change == "generation":
+        row["generation"] += 1
+    else:
+        row["record_sha256"] = "0" * 64
+    input_path.write_text(json.dumps(value), encoding="utf-8")
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    assert run_absent_validate_recovery(project, input_path, apply=False, output_format="json") == 3
+    captured = capsys.readouterr()
+    outcomes = json.loads(captured.out)
+    assert [row["outcome"] for row in outcomes["rows"]] == ["refused"]
+    assert "changed" in captured.err
+    assert len(active_slots(project)) == 1
+
+
+def test_absent_validate_mixed_batch_refusal_writes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    first_made = create(
+        project,
+        slot="valid-first",
+        agent="validate-a",
+        branch=None,
+        slot_type="validate",
+        bind_owner=False,
+    )
+    assert first_made.returncode == 0, first_made.stderr
+    second_made = create(
+        project,
+        slot="invalid-last",
+        agent="validate-b",
+        branch=None,
+        slot_type="validate",
+        bind_owner=False,
+    )
+    assert second_made.returncode == 0, second_made.stderr
+    config = wrkslots._load_config(str(project), "testhost")
+    state = wrkslots._load_active(config)
+    first = wrkslots._find_record(state, "valid-first")
+    second = wrkslots._find_record(state, "invalid-last")
+    make_validate_row_absent(project, repository, first)
+    make_validate_row_absent(project, repository, second)
+    input_path = write_absent_validate_input(project, [first, second])
+    value = json.loads(input_path.read_text(encoding="utf-8"))
+    value["rows"][1]["record_sha256"] = "0" * 64
+    input_path.write_text(json.dumps(value), encoding="utf-8")
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    control = control_directory(project)
+    before = {
+        path.relative_to(control): path.read_bytes()
+        for path in control.rglob("*")
+        if path.is_file()
+    }
+
+    assert run_absent_validate_recovery(project, input_path, apply=True, output_format="json") == 3
+    outcomes = json.loads(capsys.readouterr().out)["rows"]
+    assert [row["outcome"] for row in outcomes] == ["refused", "refused"]
+    after = {
+        path.relative_to(control): path.read_bytes()
+        for path in control.rglob("*")
+        if path.is_file()
+    }
+    assert after == before
+
+
+def test_absent_validate_mixed_prior_recovery_and_invalid_active_row_writes_nothing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    recovered_made = create(
+        project,
+        slot="already",
+        agent="validate-a",
+        branch=None,
+        slot_type="validate",
+    )
+    assert recovered_made.returncode == 0, recovered_made.stderr
+    invalid_made = create(
+        project,
+        slot="invalid",
+        agent="validate-b",
+        branch=None,
+        slot_type="validate",
+    )
+    assert invalid_made.returncode == 0, invalid_made.stderr
+    recovered = mark_recorded_owner_dead(project, "already")
+    invalid = mark_recorded_owner_dead(project, "invalid")
+    make_validate_row_absent(project, repository, recovered)
+    make_validate_row_absent(project, repository, invalid)
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    recovered_input = write_absent_validate_input(project, [recovered])
+    assert run_absent_validate_recovery(project, recovered_input, apply=True) == 0
+    capsys.readouterr()
+
+    mixed_input = write_absent_validate_input(project, [recovered, invalid])
+    value = json.loads(mixed_input.read_text(encoding="utf-8"))
+    value["rows"][1]["record_sha256"] = "0" * 64
+    mixed_input.write_text(json.dumps(value), encoding="utf-8")
+    control = control_directory(project)
+    before = {
+        path.relative_to(control): path.read_bytes()
+        for path in control.rglob("*")
+        if path.is_file()
+    }
+
+    assert run_absent_validate_recovery(project, mixed_input, apply=True, output_format="json") == 3
+    outcomes = json.loads(capsys.readouterr().out)["rows"]
+    assert [row["outcome"] for row in outcomes] == [
+        "already-recovered",
+        "refused",
+    ]
+    after = {
+        path.relative_to(control): path.read_bytes()
+        for path in control.rglob("*")
+        if path.is_file()
+    }
+    assert after == before
+
+
+def test_absent_validate_recovery_refuses_agent_row_and_existing_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    agent = create(project, slot="agent-row", agent="agent-a")
+    assert agent.returncode == 0, agent.stderr
+    config = wrkslots._load_config(str(project), "testhost")
+    agent_record = wrkslots._find_record(wrkslots._load_active(config), "agent-row")
+    input_path = write_absent_validate_input(project, [agent_record])
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    assert run_absent_validate_recovery(project, input_path, apply=False) == 3
+    assert "not a validation row" in capsys.readouterr().err
+
+    validate = create(
+        project,
+        slot="present",
+        agent="validate-a",
+        branch=None,
+        slot_type="validate",
+    )
+    assert validate.returncode == 0, validate.stderr
+    present = wrkslots._find_record(wrkslots._load_active(config), "present")
+    input_path = write_absent_validate_input(project, [present])
+    assert run_absent_validate_recovery(project, input_path, apply=False) == 3
+    assert "still has physical storage" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "name",
+    (
+        ".gone.fenced.{generation}.junk.fenced.x",
+        ".gone.ownerless-validate.deadbeef.junk.ownerless-validate.x",
+    ),
+)
+def test_absent_validate_recovery_refuses_multi_marker_fenced_sibling(
+    tmp_path: Path, name: str
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    record = prepare_absent_validate_row(
+        project, repository, slot="gone", agent="validate-a"
+    )
+    config = wrkslots._load_config(str(project), "testhost")
+    sibling = wrkslots._validate_slots_directory(config) / name.format(
+        generation=record.generation
+    )
+    sibling.mkdir()
+
+    with pytest.raises(wrkslots.Refusal, match="possible fenced path"):
+        wrkslots._assert_absent_validate_rows_storage(config, (record,))
+
+
+def test_absent_validate_recovery_refuses_remote_machine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    record = prepare_absent_validate_row(project, repository, slot="gone", agent="validate-a")
+    input_path = write_absent_validate_input(project, [record])
+    monkeypatch.setattr(wrkslots, "_short_hostname", lambda: "another-host")
+
+    assert run_absent_validate_recovery(project, input_path, apply=False, output_format="json") == 3
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["rows"][0]["outcome"] == "refused"
+    assert "liveness evidence is local to another-host" in captured.err
+
+
+def test_absent_validate_recovery_binds_stable_host_identity(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    made = create(
+        project,
+        slot="host-bound",
+        agent="validate-a",
+        branch=None,
+        slot_type="validate",
+    )
+    assert made.returncode == 0, made.stderr
+    config = wrkslots._load_config(str(project), "testhost")
+    record = wrkslots._find_record(wrkslots._load_active(config), "host-bound")
+    foreign = replace(
+        record,
+        owner=None,
+        coordinator_lease=replace(record.coordinator_lease, host_id="foreign-host-id"),
+    )
+    with pytest.raises(wrkslots.Refusal, match="belongs to stable host"):
+        wrkslots._assert_absent_validate_row_is_local(foreign)
+
+    assert record.owner is not None
+    mixed = replace(
+        record,
+        owner=replace(record.owner, host_id="foreign-host-id"),
+    )
+    with pytest.raises(wrkslots.Refusal, match="missing or mixed"):
+        wrkslots._assert_absent_validate_row_is_local(mixed)
+
+    with pytest.raises(wrkslots.Refusal, match="no exact owner process generation"):
+        wrkslots._assert_absent_validate_owners_dead((replace(record, owner=None),))
+
+    live = wrkslots._read_process_identity(os.getpid())
+    dead_owner = replace(
+        record,
+        owner=replace(live, pid=2_147_483_647),
+    )
+    wrkslots._assert_absent_validate_owners_dead((dead_owner,))
+    moved_cgroup = replace(
+        record,
+        owner=replace(live, cgroup_path="/different/cgroup"),
+    )
+    with pytest.raises(wrkslots.Refusal, match="generation is still live"):
+        wrkslots._assert_absent_validate_owners_dead((moved_cgroup,))
+
+
+def test_absent_validate_recovery_allows_live_agent_without_resource_use(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    record = prepare_absent_validate_row(project, repository, slot="gone", agent="validate-a")
+    config = wrkslots._load_config(str(project), "testhost")
+    set_liveness(project, "alive")
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    monkeypatch.setattr(
+        wrkslots,
+        "_registered_liveness_state",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("agent-name liveness is not resource ownership")
+        ),
+    )
+    wrkslots._assert_absent_validate_rows_safe(config, (record,))
+
+
+def test_generic_recovery_refuses_on_another_stable_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    record = prepare_absent_validate_row(project, repository, slot="gone", agent="validate-a")
+    input_path = write_absent_validate_input(project, [record])
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    class Interrupted(RuntimeError):
+        pass
+
+    def interrupt(point: str) -> None:
+        if point == "after-absent-validate-batch-journal":
+            raise Interrupted
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", interrupt)
+    with pytest.raises(Interrupted):
+        run_absent_validate_recovery(project, input_path, apply=True)
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _point: None)
+    monkeypatch.setattr(wrkslots, "_host_id", lambda: "another-stable-host")
+
+    assert (
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "recover",
+                "--coordinator-authorized",
+                "--coordinator-pid",
+                str(os.getpid()),
+            ]
+        )
+        == 3
+    )
+    assert "journal belongs to another host identity" in capsys.readouterr().err
+
+
+def test_generic_recovery_resumes_without_original_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    record = prepare_absent_validate_row(project, repository, slot="gone", agent="validate-a")
+    input_path = write_absent_validate_input(project, [record])
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    class Interrupted(RuntimeError):
+        pass
+
+    def interrupt(point: str) -> None:
+        if point == "after-absent-validate-batch-journal":
+            raise Interrupted
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", interrupt)
+    with pytest.raises(Interrupted):
+        run_absent_validate_recovery(project, input_path, apply=True)
+    input_path.unlink()
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _point: None)
+
+    assert (
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "recover",
+                "--coordinator-authorized",
+                "--coordinator-pid",
+                str(os.getpid()),
+            ]
+        )
+        == 0
+    )
+    assert "outcome=recovered" in capsys.readouterr().out
+    assert (
+        wrkslots._load_active_snapshot(wrkslots._load_config(str(project), "testhost")).slots == ()
+    )
+
+
+def test_absent_validate_recovery_refuses_git_registration_and_hold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    registered_made = create(
+        project,
+        slot="registered",
+        agent="validate-a",
+        branch=None,
+        slot_type="validate",
+    )
+    assert registered_made.returncode == 0, registered_made.stderr
+    held_made = create(
+        project,
+        slot="held",
+        agent="validate-b",
+        branch=None,
+        slot_type="validate",
+    )
+    assert held_made.returncode == 0, held_made.stderr
+    config = wrkslots._load_config(str(project), "testhost")
+    state = wrkslots._load_active(config)
+    registered = wrkslots._find_record(state, "registered")
+    held = wrkslots._find_record(state, "held")
+    held_result = raw_command(project, "hold", "held", "--reason", "operator hold")
+    assert held_result.returncode == 0, held_result.stderr
+    make_validate_row_absent(project, repository, registered, unregister=False)
+    input_path = write_absent_validate_input(project, [registered])
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    assert run_absent_validate_recovery(project, input_path, apply=False) == 3
+    assert "Git still registers" in capsys.readouterr().err
+
+    git(repository, "worktree", "prune")
+    held_checkout = wrkslots._stored_path(config, held.checkouts[0].path, "held checkout")
+    git(repository, "worktree", "remove", "--force", "--", str(held_checkout))
+    wrkslots._slot_directory(config, "held", "validate").rmdir()
+    input_path = write_absent_validate_input(project, [held])
+    assert run_absent_validate_recovery(project, input_path, apply=False) == 3
+    assert "is held" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("handle_kind", ("unit-mismatch", "malformed"))
+def test_absent_validate_recovery_refuses_unsafe_retained_handle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    handle_kind: str,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    record = prepare_absent_validate_row(project, repository, slot="gone", agent="validate-a")
+    config = wrkslots._load_config(str(project), "testhost")
+    handle = project / "ignored" / "validate" / "runs" / "handle.json"
+    handle.parent.mkdir(parents=True, exist_ok=True)
+    if handle_kind == "unit-mismatch":
+        handle.write_text(
+            json.dumps(
+                {
+                    "checkout": str(
+                        wrkslots._stored_path(config, record.checkouts[0].path, "checkout")
+                    ),
+                    "state": "running",
+                    "unit": "different.service",
+                }
+            ),
+            encoding="utf-8",
+        )
+    else:
+        handle.write_text("{", encoding="utf-8")
+    input_path = write_absent_validate_input(project, [record])
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    assert run_absent_validate_recovery(project, input_path, apply=False) == 3
+    assert "retained validation handle" in capsys.readouterr().err
+
+
+def test_absent_validate_handle_uses_exact_process_and_unit_liveness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pid = os.getpid()
+    start_ticks = wrkslots._process_start_ticks(Path("/proc") / str(pid))
+    assert start_ticks is not None
+    live = wrkslots._RetainedValidationHandle(
+        Path("/runs/exact.json"),
+        "exact.service",
+        pid,
+        start_ticks,
+        wrkslots._boot_id(Path("/proc")),
+    )
+    with pytest.raises(wrkslots.Refusal, match="live exact process generation"):
+        wrkslots._assert_retained_handle_processes_dead({"gone": (live,)})
+
+    dead = replace(live, pid=2_147_483_647)
+    wrkslots._assert_retained_handle_processes_dead({"gone": (dead,)})
+    with pytest.raises(wrkslots.Refusal, match="live exact process generation"):
+        wrkslots._assert_retained_handle_processes_dead({"gone": (dead, live)})
+    record = object.__new__(wrkslots.ActiveRecord)
+    object.__setattr__(record, "slot", "gone")
+    rows = ((record, (Path("/absent/gone"),)),)
+    active_unit = {
+        "Id": "exact.service",
+        "LoadState": "loaded",
+        "ActiveState": "active",
+        "SubState": "running",
+        "MainPID": "0",
+        "ControlGroup": "/user.slice/exact.service",
+        "WorkingDirectory": "",
+        "ExecStart": "",
+        "Environment": "",
+        "PendingJob": "no",
+    }
+    monkeypatch.setattr(wrkslots, "_user_systemd_snapshot", lambda: (active_unit,))
+    with pytest.raises(wrkslots.Refusal, match="exact.service may still use"):
+        wrkslots._assert_absent_validate_systemd_unrelated(
+            rows, {"gone": (dead,)}, ()
+        )
+
+    inactive_unit = {**active_unit, "ActiveState": "inactive", "SubState": "dead"}
+    monkeypatch.setattr(wrkslots, "_user_systemd_snapshot", lambda: (inactive_unit,))
+    exact_process = wrkslots._AbsentProcessObservation(
+        123, 17, "/user.slice/exact.service/child", "mnt:[123]"
+    )
+    with pytest.raises(wrkslots.Refusal, match="live cgroup process"):
+        wrkslots._assert_absent_validate_systemd_unrelated(
+            rows, {"gone": (dead,)}, (exact_process,)
+        )
+
+    unrelated = replace(exact_process, cgroup_path="/shared/launcher.scope")
+    wrkslots._assert_absent_validate_systemd_unrelated(
+        rows, {"gone": (dead,)}, (unrelated,)
+    )
+
+
+def test_retained_handle_binds_checkout_and_source_checkout_even_when_nonterminal(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    first_made = create(
+        project,
+        slot="checkout-row",
+        agent="validate-a",
+        branch=None,
+        slot_type="validate",
+    )
+    assert first_made.returncode == 0, first_made.stderr
+    second_made = create(
+        project,
+        slot="source-row",
+        agent="validate-b",
+        branch=None,
+        slot_type="validate",
+    )
+    assert second_made.returncode == 0, second_made.stderr
+    first = mark_recorded_owner_dead(project, "checkout-row")
+    second = mark_recorded_owner_dead(project, "source-row")
+    make_validate_row_absent(project, repository, first)
+    make_validate_row_absent(project, repository, second)
+    config = wrkslots._load_config(str(project), "testhost")
+    first_paths = wrkslots._absent_validate_row_paths(config, first)
+    second_paths = wrkslots._absent_validate_row_paths(config, second)
+    handle_path = project / "ignored" / "validate" / "runs" / "exact-run.json"
+    handle_path.parent.mkdir(parents=True, exist_ok=True)
+    handle_path.write_text(
+        json.dumps(
+            {
+                "checkout": str(first_paths[-1]),
+                "source_checkout": str(second_paths[-1]),
+                "unit": "exact-run.service",
+                "state": "running",
+                "process_identity": {
+                    "pid": 2_147_483_647,
+                    "start_ticks": 17,
+                    "boot_id": wrkslots._boot_id(Path("/proc")),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    bindings = wrkslots._retained_handles_for_absent_rows(
+        config,
+        ((first, first_paths), (second, second_paths)),
+    )
+    assert [handle.path for handle in bindings["checkout-row"]] == [handle_path]
+    assert [handle.path for handle in bindings["source-row"]] == [handle_path]
+    wrkslots._assert_retained_handle_processes_dead(bindings)
+
+
+@pytest.mark.parametrize("bound", ("count", "bytes", "deadline"))
+def test_retained_handle_enumeration_is_bounded_before_sorting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bound: str
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    config = wrkslots._load_config(str(project), "testhost")
+    handles = project / "ignored" / "validate" / "runs"
+    handles.mkdir(parents=True, exist_ok=True)
+    (handles / "one.json").write_text("{}", encoding="utf-8")
+    if bound == "count":
+        (handles / "two.json").write_text("{}", encoding="utf-8")
+        monkeypatch.setattr(wrkslots, "_RETAINED_HANDLE_COUNT_LIMIT", 1)
+        message = "file-count census bound"
+    elif bound == "bytes":
+        monkeypatch.setattr(wrkslots, "_RETAINED_HANDLE_BYTES_LIMIT", 1)
+        message = "64 MiB census bound"
+    else:
+        ticks = iter((0.0, 2.0))
+        monkeypatch.setattr(wrkslots, "_RETAINED_HANDLE_CENSUS_SECONDS", 1.0)
+        monkeypatch.setattr(time, "monotonic", lambda: next(ticks))
+        message = "time bound"
+
+    with pytest.raises(wrkslots.Refusal, match=message):
+        wrkslots._retained_handles_for_absent_rows(config, ())
+
+
+def test_absent_validate_recovery_refuses_row_mutation_after_journal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    record = prepare_absent_validate_row(project, repository, slot="gone", agent="validate-a")
+    input_path = write_absent_validate_input(project, [record])
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    class Interrupted(RuntimeError):
+        pass
+
+    def interrupt(point: str) -> None:
+        if point == "after-absent-validate-batch-journal":
+            raise Interrupted
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", interrupt)
+    with pytest.raises(Interrupted):
+        run_absent_validate_recovery(project, input_path, apply=True)
+    config = wrkslots._load_config(str(project), "testhost")
+    state = wrkslots._load_active(config)
+    current = wrkslots._find_record(state, "gone")
+    wrkslots._write_active_state(
+        config,
+        wrkslots._replace_record(state, replace(current, purpose="changed concurrently")),
+        action="test-concurrent-change",
+        slot="gone",
+    )
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _point: None)
+
+    assert run_absent_validate_recovery(project, input_path, apply=True) == 3
+    assert "changed" in capsys.readouterr().err
+
+
+def test_absent_validate_process_and_systemd_checks_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    record = prepare_absent_validate_row(project, repository, slot="gone", agent="validate-a")
+    target = Path("/absent/validate/gone")
+    rows = ((record, (target,)),)
+    proc_root = tmp_path / "proc"
+    (proc_root / "123").mkdir(parents=True)
+    monkeypatch.setattr(
+        wrkslots,
+        "_read_process_stat",
+        lambda _path: wrkslots._ProcessStat(start_ticks=17, flags=0),
+    )
+    monkeypatch.setattr(
+        wrkslots,
+        "_process_uid",
+        lambda _path: os.getuid() + 1,
+    )
+    monkeypatch.setattr(wrkslots, "_read_process_cgroup", lambda _path: "/other")
+    monkeypatch.setattr(wrkslots, "_mount_namespace", lambda _path: "mnt:[123]")
+    snapshot = wrkslots._absent_validate_process_snapshot(proc_root)
+    assert snapshot == (wrkslots._AbsentProcessObservation(123, 17, "/other", "mnt:[123]"),)
+
+    monkeypatch.setattr(
+        wrkslots, "_mountinfo_path_references", lambda _pid, _budget: ()
+    )
+    shared_launcher_cgroup = wrkslots._absent_validate_mount_match(
+        (wrkslots._AbsentProcessObservation(123, 17, "/recorded/owner/child", "mnt:[123]"),),
+        {target: "gone"},
+    )
+    assert shared_launcher_cgroup is None
+
+    monkeypatch.setattr(wrkslots, "_root_owned_executable", lambda path, _label: path)
+    monkeypatch.setattr(
+        wrkslots,
+        "_run_bounded_read_only_command",
+        lambda _command, **_kwargs: (1, b"", b"sudo denied"),
+    )
+    with pytest.raises(wrkslots.Refusal, match="find census produced diagnostics"):
+        wrkslots._absent_validate_find_match(snapshot, {target: "gone"})
+
+    monkeypatch.setattr(
+        wrkslots,
+        "_user_systemd_snapshot",
+        lambda: (
+            {
+                "Id": "validate.service",
+                "LoadState": "loaded",
+                "ActiveState": "active",
+                "SubState": "running",
+                "MainPID": "0",
+                "ControlGroup": "/unrelated",
+                "WorkingDirectory": str(target),
+                "ExecStart": "",
+                "Environment": "",
+                "PendingJob": "no",
+            },
+        ),
+    )
+    with pytest.raises(wrkslots.Refusal, match="names validation row"):
+        wrkslots._assert_absent_validate_systemd_unrelated(rows, {"gone": ()}, snapshot)
+
+    monkeypatch.setattr(
+        wrkslots,
+        "_user_systemd_snapshot",
+        lambda: (
+            {
+                "Id": "queued.scope",
+                "LoadState": "loaded",
+                "ActiveState": "inactive",
+                "SubState": "dead",
+                "MainPID": "0",
+                "ControlGroup": "/unrelated",
+                "WorkingDirectory": "",
+                "ExecStart": f"/bin/true {target}",
+                "Environment": "",
+                "PendingJob": "yes",
+            },
+        ),
+    )
+    with pytest.raises(wrkslots.Refusal, match="names validation row"):
+        wrkslots._assert_absent_validate_systemd_unrelated(rows, {"gone": ()}, snapshot)
+
+
+def test_mount_namespace_reselects_after_representative_generation_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = Path("/absent/validate/gone")
+    processes = (
+        wrkslots._AbsentProcessObservation(123, 17, "/other", "mnt:[same]"),
+        wrkslots._AbsentProcessObservation(124, 18, "/other", "mnt:[same]"),
+    )
+    inspected: list[int] = []
+
+    def mountinfo(
+        pid: int, _budget: wrkslots._ReadOnlyCommandBudget
+    ) -> tuple[tuple[Path, str], ...]:
+        inspected.append(pid)
+        return ((target, str(target)),) if pid == 123 else ()
+
+    monkeypatch.setattr(wrkslots, "_mountinfo_path_references", mountinfo)
+    monkeypatch.setattr(
+        wrkslots,
+        "_process_start_ticks",
+        lambda path: None if path.name == "123" else 18,
+    )
+    assert wrkslots._absent_validate_mount_match(processes, {target: "gone"}) is None
+    assert inspected == [123, 124]
+
+
+def test_mountinfo_census_enforces_file_aggregate_and_deadline_bounds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed_limits: list[int] = []
+
+    def bounded_read(_path: Path, _label: str, limit: int) -> bytes:
+        observed_limits.append(limit)
+        return b"abc"
+
+    monkeypatch.setattr(wrkslots, "_read_bounded_regular_file", bounded_read)
+    monkeypatch.setattr(wrkslots, "_parse_mountinfo_paths", lambda _text, _label: ())
+    budget = wrkslots._ReadOnlyCommandBudget.start(
+        timeout_seconds=30,
+        stdout_limit=1,
+        stderr_limit=1,
+        input_limit=5,
+    )
+    assert wrkslots._mountinfo_path_references(1, budget) == ()
+    with pytest.raises(wrkslots.Refusal, match="input bound"):
+        wrkslots._mountinfo_path_references(2, budget)
+    assert observed_limits == [5, 2]
+
+    expired = wrkslots._ReadOnlyCommandBudget.start(
+        timeout_seconds=30,
+        stdout_limit=1,
+        stderr_limit=1,
+        input_limit=wrkslots._MOUNTINFO_CENSUS_BYTES_LIMIT,
+    )
+    expired.deadline = time.monotonic() - 1
+    with pytest.raises(wrkslots.Refusal, match="time bound"):
+        wrkslots._mountinfo_path_references(3, expired)
+
+
+@pytest.mark.parametrize(
+    ("evidence_path", "observed"),
+    (
+        ("/proc/123/cwd", "/absent/validate/gone"),
+        ("/proc/123/root", "/absent/validate/gone/root"),
+        ("/proc/123/fd/42", "/absent/validate/gone/open"),
+    ),
+)
+def test_privileged_find_census_reports_deleted_process_links(
+    monkeypatch: pytest.MonkeyPatch, evidence_path: str, observed: str
+) -> None:
+    process = wrkslots._AbsentProcessObservation(123, 17, "/other", "mnt:[123]")
+    target = Path("/absent/validate/gone")
+    monkeypatch.setattr(
+        wrkslots,
+        "_process_symlink_roots",
+        lambda _processes: ("/proc/123/fd",),
+    )
+    monkeypatch.setattr(wrkslots, "_process_start_ticks", lambda _path: 17)
+    monkeypatch.setattr(
+        wrkslots,
+        "_run_root_owned_command",
+        lambda *_args, **_kwargs: (
+            0,
+            evidence_path.encode() + b"\0" + observed.encode() + b" (deleted)\0",
+            b"",
+        ),
+    )
+    assert wrkslots._absent_validate_find_match((process,), {target: "gone"}) == (
+        123,
+        "gone",
+        "link",
+        f"{observed} (deleted)",
+    )
+
+
+def test_privileged_grep_census_reports_deleted_mapping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = wrkslots._AbsentProcessObservation(123, 17, "/other", "mnt:[123]")
+    target = Path("/absent/validate/gone")
+    monkeypatch.setattr(wrkslots, "_process_start_ticks", lambda _path: 17)
+    monkeypatch.setattr(
+        wrkslots,
+        "_run_root_owned_command",
+        lambda *_args, **_kwargs: (
+            0,
+            b"/proc/123/maps:7f00-7f10 r--p 00000000 00:00 0 "
+            b"/absent/validate/gone/mapped (deleted)\n",
+            b"",
+        ),
+    )
+    assert wrkslots._absent_validate_maps_match((process,), {target: "gone"}) == (
+        123,
+        "gone",
+        "map",
+        "/absent/validate/gone/mapped",
+    )
+
+
+def test_privileged_process_arguments_batch_and_refuse_oversized_item() -> None:
+    batches = wrkslots._argument_batches(
+        ("prefix",), ("a" * 20, "b" * 20, "c" * 20), ("suffix",), budget=55
+    )
+    assert len(batches) > 1
+    assert [item for batch in batches for item in batch[1:-1]] == [
+        "a" * 20,
+        "b" * 20,
+        "c" * 20,
+    ]
+    with pytest.raises(wrkslots.Refusal, match="one .* argument exceeds"):
+        wrkslots._argument_batches(("p",), ("x" * 100,), ("s",), budget=32)
+
+
+def test_privileged_process_diagnostics_allow_only_vanished_generations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = wrkslots._AbsentProcessObservation(123, 17, "/other", "mnt:[123]")
+    find_error = b"/usr/bin/find: '/proc/123/fd': No such file or directory\n"
+    grep_error = b"/usr/bin/grep: /proc/123/maps: No such file or directory\n"
+    monkeypatch.setattr(wrkslots, "_process_start_ticks", lambda _path: None)
+    wrkslots._allow_only_vanished_process_diagnostics("find", 1, find_error, {123: process})
+    wrkslots._allow_only_vanished_process_diagnostics("grep", 2, grep_error, {123: process})
+
+    monkeypatch.setattr(wrkslots, "_process_start_ticks", lambda _path: 17)
+    with pytest.raises(wrkslots.Refusal, match="find census produced diagnostics"):
+        wrkslots._allow_only_vanished_process_diagnostics("find", 1, find_error, {123: process})
+    with pytest.raises(wrkslots.Refusal, match="grep census produced diagnostics"):
+        wrkslots._allow_only_vanished_process_diagnostics("grep", 2, grep_error, {123: process})
+
+
+def test_kernel_thread_process_scan_omits_only_exe() -> None:
+    process = wrkslots._AbsentProcessObservation(123, 17, "/other", "mnt:[123]", kernel_thread=True)
+    roots = wrkslots._process_symlink_roots((process,))
+    assert roots == ("/proc/123/cwd", "/proc/123/root", "/proc/123/fd")
+
+
+def test_integrated_process_liveness_clear_and_in_use(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = Path("/absent/validate/gone")
+    record = object.__new__(wrkslots.ActiveRecord)
+    object.__setattr__(record, "slot", "gone")
+    object.__setattr__(record, "owner", None)
+    rows = ((record, (target,)),)
+    process = wrkslots._AbsentProcessObservation(123, 17, "/other", "mnt:[123]")
+    monkeypatch.setattr(wrkslots, "_absent_validate_process_snapshot", lambda: (process,))
+    monkeypatch.setattr(
+        wrkslots,
+        "_absent_validate_mount_match",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        wrkslots,
+        "_absent_validate_privileged_path_match",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        wrkslots,
+        "_process_start_ticks",
+        lambda _path: (_ for _ in ()).throw(
+            AssertionError("unrelated PID generations must not be globally rechecked")
+        ),
+    )
+    wrkslots._assert_absent_validate_processes_unrelated(rows)
+
+    monkeypatch.setattr(
+        wrkslots,
+        "_absent_validate_privileged_path_match",
+        lambda *_args: (123, "gone", "cwd", str(target)),
+    )
+    monkeypatch.setattr(wrkslots, "_process_start_ticks", lambda _path: 17)
+    with pytest.raises(wrkslots.Refusal, match="live process 123"):
+        wrkslots._assert_absent_validate_processes_unrelated(rows)
+
+
+def test_user_systemd_uses_validated_bus_and_absolute_binary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/tmp/shadowed-user-bus")
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/tmp/shadowed-user-bus/bus")
+    with pytest.raises(wrkslots.Refusal, match="XDG_RUNTIME_DIR must be"):
+        wrkslots._user_bus_environment()
+
+    seen: dict[str, object] = {}
+    monkeypatch.setattr(
+        wrkslots,
+        "_user_bus_environment",
+        lambda: {"XDG_RUNTIME_DIR": "/run/user/123"},
+    )
+    monkeypatch.setattr(
+        wrkslots,
+        "_root_owned_executable",
+        lambda path, _label: path,
+    )
+
+    def bounded(command: list[str], **kwargs: object) -> tuple[int, bytes, bytes]:
+        seen["command"] = command
+        seen["kwargs"] = kwargs
+        return 0, b"unit.service loaded active running\n", b""
+
+    monkeypatch.setattr(wrkslots, "_run_bounded_read_only_command", bounded)
+    budget = wrkslots._ReadOnlyCommandBudget.start(
+        timeout_seconds=30,
+        stdout_limit=1024 * 1024,
+        stderr_limit=64 * 1024,
+    )
+    assert "unit.service" in wrkslots._run_user_systemctl(("list-units",), budget)
+    assert seen["command"] == ["/usr/bin/systemctl", "--user", "list-units"]
+    kwargs = seen["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert 0 < kwargs["timeout_seconds"] <= 30
+    assert kwargs["stdout_limit"] == 1024 * 1024
+    assert kwargs["stderr_limit"] == 64 * 1024
+    assert kwargs["env_overrides"] == {"XDG_RUNTIME_DIR": "/run/user/123"}
+
+
+def test_bounded_read_only_command_refuses_output_and_time_overruns() -> None:
+    with pytest.raises(wrkslots.Refusal, match="stdout exceeded"):
+        wrkslots._run_bounded_read_only_command(["/usr/bin/printf", "12345"], stdout_limit=4)
+    with pytest.raises(wrkslots.Refusal, match="exceeded"):
+        wrkslots._run_bounded_read_only_command(["/usr/bin/sleep", "1"], timeout_seconds=0.01)
+    with pytest.raises(wrkslots.Refusal, match="exceeded"):
+        wrkslots._run_bounded_read_only_command(
+            ["/usr/bin/sleep", "1"],
+            timeout_seconds=0.01,
+            input_data=b"x" * (256 * 1024),
+        )
+
+
+def test_privileged_census_enforces_one_operation_wide_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(wrkslots, "_root_owned_executable", lambda path, _label: path)
+    monkeypatch.setattr(
+        wrkslots,
+        "_run_bounded_read_only_command",
+        lambda _command, **_kwargs: (0, b"abc", b""),
+    )
+    budget = wrkslots._ReadOnlyCommandBudget.start(
+        timeout_seconds=30,
+        stdout_limit=5,
+        stderr_limit=64,
+    )
+    wrkslots._run_root_owned_command(Path("/usr/bin/find"), ("/proc/1/fd",), budget=budget)
+    with pytest.raises(wrkslots.Refusal, match="operation-wide output bound"):
+        wrkslots._run_root_owned_command(
+            Path("/usr/bin/find"), ("/proc/2/fd",), budget=budget
+        )
+
+
+def test_process_census_retries_only_generation_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    record = object.__new__(wrkslots.ActiveRecord)
+    object.__setattr__(record, "slot", "gone")
+    rows = ((record, (Path("/absent/gone"),)),)
+    calls = 0
+
+    def stable_refusal() -> tuple[wrkslots._AbsentProcessObservation, ...]:
+        nonlocal calls
+        calls += 1
+        raise wrkslots.Refusal("permission denied")
+
+    monkeypatch.setattr(wrkslots, "_absent_validate_process_snapshot", stable_refusal)
+    with pytest.raises(wrkslots.Refusal, match="permission denied"):
+        wrkslots._assert_absent_validate_processes_unrelated(rows)
+    assert calls == 1
+
+    calls = 0
+
+    def changed() -> tuple[wrkslots._AbsentProcessObservation, ...]:
+        nonlocal calls
+        calls += 1
+        raise wrkslots._ProcessEvidenceChanged("generation changed")
+
+    monkeypatch.setattr(wrkslots, "_absent_validate_process_snapshot", changed)
+    with pytest.raises(wrkslots.Refusal, match="three liveness attempts"):
+        wrkslots._assert_absent_validate_processes_unrelated(rows)
+    assert calls == 3
+
+
+def test_bounded_read_only_command_uses_a_fixed_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PATH", "/tmp/shadowed-bin")
+    monkeypatch.setenv("WRKSLOTS_UNTRUSTED", "must-not-cross-boundary")
+    returncode, stdout, stderr = wrkslots._run_bounded_read_only_command(["/usr/bin/env"])
+    assert returncode == 0
+    assert stderr == b""
+    assert set(stdout.decode("ascii").splitlines()) == {
+        "LC_ALL=C",
+        "PATH=/usr/sbin:/usr/bin:/sbin:/bin",
+    }
