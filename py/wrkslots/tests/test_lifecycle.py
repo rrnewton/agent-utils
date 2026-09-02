@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
 
@@ -1957,7 +1958,7 @@ def test_ownerless_validate_recovery_resumes_without_reauthorizing(
     assert not journal.exists()
 
 
-def test_ownerless_recovery_does_not_make_status_tolerate_other_drift(
+def test_ownerless_recovery_keeps_unrelated_drift_visible_in_status(
     tmp_path: Path,
 ) -> None:
     project, _repository, _remote = make_project(
@@ -1974,7 +1975,9 @@ def test_ownerless_recovery_does_not_make_status_tolerate_other_drift(
     other.mkdir()
 
     before = raw_command(project, "status")
-    assert before.returncode == 3
+    assert before.returncode == 0, before.stderr
+    assert "registry_storage=INCONSISTENT" in before.stdout
+    assert "target=agent/validate-cargo-target" in before.stdout
     recovered = raw_command(
         project,
         "--allow-existing-unregistered-worktrees",
@@ -1991,8 +1994,10 @@ def test_ownerless_recovery_does_not_make_status_tolerate_other_drift(
     assert not target.exists()
     assert other.is_dir()
     after = raw_command(project, "status")
-    assert after.returncode == 3
-    assert "agent:validate-cargo-target" in after.stderr
+    assert after.returncode == 0, after.stderr
+    assert "registry_storage=INCONSISTENT" in after.stdout
+    assert "target=agent/validate-cargo-target" in after.stdout
+    assert "target=validate/validate-cargo-target" not in after.stdout
 
 
 def test_create_without_slot_type_names_both_choices_and_changes_nothing(
@@ -2042,12 +2047,14 @@ def test_existing_unregistered_flag_retains_and_warns_without_treating_path_free
     orphan.mkdir()
 
     strict = raw_command(project, "status", "--format", "json")
-    assert strict.returncode == 3
-    assert "directory without an active row" in strict.stderr
-    assert "no registered slot or unregistered directory was changed" in strict.stderr
-    assert "wrkslots audit --format json" in strict.stderr
-    assert "--allow-existing-unregistered-worktrees" in strict.stderr
-    assert strict.stdout == ""
+    assert strict.returncode == 0, strict.stderr
+    strict_payload = json.loads(strict.stdout)
+    assert strict_payload["active"] == []
+    assert strict_payload["registry_storage_state"] == "inconsistent"
+    strict_findings = strict_payload["registry_storage_inconsistencies"]
+    assert len(strict_findings) == 1
+    assert strict_findings[0]["kind"] == "directory-without-row"
+    assert strict_findings[0]["slot"] == "historical"
     assert orphan.is_dir()
 
     audited = raw_command(project, "audit", "--format", "json")
@@ -2074,9 +2081,8 @@ def test_existing_unregistered_flag_retains_and_warns_without_treating_path_free
         "json",
     )
     assert reported.returncode == 0, reported.stderr
-    assert json.loads(reported.stdout)["active"] == []
-    assert "existing unregistered worktree" in reported.stderr
-    assert "will not inspect, select, or remove them" in reported.stderr
+    reported_payload = json.loads(reported.stdout)
+    assert reported_payload == strict_payload
     assert orphan.is_dir()
 
     made = raw_command(
@@ -2342,6 +2348,45 @@ def test_different_machines_use_different_shards(tmp_path: Path) -> None:
     assert len(active_slots(project, "machine-a")) == 1
     assert len(active_slots(project, "machine-b")) == 1
     assert (project / "worktrees" / "ARCHIVED.machine-b.json").is_file()
+
+
+def test_default_doctor_classifies_storage_against_all_machine_rows(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path, machine="testhost")
+    first = create(
+        project,
+        slot="slot01",
+        agent="codex-1",
+        branch="codex/machine-a",
+        machine="testhost",
+    )
+    second = create(
+        project,
+        slot="slot02",
+        agent="codex-2",
+        branch="codex/machine-b",
+        machine="machine-b",
+    )
+    assert first.returncode == 0, first.stderr
+    assert second.returncode == 0, second.stderr
+
+    local = command(project, "doctor", "--format", "json")
+    global_view = command(
+        project, "doctor", "--all-machines", "--format", "json"
+    )
+
+    assert local.returncode == 0, local.stderr
+    assert global_view.returncode == 0, global_view.stderr
+    local_payload = json.loads(local.stdout)
+    global_payload = json.loads(global_view.stdout)
+    assert [row["slot"] for row in local_payload["active"]] == ["slot01"]
+    assert local_payload["findings"] == []
+    assert {row["slot"] for row in global_payload["active"]} == {
+        "slot01",
+        "slot02",
+    }
+    assert global_payload["findings"] == []
 
 
 def test_interrupted_create_requires_and_supports_recovery(tmp_path: Path) -> None:
@@ -4188,6 +4233,18 @@ def test_status_reports_registry_directory_mismatch(
         assert status.returncode == 0, status.stderr
 
 
+def test_fresh_registry_status_is_consistent(tmp_path: Path) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+
+    status = command(project, "status", "--all-machines", "--format", "json")
+
+    assert status.returncode == 0, status.stderr
+    payload = json.loads(status.stdout)
+    assert payload["active"] == []
+    assert payload["registry_storage_state"] == "consistent"
+    assert payload["registry_storage_inconsistencies"] == []
+
+
 def test_unbound_owner_remains_unreclaimable_after_recovery_note(
     tmp_path: Path,
 ) -> None:
@@ -4541,6 +4598,12 @@ def test_repository_path_refuses_non_sibling_parent_forms_before_normalizing(
         wrkslots._repository_path(config, "../..")
     with pytest.raises(wrkslots.Refusal, match="aliases the project root"):
         wrkslots._repository_path(config, f"../{project.name}")
+    with pytest.raises(wrkslots.Refusal, match="aliases the project root"):
+        wrkslots._stored_repository_path(config, f"../{project.name}")
+    with pytest.raises(
+        wrkslots.Refusal, match="outside the managed worktrees directory"
+    ):
+        wrkslots._stored_repository_path(config, "worktrees/recorded-source")
     with pytest.raises(wrkslots.Refusal, match="other parent traversal is refused"):
         wrkslots._repository_path(config, f"{alias.name}/../{repository.name}")
     root_level_config = replace(config, root=Path("/synthetic-project"))
@@ -5942,8 +6005,595 @@ def test_create_ignores_unrelated_drift_but_refuses_target_collisions(
         branch="codex/new-registration",
     )
     assert git_collision.returncode == 3
-    assert "Git still registers checkout destination" in git_collision.stderr
+    assert "overlaps Git-registered worktree" in git_collision.stderr
     assert not registered.exists()
+
+
+@pytest.mark.parametrize("registration_location", ["slot-root", "descendant"])
+def test_create_refuses_git_registration_overlapping_target_slot(
+    tmp_path: Path, registration_location: str
+) -> None:
+    """A stale Git registration cannot be hidden beside the planned checkout name."""
+    project, repository, _remote = make_project(tmp_path)
+    target_slot = project / "worktrees" / "slot01"
+    registered = (
+        target_slot
+        if registration_location == "slot-root"
+        else target_slot / "stale-checkout"
+    )
+    registered.parent.mkdir(parents=True, exist_ok=True)
+    git(
+        repository,
+        "worktree",
+        "add",
+        "-b",
+        f"codex/stale-{registration_location}",
+        str(registered),
+        "origin/main",
+    )
+    shutil.rmtree(target_slot)
+    assert not target_slot.exists()
+
+    refused = create(project)
+
+    assert refused.returncode == 3
+    assert f"requested slot path {target_slot} overlaps Git-registered worktree" in refused.stderr
+    assert str(registered) in refused.stderr
+    assert not target_slot.exists()
+    assert active_slots(project) == []
+
+
+def test_status_reports_missing_recorded_repository_but_create_refuses(
+    tmp_path: Path,
+) -> None:
+    """Missing Git evidence is row-local for status and fail-closed for mutation."""
+    project, repository, _remote = make_project(tmp_path)
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    unavailable = project / "repository-unavailable"
+    repository.rename(unavailable)
+
+    status = command(project, "status", "--all-machines", "--format", "json")
+
+    assert status.returncode == 0, status.stderr
+    payload = json.loads(status.stdout)
+    assert [row["slot"] for row in payload["active"]] == ["slot01"]
+    assert payload["registry_storage_state"] == "inconsistent"
+    findings = payload["registry_storage_inconsistencies"]
+    unavailable_findings = [
+        item for item in findings if item["kind"] == "repository-evidence-unavailable"
+    ]
+    assert len(unavailable_findings) == 1
+    assert unavailable_findings[0]["slot"] == "slot01"
+    assert unavailable_findings[0]["checkout"] == "product"
+    assert "restore the recorded source repository" in unavailable_findings[0]["remedy"]
+    assert payload["active"][0]["storage_inconsistencies"] == unavailable_findings
+
+    refused = create(
+        project,
+        slot="slot02",
+        agent="codex-2",
+        branch="codex/unavailable-source",
+    )
+    assert refused.returncode == 3
+    assert "repository does not exist or cannot be resolved" in refused.stderr
+    assert not checkout(project, "slot02").exists()
+
+
+def test_status_reports_git_registration_without_an_active_row(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    stale = project / "worktrees" / "stale-slot" / "product"
+    stale.parent.mkdir()
+    git(
+        repository,
+        "worktree",
+        "add",
+        "-b",
+        "codex/stale-status-registration",
+        str(stale),
+        "origin/main",
+    )
+    shutil.rmtree(stale.parent)
+
+    status = command(project, "status", "--all-machines", "--format", "json")
+
+    assert status.returncode == 0, status.stderr
+    payload = json.loads(status.stdout)
+    findings = [
+        item
+        for item in payload["registry_storage_inconsistencies"]
+        if item["kind"] == "git-registration-without-row"
+    ]
+    assert len(findings) == 1
+    assert findings[0]["scope"] == "directory"
+    assert findings[0]["slot"] == "stale-slot"
+    assert findings[0]["slot_type"] == "agent"
+    assert str(stale) in findings[0]["detail"]
+    assert payload["active"][0]["storage_inconsistencies"] == []
+
+    before_events = tuple(
+        path.read_bytes()
+        for path in sorted((project / "worktrees" / "EVENTS.testhost").glob("*.json"))
+    )
+    heartbeat = command(
+        project,
+        "heartbeat",
+        "slot01",
+        "--agent",
+        "codex-1",
+        "--owner-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+    )
+    assert heartbeat.returncode == 3
+    assert "Git common directory" in heartbeat.stderr
+    assert "no active checkout row" in heartbeat.stderr
+    after_events = tuple(
+        path.read_bytes()
+        for path in sorted((project / "worktrees" / "EVENTS.testhost").glob("*.json"))
+    )
+    assert after_events == before_events
+
+
+def test_status_attaches_extra_registration_inside_active_slot_to_row(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    extra = project / "worktrees" / "slot01" / "stale-registration"
+    git(
+        repository,
+        "worktree",
+        "add",
+        "-b",
+        "codex/stale-inside-active-slot",
+        str(extra),
+        "origin/main",
+    )
+
+    status = command(project, "status", "--all-machines", "--format", "json")
+
+    assert status.returncode == 0, status.stderr
+    row = json.loads(status.stdout)["active"][0]
+    findings = row["storage_inconsistencies"]
+    registration = next(
+        item for item in findings if item["kind"] == "git-registration-without-row"
+    )
+    assert registration["scope"] == "row"
+    assert registration["machine"] == "testhost"
+    assert registration["slot"] == "slot01"
+    assert str(extra) in registration["detail"]
+
+
+def test_status_reports_unresolvable_checkout_head_and_create_warns(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    tree = checkout(project)
+    head_path = Path(
+        git(tree, "rev-parse", "--path-format=absolute", "--git-path", "HEAD")
+        .stdout.strip()
+    )
+    head_path.write_text("ref: refs/heads/missing-after-record\n", encoding="utf-8")
+
+    status = command(project, "status", "--all-machines", "--format", "json")
+
+    assert status.returncode == 0, status.stderr
+    row_findings = json.loads(status.stdout)["active"][0]["storage_inconsistencies"]
+    unreadable = next(
+        item for item in row_findings if item["kind"] == "git-worktree-unreadable"
+    )
+    assert "cannot verify recorded checkout" in unreadable["detail"]
+
+    distinct = create(
+        project,
+        slot="slot02",
+        agent="codex-2",
+        branch="codex/distinct-from-broken-head",
+    )
+    assert distinct.returncode == 0, distinct.stderr
+    assert "kind=git-worktree-unreadable" in distinct.stderr
+    assert checkout(project, "slot02").is_dir()
+
+
+def test_status_does_not_invent_missing_entries_when_a_slot_is_unreadable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    config = wrkslots._load_config(str(project), "testhost")
+    states, _archives = wrkslots._validate_global_state(config)
+    slot_path = project / "worktrees" / "slot01"
+    original_iterdir = Path.iterdir
+
+    def guarded_iterdir(path: Path) -> Iterator[Path]:
+        if path == slot_path:
+            raise OSError("injected unreadable slot")
+        return original_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", guarded_iterdir)
+
+    findings = wrkslots._registry_storage_inconsistencies(config, states)
+
+    row_kinds = {
+        item.kind for item in findings if item.machine == "testhost" and item.slot == "slot01"
+    }
+    assert "slot-unreadable" in row_kinds
+    assert "missing-checkout" not in row_kinds
+    assert "unexpected-entry" not in row_kinds
+
+
+def test_status_reports_symlinked_slot_without_hiding_roster(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    tree = checkout(project)
+    git(repository, "worktree", "remove", "--force", str(tree))
+    slot_path = project / "worktrees" / "slot01"
+    slot_path.rmdir()
+    external = tmp_path / "external-slot"
+    external.mkdir()
+    slot_path.symlink_to(external, target_is_directory=True)
+
+    status = command(project, "status", "--all-machines", "--format", "json")
+
+    assert status.returncode == 0, status.stderr
+    payload = json.loads(status.stdout)
+    assert [row["slot"] for row in payload["active"]] == ["slot01"]
+    row_findings = payload["active"][0]["storage_inconsistencies"]
+    unsafe = next(
+        item for item in row_findings if item["kind"] == "unsafe-slot-directory"
+    )
+    assert unsafe["scope"] == "row"
+    assert str(slot_path) in unsafe["detail"]
+
+    heartbeat = command(
+        project,
+        "heartbeat",
+        "slot01",
+        "--agent",
+        "codex-1",
+        "--owner-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+    )
+    assert heartbeat.returncode == 3
+    assert "slot crosses a symlink" in heartbeat.stderr
+
+
+def test_status_reports_missing_slot_and_repository_as_independent_facts(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    git(repository, "worktree", "remove", "--force", str(checkout(project)))
+    (project / "worktrees" / "slot01").rmdir()
+    repository.rename(project / "repository-unavailable")
+
+    status = command(project, "status", "--all-machines", "--format", "json")
+
+    assert status.returncode == 0, status.stderr
+    findings = json.loads(status.stdout)["active"][0]["storage_inconsistencies"]
+    assert {item["kind"] for item in findings} >= {
+        "row-without-directory",
+        "repository-evidence-unavailable",
+    }
+
+
+def test_status_reports_unregistered_symlink_under_managed_root(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    external = tmp_path / "external-unregistered"
+    external.mkdir()
+    orphan = project / "worktrees" / "orphan-link"
+    orphan.symlink_to(external, target_is_directory=True)
+
+    status = command(project, "status", "--all-machines", "--format", "json")
+
+    assert status.returncode == 0, status.stderr
+    payload = json.loads(status.stdout)
+    assert payload["registry_storage_state"] == "inconsistent"
+    finding = next(
+        item
+        for item in payload["registry_storage_inconsistencies"]
+        if item["slot"] == "orphan-link"
+    )
+    assert finding["kind"] == "directory-without-row"
+    assert finding["scope"] == "directory"
+    assert orphan.is_symlink()
+
+
+def test_status_parses_archived_row_when_old_slot_path_is_symlinked(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    commit_task(repository, checkout(project), "codex/task")
+    handed_off = finish(project)
+    assert handed_off.returncode == 0, handed_off.stderr
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+    removed = remove(project)
+    assert removed.returncode == 0, removed.stderr
+    old_slot = project / "worktrees" / "slot01"
+    external = tmp_path / "external-archived-slot"
+    external.mkdir()
+    old_slot.symlink_to(external, target_is_directory=True)
+
+    status = command(project, "status", "--all-machines", "--format", "json")
+
+    assert status.returncode == 0, status.stderr
+    payload = json.loads(status.stdout)
+    assert payload["active"] == []
+    assert payload["registry_storage_state"] == "inconsistent"
+    assert any(
+        item["slot"] == "slot01" and item["kind"] == "directory-without-row"
+        for item in payload["registry_storage_inconsistencies"]
+    )
+
+
+def test_create_reports_unrelated_git_registration_from_new_repository(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    stale = project / "worktrees" / "stale-slot" / "product"
+    stale.parent.mkdir()
+    git(
+        repository,
+        "worktree",
+        "add",
+        "-b",
+        "codex/stale-before-first-row",
+        str(stale),
+        "origin/main",
+    )
+    shutil.rmtree(stale.parent)
+
+    distinct = create(
+        project,
+        slot="slot02",
+        agent="codex-2",
+        branch="codex/distinct-from-stale",
+    )
+
+    assert distinct.returncode == 0, distinct.stderr
+    assert "registry/storage state remains INCONSISTENT" in distinct.stderr
+    assert "kind=git-registration-without-row" in distinct.stderr
+    assert str(stale) in distinct.stderr
+    assert "retained_storage_inconsistencies=1" in distinct.stdout
+    assert checkout(project, "slot02").is_dir()
+
+
+def test_create_accepts_the_documented_project_root_source_repository(
+    tmp_path: Path,
+) -> None:
+    remote = tmp_path / "remote.git"
+    project = tmp_path / "project"
+    subprocess.run(
+        ["git", "init", "--bare", "--initial-branch=main", str(remote)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "clone", str(remote), str(project)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    git(project, "config", "user.name", "Wrkslots Test")
+    git(project, "config", "user.email", "wrkslots@example.invalid")
+    (project / "seed.txt").write_text("seed\n", encoding="utf-8")
+    git(project, "add", "seed.txt")
+    git(project, "commit", "-m", "seed")
+    git(project, "push", "-u", "origin", "main")
+    initialize(project)
+
+    made = create(project, repository_name=".")
+
+    assert made.returncode == 0, made.stderr
+    assert checkout(project).is_dir()
+
+
+def test_create_refuses_a_foreign_registered_ancestor_of_target(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    config = wrkslots._load_config(str(project), "testhost")
+    destination, _path = wrkslots._checkout_path(
+        config, "slot01", "product", "agent"
+    )
+    plan = (
+        wrkslots.PlannedCheckout(
+            name="product",
+            destination=destination,
+            repository="repo",
+            branch="codex/task",
+            start_point="0" * 40,
+            remote="origin",
+            remote_url_sha256="0" * 64,
+            landed_ref="refs/remotes/origin/main",
+        ),
+    )
+    foreign_ancestor = project / "worktrees"
+
+    class ForeignAncestorVcs(wrkslots._GitVcs):
+        def listed_worktrees(self, source: Path) -> set[Path]:
+            assert source == repository
+            return {source.absolute(), foreign_ancestor.absolute()}
+
+    with pytest.raises(
+        wrkslots.Refusal, match="overlaps Git-registered worktree"
+    ):
+        wrkslots._assert_create_target_clear(
+            config,
+            (),
+            "slot01",
+            "agent",
+            plan,
+            ForeignAncestorVcs(),
+        )
+
+
+def test_status_reports_malformed_journal_without_hiding_roster(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    journal = project / "worktrees" / "ACTIVE.testhost.journal"
+    journal.write_text("{broken\n", encoding="utf-8")
+
+    status = command(project, "status", "--all-machines", "--format", "json")
+
+    assert status.returncode == 0, status.stderr
+    payload = json.loads(status.stdout)
+    assert [row["slot"] for row in payload["active"]] == ["slot01"]
+    assert payload["journals"] == [journal.name]
+    assert payload["registry_storage_state"] == "inconsistent"
+    finding = next(
+        item
+        for item in payload["registry_storage_inconsistencies"]
+        if item["kind"] == "journal-unreadable"
+    )
+    assert finding["scope"] == "journal"
+    assert finding["machine"] == "testhost"
+    assert str(journal) in finding["detail"]
+
+    refused = create(
+        project,
+        slot="slot02",
+        agent="codex-2",
+        branch="codex/blocked-by-journal",
+    )
+    assert refused.returncode == 3
+    assert "interrupted mutation recorded" in refused.stderr
+    assert not checkout(project, "slot02").exists()
+
+
+@pytest.mark.parametrize("source", ["standalone", "append-only"])
+def test_status_reports_structurally_incomplete_journal_from_each_source(
+    tmp_path: Path, source: str
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    config = wrkslots._load_config(str(project), "testhost")
+    journal = project / "worktrees" / "ACTIVE.testhost.journal"
+    incomplete: dict[str, object] = {
+        "schema": wrkslots.SCHEMA,
+        "machine": "testhost",
+        "kind": "create",
+        "slot": "slot01",
+    }
+    if source == "standalone":
+        journal.write_text(json.dumps(incomplete) + "\n", encoding="utf-8")
+    else:
+        wrkslots._write_event_file(
+            config,
+            "testhost",
+            "operation-progress-recorded",
+            {"slot": "slot01", "operation": "create", "journal": incomplete},
+        )
+
+    status = command(project, "status", "--all-machines", "--format", "json")
+
+    assert status.returncode == 0, status.stderr
+    payload = json.loads(status.stdout)
+    assert [row["slot"] for row in payload["active"]] == ["slot01"]
+    assert payload["journals"] == [journal.name]
+    finding = next(
+        item
+        for item in payload["registry_storage_inconsistencies"]
+        if item["kind"] == "journal-unreadable"
+    )
+    assert "create journal has invalid fields" in finding["detail"]
+    assert "agent" in finding["detail"]
+
+
+def test_status_reports_semantically_invalid_finish_journal(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    commit_task(repository, checkout(project), "codex/task")
+    handed_off = finish(project)
+    assert handed_off.returncode == 0, handed_off.stderr
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+    interrupted = command(
+        project,
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-finish-journal"},
+    )
+    assert interrupted.returncode == 86
+    journal = project / "worktrees" / "ACTIVE.testhost.journal"
+    raw = json.loads(journal.read_text(encoding="utf-8"))
+    raw["mode"] = "bogus"
+    raw["actor"] = "not-coordinator"
+    raw["phase"] = "nonsense"
+    journal.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
+    shutil.rmtree(project / "worktrees" / "EVENTS.testhost")
+
+    status = command(project, "status", "--all-machines", "--format", "json")
+
+    assert status.returncode == 0, status.stderr
+    payload = json.loads(status.stdout)
+    assert [row["slot"] for row in payload["active"]] == ["slot01"]
+    finding = next(
+        item
+        for item in payload["registry_storage_inconsistencies"]
+        if item["kind"] == "journal-unreadable"
+    )
+    assert "finish journal actor does not match its operation" in finding["detail"]
+
+
+@pytest.mark.parametrize(
+    ("stored_repository", "expected_error"),
+    (
+        ("worktrees/recorded-source", "outside the managed worktrees directory"),
+        ("../project", "aliases the project root"),
+    ),
+)
+def test_status_refuses_an_ambiguous_stored_repository_identity(
+    tmp_path: Path, stored_repository: str, expected_error: str
+) -> None:
+    """Read-only tolerance applies to availability, never ambiguous authority."""
+    project, _repository, _remote = make_project(tmp_path)
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    shutil.rmtree(project / "worktrees" / "EVENTS.testhost")
+    state_path = project / "worktrees" / "ACTIVE.testhost.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["slots"][0]["checkouts"][0]["repository"] = stored_repository
+    state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+
+    refused = command(project, "status", "--all-machines", "--format", "json")
+
+    assert refused.returncode == 3
+    assert expected_error in refused.stderr
+    assert refused.stdout == ""
 
 
 def test_flat_layout_keeps_controls_beside_slots_and_completes_lifecycle(
