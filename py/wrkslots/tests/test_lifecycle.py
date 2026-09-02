@@ -2159,6 +2159,16 @@ def test_event_history_is_append_only_and_hash_chained(tmp_path: Path) -> None:
     assert "digest does not match" in refused.stderr
     assert refused.stdout == ""
 
+    create_refused = create(
+        project,
+        slot="slot02",
+        agent="codex-2",
+        branch="codex/after-tamper",
+    )
+    assert create_refused.returncode == 3
+    assert "digest does not match" in create_refused.stderr
+    assert not checkout(project, "slot02").exists()
+
 
 def test_status_derives_state_when_compatibility_views_are_missing(
     tmp_path: Path,
@@ -4112,7 +4122,7 @@ def test_cross_shard_duplicate_refuses_before_deletion(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("mismatch", ["row-without-directory", "directory-without-row"])
-def test_status_refuses_registry_directory_mismatch(
+def test_status_reports_registry_directory_mismatch(
     tmp_path: Path, mismatch: str
 ) -> None:
     project, repository, _remote = make_project(tmp_path)
@@ -4134,24 +4144,27 @@ def test_status_refuses_registry_directory_mismatch(
             "origin/main",
         )
 
-    refused = command(project, "status", "--all-machines")
+    reported = command(
+        project, "status", "--all-machines", "--format", "json"
+    )
 
-    assert refused.returncode == 3
-    expected = "slot directory is missing" if mismatch == "row-without-directory" else "directory without an active row"
-    assert expected in refused.stderr
-    assert "REMEDY:" in refused.stderr
+    assert reported.returncode == 0, reported.stderr
+    payload = json.loads(reported.stdout)
+    assert payload["registry_storage_state"] == "inconsistent"
+    findings = payload["registry_storage_inconsistencies"]
+    assert mismatch in {finding["kind"] for finding in findings}
+    assert all(finding["remedy"] for finding in findings)
+    assert [record["slot"] for record in payload["active"]] == ["slot01"]
+    row_findings = payload["active"][0]["storage_inconsistencies"]
+    if mismatch == "row-without-directory":
+        assert mismatch in {finding["kind"] for finding in row_findings}
+    else:
+        assert row_findings == []
     if mismatch == "directory-without-row":
-        assert "wrkslots register orphan --help" in refused.stderr
-        for required in (
-            "--agent",
-            "--task",
-            "--purpose",
-            "--owner-pid",
-            "--coordinator-pid",
-            "--verified-live",
-            "--repo",
-        ):
-            assert required in refused.stderr
+        finding = next(
+            item for item in findings if item["kind"] == "directory-without-row"
+        )
+        assert "wrkslots register orphan --help" in finding["remedy"]
         repaired = command(
             project,
             "register",
@@ -5823,10 +5836,10 @@ def test_absent_cap_means_uncapped_and_init_stays_idempotent(tmp_path: Path) -> 
     assert second.returncode == 0, second.stderr
 
 
-def test_doctor_reports_every_disagreement_at_once_and_status_still_refuses(
+def test_status_and_doctor_report_every_disagreement_at_once(
     tmp_path: Path,
 ) -> None:
-    """Diagnosis must show the shape of the drift; status keeps its refusal."""
+    """Read-only views show the whole drift without relabelling it healthy."""
     project, repository, _remote = make_project(tmp_path)
     assert create(project).returncode == 0
     git(repository, "worktree", "remove", "--force", str(checkout(project)))
@@ -5834,9 +5847,21 @@ def test_doctor_reports_every_disagreement_at_once_and_status_still_refuses(
     (project / "worktrees" / "orphan-a").mkdir()
     (project / "worktrees" / "orphan-b").mkdir()
 
-    # The pre-existing contract is unchanged: status refuses, naming one thing.
-    refused = command(project, "status", "--all-machines")
-    assert refused.returncode == 3
+    status = command(project, "status", "--all-machines", "--format", "json")
+    assert status.returncode == 0, status.stderr
+    status_payload = json.loads(status.stdout)
+    assert status_payload["registry_storage_state"] == "inconsistent"
+    assert [row["slot"] for row in status_payload["active"]] == ["slot01"]
+    status_findings = status_payload["registry_storage_inconsistencies"]
+    assert {item["kind"] for item in status_findings} >= {
+        "row-without-directory",
+        "directory-without-row",
+    }
+    assert sorted(
+        item["slot"]
+        for item in status_findings
+        if item["kind"] == "directory-without-row"
+    ) == ["orphan-a", "orphan-b"]
 
     report = command(project, "doctor", "--all-machines", "--format", "json")
     assert report.returncode == 0, report.stderr
@@ -5850,6 +5875,75 @@ def test_doctor_reports_every_disagreement_at_once_and_status_still_refuses(
     # Diagnosis authorizes nothing and changes nothing.
     assert (project / "worktrees" / "orphan-a").is_dir()
     assert len(active_slots(project)) == 1
+
+
+def test_create_ignores_unrelated_drift_but_refuses_target_collisions(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    git(repository, "worktree", "remove", "--force", str(checkout(project)))
+    (project / "worktrees" / "slot01").rmdir()
+    (project / "worktrees" / "orphan").mkdir()
+
+    distinct = create(
+        project,
+        slot="slot02",
+        agent="codex-2",
+        branch="codex/distinct",
+    )
+
+    assert distinct.returncode == 0, distinct.stderr
+    assert "registry/storage state remains INCONSISTENT" in distinct.stderr
+    assert "kind=row-without-directory" in distinct.stderr
+    assert "kind=directory-without-row" in distinct.stderr
+    assert "retained_storage_inconsistencies=2" in distinct.stdout
+    assert checkout(project, "slot02").is_dir()
+
+    same_name = create(
+        project,
+        slot="slot02",
+        agent="codex-3",
+        branch="codex/same-name",
+    )
+    assert same_name.returncode == 3
+    assert "slot 'slot02' is already active" in same_name.stderr
+
+    same_path = project / "worktrees" / "occupied"
+    same_path.mkdir()
+    occupied = create(
+        project,
+        slot="occupied",
+        agent="codex-4",
+        branch="codex/same-path",
+    )
+    assert occupied.returncode == 3
+    assert f"slot path already exists: {same_path}" in occupied.stderr
+
+    registered = checkout(project, "git-held")
+    git(
+        repository,
+        "worktree",
+        "add",
+        "-b",
+        "codex/stale-registration",
+        str(registered),
+        "origin/main",
+    )
+    assert registered.is_dir()
+    shutil.rmtree(registered.parent)
+    assert not registered.exists()
+    assert str(registered) in git(repository, "worktree", "list", "--porcelain").stdout
+
+    git_collision = create(
+        project,
+        slot="git-held",
+        agent="codex-5",
+        branch="codex/new-registration",
+    )
+    assert git_collision.returncode == 3
+    assert "Git still registers checkout destination" in git_collision.stderr
+    assert not registered.exists()
 
 
 def test_flat_layout_keeps_controls_beside_slots_and_completes_lifecycle(

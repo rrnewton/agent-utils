@@ -283,6 +283,25 @@ class AbsentValidateRow:
 
 
 @dataclasses.dataclass(frozen=True)
+class StorageInconsistency:
+    """One typed disagreement between durable slot state and physical storage."""
+
+    kind: str
+    scope: str
+    slot: str | None
+    slot_type: str | None
+    machine: str | None
+    checkout: str | None
+    detail: str
+    remedy: str
+
+    def to_obj(self) -> dict[str, object]:
+        """Return the stable JSON representation shared by status and doctor."""
+
+        return dataclasses.asdict(self)
+
+
+@dataclasses.dataclass(frozen=True)
 class _RetainedValidationHandle:
     """Present-tense liveness identity retained by one validation launcher."""
 
@@ -2851,6 +2870,259 @@ def _validate_global_state_for_finish_recovery(
                 f"slot {slot!r} is active on {active_machine} and archived on {archive.machine}"
             )
     return states, archives
+
+
+def _registry_storage_inconsistencies(
+    config: Config, states: Sequence[ActiveState]
+) -> tuple[StorageInconsistency, ...]:
+    """Describe storage drift without weakening authoritative state validation.
+
+    Callers must load ``states`` through ``_validate_global_state`` first. That
+    keeps malformed events, invalid schemas or hashes, duplicate identities,
+    and ambiguous repository paths fail-closed. This function handles only the
+    later question of whether that readable authority still agrees with disk
+    and Git worktree registration.
+    """
+
+    findings: list[StorageInconsistency] = []
+
+    def note(
+        kind: str,
+        scope: str,
+        detail: str,
+        remedy: str,
+        *,
+        slot: str | None = None,
+        slot_type: str | None = None,
+        machine: str | None = None,
+        checkout: str | None = None,
+    ) -> None:
+        findings.append(
+            StorageInconsistency(
+                kind=kind,
+                scope=scope,
+                slot=slot,
+                slot_type=slot_type,
+                machine=machine,
+                checkout=checkout,
+                detail=detail,
+                remedy=remedy,
+            )
+        )
+
+    records = [record for state in states for record in state.slots]
+    expected = {
+        slot_type: {record.slot for record in records if record.slot_type == slot_type}
+        for slot_type in SLOT_TYPES
+    }
+    vcs = _GitVcs()
+    listed_by_repository: dict[Path, set[Path]] = {}
+    common_by_repository: dict[Path, Path] = {}
+
+    for record in sorted(records, key=lambda item: (item.machine, item.slot)):
+        slot_path = _slot_directory(config, record.slot, record.slot_type)
+        slot_present = slot_path.exists() or slot_path.is_symlink()
+        slot_safe = slot_path.is_dir() and not slot_path.is_symlink()
+        if not slot_safe:
+            kind = "unsafe-slot-directory" if slot_present else "row-without-directory"
+            detail = (
+                f"active row points at an unsafe slot path {slot_path}"
+                if slot_present
+                else f"active row but no slot directory at {slot_path}"
+            )
+            note(
+                kind,
+                "row",
+                detail,
+                "preserve the active row; restore its exact slot directory or use the "
+                "supported recovery command after proving the storage is intentionally absent",
+                slot=record.slot,
+                slot_type=record.slot_type,
+                machine=record.machine,
+            )
+        elif _record_layout(config, record) == "nested":
+            try:
+                actual = {entry.name for entry in slot_path.iterdir()}
+            except OSError as exc:
+                note(
+                    "slot-unreadable",
+                    "row",
+                    f"cannot inspect {slot_path}: {exc}",
+                    "make the recorded slot directory readable, then rerun 'wrkslots status'",
+                    slot=record.slot,
+                    slot_type=record.slot_type,
+                    machine=record.machine,
+                )
+                actual = set()
+            wanted = {checkout.name for checkout in record.checkouts}
+            allowed = set(wanted)
+            if record.slot_type == "agent":
+                allowed.add("HANDOFF.md")
+            for name in sorted(wanted - actual):
+                note(
+                    "missing-checkout",
+                    "row",
+                    f"record names checkout {name!r} but it is not in {slot_path}",
+                    "preserve the row and repair or recover the named checkout before mutation",
+                    slot=record.slot,
+                    slot_type=record.slot_type,
+                    machine=record.machine,
+                    checkout=name,
+                )
+            for name in sorted(actual - allowed):
+                note(
+                    "unexpected-entry",
+                    "row",
+                    f"slot holds {name!r}, which its record does not name",
+                    "inspect and register or relocate the unexpected entry; do not delete it "
+                    "to make the registry look consistent",
+                    slot=record.slot,
+                    slot_type=record.slot_type,
+                    machine=record.machine,
+                    checkout=name,
+                )
+
+        for checkout in record.checkouts:
+            path = _stored_path(config, checkout.path, "checkout path")
+            _relative, repository = _stored_repository_path(config, checkout.repository)
+            if repository not in listed_by_repository:
+                # A source that is not one readable Git repository is ambiguous
+                # authority, not row-local storage drift, so let either call
+                # refuse the whole operation.
+                common_by_repository[repository] = vcs.common_directory(repository)
+                listed_by_repository[repository] = vcs.listed_worktrees(repository)
+            registered = path.absolute() in listed_by_repository[repository]
+            present = path.exists() or path.is_symlink()
+            if not present:
+                if registered:
+                    note(
+                        "git-registration-without-directory",
+                        "row",
+                        f"Git still registers absent checkout path {path}",
+                        "inspect 'git worktree list --porcelain' and repair or remove the stale "
+                        "registration through Git before reusing this path",
+                        slot=record.slot,
+                        slot_type=record.slot_type,
+                        machine=record.machine,
+                        checkout=checkout.name,
+                    )
+                continue
+            if path.is_symlink() or not path.is_dir():
+                note(
+                    "unsafe-checkout-path",
+                    "row",
+                    f"recorded checkout path is not a real directory: {path}",
+                    "preserve and inspect the recorded path; replace no filesystem object "
+                    "until its ownership is established",
+                    slot=record.slot,
+                    slot_type=record.slot_type,
+                    machine=record.machine,
+                    checkout=checkout.name,
+                )
+                continue
+            if not registered:
+                note(
+                    "checkout-without-git-registration",
+                    "row",
+                    f"checkout exists but Git does not register it at {path}",
+                    "inspect 'git worktree list --porcelain' and repair the exact worktree "
+                    "registration before mutation",
+                    slot=record.slot,
+                    slot_type=record.slot_type,
+                    machine=record.machine,
+                    checkout=checkout.name,
+                )
+                continue
+            try:
+                checkout_root = vcs.repository_root(path)
+                checkout_common = vcs.common_directory(path)
+            except Refusal as exc:
+                note(
+                    "git-worktree-unreadable",
+                    "row",
+                    f"cannot verify recorded checkout {path}: {exc}",
+                    "preserve the checkout and repair its Git metadata before mutation",
+                    slot=record.slot,
+                    slot_type=record.slot_type,
+                    machine=record.machine,
+                    checkout=checkout.name,
+                )
+                continue
+            if checkout_root != path.absolute() or checkout_common != common_by_repository[repository]:
+                note(
+                    "git-worktree-mismatch",
+                    "row",
+                    f"checkout {path} does not identify the recorded repository worktree",
+                    "preserve the checkout and repair the exact Git worktree registration "
+                    "before mutation",
+                    slot=record.slot,
+                    slot_type=record.slot_type,
+                    machine=record.machine,
+                    checkout=checkout.name,
+                )
+
+    for slot_type, root in _slot_roots(config).items():
+        if not root.exists() and not root.is_symlink():
+            continue
+        if root.is_symlink() or not root.is_dir():
+            note(
+                "unsafe-slots-directory",
+                "directory",
+                f"managed {slot_type} slots directory is unsafe: {root}",
+                "restore the configured managed directory as a real directory before mutation",
+                slot_type=slot_type,
+            )
+            continue
+        try:
+            actual = {
+                entry.name
+                for entry in root.iterdir()
+                if entry.is_dir()
+                and not entry.is_symlink()
+                and not entry.name.startswith("EVENTS.")
+                and not (
+                    slot_type == "agent"
+                    and entry == _validate_slots_directory(config)
+                )
+            }
+        except OSError as exc:
+            note(
+                "slots-directory-unreadable",
+                "directory",
+                f"cannot enumerate {root}: {exc}",
+                "make the configured managed directory readable, then rerun 'wrkslots status'",
+                slot_type=slot_type,
+            )
+            continue
+        for slot in sorted(actual - expected[slot_type]):
+            remedy = (
+                f"inspect the directory, then run 'wrkslots register {slot} --help' to "
+                "record a live agent slot"
+                if slot_type == "agent"
+                else "inspect the retained validation directory, then run "
+                "'wrkslots import-existing --help'"
+            )
+            note(
+                "directory-without-row",
+                "directory",
+                f"{root / slot} exists but no active {slot_type} row claims it",
+                remedy,
+                slot=slot,
+                slot_type=slot_type,
+            )
+
+    return tuple(
+        sorted(
+            findings,
+            key=lambda item: (
+                item.machine or "",
+                item.slot_type or "",
+                item.slot or "",
+                item.checkout or "",
+                item.kind,
+            ),
+        )
+    )
 
 
 def _assert_registry_storage_consistent(
@@ -5467,6 +5739,89 @@ def _assert_agent_and_slot_free(
                 )
 
 
+def _assert_create_target_clear(
+    config: Config,
+    states: Sequence[ActiveState],
+    slot: str,
+    slot_type: str,
+    plan: Sequence[PlannedCheckout],
+    vcs: _GitVcs,
+) -> None:
+    """Refuse collisions relevant to one create without requiring unrelated storage health."""
+
+    target_slot = _slot_directory(config, slot, slot_type)
+    for state in states:
+        for record in state.slots:
+            active_slot = _slot_directory(config, record.slot, record.slot_type)
+            if _path_is_within(target_slot, active_slot) or _path_is_within(
+                active_slot, target_slot
+            ):
+                raise Refusal(
+                    f"requested slot path {target_slot} overlaps active slot "
+                    f"{record.machine}/{record.slot} at {active_slot}"
+                )
+            for checkout in record.checkouts:
+                active_path = _stored_path(config, checkout.path, "checkout path")
+                for item in plan:
+                    destination = _stored_path(
+                        config, item.destination, "checkout destination"
+                    )
+                    if _path_is_within(destination, active_path) or _path_is_within(
+                        active_path, destination
+                    ):
+                        raise Refusal(
+                            f"checkout destination {destination} overlaps active checkout "
+                            f"{record.machine}/{record.slot}/{checkout.name} at {active_path}"
+                        )
+
+    repositories = {
+        _stored_repository_path(config, checkout.repository)[1]
+        for state in states
+        for record in state.slots
+        for checkout in record.checkouts
+    }
+    repositories.update(
+        _stored_repository_path(config, item.repository)[1] for item in plan
+    )
+    registrations = {
+        repository: vcs.listed_worktrees(repository) for repository in repositories
+    }
+    for item in plan:
+        destination = _stored_path(config, item.destination, "checkout destination")
+        for repository, worktrees in registrations.items():
+            if destination.absolute() in worktrees:
+                raise Refusal(
+                    f"Git still registers checkout destination {destination} in "
+                    f"repository {repository}; inspect 'git worktree list --porcelain' "
+                    "and repair or remove that exact stale registration before retrying"
+                )
+
+
+def _format_storage_inconsistency(item: StorageInconsistency) -> str:
+    identity = "/".join(
+        value
+        for value in (item.machine, item.slot_type, item.slot, item.checkout)
+        if value is not None
+    )
+    return f"kind={item.kind} target={identity or '-'}: {item.detail}"
+
+
+def _warn_retained_storage_inconsistencies(
+    findings: Sequence[StorageInconsistency],
+) -> None:
+    if not findings:
+        return
+    print(
+        f"WARNING: registry/storage state remains INCONSISTENT "
+        f"({len(findings)} finding(s)); this create target is distinct and none of "
+        "the reported state was changed",
+        file=sys.stderr,
+    )
+    for item in findings:
+        print(f"INCONSISTENT {_format_storage_inconsistency(item)}", file=sys.stderr)
+        print(f"  REMEDY: {item.remedy}", file=sys.stderr)
+
+
 def _create_journal_payload(
     config: Config,
     args: argparse.Namespace,
@@ -5602,17 +5957,21 @@ def _cmd_create(args: argparse.Namespace) -> int:
         _refuse_partial_state(config)
         _assert_no_journal(config)
         states, archives = _validate_global_state(config)
-        _assert_command_registry_storage(config, states, args)
+        storage_inconsistencies = _registry_storage_inconsistencies(config, states)
         before = _global_rows(states, archives)
         _ensure_state_shard(config)
         state = _load_active(config)
         _assert_agent_and_slot_free(config, args.slot, args.agent, args.slot_type)
         _assert_create_disk_space(config, args.override_disk_floor)
         slot_path = _slot_directory(config, args.slot, args.slot_type)
-        slot_path.parent.mkdir(parents=True, exist_ok=True)
         if slot_path.exists() or slot_path.is_symlink():
             raise Refusal(f"slot path already exists: {slot_path}")
         plan = _create_plan(config, args, vcs)
+        _assert_create_target_clear(
+            config, states, args.slot, args.slot_type, plan, vcs
+        )
+        _warn_retained_storage_inconsistencies(storage_inconsistencies)
+        slot_path.parent.mkdir(parents=True, exist_ok=True)
         created_at = _utc_now()
         heartbeat_at = created_at
         journal_path = _journal_path(config)
@@ -5764,6 +6123,9 @@ def _cmd_create(args: argparse.Namespace) -> int:
                     "agent": record.agent,
                     "generation": record.generation,
                     "owner_process": "unbound" if owner is None else "bound",
+                    "retained_storage_inconsistencies": [
+                        item.to_obj() for item in storage_inconsistencies
+                    ],
                     "checkouts": [
                         {
                             "name": checkout.name,
@@ -5782,7 +6144,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
     else:
         print(
             f"created slot={record.slot} agent={record.agent} generation={record.generation} "
-            f"checkouts={len(record.checkouts)}"
+            f"checkouts={len(record.checkouts)} "
+            f"retained_storage_inconsistencies={len(storage_inconsistencies)}"
         )
         for checkout in record.checkouts:
             print(
@@ -7973,7 +8336,11 @@ def _cmd_unpushed(args: argparse.Namespace) -> int:
 
 
 def _status_record(
-    config: Config, record: ActiveRecord, *, tolerate_hold_error: bool = False
+    config: Config,
+    record: ActiveRecord,
+    *,
+    tolerate_hold_error: bool = False,
+    storage_inconsistencies: Sequence[StorageInconsistency] = (),
 ) -> dict[str, object]:
     process_state, process_detail = _process_state(record.owner)
     age, expired = _heartbeat_diagnosis(record)
@@ -7993,80 +8360,39 @@ def _status_record(
     value["held"] = hold is not None
     value["hold_reason"] = None if hold is None else hold["reason"]
     value["hold_error"] = hold_error
+    value["storage_inconsistencies"] = [
+        item.to_obj() for item in storage_inconsistencies
+    ]
     return value
 
 
 def _slot_findings(config: Config, states: Sequence[ActiveState]) -> list[dict[str, object]]:
-    """Every registry/storage disagreement, as data rather than as a refusal.
+    """Every storage and operational diagnosis, without authorizing mutation."""
 
-    ``status`` deliberately refuses on the first disagreement, because a caller
-    that is about to act must not act on a model known to be wrong. That
-    refusal is the right contract for status and is left exactly as it was.
-    But it names one problem and hides the rest, so an operator repairing a
-    registry that has drifted learns about the drift one run at a time, and
-    cannot see the shape of it at all.
-
-    This collects the same conditions without raising and without authorizing
-    anything. It is diagnosis only: nothing here is a precondition for removal,
-    and no caller may treat a clean result as permission.
-    """
-    findings: list[dict[str, object]] = []
+    findings = [
+        item.to_obj() for item in _registry_storage_inconsistencies(config, states)
+    ]
 
     def note(kind: str, slot: str | None, machine: str | None, detail: str) -> None:
         findings.append(
-            {"kind": kind, "slot": slot, "machine": machine, "detail": detail}
+            {
+                "kind": kind,
+                "scope": "operational",
+                "slot": slot,
+                "slot_type": None,
+                "machine": machine,
+                "checkout": None,
+                "detail": detail,
+                "remedy": "inspect the named condition; diagnosis alone authorizes no mutation",
+            }
         )
 
-    expected: dict[str, set[str]] = {slot_type: set() for slot_type in SLOT_TYPES}
     for state in states:
         for record in state.slots:
-            expected[record.slot_type].add(record.slot)
             try:
                 _load_hold(config, record.slot, record.machine)
             except Refusal as exc:
                 note("invalid-hold", record.slot, state.machine, str(exc))
-            slot_path = _slot_directory(config, record.slot, record.slot_type)
-            if not slot_path.is_dir() or slot_path.is_symlink():
-                note(
-                    "row-without-directory",
-                    record.slot,
-                    state.machine,
-                    f"active row but no slot directory at {slot_path}",
-                )
-                continue
-            record_layout = _record_layout(config, record)
-            if record_layout == "flat":
-                if len(record.checkouts) != 1:
-                    note(
-                        "flat-layout-cardinality",
-                        record.slot,
-                        state.machine,
-                        "flat layout requires exactly one checkout",
-                    )
-            else:
-                try:
-                    actual = {entry.name for entry in slot_path.iterdir()}
-                except OSError as exc:
-                    note(
-                        "slot-unreadable", record.slot, state.machine,
-                        f"cannot inspect {slot_path}: {exc}",
-                    )
-                    continue
-                want = {checkout.name for checkout in record.checkouts}
-                if record.slot_type == "agent":
-                    want.add("HANDOFF.md")
-                for name in sorted(want - actual):
-                    if name == "HANDOFF.md":
-                        continue
-                    note(
-                        "missing-checkout", record.slot, state.machine,
-                        f"record names checkout {name!r} but it is not in the slot",
-                    )
-                for name in sorted(actual - want):
-                    note(
-                        "unexpected-entry", record.slot, state.machine,
-                        f"slot holds {name!r}, which its record does not name",
-                    )
             process_state, process_detail = _process_state(record.owner)
             if process_state == "dead":
                 note(
@@ -8074,29 +8400,6 @@ def _slot_findings(config: Config, states: Sequence[ActiveState]) -> list[dict[s
                     f"recorded owner is not running ({process_detail}); the slot "
                     "is held by a row whose owner has exited",
                 )
-
-    for slot_type, root in _slot_roots(config).items():
-        try:
-            on_disk = {
-                entry.name
-                for entry in root.iterdir()
-                if entry.is_dir()
-                and not entry.is_symlink()
-                and not entry.name.startswith("EVENTS.")
-                and not (slot_type == "agent" and entry == _validate_slots_directory(config))
-            }
-        except FileNotFoundError:
-            on_disk = set()
-        except OSError as exc:
-            note("worktrees-unreadable", None, None, f"cannot enumerate {root}: {exc}")
-            on_disk = set()
-        for name in sorted(on_disk - expected[slot_type]):
-            note(
-                "directory-without-row",
-                name,
-                None,
-                f"{root / name} exists but no active {slot_type} row claims it",
-            )
 
     for path in _outstanding_journals(config):
         note("unfinished-journal", None, None, f"recovery required: {path.name}")
@@ -8197,7 +8500,9 @@ def _cmd_status(args: argparse.Namespace) -> int:
     ):
         _refuse_partial_state(config)
         all_states, _archives = _validate_global_state(config)
-        _assert_command_registry_storage(config, all_states, args)
+        storage_inconsistencies = _registry_storage_inconsistencies(
+            config, all_states
+        )
         states = (
             all_states
             if args.all_machines
@@ -8205,7 +8510,15 @@ def _cmd_status(args: argparse.Namespace) -> int:
         )
         journals = [path.name for path in _outstanding_journals(config)]
         records = [
-            _status_record(config, record)
+            _status_record(
+                config,
+                record,
+                storage_inconsistencies=tuple(
+                    item
+                    for item in storage_inconsistencies
+                    if item.machine == record.machine and item.slot == record.slot
+                ),
+            )
             for state in states
             for record in state.slots
             if args.slot is None or record.slot == args.slot
@@ -8222,6 +8535,12 @@ def _cmd_status(args: argparse.Namespace) -> int:
                     "machines": [state.machine for state in states],
                     "active": records,
                     "journals": journals,
+                    "registry_storage_state": (
+                        "inconsistent" if storage_inconsistencies else "consistent"
+                    ),
+                    "registry_storage_inconsistencies": [
+                        item.to_obj() for item in storage_inconsistencies
+                    ],
                 },
                 indent=2,
                 sort_keys=True,
@@ -8232,7 +8551,9 @@ def _cmd_status(args: argparse.Namespace) -> int:
         f"project={config.root} worktrees={config.worktrees} control={config.control} "
         f"layout={config.layout} "
         f"active={len(records)} journals={len(journals)} "
-        f"events={sum(len(_load_events(config, state.machine)) for state in states)}"
+        f"events={sum(len(_load_events(config, state.machine)) for state in states)} "
+        f"registry_storage={'INCONSISTENT' if storage_inconsistencies else 'CONSISTENT'} "
+        f"inconsistencies={len(storage_inconsistencies)}"
     )
     if journals:
         for journal in journals:
@@ -8240,13 +8561,20 @@ def _cmd_status(args: argparse.Namespace) -> int:
     for value in records:
         owner_state = _as_str(value["owner_state"], "status owner_state")
         expired = value["heartbeat_expired"] is True
+        row_inconsistencies = _as_list(
+            value["storage_inconsistencies"], "status storage_inconsistencies"
+        )
         print(
             f"{value['machine']}/{value['slot']}: type={value['slot_type']} "
             f"agent={value['agent']} task={value['task']} "
             f"generation={value['generation']} owner={owner_state} "
             f"heartbeat_age={value['heartbeat_age_seconds']}s expired={'yes' if expired else 'no'} "
-            f"held={'yes' if value['held'] is True else 'no'}"
+            f"held={'yes' if value['held'] is True else 'no'} "
+            f"inconsistencies={len(row_inconsistencies)}"
         )
+    for item in storage_inconsistencies:
+        print(f"INCONSISTENT {_format_storage_inconsistency(item)}")
+        print(f"  REMEDY: {item.remedy}")
     return 0
 
 
