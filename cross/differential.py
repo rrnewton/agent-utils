@@ -8436,6 +8436,7 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
                     "head_sha": "sha-9",
                     "base_sha": "basesha-main",
                     "validation_evidence": "clean-validate-record",
+                    "validation_authority": "hard-green",
                     "policy_class": "gate-policy",
                     "assigned_agent": "reviewer",
                 }
@@ -8652,6 +8653,10 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
                 '{"prs":[{"pr":1,"head_sha":"sha-1","validation_evidence":"clean-validate-record"}]}',
             ),
             (
+                "exact-base-no-authority-context.json",
+                '{"prs":[{"pr":1,"head_sha":"sha-1","base_sha":"basesha-main","validation_evidence":"clean-validate-record"}]}',
+            ),
+            (
                 "stale-base-context.json",
                 '{"prs":[{"pr":1,"head_sha":"sha-1","base_sha":"old-base","validation_evidence":"clean-validate-record"}]}',
             ),
@@ -8722,6 +8727,53 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
                 "accept:soft-green-authority-is-durable-and-landable",
                 f"exit={soft_green.returncode}; authority={authority_recorded}; "
                 f"landable={soft_green_landable}",
+            )
+
+        hard_green_path = os.path.join(tmp, "hard-green-context.json")
+        with open(hard_green_path, "w", encoding="utf-8") as handle:
+            handle.write(
+                '{"prs":[{"pr":1,"head_sha":"sha-1","base_sha":"basesha-main",'
+                '"validation_evidence":"clean-validate-record",'
+                '"validation_authority":"hard-green"}]}'
+            )
+        hard_green_args = (
+            "plan",
+            "--fixture",
+            fixture_path,
+            "--landing-context",
+            hard_green_path,
+            "--format",
+            "json",
+        )
+        _record_exact(rep, "accept:hard-green-current-base", py, rs, hard_green_args)
+        hard_green = run(py, hard_green_args)
+        hard_green_ok, hard_green_payload = _parsed_json(hard_green.stdout)
+        hard_green_nodes = (
+            hard_green_payload.get("nodes")
+            if hard_green_ok and isinstance(hard_green_payload, dict)
+            else None
+        )
+        hard_green_plan = (
+            hard_green_payload.get("plan")
+            if hard_green_ok and isinstance(hard_green_payload, dict)
+            else None
+        )
+        hard_authority_recorded = isinstance(hard_green_nodes, list) and any(
+            isinstance(node, dict)
+            and node.get("pr") == 1
+            and node.get("validation_authority") == "hard-green"
+            for node in hard_green_nodes
+        )
+        hard_green_landable = isinstance(hard_green_plan, dict) and 1 in hard_green_plan.get(
+            "land_now", []
+        )
+        if hard_green.returncode == 0 and hard_authority_recorded and hard_green_landable:
+            rep.ok("accept:hard-green-authority-is-durable-and-landable")
+        else:
+            rep.bad(
+                "accept:hard-green-authority-is-durable-and-landable",
+                f"exit={hard_green.returncode}; authority={hard_authority_recorded}; "
+                f"landable={hard_green_landable}",
             )
 
         for flag, value in (

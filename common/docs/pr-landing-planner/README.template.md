@@ -10,7 +10,8 @@ or otherwise mutates a pull request.
 
 Landing evidence is fail-closed: required reviews bind the exact fetched head,
 local validation records name the exact tested head and base, the consuming
-workspace supplies any hard/soft-green authorization after the base advances, and dependency cycles
+workspace supplies explicit hard/soft-green authorization for every clean
+validation record, and dependency cycles
 or non-landable predecessors cannot enter a batch.
 
 {{DISTRIBUTION}}

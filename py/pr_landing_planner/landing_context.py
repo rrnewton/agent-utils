@@ -104,6 +104,14 @@ def parse_landing_context(raw: object) -> tuple[LandingContext, ...]:
                 f"PR #{pr} {authority.value} validation_authority requires "
                 "validation_evidence 'clean-validate-record'"
             )
+        if evidence is ValidationEvidence.CLEAN_VALIDATE_RECORD and authority not in (
+            ValidationAuthority.HARD_GREEN,
+            ValidationAuthority.SOFT_GREEN,
+        ):
+            raise ValueError(
+                f"PR #{pr} clean-validate-record requires explicit "
+                "validation_authority 'hard-green' or 'soft-green'"
+            )
         raw_review_pass_heads = obj.get("review_pass_heads", {})
         if not isinstance(raw_review_pass_heads, dict):
             raise ValueError(

@@ -81,12 +81,15 @@ def _ci_action(node: PrNode, freshness_max_behind: int | None) -> tuple[PrAction
             "gate-policy change requires coordinator decision; validation evidence is not approval",
         )
     if node.validation_evidence is ValidationEvidence.CLEAN_VALIDATE_RECORD:
-        authority = node.validation_authority.value
         if node.validation_authority is ValidationAuthority.NONE:
-            authority = "exact fetched base"
+            return (
+                PrAction.WAIT,
+                "clean-validate-record has no consuming-workspace hard/soft-green authority",
+            )
         return (
             PrAction.LAND_NOW,
-            f"{node.validation_evidence.value} at exact head with {authority} authority; "
+            f"{node.validation_evidence.value} at exact head with "
+            f"{node.validation_authority.value} authority; "
             "no merge-gate wait",
         )
     if red is RedClass.RUNNER_OUTAGE:

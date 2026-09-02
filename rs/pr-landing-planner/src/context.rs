@@ -114,6 +114,16 @@ pub fn parse_landing_context(raw: &Value) -> Result<Vec<LandingContext>, String>
                 authority.expect("matched validation authority").as_str()
             ));
         }
+        if evidence == Some(ValidationEvidence::CleanValidateRecord)
+            && !matches!(
+                authority,
+                Some(ValidationAuthority::HardGreen | ValidationAuthority::SoftGreen)
+            )
+        {
+            return Err(format!(
+                "PR #{pr} clean-validate-record requires explicit validation_authority 'hard-green' or 'soft-green'"
+            ));
+        }
         let mut review_pass_heads = BTreeMap::new();
         if let Some(raw_heads) = item.get("review_pass_heads") {
             let heads = raw_heads.as_object().ok_or_else(|| {
@@ -284,7 +294,8 @@ mod tests {
             .contains("requires exact 'head_sha'"));
         let context = parse_landing_context(&json!({"prs":[{
             "pr":1,"head_sha":"stale","base_sha":"base",
-            "validation_evidence":"clean-validate-record"
+            "validation_evidence":"clean-validate-record",
+            "validation_authority":"hard-green"
         }]}))
         .unwrap();
         assert!(
@@ -292,18 +303,32 @@ mod tests {
                 .unwrap_err()
                 .contains("stale")
         );
-        let unproven_base = parse_landing_context(&json!({"prs":[{
+        let no_authority = json!({"prs":[{
             "pr":1,
             "head_sha":"current",
-            "base_sha":"divergent-or-unproven-base",
+            "base_sha":"base",
             "validation_evidence":"clean-validate-record"
+        }]});
+        assert!(parse_landing_context(&no_authority)
+            .unwrap_err()
+            .contains("requires explicit validation_authority"));
+        let hard_green = parse_landing_context(&json!({"prs":[{
+            "pr":1,
+            "head_sha":"current",
+            "base_sha":"base",
+            "validation_evidence":"clean-validate-record",
+            "validation_authority":"hard-green"
         }]}))
         .unwrap();
-        assert!(
-            apply_landing_context(vec![node(1, "current", &[])], &unproven_base)
-                .unwrap_err()
-                .contains("supplied no soft-green authority")
+        let hard_green_node = apply_landing_context(vec![node(1, "current", &[])], &hard_green)
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            hard_green_node.validation_authority,
+            ValidationAuthority::HardGreen
         );
+        let (hard_green_plan, _) = compute_plan(&[hard_green_node], &[], &[], &[], None, 2, false);
+        assert_eq!(hard_green_plan.per_pr_actions[0].action, PrAction::LandNow);
         let earlier_green = parse_landing_context(&json!({"prs":[{
             "pr":1,
             "head_sha":"current",

@@ -148,8 +148,10 @@ Accepted validation evidence is `none`, `authoritative-ci`,
 `locally-validated`, or `clean-validate-record`. Both local evidence values must
 come from caller-supplied dereferenced records naming the exact fetched head and
 base SHAs. A bare `locally-validated` label is only a cache hint and maps to
-`none`; a head-only record is incomplete and is rejected. `validation_authority`
-accepts `hard-green` or `soft-green` only with a `clean-validate-record`. The
+`none`; a head-only record is incomplete and is rejected. Every
+`clean-validate-record` requires an explicit `validation_authority` of
+`hard-green` or `soft-green`, and either authority is refused without that clean
+record. The
 recorded head must always equal the fetched PR head. When the recorded base no
 longer equals the fetched base, only explicit `soft-green` authority permits the
 planner to retain that evidence; absent authority and `hard-green` both refuse.
