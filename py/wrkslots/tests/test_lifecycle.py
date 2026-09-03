@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import hashlib
 import datetime as dt
 import errno
+import itertools
 import json
 import os
 import signal
@@ -13184,3 +13186,93 @@ def test_stale_row_with_no_named_slot_still_refuses(tmp_path: Path) -> None:
 
     with pytest.raises(wrkslots.Refusal, match="slot directory is missing or unsafe"):
         wrkslots._assert_registry_storage_consistent(config, [state])
+
+
+def _reference_glob_matches_path(pattern: str, path: str) -> bool:
+    """The straightforward reading of the cache-glob contract, kept for comparison.
+
+    It is deliberately the slow, obvious form: split both sides, walk them
+    component by component, and let a ``**`` component consume any number of
+    path components. The shipped matcher decides the same question with
+    per-pattern work hoisted out of the per-path loop, so the two must agree on
+    every input or the faster one has changed which paths count as cache.
+    """
+
+    pattern_parts = tuple(part for part in pattern.split("/") if part)
+    path_parts = tuple(part for part in path.split("/") if part)
+
+    def matches(pattern_index: int, path_index: int) -> bool:
+        if pattern_index == len(pattern_parts):
+            return path_index == len(path_parts)
+        part = pattern_parts[pattern_index]
+        if part == "**":
+            return matches(pattern_index + 1, path_index) or (
+                path_index < len(path_parts) and matches(pattern_index, path_index + 1)
+            )
+        return (
+            path_index < len(path_parts)
+            and fnmatch.fnmatchcase(path_parts[path_index], part)
+            and matches(pattern_index + 1, path_index + 1)
+        )
+
+    return matches(0, 0)
+
+
+def _reference_cache_glob_contains_path(pattern: str, path: str) -> bool:
+    parts = tuple(part for part in path.split("/") if part)
+    return any(
+        _reference_glob_matches_path(pattern, "/".join(parts[:length]))
+        for length in range(1, len(parts) + 1)
+    )
+
+
+def test_cache_glob_matching_accepts_exactly_the_documented_paths() -> None:
+    # A cache glob names a directory, so every path INSIDE it is cache and the
+    # sibling that merely starts with the same letters is not.
+    assert wrkslots._cache_glob_contains_path("target", "target")
+    assert wrkslots._cache_glob_contains_path("target", "target/debug/build/x.o")
+    assert not wrkslots._cache_glob_contains_path("target", "targets/debug/x.o")
+    assert not wrkslots._cache_glob_contains_path("target", "src/target.rs")
+
+    # A multi-component glob matches at its own depth, not at every depth.
+    assert wrkslots._cache_glob_contains_path("crates/target", "crates/target/a")
+    assert not wrkslots._cache_glob_contains_path("crates/target", "target/a")
+    assert not wrkslots._cache_glob_contains_path("crates/target", "a/crates/target")
+
+    # '**' is the one form that may match at more than one depth.
+    assert wrkslots._cache_glob_contains_path("crates/**/target", "crates/target/a")
+    assert wrkslots._cache_glob_contains_path("crates/**/target", "crates/x/y/target/a")
+
+    # A wildcard never crosses a slash.
+    assert wrkslots._cache_glob_contains_path("tar*", "target/debug")
+    assert not wrkslots._cache_glob_contains_path("tar*", "src/target/debug")
+    assert not wrkslots._cache_glob_contains_path("t*t/debug", "tat/x/debug")
+
+    # An empty glob selects nothing rather than everything.
+    assert not wrkslots._cache_glob_contains_path("", "target/debug")
+    assert not wrkslots._cache_glob_contains_path("", "")
+
+
+def test_cache_glob_matching_agrees_with_the_reference_on_every_combination() -> None:
+    patterns = [
+        "/".join(combination)
+        for length in range(0, 4)
+        for combination in itertools.product(
+            ("a", "target", "*", "?", "**", "a*", "[ab]", ""), repeat=length
+        )
+    ]
+    paths = [
+        "/".join(combination)
+        for length in range(0, 5)
+        for combination in itertools.product(("a", "b", "target", "ab"), repeat=length)
+    ]
+    assert len(patterns) * len(paths) > 150_000
+
+    for pattern in patterns:
+        for path in paths:
+            assert wrkslots._cache_glob_contains_path(
+                pattern, path
+            ) == _reference_cache_glob_contains_path(pattern, path), (pattern, path)
+            assert wrkslots._glob_matches_path(
+                pattern, path
+            ) == _reference_glob_matches_path(pattern, path), (pattern, path)

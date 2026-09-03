@@ -11,6 +11,7 @@ import datetime as dt
 import errno
 import fcntl
 import fnmatch
+import functools
 import hashlib
 import json
 import os
@@ -606,11 +607,23 @@ def _validate_cache_glob(value: str) -> str:
     return normalized
 
 
-def _glob_matches_path(pattern: str, path: str) -> bool:
-    """Match one slash-delimited path without allowing '*' to cross a slash."""
+@functools.lru_cache(maxsize=None)
+def _glob_pattern_parts(pattern: str) -> tuple[str, ...]:
+    """Split one cache glob into components once rather than once per path."""
 
-    pattern_parts = tuple(part for part in pattern.split("/") if part)
-    path_parts = tuple(part for part in path.split("/") if part)
+    return tuple(part for part in pattern.split("/") if part)
+
+
+@functools.lru_cache(maxsize=None)
+def _glob_parts_are_literal(pattern_parts: tuple[str, ...]) -> bool:
+    return not any(character in part for part in pattern_parts for character in "*?[")
+
+
+def _glob_parts_match(
+    pattern_parts: tuple[str, ...], path_parts: tuple[str, ...]
+) -> bool:
+    if _glob_parts_are_literal(pattern_parts):
+        return pattern_parts == path_parts
 
     def matches(pattern_index: int, path_index: int) -> bool:
         if pattern_index == len(pattern_parts):
@@ -629,12 +642,40 @@ def _glob_matches_path(pattern: str, path: str) -> bool:
     return matches(0, 0)
 
 
-def _cache_glob_contains_path(pattern: str, path: str) -> bool:
-    parts = tuple(part for part in path.split("/") if part)
-    return any(
-        _glob_matches_path(pattern, "/".join(parts[:length]))
-        for length in range(1, len(parts) + 1)
+def _glob_matches_path(pattern: str, path: str) -> bool:
+    """Match one slash-delimited path without allowing '*' to cross a slash."""
+
+    return _glob_parts_match(
+        _glob_pattern_parts(pattern),
+        tuple(part for part in path.split("/") if part),
     )
+
+
+def _cache_glob_contains_path(pattern: str, path: str) -> bool:
+    """Whether any prefix of ``path`` is the cache directory named by ``pattern``.
+
+    This decides one path against one cache glob, and every checkout inspection
+    calls it once per path per glob over complete ``git ls-files`` and
+    ``git ls-tree`` listings, so it is the hottest loop in a large registry's
+    audit. Two properties keep it cheap without changing which paths it accepts:
+    only a prefix whose component count equals the pattern's own can match
+    unless a ``**`` component absorbs a variable number, and a pattern whose
+    components are all literal is decided by comparing the components directly
+    instead of by a per-component wildcard match.
+    """
+
+    pattern_parts = _glob_pattern_parts(pattern)
+    if not pattern_parts:
+        return False
+    path_parts = tuple(part for part in path.split("/") if part)
+    if "**" in pattern_parts:
+        return any(
+            _glob_parts_match(pattern_parts, path_parts[:length])
+            for length in range(1, len(path_parts) + 1)
+        )
+    if len(pattern_parts) > len(path_parts):
+        return False
+    return _glob_parts_match(pattern_parts, path_parts[: len(pattern_parts)])
 
 
 def _validate_hook(value: str) -> str:
