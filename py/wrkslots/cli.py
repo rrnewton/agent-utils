@@ -119,6 +119,23 @@ _OWNERLESS_AGENT_JOURNAL_REQUIRED = frozenset(
         "salvage",
     }
 )
+_OWNERLESS_AGENT_AUTHORIZATION_REQUIRED = frozenset(
+    {
+        "path",
+        "identity",
+        "actor",
+        "repository",
+        "head",
+        "branch",
+        "remote",
+        "remote_url_sha256",
+        "handoff_sha256",
+        "recorded_at",
+    }
+)
+_OWNERLESS_AGENT_AUTHORIZATION_PRE_HANDOFF_REQUIRED = (
+    _OWNERLESS_AGENT_AUTHORIZATION_REQUIRED - {"handoff_sha256"}
+)
 _OWNERLESS_AGENT_CACHE_JOURNAL_REQUIRED = frozenset(
     {
         "schema",
@@ -13299,18 +13316,7 @@ def _ownerless_agent_authorization_from_obj(
     raw = _as_mapping(value, "ownerless agent authorization")
     _exact_keys(
         raw,
-        {
-            "path",
-            "identity",
-            "actor",
-            "repository",
-            "head",
-            "branch",
-            "remote",
-            "remote_url_sha256",
-            "handoff_sha256",
-            "recorded_at",
-        },
+        _OWNERLESS_AGENT_AUTHORIZATION_REQUIRED,
         set(),
         "ownerless agent authorization",
     )
@@ -13349,6 +13355,17 @@ def _ownerless_agent_authorization_from_obj(
         handoff_sha256=handoff_digest,
         recorded_at=recorded_at,
     )
+
+
+def _ownerless_agent_journal_authorization_from_obj(
+    value: object,
+) -> OwnerlessAgentAuthorization:
+    """Read current authorization or the exact schema-2 shape predating handoffs."""
+
+    raw = _as_mapping(value, "ownerless agent authorization")
+    if set(raw) == _OWNERLESS_AGENT_AUTHORIZATION_PRE_HANDOFF_REQUIRED:
+        raw = {**raw, "handoff_sha256": None}
+    return _ownerless_agent_authorization_from_obj(raw)
 
 
 def _ownerless_agent_target(config: Config, raw: str) -> tuple[str, Path]:
@@ -13450,7 +13467,9 @@ def _ownerless_agent_journal_inputs(
         or raw["machine"] != config.machine
     ):
         raise StateError("ownerless agent journal identity is invalid")
-    authorization = _ownerless_agent_authorization_from_obj(raw["authorization"])
+    authorization = _ownerless_agent_journal_authorization_from_obj(
+        raw["authorization"]
+    )
     _relative, target = _ownerless_agent_target(config, authorization.path)
     if raw["slot"] != target.name:
         raise StateError("ownerless agent journal slot differs from its path")
@@ -15835,9 +15854,10 @@ class _ProcessPathCensus:
         *,
         ignore_invoking_ancestry: bool = False,
     ) -> None:
-        ignored = {os.getpid()}
+        current_pid = os.getpid()
+        ignored = {current_pid}
         if ignore_invoking_ancestry:
-            ancestor: int | None = os.getpid()
+            ancestor = _read_process_parent(current_pid)
             for _ in range(256):
                 if ancestor is None or ancestor in ignored:
                     break

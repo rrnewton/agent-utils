@@ -124,7 +124,7 @@ python3 tests/e2e_stress.py --seed 1 --workers 8 --seconds 20
 ```
 
 The lifecycle suite uses a PID namespace where possible to retain real process checks without
-repeatedly scanning every process on a shared host. The four tests that require host-visible child
-PIDs still run outside that namespace. Coverage and assertions are identical.
+repeatedly scanning every process on a shared host. Five tests require host-visible process
+evidence and run outside that namespace. Coverage and assertions are identical.
 
 See [USER_GUIDE.md](USER_GUIDE.md) and [RELATED_WORK.md](RELATED_WORK.md).

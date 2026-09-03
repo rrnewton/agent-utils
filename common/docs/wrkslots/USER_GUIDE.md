@@ -334,4 +334,4 @@ capture, validate deletion without salvage, unread handoffs, process use, path f
 operations, hash-chain corruption, missing compatibility views, and later-participant recovery.
 
 The default test run uses a PID namespace for tests that only need isolated process evidence and
-runs four host-visible process tests separately. This changes test cost, not coverage or assertions.
+runs five host-visible process tests separately. This changes test cost, not coverage or assertions.

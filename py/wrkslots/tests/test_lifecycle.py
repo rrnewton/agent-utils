@@ -4128,6 +4128,39 @@ def test_incomplete_owner_cgroup_census_refuses_owner_check(tmp_path: Path) -> N
         )
 
 
+def test_process_census_ignores_only_the_invoking_process_ancestry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "slot"
+    current = os.getpid()
+    parent = current + 100_000
+    unrelated = current + 200_000
+    monkeypatch.setattr(
+        wrkslots,
+        "_read_process_parent",
+        lambda pid: parent if pid == current else None,
+    )
+    parent_census = wrkslots._ProcessPathCensus(
+        (), ((parent, str(target), "cwd", str(target)),)
+    )
+
+    parent_census.assert_slot_unused(
+        target, None, ignore_invoking_ancestry=True
+    )
+    with pytest.raises(wrkslots.Refusal, match=f"live process {parent}"):
+        parent_census.assert_slot_unused(
+            target, None, ignore_invoking_ancestry=False
+        )
+
+    unrelated_census = wrkslots._ProcessPathCensus(
+        (), ((unrelated, str(target), "cwd", str(target)),)
+    )
+    with pytest.raises(wrkslots.Refusal, match=f"live process {unrelated}"):
+        unrelated_census.assert_slot_unused(
+            target, None, ignore_invoking_ancestry=True
+        )
+
+
 def test_validate_batch_rechecks_later_slot_use_after_shared_census(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -10701,6 +10734,49 @@ def allow_test_host_for_ownerless_agent_recovery(
     monkeypatch.setattr(wrkslots, "_user_systemd_snapshot", lambda: ())
 
 
+def write_pre_handoff_ownerless_agent_journal(
+    project: Path,
+    target: Path,
+    head: str,
+    remote_digest: str,
+) -> dict[str, object]:
+    """Write the exact schema-2 journal shape produced before handoff digests."""
+
+    config = wrkslots._load_config(str(project), "testhost")
+    authorization: dict[str, object] = {
+        "path": target.relative_to(project).as_posix(),
+        "identity": list(
+            wrkslots._open_directory_identity(target, "ownerless agent worktree")
+        ),
+        "actor": wrkslots._identity_to_obj(
+            wrkslots._read_process_identity(os.getpid())
+        ),
+        "repository": "repo",
+        "head": head,
+        "branch": f"agent/{target.name}",
+        "remote": "origin",
+        "remote_url_sha256": remote_digest,
+        "recorded_at": wrkslots._utc_now(),
+    }
+    assert set(authorization) == wrkslots._OWNERLESS_AGENT_AUTHORIZATION_PRE_HANDOFF_REQUIRED
+    journal: dict[str, object] = {
+        "schema": 2,
+        "kind": "ownerless-agent-remove",
+        "machine": "testhost",
+        "slot": target.name,
+        "phase": "prepared",
+        "fenced": (
+            target.with_name(f".{target.name}.ownerless-agent.{'a' * 32}")
+            .relative_to(project)
+            .as_posix()
+        ),
+        "authorization": authorization,
+        "salvage": [],
+    }
+    wrkslots._write_journal(config, journal)
+    return journal
+
+
 def run_ownerless_agent_recovery(
     project: Path,
     target: Path,
@@ -10773,6 +10849,83 @@ def test_recover_ownerless_agent_worktree_salvages_dirty_tree_without_owner(
     salvage_commit = git(remote, "rev-parse", rescue_ref).stdout.strip()
     assert salvage_commit == receipt["salvage_commit"]
     assert git(remote, "show", f"{salvage_commit}:uncommitted.txt").stdout == "preserve me\n"
+
+
+def test_recover_ownerless_agent_worktree_resumes_literal_pre_handoff_journal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    target, head, remote_digest = prepare_ownerless_agent_worktree(project, repository)
+    allow_test_host_for_ownerless_agent_recovery(monkeypatch)
+    journal = write_pre_handoff_ownerless_agent_journal(
+        project, target, head, remote_digest
+    )
+
+    with pytest.raises(wrkslots.StateError, match="missing handoff_sha256"):
+        wrkslots._ownerless_agent_authorization_from_obj(journal["authorization"])
+    assert (
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "recover",
+                "--coordinator-authorized",
+                "--coordinator-pid",
+                str(os.getpid()),
+            ]
+        )
+        == 0
+    )
+    assert not target.exists()
+    event = next(
+        value
+        for value in reversed(
+            wrkslots._load_events(wrkslots._load_config(str(project), "testhost"))
+        )
+        if value["kind"] == "ownerless-agent-worktree-removed"
+    )
+    payload = wrkslots._as_mapping(event["payload"], "ownerless event payload")
+    authorization = wrkslots._as_mapping(
+        payload["authorization"], "ownerless authorization"
+    )
+    assert authorization["handoff_sha256"] is None
+
+
+@pytest.mark.parametrize(
+    ("conflict", "message"),
+    (("handoff", "unread HANDOFF.md"), ("head", "HEAD or branch changed")),
+)
+def test_pre_handoff_ownerless_agent_journal_still_refuses_changed_facts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    conflict: str,
+    message: str,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    target, head, remote_digest = prepare_ownerless_agent_worktree(project, repository)
+    allow_test_host_for_ownerless_agent_recovery(monkeypatch)
+    if conflict == "handoff":
+        (target / "HANDOFF.md").write_text("unread\n", encoding="utf-8")
+    elif conflict == "head":
+        head = "0" * 40
+    write_pre_handoff_ownerless_agent_journal(project, target, head, remote_digest)
+
+    assert (
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "recover",
+                "--coordinator-authorized",
+                "--coordinator-pid",
+                str(os.getpid()),
+            ]
+        )
+        == 3
+    )
+    assert message in capsys.readouterr().err
+    assert target.exists()
 
 
 def test_recover_ownerless_agent_worktree_requires_read_handoff_and_preserves_it(
