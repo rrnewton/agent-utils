@@ -33,6 +33,7 @@ from wrkslots import __version__
 VERSION = __version__
 SCHEMA = 2
 VALIDATE_REMOVE_BATCH_LIMIT = 8
+_VALIDATE_BATCH_SEAL_SCHEMA = 1
 _CREATE_JOURNAL_REQUIRED = frozenset(
     {
         "schema",
@@ -79,7 +80,14 @@ _FINISH_JOURNAL_REQUIRED = frozenset(
         "record",
     }
 )
-_FINISH_JOURNAL_OPTIONAL = frozenset({"salvage", "validate_complete"})
+_FINISH_JOURNAL_OPTIONAL = frozenset(
+    {
+        "salvage",
+        "validate_complete",
+        "original_mode",
+        "private_census_identity",
+    }
+)
 _LEGACY_VALIDATE_JOURNAL_REQUIRED = frozenset(
     {
         "schema",
@@ -193,6 +201,11 @@ _RETAINED_HANDLE_CENSUS_SECONDS = 30.0
 _MOUNTINFO_FILE_BYTES_LIMIT = 4 * 1024 * 1024
 _MOUNTINFO_CENSUS_BYTES_LIMIT = 64 * 1024 * 1024
 _ABSENT_PROCESS_CENSUS_SECONDS = 60.0
+_TRUSTED_EXECUTABLE_DIRECTORY = Path("/usr/bin")
+# Keep this provider command inside the intended 30-second integration envelope:
+# one evidence deadline leaves eight seconds for rollback, Git removal, and
+# durable state restoration. The parent batch caller still needs end-to-end timing.
+_VALIDATE_REMOVE_BATCH_CENSUS_SECONDS = 22.0
 
 
 class Refusal(RuntimeError):
@@ -1045,6 +1058,7 @@ def _config_is_authoritative_candidate(root: Path, config_path: Path) -> bool:
         or any(control.glob("ACTIVE.*.json"))
         or any(control.glob("ARCHIVED.*.json"))
         or any(control.glob("ACTIVE.*.journal"))
+        or any(control.glob("VALIDATE-BATCH-SEAL.*.journal"))
         or any(control.glob("EVENTS.*"))
     )
 
@@ -1242,6 +1256,14 @@ def _journal_path(config: Config, machine: str | None = None) -> Path:
     selected = machine or config.machine
     _validate_name(selected, "machine")
     return config.control / f"ACTIVE.{selected}.journal"
+
+
+def _validate_batch_seal_journal_path(
+    config: Config, machine: str | None = None
+) -> Path:
+    selected = machine or config.machine
+    _validate_name(selected, "machine")
+    return config.control / f"VALIDATE-BATCH-SEAL.{selected}.journal"
 
 
 def _hold_path(config: Config, slot: str, machine: str | None = None) -> Path:
@@ -2747,9 +2769,14 @@ def _write_active_state(
     action: str,
     slot: str,
     evidence: Mapping[str, object] | None = None,
+    require_repository: bool = True,
 ) -> None:
-    _ensure_event_log(config, state.machine)
-    previous = _load_active(config, state.machine)
+    _ensure_event_log(
+        config, state.machine, require_repository=require_repository
+    )
+    previous = _load_active(
+        config, state.machine, require_repository=require_repository
+    )
     if state.revision != previous.revision + 1:
         raise StateError(
             "active state revision must advance exactly once before it is recorded"
@@ -2848,9 +2875,14 @@ def _write_archive_state(
     action: str,
     slot: str,
     evidence: Mapping[str, object] | None = None,
+    require_repository: bool = True,
 ) -> None:
-    _ensure_event_log(config, state.machine)
-    previous = _load_archive(config, state.machine)
+    _ensure_event_log(
+        config, state.machine, require_repository=require_repository
+    )
+    previous = _load_archive(
+        config, state.machine, require_repository=require_repository
+    )
     if state.revision != previous.revision + 1:
         raise StateError(
             "archive state revision must advance exactly once before it is recorded"
@@ -3134,8 +3166,8 @@ def _validate_global_state(
 def _validate_global_state_for_finish_recovery(
     config: Config, journal: Mapping[str, object]
 ) -> tuple[list[ActiveState], list[ArchiveState]]:
-    states = _load_all_active(config)
-    archives = _load_all_archives(config)
+    states = _load_all_active(config, require_repository=False)
+    archives = _load_all_archives(config, require_repository=False)
     recorded = _record_from_obj(journal.get("record"), "finish journal.record")
     expected_entry = _archive_entry(journal, recorded)
     active = {
@@ -3643,6 +3675,31 @@ def _validate_journal_shape(
             raw["validate_complete"], bool
         ):
             raise StateError("finish journal.validate_complete must be boolean")
+        if "original_mode" in raw:
+            original_mode = _as_int(
+                raw["original_mode"], "finish journal.original_mode"
+            )
+            if original_mode > 0o7777:
+                raise StateError("finish journal.original_mode exceeds permission bits")
+        if "private_census_identity" in raw:
+            identity = _as_list(
+                raw["private_census_identity"],
+                "finish journal.private_census_identity",
+            )
+            if len(identity) != 3:
+                raise StateError(
+                    "finish journal.private_census_identity must contain dev, ino, and mount id"
+                )
+            for index, value in enumerate(identity):
+                _as_int(
+                    value,
+                    f"finish journal.private_census_identity[{index}]",
+                    minimum=1,
+                )
+            if "original_mode" not in raw:
+                raise StateError(
+                    "finish journal private census identity has no original mode"
+                )
     elif kind == "legacy-validate-remove":
         _exact_keys(
             raw,
@@ -3763,10 +3820,21 @@ def _assert_target_record_storage_consistent(
 ) -> None:
     """Refuse physical or Git drift attributable to one requested record."""
 
+    authoritative_state = next(
+        (
+            state
+            for state in states
+            if state.machine == record.machine and record in state.slots
+        ),
+        None,
+    )
+    if authoritative_state is None:
+        raise StateError(
+            f"slot {record.machine}/{record.slot} is not in the validated active state"
+        )
     findings = _registry_storage_inconsistencies(
         config,
-        states,
-        tolerate_unavailable_repositories=True,
+        (dataclasses.replace(authoritative_state, slots=(record,)),),
     )
     for finding in findings:
         if (
@@ -3775,6 +3843,61 @@ def _assert_target_record_storage_consistent(
             and finding.machine in {None, record.machine}
         ):
             raise StateError(finding.detail, remedy=finding.remedy)
+    _assert_no_cross_repository_target_registrations(config, states, record)
+
+
+def _assert_no_cross_repository_target_registrations(
+    config: Config,
+    states: Sequence[ActiveState],
+    record: ActiveRecord,
+) -> None:
+    """Reject any available repository registration entering the target slot."""
+
+    vcs = _GitVcs()
+    target_slot = _slot_directory(config, record.slot, record.slot_type).absolute()
+    expected_common_by_path: dict[Path, Path] = {}
+    for checkout in record.checkouts:
+        path = _stored_path(config, checkout.path, "checkout path").absolute()
+        _relative, repository = _stored_repository_path(config, checkout.repository)
+        expected_common_by_path[path] = vcs.common_directory(repository)
+
+    repository_paths: set[Path] = set()
+    for state in states:
+        for active_record in state.slots:
+            for checkout in active_record.checkouts:
+                try:
+                    _relative, repository = _stored_repository_path(
+                        config, checkout.repository
+                    )
+                except Refusal:
+                    continue
+                repository_paths.add(repository)
+    inspected_common: set[Path] = set()
+    for repository in sorted(repository_paths):
+        try:
+            common = vcs.common_directory(repository)
+            if common in inspected_common:
+                continue
+            registered_paths = vcs.listed_worktrees(repository)
+        except Refusal:
+            # Availability outside the selected record is intentionally not a
+            # precondition for removing the selected target.
+            continue
+        inspected_common.add(common)
+        for registered_path in registered_paths:
+            registered = registered_path.absolute()
+            if not _path_is_within(registered, target_slot):
+                continue
+            if expected_common_by_path.get(registered) == common:
+                continue
+            raise StateError(
+                f"source repository {repository} (Git common directory {common}) "
+                f"registers unexpected path {registered} inside target slot "
+                f"{record.slot}",
+                remedy="inspect every recorded repository's 'git worktree list "
+                "--porcelain' output and remove the unexpected target-slot "
+                "registration before retrying removal",
+            )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -4583,7 +4706,8 @@ def _resolved_repository_path(
         absolute = unresolved.resolve(strict=True)
     except OSError as exc:
         raise Refusal(
-            f"repository does not exist or cannot be resolved: {unresolved}",
+            f"source repository {stored!r} does not exist or cannot be resolved: "
+            f"{unresolved}",
             remedy="pass --repo NAME=PATH with an existing Git worktree path",
         ) from exc
     if not absolute.is_dir():
@@ -5123,7 +5247,7 @@ def _mount_namespace(pid_dir: Path) -> str | None:
         ) from exc
 
 
-def _process_uid(pid_dir: Path) -> int | None:
+def _process_uids(pid_dir: Path) -> tuple[int, int, int, int] | None:
     try:
         status = (pid_dir / "status").read_text(encoding="ascii")
     except FileNotFoundError:
@@ -5135,13 +5259,28 @@ def _process_uid(pid_dir: Path) -> int | None:
     for line in status.splitlines():
         if line.startswith("Uid:"):
             fields = line.split()
-            if len(fields) < 2:
+            if len(fields) != 5:
                 break
             try:
-                return int(fields[1])
+                real, effective, saved, filesystem = (
+                    int(field) for field in fields[1:]
+                )
+                return real, effective, saved, filesystem
             except ValueError:
                 break
     raise Refusal(f"process ownership is indeterminate for {pid_dir.name}")
+
+
+def _process_uid(pid_dir: Path) -> int | None:
+    uids = _process_uids(pid_dir)
+    return None if uids is None else uids[0]
+
+
+def _process_filesystem_uid(pid_dir: Path) -> int | None:
+    """Return the credential Linux uses for filesystem permission checks."""
+
+    uids = _process_uids(pid_dir)
+    return None if uids is None else uids[3]
 
 
 def _unrelated_lsof_warnings(stderr: str, slot_path: Path) -> bool:
@@ -5177,6 +5316,7 @@ def _assert_slot_unused(
     ignore_invoking_ancestry: bool = False,
     census: _ProcessPathCensus | None = None,
     fallback_census: _ProcessPathCensus | None = None,
+    proc_root: Path = Path("/proc"),
 ) -> None:
     try:
         current_directory = Path.cwd().resolve(strict=True)
@@ -5235,7 +5375,6 @@ def _assert_slot_unused(
                 f"process use is indeterminate because lsof exited {completed.returncode}"
             )
         direct_use_proven_absent = True
-    proc_root = Path("/proc")
     try:
         pid_dirs = [path for path in proc_root.iterdir() if path.name.isdigit()]
     except OSError as exc:
@@ -5255,8 +5394,8 @@ def _assert_slot_unused(
         pid = int(pid_dir.name)
         if pid == current_pid or pid in invoking_ancestry:
             continue
-        uid = _process_uid(pid_dir)
-        if uid is None:
+        uids = _process_uids(pid_dir)
+        if uids is None:
             continue
         if record is not None and record.owner is not None:
             try:
@@ -5269,7 +5408,12 @@ def _assert_slot_unused(
                 raise Refusal(
                     f"live process {pid} remains in recorded owner cgroup {cgroup}"
                 )
-        if not use_lsof and fallback_census is not None and uid != os.getuid():
+        filesystem_uid = uids[3]
+        if (
+            not use_lsof
+            and fallback_census is not None
+            and filesystem_uid != os.getuid()
+        ):
             continue
         try:
             if direct_use_proven_absent:
@@ -5291,18 +5435,14 @@ def _assert_slot_unused(
             )
     if indeterminate_use is not None:
         if not use_lsof and fallback_census is not None:
-            fallback_census.assert_slot_unused(
-                slot_path,
-                record,
-                ignore_invoking_ancestry=ignore_invoking_ancestry,
-            )
-            return
+            raise indeterminate_use
         if not use_lsof:
             _assert_slot_unused(
                 slot_path,
                 record,
                 use_lsof=True,
                 ignore_invoking_ancestry=ignore_invoking_ancestry,
+                proc_root=proc_root,
             )
             return
         raise indeterminate_use
@@ -6119,30 +6259,38 @@ def _remove_preconditions(
 def _reclaim_preconditions(
     config: Config,
     record: ActiveRecord,
-    salvage: Sequence[Mapping[str, object]],
     vcs: _GitVcs,
-    *,
-    validate_complete: bool = False,
-    allow_live_validate_owner: bool = False,
-    process_census_fallback: _ProcessPathCensus | None = None,
+    finish: _FinishContext,
 ) -> tuple[Path, tuple[Checkout, ...]]:
     _assert_record_paths(config, record)
     slot_path = _assert_slot_contents(config, record)
     _assert_handoff_read(config, record, slot_path)
     use_check_record = _record_for_slot_use_check(
         record,
-        validate_complete=validate_complete,
-        allow_live_validate_owner=allow_live_validate_owner,
+        validate_complete=finish.validate_complete,
+        allow_live_validate_owner=finish.allow_live_validate_owner,
     )
-    _assert_slot_unused(
-        slot_path,
-        use_check_record,
-        use_lsof=use_check_record is not None,
-        fallback_census=process_census_fallback,
-        ignore_invoking_ancestry=(
-            allow_live_validate_owner and record.slot_type == "validate"
-        ),
-    )
+    private_cleanup = finish.private_cleanup
+    if private_cleanup is not None:
+        if private_cleanup.target.path != slot_path:
+            raise StateError("private cleanup context does not match its slot path")
+        if (
+            _private_cleanup_fence_identity(config, slot_path)
+            != private_cleanup.target.identity
+        ):
+            raise Refusal(
+                f"private cleanup path identity changed after its shared census: "
+                f"{slot_path}"
+            )
+    else:
+        _assert_slot_unused(
+            slot_path,
+            use_check_record,
+            use_lsof=use_check_record is not None,
+            ignore_invoking_ancestry=(
+                finish.allow_live_validate_owner and record.slot_type == "validate"
+            ),
+        )
     final: list[Checkout] = []
     for checkout in record.checkouts:
         path = _stored_path(config, checkout.path, "checkout path")
@@ -6170,10 +6318,10 @@ def _reclaim_preconditions(
             )
         final.append(dataclasses.replace(checkout, head=head))
     if record.slot_type == "validate":
-        if salvage:
+        if finish.salvage:
             raise StateError("validate slot unexpectedly records salvage evidence")
-    elif salvage:
-        _assert_salvage_still_matches(config, record, salvage, vcs)
+    elif finish.salvage:
+        _assert_salvage_still_matches(config, record, finish.salvage, vcs)
     elif record.handoff is not None:
         return _remove_preconditions(config, record, vcs)
     else:
@@ -6200,16 +6348,31 @@ def _record_for_slot_use_check(
     return record
 
 
-def _refuse_partial_state(config: Config) -> None:
+def _validate_batch_seal_journals(config: Config) -> list[Path]:
+    return sorted(config.control.glob("VALIDATE-BATCH-SEAL.*.journal"))
+
+
+def _refuse_partial_state(
+    config: Config, *, allow_validate_batch_seals: bool = False
+) -> None:
     leftovers = sorted(config.control.glob("ACTIVE.*.json.tmp.*"))
     leftovers += sorted(config.control.glob("ARCHIVED.*.json.tmp.*"))
     leftovers += sorted(config.control.glob("ACTIVE.*.journal.tmp.*"))
+    leftovers += sorted(
+        config.control.glob("VALIDATE-BATCH-SEAL.*.journal.tmp.*")
+    )
     for event_directory in sorted(config.control.glob("EVENTS.*")):
         if event_directory.is_dir() and not event_directory.is_symlink():
             leftovers += sorted(event_directory.glob("*.json.tmp.*"))
     if leftovers:
         raise StateError(
             f"partial atomic update found: {leftovers[0]}; preserve it and use 'wrkslots recover'"
+        )
+    seal_journals = _validate_batch_seal_journals(config)
+    if seal_journals and not allow_validate_batch_seals:
+        raise Refusal(
+            f"interrupted validation-batch seal recorded in {seal_journals[0]}; "
+            "run 'wrkslots recover' first"
         )
 
 
@@ -9073,12 +9236,51 @@ def _audit_record(
     )
 
 
+def _audit_validate_batch_seal_evidence(
+    config: Config,
+) -> tuple[
+    tuple[tuple[str, str, int, Path], ...],
+    tuple[tuple[str | None, str, str], ...],
+]:
+    """Parse seal targets for audit without letting one bad journal hide all rows."""
+
+    targets: list[tuple[str, str, int, Path]] = []
+    errors: list[tuple[str | None, str, str]] = []
+    for path in _validate_batch_seal_journals(config):
+        match = re.fullmatch(
+            r"VALIDATE-BATCH-SEAL\.([A-Za-z0-9][A-Za-z0-9._-]{0,63})\.journal",
+            path.name,
+        )
+        machine = None if match is None else match.group(1)
+        try:
+            raw, parsed = _validate_batch_seal_journal(
+                config,
+                path,
+                _read_json(path, "validation-batch seal journal"),
+            )
+        except (Refusal, StateError) as exc:
+            errors.append((machine, path.name, str(exc)))
+            continue
+        parsed_machine = _as_str(raw["machine"], "validation-batch seal journal.machine")
+        targets.extend(
+            (parsed_machine, slot, generation, target.path)
+            for slot, generation, target in parsed
+        )
+    return tuple(targets), tuple(errors)
+
+
 def _cmd_audit(args: argparse.Namespace) -> int:
     config = _load_config(args.project_root, args.machine)
     with _locked(config.control / "ACTIVE", exclusive=False, wait_seconds=args.wait_lock):
-        _refuse_partial_state(config)
+        _refuse_partial_state(config, allow_validate_batch_seals=True)
         states, _archives = _validate_global_state(config)
         records = [record for state in states for record in state.slots]
+        seal_targets, seal_errors = _audit_validate_batch_seal_evidence(config)
+        seal_by_slot = {
+            (machine, slot): (generation, path)
+            for machine, slot, generation, path in seal_targets
+        }
+        represented_seals: set[tuple[str, str, int]] = set()
         process_census: _ProcessPathCensus | None = None
         process_census_error: str | None = None
         if records:
@@ -9108,6 +9310,28 @@ def _cmd_audit(args: argparse.Namespace) -> int:
                     "wrkslots recover",
                 )
                 row["verdict"] = "BLOCKED"
+            sealed = seal_by_slot.get((record.machine, record.slot))
+            if sealed is not None:
+                sealed_generation, _sealed_path = sealed
+                reasons = row["reasons"]
+                assert isinstance(reasons, list)
+                if sealed_generation == record.generation:
+                    reasons.insert(
+                        0,
+                        "interrupted validation-batch seal requires wrkslots recover",
+                    )
+                    row["verdict"] = "BLOCKED"
+                else:
+                    reasons.insert(
+                        0,
+                        "validation-batch seal cannot be attributed to the active "
+                        f"generation: sealed={sealed_generation} "
+                        f"active={record.generation}",
+                    )
+                    row["verdict"] = "UNKNOWN"
+                represented_seals.add(
+                    (record.machine, record.slot, sealed_generation)
+                )
             rows.append(row)
             running_agent_count += int(running)
         on_disk: set[tuple[str, str]] = set()
@@ -9128,6 +9352,7 @@ def _cmd_audit(args: argparse.Namespace) -> int:
         registered = {(record.slot_type, record.slot) for record in records}
         for slot_type, slot in sorted(on_disk - registered):
             journal_slot = journal_slots.get(slot)
+            sealed = seal_by_slot.get((config.machine, slot))
             cache_bytes = 0
             cache_error: str | None = None
             if slot_type == "agent":
@@ -9147,9 +9372,13 @@ def _cmd_audit(args: argparse.Namespace) -> int:
                 {
                     "slot": slot,
                     "slot_type": slot_type,
-                    "machine": None if journal_slot is None else journal_slot.machine,
+                    "machine": (
+                        journal_slot.machine
+                        if journal_slot is not None
+                        else (config.machine if sealed is not None else None)
+                    ),
                     "agent": None,
-                    "generation": None,
+                    "generation": None if sealed is None else sealed[0],
                     "record_sha256": None,
                     "verdict": "BLOCKED",
                     "reasons": [
@@ -9157,19 +9386,29 @@ def _cmd_audit(args: argparse.Namespace) -> int:
                             f"interrupted {journal_slot.state.replace('-', ' ')} requires "
                             "wrkslots recover"
                             if journal_slot is not None
-                            else "directory has no active registry row; inspect or import it"
+                            else (
+                                "interrupted validation-batch seal requires wrkslots recover"
+                                if sealed is not None
+                                else "directory has no active registry row; inspect or import it"
+                            )
                         )
                     ],
                     "owner_state": (
                         journal_slot.state
                         if journal_slot is not None
-                        else "unregistered"
+                        else (
+                            "validation-batch-seal"
+                            if sealed is not None
+                            else "unregistered"
+                        )
                     ),
                     "liveness_state": "unverifiable",
                     "cache_bytes": cache_bytes,
                     "cache_error": cache_error,
                 }
             )
+            if sealed is not None:
+                represented_seals.add((config.machine, slot, sealed[0]))
         for journal_slot in sorted(journal_slots.values(), key=lambda item: item.slot):
             if any(
                 slot == journal_slot.slot
@@ -9195,6 +9434,47 @@ def _cmd_audit(args: argparse.Namespace) -> int:
                     "cache_error": None,
                 }
             )
+        for machine, slot, generation, sealed_path in seal_targets:
+            if (machine, slot, generation) in represented_seals:
+                continue
+            rows.append(
+                {
+                    "slot": slot,
+                    "slot_type": "validate",
+                    "machine": machine,
+                    "agent": None,
+                    "generation": generation,
+                    "record_sha256": None,
+                    "verdict": "BLOCKED",
+                    "reasons": [
+                        "interrupted validation-batch seal requires wrkslots recover; "
+                        f"recorded path={sealed_path}"
+                    ],
+                    "owner_state": "validation-batch-seal",
+                    "liveness_state": "unverifiable",
+                    "cache_bytes": 0,
+                    "cache_error": None,
+                }
+            )
+        for seal_error_machine, journal_name, error in seal_errors:
+            rows.append(
+                {
+                    "slot": journal_name,
+                    "slot_type": "validate",
+                    "machine": seal_error_machine,
+                    "agent": None,
+                    "generation": None,
+                    "record_sha256": None,
+                    "verdict": "UNKNOWN",
+                    "reasons": [
+                        f"validation-batch seal evidence is unreadable: {error}"
+                    ],
+                    "owner_state": "validation-batch-seal",
+                    "liveness_state": "unverifiable",
+                    "cache_bytes": 0,
+                    "cache_error": None,
+                }
+            )
         worktree_count = len(on_disk)
         disk = _disk_status(config)
     sorted_rows = sorted(rows, key=lambda row: str(row["slot"]))
@@ -9211,16 +9491,19 @@ def _cmd_audit(args: argparse.Namespace) -> int:
     unknown = [
         row
         for row in sorted_rows
-        if row["verdict"] == "BLOCKED"
-        and row.get("heartbeat_expired") is True
-        and (
-            row["owner_state"] not in ("live", "dead")
-            or row["liveness_state"] not in ("alive", "dead")
-            or row["cache_error"] is not None
-            or any(
-                token in str(reason).lower()
-                for reason in _as_list(row["reasons"], "audit row.reasons")
-                for token in ("cannot", "failed", "unavailable", "unknown")
+        if row["verdict"] == "UNKNOWN"
+        or (
+            row["verdict"] == "BLOCKED"
+            and row.get("heartbeat_expired") is True
+            and (
+                row["owner_state"] not in ("live", "dead")
+                or row["liveness_state"] not in ("alive", "dead")
+                or row["cache_error"] is not None
+                or any(
+                    token in str(reason).lower()
+                    for reason in _as_list(row["reasons"], "audit row.reasons")
+                    for token in ("cannot", "failed", "unavailable", "unknown")
+                )
             )
         )
     ]
@@ -9304,7 +9587,7 @@ def _cmd_unpushed(args: argparse.Namespace) -> int:
     if args.slot is not None:
         _validate_name(args.slot, "slot")
     with _locked(config.control / "ACTIVE", exclusive=False, wait_seconds=args.wait_lock):
-        _refuse_partial_state(config)
+        _refuse_partial_state(config, allow_validate_batch_seals=True)
         states, _archives = _validate_global_state(config)
         _assert_command_registry_storage(config, states, args)
         records = [
@@ -9550,7 +9833,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
     with _locked(
         config.control / "ACTIVE", exclusive=False, wait_seconds=args.wait_lock
     ):
-        _refuse_partial_state(config)
+        _refuse_partial_state(config, allow_validate_batch_seals=True)
         all_states, _archives = _validate_global_state(
             config, require_repository=False
         )
@@ -9562,11 +9845,15 @@ def _cmd_status(args: argparse.Namespace) -> int:
             if args.all_machines
             else [state for state in all_states if state.machine == config.machine]
         )
-        journals = [path.name for path in _outstanding_journals(config)]
+        ordinary_journals = _outstanding_journals(config)
+        seal_journals = _validate_batch_seal_journals(config)
+        journals = [
+            path.name for path in (*ordinary_journals, *seal_journals)
+        ]
         storage_inconsistencies = (
             *storage_inconsistencies,
             *_journal_inconsistencies(
-                config, [config.control / name for name in journals]
+                config, ordinary_journals
             ),
         )
         records = [
@@ -9642,36 +9929,53 @@ def _finish_journal_payload(
     config: Config,
     record: ActiveRecord,
     *,
-    mode: str,
-    actor: str,
     finished_at: str,
     removed: Sequence[str],
     phase: str,
-    salvage: Sequence[Mapping[str, object]] = (),
-    validate_complete: bool = False,
+    finish: _FinishContext,
 ) -> dict[str, object]:
     archive_id = f"{config.machine}:{record.slot}:{record.generation}:{finished_at}"
-    slot_parent = _slot_directory(config, record.slot, record.slot_type).parent
+    slot_path = _slot_directory(config, record.slot, record.slot_type)
+    slot_parent = slot_path.parent
+    if finish.private_cleanup is None:
+        try:
+            original_mode = stat.S_IMODE(
+                slot_path.stat(follow_symlinks=False).st_mode
+            )
+        except OSError as exc:
+            raise Refusal(
+                f"cannot inspect slot permissions before fencing: {slot_path}: {exc}"
+            ) from exc
+    else:
+        if finish.private_cleanup.target.path != slot_path:
+            raise StateError("private cleanup context does not match its slot path")
+        original_mode = finish.private_cleanup.target.original_mode
     fenced = (
         slot_parent
         / f".{record.slot}.fenced.{record.generation}.{uuid.uuid4().hex}"
     )
-    return {
+    payload: dict[str, object] = {
         "schema": SCHEMA,
         "kind": "finish",
         "machine": config.machine,
         "slot": record.slot,
-        "mode": mode,
-        "actor": actor,
+        "mode": finish.mode,
+        "actor": finish.actor,
         "finished_at": finished_at,
         "archive_id": archive_id,
         "phase": phase,
         "fenced": fenced.relative_to(config.root).as_posix(),
+        "original_mode": original_mode,
         "removed": list(removed),
-        "salvage": [dict(item) for item in salvage],
-        "validate_complete": validate_complete,
+        "salvage": [dict(item) for item in finish.salvage],
+        "validate_complete": finish.validate_complete,
         "record": _record_to_obj(record),
     }
+    if finish.private_cleanup is not None:
+        payload["private_census_identity"] = list(
+            finish.private_cleanup.target.identity
+        )
+    return payload
 
 
 def _archive_entry(
@@ -9716,6 +10020,7 @@ def _append_archive_once(
     *,
     action: str = "slot-archived",
     evidence: Mapping[str, object] | None = None,
+    require_repository: bool = True,
 ) -> ArchiveState:
     archive_id = _as_str(entry["archive_id"], "archive entry archive_id")
     for existing in archive.records:
@@ -9739,6 +10044,7 @@ def _append_archive_once(
         action=action,
         slot=_as_str(entry["slot"], "archive entry slot"),
         evidence={"archive_id": archive_id} if evidence is None else evidence,
+        require_repository=require_repository,
     )
     return updated
 
@@ -9861,6 +10167,467 @@ def _remove_fenced_directory(config: Config, fenced_slot: Path) -> None:
     _fsync_directory(fenced_slot.parent)
 
 
+def _assert_cleanup_fence_root_trusted(config: Config, fenced_slot: Path) -> None:
+    """Require a path namespace that another ordinary UID cannot rewrite."""
+
+    try:
+        relative_parent = fenced_slot.parent.relative_to(config.root)
+    except ValueError as exc:
+        raise Refusal(f"cleanup fence escapes the project root: {fenced_slot}") from exc
+    current = config.root
+    for component in (None, *relative_parent.parts):
+        if component is not None:
+            current /= component
+        try:
+            metadata = current.stat(follow_symlinks=False)
+        except OSError as exc:
+            raise Refusal(f"cannot inspect cleanup fence root {current}: {exc}") from exc
+        mode = stat.S_IMODE(metadata.st_mode)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or current.is_symlink()
+            or metadata.st_uid != os.getuid()
+            or mode & 0o022
+        ):
+            raise Refusal(
+                f"cleanup fence root is not an owner-controlled directory: {current}; "
+                "the owner must own it and group/other write bits must be clear"
+            )
+
+
+def _seal_cleanup_path_private(
+    config: Config,
+    fenced_slot: Path,
+    *,
+    before_seal: Callable[[int, tuple[int, int, int]], None] | None = None,
+) -> tuple[int, tuple[int, int, int]]:
+    """Seal one cleanup path and return its prior mode and stable identity."""
+
+    _assert_cleanup_fence_root_trusted(config, fenced_slot)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        descriptor = os.open(fenced_slot, flags)
+    except OSError as exc:
+        raise Refusal(f"cannot safely open cleanup fence {fenced_slot}: {exc}") from exc
+    original_mode: int | None = None
+    mode_changed = False
+    try:
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid():
+                raise Refusal(
+                    f"cleanup fence is not an owner-controlled directory: {fenced_slot}"
+                )
+            original_mode = stat.S_IMODE(metadata.st_mode)
+            identity = (
+                metadata.st_dev,
+                metadata.st_ino,
+                _fd_mount_id(descriptor, str(fenced_slot)),
+            )
+            if before_seal is not None:
+                before_seal(original_mode, identity)
+            os.fchmod(descriptor, 0o700)
+            mode_changed = True
+            metadata = os.fstat(descriptor)
+            if stat.S_IMODE(metadata.st_mode) != 0o700:
+                raise Refusal(f"cleanup fence did not become private: {fenced_slot}")
+            path_metadata = fenced_slot.stat(follow_symlinks=False)
+            if (path_metadata.st_dev, path_metadata.st_ino) != (
+                metadata.st_dev,
+                metadata.st_ino,
+            ):
+                raise Refusal(
+                    f"cleanup fence identity changed while sealing it: {fenced_slot}"
+                )
+            os.fsync(descriptor)
+            if identity[:2] != (metadata.st_dev, metadata.st_ino):
+                raise Refusal(
+                    f"cleanup fence identity changed after sealing it: {fenced_slot}"
+                )
+        except BaseException as exc:
+            if mode_changed and original_mode is not None:
+                try:
+                    os.fchmod(descriptor, original_mode)
+                    os.fsync(descriptor)
+                except OSError as restore_exc:
+                    raise Refusal(
+                        f"cannot restore cleanup fence permissions after sealing failed at "
+                        f"{fenced_slot}: {restore_exc}"
+                    ) from exc
+            raise
+    except OSError as exc:
+        raise Refusal(f"cannot seal cleanup fence {fenced_slot}: {exc}") from exc
+    finally:
+        os.close(descriptor)
+    assert original_mode is not None
+    return original_mode, identity
+
+
+def _private_cleanup_fence_identity(
+    config: Config, fenced_slot: Path
+) -> tuple[int, int, int]:
+    """Prove the private fence invariant and return its stable directory identity."""
+
+    _assert_cleanup_fence_root_trusted(config, fenced_slot)
+    try:
+        metadata = fenced_slot.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise Refusal(f"cannot inspect private cleanup fence {fenced_slot}: {exc}") from exc
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or fenced_slot.is_symlink()
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        raise Refusal(f"cleanup fence is no longer a private owned directory: {fenced_slot}")
+    identity = _open_directory_identity(fenced_slot, "private cleanup fence")
+    if identity[:2] != (metadata.st_dev, metadata.st_ino):
+        raise Refusal(f"cleanup fence identity changed during inspection: {fenced_slot}")
+    return identity
+
+
+def _restore_finish_original_mode(
+    original: Path, journal: Mapping[str, object]
+) -> None:
+    raw_mode = journal.get("original_mode")
+    if raw_mode is None:
+        return
+    mode = _as_int(raw_mode, "finish journal.original_mode")
+    if mode > 0o7777:
+        raise StateError("finish journal.original_mode exceeds permission bits")
+    try:
+        os.chmod(original, mode, follow_symlinks=False)
+    except OSError as exc:
+        raise Refusal(f"cannot restore slot permissions at {original}: {exc}") from exc
+
+
+def _finish_private_census_identity(
+    journal: Mapping[str, object],
+) -> tuple[int, int, int] | None:
+    raw = journal.get("private_census_identity")
+    if raw is None:
+        return None
+    values = _as_list(raw, "finish journal.private_census_identity")
+    if len(values) != 3:
+        raise StateError(
+            "finish journal.private_census_identity must contain dev, ino, and mount id"
+        )
+    return (
+        _as_int(values[0], "finish journal.private_census_identity[0]", minimum=1),
+        _as_int(values[1], "finish journal.private_census_identity[1]", minimum=1),
+        _as_int(values[2], "finish journal.private_census_identity[2]", minimum=1),
+    )
+
+
+def _restore_private_cleanup_path(
+    path: Path,
+    original_mode: int,
+    expected_identity: tuple[int, int, int],
+    *,
+    allow_missing: bool = True,
+) -> None:
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        if allow_missing:
+            return
+        raise Refusal(f"private cleanup path disappeared before mode restoration: {path}")
+    except OSError as exc:
+        raise Refusal(f"cannot open private cleanup path {path}: {exc}") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        identity = (
+            metadata.st_dev,
+            metadata.st_ino,
+            _fd_mount_id(descriptor, str(path)),
+        )
+        if identity != expected_identity:
+            raise Refusal(
+                f"private cleanup path identity changed before mode restoration: {path}"
+            )
+        os.fchmod(descriptor, original_mode)
+        os.fsync(descriptor)
+    except OSError as exc:
+        raise Refusal(f"cannot restore cleanup path permissions at {path}: {exc}") from exc
+    finally:
+        os.close(descriptor)
+
+
+def _reestablish_private_cleanup_fence(
+    config: Config,
+    path: Path,
+    original_mode: int,
+    expected_identity: tuple[int, int, int],
+) -> None:
+    """Verify an interrupted target and re-seal an exactly restored mode."""
+
+    _assert_cleanup_fence_root_trusted(config, path)
+    try:
+        metadata = path.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise Refusal(f"cannot inspect interrupted cleanup fence {path}: {exc}") from exc
+    if not stat.S_ISDIR(metadata.st_mode) or path.is_symlink():
+        raise Refusal(f"interrupted cleanup fence is not a real directory: {path}")
+    mode = stat.S_IMODE(metadata.st_mode)
+    if mode == 0o700:
+        if _private_cleanup_fence_identity(config, path) != expected_identity:
+            raise Refusal(f"interrupted cleanup fence identity changed: {path}")
+        return
+    if mode != original_mode:
+        raise Refusal(
+            f"interrupted cleanup fence mode changed at {path}: expected "
+            f"{original_mode:o} or 700, found {mode:o}"
+        )
+
+    def verify_before_seal(
+        observed_mode: int, observed_identity: tuple[int, int, int]
+    ) -> None:
+        if observed_mode != original_mode or observed_identity != expected_identity:
+            raise Refusal(f"interrupted cleanup fence identity changed: {path}")
+
+    sealed_mode, sealed_identity = _seal_cleanup_path_private(
+        config, path, before_seal=verify_before_seal
+    )
+    if sealed_mode != original_mode or sealed_identity != expected_identity:
+        raise StateError(f"interrupted cleanup fence changed while resealing: {path}")
+
+
+def _private_cleanup_target_to_obj(
+    config: Config,
+    slot: str,
+    generation: int,
+    target: _PrivateCleanupTarget,
+) -> dict[str, object]:
+    return {
+        "slot": slot,
+        "generation": generation,
+        "path": target.path.relative_to(config.root).as_posix(),
+        "original_mode": target.original_mode,
+        "identity": list(target.identity),
+    }
+
+
+def _private_cleanup_target_from_obj(
+    config: Config, value: object, label: str
+) -> tuple[str, int, _PrivateCleanupTarget]:
+    raw = _as_mapping(value, label)
+    _exact_keys(
+        raw,
+        {"slot", "generation", "path", "original_mode", "identity"},
+        set(),
+        label,
+    )
+    slot = _validate_name(_as_str(raw["slot"], f"{label}.slot"), "slot")
+    generation = _as_int(raw["generation"], f"{label}.generation", minimum=1)
+    _relative, path = _relative_inside(
+        config.root, _as_str(raw["path"], f"{label}.path"), f"{label}.path"
+    )
+    expected = _slot_directory(config, slot, "validate")
+    if path != expected:
+        raise StateError(f"{label}.path does not match validation slot {slot}")
+    original_mode = _as_int(raw["original_mode"], f"{label}.original_mode")
+    if original_mode > 0o7777:
+        raise StateError(f"{label}.original_mode exceeds permission bits")
+    identity_values = _as_list(raw["identity"], f"{label}.identity")
+    if len(identity_values) != 3:
+        raise StateError(f"{label}.identity must contain dev, ino, and mount id")
+    identity = (
+        _as_int(identity_values[0], f"{label}.identity[0]", minimum=1),
+        _as_int(identity_values[1], f"{label}.identity[1]", minimum=1),
+        _as_int(identity_values[2], f"{label}.identity[2]", minimum=1),
+    )
+    return slot, generation, _PrivateCleanupTarget(path, original_mode, identity)
+
+
+def _validate_batch_seal_journal(
+    config: Config, path: Path, value: object
+) -> tuple[Mapping[str, object], tuple[tuple[str, int, _PrivateCleanupTarget], ...]]:
+    raw = _as_mapping(value, "validation-batch seal journal")
+    _exact_keys(
+        raw,
+        {"schema", "kind", "machine", "created_at", "actor", "targets"},
+        set(),
+        "validation-batch seal journal",
+    )
+    if _as_int(raw["schema"], "validation-batch seal journal.schema") != (
+        _VALIDATE_BATCH_SEAL_SCHEMA
+    ):
+        raise StateError("unsupported validation-batch seal journal schema")
+    if raw["kind"] != "validate-batch-seal":
+        raise StateError("validation-batch seal journal has the wrong operation kind")
+    machine = _validate_name(
+        _as_str(raw["machine"], "validation-batch seal journal.machine"),
+        "machine",
+    )
+    if path != _validate_batch_seal_journal_path(config, machine):
+        raise StateError("validation-batch seal journal filename does not match its machine")
+    _parse_timestamp(
+        _as_str(raw["created_at"], "validation-batch seal journal.created_at"),
+        "validation-batch seal journal.created_at",
+    )
+    if _identity_from_obj(raw["actor"], "validation-batch seal journal.actor") is None:
+        raise StateError("validation-batch seal journal has no actor")
+    targets = tuple(
+        _private_cleanup_target_from_obj(
+            config, item, f"validation-batch seal journal.targets[{index}]"
+        )
+        for index, item in enumerate(
+            _as_list(raw["targets"], "validation-batch seal journal.targets")
+        )
+    )
+    if len(targets) > VALIDATE_REMOVE_BATCH_LIMIT:
+        raise StateError("validation-batch seal journal exceeds the batch limit")
+    if len({slot for slot, _generation, _target in targets}) != len(targets):
+        raise StateError("validation-batch seal journal repeats a slot")
+    return raw, targets
+
+
+def _load_validate_batch_seal_journal(
+    config: Config,
+) -> tuple[Path, Mapping[str, object], tuple[tuple[str, int, _PrivateCleanupTarget], ...]] | None:
+    paths = _validate_batch_seal_journals(config)
+    if not paths:
+        return None
+    if len(paths) != 1:
+        raise StateError(
+            "multiple validation-batch seal journals are present; recover each machine "
+            "before continuing"
+        )
+    path = paths[0]
+    raw, targets = _validate_batch_seal_journal(
+        config, path, _read_json(path, "validation-batch seal journal")
+    )
+    if path != _validate_batch_seal_journal_path(config):
+        raise Refusal(
+            f"validation-batch seal journal belongs to {raw['machine']}; rerun with "
+            f"--machine {raw['machine']}"
+        )
+    return path, raw, targets
+
+
+def _write_validate_batch_seal_journal(
+    config: Config, payload: Mapping[str, object]
+) -> None:
+    path = _validate_batch_seal_journal_path(config)
+    _validate_batch_seal_journal(config, path, payload)
+    _atomic_write_json(path, dict(payload))
+
+
+def _assert_validate_batch_seal_target(
+    config: Config,
+    record: ActiveRecord,
+    original_mode: int,
+    identity: tuple[int, int, int],
+) -> None:
+    loaded = _load_validate_batch_seal_journal(config)
+    if loaded is None:
+        raise StateError("private batch removal has no durable seal journal")
+    _path, _raw, targets = loaded
+    expected_path = _slot_directory(config, record.slot, record.slot_type)
+    if not any(
+        slot == record.slot
+        and generation == record.generation
+        and target.path == expected_path
+        and target.original_mode == original_mode
+        and target.identity == identity
+        for slot, generation, target in targets
+    ):
+        raise StateError(
+            f"durable seal journal does not match target {record.slot} generation "
+            f"{record.generation}"
+        )
+
+
+def _recover_validate_batch_seal_journal(
+    config: Config,
+    *,
+    emit: bool = True,
+    retain_evidence: bool = False,
+) -> bool:
+    loaded = _load_validate_batch_seal_journal(config)
+    if loaded is None:
+        return False
+    path, raw, targets = loaded
+    states, archives = _validate_global_state(config, require_repository=False)
+    records = {record.slot: record for state in states for record in state.slots}
+    unresolved: list[dict[str, object]] = []
+    errors: list[str] = []
+    restored = 0
+    for slot, generation, target in targets:
+        current = records.get(slot)
+        path_present = target.path.exists() or target.path.is_symlink()
+        if current is None:
+            archived = any(
+                archived.get("slot") == slot
+                and archived.get("generation") == generation
+                for archive in archives
+                for archived in archive.records
+            )
+            if archived and not path_present:
+                continue
+            errors.append(
+                f"sealed target {slot} has no exact active row and cannot be restored"
+            )
+            unresolved.append(
+                _private_cleanup_target_to_obj(config, slot, generation, target)
+            )
+            continue
+        if current.generation != generation or current.slot_type != "validate":
+            errors.append(
+                f"sealed target {slot} no longer has validation generation {generation}"
+            )
+            unresolved.append(
+                _private_cleanup_target_to_obj(config, slot, generation, target)
+            )
+            continue
+        if not path_present:
+            errors.append(
+                f"sealed target {slot} is absent while its ACTIVE row remains"
+            )
+            unresolved.append(
+                _private_cleanup_target_to_obj(config, slot, generation, target)
+            )
+            continue
+        try:
+            _restore_private_cleanup_path(
+                target.path,
+                target.original_mode,
+                target.identity,
+                allow_missing=False,
+            )
+        except (Refusal, StateError) as exc:
+            errors.append(str(exc))
+            unresolved.append(
+                _private_cleanup_target_to_obj(config, slot, generation, target)
+            )
+        else:
+            restored += 1
+    if unresolved:
+        if not retain_evidence:
+            updated = dict(raw)
+            updated["targets"] = unresolved
+            _write_validate_batch_seal_journal(config, updated)
+        raise Refusal(
+            f"validation-batch seal recovery retained {len(unresolved)} target(s): "
+            f"{errors[0]}"
+        )
+    if retain_evidence:
+        if emit:
+            print(
+                f"restored validation-batch seals: restored={restored}; "
+                "durable evidence retained for finish retry"
+            )
+        return True
+    _remove_control_file(path)
+    if emit:
+        print(
+            f"recovered validation-batch seals: restored={restored} "
+            f"resolved={len(targets)}"
+        )
+    return True
+
+
 def _rollback_path_fence(
     config: Config,
     record: ActiveRecord,
@@ -9881,6 +10648,16 @@ def _rollback_path_fence(
         raise Refusal(f"fenced slot is missing or unsafe during rollback: {fenced}")
     try:
         os.rename(fenced, original)
+        private_identity = _finish_private_census_identity(journal)
+        if private_identity is None:
+            _restore_finish_original_mode(original, journal)
+        else:
+            original_mode = _as_int(
+                journal.get("original_mode"), "finish journal.original_mode"
+            )
+            _restore_private_cleanup_path(
+                original, original_mode, private_identity, allow_missing=False
+            )
         _fsync_directory(original.parent)
     except OSError as exc:
         raise Refusal(f"cannot restore path fence {fenced} to {original}: {exc}") from exc
@@ -9901,10 +10678,7 @@ def _begin_or_resume_path_fence(
     record: ActiveRecord,
     journal: dict[str, object],
     vcs: _GitVcs,
-    *,
-    validate_complete: bool = False,
-    allow_live_validate_owner: bool = False,
-    process_census_fallback: _ProcessPathCensus | None = None,
+    finish: _FinishContext,
 ) -> tuple[dict[str, object], Path]:
     original = _slot_directory(config, record.slot, record.slot_type)
     fenced = _finish_fenced_slot(config, record, journal)
@@ -9913,21 +10687,16 @@ def _begin_or_resume_path_fence(
     if original_present and fenced_present:
         raise Refusal(f"both canonical and fenced slot paths exist for {record.slot}")
     if original_present:
+        if finish.private_cleanup is not None:
+            _assert_cleanup_fence_root_trusted(config, fenced)
         removed = _as_list(journal["removed"], "journal.removed")
         if removed:
             raise StateError("finish journal records removals while the canonical slot still exists")
-        salvage = tuple(
-            _as_mapping(item, "finish journal.salvage entry")
-            for item in _as_list(journal.get("salvage", []), "finish journal.salvage")
-        )
         _slot_path, current_checkouts = _reclaim_preconditions(
             config,
             record,
-            salvage,
             vcs,
-            validate_complete=validate_complete,
-            allow_live_validate_owner=allow_live_validate_owner,
-            process_census_fallback=process_census_fallback,
+            finish,
         )
         if current_checkouts != record.checkouts:
             raise Refusal(
@@ -9947,6 +10716,8 @@ def _begin_or_resume_path_fence(
         raise Refusal(f"fenced slot is missing or unsafe: {fenced}")
     if original.exists() or original.is_symlink():
         raise Refusal(f"canonical slot still exists after path fence: {original}")
+    if finish.private_cleanup is not None:
+        _seal_cleanup_path_private(config, fenced)
     for checkout in record.checkouts:
         _moved, path = _checkout_at_slot(config, record, checkout, fenced)
         if path.exists() or path.is_symlink():
@@ -9962,10 +10733,7 @@ def _finish_remove_paths(
     record: ActiveRecord,
     journal: dict[str, object],
     vcs: _GitVcs,
-    *,
-    validate_complete: bool = False,
-    allow_live_validate_owner: bool = False,
-    process_census_fallback: _ProcessPathCensus | None = None,
+    finish: _FinishContext,
 ) -> dict[str, object]:
     removed_values = _as_list(journal["removed"], "journal.removed")
     removed = {_as_str(item, "journal.removed item") for item in removed_values}
@@ -9977,10 +10745,20 @@ def _finish_remove_paths(
         record,
         journal,
         vcs,
-        validate_complete=validate_complete,
-        allow_live_validate_owner=allow_live_validate_owner,
-        process_census_fallback=process_census_fallback,
+        finish,
     )
+    private_fence_identity = (
+        None
+        if finish.private_cleanup is None
+        else finish.private_cleanup.target.identity
+    )
+    if finish.private_cleanup is not None:
+        observed_identity = _private_cleanup_fence_identity(config, fenced_slot)
+        if observed_identity != private_fence_identity:
+            raise Refusal(
+                f"private cleanup fence identity changed after its shared census: "
+                f"{fenced_slot}"
+            )
     present: list[Checkout] = []
     missing_after_remove: list[Checkout] = []
     for checkout in record.checkouts:
@@ -10030,10 +10808,7 @@ def _finish_remove_paths(
         try:
             moved_checkouts: list[Checkout] = []
             moved_paths: dict[str, Path] = {}
-            salvage = tuple(
-                _as_mapping(item, "finish journal.salvage entry")
-                for item in _as_list(journal.get("salvage", []), "finish journal.salvage")
-            )
+            salvage = finish.salvage
             for checkout in remaining:
                 moved, moved_path = _checkout_at_slot(
                     config, record, checkout, fenced_slot
@@ -10063,18 +10838,44 @@ def _finish_remove_paths(
                 )
             use_check_record = _record_for_slot_use_check(
                 record,
-                validate_complete=validate_complete,
-                allow_live_validate_owner=allow_live_validate_owner,
+                validate_complete=finish.validate_complete,
+                allow_live_validate_owner=finish.allow_live_validate_owner,
             )
-            _assert_slot_unused(
-                fenced_slot,
-                use_check_record,
-                use_lsof=use_check_record is not None,
-                fallback_census=process_census_fallback,
-                ignore_invoking_ancestry=(
-                    allow_live_validate_owner and record.slot_type == "validate"
-                ),
-            )
+            if private_fence_identity is None:
+                _assert_slot_unused(
+                    fenced_slot,
+                    use_check_record,
+                    use_lsof=use_check_record is not None,
+                    ignore_invoking_ancestry=(
+                        finish.allow_live_validate_owner
+                        and record.slot_type == "validate"
+                    ),
+                )
+            else:
+                if (
+                    _private_cleanup_fence_identity(config, fenced_slot)
+                    != private_fence_identity
+                ):
+                    raise Refusal(
+                        f"private cleanup fence identity changed before its fresh census: "
+                        f"{fenced_slot}"
+                    )
+                assert finish.private_cleanup is not None
+                finish.private_cleanup.same_uid_census_performed = True
+                same_uid_census = _capture_same_uid_process_path_census(
+                    (fenced_slot,),
+                    budget=finish.private_cleanup.census_budget,
+                )
+                same_uid_census.assert_slot_unused(
+                    fenced_slot,
+                    use_check_record,
+                    ignore_invoking_ancestry=(
+                        finish.allow_live_validate_owner
+                        and record.slot_type == "validate"
+                    ),
+                )
+                # Do not begin destructive work after the batch evidence deadline.
+                finish.private_cleanup.census_budget.remaining_seconds()
             for checkout in moved_checkouts:
                 for cache in _cache_directories_for_checkout(config, checkout):
                     _remove_cache_directory(config, cache)
@@ -10096,6 +10897,13 @@ def _finish_remove_paths(
                 f"finished fenced slot contains unexpected entry: {unexpected[0]}"
             )
     for checkout in remaining:
+        if private_fence_identity is not None and (
+            _private_cleanup_fence_identity(config, fenced_slot)
+            != private_fence_identity
+        ):
+            raise Refusal(
+                f"private cleanup fence identity changed before deletion: {fenced_slot}"
+            )
         _relative, repository = _stored_repository_path(config, checkout.repository)
         _moved, path = _checkout_at_slot(config, record, checkout, fenced_slot)
         vcs.remove_worktree(
@@ -10146,6 +10954,7 @@ def _finish_remove_paths(
                 },
             )
     _remove_fenced_directory(config, fenced_slot)
+    _interrupt_for_test("after-remove-fenced-directory")
     journal["phase"] = "removed"
     _write_journal(config, journal)
     return journal
@@ -10195,9 +11004,11 @@ def _finish_state_update(
     if current is not None and _record_to_obj(current) != _record_to_obj(record):
         raise StateError("active record changed during an interrupted finish")
     _assert_physical_slot_removed(config, record, _GitVcs(), journal)
-    archive = _load_archive(config)
+    archive = _load_archive(config, require_repository=False)
     entry = _archive_entry(journal, record)
-    _append_archive_once(config, archive, entry)
+    _append_archive_once(
+        config, archive, entry, require_repository=False
+    )
     _interrupt_for_test("after-archive-before-active")
     if current is not None:
         updated_state = _delete_record(state, record.slot)
@@ -10207,6 +11018,7 @@ def _finish_state_update(
             action="slot-removed",
             slot=record.slot,
             evidence={"archive_id": entry["archive_id"]},
+            require_repository=False,
         )
     _clear_journal(config, journal)
 
@@ -10215,25 +11027,16 @@ def _begin_finish(
     config: Config,
     state: ActiveState,
     record: ActiveRecord,
-    *,
-    mode: str,
-    actor: str,
-    salvage: Sequence[Mapping[str, object]] = (),
-    validate_complete: bool = False,
-    allow_live_validate_owner: bool = False,
-    process_census_fallback: _ProcessPathCensus | None = None,
+    finish: _FinishContext,
 ) -> None:
     vcs = _GitVcs()
-    _load_archive(config)
+    _load_archive(config, require_repository=False)
     _assert_not_held(config, record)
     _slot_path, final_checkouts = _reclaim_preconditions(
         config,
         record,
-        salvage,
         vcs,
-        validate_complete=validate_complete,
-        allow_live_validate_owner=allow_live_validate_owner,
-        process_census_fallback=process_census_fallback,
+        finish,
     )
     final_record = dataclasses.replace(record, checkouts=final_checkouts)
     state = _replace_record(state, final_record)
@@ -10242,18 +11045,30 @@ def _begin_finish(
         state,
         action="checkout-evidence-refreshed",
         slot=record.slot,
+        require_repository=False,
+    )
+    boundary_states, _boundary_archives = _validate_global_state(
+        config, require_repository=False
+    )
+    boundary_state = next(
+        item for item in boundary_states if item.machine == config.machine
+    )
+    boundary_record = _find_record(boundary_state, final_record.slot)
+    if _record_to_obj(boundary_record) != _record_to_obj(final_record):
+        raise StateError(
+            f"slot {final_record.slot} changed before its destructive boundary"
+        )
+    _assert_target_record_storage_consistent(
+        config, boundary_states, boundary_record
     )
     finished_at = _utc_now()
     journal = _finish_journal_payload(
         config,
         final_record,
-        mode=mode,
-        actor=actor,
         finished_at=finished_at,
         removed=(),
         phase="prepared",
-        salvage=salvage,
-        validate_complete=validate_complete,
+        finish=finish,
     )
     _write_journal(config, journal)
     _interrupt_for_test("after-finish-journal")
@@ -10263,9 +11078,7 @@ def _begin_finish(
             final_record,
             journal,
             vcs,
-            validate_complete=validate_complete,
-            allow_live_validate_owner=allow_live_validate_owner,
-            process_census_fallback=process_census_fallback,
+            finish,
         )
     except Refusal:
         canonical = _slot_directory(config, final_record.slot, final_record.slot_type)
@@ -10346,20 +11159,33 @@ def _cmd_finish(args: argparse.Namespace) -> int:
 def _cmd_remove(
     args: argparse.Namespace,
     *,
-    process_census: _ProcessPathCensus | None = None,
+    private_cleanup: _PrivateCleanupContext | None = None,
     emit: bool = True,
 ) -> int:
     config = _load_config(args.project_root, args.machine)
     _validate_name(args.slot, "slot")
     coordinator = _capture_caller_process(args.coordinator_pid, "coordinator")
     with _mutation_locks(config, args.wait_lock):
-        _refuse_partial_state(config)
+        _refuse_partial_state(
+            config,
+            allow_validate_batch_seals=private_cleanup is not None,
+        )
         _assert_no_journal(config)
-        states, archives = _validate_global_state(config)
+        states, archives = _validate_global_state(
+            config, require_repository=False
+        )
         before = _global_rows(states, archives)
-        state = _load_active(config)
+        state = _load_active(config, require_repository=False)
         record = _find_record(state, args.slot)
         _expected_generation(record, args.expected_generation)
+        if private_cleanup is not None:
+            _assert_validate_batch_seal_target(
+                config,
+                record,
+                private_cleanup.target.original_mode,
+                private_cleanup.target.identity,
+            )
+        _assert_target_record_storage_consistent(config, states, record)
         _assert_caller_process(coordinator, "coordinator")
         if args.validate_complete and record.slot_type != "validate":
             raise Refusal(
@@ -10405,6 +11231,17 @@ def _cmd_remove(
             )
         slot_path = _assert_slot_contents(config, record)
         _assert_handoff_read(config, record, slot_path)
+        if private_cleanup is not None:
+            if private_cleanup.target.path != slot_path:
+                raise StateError("private cleanup context does not match its slot path")
+            if (
+                _private_cleanup_fence_identity(config, slot_path)
+                != private_cleanup.target.identity
+            ):
+                raise Refusal(
+                    f"private cleanup path identity changed after its shared census: "
+                    f"{slot_path}"
+                )
         _assert_slot_unused(
             slot_path,
             _record_for_slot_use_check(
@@ -10414,9 +11251,11 @@ def _cmd_remove(
             ),
             use_lsof=not live_validate_owner,
             ignore_invoking_ancestry=live_validate_owner,
-            census=process_census,
+            census=None if private_cleanup is None else private_cleanup.shared_census,
         )
-        _ensure_event_log(config, record.machine)
+        _ensure_event_log(
+            config, record.machine, require_repository=False
+        )
         _write_event_file(
             config,
             record.machine,
@@ -10486,19 +11325,24 @@ def _cmd_remove(
                     "heartbeat_age_seconds": int(age),
                     "salvage": list(salvage),
                 },
+                require_repository=False,
             )
         _begin_finish(
             config,
             state,
             record,
-            mode="remove",
-            actor="coordinator",
-            salvage=salvage,
-            validate_complete=bool(args.validate_complete),
-            allow_live_validate_owner=live_validate_owner,
-            process_census_fallback=process_census,
+            _FinishContext(
+                mode="remove",
+                actor="coordinator",
+                salvage=salvage,
+                validate_complete=bool(args.validate_complete),
+                allow_live_validate_owner=live_validate_owner,
+                private_cleanup=private_cleanup,
+            ),
         )
-        after_states, after_archives = _validate_global_state(config)
+        after_states, after_archives = _validate_global_state(
+            config, require_repository=False
+        )
         _assert_only_slot_changed(
             before,
             _global_rows(after_states, after_archives),
@@ -10527,6 +11371,95 @@ def _parse_validate_batch_slot(raw: str) -> tuple[str, int]:
     return slot, generation
 
 
+def _seal_validate_batch_targets(
+    config: Config,
+    coordinator: ProcessIdentity,
+    requested: Sequence[tuple[str, int]],
+    wait_seconds: float,
+    retained: list[dict[str, object]],
+    private_targets: dict[str, _PrivateCleanupTarget],
+) -> None:
+    """Preflight and seal each eligible target while the mutation locks are held."""
+
+    with _mutation_locks(config, wait_seconds):
+        _refuse_partial_state(config)
+        _assert_no_journal(config)
+        states, _archives = _validate_global_state(
+            config, require_repository=False
+        )
+        _assert_caller_process(coordinator, "coordinator")
+        seal_journal: dict[str, object] = {
+            "schema": _VALIDATE_BATCH_SEAL_SCHEMA,
+            "kind": "validate-batch-seal",
+            "machine": config.machine,
+            "created_at": _utc_now(),
+            "actor": _identity_to_obj(coordinator),
+            "targets": [],
+        }
+        _write_validate_batch_seal_journal(config, seal_journal)
+        _interrupt_for_test("after-validate-batch-seal-journal")
+        records = {record.slot: record for state in states for record in state.slots}
+        for slot, generation in requested:
+            try:
+                record = records.get(slot)
+                if record is None:
+                    raise Refusal(
+                        f"slot {slot!r} is not active on machine {config.machine}"
+                    )
+                _expected_generation(record, generation)
+                if record.slot_type != "validate":
+                    raise Refusal(
+                        "batch validation cleanup accepts only validate slots"
+                    )
+                _assert_not_held(config, record)
+                _assert_registered_liveness(config, record)
+                owner_state, owner_detail = _process_state(record.owner)
+                if owner_state != "dead":
+                    raise Refusal(
+                        "batch validation cleanup requires a proven-dead recorded owner; "
+                        f"owner is {owner_state}: {owner_detail}"
+                    )
+                slot_path = _assert_slot_contents(config, record)
+
+                def record_before_seal(
+                    original_mode: int,
+                    identity: tuple[int, int, int],
+                    *,
+                    selected_slot: str = slot,
+                    selected_generation: int = generation,
+                    selected_path: Path = slot_path,
+                ) -> None:
+                    target = _PrivateCleanupTarget(
+                        selected_path, original_mode, identity
+                    )
+                    entries = _as_list(
+                        seal_journal["targets"],
+                        "validation-batch seal journal.targets",
+                    )
+                    seal_journal["targets"] = [
+                        *entries,
+                        _private_cleanup_target_to_obj(
+                            config, selected_slot, selected_generation, target
+                        ),
+                    ]
+                    _write_validate_batch_seal_journal(config, seal_journal)
+                    _interrupt_for_test("after-validate-batch-seal-target-planned")
+
+                original_mode, identity = _seal_cleanup_path_private(
+                    config, slot_path, before_seal=record_before_seal
+                )
+                private_targets[slot] = _PrivateCleanupTarget(
+                    path=slot_path,
+                    original_mode=original_mode,
+                    identity=identity,
+                )
+                _interrupt_for_test("after-validate-batch-seal-target")
+            except (Refusal, StateError) as exc:
+                retained.append(
+                    {"slot": slot, "generation": generation, "reason": str(exc)}
+                )
+
+
 def _cmd_remove_validate_batch(args: argparse.Namespace) -> int:
     requested = tuple(_parse_validate_batch_slot(raw) for raw in args.slots)
     if len(requested) > VALIDATE_REMOVE_BATCH_LIMIT:
@@ -10537,46 +11470,122 @@ def _cmd_remove_validate_batch(args: argparse.Namespace) -> int:
     if len({slot for slot, _generation in requested}) != len(requested):
         raise Refusal("remove-validate-batch received the same slot more than once")
     config = _load_config(args.project_root, args.machine)
-    with _locked(config.control / "ACTIVE", exclusive=False, wait_seconds=args.wait_lock):
-        _refuse_partial_state(config)
-        states, _archives = _validate_global_state(config)
-        records = {record.slot: record for state in states for record in state.slots}
-        paths: list[Path] = []
-        for slot, generation in requested:
-            record = records.get(slot)
-            if record is None:
-                continue
-            if record.generation != generation or record.slot_type != "validate":
-                continue
-            paths.append(_slot_directory(config, slot, "validate"))
-    process_census = _capture_process_path_census(paths)
-    removed: list[dict[str, object]] = []
+    coordinator = _capture_caller_process(args.coordinator_pid, "coordinator")
     retained: list[dict[str, object]] = []
-    for slot, generation in requested:
-        item_args = argparse.Namespace(**vars(args))
-        item_args.command = "remove"
-        item_args.slot = slot
-        item_args.expected_generation = generation
-        item_args.validate_complete = True
-        try:
-            current = _find_record(_load_active(config), slot)
-            owner_state, owner_detail = _process_state(current.owner)
-            if owner_state != "dead":
-                raise Refusal(
-                    "batch validation cleanup requires a proven-dead recorded owner; "
-                    f"owner is {owner_state}: {owner_detail}"
+    private_targets: dict[str, _PrivateCleanupTarget] = {}
+    removed: list[dict[str, object]] = []
+    same_uid_census_count = 0
+    census_budget = _ReadOnlyCommandBudget.start(
+        timeout_seconds=_VALIDATE_REMOVE_BATCH_CENSUS_SECONDS,
+        stdout_limit=16 * 1024 * 1024,
+        stderr_limit=64 * 1024,
+        input_limit=_MOUNTINFO_CENSUS_BYTES_LIMIT,
+    )
+    try:
+        _seal_validate_batch_targets(
+            config,
+            coordinator,
+            requested,
+            args.wait_lock,
+            retained,
+            private_targets,
+        )
+        private_paths = [
+            private_target.path for private_target in private_targets.values()
+        ]
+        shared_census_count = int(bool(private_paths))
+        shared_census_refusal: str | None = None
+        if private_paths:
+            try:
+                privileged_census = _capture_process_path_census(
+                    private_paths,
+                    budget=census_budget,
+                    include_owner_cgroups=False,
                 )
-            _cmd_remove(item_args, process_census=process_census, emit=False)
-        except (Refusal, StateError) as exc:
-            retained.append(
-                {"slot": slot, "generation": generation, "reason": str(exc)}
-            )
+                census_budget.remaining_seconds()
+            except Refusal as exc:
+                shared_census_refusal = str(exc)
+                privileged_census = _ProcessPathCensus((), ())
+                retained.extend(
+                    {
+                        "slot": slot,
+                        "generation": generation,
+                        "reason": shared_census_refusal,
+                    }
+                    for slot, generation in requested
+                    if slot in private_targets
+                )
+            else:
+                _interrupt_for_test("after-validate-batch-shared-census")
         else:
-            removed.append({"slot": slot, "generation": generation})
+            privileged_census = _ProcessPathCensus((), ())
+        for request_index, (slot, generation) in enumerate(requested):
+            target = private_targets.get(slot)
+            if target is None or shared_census_refusal is not None:
+                continue
+            try:
+                census_budget.remaining_seconds()
+            except Refusal as deadline:
+                retained.extend(
+                    {
+                        "slot": remaining_slot,
+                        "generation": remaining_generation,
+                        "reason": str(deadline),
+                    }
+                    for remaining_slot, remaining_generation in requested[request_index:]
+                    if remaining_slot in private_targets
+                )
+                break
+            item_args = argparse.Namespace(**vars(args))
+            item_args.command = "remove"
+            item_args.slot = slot
+            item_args.expected_generation = generation
+            item_args.validate_complete = True
+            private_cleanup = _PrivateCleanupContext(
+                target, privileged_census, census_budget
+            )
+            try:
+                privileged_census.assert_slot_unused(target.path, None)
+                _cmd_remove(
+                    item_args,
+                    private_cleanup=private_cleanup,
+                    emit=False,
+                )
+            except (Refusal, StateError) as exc:
+                retained.append(
+                    {"slot": slot, "generation": generation, "reason": str(exc)}
+                )
+                try:
+                    census_budget.remaining_seconds()
+                except Refusal as deadline:
+                    retained.extend(
+                        {
+                            "slot": remaining_slot,
+                            "generation": remaining_generation,
+                            "reason": str(deadline),
+                        }
+                        for remaining_slot, remaining_generation in requested[
+                            request_index + 1 :
+                        ]
+                        if remaining_slot in private_targets
+                    )
+                    break
+            else:
+                removed.append({"slot": slot, "generation": generation})
+            finally:
+                same_uid_census_count += int(
+                    private_cleanup.same_uid_census_performed
+                )
+    finally:
+        with _mutation_locks(config, args.wait_lock):
+            if not _outstanding_journals(config):
+                _recover_validate_batch_seal_journal(config, emit=False)
     payload = {
         "schema": 1,
         "batch_limit": VALIDATE_REMOVE_BATCH_LIMIT,
-        "process_censuses": 1,
+        "process_censuses": shared_census_count,
+        "shared_process_censuses": shared_census_count,
+        "same_uid_process_censuses": same_uid_census_count,
         "requested": len(requested),
         "removed": removed,
         "retained": retained,
@@ -10586,7 +11595,7 @@ def _cmd_remove_validate_batch(args: argparse.Namespace) -> int:
     else:
         print(
             f"requested={len(requested)} removed={len(removed)} "
-            f"retained={len(retained)} process_censuses=1"
+            f"retained={len(retained)} process_censuses={shared_census_count}"
         )
         for row in retained:
             print(f"RETAINED: {row['slot']} reason={row['reason']}")
@@ -10597,6 +11606,9 @@ def _recover_partial_updates(config: Config, discard: bool) -> bool:
     leftovers = sorted(config.control.glob("ACTIVE.*.json.tmp.*"))
     leftovers += sorted(config.control.glob("ARCHIVED.*.json.tmp.*"))
     leftovers += sorted(config.control.glob("ACTIVE.*.journal.tmp.*"))
+    leftovers += sorted(
+        config.control.glob("VALIDATE-BATCH-SEAL.*.journal.tmp.*")
+    )
     for event_directory in sorted(config.control.glob("EVENTS.*")):
         if event_directory.is_dir() and not event_directory.is_symlink():
             leftovers += sorted(event_directory.glob("*.json.tmp.*"))
@@ -11359,6 +12371,14 @@ def _recover_finish(
     validate_complete = raw.get("validate_complete", False)
     if not isinstance(validate_complete, bool):
         raise StateError("finish journal.validate_complete must be boolean")
+    original_mode: int | None = None
+    if "original_mode" in raw:
+        original_mode = _as_int(raw["original_mode"], "finish journal.original_mode")
+        if original_mode > 0o7777:
+            raise StateError("finish journal.original_mode exceeds permission bits")
+    private_identity = _finish_private_census_identity(raw)
+    if private_identity is not None and original_mode is None:
+        raise StateError("private finish journal has no original directory mode")
     if validate_complete and record.slot_type != "validate":
         raise StateError("agent finish journal cannot claim validate completion")
     if record.slot_type == "agent" and salvage:
@@ -11376,7 +12396,7 @@ def _recover_finish(
                 "unrelated nested repository"
             )
     current = next((item for item in state.slots if item.slot == record.slot), None)
-    archive = _load_archive(config)
+    archive = _load_archive(config, require_repository=False)
     archive_id = _as_str(raw["archive_id"], "finish journal.archive_id")
     already_archived = any(item.get("archive_id") == archive_id for item in archive.records)
     if current is None and already_archived:
@@ -11425,13 +12445,78 @@ def _recover_finish(
     if phase not in ("prepared", "fenced", "removed"):
         raise StateError(f"unknown finish journal phase {phase!r}")
     if phase in ("prepared", "fenced"):
+        private_cleanup: _PrivateCleanupContext | None = None
+        if private_identity is not None:
+            assert original_mode is not None
+            original = _slot_directory(config, record.slot, record.slot_type)
+            fenced = _finish_fenced_slot(config, record, journal)
+            present = [
+                candidate
+                for candidate in (original, fenced)
+                if candidate.exists() or candidate.is_symlink()
+            ]
+            if len(present) > 1:
+                raise Refusal(
+                    f"private finish recovery requires at most one target path for "
+                    f"{record.slot}; found {len(present)}"
+                )
+            if present:
+                census_path = present[0]
+                identity_verified = False
+                recovery_budget = _ReadOnlyCommandBudget.start(
+                    timeout_seconds=_VALIDATE_REMOVE_BATCH_CENSUS_SECONDS,
+                    stdout_limit=16 * 1024 * 1024,
+                    stderr_limit=64 * 1024,
+                    input_limit=_MOUNTINFO_CENSUS_BYTES_LIMIT,
+                )
+                try:
+                    _reestablish_private_cleanup_fence(
+                        config, census_path, original_mode, private_identity
+                    )
+                    identity_verified = True
+                    recovery_census = _capture_process_path_census(
+                        (census_path,), budget=recovery_budget
+                    )
+                    recovery_census.assert_slot_unused(
+                        census_path,
+                        _record_for_slot_use_check(
+                            record,
+                            validate_complete=validate_complete,
+                            allow_live_validate_owner=live_validate_owner,
+                        ),
+                        ignore_invoking_ancestry=(
+                            live_validate_owner and record.slot_type == "validate"
+                        ),
+                    )
+                except Refusal as exc:
+                    if identity_verified and census_path == fenced and not removed_names:
+                        try:
+                            _rollback_path_fence(config, record, journal, _GitVcs())
+                        except Refusal as rollback:
+                            raise Refusal(
+                                f"{exc}; path-fence rollback failed: {rollback}"
+                            ) from rollback
+                    raise
+                private_cleanup = _PrivateCleanupContext(
+                    _PrivateCleanupTarget(
+                        census_path, original_mode, private_identity
+                    ),
+                    recovery_census,
+                    recovery_budget,
+                )
         journal = _finish_remove_paths(
             config,
             record,
             journal,
             _GitVcs(),
-            validate_complete=validate_complete,
-            allow_live_validate_owner=live_validate_owner,
+            _FinishContext(
+                mode=mode,
+                actor=actor,
+                salvage=salvage,
+                validate_complete=validate_complete,
+                allow_live_validate_owner=live_validate_owner,
+                private_cleanup=private_cleanup,
+            ),
         )
     else:
         if set(removed_names) != {checkout.name for checkout in record.checkouts}:
@@ -11439,6 +12524,39 @@ def _recover_finish(
         _assert_physical_slot_removed(config, record, _GitVcs(), journal)
     _finish_state_update(config, state, record, journal)
     print(f"recovered finish: archived and removed slot={record.slot}")
+
+
+def _restore_interrupted_private_finish_after_refusal(
+    config: Config,
+    raw: Mapping[str, object],
+    refusal: Refusal,
+) -> None:
+    """Restore a still-canonical batch target after recovery safely refuses."""
+
+    identity = _finish_private_census_identity(raw)
+    if identity is None:
+        return
+    removed = _as_list(raw["removed"], "finish journal.removed")
+    if removed:
+        return
+    record = _record_from_obj(raw["record"], "finish journal.record")
+    original = _slot_directory(config, record.slot, record.slot_type)
+    fenced = _finish_fenced_slot(config, record, raw)
+    if not (original.exists() or original.is_symlink()) or (
+        fenced.exists() or fenced.is_symlink()
+    ):
+        return
+    original_mode = _as_int(
+        raw.get("original_mode"), "finish journal.original_mode"
+    )
+    try:
+        _restore_private_cleanup_path(
+            original, original_mode, identity, allow_missing=False
+        )
+    except (Refusal, StateError) as restore:
+        raise Refusal(
+            f"{refusal}; cleanup path mode restoration also failed: {restore}"
+        ) from restore
 
 
 def _legacy_validate_recovery_inputs(
@@ -12947,6 +14065,23 @@ def _absent_agent_checkout_receipts(
             )
         if vcs.verify_ref(repository, checkout.head, "recorded checkout HEAD") != checkout.head:
             raise Refusal(f"recorded commit object is unavailable for {checkout.name}")
+        branch_ref = f"refs/heads/{checkout.branch}"
+        try:
+            branch_head = vcs.verify_ref(
+                repository, branch_ref, "recorded checkout local branch"
+            )
+        except Refusal as exc:
+            raise Refusal(
+                f"recorded checkout local branch {checkout.branch!r} is unavailable for "
+                f"{checkout.name}; preserve the ACTIVE row"
+            ) from exc
+        if branch_head != checkout.head:
+            raise Refusal(
+                f"local branch {checkout.branch!r} for absent checkout "
+                f"{checkout.name} moved from recorded HEAD {checkout.head} to "
+                f"{branch_head}; preserve the ACTIVE row and inspect the branch "
+                "before recovery"
+            )
         path = _stored_path(config, checkout.path, "agent checkout path").absolute()
         registration = vcs.worktree_registration(repository, path)
         if registration is not None:
@@ -13659,6 +14794,8 @@ def _process_is_zombie(pid_dir: Path) -> bool:
 
 def _absent_validate_process_snapshot(
     proc_root: Path = Path("/proc"),
+    *,
+    include_owner_cgroups: bool = True,
 ) -> tuple[_AbsentProcessObservation, ...]:
     try:
         pid_dirs = sorted(
@@ -13675,7 +14812,7 @@ def _absent_validate_process_snapshot(
         try:
             if _process_uid(pid_dir) is None:
                 continue
-            cgroup = _read_process_cgroup(pid_dir)
+            cgroup = _read_process_cgroup(pid_dir) if include_owner_cgroups else ""
             mount_namespace = _mount_namespace(pid_dir)
         except Refusal:
             if _process_start_ticks(pid_dir) is None:
@@ -13757,8 +14894,8 @@ def _absent_validate_mount_matches(
         failures: list[tuple[_AbsentProcessObservation, Refusal]] = []
         for process in representatives:
             try:
-                candidate_references = _mountinfo_path_references(
-                    process.pid, selected_budget
+                candidate_references = _mountinfo_path_references_with_retry(
+                    process, selected_budget
                 )
             except Refusal as exc:
                 failures.append((process, exc))
@@ -13781,20 +14918,125 @@ def _absent_validate_mount_matches(
     return tuple(matches)
 
 
-def _root_owned_executable(path: Path, label: str) -> Path:
+def _mountinfo_path_references_with_retry(
+    process: _AbsentProcessObservation,
+    budget: _ReadOnlyCommandBudget,
+) -> tuple[tuple[Path, str], ...]:
+    """Retry one stable procfs EINVAL; persistent errors remain refusals."""
+
+    for attempt in range(2):
+        try:
+            return _mountinfo_path_references(process.pid, budget)
+        except Refusal as exc:
+            cause = exc.__cause__
+            if not isinstance(cause, OSError) or cause.errno != errno.EINVAL:
+                raise
+            if not _process_generation_is_current(process):
+                raise _ProcessEvidenceChanged(
+                    f"PID {process.pid} generation changed during mountinfo retry"
+                ) from exc
+            if attempt:
+                raise
+    raise AssertionError("unreachable mountinfo retry")
+
+
+def _has_identity_user_namespace(
+    uid_map_path: Path = Path("/proc/self/uid_map"),
+) -> bool:
+    """Accept executable ownership only in the full identity UID namespace."""
+
+    try:
+        rows = uid_map_path.read_text(encoding="ascii").splitlines()
+    except (OSError, UnicodeError) as exc:
+        raise Refusal(f"cannot read user-namespace UID mapping: {exc}") from exc
+    mappings: list[tuple[int, int, int]] = []
+    for row in rows:
+        fields = row.split()
+        if len(fields) != 3 or any(
+            not field.isascii() or not field.isdecimal() for field in fields
+        ):
+            raise Refusal("user-namespace UID mapping is malformed")
+        inside, outside, length = (int(field) for field in fields)
+        if length <= 0 or inside + length > 1 << 32 or outside + length > 1 << 32:
+            raise Refusal("user-namespace UID mapping is out of range")
+        mappings.append((inside, outside, length))
+    return mappings == [(0, 0, (1 << 32) - 1)]
+
+
+@dataclasses.dataclass(frozen=True)
+class _TrustedExecutablePath:
+    path: Path
+    identities: tuple[tuple[Path, int, int, int, int, int], ...]
+
+
+def _trusted_path_identity(path: Path) -> tuple[Path, int, int, int, int, int]:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise Refusal(f"trusted executable path is unavailable {path}: {exc}") from exc
+    return (
+        path,
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+    )
+
+
+def _root_owned_executable(path: Path, label: str) -> _TrustedExecutablePath:
+    if not path.is_absolute() or path.parent != _TRUSTED_EXECUTABLE_DIRECTORY:
+        raise Refusal(f"{label} must use its hard-coded canonical /usr/bin path: {path}")
     try:
         resolved = path.resolve(strict=True)
-        metadata = resolved.stat()
     except OSError as exc:
         raise Refusal(f"{label} is unavailable: {exc}") from exc
-    if (
-        not stat.S_ISREG(metadata.st_mode)
-        or metadata.st_uid != 0
-        or metadata.st_mode & 0o022
-        or not os.access(resolved, os.X_OK)
-    ):
+    if resolved != path or not _has_identity_user_namespace():
         raise Refusal(f"{label} is not a root-owned, non-writable executable: {resolved}")
-    return resolved
+    chain: list[tuple[Path, int, int, int, int, int]] = []
+    candidate = resolved
+    while True:
+        identity = _trusted_path_identity(candidate)
+        _path, _device, _inode, mode, uid, gid = identity
+        expected_type = stat.S_ISREG(mode) if candidate == resolved else stat.S_ISDIR(mode)
+        if (
+            not expected_type
+            or uid != 0
+            or gid != 0
+            or mode & 0o022
+            or os.access(candidate, os.W_OK, effective_ids=True)
+        ):
+            raise Refusal(
+                f"{label} has an untrusted executable path component: {candidate}"
+            )
+        chain.append(identity)
+        if candidate == candidate.parent:
+            break
+        candidate = candidate.parent
+    if not os.access(resolved, os.X_OK):
+        raise Refusal(f"{label} is not executable: {resolved}")
+    if resolved.resolve(strict=True) != resolved:
+        raise Refusal(f"{label} executable path changed during validation: {resolved}")
+    return _TrustedExecutablePath(resolved, tuple(chain))
+
+
+def _recheck_trusted_executable(executable: _TrustedExecutablePath) -> None:
+    try:
+        if executable.path.resolve(strict=True) != executable.path:
+            raise Refusal(
+                f"trusted executable path changed before execution: {executable.path}"
+            )
+    except OSError as exc:
+        raise Refusal(
+            f"trusted executable path is unavailable before execution: "
+            f"{executable.path}: {exc}"
+        ) from exc
+    for expected in executable.identities:
+        observed = _trusted_path_identity(expected[0])
+        if observed != expected:
+            raise Refusal(
+                f"trusted executable path identity changed before execution: {expected[0]}"
+            )
 
 
 @dataclasses.dataclass
@@ -13848,12 +15090,15 @@ def _run_bounded_read_only_command(
     stderr_limit: int = 64 * 1024,
     env_overrides: Mapping[str, str] | None = None,
     input_data: bytes | None = None,
+    trusted_executables: Sequence[_TrustedExecutablePath] = (),
 ) -> tuple[int, bytes, bytes]:
     if input_data is not None and len(input_data) > 1024 * 1024:
         raise Refusal("privileged read-only census input exceeds 1 MiB")
     environment = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"}
     if env_overrides is not None:
         environment.update(env_overrides)
+    for executable in trusted_executables:
+        _recheck_trusted_executable(executable)
     try:
         process = subprocess.Popen(
             list(command),
@@ -13959,7 +15204,15 @@ def _run_root_owned_command(
 ) -> tuple[int, bytes, bytes]:
     sudo = _root_owned_executable(Path("/usr/bin/sudo"), "sudo")
     executable = _root_owned_executable(program, program.name)
-    command = [str(sudo), "-n", "-u", "root", "--", str(executable), *arguments]
+    command = [
+        str(sudo.path),
+        "-n",
+        "-u",
+        "root",
+        "--",
+        str(executable.path),
+        *arguments,
+    ]
     if sum(len(os.fsencode(argument)) + 1 for argument in command) > 64 * 1024:
         raise Refusal("privileged read-only census command exceeds the 64 KiB argv bound")
     selected_budget = budget or _ReadOnlyCommandBudget.start(
@@ -13978,8 +15231,39 @@ def _run_root_owned_command(
         stdout_limit=stdout_limit,
         stderr_limit=stderr_limit,
         input_data=input_data,
+        trusted_executables=(sudo, executable),
     )
     selected_budget.consume_output(result[1], result[2])
+    return result
+
+
+def _run_same_uid_command(
+    program: Path,
+    arguments: Sequence[str],
+    *,
+    budget: _ReadOnlyCommandBudget,
+    input_data: bytes | None = None,
+) -> tuple[int, bytes, bytes]:
+    """Run one bounded unprivileged census command from the shared batch budget."""
+
+    executable = _root_owned_executable(program, program.name)
+    command = [str(executable.path), *arguments]
+    if sum(len(os.fsencode(argument)) + 1 for argument in command) > 64 * 1024:
+        raise Refusal("same-UID read-only census command exceeds the 64 KiB argv bound")
+    budget.reserve_input(0 if input_data is None else len(input_data))
+    stdout_limit = budget.stdout_remaining
+    stderr_limit = budget.stderr_remaining
+    if stdout_limit <= 0 or stderr_limit <= 0:
+        raise Refusal("same-UID census exhausted its operation-wide output bound")
+    result = _run_bounded_read_only_command(
+        command,
+        timeout_seconds=budget.remaining_seconds(),
+        stdout_limit=stdout_limit,
+        stderr_limit=stderr_limit,
+        input_data=input_data,
+        trusted_executables=(executable,),
+    )
+    budget.consume_output(result[1], result[2])
     return result
 
 
@@ -14040,6 +15324,12 @@ _FIND_MISSING_RE = re.compile(
 _GREP_MISSING_RE = re.compile(
     r"^/usr/bin/grep: /proc/(?P<pid>[0-9]+)/maps: No such file or directory$"
 )
+_FIND_PERMISSION_RE = re.compile(
+    r"^/usr/bin/find: '/proc/(?P<pid>[0-9]+)(?:/[^']*)?': Permission denied$"
+)
+_GREP_PERMISSION_RE = re.compile(
+    r"^/usr/bin/grep: /proc/(?P<pid>[0-9]+)/maps: Permission denied$"
+)
 
 
 def _process_generation_is_current(process: _AbsentProcessObservation) -> bool:
@@ -14074,6 +15364,127 @@ def _allow_only_vanished_process_diagnostics(
         process = processes.get(int(match.group("pid"))) if match else None
         if process is None or _process_generation_is_current(process):
             raise Refusal(f"privileged {program} census produced diagnostics: {line}")
+
+
+def _same_uid_indeterminate_processes(
+    program: str,
+    returncode: int,
+    stderr: bytes,
+    processes: Mapping[int, _AbsentProcessObservation],
+) -> tuple[_AbsentProcessObservation, ...]:
+    """Return stable protected PIDs that require fresh privileged evidence."""
+
+    if returncode == 0 and not stderr:
+        return ()
+    if program == "grep" and returncode == 1 and not stderr:
+        return ()
+    expected_error = 1 if program == "find" else 2
+    if returncode != expected_error or not stderr:
+        raise Refusal(
+            f"same-UID {program} census returned inconsistent exit {returncode}"
+        )
+    try:
+        lines = stderr.decode("ascii").splitlines()
+    except UnicodeError as exc:
+        raise Refusal(
+            f"same-UID {program} census diagnostics are undecodable"
+        ) from exc
+    missing_pattern = _FIND_MISSING_RE if program == "find" else _GREP_MISSING_RE
+    permission_pattern = (
+        _FIND_PERMISSION_RE if program == "find" else _GREP_PERMISSION_RE
+    )
+    indeterminate: dict[int, _AbsentProcessObservation] = {}
+    for line in lines:
+        missing = missing_pattern.fullmatch(line)
+        if missing is not None:
+            process = processes.get(int(missing.group("pid")))
+            if process is None or _process_generation_is_current(process):
+                raise Refusal(
+                    f"same-UID {program} census produced diagnostics: {line}"
+                )
+            continue
+        denied = permission_pattern.fullmatch(line)
+        process = (
+            None if denied is None else processes.get(int(denied.group("pid")))
+        )
+        if process is None or not _process_generation_is_current(process):
+            if process is not None:
+                continue
+            raise Refusal(f"same-UID {program} census produced diagnostics: {line}")
+        indeterminate[process.pid] = process
+    return tuple(indeterminate.values())
+
+
+def _parse_find_path_matches(
+    output: bytes,
+    processes: Mapping[int, _AbsentProcessObservation],
+    targets: Mapping[Path, str],
+    *,
+    census: str,
+) -> tuple[tuple[int, str, str, str], ...]:
+    fields = output.split(b"\0")
+    if fields and fields[-1] == b"":
+        fields.pop()
+    if len(fields) % 2:
+        raise Refusal(f"{census} find census returned a truncated record")
+    matches: list[tuple[int, str, str, str]] = []
+    for index in range(0, len(fields), 2):
+        evidence_path = Path(fields[index].decode("utf-8", errors="surrogateescape"))
+        raw_target = fields[index + 1].decode("utf-8", errors="surrogateescape")
+        pid = _pid_from_proc_evidence(evidence_path)
+        process = processes.get(pid)
+        if process is None:
+            raise Refusal(f"{census} find census returned an unexpected PID: {pid}")
+        observed = Path(os.path.normpath(raw_target.removesuffix(" (deleted)")))
+        matched = _matching_absent_validate_target(observed, targets)
+        if matched is None:
+            continue
+        if not _process_generation_is_current(process):
+            raise _ProcessEvidenceChanged(
+                f"PID {pid} generation changed during {census} find census"
+            )
+        _target, slot = matched
+        matches.append((pid, slot, "link", raw_target))
+    return tuple(matches)
+
+
+def _parse_maps_path_matches(
+    output: bytes,
+    processes: Mapping[int, _AbsentProcessObservation],
+    targets: Mapping[Path, str],
+    *,
+    census: str,
+) -> tuple[tuple[int, str, str, str], ...]:
+    matches: list[tuple[int, str, str, str]] = []
+    for raw_line in output.splitlines():
+        raw_path, separator, raw_mapping = raw_line.partition(b":")
+        if not separator:
+            raise Refusal(f"{census} grep census returned an unframed maps record")
+        try:
+            evidence_path = Path(raw_path.decode("ascii"))
+        except UnicodeError as exc:
+            raise Refusal(f"{census} grep census is undecodable: {exc}") from exc
+        mapping = raw_mapping.decode("utf-8", errors="surrogateescape")
+        fields = mapping.split(maxsplit=5)
+        if len(fields) != 6:
+            raise Refusal(f"{census} grep census returned a malformed maps record")
+        observed = Path(fields[5].removesuffix(" (deleted)"))
+        if not observed.is_absolute():
+            continue
+        matched = _matching_absent_validate_target(observed, targets)
+        if matched is None:
+            continue
+        pid = _pid_from_proc_evidence(evidence_path)
+        process = processes.get(pid)
+        if process is None:
+            raise Refusal(f"{census} grep census returned an unexpected PID: {pid}")
+        if not _process_generation_is_current(process):
+            raise _ProcessEvidenceChanged(
+                f"PID {pid} generation changed during {census} maps census"
+            )
+        _target, slot = matched
+        matches.append((pid, slot, "map", str(observed)))
+    return tuple(matches)
 
 
 def _absent_validate_find_match(
@@ -14117,34 +15528,9 @@ def _absent_validate_find_matches(
         )
         _allow_only_vanished_process_diagnostics("find", returncode, stderr, batch_processes)
         chunks.append(stdout)
-    output = b"".join(chunks)
-    fields = output.split(b"\0")
-    if fields and fields[-1] == b"":
-        fields.pop()
-    if len(fields) % 2:
-        raise Refusal("privileged find census returned a truncated record")
-    matches: list[tuple[int, str, str, str]] = []
-    for index in range(0, len(fields), 2):
-        try:
-            evidence_path = Path(fields[index].decode("utf-8", errors="surrogateescape"))
-            raw_target = fields[index + 1].decode("utf-8", errors="surrogateescape")
-        except UnicodeError as exc:
-            raise Refusal(f"privileged find census is undecodable: {exc}") from exc
-        pid = _pid_from_proc_evidence(evidence_path)
-        process = observed_by_pid.get(pid)
-        if process is None:
-            raise Refusal(f"privileged find census returned an unexpected PID: {pid}")
-        observed = Path(os.path.normpath(raw_target.removesuffix(" (deleted)")))
-        matched = _matching_absent_validate_target(observed, targets)
-        if matched is None:
-            continue
-        if not _process_generation_is_current(process):
-            raise _ProcessEvidenceChanged(
-                f"PID {pid} generation changed during privileged find census"
-            )
-        _target, slot = matched
-        matches.append((pid, slot, "link", raw_target))
-    return tuple(matches)
+    return _parse_find_path_matches(
+        b"".join(chunks), observed_by_pid, targets, census="privileged"
+    )
 
 
 def _absent_validate_maps_match(
@@ -14185,36 +15571,9 @@ def _absent_validate_maps_matches(
             raise Refusal(f"privileged grep census refused with exit {returncode}")
         _allow_only_vanished_process_diagnostics("grep", returncode, stderr, batch_processes)
         chunks.append(stdout)
-    output = b"".join(chunks)
-    matches: list[tuple[int, str, str, str]] = []
-    for raw_line in output.splitlines():
-        raw_path, separator, raw_mapping = raw_line.partition(b":")
-        if not separator:
-            raise Refusal("privileged grep census returned an unframed maps record")
-        try:
-            evidence_path = Path(raw_path.decode("ascii"))
-            mapping = raw_mapping.decode("utf-8", errors="surrogateescape")
-        except UnicodeError as exc:
-            raise Refusal(f"privileged grep census is undecodable: {exc}") from exc
-        fields = mapping.split(maxsplit=5)
-        if len(fields) != 6:
-            raise Refusal("privileged grep census returned a malformed maps record")
-        observed = Path(fields[5].removesuffix(" (deleted)"))
-        if not observed.is_absolute():
-            continue
-        matched = _matching_absent_validate_target(observed, targets)
-        if matched is not None:
-            pid = _pid_from_proc_evidence(evidence_path)
-            process = observed_by_pid.get(pid)
-            if process is None:
-                raise Refusal(f"privileged grep census returned an unexpected PID: {pid}")
-            if not _process_generation_is_current(process):
-                raise _ProcessEvidenceChanged(
-                    f"PID {pid} generation changed during privileged maps census"
-                )
-            _target, slot = matched
-            matches.append((pid, slot, "map", str(observed)))
-    return tuple(matches)
+    return _parse_maps_path_matches(
+        b"".join(chunks), observed_by_pid, targets, census="privileged"
+    )
 
 
 def _absent_validate_privileged_path_match(
@@ -14227,10 +15586,247 @@ def _absent_validate_privileged_path_match(
     )
 
 
+def _same_uid_process_observations(
+    budget: _ReadOnlyCommandBudget,
+    proc_root: Path = Path("/proc"),
+) -> tuple[_AbsentProcessObservation, ...]:
+    """Snapshot processes whose filesystem UID can traverse a private fence."""
+
+    budget.remaining_seconds()
+    try:
+        pid_dirs = sorted(
+            (path for path in proc_root.iterdir() if path.name.isdigit()),
+            key=lambda path: int(path.name),
+        )
+    except OSError as exc:
+        raise Refusal(f"cannot enumerate live processes: {exc}") from exc
+    observations: list[_AbsentProcessObservation] = []
+    for pid_dir in pid_dirs:
+        budget.remaining_seconds()
+        generation = _read_process_stat(pid_dir)
+        if generation is None:
+            continue
+        filesystem_uid = _process_filesystem_uid(pid_dir)
+        if filesystem_uid is None or filesystem_uid != os.getuid():
+            continue
+        try:
+            # Validation-batch final checks pass record=None and need path and
+            # mount evidence, never owner-cgroup membership. Avoid rereading an
+            # unused cgroup file for every same-filesystem-UID PID and target.
+            mount_namespace = _mount_namespace(pid_dir)
+        except Refusal:
+            if _process_start_ticks(pid_dir) is None:
+                continue
+            raise
+        if mount_namespace is None:
+            if _process_is_zombie(pid_dir) or _process_start_ticks(pid_dir) is None:
+                continue
+            raise Refusal(f"mount namespace is indeterminate for live PID {pid_dir.name}")
+        current_generation = _read_process_stat(pid_dir)
+        if current_generation is None:
+            continue
+        if current_generation.start_ticks != generation.start_ticks:
+            raise _ProcessEvidenceChanged(
+                f"process generation changed while reading PID {pid_dir.name}"
+            )
+        observations.append(
+            _AbsentProcessObservation(
+                pid=int(pid_dir.name),
+                start_ticks=generation.start_ticks,
+                cgroup_path="",
+                mount_namespace=mount_namespace,
+                kernel_thread=bool(generation.flags & _PF_KTHREAD),
+            )
+        )
+    return tuple(observations)
+
+
+def _same_uid_direct_path_processes(
+    processes: Sequence[_AbsentProcessObservation],
+    budget: _ReadOnlyCommandBudget,
+) -> tuple[
+    tuple[_AbsentProcessObservation, ...],
+    tuple[_AbsentProcessObservation, ...],
+]:
+    """Separate directly readable proc entries from privileged-fallback work."""
+
+    direct: list[_AbsentProcessObservation] = []
+    indeterminate: list[_AbsentProcessObservation] = []
+    for process in processes:
+        budget.remaining_seconds()
+        base = Path("/proc") / str(process.pid)
+        try:
+            os.readlink(base / "cwd")
+            os.readlink(base / "root")
+            if not process.kernel_thread:
+                os.readlink(base / "exe")
+            with os.scandir(base / "fd"):
+                pass
+        except PermissionError:
+            if not _process_generation_is_current(process):
+                raise _ProcessEvidenceChanged(
+                    f"PID {process.pid} generation changed before same-UID path census"
+                )
+            indeterminate.append(process)
+        except FileNotFoundError as exc:
+            raise _ProcessEvidenceChanged(
+                f"PID {process.pid} proc entries changed before same-UID path census"
+            ) from exc
+        except OSError as exc:
+            if not _process_generation_is_current(process):
+                raise _ProcessEvidenceChanged(
+                    f"PID {process.pid} generation changed before same-UID path census"
+                ) from exc
+            raise Refusal(
+                f"cannot inspect same-UID process {process.pid} path evidence: {exc}"
+            ) from exc
+        else:
+            direct.append(process)
+    return tuple(direct), tuple(indeterminate)
+
+
+def _same_uid_batched_path_matches(
+    processes: Sequence[_AbsentProcessObservation],
+    targets: Mapping[Path, str],
+    budget: _ReadOnlyCommandBudget,
+) -> tuple[
+    tuple[tuple[int, str, str, str], ...],
+    tuple[_AbsentProcessObservation, ...],
+]:
+    """Inspect readable links/maps in batches and identify protected procfs rows."""
+
+    direct_processes, fallback_processes = _same_uid_direct_path_processes(
+        processes, budget
+    )
+    observed_by_pid = {process.pid: process for process in direct_processes}
+    matches: list[tuple[int, str, str, str]] = []
+    indeterminate = {process.pid: process for process in fallback_processes}
+    roots = _process_symlink_roots(direct_processes)
+    link_tests: list[str] = []
+    for target in sorted(targets, key=str):
+        literal = str(target)
+        for character in ("\\", "*", "?", "["):
+            literal = literal.replace(character, f"\\{character}")
+        for pattern in (literal, f"{literal}/*", f"{literal} (deleted)"):
+            if link_tests:
+                link_tests.append("-o")
+            link_tests.extend(("-lname", pattern))
+    find_suffix = (
+        "-ignore_readdir_race",
+        "-maxdepth",
+        "1",
+        "-type",
+        "l",
+        "(",
+        *link_tests,
+        ")",
+        "-printf",
+        "%p\\0%l\\0",
+    )
+    find_chunks: list[bytes] = []
+    for arguments in _argument_batches(("-P",), roots, find_suffix):
+        batch_pids = {
+            _pid_from_proc_evidence(Path(argument))
+            for argument in arguments[1 : len(arguments) - len(find_suffix)]
+        }
+        batch_processes = {
+            pid: observed_by_pid[pid] for pid in batch_pids if pid in observed_by_pid
+        }
+        returncode, stdout, stderr = _run_same_uid_command(
+            Path("/usr/bin/find"), arguments, budget=budget
+        )
+        for process in _same_uid_indeterminate_processes(
+            "find", returncode, stderr, batch_processes
+        ):
+            indeterminate[process.pid] = process
+        find_chunks.append(stdout)
+    matches.extend(
+        _parse_find_path_matches(
+            b"".join(find_chunks), observed_by_pid, targets, census="same-UID"
+        )
+    )
+
+    files = [
+        str(Path("/proc") / str(process.pid) / "maps")
+        for process in direct_processes
+    ]
+    patterns: list[str] = []
+    for target in sorted(targets, key=str):
+        text = str(target)
+        if "\n" in text or "\0" in text:
+            raise Refusal("validation paths containing line or NUL bytes cannot be probed")
+        patterns.append(text)
+    pattern_input = ("\n".join(patterns) + "\n").encode("utf-8")
+    maps_chunks: list[bytes] = []
+    for arguments in _argument_batches(("-F", "-H", "-f", "-", "--"), files, ()):
+        batch_pids = {
+            _pid_from_proc_evidence(Path(argument)) for argument in arguments[5:]
+        }
+        batch_processes = {
+            pid: observed_by_pid[pid] for pid in batch_pids if pid in observed_by_pid
+        }
+        returncode, stdout, stderr = _run_same_uid_command(
+            Path("/usr/bin/grep"),
+            arguments,
+            input_data=pattern_input,
+            budget=budget,
+        )
+        for process in _same_uid_indeterminate_processes(
+            "grep", returncode, stderr, batch_processes
+        ):
+            indeterminate[process.pid] = process
+        maps_chunks.append(stdout)
+    matches.extend(
+        _parse_maps_path_matches(
+            b"".join(maps_chunks), observed_by_pid, targets, census="same-UID"
+        )
+    )
+    return tuple(matches), tuple(indeterminate.values())
+
+
+def _capture_same_uid_process_path_census(
+    slot_paths: Sequence[Path],
+    *,
+    budget: _ReadOnlyCommandBudget,
+) -> _ProcessPathCensus:
+    """Capture one fresh snapshot for paths reachable by this filesystem UID."""
+
+    targets = {path: str(path) for path in slot_paths}
+    if not targets:
+        return _ProcessPathCensus((), (), owner_cgroup_complete=False)
+    for attempt in range(3):
+        budget.remaining_seconds()
+        try:
+            processes = _same_uid_process_observations(budget)
+            direct_matches, indeterminate = _same_uid_batched_path_matches(
+                processes, targets, budget
+            )
+            matches = (
+                *_absent_validate_mount_matches(processes, targets, budget),
+                *direct_matches,
+                *_absent_validate_find_matches(indeterminate, targets, budget),
+                *_absent_validate_maps_matches(indeterminate, targets, budget),
+            )
+        except _ProcessEvidenceChanged:
+            if attempt < 2:
+                continue
+            raise Refusal(
+                "same-UID process evidence changed during three liveness attempts"
+            )
+        return _ProcessPathCensus(
+            processes, matches, owner_cgroup_complete=False
+        )
+    raise Refusal(
+        "same-UID liveness proof is indeterminate because relevant process "
+        "evidence changed during three attempts"
+    )
+
+
 @dataclasses.dataclass(frozen=True)
 class _ProcessPathCensus:
     processes: tuple[_AbsentProcessObservation, ...]
     matches: tuple[tuple[int, str, str, str], ...]
+    owner_cgroup_complete: bool = True
 
     def assert_slot_unused(
         self,
@@ -14247,6 +15843,14 @@ class _ProcessPathCensus:
                     break
                 ignored.add(ancestor)
                 ancestor = _read_process_parent(ancestor)
+        if (
+            record is not None
+            and record.owner is not None
+            and not self.owner_cgroup_complete
+        ):
+            raise Refusal(
+                "process census omitted owner-cgroup evidence required for this slot"
+            )
         if record is not None and record.owner is not None:
             for process in self.processes:
                 if process.pid in ignored:
@@ -14265,25 +15869,70 @@ class _ProcessPathCensus:
                 )
 
 
+@dataclasses.dataclass(frozen=True)
+class _PrivateCleanupTarget:
+    """One validation slot sealed before its shared destructive census."""
+
+    path: Path
+    original_mode: int
+    identity: tuple[int, int, int]
+
+
+@dataclasses.dataclass
+class _PrivateCleanupContext:
+    """Sealed target and batch-wide evidence budget for its final scan."""
+
+    target: _PrivateCleanupTarget
+    shared_census: _ProcessPathCensus
+    census_budget: _ReadOnlyCommandBudget
+    same_uid_census_performed: bool = False
+
+
+@dataclasses.dataclass(frozen=True)
+class _FinishContext:
+    """Immutable policy and evidence carried through one finish operation."""
+
+    mode: str
+    actor: str
+    salvage: tuple[Mapping[str, object], ...] = ()
+    validate_complete: bool = False
+    allow_live_validate_owner: bool = False
+    private_cleanup: _PrivateCleanupContext | None = None
+
+
 def _capture_process_path_census(
     slot_paths: Sequence[Path],
+    *,
+    budget: _ReadOnlyCommandBudget | None = None,
+    include_owner_cgroups: bool = True,
 ) -> _ProcessPathCensus:
     targets = {path: str(path) for path in slot_paths}
     if not targets:
-        return _ProcessPathCensus((), ())
-    budget = _ReadOnlyCommandBudget.start(
+        return _ProcessPathCensus(
+            (), (), owner_cgroup_complete=include_owner_cgroups
+        )
+    selected_budget = budget or _ReadOnlyCommandBudget.start(
         timeout_seconds=_ABSENT_PROCESS_CENSUS_SECONDS,
         stdout_limit=16 * 1024 * 1024,
         stderr_limit=64 * 1024,
         input_limit=_MOUNTINFO_CENSUS_BYTES_LIMIT,
     )
     for attempt in range(3):
+        selected_budget.remaining_seconds()
         try:
-            processes = _absent_validate_process_snapshot()
-            mount_matches = _absent_validate_mount_matches(processes, targets, budget)
+            processes = (
+                _absent_validate_process_snapshot()
+                if include_owner_cgroups
+                else _absent_validate_process_snapshot(
+                    include_owner_cgroups=False
+                )
+            )
+            mount_matches = _absent_validate_mount_matches(
+                processes, targets, selected_budget
+            )
             path_matches = (
-                *_absent_validate_find_matches(processes, targets, budget),
-                *_absent_validate_maps_matches(processes, targets, budget),
+                *_absent_validate_find_matches(processes, targets, selected_budget),
+                *_absent_validate_maps_matches(processes, targets, selected_budget),
             )
         except _ProcessEvidenceChanged:
             if attempt < 2:
@@ -14291,7 +15940,11 @@ def _capture_process_path_census(
             raise Refusal(
                 "relevant process evidence changed during three liveness attempts"
             )
-        return _ProcessPathCensus(processes, (*mount_matches, *path_matches))
+        return _ProcessPathCensus(
+            processes,
+            (*mount_matches, *path_matches),
+            owner_cgroup_complete=include_owner_cgroups,
+        )
     raise Refusal(
         "all-process liveness proof is indeterminate because relevant process "
         "evidence changed during three attempts"
@@ -14350,11 +16003,12 @@ def _run_user_systemctl(
     if stdout_limit <= 0 or stderr_limit <= 0:
         raise Refusal("user-systemd census exhausted its operation-wide output bound")
     returncode, stdout, stderr = _run_bounded_read_only_command(
-        [str(systemctl), "--user", *arguments],
+        [str(systemctl.path), "--user", *arguments],
         timeout_seconds=budget.remaining_seconds(),
         stdout_limit=stdout_limit,
         stderr_limit=stderr_limit,
         env_overrides=_user_bus_environment(),
+        trusted_executables=(systemctl,),
     )
     budget.consume_output(stdout, stderr)
     if returncode != 0:
@@ -15348,7 +17002,12 @@ def _cmd_recover(args: argparse.Namespace) -> int:
     coordinator = _capture_caller_process(args.coordinator_pid, "coordinator")
     with _mutation_locks(config, args.wait_lock):
         recovered_partial = _recover_partial_updates(config, args.discard_partial)
-        if recovered_partial and not _outstanding_journals(config):
+        _refuse_partial_state(config, allow_validate_batch_seals=True)
+        if (
+            recovered_partial
+            and not _outstanding_journals(config)
+            and not _validate_batch_seal_journals(config)
+        ):
             _ensure_event_log(config)
             _write_event_file(
                 config,
@@ -15399,7 +17058,9 @@ def _cmd_recover(args: argparse.Namespace) -> int:
                 raise Refusal(
                     "ownerless validation cleanup requires exactly one target path"
                 )
-            if _outstanding_journals(config):
+            if _outstanding_journals(config) or _validate_batch_seal_journals(
+                config
+            ):
                 raise Refusal(
                     "an interrupted mutation is already recorded. state: REFUSED -- the new "
                     "validation cleanup did not start. remedy: rerun 'wrkslots recover "
@@ -15427,6 +17088,12 @@ def _cmd_recover(args: argparse.Namespace) -> int:
             path = _journal_path(config)
             raw: Mapping[str, object] = journal
         else:
+            journals = _outstanding_journals(config)
+            seal_journals = _validate_batch_seal_journals(config)
+            if not journals and seal_journals:
+                _assert_caller_process(coordinator, "coordinator")
+                _recover_validate_batch_seal_journal(config)
+                return 0
             path, raw = _load_journal(config)
         _ensure_event_log(config)
         _write_event_file(
@@ -15448,6 +17115,28 @@ def _cmd_recover(args: argparse.Namespace) -> int:
                 f"journal belongs to machine {machine}; rerun with --machine {machine}"
             )
         kind = _as_str(raw.get("kind"), "journal.kind")
+        seal_journals = _validate_batch_seal_journals(config)
+        if seal_journals:
+            if kind != "finish":
+                raise StateError(
+                    "validation-batch seal evidence coexists with a non-finish journal"
+                )
+            record = _record_from_obj(raw.get("record"), "finish journal.record")
+            private_identity = _finish_private_census_identity(raw)
+            if private_identity is None:
+                raise StateError(
+                    "validation-batch seal evidence coexists with a non-batch finish journal"
+                )
+            original_mode = _as_int(
+                raw.get("original_mode"), "finish journal.original_mode"
+            )
+            _assert_validate_batch_seal_target(
+                config, record, original_mode, private_identity
+            )
+        elif kind == "finish" and _finish_private_census_identity(raw) is not None:
+            raise StateError(
+                "private finish journal is missing its validation-batch seal evidence"
+            )
         if kind == "finish":
             states, archives = _validate_global_state_for_finish_recovery(config, raw)
         elif kind == "recover-absent-validate-rows":
@@ -15464,7 +17153,9 @@ def _cmd_recover(args: argparse.Namespace) -> int:
         else:
             states, archives = _validate_global_state(config)
         before = _global_rows(states, archives)
-        state = _load_active(config)
+        state = _load_active(
+            config, require_repository=kind != "finish"
+        )
         if kind == "create":
             _assert_caller_process(coordinator, "coordinator")
             _recover_create(
@@ -15487,7 +17178,17 @@ def _cmd_recover(args: argparse.Namespace) -> int:
                 raise Refusal(
                     "--retry-running-hook and --abort-create apply only to create journals"
                 )
-            _recover_finish(config, path, raw, state, coordinator)
+            try:
+                _recover_finish(config, path, raw, state, coordinator)
+            except Refusal as exc:
+                _restore_interrupted_private_finish_after_refusal(
+                    config, raw, exc
+                )
+                if seal_journals:
+                    _recover_validate_batch_seal_journal(
+                        config, retain_evidence=True
+                    )
+                raise
         elif kind == "legacy-validate-remove":
             if args.retry_running_hook or args.abort_create:
                 raise Refusal(
@@ -15544,7 +17245,11 @@ def _cmd_recover(args: argparse.Namespace) -> int:
             _recover_absent_agent_row(config, path, raw, coordinator)
         else:
             raise StateError(f"unknown recovery journal kind {kind!r}")
-        after_states, after_archives = _validate_global_state(config)
+        if seal_journals:
+            _recover_validate_batch_seal_journal(config)
+        after_states, after_archives = _validate_global_state(
+            config, require_repository=kind != "finish"
+        )
         after = _global_rows(after_states, after_archives)
         if kind == "recover-absent-validate-rows":
             pass
@@ -16353,12 +18058,15 @@ usage or audit gate unknown, 3 fail-closed refusal.
         "remove-validate-batch",
         help="remove one bounded batch of completed validation slots",
         description=(
-            f"Capture one shared process/path census, then attempt at most "
-            f"{VALIDATE_REMOVE_BATCH_LIMIT} completed "
-            "validation slots. Every slot must still have a proven-dead exact owner and pass "
-            "the ordinary registered-liveness, path-fence, mount, Git, and handoff checks. "
-            "Per-slot refusals are reported without preventing other requested slots from "
-            "being considered."
+            "Privately seal the requested paths, capture one shared privileged process/path "
+            "census plus one fresh same-UID census per target, then attempt at most "
+            f"{VALIDATE_REMOVE_BATCH_LIMIT} completed validation slots. Every slot must still "
+            "have a proven-dead exact owner and pass the ordinary registered-liveness, "
+            "path-fence, mount, Git, and handoff checks. Per-slot refusals are reported "
+            "without preventing other requested slots from being considered. Sealing prevents "
+            "later entry by ordinary processes under another UID. The post-fence scan detects "
+            "existing or cooperative use under the same UID; it is not isolation from a "
+            "same-UID process deliberately racing cleanup."
         ),
         formatter_class=_HelpFormatter,
     )

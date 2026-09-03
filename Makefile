@@ -81,9 +81,10 @@ check-test-suite-selector:
 # On a shared host both operations walk every unrelated process: measured with
 # 3,754 processes, one empty two-directory test slot took about 30 seconds even
 # though no process used it. A PID namespace keeps the real lsof and /proc checks
-# while limiting them to the test and its children. The four tests below manage
-# child PIDs whose signal/reap behaviour must remain host-visible, so they run in
-# the ordinary environment. If unprivileged namespaces are unavailable, run the
+# while limiting them to the test and its children. Four tests below manage child
+# PIDs whose signal/reap behaviour must remain host-visible. The root-helper test
+# must instead exercise the initial identity user namespace. Run all five in the
+# ordinary environment. If unprivileged namespaces are unavailable, run the
 # original single pytest command; availability changes cost, never coverage.
 test:
 ifneq ($(TEST_SUITE),rust)
@@ -93,12 +94,13 @@ ifneq ($(TEST_SUITE),rust)
 		python3 -m pytest -q --ignore=wrkslots/tests/test_lifecycle.py && \
 		unshare --user --map-root-user --pid --fork --mount-proc \
 			python3 -m pytest -q -c pyproject.toml --rootdir=. wrkslots/tests/test_lifecycle.py \
-			-k 'not test_lock_conflict_refuses_without_state_change and not test_process_entering_after_final_scan_before_path_move_is_not_deleted and not test_adopt_refuses_pid_outside_invoking_process_ancestry and not test_remove_refuses_live_process_using_slot' && \
+			-k 'not test_lock_conflict_refuses_without_state_change and not test_process_entering_after_final_scan_before_path_move_is_not_deleted and not test_adopt_refuses_pid_outside_invoking_process_ancestry and not test_remove_refuses_live_process_using_slot and not test_root_owned_executable_accepts_host_root_helper' && \
 		python3 -m pytest -q \
 			wrkslots/tests/test_lifecycle.py::test_lock_conflict_refuses_without_state_change \
 			wrkslots/tests/test_lifecycle.py::test_process_entering_after_final_scan_before_path_move_is_not_deleted \
 			wrkslots/tests/test_lifecycle.py::test_adopt_refuses_pid_outside_invoking_process_ancestry \
-			wrkslots/tests/test_lifecycle.py::test_remove_refuses_live_process_using_slot; \
+			wrkslots/tests/test_lifecycle.py::test_remove_refuses_live_process_using_slot \
+			wrkslots/tests/test_lifecycle.py::test_root_owned_executable_accepts_host_root_helper; \
 	else \
 		python3 -m pytest -q; \
 	fi
