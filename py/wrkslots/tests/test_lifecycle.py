@@ -10798,3 +10798,78 @@ def test_bounded_read_only_command_uses_a_fixed_environment(
         "LC_ALL=C",
         "PATH=/usr/sbin:/usr/bin:/sbin:/bin",
     }
+
+
+def test_stale_row_for_another_slot_does_not_refuse_this_command(
+    tmp_path: Path,
+) -> None:
+    """A row whose directory is gone must not refuse a command naming a different slot.
+
+    Measured on devbig014 2026-09-03: 47 of 92 registered rows had lost their
+    directories and 13 commands gated on the whole registry, so `wrkslots adopt
+    demos-calib` died reporting `lander-3`. The reported name was simply the
+    first record the loop reached, so repairing that one directory would have
+    cleared the message and left the defect whole. The failure surfaced inside
+    the new agent's operation while the cause belonged to a slot it had never
+    touched.
+    """
+    project, _repository, _remote = make_project(tmp_path)
+    first = create(project, slot="slot01", agent="codex-1", branch="codex/one")
+    assert first.returncode == 0, first.stderr
+    second = create(project, slot="slot02", agent="codex-2", branch="codex/two")
+    assert second.returncode == 0, second.stderr
+
+    shutil.rmtree(slots_directory(project) / "slot02")
+
+    config = wrkslots._load_config(str(project), "testhost")
+    state = wrkslots._load_active(config)
+
+    findings = wrkslots._assert_registry_storage_consistent(
+        config, [state], target_slot="slot01"
+    )
+    assert findings.stale == ("agent:slot02",), findings.stale
+
+
+def test_stale_row_for_the_named_slot_STILL_REFUSES(tmp_path: Path) -> None:
+    """The other direction: a command naming the broken slot must still refuse.
+
+    Identical fixture to the test above with one thing changed -- which slot the
+    command names -- so it isolates the scoping decision rather than re-testing
+    that a missing directory is detected at all.
+    """
+    project, _repository, _remote = make_project(tmp_path)
+    first = create(project, slot="slot01", agent="codex-1", branch="codex/one")
+    assert first.returncode == 0, first.stderr
+    second = create(project, slot="slot02", agent="codex-2", branch="codex/two")
+    assert second.returncode == 0, second.stderr
+
+    shutil.rmtree(slots_directory(project) / "slot02")
+
+    config = wrkslots._load_config(str(project), "testhost")
+    state = wrkslots._load_active(config)
+
+    with pytest.raises(wrkslots.Refusal, match="slot directory is missing or unsafe"):
+        wrkslots._assert_registry_storage_consistent(
+            config, [state], target_slot="slot02"
+        )
+
+
+def test_stale_row_with_no_named_slot_still_refuses(tmp_path: Path) -> None:
+    """`wrkslots recover` names no slot, and its behaviour is deliberately unchanged.
+
+    Widening a recovery path was not measured here, so with no target every
+    inconsistent row refuses exactly as before this scoping existed.
+    """
+    project, _repository, _remote = make_project(tmp_path)
+    first = create(project, slot="slot01", agent="codex-1", branch="codex/one")
+    assert first.returncode == 0, first.stderr
+    second = create(project, slot="slot02", agent="codex-2", branch="codex/two")
+    assert second.returncode == 0, second.stderr
+
+    shutil.rmtree(slots_directory(project) / "slot02")
+
+    config = wrkslots._load_config(str(project), "testhost")
+    state = wrkslots._load_active(config)
+
+    with pytest.raises(wrkslots.Refusal, match="slot directory is missing or unsafe"):
+        wrkslots._assert_registry_storage_consistent(config, [state])

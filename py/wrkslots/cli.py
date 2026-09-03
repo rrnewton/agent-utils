@@ -3777,21 +3777,83 @@ def _assert_target_record_storage_consistent(
             raise StateError(finding.detail, remedy=finding.remedy)
 
 
+@dataclasses.dataclass(frozen=True)
+class RegistryStorageFindings:
+    """Registry and disk disagreements, separated by whose problem they are.
+
+    Both are real defects and neither is discarded. They are carried apart
+    because a command operating on one slot needs different responses to them:
+    an entry naming its own slot must stop it, and an entry belonging to some
+    other slot must be reported to the operator instead of stopping it.
+    """
+
+    #: ``slot_type:slot`` for a directory with no active row.
+    unexpected: tuple[str, ...] = ()
+    #: ``slot_type:slot`` for an active row whose storage is missing or
+    #: inconsistent, excluding the slot the command named -- that one raises.
+    stale: tuple[str, ...] = ()
+
+
 def _assert_registry_storage_consistent(
     config: Config,
     states: Sequence[ActiveState],
     allowed_unregistered_slot: tuple[str, str] | None = None,
     *,
     allow_unregistered_migration_slots: bool = False,
-) -> tuple[str, ...]:
+    target_slot: str | None = None,
+) -> RegistryStorageFindings:
     records = [record for state in states for record in state.slots]
     expected_slots = {
         slot_type: {record.slot for record in records if record.slot_type == slot_type}
         for slot_type in SLOT_TYPES
     }
+    # ⚠️ ONE ROW'S DEFECT MUST NOT REFUSE ANOTHER SLOT'S COMMAND. This loop
+    # raised on the FIRST inconsistent record it reached, so a command naming
+    # slot X died on a defect in unrelated slot Y and the message named Y. The
+    # failure surfaced inside the new agent's operation while the cause belonged
+    # to a slot it had never touched, so the agent investigated its own state and
+    # found nothing wrong. Two lanes did exactly that.
+    #
+    # Measured 2026-09-03 on devbig014: 47 of 92 registered rows fail this check
+    # and 11 call sites gate on it. A precondition that half the population fails
+    # is not gating work, it is stopping arbitrary work -- nobody clears 47 rows
+    # incidentally. `wrkslots adopt demos-calib` reported `lander-3`, which is not
+    # special and was merely first in iteration order; repairing that one
+    # directory would have cleared the message and left the other 46 behind.
+    #
+    # THE CHECK IS NOT REMOVED AND NOTHING IS SWEPT. Those 47 rows ARE a
+    # lifecycle defect: they outlived their directories and nothing retired them.
+    # A defect in the slot the command NAMES still refuses, and now refuses
+    # naming that slot rather than an unrelated one, so a genuinely inconsistent
+    # operation is still refused. A defect anywhere else is collected and
+    # reported BY NAME by the caller, and the command proceeds.
+    #
+    # Scoping loses no reporting. `wrkslots audit` already names this exact
+    # condition per slot in its `reasons` field -- verified 2026-09-03, audit
+    # exits 0 and reports it for every one of the 47 -- and the caller here adds
+    # a named warning on top. What scoping removes is only the REFUSAL of an
+    # unrelated command, which told the operator nothing actionable because it
+    # named one arbitrary slot and hid the rest.
+    #
+    # This generalises the direction `_assert_target_record_storage_consistent`
+    # already took for `read-handoff`: scope the refusal to the requested record.
+    #
+    # Slot names are unique across both slot types -- `_active_from_obj` refuses
+    # a duplicate -- so matching the target by name alone is unambiguous and needs
+    # no slot type from the caller's arguments.
+    #
+    # ⚠️ WITH NO TARGET SLOT THIS STILL RAISES, DELIBERATELY. `wrkslots recover`
+    # is the only gated command naming no slot, and widening a recovery path was
+    # not measured here, so its behaviour is exactly as before.
+    stale: list[str] = []
     vcs = _GitVcs()
     for record in records:
-        _assert_record_storage_consistent(config, record, vcs=vcs)
+        try:
+            _assert_record_storage_consistent(config, record, vcs=vcs)
+        except Refusal:
+            if target_slot is None or record.slot == target_slot:
+                raise
+            stale.append(f"{record.slot_type}:{record.slot}")
     unexpected: list[str] = []
     for slot_type, root in _slot_roots(config).items():
         if not root.exists():
@@ -3863,7 +3925,7 @@ def _assert_registry_storage_consistent(
             "directory was changed",
             remedy=remedy,
         )
-    return tuple(unexpected)
+    return RegistryStorageFindings(tuple(unexpected), tuple(sorted(stale)))
 
 
 def _assert_command_registry_storage(
@@ -3878,12 +3940,34 @@ def _assert_command_registry_storage(
         migration_operation
         or getattr(args, "allow_existing_unregistered_worktrees", False)
     )
-    unexpected = _assert_registry_storage_consistent(
+    # The slot this command names. Every gated command except `recover` takes
+    # one, and slot names are unique across both slot types, so the name alone
+    # identifies the row whose defect must still stop this command.
+    target_slot = getattr(args, "slot", None)
+    findings = _assert_registry_storage_consistent(
         config,
         states,
         allowed_unregistered_slot=allowed_unregistered_slot,
         allow_unregistered_migration_slots=allow,
+        target_slot=target_slot if isinstance(target_slot, str) and target_slot else None,
     )
+    unexpected = findings.unexpected
+    if findings.stale:
+        # ⚠️ NAMED, NOT COUNTED. This defect survived because the old refusal
+        # printed ONE slot -- whichever came first -- so a reader repaired that
+        # directory and believed it fixed. Listing every affected row is what
+        # makes the real scale visible from the message itself.
+        shown = ", ".join(findings.stale[:12])
+        more = f" (+{len(findings.stale) - 12} more)" if len(findings.stale) > 12 else ""
+        print(
+            f"WARNING: {len(findings.stale)} registered slot(s) have missing or "
+            "inconsistent storage. state: RETAINED -- this command named a different "
+            "slot, changed none of these rows, and did not inspect them: "
+            f"{shown}{more}. remedy: these rows outlived their directories; retire each "
+            "one through its own lifecycle command rather than deleting rows in bulk, "
+            "because a row is also what protects a slot holding an unread HANDOFF.md",
+            file=sys.stderr,
+        )
     if unexpected and allow:
         print(
             f"WARNING: {len(unexpected)} existing unregistered worktree directories "
