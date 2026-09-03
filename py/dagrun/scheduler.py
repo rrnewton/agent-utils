@@ -41,6 +41,7 @@ from dagrun.attribution import (
 from dagrun.capabilities import Lane, is_enforced
 from dagrun.model import (
     DagConfig,
+    DEFAULT_WALL_TIMEOUT_MULTIPLIER,
     Step,
     command_with_inner_jobs,
     cmdtype_env_with_inner_jobs,
@@ -1405,7 +1406,10 @@ class Runner:
         # 0 sentinel and gets a backstop derived from its own CPU budget instead of the graph's
         # baked-in 1800 (see resolved_wall_timeout).
         wall_budget = resolved_wall_timeout(
-            step, self.cfg.default_step_timeout, self.cfg.cpu_timeout_multiplier
+            step,
+            self.cfg.default_step_timeout,
+            self.cfg.cpu_timeout_multiplier,
+            self.cfg.wall_timeout_multiplier,
         )
         trace_started = time.monotonic()
         start = time.time()
@@ -1531,14 +1535,22 @@ class Runner:
 
         sink = StepStream(step.tag, self.evidence)
         if self.evidence is not None:
+            start_fields = [
+                ("step", step.tag),
+                ("pid", str(proc.pid)),
+                ("timeout_s", str(wall_budget)),
+                ("cmd", run_cmd),
+            ]
+            if self.cfg.wall_timeout_multiplier != DEFAULT_WALL_TIMEOUT_MULTIPLIER:
+                start_fields.extend(
+                    [
+                        ("wall_timeout_multiplier", str(self.cfg.wall_timeout_multiplier)),
+                        ("wall_timeout_platform", self.cfg.wall_timeout_platform),
+                    ]
+                )
             self.evidence.record(
                 "step_start",
-                [
-                    ("step", step.tag),
-                    ("pid", str(proc.pid)),
-                    ("timeout_s", str(wall_budget)),
-                    ("cmd", run_cmd),
-                ],
+                start_fields,
             )
         captured = _BoundedCapture(capture_max_bytes())
 
@@ -2066,6 +2078,13 @@ class Runner:
                 fields.append(("cpu_limit_s", str(cpu_budget)))
             if wall_budget > 0:
                 fields.append(("wall_limit_s", str(wall_budget)))
+            if self.cfg.wall_timeout_multiplier != DEFAULT_WALL_TIMEOUT_MULTIPLIER:
+                fields.extend(
+                    [
+                        ("wall_timeout_multiplier", str(self.cfg.wall_timeout_multiplier)),
+                        ("wall_timeout_platform", self.cfg.wall_timeout_platform),
+                    ]
+                )
             fields.extend(_cpu_journal_fields(cpu_stats))
             self.evidence.record("step_end", fields)
 
@@ -2117,7 +2136,15 @@ def steps_violating_run_timeout(
     # 0 sentinel, which would pass a `>= run_timeout_s` test trivially while the value it will
     # actually run under — derived from its CPU budget, or 1800 — might not.
     resolved = (
-        (s.tag, resolved_wall_timeout(s, cfg.default_step_timeout, cfg.cpu_timeout_multiplier))
+        (
+            s.tag,
+            resolved_wall_timeout(
+                s,
+                cfg.default_step_timeout,
+                cfg.cpu_timeout_multiplier,
+                cfg.wall_timeout_multiplier,
+            ),
+        )
         for s in cfg.steps
     )
     return sorted((tag, bound) for tag, bound in resolved if bound >= run_timeout_s)

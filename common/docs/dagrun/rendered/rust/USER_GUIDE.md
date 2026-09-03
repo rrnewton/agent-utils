@@ -107,7 +107,7 @@ is therefore a complete, cheap graph check that executes no step.
 | a dependency no step declares | the step and the missing tag |
 | a dependency cycle | **the cycle**, as `a.one -> b.two -> a.one` |
 | a demand above a **positive** `resource_caps` entry | the step, the demand, and the cap |
-| one of the six top-level keys the format does not carry (below) | each key |
+| one of the eight top-level keys the format does not carry (below) | each key |
 
 Those objects are **closed**: a field they do not define is refused rather than
 ignored, because an ignored field reads exactly like one that took effect —
@@ -130,22 +130,24 @@ as well, so a configuration built in memory by a library caller cannot bypass
 the file loader. (The others are properties of the document text, which an
 in-memory configuration does not have.)
 
-#### Six top-level keys the document format does not carry (breaking change)
+#### Eight top-level keys the document format does not carry (breaking change)
 
 A DAG document is **refused at load** (exit 2) if it sets any of:
 
     default_step_mem_cap_bytes   default_step_cpu_timeout   cpu_timeout_platform
-    default_step_cpu_count       cpu_timeout_multiplier     known_failures
+    default_step_cpu_count       cpu_timeout_multiplier     wall_timeout_multiplier
+    wall_timeout_platform        known_failures
 
 These name real runner-configuration fields, but the document format has never
 carried them: writing one had **no effect whatsoever**, and nothing said so — a
 cap you thought you had set was silently the default. That is the reader's side
 of the dropped-field bug, so the loader now names the key instead of ignoring
-it. Both language editions refuse exactly the same six.
+it. Both language editions refuse exactly the same eight.
 
 **This can break a document that loaded before.** Set these at the call site
 (they are caller/platform policy, not properties of the graph — several have
-`--cpu-timeout-multiplier`-style flags or environment variables), or delete
+`--cpu-timeout-multiplier`/`--wall-timeout-multiplier` flags or environment
+variables), or delete
 them: deleting changes nothing, because they were never in effect. A key that
 names *nothing* at all is still tolerated, so forward-compatible additions keep
 loading.
@@ -501,6 +503,18 @@ carries, so a step that declares nothing keeps its 1800-second backstop instead
 of silently dropping to thirty seconds. It tracks the **platform-scaled** budget,
 so raising `cpu_timeout_multiplier` for a slow platform moves the backstop with
 it rather than letting the wall guard start racing the CPU guard there.
+
+CPU speed and elapsed delay are calibrated independently. Use
+`--cpu-timeout-multiplier FACTOR` (or `DAGRUN_CPU_TIMEOUT_MULTIPLIER`) to scale
+CPU-second enforcement, and `--wall-timeout-multiplier FACTOR` (or
+`DAGRUN_WALL_TIMEOUT_MULTIPLIER`) to scale the resolved wall ceiling. A wall
+factor applies after the four rules above, including to explicit step and
+document defaults. The two positive finite factors default to `1.0`; live
+budgets are rounded to whole seconds, half upward, and never below one second.
+Optional `DAGRUN_CPU_TIMEOUT_PLATFORM` and `DAGRUN_WALL_TIMEOUT_PLATFORM`
+labels make the active machine policy visible in diagnostics and durable run
+evidence. The graph itself remains canonical and is never rewritten with a
+machine-specific value.
 
 One thing to know when upgrading: the `--run-timeout` ordering check below is
 applied to the resolved value, so a graph with a large `cpu_timeout` and a run

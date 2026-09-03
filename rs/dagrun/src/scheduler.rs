@@ -48,10 +48,10 @@ use crate::cgroup::CgroupManager;
 use crate::model::{
     canonical_cpu_timeout, cmdtype_env_with_inner_jobs, command_with_inner_jobs,
     effective_cpu_count, effective_cpu_timeout, env_with_inner_jobs, graph_structure_violations,
-    preferred_inner_jobs, resolved_wall_timeout, scale_cpu_timeout, step_classification,
-    step_width_is_resizable, undeclared_resource_demands, validate_cmdtype_config,
-    validate_jobs_env_config, write_domain_violations, DagConfig, RunResult, Step, StepOutcome,
-    DAGRUN_EXTRA_ARGS_ENV, JOBS_ENV_ENV,
+    preferred_inner_jobs, resolved_wall_timeout_with_multipliers, scale_cpu_timeout,
+    step_classification, step_width_is_resizable, undeclared_resource_demands,
+    validate_cmdtype_config, validate_jobs_env_config, write_domain_violations, DagConfig,
+    RunResult, Step, StepOutcome, DAGRUN_EXTRA_ARGS_ENV, JOBS_ENV_ENV,
 };
 use crate::proccpu::{subtree_cpu_seconds, CPU_SOURCE_CGROUP, CPU_SOURCE_PROCFS};
 use crate::profile_enrich::{resolve_effective_inner_jobs, step_enrichment_columns};
@@ -1403,6 +1403,8 @@ struct Runner {
     default_step_timeout: i64,
     cpu_timeout_multiplier: f64,
     cpu_timeout_platform: String,
+    wall_timeout_multiplier: f64,
+    wall_timeout_platform: String,
     /// OUTER wall budget for the WHOLE run, in seconds; `None` leaves the run unbounded.
     ///
     /// Independent of every per-step budget, and that independence is the point: no combination of
@@ -1513,6 +1515,8 @@ impl Runner {
             default_step_timeout: capped.default_step_timeout,
             cpu_timeout_multiplier: capped.cpu_timeout_multiplier,
             cpu_timeout_platform: capped.cpu_timeout_platform.clone(),
+            wall_timeout_multiplier: capped.wall_timeout_multiplier,
+            wall_timeout_platform: capped.wall_timeout_platform.clone(),
             run_timeout_s,
             run_cpu_budget,
             evidence: RunEvidence::open(default_log_dir()).map(Arc::new),
@@ -2015,6 +2019,8 @@ impl Runner {
                 let evidence = self.evidence.clone();
                 let cpu_timeout_multiplier = self.cpu_timeout_multiplier;
                 let cpu_timeout_platform = self.cpu_timeout_platform.clone();
+                let wall_timeout_multiplier = self.wall_timeout_multiplier;
+                let wall_timeout_platform = self.wall_timeout_platform.clone();
                 let profile_timeseries_interval = self.profile_timeseries_interval;
                 let recovery = SupervisorRecovery {
                     step: step.clone(),
@@ -2053,6 +2059,8 @@ impl Runner {
                                 evidence,
                                 cpu_timeout_multiplier,
                                 cpu_timeout_platform,
+                                wall_timeout_multiplier,
+                                wall_timeout_platform,
                                 profile_timeseries_interval,
                                 run_origin: wall_start,
                                 resource_reservation,
@@ -2581,6 +2589,8 @@ struct StepCtx {
     evidence: Option<Arc<RunEvidence>>,
     cpu_timeout_multiplier: f64,
     cpu_timeout_platform: String,
+    wall_timeout_multiplier: f64,
+    wall_timeout_platform: String,
     /// Sampling interval for opt-in exact cgroup CPU/thread traces.
     profile_timeseries_interval: Option<Duration>,
     /// Monotonic origin every profiled step measures its start/finish offset from, so two rows of
@@ -2840,6 +2850,8 @@ fn run_step(ctx: StepCtx) {
         evidence,
         cpu_timeout_multiplier,
         cpu_timeout_platform,
+        wall_timeout_multiplier,
+        wall_timeout_platform,
         profile_timeseries_interval,
         run_origin,
         resource_reservation,
@@ -2923,7 +2935,12 @@ fn run_step(ctx: StepCtx) {
     // The wall ceiling this step actually runs under. A step that declared none carries the 0
     // sentinel and gets a backstop derived from its own CPU budget instead of the graph's
     // baked-in 1800 (see `resolved_wall_timeout`).
-    let wall_budget = resolved_wall_timeout(&step, default_step_timeout, cpu_timeout_multiplier);
+    let wall_budget = resolved_wall_timeout_with_multipliers(
+        &step,
+        default_step_timeout,
+        cpu_timeout_multiplier,
+        wall_timeout_multiplier,
+    );
     // When boxing is enabled, prepare_command wraps the command so the bash leader self-moves into
     // the step's child cgroup BEFORE forking any grandchild (the cgroup-v2 fork-inheritance rule),
     // applying the inner memory/CPU caps. Disabled / absent -> the command is unchanged.
@@ -3077,15 +3094,20 @@ fn run_step(ctx: StepCtx) {
     // single order and a harness that reports progress on stderr is attributed just as well.
     let sink = Arc::new(StepStream::new(&tag, evidence.clone()));
     if let Some(e) = &evidence {
-        e.record(
-            "step_start",
-            &[
-                ("step", tag.clone()),
-                ("pid", pid.to_string()),
-                ("timeout_s", wall_budget.to_string()),
-                ("cmd", run_cmd.clone()),
-            ],
-        );
+        let mut fields = vec![
+            ("step", tag.clone()),
+            ("pid", pid.to_string()),
+            ("timeout_s", wall_budget.to_string()),
+            ("cmd", run_cmd.clone()),
+        ];
+        if wall_timeout_multiplier != crate::model::DEFAULT_WALL_TIMEOUT_MULTIPLIER {
+            fields.push((
+                "wall_timeout_multiplier",
+                wall_timeout_multiplier.to_string(),
+            ));
+            fields.push(("wall_timeout_platform", wall_timeout_platform.clone()));
+        }
+        e.record("step_start", &fields);
     }
 
     // ONE RING FOR THE STEP, not one per stream, and the distinction is the whole ceiling.
@@ -3821,6 +3843,13 @@ fn run_step(ctx: StepCtx) {
         if wall_budget > 0 {
             fields.push(("wall_limit_s", wall_budget.to_string()));
         }
+        if wall_timeout_multiplier != crate::model::DEFAULT_WALL_TIMEOUT_MULTIPLIER {
+            fields.push((
+                "wall_timeout_multiplier",
+                wall_timeout_multiplier.to_string(),
+            ));
+            fields.push(("wall_timeout_platform", wall_timeout_platform.clone()));
+        }
         fields.extend(cpu_journal_fields(cpu_stats.as_ref()));
         e.record("step_end", &fields);
     }
@@ -3955,7 +3984,12 @@ pub fn steps_violating_run_timeout(cfg: &DagConfig, run_timeout_s: i64) -> Vec<(
         .map(|s| {
             (
                 s.tag(),
-                resolved_wall_timeout(s, cfg.default_step_timeout, cfg.cpu_timeout_multiplier),
+                resolved_wall_timeout_with_multipliers(
+                    s,
+                    cfg.default_step_timeout,
+                    cfg.cpu_timeout_multiplier,
+                    cfg.wall_timeout_multiplier,
+                ),
             )
         })
         .filter(|(_, bound)| *bound >= run_timeout_s)

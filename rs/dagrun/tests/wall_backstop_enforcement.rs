@@ -33,7 +33,10 @@ const DERIVED_DAG: &str = r#"{"steps": [{"group": "g", "job": "derived",
 const DECLARED_HANG_DAG: &str = r#"{"steps": [{"group": "g", "job": "hang",
   "desc": "outlives its declared wall ceiling", "cmd": "sleep 30", "timeout": 2}]}"#;
 
-fn run_unboxed(name: &str, dag_text: &str) -> (Option<i32>, String, String) {
+const SCALED_HANG_DAG: &str = r#"{"steps": [{"group": "g", "job": "scaled-hang",
+  "desc": "outlives its scaled wall ceiling", "cmd": "sleep 30", "timeout": 4}]}"#;
+
+fn run_unboxed(name: &str, dag_text: &str, extra_args: &[&str]) -> (Option<i32>, String, String) {
     let bin = env!("CARGO_BIN_EXE_dagrun");
     let dir = std::env::temp_dir().join(format!(
         "dagrun_wall_backstop_{name}_{}",
@@ -47,15 +50,17 @@ fn run_unboxed(name: &str, dag_text: &str) -> (Option<i32>, String, String) {
     drop(f);
     let evidence = dir.join("evidence");
 
-    let output = Command::new(bin)
-        .args([
-            "run",
-            "--dag",
-            dag.to_str().unwrap(),
-            "-q",
-            "--no-profile",
-            "--unsafe-no-cgroups",
-        ])
+    let mut command = Command::new(bin);
+    command.args([
+        "run",
+        "--dag",
+        dag.to_str().unwrap(),
+        "-q",
+        "--no-profile",
+        "--unsafe-no-cgroups",
+    ]);
+    command.args(extra_args);
+    let output = command
         .env("DAGRUN_LOG_DIR", &evidence)
         .output()
         .expect("failed to spawn the built binary");
@@ -87,7 +92,7 @@ fn field(rec: &str, key: &str) -> String {
 
 #[test]
 fn a_step_declaring_only_a_cpu_budget_runs_under_the_derived_ceiling() {
-    let (code, journal, stderr) = run_unboxed("derived", DERIVED_DAG);
+    let (code, journal, stderr) = run_unboxed("derived", DERIVED_DAG, &[]);
     assert_eq!(code, Some(0), "the step should succeed:\n{stderr}");
     let end = record(&journal, "step_end");
     // 2700, named literally. 1800 here is the pre-derivation fallback still being enforced while
@@ -105,7 +110,7 @@ fn the_journalled_wall_ceiling_is_the_one_the_killer_enforces() {
     // The second link. Without it, leg one only shows that a number was written down; this shows
     // that the number written down under `wall_limit_s` is the deadline the step is reaped on.
     let started = std::time::Instant::now();
-    let (code, journal, stderr) = run_unboxed("declared", DECLARED_HANG_DAG);
+    let (code, journal, stderr) = run_unboxed("declared", DECLARED_HANG_DAG, &[]);
     let elapsed = started.elapsed().as_secs_f64();
     assert_eq!(code, Some(1), "a wall breach must fail the run:\n{stderr}");
 
@@ -123,4 +128,20 @@ fn the_journalled_wall_ceiling_is_the_one_the_killer_enforces() {
         "the step was reaped on its 2-second ceiling, not left to finish its 30-second sleep; \
          the whole run took {elapsed}s"
     );
+}
+
+#[test]
+fn a_scaled_wall_ceiling_is_the_one_the_killer_enforces() {
+    let (code, journal, stderr) = run_unboxed(
+        "scaled",
+        SCALED_HANG_DAG,
+        &["--wall-timeout-multiplier", "0.5"],
+    );
+    assert_eq!(code, Some(1), "a scaled wall breach must fail:\n{stderr}");
+    let breach = record(&journal, "step_timeout");
+    assert_eq!(field(breach, "limit_s"), "2", "{breach}");
+    assert_eq!(field(breach, "unit"), "wall_seconds", "{breach}");
+    let end = record(&journal, "step_end");
+    assert_eq!(field(end, "wall_limit_s"), "2", "{end}");
+    assert_eq!(field(end, "wall_timeout_multiplier"), "0.5", "{end}");
 }

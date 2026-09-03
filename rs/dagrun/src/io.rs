@@ -630,12 +630,14 @@ pub fn dag_from_yaml(text: &str) -> Result<DagConfig, DagJsonError> {
 /// did. `known_failures` is listed although this crate has no such field, because the key set is
 /// a shared contract: both language editions of the runner must refuse the same keys byte for
 /// byte, and a document is not more portable for being accepted by only one of them.
-const UNCARRIED_CONFIG_KEYS: [&str; 6] = [
+const UNCARRIED_CONFIG_KEYS: [&str; 8] = [
     "default_step_mem_cap_bytes",
     "default_step_cpu_count",
     "default_step_cpu_timeout",
     "cpu_timeout_multiplier",
     "cpu_timeout_platform",
+    "wall_timeout_multiplier",
+    "wall_timeout_platform",
     "known_failures",
 ];
 
@@ -1775,7 +1777,7 @@ steps:
 
     // ---------------------------------------------- uncarried top-level config keys (#21)
 
-    // The six keys the loader must refuse, WRITTEN OUT rather than read from the production
+    // The eight keys the loader must refuse, WRITTEN OUT rather than read from the production
     // constant.
     //
     // Iterating `UNCARRIED_CONFIG_KEYS` here was a tautology: deleting two names from the
@@ -1784,12 +1786,14 @@ steps:
     // literal list is the only kind that can fail. It is also the parity contract the other
     // edition's `test_config_carry.py` repeats verbatim, and the cross differential now drives
     // both binaries with each of these keys.
-    const REFUSED_KEYS: [&str; 6] = [
+    const REFUSED_KEYS: [&str; 8] = [
         "default_step_mem_cap_bytes",
         "default_step_cpu_count",
         "default_step_cpu_timeout",
         "cpu_timeout_multiplier",
         "cpu_timeout_platform",
+        "wall_timeout_multiplier",
+        "wall_timeout_platform",
         "known_failures",
     ];
 
@@ -1809,7 +1813,7 @@ steps:
     }
 
     #[test]
-    fn the_refused_key_set_is_exactly_the_six_names_the_contract_lists() {
+    fn the_refused_key_set_is_exactly_the_eight_names_the_contract_lists() {
         // The other direction, so the literal list cannot silently GROW either: a key added to
         // the production array without being added to the shared contract (and to the Python
         // edition, and to the cross differential) is a document that loads on one build and is

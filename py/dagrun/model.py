@@ -75,6 +75,17 @@ CPU_TIMEOUT_MULTIPLIER_ENV = "DAGRUN_CPU_TIMEOUT_MULTIPLIER"
 #: that set it. Empty when the multiplier is 1.0 or the caller supplied no label.
 CPU_TIMEOUT_PLATFORM_ENV = "DAGRUN_CPU_TIMEOUT_PLATFORM"
 
+#: Per-platform wall-budget multiplier. This is deliberately distinct from the CPU multiplier:
+#: CPU seconds compensate for core speed, while wall seconds compensate for scheduling and I/O
+#: latency. Conflating them makes a CPU calibration silently rewrite the hang backstop.
+DEFAULT_WALL_TIMEOUT_MULTIPLIER = 1.0
+
+#: Environment override for :data:`DEFAULT_WALL_TIMEOUT_MULTIPLIER`.
+WALL_TIMEOUT_MULTIPLIER_ENV = "DAGRUN_WALL_TIMEOUT_MULTIPLIER"
+
+#: Companion label naming the platform whose wall budgets are scaled.
+WALL_TIMEOUT_PLATFORM_ENV = "DAGRUN_WALL_TIMEOUT_PLATFORM"
+
 #: Default template for the inner-parallelism (concurrency) flag appended to a step's command
 #: when the step declares ``preferred_inner_jobs``. See :func:`render_jobs_flag`.
 DEFAULT_JOBS_FLAG = "-j"
@@ -596,6 +607,19 @@ def scale_cpu_timeout(canonical: int, multiplier: float) -> int:
     return max(1, math.floor(canonical * multiplier + 0.5))
 
 
+def scale_wall_timeout(canonical: int, multiplier: float) -> int:
+    """Apply a per-platform multiplier to a canonical wall budget.
+
+    This has the same integer rounding and live-budget floor as CPU scaling, but a distinct
+    multiplier because elapsed delay and CPU occupancy are separate machine effects.
+    """
+    if canonical <= 0:
+        return 0
+    if multiplier == DEFAULT_WALL_TIMEOUT_MULTIPLIER:
+        return canonical
+    return max(1, math.floor(canonical * multiplier + 0.5))
+
+
 def effective_cpu_timeout(
     step: Step,
     default_cpu_timeout: int,
@@ -611,7 +635,8 @@ def effective_cpu_timeout(
 def resolved_wall_timeout(
     step: Step,
     default_step_timeout: int,
-    multiplier: float = DEFAULT_CPU_TIMEOUT_MULTIPLIER,
+    cpu_multiplier: float = DEFAULT_CPU_TIMEOUT_MULTIPLIER,
+    wall_multiplier: float = DEFAULT_WALL_TIMEOUT_MULTIPLIER,
 ) -> int:
     """The wall-clock ceiling a step is actually run under, deriving one when none was declared.
 
@@ -633,7 +658,7 @@ def resolved_wall_timeout(
     one: a step declaring ``cpu_timeout: 900`` had a 1800 s wall ceiling that its own CPU guard
     could reach — at a 2.5x platform multiplier the enforced budget is 2250 s, ABOVE the wall
     bound — so the wall guard fired first and reported a hang where the truth was a slow machine.
-    Rule 3 lifts that step to 2700 s and restores the 3x margin.
+    Rule 3 lifts that step to 6750 s and restores the 3x margin.
 
     Two further choices in rule 3 are deliberate and were the open questions in the design:
 
@@ -649,15 +674,22 @@ def resolved_wall_timeout(
     enforced budget and start racing — firing FIRST on precisely the platform the multiplier was
     added for, and reporting a wall hang where the truth is a slow machine. Tracking the scaled
     budget keeps the 3x ratio wherever the multiplier goes.
+
+    Finally, ``wall_multiplier`` scales the resolved result from any of the four rules. It is a
+    separate machine policy because elapsed scheduling/I/O delay and consumed CPU are distinct.
     """
     if step.timeout > 0:
-        return step.timeout
-    if default_step_timeout > 0:
-        return default_step_timeout
-    if step.cpu_timeout > 0:
-        derived = WALL_CPU_BACKSTOP_FACTOR * scale_cpu_timeout(step.cpu_timeout, multiplier)
-        return max(derived, DEFAULT_STEP_TIMEOUT)
-    return DEFAULT_STEP_TIMEOUT
+        canonical = step.timeout
+    elif default_step_timeout > 0:
+        canonical = default_step_timeout
+    elif step.cpu_timeout > 0:
+        canonical = max(
+            WALL_CPU_BACKSTOP_FACTOR * scale_cpu_timeout(step.cpu_timeout, cpu_multiplier),
+            DEFAULT_STEP_TIMEOUT,
+        )
+    else:
+        canonical = DEFAULT_STEP_TIMEOUT
+    return scale_wall_timeout(canonical, wall_multiplier)
 
 
 def resolve_cpu_timeout_multiplier(
@@ -688,6 +720,33 @@ def resolve_cpu_timeout_multiplier(
         ) from exc
     if value <= 0:
         raise ValueError(f"{CPU_TIMEOUT_MULTIPLIER_ENV}={raw!r} must be > 0")
+    return value, label
+
+
+def resolve_wall_timeout_multiplier(
+    explicit: float | None = None,
+    env: Mapping[str, str] | None = None,
+) -> tuple[float, str]:
+    """Resolve the independent platform wall-budget multiplier and label."""
+    environ = os.environ if env is None else env
+    label = (environ.get(WALL_TIMEOUT_PLATFORM_ENV) or "").strip()
+    if explicit is not None:
+        if not math.isfinite(explicit) or explicit <= 0:
+            raise ValueError(f"wall-timeout multiplier must be finite and > 0, got {explicit}")
+        return explicit, label
+    raw = (environ.get(WALL_TIMEOUT_MULTIPLIER_ENV) or "").strip()
+    if not raw:
+        return DEFAULT_WALL_TIMEOUT_MULTIPLIER, label
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"{WALL_TIMEOUT_MULTIPLIER_ENV}={raw!r} is not a number"
+        ) from exc
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(
+            f"{WALL_TIMEOUT_MULTIPLIER_ENV}={raw!r} must be finite and > 0"
+        )
     return value, label
 
 
@@ -827,6 +886,10 @@ class DagConfig:
     cpu_timeout_multiplier: float = DEFAULT_CPU_TIMEOUT_MULTIPLIER
     # Free-form platform label reported alongside the multiplier in a breach message.
     cpu_timeout_platform: str = ""
+    # Independent execution-time multiplier over the resolved wall budget for THIS platform.
+    wall_timeout_multiplier: float = DEFAULT_WALL_TIMEOUT_MULTIPLIER
+    # Free-form platform label reported when wall scaling is enabled.
+    wall_timeout_platform: str = ""
     write_domain_policy: WriteDomainPolicy = field(default_factory=WriteDomainPolicy)
 
     def by_tag(self) -> dict[str, Step]:
@@ -869,6 +932,8 @@ DAG_CONFIG_FIELDS: tuple[str, ...] = (
     "known_failures",
     "cpu_timeout_multiplier",
     "cpu_timeout_platform",
+    "wall_timeout_multiplier",
+    "wall_timeout_platform",
     "write_domain_policy",
 )
 
@@ -956,6 +1021,8 @@ def dag_config_carry_diff(frm: DagConfig, to: DagConfig) -> list[str]:
         ("known_failures", tuple(sorted(frm.known_failures)), tuple(sorted(to.known_failures))),
         ("cpu_timeout_multiplier", repr(frm.cpu_timeout_multiplier), repr(to.cpu_timeout_multiplier)),
         ("cpu_timeout_platform", frm.cpu_timeout_platform, to.cpu_timeout_platform),
+        ("wall_timeout_multiplier", repr(frm.wall_timeout_multiplier), repr(to.wall_timeout_multiplier)),
+        ("wall_timeout_platform", frm.wall_timeout_platform, to.wall_timeout_platform),
         (
             "write_domain_policy",
             _render_policy(frm.write_domain_policy),

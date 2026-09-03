@@ -408,6 +408,12 @@ fn run_help(c: &Palette) -> String {
                 "scale every step's canonical cpu_timeout by FACTOR on THIS platform \
                  (default 1.0 = no scaling); also $DAGRUN_CPU_TIMEOUT_MULTIPLIER",
             ),
+            (
+                "--wall-timeout-multiplier FACTOR",
+                "scale every step's resolved wall timeout by FACTOR on THIS platform, \
+                 independently of CPU scaling (default 1.0); also \
+                 $DAGRUN_WALL_TIMEOUT_MULTIPLIER",
+            ),
             ("-v", "stream child output (repeatable)"),
             ("-q, --quiet", "quieter output"),
             ("-h, --help", "show this help and exit"),
@@ -1059,6 +1065,7 @@ struct RunArgs {
     allow_unwise_nest_dagruns: bool,
     small_default_cap: bool,
     cpu_timeout_multiplier: Option<f64>,
+    wall_timeout_multiplier: Option<f64>,
     verbosity: i64,
     quiet: bool,
 }
@@ -1126,6 +1133,7 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
         allow_unwise_nest_dagruns: false,
         small_default_cap: false,
         cpu_timeout_multiplier: None,
+        wall_timeout_multiplier: None,
         verbosity: 1,
         quiet: false,
     };
@@ -1287,6 +1295,13 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
             "--cpu-timeout-multiplier" => {
                 let v = take_value(inline, &mut i)?;
                 a.cpu_timeout_multiplier = Some(
+                    v.parse::<f64>()
+                        .map_err(|_| format!("{key}: invalid float value: '{v}'"))?,
+                );
+            }
+            "--wall-timeout-multiplier" => {
+                let v = take_value(inline, &mut i)?;
+                a.wall_timeout_multiplier = Some(
                     v.parse::<f64>()
                         .map_err(|_| format!("{key}: invalid float value: '{v}'"))?,
                 );
@@ -4330,6 +4345,27 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
              every step's canonical cpu_timeout is scaled by it for enforcement on this platform"
         );
     }
+    let (wall_multiplier, wall_platform) =
+        match crate::model::resolve_wall_timeout_multiplier(a.wall_timeout_multiplier) {
+            Ok(pair) => pair,
+            Err(e) => {
+                eprintln!("{PROG}: error: {e}");
+                return 2;
+            }
+        };
+    if wall_multiplier != crate::model::DEFAULT_WALL_TIMEOUT_MULTIPLIER {
+        applied.wall_timeout_multiplier = wall_multiplier;
+        applied.wall_timeout_platform = wall_platform.clone();
+        let label = if wall_platform.is_empty() {
+            String::new()
+        } else {
+            format!(" ({wall_platform})")
+        };
+        eprintln!(
+            "{PROG}: per-platform wall-budget multiplier x{wall_multiplier}{label} in effect; \
+             every step's resolved wall timeout is scaled by it for enforcement on this platform"
+        );
+    }
     let cfg: &DagConfig = &applied;
     if a.show_plan {
         print!("{}", plan_to_text(&plan));
@@ -5275,6 +5311,8 @@ mod tests {
         cfg.default_step_cpu_timeout = 120;
         cfg.cpu_timeout_multiplier = 2.0;
         cfg.cpu_timeout_platform = "github-hosted".to_string();
+        cfg.wall_timeout_multiplier = 1.5;
+        cfg.wall_timeout_platform = "loaded-host".to_string();
 
         let expanded = expand_stress(&cfg, 3);
         let named: Vec<String> = crate::model::dag_config_carry_diff(&cfg, &expanded)
@@ -5285,6 +5323,19 @@ mod tests {
         assert_eq!(expanded.steps.len(), 6);
         assert_eq!(expanded.default_step_timeout, 600);
         assert_eq!(expanded.cpu_timeout_multiplier, 2.0);
+        assert_eq!(expanded.wall_timeout_multiplier, 1.5);
+    }
+
+    #[test]
+    fn run_parser_accepts_the_independent_wall_multiplier() {
+        let args = parse_run_args(&[
+            "--dag".into(),
+            "pipeline.yaml".into(),
+            "--wall-timeout-multiplier".into(),
+            "1.75".into(),
+        ])
+        .unwrap();
+        assert_eq!(args.wall_timeout_multiplier, Some(1.75));
     }
 
     #[test]

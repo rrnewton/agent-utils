@@ -501,6 +501,8 @@ UNCARRIED_CONFIG_KEYS: tuple[str, ...] = (
     "default_step_cpu_timeout",
     "cpu_timeout_multiplier",
     "cpu_timeout_platform",
+    "wall_timeout_multiplier",
+    "wall_timeout_platform",
     "known_failures",
 )
 

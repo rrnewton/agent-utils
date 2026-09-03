@@ -82,6 +82,17 @@ pub const CPU_TIMEOUT_MULTIPLIER_ENV: &str = "DAGRUN_CPU_TIMEOUT_MULTIPLIER";
 /// message.
 pub const CPU_TIMEOUT_PLATFORM_ENV: &str = "DAGRUN_CPU_TIMEOUT_PLATFORM";
 
+/// Per-platform wall-budget multiplier. This is deliberately distinct from the CPU multiplier:
+/// CPU seconds compensate for core speed, while wall seconds compensate for scheduling and I/O
+/// latency. Conflating them makes a CPU calibration silently rewrite the hang backstop.
+pub const DEFAULT_WALL_TIMEOUT_MULTIPLIER: f64 = 1.0;
+
+/// Environment override for [`DEFAULT_WALL_TIMEOUT_MULTIPLIER`].
+pub const WALL_TIMEOUT_MULTIPLIER_ENV: &str = "DAGRUN_WALL_TIMEOUT_MULTIPLIER";
+
+/// Companion label naming the platform whose wall budgets are scaled.
+pub const WALL_TIMEOUT_PLATFORM_ENV: &str = "DAGRUN_WALL_TIMEOUT_PLATFORM";
+
 /// How a step uses the machine, used for scheduling decisions.
 ///
 /// The serde/string values (`"cpu-bound"`, `"latency-bound"`, `"light"`) are load-bearing:
@@ -754,6 +765,21 @@ pub fn scale_cpu_timeout(canonical: i64, multiplier: f64) -> i64 {
     scaled.max(1)
 }
 
+/// Apply a per-platform multiplier to a canonical wall budget.
+///
+/// Uses the same whole-second rounding and live-budget floor as CPU scaling, but a distinct
+/// multiplier because elapsed delay and CPU occupancy are separate machine effects.
+pub fn scale_wall_timeout(canonical: i64, multiplier: f64) -> i64 {
+    if canonical <= 0 {
+        return 0;
+    }
+    if multiplier == DEFAULT_WALL_TIMEOUT_MULTIPLIER {
+        return canonical;
+    }
+    let scaled = (canonical as f64 * multiplier).round() as i64;
+    scaled.max(1)
+}
+
 /// CPU-time budget actually ENFORCED for a step on this platform: the canonical budget scaled by
 /// the platform multiplier. With the default 1.0 multiplier this is exactly the canonical budget.
 pub fn effective_cpu_timeout(step: &Step, default_cpu_timeout: i64, multiplier: f64) -> i64 {
@@ -780,7 +806,7 @@ pub fn effective_cpu_timeout(step: &Step, default_cpu_timeout: i64, multiplier: 
 /// `cpu_timeout: 900` had a 1800 s wall ceiling that its own CPU guard could reach — at a 2.5x
 /// platform multiplier the enforced budget is 2250 s, ABOVE the wall bound — so the wall guard
 /// fired first and reported a hang where the truth was a slow machine. Rule 3 lifts that step to
-/// 2700 s and restores the 3x margin.
+/// 6750 s and restores the 3x margin.
 ///
 /// Two further choices in rule 3 are deliberate and were the open questions in the design:
 ///
@@ -796,18 +822,41 @@ pub fn effective_cpu_timeout(step: &Step, default_cpu_timeout: i64, multiplier: 
 /// enforced budget and start racing — firing FIRST on precisely the platform the multiplier was
 /// added for, and reporting a wall hang where the truth is a slow machine. Tracking the scaled
 /// budget keeps the 3x ratio wherever the multiplier goes.
+///
+/// A separate wall multiplier is available through [`resolved_wall_timeout_with_multipliers`].
+/// It scales the resolved result from any rule without conflating elapsed scheduling/I/O delay
+/// with consumed CPU time.
 pub fn resolved_wall_timeout(step: &Step, default_step_timeout: i64, multiplier: f64) -> i64 {
-    if step.timeout > 0 {
-        return step.timeout;
-    }
-    if default_step_timeout > 0 {
-        return default_step_timeout;
-    }
-    if step.cpu_timeout > 0 {
-        let derived = WALL_CPU_BACKSTOP_FACTOR * scale_cpu_timeout(step.cpu_timeout, multiplier);
-        return derived.max(DEFAULT_STEP_TIMEOUT);
-    }
-    DEFAULT_STEP_TIMEOUT
+    resolved_wall_timeout_with_multipliers(
+        step,
+        default_step_timeout,
+        multiplier,
+        DEFAULT_WALL_TIMEOUT_MULTIPLIER,
+    )
+}
+
+/// Resolve and scale a wall-clock ceiling with independent CPU and wall platform policies.
+///
+/// `cpu_multiplier` participates only when a missing wall declaration must be derived from an
+/// explicit CPU budget. `wall_multiplier` then scales the resolved wall bound in every case.
+pub fn resolved_wall_timeout_with_multipliers(
+    step: &Step,
+    default_step_timeout: i64,
+    cpu_multiplier: f64,
+    wall_multiplier: f64,
+) -> i64 {
+    let canonical = if step.timeout > 0 {
+        step.timeout
+    } else if default_step_timeout > 0 {
+        default_step_timeout
+    } else if step.cpu_timeout > 0 {
+        let derived =
+            WALL_CPU_BACKSTOP_FACTOR * scale_cpu_timeout(step.cpu_timeout, cpu_multiplier);
+        derived.max(DEFAULT_STEP_TIMEOUT)
+    } else {
+        DEFAULT_STEP_TIMEOUT
+    };
+    scale_wall_timeout(canonical, wall_multiplier)
 }
 
 /// Resolve the platform CPU-budget multiplier and its label from an explicit value then the
@@ -834,6 +883,36 @@ pub fn resolve_cpu_timeout_multiplier(explicit: Option<f64>) -> Result<(f64, Str
         .map_err(|_| format!("{CPU_TIMEOUT_MULTIPLIER_ENV}={raw:?} is not a number"))?;
     if value <= 0.0 {
         return Err(format!("{CPU_TIMEOUT_MULTIPLIER_ENV}={raw:?} must be > 0"));
+    }
+    Ok((value, label))
+}
+
+/// Resolve the independent platform wall-budget multiplier and its label.
+pub fn resolve_wall_timeout_multiplier(explicit: Option<f64>) -> Result<(f64, String), String> {
+    let label = std::env::var(WALL_TIMEOUT_PLATFORM_ENV)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if let Some(value) = explicit {
+        if !value.is_finite() || value <= 0.0 {
+            return Err(format!(
+                "wall-timeout multiplier must be finite and > 0, got {value}"
+            ));
+        }
+        return Ok((value, label));
+    }
+    let raw = std::env::var(WALL_TIMEOUT_MULTIPLIER_ENV).unwrap_or_default();
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok((DEFAULT_WALL_TIMEOUT_MULTIPLIER, label));
+    }
+    let value: f64 = raw
+        .parse()
+        .map_err(|_| format!("{WALL_TIMEOUT_MULTIPLIER_ENV}={raw:?} is not a number"))?;
+    if !value.is_finite() || value <= 0.0 {
+        return Err(format!(
+            "{WALL_TIMEOUT_MULTIPLIER_ENV}={raw:?} must be finite and > 0"
+        ));
     }
     Ok((value, label))
 }
@@ -1007,6 +1086,11 @@ pub struct DagConfig {
     pub cpu_timeout_multiplier: f64,
     /// Free-form platform label reported alongside the multiplier in a breach message.
     pub cpu_timeout_platform: String,
+    /// Execution-time multiplier over the resolved wall budget for THIS platform. Independent
+    /// of CPU scaling because host scheduling/I/O delay and core speed are distinct measurements.
+    pub wall_timeout_multiplier: f64,
+    /// Free-form platform label reported when wall scaling is enabled.
+    pub wall_timeout_platform: String,
     /// Fail-closed write-domain policy. Default is disabled for generic DAGs that do not opt in.
     pub write_domain_policy: WriteDomainPolicy,
 }
@@ -1032,6 +1116,8 @@ impl Default for DagConfig {
             default_step_cpu_timeout: DEFAULT_SMALL_CPU_TIMEOUT,
             cpu_timeout_multiplier: DEFAULT_CPU_TIMEOUT_MULTIPLIER,
             cpu_timeout_platform: String::new(),
+            wall_timeout_multiplier: DEFAULT_WALL_TIMEOUT_MULTIPLIER,
+            wall_timeout_platform: String::new(),
             write_domain_policy: WriteDomainPolicy::default(),
         }
     }
@@ -1063,7 +1149,7 @@ impl DagConfig {
 /// Written down so a reader can see the whole surface at once; the compiler holds it honest,
 /// because [`dag_config_carry_diff`] destructures `DagConfig` exhaustively (no `..`) and a new
 /// field therefore fails to build until it is given a comparison here too.
-pub const DAG_CONFIG_FIELDS: [&str; 15] = [
+pub const DAG_CONFIG_FIELDS: [&str; 17] = [
     "steps",
     "description",
     "resource_caps",
@@ -1078,6 +1164,8 @@ pub const DAG_CONFIG_FIELDS: [&str; 15] = [
     "default_step_cpu_timeout",
     "cpu_timeout_multiplier",
     "cpu_timeout_platform",
+    "wall_timeout_multiplier",
+    "wall_timeout_platform",
     "write_domain_policy",
 ];
 
@@ -1115,6 +1203,8 @@ pub fn dag_config_carry_diff(from: &DagConfig, to: &DagConfig) -> Vec<String> {
         default_step_cpu_timeout: from_default_step_cpu_timeout,
         cpu_timeout_multiplier: from_cpu_timeout_multiplier,
         cpu_timeout_platform: from_cpu_timeout_platform,
+        wall_timeout_multiplier: from_wall_timeout_multiplier,
+        wall_timeout_platform: from_wall_timeout_platform,
         write_domain_policy: from_write_domain_policy,
     } = from;
     let DagConfig {
@@ -1132,6 +1222,8 @@ pub fn dag_config_carry_diff(from: &DagConfig, to: &DagConfig) -> Vec<String> {
         default_step_cpu_timeout: to_default_step_cpu_timeout,
         cpu_timeout_multiplier: to_cpu_timeout_multiplier,
         cpu_timeout_platform: to_cpu_timeout_platform,
+        wall_timeout_multiplier: to_wall_timeout_multiplier,
+        wall_timeout_platform: to_wall_timeout_platform,
         write_domain_policy: to_write_domain_policy,
     } = to;
 
@@ -1209,6 +1301,16 @@ pub fn dag_config_carry_diff(from: &DagConfig, to: &DagConfig) -> Vec<String> {
         "cpu_timeout_platform",
         from_cpu_timeout_platform.clone(),
         to_cpu_timeout_platform.clone(),
+    );
+    note(
+        "wall_timeout_multiplier",
+        from_wall_timeout_multiplier.to_string(),
+        to_wall_timeout_multiplier.to_string(),
+    );
+    note(
+        "wall_timeout_platform",
+        from_wall_timeout_platform.clone(),
+        to_wall_timeout_platform.clone(),
     );
     note(
         "write_domain_policy",
@@ -2058,6 +2160,8 @@ mod cpu_timeout_multiplier_tests {
         let cfg = DagConfig::default();
         assert_eq!(cfg.cpu_timeout_multiplier, DEFAULT_CPU_TIMEOUT_MULTIPLIER);
         assert_eq!(cfg.cpu_timeout_platform, "");
+        assert_eq!(cfg.wall_timeout_multiplier, DEFAULT_WALL_TIMEOUT_MULTIPLIER);
+        assert_eq!(cfg.wall_timeout_platform, "");
         let s = step(30);
         assert_eq!(canonical_cpu_timeout(&s, DEFAULT_SMALL_CPU_TIMEOUT), 30);
         assert_eq!(
@@ -2191,6 +2295,43 @@ mod cpu_timeout_multiplier_tests {
         assert!(resolve_cpu_timeout_multiplier(Some(-1.0)).is_err());
         assert_eq!(resolve_cpu_timeout_multiplier(Some(1.5)).unwrap().0, 1.5);
     }
+
+    #[test]
+    fn wall_multiplier_is_independent_and_rounds_half_up() {
+        let mut declared = step(22);
+        declared.timeout = 57;
+        assert_eq!(
+            resolved_wall_timeout_with_multipliers(&declared, 0, 3.0, 1.0),
+            57
+        );
+        assert_eq!(
+            resolved_wall_timeout_with_multipliers(&declared, 0, 1.0, 2.0),
+            114
+        );
+        assert_eq!(scale_wall_timeout(57, 1.5), 86);
+        assert_eq!(scale_wall_timeout(7, 1.5), 11);
+        assert_eq!(scale_wall_timeout(1, 0.01), 1);
+        assert_eq!(scale_wall_timeout(0, 2.0), 0);
+    }
+
+    #[test]
+    fn cpu_derived_wall_bound_composes_both_machine_effects() {
+        let mut derived = step(700);
+        derived.timeout = 0;
+        assert_eq!(
+            resolved_wall_timeout_with_multipliers(&derived, 0, 2.0, 1.5),
+            6300
+        );
+    }
+
+    #[test]
+    fn invalid_explicit_wall_multiplier_is_refused() {
+        assert!(resolve_wall_timeout_multiplier(Some(0.0)).is_err());
+        assert!(resolve_wall_timeout_multiplier(Some(-1.0)).is_err());
+        assert!(resolve_wall_timeout_multiplier(Some(f64::NAN)).is_err());
+        assert!(resolve_wall_timeout_multiplier(Some(f64::INFINITY)).is_err());
+        assert_eq!(resolve_wall_timeout_multiplier(Some(1.5)).unwrap().0, 1.5);
+    }
 }
 
 /// The CARRY ASSERTION: a rebuilt `DagConfig` must be provably the same configuration.
@@ -2255,6 +2396,8 @@ mod carry_tests {
             default_step_cpu_timeout: 120,
             cpu_timeout_multiplier: 2.0,
             cpu_timeout_platform: "github-hosted".to_string(),
+            wall_timeout_multiplier: 1.5,
+            wall_timeout_platform: "loaded-host".to_string(),
             write_domain_policy: policy,
         }
     }

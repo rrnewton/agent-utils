@@ -68,6 +68,8 @@ def configured() -> DagConfig:
         known_failures=frozenset({"g.j"}),
         cpu_timeout_multiplier=2.0,
         cpu_timeout_platform="github-hosted",
+        wall_timeout_multiplier=1.5,
+        wall_timeout_platform="loaded-host",
         write_domain_policy=WriteDomainPolicy(
             require_explicit=True, allowed_domains=frozenset({"shared-cargo-target"})
         ),
@@ -142,6 +144,7 @@ def test_the_stress_expansion_carries_the_whole_lane_policy_forward() -> None:
     assert len(expanded.steps) == 3
     assert expanded.default_step_timeout == 600
     assert expanded.cpu_timeout_multiplier == 2.0
+    assert expanded.wall_timeout_multiplier == 1.5
 
 
 def test_an_absent_default_cap_is_reported_as_absent_not_as_zero() -> None:
@@ -175,7 +178,7 @@ def test_the_field_checklist_is_exactly_the_dataclass() -> None:
 # --------------------------------------------- uncarried top-level config keys (#21)
 
 
-#: The six keys the loader must refuse, WRITTEN OUT rather than read from the production
+#: The eight keys the loader must refuse, WRITTEN OUT rather than read from the production
 #: constant.
 #:
 #: Parametrising over :data:`UNCARRIED_CONFIG_KEYS` was a tautology: deleting two names from the
@@ -191,6 +194,8 @@ REFUSED_KEYS = (
     "default_step_cpu_timeout",
     "cpu_timeout_multiplier",
     "cpu_timeout_platform",
+    "wall_timeout_multiplier",
+    "wall_timeout_platform",
     "known_failures",
 )
 
@@ -204,7 +209,7 @@ def test_a_top_level_key_the_format_cannot_carry_is_refused_by_name(key: str) ->
     assert "SILENTLY replaced by a default" in message
 
 
-def test_the_refused_key_set_is_exactly_the_six_names_the_contract_lists() -> None:
+def test_the_refused_key_set_is_exactly_the_eight_names_the_contract_lists() -> None:
     # The other direction, so the literal list cannot silently GROW either: a key added to the
     # production tuple without being added to the shared contract (and to the Rust edition, and
     # to the cross differential) is a document that loads on one build and is rejected on the

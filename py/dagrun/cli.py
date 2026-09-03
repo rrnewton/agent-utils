@@ -69,6 +69,7 @@ from dagrun.model import (
     CPU_TIMEOUT_MULTIPLIER_ENV,
     CPU_TIMEOUT_PLATFORM_ENV,
     DEFAULT_CPU_TIMEOUT_MULTIPLIER,
+    DEFAULT_WALL_TIMEOUT_MULTIPLIER,
     DEFAULT_SMALL_CPU_COUNT,
     DEFAULT_SMALL_CPU_TIMEOUT,
     DEFAULT_SMALL_MEM_CAP_BYTES,
@@ -83,6 +84,9 @@ from dagrun.model import (
     effective_cpu_count,
     env_with_inner_jobs,
     resolve_cpu_timeout_multiplier,
+    resolve_wall_timeout_multiplier,
+    WALL_TIMEOUT_MULTIPLIER_ENV,
+    WALL_TIMEOUT_PLATFORM_ENV,
     step_classification,
     step_width_is_resizable,
 )
@@ -703,6 +707,16 @@ def build_parser() -> argparse.ArgumentParser:
         "adapts enforcement per platform instead of maintaining a second, drifting table of "
         f"pre-multiplied numbers. Also settable per-lane via ${CPU_TIMEOUT_MULTIPLIER_ENV} "
         f"(and ${CPU_TIMEOUT_PLATFORM_ENV} for the label named in breach messages).",
+    )
+    run_p.add_argument(
+        "--wall-timeout-multiplier",
+        type=float,
+        default=None,
+        metavar="FACTOR",
+        help="scale every step's resolved wall timeout by FACTOR on THIS platform (default "
+        "1.0 = no scaling). This is independent of CPU scaling because scheduling and I/O "
+        f"delay are separate from core speed. Also settable via ${WALL_TIMEOUT_MULTIPLIER_ENV} "
+        f"(and ${WALL_TIMEOUT_PLATFORM_ENV} for the platform label).",
     )
     run_p.add_argument("-v", dest="verbosity", action="count", default=1, help="-v: stream child output")
     run_p.add_argument("-q", "--quiet", action="store_true", help="quieter output")
@@ -4018,6 +4032,25 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
         print(
             f"{PROG}: per-platform CPU-budget multiplier x{cpu_multiplier:g}{label} in effect; "
             "every step's canonical cpu_timeout is scaled by it for enforcement on this platform",
+            file=sys.stderr,
+        )
+    try:
+        wall_multiplier, wall_platform = resolve_wall_timeout_multiplier(
+            getattr(ns, "wall_timeout_multiplier", None)
+        )
+    except ValueError as exc:
+        print(f"{PROG}: error: {exc}", file=sys.stderr)
+        return 2
+    if wall_multiplier != DEFAULT_WALL_TIMEOUT_MULTIPLIER:
+        cfg = dataclasses.replace(
+            cfg,
+            wall_timeout_multiplier=wall_multiplier,
+            wall_timeout_platform=wall_platform,
+        )
+        label = f" ({wall_platform})" if wall_platform else ""
+        print(
+            f"{PROG}: per-platform wall-budget multiplier x{wall_multiplier:g}{label} in effect; "
+            "every step's resolved wall timeout is scaled by it for enforcement on this platform",
             file=sys.stderr,
         )
     if bool(ns.show_plan):

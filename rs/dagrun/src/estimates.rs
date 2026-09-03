@@ -2922,6 +2922,8 @@ mod tests {
             default_step_cpu_timeout: 120,
             cpu_timeout_multiplier: 2.0,
             cpu_timeout_platform: "github-hosted".to_string(),
+            wall_timeout_multiplier: 1.5,
+            wall_timeout_platform: "loaded-host".to_string(),
             write_domain_policy: Default::default(),
         };
         let empty: HashMap<String, StepSamples> = HashMap::new();

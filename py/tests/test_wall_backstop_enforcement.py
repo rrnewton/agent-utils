@@ -32,12 +32,21 @@ from dagrun.attribution import LOG_DIR_ENV
 from dagrun.cgroup import NoopCgroups
 
 
-def _run(log_dir: Path, step: Step) -> list[dict[str, str]]:
+def _run(
+    log_dir: Path, step: Step, *, wall_timeout_multiplier: float = 1.0
+) -> list[dict[str, str]]:
     previous = os.environ.get(LOG_DIR_ENV)
     os.environ[LOG_DIR_ENV] = str(log_dir)
     try:
         Runner(
-            DagConfig(steps=(step,)), max_steps=1, max_cpus=1, cgroups=NoopCgroups()
+            DagConfig(
+                steps=(step,),
+                wall_timeout_multiplier=wall_timeout_multiplier,
+                wall_timeout_platform="test-host" if wall_timeout_multiplier != 1.0 else "",
+            ),
+            max_steps=1,
+            max_cpus=1,
+            cgroups=NoopCgroups(),
         ).run()
     finally:
         if previous is None:
@@ -93,3 +102,16 @@ def test_the_journalled_wall_ceiling_is_the_one_the_killer_enforces(tmp_path: Pa
         "the step was reaped on its 2-second ceiling, not left to finish its 30-second sleep; "
         f"the run took {elapsed}s"
     )
+
+
+def test_scaled_wall_ceiling_is_the_one_the_killer_enforces(tmp_path: Path) -> None:
+    step = Step("g", "scaled-hang", "outlives its scaled ceiling", "sleep 30", timeout=4)
+    records = _run(tmp_path / "scaled", step, wall_timeout_multiplier=0.5)
+
+    breach = _one(records, "step_timeout")
+    assert breach["limit_s"] == "2"
+    assert breach["unit"] == "wall_seconds"
+    end = _one(records, "step_end")
+    assert end["wall_limit_s"] == "2"
+    assert end["wall_timeout_multiplier"] == "0.5"
+    assert end["wall_timeout_platform"] == "test-host"
