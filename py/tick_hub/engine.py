@@ -17,7 +17,7 @@ deterministic given ``now`` and the injected probes.
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence, Set as AbstractSet
 from dataclasses import dataclass
 from enum import Enum
 
@@ -334,17 +334,34 @@ def run_tick(
     age_probe: FileAgeProbe,
     current_tick_min: int | None = None,
     report_pending: bool = False,
+    emit: Callable[[str], None] | None = None,
 ) -> TickResult:
     """Run one tick and return the emitted lines plus the advanced fired-state (pure w.r.t. I/O,
-    which is confined to the injected ``gate_runner`` / ``age_probe``)."""
+    which is confined to the injected ``gate_runner`` / ``age_probe``).
+
+    ``emit`` receives each report line at the moment it is produced, in the same
+    order as ``TickResult.lines``, and is the difference between a tick that is
+    stopped partway reporting what it had already found and one that reports
+    nothing at all. A caller that runs the tick under an external time bound --
+    a service manager, a supervisor, an agent runtime -- gets no output when the
+    bound fires unless the lines have already left this function, because the
+    return value never arrives. Passing ``emit`` makes an interrupted run
+    self-describing; omitting it keeps the previous collect-then-return
+    behaviour exactly.
+    """
     lines: list[str] = []
     actions = 0
 
+    def record(line: str) -> None:
+        lines.append(line)
+        if emit is not None:
+            emit(line)
+
     for hc in config.health_checks:
-        lines.append(evaluate_health(hc, age_probe, now))
+        record(evaluate_health(hc, age_probe, now))
 
     for line in state_lines(state, current_tick_min):
-        lines.append(line)
+        record(line)
         if line.startswith("ACTION: "):
             actions += 1
 
@@ -353,7 +370,7 @@ def run_tick(
         new_fired, {reminder.name for reminder in config.reminders}
     )
     if state.enabled:
-        evaluations: list[_ReminderEvaluation] = []
+        due: list[Reminder] = []
         for rem in config.reminders:
             if not is_due(rem.name, rem.cadence_secs, now, fired):
                 continue
@@ -368,127 +385,168 @@ def run_tick(
                         for flag in rem.requires_flags
                         if not state.flags.get(flag, False)
                     )
-                    lines.append(format_suppressed(rem.name, missing))
+                    record(format_suppressed(rem.name, missing))
                 continue
+            due.append(rem)
+
+        # Whether a gate's report line is final the moment that gate finishes.
+        # It is not, in general: a QUIET gate is downgraded when a reminder it
+        # depends on could not determine anything, and that reminder may appear
+        # LATER in the file, so its verdict is not yet known. When no due
+        # reminder declares a dependency -- which is every configuration that
+        # uses none -- there is nothing that can downgrade a line afterwards,
+        # and holding the whole report back until the last gate finishes buys
+        # nothing while costing everything if the run is stopped first.
+        stream_gate_lines = emit is not None and not any(rem.depends_on for rem in due)
+
+        no_dependencies: set[str] = set()
+        evaluations: list[_ReminderEvaluation] = []
+        for rem in due:
             outcome, captured, error = _eval_gate(rem.gate, gate_runner)
-            evaluations.append(_ReminderEvaluation(rem, outcome, captured, error))
+            evaluation = _ReminderEvaluation(rem, outcome, captured, error)
+            evaluations.append(evaluation)
+            if stream_gate_lines:
+                actions += _render_evaluation(
+                    evaluation, no_dependencies, new_fired, now, record, report_pending
+                )
+        if not stream_gate_lines:
+            actions += _render_after_dependency_pass(
+                evaluations, new_fired, now, record, report_pending
+            )
 
-        # Evaluate every due gate before interpreting dependency edges. A
-        # dependency never decides whether another gate runs, and config order
-        # therefore cannot turn a forward reference into a false clean.
-        unavailable = {
-            evaluation.reminder.name
-            for evaluation in evaluations
-            if evaluation.error is None
-            and evaluation.outcome is GateOutcome.NO_RESULT
-        }
-        changed = True
-        while changed:
-            changed = False
-            for evaluation in evaluations:
-                if evaluation.error is not None or evaluation.outcome is not GateOutcome.QUIET:
-                    continue
-                if evaluation.reminder.name in unavailable:
-                    continue
-                if any(
-                    dependency in unavailable
-                    for dependency in evaluation.reminder.depends_on
-                ):
-                    unavailable.add(evaluation.reminder.name)
-                    changed = True
-
-        for evaluation in evaluations:
-            rem = evaluation.reminder
-            outcome = evaluation.outcome
-            captured = evaluation.captured
-            error = evaluation.error
-            if error is not None:
-                _clear_render_failure_state(new_fired, rem.name)
-                # The check did not complete. Keep the ERROR for full diagnostic
-                # readers and emit a counted NO-SIGNAL action because production
-                # consumers may intentionally forward ACTION lines only. Retry
-                # next tick by leaving the cadence unconsumed.
-                lines.append(format_error(f"reminder {rem.name}: {error}"))
-                lines.append(
-                    _no_signal_action(rem, "gate-execution-error", detail=error)
-                )
-                actions += 1
-                continue
-            if outcome is GateOutcome.NO_RESULT:
-                _clear_render_failure_state(new_fired, rem.name)
-                # A legitimate verdict, not a reporting fault: the gate ran and
-                # said it could not tell. Emitted as BOTH the explicit
-                # NO_RESULT diagnostic and a counted ACTION, because
-                # ACTION-only consumers would otherwise see nothing -- and
-                # "consumer sees nothing" is precisely the failure this code
-                # exists to remove. Cadence is left unconsumed so it
-                # re-announces every tick until it can determine something.
-                detail = captured.get("summary", "")
-                lines.append(format_no_result(rem.name, detail))
-                lines.append(
-                    _no_signal_action(rem, "could-not-determine", detail=detail)
-                )
-                actions += 1
-                continue
-            if outcome is GateOutcome.QUIET:
-                _clear_render_failure_state(new_fired, rem.name)
-                unavailable_dependencies = tuple(
-                    dependency
-                    for dependency in rem.depends_on
-                    if dependency in unavailable
-                )
-                if unavailable_dependencies:
-                    lines.append(format_unevaluable(rem.name, unavailable_dependencies))
-                    lines.append(
-                        _no_signal_action(
-                            rem,
-                            "dependency-could-not-determine",
-                            detail=",".join(unavailable_dependencies),
-                        )
-                    )
-                    actions += 1
-                    continue
-                if report_pending:
-                    lines.append(format_clean(rem.name))
-                new_fired[rem.name] = now  # the check ran; the cadence clock resets
-                continue
-            try:
-                line = render_emit(rem.emit, captured)
-            except UnresolvedPlaceholderError as exc:
-                # A templated hole is not the domain warning, so never emit the
-                # malformed action. Surface a separate, counted NO-SIGNAL action
-                # and leave cadence unconsumed so the reminder retries.
-                lines.append(format_error(f"reminder {rem.name}: {exc}"))
-                lines.append(
-                    _no_signal_action(
-                        rem,
-                        "unresolved-placeholder",
-                        missing_placeholders=exc.placeholders,
-                    )
-                )
-                actions += 1
-                consecutive, first_failure_epoch = _record_render_failure(
-                    new_fired, rem.name, now
-                )
-                if consecutive >= REPEATED_RENDER_FAILURE_THRESHOLD:
-                    lines.append(
-                        _repeated_render_failure_action(
-                            rem,
-                            consecutive_failures=consecutive,
-                            first_failure_epoch=first_failure_epoch,
-                            missing_placeholders=exc.placeholders,
-                        )
-                    )
-                    actions += 1
-                continue
-            _clear_render_failure_state(new_fired, rem.name)
-            new_fired[rem.name] = now
-            lines.append(line)
-            if line.startswith("ACTION: "):
-                actions += 1
-
-    lines.append(format_note(f"emitted {actions} instruction(s) this tick"))
+    record(format_note(f"emitted {actions} instruction(s) this tick"))
     return TickResult(tuple(lines), new_fired, actions)
+
+
+def _render_after_dependency_pass(
+    evaluations: Sequence[_ReminderEvaluation],
+    new_fired: dict[str, int],
+    now: int,
+    record: Callable[[str], None],
+    report_pending: bool,
+) -> int:
+    """Interpret dependency edges over completed evaluations, then render in config order."""
+    # Evaluate every due gate before interpreting dependency edges. A
+    # dependency never decides whether another gate runs, and config order
+    # therefore cannot turn a forward reference into a false clean.
+    unavailable = {
+        evaluation.reminder.name
+        for evaluation in evaluations
+        if evaluation.error is None and evaluation.outcome is GateOutcome.NO_RESULT
+    }
+    changed = True
+    while changed:
+        changed = False
+        for evaluation in evaluations:
+            if evaluation.error is not None or evaluation.outcome is not GateOutcome.QUIET:
+                continue
+            if evaluation.reminder.name in unavailable:
+                continue
+            if any(
+                dependency in unavailable
+                for dependency in evaluation.reminder.depends_on
+            ):
+                unavailable.add(evaluation.reminder.name)
+                changed = True
+
+    actions = 0
+    for evaluation in evaluations:
+        actions += _render_evaluation(
+            evaluation, unavailable, new_fired, now, record, report_pending
+        )
+    return actions
+
+
+def _render_evaluation(
+    evaluation: _ReminderEvaluation,
+    unavailable: AbstractSet[str],
+    new_fired: dict[str, int],
+    now: int,
+    record: Callable[[str], None],
+    report_pending: bool,
+) -> int:
+    """Write one completed gate's report lines and return the actions they carry."""
+    actions = 0
+    rem = evaluation.reminder
+    outcome = evaluation.outcome
+    captured = evaluation.captured
+    error = evaluation.error
+    if error is not None:
+        _clear_render_failure_state(new_fired, rem.name)
+        # The check did not complete. Keep the ERROR for full diagnostic
+        # readers and emit a counted NO-SIGNAL action because production
+        # consumers may intentionally forward ACTION lines only. Retry
+        # next tick by leaving the cadence unconsumed.
+        record(format_error(f"reminder {rem.name}: {error}"))
+        record(_no_signal_action(rem, "gate-execution-error", detail=error))
+        return actions + 1
+    if outcome is GateOutcome.NO_RESULT:
+        _clear_render_failure_state(new_fired, rem.name)
+        # A legitimate verdict, not a reporting fault: the gate ran and
+        # said it could not tell. Emitted as BOTH the explicit
+        # NO_RESULT diagnostic and a counted ACTION, because
+        # ACTION-only consumers would otherwise see nothing -- and
+        # "consumer sees nothing" is precisely the failure this code
+        # exists to remove. Cadence is left unconsumed so it
+        # re-announces every tick until it can determine something.
+        detail = captured.get("summary", "")
+        record(format_no_result(rem.name, detail))
+        record(_no_signal_action(rem, "could-not-determine", detail=detail))
+        return actions + 1
+    if outcome is GateOutcome.QUIET:
+        _clear_render_failure_state(new_fired, rem.name)
+        unavailable_dependencies = tuple(
+            dependency for dependency in rem.depends_on if dependency in unavailable
+        )
+        if unavailable_dependencies:
+            record(format_unevaluable(rem.name, unavailable_dependencies))
+            record(
+                _no_signal_action(
+                    rem,
+                    "dependency-could-not-determine",
+                    detail=",".join(unavailable_dependencies),
+                )
+            )
+            return actions + 1
+        if report_pending:
+            record(format_clean(rem.name))
+        new_fired[rem.name] = now  # the check ran; the cadence clock resets
+        return actions
+    try:
+        line = render_emit(rem.emit, captured)
+    except UnresolvedPlaceholderError as exc:
+        # A templated hole is not the domain warning, so never emit the
+        # malformed action. Surface a separate, counted NO-SIGNAL action
+        # and leave cadence unconsumed so the reminder retries.
+        record(format_error(f"reminder {rem.name}: {exc}"))
+        record(
+            _no_signal_action(
+                rem,
+                "unresolved-placeholder",
+                missing_placeholders=exc.placeholders,
+            )
+        )
+        actions += 1
+        consecutive, first_failure_epoch = _record_render_failure(
+            new_fired, rem.name, now
+        )
+        if consecutive >= REPEATED_RENDER_FAILURE_THRESHOLD:
+            record(
+                _repeated_render_failure_action(
+                    rem,
+                    consecutive_failures=consecutive,
+                    first_failure_epoch=first_failure_epoch,
+                    missing_placeholders=exc.placeholders,
+                )
+            )
+            actions += 1
+        return actions
+    _clear_render_failure_state(new_fired, rem.name)
+    new_fired[rem.name] = now
+    record(line)
+    if line.startswith("ACTION: "):
+        actions += 1
+    return actions
 
 
 __all__ = [

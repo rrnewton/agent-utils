@@ -615,3 +615,150 @@ def test_empty_success_is_not_inferred_to_be_no_result() -> None:
     )
     assert not any(line.startswith("NO_RESULT: ") for line in result.lines), result.lines
     assert result.fired == {"foundation": 5, "dependent": 5}
+
+
+class RecordingGate:
+    """A gate runner that records what the tick had already reported when it ran.
+
+    The interesting property of incremental emission is not that the same lines
+    come out -- it is WHEN they come out. This runner captures the emitted
+    report as each subsequent gate starts, so a test can prove that an earlier
+    gate's verdict had already left the engine before a later, slower gate was
+    even invoked.
+    """
+
+    def __init__(self, emitted: list[str], by_cmd: dict[str, GateResult]) -> None:
+        self.emitted = emitted
+        self.by_cmd = by_cmd
+        self.seen_at_call: list[tuple[str, tuple[str, ...]]] = []
+
+    def run(self, cmd: str, *, timeout: int | None = None) -> GateResult:
+        self.seen_at_call.append((cmd, tuple(self.emitted)))
+        return self.by_cmd.get(cmd, GateResult(returncode=0, stdout="", ok=True))
+
+
+def test_emit_delivers_a_gate_verdict_before_the_next_gate_runs() -> None:
+    cfg = TickConfig(
+        health_checks=(HealthCheck("fresh", "/f", 100, "f"),),
+        reminders=(
+            _dependency_probe("first"),
+            _dependency_probe("second"),
+            _dependency_probe("third"),
+        ),
+    )
+    emitted: list[str] = []
+    runner = RecordingGate(
+        emitted,
+        {
+            "first": GateResult(1, "summary=first is unhappy", True),
+            "second": GateResult(1, "summary=second is unhappy", True),
+            "third": GateResult(0, "", True),
+        },
+    )
+    result = run_tick(
+        cfg,
+        OpsState.default(),
+        now=5,
+        fired={},
+        gate_runner=runner,
+        age_probe=FakeProbe({"/f": 10}),
+        emit=emitted.append,
+    )
+
+    # Streaming must not change what the report says, only when it is written.
+    assert tuple(emitted) == result.lines
+
+    seen = dict(runner.seen_at_call)
+    assert any("HEALTH: fresh ok" in line for line in seen["first"]), (
+        "the health lines precede every gate and must already be out"
+    )
+    assert any("first found a problem" in line for line in seen["second"]), (
+        "the first gate's finding must be readable before the second gate runs"
+    )
+    assert any("second found a problem" in line for line in seen["third"])
+    assert not any("second found a problem" in line for line in seen["second"]), (
+        "a gate's own line cannot exist before that gate has run"
+    )
+
+
+def test_a_dependent_reminder_holds_the_report_until_every_gate_has_run() -> None:
+    # A QUIET gate is downgraded when something it depends on could not
+    # determine anything, and that something may run LATER. Emitting its clean
+    # line early would publish a verdict the tick is about to withdraw, so this
+    # configuration must fall back to reporting once at the end.
+    cfg = TickConfig(
+        reminders=(
+            _dependency_probe("dependent", "foundation"),
+            _dependency_probe("foundation"),
+        )
+    )
+    emitted: list[str] = []
+    runner = RecordingGate(
+        emitted,
+        {
+            "foundation": GateResult(NO_RESULT_EXIT, "", True),
+            "dependent": GateResult(0, "", True),
+        },
+    )
+    result = run_tick(
+        cfg,
+        OpsState.default(),
+        now=5,
+        fired={},
+        gate_runner=runner,
+        age_probe=FakeProbe({}),
+        emit=emitted.append,
+    )
+    before_foundation = dict(runner.seen_at_call)["foundation"]
+    assert not any(
+        "found a problem" in line or line.startswith("NO_RESULT: ")
+        for line in before_foundation
+    ), (
+        "no gate verdict may be published before the dependency verdict is known: "
+        f"{before_foundation}"
+    )
+    assert tuple(emitted) == result.lines
+    assert any(
+        line.startswith("NO_RESULT: dependent is unevaluable because dependency foundation")
+        for line in result.lines
+    ), result.lines
+
+
+def test_omitting_emit_reports_exactly_what_streaming_reports() -> None:
+    def build() -> TickConfig:
+        return TickConfig(
+            health_checks=(HealthCheck("fresh", "/f", 100, "f"),),
+            reminders=(
+                _dependency_probe("noisy"),
+                _dependency_probe("quiet"),
+                _dependency_probe("undetermined"),
+            ),
+        )
+
+    results = {
+        "noisy": GateResult(1, "summary=noisy is unhappy", True),
+        "quiet": GateResult(0, "", True),
+        "undetermined": GateResult(NO_RESULT_EXIT, "summary=cannot tell", True),
+    }
+    collected = run_tick(
+        build(),
+        OpsState.default(),
+        now=5,
+        fired={},
+        gate_runner=FakeGate(dict(results)),
+        age_probe=FakeProbe({"/f": 10}),
+    )
+    emitted: list[str] = []
+    streamed = run_tick(
+        build(),
+        OpsState.default(),
+        now=5,
+        fired={},
+        gate_runner=FakeGate(dict(results)),
+        age_probe=FakeProbe({"/f": 10}),
+        emit=emitted.append,
+    )
+    assert collected.lines == streamed.lines
+    assert tuple(emitted) == collected.lines
+    assert collected.fired == streamed.fired
+    assert collected.actions_emitted == streamed.actions_emitted

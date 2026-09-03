@@ -429,6 +429,22 @@ def _cmd_tick(ns: argparse.Namespace, c: Palette) -> int:
     # -- run_tick is pure with respect to it and only --flush persists, which the
     # guard above has already excluded.
     fired = load_fired_state(fired_path)
+
+    # ⚠️ THE HEADER GOES OUT BEFORE THE TICK RUNS, because the report now does too.
+    # A tick can take minutes, and callers run it under an external time bound
+    # that kills it. Everything this command has already determined must be on
+    # stdout by then, so each line is written and FLUSHED as it is produced
+    # rather than collected and printed after run_tick returns -- which, in the
+    # case that matters, it never does.
+    if not bool(ns.no_header):
+        print(_banner(c), file=sys.stderr)
+        if state_note is not None:
+            print(f"{PROG}: {state_note}", file=sys.stderr)
+
+    def emit_line(line: str) -> None:
+        print(line)
+        sys.stdout.flush()
+
     result = run_tick(
         cfg,
         state,
@@ -438,15 +454,8 @@ def _cmd_tick(ns: argparse.Namespace, c: Palette) -> int:
         age_probe=GlobFileAgeProbe(),
         current_tick_min=current_tick_min,
         report_pending=pending,
+        emit=emit_line,
     )
-
-    if not bool(ns.no_header):
-        print(_banner(c), file=sys.stderr)
-        if state_note is not None:
-            print(f"{PROG}: {state_note}", file=sys.stderr)
-
-    for line in result.lines:
-        print(line)
 
     if bool(ns.flush):
         try:
