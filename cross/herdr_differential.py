@@ -948,11 +948,12 @@ def _reap_record(pane_id: str, workspace: str, exit_code: str = "0") -> str:
 
 
 def _workspace_is_safely_unresolvable(stdout: str) -> bool:
-    """The two safe reasons a planted workspace cannot establish live-pane evidence."""
+    """The three safe reasons a planted workspace cannot establish live-pane evidence."""
 
     return (
         "no workspace labelled" in stdout
         or "evidence unavailable: workspace list:" in stdout
+        or "evidence unavailable: Herdr executable not found in fixed install locations:" in stdout
     )
 
 
