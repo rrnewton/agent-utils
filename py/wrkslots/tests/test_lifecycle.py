@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import datetime as dt
+import errno
 import json
 import os
 import signal
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import replace
 from pathlib import Path
 
@@ -87,6 +90,62 @@ def raw_command(
         capture_output=True,
         check=False,
         env=process_env,
+    )
+
+
+def raw_command_with_census_authority_stub(
+    project: Path,
+    *args: str,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run one crash/recovery boundary without depending on host-root helpers."""
+
+    launcher = """
+import os
+import sys
+from pathlib import Path
+from wrkslots import cli
+
+def test_slot_unused(slot_path, _record=None, **_kwargs):
+    for pid_dir in Path('/proc').iterdir():
+        if not pid_dir.name.isdigit() or int(pid_dir.name) == os.getpid():
+            continue
+        try:
+            observed = Path(os.readlink(pid_dir / 'cwd'))
+        except OSError:
+            continue
+        if observed == slot_path or slot_path in observed.parents:
+            raise cli.Refusal(
+                f'live process {pid_dir.name} uses slot {slot_path}: cwd={observed}'
+            )
+
+def test_census(paths, **_kwargs):
+    for path in paths:
+        test_slot_unused(path)
+    return cli._ProcessPathCensus((), ())
+
+def test_same_uid_census(_paths, **_kwargs):
+    return cli._ProcessPathCensus((), ())
+
+cli._assert_slot_unused = test_slot_unused
+cli._capture_process_path_census = test_census
+cli._capture_same_uid_process_path_census = test_same_uid_census
+raise SystemExit(cli.main(sys.argv[1:]))
+"""
+    argv = [
+        sys.executable,
+        "-c",
+        launcher,
+        "--project-root",
+        str(project),
+        *args,
+    ]
+    return subprocess.run(
+        argv,
+        text=True,
+        capture_output=True,
+        check=False,
+        env=source_environment(env),
     )
 
 
@@ -560,6 +619,119 @@ def mark_owner_dead_in_current_cgroup(
         action="test-owner-exited-in-shared-cgroup",
         slot=record.slot,
     )
+
+
+def prepare_dead_validate_slots(project: Path, slots: Sequence[str]) -> dict[str, Path]:
+    """Create validation slots whose exact recorded owners are provably dead."""
+
+    for slot in slots:
+        made = create(project, slot=slot, slot_type="validate", branch=None)
+        assert made.returncode == 0, made.stderr
+    config = wrkslots._load_config(str(project), "testhost")
+    for slot in slots:
+        state = wrkslots._load_active(config)
+        record = next(item for item in state.slots if item.slot == slot)
+        assert record.owner is not None
+        wrkslots._write_active_state(
+            config,
+            wrkslots._replace_record(
+                state,
+                replace(record, owner=replace(record.owner, boot_id="finished-boot")),
+            ),
+            action="test-owner-exited",
+            slot=slot,
+        )
+    set_liveness(project, "dead")
+    return {
+        slot: wrkslots._slot_directory(config, slot, "validate")
+        for slot in slots
+    }
+
+
+def stub_validate_batch_censuses(
+    monkeypatch: pytest.MonkeyPatch,
+    privileged: Callable[[Sequence[Path]], wrkslots._ProcessPathCensus] | None = None,
+) -> None:
+    empty = lambda _paths: wrkslots._ProcessPathCensus((), ())
+
+    def shared(
+        paths: Sequence[Path],
+        *,
+        budget: wrkslots._ReadOnlyCommandBudget | None = None,
+        include_owner_cgroups: bool = True,
+    ) -> wrkslots._ProcessPathCensus:
+        del budget
+        result = (privileged or empty)(paths)
+        return replace(result, owner_cgroup_complete=include_owner_cgroups)
+
+    def fresh(
+        _paths: Sequence[Path], *, budget: wrkslots._ReadOnlyCommandBudget
+    ) -> wrkslots._ProcessPathCensus:
+        del budget
+        return wrkslots._ProcessPathCensus((), ())
+
+    monkeypatch.setattr(wrkslots, "_capture_process_path_census", shared)
+    monkeypatch.setattr(wrkslots, "_capture_same_uid_process_path_census", fresh)
+
+
+def interrupt_validate_batch(
+    project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+    slots: Sequence[str],
+    *,
+    occurrence: int = 1,
+) -> None:
+    class Interrupted(RuntimeError):
+        pass
+
+    seen = 0
+
+    def interrupt(point: str) -> None:
+        nonlocal seen
+        if point == boundary:
+            seen += 1
+        if point == boundary and seen == occurrence:
+            raise Interrupted
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", interrupt)
+    arguments = [
+        "--project-root",
+        str(project),
+        "remove-validate-batch",
+        "--coordinator-pid",
+        str(os.getpid()),
+    ]
+    for slot in slots:
+        arguments.extend(("--slot", f"{slot}=1"))
+    with pytest.raises(Interrupted):
+        wrkslots.main(arguments)
+    assert seen == occurrence
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _point: None)
+
+
+def prepare_cross_repository_target(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """Create one removable target and one independently registered repository."""
+
+    project, _repository, remote = make_project(tmp_path)
+    assert create(project, slot="target", slot_type="validate", branch=None).returncode == 0
+    other = project / "repo-other"
+    subprocess.run(
+        ["git", "clone", str(remote), str(other)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert create(
+        project,
+        slot="other",
+        agent="other",
+        branch="other/task",
+        repository_name="repo-other",
+    ).returncode == 0
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+    return project, other, checkout(project, slot="target", slot_type="validate")
 
 
 def replace_owner(project: Path, owner: wrkslots.ProcessIdentity) -> None:
@@ -3576,39 +3748,36 @@ def test_validate_batch_shares_one_census_and_retains_each_refusal(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     project, _repository, _remote = make_project(tmp_path)
-    for slot in ("unused", "in-use"):
-        made = create(project, slot=slot, slot_type="validate", branch=None)
-        assert made.returncode == 0, made.stderr
-    config = wrkslots._load_config(str(project), "testhost")
-    for slot in ("unused", "in-use"):
-        state = wrkslots._load_active(config)
-        record = next(item for item in state.slots if item.slot == slot)
-        assert record.owner is not None
-        wrkslots._write_active_state(
-            config,
-            wrkslots._replace_record(
-                state,
-                replace(record, owner=replace(record.owner, boot_id="finished-boot")),
-            ),
-            action="test-owner-exited",
-            slot=slot,
-        )
-    set_liveness(project, "dead")
-    in_use = checkout(project, slot="in-use", slot_type="validate").parent
-    calls = 0
+    slot_paths = prepare_dead_validate_slots(project, ("unused", "in-use"))
+    in_use = slot_paths["in-use"]
+    calls: list[tuple[Path, ...]] = []
+    census_order: list[str] = []
 
-    def census(paths: list[Path]) -> wrkslots._ProcessPathCensus:
-        nonlocal calls
-        calls += 1
+    def census(
+        paths: Sequence[Path],
+        *,
+        budget: wrkslots._ReadOnlyCommandBudget | None = None,
+        include_owner_cgroups: bool = True,
+    ) -> wrkslots._ProcessPathCensus:
+        assert budget is not None
+        assert include_owner_cgroups is False
+        census_order.append("privileged")
+        calls.append(tuple(paths))
         assert set(paths) == {
-            checkout(project, slot="unused", slot_type="validate").parent,
+            slot_paths["unused"],
             in_use,
         }
+        assert all(stat.S_IMODE(path.stat().st_mode) == 0o700 for path in paths)
         return wrkslots._ProcessPathCensus(
             (), ((12345, str(in_use), "link", str(in_use)),)
         )
 
     monkeypatch.setattr(wrkslots, "_capture_process_path_census", census)
+    monkeypatch.setattr(
+        wrkslots,
+        "_capture_same_uid_process_path_census",
+        lambda _paths, **_kwargs: wrkslots._ProcessPathCensus((), ()),
+    )
 
     rc = wrkslots.main(
         [
@@ -3630,12 +3799,15 @@ def test_validate_batch_shares_one_census_and_retains_each_refusal(
     assert rc == 0
     report = json.loads(capsys.readouterr().out)
     assert report["process_censuses"] == 1
+    assert report["shared_process_censuses"] == 1
+    assert report["same_uid_process_censuses"] == 1
     assert report["removed"] == [{"generation": 1, "slot": "unused"}]
     assert len(report["retained"]) == 1
     assert report["retained"][0]["slot"] == "in-use"
     assert "live process 12345" in report["retained"][0]["reason"]
-    assert calls == 1
-    assert not checkout(project, slot="unused", slot_type="validate").exists()
+    assert len(calls) == 1
+    assert census_order == ["privileged"]
+    assert not slot_paths["unused"].exists()
     assert in_use.is_dir()
 
 
@@ -3668,47 +3840,338 @@ def test_validate_batch_is_bounded_before_process_census(
     assert called is False
 
 
-def test_validate_batch_rechecks_use_that_starts_after_shared_census(
+def test_validate_batch_all_ineligible_reports_zero_censuses(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     project, _repository, _remote = make_project(tmp_path)
-    made = create(project, slot="late-use", slot_type="validate", branch=None)
-    assert made.returncode == 0, made.stderr
-    mark_owner_dead(project)
-    set_liveness(project, "dead")
-    tree = checkout(project, slot="late-use", slot_type="validate")
     monkeypatch.setattr(
         wrkslots,
         "_capture_process_path_census",
-        lambda _paths: wrkslots._ProcessPathCensus((), ()),
+        lambda _paths, **_kwargs: pytest.fail(
+            "all-ineligible batch ran a privileged census"
+        ),
     )
-    real_assert_unused = wrkslots._assert_slot_unused
-    late_user: subprocess.Popen[str] | None = None
-
-    def enter_after_census(
-        slot_path: Path,
-        record: wrkslots.ActiveRecord | None = None,
-        *,
-        use_lsof: bool = True,
-        ignore_invoking_ancestry: bool = False,
-        census: wrkslots._ProcessPathCensus | None = None,
-        fallback_census: wrkslots._ProcessPathCensus | None = None,
-    ) -> None:
-        nonlocal late_user
-        real_assert_unused(
-            slot_path,
-            record,
-            use_lsof=use_lsof,
-            ignore_invoking_ancestry=ignore_invoking_ancestry,
-            census=census,
-            fallback_census=fallback_census,
+    assert (
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "remove-validate-batch",
+                "--coordinator-pid",
+                str(os.getpid()),
+                "--slot",
+                "missing=1",
+                "--format",
+                "json",
+            ]
         )
-        if census is not None and late_user is None:
-            late_user = subprocess.Popen(["sleep", "60"], cwd=tree, text=True)
+        == 0
+    )
 
-    monkeypatch.setattr(wrkslots, "_assert_slot_unused", enter_after_census)
+    report = json.loads(capsys.readouterr().out)
+    assert report["process_censuses"] == 0
+    assert report["shared_process_censuses"] == 0
+    assert report["same_uid_process_censuses"] == 0
+    assert report["removed"] == []
+    assert len(report["retained"]) == 1
+    config = wrkslots._load_config(str(project), "testhost")
+    assert not wrkslots._validate_batch_seal_journal_path(config).exists()
+
+
+@pytest.mark.parametrize("expiry_point", ("shared", "fresh"))
+def test_validate_batch_census_deadline_restores_seals_before_outer_bound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    expiry_point: str,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    slots = tuple(
+        f"slot{index:02d}" for index in range(1, wrkslots.VALIDATE_REMOVE_BATCH_LIMIT + 1)
+    )
+    slot_paths = prepare_dead_validate_slots(project, slots)
+    original_modes = {
+        slot: stat.S_IMODE(path.stat().st_mode) for slot, path in slot_paths.items()
+    }
+    monotonic_now = 100.0
+
+    def monotonic() -> float:
+        return monotonic_now
+
+    def exhaust_after_shared_census(
+        _paths: Sequence[Path],
+        *,
+        budget: wrkslots._ReadOnlyCommandBudget | None = None,
+        include_owner_cgroups: bool = True,
+    ) -> wrkslots._ProcessPathCensus:
+        nonlocal monotonic_now
+        assert budget is not None
+        assert include_owner_cgroups is False
+        assert budget.deadline == pytest.approx(
+            100.0 + wrkslots._VALIDATE_REMOVE_BATCH_CENSUS_SECONDS
+        )
+        if expiry_point == "shared":
+            monotonic_now = budget.deadline + 1.0
+        return wrkslots._ProcessPathCensus((), ())
+
+    def exhaust_during_fresh_census(
+        _paths: Sequence[Path], *, budget: wrkslots._ReadOnlyCommandBudget
+    ) -> wrkslots._ProcessPathCensus:
+        nonlocal monotonic_now
+        monotonic_now = budget.deadline + 1.0
+        budget.remaining_seconds()
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(time, "monotonic", monotonic)
+    monkeypatch.setattr(
+        wrkslots, "_capture_process_path_census", exhaust_after_shared_census
+    )
+    monkeypatch.setattr(
+        wrkslots,
+        "_capture_same_uid_process_path_census",
+        exhaust_during_fresh_census,
+    )
+    arguments = [
+        "--project-root",
+        str(project),
+        "remove-validate-batch",
+        "--coordinator-pid",
+        str(os.getpid()),
+    ]
+    for slot in slots:
+        arguments.extend(("--slot", f"{slot}=1"))
+    arguments.extend(("--format", "json"))
+    started = time.perf_counter()
+    assert wrkslots.main(arguments) == 0
+    rollback_seconds = time.perf_counter() - started
+
+    report = json.loads(capsys.readouterr().out)
+    assert report["removed"] == []
+    assert report["same_uid_process_censuses"] == int(expiry_point == "fresh")
+    assert len(report["retained"]) == wrkslots.VALIDATE_REMOVE_BATCH_LIMIT
+    assert all(
+        "operation-wide time bound" in row["reason"] for row in report["retained"]
+    )
+    rollback_reserve = 30.0 - wrkslots._VALIDATE_REMOVE_BATCH_CENSUS_SECONDS
+    assert rollback_reserve == 8.0
+    assert rollback_seconds < rollback_reserve
+    assert all(path.is_dir() for path in slot_paths.values())
+    assert {
+        slot: stat.S_IMODE(path.stat().st_mode) for slot, path in slot_paths.items()
+    } == original_modes
+    config = wrkslots._load_config(str(project), "testhost")
+    assert not wrkslots._journal_path(config).exists()
+    assert not wrkslots._validate_batch_seal_journal_path(config).exists()
+    assert not any(
+        list(path.parent.glob(f".{slot}.fenced.*"))
+        for slot, path in slot_paths.items()
+    )
+
+
+def test_validate_batch_deadline_between_targets_never_enters_later_removals(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    slots = tuple(
+        f"slot{index:02d}" for index in range(1, wrkslots.VALIDATE_REMOVE_BATCH_LIMIT + 1)
+    )
+    slot_paths = prepare_dead_validate_slots(project, slots)
+    original_modes = {
+        slot: stat.S_IMODE(path.stat().st_mode) for slot, path in slot_paths.items()
+    }
+    monotonic_now = 100.0
+    entered: list[str] = []
+    fresh_scans: list[tuple[Path, ...]] = []
+    fenced: list[str] = []
+    original_remove = wrkslots._cmd_remove
+
+    monkeypatch.setattr(time, "monotonic", lambda: monotonic_now)
+    monkeypatch.setattr(
+        wrkslots,
+        "_capture_process_path_census",
+        lambda _paths, **_kwargs: wrkslots._ProcessPathCensus((), ()),
+    )
+
+    def fresh_census(
+        paths: Sequence[Path], *, budget: wrkslots._ReadOnlyCommandBudget
+    ) -> wrkslots._ProcessPathCensus:
+        del budget
+        fresh_scans.append(tuple(paths))
+        return wrkslots._ProcessPathCensus((), ())
+
+    def remove_then_expire(
+        args: argparse.Namespace,
+        *,
+        private_cleanup: wrkslots._PrivateCleanupContext | None = None,
+        emit: bool = True,
+    ) -> int:
+        nonlocal monotonic_now
+        entered.append(args.slot)
+        result = original_remove(args, private_cleanup=private_cleanup, emit=emit)
+        assert private_cleanup is not None
+        monotonic_now = private_cleanup.census_budget.deadline + 1.0
+        return result
+
+    def record_fence(point: str) -> None:
+        if point == "after-path-fence":
+            fenced.append(entered[-1])
+
+    monkeypatch.setattr(wrkslots, "_capture_same_uid_process_path_census", fresh_census)
+    monkeypatch.setattr(wrkslots, "_cmd_remove", remove_then_expire)
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", record_fence)
+    arguments = [
+        "--project-root",
+        str(project),
+        "remove-validate-batch",
+        "--coordinator-pid",
+        str(os.getpid()),
+    ]
+    for slot in slots:
+        arguments.extend(("--slot", f"{slot}=1"))
+    arguments.extend(("--format", "json"))
+
+    assert wrkslots.main(arguments) == 0
+
+    report = json.loads(capsys.readouterr().out)
+    assert entered == [slots[0]]
+    assert fenced == [slots[0]]
+    assert len(fresh_scans) == 1
+    assert report["removed"] == [{"generation": 1, "slot": slots[0]}]
+    assert {row["slot"] for row in report["retained"]} == set(slots[1:])
+    assert all(
+        "operation-wide time bound" in row["reason"] for row in report["retained"]
+    )
+    assert report["same_uid_process_censuses"] == 1
+    assert not slot_paths[slots[0]].exists()
+    assert all(slot_paths[slot].is_dir() for slot in slots[1:])
+    assert {
+        slot: stat.S_IMODE(slot_paths[slot].stat().st_mode) for slot in slots[1:]
+    } == {slot: original_modes[slot] for slot in slots[1:]}
+    config = wrkslots._load_config(str(project), "testhost")
+    assert not wrkslots._journal_path(config).exists()
+    assert not wrkslots._validate_batch_seal_journal_path(config).exists()
+    assert not any(
+        list(path.parent.glob(f".{slot}.fenced.*"))
+        for slot, path in slot_paths.items()
+    )
+
+
+def test_validate_batch_shared_census_explicitly_omits_owner_cgroups(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    prepare_dead_validate_slots(project, ("slot01",))
+    observed_owner_cgroup_flags: list[bool] = []
+
+    def shared_census(
+        _paths: Sequence[Path],
+        *,
+        budget: wrkslots._ReadOnlyCommandBudget | None = None,
+        include_owner_cgroups: bool = True,
+    ) -> wrkslots._ProcessPathCensus:
+        del budget
+        observed_owner_cgroup_flags.append(include_owner_cgroups)
+        return wrkslots._ProcessPathCensus(
+            (), (), owner_cgroup_complete=include_owner_cgroups
+        )
+
+    monkeypatch.setattr(wrkslots, "_capture_process_path_census", shared_census)
+    monkeypatch.setattr(
+        wrkslots,
+        "_capture_same_uid_process_path_census",
+        lambda _paths, **_kwargs: wrkslots._ProcessPathCensus(
+            (), (), owner_cgroup_complete=False
+        ),
+    )
+
+    assert (
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "remove-validate-batch",
+                "--coordinator-pid",
+                str(os.getpid()),
+                "--slot",
+                "slot01=1",
+                "--format",
+                "json",
+            ]
+        )
+        == 0
+    )
+
+    report = json.loads(capsys.readouterr().out)
+    assert observed_owner_cgroup_flags == [False]
+    assert report["removed"] == [{"generation": 1, "slot": "slot01"}]
+
+
+def test_incomplete_owner_cgroup_census_refuses_owner_check(tmp_path: Path) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    prepare_dead_validate_slots(project, ("slot01",))
+    config = wrkslots._load_config(str(project), "testhost")
+    record = wrkslots._find_record(wrkslots._load_active(config), "slot01")
+    assert record.owner is not None
+    census = wrkslots._ProcessPathCensus(
+        (), (), owner_cgroup_complete=False
+    )
+
+    with pytest.raises(wrkslots.Refusal, match="omitted owner-cgroup evidence"):
+        census.assert_slot_unused(
+            wrkslots._slot_directory(config, "slot01", "validate"), record
+        )
+
+
+def test_validate_batch_rechecks_later_slot_use_after_shared_census(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    paths = prepare_dead_validate_slots(project, ("first", "late-use"))
+    tree = paths["late-use"] / "product"
+    monkeypatch.setattr(
+        wrkslots,
+        "_capture_process_path_census",
+        lambda _paths, **_kwargs: wrkslots._ProcessPathCensus((), ()),
+    )
+    real_rename = os.rename
+    late_user: subprocess.Popen[str] | None = None
+    fenced_scans = 0
+
+    def record_slot_scan(
+        slot_paths: Sequence[Path], *, budget: wrkslots._ReadOnlyCommandBudget
+    ) -> wrkslots._ProcessPathCensus:
+        nonlocal fenced_scans
+        del budget
+        assert len(slot_paths) == 1
+        slot_path = slot_paths[0]
+        if slot_path.name.startswith(".") and ".fenced." in slot_path.name:
+            fenced_scans += 1
+        if late_user is not None:
+            observed = Path(os.readlink(f"/proc/{late_user.pid}/cwd"))
+            if observed == slot_path or slot_path in observed.parents:
+                return wrkslots._ProcessPathCensus(
+                    (), ((late_user.pid, str(slot_path), "cwd", str(observed)),)
+                )
+        return wrkslots._ProcessPathCensus((), ())
+
+    def enter_at_final_path_fence(source: os.PathLike[str], target: os.PathLike[str]) -> None:
+        nonlocal late_user
+        if Path(source) == paths["late-use"]:
+            late_user = subprocess.Popen(["sleep", "60"], cwd=tree, text=True)
+        real_rename(source, target)
+
+    monkeypatch.setattr(
+        wrkslots, "_capture_same_uid_process_path_census", record_slot_scan
+    )
+    monkeypatch.setattr("wrkslots.cli.os.rename", enter_at_final_path_fence)
     try:
         rc = wrkslots.main(
             [
@@ -3717,6 +4180,8 @@ def test_validate_batch_rechecks_use_that_starts_after_shared_census(
                 "remove-validate-batch",
                 "--coordinator-pid",
                 str(os.getpid()),
+                "--slot",
+                "first=1",
                 "--slot",
                 "late-use=1",
                 "--format",
@@ -3729,10 +4194,771 @@ def test_validate_batch_rechecks_use_that_starts_after_shared_census(
 
     assert rc == 0
     report = json.loads(capsys.readouterr().out)
-    assert report["removed"] == []
+    assert report["removed"] == [{"generation": 1, "slot": "first"}], json.dumps(
+        report, sort_keys=True
+    )
     assert len(report["retained"]) == 1
     assert "live process" in report["retained"][0]["reason"]
+    assert fenced_scans == 2
+    assert not paths["first"].exists()
     assert tree.is_dir()
+
+
+@pytest.mark.parametrize("foreign_process_preexisted", (False, True))
+def test_validate_batch_fresh_privileged_census_refuses_foreign_uid_late_use(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    foreign_process_preexisted: bool,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    made = create(project, slot="late-foreign", slot_type="validate", branch=None)
+    assert made.returncode == 0, made.stderr
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+    tree = checkout(project, slot="late-foreign", slot_type="validate").parent
+    original_mode = stat.S_IMODE(tree.stat().st_mode)
+    foreign = wrkslots._AbsentProcessObservation(
+        54321, 91, "/foreign", "mnt:[54321]"
+    )
+    calls: list[tuple[Path, ...]] = []
+    foreign_exists = foreign_process_preexisted
+    foreign_uses_target = False
+    ordering: list[str] = ["foreign-exists"] if foreign_exists else []
+    original_seal = wrkslots._seal_cleanup_path_private
+
+    def seal(
+        config: wrkslots.Config,
+        path: Path,
+        *,
+        before_seal: Callable[[int, tuple[int, int, int]], None] | None = None,
+    ) -> tuple[int, tuple[int, int, int]]:
+        nonlocal foreign_exists, foreign_uses_target
+        if foreign_process_preexisted:
+            foreign_uses_target = True
+            ordering.append("foreign-transitioned-before-seal")
+        result = original_seal(config, path, before_seal=before_seal)
+        ordering.append("sealed")
+        if not foreign_process_preexisted:
+            foreign_exists = True
+            foreign_uses_target = True
+            ordering.append("foreign-spawned-after-seal")
+        return result
+
+    def census(
+        paths: Sequence[Path],
+        *,
+        budget: wrkslots._ReadOnlyCommandBudget | None = None,
+        include_owner_cgroups: bool = True,
+    ) -> wrkslots._ProcessPathCensus:
+        assert budget is not None
+        assert include_owner_cgroups is False
+        calls.append(tuple(paths))
+        assert foreign_exists
+        assert foreign_uses_target
+        ordering.append("privileged-census")
+        assert paths == [tree]
+        assert stat.S_IMODE(tree.stat().st_mode) == 0o700
+        return wrkslots._ProcessPathCensus(
+            (foreign,), ((foreign.pid, str(tree), "link", str(tree)),)
+        )
+
+    monkeypatch.setattr(wrkslots, "_seal_cleanup_path_private", seal)
+    monkeypatch.setattr(wrkslots, "_capture_process_path_census", census)
+    monkeypatch.setattr(
+        wrkslots,
+        "_capture_same_uid_process_path_census",
+        lambda _paths, **_kwargs: wrkslots._ProcessPathCensus((), ()),
+    )
+
+    assert (
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "remove-validate-batch",
+                "--coordinator-pid",
+                str(os.getpid()),
+                "--slot",
+                "late-foreign=1",
+                "--format",
+                "json",
+            ]
+        )
+        == 0
+    )
+
+    report = json.loads(capsys.readouterr().out)
+    assert report["removed"] == []
+    assert report["process_censuses"] == 1
+    assert len(report["retained"]) == 1
+    assert "live process 54321" in report["retained"][0]["reason"]
+    assert tree.is_dir()
+    assert stat.S_IMODE(tree.stat().st_mode) == original_mode
+    assert not list(tree.parent.glob(".late-foreign.fenced.*"))
+    assert any(
+        isinstance(row, dict) and row.get("slot") == "late-foreign"
+        for row in active_slots(project)
+    )
+    expected_prefix = (
+        ["foreign-exists", "foreign-transitioned-before-seal", "sealed"]
+        if foreign_process_preexisted
+        else ["sealed", "foreign-spawned-after-seal"]
+    )
+    assert ordering == [*expected_prefix, "privileged-census"]
+
+
+def test_validate_batch_refuses_untrusted_cleanup_fence_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    made = create(project, slot="untrusted-root", slot_type="validate", branch=None)
+    assert made.returncode == 0, made.stderr
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+    tree = checkout(project, slot="untrusted-root", slot_type="validate").parent
+    tree.parent.chmod(0o777)
+    monkeypatch.setattr(
+        wrkslots,
+        "_capture_process_path_census",
+        lambda _paths, **_kwargs: wrkslots._ProcessPathCensus((), ()),
+    )
+
+    assert (
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "remove-validate-batch",
+                "--coordinator-pid",
+                str(os.getpid()),
+                "--slot",
+                "untrusted-root=1",
+                "--format",
+                "json",
+            ]
+        )
+        == 0
+    )
+
+    report = json.loads(capsys.readouterr().out)
+    assert report["removed"] == []
+    assert "not an owner-controlled directory" in report["retained"][0]["reason"]
+    assert tree.is_dir()
+    assert not list(tree.parent.glob(".untrusted-root.fenced.*"))
+
+
+def test_validate_batch_seal_failure_restores_original_mode_through_fd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    made = create(project, slot="seal-failure", slot_type="validate", branch=None)
+    assert made.returncode == 0, made.stderr
+    config = wrkslots._load_config(str(project), "testhost")
+    slot_path = checkout(project, slot="seal-failure", slot_type="validate").parent
+    original_mode = stat.S_IMODE(slot_path.stat().st_mode)
+
+    real_fstat = os.fstat
+    fstat_calls = 0
+
+    def fail_after_chmod(descriptor: int) -> os.stat_result:
+        nonlocal fstat_calls
+        fstat_calls += 1
+        if fstat_calls == 2:
+            raise OSError("injected post-fchmod failure")
+        return real_fstat(descriptor)
+
+    monkeypatch.setattr(os, "fstat", fail_after_chmod)
+
+    with pytest.raises(wrkslots.Refusal, match="injected post-fchmod failure"):
+        wrkslots._seal_cleanup_path_private(config, slot_path)
+
+    assert stat.S_IMODE(slot_path.stat().st_mode) == original_mode
+
+
+def test_validate_batch_unexpected_preflight_failure_restores_prior_targets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    paths = prepare_dead_validate_slots(project, ("first", "second"))
+    first_path = paths["first"]
+    original_mode = stat.S_IMODE(first_path.stat().st_mode)
+    real_seal = wrkslots._seal_cleanup_path_private
+    calls = 0
+
+    def fail_after_first_seal(
+        batch_config: wrkslots.Config,
+        path: Path,
+        *,
+        before_seal: Callable[[int, tuple[int, int, int]], None] | None = None,
+    ) -> tuple[int, tuple[int, int, int]]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("injected preflight failure")
+        return real_seal(batch_config, path, before_seal=before_seal)
+
+    monkeypatch.setattr(wrkslots, "_seal_cleanup_path_private", fail_after_first_seal)
+
+    with pytest.raises(RuntimeError, match="injected preflight failure"):
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "remove-validate-batch",
+                "--coordinator-pid",
+                str(os.getpid()),
+                "--slot",
+                "first=1",
+                "--slot",
+                "second=1",
+            ]
+        )
+
+    assert stat.S_IMODE(first_path.stat().st_mode) == original_mode
+
+
+@pytest.mark.parametrize(
+    ("interrupt", "sealed"),
+    (
+        ("after-validate-batch-seal-journal", False),
+        ("after-validate-batch-seal-target-planned", False),
+        ("after-validate-batch-seal-target", True),
+        ("after-validate-batch-shared-census", True),
+    ),
+)
+def test_validate_batch_kill_boundaries_recover_without_deletion_or_mode_leak(
+    tmp_path: Path,
+    interrupt: str,
+    sealed: bool,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    slot_path = prepare_dead_validate_slots(project, ("slot01",))["slot01"]
+    original_mode = stat.S_IMODE(slot_path.stat().st_mode)
+
+    interrupted = raw_command_with_census_authority_stub(
+        project,
+        "remove-validate-batch",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot",
+        "slot01=1",
+        env={"WRKSLOTS_TEST_INTERRUPT": interrupt},
+    )
+
+    assert interrupted.returncode == 86, interrupted.stderr
+    assert slot_path.is_dir()
+    assert stat.S_IMODE(slot_path.stat().st_mode) == (
+        0o700 if sealed else original_mode
+    )
+    config = wrkslots._load_config(str(project), "testhost")
+    seal_journal = wrkslots._validate_batch_seal_journal_path(config)
+    assert seal_journal.is_file()
+    blocked = command(project, "hold", "slot01", "--reason", "blocked")
+    assert blocked.returncode == 3
+    assert "validation-batch seal" in blocked.stderr
+
+    recovered = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+    )
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert slot_path.is_dir()
+    assert stat.S_IMODE(slot_path.stat().st_mode) == original_mode
+    assert not seal_journal.exists()
+    assert len(active_slots(project)) == 1
+
+
+def test_validate_batch_seal_temp_is_a_fail_closed_partial_update(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    config = wrkslots._load_config(str(project), "testhost")
+    journal = {
+        "schema": wrkslots._VALIDATE_BATCH_SEAL_SCHEMA,
+        "kind": "validate-batch-seal",
+        "machine": "testhost",
+        "created_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+        "actor": wrkslots._identity_to_obj(wrkslots._read_process_identity(os.getpid())),
+        "targets": [],
+    }
+    wrkslots._write_validate_batch_seal_journal(config, journal)
+    temporary = config.control / f"{wrkslots._validate_batch_seal_journal_path(config).name}.tmp.test"
+    temporary.write_text("{}\n", encoding="utf-8")
+
+    refused = command(
+        project,
+        "recover",
+        "--discard-partial",
+        "--coordinator-pid",
+        str(os.getpid()),
+    )
+
+    assert refused.returncode == 3
+    assert "cannot automatically discard journal update" in refused.stderr
+    assert temporary.is_file()
+    assert wrkslots._validate_batch_seal_journal_path(config).is_file()
+
+
+def test_validate_batch_seal_recovery_refuses_path_disappearing_before_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    slot_path = prepare_dead_validate_slots(project, ("slot01",))["slot01"]
+    interrupted = raw_command(
+        project,
+        "remove-validate-batch",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot",
+        "slot01=1",
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-validate-batch-seal-target"},
+    )
+    assert interrupted.returncode == 86
+    config = wrkslots._load_config(str(project), "testhost")
+    seal_journal = wrkslots._validate_batch_seal_journal_path(config)
+    real_restore = wrkslots._restore_private_cleanup_path
+
+    def disappear_then_restore(
+        path: Path,
+        original_mode: int,
+        identity: tuple[int, int, int],
+        *,
+        allow_missing: bool = True,
+    ) -> None:
+        shutil.rmtree(path)
+        real_restore(
+            path,
+            original_mode,
+            identity,
+            allow_missing=allow_missing,
+        )
+
+    monkeypatch.setattr(
+        wrkslots, "_restore_private_cleanup_path", disappear_then_restore
+    )
+
+    assert (
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "recover",
+                "--coordinator-pid",
+                str(os.getpid()),
+            ]
+        )
+        == 3
+    )
+    assert seal_journal.is_file()
+    assert len(active_slots(project)) == 1
+
+
+def test_validate_batch_recovery_refusal_restores_sealed_mode(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    slot_path = prepare_dead_validate_slots(project, ("slot01",))["slot01"]
+    tree = slot_path / "product"
+    original_mode = stat.S_IMODE(slot_path.stat().st_mode)
+
+    interrupted = raw_command_with_census_authority_stub(
+        project,
+        "remove-validate-batch",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot",
+        "slot01=1",
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-finish-journal"},
+    )
+    assert interrupted.returncode == 86
+    assert stat.S_IMODE(slot_path.stat().st_mode) == 0o700
+    config = wrkslots._load_config(str(project), "testhost")
+    seal_journal = wrkslots._validate_batch_seal_journal_path(config)
+    assert seal_journal.is_file()
+    user = subprocess.Popen(["sleep", "60"], cwd=tree, text=True)
+    try:
+        refused = raw_command_with_census_authority_stub(
+            project,
+            "recover",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(os.getpid()),
+        )
+        assert refused.returncode == 3
+        assert "live process" in refused.stderr
+        assert stat.S_IMODE(slot_path.stat().st_mode) == original_mode
+        assert seal_journal.is_file()
+    finally:
+        terminate_process(user)
+
+    recovered = raw_command_with_census_authority_stub(
+        project,
+        "recover",
+        "--coordinator-authorized",
+        "--coordinator-pid",
+        str(os.getpid()),
+    )
+    assert recovered.returncode == 0, recovered.stderr
+    assert not slot_path.exists()
+    assert not seal_journal.exists()
+
+
+@pytest.mark.parametrize(
+    "interrupt",
+    ("after-finish-journal", "after-path-fence-before-journal"),
+)
+@pytest.mark.parametrize("substitution", ("mode", "inode"))
+def test_validate_batch_finish_recovery_rechecks_private_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    interrupt: str,
+    substitution: str,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    slot_path = prepare_dead_validate_slots(project, ("slot01",))["slot01"]
+    census_calls: list[tuple[Path, ...]] = []
+
+    def empty_census(paths: Sequence[Path]) -> wrkslots._ProcessPathCensus:
+        census_calls.append(tuple(paths))
+        return wrkslots._ProcessPathCensus((), ())
+
+    stub_validate_batch_censuses(monkeypatch, empty_census)
+    interrupt_validate_batch(project, monkeypatch, interrupt, ("slot01",))
+    config = wrkslots._load_config(str(project), "testhost")
+    finish_journal = wrkslots._journal_path(config)
+    seal_journal = wrkslots._validate_batch_seal_journal_path(config)
+    assert finish_journal.is_file()
+    assert seal_journal.is_file()
+    if interrupt == "after-finish-journal":
+        subject = slot_path
+    else:
+        fenced = tuple(slot_path.parent.glob(".slot01.fenced.1.*"))
+        assert len(fenced) == 1
+        subject = fenced[0]
+    saved = subject.with_name(f"{subject.name}.saved")
+    if substitution == "mode":
+        subject.chmod(0o750)
+    else:
+        subject.rename(saved)
+        subject.mkdir(mode=0o700)
+
+    census_calls.clear()
+    assert (
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "recover",
+                "--coordinator-pid",
+                str(os.getpid()),
+            ]
+        )
+        == 3
+    )
+    assert census_calls == []
+    assert finish_journal.is_file()
+    assert seal_journal.is_file()
+    assert len(active_slots(project)) == 1
+
+    if substitution == "mode":
+        subject.chmod(0o700)
+    else:
+        subject.rmdir()
+        saved.rename(subject)
+    capsys.readouterr()
+    census_calls.clear()
+
+    assert (
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "recover",
+                "--coordinator-pid",
+                str(os.getpid()),
+            ]
+        )
+        == 0
+    )
+    assert len(census_calls) == 1
+    assert not slot_path.exists()
+    assert not finish_journal.exists()
+    assert not seal_journal.exists()
+
+
+@pytest.mark.parametrize(
+    "interrupt",
+    (
+        "after-remove-before-journal",
+        "after-remove-worktree",
+        "after-archive-before-active",
+    ),
+)
+def test_validate_batch_finish_recovery_resumes_destructive_phases(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interrupt: str,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    slot_path = prepare_dead_validate_slots(project, ("slot01",))["slot01"]
+    stub_validate_batch_censuses(monkeypatch)
+    interrupt_validate_batch(project, monkeypatch, interrupt, ("slot01",))
+    config = wrkslots._load_config(str(project), "testhost")
+    finish_journal = wrkslots._journal_path(config)
+    seal_journal = wrkslots._validate_batch_seal_journal_path(config)
+    assert finish_journal.is_file()
+    assert seal_journal.is_file()
+
+    assert (
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "recover",
+                "--coordinator-pid",
+                str(os.getpid()),
+            ]
+        )
+        == 0
+    )
+    assert not slot_path.exists()
+    assert not finish_journal.exists()
+    assert not seal_journal.exists()
+    assert active_slots(project) == []
+
+
+@pytest.mark.parametrize(
+    "interrupt",
+    ("after-remove-before-journal", "after-remove-worktree"),
+)
+def test_validate_batch_flat_finish_recovers_after_worktree_removed(
+    tmp_path: Path,
+    interrupt: str,
+) -> None:
+    project, _repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    prepare_dead_validate_slots(project, ("slot01",))
+    config = wrkslots._load_config(str(project), "testhost")
+    slot_path = wrkslots._slot_directory(config, "slot01", "validate")
+    assert slot_path.is_dir()
+
+    interrupted = raw_command_with_census_authority_stub(
+        project,
+        "remove-validate-batch",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot",
+        "slot01=1",
+        env={"WRKSLOTS_TEST_INTERRUPT": interrupt},
+    )
+
+    assert interrupted.returncode == 86, interrupted.stderr
+    finish_journal = wrkslots._journal_path(config)
+    seal_journal = wrkslots._validate_batch_seal_journal_path(config)
+    assert finish_journal.is_file()
+    assert seal_journal.is_file()
+    raw = json.loads(finish_journal.read_text(encoding="utf-8"))
+    fenced = wrkslots._finish_fenced_slot(
+        config,
+        wrkslots._record_from_obj(raw["record"], "finish journal.record"),
+        raw,
+    )
+    assert not slot_path.exists()
+    assert not fenced.exists()
+
+    recovered = raw_command_with_census_authority_stub(
+        project,
+        "recover",
+        "--coordinator-authorized",
+        "--coordinator-pid",
+        str(os.getpid()),
+    )
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert active_slots(project) == []
+    assert not finish_journal.exists()
+    assert not seal_journal.exists()
+    archive = wrkslots._load_archive(config, require_repository=False)
+    assert [(row["slot"], row["generation"]) for row in archive.records] == [
+        ("slot01", 1)
+    ]
+    assert not slot_path.exists()
+    assert not fenced.exists()
+
+
+def test_validate_batch_nested_finish_recovers_after_fence_directory_removed(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    prepare_dead_validate_slots(project, ("slot01",))
+    config = wrkslots._load_config(str(project), "testhost")
+    slot_path = wrkslots._slot_directory(config, "slot01", "validate")
+
+    interrupted = raw_command_with_census_authority_stub(
+        project,
+        "remove-validate-batch",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot",
+        "slot01=1",
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-remove-fenced-directory"},
+    )
+
+    assert interrupted.returncode == 86, interrupted.stderr
+    finish_journal = wrkslots._journal_path(config)
+    seal_journal = wrkslots._validate_batch_seal_journal_path(config)
+    assert finish_journal.is_file()
+    assert seal_journal.is_file()
+    raw = json.loads(finish_journal.read_text(encoding="utf-8"))
+    fenced = wrkslots._finish_fenced_slot(
+        config,
+        wrkslots._record_from_obj(raw["record"], "finish journal.record"),
+        raw,
+    )
+    assert not slot_path.exists()
+    assert not fenced.exists()
+
+    recovered = raw_command_with_census_authority_stub(
+        project,
+        "recover",
+        "--coordinator-authorized",
+        "--coordinator-pid",
+        str(os.getpid()),
+    )
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert active_slots(project) == []
+    assert not finish_journal.exists()
+    assert not seal_journal.exists()
+    assert not slot_path.exists()
+    assert not fenced.exists()
+
+
+def test_validate_batch_finish_recovery_resumes_after_prior_target_completed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    paths = prepare_dead_validate_slots(project, ("first", "second"))
+    stub_validate_batch_censuses(monkeypatch)
+    interrupt_validate_batch(
+        project,
+        monkeypatch,
+        "after-remove-worktree",
+        ("first", "second"),
+        occurrence=2,
+    )
+    config = wrkslots._load_config(str(project), "testhost")
+    assert not paths["first"].exists()
+    assert wrkslots._journal_path(config).is_file()
+    assert wrkslots._validate_batch_seal_journal_path(config).is_file()
+    assert {row["slot"] for row in active_slots(project) if isinstance(row, dict)} == {
+        "second"
+    }
+
+    assert (
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "recover",
+                "--coordinator-pid",
+                str(os.getpid()),
+            ]
+        )
+        == 0
+    )
+    assert not paths["second"].exists()
+    assert not wrkslots._journal_path(config).exists()
+    assert not wrkslots._validate_batch_seal_journal_path(config).exists()
+    assert active_slots(project) == []
+
+
+def test_validate_batch_refused_finish_retains_all_sidecar_targets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    paths = prepare_dead_validate_slots(project, ("first", "second"))
+    config = wrkslots._load_config(str(project), "testhost")
+    first_path = paths["first"]
+    second_path = paths["second"]
+    second_original_mode = stat.S_IMODE(second_path.stat().st_mode)
+    recovery_in_use = False
+
+    def census(paths: Sequence[Path]) -> wrkslots._ProcessPathCensus:
+        if recovery_in_use and tuple(paths) == (first_path,):
+            return wrkslots._ProcessPathCensus(
+                (), ((98765, str(first_path), "link", str(first_path)),)
+            )
+        return wrkslots._ProcessPathCensus((), ())
+
+    stub_validate_batch_censuses(monkeypatch, census)
+    interrupt_validate_batch(
+        project, monkeypatch, "after-finish-journal", ("first", "second")
+    )
+    saved_second = second_path.with_name("second.saved")
+    second_path.rename(saved_second)
+    second_path.mkdir(mode=0o700)
+    recovery_in_use = True
+
+    assert (
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "recover",
+                "--coordinator-pid",
+                str(os.getpid()),
+            ]
+        )
+        == 3
+    )
+    seal_path = wrkslots._validate_batch_seal_journal_path(config)
+    _raw, targets = wrkslots._validate_batch_seal_journal(
+        config,
+        seal_path,
+        json.loads(seal_path.read_text(encoding="utf-8")),
+    )
+    assert {slot for slot, _generation, _target in targets} == {"first", "second"}
+    assert wrkslots._journal_path(config).is_file()
+    assert first_path.is_dir()
+
+    second_path.rmdir()
+    saved_second.rename(second_path)
+    recovery_in_use = False
+    assert (
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "recover",
+                "--coordinator-pid",
+                str(os.getpid()),
+            ]
+        )
+        == 0
+    )
+    assert not first_path.exists()
+    assert second_path.is_dir()
+    assert stat.S_IMODE(second_path.stat().st_mode) == second_original_mode
+    assert not seal_path.exists()
+    assert {record["slot"] for record in active_slots(project) if isinstance(record, dict)} == {
+        "second"
+    }
 
 
 def test_agent_remove_still_refuses_dead_owner_cgroup_with_live_process(
@@ -4260,6 +5486,7 @@ def test_read_handoff_legacy_bootstrap_refuses_bad_target_before_output(
     state = json.loads(state_path.read_text(encoding="utf-8"))
     state["slots"][0]["checkouts"][0]["repository"] = "missing-target-repository"
     state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+    before_state = state_path.read_bytes()
 
     refused = raw_command(
         project,
@@ -4273,6 +5500,10 @@ def test_read_handoff_legacy_bootstrap_refuses_bad_target_before_output(
     assert "source repository" in refused.stderr
     assert "missing-target-repository" in refused.stderr
     assert refused.stdout == ""
+    assert state_path.read_bytes() == before_state
+    assert handoff.read_text(encoding="utf-8") == (
+        "Do not acknowledge malformed target authority.\n"
+    )
     assert not wrkslots._event_directory(config).exists()
 
 
@@ -6510,7 +7741,7 @@ def test_status_reports_missing_recorded_repository_but_create_refuses(
         branch="codex/unavailable-source",
     )
     assert refused.returncode == 3
-    assert "repository does not exist or cannot be resolved" in refused.stderr
+    assert "source repository 'repo' does not exist or cannot be resolved" in refused.stderr
     assert not checkout(project, "slot02").exists()
 
 
@@ -7455,6 +8686,110 @@ def test_audit_associates_recovery_journals_from_other_machine_shards(
     missing_row = json.loads(without_directory.stdout)["slots"][0]
     assert missing_row["slot"] == "slot01"
     assert missing_row["owner_state"] == "create-journal"
+
+
+def test_audit_blocks_exact_validation_batch_seal_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    prepare_dead_validate_slots(project, ("slot01",))
+    config = wrkslots._load_config(str(project), "testhost")
+    monkeypatch.setattr(
+        wrkslots,
+        "_capture_process_path_census",
+        lambda _paths: wrkslots._ProcessPathCensus((), ()),
+    )
+    interrupted = raw_command(
+        project,
+        "remove-validate-batch",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot",
+        "slot01=1",
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-validate-batch-seal-target"},
+    )
+    assert interrupted.returncode == 86, interrupted.stderr
+    active_before = wrkslots._active_path(config).read_bytes()
+    seal_path = wrkslots._validate_batch_seal_journal_path(config)
+    seal_before = seal_path.read_bytes()
+    assert (
+        wrkslots.main(
+            ["--project-root", str(project), "audit", "--gate", "--format", "json"]
+        )
+        == 1
+    )
+    payload = json.loads(capsys.readouterr().out)
+    row = next(row for row in payload["slots"] if row["slot"] == "slot01")
+    assert row["verdict"] == "BLOCKED"
+    assert "validation-batch seal" in row["reasons"][0]
+    assert wrkslots._active_path(config).read_bytes() == active_before
+    assert seal_path.read_bytes() == seal_before
+
+
+def test_audit_reports_malformed_validation_batch_seal_as_unknown(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    config = wrkslots._load_config(str(project), "testhost")
+    seal_path = wrkslots._validate_batch_seal_journal_path(config)
+    seal_path.write_text("{not-json\n", encoding="utf-8")
+    before = seal_path.read_bytes()
+
+    assert (
+        wrkslots.main(
+            ["--project-root", str(project), "audit", "--gate", "--format", "json"]
+        )
+        == 2
+    )
+    payload = json.loads(capsys.readouterr().out)
+    row = next(row for row in payload["slots"] if row["slot"] == seal_path.name)
+    assert row["verdict"] == "UNKNOWN"
+    assert "seal evidence is unreadable" in row["reasons"][0]
+    assert seal_path.read_bytes() == before
+
+
+def test_audit_reports_unattributable_validation_batch_seal_as_unknown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    prepare_dead_validate_slots(project, ("slot01",))
+    config = wrkslots._load_config(str(project), "testhost")
+    monkeypatch.setattr(
+        wrkslots,
+        "_capture_process_path_census",
+        lambda _paths: wrkslots._ProcessPathCensus((), ()),
+    )
+    interrupted = raw_command(
+        project,
+        "remove-validate-batch",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot",
+        "slot01=1",
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-validate-batch-seal-target"},
+    )
+    assert interrupted.returncode == 86, interrupted.stderr
+    seal_path = wrkslots._validate_batch_seal_journal_path(config)
+    seal = json.loads(seal_path.read_text(encoding="utf-8"))
+    seal["targets"][0]["generation"] = 2
+    seal_path.write_text(json.dumps(seal, indent=2) + "\n", encoding="utf-8")
+    before = seal_path.read_bytes()
+    assert (
+        wrkslots.main(
+            ["--project-root", str(project), "audit", "--gate", "--format", "json"]
+        )
+        == 2
+    )
+    payload = json.loads(capsys.readouterr().out)
+    row = next(row for row in payload["slots"] if row["slot"] == "slot01")
+    assert row["verdict"] == "UNKNOWN"
+    assert "cannot be attributed" in row["reasons"][0]
+    assert seal_path.read_bytes() == before
 
 
 def test_abort_create_preflights_every_checkout_before_removing_any(
@@ -8429,6 +9764,152 @@ def test_remove_validates_the_target_without_unrelated_storage(
     )
 
 
+def test_remove_ignores_unrelated_unavailable_repository(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, _repository, remote = make_project(tmp_path)
+    made = create(project, slot="target", slot_type="validate", branch=None)
+    assert made.returncode == 0, made.stderr
+    unrelated_repository = project / "repo-unrelated"
+    subprocess.run(
+        ["git", "clone", str(remote), str(unrelated_repository)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    unrelated = create(
+        project,
+        slot="unrelated",
+        agent="other",
+        branch="other/task",
+        repository_name="repo-unrelated",
+    )
+    assert unrelated.returncode == 0, unrelated.stderr
+    config = wrkslots._load_config(str(project), "testhost")
+    state = wrkslots._load_active(config)
+    target = next(record for record in state.slots if record.slot == "target")
+    assert target.owner is not None
+    wrkslots._write_active_state(
+        config,
+        wrkslots._replace_record(
+            state,
+            replace(target, owner=replace(target.owner, boot_id="finished-boot")),
+        ),
+        action="test-owner-exited",
+        slot="target",
+    )
+    set_liveness(project, "dead")
+    shutil.rmtree(unrelated_repository)
+    monkeypatch.setattr(
+        wrkslots, "_assert_slot_unused", lambda *_args, **_kwargs: None
+    )
+
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "remove",
+            "target",
+            "--validate-complete",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--expected-generation",
+            "1",
+        ]
+    )
+
+    assert rc == 0, capsys.readouterr().err
+    state = wrkslots._load_active(config, require_repository=False)
+    assert {record.slot for record in state.slots} == {"unrelated"}
+
+
+def test_remove_recovery_ignores_unrelated_unavailable_repository(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, _repository, remote = make_project(tmp_path)
+    made = create(project, slot="target", slot_type="validate", branch=None)
+    assert made.returncode == 0, made.stderr
+    unrelated_repository = project / "repo-unrelated"
+    subprocess.run(
+        ["git", "clone", str(remote), str(unrelated_repository)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    unrelated = create(
+        project,
+        slot="unrelated",
+        agent="other",
+        branch="other/recovery",
+        repository_name="repo-unrelated",
+    )
+    assert unrelated.returncode == 0, unrelated.stderr
+    config = wrkslots._load_config(str(project), "testhost")
+    state = wrkslots._load_active(config)
+    target = next(record for record in state.slots if record.slot == "target")
+    assert target.owner is not None
+    wrkslots._write_active_state(
+        config,
+        wrkslots._replace_record(
+            state,
+            replace(target, owner=replace(target.owner, boot_id="finished-boot")),
+        ),
+        action="test-owner-exited",
+        slot="target",
+    )
+    set_liveness(project, "dead")
+    shutil.rmtree(unrelated_repository)
+    monkeypatch.setattr(
+        wrkslots, "_assert_slot_unused", lambda *_args, **_kwargs: None
+    )
+
+    class Interrupted(RuntimeError):
+        pass
+
+    def interrupt_after_finish_journal(point: str) -> None:
+        if point == "after-finish-journal":
+            raise Interrupted
+
+    monkeypatch.setattr(
+        wrkslots, "_interrupt_for_test", interrupt_after_finish_journal
+    )
+    with pytest.raises(Interrupted):
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "remove",
+                "target",
+                "--validate-complete",
+                "--coordinator-authorized",
+                "--coordinator-pid",
+                str(os.getpid()),
+                "--expected-generation",
+                "1",
+            ]
+        )
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _point: None)
+
+    assert (
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "recover",
+                "--coordinator-pid",
+                str(os.getpid()),
+            ]
+        )
+        == 0
+    )
+    state = wrkslots._load_active(config, require_repository=False)
+    assert {record.slot for record in state.slots} == {"unrelated"}
+
+
 def test_remove_still_refuses_when_the_target_storage_is_missing(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -8457,11 +9938,203 @@ def test_remove_still_refuses_when_the_target_storage_is_missing(
     )
 
     assert rc == 3
-    assert "slot directory does not match its record" in capsys.readouterr().err
+    assert "record names checkout 'product' but it is not in" in capsys.readouterr().err
     assert any(
         isinstance(row, dict) and row.get("slot") == "target"
         for row in active_slots(project)
     )
+
+
+def test_remove_refuses_exact_target_extra_registration_at_selection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    made = create(project, slot="target", slot_type="validate", branch=None)
+    assert made.returncode == 0, made.stderr
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+    target = checkout(project, slot="target", slot_type="validate")
+    extra = target.parent / "extra-registration"
+    git(repository, "worktree", "add", "-b", "extra/selection", str(extra), "main")
+    shutil.rmtree(extra)
+    monkeypatch.setattr(
+        wrkslots, "_assert_slot_unused", lambda *_args, **_kwargs: None
+    )
+
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "remove",
+            "target",
+            "--validate-complete",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--expected-generation",
+            "1",
+        ]
+    )
+
+    assert rc == 3
+    assert "registers" in capsys.readouterr().err
+    assert target.is_dir()
+    assert any(
+        isinstance(row, dict) and row.get("slot") == "target"
+        for row in active_slots(project)
+    )
+
+
+def test_remove_rechecks_exact_target_extra_registration_at_delete_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    made = create(project, slot="target", slot_type="validate", branch=None)
+    assert made.returncode == 0, made.stderr
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+    target = checkout(project, slot="target", slot_type="validate")
+    extra = target.parent / "extra-registration"
+    original_check = wrkslots._assert_target_record_storage_consistent
+    calls = 0
+
+    def check_then_inject(
+        config: wrkslots.Config,
+        states: list[wrkslots.ActiveState],
+        record: wrkslots.ActiveRecord,
+    ) -> None:
+        nonlocal calls
+        calls += 1
+        original_check(config, states, record)
+        if calls == 1:
+            git(repository, "worktree", "add", "-b", "extra/boundary", str(extra), "main")
+            shutil.rmtree(extra)
+
+    monkeypatch.setattr(
+        wrkslots, "_assert_target_record_storage_consistent", check_then_inject
+    )
+    monkeypatch.setattr(
+        wrkslots, "_assert_slot_unused", lambda *_args, **_kwargs: None
+    )
+
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "remove",
+            "target",
+            "--validate-complete",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--expected-generation",
+            "1",
+        ]
+    )
+
+    assert rc == 3
+    assert calls == 2
+    assert "registers" in capsys.readouterr().err
+    assert target.is_dir()
+    assert any(
+        isinstance(row, dict) and row.get("slot") == "target"
+        for row in active_slots(project)
+    )
+
+
+def test_remove_refuses_cross_repository_target_registration_at_selection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, other, target = prepare_cross_repository_target(tmp_path)
+    extra = target.parent / "foreign-registration"
+    git(other, "worktree", "add", "-b", "foreign/selection", str(extra), "main")
+    shutil.rmtree(extra)
+    monkeypatch.setattr(
+        wrkslots, "_assert_slot_unused", lambda *_args, **_kwargs: None
+    )
+
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "remove",
+            "target",
+            "--validate-complete",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--expected-generation",
+            "1",
+        ]
+    )
+
+    assert rc == 3
+    assert "registers unexpected path" in capsys.readouterr().err
+    assert target.is_dir()
+
+
+def test_remove_rechecks_cross_repository_registration_at_delete_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, other, target = prepare_cross_repository_target(tmp_path)
+    extra = target.parent / "foreign-registration"
+    original_check = wrkslots._assert_target_record_storage_consistent
+    calls = 0
+
+    def check_then_inject(
+        config: wrkslots.Config,
+        states: Sequence[wrkslots.ActiveState],
+        record: wrkslots.ActiveRecord,
+    ) -> None:
+        nonlocal calls
+        calls += 1
+        original_check(config, states, record)
+        if calls == 1:
+            git(
+                other,
+                "worktree",
+                "add",
+                "-b",
+                "foreign/boundary",
+                str(extra),
+                "main",
+            )
+            shutil.rmtree(extra)
+
+    monkeypatch.setattr(
+        wrkslots, "_assert_target_record_storage_consistent", check_then_inject
+    )
+    monkeypatch.setattr(
+        wrkslots, "_assert_slot_unused", lambda *_args, **_kwargs: None
+    )
+
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "remove",
+            "target",
+            "--validate-complete",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--expected-generation",
+            "1",
+        ]
+    )
+
+    assert rc == 3
+    assert calls == 2
+    assert "registers unexpected path" in capsys.readouterr().err
+    assert target.is_dir()
 
 
 def test_unpushed_distinguishes_absent_and_rewritten_same_named_remote(
@@ -8765,6 +10438,137 @@ def test_recover_absent_agent_row_preserves_commit_before_registry_repair(
     path = wrkslots._stored_path(config, record.checkouts[0].path, "test checkout")
     assert wrkslots._GitVcs().worktree_registration(repository, path) is None
     assert run_absent_agent_recovery(project, record, apply=True) == 0
+
+
+def test_recover_absent_agent_row_accepts_unchanged_unregistered_branch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    record = prepare_absent_agent_row(project, repository)
+    git(repository, "worktree", "prune", "--expire=now")
+    set_liveness(project, "dead")
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    config = wrkslots._load_config(str(project), "testhost")
+    path = wrkslots._stored_path(config, record.checkouts[0].path, "test checkout")
+    assert wrkslots._GitVcs().worktree_registration(repository, path) is None
+    assert (
+        git(
+            repository,
+            "rev-parse",
+            f"refs/heads/{record.checkouts[0].branch}",
+        ).stdout.strip()
+        == record.checkouts[0].head
+    )
+
+    assert run_absent_agent_recovery(project, record, apply=True) == 0
+    assert not wrkslots._load_active(config).slots
+
+
+def test_recover_absent_agent_row_refuses_missing_recorded_local_branch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, remote = make_project(tmp_path)
+    record = prepare_absent_agent_row(project, repository)
+    git(repository, "worktree", "prune", "--expire=now")
+    checkout_record = record.checkouts[0]
+    branch_ref = f"refs/heads/{checkout_record.branch}"
+    git(repository, "update-ref", "-d", branch_ref)
+    set_liveness(project, "dead")
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    assert run_absent_agent_recovery(project, record, apply=True) == 3
+    assert "recorded checkout local branch" in capsys.readouterr().err
+    config = wrkslots._load_config(str(project), "testhost")
+    assert wrkslots._find_record(wrkslots._load_active(config), record.slot) == record
+    assert not (config.control / "ACTIVE.testhost.journal").exists()
+    rescue_ref = wrkslots._absent_agent_rescue_ref(record, checkout_record)
+    assert git(remote, "rev-parse", rescue_ref, check=False).returncode != 0
+
+
+def test_recover_absent_agent_row_refuses_branch_ahead_before_journal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, remote = make_project(tmp_path)
+    record = prepare_absent_agent_row(project, repository)
+    git(repository, "worktree", "prune", "--expire=now")
+    checkout_record = record.checkouts[0]
+    tree = git(repository, "rev-parse", f"{checkout_record.head}^{{tree}}").stdout.strip()
+    ahead = git(
+        repository,
+        "commit-tree",
+        tree,
+        "-p",
+        checkout_record.head,
+        "-m",
+        "unrecorded branch work",
+    ).stdout.strip()
+    branch_ref = f"refs/heads/{checkout_record.branch}"
+    git(repository, "update-ref", branch_ref, ahead, checkout_record.head)
+    set_liveness(project, "dead")
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    assert run_absent_agent_recovery(project, record, apply=True) == 3
+    assert "moved from recorded HEAD" in capsys.readouterr().err
+    config = wrkslots._load_config(str(project), "testhost")
+    assert wrkslots._find_record(wrkslots._load_active(config), record.slot) == record
+    assert git(repository, "rev-parse", branch_ref).stdout.strip() == ahead
+    assert not (config.control / "ACTIVE.testhost.journal").exists()
+    rescue_ref = wrkslots._absent_agent_rescue_ref(record, checkout_record)
+    assert git(remote, "rev-parse", rescue_ref, check=False).returncode != 0
+
+
+def test_recover_absent_agent_row_rechecks_branch_before_archive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, remote = make_project(tmp_path)
+    record = prepare_absent_agent_row(project, repository)
+    git(repository, "worktree", "prune", "--expire=now")
+    checkout_record = record.checkouts[0]
+    tree = git(repository, "rev-parse", f"{checkout_record.head}^{{tree}}").stdout.strip()
+    ahead = git(
+        repository,
+        "commit-tree",
+        tree,
+        "-p",
+        checkout_record.head,
+        "-m",
+        "branch advances during recovery",
+    ).stdout.strip()
+    branch_ref = f"refs/heads/{checkout_record.branch}"
+    original_push = wrkslots._GitVcs.push_salvage
+    advanced = False
+
+    def push_then_advance(
+        self: wrkslots._GitVcs,
+        checkout_path: Path,
+        remote_name: str,
+        commit: str,
+        rescue_ref: str,
+    ) -> None:
+        nonlocal advanced
+        original_push(self, checkout_path, remote_name, commit, rescue_ref)
+        if not advanced:
+            git(repository, "update-ref", branch_ref, ahead, checkout_record.head)
+            advanced = True
+
+    monkeypatch.setattr(wrkslots._GitVcs, "push_salvage", push_then_advance)
+    set_liveness(project, "dead")
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    assert run_absent_agent_recovery(project, record, apply=True) == 3
+    assert "moved from recorded HEAD" in capsys.readouterr().err
+    config = wrkslots._load_config(str(project), "testhost")
+    assert wrkslots._find_record(wrkslots._load_active(config), record.slot) == record
+    assert git(repository, "rev-parse", branch_ref).stdout.strip() == ahead
+    assert not wrkslots._load_archive(config).records
+    rescue_ref = wrkslots._absent_agent_rescue_ref(record, checkout_record)
+    assert git(remote, "rev-parse", rescue_ref).stdout.strip() == checkout_record.head
 
 
 def test_recover_absent_agent_row_refuses_live_or_changed_evidence(
@@ -10375,10 +12179,24 @@ def test_absent_validate_process_and_systemd_checks_fail_closed(
         "_process_uid",
         lambda _path: os.getuid() + 1,
     )
-    monkeypatch.setattr(wrkslots, "_read_process_cgroup", lambda _path: "/other")
+    cgroup_reads = 0
+
+    def read_cgroup(_path: Path) -> str:
+        nonlocal cgroup_reads
+        cgroup_reads += 1
+        return "/other"
+
+    monkeypatch.setattr(wrkslots, "_read_process_cgroup", read_cgroup)
     monkeypatch.setattr(wrkslots, "_mount_namespace", lambda _path: "mnt:[123]")
     snapshot = wrkslots._absent_validate_process_snapshot(proc_root)
     assert snapshot == (wrkslots._AbsentProcessObservation(123, 17, "/other", "mnt:[123]"),)
+    assert cgroup_reads == 1
+    cgroup_reads = 0
+    cgroupless = wrkslots._absent_validate_process_snapshot(
+        proc_root, include_owner_cgroups=False
+    )
+    assert cgroupless == (wrkslots._AbsentProcessObservation(123, 17, "", "mnt:[123]"),)
+    assert cgroup_reads == 0
 
     monkeypatch.setattr(
         wrkslots, "_mountinfo_path_references", lambda _pid, _budget: ()
@@ -10389,7 +12207,11 @@ def test_absent_validate_process_and_systemd_checks_fail_closed(
     )
     assert shared_launcher_cgroup is None
 
-    monkeypatch.setattr(wrkslots, "_root_owned_executable", lambda path, _label: path)
+    monkeypatch.setattr(
+        wrkslots,
+        "_root_owned_executable",
+        lambda path, _label: wrkslots._TrustedExecutablePath(path, ()),
+    )
     monkeypatch.setattr(
         wrkslots,
         "_run_bounded_read_only_command",
@@ -10441,6 +12263,77 @@ def test_absent_validate_process_and_systemd_checks_fail_closed(
         wrkslots._assert_absent_validate_systemd_unrelated(rows, {"gone": ()}, snapshot)
 
 
+def test_final_slot_scan_uses_filesystem_uid_for_private_fence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    proc_root = tmp_path / "proc"
+    pid_dir = proc_root / "123"
+    pid_dir.mkdir(parents=True)
+    filesystem_uid = os.getuid()
+    inspected: list[Path] = []
+    monkeypatch.setattr(
+        wrkslots,
+        "_process_uids",
+        lambda _path: (
+            os.getuid() + 1,
+            os.getuid() + 1,
+            os.getuid() + 1,
+            filesystem_uid,
+        ),
+    )
+
+    def uses(process: Path, _slot: Path) -> list[str]:
+        inspected.append(process)
+        return ["cwd=/private/fence"]
+
+    monkeypatch.setattr(wrkslots, "_process_uses_slot", uses)
+    fallback = wrkslots._ProcessPathCensus((), ())
+    with pytest.raises(wrkslots.Refusal, match="live process 123"):
+        wrkslots._assert_slot_unused(
+            Path("/private/fence"),
+            use_lsof=False,
+            fallback_census=fallback,
+            proc_root=proc_root,
+        )
+    assert inspected == [pid_dir]
+
+    filesystem_uid = os.getuid() + 1
+    inspected.clear()
+    wrkslots._assert_slot_unused(
+        Path("/private/fence"),
+        use_lsof=False,
+        fallback_census=fallback,
+        proc_root=proc_root,
+    )
+    assert inspected == []
+
+
+def test_final_slot_scan_does_not_use_stale_census_for_indeterminate_current_uid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    proc_root = tmp_path / "proc"
+    (proc_root / "123").mkdir(parents=True)
+    monkeypatch.setattr(
+        wrkslots,
+        "_process_uids",
+        lambda _path: (os.getuid(), os.getuid(), os.getuid(), os.getuid()),
+    )
+    monkeypatch.setattr(
+        wrkslots,
+        "_process_uses_slot",
+        lambda _process, _slot: (_ for _ in ()).throw(
+            wrkslots.Refusal("fresh process evidence is unreadable")
+        ),
+    )
+    with pytest.raises(wrkslots.Refusal, match="fresh process evidence is unreadable"):
+        wrkslots._assert_slot_unused(
+            Path("/private/fence"),
+            use_lsof=False,
+            fallback_census=wrkslots._ProcessPathCensus((), ()),
+            proc_root=proc_root,
+        )
+
+
 def test_mount_namespace_reselects_after_representative_generation_changes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -10465,6 +12358,39 @@ def test_mount_namespace_reselects_after_representative_generation_changes(
     )
     assert wrkslots._absent_validate_mount_match(processes, {target: "gone"}) is None
     assert inspected == [123, 124]
+
+
+@pytest.mark.parametrize("persistent", (False, True))
+def test_mountinfo_census_retries_only_transient_stable_einval(
+    monkeypatch: pytest.MonkeyPatch,
+    persistent: bool,
+) -> None:
+    target = Path("/absent/validate/gone")
+    process = wrkslots._AbsentProcessObservation(123, 17, "/other", "mnt:[123]")
+    calls = 0
+
+    def mountinfo(
+        _pid: int, _budget: wrkslots._ReadOnlyCommandBudget
+    ) -> tuple[tuple[Path, str], ...]:
+        nonlocal calls
+        calls += 1
+        if persistent or calls == 1:
+            try:
+                raise OSError(errno.EINVAL, "transient procfs state")
+            except OSError as cause:
+                raise wrkslots.Refusal("cannot read mountinfo") from cause
+        return ((target, str(target)),)
+
+    monkeypatch.setattr(wrkslots, "_mountinfo_path_references", mountinfo)
+    monkeypatch.setattr(wrkslots, "_process_start_ticks", lambda _path: 17)
+    if persistent:
+        with pytest.raises(wrkslots.Refusal, match="cannot read mountinfo"):
+            wrkslots._absent_validate_mount_matches((process,), {target: "gone"})
+    else:
+        assert wrkslots._absent_validate_mount_matches(
+            (process,), {target: "gone"}
+        ) == ((123, "gone", "mount", str(target)),)
+    assert calls == 2
 
 
 def test_mountinfo_census_enforces_file_aggregate_and_deadline_bounds(
@@ -10697,7 +12623,7 @@ def test_user_systemd_uses_validated_bus_and_absolute_binary(
     monkeypatch.setattr(
         wrkslots,
         "_root_owned_executable",
-        lambda path, _label: path,
+        lambda path, _label: wrkslots._TrustedExecutablePath(path, ()),
     )
 
     def bounded(command: list[str], **kwargs: object) -> tuple[int, bytes, bytes]:
@@ -10734,10 +12660,242 @@ def test_bounded_read_only_command_refuses_output_and_time_overruns() -> None:
         )
 
 
+def test_root_owned_executable_rejects_namespace_root_without_host_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if os.getuid() != 0 or wrkslots._has_identity_user_namespace():
+        pytest.skip("requires a nonidentity user namespace with visible UID 0")
+    helper = tmp_path / "attacker-owned-helper"
+    helper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    helper.chmod(0o755)
+    assert helper.stat().st_uid == 0
+    assert not wrkslots._has_identity_user_namespace()
+    monkeypatch.setattr(wrkslots, "_TRUSTED_EXECUTABLE_DIRECTORY", tmp_path)
+    with pytest.raises(wrkslots.Refusal, match="not a root-owned"):
+        wrkslots._root_owned_executable(helper, "attacker helper")
+
+
+def test_root_owned_executable_accepts_host_root_helper() -> None:
+    if not wrkslots._has_identity_user_namespace():
+        pytest.skip("requires the initial identity user namespace")
+    executable = wrkslots._root_owned_executable(Path("/usr/bin/find"), "find")
+    assert executable.path == Path("/usr/bin/find").resolve(strict=True)
+    wrkslots._recheck_trusted_executable(executable)
+
+
+def test_root_owned_executable_rejects_nested_identity_map(tmp_path: Path) -> None:
+    uid_map = tmp_path / "uid_map"
+    uid_map.write_text("0 0 1\n", encoding="ascii")
+    assert not wrkslots._has_identity_user_namespace(uid_map)
+
+
+def test_root_owned_executable_refuses_effectively_writable_ancestor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executable = Path("/usr/bin/find")
+
+    def identity(path: Path) -> tuple[Path, int, int, int, int, int]:
+        mode = stat.S_IFREG | 0o555 if path == executable else stat.S_IFDIR | 0o555
+        return path, 1, len(path.parts), mode, 0, 0
+
+    def access(path: os.PathLike[str], mode: int, *, effective_ids: bool = False) -> bool:
+        assert effective_ids
+        if mode == os.W_OK:
+            return Path(path) == Path("/usr")
+        assert mode == os.X_OK
+        return True
+
+    monkeypatch.setattr(wrkslots, "_has_identity_user_namespace", lambda: True)
+    monkeypatch.setattr(wrkslots, "_trusted_path_identity", identity)
+    monkeypatch.setattr(os, "access", access)
+    with pytest.raises(wrkslots.Refusal, match=r"component: /usr$"):
+        wrkslots._root_owned_executable(executable, "find")
+
+
+def test_trusted_executable_recheck_refuses_substitution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executable = Path("/usr/bin/find")
+    expected = (executable, 1, 2, stat.S_IFREG | 0o555, 0, 0)
+    authority = wrkslots._TrustedExecutablePath(executable, (expected,))
+    monkeypatch.setattr(
+        wrkslots,
+        "_trusted_path_identity",
+        lambda path: (path, 1, 3, stat.S_IFREG | 0o555, 0, 0),
+    )
+    with pytest.raises(wrkslots.Refusal, match="identity changed before execution"):
+        wrkslots._recheck_trusted_executable(authority)
+
+
+def test_same_uid_snapshot_selects_filesystem_uid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    proc_root = tmp_path / "proc"
+    pid_dir = proc_root / "123"
+    pid_dir.mkdir(parents=True)
+    filesystem_uid = os.getuid() + 1
+    monkeypatch.setattr(
+        wrkslots,
+        "_read_process_stat",
+        lambda _path: wrkslots._ProcessStat(start_ticks=17, flags=0),
+    )
+    monkeypatch.setattr(
+        wrkslots, "_process_filesystem_uid", lambda _path: filesystem_uid
+    )
+    monkeypatch.setattr(
+        wrkslots,
+        "_read_process_cgroup",
+        lambda _path: pytest.fail("same-UID final snapshot read unused cgroup evidence"),
+    )
+    monkeypatch.setattr(wrkslots, "_mount_namespace", lambda _path: "mnt:[123]")
+    budget = wrkslots._ReadOnlyCommandBudget.start(
+        timeout_seconds=30,
+        stdout_limit=1024,
+        stderr_limit=1024,
+    )
+
+    assert wrkslots._same_uid_process_observations(budget, proc_root) == ()
+    filesystem_uid = os.getuid()
+    observed = wrkslots._same_uid_process_observations(budget, proc_root)
+    assert len(observed) == 1
+    assert observed[0].pid == 123
+    assert observed[0].start_ticks == 17
+
+
+def test_same_uid_path_census_routes_protected_process_to_fresh_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = wrkslots._AbsentProcessObservation(123, 17, "/other", "mnt:[123]")
+    target = Path("/absent/validate/gone")
+    monkeypatch.setattr(
+        os,
+        "readlink",
+        lambda _path: (_ for _ in ()).throw(PermissionError("procfs denied")),
+    )
+    monkeypatch.setattr(wrkslots, "_process_start_ticks", lambda _path: 17)
+    monkeypatch.setattr(
+        wrkslots,
+        "_run_same_uid_command",
+        lambda *_args, **_kwargs: pytest.fail(
+            "known-protected proc entries reached the unprivileged command"
+        ),
+    )
+    budget = wrkslots._ReadOnlyCommandBudget.start(
+        timeout_seconds=30,
+        stdout_limit=1024,
+        stderr_limit=1024,
+    )
+
+    matches, fallback = wrkslots._same_uid_batched_path_matches(
+        (process,), {target: str(target)}, budget
+    )
+    assert matches == ()
+    assert fallback == (process,)
+
+
+@pytest.mark.parametrize("fallback", ("clear", "in-use", "refused"))
+def test_same_uid_census_resolves_protected_process_only_with_fresh_privilege(
+    monkeypatch: pytest.MonkeyPatch,
+    fallback: str,
+) -> None:
+    process = wrkslots._AbsentProcessObservation(123, 17, "/other", "mnt:[123]")
+    target = Path("/absent/validate/gone")
+    monkeypatch.setattr(
+        wrkslots, "_same_uid_process_observations", lambda _budget: (process,)
+    )
+    monkeypatch.setattr(
+        wrkslots,
+        "_same_uid_batched_path_matches",
+        lambda _processes, _targets, _budget: ((), (process,)),
+    )
+    monkeypatch.setattr(
+        wrkslots, "_absent_validate_mount_matches", lambda *_args: ()
+    )
+    privileged_calls: list[str] = []
+
+    def privileged_find(
+        _processes: Sequence[wrkslots._AbsentProcessObservation],
+        _targets: dict[Path, str],
+        _budget: wrkslots._ReadOnlyCommandBudget,
+    ) -> tuple[tuple[int, str, str, str], ...]:
+        privileged_calls.append("find")
+        if fallback == "refused":
+            raise wrkslots.Refusal("fresh privileged fallback refused")
+        if fallback == "in-use":
+            return ((process.pid, str(target), "cwd", str(target)),)
+        return ()
+
+    monkeypatch.setattr(wrkslots, "_absent_validate_find_matches", privileged_find)
+
+    def privileged_maps(*_args: object) -> tuple[()]:
+        privileged_calls.append("maps")
+        return ()
+
+    monkeypatch.setattr(
+        wrkslots,
+        "_absent_validate_maps_matches",
+        privileged_maps,
+    )
+    budget = wrkslots._ReadOnlyCommandBudget.start(
+        timeout_seconds=30,
+        stdout_limit=1024,
+        stderr_limit=1024,
+    )
+
+    if fallback == "refused":
+        with pytest.raises(wrkslots.Refusal, match="fresh privileged fallback refused"):
+            wrkslots._capture_same_uid_process_path_census((target,), budget=budget)
+        assert privileged_calls == ["find"]
+        return
+    census = wrkslots._capture_same_uid_process_path_census((target,), budget=budget)
+    assert privileged_calls == ["find", "maps"]
+    if fallback == "in-use":
+        with pytest.raises(wrkslots.Refusal, match="live process 123"):
+            census.assert_slot_unused(target, None)
+    else:
+        census.assert_slot_unused(target, None)
+
+
+def test_same_uid_census_retries_share_one_batch_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monotonic_now = 0.0
+
+    def monotonic() -> float:
+        return monotonic_now
+
+    monkeypatch.setattr(time, "monotonic", monotonic)
+    budget = wrkslots._ReadOnlyCommandBudget.start(
+        timeout_seconds=20,
+        stdout_limit=1024,
+        stderr_limit=1024,
+    )
+    calls = 0
+
+    def changed(_budget: wrkslots._ReadOnlyCommandBudget) -> tuple[object, ...]:
+        nonlocal calls, monotonic_now
+        assert _budget is budget
+        calls += 1
+        monotonic_now += 11.0
+        raise wrkslots._ProcessEvidenceChanged("generation changed")
+
+    monkeypatch.setattr(wrkslots, "_same_uid_process_observations", changed)
+    with pytest.raises(wrkslots.Refusal, match="operation-wide time bound"):
+        wrkslots._capture_same_uid_process_path_census(
+            (Path("/absent/validate/gone"),), budget=budget
+        )
+    assert calls == 2
+
+
 def test_privileged_census_enforces_one_operation_wide_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(wrkslots, "_root_owned_executable", lambda path, _label: path)
+    monkeypatch.setattr(
+        wrkslots,
+        "_root_owned_executable",
+        lambda path, _label: wrkslots._TrustedExecutablePath(path, ()),
+    )
     monkeypatch.setattr(
         wrkslots,
         "_run_bounded_read_only_command",
