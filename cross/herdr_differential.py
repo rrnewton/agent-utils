@@ -953,6 +953,7 @@ def _workspace_is_safely_unresolvable(stdout: str) -> bool:
     return (
         "no workspace labelled" in stdout
         or "evidence unavailable: workspace list:" in stdout
+        or "evidence unavailable: Herdr executable not found in fixed install locations:" in stdout
     )
 
 

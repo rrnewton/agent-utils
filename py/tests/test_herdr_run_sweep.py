@@ -440,9 +440,11 @@ def test_a_pane_in_another_workspace_is_out_of_scope(tmp_path: object) -> None:
     root = str(tmp_path)
     _write_spool(root, [_record(pane_id="w1:p1", workspace="someone-elses")])
     fake = _fake_with_pane("w1:p1", shell_pid=4242)
+    fake.calls.clear()
     proc = _proc_with(root, 0, 0)
 
     plan = sweep(_client(fake), _config(root), proc_root=proc)
+    assert fake.calls == []
     assert plan.counts()["OUT_OF_SCOPE"] == 1
     assert plan.reapable == ()
 
@@ -464,10 +466,12 @@ def test_an_unanswering_herdr_reaps_nothing(tmp_path: object) -> None:
     root = str(tmp_path)
     _write_spool(root, [_record(pane_id="w1:p1")])
     fake = _fake_with_pane("w1:p1", shell_pid=4242)
+    fake.calls.clear()
     fake.fail_pane_list = True
     proc = _proc_with(root, 0, 0)
 
     plan = sweep(_client(fake), _config(root), proc_root=proc)
+    assert fake.calls == ["workspace_id_for_label(agent-cmds)"]
     assert plan.counts()["STALE"] == 0
     assert plan.counts()["UNKNOWN"] == 1
     # And it must say the SERVER did not answer, not that herdr no longer lists the pane. The
@@ -483,7 +487,9 @@ def test_an_unanswering_herdr_reaps_nothing(tmp_path: object) -> None:
 
 def test_an_empty_spool_reports_zero_of_everything(tmp_path: object) -> None:
     root = str(tmp_path)
-    plan = sweep(_client(FakeHerdrClient()), _config(root), proc_root=str(tmp_path))
+    fake = FakeHerdrClient()
+    plan = sweep(_client(fake), _config(root), proc_root=str(tmp_path))
+    assert fake.calls == []
     counts = plan.counts()
     assert counts["considered"] == 0
     # Every verdict is present even at zero, so an inert sweep still prints its own shape.

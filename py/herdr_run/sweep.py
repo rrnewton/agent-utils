@@ -166,26 +166,27 @@ def build_evidence(
     """Gather one :class:`PaneEvidence` per pane this tool has run a command in."""
     spool = load_run_records(config) if records is None else tuple(records)
     boot = current_boot_id(proc_root=proc_root)
+    pane_ids = pane_ids_in(spool)
+    scopes = tuple(_scope_of(pane_id, spool, config) for pane_id in pane_ids)
 
     live_pane_ids: frozenset[str] = frozenset()
     listing_error: str | None = None
-    try:
-        workspace_id = client.workspace_id_for_label(config.workspace)
-        if workspace_id is None:
-            # No workspace by that label means we never got a listing at all. Saying nothing here
-            # would leave every pane reporting "herdr does not list this pane", which tells an
-            # operator the tabs are already gone -- the opposite of what happened.
-            listing_error = f"herdr has no workspace labelled {config.workspace!r}"
-        else:
-            live_pane_ids = frozenset(pane.pane_id for pane in client.panes(workspace_id))
-    except HerdrRunError as exc:
-        # Not fatal, and NOT an empty listing: "herdr did not answer" must not be read as "every
-        # pane is gone", which is the one mistake that would close the whole workspace.
-        listing_error = str(exc)
+    if any(scope[0] for scope in scopes):
+        try:
+            workspace_id = client.workspace_id_for_label(config.workspace)
+            if workspace_id is None:
+                # No workspace by that label means no listing was obtained. Saying nothing here
+                # would tell an operator the tabs are already gone -- the opposite of what happened.
+                listing_error = f"herdr has no workspace labelled {config.workspace!r}"
+            else:
+                live_pane_ids = frozenset(pane.pane_id for pane in client.panes(workspace_id))
+        except HerdrRunError as exc:
+            # Not fatal, and NOT an empty listing: "herdr did not answer" must not be read as
+            # "every pane is gone", which is the one mistake that would close the workspace.
+            listing_error = str(exc)
 
     evidence: list[PaneEvidence] = []
-    for pane_id in pane_ids_in(spool):
-        in_scope, tab_id, tab_label, workspace_label = _scope_of(pane_id, spool, config)
+    for pane_id, (in_scope, tab_id, tab_label, workspace_label) in zip(pane_ids, scopes):
         flags, recorded = evidence_from_runs(pane_id, spool)
         live: ProcessIdentity | None = None
         error = listing_error

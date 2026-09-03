@@ -690,10 +690,13 @@ fn command_status(config: &Config, agent: &str, json_output: bool) -> Result<i32
     use crate::status::{inspect_session, status_document, status_text, Session};
 
     let tab_label = tab_label_for(config, agent)?;
-    // A construction failure is a fact about the session worth REPORTING, not an error to exit on:
+    // A resolution failure is a fact about the session worth REPORTING, not an error to exit on:
     // "herdr is not installed" is one of the most useful things status can tell somebody.
     let session = match HerdrClient::new(&config.broker) {
-        Ok(client) => inspect_session(&client, config, &tab_label),
+        Ok(client) => match client.preflight() {
+            Ok(()) => inspect_session(&client, config, &tab_label),
+            Err(error) => Session::Unreachable(error.message().to_owned()),
+        },
         Err(error) => Session::Unreachable(error.message().to_owned()),
     };
     if json_output {

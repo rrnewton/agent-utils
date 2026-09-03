@@ -222,31 +222,39 @@ pub fn build_evidence<A: HerdrApi + ?Sized>(
 ) -> Vec<PaneEvidence> {
     let spool = records.unwrap_or_else(|| load_run_records(config));
     let boot = current_boot_id(proc_root);
+    let pane_ids = pane_ids_in(&spool);
+    let scopes = pane_ids
+        .iter()
+        .map(|pane_id| scope_of(pane_id, &spool, config))
+        .collect::<Vec<_>>();
 
     let mut live_pane_ids: BTreeSet<String> = BTreeSet::new();
     let mut listing_error: Option<String> = None;
-    match client.workspace_id_for_label(&config.workspace) {
-        Ok(Some(workspace_id)) => match client.panes(Some(&workspace_id)) {
-            Ok(panes) => live_pane_ids.extend(panes.into_iter().map(|pane| pane.pane_id)),
-            // Not fatal, and NOT an empty listing: "herdr did not answer" must not be read as
-            // "every pane is gone", which is the one mistake that would close the whole workspace.
+    if scopes.iter().any(|scope| scope.0) {
+        match client.workspace_id_for_label(&config.workspace) {
+            Ok(Some(workspace_id)) => match client.panes(Some(&workspace_id)) {
+                Ok(panes) => live_pane_ids.extend(panes.into_iter().map(|pane| pane.pane_id)),
+                // Not fatal, and NOT an empty listing: "herdr did not answer" must not be read as
+                // "every pane is gone", which is the one mistake that would close the workspace.
+                Err(error) => listing_error = Some(error.to_string()),
+            },
+            // No workspace by that label means we never got a listing at all. Saying nothing here
+            // would leave every pane reporting "herdr does not list this pane", which tells an
+            // operator the tabs are already gone — the opposite of what happened.
+            Ok(None) => {
+                listing_error = Some(format!(
+                    "herdr has no workspace labelled '{}'",
+                    config.workspace
+                ));
+            }
             Err(error) => listing_error = Some(error.to_string()),
-        },
-        // No workspace by that label means we never got a listing at all. Saying nothing here would
-        // leave every pane reporting "herdr does not list this pane", which tells an operator the
-        // tabs are already gone — the opposite of what happened.
-        Ok(None) => {
-            listing_error = Some(format!(
-                "herdr has no workspace labelled '{}'",
-                config.workspace
-            ));
         }
-        Err(error) => listing_error = Some(error.to_string()),
     }
 
     let mut evidence = Vec::new();
-    for pane_id in pane_ids_in(&spool) {
-        let (in_scope, tab_id, tab_label, workspace_label) = scope_of(&pane_id, &spool, config);
+    for (pane_id, (in_scope, tab_id, tab_label, workspace_label)) in
+        pane_ids.into_iter().zip(scopes)
+    {
         let (flags, recorded) = evidence_from_runs(&pane_id, &spool);
         let known = live_pane_ids.contains(&pane_id);
         let mut live = None;
@@ -335,6 +343,7 @@ mod tests {
     struct SweepFake {
         panes: Vec<Pane>,
         shell_pids: BTreeMap<String, i64>,
+        workspace_queries: AtomicUsize,
         fail_pane_list: bool,
         /// When true, `process_info` fails the way a busy or restarting server does. A control call
         /// that did not answer says nothing about whether the pane's shell is alive, so the sweep
@@ -354,6 +363,7 @@ mod tests {
                     workspace_id: "w1".to_owned(),
                 }],
                 shell_pids: BTreeMap::from([(pane_id.to_owned(), shell_pid)]),
+                workspace_queries: AtomicUsize::new(0),
                 fail_pane_list: false,
                 fail_process_info: false,
                 workspace_exists: true,
@@ -371,6 +381,7 @@ mod tests {
         }
 
         fn workspace_id_for_label(&self, _label: &str) -> Result<Option<String>> {
+            self.workspace_queries.fetch_add(1, Ordering::Relaxed);
             Ok(self.workspace_exists.then(|| "w1".to_owned()))
         }
 
@@ -807,7 +818,9 @@ mod tests {
         let root = temporary_root("other-workspace");
         write_spool(&root, &[record("w1:p1", json!(0), "someone-elses", "kvm")]);
         let proc = proc_with(&root, None, 0);
-        let plan = sweep(&SweepFake::with_pane("w1:p1", 4242), &config(&root), &proc);
+        let fake = SweepFake::with_pane("w1:p1", 4242);
+        let plan = sweep(&fake, &config(&root), &proc);
+        assert_eq!(fake.workspace_queries.load(Ordering::Relaxed), 0);
         assert_eq!(plan.counts()["OUT_OF_SCOPE"], 1);
         assert!(plan.reapable().is_empty());
         fs::remove_dir_all(root).unwrap();
@@ -843,6 +856,7 @@ mod tests {
         let mut fake = SweepFake::with_pane("w1:p1", 4242);
         fake.fail_pane_list = true;
         let plan = sweep(&fake, &config(&root), &proc);
+        assert_eq!(fake.workspace_queries.load(Ordering::Relaxed), 1);
         assert_eq!(plan.counts()["STALE"], 0);
         assert_eq!(plan.counts()["UNKNOWN"], 1);
         // And it must say the SERVER did not answer, not that herdr no longer lists the pane. The
@@ -861,7 +875,9 @@ mod tests {
     fn an_empty_spool_reports_zero_of_everything() {
         let root = temporary_root("empty");
         let proc = proc_with(&root, None, 0);
-        let plan = sweep(&SweepFake::with_pane("w1:p1", 4242), &config(&root), &proc);
+        let fake = SweepFake::with_pane("w1:p1", 4242);
+        let plan = sweep(&fake, &config(&root), &proc);
+        assert_eq!(fake.workspace_queries.load(Ordering::Relaxed), 0);
         let counts = plan.counts();
         assert_eq!(counts["considered"], 0);
         for verdict in Verdict::all() {

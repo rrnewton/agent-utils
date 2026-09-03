@@ -21,7 +21,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -295,7 +295,8 @@ impl Broker {
 
 /// Production command-level client for a Herdr session.
 pub struct HerdrClient {
-    herdr_bin: String,
+    configured_herdr_bin: PathBuf,
+    herdr_bin: OnceLock<String>,
     systemd_run_bin: String,
     account_home: String,
     broker: Broker,
@@ -307,7 +308,8 @@ impl fmt::Debug for HerdrClient {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("HerdrClient")
-            .field("herdr_bin", &self.herdr_bin)
+            .field("configured_herdr_bin", &self.configured_herdr_bin)
+            .field("herdr_bin", &self.herdr_bin.get())
             .field("systemd_run_bin", &self.systemd_run_bin)
             .field("account_home", &self.account_home)
             .field("broker", &self.broker)
@@ -328,7 +330,6 @@ impl HerdrClient {
     /// group/world writable; caller-controlled `PATH` is never searched.
     pub fn with_executable(broker: &str, configured: &Path) -> Result<Self> {
         let account_home = current_account_home()?;
-        let herdr_bin = resolve_configured_herdr_executable(configured, &account_home)?;
         let systemd_run_bin = resolve_fixed_executable(
             "systemd-run",
             &[
@@ -337,16 +338,20 @@ impl HerdrClient {
             ],
         )?;
         let runner = Arc::new(SystemCommandRunner::new(&account_home));
-        Self::from_parts(
-            broker,
-            herdr_bin,
+        let account_home = utf8_absolute(&account_home, "account home")?;
+        let systemd_run_bin = utf8_absolute(&systemd_run_bin, "systemd-run executable")?;
+        Ok(Self {
+            configured_herdr_bin: configured.to_path_buf(),
+            herdr_bin: OnceLock::new(),
             systemd_run_bin,
             account_home,
+            broker: Broker::parse(broker)?,
             runner,
-            Arc::new(ThreadSleeper),
-        )
+            sleeper: Arc::new(ThreadSleeper),
+        })
     }
 
+    #[cfg(test)]
     fn from_parts(
         broker: &str,
         herdr_bin: PathBuf,
@@ -359,13 +364,43 @@ impl HerdrClient {
         let systemd_run_bin = utf8_absolute(&systemd_run_bin, "systemd-run executable")?;
         let account_home = utf8_absolute(&account_home, "account home")?;
         Ok(Self {
-            herdr_bin,
+            configured_herdr_bin: PathBuf::from(&herdr_bin),
+            herdr_bin: OnceLock::from(herdr_bin),
             systemd_run_bin,
             account_home,
             broker: Broker::parse(broker)?,
             runner,
             sleeper,
         })
+    }
+
+    /// Resolve the configured Herdr executable without invoking it.
+    ///
+    /// Normal construction is deliberately lazy: report-only operations such as an empty reap do
+    /// not depend on a Herdr installation. `status` calls this method because it must distinguish
+    /// "Herdr is not installed" from "Herdr is installed and no server is running".
+    pub fn preflight(&self) -> Result<()> {
+        self.herdr_executable()?;
+        Ok(())
+    }
+
+    fn herdr_executable(&self) -> Result<String> {
+        if let Some(resolved) = self.herdr_bin.get() {
+            return Ok(resolved.clone());
+        }
+        let resolved = resolve_configured_herdr_executable(
+            &self.configured_herdr_bin,
+            Path::new(&self.account_home),
+        )?;
+        let resolved = utf8_absolute(&resolved, "Herdr executable")?;
+        // Concurrent first callers may both resolve. Whichever stores first becomes the stable
+        // executable for this client; every caller returns that same cached winner.
+        let _ = self.herdr_bin.set(resolved);
+        Ok(self
+            .herdr_bin
+            .get()
+            .expect("a successful Herdr resolution must populate the cache")
+            .clone())
     }
 
     /// Ensure a compatible server is available, using production polling limits.
@@ -382,6 +417,8 @@ impl HerdrClient {
             return Ok(false);
         }
 
+        let herdr_bin = self.herdr_executable()?;
+
         let launch = vec![
             self.systemd_run_bin.clone(),
             "--user".to_owned(),
@@ -392,7 +429,7 @@ impl HerdrClient {
             "herdr-run Herdr server (outside the agent sandbox)".to_owned(),
             "--setenv".to_owned(),
             format!("HOME={}", self.account_home),
-            self.herdr_bin.clone(),
+            herdr_bin,
             "server".to_owned(),
         ];
         let completed = self.runner.run(&launch).map_err(|error| {
@@ -746,7 +783,7 @@ impl HerdrClient {
 
     fn invoke_with_timeout(&self, args: &[String], timeout: Duration) -> Result<CommandOutput> {
         let mut command = Vec::with_capacity(args.len() + 1);
-        command.push(self.herdr_bin.clone());
+        command.push(self.herdr_executable()?);
         command.extend_from_slice(args);
         if self.broker == Broker::SystemdRun {
             let mut wrapped = vec![
@@ -1245,6 +1282,34 @@ mod tests {
             fs::canonicalize(&cargo_candidate).unwrap()
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_herdr_is_deferred_until_preflight_or_a_live_query() {
+        let missing = std::env::temp_dir().join(format!(
+            "missing-herdr-{}-{}",
+            std::process::id(),
+            TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let client = HerdrClient::with_executable("direct", &missing)
+            .expect("constructing a query-free client must not resolve Herdr");
+
+        assert!(client.herdr_bin.get().is_none());
+        let preflight_error = client.preflight().unwrap_err();
+        assert_eq!(preflight_error.kind(), crate::error::ErrorKind::Unavailable);
+        assert!(preflight_error
+            .to_string()
+            .contains(&missing.display().to_string()));
+        assert!(
+            client.herdr_bin.get().is_none(),
+            "failed resolution is not cached"
+        );
+
+        let query_error = client.workspace_id_for_label("wanted").unwrap_err();
+        assert_eq!(query_error.kind(), crate::error::ErrorKind::Unavailable);
+        assert!(query_error
+            .to_string()
+            .contains(&missing.display().to_string()));
     }
 
     #[test]
