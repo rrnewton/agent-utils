@@ -466,22 +466,23 @@ fn run_tick_command(
             let _ = writeln!(stderr, "{PROG}: {note}");
         }
     }
-    let mut emit_line = |line: &str| {
-        writeln!(stdout, "{line}")?;
-        stdout.flush()
+    let result = {
+        let mut emit_line = |line: &str| {
+            writeln!(stdout, "{line}")?;
+            stdout.flush()
+        };
+        run_tick_with_emit(
+            &config,
+            &state,
+            args.now.unwrap_or_else(wall_clock_now),
+            &fired,
+            &SubprocessGateRunner::default(),
+            &GlobFileAgeProbe,
+            args.current_tick_min,
+            args.report_pending,
+            &mut emit_line,
+        )
     };
-    let result = run_tick_with_emit(
-        &config,
-        &state,
-        args.now.unwrap_or_else(wall_clock_now),
-        &fired,
-        &SubprocessGateRunner::default(),
-        &GlobFileAgeProbe,
-        args.current_tick_min,
-        args.report_pending,
-        &mut emit_line,
-    );
-    drop(emit_line);
     let result = match result {
         Ok(result) => result,
         Err(error) => {
