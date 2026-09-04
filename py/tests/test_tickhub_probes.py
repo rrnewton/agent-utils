@@ -179,3 +179,42 @@ def test_external_sigterm_returns_promptly_when_descendant_escapes_gate_group(
             process.wait(timeout=3)
         _kill_pinned_process(gate_pidfd)
         _kill_pinned_process(child_pidfd)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="process liveness is read from Linux /proc")
+def test_parallel_gate_scope_reaps_every_gate_on_sigterm(tmp_path: Path) -> None:
+    first_pid_file = tmp_path / "first.pid"
+    second_pid_file = tmp_path / "second.pid"
+    first = f"echo $$ > {shlex.quote(str(first_pid_file))}; exec sleep 30"
+    second = f"echo $$ > {shlex.quote(str(second_pid_file))}; exec sleep 30"
+    harness = textwrap.dedent(
+        f"""
+        from tick_hub.probes import SubprocessGateRunner
+        from concurrent.futures import ThreadPoolExecutor
+        runner = SubprocessGateRunner(timeout=30)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            with runner.parallel_scope():
+                futures = [executor.submit(runner.run, command) for command in ({first!r}, {second!r})]
+                [future.result() for future in futures]
+        """
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", harness],
+        env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1])},
+        start_new_session=True,
+    )
+    pids: tuple[int, ...] = ()
+    pidfds: tuple[int, ...] = ()
+    try:
+        pids = _wait_for_pids(first_pid_file, second_pid_file)
+        pidfds = tuple(os.pidfd_open(pid) for pid in pids)
+        process.send_signal(signal.SIGTERM)
+        assert process.wait(timeout=3) == -signal.SIGTERM
+        for pid in pids:
+            _wait_for_process_reaped(pid)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=3)
+        for pidfd in pidfds:
+            _kill_pinned_process(pidfd)

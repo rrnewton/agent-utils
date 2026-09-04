@@ -17,6 +17,7 @@ deterministic given ``now`` and the injected probes.
 from __future__ import annotations
 
 import re
+from concurrent.futures import Future, ThreadPoolExecutor
 from collections.abc import Callable, Mapping, Sequence, Set as AbstractSet
 from dataclasses import dataclass
 from enum import Enum
@@ -43,8 +44,10 @@ from tick_hub.emit import (
     format_unevaluable,
 )
 from tick_hub.model import Emit, EmitKind, Gate, GateWhen, HealthCheck, Reminder, TickConfig
-from tick_hub.protocols import FileAgeProbe, GateRunner
+from tick_hub.protocols import FileAgeProbe, GateResult, GateRunner, ParallelGateRunner
 from tick_hub.state import OpsState, flag_truthy, state_lines
+
+MAX_PARALLEL_GATES = 8
 
 
 @dataclass(frozen=True)
@@ -155,6 +158,13 @@ def _eval_gate(
         if gate.timeout_secs is None
         else runner.run(gate.cmd, timeout=gate.timeout_secs)
     )
+    return _interpret_gate_result(gate, result)
+
+
+def _interpret_gate_result(
+    gate: Gate, result: GateResult
+) -> tuple[GateOutcome, dict[str, str], str | None]:
+    """Interpret one already-completed gate process result."""
     if not result.ok:
         return GateOutcome.QUIET, {}, f"gate command could not run ({gate.cmd!r}): {result.error}"
     captured = parse_kv_lines(result.stdout) if gate.capture else {}
@@ -409,20 +419,62 @@ def run_tick(
 
         no_dependencies: set[str] = set()
         reports: list[_ReminderEvaluation | str] = []
-        for index, entry in enumerate(planned):
-            if isinstance(entry, str):
-                report: _ReminderEvaluation | str = entry
-            else:
-                outcome, captured, error = _eval_gate(entry.gate, gate_runner)
-                report = _ReminderEvaluation(entry, outcome, captured, error)
-            reports.append(report)
-            if index < stream_prefix_len:
-                if isinstance(report, str):
-                    record(report)
+
+        def evaluate(reminder: Reminder) -> _ReminderEvaluation:
+            outcome, captured, error = _eval_gate(reminder.gate, gate_runner)
+            return _ReminderEvaluation(reminder, outcome, captured, error)
+
+        def collect(futures: Mapping[int, Future[_ReminderEvaluation]]) -> None:
+            nonlocal actions
+            for index, entry in enumerate(planned):
+                if isinstance(entry, str):
+                    report: _ReminderEvaluation | str = entry
+                elif index in futures:
+                    report = futures[index].result()
                 else:
-                    actions += _render_evaluation(
-                        report, no_dependencies, new_fired, now, record, report_pending
-                    )
+                    report = evaluate(entry)
+                reports.append(report)
+                if index < stream_prefix_len:
+                    if isinstance(report, str):
+                        record(report)
+                    else:
+                        actions += _render_evaluation(
+                            report,
+                            no_dependencies,
+                            new_fired,
+                            now,
+                            record,
+                            report_pending,
+                        )
+
+        parallel_indices = tuple(
+            index
+            for index, entry in enumerate(planned)
+            if isinstance(entry, Reminder)
+            and entry.gate is not None
+            and entry.gate.parallel
+        )
+        if len(parallel_indices) >= 2 and isinstance(gate_runner, ParallelGateRunner):
+            # The executor owns the shared cancellation scope. A failed output
+            # write therefore exits the scope and kills outstanding gates
+            # before the executor waits for its worker threads.
+            with ThreadPoolExecutor(
+                max_workers=min(MAX_PARALLEL_GATES, len(parallel_indices))
+            ) as executor:
+                with gate_runner.parallel_scope():
+                    futures: dict[int, Future[_ReminderEvaluation]] = {}
+                    for index in parallel_indices:
+                        reminder = planned[index]
+                        if isinstance(reminder, Reminder):
+                            futures[index] = executor.submit(evaluate, reminder)
+                    try:
+                        collect(futures)
+                    except BaseException:
+                        for future in futures.values():
+                            future.cancel()
+                        raise
+        else:
+            collect({})
         if stream_prefix_len < len(reports):
             actions += _render_after_dependency_pass(
                 reports,

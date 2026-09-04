@@ -312,7 +312,7 @@ fn gate_from(value: Option<&Value>, where_: &str) -> Result<Option<Gate>, TickCo
         return Ok(None);
     }
     let object = as_obj(value, where_)?;
-    reject_unknown(object, &["cmd", "when", "capture"], where_)?;
+    reject_unknown(object, &["cmd", "when", "capture", "parallel"], where_)?;
     let when_name = opt_str(object, "when", "success", where_)?;
     let when = GateWhen::from_value(&when_name).ok_or_else(|| {
         TickConfigError(format!(
@@ -324,6 +324,7 @@ fn gate_from(value: Option<&Value>, where_: &str) -> Result<Option<Gate>, TickCo
         cmd: req_str(object, "cmd", where_)?,
         when,
         capture: opt_bool(object, "capture", false, where_)?,
+        parallel: opt_bool(object, "parallel", false, where_)?,
     }))
 }
 
@@ -588,6 +589,9 @@ fn gate_to_value(gate: Option<&Gate>) -> Value {
     object.insert("cmd".into(), Value::String(gate.cmd.clone()));
     object.insert("when".into(), Value::String(gate.when.as_str().into()));
     object.insert("capture".into(), Value::Bool(gate.capture));
+    if gate.parallel {
+        object.insert("parallel".into(), Value::Bool(true));
+    }
     Value::Object(object)
 }
 
@@ -792,11 +796,12 @@ mod tests {
     fn dependency_edges_round_trip_and_reject_invalid_graphs() {
         let text = r#"{
           "reminders": [
-            {"name":"foundation","gate":{"cmd":"f"},"emit":{"skill":"s"}},
+            {"name":"foundation","gate":{"cmd":"f","parallel":true},"emit":{"skill":"s"}},
             {"name":"dependent","depends_on":["foundation"],"gate":{"cmd":"d"},"emit":{"skill":"s"}}
           ]
         }"#;
         let config = config_from_json(text).unwrap();
+        assert!(config.reminders[0].gate.as_ref().unwrap().parallel);
         assert_eq!(config.reminders[1].depends_on, vec!["foundation"]);
         assert_eq!(
             config_from_json(&config_to_json(&config).unwrap()).unwrap(),

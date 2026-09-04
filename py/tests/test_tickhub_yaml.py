@@ -44,6 +44,7 @@ reminders:
       when: nonempty
       capture: true
       timeout_secs: 195
+      parallel: true
     emit:
       kind: note
       title: "no"            # quoted Norway token -> string, not bool false
@@ -58,7 +59,7 @@ _JSON = (
     '{"name": "git_sync", "cadence_secs": 21600,'
     ' "emit": {"kind": "action", "skill": "git-sync", "title": "sync now"}},'
     '{"name": "gated", "gate": {"cmd": "echo count=3", "when": "nonempty", "capture": true,'
-    ' "timeout_secs": 195},'
+    ' "timeout_secs": 195, "parallel": true},'
     ' "emit": {"kind": "note", "title": "no"}}],'
     ' "health_checks": [{"name": "db", "glob": "/var/*.sql", "threshold_secs": 3600}]}'
 )
@@ -71,6 +72,7 @@ def test_yaml_isomorphic_to_json() -> None:
     assert from_yaml.reminders[1].emit.title == "no"  # stayed a string
     assert from_yaml.reminders[1].gate is not None
     assert from_yaml.reminders[1].gate.timeout_secs == 195
+    assert from_yaml.reminders[1].gate.parallel is True
     assert from_yaml.description == "the whole tick"
 
 

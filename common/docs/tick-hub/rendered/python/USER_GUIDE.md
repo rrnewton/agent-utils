@@ -48,6 +48,7 @@ reminders:
       cmd: test -f /srv/cache/stale
       when: success
       capture: false
+      parallel: false
     emit:
       kind: action
       skill: refresh-cache
@@ -175,6 +176,13 @@ configured and captured fields:
 Captured values override same-named configured fields. A failed-to-start or
 timed-out gate emits `ERROR:` and does not consume the reminder's cadence.
 Gate commands execute through `bash` and should be treated as trusted config.
+
+Gates run one at a time unless at least two due gates explicitly set
+`parallel: true`. The production runner starts those permitted gates together
+before the serial pass and still reports every result in configuration order.
+Leave the field false unless the command can safely overlap every other due
+gate: commands that update shared state, acquire the same lock, or depend on
+another gate's side effects must remain serial.
 
 ## Per-host state and flags
 
