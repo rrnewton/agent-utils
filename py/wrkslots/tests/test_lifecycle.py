@@ -8812,14 +8812,21 @@ def test_flat_layout_keeps_controls_beside_slots_and_completes_lifecycle(
     monkeypatch.setattr(
         wrkslots, "_assert_slot_unused", lambda *_args, **_kwargs: None
     )
-    removed_cache_paths: list[Path] = []
+    removed_caches: list[tuple[Path, bool]] = []
     original_remove_cache_directory = wrkslots._remove_cache_directory
 
     def record_cache_removal(
-        config: wrkslots.Config, cache_directory: wrkslots.CacheDirectory
+        config: wrkslots.Config,
+        cache_directory: wrkslots.CacheDirectory,
+        *,
+        allow_git_metadata: bool = False,
     ) -> int:
-        removed_cache_paths.append(cache_directory.path)
-        return original_remove_cache_directory(config, cache_directory)
+        removed_caches.append((cache_directory.path, allow_git_metadata))
+        return original_remove_cache_directory(
+            config,
+            cache_directory,
+            allow_git_metadata=allow_git_metadata,
+        )
 
     monkeypatch.setattr(wrkslots, "_remove_cache_directory", record_cache_removal)
 
@@ -8839,9 +8846,11 @@ def test_flat_layout_keeps_controls_beside_slots_and_completes_lifecycle(
     captured = capsys.readouterr()
 
     assert remove_code == 0, captured.err
-    assert len(removed_cache_paths) == 1
-    assert removed_cache_paths[0].name == "target"
-    assert any(part.startswith(".slot01.fenced.") for part in removed_cache_paths[0].parts)
+    assert len(removed_caches) == 1
+    removed_cache_path, allow_git_metadata = removed_caches[0]
+    assert removed_cache_path.name == "target"
+    assert any(part.startswith(".slot01.fenced.") for part in removed_cache_path.parts)
+    assert allow_git_metadata is False
     assert not tree.exists()
     assert slots.is_dir()
     archive = json.loads(
