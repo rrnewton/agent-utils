@@ -467,8 +467,8 @@ fn run_tick_command(
         }
     }
     let mut emit_line = |line: &str| {
-        let _ = writeln!(stdout, "{line}");
-        let _ = stdout.flush();
+        writeln!(stdout, "{line}")?;
+        stdout.flush()
     };
     let result = run_tick_with_emit(
         &config,
@@ -482,6 +482,13 @@ fn run_tick_command(
         &mut emit_line,
     );
     drop(emit_line);
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = writeln!(stderr, "{PROG}: could not write tick report: {error}");
+            return 1;
+        }
+    };
     if args.flush {
         if let Err(error) = persist_fired_state(&path, &result.fired) {
             let _ = writeln!(
@@ -626,7 +633,20 @@ pub fn run_from_env() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct FailedWriter;
+
+    impl Write for FailedWriter {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "reader closed"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "reader closed"))
+        }
+    }
 
     fn invoke(args: &[&str]) -> (i32, String, String) {
         let args = args
@@ -747,6 +767,39 @@ mod tests {
         assert!(!stdout.contains("CLEAN: quiet"));
         let _ = fs::remove_file(config);
         let _ = fs::remove_file(fired);
+    }
+
+    #[test]
+    fn failed_report_write_returns_nonzero_without_persisting_cadence() {
+        let config = temp_file(
+            "failed-writer.json",
+            r#"{"reminders":[{"name":"due","emit":{"skill":"warn","title":"problem"}}]}"#,
+        );
+        let fired = config.with_extension("state");
+        let args = [
+            "tick",
+            "--config",
+            &config.to_string_lossy(),
+            "--fired-state",
+            &fired.to_string_lossy(),
+            "--now",
+            "1000",
+            "--flush",
+            "--report-pending",
+            "--no-header",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        let mut stdout = FailedWriter;
+        let mut stderr = Vec::new();
+        let code = run(&args, &mut stdout, &mut stderr);
+        assert_eq!(code, 1);
+        assert!(String::from_utf8(stderr)
+            .unwrap()
+            .contains("could not write tick report"));
+        assert!(!fired.exists(), "a failed report must not consume cadence");
+        let _ = fs::remove_file(config);
     }
 
     #[test]

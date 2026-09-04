@@ -446,6 +446,45 @@ def run_until_stdout_contains(
     )
 
 
+def run_with_closed_stdout(
+    cmd: Sequence[str],
+    args: Sequence[str],
+    *,
+    timeout_s: float = 10.0,
+) -> Outcome:
+    """Run with no stdout reader so the first flushed report gets EPIPE."""
+    started = time.monotonic()
+    read_fd, write_fd = os.pipe()
+    os.close(read_fd)
+    try:
+        proc = subprocess.Popen(
+            [*cmd, *args],
+            stdout=write_fd,
+            stderr=subprocess.PIPE,
+            env=_env(),
+            start_new_session=True,
+        )
+    finally:
+        os.close(write_fd)
+    assert proc.stderr is not None
+    timed_out = False
+    try:
+        proc.wait(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
+    stderr = proc.stderr.read().decode("utf-8", errors="replace")
+    if timed_out:
+        stderr += f"\nTIMEOUT after {timeout_s:g} seconds"
+    return Outcome(
+        124 if timed_out else proc.returncode,
+        "",
+        stderr,
+        time.monotonic() - started,
+    )
+
+
 # --------------------------------------------------------------------------- fixtures
 
 
@@ -7971,6 +8010,39 @@ def compare_tick_hub(rand_count: int, seed: int) -> int:
                 "report-pending:flush-preserves-cadence",
                 f"first py={po}\nfirst rs={ro}\nsecond py={po_again}\nsecond rs={ro_again}\n"
                 f"state py={py_quiet_state!r} rs={rs_quiet_state!r}",
+            )
+
+        py_broken_fired = os.path.join(tmp, "py-broken-pipe-fired")
+        rs_broken_fired = os.path.join(tmp, "rs-broken-pipe-fired")
+        broken_args = (
+            "tick",
+            "--config",
+            quiet_path,
+            "--state",
+            state_path,
+            "--now",
+            "2000",
+            "--report-pending",
+            "--no-header",
+        )
+        po = run_with_closed_stdout(
+            py, (*broken_args, "--fired-state", py_broken_fired, "--flush")
+        )
+        ro = run_with_closed_stdout(
+            rs, (*broken_args, "--fired-state", rs_broken_fired, "--flush")
+        )
+        if (
+            po.returncode != 0
+            and ro.returncode != 0
+            and not os.path.exists(py_broken_fired)
+            and not os.path.exists(rs_broken_fired)
+        ):
+            rep.ok("report-pending:broken-pipe-does-not-consume-cadence")
+        else:
+            rep.bad(
+                "report-pending:broken-pipe-does-not-consume-cadence",
+                f"py={po} py_state_exists={os.path.exists(py_broken_fired)}\n"
+                f"rs={ro} rs_state_exists={os.path.exists(rs_broken_fired)}",
             )
 
         ordered_config = {
