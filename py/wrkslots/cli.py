@@ -11263,7 +11263,13 @@ def _finish_remove_paths(
                 finish.private_cleanup.census_budget.remaining_seconds()
             for checkout in moved_checkouts:
                 for cache in _cache_directories_for_checkout(config, checkout):
-                    _remove_cache_directory(config, cache)
+                    _remove_cache_directory(
+                        config,
+                        cache,
+                        allow_git_metadata=(
+                            record.slot_type == "validate" and finish.validate_complete
+                        ),
+                    )
         except Refusal as exc:
             if not removed:
                 try:

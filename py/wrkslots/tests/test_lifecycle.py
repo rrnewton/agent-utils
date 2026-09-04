@@ -3682,6 +3682,58 @@ def test_validate_complete_removes_dead_owner_checkout_despite_shared_cgroup(
     assert active_slots(project) == []
 
 
+def test_validate_complete_removes_nested_git_metadata_in_configured_cache(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path, cache_globs=("target",))
+    made = create(project, slot_type="validate", branch=None)
+    assert made.returncode == 0, made.stderr
+    tree = checkout(project, slot_type="validate")
+    nested_git = tree / "target" / "install-build" / "dependency" / ".git"
+    nested_git.mkdir(parents=True)
+    (nested_git / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    mark_owner_dead_in_current_cgroup(project)
+    set_liveness(project, "dead")
+
+    removed = command(
+        project,
+        "remove",
+        "slot01",
+        "--validate-complete",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+    )
+
+    assert removed.returncode == 0, removed.stderr
+    assert not tree.exists()
+    assert active_slots(project) == []
+
+
+def test_validate_removal_without_complete_refuses_nested_git_metadata(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path, cache_globs=("target",))
+    made = create(project, slot_type="validate", branch=None)
+    assert made.returncode == 0, made.stderr
+    tree = checkout(project, slot_type="validate")
+    nested_git = tree / "target" / "install-build" / "dependency" / ".git"
+    nested_git.mkdir(parents=True)
+    sentinel = nested_git / "HEAD"
+    sentinel.write_text("ref: refs/heads/main\n", encoding="utf-8")
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+
+    removed = remove(project)
+
+    assert removed.returncode == 3
+    assert "nested Git metadata" in removed.stderr
+    assert sentinel.is_file()
+    assert tree.is_dir()
+    assert active_slots(project)
+
+
 def test_validate_complete_still_refuses_live_owner_from_shared_cgroup(
     tmp_path: Path,
 ) -> None:
@@ -3811,6 +3863,50 @@ def test_validate_batch_shares_one_census_and_retains_each_refusal(
     assert census_order == ["privileged"]
     assert not slot_paths["unused"].exists()
     assert in_use.is_dir()
+
+
+def test_validate_batch_removes_nested_git_metadata_in_configured_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, _repository, _remote = make_project(tmp_path, cache_globs=("target",))
+    prepare_dead_validate_slots(project, ("nested-cache",))
+    tree = checkout(project, slot="nested-cache", slot_type="validate")
+    nested_git = tree / "target" / "install-build" / "dependency" / ".git"
+    nested_git.mkdir(parents=True)
+    (nested_git / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    stub_validate_batch_censuses(monkeypatch)
+
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "remove-validate-batch",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--slot",
+            "nested-cache=1",
+            "--format",
+            "json",
+        ]
+    )
+
+    assert rc == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report == {
+        "batch_limit": wrkslots.VALIDATE_REMOVE_BATCH_LIMIT,
+        "process_censuses": 1,
+        "removed": [{"generation": 1, "slot": "nested-cache"}],
+        "requested": 1,
+        "retained": [],
+        "same_uid_process_censuses": 1,
+        "schema": 1,
+        "shared_process_censuses": 1,
+    }
+    assert not tree.exists()
+    assert active_slots(project) == []
 
 
 def test_validate_batch_is_bounded_before_process_census(
@@ -9403,6 +9499,38 @@ def test_clean_caches_reports_then_cleans_only_explicit_or_all_slots(
     }
     assert empty_rows["slot01"]["cache_bytes"] == 0
     assert empty_rows["slot02"]["cache_bytes"] == 0
+
+
+def test_agent_removal_and_clean_caches_refuse_nested_git_metadata(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path, cache_globs=("target",))
+    assert create(project).returncode == 0
+    tree = checkout(project)
+    commit_task(repository, tree, "codex/task")
+    nested_git = tree / "target" / "install-build" / "dependency" / ".git"
+    nested_git.mkdir(parents=True)
+    sentinel = nested_git / "HEAD"
+    sentinel.write_text("ref: refs/heads/main\n", encoding="utf-8")
+
+    cleaned = command(project, "clean-caches", "--only", "slot01")
+
+    assert cleaned.returncode == 3
+    assert "nested Git metadata" in cleaned.stderr
+    assert sentinel.is_file()
+
+    handed_off = finish(project)
+    assert handed_off.returncode == 0, handed_off.stderr
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+
+    removed = remove(project)
+
+    assert removed.returncode == 3
+    assert "nested Git metadata" in removed.stderr
+    assert sentinel.is_file()
+    assert tree.is_dir()
+    assert active_slots(project)
 
 
 def test_repository_specific_cache_globs_do_not_apply_to_sibling_checkouts(
