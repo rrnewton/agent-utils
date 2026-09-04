@@ -772,6 +772,58 @@ def test_independent_prefix_streams_before_a_later_dependency_group() -> None:
     assert streamed.actions_emitted == collected.actions_emitted
 
 
+def test_suppressed_verdict_keeps_config_order_between_runnable_gates() -> None:
+    cfg = TickConfig(
+        reminders=(
+            _dependency_probe("first"),
+            Reminder(
+                "suppressed",
+                Emit(EmitKind.ACTION, title="suppressed fired", skill="warn"),
+                requires_flags=("enabled",),
+            ),
+            _dependency_probe("third"),
+        )
+    )
+    gate_results = {
+        "first": GateResult(1, "", True),
+        "third": GateResult(1, "", True),
+    }
+    emitted: list[str] = []
+    runner = RecordingGate(emitted, dict(gate_results))
+    streamed = run_tick(
+        cfg,
+        OpsState.default(),
+        now=5,
+        fired={},
+        gate_runner=runner,
+        age_probe=FakeProbe({}),
+        report_pending=True,
+        emit=emitted.append,
+    )
+    collected = run_tick(
+        cfg,
+        OpsState.default(),
+        now=5,
+        fired={},
+        gate_runner=FakeGate(dict(gate_results)),
+        age_probe=FakeProbe({}),
+        report_pending=True,
+    )
+
+    verdicts = tuple(
+        line
+        for line in streamed.lines
+        if line.startswith(("ACTION: warn", "SUPPRESSED: "))
+    )
+    assert verdicts == (
+        'ACTION: warn title="first found a problem"',
+        "SUPPRESSED: suppressed did not run; required flag(s) not set: enabled",
+        'ACTION: warn title="third found a problem"',
+    )
+    assert tuple(emitted) == collected.lines == streamed.lines
+    assert any("first found a problem" in line for line in dict(runner.seen_at_call)["third"])
+
+
 def test_omitting_emit_reports_exactly_what_streaming_reports() -> None:
     def build() -> TickConfig:
         return TickConfig(

@@ -370,7 +370,7 @@ def run_tick(
         new_fired, {reminder.name for reminder in config.reminders}
     )
     if state.enabled:
-        due: list[Reminder] = []
+        planned: list[Reminder | str] = []
         for rem in config.reminders:
             if not is_due(rem.name, rem.cadence_secs, now, fired):
                 continue
@@ -385,9 +385,9 @@ def run_tick(
                         for flag in rem.requires_flags
                         if not state.flags.get(flag, False)
                     )
-                    record(format_suppressed(rem.name, missing))
+                    planned.append(format_suppressed(rem.name, missing))
                 continue
-            due.append(rem)
+            planned.append(rem)
 
         # A dependency-free prefix is final as each gate finishes and can be
         # streamed immediately. Once a dependency-bearing reminder appears we
@@ -399,23 +399,33 @@ def run_tick(
         stream_prefix_len = 0
         if emit is not None:
             stream_prefix_len = next(
-                (index for index, rem in enumerate(due) if rem.depends_on),
-                len(due),
+                (
+                    index
+                    for index, entry in enumerate(planned)
+                    if isinstance(entry, Reminder) and entry.depends_on
+                ),
+                len(planned),
             )
 
         no_dependencies: set[str] = set()
-        evaluations: list[_ReminderEvaluation] = []
-        for index, rem in enumerate(due):
-            outcome, captured, error = _eval_gate(rem.gate, gate_runner)
-            evaluation = _ReminderEvaluation(rem, outcome, captured, error)
-            evaluations.append(evaluation)
+        reports: list[_ReminderEvaluation | str] = []
+        for index, entry in enumerate(planned):
+            if isinstance(entry, str):
+                report: _ReminderEvaluation | str = entry
+            else:
+                outcome, captured, error = _eval_gate(entry.gate, gate_runner)
+                report = _ReminderEvaluation(entry, outcome, captured, error)
+            reports.append(report)
             if index < stream_prefix_len:
-                actions += _render_evaluation(
-                    evaluation, no_dependencies, new_fired, now, record, report_pending
-                )
-        if stream_prefix_len < len(evaluations):
+                if isinstance(report, str):
+                    record(report)
+                else:
+                    actions += _render_evaluation(
+                        report, no_dependencies, new_fired, now, record, report_pending
+                    )
+        if stream_prefix_len < len(reports):
             actions += _render_after_dependency_pass(
-                evaluations,
+                reports,
                 new_fired,
                 now,
                 record,
@@ -428,7 +438,7 @@ def run_tick(
 
 
 def _render_after_dependency_pass(
-    evaluations: Sequence[_ReminderEvaluation],
+    reports: Sequence[_ReminderEvaluation | str],
     new_fired: dict[str, int],
     now: int,
     record: Callable[[str], None],
@@ -437,6 +447,7 @@ def _render_after_dependency_pass(
     render_from: int = 0,
 ) -> int:
     """Interpret dependency edges over completed evaluations, then render in config order."""
+    evaluations = tuple(report for report in reports if not isinstance(report, str))
     # Evaluate every due gate before interpreting dependency edges. A
     # dependency never decides whether another gate runs, and config order
     # therefore cannot turn a forward reference into a false clean.
@@ -461,10 +472,13 @@ def _render_after_dependency_pass(
                 changed = True
 
     actions = 0
-    for evaluation in evaluations[render_from:]:
-        actions += _render_evaluation(
-            evaluation, unavailable, new_fired, now, record, report_pending
-        )
+    for report in reports[render_from:]:
+        if isinstance(report, str):
+            record(report)
+        else:
+            actions += _render_evaluation(
+                report, unavailable, new_fired, now, record, report_pending
+            )
     return actions
 
 
