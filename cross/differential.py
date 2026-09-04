@@ -85,6 +85,7 @@ import fcntl
 import hashlib
 import json
 import os
+import select
 import signal
 import random
 import re
@@ -384,6 +385,65 @@ def run(
             time.monotonic() - started,
         )
     return Outcome(proc.returncode, proc.stdout, proc.stderr, time.monotonic() - started)
+
+
+def run_until_stdout_contains(
+    cmd: Sequence[str],
+    args: Sequence[str],
+    expected: str,
+    *,
+    timeout_s: float = 10.0,
+) -> tuple[Outcome, bytes, bool]:
+    """Run a command and retain the bytes observable when ``expected`` first arrives."""
+    started = time.monotonic()
+    proc = subprocess.Popen(
+        [*cmd, *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=_env(),
+        start_new_session=True,
+    )
+    assert proc.stdout is not None
+    expected_bytes = expected.encode("utf-8")
+    observed = bytearray()
+    deadline = started + timeout_s
+    while expected_bytes not in observed and time.monotonic() < deadline:
+        readable, _, _ = select.select([proc.stdout], [], [], 0.05)
+        if readable:
+            chunk = os.read(proc.stdout.fileno(), 4096)
+            if not chunk:
+                break
+            observed.extend(chunk)
+        elif proc.poll() is not None:
+            break
+    observed_before_exit = expected_bytes in observed and proc.poll() is None
+    # Give a wrongly streamed line immediately after the expected prefix a
+    # chance to become observable while the final gate remains deliberately
+    # asleep. Reading is nonblocking after the short sampling interval.
+    if observed_before_exit:
+        time.sleep(0.1)
+        while select.select([proc.stdout], [], [], 0)[0]:
+            chunk = os.read(proc.stdout.fileno(), 4096)
+            if not chunk:
+                break
+            observed.extend(chunk)
+    try:
+        remaining_stdout, stderr = proc.communicate(timeout=max(0.1, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        remaining_stdout, stderr = proc.communicate()
+        stderr += f"\nTIMEOUT after {timeout_s:g} seconds".encode()
+    stdout = bytes(observed) + remaining_stdout
+    return (
+        Outcome(
+            proc.returncode if proc.returncode is not None else 124,
+            stdout.decode("utf-8", errors="replace"),
+            stderr.decode("utf-8", errors="replace"),
+            time.monotonic() - started,
+        ),
+        bytes(observed),
+        observed_before_exit,
+    )
 
 
 # --------------------------------------------------------------------------- fixtures
@@ -7722,6 +7782,7 @@ def compare_tick_hub(rand_count: int, seed: int) -> int:
                 "--now",
                 "--current-tick-min",
                 "--flush",
+                "--report-pending",
                 "--no-header",
             ),
             "state": ("--state", "--current-tick-min"),
@@ -7843,6 +7904,189 @@ def compare_tick_hub(rand_count: int, seed: int) -> int:
             rep.bad(
                 "representative:tick",
                 f"py={po.returncode}:{po.stdout!r}\nrs={ro.returncode}:{ro.stdout!r}",
+            )
+
+        quiet_config = {
+            "reminders": [
+                {
+                    "name": "quiet",
+                    "cadence_secs": 3600,
+                    "gate": {"cmd": "true", "when": "failure"},
+                    "emit": {"skill": "warn", "title": "problem"},
+                }
+            ]
+        }
+        quiet_path = os.path.join(tmp, "report-pending.json")
+        with open(quiet_path, "w", encoding="utf-8") as handle:
+            json.dump(quiet_config, handle)
+        py_quiet_fired = os.path.join(tmp, "py-report-pending-fired")
+        rs_quiet_fired = os.path.join(tmp, "rs-report-pending-fired")
+        quiet_args = (
+            "tick",
+            "--config",
+            quiet_path,
+            "--state",
+            state_path,
+            "--now",
+            "1000",
+            "--report-pending",
+            "--no-header",
+        )
+        po = run(py, (*quiet_args, "--fired-state", py_quiet_fired, "--flush"))
+        ro = run(rs, (*quiet_args, "--fired-state", rs_quiet_fired, "--flush"))
+        py_quiet_state = Path(py_quiet_fired).read_text(encoding="utf-8")
+        rs_quiet_state = Path(rs_quiet_fired).read_text(encoding="utf-8")
+        po_again = run(
+            py,
+            (
+                *quiet_args[:6],
+                "1001",
+                *quiet_args[7:],
+                "--fired-state",
+                py_quiet_fired,
+            ),
+        )
+        ro_again = run(
+            rs,
+            (
+                *quiet_args[:6],
+                "1001",
+                *quiet_args[7:],
+                "--fired-state",
+                rs_quiet_fired,
+            ),
+        )
+        if (
+            po.returncode == ro.returncode == po_again.returncode == ro_again.returncode == 0
+            and po.stdout == ro.stdout
+            and po_again.stdout == ro_again.stdout
+            and py_quiet_state == rs_quiet_state
+            and "quiet=1000\n" in py_quiet_state
+            and "CLEAN: quiet ran and found nothing to report" in po.stdout
+            and "CLEAN: quiet" not in po_again.stdout
+        ):
+            rep.ok("report-pending:flush-preserves-cadence")
+        else:
+            rep.bad(
+                "report-pending:flush-preserves-cadence",
+                f"first py={po}\nfirst rs={ro}\nsecond py={po_again}\nsecond rs={ro_again}\n"
+                f"state py={py_quiet_state!r} rs={rs_quiet_state!r}",
+            )
+
+        ordered_config = {
+            "reminders": [
+                {
+                    "name": "first",
+                    "gate": {"cmd": "exit 1", "when": "failure"},
+                    "emit": {"skill": "warn", "title": "first found a problem"},
+                },
+                {
+                    "name": "suppressed",
+                    "requires_flags": ["disabled"],
+                    "emit": {"skill": "warn", "title": "suppressed fired"},
+                },
+                {
+                    "name": "third",
+                    "gate": {"cmd": "exit 1", "when": "failure"},
+                    "emit": {"skill": "warn", "title": "third found a problem"},
+                },
+            ]
+        }
+        ordered_path = os.path.join(tmp, "report-order.json")
+        with open(ordered_path, "w", encoding="utf-8") as handle:
+            json.dump(ordered_config, handle)
+        ordered_args = (
+            "tick",
+            "--config",
+            ordered_path,
+            "--state",
+            state_path,
+            "--now",
+            "1000",
+            "--report-pending",
+            "--no-header",
+        )
+        po = run(py, ordered_args)
+        ro = run(rs, ordered_args)
+        ordered_verdicts = tuple(
+            line
+            for line in po.stdout.splitlines()
+            if line.startswith(("ACTION: warn", "SUPPRESSED: "))
+        )
+        if (
+            po.returncode == ro.returncode == 0
+            and po.stdout == ro.stdout
+            and ordered_verdicts
+            == (
+                'ACTION: warn title="first found a problem"',
+                "SUPPRESSED: suppressed did not run; required flag(s) not set: disabled",
+                'ACTION: warn title="third found a problem"',
+            )
+        ):
+            rep.ok("report-pending:suppressed-keeps-config-order")
+        else:
+            rep.bad(
+                "report-pending:suppressed-keeps-config-order",
+                f"py={po.returncode}:{po.stdout!r}\nrs={ro.returncode}:{ro.stdout!r}",
+            )
+
+        streaming_config = {
+            "reminders": [
+                {
+                    "name": "independent",
+                    "gate": {"cmd": "exit 1", "when": "failure"},
+                    "emit": {"skill": "warn", "title": "independent found a problem"},
+                },
+                {
+                    "name": "dependent",
+                    "depends_on": ["foundation"],
+                    "gate": {"cmd": "exit 0", "when": "failure"},
+                    "emit": {"skill": "warn", "title": "dependent problem"},
+                },
+                {
+                    "name": "foundation",
+                    "gate": {"cmd": "sleep 1; exit 75", "when": "failure"},
+                    "emit": {"skill": "warn", "title": "foundation problem"},
+                },
+            ]
+        }
+        streaming_path = os.path.join(tmp, "streaming-dependencies.json")
+        with open(streaming_path, "w", encoding="utf-8") as handle:
+            json.dump(streaming_config, handle)
+        streaming_args = (
+            "tick",
+            "--config",
+            streaming_path,
+            "--state",
+            state_path,
+            "--now",
+            "1000",
+            "--report-pending",
+            "--no-header",
+        )
+        expected_prefix = 'ACTION: warn title="independent found a problem"\n'
+        po, py_early, py_before_exit = run_until_stdout_contains(
+            py, streaming_args, expected_prefix
+        )
+        ro, rs_early, rs_before_exit = run_until_stdout_contains(
+            rs, streaming_args, expected_prefix
+        )
+        forbidden_early = b"CLEAN: dependent ran and found nothing to report"
+        if (
+            po.returncode == ro.returncode == 0
+            and po.stdout == ro.stdout
+            and py_before_exit
+            and rs_before_exit
+            and forbidden_early not in py_early
+            and forbidden_early not in rs_early
+            and "NO_RESULT: dependent is unevaluable" in po.stdout
+        ):
+            rep.ok("streaming:mixed-dependency-prefix-visible")
+        else:
+            rep.bad(
+                "streaming:mixed-dependency-prefix-visible",
+                f"py_before_exit={py_before_exit} py_early={py_early!r} py={po}\n"
+                f"rs_before_exit={rs_before_exit} rs_early={rs_early!r} rs={ro}",
             )
 
         dependency_config = {

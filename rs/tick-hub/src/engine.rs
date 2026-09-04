@@ -11,10 +11,11 @@ use crate::cadence::{
     UNRESOLVED_RENDER_FIRST_SUFFIX, UNRESOLVED_RENDER_STATE_PREFIX,
 };
 use crate::emit::{
-    format_action, format_error, format_health, format_no_result, format_note, format_unevaluable,
-    HEALTH_STATUS_MISSING, HEALTH_STATUS_OK, HEALTH_STATUS_STALE,
+    format_action, format_clean, format_error, format_health, format_no_result, format_note,
+    format_suppressed, format_unevaluable, HEALTH_STATUS_MISSING, HEALTH_STATUS_OK,
+    HEALTH_STATUS_STALE,
 };
-use crate::model::{Emit, EmitKind, Gate, GateWhen, HealthCheck, TickConfig};
+use crate::model::{Emit, EmitKind, Gate, GateWhen, HealthCheck, Reminder, TickConfig};
 use crate::protocols::{FileAgeProbe, GateRunner};
 use crate::state::{flag_truthy, state_lines, OpsState};
 use crate::text::{split_lines, string_repr, trim};
@@ -104,10 +105,20 @@ pub enum GateOutcome {
 }
 
 struct ReminderEvaluation<'a> {
-    reminder: &'a crate::model::Reminder,
+    reminder: &'a Reminder,
     outcome: GateOutcome,
     captured: IndexMap<String, String>,
     error: Option<String>,
+}
+
+enum PlannedReminder<'a> {
+    Runnable(&'a Reminder),
+    Suppressed(String),
+}
+
+enum ReminderReport<'a> {
+    Evaluated(ReminderEvaluation<'a>),
+    Suppressed(String),
 }
 
 fn gate_fires(when: GateWhen, returncode: i32, stdout: &str) -> bool {
@@ -354,6 +365,192 @@ fn prune_removed_render_failure_state(
     });
 }
 
+fn record_line(lines: &mut Vec<String>, emit: &mut Option<&mut dyn FnMut(&str)>, line: String) {
+    lines.push(line);
+    if let Some(callback) = emit.as_deref_mut() {
+        callback(lines.last().expect("line was just appended"));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_evaluation(
+    evaluation: &ReminderEvaluation<'_>,
+    unavailable: &BTreeSet<String>,
+    new_fired: &mut BTreeMap<String, i64>,
+    now: i64,
+    lines: &mut Vec<String>,
+    emit: &mut Option<&mut dyn FnMut(&str)>,
+    report_pending: bool,
+) -> usize {
+    let reminder = evaluation.reminder;
+    if let Some(error) = &evaluation.error {
+        clear_render_failure_state(new_fired, &reminder.name);
+        record_line(
+            lines,
+            emit,
+            format_error(&format!("reminder {}: {error}", reminder.name)),
+        );
+        record_line(
+            lines,
+            emit,
+            no_signal_action(reminder, "gate-execution-error", error, &[]),
+        );
+        return 1;
+    }
+    if evaluation.outcome == GateOutcome::NoResult {
+        clear_render_failure_state(new_fired, &reminder.name);
+        let detail = evaluation
+            .captured
+            .get("summary")
+            .map(String::as_str)
+            .unwrap_or("");
+        record_line(lines, emit, format_no_result(&reminder.name, detail));
+        record_line(
+            lines,
+            emit,
+            no_signal_action(reminder, "could-not-determine", detail, &[]),
+        );
+        return 1;
+    }
+    if evaluation.outcome == GateOutcome::Quiet {
+        clear_render_failure_state(new_fired, &reminder.name);
+        let unavailable_dependencies: Vec<String> = reminder
+            .depends_on
+            .iter()
+            .filter(|dependency| unavailable.contains(*dependency))
+            .cloned()
+            .collect();
+        if !unavailable_dependencies.is_empty() {
+            record_line(
+                lines,
+                emit,
+                format_unevaluable(&reminder.name, &unavailable_dependencies),
+            );
+            record_line(
+                lines,
+                emit,
+                no_signal_action(
+                    reminder,
+                    "dependency-could-not-determine",
+                    &unavailable_dependencies.join(","),
+                    &[],
+                ),
+            );
+            return 1;
+        }
+        if report_pending {
+            record_line(lines, emit, format_clean(&reminder.name));
+        }
+        new_fired.insert(reminder.name.clone(), now);
+        return 0;
+    }
+    let line = match render_emit(&reminder.emit, &evaluation.captured) {
+        Ok(line) => line,
+        Err(error) => {
+            record_line(
+                lines,
+                emit,
+                format_error(&format!("reminder {}: {error}", reminder.name)),
+            );
+            record_line(
+                lines,
+                emit,
+                no_signal_action(reminder, "unresolved-placeholder", "", &error.placeholders),
+            );
+            let mut actions = 1;
+            let (consecutive, first_failure_epoch) =
+                record_render_failure(new_fired, &reminder.name, now);
+            if consecutive >= REPEATED_RENDER_FAILURE_THRESHOLD {
+                record_line(
+                    lines,
+                    emit,
+                    repeated_render_failure_action(
+                        reminder,
+                        consecutive,
+                        first_failure_epoch,
+                        &error.placeholders,
+                    ),
+                );
+                actions += 1;
+            }
+            return actions;
+        }
+    };
+    clear_render_failure_state(new_fired, &reminder.name);
+    new_fired.insert(reminder.name.clone(), now);
+    let actions = usize::from(line.starts_with("ACTION: "));
+    record_line(lines, emit, line);
+    actions
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_after_dependency_pass(
+    reports: &[ReminderReport<'_>],
+    render_from: usize,
+    new_fired: &mut BTreeMap<String, i64>,
+    now: i64,
+    lines: &mut Vec<String>,
+    emit: &mut Option<&mut dyn FnMut(&str)>,
+    report_pending: bool,
+) -> usize {
+    let mut unavailable: BTreeSet<String> = reports
+        .iter()
+        .filter_map(|report| match report {
+            ReminderReport::Evaluated(evaluation)
+                if evaluation.error.is_none() && evaluation.outcome == GateOutcome::NoResult =>
+            {
+                Some(evaluation.reminder.name.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    loop {
+        let mut changed = false;
+        for report in reports {
+            let ReminderReport::Evaluated(evaluation) = report else {
+                continue;
+            };
+            if evaluation.error.is_some()
+                || evaluation.outcome != GateOutcome::Quiet
+                || unavailable.contains(&evaluation.reminder.name)
+            {
+                continue;
+            }
+            if evaluation
+                .reminder
+                .depends_on
+                .iter()
+                .any(|dependency| unavailable.contains(dependency))
+            {
+                unavailable.insert(evaluation.reminder.name.clone());
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let mut actions = 0;
+    for report in &reports[render_from..] {
+        match report {
+            ReminderReport::Suppressed(line) => record_line(lines, emit, line.clone()),
+            ReminderReport::Evaluated(evaluation) => {
+                actions += render_evaluation(
+                    evaluation,
+                    &unavailable,
+                    new_fired,
+                    now,
+                    lines,
+                    emit,
+                    report_pending,
+                );
+            }
+        }
+    }
+    actions
+}
+
 /// Run one tick using explicit time and injected side-effect boundaries.
 #[allow(clippy::too_many_arguments)]
 pub fn run_tick(
@@ -365,16 +562,71 @@ pub fn run_tick(
     age_probe: &dyn FileAgeProbe,
     current_tick_min: Option<i64>,
 ) -> TickResult {
+    run_tick_inner(
+        config,
+        state,
+        now,
+        fired,
+        gate_runner,
+        age_probe,
+        current_tick_min,
+        false,
+        None,
+    )
+}
+
+/// Run one tick while reporting each final line as soon as config order permits.
+#[allow(clippy::too_many_arguments)]
+pub fn run_tick_with_emit(
+    config: &TickConfig,
+    state: &OpsState,
+    now: i64,
+    fired: &BTreeMap<String, i64>,
+    gate_runner: &dyn GateRunner,
+    age_probe: &dyn FileAgeProbe,
+    current_tick_min: Option<i64>,
+    report_pending: bool,
+    emit: &mut dyn FnMut(&str),
+) -> TickResult {
+    run_tick_inner(
+        config,
+        state,
+        now,
+        fired,
+        gate_runner,
+        age_probe,
+        current_tick_min,
+        report_pending,
+        Some(emit),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_tick_inner(
+    config: &TickConfig,
+    state: &OpsState,
+    now: i64,
+    fired: &BTreeMap<String, i64>,
+    gate_runner: &dyn GateRunner,
+    age_probe: &dyn FileAgeProbe,
+    current_tick_min: Option<i64>,
+    report_pending: bool,
+    mut emit: Option<&mut dyn FnMut(&str)>,
+) -> TickResult {
     let mut lines = Vec::new();
     let mut actions = 0;
     for health in &config.health_checks {
-        lines.push(evaluate_health(health, age_probe, now));
+        record_line(
+            &mut lines,
+            &mut emit,
+            evaluate_health(health, age_probe, now),
+        );
     }
     for line in state_lines(state, current_tick_min) {
         if line.starts_with("ACTION: ") {
             actions += 1;
         }
-        lines.push(line);
+        record_line(&mut lines, &mut emit, line);
     }
     let mut new_fired = fired.clone();
     let reminder_names = config
@@ -384,7 +636,7 @@ pub fn run_tick(
         .collect::<BTreeSet<_>>();
     prune_removed_render_failure_state(&mut new_fired, &reminder_names);
     if state.enabled {
-        let mut evaluations = Vec::new();
+        let mut planned = Vec::new();
         for reminder in &config.reminders {
             if !is_due(&reminder.name, reminder.cadence_secs, now, fired) {
                 continue;
@@ -394,154 +646,89 @@ pub fn run_tick(
                 .iter()
                 .all(|name| flag_truthy(&state.flags, name))
             {
-                continue;
-            }
-            let (outcome, captured, error) = match eval_gate(reminder.gate.as_ref(), gate_runner) {
-                Ok((outcome, captured)) => (outcome, captured, None),
-                Err(error) => (GateOutcome::Quiet, IndexMap::new(), Some(error)),
-            };
-            evaluations.push(ReminderEvaluation {
-                reminder,
-                outcome,
-                captured,
-                error,
-            });
-        }
-
-        // Run every due gate before interpreting dependency edges. Dependencies
-        // never decide whether another gate runs, and config order therefore
-        // cannot turn a forward reference into a false clean.
-        let mut unavailable: BTreeSet<String> = evaluations
-            .iter()
-            .filter(|evaluation| {
-                evaluation.error.is_none() && evaluation.outcome == GateOutcome::NoResult
-            })
-            .map(|evaluation| evaluation.reminder.name.clone())
-            .collect();
-        loop {
-            let mut changed = false;
-            for evaluation in &evaluations {
-                if evaluation.error.is_some()
-                    || evaluation.outcome != GateOutcome::Quiet
-                    || unavailable.contains(&evaluation.reminder.name)
-                {
-                    continue;
-                }
-                if evaluation
-                    .reminder
-                    .depends_on
-                    .iter()
-                    .any(|dependency| unavailable.contains(dependency))
-                {
-                    unavailable.insert(evaluation.reminder.name.clone());
-                    changed = true;
-                }
-            }
-            if !changed {
-                break;
-            }
-        }
-
-        for evaluation in evaluations {
-            let reminder = evaluation.reminder;
-            let outcome = evaluation.outcome;
-            let captured = evaluation.captured;
-            if let Some(error) = evaluation.error {
-                clear_render_failure_state(&mut new_fired, &reminder.name);
-                lines.push(format_error(&format!(
-                    "reminder {}: {error}",
-                    reminder.name
-                )));
-                lines.push(no_signal_action(
-                    reminder,
-                    "gate-execution-error",
-                    &error,
-                    &[],
-                ));
-                actions += 1;
-                continue;
-            }
-            // A NO_RESULT does NOT consume cadence, matching the existing
-            // cannot-run path above: the gate keeps announcing every tick until
-            // it can determine something. Deliberately noisy -- silence is the
-            // hazard here, so repetition is the correct trade.
-            if outcome == GateOutcome::NoResult {
-                clear_render_failure_state(&mut new_fired, &reminder.name);
-                let detail = captured.get("summary").map(String::as_str).unwrap_or("");
-                lines.push(format_no_result(&reminder.name, detail));
-                lines.push(no_signal_action(
-                    reminder,
-                    "could-not-determine",
-                    detail,
-                    &[],
-                ));
-                actions += 1;
-                continue;
-            }
-            if outcome == GateOutcome::Quiet {
-                clear_render_failure_state(&mut new_fired, &reminder.name);
-                let unavailable_dependencies: Vec<String> = reminder
-                    .depends_on
-                    .iter()
-                    .filter(|dependency| unavailable.contains(*dependency))
-                    .cloned()
-                    .collect();
-                if !unavailable_dependencies.is_empty() {
-                    lines.push(format_unevaluable(
+                if report_pending {
+                    let missing = reminder
+                        .requires_flags
+                        .iter()
+                        .filter(|name| !flag_truthy(&state.flags, name))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    planned.push(PlannedReminder::Suppressed(format_suppressed(
                         &reminder.name,
-                        &unavailable_dependencies,
-                    ));
-                    lines.push(no_signal_action(
-                        reminder,
-                        "dependency-could-not-determine",
-                        &unavailable_dependencies.join(","),
-                        &[],
-                    ));
-                    actions += 1;
-                    continue;
+                        &missing,
+                    )));
                 }
-                new_fired.insert(reminder.name.clone(), now);
                 continue;
             }
-            let line = match render_emit(&reminder.emit, &captured) {
-                Ok(line) => line,
-                Err(error) => {
-                    lines.push(format_error(&format!(
-                        "reminder {}: {error}",
-                        reminder.name
-                    )));
-                    lines.push(no_signal_action(
+            planned.push(PlannedReminder::Runnable(reminder));
+        }
+
+        let stream_prefix_len = if emit.is_some() {
+            planned
+                .iter()
+                .position(|entry| {
+                    matches!(entry, PlannedReminder::Runnable(reminder) if !reminder.depends_on.is_empty())
+                })
+                .unwrap_or(planned.len())
+        } else {
+            0
+        };
+        let no_dependencies = BTreeSet::new();
+        let mut reports = Vec::new();
+        for (index, entry) in planned.into_iter().enumerate() {
+            let report = match entry {
+                PlannedReminder::Suppressed(line) => ReminderReport::Suppressed(line),
+                PlannedReminder::Runnable(reminder) => {
+                    let (outcome, captured, error) =
+                        match eval_gate(reminder.gate.as_ref(), gate_runner) {
+                            Ok((outcome, captured)) => (outcome, captured, None),
+                            Err(error) => (GateOutcome::Quiet, IndexMap::new(), Some(error)),
+                        };
+                    ReminderReport::Evaluated(ReminderEvaluation {
                         reminder,
-                        "unresolved-placeholder",
-                        "",
-                        &error.placeholders,
-                    ));
-                    actions += 1;
-                    let (consecutive, first_failure_epoch) =
-                        record_render_failure(&mut new_fired, &reminder.name, now);
-                    if consecutive >= REPEATED_RENDER_FAILURE_THRESHOLD {
-                        lines.push(repeated_render_failure_action(
-                            reminder,
-                            consecutive,
-                            first_failure_epoch,
-                            &error.placeholders,
-                        ));
-                        actions += 1;
-                    }
-                    continue;
+                        outcome,
+                        captured,
+                        error,
+                    })
                 }
             };
-            clear_render_failure_state(&mut new_fired, &reminder.name);
-            new_fired.insert(reminder.name.clone(), now);
-            if line.starts_with("ACTION: ") {
-                actions += 1;
+            reports.push(report);
+            if index < stream_prefix_len {
+                match reports.last().expect("report was just appended") {
+                    ReminderReport::Suppressed(line) => {
+                        record_line(&mut lines, &mut emit, line.clone());
+                    }
+                    ReminderReport::Evaluated(evaluation) => {
+                        actions += render_evaluation(
+                            evaluation,
+                            &no_dependencies,
+                            &mut new_fired,
+                            now,
+                            &mut lines,
+                            &mut emit,
+                            report_pending,
+                        );
+                    }
+                }
             }
-            lines.push(line);
+        }
+        if stream_prefix_len < reports.len() {
+            actions += render_after_dependency_pass(
+                &reports,
+                stream_prefix_len,
+                &mut new_fired,
+                now,
+                &mut lines,
+                &mut emit,
+                report_pending,
+            );
         }
     }
-    lines.push(format_note(&format!(
-        "emitted {actions} instruction(s) this tick"
-    )));
+    record_line(
+        &mut lines,
+        &mut emit,
+        format_note(&format!("emitted {actions} instruction(s) this tick")),
+    );
     TickResult {
         lines,
         fired: new_fired,
@@ -556,6 +743,7 @@ mod tests {
     use crate::protocols::GateResult;
     use crate::state::FlagValue;
     use std::cell::RefCell;
+    use std::rc::Rc;
 
     struct FakeGate {
         outcomes: BTreeMap<String, GateResult>,
@@ -1242,5 +1430,136 @@ mod tests {
             result.fired,
             BTreeMap::from([("foundation".into(), 5), ("dependent".into(), 5)])
         );
+    }
+
+    struct RecordingGate {
+        outcomes: BTreeMap<String, GateResult>,
+        emitted: Rc<RefCell<Vec<String>>>,
+        seen_at_call: RefCell<Vec<(String, Vec<String>)>>,
+    }
+
+    impl GateRunner for RecordingGate {
+        fn run(&self, cmd: &str) -> GateResult {
+            self.seen_at_call
+                .borrow_mut()
+                .push((cmd.to_string(), self.emitted.borrow().clone()));
+            self.outcomes
+                .get(cmd)
+                .cloned()
+                .unwrap_or_else(|| GateResult::completed(0, ""))
+        }
+    }
+
+    #[test]
+    fn independent_prefix_streams_before_a_later_dependency_group() {
+        let config = TickConfig {
+            reminders: vec![
+                dependency_probe("independent", &[]),
+                dependency_probe("dependent", &["foundation"]),
+                dependency_probe("foundation", &[]),
+            ],
+            ..TickConfig::default()
+        };
+        let outcomes = BTreeMap::from([
+            ("independent".into(), GateResult::completed(1, "")),
+            ("dependent".into(), GateResult::completed(0, "")),
+            (
+                "foundation".into(),
+                GateResult::completed(NO_RESULT_EXIT, ""),
+            ),
+        ]);
+        let collected = run_tick_inner(
+            &config,
+            &OpsState::default(),
+            5,
+            &BTreeMap::new(),
+            &FakeGate {
+                outcomes: outcomes.clone(),
+                calls: RefCell::new(Vec::new()),
+            },
+            &FakeProbe(BTreeMap::new()),
+            None,
+            true,
+            None,
+        );
+        let emitted = Rc::new(RefCell::new(Vec::new()));
+        let runner = RecordingGate {
+            outcomes,
+            emitted: Rc::clone(&emitted),
+            seen_at_call: RefCell::new(Vec::new()),
+        };
+        let emitted_for_callback = Rc::clone(&emitted);
+        let mut callback = move |line: &str| emitted_for_callback.borrow_mut().push(line.into());
+        let streamed = run_tick_with_emit(
+            &config,
+            &OpsState::default(),
+            5,
+            &BTreeMap::new(),
+            &runner,
+            &FakeProbe(BTreeMap::new()),
+            None,
+            true,
+            &mut callback,
+        );
+
+        let seen = runner.seen_at_call.borrow();
+        let before_dependent = &seen.iter().find(|(cmd, _)| cmd == "dependent").unwrap().1;
+        assert!(before_dependent
+            .iter()
+            .any(|line| line.contains("independent found a problem")));
+        let before_foundation = &seen.iter().find(|(cmd, _)| cmd == "foundation").unwrap().1;
+        assert!(!before_foundation
+            .iter()
+            .any(|line| line == "CLEAN: dependent ran and found nothing to report"));
+        assert_eq!(*emitted.borrow(), collected.lines);
+        assert_eq!(streamed, collected);
+    }
+
+    #[test]
+    fn suppressed_verdict_keeps_config_order_between_runnable_gates() {
+        let mut suppressed = Reminder::new("suppressed", Emit::action("warn", "suppressed"));
+        suppressed.requires_flags.push("enabled".into());
+        let config = TickConfig {
+            reminders: vec![
+                dependency_probe("first", &[]),
+                suppressed,
+                dependency_probe("third", &[]),
+            ],
+            ..TickConfig::default()
+        };
+        let gate = FakeGate {
+            outcomes: BTreeMap::from([
+                ("first".into(), GateResult::completed(1, "")),
+                ("third".into(), GateResult::completed(1, "")),
+            ]),
+            calls: RefCell::new(Vec::new()),
+        };
+        let mut emitted = Vec::new();
+        let result = run_tick_with_emit(
+            &config,
+            &OpsState::default(),
+            5,
+            &BTreeMap::new(),
+            &gate,
+            &FakeProbe(BTreeMap::new()),
+            None,
+            true,
+            &mut |line| emitted.push(line.to_string()),
+        );
+        let verdicts = result
+            .lines
+            .iter()
+            .filter(|line| line.starts_with("ACTION: warn") || line.starts_with("SUPPRESSED: "))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            verdicts,
+            vec![
+                "ACTION: warn title=\"first found a problem\"",
+                "SUPPRESSED: suppressed did not run; required flag(s) not set: enabled",
+                "ACTION: warn title=\"third found a problem\"",
+            ]
+        );
+        assert_eq!(emitted, result.lines);
     }
 }

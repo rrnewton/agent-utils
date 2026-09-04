@@ -18,11 +18,12 @@ mod text;
 pub use cadence::{due_reminders, is_due, load_fired_state, persist_fired_state};
 pub use cli::{render_list, run as run_cli, DEFAULT_FIRED_STATE, STATE_FILE_ENV};
 pub use emit::{
-    format_action, format_error, format_health, format_note, HEALTH_STATUS_MISSING,
-    HEALTH_STATUS_OK, HEALTH_STATUS_STALE,
+    format_action, format_clean, format_error, format_health, format_note, format_suppressed,
+    HEALTH_STATUS_MISSING, HEALTH_STATUS_OK, HEALTH_STATUS_STALE,
 };
 pub use engine::{
-    evaluate_health, parse_kv_lines, render_emit, run_tick, TickResult, UnresolvedPlaceholderError,
+    evaluate_health, parse_kv_lines, render_emit, run_tick, run_tick_with_emit, TickResult,
+    UnresolvedPlaceholderError,
 };
 pub use io::{config_from_json, config_from_yaml, config_to_json, config_to_yaml, TickConfigError};
 pub use model::{Emit, EmitKind, Gate, GateWhen, HealthCheck, Reminder, TickConfig, EVERY_TICK};

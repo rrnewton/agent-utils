@@ -7,7 +7,7 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use crate::cadence::{load_fired_state, persist_fired_state};
-use crate::engine::run_tick;
+use crate::engine::run_tick_with_emit;
 use crate::io::{config_from_json, config_from_yaml, config_to_json, config_to_yaml};
 use crate::model::{TickConfig, EVERY_TICK};
 use crate::probes::{wall_clock_now, GlobFileAgeProbe, SubprocessGateRunner};
@@ -161,7 +161,7 @@ fn command_help(command: &str) -> String {
     match command {
         "tick" => format!(
             "usage: {PROG} tick --config FILE [--state FILE] [--fired-state FILE] [--now EPOCH]\n\
-                    [--current-tick-min N] [--flush] [--no-header]\n\n\
+                    [--current-tick-min N] [--flush] [--report-pending] [--no-header]\n\n\
 options:\n\
   -h, --help            show this help message and exit\n\
   --config FILE         reminder-set config; .yaml/.yml load as YAML, else JSON\n\
@@ -170,6 +170,7 @@ options:\n\
   --now EPOCH           override the clock for deterministic runs\n\
   --current-tick-min N  actually-running tick cadence in minutes\n\
   --flush               persist the advanced fired-state\n\
+  --report-pending      print CLEAN/SUPPRESSED verdicts for due reminders\n\
   --no-header           suppress the explanatory stderr banner"
         ),
         "state" => format!(
@@ -198,6 +199,7 @@ struct TickArgs {
     now: Option<i64>,
     current_tick_min: Option<i64>,
     flush: bool,
+    report_pending: bool,
     no_header: bool,
 }
 
@@ -286,6 +288,8 @@ fn parse_tick(args: &[String]) -> Result<TickArgs, String> {
             out.current_tick_min = Some(parse_positive_i64(value?, "--current-tick-min")?);
         } else if arg == "--flush" {
             out.flush = true;
+        } else if arg == "--report-pending" {
+            out.report_pending = true;
         } else if arg == "--no-header" {
             out.no_header = true;
         } else {
@@ -456,7 +460,17 @@ fn run_tick_command(
     };
     let path = fired_path(args.fired_state.as_deref());
     let fired = load_fired_state(&path);
-    let result = run_tick(
+    if !args.no_header {
+        let _ = writeln!(stderr, "{}", banner(c));
+        if let Some(note) = state_note {
+            let _ = writeln!(stderr, "{PROG}: {note}");
+        }
+    }
+    let mut emit_line = |line: &str| {
+        let _ = writeln!(stdout, "{line}");
+        let _ = stdout.flush();
+    };
+    let result = run_tick_with_emit(
         &config,
         &state,
         args.now.unwrap_or_else(wall_clock_now),
@@ -464,16 +478,10 @@ fn run_tick_command(
         &SubprocessGateRunner::default(),
         &GlobFileAgeProbe,
         args.current_tick_min,
+        args.report_pending,
+        &mut emit_line,
     );
-    if !args.no_header {
-        let _ = writeln!(stderr, "{}", banner(c));
-        if let Some(note) = state_note {
-            let _ = writeln!(stderr, "{PROG}: {note}");
-        }
-    }
-    for line in result.lines {
-        let _ = writeln!(stdout, "{line}");
-    }
+    drop(emit_line);
     if args.flush {
         if let Err(error) = persist_fired_state(&path, &result.fired) {
             let _ = writeln!(
@@ -696,6 +704,49 @@ mod tests {
         assert!(stderr.contains("dry-run"));
         assert!(!fired.exists());
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn report_pending_is_compatible_with_flush_and_cadence() {
+        let config = temp_file(
+            "report-pending.json",
+            r#"{"reminders":[{"name":"quiet","cadence_secs":3600,"gate":{"cmd":"true","when":"failure"},"emit":{"skill":"warn","title":"problem"}}]}"#,
+        );
+        let fired = config.with_extension("state");
+        let config_text = config.to_string_lossy();
+        let fired_text = fired.to_string_lossy();
+        let (code, stdout, stderr) = invoke(&[
+            "tick",
+            "--config",
+            &config_text,
+            "--fired-state",
+            &fired_text,
+            "--now",
+            "1000",
+            "--flush",
+            "--report-pending",
+            "--no-header",
+        ]);
+        assert_eq!(code, 0, "{stderr}");
+        assert!(stdout.contains("CLEAN: quiet ran and found nothing to report\n"));
+        assert!(fs::read_to_string(&fired).unwrap().contains("quiet=1000\n"));
+        assert!(stderr.contains("persisted"));
+
+        let (code, stdout, stderr) = invoke(&[
+            "tick",
+            "--config",
+            &config_text,
+            "--fired-state",
+            &fired_text,
+            "--now",
+            "1001",
+            "--report-pending",
+            "--no-header",
+        ]);
+        assert_eq!(code, 0, "{stderr}");
+        assert!(!stdout.contains("CLEAN: quiet"));
+        let _ = fs::remove_file(config);
+        let _ = fs::remove_file(fired);
     }
 
     #[test]
