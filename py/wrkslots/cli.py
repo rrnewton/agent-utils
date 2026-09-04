@@ -9,6 +9,7 @@ import contextlib
 import ctypes
 import dataclasses
 import datetime as dt
+import enum
 import errno
 import fcntl
 import fnmatch
@@ -36,6 +37,13 @@ VERSION = __version__
 SCHEMA = 2
 VALIDATE_REMOVE_BATCH_LIMIT = 8
 _VALIDATE_BATCH_SEAL_SCHEMA = 1
+
+
+class _ValidateBatchSealRecoveryKind(enum.Enum):
+    SEAL_ONLY = "seal-only"
+    PAIRED_FINISH = "paired-finish"
+
+
 _CREATE_JOURNAL_REQUIRED = frozenset(
     {
         "schema",
@@ -10442,7 +10450,7 @@ def _upgrade_legacy_private_cleanup_identity(
     original_mode: int,
     expected: _PrivateCleanupIdentity,
     *,
-    require_clean: bool,
+    recovery_kind: _ValidateBatchSealRecoveryKind,
 ) -> tuple[int, int, int, str]:
     """Enroll a pre-file-handle journal only after revalidating its whole checkout."""
 
@@ -10456,7 +10464,7 @@ def _upgrade_legacy_private_cleanup_identity(
 
     canonical = _slot_directory(config, record.slot, record.slot_type)
     vcs = _GitVcs()
-    if require_clean:
+    if recovery_kind is _ValidateBatchSealRecoveryKind.PAIRED_FINISH:
         if path == canonical:
             slot_path, final_checkouts = _handoff_preconditions(
                 config, record, vcs, refresh_remote=False
@@ -10757,6 +10765,7 @@ def _upgrade_legacy_validate_batch_seal_targets(
     raw: Mapping[str, object],
     targets: Sequence[tuple[str, int, _PrivateCleanupTarget]],
     records: Mapping[str, ActiveRecord],
+    paired_finish: ActiveRecord | None,
 ) -> tuple[Mapping[str, object], tuple[tuple[str, int, _PrivateCleanupTarget], ...]]:
     """Replace recoverable mount-id identities before restoring any target."""
 
@@ -10778,7 +10787,13 @@ def _upgrade_legacy_validate_batch_seal_targets(
                 target.path,
                 target.original_mode,
                 target.identity,
-                require_clean=False,
+                recovery_kind=(
+                    _ValidateBatchSealRecoveryKind.PAIRED_FINISH
+                    if paired_finish is not None
+                    and paired_finish.slot == slot
+                    and paired_finish.generation == generation
+                    else _ValidateBatchSealRecoveryKind.SEAL_ONLY
+                ),
             )
             target = dataclasses.replace(target, identity=stable)
             changed = True
@@ -10800,6 +10815,13 @@ def _upgrade_legacy_finish_seal_identity(
     record: ActiveRecord,
 ) -> Mapping[str, object]:
     """Upgrade a paired finish/seal identity before destructive recovery resumes."""
+
+    paired_finish = _assert_validate_batch_seal_recovery_kind(
+        config, _ValidateBatchSealRecoveryKind.PAIRED_FINISH
+    )
+    assert paired_finish is not None
+    if _record_to_obj(paired_finish) != _record_to_obj(record):
+        raise StateError("paired finish journal record changed during recovery")
 
     finish_identity = _finish_private_census_identity(raw)
     if finish_identity is None:
@@ -10845,7 +10867,7 @@ def _upgrade_legacy_finish_seal_identity(
         subject,
         seal_target.original_mode,
         legacy,
-        require_clean=True,
+        recovery_kind=_ValidateBatchSealRecoveryKind.PAIRED_FINISH,
     )
     for identity in (finish_identity, seal_identity):
         if len(identity) == 4 and identity != stable:
@@ -10872,12 +10894,39 @@ def _upgrade_legacy_finish_seal_identity(
     return updated_finish
 
 
+def _assert_validate_batch_seal_recovery_kind(
+    config: Config, recovery_kind: _ValidateBatchSealRecoveryKind
+) -> ActiveRecord | None:
+    """Require the named recovery boundary to match durable journal state."""
+
+    journals = _outstanding_journals(config)
+    if recovery_kind is _ValidateBatchSealRecoveryKind.SEAL_ONLY:
+        if journals:
+            raise StateError(
+                "seal-only validation-batch recovery cannot run with a paired "
+                "mutation journal"
+            )
+        return None
+    if len(journals) != 1:
+        raise StateError(
+            "paired-finish validation-batch recovery requires one mutation journal"
+        )
+    _path, raw = _load_journal(config)
+    if _as_str(raw.get("kind"), "journal.kind") != "finish":
+        raise StateError(
+            "paired-finish validation-batch recovery requires a finish journal"
+        )
+    return _record_from_obj(raw.get("record"), "finish journal.record")
+
+
 def _recover_validate_batch_seal_journal(
     config: Config,
     *,
+    recovery_kind: _ValidateBatchSealRecoveryKind,
     emit: bool = True,
     retain_evidence: bool = False,
 ) -> bool:
+    paired_finish = _assert_validate_batch_seal_recovery_kind(config, recovery_kind)
     loaded = _load_validate_batch_seal_journal(config)
     if loaded is None:
         return False
@@ -10885,7 +10934,7 @@ def _recover_validate_batch_seal_journal(
     states, archives = _validate_global_state(config, require_repository=False)
     records = {record.slot: record for state in states for record in state.slots}
     raw, targets = _upgrade_legacy_validate_batch_seal_targets(
-        config, raw, targets, records
+        config, raw, targets, records, paired_finish
     )
     unresolved: list[dict[str, object]] = []
     errors: list[str] = []
@@ -11915,7 +11964,11 @@ def _cmd_remove_validate_batch(args: argparse.Namespace) -> int:
     finally:
         with _mutation_locks(config, args.wait_lock):
             if not _outstanding_journals(config):
-                _recover_validate_batch_seal_journal(config, emit=False)
+                _recover_validate_batch_seal_journal(
+                    config,
+                    recovery_kind=_ValidateBatchSealRecoveryKind.SEAL_ONLY,
+                    emit=False,
+                )
     payload = {
         "schema": 1,
         "batch_limit": VALIDATE_REMOVE_BATCH_LIMIT,
@@ -17431,7 +17484,10 @@ def _cmd_recover(args: argparse.Namespace) -> int:
             seal_journals = _validate_batch_seal_journals(config)
             if not journals and seal_journals:
                 _assert_caller_process(coordinator, "coordinator")
-                _recover_validate_batch_seal_journal(config)
+                _recover_validate_batch_seal_journal(
+                    config,
+                    recovery_kind=_ValidateBatchSealRecoveryKind.SEAL_ONLY,
+                )
                 return 0
             path, raw = _load_journal(config)
         _ensure_event_log(config)
@@ -17526,7 +17582,9 @@ def _cmd_recover(args: argparse.Namespace) -> int:
                 )
                 if seal_journals:
                     _recover_validate_batch_seal_journal(
-                        config, retain_evidence=True
+                        config,
+                        recovery_kind=_ValidateBatchSealRecoveryKind.PAIRED_FINISH,
+                        retain_evidence=True,
                     )
                 raise
         elif kind == "legacy-validate-remove":
@@ -17586,7 +17644,10 @@ def _cmd_recover(args: argparse.Namespace) -> int:
         else:
             raise StateError(f"unknown recovery journal kind {kind!r}")
         if seal_journals:
-            _recover_validate_batch_seal_journal(config)
+            _recover_validate_batch_seal_journal(
+                config,
+                recovery_kind=_ValidateBatchSealRecoveryKind.SEAL_ONLY,
+            )
         after_states, after_archives = _validate_global_state(
             config, require_repository=kind != "finish"
         )
