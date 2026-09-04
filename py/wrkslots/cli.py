@@ -13269,7 +13269,7 @@ def _terminal_validation_record(
         raise Refusal(f"terminal validation record does not name this exact {field}")
     if target_kind == "checkout" and record.get("temporary_checkout") is False:
         raise Refusal("terminal validation record says the checkout is not temporary")
-    if not _validation_record_is_terminal(record):
+    if not _validation_record_is_terminal(record, target_kind=target_kind):
         raise Refusal(
             "validation record does not contain an evidenced terminal result; no path was "
             "removed. Let validate-run finish recording the result or preserve the path"
@@ -13277,14 +13277,120 @@ def _terminal_validation_record(
     return relative, digest
 
 
-def _validation_record_is_terminal(record: Mapping[str, object]) -> bool:
-    """Return whether one retained validation handle contains a typed terminal result."""
+def _validation_record_has_typed_admission(record: Mapping[str, object]) -> bool:
+    """Return whether a current validation handle records a complete admission result."""
+
+    kind = record.get("kind")
+    if (
+        type(record.get("schema_version")) is not int
+        or record.get("schema_version") != 1
+        or not isinstance(kind, str)
+        or kind not in {"validate", "reverie-validate"}
+        or record.get("producer") != "ci-hub/validate/run_registry.py"
+        or record.get("admission") != "ci-hub validate-lock"
+        or record.get("temporary_checkout") is not True
+    ):
+        return False
+    raw = record.get("admission_result")
+    if not isinstance(raw, dict):
+        return False
+    state = raw.get("state")
+    if state == "admitted":
+        if not {"state", "recorded_at"} <= set(raw) or not set(raw) <= {
+            "state",
+            "recorded_at",
+            "run_number",
+        }:
+            return False
+        run_number = raw.get("run_number")
+        if run_number is not None and (
+            not isinstance(run_number, int)
+            or isinstance(run_number, bool)
+            or run_number <= 0
+        ):
+            return False
+    elif state == "refused":
+        if set(raw) != {"state", "recorded_at", "reason", "exit_code"}:
+            return False
+        reason = raw.get("reason")
+        if not isinstance(reason, str) or reason not in {
+            "stale-base",
+            "validation-lock-refusal",
+        }:
+            return False
+        exit_code = raw.get("exit_code")
+        if (
+            not isinstance(exit_code, int)
+            or isinstance(exit_code, bool)
+            or exit_code == 0
+        ):
+            return False
+    else:
+        return False
+    recorded_at = raw.get("recorded_at")
+    if not isinstance(recorded_at, str):
+        return False
+    try:
+        _parse_timestamp(recorded_at, "validation admission result")
+    except StateError:
+        return False
+    return True
+
+
+def _validation_record_process_is_dead(record: Mapping[str, object]) -> bool:
+    """Prove that the exact process generation recorded by a validation is gone."""
+
+    raw = record.get("process_identity")
+    if not isinstance(raw, dict) or set(raw) != {"pid", "start_ticks", "boot_id"}:
+        return False
+    pid = raw.get("pid")
+    start_ticks = raw.get("start_ticks")
+    boot_id = raw.get("boot_id")
+    if (
+        not isinstance(pid, int)
+        or isinstance(pid, bool)
+        or pid <= 0
+        or not isinstance(start_ticks, int)
+        or isinstance(start_ticks, bool)
+        or start_ticks <= 0
+        or not isinstance(boot_id, str)
+        or not boot_id.strip()
+    ):
+        return False
+    try:
+        current_boot = _boot_id(Path("/proc"))
+        process = _read_process_stat(Path("/proc") / str(pid))
+    except Refusal:
+        return False
+    return current_boot != boot_id or process is None or process.start_ticks != start_ticks
+
+
+def _validation_record_is_terminal(
+    record: Mapping[str, object], *, target_kind: str
+) -> bool:
+    """Return whether one retained validation handle proves execution has stopped.
+
+    A current handle may retain an unknown validation verdict after its service
+    result was lost.  Its exact process generation being gone still proves that
+    disposable validation storage is no longer owned by that execution.  This
+    cleanup fact does not promote the unknown verdict to passed or failed.
+    """
 
     state = record.get("state")
+    if not isinstance(state, str):
+        return False
     if state in {"killed", "not-run", "refused"}:
         return True
     if state != "completed":
-        return False
+        return bool(
+            target_kind == "cargo-home"
+            and state == "unknown"
+            and record.get("result") == "unknown"
+            and isinstance(record.get("detail"), str)
+            and str(record["detail"]).strip()
+            and _validation_record_has_typed_admission(record)
+            and _validation_record_process_is_dead(record)
+        )
     exits = {"PASSED": 0, "FAILED": 1, "COULD_NOT_RUN": 75}
     status = record.get("final_validate_status")
     expected_exit = exits.get(status) if isinstance(status, str) else None

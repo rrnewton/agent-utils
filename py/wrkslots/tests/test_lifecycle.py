@@ -1859,6 +1859,256 @@ def test_ownerless_cleanup_refuses_unknown_record(
     assert target.is_dir()
 
 
+@pytest.mark.parametrize("admission_state", ("admitted", "refused"))
+def test_ownerless_cleanup_accepts_unknown_record_after_exact_process_exits(
+    tmp_path: Path, admission_state: str
+) -> None:
+    project, _repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    target = project / "worktrees" / "validate" / f"validate-cargo-{admission_state}"
+    target.mkdir(parents=True)
+    record = prepare_terminal_validation_record(
+        project,
+        target,
+        field="cargo_home",
+        state="unknown",
+        name=f"validate-{admission_state}",
+    )
+    current = wrkslots._read_process_stat(Path("/proc") / str(os.getpid()))
+    assert current is not None
+    value = json.loads(record.read_text())
+    value.update(
+        {
+            "kind": "validate",
+            "producer": "ci-hub/validate/run_registry.py",
+            "admission": "ci-hub validate-lock",
+            "temporary_checkout": True,
+            "result": "unknown",
+            "detail": "the validation result was not recorded",
+            "process_identity": {
+                "pid": os.getpid(),
+                "start_ticks": current.start_ticks + 1,
+                "boot_id": wrkslots._boot_id(Path("/proc")),
+            },
+            "admission_result": (
+                {
+                    "state": "admitted",
+                    "recorded_at": "2026-09-04T12:00:00+00:00",
+                    "run_number": 7,
+                }
+                if admission_state == "admitted"
+                else {
+                    "state": "refused",
+                    "recorded_at": "2026-09-04T12:00:00+00:00",
+                    "reason": "stale-base",
+                    "exit_code": 3,
+                }
+            ),
+        }
+    )
+    record.write_text(json.dumps(value), encoding="utf-8")
+
+    recovered = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--ownerless-validate-cargo-home",
+        target.relative_to(project).as_posix(),
+        "--completed-record",
+        record.relative_to(project).as_posix(),
+    )
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert not target.exists()
+
+
+def test_ownerless_cleanup_retains_unknown_record_while_exact_process_is_live(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    target = project / "worktrees" / "validate" / "validate-cargo-live"
+    target.mkdir(parents=True)
+    record = prepare_terminal_validation_record(
+        project, target, field="cargo_home", state="unknown"
+    )
+    current = wrkslots._read_process_stat(Path("/proc") / str(os.getpid()))
+    assert current is not None
+    value = json.loads(record.read_text())
+    value.update(
+        {
+            "kind": "validate",
+            "producer": "ci-hub/validate/run_registry.py",
+            "admission": "ci-hub validate-lock",
+            "temporary_checkout": True,
+            "result": "unknown",
+            "detail": "the validation result was not recorded",
+            "process_identity": {
+                "pid": os.getpid(),
+                "start_ticks": current.start_ticks,
+                "boot_id": wrkslots._boot_id(Path("/proc")),
+            },
+            "admission_result": {
+                "state": "admitted",
+                "recorded_at": "2026-09-04T12:00:00+00:00",
+                "run_number": 7,
+            },
+        }
+    )
+    record.write_text(json.dumps(value), encoding="utf-8")
+
+    refused = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--ownerless-validate-cargo-home",
+        target.relative_to(project).as_posix(),
+        "--completed-record",
+        record.relative_to(project).as_posix(),
+    )
+
+    assert refused.returncode == 3
+    assert "does not contain an evidenced terminal result" in refused.stderr
+    assert target.is_dir()
+
+
+@pytest.mark.parametrize(
+    ("pid", "start_ticks_delta", "boot_id"),
+    (
+        (2**31 - 1, 0, None),
+        (None, 1, None),
+        (None, 0, "different-boot"),
+    ),
+)
+def test_unknown_validation_record_accepts_each_exact_dead_process_proof(
+    pid: int | None,
+    start_ticks_delta: int,
+    boot_id: str | None,
+) -> None:
+    current = wrkslots._read_process_stat(Path("/proc") / str(os.getpid()))
+    assert current is not None
+    record = {
+        "schema_version": 1,
+        "kind": "validate",
+        "producer": "ci-hub/validate/run_registry.py",
+        "admission": "ci-hub validate-lock",
+        "temporary_checkout": True,
+        "state": "unknown",
+        "result": "unknown",
+        "detail": "the validation result was not recorded",
+        "process_identity": {
+            "pid": pid if pid is not None else os.getpid(),
+            "start_ticks": current.start_ticks + start_ticks_delta,
+            "boot_id": boot_id or wrkslots._boot_id(Path("/proc")),
+        },
+        "admission_result": {
+            "state": "admitted",
+            "recorded_at": "2026-09-04T12:00:00+00:00",
+            "run_number": 7,
+        },
+    }
+
+    assert wrkslots._validation_record_is_terminal(record, target_kind="cargo-home")
+    assert not wrkslots._validation_record_is_terminal(
+        record, target_kind="checkout"
+    )
+
+
+@pytest.mark.parametrize(
+    "admission_result",
+    (
+        None,
+        {"state": "admitted", "recorded_at": "not-a-timestamp"},
+        {
+            "state": "admitted",
+            "recorded_at": "2026-09-04T12:00:00+00:00",
+            "run_number": True,
+        },
+        {
+            "state": "refused",
+            "recorded_at": "2026-09-04T12:00:00+00:00",
+            "reason": "unknown-reason",
+            "exit_code": 3,
+        },
+        {
+            "state": "refused",
+            "recorded_at": "2026-09-04T12:00:00+00:00",
+            "reason": ["stale-base"],
+            "exit_code": 3,
+        },
+    ),
+)
+def test_unknown_validation_record_rejects_missing_or_malformed_admission(
+    admission_result: object,
+) -> None:
+    record = {
+        "schema_version": 1,
+        "kind": "validate",
+        "producer": "ci-hub/validate/run_registry.py",
+        "admission": "ci-hub validate-lock",
+        "temporary_checkout": True,
+        "state": "unknown",
+        "result": "unknown",
+        "detail": "the validation result was not recorded",
+        "process_identity": {
+            "pid": 2**31 - 1,
+            "start_ticks": 1,
+            "boot_id": wrkslots._boot_id(Path("/proc")),
+        },
+        "admission_result": admission_result,
+    }
+
+    assert not wrkslots._validation_record_is_terminal(
+        record, target_kind="cargo-home"
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("schema_version", True),
+        ("kind", ["validate"]),
+        ("state", ["unknown"]),
+    ),
+)
+def test_unknown_validation_record_rejects_malformed_discriminator_types(
+    field: str, value: object
+) -> None:
+    record = {
+        "schema_version": 1,
+        "kind": "validate",
+        "producer": "ci-hub/validate/run_registry.py",
+        "admission": "ci-hub validate-lock",
+        "temporary_checkout": True,
+        "state": "unknown",
+        "result": "unknown",
+        "detail": "the validation result was not recorded",
+        "process_identity": {
+            "pid": 2**31 - 1,
+            "start_ticks": 1,
+            "boot_id": wrkslots._boot_id(Path("/proc")),
+        },
+        "admission_result": {
+            "state": "admitted",
+            "recorded_at": "2026-09-04T12:00:00+00:00",
+            "run_number": 7,
+        },
+    }
+    record[field] = value
+
+    assert not wrkslots._validation_record_is_terminal(
+        record, target_kind="cargo-home"
+    )
+
+
 def test_ownerless_cleanup_accepts_current_pass_with_failed_writeback(
     tmp_path: Path,
 ) -> None:
