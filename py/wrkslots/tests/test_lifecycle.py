@@ -4720,6 +4720,62 @@ def test_seal_only_legacy_identity_upgrade_allows_dirty_retained_output(
 
 
 @pytest.mark.parametrize(
+    ("paired_finish", "recovery_kind", "message"),
+    (
+        (
+            False,
+            wrkslots._ValidateBatchSealRecoveryKind.PAIRED_FINISH,
+            "requires one mutation journal",
+        ),
+        (
+            True,
+            wrkslots._ValidateBatchSealRecoveryKind.SEAL_ONLY,
+            "cannot run with a paired mutation journal",
+        ),
+    ),
+)
+def test_validate_batch_seal_recovery_rejects_wrong_journal_kind(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    paired_finish: bool,
+    recovery_kind: wrkslots._ValidateBatchSealRecoveryKind,
+    message: str,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    slot_path = prepare_dead_validate_slots(project, ("slot01",))["slot01"]
+    if paired_finish:
+        stub_validate_batch_censuses(monkeypatch)
+        interrupt_validate_batch(
+            project, monkeypatch, "after-finish-journal", ("slot01",)
+        )
+    else:
+        interrupted = raw_command(
+            project,
+            "remove-validate-batch",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--slot",
+            "slot01=1",
+            env={"WRKSLOTS_TEST_INTERRUPT": "after-validate-batch-seal-target"},
+        )
+        assert interrupted.returncode == 86, interrupted.stderr
+    config = wrkslots._load_config(str(project), "testhost")
+    finish_path = wrkslots._journal_path(config)
+    seal_path = wrkslots._validate_batch_seal_journal_path(config)
+    seal_before = seal_path.read_bytes()
+
+    with pytest.raises(wrkslots.StateError, match=message):
+        wrkslots._recover_validate_batch_seal_journal(
+            config, recovery_kind=recovery_kind
+        )
+
+    assert slot_path.is_dir()
+    assert stat.S_IMODE(slot_path.stat().st_mode) == 0o700
+    assert seal_path.read_bytes() == seal_before
+    assert finish_path.exists() is paired_finish
+
+
+@pytest.mark.parametrize(
     ("interrupt", "sealed"),
     (
         ("after-validate-batch-seal-journal", False),
