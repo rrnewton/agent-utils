@@ -84,12 +84,12 @@ pub use model::{
     cmdtype_env_with_inner_jobs, cmdtype_extra_args, command_uses_extra_args,
     command_with_inner_jobs, dag_config_carry_diff, effective_jobs_env, effective_jobs_flag,
     env_with_inner_jobs, preferred_inner_jobs, render_jobs_flag, resolve_jobs_env,
-    resolved_wall_timeout, step_classification, step_failure_reason, step_width_is_resizable,
-    undeclared_resource_demands, validate_cmdtype_config, validate_jobs_env_config,
-    write_domain_violations, CmdType, DagConfig, DagManifest, ResourceHint, RunResult, Step,
-    StepClass, StepOutcome, WriteDomainGuarantee, WriteDomainPolicy, DAGRUN_EXTRA_ARGS_ENV,
-    DAG_CONFIG_FIELDS, DEFAULT_JOBS_FLAG, DEFAULT_STEP_TIMEOUT, JOBS_ENV_ENV,
-    WALL_CPU_BACKSTOP_FACTOR,
+    resolved_wall_timeout, result_manifest_owner, step_classification, step_failure_reason,
+    step_width_is_resizable, undeclared_resource_demands, validate_cmdtype_config,
+    validate_jobs_env_config, write_domain_violations, CmdType, DagConfig, DagManifest,
+    ResourceHint, RunResult, Step, StepClass, StepOutcome, WriteDomainGuarantee, WriteDomainPolicy,
+    DAGRUN_EXTRA_ARGS_ENV, DAG_CONFIG_FIELDS, DEFAULT_JOBS_FLAG, DEFAULT_STEP_TIMEOUT,
+    JOBS_ENV_ENV, WALL_CPU_BACKSTOP_FACTOR,
 };
 pub use perflog::{
     append_step_profiles, append_step_timeseries, PerfWindow, STEP_TIMESERIES_COLUMNS,

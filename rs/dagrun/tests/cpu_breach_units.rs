@@ -122,6 +122,7 @@ fn sleeping_step() -> DagConfig {
         cmd: "sleep 30".into(),
         cmdtype: dagrun::CmdType::Unknown,
         manifest: None,
+        result_manifests: None,
         integration_test_binaries: None,
         deps: Vec::new(),
         env: BTreeMap::new(),

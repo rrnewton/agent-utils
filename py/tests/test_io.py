@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,7 @@ from dagrun.model import (
     StepClass,
     WriteDomainGuarantee,
     WriteDomainPolicy,
+    result_manifest_owner,
     resolved_wall_timeout,
 )
 from dagrun.scheduler import run_dag
@@ -119,6 +121,7 @@ def test_manifest_selection_roundtrips_and_refuses_malformed_values() -> None:
     )
     cfg = dag_from_json(doc)
     assert cfg.steps[0].manifest == DagManifest(lane="portable", category="applications")
+    assert cfg.steps[0].result_manifests is None
     encoded = dag_to_json(cfg)
     assert dag_to_json(dag_from_json(encoded)) == encoded
 
@@ -137,6 +140,122 @@ def test_manifest_selection_roundtrips_and_refuses_malformed_values() -> None:
                 f'"cmd":"true","manifest":{value}}}]}}'
             )
         assert message in str(raised.value)
+
+
+def test_result_manifests_roundtrip_preserves_absent_and_explicit_empty() -> None:
+    doc = """{"steps":[
+        {"group":"e2e","job":"legacy","cmd":"true",
+         "manifest":{"lane":"portable","category":"applications"}},
+        {"group":"e2e","job":"none","cmd":"true",
+         "manifest":{"lane":"portable","category":"applications"},
+         "result_manifests":[]},
+        {"group":"e2e","job":"many","cmd":"true","result_manifests":[
+            {"lane":"portable","category":"applications","mode":"verify","backend":"ptrace"},
+            {"lane":"portable","category":"c-programs","test":"c-programs/add-key-enosys",
+             "mode":"run","backend":"kvm"}
+         ]}
+    ]}"""
+    cfg = dag_from_json(doc)
+    assert cfg.steps[0].result_manifests is None
+    assert cfg.steps[0].effective_result_manifests() == (
+        DagManifest(lane="portable", category="applications"),
+    )
+    assert cfg.steps[1].result_manifests == []
+    assert cfg.steps[1].effective_result_manifests() == ()
+    assert cfg.steps[2].effective_result_manifests()[-1] == DagManifest(
+        lane="portable",
+        category="c-programs",
+        test="c-programs/add-key-enosys",
+        mode="run",
+        backend="kvm",
+    )
+    encoded = dag_to_json(cfg)
+    encoded_steps = json.loads(encoded)["steps"]
+    assert "result_manifests" not in encoded_steps[0]
+    assert encoded_steps[1]["result_manifests"] == []
+    assert dag_to_json(dag_from_json(encoded)) == encoded
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        (
+            '{"lane":"portable","category":"applications"}',
+            "result_manifests: must be a list of manifest selectors or null",
+        ),
+        ("[null]", "result_manifests[0]: expected an object"),
+        (
+            '[{"lane":"portable"}]',
+            "result_manifests[0]: field 'category' must be a string",
+        ),
+        (
+            '[{"lane":"portable","category":"applications","mode":""}]',
+            "result_manifests[0].mode: must be non-empty when present",
+        ),
+        (
+            '[{"lane":"portable","category":"applications"},'
+            '{"lane":"portable","category":"applications"}]',
+            "result_manifests: duplicate selector at index 1",
+        ),
+        (
+            '[{"lane":"portable","category":"applications","future":1}]',
+            "result_manifests[0]: unknown field(s) 'future'",
+        ),
+    ],
+)
+def test_result_manifests_refuse_malformed_and_duplicate_selectors(
+    value: str, message: str
+) -> None:
+    with pytest.raises(DagJsonError) as raised:
+        dag_from_json(
+            '{"steps":[{"group":"e2e","job":"results","cmd":"true",'
+            f'"result_manifests":{value}}}]}}'
+        )
+    assert message in str(raised.value)
+
+
+def test_result_manifest_owner_refuses_missing_inexact_and_cross_node_ownership() -> None:
+    result = DagManifest(
+        lane="portable",
+        category="applications",
+        test="applications/date",
+        mode="verify",
+        backend="ptrace",
+    )
+    legacy = Step(
+        "e2e",
+        "legacy",
+        "legacy owner",
+        "true",
+        manifest=DagManifest(lane="portable", category="applications"),
+    )
+    assert result_manifest_owner([legacy], result) is legacy
+
+    explicit_empty = Step(
+        "e2e",
+        "none",
+        "no results",
+        "true",
+        manifest=DagManifest(lane="portable", category="applications"),
+        result_manifests=[],
+    )
+    with pytest.raises(ValueError, match="has no owning step"):
+        result_manifest_owner([explicit_empty], result)
+
+    with pytest.raises(ValueError, match="missing test, mode, backend"):
+        result_manifest_owner(
+            [legacy], DagManifest(lane="portable", category="applications")
+        )
+
+    exact_owner = Step(
+        "e2e",
+        "exact",
+        "exact owner",
+        "true",
+        result_manifests=[result],
+    )
+    with pytest.raises(ValueError, match="multiple owning steps.*e2e.legacy, e2e.exact"):
+        result_manifest_owner([legacy, exact_owner], result)
 
 
 def test_integration_test_binaries_roundtrip_and_refuse_malformed_values() -> None:

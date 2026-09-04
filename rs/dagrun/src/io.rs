@@ -146,7 +146,7 @@ fn err(msg: impl Into<String>) -> DagJsonError {
 /// `cmds`, `timeouts`, `env_vars`, `description` vs `desc`. Silently ignored, the instruction is
 /// simply not carried out and the document still says it was: the step runs with no timeout, no
 /// dependency, no environment, and nothing anywhere reports it.
-const STEP_KEYS: [&str; 24] = [
+const STEP_KEYS: [&str; 25] = [
     "cmd",
     "cmdtype",
     "cpu_timeout",
@@ -171,9 +171,9 @@ const STEP_KEYS: [&str; 24] = [
     "write_domains",
     // ⚠️ DECLARED HERE, CONSUMED DOWNSTREAM, NOT BY dagrun.
     // `requires_host_capability` drives a consuming planner's HOST-INAPPLICABLE
-    // decision, while `manifest` and `integration_test_binaries` carry other
-    // consumer-owned selection facts. dagrun retains them but does not interpret
-    // them by design.
+    // decision, while `manifest`, `result_manifests`, and `integration_test_binaries`
+    // carry other consumer-owned selection facts. dagrun retains the declarations;
+    // only its generic exact-result ownership helper interprets the selectors.
     //
     // Retained because this schema is CLOSED, and closing it without these fields
     // made dagrun REFUSE graphs that were already in use -- measured 2026-08-26,
@@ -181,6 +181,7 @@ const STEP_KEYS: [&str; 24] = [
     // for another. Keep this list in step with the Python edition's STEP_KEYS;
     // the two are asserted identical.
     "manifest",
+    "result_manifests",
     "requires_host_capability",
 ];
 
@@ -197,8 +198,8 @@ const HINT_KEYS: [&str; 8] = [
     "rss_baseline_bytes",
 ];
 
-/// Every key the existing per-step `manifest` object may carry.
-const MANIFEST_KEYS: [&str; 2] = ["category", "lane"];
+/// Every key a per-step manifest selector may carry.
+const MANIFEST_KEYS: [&str; 5] = ["backend", "category", "lane", "mode", "test"];
 
 /// Every key the top-level `write_domain_policy` object may carry. Closed: a misspelled
 /// `require_explicit` turns a fail-closed policy into no policy at all, silently.
@@ -344,13 +345,7 @@ fn opt_str_or_none(
     }
 }
 
-fn manifest_from(value: Option<&Value>, where_: &str) -> Result<Option<DagManifest>, DagJsonError> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    if value.is_null() {
-        return Ok(None);
-    }
+fn manifest_value_from(value: &Value, where_: &str) -> Result<DagManifest, DagJsonError> {
     let object = as_obj(value, where_)?;
     refuse_unknown_keys(object, &MANIFEST_KEYS, where_)?;
     let lane = req_str(object, "lane", where_)?;
@@ -361,7 +356,59 @@ fn manifest_from(value: Option<&Value>, where_: &str) -> Result<Option<DagManife
     if category.is_empty() {
         return Err(err(format!("{where_}.category: must be non-empty")));
     }
-    Ok(Some(DagManifest { lane, category }))
+    let test = opt_str_or_none(object, "test")?;
+    let mode = opt_str_or_none(object, "mode")?;
+    let backend = opt_str_or_none(object, "backend")?;
+    for (field, value) in [("test", &test), ("mode", &mode), ("backend", &backend)] {
+        if value.as_deref() == Some("") {
+            return Err(err(format!(
+                "{where_}.{field}: must be non-empty when present"
+            )));
+        }
+    }
+    Ok(DagManifest {
+        lane,
+        category,
+        test,
+        mode,
+        backend,
+    })
+}
+
+fn manifest_from(value: Option<&Value>, where_: &str) -> Result<Option<DagManifest>, DagJsonError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => manifest_value_from(value, where_).map(Some),
+    }
+}
+
+fn result_manifests_from(
+    value: Option<&Value>,
+    where_: &str,
+) -> Result<Option<Vec<DagManifest>>, DagJsonError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let Value::Array(values) = value else {
+        return Err(err(format!(
+            "{where_}: must be a list of manifest selectors or null"
+        )));
+    };
+    let mut manifests = Vec::with_capacity(values.len());
+    for (index, value) in values.iter().enumerate() {
+        let item_where = format!("{where_}[{index}]");
+        let manifest = manifest_value_from(value, &item_where)?;
+        if manifests.contains(&manifest) {
+            return Err(err(format!(
+                "{where_}: duplicate selector at index {index}"
+            )));
+        }
+        manifests.push(manifest);
+    }
+    Ok(Some(manifests))
 }
 
 fn opt_int_or_none(
@@ -714,6 +761,10 @@ pub fn dag_from_value(raw: &Value) -> Result<DagConfig, DagJsonError> {
             cmd: req_str(sm, "cmd", &where_)?,
             cmdtype,
             manifest: manifest_from(sm.get("manifest"), &format!("{where_}.manifest"))?,
+            result_manifests: result_manifests_from(
+                sm.get("result_manifests"),
+                &format!("{where_}.result_manifests"),
+            )?,
             integration_test_binaries: integration_test_binaries_from(sm)?,
             deps: opt_str_list(sm, "deps")?,
             env: opt_str_str_map(sm, "env", &where_)?,
@@ -1041,6 +1092,52 @@ fn emit_str_list(s: &mut String, list: &[String], base: usize) {
     s.push(']');
 }
 
+fn emit_manifest(s: &mut String, manifest: &DagManifest, base: usize) {
+    let fields = [
+        ("lane", Some(manifest.lane.as_str())),
+        ("category", Some(manifest.category.as_str())),
+        ("test", manifest.test.as_deref()),
+        ("mode", manifest.mode.as_deref()),
+        ("backend", manifest.backend.as_deref()),
+    ];
+    let present: Vec<(&str, &str)> = fields
+        .into_iter()
+        .filter_map(|(name, value)| value.map(|value| (name, value)))
+        .collect();
+    s.push_str("{\n");
+    let key = " ".repeat(base + 2);
+    for (index, (name, value)) in present.iter().enumerate() {
+        s.push_str(&key);
+        s.push_str(&format!("{}: {}", json_str(name), json_str(value)));
+        s.push_str(if index + 1 < present.len() {
+            ",\n"
+        } else {
+            "\n"
+        });
+    }
+    s.push_str(&" ".repeat(base));
+    s.push('}');
+}
+
+fn emit_manifest_list(s: &mut String, manifests: &[DagManifest], base: usize) {
+    if manifests.is_empty() {
+        s.push_str("[]");
+        return;
+    }
+    s.push_str("[\n");
+    for (index, manifest) in manifests.iter().enumerate() {
+        s.push_str(&" ".repeat(base + 2));
+        emit_manifest(s, manifest, base + 2);
+        s.push_str(if index + 1 < manifests.len() {
+            ",\n"
+        } else {
+            "\n"
+        });
+    }
+    s.push_str(&" ".repeat(base));
+    s.push(']');
+}
+
 fn emit_hint(s: &mut String, hint: &ResourceHint, base: usize) {
     // base is the indent of the enclosing key; the object's fields sit at base+2.
     let key = " ".repeat(base + 2);
@@ -1121,13 +1218,15 @@ fn emit_step(s: &mut String, step: &Step, base: usize) {
     }
     if let Some(manifest) = &step.manifest {
         s.push_str(&key);
-        s.push_str("\"manifest\": {\n");
-        s.push_str(&" ".repeat(base + 4));
-        s.push_str(&format!("\"lane\": {},\n", json_str(&manifest.lane)));
-        s.push_str(&" ".repeat(base + 4));
-        s.push_str(&format!("\"category\": {}\n", json_str(&manifest.category)));
+        s.push_str("\"manifest\": ");
+        emit_manifest(s, manifest, base + 2);
+        s.push_str(",\n");
+    }
+    if let Some(manifests) = &step.result_manifests {
         s.push_str(&key);
-        s.push_str("},\n");
+        s.push_str("\"result_manifests\": ");
+        emit_manifest_list(s, manifests, base + 2);
+        s.push_str(",\n");
     }
     if let Some(targets) = &step.integration_test_binaries {
         s.push_str(&key);
@@ -1451,6 +1550,7 @@ steps:
         assert_eq!(step.hint.classification, StepClass::Light);
         assert_eq!(step.jobs_flag, None);
         assert_eq!(step.manifest, None);
+        assert_eq!(step.result_manifests, None);
         assert_eq!(step.integration_test_binaries, None);
         assert!(cfg.resource_caps.is_empty());
         assert_eq!(cfg.mem_cap_factor, 1.25);
@@ -1486,8 +1586,12 @@ steps:
             Some(DagManifest {
                 lane: "portable".into(),
                 category: "applications".into(),
+                test: None,
+                mode: None,
+                backend: None,
             })
         );
+        assert_eq!(cfg.steps[0].result_manifests, None);
         let encoded = dag_to_json(&cfg);
         assert_eq!(dag_to_json(&dag_from_json(&encoded).unwrap()), encoded);
 
@@ -1507,6 +1611,77 @@ steps:
         ] {
             let input = format!(
                 r#"{{"steps":[{{"group":"e2e","job":"manifest_applications","cmd":"true","manifest":{value}}}]}}"#
+            );
+            let error = dag_from_json(&input).unwrap_err().to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn result_manifests_roundtrip_preserves_absent_and_explicit_empty() {
+        let doc = r#"{"steps":[
+            {"group":"e2e","job":"legacy","cmd":"true",
+             "manifest":{"lane":"portable","category":"applications"}},
+            {"group":"e2e","job":"none","cmd":"true",
+             "manifest":{"lane":"portable","category":"applications"},
+             "result_manifests":[]},
+            {"group":"e2e","job":"many","cmd":"true","result_manifests":[
+                {"lane":"portable","category":"applications","mode":"verify","backend":"ptrace"},
+                {"lane":"portable","category":"c-programs","test":"c-programs/add-key-enosys",
+                 "mode":"run","backend":"kvm"}
+             ]}
+        ]}"#;
+        let cfg = dag_from_json(doc).unwrap();
+        assert_eq!(cfg.steps[0].result_manifests, None);
+        assert_eq!(cfg.steps[0].effective_result_manifests().len(), 1);
+        assert_eq!(cfg.steps[1].result_manifests, Some(Vec::new()));
+        assert!(cfg.steps[1].effective_result_manifests().is_empty());
+        assert_eq!(cfg.steps[2].effective_result_manifests().len(), 2);
+        assert_eq!(
+            cfg.steps[2].result_manifests.as_ref().unwrap()[1],
+            DagManifest {
+                lane: "portable".into(),
+                category: "c-programs".into(),
+                test: Some("c-programs/add-key-enosys".into()),
+                mode: Some("run".into()),
+                backend: Some("kvm".into()),
+            }
+        );
+        let encoded = dag_to_json(&cfg);
+        let encoded_value: Value = serde_json::from_str(&encoded).unwrap();
+        let encoded_steps = encoded_value["steps"].as_array().unwrap();
+        assert!(encoded_steps[0].get("result_manifests").is_none());
+        assert_eq!(encoded_steps[1]["result_manifests"], serde_json::json!([]));
+        assert_eq!(dag_to_json(&dag_from_json(&encoded).unwrap()), encoded);
+    }
+
+    #[test]
+    fn result_manifests_refuse_malformed_and_duplicate_selectors() {
+        for (value, expected) in [
+            (
+                r#"{"lane":"portable","category":"applications"}"#,
+                "result_manifests: must be a list of manifest selectors or null",
+            ),
+            (r#"[null]"#, "result_manifests[0]: expected an object"),
+            (
+                r#"[{"lane":"portable"}]"#,
+                "result_manifests[0]: field 'category' must be a string",
+            ),
+            (
+                r#"[{"lane":"portable","category":"applications","mode":""}]"#,
+                "result_manifests[0].mode: must be non-empty when present",
+            ),
+            (
+                r#"[{"lane":"portable","category":"applications"},{"lane":"portable","category":"applications"}]"#,
+                "result_manifests: duplicate selector at index 1",
+            ),
+            (
+                r#"[{"lane":"portable","category":"applications","future":1}]"#,
+                "result_manifests[0]: unknown field(s) 'future'",
+            ),
+        ] {
+            let input = format!(
+                r#"{{"steps":[{{"group":"e2e","job":"results","cmd":"true","result_manifests":{value}}}]}}"#
             );
             let error = dag_from_json(&input).unwrap_err().to_string();
             assert!(error.contains(expected), "{error}");

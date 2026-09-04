@@ -528,6 +528,21 @@ def representative_fixtures() -> list[Fixture]:
                         "desc": "browser smoke",
                         "cmd": "echo e2e",
                         "manifest": {"lane": "portable", "category": "applications"},
+                        "result_manifests": [
+                            {
+                                "lane": "portable",
+                                "category": "applications",
+                                "mode": "verify",
+                                "backend": "ptrace",
+                            },
+                            {
+                                "lane": "portable",
+                                "category": "c-programs",
+                                "test": "c-programs/add-key-enosys",
+                                "mode": "run",
+                                "backend": "kvm",
+                            },
+                        ],
                         "integration_test_binaries": ["unit_alpha", "unit_beta"],
                         "deps": ["build.app"],
                         "hint": {"resources": {"browser": 1}, "classification": "latency-bound"},
@@ -537,6 +552,7 @@ def representative_fixtures() -> list[Fixture]:
                         "job": "smoke2",
                         "desc": "browser smoke 2",
                         "cmd": "echo e2e2",
+                        "result_manifests": [],
                         "deps": ["build.app"],
                         "hint": {"resources": {"browser": 1}},
                     },
@@ -1434,6 +1450,32 @@ LOADER_REFUSALS: tuple[tuple[str, str, str], ...] = (
         "steps[0].manifest: unknown field(s) 'future'",
     ),
     (
+        "result-manifests-not-a-list",
+        '{"steps":[{"group":"a","job":"one","cmd":"true",'
+        '"result_manifests":{"lane":"portable","category":"applications"}}]}',
+        "steps[0].result_manifests: must be a list of manifest selectors or null",
+    ),
+    (
+        "incomplete-result-manifest-selector",
+        '{"steps":[{"group":"a","job":"one","cmd":"true",'
+        '"result_manifests":[{"lane":"portable"}]}]}',
+        "steps[0].result_manifests[0]: field 'category' must be a string",
+    ),
+    (
+        "unknown-result-manifest-field",
+        '{"steps":[{"group":"a","job":"one","cmd":"true",'
+        '"result_manifests":[{"lane":"portable","category":"applications",'
+        '"future":1}]}]}',
+        "steps[0].result_manifests[0]: unknown field(s) 'future'",
+    ),
+    (
+        "duplicate-result-manifest-selector",
+        '{"steps":[{"group":"a","job":"one","cmd":"true",'
+        '"result_manifests":[{"lane":"portable","category":"applications"},'
+        '{"lane":"portable","category":"applications"}]}]}',
+        "steps[0].result_manifests: duplicate selector at index 1",
+    ),
+    (
         "empty-integration-test-binary",
         '{"steps":[{"group":"a","job":"one","cmd":"true",'
         '"integration_test_binaries":["unit_alpha",""]}]}',
@@ -1498,6 +1540,8 @@ LOADER_ACCEPTANCES: tuple[tuple[str, str], ...] = (
         "every-declared-step-field",
         '{"steps":[{"group":"a","job":"one","desc":"d","description":"long","cmd":"true",'
         '"manifest":{"lane":"portable","category":"applications"},'
+        '"result_manifests":[{"lane":"portable","category":"applications",'
+        '"test":"applications/date","mode":"verify","backend":"ptrace"}],'
         '"integration_test_binaries":["unit_alpha"],'
         '"deps":[],"env":{"K":"V"},"networkonly":false,"engine_only":false,"timeout":5,'
         '"cpu_timeout":3,"cmdtype":"generic-with-flag","jobs_flag":"-j","jobs_env":"J","explains":[],'
