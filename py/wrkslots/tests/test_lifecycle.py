@@ -10743,7 +10743,11 @@ def prepare_absent_agent_row(
 
 
 def run_absent_agent_recovery(
-    project: Path, record: wrkslots.ActiveRecord, *, apply: bool
+    project: Path,
+    record: wrkslots.ActiveRecord,
+    *,
+    apply: bool,
+    rescued_current_tips: Sequence[tuple[str, str]] = (),
 ) -> int:
     args = [
         "--project-root",
@@ -10755,6 +10759,10 @@ def run_absent_agent_recovery(
         "--record-sha256",
         wrkslots._record_sha256(record),
     ]
+    for checkout_name, remote_ref in rescued_current_tips:
+        args.extend(
+            ("--rescued-current-tip", f"{checkout_name}={remote_ref}")
+        )
     if apply:
         args.extend(
             (
@@ -10765,6 +10773,41 @@ def run_absent_agent_recovery(
             )
         )
     return wrkslots.main(args)
+
+
+def prepare_rescued_current_tip(
+    repository: Path,
+    record: wrkslots.ActiveRecord,
+    *,
+    extra_unlanded_commit: bool = False,
+) -> tuple[str, str, str, tuple[str, ...]]:
+    checkout_record = record.checkouts[0]
+    git(repository, "worktree", "prune", "--expire=now")
+    git(repository, "switch", checkout_record.branch)
+    (repository / "shared-change.txt").write_text("shared change\n", encoding="utf-8")
+    git(repository, "add", "shared-change.txt")
+    git(repository, "commit", "-m", "current branch change")
+    delta_commits = [git(repository, "rev-parse", "HEAD").stdout.strip()]
+    if extra_unlanded_commit:
+        (repository / "unlanded-change.txt").write_text(
+            "not represented upstream\n", encoding="utf-8"
+        )
+        git(repository, "add", "unlanded-change.txt")
+        git(repository, "commit", "-m", "unlanded branch change")
+        delta_commits.append(git(repository, "rev-parse", "HEAD").stdout.strip())
+    current_tip = delta_commits[-1]
+
+    git(repository, "switch", "main")
+    (repository / "shared-change.txt").write_text("shared change\n", encoding="utf-8")
+    git(repository, "add", "shared-change.txt")
+    git(repository, "commit", "-m", "land equivalent change")
+    landed_tip = git(repository, "rev-parse", "HEAD").stdout.strip()
+    git(repository, "push", "origin", "main")
+    git(repository, "fetch", "origin", "main")
+
+    rescue_ref = f"refs/rescue/tests/{record.slot}/current-tip"
+    git(repository, "push", "origin", f"{current_tip}:{rescue_ref}")
+    return current_tip, landed_tip, rescue_ref, tuple(delta_commits)
 
 
 def test_recover_absent_agent_row_preserves_commit_before_registry_repair(
@@ -10872,6 +10915,394 @@ def test_recover_absent_agent_row_refuses_branch_ahead_before_journal(
     assert not (config.control / "ACTIVE.testhost.journal").exists()
     rescue_ref = wrkslots._absent_agent_rescue_ref(record, checkout_record)
     assert git(remote, "rev-parse", rescue_ref, check=False).returncode != 0
+
+
+def test_recover_absent_agent_row_accepts_verified_rescued_current_tip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, repository, remote = make_project(tmp_path)
+    record = prepare_absent_agent_row(project, repository)
+    recorded_7ef8 = record.checkouts[0].head
+    current_d0, landed_ff3, rescue_ref, _delta = prepare_rescued_current_tip(
+        repository, record
+    )
+    assert len({recorded_7ef8, current_d0, landed_ff3}) == 3
+    assert git(repository, "merge-base", "--is-ancestor", recorded_7ef8, current_d0).returncode == 0
+    assert git(remote, "rev-parse", rescue_ref).stdout.strip() == current_d0
+
+    other = create(
+        project,
+        slot="unrelated",
+        agent="agent-unrelated",
+        branch="agent/unrelated",
+        machine="otherhost",
+    )
+    assert other.returncode == 0, other.stderr
+    other_config = wrkslots._load_config(str(project), "otherhost")
+    other_paths = (
+        wrkslots._active_path(other_config),
+        wrkslots._archive_path(other_config),
+    )
+    other_events = wrkslots._event_directory(other_config)
+    other_before = {
+        path.relative_to(other_config.control): path.read_bytes()
+        for path in (*other_paths, *other_events.glob("*.json"))
+    }
+
+    set_liveness(project, "dead")
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    def forbidden_git_mutation(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("explicit moved-tip recovery must not mutate Git refs or paths")
+
+    monkeypatch.setattr(wrkslots._GitVcs, "push_salvage", forbidden_git_mutation)
+    monkeypatch.setattr(wrkslots._GitVcs, "remove_worktree", forbidden_git_mutation)
+    assert (
+        run_absent_agent_recovery(
+            project,
+            record,
+            apply=True,
+            rescued_current_tips=((record.checkouts[0].name, rescue_ref),),
+        )
+        == 0
+    )
+
+    config = wrkslots._load_config(str(project), "testhost")
+    assert not wrkslots._load_active(config).slots
+    assert git(repository, "rev-parse", f"refs/heads/{record.checkouts[0].branch}").stdout.strip() == current_d0
+    assert git(remote, "rev-parse", rescue_ref).stdout.strip() == current_d0
+    assert not wrkslots._stored_path(config, record.checkouts[0].path, "test checkout").exists()
+    archived = wrkslots._load_archive(config).records[-1]
+    salvage = archived["salvage"]
+    assert isinstance(salvage, list)
+    receipt = salvage[0]
+    assert isinstance(receipt, dict)
+    assert receipt["source_head"] == recorded_7ef8
+    assert receipt["salvage_commit"] == current_d0
+    assert receipt["remote_ref"] == rescue_ref
+    assert receipt["landed_ref"] == record.checkouts[0].landed_ref
+    assert receipt["disposition"] == "verified-preexisting-rescue"
+    other_after = {
+        path.relative_to(other_config.control): path.read_bytes()
+        for path in (*other_paths, *other_events.glob("*.json"))
+    }
+    assert other_after == other_before
+
+
+def test_recover_absent_agent_row_resumes_rescued_tip_without_git_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, repository, remote = make_project(tmp_path)
+    record = prepare_absent_agent_row(project, repository)
+    current_tip, _landed_tip, rescue_ref, _delta = prepare_rescued_current_tip(
+        repository, record
+    )
+    set_liveness(project, "dead")
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    class Interrupted(RuntimeError):
+        pass
+
+    def interrupt(point: str) -> None:
+        if point == "after-absent-agent-rescue-ref":
+            raise Interrupted
+
+    def forbidden_git_mutation(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("explicit moved-tip recovery must not mutate Git refs or paths")
+
+    monkeypatch.setattr(wrkslots._GitVcs, "push_salvage", forbidden_git_mutation)
+    monkeypatch.setattr(wrkslots._GitVcs, "remove_worktree", forbidden_git_mutation)
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", interrupt)
+    with pytest.raises(Interrupted):
+        run_absent_agent_recovery(
+            project,
+            record,
+            apply=True,
+            rescued_current_tips=((record.checkouts[0].name, rescue_ref),),
+        )
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _point: None)
+
+    assert (
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "recover",
+                "--coordinator-authorized",
+                "--coordinator-pid",
+                str(os.getpid()),
+            ]
+        )
+        == 0
+    )
+    config = wrkslots._load_config(str(project), "testhost")
+    assert not wrkslots._load_active(config).slots
+    assert git(repository, "rev-parse", f"refs/heads/{record.checkouts[0].branch}").stdout.strip() == current_tip
+    assert git(remote, "rev-parse", rescue_ref).stdout.strip() == current_tip
+
+
+@pytest.mark.parametrize("rescue_state", ("missing", "wrong"))
+def test_recover_absent_agent_row_refuses_unverified_current_tip_rescue(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    rescue_state: str,
+) -> None:
+    project, repository, remote = make_project(tmp_path)
+    record = prepare_absent_agent_row(project, repository)
+    current_tip, _landed_tip, rescue_ref, _delta = prepare_rescued_current_tip(
+        repository, record
+    )
+    if rescue_state == "missing":
+        git(remote, "update-ref", "-d", rescue_ref)
+    else:
+        git(remote, "update-ref", rescue_ref, record.checkouts[0].head, current_tip)
+    set_liveness(project, "dead")
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    assert (
+        run_absent_agent_recovery(
+            project,
+            record,
+            apply=False,
+            rescued_current_tips=((record.checkouts[0].name, rescue_ref),),
+        )
+        == 3
+    )
+    assert "not current local branch tip" in capsys.readouterr().err
+    config = wrkslots._load_config(str(project), "testhost")
+    assert wrkslots._find_record(wrkslots._load_active(config), record.slot) == record
+    assert not (config.control / "ACTIVE.testhost.journal").exists()
+
+
+def test_recover_absent_agent_row_refuses_stale_landed_ref(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    record = prepare_absent_agent_row(project, repository)
+    _current_tip, landed_tip, rescue_ref, _delta = prepare_rescued_current_tip(
+        repository, record
+    )
+    git(
+        repository,
+        "update-ref",
+        record.checkouts[0].landed_ref,
+        record.checkouts[0].head,
+        landed_tip,
+    )
+    set_liveness(project, "dead")
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    assert (
+        run_absent_agent_recovery(
+            project,
+            record,
+            apply=False,
+            rescued_current_tips=((record.checkouts[0].name, rescue_ref),),
+        )
+        == 3
+    )
+    assert "recorded landed ref" in capsys.readouterr().err
+    config = wrkslots._load_config(str(project), "testhost")
+    assert wrkslots._find_record(wrkslots._load_active(config), record.slot) == record
+
+
+def test_recover_absent_agent_row_refuses_non_descendant_rescued_tip(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    record = prepare_absent_agent_row(project, repository)
+    git(repository, "worktree", "prune", "--expire=now")
+    checkout_record = record.checkouts[0]
+    tree = git(repository, "rev-parse", f"{checkout_record.head}^{{tree}}").stdout.strip()
+    current_tip = git(
+        repository,
+        "commit-tree",
+        tree,
+        "-m",
+        "unrelated current tip",
+    ).stdout.strip()
+    git(
+        repository,
+        "update-ref",
+        f"refs/heads/{checkout_record.branch}",
+        current_tip,
+        checkout_record.head,
+    )
+    rescue_ref = f"refs/rescue/tests/{record.slot}/current-tip"
+    git(repository, "push", "origin", f"{current_tip}:{rescue_ref}")
+    set_liveness(project, "dead")
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    assert (
+        run_absent_agent_recovery(
+            project,
+            record,
+            apply=False,
+            rescued_current_tips=((checkout_record.name, rescue_ref),),
+        )
+        == 3
+    )
+    assert "is not an ancestor" in capsys.readouterr().err
+
+
+def test_recover_absent_agent_row_refuses_incomplete_landed_equivalence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    record = prepare_absent_agent_row(project, repository)
+    _current_tip, _landed_tip, rescue_ref, delta_commits = prepare_rescued_current_tip(
+        repository, record, extra_unlanded_commit=True
+    )
+    set_liveness(project, "dead")
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    assert (
+        run_absent_agent_recovery(
+            project,
+            record,
+            apply=False,
+            rescued_current_tips=((record.checkouts[0].name, rescue_ref),),
+        )
+        == 3
+    )
+    error = capsys.readouterr().err
+    assert delta_commits[-1] in error
+    assert "nor patch-equivalent" in error
+
+
+def test_recover_absent_agent_row_rescued_tip_refuses_stale_registration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    record = prepare_absent_agent_row(project, repository)
+    current_tip, _landed_tip, rescue_ref, _delta = prepare_rescued_current_tip(
+        repository, record
+    )
+    config = wrkslots._load_config(str(project), "testhost")
+    checkout_record = record.checkouts[0]
+    path = wrkslots._stored_path(config, checkout_record.path, "test checkout")
+    git(
+        repository,
+        "worktree",
+        "add",
+        str(path),
+        checkout_record.branch,
+    )
+    shutil.rmtree(wrkslots._slot_directory(config, record.slot, "agent"))
+    assert wrkslots._GitVcs().worktree_registration(repository, path) == (
+        current_tip,
+        f"refs/heads/{checkout_record.branch}",
+    )
+    set_liveness(project, "dead")
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    assert (
+        run_absent_agent_recovery(
+            project,
+            record,
+            apply=False,
+            rescued_current_tips=((checkout_record.name, rescue_ref),),
+        )
+        == 3
+    )
+    assert "explicit recovery never removes it" in capsys.readouterr().err
+    assert wrkslots._GitVcs().worktree_registration(repository, path) == (
+        current_tip,
+        f"refs/heads/{checkout_record.branch}",
+    )
+
+
+def test_recover_absent_agent_row_rescued_tip_does_not_bypass_stale_row(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    record = prepare_absent_agent_row(project, repository)
+    _current_tip, _landed_tip, rescue_ref, _delta = prepare_rescued_current_tip(
+        repository, record
+    )
+    config = wrkslots._load_config(str(project), "testhost")
+    state = wrkslots._load_active(config)
+    changed = replace(record, purpose="changed after recovery plan")
+    wrkslots._write_active_state(
+        config,
+        wrkslots._replace_record(state, changed),
+        action="test-row-changed",
+        slot=record.slot,
+    )
+    set_liveness(project, "dead")
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    assert (
+        run_absent_agent_recovery(
+            project,
+            record,
+            apply=False,
+            rescued_current_tips=((record.checkouts[0].name, rescue_ref),),
+        )
+        == 3
+    )
+    assert "changed: expected" in capsys.readouterr().err
+    assert wrkslots._find_record(wrkslots._load_active(config), record.slot) == changed
+
+
+@pytest.mark.parametrize("filesystem_state", ("directory", "symlink", "fenced"))
+def test_recover_absent_agent_row_rescued_tip_refuses_filesystem_content(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    filesystem_state: str,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    record = prepare_absent_agent_row(project, repository)
+    _current_tip, _landed_tip, rescue_ref, _delta = prepare_rescued_current_tip(
+        repository, record
+    )
+    config = wrkslots._load_config(str(project), "testhost")
+    active_path = wrkslots._active_path(config)
+    active_before = active_path.read_bytes()
+    path = wrkslots._stored_path(config, record.checkouts[0].path, "test checkout")
+    if filesystem_state == "directory":
+        path.mkdir(parents=True)
+        (path / "unrecoverable.txt").write_text("content\n", encoding="utf-8")
+    elif filesystem_state == "symlink":
+        path.parent.mkdir(parents=True)
+        path.symlink_to(repository, target_is_directory=True)
+    else:
+        fenced = wrkslots._slot_roots(config)["agent"] / (
+            f".{record.slot}.fenced.{record.generation}.test"
+        )
+        fenced.mkdir()
+        (fenced / "unrecoverable.txt").write_text("content\n", encoding="utf-8")
+    set_liveness(project, "dead")
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    assert (
+        run_absent_agent_recovery(
+            project,
+            record,
+            apply=False,
+            rescued_current_tips=((record.checkouts[0].name, rescue_ref),),
+        )
+        == 3
+    )
+    error = capsys.readouterr().err
+    assert (
+        "physical storage" in error
+        or "possible fenced path" in error
+        or "crosses a symlink" in error
+    )
+    assert active_path.read_bytes() == active_before
 
 
 def test_recover_absent_agent_row_rechecks_branch_before_archive(

@@ -194,7 +194,13 @@ after a refusal and report the exact message.
 For a registered agent row whose directory is already absent, use
 `recover-absent-agent-row` with the fresh audit's exact machine-selected slot, generation, and
 `record_sha256`. It publishes and reads back every recorded checkout commit before removing an exact
-stale Git registration, then archives before changing ACTIVE. For a real unregistered agent
+stale Git registration, then archives before changing ACTIVE. If every current local branch tip was
+already preserved, pass one exact `--rescued-current-tip NAME=refs/rescue/EXACT-REF` per checkout.
+That explicit mode freshly reads each rescue ref, requires the recorded HEAD to be its ancestor and
+each delta commit to be landed or patch-equivalent, and requires the checkout path and Git
+registration to be absent. It archives the row without pushing, moving, or deleting any Git ref,
+registration, or checkout path. Without the complete explicit proof, the strict recorded-HEAD path
+still applies. For a real unregistered agent
 worktree, use `recover-ownerless-agent-worktree` with its exact path, repository, HEAD, branch,
 remote, and remote URL digest. This path deliberately records no owner, task, or handoff. If
 HANDOFF.md exists, read it and supply its exact `--handoff-sha256`; the command rechecks and

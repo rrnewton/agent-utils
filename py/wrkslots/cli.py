@@ -190,6 +190,7 @@ _ABSENT_AGENT_JOURNAL_REQUIRED = frozenset(
         "archive_entry",
     }
 )
+_ABSENT_AGENT_JOURNAL_OPTIONAL = frozenset({"rescued_current_tips"})
 CONFIG_NAME = ".wrkslots.yml"
 # Configuration keys that may be absent. Absent is a meaning, not a default to
 # be materialised: no `max_active_slots` key means allocation is uncapped.
@@ -477,6 +478,15 @@ class AbsentAgentRow:
     slot: str
     generation: int
     record_sha256: str
+
+
+@dataclasses.dataclass(frozen=True)
+class AbsentAgentRescuedTip:
+    """A caller-named remote proof for one moved local branch tip."""
+
+    checkout: str
+    head: str
+    remote_ref: str
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1395,6 +1405,15 @@ def _landed_ref_for_remote(config: Config, remote: str) -> str:
     if not config.default_landed_ref.startswith(prefix):
         raise StateError(f"configured landed ref must be under {prefix}")
     return f"refs/remotes/{remote}/{config.default_landed_ref.removeprefix(prefix)}"
+
+
+def _remote_head_for_landed_ref(remote: str, landed_ref: str) -> str:
+    _validate_remote(remote)
+    _validate_full_ref(landed_ref, "landed ref")
+    prefix = f"refs/remotes/{remote}/"
+    if not landed_ref.startswith(prefix):
+        raise Refusal(f"landed ref must be under {prefix}: {landed_ref}")
+    return f"refs/heads/{landed_ref.removeprefix(prefix)}"
 
 
 def _archive_path(config: Config, machine: str | None = None) -> Path:
@@ -3354,7 +3373,7 @@ def _validate_global_state_for_absent_agent_recovery(
 
     states = _load_all_active(config)
     archives = _load_all_archives(config)
-    item, recorded, _receipts, expected_entry = _absent_agent_journal_inputs(
+    item, recorded, _rescued_tips, _receipts, expected_entry = _absent_agent_journal_inputs(
         config, journal
     )
     active = {
@@ -4700,6 +4719,39 @@ class _GitVcs:
                 f"cannot compare checkout HEAD {ancestor} with landed ref {descendant}"
             )
         return result.returncode == 0
+
+    def commits_between(
+        self, checkout: Path, ancestor: str, descendant: str
+    ) -> tuple[str, ...]:
+        if not SHA_RE.fullmatch(ancestor) or not SHA_RE.fullmatch(descendant):
+            raise Refusal("commit range requires two full lowercase Git commits")
+        result = self._run(
+            checkout,
+            ["rev-list", "--reverse", "--topo-order", f"{ancestor}..{descendant}"],
+        )
+        commits = tuple(line for line in result.stdout.splitlines() if line)
+        if any(not SHA_RE.fullmatch(commit) for commit in commits):
+            raise Refusal("Git returned an invalid commit while inspecting moved branch history")
+        return commits
+
+    def is_patch_equivalent(self, checkout: Path, commit: str, landed_ref: str) -> bool:
+        if not SHA_RE.fullmatch(commit):
+            raise Refusal(f"cannot compare invalid commit {commit!r}")
+        self.verify_ref(checkout, landed_ref, "landed ref")
+        parents = self._run(checkout, ["rev-list", "--parents", "-n", "1", commit])
+        parts = parents.stdout.strip().split()
+        if not parts or parts[0] != commit:
+            raise Refusal(f"Git returned invalid ancestry for commit {commit}")
+        if len(parts) != 2:
+            return False
+        result = self._run(
+            checkout,
+            ["cherry", landed_ref, commit, parts[1]],
+        )
+        lines = [line.split() for line in result.stdout.splitlines() if line.strip()]
+        if len(lines) != 1 or len(lines[0]) != 2 or lines[0][1] != commit:
+            return False
+        return lines[0][0] == "-"
 
     def remove_worktree(
         self, repository: Path, checkout: Path, *, force: bool = False
@@ -14376,6 +14428,97 @@ def _absent_agent_row_identity(raw: object, label: str) -> AbsentAgentRow:
     )
 
 
+def _absent_agent_rescued_tip_to_obj(item: AbsentAgentRescuedTip) -> dict[str, str]:
+    return dataclasses.asdict(item)
+
+
+def _absent_agent_rescued_tip_from_obj(
+    raw: object, label: str
+) -> AbsentAgentRescuedTip:
+    value = _as_mapping(raw, label)
+    _exact_keys(value, {"checkout", "head", "remote_ref"}, set(), label)
+    checkout = _validate_name(
+        _as_str(value["checkout"], f"{label}.checkout"), "checkout name"
+    )
+    head = _as_str(value["head"], f"{label}.head")
+    if not SHA_RE.fullmatch(head):
+        raise StateError(f"{label}.head must be a full lowercase Git commit")
+    remote_ref = _validate_full_ref(
+        _as_str(value["remote_ref"], f"{label}.remote_ref"), "remote rescue ref"
+    )
+    if not remote_ref.startswith("refs/rescue/"):
+        raise Refusal(f"{label}.remote_ref must be under refs/rescue/")
+    return AbsentAgentRescuedTip(
+        checkout=checkout,
+        head=head,
+        remote_ref=remote_ref,
+    )
+
+
+def _absent_agent_rescued_tip_map(
+    record: ActiveRecord, rescued_tips: Sequence[AbsentAgentRescuedTip]
+) -> dict[str, AbsentAgentRescuedTip]:
+    checkouts = {checkout.name for checkout in record.checkouts}
+    result: dict[str, AbsentAgentRescuedTip] = {}
+    for item in rescued_tips:
+        if item.checkout not in checkouts:
+            raise Refusal(
+                f"rescued current tip names unknown checkout {item.checkout!r}"
+            )
+        if item.checkout in result:
+            raise Refusal(f"duplicate rescued current tip for {item.checkout!r}")
+        result[item.checkout] = item
+    missing = sorted(checkouts - set(result))
+    if result and missing:
+        raise Refusal(
+            "explicit rescued-current-tip mode requires every checkout; missing: "
+            + ", ".join(missing)
+        )
+    return result
+
+
+def _resolve_absent_agent_rescued_tips(
+    config: Config,
+    record: ActiveRecord,
+    rescue_refs: Mapping[str, str],
+    vcs: _GitVcs,
+) -> tuple[AbsentAgentRescuedTip, ...]:
+    checkouts = {checkout.name: checkout for checkout in record.checkouts}
+    unknown = sorted(set(rescue_refs) - set(checkouts))
+    if unknown:
+        raise Refusal(
+            "--rescued-current-tip names unknown checkout(s): " + ", ".join(unknown)
+        )
+    missing = sorted(set(checkouts) - set(rescue_refs))
+    if rescue_refs and missing:
+        raise Refusal(
+            "explicit rescued-current-tip mode requires every checkout; missing: "
+            + ", ".join(missing)
+        )
+    resolved: list[AbsentAgentRescuedTip] = []
+    for checkout in record.checkouts:
+        remote_ref = rescue_refs.get(checkout.name)
+        if remote_ref is None:
+            continue
+        remote_ref = _validate_full_ref(remote_ref, "remote rescue ref")
+        if not remote_ref.startswith("refs/rescue/"):
+            raise Refusal("remote rescue ref must be under refs/rescue/")
+        _stored, repository = _stored_repository_path(config, checkout.repository)
+        branch_head = vcs.verify_ref(
+            repository,
+            f"refs/heads/{checkout.branch}",
+            "current local branch tip",
+        )
+        resolved.append(
+            AbsentAgentRescuedTip(
+                checkout=checkout.name,
+                head=branch_head,
+                remote_ref=remote_ref,
+            )
+        )
+    return tuple(resolved)
+
+
 def _validate_absent_agent_row(record: ActiveRecord, item: AbsentAgentRow) -> None:
     if record.slot_type != "agent":
         raise Refusal(f"slot {item.slot} is not an agent row")
@@ -14446,8 +14589,12 @@ def _absent_agent_rescue_ref(record: ActiveRecord, checkout: Checkout) -> str:
 
 
 def _absent_agent_checkout_receipts(
-    config: Config, record: ActiveRecord, vcs: _GitVcs
+    config: Config,
+    record: ActiveRecord,
+    vcs: _GitVcs,
+    rescued_tips: Sequence[AbsentAgentRescuedTip] = (),
 ) -> tuple[dict[str, object], ...]:
+    rescued_by_checkout = _absent_agent_rescued_tip_map(record, rescued_tips)
     for checkout in record.checkouts:
         _stored, repository = _stored_repository_path(config, checkout.repository)
         if vcs.remote_url_sha256(repository, checkout.remote) != checkout.remote_url_sha256:
@@ -14466,16 +14613,66 @@ def _absent_agent_checkout_receipts(
                 f"recorded checkout local branch {checkout.branch!r} is unavailable for "
                 f"{checkout.name}; preserve the ACTIVE row"
             ) from exc
-        if branch_head != checkout.head:
+        rescued = rescued_by_checkout.get(checkout.name)
+        if rescued is None and branch_head != checkout.head:
             raise Refusal(
                 f"local branch {checkout.branch!r} for absent checkout "
                 f"{checkout.name} moved from recorded HEAD {checkout.head} to "
                 f"{branch_head}; preserve the ACTIVE row and inspect the branch "
                 "before recovery"
             )
+        if rescued is not None:
+            if branch_head != rescued.head:
+                raise Refusal(
+                    f"current local branch tip for absent checkout {checkout.name} "
+                    f"changed from authorized HEAD {rescued.head} to {branch_head}"
+                )
+            vcs.assert_ordinary_history(repository)
+            if not vcs.is_ancestor(repository, checkout.head, branch_head):
+                raise Refusal(
+                    f"recorded HEAD {checkout.head} is not an ancestor of rescued current "
+                    f"branch tip {branch_head} for {checkout.name}"
+                )
+            remote_head = vcs.remote_ref_sha(
+                repository, checkout.remote, rescued.remote_ref
+            )
+            if remote_head != branch_head:
+                raise Refusal(
+                    f"remote rescue ref {rescued.remote_ref} for {checkout.name} names "
+                    f"{remote_head or 'no commit'}, not current local branch tip {branch_head}"
+                )
+            landed_head = vcs.verify_ref(
+                repository, checkout.landed_ref, "landed ref"
+            )
+            remote_landed_ref = _remote_head_for_landed_ref(
+                checkout.remote, checkout.landed_ref
+            )
+            remote_landed_head = vcs.remote_ref_sha(
+                repository, checkout.remote, remote_landed_ref
+            )
+            if remote_landed_head != landed_head:
+                raise Refusal(
+                    f"recorded landed ref {checkout.landed_ref} for {checkout.name} is stale "
+                    f"or missing: local {landed_head}, remote "
+                    f"{remote_landed_head or 'no commit'}"
+                )
+            for commit in vcs.commits_between(repository, checkout.head, branch_head):
+                if vcs.is_ancestor(repository, commit, checkout.landed_ref):
+                    continue
+                if vcs.is_patch_equivalent(repository, commit, checkout.landed_ref):
+                    continue
+                raise Refusal(
+                    f"moved branch commit {commit} for {checkout.name} is neither an "
+                    f"ancestor of {checkout.landed_ref} nor patch-equivalent to it"
+                )
         path = _stored_path(config, checkout.path, "agent checkout path").absolute()
         registration = vcs.worktree_registration(repository, path)
         if registration is not None:
+            if rescued is not None:
+                raise Refusal(
+                    f"Git registration still exists for rescued current tip checkout "
+                    f"{checkout.name}; explicit recovery never removes it"
+                )
             head, branch = registration
             if head != checkout.head:
                 raise Refusal(
@@ -14488,25 +14685,37 @@ def _absent_agent_checkout_receipts(
                     f"Git registration branch for absent checkout {checkout.name} changed: "
                     f"expected {expected_branch}, found {branch or 'detached'}"
                 )
-    return _absent_agent_planned_receipts(record)
+    return _absent_agent_planned_receipts(record, rescued_tips)
 
 
 def _absent_agent_planned_receipts(
     record: ActiveRecord,
+    rescued_tips: Sequence[AbsentAgentRescuedTip] = (),
 ) -> tuple[dict[str, object], ...]:
-    return tuple(
-        {
+    rescued_by_checkout = _absent_agent_rescued_tip_map(record, rescued_tips)
+    receipts: list[dict[str, object]] = []
+    for checkout in record.checkouts:
+        rescued = rescued_by_checkout.get(checkout.name)
+        receipt: dict[str, object] = {
             "checkout": checkout.name,
             "source_head": checkout.head,
-            "salvage_commit": checkout.head,
+            "salvage_commit": rescued.head if rescued is not None else checkout.head,
             "status_sha256": None,
-            "disposition": "salvaged",
-            "remote_ref": _absent_agent_rescue_ref(record, checkout),
+            "disposition": (
+                "verified-preexisting-rescue" if rescued is not None else "salvaged"
+            ),
+            "remote_ref": (
+                rescued.remote_ref
+                if rescued is not None
+                else _absent_agent_rescue_ref(record, checkout)
+            ),
             "containing_remote_refs": [],
             "working_tree_contents": "unknown-storage-absent-before-recovery",
         }
-        for checkout in record.checkouts
-    )
+        if rescued is not None:
+            receipt["landed_ref"] = checkout.landed_ref
+        receipts.append(receipt)
+    return tuple(receipts)
 
 
 def _absent_agent_archive_entry(
@@ -14584,8 +14793,19 @@ def _absent_agent_event_evidence(
 
 def _absent_agent_journal_inputs(
     config: Config, raw: Mapping[str, object]
-) -> tuple[AbsentAgentRow, ActiveRecord, tuple[Mapping[str, object], ...], dict[str, object]]:
-    _exact_keys(raw, _ABSENT_AGENT_JOURNAL_REQUIRED, set(), "absent-agent-row journal")
+) -> tuple[
+    AbsentAgentRow,
+    ActiveRecord,
+    tuple[AbsentAgentRescuedTip, ...],
+    tuple[Mapping[str, object], ...],
+    dict[str, object],
+]:
+    _exact_keys(
+        raw,
+        _ABSENT_AGENT_JOURNAL_REQUIRED,
+        _ABSENT_AGENT_JOURNAL_OPTIONAL,
+        "absent-agent-row journal",
+    )
     if (
         _as_int(raw["schema"], "absent-agent-row journal.schema") != SCHEMA
         or raw["kind"] != "recover-absent-agent-row"
@@ -14604,6 +14824,18 @@ def _absent_agent_journal_inputs(
         raise StateError(f"unknown absent-agent-row phase {phase!r}")
     record = _record_from_obj(raw["record"], "absent-agent-row journal.record")
     _validate_absent_agent_row(record, item)
+    rescued_tips = tuple(
+        _absent_agent_rescued_tip_from_obj(
+            value, f"absent-agent-row journal.rescued_current_tips[{index}]"
+        )
+        for index, value in enumerate(
+            _as_list(
+                raw.get("rescued_current_tips", []),
+                "absent-agent-row journal.rescued_current_tips",
+            )
+        )
+    )
+    _absent_agent_rescued_tip_map(record, rescued_tips)
     receipts = tuple(
         _as_mapping(value, f"absent-agent-row journal.preserved[{index}]")
         for index, value in enumerate(_as_list(raw["preserved"], "absent-agent-row journal.preserved"))
@@ -14620,7 +14852,7 @@ def _absent_agent_journal_inputs(
     archive_entry = dict(
         _as_mapping(raw["archive_entry"], "absent-agent-row journal.archive_entry")
     )
-    expected_receipts = _absent_agent_planned_receipts(record)
+    expected_receipts = _absent_agent_planned_receipts(record, rescued_tips)
     finished_at = _as_str(archive_entry.get("finished_at"), "absent-agent archive.finished_at")
     _parse_timestamp(finished_at, "absent-agent archive.finished_at")
     expected_archive = _absent_agent_archive_entry(
@@ -14639,14 +14871,18 @@ def _absent_agent_journal_inputs(
         raise StateError("absent-agent-row journal phase precedes complete remote preservation")
     if phase == "registrations-removed" and len(removed) != len(record.checkouts):
         raise StateError("absent-agent-row journal phase precedes complete registration removal")
-    return item, record, expected_receipts, archive_entry
+    return item, record, rescued_tips, expected_receipts, archive_entry
 
 
-def _assert_absent_agent_safe(config: Config, record: ActiveRecord) -> tuple[Path, ...]:
+def _assert_absent_agent_safe(
+    config: Config,
+    record: ActiveRecord,
+    rescued_tips: Sequence[AbsentAgentRescuedTip] = (),
+) -> tuple[Path, ...]:
     _assert_absent_validate_rows_not_held(config, (record,))
     paths = _assert_absent_agent_storage(config, record)
     _assert_absent_agent_liveness(config, record, paths)
-    _absent_agent_checkout_receipts(config, record, _GitVcs())
+    _absent_agent_checkout_receipts(config, record, _GitVcs(), rescued_tips)
     return paths
 
 
@@ -14661,7 +14897,10 @@ def _recover_absent_agent_row(
     if raw.get("host_id") != _host_id():
         raise Refusal("absent-agent-row journal belongs to another host identity")
     _assert_caller_process(coordinator, "coordinator")
-    item, recorded, planned, archive_entry = _absent_agent_journal_inputs(config, raw)
+    item, recorded, rescued_tips, planned, archive_entry = _absent_agent_journal_inputs(
+        config, raw
+    )
+    rescued_by_checkout = _absent_agent_rescued_tip_map(recorded, rescued_tips)
     state = _load_active(config)
     current = next((row for row in state.slots if row.slot == item.slot), None)
     archive = _load_archive(config)
@@ -14677,7 +14916,7 @@ def _recover_absent_agent_row(
         return
     if _record_to_obj(current) != _record_to_obj(recorded):
         raise StateError(f"agent row {item.slot} differs from its journal snapshot")
-    _assert_absent_agent_safe(config, current)
+    _assert_absent_agent_safe(config, current, rescued_tips)
     journal = dict(raw)
     preserved = [
         dict(_as_mapping(value, f"preserved[{index}]"))
@@ -14686,20 +14925,22 @@ def _recover_absent_agent_row(
     vcs = _GitVcs()
     for checkout, receipt in zip(recorded.checkouts[len(preserved) :], planned[len(preserved) :]):
         _stored, repository = _stored_repository_path(config, checkout.repository)
-        vcs.push_salvage(
-            repository,
-            checkout.remote,
-            checkout.head,
-            _as_str(receipt["remote_ref"], "agent-row rescue ref"),
-        )
+        if checkout.name not in rescued_by_checkout:
+            vcs.push_salvage(
+                repository,
+                checkout.remote,
+                checkout.head,
+                _as_str(receipt["remote_ref"], "agent-row rescue ref"),
+            )
         preserved.append(dict(receipt))
         journal["preserved"] = preserved
         _write_journal(config, journal)
         _interrupt_for_test("after-absent-agent-rescue-ref")
     for checkout, receipt in zip(recorded.checkouts, planned):
         remote_ref = _as_str(receipt["remote_ref"], "agent-row rescue ref")
+        salvage_commit = _as_str(receipt["salvage_commit"], "agent-row salvage commit")
         _stored, repository = _stored_repository_path(config, checkout.repository)
-        if vcs.remote_ref_sha(repository, checkout.remote, remote_ref) != checkout.head:
+        if vcs.remote_ref_sha(repository, checkout.remote, remote_ref) != salvage_commit:
             raise Refusal(f"remote rescue ref for {checkout.name} no longer preserves its HEAD")
     journal["phase"] = "preserved"
     _write_journal(config, journal)
@@ -14709,6 +14950,11 @@ def _recover_absent_agent_row(
         checkout_path = _stored_path(config, checkout.path, "agent checkout path").absolute()
         registration = vcs.worktree_registration(repository, checkout_path)
         if registration is not None:
+            if checkout.name in rescued_by_checkout:
+                raise Refusal(
+                    f"Git registration appeared for rescued current tip checkout "
+                    f"{checkout.name}; explicit recovery never removes it"
+                )
             head, branch = registration
             if head != checkout.head or branch != f"refs/heads/{checkout.branch}":
                 raise Refusal(f"Git registration changed for absent checkout {checkout.name}")
@@ -14721,7 +14967,7 @@ def _recover_absent_agent_row(
         _interrupt_for_test("after-absent-agent-registration-remove")
     journal["phase"] = "registrations-removed"
     _write_journal(config, journal)
-    _assert_absent_agent_safe(config, current)
+    _assert_absent_agent_safe(config, current, rescued_tips)
     if archived is None:
         archive = _append_archive_once(
             config,
@@ -14751,6 +14997,9 @@ def _recover_absent_agent_row(
 
 def _cmd_recover_absent_agent_row(args: argparse.Namespace) -> int:
     config = _load_config(args.project_root, args.machine)
+    rescue_refs = _assignments(
+        args.rescued_current_tip, "--rescued-current-tip"
+    )
     item = AbsentAgentRow(
         machine=config.machine,
         slot=_validate_name(args.slot, "slot"),
@@ -14774,9 +15023,22 @@ def _cmd_recover_absent_agent_row(args: argparse.Namespace) -> int:
             path, raw = _load_journal(config)
             if raw.get("kind") != "recover-absent-agent-row":
                 raise Refusal(f"another interrupted mutation is recorded in {path}")
-            journal_item, _record, _planned, _archive = _absent_agent_journal_inputs(config, raw)
+            (
+                journal_item,
+                _record,
+                journal_rescued_tips,
+                _planned,
+                _archive,
+            ) = _absent_agent_journal_inputs(config, raw)
             if journal_item != item:
                 raise Refusal("requested agent row differs from the interrupted recovery")
+            journal_rescue_refs = {
+                tip.checkout: tip.remote_ref for tip in journal_rescued_tips
+            }
+            if rescue_refs and rescue_refs != journal_rescue_refs:
+                raise Refusal(
+                    "--rescued-current-tip differs from the interrupted recovery"
+                )
             if not args.apply:
                 print(f"ROW machine={item.machine} slot={item.slot} outcome=planned detail=resume")
                 return 0
@@ -14808,7 +15070,11 @@ def _cmd_recover_absent_agent_row(args: argparse.Namespace) -> int:
                 f"agent row {item.machine}/{item.slot} is neither active nor an exact prior recovery"
             )
         _validate_absent_agent_row(record, item)
-        _assert_absent_agent_safe(config, record)
+        vcs = _GitVcs()
+        rescued_tips = _resolve_absent_agent_rescued_tips(
+            config, record, rescue_refs, vcs
+        )
+        _assert_absent_agent_safe(config, record, rescued_tips)
         if not args.apply:
             print(
                 f"ROW machine={item.machine} slot={item.slot} generation={item.generation} "
@@ -14816,7 +15082,9 @@ def _cmd_recover_absent_agent_row(args: argparse.Namespace) -> int:
             )
             return 0
         assert coordinator is not None
-        receipts = _absent_agent_checkout_receipts(config, record, _GitVcs())
+        receipts = _absent_agent_checkout_receipts(
+            config, record, vcs, rescued_tips
+        )
         finished_at = _utc_now()
         journal = {
             "schema": SCHEMA,
@@ -14832,6 +15100,16 @@ def _cmd_recover_absent_agent_row(args: argparse.Namespace) -> int:
             "removed": [],
             "archive_entry": _absent_agent_archive_entry(
                 record, item, finished_at, receipts
+            ),
+            **(
+                {
+                    "rescued_current_tips": [
+                        _absent_agent_rescued_tip_to_obj(tip)
+                        for tip in rescued_tips
+                    ]
+                }
+                if rescued_tips
+                else {}
             ),
         }
         _write_journal(config, journal)
@@ -18550,7 +18828,10 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "is a read-only plan. --apply proves registered and operating-system liveness, "
             "pushes every recorded checkout HEAD to an individual rescue ref and reads it "
             "back, removes only exact stale Git worktree registrations, archives the absent "
-            "storage and its limitations, and only then removes the ACTIVE row."
+            "storage and its limitations, and only then removes the ACTIVE row. An explicit "
+            "--rescued-current-tip accepts a moved local branch only after independently "
+            "verifying its pre-existing remote rescue and landed content; that mode never "
+            "moves or removes the branch, rescue ref, worktree registration, or path."
         ),
         formatter_class=_HelpFormatter,
     )
@@ -18560,6 +18841,17 @@ usage or audit gate unknown, 3 fail-closed refusal.
     )
     recover_absent_agent.add_argument(
         "--record-sha256", required=True, metavar="SHA256"
+    )
+    recover_absent_agent.add_argument(
+        "--rescued-current-tip",
+        action="append",
+        metavar="NAME=REMOTE-REF",
+        help=(
+            "explicitly accept current local branch tips only when every checkout names an "
+            "exact existing refs/rescue/... ref that reads back at its tip and every "
+            "added commit is contained by or patch-equivalent to the recorded landed ref; "
+            "this mode performs no Git ref, registration, or path mutation (repeatable)"
+        ),
     )
     recover_absent_agent.add_argument("--apply", action="store_true")
     recover_absent_agent.add_argument(

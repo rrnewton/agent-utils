@@ -103,6 +103,13 @@ requires its exact SHA-256 after the coordinator reads it; that content is reche
 with the worktree. `recover-ownerless-agent-cache` relocates only its one explicitly supported cache
 tree outside the managed slot root; it is not an exemption for arbitrary directories.
 
+If every branch tip for an absent registered agent row was already preserved, the explicit
+`--rescued-current-tip NAME=refs/rescue/EXACT-REF` mode verifies fresh remote readback,
+fresh agreement between the local landed tracking ref and its remote branch, recorded-head
+ancestry, and landed ancestry or patch equivalence for every intervening commit. It requires both
+the checkout path and stale Git registration to be absent and performs no Git or path mutation.
+Without that complete explicit proof, the original exact-recorded-HEAD behavior remains unchanged.
+
 If a command reports an interrupted operation, preserve the paths and run:
 
 ```sh
