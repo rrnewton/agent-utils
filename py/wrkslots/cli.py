@@ -4069,7 +4069,9 @@ def _assert_registry_storage_consistent(
     *,
     allow_unregistered_migration_slots: bool = False,
     target_slot: str | None = None,
+    scope_to_target: bool = False,
 ) -> RegistryStorageFindings:
+    scope_to_target = scope_to_target or target_slot is not None
     records = [record for state in states for record in state.slots]
     expected_slots = {
         slot_type: {record.slot for record in records if record.slot_type == slot_type}
@@ -4110,16 +4112,16 @@ def _assert_registry_storage_consistent(
     # a duplicate -- so matching the target by name alone is unambiguous and needs
     # no slot type from the caller's arguments.
     #
-    # ⚠️ WITH NO TARGET SLOT THIS STILL RAISES, DELIBERATELY. `wrkslots recover`
-    # is the only gated command naming no slot, and widening a recovery path was
-    # not measured here, so its behaviour is exactly as before.
+    # ⚠️ WITH NO TARGET SCOPE THIS STILL RAISES, DELIBERATELY. Ownerless
+    # validation recovery supplies an explicit scope because its exact path is
+    # checked independently below; a bare recovery command still raises.
     stale: list[str] = []
     vcs = _GitVcs()
     for record in records:
         try:
             _assert_record_storage_consistent(config, record, vcs=vcs)
         except Refusal:
-            if target_slot is None or record.slot == target_slot:
+            if not scope_to_target or record.slot == target_slot:
                 raise
             stale.append(f"{record.slot_type}:{record.slot}")
     unexpected: list[str] = []
@@ -4186,7 +4188,7 @@ def _assert_registry_storage_consistent(
         ):
             continue
         if (
-            target_slot is not None
+            scope_to_target
             and finding.slot is not None
             and finding.slot != target_slot
         ):
@@ -4206,7 +4208,7 @@ def _assert_registry_storage_consistent(
     # caller. With no target slot every entry still refuses, as above.
     blocking_unexpected = (
         [value for value in unexpected if value.split(":", 1)[1] == target_slot]
-        if target_slot is not None
+        if scope_to_target
         else list(unexpected)
     )
     if blocking_unexpected and not allow_unregistered_migration_slots:
@@ -4245,6 +4247,8 @@ def _assert_command_registry_storage(
     *,
     allowed_unregistered_slot: tuple[str, str] | None = None,
     migration_operation: bool = False,
+    target_slot: str | None = None,
+    scope_to_target: bool = False,
 ) -> None:
     allow = bool(
         migration_operation
@@ -4253,13 +4257,16 @@ def _assert_command_registry_storage(
     # The slot this command names. Every gated command except `recover` takes
     # one, and slot names are unique across both slot types, so the name alone
     # identifies the row whose defect must still stop this command.
-    target_slot = getattr(args, "slot", None)
+    argument_slot = getattr(args, "slot", None)
+    if target_slot is None and isinstance(argument_slot, str) and argument_slot:
+        target_slot = argument_slot
     findings = _assert_registry_storage_consistent(
         config,
         states,
         allowed_unregistered_slot=allowed_unregistered_slot,
         allow_unregistered_migration_slots=allow,
-        target_slot=target_slot if isinstance(target_slot, str) and target_slot else None,
+        target_slot=target_slot,
+        scope_to_target=scope_to_target or target_slot is not None,
     )
     unexpected = findings.unexpected
     if findings.stale:
@@ -4271,8 +4278,8 @@ def _assert_command_registry_storage(
         more = f" (+{len(findings.stale) - 12} more)" if len(findings.stale) > 12 else ""
         print(
             f"WARNING: {len(findings.stale)} registered slot(s) have missing or "
-            "inconsistent storage. state: RETAINED -- this command named a different "
-            "slot, changed none of these rows, and did not inspect them: "
+            "inconsistent storage. state: RETAINED -- this command targets different "
+            "storage, changed none of these rows, and did not inspect them: "
             f"{shown}{more}. remedy: these rows outlived their directories; retire each "
             "one through its own lifecycle command rather than deleting rows in bulk, "
             "because a row is also what protects a slot holding an unread HANDOFF.md",
@@ -4304,7 +4311,7 @@ def _assert_command_registry_storage(
         print(
             f"WARNING: {len(findings.registrations)} Git-registered path(s) inside the "
             "managed root have no active row. state: RETAINED -- this command named a "
-            "different slot, changed none of them, and did not inspect them: "
+            "different target, changed none of them, and did not inspect them: "
             f"{shown}{more}. remedy: run 'wrkslots audit --format json', then restore "
             "and register each live slot, or retire the stale Git registration through "
             "its own lifecycle command; do not delete a directory to repair bookkeeping, "
@@ -17649,7 +17656,12 @@ def _cmd_recover(args: argparse.Namespace) -> int:
                 config, raw_target, target_kind
             )
             _assert_command_registry_storage(
-                config, states, args, allowed_unregistered_slot=allowed
+                config,
+                states,
+                args,
+                allowed_unregistered_slot=allowed,
+                target_slot=allowed[1] if allowed is not None else None,
+                scope_to_target=True,
             )
             before = _global_rows(states, archives)
             journal, _allowed = _ownerless_validation_journal(
