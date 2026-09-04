@@ -7918,12 +7918,18 @@ def compare_tick_hub(rand_count: int, seed: int) -> int:
                         "cmd": "printf 'count=3\\n'",
                         "when": "nonempty",
                         "capture": True,
+                        "parallel": True,
                     },
                     "emit": {
                         "kind": "action",
                         "skill": "triage",
                         "title": "triage {count}",
                     },
+                },
+                {
+                    "name": "parallel_note",
+                    "gate": {"cmd": "true", "when": "success", "parallel": True},
+                    "emit": {"kind": "note", "title": "parallel gate completed"},
                 },
                 {
                     "name": "guarded",

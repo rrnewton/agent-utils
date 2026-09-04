@@ -180,7 +180,9 @@ def _gate_from(value: object, where: str) -> Gate | None:
     if value is None:
         return None
     obj = _as_obj(value, where)
-    _reject_unknown(obj, frozenset({"cmd", "when", "capture", "timeout_secs"}), where)
+    _reject_unknown(
+        obj, frozenset({"cmd", "when", "capture", "timeout_secs", "parallel"}), where
+    )
     when_name = _opt_str(obj, "when", GateWhen.SUCCESS.value, where)
     try:
         when = GateWhen(when_name)
@@ -194,6 +196,7 @@ def _gate_from(value: object, where: str) -> Gate | None:
         when=when,
         capture=_opt_bool(obj, "capture", False, where),
         timeout_secs=_opt_positive_int_or_none(obj, "timeout_secs", where),
+        parallel=_opt_bool(obj, "parallel", False, where),
     )
 
 
@@ -385,6 +388,8 @@ def _gate_to_obj(gate: Gate | None) -> object:
     }
     if gate.timeout_secs is not None:
         obj["timeout_secs"] = gate.timeout_secs
+    if gate.parallel:
+        obj["parallel"] = True
     return obj
 
 

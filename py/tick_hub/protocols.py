@@ -9,7 +9,8 @@ here. The engine takes them as parameters; production uses the default implement
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Protocol
+from contextlib import AbstractContextManager
+from typing import Optional, Protocol, runtime_checkable
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,15 @@ class GateRunner(Protocol):
 
         ``timeout`` overrides the runner's default for this invocation only.
         """
+        ...
+
+
+@runtime_checkable
+class ParallelGateRunner(GateRunner, Protocol):
+    """A gate runner that can safely execute ``run`` from concurrent threads."""
+
+    def parallel_scope(self) -> AbstractContextManager[None]:
+        """Own all gate processes launched during one concurrent evaluation scope."""
         ...
 
 

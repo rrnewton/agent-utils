@@ -2,6 +2,13 @@
 
 from __future__ import annotations
 
+import os
+import shlex
+import time
+from pathlib import Path
+
+import pytest
+
 from tick_hub.cadence import unresolved_render_state_keys
 from tick_hub.engine import NO_RESULT_EXIT, TickResult, parse_kv_lines, render_emit, run_tick
 from tick_hub.model import (
@@ -14,6 +21,7 @@ from tick_hub.model import (
     TickConfig,
 )
 from tick_hub.protocols import GateResult
+from tick_hub.probes import SubprocessGateRunner
 from tick_hub.state import OpsState
 
 
@@ -862,3 +870,104 @@ def test_omitting_emit_reports_exactly_what_streaming_reports() -> None:
     assert tuple(emitted) == collected.lines
     assert collected.fired == streamed.fired
     assert collected.actions_emitted == streamed.actions_emitted
+
+
+def test_explicit_parallel_gates_overlap_and_keep_config_order(tmp_path: Path) -> None:
+    marker = tmp_path / "second-started"
+    marker_arg = shlex.quote(str(marker))
+    first = Reminder(
+        "first",
+        Emit(EmitKind.ACTION, title="first", skill="warn"),
+        gate=Gate(
+            cmd=(
+                f"for unused in $(seq 1 200); do [ -e {marker_arg} ] && "
+                "printf 'summary=first\\n' && exit 1; sleep 0.01; done; exit 75"
+            ),
+            when=GateWhen.FAILURE,
+            capture=True,
+            timeout_secs=4,
+            parallel=True,
+        ),
+    )
+    second = Reminder(
+        "second",
+        Emit(EmitKind.ACTION, title="second", skill="warn"),
+        gate=Gate(
+            cmd=f"sleep 0.1; : > {marker_arg}; printf 'summary=second\\n'; exit 1",
+            when=GateWhen.FAILURE,
+            capture=True,
+            timeout_secs=4,
+            parallel=True,
+        ),
+    )
+
+    result = run_tick(
+        TickConfig(reminders=(first, second)),
+        OpsState.default(),
+        now=5,
+        fired={},
+        gate_runner=SubprocessGateRunner(timeout=4),
+        age_probe=FakeProbe({}),
+    )
+
+    actions = tuple(line for line in result.lines if line.startswith("ACTION: warn"))
+    assert actions == (
+        'ACTION: warn summary=first title="first"',
+        'ACTION: warn summary=second title="second"',
+    )
+    assert result.fired == {"first": 5, "second": 5}
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process liveness is POSIX-specific")
+def test_failed_stream_write_kills_outstanding_parallel_gate(tmp_path: Path) -> None:
+    pid_file = tmp_path / "second.pid"
+    pid_arg = shlex.quote(str(pid_file))
+    first = Reminder(
+        "first",
+        Emit(EmitKind.ACTION, title="first", skill="warn"),
+        gate=Gate(
+            cmd=(
+                f"for unused in $(seq 1 200); do [ -e {pid_arg} ] && exit 1; "
+                "sleep 0.01; done; exit 75"
+            ),
+            when=GateWhen.FAILURE,
+            parallel=True,
+        ),
+    )
+    second = Reminder(
+        "second",
+        Emit(EmitKind.ACTION, title="second", skill="warn"),
+        gate=Gate(
+            cmd=f"echo $$ > {pid_arg}; exec sleep 30",
+            when=GateWhen.FAILURE,
+            timeout_secs=30,
+            parallel=True,
+        ),
+    )
+
+    def fail_on_verdict(line: str) -> None:
+        if line.startswith("ACTION: warn"):
+            raise OSError("reader closed")
+
+    with pytest.raises(OSError, match="reader closed"):
+        run_tick(
+            TickConfig(reminders=(first, second)),
+            OpsState.default(),
+            now=5,
+            fired={},
+            gate_runner=SubprocessGateRunner(timeout=30),
+            age_probe=FakeProbe({}),
+            emit=fail_on_verdict,
+        )
+
+    pid = int(pid_file.read_text(encoding="utf-8"))
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.01)
+    else:
+        os.kill(pid, 9)
+        raise AssertionError("failed output left a parallel gate running")

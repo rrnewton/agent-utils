@@ -41,6 +41,7 @@ def _cfg() -> TickConfig:
                     when=GateWhen.ALWAYS,
                     capture=True,
                     timeout_secs=195,
+                    parallel=True,
                 ),
             ),
         ),
@@ -63,6 +64,7 @@ def test_roundtrip_is_stable() -> None:
     gate = back.reminders[1].gate
     assert gate is not None and gate.when is GateWhen.ALWAYS and gate.capture is True
     assert gate.timeout_secs == 195
+    assert gate.parallel is True
     assert back.reminders[1].emit.fields == {"threshold": "20"}
     assert back.health_checks[0].glob == "/var/*.sql"
 

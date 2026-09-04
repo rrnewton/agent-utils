@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::io;
+use std::thread;
 
 use indexmap::IndexMap;
 
@@ -20,6 +21,8 @@ use crate::model::{Emit, EmitKind, Gate, GateWhen, HealthCheck, Reminder, TickCo
 use crate::protocols::{FileAgeProbe, GateRunner};
 use crate::state::{flag_truthy, state_lines, OpsState};
 use crate::text::{split_lines, string_repr, trim};
+
+const MAX_PARALLEL_GATES: usize = 8;
 
 /// Everything produced by one tick.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -141,6 +144,13 @@ fn eval_gate(
         return Ok((GateOutcome::Fire, IndexMap::new()));
     };
     let result = runner.run(&gate.cmd);
+    interpret_gate_result(gate, result)
+}
+
+fn interpret_gate_result(
+    gate: &Gate,
+    result: crate::protocols::GateResult,
+) -> Result<(GateOutcome, IndexMap<String, String>), String> {
     if !result.ok {
         return Err(format!(
             "gate command could not run ({}): {}",
@@ -680,43 +690,95 @@ fn run_tick_inner(
         };
         let no_dependencies = BTreeSet::new();
         let mut reports = Vec::new();
-        for (index, entry) in planned.into_iter().enumerate() {
-            let report = match entry {
-                PlannedReminder::Suppressed(line) => ReminderReport::Suppressed(line),
-                PlannedReminder::Runnable(reminder) => {
-                    let (outcome, captured, error) =
-                        match eval_gate(reminder.gate.as_ref(), gate_runner) {
+        let parallel_indexes = planned
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| match entry {
+                PlannedReminder::Runnable(reminder)
+                    if reminder.gate.as_ref().is_some_and(|gate| gate.parallel) =>
+                {
+                    Some(index)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        thread::scope(|scope| -> io::Result<()> {
+            let mut parallel = BTreeMap::new();
+            if parallel_indexes.len() >= 2 {
+                for index in parallel_indexes.iter().take(MAX_PARALLEL_GATES) {
+                    let PlannedReminder::Runnable(reminder) = &planned[*index] else {
+                        unreachable!("parallel indexes contain runnable reminders")
+                    };
+                    let reminder = *reminder;
+                    parallel.insert(
+                        *index,
+                        scope.spawn(move || eval_gate(reminder.gate.as_ref(), gate_runner)),
+                    );
+                }
+            }
+            let mut next_parallel = MAX_PARALLEL_GATES;
+            for (index, entry) in planned.iter().enumerate() {
+                let report = match entry {
+                    PlannedReminder::Suppressed(line) => ReminderReport::Suppressed(line.clone()),
+                    PlannedReminder::Runnable(reminder) => {
+                        let evaluated = match parallel.remove(&index) {
+                            Some(handle) => {
+                                let result = handle.join().unwrap_or_else(|_| {
+                                    Err("parallel gate worker panicked".into())
+                                });
+                                if let Some(next_index) = parallel_indexes.get(next_parallel) {
+                                    let PlannedReminder::Runnable(next_reminder) =
+                                        &planned[*next_index]
+                                    else {
+                                        unreachable!("parallel indexes contain runnable reminders")
+                                    };
+                                    let next_reminder = *next_reminder;
+                                    parallel.insert(
+                                        *next_index,
+                                        scope.spawn(move || {
+                                            eval_gate(next_reminder.gate.as_ref(), gate_runner)
+                                        }),
+                                    );
+                                    next_parallel += 1;
+                                }
+                                result
+                            }
+                            None => eval_gate(reminder.gate.as_ref(), gate_runner),
+                        };
+                        let (outcome, captured, error) = match evaluated {
                             Ok((outcome, captured)) => (outcome, captured, None),
                             Err(error) => (GateOutcome::Quiet, IndexMap::new(), Some(error)),
                         };
-                    ReminderReport::Evaluated(ReminderEvaluation {
-                        reminder,
-                        outcome,
-                        captured,
-                        error,
-                    })
-                }
-            };
-            reports.push(report);
-            if index < stream_prefix_len {
-                match reports.last().expect("report was just appended") {
-                    ReminderReport::Suppressed(line) => {
-                        record_line(&mut lines, &mut emit, line.clone())?;
+                        ReminderReport::Evaluated(ReminderEvaluation {
+                            reminder,
+                            outcome,
+                            captured,
+                            error,
+                        })
                     }
-                    ReminderReport::Evaluated(evaluation) => {
-                        actions += render_evaluation(
-                            evaluation,
-                            &no_dependencies,
-                            &mut new_fired,
-                            now,
-                            &mut lines,
-                            &mut emit,
-                            report_pending,
-                        )?;
+                };
+                reports.push(report);
+                if index < stream_prefix_len {
+                    match reports.last().expect("report was just appended") {
+                        ReminderReport::Suppressed(line) => {
+                            record_line(&mut lines, &mut emit, line.clone())?;
+                        }
+                        ReminderReport::Evaluated(evaluation) => {
+                            actions += render_evaluation(
+                                evaluation,
+                                &no_dependencies,
+                                &mut new_fired,
+                                now,
+                                &mut lines,
+                                &mut emit,
+                                report_pending,
+                            )?;
+                        }
                     }
                 }
             }
-        }
+            Ok(())
+        })?;
         if stream_prefix_len < reports.len() {
             actions += render_after_dependency_pass(
                 &reports,
@@ -747,17 +809,16 @@ mod tests {
     use crate::model::{Emit, Gate, HealthCheck, Reminder};
     use crate::protocols::GateResult;
     use crate::state::FlagValue;
-    use std::cell::RefCell;
-    use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
 
     struct FakeGate {
         outcomes: BTreeMap<String, GateResult>,
-        calls: RefCell<Vec<String>>,
+        calls: Mutex<Vec<String>>,
     }
 
     impl GateRunner for FakeGate {
         fn run(&self, cmd: &str) -> GateResult {
-            self.calls.borrow_mut().push(cmd.to_string());
+            self.calls.lock().unwrap().push(cmd.to_string());
             self.outcomes
                 .get(cmd)
                 .cloned()
@@ -777,7 +838,7 @@ mod tests {
         (
             FakeGate {
                 outcomes: BTreeMap::new(),
-                calls: RefCell::new(Vec::new()),
+                calls: Mutex::new(Vec::new()),
             },
             FakeProbe(BTreeMap::new()),
         )
@@ -825,6 +886,134 @@ mod tests {
     }
 
     #[test]
+    fn explicitly_parallel_gates_overlap_and_keep_config_order() {
+        let marker = std::env::temp_dir().join(format!(
+            "tick-hub-parallel-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut first = Reminder::new("first", Emit::action("warn", "first"));
+        let mut first_gate = Gate::new(format!(
+            "for unused in $(seq 1 200); do [ -e {} ] && exit 1; sleep 0.01; done; exit 75",
+            marker.display()
+        ));
+        first_gate.when = GateWhen::Failure;
+        first_gate.parallel = true;
+        first.gate = Some(first_gate);
+
+        let mut second = Reminder::new("second", Emit::action("warn", "second"));
+        let mut second_gate = Gate::new(format!("sleep 0.1; : > {}; exit 1", marker.display()));
+        second_gate.when = GateWhen::Failure;
+        second_gate.parallel = true;
+        second.gate = Some(second_gate);
+
+        let result = run_tick(
+            &TickConfig {
+                reminders: vec![first, second],
+                ..TickConfig::default()
+            },
+            &OpsState::default(),
+            5,
+            &BTreeMap::new(),
+            &crate::probes::SubprocessGateRunner::new(4),
+            &FakeProbe(BTreeMap::new()),
+            None,
+        );
+        let actions = result
+            .lines
+            .iter()
+            .filter(|line| line.starts_with("ACTION: warn"))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actions,
+            vec![
+                "ACTION: warn title=\"first\"".to_string(),
+                "ACTION: warn title=\"second\"".to_string()
+            ]
+        );
+        assert_eq!(
+            result.fired,
+            BTreeMap::from([("first".into(), 5), ("second".into(), 5)])
+        );
+        let _ = std::fs::remove_file(marker);
+    }
+
+    #[test]
+    fn parallel_prefix_is_emitted_while_a_later_gate_is_running() {
+        let root = std::env::temp_dir().join(format!(
+            "tick-hub-parallel-stream-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let started = root.join("second-started");
+        let release = root.join("release-second");
+        let finished = root.join("second-finished");
+
+        let mut first = Reminder::new("first", Emit::action("warn", "first"));
+        let mut first_gate = Gate::new(format!(
+            "for unused in $(seq 1 200); do [ -e {} ] && exit 1; sleep 0.01; done; exit 75",
+            started.display()
+        ));
+        first_gate.when = GateWhen::Failure;
+        first_gate.parallel = true;
+        first.gate = Some(first_gate);
+
+        let mut second = Reminder::new("second", Emit::action("warn", "second"));
+        let mut second_gate = Gate::new(format!(
+            ": > {}; while [ ! -e {} ]; do sleep 0.01; done; : > {}",
+            started.display(),
+            release.display(),
+            finished.display()
+        ));
+        second_gate.when = GateWhen::Failure;
+        second_gate.parallel = true;
+        second.gate = Some(second_gate);
+
+        let config = TickConfig {
+            reminders: vec![first, second],
+            ..TickConfig::default()
+        };
+        let mut observed_running = false;
+        let mut emit = |line: &str| {
+            if line.starts_with("ACTION: warn") {
+                observed_running = started.exists() && !finished.exists();
+                std::fs::write(&release, b"release").unwrap();
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "reader closed"));
+            }
+            Ok(())
+        };
+        let result = run_tick_with_emit(
+            &config,
+            &OpsState::default(),
+            5,
+            &BTreeMap::new(),
+            &crate::probes::SubprocessGateRunner::new(4),
+            &FakeProbe(BTreeMap::new()),
+            None,
+            false,
+            &mut emit,
+        );
+        assert!(result.is_err());
+        assert!(
+            observed_running,
+            "the first verdict waited for the later gate"
+        );
+        assert!(
+            finished.exists(),
+            "the worker was not joined after write failure"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn capture_interpolates_and_preserves_field_order() {
         let mut emit = Emit::action("triage", "{count} ready (> {threshold})");
         emit.fields.insert("threshold".into(), "5".into());
@@ -833,6 +1022,7 @@ mod tests {
             cmd: "count".into(),
             when: GateWhen::Always,
             capture: true,
+            parallel: false,
         });
         let config = TickConfig {
             reminders: vec![reminder],
@@ -840,7 +1030,7 @@ mod tests {
         };
         let gate = FakeGate {
             outcomes: BTreeMap::from([("count".into(), GateResult::completed(0, "count=7\n"))]),
-            calls: RefCell::new(Vec::new()),
+            calls: Mutex::new(Vec::new()),
         };
         let probe = FakeProbe(BTreeMap::new());
         let result = run_tick(
@@ -916,7 +1106,7 @@ mod tests {
         };
         let gate = FakeGate {
             outcomes: BTreeMap::from([("boom".into(), GateResult::failed("not found"))]),
-            calls: RefCell::new(Vec::new()),
+            calls: Mutex::new(Vec::new()),
         };
         let probe = FakeProbe(BTreeMap::new());
         let result = run_tick(
@@ -964,7 +1154,7 @@ mod tests {
         };
         let runner = FakeGate {
             outcomes: BTreeMap::from([(cmd.into(), GateResult::completed(code, stdout))]),
-            calls: RefCell::new(Vec::new()),
+            calls: Mutex::new(Vec::new()),
         };
         (config, runner, FakeProbe(BTreeMap::new()))
     }
@@ -1062,7 +1252,7 @@ mod tests {
         ] {
             let gate = FakeGate {
                 outcomes: BTreeMap::from([("check".into(), outcome)]),
-                calls: RefCell::new(Vec::new()),
+                calls: Mutex::new(Vec::new()),
             };
             let result = run_tick(
                 &config,
@@ -1301,7 +1491,7 @@ mod tests {
                 ("dependent".into(), GateResult::completed(0, "")),
                 ("independent".into(), GateResult::completed(0, "")),
             ]),
-            calls: RefCell::new(Vec::new()),
+            calls: Mutex::new(Vec::new()),
         };
         let result = run_tick(
             &config,
@@ -1313,7 +1503,7 @@ mod tests {
             None,
         );
         assert_eq!(
-            *gate.calls.borrow(),
+            *gate.calls.lock().unwrap(),
             vec!["dependent", "independent", "foundation"]
         );
         assert!(result.lines.iter().any(|line| line
@@ -1340,7 +1530,7 @@ mod tests {
                 ),
                 ("dependent".into(), GateResult::completed(1, "")),
             ]),
-            calls: RefCell::new(Vec::new()),
+            calls: Mutex::new(Vec::new()),
         };
         let result = run_tick(
             &config,
@@ -1381,7 +1571,7 @@ mod tests {
                 ("middle".into(), GateResult::completed(0, "")),
                 ("leaf".into(), GateResult::completed(0, "")),
             ]),
-            calls: RefCell::new(Vec::new()),
+            calls: Mutex::new(Vec::new()),
         };
         let result = run_tick(
             &config,
@@ -1416,7 +1606,7 @@ mod tests {
                 ("foundation".into(), GateResult::completed(0, "")),
                 ("dependent".into(), GateResult::completed(0, "")),
             ]),
-            calls: RefCell::new(Vec::new()),
+            calls: Mutex::new(Vec::new()),
         };
         let result = run_tick(
             &config,
@@ -1439,15 +1629,16 @@ mod tests {
 
     struct RecordingGate {
         outcomes: BTreeMap<String, GateResult>,
-        emitted: Rc<RefCell<Vec<String>>>,
-        seen_at_call: RefCell<Vec<(String, Vec<String>)>>,
+        emitted: Arc<Mutex<Vec<String>>>,
+        seen_at_call: Mutex<Vec<(String, Vec<String>)>>,
     }
 
     impl GateRunner for RecordingGate {
         fn run(&self, cmd: &str) -> GateResult {
             self.seen_at_call
-                .borrow_mut()
-                .push((cmd.to_string(), self.emitted.borrow().clone()));
+                .lock()
+                .unwrap()
+                .push((cmd.to_string(), self.emitted.lock().unwrap().clone()));
             self.outcomes
                 .get(cmd)
                 .cloned()
@@ -1480,7 +1671,7 @@ mod tests {
             &BTreeMap::new(),
             &FakeGate {
                 outcomes: outcomes.clone(),
-                calls: RefCell::new(Vec::new()),
+                calls: Mutex::new(Vec::new()),
             },
             &FakeProbe(BTreeMap::new()),
             None,
@@ -1488,15 +1679,15 @@ mod tests {
             None,
         )
         .unwrap();
-        let emitted = Rc::new(RefCell::new(Vec::new()));
+        let emitted = Arc::new(Mutex::new(Vec::new()));
         let runner = RecordingGate {
             outcomes,
-            emitted: Rc::clone(&emitted),
-            seen_at_call: RefCell::new(Vec::new()),
+            emitted: Arc::clone(&emitted),
+            seen_at_call: Mutex::new(Vec::new()),
         };
-        let emitted_for_callback = Rc::clone(&emitted);
+        let emitted_for_callback = Arc::clone(&emitted);
         let mut callback = move |line: &str| {
-            emitted_for_callback.borrow_mut().push(line.into());
+            emitted_for_callback.lock().unwrap().push(line.into());
             Ok(())
         };
         let streamed = run_tick_with_emit(
@@ -1512,7 +1703,7 @@ mod tests {
         )
         .unwrap();
 
-        let seen = runner.seen_at_call.borrow();
+        let seen = runner.seen_at_call.lock().unwrap();
         let before_dependent = &seen.iter().find(|(cmd, _)| cmd == "dependent").unwrap().1;
         assert!(before_dependent
             .iter()
@@ -1521,7 +1712,7 @@ mod tests {
         assert!(!before_foundation
             .iter()
             .any(|line| line == "CLEAN: dependent ran and found nothing to report"));
-        assert_eq!(*emitted.borrow(), collected.lines);
+        assert_eq!(*emitted.lock().unwrap(), collected.lines);
         assert_eq!(streamed, collected);
     }
 
@@ -1542,7 +1733,7 @@ mod tests {
                 ("first".into(), GateResult::completed(1, "")),
                 ("third".into(), GateResult::completed(1, "")),
             ]),
-            calls: RefCell::new(Vec::new()),
+            calls: Mutex::new(Vec::new()),
         };
         let mut emitted = Vec::new();
         let result = run_tick_with_emit(
@@ -1598,7 +1789,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
         assert!(
-            gate.calls.borrow().is_empty(),
+            gate.calls.lock().unwrap().is_empty(),
             "evaluation must stop at the failed write"
         );
     }

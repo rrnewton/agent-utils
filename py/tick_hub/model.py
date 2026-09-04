@@ -53,13 +53,17 @@ class Gate:
     placeholders — so a reminder can carry live values (a count, a SHA, a URL)
     without the engine hardcoding anything. ``timeout_secs`` optionally raises
     or lowers the subprocess boundary for this gate only; ``None`` retains the
-    runner's global default.
+    runner's global default. ``parallel`` permits the production runner to
+    start this command ahead of its configuration position and overlap it with
+    other gate commands. It defaults to false because callers must establish
+    that the command cannot race any other due gate's shared state.
     """
 
     cmd: str
     when: GateWhen = GateWhen.SUCCESS
     capture: bool = False
     timeout_secs: int | None = None
+    parallel: bool = False
 
 
 @dataclass(frozen=True)

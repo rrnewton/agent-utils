@@ -36,7 +36,7 @@ impl GateResult {
 }
 
 /// Runs a reminder gate command.
-pub trait GateRunner {
+pub trait GateRunner: Sync {
     /// Execute `cmd` and report its exit code and stdout.
     fn run(&self, cmd: &str) -> GateResult;
 }

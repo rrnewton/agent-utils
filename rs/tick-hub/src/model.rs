@@ -78,6 +78,8 @@ pub struct Gate {
     pub when: GateWhen,
     /// Whether `key=value` stdout lines are captured.
     pub capture: bool,
+    /// Whether this gate may start early and overlap other due gate commands.
+    pub parallel: bool,
 }
 
 impl Gate {
@@ -87,6 +89,7 @@ impl Gate {
             cmd: cmd.into(),
             when: GateWhen::Success,
             capture: false,
+            parallel: false,
         }
     }
 }
