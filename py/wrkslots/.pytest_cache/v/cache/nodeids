@@ -1,0 +1,13 @@
+[
+  "tests/test_lifecycle.py::test_agent_removal_and_clean_caches_refuse_nested_git_metadata",
+  "tests/test_lifecycle.py::test_cache_removal_refuses_replacement_of_fenced_target",
+  "tests/test_lifecycle.py::test_clean_caches_refuses_checkout_replacement_after_planning",
+  "tests/test_lifecycle.py::test_clean_caches_refuses_intermediate_symlink_escape",
+  "tests/test_lifecycle.py::test_path_escape_and_symlink_are_refused_without_touching_target",
+  "tests/test_lifecycle.py::test_validate_batch_removes_nested_git_metadata_in_configured_cache",
+  "tests/test_lifecycle.py::test_validate_complete_cannot_bypass_agent_reclaim",
+  "tests/test_lifecycle.py::test_validate_complete_removes_nested_git_metadata_in_configured_cache",
+  "tests/test_lifecycle.py::test_validate_complete_still_refuses_live_owner_from_shared_cgroup",
+  "tests/test_lifecycle.py::test_validate_complete_still_refuses_live_path_use_after_owner_dies",
+  "tests/test_lifecycle.py::test_validate_removal_without_complete_refuses_nested_git_metadata"
+]
