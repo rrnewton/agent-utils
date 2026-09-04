@@ -1682,6 +1682,43 @@ def test_recover_ownerless_validate_cargo_home_requires_terminal_or_manual_evide
     assert active_slots(project) == []
 
 
+def test_ownerless_cargo_cleanup_ignores_an_unrelated_missing_slot(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    made = create(project, slot="unrelated", agent="other", branch="other/task")
+    assert made.returncode == 0, made.stderr
+    unrelated = checkout(project, "unrelated")
+    shutil.rmtree(unrelated)
+
+    target = project / "ignored" / "validate" / "cargo-homes" / "validate-cargo-old"
+    target.mkdir(parents=True)
+    record = prepare_terminal_validation_record(project, target, field="cargo_home")
+
+    recovered = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--ownerless-validate-cargo-home",
+        target.relative_to(project).as_posix(),
+        "--completed-record",
+        record.relative_to(project).as_posix(),
+    )
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert "unrelated" in recovered.stderr
+    assert not target.exists()
+    rows = active_slots(project)
+    assert len(rows) == 1
+    row = wrkslots._as_mapping(rows[0], "remaining active slot")
+    assert row["slot"] == "unrelated"
+
+
 def test_ownerless_cargo_home_allows_nested_git_cache_and_records_determination(
     tmp_path: Path,
 ) -> None:
@@ -14132,6 +14169,37 @@ def test_registry_storage_guard_still_refuses_when_no_slot_is_named(
         config, states, target_slot="slot01"
     )
     assert any("stranded" in value for value in findings.registrations)
+
+
+def test_target_scoped_guard_still_refuses_unattributable_registration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    config = wrkslots._load_config(str(project), "testhost")
+    states = [wrkslots._load_active(config)]
+    finding = wrkslots.StorageInconsistency(
+        kind="git-registration-without-row",
+        scope="directory",
+        slot=None,
+        slot_type="validate",
+        machine=None,
+        checkout=None,
+        detail="unattributable registration",
+        remedy="inspect the registration",
+    )
+    monkeypatch.setattr(
+        wrkslots,
+        "_registry_storage_inconsistencies",
+        lambda *_args, **_kwargs: (finding,),
+    )
+
+    with pytest.raises(wrkslots.StateError, match="unattributable registration"):
+        wrkslots._assert_registry_storage_consistent(
+            config,
+            states,
+            target_slot="review-checkout",
+            scope_to_target=True,
+        )
 
 
 def test_hold_ignores_an_unrelated_directory_without_a_row(tmp_path: Path) -> None:
