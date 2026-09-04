@@ -2152,13 +2152,15 @@ fn parse_tag_list(raw: &str) -> Vec<String> {
         .collect()
 }
 
-// Return the named steps and, by default, every dependency they require.
-//
-// `ignore_selected_deps` keeps only the named steps and drops dependency edges to steps outside
-// the selection because their outputs are assumed already present. Edges among selected steps are
-// preserved. Registration order is preserved in both modes, matching the Python build. `Err` on
-// an unknown named tag.
-fn select_steps(
+/// Return the exactly named steps and, by default, every dependency they require.
+///
+/// `ignore_selected_deps` keeps only the named steps and drops dependency edges to steps outside
+/// the selection because their outputs are assumed already present. Edges among selected steps are
+/// preserved. Registration order is preserved in both modes, matching `run --selected`.
+///
+/// The source configuration is never modified. Its complete non-step policy is cloned into the
+/// returned configuration. Returns an error when any requested tag is unknown.
+pub fn select_steps_by_tags(
     cfg: &DagConfig,
     tags: &[String],
     ignore_selected_deps: bool,
@@ -2242,7 +2244,7 @@ pub fn select_steps_by_labels(cfg: &DagConfig, labels: &[String]) -> Result<DagC
         .filter(|step| labels.iter().any(|label| step.labels.contains(label)))
         .map(Step::tag)
         .collect::<Vec<_>>();
-    select_steps(cfg, &tags, false)
+    select_steps_by_tags(cfg, &tags, false)
 }
 
 // --------------------------------------------------------------------------- --args / --stress
@@ -4097,7 +4099,7 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
             eprintln!("{PROG}: run: --selected requires at least one tag");
             return 2;
         }
-        match select_steps(cfg, &tags, a.ignore_selected_deps) {
+        match select_steps_by_tags(cfg, &tags, a.ignore_selected_deps) {
             Ok(f) => Some(f),
             Err(e) => {
                 eprintln!("{PROG}: {e}");
@@ -5192,7 +5194,7 @@ mod tests {
         let cfg = tiny();
         let applied = apply_passthrough_args(&cfg, Some("--case xyz")).unwrap();
         assert_eq!(applied.steps[0].cmd, "echo --case xyz");
-        let selected = select_steps(&cfg, &["test.unit".to_string()], true).unwrap();
+        let selected = select_steps_by_tags(&cfg, &["test.unit".to_string()], true).unwrap();
         assert!(apply_passthrough_args(&selected, Some("x")).is_err());
     }
 
@@ -5207,7 +5209,7 @@ mod tests {
         )
         .unwrap();
 
-        let selected = select_steps(&cfg, &["package.tarball".to_string()], false).unwrap();
+        let selected = select_steps_by_tags(&cfg, &["package.tarball".to_string()], false).unwrap();
         assert_eq!(
             selected.steps.iter().map(Step::tag).collect::<Vec<_>>(),
             ["package.tarball", "test.unit", "build.app"]
@@ -5219,7 +5221,7 @@ mod tests {
     #[test]
     fn selected_dependencies_can_be_explicitly_ignored() {
         let cfg = tiny();
-        let selected = select_steps(&cfg, &["test.unit".to_string()], true).unwrap();
+        let selected = select_steps_by_tags(&cfg, &["test.unit".to_string()], true).unwrap();
         assert_eq!(
             selected.steps.iter().map(Step::tag).collect::<Vec<_>>(),
             ["test.unit"]
