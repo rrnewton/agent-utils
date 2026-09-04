@@ -34,6 +34,7 @@ from pr_landing_planner.host import VcsHost
 from pr_landing_planner.landing_context import (
     LandingContext,
     apply_landing_context,
+    review_evidence_digest,
 )
 from pr_landing_planner.model import (
     CollectedGraph,
@@ -202,6 +203,31 @@ def collect_graph(
                 f"PR #{pr.number} host returned negative commits-behind value {behind}"
             )
         verdict = classify_pr(pr.checks, cfg)
+        review_digest = ""
+        review_decision = pr.review_decision
+        if pr.review_snapshot is not None:
+            if pr.review_snapshot.head_sha != head_sha:
+                raise CollectionError(
+                    f"PR #{pr.number} review evidence changed during collection: "
+                    f"snapshot={pr.review_snapshot.head_sha}, fetched={head_sha}; rerun"
+                )
+            if (
+                review_decision
+                and pr.review_snapshot.review_decision != review_decision
+            ):
+                raise CollectionError(
+                    f"PR #{pr.number} aggregate review decision changed during collection: "
+                    f"list={review_decision!r}, "
+                    f"snapshot={pr.review_snapshot.review_decision!r}; rerun"
+                )
+            if pr.review_snapshot.review_decision:
+                review_decision = pr.review_snapshot.review_decision
+            try:
+                review_digest = review_evidence_digest(pr.review_snapshot)
+            except ValueError as exc:
+                raise CollectionError(
+                    f"PR #{pr.number} review evidence is not safely identifiable: {exc}"
+                ) from exc
         nodes.append(
             PrNode(
                 number=pr.number,
@@ -213,8 +239,9 @@ def collect_graph(
                 author=pr.author,
                 is_draft=pr.is_draft,
                 mergeable=pr.mergeable,
-                review_decision=pr.review_decision,
+                review_decision=review_decision,
                 created_at=pr.created_at,
+                updated_at=pr.updated_at,
                 additions=pr.additions,
                 deletions=pr.deletions,
                 labels=pr.labels,
@@ -224,6 +251,7 @@ def collect_graph(
                 commits_behind=behind,
                 ci=verdict,
                 priority=provider.priority(pr.number, pr.labels),
+                review_evidence_digest=review_digest,
             )
         )
 

@@ -8580,6 +8580,59 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
     rs = rs_command(tool)
     rep = Report()
 
+    def review_digest(
+        head: str, decision: str, events: Sequence[Mapping[str, object]]
+    ) -> str:
+        digest = hashlib.sha256(b"pr-landing-planner-review-evidence-v2")
+
+        def feed(value: str) -> None:
+            encoded = value.encode("utf-8")
+            digest.update(len(encoded).to_bytes(8, "big"))
+            digest.update(encoded)
+
+        def event_field(event: Mapping[str, object], field: str) -> str:
+            value = event.get(field)
+            if not isinstance(value, str):
+                raise ValueError(f"review event field {field!r} is not a string")
+            return value
+
+        feed(head)
+        feed(decision)
+        ordered = sorted(
+            events,
+            key=lambda event: tuple(
+                event_field(event, field)
+                for field in (
+                    "kind",
+                    "identity",
+                    "author",
+                    "state",
+                    "head_sha",
+                    "created_at",
+                    "updated_at",
+                    "last_edited_at",
+                    "body",
+                    "retirement_actor_permission",
+                )
+            ),
+        )
+        digest.update(len(ordered).to_bytes(8, "big"))
+        for event in ordered:
+            for field in (
+                "kind",
+                "identity",
+                "author",
+                "state",
+                "head_sha",
+                "created_at",
+                "updated_at",
+                "last_edited_at",
+                "body",
+                "retirement_actor_permission",
+            ):
+                feed(event_field(event, field))
+        return digest.hexdigest()
+
     _record_exact(rep, "version", py, rs, ("--version",))
     compare_package_guides(tool, py, rs, rep)
     command_flags = (
@@ -9161,6 +9214,455 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
                 f"exit={hard_green.returncode}; authority={hard_authority_recorded}; "
                 f"landable={hard_green_landable}",
             )
+
+        review_head = "a" * 40
+        observed_at = "2026-09-04T12:00:00Z"
+        review_events: list[dict[str, object]] = [
+            {
+                "kind": "review",
+                "identity": "review-1",
+                "author": "reviewer",
+                "state": "CHANGES_REQUESTED",
+                "head_sha": review_head,
+                "created_at": observed_at,
+                "updated_at": observed_at,
+                "last_edited_at": "",
+                "body": "please address this",
+                "retirement_actor_permission": "",
+            },
+            {
+                "kind": "issue-comment",
+                "identity": "comment-1",
+                "author": "release-authority",
+                "state": "ACTIVE",
+                "head_sha": "",
+                "created_at": observed_at,
+                "updated_at": observed_at,
+                "last_edited_at": "",
+                "body": (
+                    "[team, release-authority, session, model, role=observer]\n"
+                    f"CHANGES-REQUESTED-WITHDRAWN-AT: codex {review_head} "
+                    "BY release-authority\n"
+                    "RETIRES 123456"
+                ),
+                "retirement_actor_permission": "write",
+            },
+            {
+                "kind": "review-comment",
+                "identity": "thread-1",
+                "author": "reviewer",
+                "state": "RESOLVED",
+                "head_sha": "",
+                "created_at": observed_at,
+                "updated_at": observed_at,
+                "last_edited_at": "",
+                "body": "inline objection retired",
+                "retirement_actor_permission": "",
+            },
+        ]
+        review_pr: dict[str, object] = {
+            "number": 394,
+            "head_sha": review_head,
+            "review_decision": "CHANGES_REQUESTED",
+            "updated_at": observed_at,
+            "review_events": review_events,
+            "checks": [
+                {
+                    "name": "merge-gate",
+                    "status": "COMPLETED",
+                    "conclusion": "SUCCESS",
+                }
+            ],
+        }
+        review_fixture: dict[str, object] = {
+            "repo": "R",
+            "base": "main",
+            "prs": [review_pr],
+        }
+        review_fixture_path = os.path.join(tmp, "review-evidence-fixture.json")
+        with open(review_fixture_path, "w", encoding="utf-8") as handle:
+            json.dump(review_fixture, handle)
+        review_probe_args = (
+            "plan",
+            "--fixture",
+            review_fixture_path,
+            "--format",
+            "json",
+        )
+        probe_py, _probe_rs = _record_exact(
+            rep,
+            "accept:emit-review-event-digest-before-authority",
+            py,
+            rs,
+            review_probe_args,
+            expected=0,
+        )
+        probe_ok, probe_payload = _parsed_json(probe_py.stdout)
+        emitted_review_digest = ""
+        if probe_ok and isinstance(probe_payload, dict):
+            nodes = probe_payload.get("nodes")
+            if isinstance(nodes, list) and len(nodes) == 1 and isinstance(nodes[0], dict):
+                value = nodes[0].get("review_evidence_digest")
+                if isinstance(value, str):
+                    emitted_review_digest = value
+        locally_computed_digest = review_digest(
+            review_head, "CHANGES_REQUESTED", review_events
+        )
+        if emitted_review_digest == locally_computed_digest:
+            rep.ok("accept:emitted-review-digest-matches-canonical-contract")
+        else:
+            rep.bad(
+                "accept:emitted-review-digest-matches-canonical-contract",
+                f"emitted={emitted_review_digest!r}; expected={locally_computed_digest!r}",
+            )
+        review_context_path = os.path.join(tmp, "review-evidence-context.json")
+        with open(review_context_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "prs": [
+                        {
+                            "pr": 394,
+                            "head_sha": review_head,
+                            "review_objections_resolved": True,
+                            "review_evidence_digest": emitted_review_digest,
+                        }
+                    ]
+                },
+                handle,
+            )
+        review_args = (
+            "plan",
+            "--fixture",
+            review_fixture_path,
+            "--landing-context",
+            review_context_path,
+            "--format",
+            "json",
+        )
+
+        def review_disposition(outcome: Outcome, pr: int) -> tuple[bool | None, str]:
+            parsed_ok, payload = _parsed_json(outcome.stdout)
+            if not parsed_ok or not isinstance(payload, dict):
+                return None, ""
+            held: bool | None = None
+            nodes = payload.get("nodes")
+            if isinstance(nodes, list):
+                for node in nodes:
+                    if not isinstance(node, dict) or node.get("pr") != pr:
+                        continue
+                    held_value = node.get("held")
+                    if isinstance(held_value, bool):
+                        held = held_value
+            action = ""
+            plan = payload.get("plan")
+            decisions = plan.get("per_pr_actions") if isinstance(plan, dict) else None
+            if isinstance(decisions, list):
+                for decision in decisions:
+                    if not isinstance(decision, dict) or decision.get("pr") != pr:
+                        continue
+                    action_value = decision.get("action")
+                    if isinstance(action_value, str):
+                        action = action_value
+            return held, action
+
+        review_accept, _review_accept_rs = _record_exact(
+            rep,
+            "accept:exact-review-event-digest",
+            py,
+            rs,
+            review_args,
+            expected=0,
+        )
+        review_accept_held, review_accept_action = review_disposition(review_accept, 394)
+        if (
+            review_accept.returncode == 0
+            and review_accept_held is False
+            and review_accept_action == "land-now"
+        ):
+            rep.ok("accept:resolved-review-is-unheld-and-land-now")
+        else:
+            rep.bad(
+                "accept:resolved-review-is-unheld-and-land-now",
+                f"exit={review_accept.returncode}; held={review_accept_held}; "
+                f"action={review_accept_action!r}",
+            )
+
+        no_retirement_args = (
+            "plan",
+            "--fixture",
+            review_fixture_path,
+            "--format",
+            "json",
+        )
+        no_retirement, _no_retirement_rs = _record_exact(
+            rep,
+            "reject:no-retirement-authority",
+            py,
+            rs,
+            no_retirement_args,
+            expected=0,
+        )
+        no_retirement_held, no_retirement_action = review_disposition(no_retirement, 394)
+        if (
+            no_retirement.returncode == 0
+            and no_retirement_held is True
+            and no_retirement_action == "wait"
+        ):
+            rep.ok("reject:no-retirement-remains-held-and-not-landable")
+        else:
+            rep.bad(
+                "reject:no-retirement-remains-held-and-not-landable",
+                f"exit={no_retirement.returncode}; held={no_retirement_held}; "
+                f"action={no_retirement_action!r}",
+            )
+
+        nullable_last_edit = dict(review_fixture)
+        nullable_last_edit_pr = dict(review_pr)
+        nullable_last_edit_events = [dict(event) for event in review_events]
+        nullable_last_edit_events[0]["last_edited_at"] = None
+        nullable_last_edit_pr["review_events"] = nullable_last_edit_events
+        nullable_last_edit["prs"] = [nullable_last_edit_pr]
+        nullable_last_edit_path = os.path.join(tmp, "nullable-review-last-edit.json")
+        with open(nullable_last_edit_path, "w", encoding="utf-8") as handle:
+            json.dump(nullable_last_edit, handle)
+        _record_exact(
+            rep,
+            "accept:null-native-last-edit-normalizes-to-empty",
+            py,
+            rs,
+            (
+                "plan",
+                "--fixture",
+                nullable_last_edit_path,
+                "--landing-context",
+                review_context_path,
+                "--format",
+                "json",
+            ),
+        )
+
+        same_second = dict(review_fixture)
+        same_second_pr = dict(review_pr)
+        same_second_pr["review_events"] = [
+            *review_events,
+            {
+                "kind": "review-comment",
+                "identity": "thread-2",
+                "author": "reviewer",
+                "state": "ACTIVE",
+                "head_sha": "",
+                "created_at": observed_at,
+                "updated_at": observed_at,
+                "last_edited_at": "",
+                "body": "new objection in the same timestamp tick",
+                "retirement_actor_permission": "",
+            },
+        ]
+        same_second["prs"] = [same_second_pr]
+        same_second_path = os.path.join(tmp, "same-timestamp-objection.json")
+        with open(same_second_path, "w", encoding="utf-8") as handle:
+            json.dump(same_second, handle)
+        _record_same_exit(
+            rep,
+            "reject:same-timestamp-review-objection",
+            py,
+            rs,
+            (
+                "plan",
+                "--fixture",
+                same_second_path,
+                "--landing-context",
+                review_context_path,
+            ),
+            2,
+        )
+
+        for label, field, value in (
+            ("body-change", "body", "changed objection text"),
+            ("author-change", "author", "different-reviewer"),
+            ("state-change", "state", "ACTIVE"),
+            ("event-head-change", "head_sha", "b" * 40),
+            ("creation-time-change", "created_at", "2026-09-04T11:59:59Z"),
+            ("version-time-change", "updated_at", "2026-09-04T12:00:01Z"),
+            ("edit-time-change", "last_edited_at", "2026-09-04T12:00:01Z"),
+        ):
+            changed_evidence = dict(review_fixture)
+            changed_pr = dict(review_pr)
+            changed_events = [dict(event) for event in review_events]
+            changed_events[2][field] = value
+            changed_pr["review_events"] = changed_events
+            changed_evidence["prs"] = [changed_pr]
+            changed_path = os.path.join(tmp, f"same-timestamp-review-{label}.json")
+            with open(changed_path, "w", encoding="utf-8") as handle:
+                json.dump(changed_evidence, handle)
+            _record_same_exit(
+                rep,
+                f"reject:same-timestamp-review-{label}",
+                py,
+                rs,
+                (
+                    "plan",
+                    "--fixture",
+                    changed_path,
+                    "--landing-context",
+                    review_context_path,
+                ),
+                2,
+            )
+
+        changed_permission = dict(review_fixture)
+        changed_permission_pr = dict(review_pr)
+        changed_permission_events = [dict(event) for event in review_events]
+        changed_permission_events[1]["retirement_actor_permission"] = "maintain"
+        changed_permission_pr["review_events"] = changed_permission_events
+        changed_permission["prs"] = [changed_permission_pr]
+        changed_permission_path = os.path.join(
+            tmp, "changed-retirement-actor-permission.json"
+        )
+        with open(changed_permission_path, "w", encoding="utf-8") as handle:
+            json.dump(changed_permission, handle)
+        _record_same_exit(
+            rep,
+            "reject:changed-retirement-actor-permission",
+            py,
+            rs,
+            (
+                "plan",
+                "--fixture",
+                changed_permission_path,
+                "--landing-context",
+                review_context_path,
+            ),
+            2,
+        )
+
+        for label, permission in (("missing", None), ("read-only", "read")):
+            bad_permission = dict(review_fixture)
+            bad_permission_pr = dict(review_pr)
+            bad_permission_events = [dict(event) for event in review_events]
+            if permission is None:
+                bad_permission_events[1].pop("retirement_actor_permission")
+            else:
+                bad_permission_events[1]["retirement_actor_permission"] = permission
+            bad_permission_pr["review_events"] = bad_permission_events
+            bad_permission["prs"] = [bad_permission_pr]
+            bad_permission_path = os.path.join(
+                tmp, f"retirement-actor-permission-{label}.json"
+            )
+            with open(bad_permission_path, "w", encoding="utf-8") as handle:
+                json.dump(bad_permission, handle)
+            _record_same_exit(
+                rep,
+                f"reject:retirement-actor-permission-{label}",
+                py,
+                rs,
+                ("plan", "--fixture", bad_permission_path),
+                2,
+            )
+
+        mismatched_snapshot = dict(review_fixture)
+        mismatched_pr = dict(review_pr)
+        mismatched_pr["review_snapshot_head_sha"] = "b" * 40
+        mismatched_snapshot["prs"] = [mismatched_pr]
+        mismatch_path = os.path.join(tmp, "mismatched-review-snapshot-head.json")
+        with open(mismatch_path, "w", encoding="utf-8") as handle:
+            json.dump(mismatched_snapshot, handle)
+        _record_same_exit(
+            rep,
+            "reject:review-snapshot-fetched-head-mismatch",
+            py,
+            rs,
+            ("plan", "--fixture", mismatch_path),
+            2,
+        )
+
+        for label, decision in (
+            ("null", None),
+            ("empty", ""),
+            ("conflict", "APPROVED"),
+        ):
+            mismatched_decision = dict(review_fixture)
+            mismatched_decision_pr = dict(review_pr)
+            mismatched_decision_pr["review_snapshot_review_decision"] = decision
+            mismatched_decision["prs"] = [mismatched_decision_pr]
+            decision_path = os.path.join(
+                tmp, f"mismatched-review-decision-{label}.json"
+            )
+            with open(decision_path, "w", encoding="utf-8") as handle:
+                json.dump(mismatched_decision, handle)
+            _record_same_exit(
+                rep,
+                f"reject:review-decision-{label}",
+                py,
+                rs,
+                ("plan", "--fixture", decision_path),
+                2,
+            )
+
+        missing_identity = dict(review_fixture)
+        missing_identity_pr = dict(review_pr)
+        missing_identity_pr["review_events"] = [{**review_events[0], "identity": ""}]
+        missing_identity["prs"] = [missing_identity_pr]
+        missing_identity_path = os.path.join(tmp, "missing-review-event-identity.json")
+        with open(missing_identity_path, "w", encoding="utf-8") as handle:
+            json.dump(missing_identity, handle)
+        _record_same_exit(
+            rep,
+            "reject:missing-review-event-identity",
+            py,
+            rs,
+            ("plan", "--fixture", missing_identity_path),
+            2,
+        )
+
+        malformed_review_cases: list[tuple[str, dict[str, object]]] = []
+        numeric_author = dict(review_events[0])
+        numeric_author["author"] = 7
+        malformed_review_cases.append(("numeric-author", numeric_author))
+        null_created = dict(review_events[0])
+        null_created["created_at"] = None
+        malformed_review_cases.append(("null-created-at", null_created))
+        numeric_last_edit = dict(review_events[0])
+        numeric_last_edit["last_edited_at"] = 7
+        malformed_review_cases.append(("numeric-last-edited-at", numeric_last_edit))
+        missing_body = dict(review_events[0])
+        missing_body.pop("body")
+        malformed_review_cases.append(("missing-body", missing_body))
+        alien_state = dict(review_events[0])
+        alien_state["state"] = "ALIEN_STATE"
+        malformed_review_cases.append(("alien-state", alien_state))
+        for label, malformed_event in malformed_review_cases:
+            malformed = dict(review_fixture)
+            malformed_pr = dict(review_pr)
+            malformed_pr["review_events"] = [malformed_event]
+            malformed["prs"] = [malformed_pr]
+            malformed_path = os.path.join(tmp, f"malformed-review-{label}.json")
+            with open(malformed_path, "w", encoding="utf-8") as handle:
+                json.dump(malformed, handle)
+            _record_same_exit(
+                rep,
+                f"reject:malformed-review-{label}",
+                py,
+                rs,
+                ("plan", "--fixture", malformed_path),
+                2,
+            )
+
+        null_snapshot_head = dict(review_fixture)
+        null_snapshot_pr = dict(review_pr)
+        null_snapshot_pr["review_snapshot_head_sha"] = None
+        null_snapshot_head["prs"] = [null_snapshot_pr]
+        null_snapshot_path = os.path.join(tmp, "null-review-snapshot-head.json")
+        with open(null_snapshot_path, "w", encoding="utf-8") as handle:
+            json.dump(null_snapshot_head, handle)
+        _record_same_exit(
+            rep,
+            "reject:null-review-snapshot-head",
+            py,
+            rs,
+            ("plan", "--fixture", null_snapshot_path),
+            2,
+        )
 
         for flag, value in (
             ("--outage-min-prs", "-1"),

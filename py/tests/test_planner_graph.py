@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from pr_landing_planner.graph import (
     build_conflict_edges_file_overlap,
     build_ordering_edges_base_ref,
@@ -122,6 +124,22 @@ def test_review_decisions_and_ordering_cycles_fail_closed() -> None:
     assert "ordering-cycle" in by[4]
     assert "ordering-cycle" in by[5]
     assert by[6] == ("depends-on-held:#5",)
+
+
+def test_exact_head_objection_resolution_only_clears_changes_requested() -> None:
+    resolved = _node(1, review_decision="CHANGES_REQUESTED")
+    resolved = replace(resolved, review_objections_resolved=True)
+    unresolved = _node(2, review_decision="CHANGES_REQUESTED")
+    review_required = replace(
+        _node(3, review_decision="REVIEW_REQUIRED"),
+        review_objections_resolved=True,
+    )
+    held = {item.pr: item.reasons for item in held_reasons(
+        [resolved, unresolved, review_required], []
+    )}
+    assert 1 not in held
+    assert held[2] == ("changes-requested",)
+    assert held[3] == ("review-required",)
 
 
 def test_partition_respects_conflicts_and_ordering() -> None:

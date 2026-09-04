@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use sha2::{Digest, Sha256};
 
 use crate::classify::{classify_pr, ClassifyConfig};
-use crate::context::{apply_landing_context, LandingContext};
+use crate::context::{apply_landing_context, review_evidence_digest, LandingContext};
 use crate::graph::{
     build_mechanism_edges, build_ordering_edges_base_ref, build_overlap_edges,
     build_unclassified_mechanisms, dedupe_ordering,
@@ -209,6 +209,32 @@ pub fn collect_graph(
             ));
         }
         let priority = priority_provider.priority(pr.number, &pr.labels);
+        let mut review_decision = pr.review_decision.clone();
+        let review_digest = if let Some(snapshot) = &pr.review_snapshot {
+            if snapshot.head_sha != head_sha {
+                return Err(format!(
+                    "PR #{} review evidence changed during collection: snapshot={}, fetched={}; rerun",
+                    pr.number, snapshot.head_sha, head_sha
+                ));
+            }
+            if !review_decision.is_empty() && snapshot.review_decision != review_decision {
+                return Err(format!(
+                    "PR #{} aggregate review decision changed during collection: list={:?}, snapshot={:?}; rerun",
+                    pr.number, review_decision, snapshot.review_decision
+                ));
+            }
+            if !snapshot.review_decision.is_empty() {
+                review_decision = snapshot.review_decision.clone();
+            }
+            review_evidence_digest(snapshot).map_err(|error| {
+                format!(
+                    "PR #{} review evidence is not safely identifiable: {error}",
+                    pr.number
+                )
+            })?
+        } else {
+            String::new()
+        };
         nodes.push(PrNode {
             number: pr.number,
             head_ref: pr.head_ref,
@@ -219,8 +245,9 @@ pub fn collect_graph(
             author: pr.author,
             is_draft: pr.is_draft,
             mergeable: pr.mergeable,
-            review_decision: pr.review_decision,
+            review_decision,
             created_at: pr.created_at,
+            updated_at: pr.updated_at,
             additions: pr.additions,
             deletions: pr.deletions,
             labels: pr.labels,
@@ -230,6 +257,7 @@ pub fn collect_graph(
             commits_behind,
             ci: classify_pr(&pr.checks, classify_config),
             priority,
+            review_evidence_digest: review_digest,
             ..PrNode::default()
         });
     }
@@ -391,5 +419,104 @@ ancestry: [{before: 1, after: 2}]
         .unwrap_err();
         assert!(error.contains("changed during collection"));
         assert!(error.contains("rerun"));
+    }
+
+    #[test]
+    fn review_snapshot_head_must_match_the_exact_fetched_head() {
+        let value = load_fixture_text(
+            r#"{"repo":"r","base":"main","prs":[{
+            "number":1,
+            "head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "api_head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "fetched_head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "review_snapshot_head_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "review_events":[]
+        }]}"#,
+            false,
+        )
+        .unwrap();
+        let (mut host, repo, base) = FakeHost::from_value(&value).unwrap();
+        let mut priority = NonePriority;
+        let classify = ClassifyConfig::default();
+        let error = collect_graph(
+            &mut host,
+            CollectOptions::new(&repo, &base, &classify, &mut priority),
+        )
+        .unwrap_err();
+        assert!(error.contains("review evidence changed during collection"));
+    }
+
+    #[test]
+    fn review_snapshot_cannot_erase_or_contradict_changes_requested() {
+        for snapshot_decision in [
+            serde_json::Value::Null,
+            serde_json::json!(""),
+            serde_json::json!("APPROVED"),
+        ] {
+            let value = serde_json::json!({
+                "repo":"r",
+                "base":"main",
+                "prs":[{
+                    "number":1,
+                    "head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "review_decision":"CHANGES_REQUESTED",
+                    "review_snapshot_review_decision":snapshot_decision,
+                    "review_events":[{
+                        "kind":"review",
+                        "identity":"review-1",
+                        "author":"reviewer",
+                        "state":"CHANGES_REQUESTED",
+                        "head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "created_at":"2026-09-04T12:00:00Z",
+                        "updated_at":"2026-09-04T12:00:00Z",
+                        "last_edited_at":"",
+                        "body":"please fix"
+                    }]
+                }]
+            });
+            let (mut host, repo, base) = FakeHost::from_value(&value).unwrap();
+            let mut priority = NonePriority;
+            let classify = ClassifyConfig::default();
+            let error = collect_graph(
+                &mut host,
+                CollectOptions::new(&repo, &base, &classify, &mut priority),
+            )
+            .unwrap_err();
+            assert!(error.contains("aggregate review decision changed"));
+        }
+    }
+
+    #[test]
+    fn matching_review_decisions_are_accepted() {
+        let value = serde_json::json!({
+            "repo":"r",
+            "base":"main",
+            "prs":[{
+                "number":1,
+                "head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "review_decision":"CHANGES_REQUESTED",
+                "review_snapshot_review_decision":"CHANGES_REQUESTED",
+                "review_events":[{
+                    "kind":"review",
+                    "identity":"review-1",
+                    "author":"reviewer",
+                    "state":"CHANGES_REQUESTED",
+                    "head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "created_at":"2026-09-04T12:00:00Z",
+                    "updated_at":"2026-09-04T12:00:00Z",
+                    "last_edited_at":"",
+                    "body":"please fix"
+                }]
+            }]
+        });
+        let (mut host, repo, base) = FakeHost::from_value(&value).unwrap();
+        let mut priority = NonePriority;
+        let classify = ClassifyConfig::default();
+        let graph = collect_graph(
+            &mut host,
+            CollectOptions::new(&repo, &base, &classify, &mut priority),
+        )
+        .unwrap();
+        assert_eq!(graph.nodes[0].review_decision, "CHANGES_REQUESTED");
     }
 }

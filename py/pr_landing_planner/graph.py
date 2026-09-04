@@ -245,7 +245,8 @@ def held_reasons(
         if review == "REVIEW_REQUIRED":
             node_reasons.append("review-required")
         elif review == "CHANGES_REQUESTED":
-            node_reasons.append("changes-requested")
+            if not node.review_objections_resolved:
+                node_reasons.append("changes-requested")
         elif review and review != "APPROVED":
             node_reasons.append(f"review-decision-unknown:{review}")
         node_reasons.extend(review_binding(node)[1])

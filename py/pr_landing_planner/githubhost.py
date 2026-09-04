@@ -1,10 +1,11 @@
 """The one real :class:`~pr_landing_planner.host.VcsHost`: GitHub via ``gh`` + a local ``git`` clone.
 
-PR listing (and the rollup + labels carried on each :class:`~pr_landing_planner.model.RawPr`) comes
-from a single ``gh pr list --json`` call; the conflict / ancestry / freshness operations are plain
-``git`` against a local clone. An optional ``--net-wrapper`` prefixes each ``gh`` and ``git fetch``
-command, while ``--gh-cmd`` supports installations that use an authenticated wrapper. Gate-check
-names and flaky signatures live in classifier configuration, not this host.
+Light PR metadata comes from one ``gh pr list`` call. Checks and three explicitly paginated review
+event sources (native reviews, issue comments, and inline review comments) are enriched per PR;
+conflict / ancestry / freshness operations are plain ``git`` against a local clone. An optional
+``--net-wrapper`` prefixes each ``gh`` and ``git fetch`` command, while ``--gh-cmd`` supports
+authenticated wrappers. Gate-check names and flaky signatures live in classifier configuration,
+not this host.
 """
 
 from __future__ import annotations
@@ -15,9 +16,20 @@ import subprocess
 import sys
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, replace
 
 from pr_landing_planner.classify import parse_rollup
-from pr_landing_planner.model import CheckRun, RawPr
+from pr_landing_planner.landing_context import (
+    ALLOWED_RETIREMENT_PERMISSIONS,
+    retirement_actor,
+)
+from pr_landing_planner.model import (
+    CheckRun,
+    NATIVE_REVIEW_STATES,
+    RawPr,
+    ReviewEvidenceEvent,
+    ReviewEvidenceSnapshot,
+)
 
 GH_FIELDS: tuple[str, ...] = (
     "number",
@@ -35,18 +47,55 @@ GH_FIELDS: tuple[str, ...] = (
     "deletions",
     "labels",
     "statusCheckRollup",
+    "reviews",
+    "comments",
 )
 
 #: The heavy ``statusCheckRollup`` field makes a single ``gh pr list`` over a large open set 504 at
 #: the GraphQL layer (measured: fails at 60 PRs on <org>/<repo>). So the light metadata is fetched
 #: in one cheap list call (:data:`LIGHT_FIELDS`) and the rollup is enriched per PR, in parallel,
-#: below. Each per-PR ``gh pr view`` is small and reliable; a rollup that still fails degrades that one
+#: below. Each per-PR query is small and bounded; an enrichment that still fails degrades that one
 #: PR to "no checks" (classified pending) with a LOUD stderr NOTE rather than aborting the whole plan.
-LIGHT_FIELDS: tuple[str, ...] = tuple(f for f in GH_FIELDS if f != "statusCheckRollup")
+_ENRICHMENT_FIELDS = frozenset(("statusCheckRollup", "reviews", "comments"))
+LIGHT_FIELDS: tuple[str, ...] = tuple(f for f in GH_FIELDS if f not in _ENRICHMENT_FIELDS)
 
-#: Concurrency for the per-PR rollup enrichment. Bounded so we never fan out hundreds of ``gh``
+#: Concurrency for per-PR checks/review enrichment. Bounded so we never fan out hundreds of ``gh``
 #: processes; the work is network-bound so a small pool already hides most latency.
-_ROLLUP_WORKERS = 8
+_ENRICHMENT_WORKERS = 8
+
+_REVIEWS_QUERY = """
+query($owner: String!, $name: String!, $number: Int!, $endCursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      headRefOid
+      reviews(first: 100, after: $endCursor) {
+        nodes { id author { login } state commit { oid } submittedAt updatedAt lastEditedAt body }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}
+""".strip()
+
+_ISSUE_COMMENTS_QUERY = """
+query($owner: String!, $name: String!, $number: Int!, $endCursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      headRefOid
+      comments(first: 100, after: $endCursor) {
+        nodes { id author { login } body createdAt updatedAt isMinimized minimizedReason }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}
+""".strip()
+
+
+@dataclass(frozen=True)
+class _Enrichment:
+    checks: tuple[CheckRun, ...]
+    review_snapshot: ReviewEvidenceSnapshot
 
 
 class HostCommandError(RuntimeError):
@@ -104,6 +153,275 @@ def _labels(value: object) -> tuple[str, ...]:
     return tuple(out)
 
 
+def _event_object(value: object, role: str) -> Mapping[str, object]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{role} is not an object")
+    return {str(key): item for key, item in value.items()}
+
+
+def _stable_identity(event: Mapping[str, object], role: str) -> str:
+    identity = event.get("id")
+    if not isinstance(identity, str) or not identity:
+        raise ValueError(f"{role} lacks a stable id")
+    return identity
+
+
+def _body(event: Mapping[str, object], role: str) -> str:
+    body = event.get("body")
+    if not isinstance(body, str):
+        raise ValueError(f"{role} lacks a string body")
+    return body
+
+
+def _required_string(event: Mapping[str, object], role: str, key: str) -> str:
+    value = event.get(key)
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{role} lacks a non-empty string {key}")
+    return value
+
+
+def _event_author(event: Mapping[str, object], role: str, key: str) -> str:
+    value = event.get(key)
+    if not isinstance(value, dict):
+        raise ValueError(f"{role} lacks an author object")
+    login = value.get("login")
+    if not isinstance(login, str) or not login:
+        raise ValueError(f"{role} lacks a stable author login")
+    return login
+
+
+_INLINE_STATE_FIELDS = (
+    "in_reply_to_id",
+    "line",
+    "original_commit_id",
+    "original_line",
+    "original_position",
+    "original_start_line",
+    "path",
+    "position",
+    "pull_request_review_id",
+    "side",
+    "start_line",
+    "start_side",
+    "subject_type",
+)
+
+
+def _numeric_identity(event: Mapping[str, object], role: str) -> str:
+    identity = event.get("id")
+    if not isinstance(identity, int) or isinstance(identity, bool) or identity <= 0:
+        raise ValueError(f"{role} lacks a stable positive numeric id")
+    return str(identity)
+
+
+def _required_nullable_string(
+    event: Mapping[str, object], role: str, key: str
+) -> str:
+    if key not in event:
+        raise ValueError(f"{role} lacks promised field {key}")
+    value = event[key]
+    if value is None:
+        return ""
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{role} field {key} is not a non-empty string or null")
+    return value
+
+
+def _optional_head(event: Mapping[str, object], role: str) -> str:
+    if "commit_id" not in event:
+        raise ValueError(f"{role} lacks promised commit_id")
+    value = event["commit_id"]
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ValueError(f"{role} commit_id is not a string or null")
+    return value
+
+
+def _inline_state(event: Mapping[str, object], role: str) -> str:
+    state: dict[str, object] = {}
+    for key in _INLINE_STATE_FIELDS:
+        if key not in event:
+            raise ValueError(f"{role} lacks promised field {key}")
+        value = event[key]
+        if isinstance(value, bool) or not isinstance(value, (str, int, type(None))):
+            raise ValueError(f"{role} field {key} is not a string, integer, or null")
+        state[key] = value
+    if not isinstance(state["path"], str) or not state["path"]:
+        raise ValueError(f"{role} lacks a non-empty path")
+    return json.dumps(state, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _graphql_connection_from_slurp(
+    raw: object, *, number: int, connection: str
+) -> tuple[str, tuple[object, ...]]:
+    if not isinstance(raw, list) or not raw:
+        raise ValueError(f"{connection} pagination for PR #{number} is not a non-empty array")
+    head = ""
+    flattened: list[object] = []
+    for page_index, page_value in enumerate(raw):
+        page = _event_object(page_value, f"{connection} page[{page_index}]")
+        if "errors" in page:
+            errors = page["errors"]
+            if not isinstance(errors, list):
+                raise ValueError(
+                    f"{connection} page {page_index} GraphQL errors is not an array"
+                )
+            if errors:
+                raise ValueError(
+                    f"{connection} page {page_index} contains GraphQL errors"
+                )
+        data = _event_object(page.get("data"), f"{connection} page[{page_index}].data")
+        repository = _event_object(
+            data.get("repository"), f"{connection} page[{page_index}].repository"
+        )
+        pull_request = _event_object(
+            repository.get("pullRequest"),
+            f"{connection} page[{page_index}].pullRequest",
+        )
+        page_head = _required_string(
+            pull_request, f"{connection} page {page_index}", "headRefOid"
+        )
+        if head and page_head != head:
+            raise ValueError(
+                f"{connection} PR head changed during pagination: {head} -> {page_head}"
+            )
+        head = page_head
+        value = _event_object(
+            pull_request.get(connection), f"{connection} page[{page_index}].{connection}"
+        )
+        nodes = value.get("nodes")
+        page_info = value.get("pageInfo")
+        if not isinstance(nodes, list) or not isinstance(page_info, dict):
+            raise ValueError(f"{connection} page {page_index} lacks nodes or pageInfo")
+        has_next = page_info.get("hasNextPage")
+        end_cursor = page_info.get("endCursor")
+        if not isinstance(has_next, bool):
+            raise ValueError(f"{connection} page {page_index} lacks hasNextPage")
+        if has_next and (not isinstance(end_cursor, str) or not end_cursor):
+            raise ValueError(f"{connection} page {page_index} lacks a next-page cursor")
+        if page_index + 1 < len(raw) and not has_next:
+            raise ValueError(f"{connection} pagination continued after its terminal page")
+        if page_index + 1 == len(raw) and has_next:
+            raise ValueError(f"{connection} pagination ended before its terminal page")
+        flattened.extend(nodes)
+    return head, tuple(flattened)
+
+
+def _review_snapshot(
+    obj: Mapping[str, object],
+    reviews: Sequence[object],
+    issue_comments: Sequence[object],
+    inline_comments: Sequence[object],
+) -> ReviewEvidenceSnapshot:
+    head = _required_string(obj, "review snapshot", "headRefOid")
+    if "reviewDecision" not in obj:
+        raise ValueError("review snapshot lacks promised reviewDecision")
+    raw_decision = obj.get("reviewDecision")
+    if raw_decision is not None and not isinstance(raw_decision, str):
+        raise ValueError("review snapshot decision is not a string or null")
+    decision = raw_decision if isinstance(raw_decision, str) else ""
+    events: list[ReviewEvidenceEvent] = []
+    for index, value in enumerate(reviews):
+        role = f"review[{index}]"
+        event = _event_object(value, role)
+        state = _required_string(event, role, "state")
+        if state not in NATIVE_REVIEW_STATES:
+            raise ValueError(f"{role} has unknown state {state!r}")
+        commit = event.get("commit")
+        event_head = _required_string(
+            _event_object(commit, f"{role}.commit"), f"{role}.commit", "oid"
+        )
+        events.append(
+            ReviewEvidenceEvent(
+                kind="review",
+                identity=_stable_identity(event, role),
+                author=_event_author(event, role, "author"),
+                state=state,
+                head_sha=event_head,
+                created_at=_required_string(event, role, "submittedAt"),
+                updated_at=_required_string(event, role, "updatedAt"),
+                last_edited_at=_required_nullable_string(
+                    event, role, "lastEditedAt"
+                ),
+                body=_body(event, role),
+            )
+        )
+    for index, value in enumerate(issue_comments):
+        role = f"issue-comment[{index}]"
+        event = _event_object(value, role)
+        minimized = event.get("isMinimized")
+        if not isinstance(minimized, bool):
+            raise ValueError(f"{role} isMinimized is not a boolean")
+        if "minimizedReason" not in event:
+            raise ValueError(f"{role} lacks promised minimizedReason")
+        minimized_reason = event["minimizedReason"]
+        if minimized_reason is not None and not isinstance(minimized_reason, str):
+            raise ValueError(f"{role} minimizedReason is not a string or null")
+        if minimized and not minimized_reason:
+            raise ValueError(f"{role} is minimized without a reason")
+        state = f"MINIMIZED:{minimized_reason}" if minimized else "ACTIVE"
+        events.append(
+            ReviewEvidenceEvent(
+                kind="issue-comment",
+                identity=_stable_identity(event, role),
+                author=_event_author(event, role, "author"),
+                state=state,
+                # GitHub issue comments do not carry a commit identity. Empty is the
+                # canonical absent value; the enclosing snapshot remains exact-head bound.
+                head_sha="",
+                created_at=_required_string(event, role, "createdAt"),
+                updated_at=_required_string(event, role, "updatedAt"),
+                last_edited_at="",
+                body=_body(event, role),
+            )
+        )
+    for index, value in enumerate(inline_comments):
+        role = f"review-comment[{index}]"
+        event = _event_object(value, role)
+        events.append(
+            ReviewEvidenceEvent(
+                kind="review-comment",
+                identity=_numeric_identity(event, role),
+                author=_event_author(event, role, "user"),
+                state=_inline_state(event, role),
+                # REST review comments may omit commit_id. Preserve that absence rather
+                # than attributing the comment to the enclosing snapshot head.
+                head_sha=_optional_head(event, role),
+                created_at=_required_string(event, role, "created_at"),
+                updated_at=_required_string(event, role, "updated_at"),
+                last_edited_at="",
+                body=_body(event, role),
+            )
+        )
+    return ReviewEvidenceSnapshot(head, decision, tuple(events))
+
+
+def _repository_permission(raw: object, expected_actor: str) -> str:
+    response = _event_object(raw, "repository permission response")
+    user = _event_object(response.get("user"), "repository permission response.user")
+    actual_actor = _required_string(
+        user, "repository permission response.user", "login"
+    )
+    if actual_actor.lower() != expected_actor.lower():
+        raise ValueError(
+            "repository permission response actor differs from retirement actor"
+        )
+    role = response.get("role_name")
+    permission = response.get("permission")
+    candidates = [
+        value.lower()
+        for value in (role, permission)
+        if isinstance(value, str) and value
+    ]
+    for candidate in candidates:
+        if candidate in ALLOWED_RETIREMENT_PERMISSIONS:
+            return candidate
+    raise ValueError(
+        "retirement actor lacks current triage-or-higher repository permission"
+    )
+
+
 class GitHubHost:
     """Talk to GitHub through ``gh`` and to a local clone through ``git``."""
 
@@ -122,6 +440,52 @@ class GitHubHost:
 
     def _net(self, cmd: Sequence[str]) -> list[str]:
         return [*self._wrapper, *cmd]
+
+    def _retirement_permission(self, repo: str, actor: str) -> str:
+        proc = _run(
+            self._net(
+                [
+                    self._gh,
+                    "api",
+                    f"repos/{repo}/collaborators/{actor}/permission",
+                ]
+            ),
+            cwd=None,
+        )
+        raw: object = json.loads(proc.stdout) if proc.stdout.strip() else None
+        return _repository_permission(raw, actor)
+
+    def _bind_retirement_permissions(
+        self, repo: str, snapshot: ReviewEvidenceSnapshot
+    ) -> ReviewEvidenceSnapshot:
+        actors: set[str] = set()
+        for event in snapshot.events:
+            actor = retirement_actor(event.body)
+            if actor is None:
+                continue
+            if event.author.lower() != actor:
+                raise ValueError(
+                    "review evidence retirement actor differs from GitHub event author"
+                )
+            actors.add(actor)
+        permissions = {
+            actor: self._retirement_permission(repo, actor)
+            for actor in sorted(actors)
+        }
+        return replace(
+            snapshot,
+            events=tuple(
+                replace(
+                    event,
+                    retirement_actor_permission=(
+                        permissions[actor]
+                        if (actor := retirement_actor(event.body)) is not None
+                        else ""
+                    ),
+                )
+                for event in snapshot.events
+            ),
+        )
 
     def list_open_prs(self, repo: str, base: str | None) -> tuple[RawPr, ...]:
         """List open pull requests and attach each request's latest check rollup."""
@@ -147,10 +511,11 @@ class GitHubHost:
         ]
         # ...then enrich each PR's rollup with a small per-PR ``gh pr view``, in parallel.
         numbers = [_int(obj, "number") for obj in entries]
-        rollups = self._fetch_rollups(repo, numbers)
+        enrichments = self._fetch_enrichments(repo, numbers)
         prs: list[RawPr] = []
         for obj in entries:
             number = _int(obj, "number")
+            enrichment = enrichments.get(number)
             prs.append(
                 RawPr(
                     number=number,
@@ -161,65 +526,145 @@ class GitHubHost:
                     author=_author_login(obj.get("author")),
                     is_draft=_bool(obj, "isDraft"),
                     mergeable=_str(obj, "mergeable"),
+                    # Preserve the independently observed light-list decision. Collection
+                    # compares it with the later evidence snapshot instead of silently
+                    # replacing a non-empty decision with missing or contradictory data.
                     review_decision=_str(obj, "reviewDecision"),
                     created_at=_str(obj, "createdAt"),
                     updated_at=_str(obj, "updatedAt"),
                     additions=_int(obj, "additions"),
                     deletions=_int(obj, "deletions"),
                     labels=_labels(obj.get("labels")),
-                    checks=rollups.get(number, ()),
+                    checks=enrichment.checks if enrichment is not None else (),
+                    review_snapshot=(
+                        enrichment.review_snapshot if enrichment is not None else None
+                    ),
                 )
             )
         return tuple(prs)
 
-    def _fetch_rollups(
+    def _fetch_enrichments(
         self, repo: str, numbers: Sequence[int]
-    ) -> Mapping[int, tuple[CheckRun, ...]]:
-        """Fetch each PR's ``statusCheckRollup`` with a small per-PR ``gh pr view``, in parallel.
+    ) -> Mapping[int, _Enrichment]:
+        """Fetch checks and exact review/comment evidence per PR, in parallel.
 
         A single per-PR failure degrades that PR to no checks (classified pending) with a LOUD stderr
         NOTE — No Silent Failure — instead of aborting the whole plan. The returned mapping is by PR
         number, so the caller's order is unaffected by completion order (result stays deterministic).
         """
-        rollups: dict[int, tuple[CheckRun, ...]] = {}
+        enrichments: dict[int, _Enrichment] = {}
         failed: list[int] = []
 
-        def one(number: int) -> tuple[int, tuple[CheckRun, ...] | None]:
+        def inline_comments(number: int) -> tuple[object, ...]:
+            proc = _run(
+                self._net(
+                    [
+                        self._gh,
+                        "api",
+                        "--paginate",
+                        "--slurp",
+                        f"repos/{repo}/pulls/{number}/comments?per_page=100",
+                    ]
+                ),
+                cwd=None,
+            )
+            raw: object = json.loads(proc.stdout) if proc.stdout.strip() else []
+            if not isinstance(raw, list) or not raw:
+                raise ValueError(
+                    "inline review-comment pagination is not a non-empty array"
+                )
+            flattened: list[object] = []
+            for page_index, page in enumerate(raw):
+                if not isinstance(page, list):
+                    raise ValueError(
+                        f"inline review-comment page {page_index} is not an array"
+                    )
+                flattened.extend(page)
+            return tuple(flattened)
+
+        def graphql_connection(
+            number: int, connection: str, query: str
+        ) -> tuple[str, tuple[object, ...]]:
+            repo_parts = repo.split("/")
+            if len(repo_parts) < 2 or not repo_parts[-2] or not repo_parts[-1]:
+                raise ValueError(f"repository {repo!r} lacks owner/name")
+            proc = _run(
+                self._net(
+                    [
+                        self._gh,
+                        "api",
+                        "graphql",
+                        "--paginate",
+                        "--slurp",
+                        "-f",
+                        f"query={query}",
+                        "-F",
+                        f"owner={repo_parts[-2]}",
+                        "-F",
+                        f"name={repo_parts[-1]}",
+                        "-F",
+                        f"number={number}",
+                    ]
+                ),
+                cwd=None,
+            )
+            raw: object = json.loads(proc.stdout) if proc.stdout.strip() else []
+            return _graphql_connection_from_slurp(
+                raw, number=number, connection=connection
+            )
+
+        def one(number: int) -> tuple[int, _Enrichment | None]:
             try:
                 proc = _run(
                     self._net(
                         [
                             self._gh, "pr", "view", str(number),
                             "--repo", repo,
-                            "--json", "number,headRefOid,statusCheckRollup",
+                            "--json",
+                            "number,headRefOid,reviewDecision,statusCheckRollup",
                         ]
                     ),
                     cwd=None,
                 )
-            except HostCommandError:
+                obj = json.loads(proc.stdout) if proc.stdout.strip() else {}
+                if not isinstance(obj, dict):
+                    raise ValueError("per-PR enrichment is not an object")
+                review_head, reviews = graphql_connection(
+                    number, "reviews", _REVIEWS_QUERY
+                )
+                comment_head, issue_comments = graphql_connection(
+                    number, "comments", _ISSUE_COMMENTS_QUERY
+                )
+                view_head = _str(obj, "headRefOid")
+                if not view_head or {view_head, review_head, comment_head} != {view_head}:
+                    raise ValueError("PR head changed during review evidence enrichment")
+                snapshot = _review_snapshot(
+                    obj, reviews, issue_comments, inline_comments(number)
+                )
+                snapshot = self._bind_retirement_permissions(repo, snapshot)
+                checks = parse_rollup(
+                    obj.get("statusCheckRollup"), head_sha=snapshot.head_sha
+                )
+            except (HostCommandError, ValueError, json.JSONDecodeError):
                 return number, None
-            obj = json.loads(proc.stdout) if proc.stdout.strip() else {}
-            if not isinstance(obj, dict):
-                return number, None
-            return number, parse_rollup(
-                obj.get("statusCheckRollup"), head_sha=_str(obj, "headRefOid")
-            )
+            return number, _Enrichment(checks, snapshot)
 
         if numbers:
-            with ThreadPoolExecutor(max_workers=_ROLLUP_WORKERS) as pool:
-                for number, checks in pool.map(one, numbers):
-                    if checks is None:
+            with ThreadPoolExecutor(max_workers=_ENRICHMENT_WORKERS) as pool:
+                for number, enrichment in pool.map(one, numbers):
+                    if enrichment is None:
                         failed.append(number)
                     else:
-                        rollups[number] = checks
+                        enrichments[number] = enrichment
         if failed:
             listed = ",".join(f"#{n}" for n in sorted(failed))
             print(
-                f"pr-landing-planner: NOTE: rollup fetch failed for {len(failed)} PR(s) "
-                f"({listed}); treating them as pending (no checks)",
+                "pr-landing-planner: NOTE: check/review evidence enrichment failed for "
+                f"{len(failed)} PR(s) ({listed}); treating checks as pending and "
+                "review-resolution authority as unavailable",
                 file=sys.stderr,
             )
-        return rollups
+        return enrichments
 
     def prefetch_refs(self, refspecs: Sequence[tuple[str, str]]) -> dict[str, str]:
         """Fetch all requested refs in one operation and return their object IDs by destination."""

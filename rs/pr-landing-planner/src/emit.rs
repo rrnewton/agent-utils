@@ -26,6 +26,7 @@ fn node_obj(node: &PrNode, held: bool) -> Value {
         "title": node.title,
         "author": node.author,
         "head": node.head_sha,
+        "updated_at": (!node.updated_at.is_empty()).then_some(node.updated_at.as_str()),
         "base_sha": node.base_sha,
         "base_ref": node.base_ref,
         "ci": node.ci.raw_state.as_str(),
@@ -42,6 +43,9 @@ fn node_obj(node: &PrNode, held: bool) -> Value {
         "validation_authority": node.validation_authority.as_str(),
         "policy_class": node.policy_class.as_str(),
         "review_decision": (!node.review_decision.is_empty()).then_some(node.review_decision.as_str()),
+        "review_evidence_digest": (!node.review_evidence_digest.is_empty())
+            .then_some(node.review_evidence_digest.as_str()),
+        "review_objections_resolved": node.review_objections_resolved,
         "review_binding": review_binding(node).0.as_str(),
         "review_pass_heads": node.review_pass_heads,
     })

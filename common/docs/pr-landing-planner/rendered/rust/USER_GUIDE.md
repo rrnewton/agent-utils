@@ -133,14 +133,16 @@ Provide them with `--landing-context`:
 ```yaml
 prs:
   - pr: 42
-    head_sha: 0123456789abcdef
-    base_sha: fedcba9876543210
+    head_sha: 0123456789abcdef0123456789abcdef01234567
+    base_sha: fedcba9876543210fedcba9876543210fedcba98
     assigned_agent: release-coordinator
     validation_evidence: clean-validate-record
     validation_authority: soft-green
     review_pass_heads:
       codex: 0123456789abcdef0123456789abcdef01234567
       claude: 0123456789abcdef0123456789abcdef01234567
+    review_objections_resolved: true
+    review_evidence_digest: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
     policy_class: ci-hygiene
 ```
 
@@ -169,6 +171,47 @@ cache hints: when the review protocol is active, each lane needs both its
 identical patch-id, therefore requires a bounded delta re-check and a new
 exact-head receipt. The JSON node reports `review_binding` and
 `review_pass_heads`; stale or incomplete bindings are held.
+
+`review_objections_resolved: true` is caller authority that the consuming
+repository checked every recorded objection and found an exact resolution
+record for each one. The human or review-authority producer decides that
+substance; the digest only binds its decision to the snapshot and is not proof
+that an objection was resolved. The assertion requires both the exact
+`head_sha` and the 64-character lowercase `review_evidence_digest` emitted as
+`nodes[].review_evidence_digest` by an uncontexted exact-head JSON plan. The
+producer must copy that field mechanically into its generated context after
+assessing that snapshot; nobody should hand-compute it. The follow-up plan
+refetches the evidence and refuses if either the head or digest differs.
+
+The digest covers the snapshot head, aggregate review decision, and the sorted
+set of explicitly paginated native reviews, issue comments, and inline review
+comments.
+Each event contributes its source kind, stable event identity, stable author
+login, state, available event head (or the documented empty value for comment
+sources without one), creation/submission timestamp, current version timestamp,
+native-review last-edit timestamp, and body. Inline location fields are part of
+state, so an outdated/retired comment changes the digest even when GitHub gives
+the change the same second-resolution timestamp. An exact `RETIRES` record also
+contributes the immutable GitHub actor's current repository permission. The
+actor must match the record's `BY`/five-field disclosure identity, and only
+`triage`, `write`, `maintain`, or `admin` permission is authority. The disclosed
+role is retained as audit metadata; it does not grant or deny authority.
+Missing permission evidence, an API failure, a mismatched actor, or read-only
+access makes the entire snapshot unavailable rather than treating the
+retirement as authoritative. A later permission change changes the digest and
+invalidates an existing context. A missing stable
+event or author identity, or another promised source field, makes the entire
+snapshot unavailable instead of dropping that event. The field suppresses only
+the repository host's aggregate
+`CHANGES_REQUESTED` hold, which may remain stale after those records exist. It
+does not grant an approval, satisfy `review_pass_heads`, or override
+`REVIEW_REQUIRED`; absent or false retains the fail-closed hold.
+
+A machine-oriented two-pass flow is therefore: run `plan --format json`
+without a resolution assertion; select the desired PR's exact `head` and
+`review_evidence_digest`; let the review authority assess that same snapshot;
+then emit both values with `review_objections_resolved: true` and rerun. A
+missing or stale digest reports this remedy and fails closed.
 
 ## Freshness, holds, priority, and batching
 

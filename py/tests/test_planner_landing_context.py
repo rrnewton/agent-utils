@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import replace
+from dataclasses import fields, replace
 
 import pytest
 
@@ -11,6 +11,8 @@ from pr_landing_planner.emit import render_json
 from pr_landing_planner.landing_context import (
     apply_landing_context,
     parse_landing_context,
+    retirement_actor,
+    review_evidence_digest,
 )
 from pr_landing_planner.graph import build_mechanism_edges, held_reasons, review_binding
 from pr_landing_planner.model import (
@@ -21,6 +23,8 @@ from pr_landing_planner.model import (
     PrAction,
     PrNode,
     RedClass,
+    ReviewEvidenceEvent,
+    ReviewEvidenceSnapshot,
     ReviewBinding,
     ValidationAuthority,
     ValidationEvidence,
@@ -287,6 +291,7 @@ def test_json_schema_exposes_context_and_mechanism_overlap() -> None:
     assert payload["nodes"][0]["validation_authority"] == "none"
     assert payload["nodes"][0]["review_binding"] == "not-required"
     assert payload["nodes"][0]["review_pass_heads"] == {}
+    assert payload["nodes"][0]["review_objections_resolved"] is False
     assert payload["mechanism_overlap_edges"] == [
         {"a": 1, "b": 2, "mechanisms": ["cancel-in-progress"]}
     ]
@@ -348,6 +353,277 @@ def test_review_passes_bind_exact_head_and_head_moves_fail_closed() -> None:
 
     changed = replace(stale, head_sha=CHANGED_HEAD)
     assert review_binding(changed)[0] is ReviewBinding.STALE
+
+
+def test_review_objection_resolution_is_boolean_and_exact_head_bound() -> None:
+    with pytest.raises(ValueError, match="must be a boolean"):
+        parse_landing_context(
+            {"prs": [{"pr": 394, "review_objections_resolved": "yes"}]}
+        )
+    with pytest.raises(ValueError, match="requires exact 'head_sha'"):
+        parse_landing_context(
+            {"prs": [{"pr": 394, "review_objections_resolved": True}]}
+        )
+    with pytest.raises(ValueError, match="review_evidence_digest"):
+        parse_landing_context(
+            {
+                "prs": [
+                    {
+                        "pr": 394,
+                        "head_sha": REBASED_HEAD,
+                        "review_objections_resolved": True,
+                    }
+                ]
+            }
+        )
+
+    observed_at = "2026-09-04T12:00:00Z"
+    snapshot = ReviewEvidenceSnapshot(
+        head_sha=REBASED_HEAD,
+        review_decision="CHANGES_REQUESTED",
+        events=(
+            ReviewEvidenceEvent(
+                kind="review", identity="review-1", state="CHANGES_REQUESTED",
+                head_sha=REBASED_HEAD, created_at=observed_at,
+                updated_at=observed_at, last_edited_at="",
+                body="please address the race", author="reviewer",
+            ),
+            ReviewEvidenceEvent(
+                kind="issue-comment", identity="comment-1", state="ACTIVE",
+                head_sha="", created_at=observed_at, updated_at=observed_at,
+                last_edited_at="", body="resolved by the latest patch",
+                author="release-authority",
+            ),
+            ReviewEvidenceEvent(
+                kind="review-comment", identity="thread-1", state="RESOLVED",
+                head_sha="", created_at=observed_at, updated_at=observed_at,
+                last_edited_at="", body="inline objection retired", author="reviewer",
+            ),
+        ),
+    )
+    digest = review_evidence_digest(snapshot)
+    context = parse_landing_context(
+        {
+            "prs": [
+                {
+                    "pr": 394,
+                    "head_sha": REBASED_HEAD,
+                    "review_objections_resolved": True,
+                    "review_evidence_digest": digest,
+                }
+            ]
+        }
+    )
+    node = apply_landing_context(
+        [
+            replace(
+                _node(394),
+                head_sha=REBASED_HEAD,
+                updated_at=observed_at,
+                review_decision="CHANGES_REQUESTED",
+                review_evidence_digest=digest,
+            )
+        ],
+        context,
+    )[0]
+    assert node.review_objections_resolved
+    assert not held_reasons((node,), ())
+
+    with pytest.raises(ValueError, match="landing context is stale"):
+        apply_landing_context([replace(node, head_sha=CHANGED_HEAD)], context)
+    same_second_objection = ReviewEvidenceSnapshot(
+        head_sha=snapshot.head_sha,
+        review_decision=snapshot.review_decision,
+        events=(*snapshot.events, ReviewEvidenceEvent(
+            kind="review-comment", identity="thread-2", state="ACTIVE",
+            head_sha="", created_at=observed_at, updated_at=observed_at,
+            last_edited_at="", body="new same-second objection", author="reviewer",
+        )),
+    )
+    with pytest.raises(
+        ValueError, match="review objection resolution is stale"
+    ) as stale_error:
+        apply_landing_context(
+            [
+                replace(
+                    node,
+                    updated_at=observed_at,
+                    review_evidence_digest=review_evidence_digest(
+                        same_second_objection
+                    ),
+                )
+            ],
+            context,
+        )
+    assert "uncontexted exact-head plan" in str(stale_error.value)
+    assert "nodes[].review_evidence_digest" in str(stale_error.value)
+
+    with pytest.raises(ValueError, match="requires review_objections_resolved=true"):
+        parse_landing_context(
+            {"prs": [{"pr": 394, "review_evidence_digest": digest}]}
+        )
+    with pytest.raises(ValueError, match="stable kind or identity"):
+        review_evidence_digest(
+            ReviewEvidenceSnapshot(
+                REBASED_HEAD,
+                "CHANGES_REQUESTED",
+                (
+                    ReviewEvidenceEvent(
+                        kind="review", identity="", state="APPROVED",
+                        head_sha=REBASED_HEAD, created_at=observed_at,
+                        updated_at=observed_at, last_edited_at="", author="reviewer",
+                    ),
+                ),
+            )
+        )
+    missing_author = replace(
+        snapshot,
+        events=(replace(snapshot.events[0], author=""), *snapshot.events[1:]),
+    )
+    with pytest.raises(ValueError, match="stable author identity"):
+        review_evidence_digest(missing_author)
+    with pytest.raises(ValueError, match="no aggregate decision"):
+        review_evidence_digest(replace(snapshot, review_decision=""))
+    with pytest.raises(ValueError, match="unknown aggregate decision"):
+        review_evidence_digest(replace(snapshot, review_decision="UNKNOWN"))
+    with pytest.raises(ValueError, match="no matching review"):
+        review_evidence_digest(replace(snapshot, events=snapshot.events[1:]))
+    author_changed = replace(
+        snapshot,
+        events=(
+            replace(snapshot.events[0], author="different-reviewer"),
+            *snapshot.events[1:],
+        ),
+    )
+    assert review_evidence_digest(author_changed) != digest
+    with pytest.raises(ValueError, match="duplicate stable identity"):
+        review_evidence_digest(
+            ReviewEvidenceSnapshot(
+                REBASED_HEAD,
+                "CHANGES_REQUESTED",
+                (
+                    ReviewEvidenceEvent(
+                        kind="review", identity="same", state="APPROVED",
+                        head_sha=REBASED_HEAD, created_at=observed_at,
+                        updated_at=observed_at, last_edited_at="", author="reviewer",
+                    ),
+                    ReviewEvidenceEvent(
+                        kind="review", identity="same", state="DISMISSED",
+                        head_sha=REBASED_HEAD, created_at=observed_at,
+                        updated_at=observed_at, last_edited_at="", author="reviewer",
+                    ),
+                ),
+            )
+        )
+
+
+def test_review_evidence_digest_covers_every_normalized_authority_field() -> None:
+    assert tuple(field.name for field in fields(ReviewEvidenceEvent)) == (
+        "kind",
+        "identity",
+        "state",
+        "head_sha",
+        "created_at",
+        "updated_at",
+        "last_edited_at",
+        "body",
+        "author",
+        "retirement_actor_permission",
+    )
+    assert tuple(field.name for field in fields(ReviewEvidenceSnapshot)) == (
+        "head_sha",
+        "review_decision",
+        "events",
+    )
+    event = ReviewEvidenceEvent(
+        kind="review",
+        identity="review-1",
+        author="reviewer",
+        state="APPROVED",
+        head_sha=REBASED_HEAD,
+        created_at="2026-09-04T11:59:00Z",
+        updated_at="2026-09-04T12:00:00Z",
+        last_edited_at="",
+        body="looks good",
+    )
+    snapshot = ReviewEvidenceSnapshot(REBASED_HEAD, "APPROVED", (event,))
+    digest = review_evidence_digest(snapshot)
+    mutations = (
+        replace(event, kind="issue-comment"),
+        replace(event, identity="review-2"),
+        replace(event, author="different-reviewer"),
+        replace(event, state="DISMISSED"),
+        replace(event, head_sha=CHANGED_HEAD),
+        replace(event, created_at="2026-09-04T11:58:00Z"),
+        replace(event, updated_at="2026-09-04T12:00:01Z"),
+        replace(event, last_edited_at="2026-09-04T12:00:01Z"),
+        replace(event, body="new objection"),
+    )
+    for mutation in mutations:
+        assert review_evidence_digest(replace(snapshot, events=(mutation,))) != digest
+    assert review_evidence_digest(replace(snapshot, head_sha=CHANGED_HEAD)) != digest
+    assert review_evidence_digest(
+        replace(snapshot, review_decision="REVIEW_REQUIRED")
+    ) != digest
+
+
+def test_retirement_permission_is_actor_bound_and_changes_the_digest() -> None:
+    body = (
+        "[team, release-authority, session, model, role=observer]\n"
+        f"CHANGES-REQUESTED-WITHDRAWN-AT: codex {REBASED_HEAD} "
+        "BY release-authority\n"
+        "RETIRES 123456"
+    )
+    event = ReviewEvidenceEvent(
+        kind="issue-comment",
+        identity="comment-1",
+        author="release-authority",
+        state="ACTIVE",
+        head_sha="",
+        created_at="2026-09-04T12:00:00Z",
+        updated_at="2026-09-04T12:00:01Z",
+        body=body,
+        retirement_actor_permission="write",
+    )
+    snapshot = ReviewEvidenceSnapshot(REBASED_HEAD, "APPROVED", (event,))
+    assert retirement_actor(body) == "release-authority"
+    write_digest = review_evidence_digest(snapshot)
+    assert write_digest == "6cbf2b5d6132e3d81390cb4b1ab1702f6092ad82b1d36e36a010e28b7a2219cb"
+    assert review_evidence_digest(
+        replace(
+            snapshot,
+            events=(replace(event, retirement_actor_permission="maintain"),),
+        )
+    ) != write_digest
+
+    for permission in ("", "read"):
+        with pytest.raises(ValueError, match="triage-or-higher"):
+            review_evidence_digest(
+                replace(
+                    snapshot,
+                    events=(replace(event, retirement_actor_permission=permission),),
+                )
+            )
+    with pytest.raises(ValueError, match="differs from GitHub event author"):
+        review_evidence_digest(
+            replace(snapshot, events=(replace(event, author="different-actor"),))
+        )
+    with pytest.raises(ValueError, match="BY identity differs"):
+        review_evidence_digest(
+            replace(
+                snapshot,
+                events=(
+                    replace(event, body=body.replace("BY release-authority", "BY other")),
+                ),
+            )
+        )
+    with pytest.raises(ValueError, match="non-retirement"):
+        review_evidence_digest(
+            replace(
+                snapshot,
+                events=(replace(event, body="ordinary comment"),),
+            )
+        )
 
 
 def test_review_pass_labels_without_receipts_are_unbound_and_bad_receipts_refuse() -> None:

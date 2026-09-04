@@ -1,10 +1,15 @@
 //! Caller-owned landing context bound to exact fetched head and base identities.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::OnceLock;
 
+use regex::Regex;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
-use crate::model::{CiState, PolicyClass, PrNode, ValidationAuthority, ValidationEvidence};
+use crate::model::{
+    CiState, PolicyClass, PrNode, ReviewEvidenceSnapshot, ValidationAuthority, ValidationEvidence,
+};
 
 /// Label prefix carrying an assigned-agent identifier.
 pub const AGENT_PREFIX: &str = "agent:";
@@ -12,6 +17,175 @@ pub const AGENT_PREFIX: &str = "agent:";
 pub const POLICY_PREFIX: &str = "landing-policy:";
 /// Review lanes required by the adversarial-review protocol.
 pub const REQUIRED_REVIEW_LANES: [&str; 2] = ["codex", "claude"];
+/// Repository permission levels that may authoritatively retire an objection.
+pub const ALLOWED_RETIREMENT_PERMISSIONS: [&str; 4] = ["triage", "write", "maintain", "admin"];
+
+fn regex<'a>(slot: &'a OnceLock<Regex>, pattern: &str) -> &'a Regex {
+    slot.get_or_init(|| Regex::new(pattern).expect("static review-evidence regex is valid"))
+}
+
+fn prose_lines(body: &str) -> Vec<&str> {
+    static FENCE: OnceLock<Regex> = OnceLock::new();
+    let fence_re = regex(&FENCE, r"^ {0,3}(?P<f>`{3,}|~{3,})\s*(?P<info>.*)$");
+    let mut lines = Vec::new();
+    let mut fence = String::new();
+    let mut indented = false;
+    let mut previous_blank = true;
+    for raw in body.split('\n') {
+        let blank = raw.trim().is_empty();
+        if !fence.is_empty() {
+            if let Some(captures) = fence_re.captures(raw) {
+                let token = captures.name("f").map(|value| value.as_str()).unwrap_or("");
+                let info = captures
+                    .name("info")
+                    .map(|value| value.as_str())
+                    .unwrap_or("");
+                if token.starts_with(&fence[..1])
+                    && token.len() >= fence.len()
+                    && info.trim().is_empty()
+                {
+                    fence.clear();
+                }
+            }
+            previous_blank = blank;
+            continue;
+        }
+        if let Some(captures) = fence_re.captures(raw) {
+            fence = captures
+                .name("f")
+                .map(|value| value.as_str())
+                .unwrap_or("")
+                .to_owned();
+            indented = false;
+            previous_blank = false;
+            continue;
+        }
+        if indented {
+            if blank {
+                previous_blank = true;
+                continue;
+            }
+            if raw.starts_with("    ") || raw.starts_with('\t') {
+                continue;
+            }
+            indented = false;
+        } else if previous_blank && (raw.starts_with("    ") || raw.starts_with('\t')) && !blank {
+            indented = true;
+            previous_blank = false;
+            continue;
+        }
+        lines.push(raw);
+        previous_blank = blank;
+    }
+    lines
+}
+
+fn undecorate(line: &str) -> String {
+    static BLOCK_PREFIX: OnceLock<Regex> = OnceLock::new();
+    let mut normalized = regex(&BLOCK_PREFIX, r"^(?:#{1,6}\s+|[-+*]\s+)")
+        .replace(line.trim(), "")
+        .trim()
+        .to_owned();
+    loop {
+        let mut changed = false;
+        for wrapper in ["`", "**", "__", "*", "_"] {
+            if normalized.starts_with(wrapper)
+                && normalized.ends_with(wrapper)
+                && normalized.len() > 2 * wrapper.len()
+            {
+                normalized = normalized[wrapper.len()..normalized.len() - wrapper.len()]
+                    .trim()
+                    .to_owned();
+                changed = true;
+                break;
+            }
+        }
+        if !changed {
+            return normalized;
+        }
+    }
+}
+
+fn disclosure_actor(body: &str) -> Option<String> {
+    static TEAM: OnceLock<Regex> = OnceLock::new();
+    static ACTOR: OnceLock<Regex> = OnceLock::new();
+    static ROLE: OnceLock<Regex> = OnceLock::new();
+    let team = regex(&TEAM, r"(?i)^[a-z0-9]+$");
+    let actor = regex(&ACTOR, r"(?i)^[a-z0-9][a-z0-9-]*$");
+    let role = regex(&ROLE, r"(?i)^role=[a-z0-9][a-z0-9_-]*$");
+    for raw in body.lines() {
+        if raw.trim().is_empty() {
+            continue;
+        }
+        if raw.starts_with("    ") || raw.starts_with('\t') {
+            return None;
+        }
+        let mut rest = raw.trim_start();
+        if rest.starts_with('>') {
+            return None;
+        }
+        while let Some(group) = rest.strip_prefix('[') {
+            let end = group.find(']')?;
+            let fields = group[..end].split(',').map(str::trim).collect::<Vec<_>>();
+            if fields.len() >= 3 && team.is_match(fields[0]) && actor.is_match(fields[1]) {
+                if fields.len() != 5 || fields.iter().any(|field| field.is_empty()) {
+                    return None;
+                }
+                if !role.is_match(fields[4]) {
+                    return None;
+                }
+                return Some(fields[1].to_ascii_lowercase());
+            }
+            rest = group[end + 1..].trim_start_matches([' ', '\t']);
+        }
+        return None;
+    }
+    None
+}
+
+/// Actor asserted by one exact objection retirement; malformed authority refuses.
+pub(crate) fn retirement_actor(body: &str) -> Result<Option<String>, String> {
+    static TARGET: OnceLock<Regex> = OnceLock::new();
+    static WITHDRAWAL: OnceLock<Regex> = OnceLock::new();
+    let target = regex(&TARGET, r"(?i)^\s*RETIRES\s+#?(\d{6,})\s*$");
+    let withdrawal = regex(
+        &WITHDRAWAL,
+        r"(?i)^CHANGES-REQUESTED-WITHDRAWN-AT:\s*(?:claude|codex)\s+[0-9a-f]{40}(?:\s+BY\s+(?P<actor>[a-z0-9][a-z0-9-]*))?$",
+    );
+    let lines = prose_lines(body);
+    let targets = lines.iter().filter(|line| target.is_match(line)).count();
+    if targets == 0 {
+        return Ok(None);
+    }
+    if targets != 1 {
+        return Err("review evidence retirement must name exactly one target".to_owned());
+    }
+    let mut withdrawals = Vec::new();
+    for line in &lines {
+        let normalized = undecorate(line);
+        if let Some(captures) = withdrawal.captures(&normalized) {
+            withdrawals.push(
+                captures
+                    .name("actor")
+                    .map(|value| value.as_str().to_owned()),
+            );
+        }
+    }
+    if withdrawals.len() != 1 {
+        return Err("review evidence retirement needs one canonical withdrawal".to_owned());
+    }
+    let actor = disclosure_actor(body).ok_or_else(|| {
+        "review evidence retirement lacks an exact five-field disclosure".to_owned()
+    })?;
+    if let Some(marker_actor) = &withdrawals[0] {
+        if !marker_actor.eq_ignore_ascii_case(&actor) {
+            return Err(
+                "review evidence retirement BY identity differs from disclosure".to_owned(),
+            );
+        }
+    }
+    Ok(Some(actor))
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// Caller-owned facts for one PR, optionally guarded by fetched commit identities.
@@ -30,6 +204,10 @@ pub struct LandingContext {
     pub validation_authority: Option<ValidationAuthority>,
     /// Caller-verified review lane to exact reviewed-head SHA receipts.
     pub review_pass_heads: BTreeMap<String, String>,
+    /// Whether the consuming repository's authority found every objection resolved.
+    pub review_objections_resolved: bool,
+    /// Digest of the exact review/comment snapshot used by that authority decision.
+    pub review_evidence_digest: String,
     /// Optional policy classification override.
     pub policy_class: Option<PolicyClass>,
 }
@@ -39,6 +217,125 @@ fn is_exact_sha(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_exact_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Digest one complete exact-head review/comment event set canonically.
+pub fn review_evidence_digest(snapshot: &ReviewEvidenceSnapshot) -> Result<String, String> {
+    if !is_exact_sha(&snapshot.head_sha) {
+        return Err("review evidence snapshot head must be an exact lowercase SHA".to_owned());
+    }
+    if !matches!(
+        snapshot.review_decision.as_str(),
+        "" | "APPROVED" | "CHANGES_REQUESTED" | "REVIEW_REQUIRED"
+    ) {
+        return Err("review evidence snapshot has an unknown aggregate decision".to_owned());
+    }
+    let mut events = snapshot.events.clone();
+    events.sort();
+    let mut seen = BTreeSet::new();
+    for event in &events {
+        if event.kind.is_empty() || event.identity.is_empty() {
+            return Err("review evidence event lacks a stable kind or identity".to_owned());
+        }
+        if !matches!(
+            event.kind.as_str(),
+            "review" | "issue-comment" | "review-comment"
+        ) {
+            return Err(format!(
+                "review evidence event has unknown kind {:?}",
+                event.kind
+            ));
+        }
+        if event.author.is_empty() {
+            return Err("review evidence event lacks a stable author identity".to_owned());
+        }
+        let actor = retirement_actor(&event.body)?;
+        if let Some(actor) = actor {
+            if !event.author.eq_ignore_ascii_case(&actor) {
+                return Err(
+                    "review evidence retirement actor differs from GitHub event author".to_owned(),
+                );
+            }
+            if !ALLOWED_RETIREMENT_PERMISSIONS.contains(&event.retirement_actor_permission.as_str())
+            {
+                return Err(
+                    "review evidence retirement lacks current triage-or-higher permission"
+                        .to_owned(),
+                );
+            }
+        } else if !event.retirement_actor_permission.is_empty() {
+            return Err("non-retirement review evidence carries repository permission".to_owned());
+        }
+        if event.state.is_empty() {
+            return Err("review evidence event lacks a state".to_owned());
+        }
+        if event.kind == "review" && !is_exact_sha(&event.head_sha) {
+            return Err("native review evidence requires an exact lowercase head SHA".to_owned());
+        }
+        if !event.head_sha.is_empty() && !is_exact_sha(&event.head_sha) {
+            return Err(
+                "review evidence event head must be empty or an exact lowercase SHA".to_owned(),
+            );
+        }
+        if event.created_at.is_empty() || event.updated_at.is_empty() {
+            return Err("review evidence event lacks a creation or version timestamp".to_owned());
+        }
+        if !seen.insert((event.kind.clone(), event.identity.clone())) {
+            return Err(format!(
+                "review evidence contains duplicate stable identity {}:{}",
+                event.kind, event.identity
+            ));
+        }
+    }
+    let has_changes_requested = events
+        .iter()
+        .any(|event| event.kind == "review" && event.state == "CHANGES_REQUESTED");
+    if snapshot.review_decision.is_empty() && has_changes_requested {
+        return Err(
+            "review evidence has a changes-requested review but no aggregate decision".to_owned(),
+        );
+    }
+    if snapshot.review_decision == "CHANGES_REQUESTED" && !has_changes_requested {
+        return Err(
+            "review evidence has a changes-requested aggregate but no matching review".to_owned(),
+        );
+    }
+
+    fn feed(digest: &mut Sha256, value: &str) {
+        let bytes = value.as_bytes();
+        digest.update((bytes.len() as u64).to_be_bytes());
+        digest.update(bytes);
+    }
+
+    let mut digest = Sha256::new();
+    digest.update(b"pr-landing-planner-review-evidence-v2");
+    feed(&mut digest, &snapshot.head_sha);
+    feed(&mut digest, &snapshot.review_decision);
+    digest.update((events.len() as u64).to_be_bytes());
+    for event in &events {
+        for value in [
+            &event.kind,
+            &event.identity,
+            &event.author,
+            &event.state,
+            &event.head_sha,
+            &event.created_at,
+            &event.updated_at,
+            &event.last_edited_at,
+            &event.body,
+            &event.retirement_actor_permission,
+        ] {
+            feed(&mut digest, value);
+        }
+    }
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 /// Parse and validate a `{"prs": [...]}` landing-context document.
@@ -96,6 +393,31 @@ pub fn parse_landing_context(raw: &Value) -> Result<Vec<LandingContext>, String>
         };
         let head_sha = string("head_sha");
         let base_sha = string("base_sha");
+        let review_objections_resolved = match item.get("review_objections_resolved") {
+            None => false,
+            Some(Value::Bool(value)) => *value,
+            Some(_) => {
+                return Err(format!(
+                    "PR #{pr} review_objections_resolved must be a boolean"
+                ))
+            }
+        };
+        let review_digest = string("review_evidence_digest");
+        if review_objections_resolved && !is_exact_sha(&head_sha) {
+            return Err(format!(
+                "PR #{pr} review_objections_resolved requires exact 'head_sha'"
+            ));
+        }
+        if review_objections_resolved && !is_exact_sha256(&review_digest) {
+            return Err(format!(
+                "PR #{pr} review_objections_resolved requires an exact lowercase 'review_evidence_digest'; run an uncontexted exact-head plan, have the review authority assess that snapshot, and copy nodes[].review_evidence_digest into the generated context"
+            ));
+        }
+        if !review_objections_resolved && !review_digest.is_empty() {
+            return Err(format!(
+                "PR #{pr} review_evidence_digest requires review_objections_resolved=true"
+            ));
+        }
         if matches!(
             evidence,
             Some(ValidationEvidence::LocallyValidated | ValidationEvidence::CleanValidateRecord)
@@ -150,6 +472,8 @@ pub fn parse_landing_context(raw: &Value) -> Result<Vec<LandingContext>, String>
             validation_evidence: evidence,
             validation_authority: authority,
             review_pass_heads,
+            review_objections_resolved,
+            review_evidence_digest: review_digest,
             policy_class: policy,
         });
     }
@@ -236,6 +560,14 @@ pub fn apply_landing_context(
                     node.number, context.head_sha, node.head_sha
                 ));
             }
+            if context.review_objections_resolved
+                && node.review_evidence_digest != context.review_evidence_digest
+            {
+                return Err(format!(
+                    "PR #{} review objection resolution is stale: context digest {:?}, host digest {:?}; rerun an uncontexted exact-head plan, have the authority reassess that snapshot, and copy nodes[].review_evidence_digest into fresh context",
+                    node.number, context.review_evidence_digest, node.review_evidence_digest
+                ));
+            }
             if !context.base_sha.is_empty()
                 && context.base_sha != node.base_sha
                 && context.validation_authority != Some(ValidationAuthority::SoftGreen)
@@ -256,6 +588,7 @@ pub fn apply_landing_context(
             }
             node.review_pass_heads
                 .clone_from(&context.review_pass_heads);
+            node.review_objections_resolved = context.review_objections_resolved;
             if let Some(policy) = context.policy_class {
                 node.policy_class = policy;
             }
@@ -268,7 +601,7 @@ pub fn apply_landing_context(
 mod tests {
     use super::*;
     use crate::graph::{held_reasons, review_binding};
-    use crate::model::{PrAction, ReviewBinding};
+    use crate::model::{PrAction, ReviewBinding, ReviewEvidenceEvent, ReviewEvidenceSnapshot};
     use crate::plan::compute_plan;
     use serde_json::json;
 
@@ -486,6 +819,307 @@ mod tests {
             .unwrap()
             .remove(0);
         assert_eq!(review_binding(&changed_node).0, ReviewBinding::Stale);
+    }
+
+    #[test]
+    fn review_objection_resolution_is_boolean_and_exact_head_bound() {
+        let invalid = json!({"prs":[{"pr":394,"review_objections_resolved":"yes"}]});
+        assert!(parse_landing_context(&invalid)
+            .unwrap_err()
+            .contains("must be a boolean"));
+        let missing_head = json!({"prs":[{"pr":394,"review_objections_resolved":true}]});
+        assert!(parse_landing_context(&missing_head)
+            .unwrap_err()
+            .contains("requires exact 'head_sha'"));
+        let missing_digest = json!({"prs":[{
+            "pr":394,
+            "head_sha":REBASED_HEAD,
+            "review_objections_resolved":true
+        }]});
+        assert!(parse_landing_context(&missing_digest)
+            .unwrap_err()
+            .contains("review_evidence_digest"));
+
+        let observed_at = "2026-09-04T12:00:00Z";
+        let snapshot = ReviewEvidenceSnapshot {
+            head_sha: REBASED_HEAD.into(),
+            review_decision: "CHANGES_REQUESTED".into(),
+            events: vec![
+                ReviewEvidenceEvent {
+                    kind: "review".into(),
+                    identity: "review-1".into(),
+                    author: "reviewer".into(),
+                    state: "CHANGES_REQUESTED".into(),
+                    head_sha: REBASED_HEAD.into(),
+                    created_at: observed_at.into(),
+                    updated_at: observed_at.into(),
+                    last_edited_at: String::new(),
+                    body: "please address the race".into(),
+                    retirement_actor_permission: String::new(),
+                },
+                ReviewEvidenceEvent {
+                    kind: "issue-comment".into(),
+                    identity: "comment-1".into(),
+                    author: "release-authority".into(),
+                    state: "ACTIVE".into(),
+                    head_sha: String::new(),
+                    created_at: observed_at.into(),
+                    updated_at: observed_at.into(),
+                    last_edited_at: String::new(),
+                    body: "resolved by the latest patch".into(),
+                    retirement_actor_permission: String::new(),
+                },
+                ReviewEvidenceEvent {
+                    kind: "review-comment".into(),
+                    identity: "thread-1".into(),
+                    author: "reviewer".into(),
+                    state: "RESOLVED".into(),
+                    head_sha: String::new(),
+                    created_at: observed_at.into(),
+                    updated_at: observed_at.into(),
+                    last_edited_at: String::new(),
+                    body: "inline objection retired".into(),
+                    retirement_actor_permission: String::new(),
+                },
+            ],
+        };
+        let digest = review_evidence_digest(&snapshot).unwrap();
+
+        let context = parse_landing_context(&json!({"prs":[{
+            "pr":394,
+            "head_sha":REBASED_HEAD,
+            "review_objections_resolved":true,
+            "review_evidence_digest":digest.clone()
+        }]}))
+        .unwrap();
+        let mut raw = node(394, REBASED_HEAD, &[]);
+        raw.updated_at = observed_at.into();
+        raw.review_decision = "CHANGES_REQUESTED".into();
+        raw.review_evidence_digest = digest.clone();
+        let resolved = apply_landing_context(vec![raw], &context)
+            .unwrap()
+            .remove(0);
+        assert!(resolved.review_objections_resolved);
+        assert!(held_reasons(std::slice::from_ref(&resolved), &[]).is_empty());
+
+        let mut changed = resolved.clone();
+        changed.head_sha = CHANGED_HEAD.into();
+        assert!(apply_landing_context(vec![changed], &context)
+            .unwrap_err()
+            .contains("landing context is stale"));
+
+        let mut same_second_objection = snapshot.clone();
+        same_second_objection.events.push(ReviewEvidenceEvent {
+            kind: "review-comment".into(),
+            identity: "thread-2".into(),
+            author: "reviewer".into(),
+            state: "ACTIVE".into(),
+            head_sha: String::new(),
+            created_at: observed_at.into(),
+            updated_at: observed_at.into(),
+            last_edited_at: String::new(),
+            body: "new same-second objection".into(),
+            retirement_actor_permission: String::new(),
+        });
+        let mut changed_review = resolved;
+        changed_review.review_evidence_digest =
+            review_evidence_digest(&same_second_objection).unwrap();
+        let stale_error = apply_landing_context(vec![changed_review], &context).unwrap_err();
+        assert!(stale_error.contains("review objection resolution is stale"));
+        assert!(stale_error.contains("uncontexted exact-head plan"));
+        assert!(stale_error.contains("nodes[].review_evidence_digest"));
+
+        let digest_without_resolution = json!({"prs":[{
+            "pr":394,"review_evidence_digest":digest
+        }]});
+        assert!(parse_landing_context(&digest_without_resolution)
+            .unwrap_err()
+            .contains("requires review_objections_resolved=true"));
+
+        let mut missing_identity = snapshot.clone();
+        missing_identity.events[0].identity.clear();
+        assert!(review_evidence_digest(&missing_identity)
+            .unwrap_err()
+            .contains("stable kind or identity"));
+        let mut missing_author = snapshot.clone();
+        missing_author.events[0].author.clear();
+        assert!(review_evidence_digest(&missing_author)
+            .unwrap_err()
+            .contains("stable author identity"));
+        let mut missing_decision = snapshot.clone();
+        missing_decision.review_decision.clear();
+        assert!(review_evidence_digest(&missing_decision)
+            .unwrap_err()
+            .contains("no aggregate decision"));
+        let mut unknown_decision = snapshot.clone();
+        unknown_decision.review_decision = "UNKNOWN".into();
+        assert!(review_evidence_digest(&unknown_decision)
+            .unwrap_err()
+            .contains("unknown aggregate decision"));
+        let mut missing_changes_requested = snapshot.clone();
+        missing_changes_requested.events.remove(0);
+        assert!(review_evidence_digest(&missing_changes_requested)
+            .unwrap_err()
+            .contains("no matching review"));
+        let mut author_changed = snapshot.clone();
+        author_changed.events[0].author = "different-reviewer".into();
+        assert_ne!(review_evidence_digest(&author_changed).unwrap(), digest);
+        let mut duplicate = snapshot;
+        duplicate.events.push(duplicate.events[0].clone());
+        assert!(review_evidence_digest(&duplicate)
+            .unwrap_err()
+            .contains("duplicate stable identity"));
+    }
+
+    #[test]
+    fn review_digest_covers_every_normalized_authority_field() {
+        let event = ReviewEvidenceEvent {
+            kind: "review".into(),
+            identity: "review-1".into(),
+            author: "reviewer".into(),
+            state: "APPROVED".into(),
+            head_sha: REBASED_HEAD.into(),
+            created_at: "2026-09-04T11:59:00Z".into(),
+            updated_at: "2026-09-04T12:00:00Z".into(),
+            last_edited_at: String::new(),
+            body: "looks good".into(),
+            retirement_actor_permission: String::new(),
+        };
+        // Deliberately exhaustive: adding another normalized authority input must update
+        // this audit instead of silently escaping the digest contract.
+        let ReviewEvidenceEvent {
+            kind: _,
+            identity: _,
+            author: _,
+            state: _,
+            head_sha: _,
+            created_at: _,
+            updated_at: _,
+            last_edited_at: _,
+            body: _,
+            retirement_actor_permission: _,
+        } = event.clone();
+        let snapshot = ReviewEvidenceSnapshot {
+            head_sha: REBASED_HEAD.into(),
+            review_decision: "APPROVED".into(),
+            events: vec![event.clone()],
+        };
+        let ReviewEvidenceSnapshot {
+            head_sha: _,
+            review_decision: _,
+            events: _,
+        } = snapshot.clone();
+        let digest = review_evidence_digest(&snapshot).unwrap();
+        let mutations = [
+            ReviewEvidenceEvent {
+                kind: "issue-comment".into(),
+                ..event.clone()
+            },
+            ReviewEvidenceEvent {
+                identity: "review-2".into(),
+                ..event.clone()
+            },
+            ReviewEvidenceEvent {
+                author: "different-reviewer".into(),
+                ..event.clone()
+            },
+            ReviewEvidenceEvent {
+                state: "DISMISSED".into(),
+                ..event.clone()
+            },
+            ReviewEvidenceEvent {
+                head_sha: CHANGED_HEAD.into(),
+                ..event.clone()
+            },
+            ReviewEvidenceEvent {
+                created_at: "2026-09-04T11:58:00Z".into(),
+                ..event.clone()
+            },
+            ReviewEvidenceEvent {
+                updated_at: "2026-09-04T12:00:01Z".into(),
+                ..event.clone()
+            },
+            ReviewEvidenceEvent {
+                last_edited_at: "2026-09-04T12:00:01Z".into(),
+                ..event.clone()
+            },
+            ReviewEvidenceEvent {
+                body: "new objection".into(),
+                ..event
+            },
+        ];
+        for mutation in mutations {
+            let mut changed = snapshot.clone();
+            changed.events = vec![mutation];
+            assert_ne!(review_evidence_digest(&changed).unwrap(), digest);
+        }
+        let mut changed_head = snapshot.clone();
+        changed_head.head_sha = CHANGED_HEAD.into();
+        assert_ne!(review_evidence_digest(&changed_head).unwrap(), digest);
+        let mut changed_decision = snapshot;
+        changed_decision.review_decision = "REVIEW_REQUIRED".into();
+        assert_ne!(review_evidence_digest(&changed_decision).unwrap(), digest);
+    }
+
+    #[test]
+    fn retirement_permission_is_actor_bound_and_changes_the_digest() {
+        let body = format!(
+            "[team, release-authority, session, model, role=observer]\n\
+             CHANGES-REQUESTED-WITHDRAWN-AT: codex {REBASED_HEAD} BY release-authority\n\
+             RETIRES 123456"
+        );
+        let event = ReviewEvidenceEvent {
+            kind: "issue-comment".into(),
+            identity: "comment-1".into(),
+            author: "release-authority".into(),
+            state: "ACTIVE".into(),
+            head_sha: String::new(),
+            created_at: "2026-09-04T12:00:00Z".into(),
+            updated_at: "2026-09-04T12:00:01Z".into(),
+            last_edited_at: String::new(),
+            body: body.clone(),
+            retirement_actor_permission: "write".into(),
+        };
+        let snapshot = ReviewEvidenceSnapshot {
+            head_sha: REBASED_HEAD.into(),
+            review_decision: "APPROVED".into(),
+            events: vec![event.clone()],
+        };
+        assert_eq!(
+            retirement_actor(&body).unwrap().as_deref(),
+            Some("release-authority")
+        );
+        let write_digest = review_evidence_digest(&snapshot).unwrap();
+        assert_eq!(
+            write_digest,
+            "6cbf2b5d6132e3d81390cb4b1ab1702f6092ad82b1d36e36a010e28b7a2219cb"
+        );
+        let mut maintain = snapshot.clone();
+        maintain.events[0].retirement_actor_permission = "maintain".into();
+        assert_ne!(review_evidence_digest(&maintain).unwrap(), write_digest);
+
+        for permission in ["", "read"] {
+            let mut invalid = snapshot.clone();
+            invalid.events[0].retirement_actor_permission = permission.into();
+            assert!(review_evidence_digest(&invalid)
+                .unwrap_err()
+                .contains("triage-or-higher"));
+        }
+        let mut mismatched_actor = snapshot.clone();
+        mismatched_actor.events[0].author = "different-actor".into();
+        assert!(review_evidence_digest(&mismatched_actor)
+            .unwrap_err()
+            .contains("differs from GitHub event author"));
+        let mut mismatched_by = snapshot.clone();
+        mismatched_by.events[0].body = body.replace("BY release-authority", "BY other");
+        assert!(review_evidence_digest(&mismatched_by)
+            .unwrap_err()
+            .contains("BY identity differs"));
+        let mut not_retirement = snapshot;
+        not_retirement.events[0].body = "ordinary comment".into();
+        assert!(review_evidence_digest(&not_retirement)
+            .unwrap_err()
+            .contains("non-retirement"));
     }
 
     #[test]

@@ -101,6 +101,95 @@ def test_content_identity_guard_aborts_on_drift() -> None:
         collect_graph(host, repo="R", base="integration")
 
 
+def test_review_snapshot_head_must_match_the_exact_fetched_head() -> None:
+    head = "a" * 40
+    fixture: dict[str, object] = {
+        "repo": "R",
+        "base": "integration",
+        "prs": [
+            {
+                "number": 1,
+                "head_ref": "a",
+                "head_sha": head,
+                "api_head_sha": head,
+                "fetched_head_sha": head,
+                "review_snapshot_head_sha": "b" * 40,
+                "review_events": [],
+            }
+        ],
+    }
+    host, _, _ = FakeHost.from_fixture(fixture)
+    with pytest.raises(CollectionError, match="review evidence changed during collection"):
+        collect_graph(host, repo="R", base="integration")
+
+
+@pytest.mark.parametrize("snapshot_decision", [None, "", "APPROVED"])
+def test_review_snapshot_cannot_erase_or_contradict_changes_requested(
+    snapshot_decision: object,
+) -> None:
+    head = "a" * 40
+    fixture: dict[str, object] = {
+        "repo": "R",
+        "base": "integration",
+        "prs": [
+            {
+                "number": 1,
+                "head_sha": head,
+                "review_decision": "CHANGES_REQUESTED",
+                "review_snapshot_review_decision": snapshot_decision,
+                "review_events": [
+                    {
+                        "kind": "review",
+                        "identity": "review-1",
+                        "author": "reviewer",
+                        "state": "CHANGES_REQUESTED",
+                        "head_sha": head,
+                        "created_at": "2026-09-04T12:00:00Z",
+                        "updated_at": "2026-09-04T12:00:00Z",
+                        "last_edited_at": "",
+                        "body": "please fix",
+                    }
+                ],
+            }
+        ],
+    }
+    host, _, _ = FakeHost.from_fixture(fixture)
+    with pytest.raises(CollectionError, match="aggregate review decision changed"):
+        collect_graph(host, repo="R", base="integration")
+
+
+def test_matching_review_decisions_are_accepted() -> None:
+    head = "a" * 40
+    fixture: dict[str, object] = {
+        "repo": "R",
+        "base": "integration",
+        "prs": [
+            {
+                "number": 1,
+                "head_sha": head,
+                "review_decision": "CHANGES_REQUESTED",
+                "review_snapshot_review_decision": "CHANGES_REQUESTED",
+                "review_events": [
+                    {
+                        "kind": "review",
+                        "identity": "review-1",
+                        "author": "reviewer",
+                        "state": "CHANGES_REQUESTED",
+                        "head_sha": head,
+                        "created_at": "2026-09-04T12:00:00Z",
+                        "updated_at": "2026-09-04T12:00:00Z",
+                        "last_edited_at": "",
+                        "body": "please fix",
+                    }
+                ],
+            }
+        ],
+    }
+    host, _, _ = FakeHost.from_fixture(fixture)
+    graph = collect_graph(host, repo="R", base="integration")
+    assert graph.nodes[0].review_decision == "CHANGES_REQUESTED"
+
+
 def test_only_numbers_restricts_selection() -> None:
     graph = collect_graph(
         _host(), repo="OWNER/NAME", base="integration", only=frozenset({1, 3})

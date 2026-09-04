@@ -8,6 +8,14 @@ pub const DEFAULT_REPO: &str = "";
 pub const DEFAULT_BASE: &str = "main";
 /// Default required landing-gate check name.
 pub const DEFAULT_GATE_CHECK: &str = "merge-gate";
+/// Complete native GitHub pull-request review state vocabulary accepted as evidence.
+pub const NATIVE_REVIEW_STATES: [&str; 5] = [
+    "APPROVED",
+    "CHANGES_REQUESTED",
+    "COMMENTED",
+    "DISMISSED",
+    "PENDING",
+];
 
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 /// Three-state interpretation of CI check results.
@@ -259,6 +267,43 @@ pub struct CheckRun {
     pub duration_secs: Option<i64>,
 }
 
+#[derive(Clone, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+/// One stable repository-host event that can change objection authority.
+pub struct ReviewEvidenceEvent {
+    /// Event class, such as `review`, `issue-comment`, or `review-comment`.
+    pub kind: String,
+    /// Stable repository-host identity within that event class.
+    pub identity: String,
+    /// Stable repository-host login of the event author.
+    pub author: String,
+    /// Current event state, including dismissal or retirement state when surfaced.
+    pub state: String,
+    /// Exact event head when the source supplies one; otherwise canonical empty.
+    pub head_sha: String,
+    /// Immutable creation/submission timestamp supplied by the host.
+    pub created_at: String,
+    /// Current object-version timestamp supplied by the host.
+    pub updated_at: String,
+    /// Native review body-edit timestamp; canonical empty for unedited/non-review events.
+    pub last_edited_at: String,
+    /// Event text; included because edits can create or remove an objection.
+    pub body: String,
+    /// Current repository permission for an exact retirement's immutable GitHub actor.
+    /// Empty for every event that is not an exact retirement.
+    pub retirement_actor_permission: String,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+/// Exact review/comment evidence observed together at one PR head.
+pub struct ReviewEvidenceSnapshot {
+    /// PR head observed with this event set.
+    pub head_sha: String,
+    /// Aggregate repository-host review decision observed with the event set.
+    pub review_decision: String,
+    /// Every surfaced event that can affect objection authority.
+    pub events: Vec<ReviewEvidenceEvent>,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 /// Pull-request metadata returned by a repository host before local collection.
 pub struct RawPr {
@@ -292,6 +337,8 @@ pub struct RawPr {
     pub labels: Vec<String>,
     /// Selected check attempts.
     pub checks: Vec<CheckRun>,
+    /// Exact-head review/comment snapshot, absent when host enrichment failed.
+    pub review_snapshot: Option<ReviewEvidenceSnapshot>,
     /// Mechanism candidates derived by the host adapter.
     pub mechanism_symbols: Vec<String>,
 }
@@ -351,6 +398,8 @@ pub struct PrNode {
     pub review_decision: String,
     /// Creation timestamp used as a tie-breaker.
     pub created_at: String,
+    /// Last-update timestamp observed from the repository host.
+    pub updated_at: String,
     /// Added line count.
     pub additions: i64,
     /// Deleted line count.
@@ -377,6 +426,11 @@ pub struct PrNode {
     pub validation_authority: ValidationAuthority,
     /// Caller-verified review lane to exact reviewed-head SHA receipts.
     pub review_pass_heads: BTreeMap<String, String>,
+    /// Digest of the exact review/comment event snapshot collected at the head.
+    pub review_evidence_digest: String,
+    /// Caller authority, bound to the exact head and review-evidence digest,
+    /// that every recorded review objection has an exact resolution record.
+    pub review_objections_resolved: bool,
     /// Landing-policy classification.
     pub policy_class: PolicyClass,
 }

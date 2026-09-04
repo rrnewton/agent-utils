@@ -274,7 +274,11 @@ pub fn held_reasons(nodes: &[PrNode], ordering_edges: &[OrderingEdge]) -> Vec<He
         let review = node.review_decision.trim().to_ascii_uppercase();
         match review.as_str() {
             "REVIEW_REQUIRED" => why.push("review-required".to_owned()),
-            "CHANGES_REQUESTED" => why.push("changes-requested".to_owned()),
+            "CHANGES_REQUESTED" => {
+                if !node.review_objections_resolved {
+                    why.push("changes-requested".to_owned());
+                }
+            }
             "" | "APPROVED" => {}
             _ => why.push(format!("review-decision-unknown:{review}")),
         }
@@ -647,6 +651,26 @@ mod tests {
         assert!(held[&4].contains(&"ordering-cycle".to_owned()));
         assert!(held[&5].contains(&"ordering-cycle".to_owned()));
         assert_eq!(held[&6], vec!["depends-on-held:#5"]);
+    }
+
+    #[test]
+    fn exact_head_objection_resolution_only_clears_changes_requested() {
+        let mut resolved = node(1, 0);
+        resolved.review_decision = "CHANGES_REQUESTED".into();
+        resolved.review_objections_resolved = true;
+        let mut unresolved = node(2, 0);
+        unresolved.review_decision = "CHANGES_REQUESTED".into();
+        let mut review_required = node(3, 0);
+        review_required.review_decision = "REVIEW_REQUIRED".into();
+        review_required.review_objections_resolved = true;
+
+        let held: BTreeMap<_, _> = held_reasons(&[resolved, unresolved, review_required], &[])
+            .into_iter()
+            .map(|held| (held.pr, held.reasons))
+            .collect();
+        assert!(!held.contains_key(&1));
+        assert_eq!(held[&2], vec!["changes-requested"]);
+        assert_eq!(held[&3], vec!["review-required"]);
     }
 
     #[test]

@@ -9,6 +9,8 @@ package.
 
 from __future__ import annotations
 
+import hashlib
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 
@@ -16,6 +18,7 @@ from pr_landing_planner.model import (
     CiState,
     PolicyClass,
     PrNode,
+    ReviewEvidenceSnapshot,
     ValidationAuthority,
     ValidationEvidence,
 )
@@ -23,6 +26,19 @@ from pr_landing_planner.model import (
 AGENT_PREFIX = "agent:"
 POLICY_PREFIX = "landing-policy:"
 REQUIRED_REVIEW_LANES = ("codex", "claude")
+ALLOWED_RETIREMENT_PERMISSIONS = frozenset(("triage", "write", "maintain", "admin"))
+
+_AGENT_ID = re.compile(r"[a-z0-9][a-z0-9-]*\Z", re.IGNORECASE)
+_BRACKET_GROUP = re.compile(r"\[([^\]\n]*)\]")
+_RETIREMENT_TARGET = re.compile(r"^\s*RETIRES\s+#?(\d{6,})\s*$", re.IGNORECASE)
+_WITHDRAWAL = re.compile(
+    r"^CHANGES-REQUESTED-WITHDRAWN-AT:\s*(?:claude|codex)\s+[0-9a-f]{40}"
+    r"(?:\s+BY\s+(?P<actor>[a-z0-9][a-z0-9-]*))?$",
+    re.IGNORECASE,
+)
+_BLOCK_PREFIX = re.compile(r"^(?:#{1,6}\s+|[-+*]\s+)")
+_FENCE = re.compile(r"^ {0,3}(?P<f>`{3,}|~{3,})\s*(?P<info>.*)$")
+_ROLE_FIELD = re.compile(r"role=[a-z0-9][a-z0-9_-]*\Z", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -36,6 +52,8 @@ class LandingContext:
     validation_evidence: ValidationEvidence | None = None
     validation_authority: ValidationAuthority | None = None
     review_pass_heads: tuple[tuple[str, str], ...] = ()
+    review_objections_resolved: bool = False
+    review_evidence_digest: str = ""
     policy_class: PolicyClass | None = None
 
 
@@ -46,6 +64,233 @@ def _str_field(obj: Mapping[str, object], key: str) -> str:
 
 def _exact_sha(value: str) -> bool:
     return len(value) == 40 and all(char in "0123456789abcdef" for char in value)
+
+
+def _exact_sha256(value: str) -> bool:
+    return len(value) == 64 and all(char in "0123456789abcdef" for char in value)
+
+
+def _prose_lines(body: str) -> tuple[str, ...]:
+    """Return comment lines outside fenced and indented code blocks."""
+
+    lines: list[str] = []
+    fence = ""
+    indented = False
+    previous_blank = True
+    for raw in body.split("\n"):
+        blank = not raw.strip()
+        if fence:
+            match = _FENCE.match(raw)
+            if (
+                match is not None
+                and match.group("f")[0] == fence[0]
+                and len(match.group("f")) >= len(fence)
+                and not match.group("info").strip()
+            ):
+                fence = ""
+            previous_blank = blank
+            continue
+        match = _FENCE.match(raw)
+        if match is not None:
+            fence = match.group("f")
+            indented = False
+            previous_blank = False
+            continue
+        if indented:
+            if blank:
+                previous_blank = True
+                continue
+            if raw.startswith(("    ", "\t")):
+                continue
+            indented = False
+        elif previous_blank and raw.startswith(("    ", "\t")) and not blank:
+            indented = True
+            previous_blank = False
+            continue
+        lines.append(raw)
+        previous_blank = blank
+    return tuple(lines)
+
+
+def _undecorate(line: str) -> str:
+    normalized = _BLOCK_PREFIX.sub("", line.strip())
+    while True:
+        for wrapper in ("`", "**", "__", "*", "_"):
+            if (
+                normalized.startswith(wrapper)
+                and normalized.endswith(wrapper)
+                and len(normalized) > 2 * len(wrapper)
+            ):
+                normalized = normalized[len(wrapper) : -len(wrapper)].strip()
+                break
+        else:
+            return normalized
+
+
+def _disclosure_actor(body: str) -> str | None:
+    for raw in body.splitlines():
+        if not raw.strip():
+            continue
+        if raw.startswith(("    ", "\t")):
+            return None
+        line = raw.lstrip()
+        if line.startswith(">"):
+            return None
+        offset = 0
+        while True:
+            match = _BRACKET_GROUP.match(line, offset)
+            if match is None:
+                break
+            fields = [field.strip() for field in match.group(1).split(",")]
+            if (
+                len(fields) >= 3
+                and re.fullmatch(r"[a-z0-9]+", fields[0], re.IGNORECASE)
+                and _AGENT_ID.fullmatch(fields[1]) is not None
+            ):
+                if len(fields) != 5 or any(not field for field in fields):
+                    return None
+                if _ROLE_FIELD.fullmatch(fields[4]) is None:
+                    return None
+                return fields[1].lower()
+            offset = match.end()
+            while offset < len(line) and line[offset] in " \t":
+                offset += 1
+        return None
+    return None
+
+
+def retirement_actor(body: str) -> str | None:
+    """Return the asserted actor for one exact retirement, or refuse malformed authority."""
+
+    lines = _prose_lines(body)
+    targets = [match for line in lines if (match := _RETIREMENT_TARGET.match(line))]
+    if not targets:
+        return None
+    if len(targets) != 1:
+        raise ValueError("review evidence retirement must name exactly one target")
+    withdrawals = [
+        match for line in lines if (match := _WITHDRAWAL.match(_undecorate(line)))
+    ]
+    if len(withdrawals) != 1:
+        raise ValueError("review evidence retirement needs one canonical withdrawal")
+    actor = _disclosure_actor(body)
+    if actor is None:
+        raise ValueError(
+            "review evidence retirement lacks an exact five-field disclosure"
+        )
+    marker_actor = withdrawals[0].group("actor")
+    if marker_actor is not None and marker_actor.lower() != actor:
+        raise ValueError("review evidence retirement BY identity differs from disclosure")
+    return actor
+
+
+def review_evidence_digest(snapshot: ReviewEvidenceSnapshot) -> str:
+    """Digest one complete exact-head review/comment event set canonically."""
+
+    if not _exact_sha(snapshot.head_sha):
+        raise ValueError("review evidence snapshot head must be an exact lowercase SHA")
+    if snapshot.review_decision not in (
+        "",
+        "APPROVED",
+        "CHANGES_REQUESTED",
+        "REVIEW_REQUIRED",
+    ):
+        raise ValueError("review evidence snapshot has an unknown aggregate decision")
+    ordered = sorted(
+        snapshot.events,
+        key=lambda event: (
+            event.kind,
+            event.identity,
+            event.author,
+            event.state,
+            event.head_sha,
+            event.created_at,
+            event.updated_at,
+            event.last_edited_at,
+            event.body,
+            event.retirement_actor_permission,
+        ),
+    )
+    seen: set[tuple[str, str]] = set()
+    for event in ordered:
+        if not event.kind or not event.identity:
+            raise ValueError("review evidence event lacks a stable kind or identity")
+        if event.kind not in ("review", "issue-comment", "review-comment"):
+            raise ValueError(f"review evidence event has unknown kind {event.kind!r}")
+        if not event.author:
+            raise ValueError("review evidence event lacks a stable author identity")
+        actor = retirement_actor(event.body)
+        permission = event.retirement_actor_permission
+        if actor is None:
+            if permission:
+                raise ValueError(
+                    "non-retirement review evidence carries repository permission"
+                )
+        else:
+            if event.author.lower() != actor:
+                raise ValueError(
+                    "review evidence retirement actor differs from GitHub event author"
+                )
+            if permission not in ALLOWED_RETIREMENT_PERMISSIONS:
+                raise ValueError(
+                    "review evidence retirement lacks current triage-or-higher permission"
+                )
+        if not event.state:
+            raise ValueError("review evidence event lacks a state")
+        if event.kind == "review" and not _exact_sha(event.head_sha):
+            raise ValueError("native review evidence requires an exact lowercase head SHA")
+        if event.head_sha and not _exact_sha(event.head_sha):
+            raise ValueError(
+                "review evidence event head must be empty or an exact lowercase SHA"
+            )
+        if not event.created_at or not event.updated_at:
+            raise ValueError(
+                "review evidence event lacks a creation or version timestamp"
+            )
+        key = (event.kind, event.identity)
+        if key in seen:
+            raise ValueError(
+                f"review evidence contains duplicate stable identity {event.kind}:{event.identity}"
+            )
+        seen.add(key)
+    has_changes_requested = any(
+        event.kind == "review" and event.state == "CHANGES_REQUESTED"
+        for event in ordered
+    )
+    if not snapshot.review_decision and has_changes_requested:
+        raise ValueError(
+            "review evidence has a changes-requested review but no aggregate decision"
+        )
+    if snapshot.review_decision == "CHANGES_REQUESTED" and not has_changes_requested:
+        raise ValueError(
+            "review evidence has a changes-requested aggregate but no matching review"
+        )
+
+    digest = hashlib.sha256(b"pr-landing-planner-review-evidence-v2")
+
+    def feed(value: str) -> None:
+        encoded = value.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+
+    feed(snapshot.head_sha)
+    feed(snapshot.review_decision)
+    digest.update(len(ordered).to_bytes(8, "big"))
+    for event in ordered:
+        for value in (
+            event.kind,
+            event.identity,
+            event.author,
+            event.state,
+            event.head_sha,
+            event.created_at,
+            event.updated_at,
+            event.last_edited_at,
+            event.body,
+            event.retirement_actor_permission,
+        ):
+            feed(value)
+    return digest.hexdigest()
 
 
 def parse_landing_context(raw: object) -> tuple[LandingContext, ...]:
@@ -91,6 +336,28 @@ def parse_landing_context(raw: object) -> tuple[LandingContext, ...]:
 
         head_sha = _str_field(obj, "head_sha")
         base_sha = _str_field(obj, "base_sha")
+        review_objections_resolved = obj.get("review_objections_resolved", False)
+        review_digest = _str_field(obj, "review_evidence_digest")
+        if not isinstance(review_objections_resolved, bool):
+            raise ValueError(
+                f"PR #{pr} review_objections_resolved must be a boolean"
+            )
+        if review_objections_resolved and not _exact_sha(head_sha):
+            raise ValueError(
+                f"PR #{pr} review_objections_resolved requires exact 'head_sha'"
+            )
+        if review_objections_resolved and not _exact_sha256(review_digest):
+            raise ValueError(
+                f"PR #{pr} review_objections_resolved requires "
+                "an exact lowercase 'review_evidence_digest'; run an uncontexted "
+                "exact-head plan, have the review authority assess that snapshot, and "
+                "copy nodes[].review_evidence_digest into the generated context"
+            )
+        if review_digest and not review_objections_resolved:
+            raise ValueError(
+                f"PR #{pr} review_evidence_digest requires "
+                "review_objections_resolved=true"
+            )
         if evidence in (
             ValidationEvidence.LOCALLY_VALIDATED,
             ValidationEvidence.CLEAN_VALIDATE_RECORD,
@@ -138,6 +405,8 @@ def parse_landing_context(raw: object) -> tuple[LandingContext, ...]:
                 validation_evidence=evidence,
                 validation_authority=authority,
                 review_pass_heads=tuple(sorted(review_pass_heads)),
+                review_objections_resolved=review_objections_resolved,
+                review_evidence_digest=review_digest,
                 policy_class=policy,
             )
         )
@@ -206,6 +475,17 @@ def apply_landing_context(
                 f"context={context.head_sha}, current={node.head_sha}"
             )
         if (
+            context.review_objections_resolved
+            and node.review_evidence_digest != context.review_evidence_digest
+        ):
+            raise ValueError(
+                f"PR #{node.number} review objection resolution is stale: "
+                f"context digest {context.review_evidence_digest!r}, "
+                f"host digest {node.review_evidence_digest!r}; rerun an uncontexted "
+                "exact-head plan, have the authority reassess that snapshot, "
+                "and copy nodes[].review_evidence_digest into fresh context"
+            )
+        if (
             context.base_sha
             and context.base_sha != node.base_sha
             and context.validation_authority is not ValidationAuthority.SOFT_GREEN
@@ -230,6 +510,7 @@ def apply_landing_context(
                     else node.validation_authority
                 ),
                 review_pass_heads=context.review_pass_heads,
+                review_objections_resolved=context.review_objections_resolved,
                 policy_class=(
                     context.policy_class
                     if context.policy_class is not None

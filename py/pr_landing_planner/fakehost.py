@@ -19,7 +19,14 @@ if TYPE_CHECKING:
     # if an installation is damaged.
     import yaml
 
-from pr_landing_planner.model import CheckRun, RawPr, edge_key
+from pr_landing_planner.model import (
+    CheckRun,
+    NATIVE_REVIEW_STATES,
+    RawPr,
+    ReviewEvidenceEvent,
+    ReviewEvidenceSnapshot,
+    edge_key,
+)
 
 _I64_MIN = -(2**63)
 _I64_MAX = 2**63 - 1
@@ -50,6 +57,31 @@ def _opt_str(m: Mapping[str, object], key: str, default: str) -> str:
     if isinstance(val, (int, float)) and not isinstance(val, bool):
         return str(val)
     return val if isinstance(val, str) else default
+
+
+def _required_review_str(
+    m: Mapping[str, object], key: str, where: str, *, allow_empty: bool
+) -> str:
+    if key not in m or not isinstance(m[key], str):
+        raise FixtureError(f"{where}: field {key!r} must be a string")
+    value = m[key]
+    assert isinstance(value, str)
+    if not allow_empty and not value:
+        raise FixtureError(f"{where}: field {key!r} must be non-empty")
+    return value
+
+
+def _required_nullable_review_str(
+    m: Mapping[str, object], key: str, where: str
+) -> str:
+    if key not in m:
+        raise FixtureError(f"{where}: field {key!r} is required")
+    value = m[key]
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise FixtureError(f"{where}: field {key!r} must be a string or null")
+    return value
 
 
 def _req_int(
@@ -123,6 +155,88 @@ def _checks_from(value: object, where: str) -> tuple[CheckRun, ...]:
     return tuple(out)
 
 
+def _review_snapshot_from(
+    obj: Mapping[str, object], where: str, *, default_head: str, default_decision: str
+) -> ReviewEvidenceSnapshot | None:
+    value = obj.get("review_events")
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise FixtureError(f"{where}: 'review_events' must be a list")
+    events: list[ReviewEvidenceEvent] = []
+    for index, entry in enumerate(value):
+        event_where = f"{where}.review_events[{index}]"
+        event = _as_obj(entry, event_where)
+        kind = _required_review_str(event, "kind", event_where, allow_empty=False)
+        identity = _required_review_str(
+            event, "identity", event_where, allow_empty=False
+        )
+        author = _required_review_str(event, "author", event_where, allow_empty=False)
+        state = _required_review_str(event, "state", event_where, allow_empty=False)
+        if kind == "review" and state not in NATIVE_REVIEW_STATES:
+            raise FixtureError(f"{event_where}: review has unknown state {state!r}")
+        head_sha = _required_review_str(event, "head_sha", event_where, allow_empty=True)
+        if kind == "review" and not head_sha:
+            raise FixtureError(f"{event_where}: review requires non-empty head_sha")
+        created_at = _required_review_str(
+            event, "created_at", event_where, allow_empty=False
+        )
+        updated_at = _required_review_str(
+            event, "updated_at", event_where, allow_empty=False
+        )
+        last_edited_at = _required_nullable_review_str(
+            event, "last_edited_at", event_where
+        )
+        body = _required_review_str(event, "body", event_where, allow_empty=True)
+        retirement_actor_permission = (
+            _required_review_str(
+                event,
+                "retirement_actor_permission",
+                event_where,
+                allow_empty=True,
+            )
+            if "retirement_actor_permission" in event
+            else ""
+        )
+        events.append(
+            ReviewEvidenceEvent(
+                kind=kind,
+                identity=identity,
+                state=state,
+                head_sha=head_sha,
+                created_at=created_at,
+                updated_at=updated_at,
+                last_edited_at=last_edited_at,
+                body=body,
+                author=author,
+                retirement_actor_permission=retirement_actor_permission,
+            )
+        )
+    if "review_snapshot_head_sha" in obj:
+        snapshot_head = _required_review_str(
+            obj, "review_snapshot_head_sha", where, allow_empty=False
+        )
+    else:
+        snapshot_head = default_head
+    if "review_snapshot_review_decision" not in obj:
+        snapshot_decision = default_decision
+    else:
+        raw_decision = obj["review_snapshot_review_decision"]
+        if raw_decision is None:
+            snapshot_decision = ""
+        elif isinstance(raw_decision, str):
+            snapshot_decision = raw_decision
+        else:
+            raise FixtureError(
+                f"{where}: field 'review_snapshot_review_decision' must be a string or null"
+            )
+    return ReviewEvidenceSnapshot(
+        head_sha=snapshot_head,
+        review_decision=snapshot_decision,
+        events=tuple(events),
+    )
+
+
 # --------------------------------------------------------------------------- internal PR record
 @dataclass(frozen=True)
 class _FakePr:
@@ -151,6 +265,7 @@ def _fake_pr_from(value: object, where: str, *, default_base: str) -> _FakePr:
     ):
         if not value:
             raise FixtureError(f"{where}: field {field!r} must be a non-empty string")
+    review_decision = _opt_str(obj, "review_decision", "")
     raw = RawPr(
         number=number,
         head_ref=head_ref,
@@ -160,13 +275,19 @@ def _fake_pr_from(value: object, where: str, *, default_base: str) -> _FakePr:
         author=_opt_str(obj, "author", ""),
         is_draft=_opt_bool(obj, "is_draft", False),
         mergeable=_opt_str(obj, "mergeable", ""),
-        review_decision=_opt_str(obj, "review_decision", ""),
+        review_decision=review_decision,
         created_at=_opt_str(obj, "created_at", ""),
         updated_at=_opt_str(obj, "updated_at", ""),
         additions=_opt_int(obj, "additions", 0, where, nonnegative=True),
         deletions=_opt_int(obj, "deletions", 0, where, nonnegative=True),
         labels=_opt_str_list(obj, "labels"),
         checks=_checks_from(obj.get("checks"), where),
+        review_snapshot=_review_snapshot_from(
+            obj,
+            where,
+            default_head=head_sha,
+            default_decision=review_decision,
+        ),
         mechanism_symbols=_opt_str_list(obj, "mechanism_symbols"),
     )
     return _FakePr(

@@ -67,6 +67,7 @@ def _node_obj(node: PrNode, held: bool) -> dict[str, object]:
         "title": node.title,
         "author": node.author,
         "head": node.head_sha,
+        "updated_at": node.updated_at or None,
         "base_sha": node.base_sha,
         "base_ref": node.base_ref,
         "ci": node.ci.raw_state.value,
@@ -83,6 +84,8 @@ def _node_obj(node: PrNode, held: bool) -> dict[str, object]:
         "validation_authority": node.validation_authority.value,
         "policy_class": node.policy_class.value,
         "review_decision": node.review_decision or None,
+        "review_evidence_digest": node.review_evidence_digest or None,
+        "review_objections_resolved": node.review_objections_resolved,
         "review_binding": review_binding(node)[0].value,
         "review_pass_heads": dict(node.review_pass_heads),
     }

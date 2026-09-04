@@ -8,7 +8,10 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use crate::host::VcsHost;
-use crate::model::{edge_key, CheckRun, RawPr, DEFAULT_BASE};
+use crate::model::{
+    edge_key, CheckRun, RawPr, ReviewEvidenceEvent, ReviewEvidenceSnapshot, DEFAULT_BASE,
+    NATIVE_REVIEW_STATES,
+};
 
 #[derive(Clone, Debug)]
 struct FakePr {
@@ -134,6 +137,35 @@ fn opt_string(obj: &Map<String, Value>, key: &str, default: &str) -> String {
     }
 }
 
+fn required_review_string(
+    obj: &Map<String, Value>,
+    key: &str,
+    where_: &str,
+    allow_empty: bool,
+) -> Result<String, String> {
+    let value = obj
+        .get(key)
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{where_}: field {key:?} must be a string"))?;
+    if !allow_empty && value.is_empty() {
+        return Err(format!("{where_}: field {key:?} must be non-empty"));
+    }
+    Ok(value.to_owned())
+}
+
+fn required_nullable_review_string(
+    obj: &Map<String, Value>,
+    key: &str,
+    where_: &str,
+) -> Result<String, String> {
+    match obj.get(key) {
+        None => Err(format!("{where_}: field {key:?} is required")),
+        Some(Value::Null) => Ok(String::new()),
+        Some(Value::String(value)) => Ok(value.clone()),
+        Some(_) => Err(format!("{where_}: field {key:?} must be a string or null")),
+    }
+}
+
 fn required_integer(
     obj: &Map<String, Value>,
     key: &str,
@@ -221,6 +253,77 @@ fn checks(value: Option<&Value>, where_: &str) -> Result<Vec<CheckRun>, String> 
         .collect()
 }
 
+fn review_snapshot(
+    obj: &Map<String, Value>,
+    where_: &str,
+    default_head: &str,
+    default_decision: &str,
+) -> Result<Option<ReviewEvidenceSnapshot>, String> {
+    let Some(raw_events) = obj.get("review_events") else {
+        return Ok(None);
+    };
+    let entries = raw_events
+        .as_array()
+        .ok_or_else(|| format!("{where_}: 'review_events' must be a list"))?;
+    let mut events = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let role = format!("{where_}.review_events[{index}]");
+        let event = object(entry, &role)?;
+        let kind = required_review_string(&event, "kind", &role, false)?;
+        let identity = required_review_string(&event, "identity", &role, false)?;
+        let author = required_review_string(&event, "author", &role, false)?;
+        let state = required_review_string(&event, "state", &role, false)?;
+        if kind == "review" && !NATIVE_REVIEW_STATES.contains(&state.as_str()) {
+            return Err(format!("{role}: review has unknown state {state:?}"));
+        }
+        let head_sha = required_review_string(&event, "head_sha", &role, true)?;
+        if kind == "review" && head_sha.is_empty() {
+            return Err(format!("{role}: review requires non-empty head_sha"));
+        }
+        let created_at = required_review_string(&event, "created_at", &role, false)?;
+        let updated_at = required_review_string(&event, "updated_at", &role, false)?;
+        let last_edited_at = required_nullable_review_string(&event, "last_edited_at", &role)?;
+        let body = required_review_string(&event, "body", &role, true)?;
+        let retirement_actor_permission = if event.contains_key("retirement_actor_permission") {
+            required_review_string(&event, "retirement_actor_permission", &role, true)?
+        } else {
+            String::new()
+        };
+        events.push(ReviewEvidenceEvent {
+            kind,
+            identity,
+            author,
+            state,
+            head_sha,
+            created_at,
+            updated_at,
+            last_edited_at,
+            body,
+            retirement_actor_permission,
+        });
+    }
+    let head_sha = if obj.contains_key("review_snapshot_head_sha") {
+        required_review_string(obj, "review_snapshot_head_sha", where_, false)?
+    } else {
+        default_head.to_owned()
+    };
+    let review_decision = match obj.get("review_snapshot_review_decision") {
+        None => default_decision.to_owned(),
+        Some(Value::Null) => String::new(),
+        Some(Value::String(value)) => value.clone(),
+        Some(_) => {
+            return Err(format!(
+                "{where_}: field 'review_snapshot_review_decision' must be a string or null"
+            ))
+        }
+    };
+    Ok(Some(ReviewEvidenceSnapshot {
+        head_sha,
+        review_decision,
+        events,
+    }))
+}
+
 fn fake_pr(value: &Value, where_: &str, default_base: &str) -> Result<FakePr, String> {
     let obj = object(value, where_)?;
     let number = required_integer(&obj, "number", where_, true)?;
@@ -242,6 +345,7 @@ fn fake_pr(value: &Value, where_: &str, default_base: &str) -> Result<FakePr, St
             ));
         }
     }
+    let review_decision = opt_string(&obj, "review_decision", "");
     Ok(FakePr {
         raw: RawPr {
             number,
@@ -255,13 +359,14 @@ fn fake_pr(value: &Value, where_: &str, default_base: &str) -> Result<FakePr, St
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
             mergeable: opt_string(&obj, "mergeable", ""),
-            review_decision: opt_string(&obj, "review_decision", ""),
+            review_decision: review_decision.clone(),
             created_at: opt_string(&obj, "created_at", ""),
             updated_at: opt_string(&obj, "updated_at", ""),
             additions: opt_integer(&obj, "additions", 0, where_, true)?,
             deletions: opt_integer(&obj, "deletions", 0, where_, true)?,
             labels: strings(&obj, "labels"),
             checks: checks(obj.get("checks"), where_)?,
+            review_snapshot: review_snapshot(&obj, where_, &head_sha, &review_decision)?,
             mechanism_symbols: strings(&obj, "mechanism_symbols"),
         },
         fetched_head_sha,
