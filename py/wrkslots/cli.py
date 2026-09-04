@@ -4057,6 +4057,9 @@ class RegistryStorageFindings:
     #: ``slot_type:slot`` for an active row whose storage is missing or
     #: inconsistent, excluding the slot the command named -- that one raises.
     stale: tuple[str, ...] = ()
+    #: ``slot_type:slot`` for a Git-registered path inside the managed root with
+    #: no active row, excluding the slot the command named -- that one raises.
+    registrations: tuple[str, ...] = ()
 
 
 def _assert_registry_storage_consistent(
@@ -4144,6 +4147,28 @@ def _assert_registry_storage_consistent(
         for item in _registry_storage_inconsistencies(config, states)
         if item.kind == "git-registration-without-row"
     )
+    # ⚠️ THE SAME SCOPING THE `stale` LOOP ABOVE ALREADY APPLIES, AND IT WAS
+    # MISSING HERE. That earlier fix scoped one of this function's three checks
+    # and left two global, so the defect it describes survived in a second
+    # shape: a Git-registered path inside the managed root with no row refused
+    # every mutating command for every lane. Measured 2026-09-04 on devbig014,
+    # one such directory -- `lander-2-pr2799-final` -- refused `adopt`, `hold`
+    # and `finish` for FIVE unrelated agents, each of which read a message
+    # naming a slot it had never touched, investigated its own state, found
+    # nothing wrong, and correctly declined to repair another lane's worktree.
+    # Nobody saw it as one row refusing for everyone.
+    #
+    # A PARTIAL SCOPING IS THE HAZARD, not the presence of a check. Scoping one
+    # of three left the message still arriving, still naming a foreign slot, and
+    # still unactionable -- while the comment above read as though the class had
+    # been dealt with.
+    #
+    # NOTHING IS SWEPT AND NOTHING IS WEAKENED. A registration overlapping the
+    # slot the command NAMES still refuses, and still names that slot. A
+    # registration that cannot be attributed to any slot still refuses, because
+    # an unattributable finding cannot be proven unrelated. Everything else is
+    # collected and reported BY NAME by the caller.
+    retained_registrations: list[str] = []
     for finding in registration_findings:
         key = (
             f"{finding.slot_type}:{finding.slot}"
@@ -4160,6 +4185,13 @@ def _assert_registry_storage_consistent(
             allow_unregistered_migration_slots or is_allowed_target
         ):
             continue
+        if (
+            target_slot is not None
+            and finding.slot is not None
+            and finding.slot != target_slot
+        ):
+            retained_registrations.append(key or finding.detail)
+            continue
         raise StateError(finding.detail, remedy=finding.remedy)
     if allowed_unregistered_slot is not None:
         allowed_slot_type, allowed_slot = allowed_unregistered_slot
@@ -4168,8 +4200,17 @@ def _assert_registry_storage_consistent(
             for value in unexpected
             if value != f"{allowed_slot_type}:{allowed_slot}"
         ]
-    if unexpected and not allow_unregistered_migration_slots:
-        slot_type, slot = unexpected[0].split(":", 1)
+    # The third check, scoped for the same reason. A bare directory with no row
+    # is a real lifecycle defect, but only the one occupying the path THIS
+    # command names can affect it; the rest are returned and named by the
+    # caller. With no target slot every entry still refuses, as above.
+    blocking_unexpected = (
+        [value for value in unexpected if value.split(":", 1)[1] == target_slot]
+        if target_slot is not None
+        else list(unexpected)
+    )
+    if blocking_unexpected and not allow_unregistered_migration_slots:
+        slot_type, slot = blocking_unexpected[0].split(":", 1)
         if slot_type == "agent":
             remedy = (
                 "run 'wrkslots audit --format json', then "
@@ -4186,11 +4227,15 @@ def _assert_registry_storage_consistent(
             )
         raise StateError(
             "managed worktrees directory has a directory without an active row: "
-            f"{unexpected[0]}. state: REFUSED -- no registered slot or unregistered "
-            "directory was changed",
+            f"{blocking_unexpected[0]}. state: REFUSED -- no registered slot or "
+            "unregistered directory was changed",
             remedy=remedy,
         )
-    return RegistryStorageFindings(tuple(unexpected), tuple(sorted(stale)))
+    return RegistryStorageFindings(
+        tuple(unexpected),
+        tuple(sorted(stale)),
+        tuple(sorted(set(retained_registrations))),
+    )
 
 
 def _assert_command_registry_storage(
@@ -4233,12 +4278,37 @@ def _assert_command_registry_storage(
             "because a row is also what protects a slot holding an unread HANDOFF.md",
             file=sys.stderr,
         )
-    if unexpected and allow:
+    if unexpected:
+        # ⚠️ NOT GATED ON `allow` ANY MORE. It used to be, because without the
+        # flag this condition always raised, so the warning was unreachable.
+        # Now that a directory belonging to another slot is retained instead of
+        # refusing, gating the warning would make the scoping SILENT -- which is
+        # worse than the refusal it replaces.
+        shown = ", ".join(sorted(unexpected)[:12])
+        more = f" (+{len(unexpected) - 12} more)" if len(unexpected) > 12 else ""
         print(
             f"WARNING: {len(unexpected)} existing unregistered worktree directories "
             "remain outside wrkslots records. state: RETAINED -- this command will not "
-            "inspect, select, or remove them. remedy: run 'wrkslots audit --format json' "
-            "and import each live slot from verified process evidence",
+            f"inspect, select, or remove them: {shown}{more}. remedy: run "
+            "'wrkslots audit --format json' and import each live slot from verified "
+            "process evidence",
+            file=sys.stderr,
+        )
+    if findings.registrations:
+        shown = ", ".join(findings.registrations[:12])
+        more = (
+            f" (+{len(findings.registrations) - 12} more)"
+            if len(findings.registrations) > 12
+            else ""
+        )
+        print(
+            f"WARNING: {len(findings.registrations)} Git-registered path(s) inside the "
+            "managed root have no active row. state: RETAINED -- this command named a "
+            "different slot, changed none of them, and did not inspect them: "
+            f"{shown}{more}. remedy: run 'wrkslots audit --format json', then restore "
+            "and register each live slot, or retire the stale Git registration through "
+            "its own lifecycle command; do not delete a directory to repair bookkeeping, "
+            "because the directory may hold the only reference to unpushed work",
             file=sys.stderr,
         )
 

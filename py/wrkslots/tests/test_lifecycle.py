@@ -8229,10 +8229,18 @@ def test_status_reports_git_registration_without_an_active_row(
     assert str(stale) in findings[0]["detail"]
     assert payload["active"][0]["storage_inconsistencies"] == []
 
-    before_events = tuple(
-        path.read_bytes()
-        for path in sorted((project / "worktrees" / "EVENTS.testhost").glob("*.json"))
-    )
+    # ⚠️ THIS HALF ASSERTED THE DEFECT, NOT THE REQUIREMENT, AND IS CHANGED
+    # DELIBERATELY. It required `heartbeat slot01` to be REFUSED by a stranded
+    # Git registration belonging to `stale-slot` -- a slot this command does not
+    # name, does not touch, and cannot repair. That is the exact condition five
+    # agents hit from the outside on 2026-09-04: each asked to operate on its own
+    # slot, read a message naming a slot it had never seen, investigated its own
+    # state, found nothing wrong, and correctly declined to touch another lane's
+    # worktree. Nobody saw it was one directory refusing for everyone.
+    #
+    # The refusal is NOT removed. It is retained for the slot the command names,
+    # asserted immediately below, and every other finding is reported by name
+    # instead of stopping unrelated work.
     heartbeat = command(
         project,
         "heartbeat",
@@ -8244,9 +8252,45 @@ def test_status_reports_git_registration_without_an_active_row(
         "--expected-generation",
         "1",
     )
-    assert heartbeat.returncode == 3
-    assert "Git common directory" in heartbeat.stderr
-    assert "no active checkout row" in heartbeat.stderr
+    assert heartbeat.returncode == 0, heartbeat.stderr
+    assert "stale-slot" in heartbeat.stderr
+    assert "RETAINED" in heartbeat.stderr
+    # Reported, not swept: the unrelated registration is untouched afterwards.
+    assert str(stale) in git(repository, "worktree", "list", "--porcelain").stdout
+
+    # The other direction, in the same test so neither can be changed alone: a
+    # stranded registration under the slot the command NAMES still refuses, and
+    # the refusal still names that slot.
+    own = checkout(project) / "stale-checkout"
+    git(
+        repository,
+        "worktree",
+        "add",
+        "-b",
+        "codex/stale-own-registration",
+        str(own),
+        "origin/main",
+    )
+    shutil.rmtree(own)
+    before_events = tuple(
+        path.read_bytes()
+        for path in sorted((project / "worktrees" / "EVENTS.testhost").glob("*.json"))
+    )
+    refused = command(
+        project,
+        "heartbeat",
+        "slot01",
+        "--agent",
+        "codex-1",
+        "--owner-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+    )
+    assert refused.returncode == 3, refused.stdout
+    assert "Git common directory" in refused.stderr
+    assert "no active checkout row" in refused.stderr
+    assert "slot01" in refused.stderr
     after_events = tuple(
         path.read_bytes()
         for path in sorted((project / "worktrees" / "EVENTS.testhost").glob("*.json"))
@@ -13722,3 +13766,128 @@ def test_cache_glob_matching_agrees_with_the_reference_on_every_combination() ->
             assert wrkslots._glob_matches_path(
                 pattern, path
             ) == _reference_glob_matches_path(pattern, path), (pattern, path)
+
+
+def _strand_git_registration(project: Path, repository: Path, slot: str) -> Path:
+    """Leave a Git worktree registration inside the managed root with no active row.
+
+    This is the `git-registration-without-row` condition: Git still lists the
+    path, wrkslots has no row for it, and the directory is gone.
+    """
+    stranded = checkout(project, slot)
+    git(
+        repository,
+        "worktree",
+        "add",
+        "-b",
+        f"codex/stranded-{slot}",
+        str(stranded),
+        "origin/main",
+    )
+    assert stranded.is_dir()
+    shutil.rmtree(stranded.parent)
+    assert not stranded.exists()
+    assert str(stranded) in git(repository, "worktree", "list", "--porcelain").stdout
+    return stranded
+
+
+def test_hold_ignores_an_unrelated_stranded_git_registration(tmp_path: Path) -> None:
+    """One slot's stranded Git registration must not refuse another slot's hold.
+
+    Five agents hit this from the outside: each asked to operate on its OWN slot,
+    was refused by a message naming a slot it had never touched, and correctly
+    declined to repair another lane's worktree. The refusal is retained for the
+    named slot and reported by name for every other, so nothing is swept.
+    """
+    project, repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    assert (
+        create(project, slot="slot02", agent="codex-2", branch="codex/two").returncode
+        == 0
+    )
+    _strand_git_registration(project, repository, "stranded")
+
+    held = command(project, "hold", "slot02", "--reason", "unrelated lane")
+
+    assert held.returncode == 0, held.stderr
+    assert "held slot=slot02" in held.stdout
+    # Scoping must not hide it: the retained finding is named, not swallowed.
+    assert "stranded" in held.stderr
+    assert "RETAINED" in held.stderr
+
+
+def test_hold_still_refuses_a_stranded_git_registration_for_its_own_slot(
+    tmp_path: Path,
+) -> None:
+    """The other direction. Scoping that stopped refusing everything would be worse."""
+    project, repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    assert (
+        create(project, slot="slot02", agent="codex-2", branch="codex/two").returncode
+        == 0
+    )
+    # Strand a registration underneath slot02's own managed path.
+    stranded = checkout(project, "slot02") / "stale-checkout"
+    git(
+        repository,
+        "worktree",
+        "add",
+        "-b",
+        "codex/stranded-own",
+        str(stranded),
+        "origin/main",
+    )
+    shutil.rmtree(stranded)
+    assert str(stranded) in git(repository, "worktree", "list", "--porcelain").stdout
+
+    refused = command(project, "hold", "slot02", "--reason", "own slot")
+
+    assert refused.returncode == 3, refused.stdout
+    assert "no active checkout row for that repository names it" in refused.stderr
+    assert "slot02" in refused.stderr
+
+
+def test_registry_storage_guard_still_refuses_when_no_slot_is_named(
+    tmp_path: Path,
+) -> None:
+    """With no target slot the guard keeps refusing, deliberately.
+
+    `recover` is the only gated command naming no slot, and it refuses earlier
+    for its own reasons, so this asserts the invariant where it lives rather
+    than through a command that cannot reach it.
+    """
+    project, repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    _strand_git_registration(project, repository, "stranded")
+    config = wrkslots._load_config(str(project), "testhost")
+    states = [wrkslots._load_active(config)]
+
+    with pytest.raises(wrkslots.StateError) as unscoped:
+        wrkslots._assert_registry_storage_consistent(config, states)
+    assert "no active checkout row for that repository names it" in str(
+        unscoped.value
+    )
+
+    # ...and the same guard, told which slot the command names, does not.
+    findings = wrkslots._assert_registry_storage_consistent(
+        config, states, target_slot="slot01"
+    )
+    assert any("stranded" in value for value in findings.registrations)
+
+
+def test_hold_ignores_an_unrelated_directory_without_a_row(tmp_path: Path) -> None:
+    """The same scoping for a bare unregistered directory in the managed root."""
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    assert (
+        create(project, slot="slot02", agent="codex-2", branch="codex/two").returncode
+        == 0
+    )
+    (slots_directory(project) / "orphan").mkdir()
+
+    held = command(project, "hold", "slot02", "--reason", "unrelated lane")
+
+    assert held.returncode == 0, held.stderr
+    assert "held slot=slot02" in held.stdout
+    assert "orphan" in held.stderr
+    assert "RETAINED" in held.stderr
