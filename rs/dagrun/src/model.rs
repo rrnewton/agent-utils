@@ -308,6 +308,12 @@ impl DagManifest {
 
     fn exact_identity(&self) -> Result<String, String> {
         let mut missing = Vec::new();
+        if self.lane.is_empty() {
+            missing.push("lane");
+        }
+        if self.category.is_empty() {
+            missing.push("category");
+        }
         if self.test.as_deref().is_none_or(str::is_empty) {
             missing.push("test");
         }
@@ -1958,6 +1964,26 @@ mod tests {
         };
         let error = result_manifest_owner(std::slice::from_ref(&broad), &inexact).unwrap_err();
         assert!(error.contains("missing test, mode, backend"), "{error}");
+
+        for (empty, missing) in [
+            (
+                DagManifest {
+                    lane: String::new(),
+                    ..exact_result()
+                },
+                "lane",
+            ),
+            (
+                DagManifest {
+                    category: String::new(),
+                    ..exact_result()
+                },
+                "category",
+            ),
+        ] {
+            let error = result_manifest_owner(std::slice::from_ref(&broad), &empty).unwrap_err();
+            assert!(error.contains(&format!("missing {missing}")), "{error}");
+        }
 
         let missing = DagManifest {
             category: "c-programs".into(),

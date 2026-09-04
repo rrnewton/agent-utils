@@ -142,10 +142,13 @@ def test_manifest_selection_roundtrips_and_refuses_malformed_values() -> None:
         assert message in str(raised.value)
 
 
-def test_result_manifests_roundtrip_preserves_absent_and_explicit_empty() -> None:
+def test_result_manifests_roundtrip_preserves_absent_null_and_explicit_empty() -> None:
     doc = """{"steps":[
         {"group":"e2e","job":"legacy","cmd":"true",
          "manifest":{"lane":"portable","category":"applications"}},
+        {"group":"e2e","job":"null","cmd":"true",
+         "manifest":{"lane":"portable","category":"applications"},
+         "result_manifests":null},
         {"group":"e2e","job":"none","cmd":"true",
          "manifest":{"lane":"portable","category":"applications"},
          "result_manifests":[]},
@@ -160,9 +163,13 @@ def test_result_manifests_roundtrip_preserves_absent_and_explicit_empty() -> Non
     assert cfg.steps[0].effective_result_manifests() == (
         DagManifest(lane="portable", category="applications"),
     )
-    assert cfg.steps[1].result_manifests == []
-    assert cfg.steps[1].effective_result_manifests() == ()
-    assert cfg.steps[2].effective_result_manifests()[-1] == DagManifest(
+    assert cfg.steps[1].result_manifests is None
+    assert cfg.steps[1].effective_result_manifests() == (
+        DagManifest(lane="portable", category="applications"),
+    )
+    assert cfg.steps[2].result_manifests == []
+    assert cfg.steps[2].effective_result_manifests() == ()
+    assert cfg.steps[3].effective_result_manifests()[-1] == DagManifest(
         lane="portable",
         category="c-programs",
         test="c-programs/add-key-enosys",
@@ -172,7 +179,8 @@ def test_result_manifests_roundtrip_preserves_absent_and_explicit_empty() -> Non
     encoded = dag_to_json(cfg)
     encoded_steps = json.loads(encoded)["steps"]
     assert "result_manifests" not in encoded_steps[0]
-    assert encoded_steps[1]["result_manifests"] == []
+    assert "result_manifests" not in encoded_steps[1]
+    assert encoded_steps[2]["result_manifests"] == []
     assert dag_to_json(dag_from_json(encoded)) == encoded
 
 
@@ -246,6 +254,31 @@ def test_result_manifest_owner_refuses_missing_inexact_and_cross_node_ownership(
         result_manifest_owner(
             [legacy], DagManifest(lane="portable", category="applications")
         )
+
+    for result_with_empty_dimension, missing in (
+        (
+            DagManifest(
+                lane="",
+                category="applications",
+                test="applications/date",
+                mode="verify",
+                backend="ptrace",
+            ),
+            "lane",
+        ),
+        (
+            DagManifest(
+                lane="portable",
+                category="",
+                test="applications/date",
+                mode="verify",
+                backend="ptrace",
+            ),
+            "category",
+        ),
+    ):
+        with pytest.raises(ValueError, match=f"missing {missing}"):
+            result_manifest_owner([legacy], result_with_empty_dimension)
 
     exact_owner = Step(
         "e2e",

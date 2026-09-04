@@ -1618,10 +1618,13 @@ steps:
     }
 
     #[test]
-    fn result_manifests_roundtrip_preserves_absent_and_explicit_empty() {
+    fn result_manifests_roundtrip_preserves_absent_null_and_explicit_empty() {
         let doc = r#"{"steps":[
             {"group":"e2e","job":"legacy","cmd":"true",
              "manifest":{"lane":"portable","category":"applications"}},
+            {"group":"e2e","job":"null","cmd":"true",
+             "manifest":{"lane":"portable","category":"applications"},
+             "result_manifests":null},
             {"group":"e2e","job":"none","cmd":"true",
              "manifest":{"lane":"portable","category":"applications"},
              "result_manifests":[]},
@@ -1634,11 +1637,13 @@ steps:
         let cfg = dag_from_json(doc).unwrap();
         assert_eq!(cfg.steps[0].result_manifests, None);
         assert_eq!(cfg.steps[0].effective_result_manifests().len(), 1);
-        assert_eq!(cfg.steps[1].result_manifests, Some(Vec::new()));
-        assert!(cfg.steps[1].effective_result_manifests().is_empty());
-        assert_eq!(cfg.steps[2].effective_result_manifests().len(), 2);
+        assert_eq!(cfg.steps[1].result_manifests, None);
+        assert_eq!(cfg.steps[1].effective_result_manifests().len(), 1);
+        assert_eq!(cfg.steps[2].result_manifests, Some(Vec::new()));
+        assert!(cfg.steps[2].effective_result_manifests().is_empty());
+        assert_eq!(cfg.steps[3].effective_result_manifests().len(), 2);
         assert_eq!(
-            cfg.steps[2].result_manifests.as_ref().unwrap()[1],
+            cfg.steps[3].result_manifests.as_ref().unwrap()[1],
             DagManifest {
                 lane: "portable".into(),
                 category: "c-programs".into(),
@@ -1651,7 +1656,8 @@ steps:
         let encoded_value: Value = serde_json::from_str(&encoded).unwrap();
         let encoded_steps = encoded_value["steps"].as_array().unwrap();
         assert!(encoded_steps[0].get("result_manifests").is_none());
-        assert_eq!(encoded_steps[1]["result_manifests"], serde_json::json!([]));
+        assert!(encoded_steps[1].get("result_manifests").is_none());
+        assert_eq!(encoded_steps[2]["result_manifests"], serde_json::json!([]));
         assert_eq!(dag_to_json(&dag_from_json(&encoded).unwrap()), encoded);
     }
 

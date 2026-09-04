@@ -556,6 +556,15 @@ def representative_fixtures() -> list[Fixture]:
                         "deps": ["build.app"],
                         "hint": {"resources": {"browser": 1}},
                     },
+                    {
+                        "group": "e2e",
+                        "job": "smoke3",
+                        "desc": "singular fallback through null",
+                        "cmd": "echo e2e3",
+                        "manifest": {"lane": "portable", "category": "applications"},
+                        "result_manifests": None,
+                        "deps": ["build.app"],
+                    },
                 ],
             },
         )
