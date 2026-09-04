@@ -10441,6 +10441,8 @@ def _upgrade_legacy_private_cleanup_identity(
     path: Path,
     original_mode: int,
     expected: _PrivateCleanupIdentity,
+    *,
+    require_clean: bool,
 ) -> tuple[int, int, int, str]:
     """Enroll a pre-file-handle journal only after revalidating its whole checkout."""
 
@@ -10454,32 +10456,64 @@ def _upgrade_legacy_private_cleanup_identity(
 
     canonical = _slot_directory(config, record.slot, record.slot_type)
     vcs = _GitVcs()
-    if path == canonical:
-        slot_path, final_checkouts = _handoff_preconditions(
-            config, record, vcs, refresh_remote=False
-        )
-        if slot_path != path or tuple(
-            checkout.head for checkout in final_checkouts
-        ) != tuple(checkout.head for checkout in record.checkouts):
-            raise Refusal(
-                f"legacy private cleanup path no longer matches its recorded checkout: {path}"
+    if require_clean:
+        if path == canonical:
+            slot_path, final_checkouts = _handoff_preconditions(
+                config, record, vcs, refresh_remote=False
             )
+            if slot_path != path or tuple(
+                checkout.head for checkout in final_checkouts
+            ) != tuple(checkout.head for checkout in record.checkouts):
+                raise Refusal(
+                    f"legacy private cleanup path no longer matches its recorded "
+                    f"checkout: {path}"
+                )
+        else:
+            expected_fenced = path.parent == canonical.parent and path.name.startswith(
+                f".{record.slot}.fenced.{record.generation}."
+            )
+            if not expected_fenced:
+                raise Refusal(
+                    f"legacy private cleanup path is not the recorded slot: {path}"
+                )
+            for checkout in record.checkouts:
+                moved, _moved_path = _checkout_at_slot(
+                    config, record, checkout, path
+                )
+                current = _assert_checkout_safe(
+                    config, moved, vcs, refresh_remote=False
+                )
+                if current.head != moved.head:
+                    raise Refusal(
+                        f"legacy private cleanup path no longer matches checkout "
+                        f"{checkout.name}: {path}"
+                    )
+        return observed
+
+    if path == canonical:
+        if _assert_slot_contents(config, record) != path:
+            raise StateError("legacy private cleanup path resolved to another slot")
     else:
         expected_fenced = path.parent == canonical.parent and path.name.startswith(
             f".{record.slot}.fenced.{record.generation}."
         )
         if not expected_fenced:
             raise Refusal(f"legacy private cleanup path is not the recorded slot: {path}")
-        for checkout in record.checkouts:
-            moved, _moved_path = _checkout_at_slot(config, record, checkout, path)
-            current = _assert_checkout_safe(
-                config, moved, vcs, refresh_remote=False
+    for checkout in record.checkouts:
+        moved, moved_path = _checkout_at_slot(config, record, checkout, path)
+        _relative, repository = _stored_repository_path(config, moved.repository)
+        head = vcs.verify_existing_worktree(repository, moved_path)
+        branch = vcs.branch(moved_path)
+        remote_url_sha256 = vcs.remote_url_sha256(moved_path, moved.remote)
+        if (
+            head != moved.head
+            or branch != moved.branch
+            or remote_url_sha256 != moved.remote_url_sha256
+        ):
+            raise Refusal(
+                f"legacy private cleanup path no longer matches checkout "
+                f"{checkout.name}: {path}"
             )
-            if current.head != moved.head:
-                raise Refusal(
-                    f"legacy private cleanup path no longer matches checkout "
-                    f"{checkout.name}: {path}"
-                )
     return observed
 
 
@@ -10739,7 +10773,12 @@ def _upgrade_legacy_validate_batch_seal_targets(
             and not target.path.is_symlink()
         ):
             stable = _upgrade_legacy_private_cleanup_identity(
-                config, record, target.path, target.original_mode, target.identity
+                config,
+                record,
+                target.path,
+                target.original_mode,
+                target.identity,
+                require_clean=False,
             )
             target = dataclasses.replace(target, identity=stable)
             changed = True
@@ -10806,6 +10845,7 @@ def _upgrade_legacy_finish_seal_identity(
         subject,
         seal_target.original_mode,
         legacy,
+        require_clean=True,
     )
     for identity in (finish_identity, seal_identity):
         if len(identity) == 4 and identity != stable:

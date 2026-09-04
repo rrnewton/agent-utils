@@ -4543,7 +4543,49 @@ def test_finish_recovery_upgrades_legacy_mount_namespace_identity(
     assert not seal_path.exists()
 
 
-def test_legacy_identity_upgrade_refuses_changed_checkout_with_same_inode(
+def test_destructive_legacy_identity_upgrade_refuses_dirty_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    slot_path = prepare_dead_validate_slots(project, ("slot01",))["slot01"]
+    stub_validate_batch_censuses(monkeypatch)
+    interrupt_validate_batch(project, monkeypatch, "after-finish-journal", ("slot01",))
+    config = wrkslots._load_config(str(project), "testhost")
+    finish_path = wrkslots._journal_path(config)
+    seal_path = wrkslots._validate_batch_seal_journal_path(config)
+    finish = json.loads(finish_path.read_text(encoding="utf-8"))
+    seal = json.loads(seal_path.read_text(encoding="utf-8"))
+    metadata = slot_path.stat()
+    legacy_identity = [metadata.st_dev, metadata.st_ino, 865]
+    finish["private_census_identity"] = legacy_identity
+    seal["targets"][0]["identity"] = legacy_identity
+    finish_path.write_text(json.dumps(finish, indent=2) + "\n", encoding="utf-8")
+    seal_path.write_text(json.dumps(seal, indent=2) + "\n", encoding="utf-8")
+    finish_before = finish_path.read_bytes()
+    seal_before = seal_path.read_bytes()
+    retained = slot_path / "product" / "seed.txt"
+    retained.write_text("dirty retained output\n", encoding="utf-8")
+
+    assert (
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "recover",
+                "--coordinator-pid",
+                str(os.getpid()),
+            ]
+        )
+        == 3
+    )
+    assert "dirty or has untracked/ignored files" in capsys.readouterr().err
+    assert retained.read_text(encoding="utf-8") == "dirty retained output\n"
+    assert finish_path.read_bytes() == finish_before
+    assert seal_path.read_bytes() == seal_before
+    assert slot_path.is_dir()
+
+
+def test_legacy_identity_upgrade_refuses_changed_head_with_same_inode(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     project, _repository, _remote = make_project(tmp_path)
@@ -4563,7 +4605,7 @@ def test_legacy_identity_upgrade_refuses_changed_checkout_with_same_inode(
     seal_path.write_text(json.dumps(seal, indent=2) + "\n", encoding="utf-8")
     finish_before = finish_path.read_bytes()
     seal_before = seal_path.read_bytes()
-    (slot_path / "product" / "seed.txt").write_text("different\n", encoding="utf-8")
+    commit_local(slot_path / "product", "seed.txt", "different\n", "different head")
     after = slot_path.stat()
     assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
 
@@ -4579,7 +4621,7 @@ def test_legacy_identity_upgrade_refuses_changed_checkout_with_same_inode(
         )
         == 3
     )
-    assert "dirty or has untracked/ignored files" in capsys.readouterr().err
+    assert "not reachable from any refs/remotes/origin" in capsys.readouterr().err
     assert finish_path.read_bytes() == finish_before
     assert seal_path.read_bytes() == seal_before
     assert slot_path.is_dir()
@@ -4630,6 +4672,49 @@ def test_seal_recovery_upgrades_legacy_mount_namespace_identity(
         == 0
     )
     assert slot_path.is_dir()
+    assert stat.S_IMODE(slot_path.stat().st_mode) == original_mode
+    assert not seal_path.exists()
+
+
+def test_seal_only_legacy_identity_upgrade_allows_dirty_retained_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    slot_path = prepare_dead_validate_slots(project, ("slot01",))["slot01"]
+    original_mode = stat.S_IMODE(slot_path.stat().st_mode)
+    interrupted = raw_command(
+        project,
+        "remove-validate-batch",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot",
+        "slot01=1",
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-validate-batch-seal-target"},
+    )
+    assert interrupted.returncode == 86, interrupted.stderr
+    config = wrkslots._load_config(str(project), "testhost")
+    seal_path = wrkslots._validate_batch_seal_journal_path(config)
+    seal = json.loads(seal_path.read_text(encoding="utf-8"))
+    metadata = slot_path.stat()
+    seal["targets"][0]["identity"] = [metadata.st_dev, metadata.st_ino, 865]
+    seal_path.write_text(json.dumps(seal, indent=2) + "\n", encoding="utf-8")
+    retained = slot_path / "product" / "seed.txt"
+    retained.write_text("dirty retained output\n", encoding="utf-8")
+    monkeypatch.setattr(wrkslots, "_fd_mount_id", lambda _fd, _label: 3503)
+
+    assert (
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "recover",
+                "--coordinator-pid",
+                str(os.getpid()),
+            ]
+        )
+        == 0
+    )
+    assert retained.read_text(encoding="utf-8") == "dirty retained output\n"
     assert stat.S_IMODE(slot_path.stat().st_mode) == original_mode
     assert not seal_path.exists()
 
