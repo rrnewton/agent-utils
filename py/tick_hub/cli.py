@@ -341,6 +341,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     tick_p.add_argument(
+        "--report-pending",
+        action="store_true",
+        help=(
+            "print a verdict for each due reminder, including CLEAN and SUPPRESSED; "
+            "unlike --dry-run, preserves cadence selection and is compatible with --flush"
+        ),
+    )
+    tick_p.add_argument(
         "--no-header",
         action="store_true",
         help="suppress the explanatory stderr banner (pure machine parsing)",
@@ -409,9 +417,10 @@ def _cmd_tick(ns: argparse.Namespace, c: Palette) -> int:
     now = int(ns.now) if isinstance(ns.now, int) else wall_clock_now()
     current_tick_min = ns.current_tick_min if isinstance(ns.current_tick_min, int) else None
     fired_path = _resolve_fired_path(ns.fired_state if isinstance(ns.fired_state, str) else None)
-    pending = bool(ns.dry_run)
-    if pending and bool(ns.flush):
-        # Refuse rather than silently ignore one of them. --pending reports what
+    dry_run = bool(ns.dry_run)
+    report_pending = dry_run or bool(ns.report_pending)
+    if dry_run and bool(ns.flush):
+        # Refuse rather than silently ignore one of them. --dry-run reports what
         # WOULD run; --flush records what DID. Advancing the cadence from a report
         # that deliberately ignored the cadence would mark every reminder as just
         # fired, which is the one outcome that silently destroys the schedule.
@@ -449,11 +458,11 @@ def _cmd_tick(ns: argparse.Namespace, c: Palette) -> int:
         cfg,
         state,
         now=now,
-        fired={} if pending else fired,
+        fired={} if dry_run else fired,
         gate_runner=SubprocessGateRunner(),
         age_probe=GlobFileAgeProbe(),
         current_tick_min=current_tick_min,
-        report_pending=pending,
+        report_pending=report_pending,
         emit=emit_line,
     )
 

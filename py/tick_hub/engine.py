@@ -389,29 +389,38 @@ def run_tick(
                 continue
             due.append(rem)
 
-        # Whether a gate's report line is final the moment that gate finishes.
-        # It is not, in general: a QUIET gate is downgraded when a reminder it
-        # depends on could not determine anything, and that reminder may appear
-        # LATER in the file, so its verdict is not yet known. When no due
-        # reminder declares a dependency -- which is every configuration that
-        # uses none -- there is nothing that can downgrade a line afterwards,
-        # and holding the whole report back until the last gate finishes buys
-        # nothing while costing everything if the run is stopped first.
-        stream_gate_lines = emit is not None and not any(rem.depends_on for rem in due)
+        # A dependency-free prefix is final as each gate finishes and can be
+        # streamed immediately. Once a dependency-bearing reminder appears we
+        # retain that reminder and everything after it: its QUIET verdict can be
+        # downgraded after a later dependency runs, and emitting a later final
+        # reminder around it would change config order. This lets mixed configs
+        # report the maximal safe prefix without publishing a verdict that may
+        # subsequently change.
+        stream_prefix_len = 0
+        if emit is not None:
+            stream_prefix_len = next(
+                (index for index, rem in enumerate(due) if rem.depends_on),
+                len(due),
+            )
 
         no_dependencies: set[str] = set()
         evaluations: list[_ReminderEvaluation] = []
-        for rem in due:
+        for index, rem in enumerate(due):
             outcome, captured, error = _eval_gate(rem.gate, gate_runner)
             evaluation = _ReminderEvaluation(rem, outcome, captured, error)
             evaluations.append(evaluation)
-            if stream_gate_lines:
+            if index < stream_prefix_len:
                 actions += _render_evaluation(
                     evaluation, no_dependencies, new_fired, now, record, report_pending
                 )
-        if not stream_gate_lines:
+        if stream_prefix_len < len(evaluations):
             actions += _render_after_dependency_pass(
-                evaluations, new_fired, now, record, report_pending
+                evaluations,
+                new_fired,
+                now,
+                record,
+                report_pending,
+                render_from=stream_prefix_len,
             )
 
     record(format_note(f"emitted {actions} instruction(s) this tick"))
@@ -424,6 +433,8 @@ def _render_after_dependency_pass(
     now: int,
     record: Callable[[str], None],
     report_pending: bool,
+    *,
+    render_from: int = 0,
 ) -> int:
     """Interpret dependency edges over completed evaluations, then render in config order."""
     # Evaluate every due gate before interpreting dependency edges. A
@@ -450,7 +461,7 @@ def _render_after_dependency_pass(
                 changed = True
 
     actions = 0
-    for evaluation in evaluations:
+    for evaluation in evaluations[render_from:]:
         actions += _render_evaluation(
             evaluation, unavailable, new_fired, now, record, report_pending
         )

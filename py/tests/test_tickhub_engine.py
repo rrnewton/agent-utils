@@ -724,6 +724,54 @@ def test_a_dependent_reminder_holds_the_report_until_every_gate_has_run() -> Non
     ), result.lines
 
 
+def test_independent_prefix_streams_before_a_later_dependency_group() -> None:
+    cfg = TickConfig(
+        reminders=(
+            _dependency_probe("independent"),
+            _dependency_probe("dependent", "foundation"),
+            _dependency_probe("foundation"),
+        )
+    )
+    gate_results = {
+        "independent": GateResult(1, "", True),
+        "dependent": GateResult(0, "", True),
+        "foundation": GateResult(NO_RESULT_EXIT, "", True),
+    }
+
+    collected = run_tick(
+        cfg,
+        OpsState.default(),
+        now=5,
+        fired={},
+        gate_runner=FakeGate(dict(gate_results)),
+        age_probe=FakeProbe({}),
+        report_pending=True,
+    )
+    emitted: list[str] = []
+    runner = RecordingGate(emitted, dict(gate_results))
+    streamed = run_tick(
+        cfg,
+        OpsState.default(),
+        now=5,
+        fired={},
+        gate_runner=runner,
+        age_probe=FakeProbe({}),
+        report_pending=True,
+        emit=emitted.append,
+    )
+
+    seen = dict(runner.seen_at_call)
+    assert any("independent found a problem" in line for line in seen["dependent"]), (
+        "a final independent verdict must not wait for a later dependency group"
+    )
+    assert not any("CLEAN: dependent" in line for line in seen["foundation"]), (
+        "the quiet dependent may still be downgraded after its dependency runs"
+    )
+    assert tuple(emitted) == collected.lines == streamed.lines
+    assert streamed.fired == collected.fired
+    assert streamed.actions_emitted == collected.actions_emitted
+
+
 def test_omitting_emit_reports_exactly_what_streaming_reports() -> None:
     def build() -> TickConfig:
         return TickConfig(
