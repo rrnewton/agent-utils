@@ -4543,7 +4543,7 @@ def test_finish_recovery_upgrades_legacy_mount_namespace_identity(
     assert not seal_path.exists()
 
 
-def test_legacy_identity_upgrade_refuses_changed_checkout_with_same_inode(
+def test_legacy_identity_upgrade_refuses_changed_head_with_same_inode(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     project, _repository, _remote = make_project(tmp_path)
@@ -4563,7 +4563,7 @@ def test_legacy_identity_upgrade_refuses_changed_checkout_with_same_inode(
     seal_path.write_text(json.dumps(seal, indent=2) + "\n", encoding="utf-8")
     finish_before = finish_path.read_bytes()
     seal_before = seal_path.read_bytes()
-    (slot_path / "product" / "seed.txt").write_text("different\n", encoding="utf-8")
+    commit_local(slot_path / "product", "seed.txt", "different\n", "different head")
     after = slot_path.stat()
     assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
 
@@ -4579,7 +4579,7 @@ def test_legacy_identity_upgrade_refuses_changed_checkout_with_same_inode(
         )
         == 3
     )
-    assert "dirty or has untracked/ignored files" in capsys.readouterr().err
+    assert "no longer matches checkout" in capsys.readouterr().err
     assert finish_path.read_bytes() == finish_before
     assert seal_path.read_bytes() == seal_before
     assert slot_path.is_dir()
