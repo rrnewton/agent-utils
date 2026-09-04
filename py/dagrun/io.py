@@ -554,9 +554,10 @@ STEP_KEYS: frozenset[str] = frozenset(
         "fail_fast_family",
         # ⚠️ DECLARED HERE, CONSUMED DOWNSTREAM, NOT BY dagrun.
         # `requires_host_capability` drives a consuming planner's
-        # HOST-INAPPLICABLE decision, while `manifest` and
+        # HOST-INAPPLICABLE decision, while `manifest`, `result_manifests`, and
         # `integration_test_binaries` carry other consumer-owned selection facts.
-        # dagrun retains them but does not interpret them by design.
+        # dagrun retains the declarations; only its generic exact-result ownership
+        # helper interprets the selectors.
         #
         # Retained because this schema is CLOSED, and closing it without these fields
         # made dagrun REFUSE graphs that were already in use: measured
@@ -565,6 +566,7 @@ STEP_KEYS: frozenset[str] = frozenset(
         # know its callers' fields does not raise the bar, it takes the caller's
         # validate offline.
         "manifest",
+        "result_manifests",
         "requires_host_capability",
     }
 )
@@ -584,12 +586,10 @@ HINT_KEYS: frozenset[str] = frozenset(
     }
 )
 
-MANIFEST_KEYS: frozenset[str] = frozenset({"lane", "category"})
+MANIFEST_KEYS: frozenset[str] = frozenset({"lane", "category", "test", "mode", "backend"})
 
 
-def _manifest_from(value: object, where: str) -> DagManifest | None:
-    if value is None:
-        return None
+def _manifest_value_from(value: object, where: str) -> DagManifest:
     obj = _as_obj(value, where)
     _refuse_unknown_keys(obj, MANIFEST_KEYS, where)
     lane = _req_str(obj, "lane", where)
@@ -598,7 +598,33 @@ def _manifest_from(value: object, where: str) -> DagManifest | None:
         raise DagJsonError(f"{where}.lane: must be non-empty")
     if not category:
         raise DagJsonError(f"{where}.category: must be non-empty")
-    return DagManifest(lane=lane, category=category)
+    test = _opt_str_or_none(obj, "test")
+    mode = _opt_str_or_none(obj, "mode")
+    backend = _opt_str_or_none(obj, "backend")
+    for field, selected in (("test", test), ("mode", mode), ("backend", backend)):
+        if selected == "":
+            raise DagJsonError(f"{where}.{field}: must be non-empty when present")
+    return DagManifest(lane=lane, category=category, test=test, mode=mode, backend=backend)
+
+
+def _manifest_from(value: object, where: str) -> DagManifest | None:
+    if value is None:
+        return None
+    return _manifest_value_from(value, where)
+
+
+def _result_manifests_from(value: object, where: str) -> list[DagManifest] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise DagJsonError(f"{where}: must be a list of manifest selectors or null")
+    manifests: list[DagManifest] = []
+    for index, item in enumerate(value):
+        manifest = _manifest_value_from(item, f"{where}[{index}]")
+        if manifest in manifests:
+            raise DagJsonError(f"{where}: duplicate selector at index {index}")
+        manifests.append(manifest)
+    return manifests
 
 #: Every key the top-level ``write_domain_policy`` object may carry. Closed: a misspelled
 #: ``require_explicit`` turns a fail-closed policy into no policy at all, silently.
@@ -743,6 +769,9 @@ def _dag_from_obj(raw: object) -> DagConfig:
                 cmd=_req_str(sm, "cmd", where),
                 labels=_labels(sm, where),
                 manifest=_manifest_from(sm.get("manifest"), f"{where}.manifest"),
+                result_manifests=_result_manifests_from(
+                    sm.get("result_manifests"), f"{where}.result_manifests"
+                ),
                 integration_test_binaries=_integration_test_binaries(sm),
                 cmdtype=_cmdtype_field(sm, where),
                 deps=_opt_str_list(sm, "deps"),
@@ -838,6 +867,17 @@ def _hint_to_json(hint: ResourceHint) -> dict[str, object]:
     }
 
 
+def _manifest_to_json(manifest: DagManifest) -> dict[str, object]:
+    obj: dict[str, object] = {
+        "lane": manifest.lane,
+        "category": manifest.category,
+        "test": manifest.test,
+        "mode": manifest.mode,
+        "backend": manifest.backend,
+    }
+    return {key: value for key, value in obj.items() if value is not None}
+
+
 def _step_to_json(step: Step) -> dict[str, object]:
     obj: dict[str, object] = {
         "group": step.group,
@@ -847,12 +887,10 @@ def _step_to_json(step: Step) -> dict[str, object]:
         "labels": list(step.labels),
         "cmd": step.cmd,
         "cmdtype": step.cmdtype.value,
-        "manifest": (
-            {
-                "lane": step.manifest.lane,
-                "category": step.manifest.category,
-            }
-            if step.manifest is not None
+        "manifest": _manifest_to_json(step.manifest) if step.manifest is not None else None,
+        "result_manifests": (
+            [_manifest_to_json(manifest) for manifest in step.result_manifests]
+            if step.result_manifests is not None
             else None
         ),
         "integration_test_binaries": (
@@ -886,6 +924,8 @@ def _step_to_json(step: Step) -> dict[str, object]:
         del obj["labels"]
     if step.manifest is None:
         del obj["manifest"]
+    if step.result_manifests is None:
+        del obj["result_manifests"]
     if step.integration_test_binaries is None:
         del obj["integration_test_binaries"]
     if step.skip_reason is None:

@@ -296,7 +296,7 @@ def _quickstart(c: Palette) -> str:
   {c.dim(f'Use {k("--no-profile-feedback")} to ignore the store and plan from the DAG hints only.')}
 
 {h('DAG schema')}  {c.dim('(only group/job/cmd are required per step; everything else has defaults)')}
-  step:   group, job, desc, description, labels[], cmd, cmdtype, deps[], env{{}}, timeout, jobs_flag, jobs_env, networkonly, engine_only, hint{{}}
+  step:   group, job, desc, description, labels[], cmd, cmdtype, manifest{{lane,category,test?,mode?,backend?}}, result_manifests[], deps[], env{{}}, timeout, jobs_flag, jobs_env, networkonly, engine_only, hint{{}}
   hint:   resources{{name:int}}, est_duration_s, rss_baseline_bytes, hard_mem_max_bytes,
           classification("cpu-bound"|"latency-bound"|"light"), preferred_inner_jobs
   top:    description, resource_caps{{name:int}}, mem_cap_factor, mem_cap_floor_bytes,

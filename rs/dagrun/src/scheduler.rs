@@ -4612,6 +4612,7 @@ mod tests {
             cmd: cmd.into(),
             cmdtype: crate::model::CmdType::Unknown,
             manifest: None,
+            result_manifests: None,
             integration_test_binaries: None,
             deps: deps.iter().map(|s| s.to_string()).collect(),
             env: BTreeMap::new(),

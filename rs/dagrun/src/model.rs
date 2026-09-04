@@ -280,6 +280,58 @@ pub struct DagManifest {
     pub lane: String,
     /// Manifest category selected by the step.
     pub category: String,
+    /// Optional exact test selector within the lane and category.
+    pub test: Option<String>,
+    /// Optional exact execution-mode selector within the lane and category.
+    pub mode: Option<String>,
+    /// Optional exact backend selector within the lane and category.
+    pub backend: Option<String>,
+}
+
+impl DagManifest {
+    fn matches_exact_result(&self, result: &Self) -> bool {
+        self.lane == result.lane
+            && self.category == result.category
+            && self
+                .test
+                .as_ref()
+                .is_none_or(|value| result.test.as_ref() == Some(value))
+            && self
+                .mode
+                .as_ref()
+                .is_none_or(|value| result.mode.as_ref() == Some(value))
+            && self
+                .backend
+                .as_ref()
+                .is_none_or(|value| result.backend.as_ref() == Some(value))
+    }
+
+    fn exact_identity(&self) -> Result<String, String> {
+        let mut missing = Vec::new();
+        if self.test.as_deref().is_none_or(str::is_empty) {
+            missing.push("test");
+        }
+        if self.mode.as_deref().is_none_or(str::is_empty) {
+            missing.push("mode");
+        }
+        if self.backend.as_deref().is_none_or(str::is_empty) {
+            missing.push("backend");
+        }
+        if !missing.is_empty() {
+            return Err(format!(
+                "result manifest is not an exact identity: missing {}",
+                missing.join(", ")
+            ));
+        }
+        Ok(format!(
+            "{}/{}/{}/{}/{}",
+            self.lane,
+            self.category,
+            self.test.as_deref().expect("checked above"),
+            self.mode.as_deref().expect("checked above"),
+            self.backend.as_deref().expect("checked above")
+        ))
+    }
 }
 
 /// One node in the DAG: a shell command plus its dependencies and resource hint.
@@ -308,6 +360,11 @@ pub struct Step {
     /// `None` means the serialized step did not declare this field. A present list is authoritative
     /// only when the consuming audit also verifies that the command executes the same targets.
     pub integration_test_binaries: Option<Vec<String>>,
+    /// Manifest selectors whose result rows this step produces.
+    ///
+    /// `None` preserves the singular [`Step::manifest`] declaration. `Some(vec![])` is
+    /// authoritative and explicitly declares that the step produces no manifest results.
+    pub result_manifests: Option<Vec<DagManifest>>,
     /// Tags (`"group.job"`) this step depends on.
     pub deps: Vec<String>,
     /// Environment variables added to the step process.
@@ -373,6 +430,14 @@ impl Step {
         format!("{}.{}", self.group, self.job)
     }
 
+    /// The result selectors declared by this step, preserving the singular fallback.
+    pub fn effective_result_manifests(&self) -> &[DagManifest] {
+        match self.result_manifests.as_deref() {
+            Some(manifests) => manifests,
+            None => self.manifest.as_slice(),
+        }
+    }
+
     /// Whether this step is exempt from eager-exit given the set of tags that genuinely FAILED.
     ///
     /// Deliberately narrow: declaring `explains` does not make a step immortal, it only protects
@@ -381,6 +446,40 @@ impl Step {
     /// eager-exit keeps doing its job everywhere else.
     pub fn explains_a_failure_in(&self, failed: &HashSet<String>) -> bool {
         self.explains.iter().any(|tag| failed.contains(tag))
+    }
+}
+
+/// Resolve one exact manifest result to the unique step that declares ownership of it.
+///
+/// The caller supplies the selected steps, so this helper stays independent of any client's
+/// manifest catalogue and label vocabulary. An exact result must name every identity dimension;
+/// zero matching steps and multiple matching steps are both refusals.
+pub fn result_manifest_owner<'a>(
+    steps: &'a [Step],
+    result: &DagManifest,
+) -> Result<&'a Step, String> {
+    let identity = result.exact_identity()?;
+    let owners: Vec<&Step> = steps
+        .iter()
+        .filter(|step| {
+            step.effective_result_manifests()
+                .iter()
+                .any(|selector| selector.matches_exact_result(result))
+        })
+        .collect();
+    match owners.as_slice() {
+        [] => Err(format!(
+            "result manifest {identity} has no owning step in the selected DAG"
+        )),
+        [owner] => Ok(*owner),
+        _ => Err(format!(
+            "result manifest {identity} has multiple owning steps in the selected DAG: {}",
+            owners
+                .iter()
+                .map(|step| step.tag())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
     }
 }
 
@@ -1747,6 +1846,7 @@ mod tests {
             cmd: "true".into(),
             cmdtype: CmdType::Unknown,
             manifest: None,
+            result_manifests: None,
             integration_test_binaries: None,
             deps: vec![],
             env: BTreeMap::new(),
@@ -1776,6 +1876,7 @@ mod tests {
             cmd: cmd.into(),
             cmdtype: CmdType::Unknown,
             manifest: None,
+            result_manifests: None,
             integration_test_binaries: None,
             deps: vec![],
             env: BTreeMap::new(),
@@ -1792,6 +1893,90 @@ mod tests {
             explains: Vec::new(),
             fail_fast_family: None,
         }
+    }
+
+    fn exact_result() -> DagManifest {
+        DagManifest {
+            lane: "portable".into(),
+            category: "applications".into(),
+            test: Some("applications/date".into()),
+            mode: Some("verify".into()),
+            backend: Some("ptrace".into()),
+        }
+    }
+
+    #[test]
+    fn result_manifest_owner_preserves_fallback_and_explicit_empty() {
+        let legacy = Step {
+            group: "e2e".into(),
+            job: "legacy".into(),
+            manifest: Some(DagManifest {
+                lane: "portable".into(),
+                category: "applications".into(),
+                test: None,
+                mode: None,
+                backend: None,
+            }),
+            ..bare_step("true", None)
+        };
+        assert_eq!(
+            result_manifest_owner(std::slice::from_ref(&legacy), &exact_result())
+                .unwrap()
+                .tag(),
+            "e2e.legacy"
+        );
+
+        let explicit_empty = Step {
+            result_manifests: Some(Vec::new()),
+            ..legacy.clone()
+        };
+        let error = result_manifest_owner(&[explicit_empty], &exact_result()).unwrap_err();
+        assert!(error.contains("has no owning step"), "{error}");
+    }
+
+    #[test]
+    fn result_manifest_owner_refuses_inexact_missing_and_cross_node_ownership() {
+        let broad = Step {
+            group: "e2e".into(),
+            job: "broad".into(),
+            result_manifests: Some(vec![DagManifest {
+                lane: "portable".into(),
+                category: "applications".into(),
+                test: None,
+                mode: Some("verify".into()),
+                backend: Some("ptrace".into()),
+            }]),
+            ..bare_step("true", None)
+        };
+
+        let inexact = DagManifest {
+            lane: "portable".into(),
+            category: "applications".into(),
+            test: None,
+            mode: None,
+            backend: None,
+        };
+        let error = result_manifest_owner(std::slice::from_ref(&broad), &inexact).unwrap_err();
+        assert!(error.contains("missing test, mode, backend"), "{error}");
+
+        let missing = DagManifest {
+            category: "c-programs".into(),
+            ..exact_result()
+        };
+        let error = result_manifest_owner(std::slice::from_ref(&broad), &missing).unwrap_err();
+        assert!(error.contains("has no owning step"), "{error}");
+
+        let exact = Step {
+            group: "e2e".into(),
+            job: "exact".into(),
+            result_manifests: Some(vec![exact_result()]),
+            ..bare_step("true", None)
+        };
+        let error = result_manifest_owner(&[broad, exact], &exact_result()).unwrap_err();
+        assert!(
+            error.contains("multiple owning steps in the selected DAG: e2e.broad, e2e.exact"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -2034,6 +2219,7 @@ mod cpu_timeout_multiplier_tests {
             cmd: "true".into(),
             cmdtype: CmdType::Unknown,
             manifest: None,
+            result_manifests: None,
             integration_test_binaries: None,
             deps: vec![],
             env: std::collections::BTreeMap::new(),
@@ -2208,6 +2394,7 @@ mod carry_tests {
             cmd: "true".into(),
             cmdtype: CmdType::Unknown,
             manifest: None,
+            result_manifests: None,
             integration_test_binaries: None,
             deps: vec![],
             env: BTreeMap::new(),

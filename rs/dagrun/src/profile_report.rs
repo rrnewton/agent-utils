@@ -1682,6 +1682,7 @@ mod tests {
             jobs_flag: None,
             jobs_env: None,
             manifest: None,
+            result_manifests: None,
             integration_test_binaries: None,
             skip_reason: None,
             write_domains: None,

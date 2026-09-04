@@ -386,6 +386,7 @@ mod tests {
             labels: Vec::new(),
             cmd: "true".to_string(),
             manifest: None,
+            result_manifests: None,
             integration_test_binaries: None,
             deps: deps.iter().map(|dep| dep.to_string()).collect(),
             env: BTreeMap::new(),

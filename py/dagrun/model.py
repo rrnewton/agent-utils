@@ -191,6 +191,38 @@ class DagManifest:
 
     lane: str
     category: str
+    test: str | None = None
+    mode: str | None = None
+    backend: str | None = None
+
+    def matches_exact_result(self, result: DagManifest) -> bool:
+        """Whether this selector matches one exact manifest-result identity."""
+
+        return (
+            self.lane == result.lane
+            and self.category == result.category
+            and (self.test is None or self.test == result.test)
+            and (self.mode is None or self.mode == result.mode)
+            and (self.backend is None or self.backend == result.backend)
+        )
+
+    def exact_identity(self) -> str:
+        """Render an exact identity or refuse an incomplete result."""
+
+        missing = [
+            name
+            for name, value in (
+                ("test", self.test),
+                ("mode", self.mode),
+                ("backend", self.backend),
+            )
+            if not value
+        ]
+        if missing:
+            raise ValueError(
+                "result manifest is not an exact identity: missing " + ", ".join(missing)
+            )
+        return f"{self.lane}/{self.category}/{self.test}/{self.mode}/{self.backend}"
 
 
 @dataclass
@@ -274,6 +306,10 @@ class Step:
     # Exact Cargo integration-test binary targets executed by this step. ``None`` preserves
     # historical graphs; a present list is checked against the command by the registration audit.
     integration_test_binaries: list[str] | None = None
+    # Result selectors produced by this step. ``None`` preserves the existing singular
+    # ``manifest`` fallback; ``[]`` explicitly declares that this step produces no results.
+    # Kept after every established field so existing positional Step(...) calls stay compatible.
+    result_manifests: list[DagManifest] | None = None
 
     def explains_a_failure_in(self, failed: Container[str]) -> bool:
         """Whether this step is exempt from eager-exit given the set of tags that FAILED.
@@ -289,6 +325,39 @@ class Step:
     def tag(self) -> str:
         """Return the stable ``group.job`` identifier for this step."""
         return f"{self.group}.{self.job}"
+
+    def effective_result_manifests(self) -> tuple[DagManifest, ...]:
+        """Return authoritative selectors, falling back to the singular declaration."""
+
+        if self.result_manifests is not None:
+            return tuple(self.result_manifests)
+        if self.manifest is not None:
+            return (self.manifest,)
+        return ()
+
+
+def result_manifest_owner(steps: Sequence[Step], result: DagManifest) -> Step:
+    """Resolve one exact manifest result to its unique owner among selected steps."""
+
+    identity = result.exact_identity()
+    owners = [
+        step
+        for step in steps
+        if any(
+            selector.matches_exact_result(result)
+            for selector in step.effective_result_manifests()
+        )
+    ]
+    if not owners:
+        raise ValueError(
+            f"result manifest {identity} has no owning step in the selected DAG"
+        )
+    if len(owners) > 1:
+        raise ValueError(
+            f"result manifest {identity} has multiple owning steps in the selected DAG: "
+            + ", ".join(step.tag for step in owners)
+        )
+    return owners[0]
 
 
 def render_jobs_flag(template: str, inner_jobs: int) -> str:

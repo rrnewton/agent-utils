@@ -622,6 +622,7 @@ mod tests {
             cmd: "true".into(),
             cmdtype: crate::model::CmdType::Unknown,
             manifest: None,
+            result_manifests: None,
             integration_test_binaries: None,
             deps: Vec::new(),
             env: BTreeMap::new(),
