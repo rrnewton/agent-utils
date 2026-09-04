@@ -212,6 +212,8 @@ class DagManifest:
         missing = [
             name
             for name, value in (
+                ("lane", self.lane),
+                ("category", self.category),
                 ("test", self.test),
                 ("mode", self.mode),
                 ("backend", self.backend),
