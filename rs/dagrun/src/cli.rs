@@ -2159,12 +2159,15 @@ fn parse_tag_list(raw: &str) -> Vec<String> {
 /// preserved. Registration order is preserved in both modes, matching `run --selected`.
 ///
 /// The source configuration is never modified. Its complete non-step policy is cloned into the
-/// returned configuration. Returns an error when any requested tag is unknown.
+/// returned configuration. Returns an error when the request is empty or any tag is unknown.
 pub fn select_steps_by_tags(
     cfg: &DagConfig,
     tags: &[String],
     ignore_selected_deps: bool,
 ) -> Result<DagConfig, String> {
+    if tags.is_empty() {
+        return Err("--selected requires at least one tag".to_string());
+    }
     let by_tag: HashSet<String> = cfg.steps.iter().map(Step::tag).collect();
     let unknown: Vec<String> = tags
         .iter()
@@ -2214,7 +2217,13 @@ pub fn select_steps_by_tags(
 }
 
 /// Return every step carrying any requested label and its dependency ancestry.
+///
+/// An empty label list selects no steps, preserving the original public-library behavior. The CLI
+/// rejects an empty `--labels` value before calling this function.
 pub fn select_steps_by_labels(cfg: &DagConfig, labels: &[String]) -> Result<DagConfig, String> {
+    if labels.is_empty() {
+        return Ok(cfg.with_steps(Vec::new()));
+    }
     let known: HashSet<String> = cfg
         .steps
         .iter()
