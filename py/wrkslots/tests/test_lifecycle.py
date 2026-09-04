@@ -4585,8 +4585,9 @@ def test_legacy_identity_upgrade_refuses_changed_checkout_with_same_inode(
     assert slot_path.is_dir()
 
 
+@pytest.mark.parametrize("already_restored", (False, True))
 def test_seal_recovery_upgrades_legacy_mount_namespace_identity(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, already_restored: bool
 ) -> None:
     project, _repository, _remote = make_project(tmp_path)
     slot_path = prepare_dead_validate_slots(project, ("slot01",))["slot01"]
@@ -4612,6 +4613,8 @@ def test_seal_recovery_upgrades_legacy_mount_namespace_identity(
     metadata = slot_path.stat()
     seal["targets"][0]["identity"] = [metadata.st_dev, metadata.st_ino, 865]
     seal_path.write_text(json.dumps(seal, indent=2) + "\n", encoding="utf-8")
+    if already_restored:
+        slot_path.chmod(original_mode)
     monkeypatch.setattr(wrkslots, "_fd_mount_id", lambda _fd, _label: 3503)
 
     assert (

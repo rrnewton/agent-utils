@@ -10393,48 +10393,62 @@ def _seal_cleanup_path_private(
     return original_mode, identity
 
 
+def _private_cleanup_path_identity(
+    config: Config, path: Path, *, allowed_modes: AbstractSet[int]
+) -> tuple[int, int, int, str]:
+    """Prove an owned path's mode and return its stable directory identity."""
+
+    _assert_cleanup_fence_root_trusted(config, path)
+    try:
+        metadata = path.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise Refusal(f"cannot inspect private cleanup path {path}: {exc}") from exc
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or path.is_symlink()
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) not in allowed_modes
+    ):
+        expected = " or ".join(f"{mode:o}" for mode in sorted(allowed_modes))
+        raise Refusal(
+            f"cleanup path is no longer an owned directory with mode {expected}: {path}"
+        )
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise Refusal(f"cannot safely open private cleanup path {path}: {exc}") from exc
+    try:
+        identity = _fd_private_cleanup_identity(descriptor, str(path))
+    finally:
+        os.close(descriptor)
+    if identity[:2] != (metadata.st_dev, metadata.st_ino):
+        raise Refusal(f"cleanup path identity changed during inspection: {path}")
+    return identity
+
+
 def _private_cleanup_fence_identity(
     config: Config, fenced_slot: Path
 ) -> tuple[int, int, int, str]:
     """Prove the private fence invariant and return its stable directory identity."""
 
-    _assert_cleanup_fence_root_trusted(config, fenced_slot)
-    try:
-        metadata = fenced_slot.stat(follow_symlinks=False)
-    except OSError as exc:
-        raise Refusal(f"cannot inspect private cleanup fence {fenced_slot}: {exc}") from exc
-    if (
-        not stat.S_ISDIR(metadata.st_mode)
-        or fenced_slot.is_symlink()
-        or metadata.st_uid != os.getuid()
-        or stat.S_IMODE(metadata.st_mode) != 0o700
-    ):
-        raise Refusal(f"cleanup fence is no longer a private owned directory: {fenced_slot}")
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
-    try:
-        descriptor = os.open(fenced_slot, flags)
-    except OSError as exc:
-        raise Refusal(f"cannot safely open private cleanup fence {fenced_slot}: {exc}") from exc
-    try:
-        identity = _fd_private_cleanup_identity(descriptor, str(fenced_slot))
-    finally:
-        os.close(descriptor)
-    if identity[:2] != (metadata.st_dev, metadata.st_ino):
-        raise Refusal(f"cleanup fence identity changed during inspection: {fenced_slot}")
-    return identity
+    return _private_cleanup_path_identity(config, fenced_slot, allowed_modes={0o700})
 
 
 def _upgrade_legacy_private_cleanup_identity(
     config: Config,
     record: ActiveRecord,
     path: Path,
+    original_mode: int,
     expected: _PrivateCleanupIdentity,
 ) -> tuple[int, int, int, str]:
     """Enroll a pre-file-handle journal only after revalidating its whole checkout."""
 
     if len(expected) != 3:
         raise StateError("only a legacy mount-id identity can be upgraded")
-    observed = _private_cleanup_fence_identity(config, path)
+    observed = _private_cleanup_path_identity(
+        config, path, allowed_modes={0o700, original_mode}
+    )
     if observed[:2] != expected[:2]:
         raise Refusal(f"legacy private cleanup path identity changed: {path}")
 
@@ -10725,7 +10739,7 @@ def _upgrade_legacy_validate_batch_seal_targets(
             and not target.path.is_symlink()
         ):
             stable = _upgrade_legacy_private_cleanup_identity(
-                config, record, target.path, target.identity
+                config, record, target.path, target.original_mode, target.identity
             )
             target = dataclasses.replace(target, identity=stable)
             changed = True
@@ -10787,7 +10801,11 @@ def _upgrade_legacy_finish_seal_identity(
     legacy = finish_identity if len(finish_identity) == 3 else seal_identity
     assert len(legacy) == 3
     stable = _upgrade_legacy_private_cleanup_identity(
-        config, record, subject, legacy
+        config,
+        record,
+        subject,
+        seal_target.original_mode,
+        legacy,
     )
     for identity in (finish_identity, seal_identity):
         if len(identity) == 4 and identity != stable:
