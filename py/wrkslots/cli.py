@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import configparser
 import contextlib
+import ctypes
 import dataclasses
 import datetime as dt
 import errno
@@ -217,6 +218,9 @@ _RETAINED_HANDLE_COUNT_LIMIT = 4096
 _RETAINED_HANDLE_BYTES_LIMIT = 64 * 1024 * 1024
 _RETAINED_HANDLE_CENSUS_SECONDS = 30.0
 _MOUNTINFO_FILE_BYTES_LIMIT = 4 * 1024 * 1024
+_FILE_HANDLE_BYTES_LIMIT = 128
+_AT_FDCWD = -100
+_AT_SYMLINK_FOLLOW = 0x400
 _MOUNTINFO_CENSUS_BYTES_LIMIT = 64 * 1024 * 1024
 _ABSENT_PROCESS_CENSUS_SECONDS = 60.0
 _TRUSTED_EXECUTABLE_DIRECTORY = Path("/usr/bin")
@@ -971,6 +975,87 @@ def _open_directory_identity(path: Path, label: str) -> tuple[int, int, int]:
         return metadata.st_dev, metadata.st_ino, _fd_mount_id(fd, str(path))
     finally:
         os.close(fd)
+
+
+class _FileHandle(ctypes.Structure):
+    _fields_ = (
+        ("handle_bytes", ctypes.c_uint),
+        ("handle_type", ctypes.c_int),
+        ("handle", ctypes.c_ubyte * _FILE_HANDLE_BYTES_LIMIT),
+    )
+
+
+_PrivateCleanupIdentity = tuple[int, int, int] | tuple[int, int, int, str]
+
+
+def _fd_file_handle(fd: int, label: str) -> tuple[int, str]:
+    """Return the filesystem's stable handle for one already-open object."""
+
+    handle = _FileHandle()
+    handle.handle_bytes = _FILE_HANDLE_BYTES_LIMIT
+    mount_id = ctypes.c_int()
+    try:
+        name_to_handle_at = ctypes.CDLL(None, use_errno=True).name_to_handle_at
+    except AttributeError as exc:
+        raise Refusal(f"cannot determine stable directory identity for {label}") from exc
+    ctypes.set_errno(0)
+    result = name_to_handle_at(
+        _AT_FDCWD,
+        os.fsencode(f"/proc/self/fd/{fd}"),
+        ctypes.byref(handle),
+        ctypes.byref(mount_id),
+        _AT_SYMLINK_FOLLOW,
+    )
+    if result != 0:
+        error = ctypes.get_errno()
+        raise Refusal(
+            f"cannot determine stable directory identity for {label}: "
+            f"{os.strerror(error)}"
+        )
+    if not 0 < handle.handle_bytes <= _FILE_HANDLE_BYTES_LIMIT:
+        raise Refusal(f"invalid stable directory identity for {label}")
+    return handle.handle_type, bytes(handle.handle[: handle.handle_bytes]).hex()
+
+
+def _fd_private_cleanup_identity(fd: int, label: str) -> tuple[int, int, int, str]:
+    """Identify a directory independently of the caller's mount namespace."""
+
+    before = os.fstat(fd)
+    handle_type, file_handle = _fd_file_handle(fd, label)
+    after = os.fstat(fd)
+    if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+        raise Refusal(f"directory identity changed while inspecting {label}")
+    return before.st_dev, before.st_ino, handle_type, file_handle
+
+
+def _private_cleanup_identity_from_obj(
+    value: object, label: str
+) -> _PrivateCleanupIdentity:
+    values = _as_list(value, label)
+    if len(values) == 3:
+        return (
+            _as_int(values[0], f"{label}[0]", minimum=1),
+            _as_int(values[1], f"{label}[1]", minimum=1),
+            _as_int(values[2], f"{label}[2]", minimum=1),
+        )
+    if len(values) != 4:
+        raise StateError(
+            f"{label} must contain dev, ino, file-handle type, and file-handle bytes"
+        )
+    file_handle = _as_str(values[3], f"{label}[3]")
+    if (
+        not file_handle
+        or len(file_handle) > _FILE_HANDLE_BYTES_LIMIT * 2
+        or len(file_handle) % 2
+        or re.fullmatch(r"[0-9a-f]+", file_handle) is None
+    ):
+        raise StateError(f"{label}[3] must be bounded lowercase hexadecimal bytes")
+    return (
+        _as_int(values[0], f"{label}[0]", minimum=1),
+        _as_int(values[1], f"{label}[1]", minimum=1),
+        _as_int(values[2], f"{label}[2]", minimum=0),
+        file_handle,
+    )
 
 
 def _config_payload(
@@ -3740,20 +3825,11 @@ def _validate_journal_shape(
             if original_mode > 0o7777:
                 raise StateError("finish journal.original_mode exceeds permission bits")
         if "private_census_identity" in raw:
-            identity = _as_list(
+            identity = _private_cleanup_identity_from_obj(
                 raw["private_census_identity"],
                 "finish journal.private_census_identity",
             )
-            if len(identity) != 3:
-                raise StateError(
-                    "finish journal.private_census_identity must contain dev, ino, and mount id"
-                )
-            for index, value in enumerate(identity):
-                _as_int(
-                    value,
-                    f"finish journal.private_census_identity[{index}]",
-                    minimum=1,
-                )
+            del identity
             if "original_mode" not in raw:
                 raise StateError(
                     "finish journal private census identity has no original mode"
@@ -10257,8 +10333,8 @@ def _seal_cleanup_path_private(
     config: Config,
     fenced_slot: Path,
     *,
-    before_seal: Callable[[int, tuple[int, int, int]], None] | None = None,
-) -> tuple[int, tuple[int, int, int]]:
+    before_seal: Callable[[int, _PrivateCleanupIdentity], None] | None = None,
+) -> tuple[int, _PrivateCleanupIdentity]:
     """Seal one cleanup path and return its prior mode and stable identity."""
 
     _assert_cleanup_fence_root_trusted(config, fenced_slot)
@@ -10277,11 +10353,7 @@ def _seal_cleanup_path_private(
                     f"cleanup fence is not an owner-controlled directory: {fenced_slot}"
                 )
             original_mode = stat.S_IMODE(metadata.st_mode)
-            identity = (
-                metadata.st_dev,
-                metadata.st_ino,
-                _fd_mount_id(descriptor, str(fenced_slot)),
-            )
+            identity = _fd_private_cleanup_identity(descriptor, str(fenced_slot))
             if before_seal is not None:
                 before_seal(original_mode, identity)
             os.fchmod(descriptor, 0o700)
@@ -10323,7 +10395,7 @@ def _seal_cleanup_path_private(
 
 def _private_cleanup_fence_identity(
     config: Config, fenced_slot: Path
-) -> tuple[int, int, int]:
+) -> tuple[int, int, int, str]:
     """Prove the private fence invariant and return its stable directory identity."""
 
     _assert_cleanup_fence_root_trusted(config, fenced_slot)
@@ -10338,10 +10410,63 @@ def _private_cleanup_fence_identity(
         or stat.S_IMODE(metadata.st_mode) != 0o700
     ):
         raise Refusal(f"cleanup fence is no longer a private owned directory: {fenced_slot}")
-    identity = _open_directory_identity(fenced_slot, "private cleanup fence")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        descriptor = os.open(fenced_slot, flags)
+    except OSError as exc:
+        raise Refusal(f"cannot safely open private cleanup fence {fenced_slot}: {exc}") from exc
+    try:
+        identity = _fd_private_cleanup_identity(descriptor, str(fenced_slot))
+    finally:
+        os.close(descriptor)
     if identity[:2] != (metadata.st_dev, metadata.st_ino):
         raise Refusal(f"cleanup fence identity changed during inspection: {fenced_slot}")
     return identity
+
+
+def _upgrade_legacy_private_cleanup_identity(
+    config: Config,
+    record: ActiveRecord,
+    path: Path,
+    expected: _PrivateCleanupIdentity,
+) -> tuple[int, int, int, str]:
+    """Enroll a pre-file-handle journal only after revalidating its whole checkout."""
+
+    if len(expected) != 3:
+        raise StateError("only a legacy mount-id identity can be upgraded")
+    observed = _private_cleanup_fence_identity(config, path)
+    if observed[:2] != expected[:2]:
+        raise Refusal(f"legacy private cleanup path identity changed: {path}")
+
+    canonical = _slot_directory(config, record.slot, record.slot_type)
+    vcs = _GitVcs()
+    if path == canonical:
+        slot_path, final_checkouts = _handoff_preconditions(
+            config, record, vcs, refresh_remote=False
+        )
+        if slot_path != path or tuple(
+            checkout.head for checkout in final_checkouts
+        ) != tuple(checkout.head for checkout in record.checkouts):
+            raise Refusal(
+                f"legacy private cleanup path no longer matches its recorded checkout: {path}"
+            )
+    else:
+        expected_fenced = path.parent == canonical.parent and path.name.startswith(
+            f".{record.slot}.fenced.{record.generation}."
+        )
+        if not expected_fenced:
+            raise Refusal(f"legacy private cleanup path is not the recorded slot: {path}")
+        for checkout in record.checkouts:
+            moved, _moved_path = _checkout_at_slot(config, record, checkout, path)
+            current = _assert_checkout_safe(
+                config, moved, vcs, refresh_remote=False
+            )
+            if current.head != moved.head:
+                raise Refusal(
+                    f"legacy private cleanup path no longer matches checkout "
+                    f"{checkout.name}: {path}"
+                )
+    return observed
 
 
 def _restore_finish_original_mode(
@@ -10361,26 +10486,19 @@ def _restore_finish_original_mode(
 
 def _finish_private_census_identity(
     journal: Mapping[str, object],
-) -> tuple[int, int, int] | None:
+) -> _PrivateCleanupIdentity | None:
     raw = journal.get("private_census_identity")
     if raw is None:
         return None
-    values = _as_list(raw, "finish journal.private_census_identity")
-    if len(values) != 3:
-        raise StateError(
-            "finish journal.private_census_identity must contain dev, ino, and mount id"
-        )
-    return (
-        _as_int(values[0], "finish journal.private_census_identity[0]", minimum=1),
-        _as_int(values[1], "finish journal.private_census_identity[1]", minimum=1),
-        _as_int(values[2], "finish journal.private_census_identity[2]", minimum=1),
+    return _private_cleanup_identity_from_obj(
+        raw, "finish journal.private_census_identity"
     )
 
 
 def _restore_private_cleanup_path(
     path: Path,
     original_mode: int,
-    expected_identity: tuple[int, int, int],
+    expected_identity: _PrivateCleanupIdentity,
     *,
     allow_missing: bool = True,
 ) -> None:
@@ -10394,12 +10512,7 @@ def _restore_private_cleanup_path(
     except OSError as exc:
         raise Refusal(f"cannot open private cleanup path {path}: {exc}") from exc
     try:
-        metadata = os.fstat(descriptor)
-        identity = (
-            metadata.st_dev,
-            metadata.st_ino,
-            _fd_mount_id(descriptor, str(path)),
-        )
+        identity = _fd_private_cleanup_identity(descriptor, str(path))
         if identity != expected_identity:
             raise Refusal(
                 f"private cleanup path identity changed before mode restoration: {path}"
@@ -10416,7 +10529,7 @@ def _reestablish_private_cleanup_fence(
     config: Config,
     path: Path,
     original_mode: int,
-    expected_identity: tuple[int, int, int],
+    expected_identity: _PrivateCleanupIdentity,
 ) -> None:
     """Verify an interrupted target and re-seal an exactly restored mode."""
 
@@ -10439,7 +10552,7 @@ def _reestablish_private_cleanup_fence(
         )
 
     def verify_before_seal(
-        observed_mode: int, observed_identity: tuple[int, int, int]
+        observed_mode: int, observed_identity: _PrivateCleanupIdentity
     ) -> None:
         if observed_mode != original_mode or observed_identity != expected_identity:
             raise Refusal(f"interrupted cleanup fence identity changed: {path}")
@@ -10488,13 +10601,7 @@ def _private_cleanup_target_from_obj(
     if original_mode > 0o7777:
         raise StateError(f"{label}.original_mode exceeds permission bits")
     identity_values = _as_list(raw["identity"], f"{label}.identity")
-    if len(identity_values) != 3:
-        raise StateError(f"{label}.identity must contain dev, ino, and mount id")
-    identity = (
-        _as_int(identity_values[0], f"{label}.identity[0]", minimum=1),
-        _as_int(identity_values[1], f"{label}.identity[1]", minimum=1),
-        _as_int(identity_values[2], f"{label}.identity[2]", minimum=1),
-    )
+    identity = _private_cleanup_identity_from_obj(identity_values, f"{label}.identity")
     return slot, generation, _PrivateCleanupTarget(path, original_mode, identity)
 
 
@@ -10576,7 +10683,7 @@ def _assert_validate_batch_seal_target(
     config: Config,
     record: ActiveRecord,
     original_mode: int,
-    identity: tuple[int, int, int],
+    identity: _PrivateCleanupIdentity,
 ) -> None:
     loaded = _load_validate_batch_seal_journal(config)
     if loaded is None:
@@ -10597,6 +10704,116 @@ def _assert_validate_batch_seal_target(
         )
 
 
+def _upgrade_legacy_validate_batch_seal_targets(
+    config: Config,
+    raw: Mapping[str, object],
+    targets: Sequence[tuple[str, int, _PrivateCleanupTarget]],
+    records: Mapping[str, ActiveRecord],
+) -> tuple[Mapping[str, object], tuple[tuple[str, int, _PrivateCleanupTarget], ...]]:
+    """Replace recoverable mount-id identities before restoring any target."""
+
+    upgraded: list[tuple[str, int, _PrivateCleanupTarget]] = []
+    changed = False
+    for slot, generation, target in targets:
+        record = records.get(slot)
+        if (
+            len(target.identity) == 3
+            and record is not None
+            and record.generation == generation
+            and record.slot_type == "validate"
+            and target.path.exists()
+            and not target.path.is_symlink()
+        ):
+            stable = _upgrade_legacy_private_cleanup_identity(
+                config, record, target.path, target.identity
+            )
+            target = dataclasses.replace(target, identity=stable)
+            changed = True
+        upgraded.append((slot, generation, target))
+    if not changed:
+        return raw, tuple(upgraded)
+    updated = dict(raw)
+    updated["targets"] = [
+        _private_cleanup_target_to_obj(config, slot, generation, target)
+        for slot, generation, target in upgraded
+    ]
+    _write_validate_batch_seal_journal(config, updated)
+    return updated, tuple(upgraded)
+
+
+def _upgrade_legacy_finish_seal_identity(
+    config: Config,
+    raw: Mapping[str, object],
+    record: ActiveRecord,
+) -> Mapping[str, object]:
+    """Upgrade a paired finish/seal identity before destructive recovery resumes."""
+
+    finish_identity = _finish_private_census_identity(raw)
+    if finish_identity is None:
+        return raw
+    loaded = _load_validate_batch_seal_journal(config)
+    if loaded is None:
+        return raw
+    _seal_path, seal_raw, targets = loaded
+    canonical = _slot_directory(config, record.slot, record.slot_type)
+    matching = [
+        (index, target)
+        for index, (slot, generation, target) in enumerate(targets)
+        if slot == record.slot
+        and generation == record.generation
+        and target.path == canonical
+        and target.original_mode
+        == _as_int(raw.get("original_mode"), "finish journal.original_mode")
+    ]
+    if len(matching) != 1:
+        return raw
+    target_index, seal_target = matching[0]
+    seal_identity = seal_target.identity
+    if len(finish_identity) == 4 and len(seal_identity) == 4:
+        return raw
+    if len(finish_identity) == 3 and len(seal_identity) == 3:
+        if finish_identity != seal_identity:
+            raise Refusal("legacy finish and validation-batch seal identities disagree")
+
+    fenced = _finish_fenced_slot(config, record, raw)
+    present = [
+        candidate
+        for candidate in (canonical, fenced)
+        if candidate.exists() or candidate.is_symlink()
+    ]
+    if len(present) != 1:
+        return raw
+    subject = present[0]
+    legacy = finish_identity if len(finish_identity) == 3 else seal_identity
+    assert len(legacy) == 3
+    stable = _upgrade_legacy_private_cleanup_identity(
+        config, record, subject, legacy
+    )
+    for identity in (finish_identity, seal_identity):
+        if len(identity) == 4 and identity != stable:
+            raise Refusal(
+                f"private cleanup path identity changed during legacy upgrade: {subject}"
+            )
+
+    upgraded_targets = list(targets)
+    upgraded_targets[target_index] = (
+        record.slot,
+        record.generation,
+        dataclasses.replace(seal_target, identity=stable),
+    )
+    updated_seal = dict(seal_raw)
+    updated_seal["targets"] = [
+        _private_cleanup_target_to_obj(config, slot, generation, target)
+        for slot, generation, target in upgraded_targets
+    ]
+    _write_validate_batch_seal_journal(config, updated_seal)
+
+    updated_finish = dict(raw)
+    updated_finish["private_census_identity"] = list(stable)
+    _write_journal(config, updated_finish)
+    return updated_finish
+
+
 def _recover_validate_batch_seal_journal(
     config: Config,
     *,
@@ -10609,6 +10826,9 @@ def _recover_validate_batch_seal_journal(
     path, raw, targets = loaded
     states, archives = _validate_global_state(config, require_repository=False)
     records = {record.slot: record for state in states for record in state.slots}
+    raw, targets = _upgrade_legacy_validate_batch_seal_targets(
+        config, raw, targets, records
+    )
     unresolved: list[dict[str, object]] = []
     errors: list[str] = []
     restored = 0
@@ -11481,7 +11701,7 @@ def _seal_validate_batch_targets(
 
                 def record_before_seal(
                     original_mode: int,
-                    identity: tuple[int, int, int],
+                    identity: _PrivateCleanupIdentity,
                     *,
                     selected_slot: str = slot,
                     selected_generation: int = generation,
@@ -15936,7 +16156,7 @@ class _PrivateCleanupTarget:
 
     path: Path
     original_mode: int
-    identity: tuple[int, int, int]
+    identity: _PrivateCleanupIdentity
 
 
 @dataclasses.dataclass
@@ -17183,6 +17403,7 @@ def _cmd_recover(args: argparse.Namespace) -> int:
                     "validation-batch seal evidence coexists with a non-finish journal"
                 )
             record = _record_from_obj(raw.get("record"), "finish journal.record")
+            raw = _upgrade_legacy_finish_seal_identity(config, raw, record)
             private_identity = _finish_private_census_identity(raw)
             if private_identity is None:
                 raise StateError(
