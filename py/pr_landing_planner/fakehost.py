@@ -132,6 +132,15 @@ def _opt_bool(m: Mapping[str, object], key: str, default: bool) -> bool:
     val = m.get(key, default)
     return val if isinstance(val, bool) else default
 
+def _strict_opt_bool(m: Mapping[str, object], key: str, default: bool, where: str) -> bool:
+    if key not in m:
+        return default
+    val = m[key]
+    if not isinstance(val, bool):
+        raise FixtureError(f"{where}: field {key!r} must be a boolean")
+    return val
+
+
 
 def _opt_str_list(m: Mapping[str, object], key: str) -> tuple[str, ...]:
     val = m.get(key)
@@ -287,8 +296,8 @@ def _fake_pr_from(value: object, where: str, *, default_base: str) -> _FakePr:
         is_draft=_opt_bool(obj, "is_draft", False),
         mergeable=_opt_str(obj, "mergeable", ""),
         review_decision=review_decision,
-        review_evidence_unavailable=_opt_bool(
-            obj, "review_evidence_unavailable", False
+        review_evidence_unavailable=_strict_opt_bool(
+            obj, "review_evidence_unavailable", False, where
         ),
         created_at=_opt_str(obj, "created_at", ""),
         updated_at=_opt_str(obj, "updated_at", ""),

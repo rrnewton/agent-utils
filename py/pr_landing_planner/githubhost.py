@@ -62,6 +62,7 @@ LIGHT_FIELDS: tuple[str, ...] = tuple(f for f in GH_FIELDS if f not in _ENRICHME
 #: Concurrency for per-PR checks/review enrichment. Bounded so we never fan out hundreds of ``gh``
 #: processes; the work is network-bound so a small pool already hides most latency.
 _ENRICHMENT_WORKERS = 8
+_PR_LIST_LIMIT = 500
 
 _REVIEWS_QUERY = """
 query($owner: String!, $name: String!, $number: Int!, $endCursor: String) {
@@ -104,6 +105,36 @@ class HostCommandError(RuntimeError):
     def __init__(self, cmd: Sequence[str], returncode: int, stderr: str) -> None:
         super().__init__(f"command failed ({returncode}): {shlex.join(cmd)}\n{stderr.strip()}")
         self.returncode = returncode
+
+def _light_pr_entries(stdout: str) -> tuple[dict[str, object], ...]:
+    if not stdout.strip():
+        raise ValueError(
+            "open PR list returned empty stdout; review evidence is unavailable"
+        )
+    try:
+        raw: object = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"open PR list returned invalid JSON; review evidence is unavailable: {exc}"
+        ) from exc
+    if not isinstance(raw, list):
+        raise ValueError(
+            "open PR list response is not an array; review evidence is unavailable"
+        )
+    if len(raw) >= _PR_LIST_LIMIT:
+        raise ValueError(
+            f"open PR list reached the {_PR_LIST_LIMIT}-item limit; "
+            "review evidence may be incomplete"
+        )
+    entries: list[dict[str, object]] = []
+    for index, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"open PR list entry {index} is not an object; review evidence is unavailable"
+            )
+        entries.append({str(key): value for key, value in entry.items()})
+    return tuple(entries)
+
 
 
 def _run(
@@ -520,18 +551,13 @@ class GitHubHost:
                     self._gh, "pr", "list",
                     "--repo", repo,
                     "--state", "open",
-                    "--limit", "500",
+                    "--limit", str(_PR_LIST_LIMIT),
                     "--json", ",".join(LIGHT_FIELDS),
                 ]
             ),
             cwd=None,
         )
-        raw: object = json.loads(proc.stdout) if proc.stdout.strip() else []
-        if not isinstance(raw, list):
-            raise HostCommandError(["gh", "pr", "list"], 0, "expected a JSON array from gh")
-        entries: list[dict[str, object]] = [
-            {str(k): v for k, v in entry.items()} for entry in raw if isinstance(entry, dict)
-        ]
+        entries = _light_pr_entries(proc.stdout)
         # ...then enrich each PR's rollup with a small per-PR ``gh pr view``, in parallel.
         numbers = [_int(obj, "number") for obj in entries]
         enrichments = self._fetch_enrichments(repo, numbers)

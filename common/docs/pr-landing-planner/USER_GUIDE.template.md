@@ -22,6 +22,9 @@ network-free, and does not archive a plan unless `--archive-dir` is explicit.
 Duplicate mapping keys, nonpositive or overflowing identifiers, duplicate PR
 identities, negative numeric counters, and relations with self/unknown endpoints
 are rejected instead of being silently normalized.
+When `review_evidence_unavailable` is present on a fixture PR, its value must be
+a boolean; malformed values are rejected.
+
 
 Use fixture mode for evaluation, tests, saved snapshots, and integrations that
 already collect repository-host data.
@@ -39,6 +42,11 @@ pr-landing-planner plan \
 `gh`, fetches exact base and PR heads into private local refs, and uses `git
 merge-tree` to detect real conflicts. It does not check out, rebase, push,
 label, refire, or merge anything.
+The live PR list must be a complete JSON array. An empty successful response,
+a non-object array entry, or a response that reaches the 500-item request limit
+is refused because the planner cannot prove that every open pull request was
+listed.
+
 
 Common collection flags include:
 
@@ -179,8 +187,9 @@ If any promised review source cannot be fetched completely, paginated, parsed,
 or assigned a stable event identity, the node reports
 `review_evidence_unavailable: true` and remains held with
 `review-evidence-unavailable`. This state is distinct from a complete snapshot
-containing no events. A clean exact validation record or an aggregate approval
-cannot clear it; the review evidence must be fetched successfully on a later run.
+containing no events. It always produces `wait`, including when a base conflict
+would otherwise recommend `rebase-then-land`. A clean exact validation record or
+an aggregate approval cannot clear it; review evidence must be fetched later.
 
 The authority decision does not require a `RETIRES` line. For example, an older
 refusal can be discharged by a later valid withdrawal followed by a current-head
@@ -198,9 +207,10 @@ last-edit timestamp, and body. The digest removes only a fleet disclosure on the
 first nonblank line, an optional `BY` value on an exact review marker, and an
 exact standalone `Unverified --who metadata: NAME` prose line. These optional
 identity fields use the canonical ASCII-only `[A-Za-z0-9_.-]+` agent-token
-grammar and are normalized for native reviews, issue comments, and inline
-review comments. They
-remain in the displayed comment for readers but do not decide authority.
+grammar and ASCII space or tab separators. Non-ASCII whitespace is substantive,
+not syntax. Identity metadata is normalized for native reviews, issue comments,
+and inline review comments; it remains in the displayed comment for readers but
+does not decide authority.
 
 Review-marker recognition does not depend on the optional `BY` value. A missing,
 alternate, or malformed `BY` value therefore cannot hide an underlying refusal
@@ -246,6 +256,9 @@ the required rebase and landing without pre-landing revalidation, while
 post-facto validation remains due. The consuming workspace remains the sole
 authority for that landability decision. Draft state, missing approvals,
 conflicts, ordering constraints, CI state, and policy escalation can hold a PR.
+Unavailable review evidence still produces `wait` when either local merge-tree
+evidence or the repository host also reports a base conflict.
+
 
 Priority defaults to deterministic size and age ordering. `--priority-source
 labels` reads a numeric label matching `--priority-label-pattern`; a configured

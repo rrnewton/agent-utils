@@ -54,6 +54,7 @@ const LIGHT_FIELDS: [&str; 14] = [
     "labels",
 ];
 const ENRICHMENT_WORKERS: usize = 8;
+const PR_LIST_LIMIT: usize = 500;
 const REVIEWS_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!, $endCursor: String) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
@@ -740,6 +741,35 @@ fn review_snapshot(
         events,
     })
 }
+fn light_pr_entries(bytes: &[u8]) -> Result<Vec<Map<String, Value>>, String> {
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        return Err(
+            "open PR list returned empty stdout; review evidence is unavailable".to_owned(),
+        );
+    }
+    let value: Value = serde_json::from_slice(bytes).map_err(|error| {
+        format!("open PR list returned invalid JSON; review evidence is unavailable: {error}")
+    })?;
+    let entries = value
+        .as_array()
+        .ok_or("open PR list response is not an array; review evidence is unavailable")?;
+    if entries.len() >= PR_LIST_LIMIT {
+        return Err(format!(
+            "open PR list reached the {PR_LIST_LIMIT}-item limit; review evidence may be incomplete"
+        ));
+    }
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            entry.as_object().cloned().ok_or_else(|| {
+                format!(
+                    "open PR list entry {index} is not an object; review evidence is unavailable"
+                )
+            })
+        })
+        .collect()
+}
 
 fn raw_pr_from_list_entry(obj: &Map<String, Value>, enrichment: Option<&HostEnrichment>) -> RawPr {
     let author = obj
@@ -787,31 +817,19 @@ impl VcsHost for GitHubHost {
             "--state".into(),
             "open".into(),
             "--limit".into(),
-            "500".into(),
+            PR_LIST_LIMIT.to_string(),
             "--json".into(),
             LIGHT_FIELDS.join(","),
         ]);
         let output = self.run(&args, None, &[0])?;
-        let value: Value = if String::from_utf8_lossy(&output.stdout).trim().is_empty() {
-            Value::Array(Vec::new())
-        } else {
-            serde_json::from_slice(&output.stdout)
-                .map_err(|error| format!("invalid JSON from gh pr list: {error}"))?
-        };
-        let entries = value
-            .as_array()
-            .ok_or("expected a JSON array from gh pr list")?;
+        let entries = light_pr_entries(&output.stdout)?;
         let numbers = entries
             .iter()
-            .filter_map(Value::as_object)
             .map(|obj| integer(obj, "number"))
             .collect::<Vec<_>>();
         let enrichments = self.fetch_enrichments(repo, &numbers)?;
         let mut prs = Vec::new();
-        for value in entries {
-            let Some(obj) = value.as_object() else {
-                continue;
-            };
+        for obj in &entries {
             prs.push(raw_pr_from_list_entry(
                 obj,
                 enrichments.get(&integer(obj, "number")),
@@ -941,8 +959,9 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::{
-        graphql_connection_from_slurp, inline_comments_from_slurp, raw_pr_from_list_entry,
-        repository_permission, review_snapshot, ISSUE_COMMENTS_QUERY, REVIEWS_QUERY,
+        graphql_connection_from_slurp, inline_comments_from_slurp, light_pr_entries,
+        raw_pr_from_list_entry, repository_permission, review_snapshot, ISSUE_COMMENTS_QUERY,
+        PR_LIST_LIMIT, REVIEWS_QUERY,
     };
     use crate::context::review_evidence_digest;
 
@@ -1049,6 +1068,23 @@ mod tests {
         assert!(raw.review_snapshot.is_none());
         assert!(raw.checks.is_empty());
         assert_eq!(raw.review_decision, "APPROVED");
+    }
+    #[test]
+    fn production_light_list_refuses_unknown_availability() {
+        assert!(light_pr_entries(b"[]").unwrap().is_empty());
+        assert!(light_pr_entries(b" \t\r\n")
+            .unwrap_err()
+            .contains("empty stdout"));
+
+        let malformed = serde_json::to_vec(&json!([{"number": 1}, "not-an-object"])).unwrap();
+        assert!(light_pr_entries(&malformed)
+            .unwrap_err()
+            .contains("entry 1 is not an object"));
+
+        let capped = serde_json::to_vec(&vec![json!({}); PR_LIST_LIMIT]).unwrap();
+        assert!(light_pr_entries(&capped)
+            .unwrap_err()
+            .contains("500-item limit"));
     }
 
     #[test]

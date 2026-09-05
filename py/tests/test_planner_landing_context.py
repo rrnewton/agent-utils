@@ -913,6 +913,93 @@ def test_comment_refusal_survives_valid_and_malformed_by_metadata(kind: str) -> 
         )
         assert has_comment_changes_requested(snapshot)
 
+@pytest.mark.parametrize("space", ("\u00a0", "\u2003"))
+def test_non_ascii_whitespace_is_not_review_evidence_syntax(space: str) -> None:
+    marker = f"CHANGES-REQUESTED-AT: codex {REBASED_HEAD}"
+    event = ReviewEvidenceEvent(
+        kind="issue-comment",
+        identity="comment-whitespace",
+        author="reviewer",
+        state="ACTIVE",
+        head_sha="",
+        created_at="2026-09-05T15:03:48Z",
+        updated_at="2026-09-05T15:03:48Z",
+        body=marker,
+    )
+    canonical = ReviewEvidenceSnapshot(REBASED_HEAD, "", (event,))
+    canonical_digest = review_evidence_digest(canonical)
+    assert has_comment_changes_requested(canonical)
+
+    malformed_markers = (
+        f"{space}{marker}",
+        marker.replace(": ", f":{space}"),
+        marker.replace("codex ", f"codex{space}"),
+        f"#{space}{marker}",
+    )
+    for malformed_marker in malformed_markers:
+        malformed = replace(
+            canonical, events=(replace(event, body=malformed_marker),)
+        )
+        assert not has_comment_changes_requested(malformed)
+        assert review_evidence_digest(malformed) != canonical_digest
+
+    canonical_by = replace(
+        canonical, events=(replace(event, body=f"{marker} BY K"),)
+    )
+    malformed_by = replace(
+        canonical, events=(replace(event, body=f"{marker} BY{space}K"),)
+    )
+    assert review_evidence_digest(canonical_by) == canonical_digest
+    assert has_comment_changes_requested(malformed_by)
+    assert review_evidence_digest(malformed_by) != canonical_digest
+
+    summary_event = replace(event, body="substantive result")
+    summary = replace(canonical, events=(summary_event,))
+    summary_digest = review_evidence_digest(summary)
+    canonical_disclosure = replace(
+        summary,
+        events=(
+            replace(
+                summary_event,
+                body="[team, reviewer, session, model, role=reviewer]\nsubstantive result",
+            ),
+        ),
+    )
+    malformed_disclosure = replace(
+        summary,
+        events=(
+            replace(
+                summary_event,
+                body=f"[team,{space}reviewer, session, model, role=reviewer]\nsubstantive result",
+            ),
+        ),
+    )
+    assert review_evidence_digest(canonical_disclosure) == summary_digest
+    assert review_evidence_digest(malformed_disclosure) != summary_digest
+
+    canonical_metadata = replace(
+        summary,
+        events=(replace(summary_event, body="substantive result\nUnverified --who metadata: K"),),
+    )
+    malformed_metadata = replace(
+        summary,
+        events=(
+            replace(
+                summary_event,
+                body=f"substantive result\nUnverified --who metadata:{space}K",
+            ),
+        ),
+    )
+    assert review_evidence_digest(canonical_metadata) == summary_digest
+    assert review_evidence_digest(malformed_metadata) != summary_digest
+
+    withdrawal = f"CHANGES-REQUESTED-WITHDRAWN-AT: codex {REBASED_HEAD}"
+    assert retirement_record(f"{withdrawal}\nRETIRES 123456") is not None
+    with pytest.raises(ValueError, match="canonical withdrawal"):
+        retirement_record(f"{withdrawal.replace(': ', f':{space}')}\nRETIRES 123456")
+    assert retirement_record(f"{withdrawal}\nRETIRES{space}123456") is None
+
+
 
 def test_unverified_retirement_stays_visible_and_does_not_clear_objection() -> None:
     observed_at = "2026-09-04T12:00:00Z"

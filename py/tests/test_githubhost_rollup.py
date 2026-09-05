@@ -229,6 +229,36 @@ def test_list_open_prs_enriches_rollup_per_pr(monkeypatch: pytest.MonkeyPatch) -
         "review-comment",
     }
     assert all(event.head_sha == "" for event in snapshot.events if event.kind != "review")
+@pytest.mark.parametrize(
+    ("stdout", "message"),
+    (
+        ("", "empty stdout"),
+        (json.dumps([{"number": 1}, "not-an-object"]), "entry 1 is not an object"),
+        (
+            json.dumps([{"number": number} for number in range(500)]),
+            "500-item limit",
+        ),
+    ),
+)
+def test_live_list_refuses_when_pr_availability_is_unknown(
+    monkeypatch: pytest.MonkeyPatch, stdout: str, message: str
+) -> None:
+    def list_only(
+        cmd: Sequence[str], cwd: str | None, allowed: tuple[int, ...] = (0,)
+    ) -> subprocess.CompletedProcess[str]:
+        assert "list" in cmd
+        return _completed(stdout)
+
+    monkeypatch.setattr(githubhost, "_run", list_only)
+    with pytest.raises(ValueError, match=message):
+        GitHubHost().list_open_prs("owner/repo", "main")
+
+
+def test_live_list_accepts_an_explicit_empty_array(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(githubhost, "_run", lambda *_args, **_kwargs: _completed("[]"))
+    assert GitHubHost().list_open_prs("owner/repo", "main") == ()
+
+
 
 
 def test_native_reviews_and_issue_comments_include_every_paginated_page(

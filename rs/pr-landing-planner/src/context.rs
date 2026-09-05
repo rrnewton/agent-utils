@@ -24,15 +24,19 @@ fn regex<'a>(slot: &'a OnceLock<Regex>, pattern: &str) -> &'a Regex {
     slot.get_or_init(|| Regex::new(pattern).expect("static review-evidence regex is valid"))
 }
 
+fn trim_ascii_whitespace(value: &str) -> &str {
+    value.trim_matches(|character: char| character.is_ascii_whitespace())
+}
+
 fn prose_line_indexes(body: &str) -> Vec<usize> {
     static FENCE: OnceLock<Regex> = OnceLock::new();
-    let fence_re = regex(&FENCE, r"^ {0,3}(?P<f>`{3,}|~{3,})\s*(?P<info>.*)$");
+    let fence_re = regex(&FENCE, r"^ {0,3}(?P<f>`{3,}|~{3,})[ \t]*(?P<info>.*)$");
     let mut indexes = Vec::new();
     let mut fence = String::new();
     let mut indented = false;
     let mut previous_blank = true;
     for (index, raw) in body.split('\n').enumerate() {
-        let blank = raw.trim().is_empty();
+        let blank = trim_ascii_whitespace(raw).is_empty();
         if !fence.is_empty() {
             if let Some(captures) = fence_re.captures(raw) {
                 let token = captures.name("f").map(|value| value.as_str()).unwrap_or("");
@@ -42,7 +46,7 @@ fn prose_line_indexes(body: &str) -> Vec<usize> {
                     .unwrap_or("");
                 if token.starts_with(&fence[..1])
                     && token.len() >= fence.len()
-                    && info.trim().is_empty()
+                    && trim_ascii_whitespace(info).is_empty()
                 {
                     fence.clear();
                 }
@@ -90,9 +94,9 @@ fn prose_lines(body: &str) -> Vec<&str> {
 
 fn undecorate(line: &str) -> String {
     static BLOCK_PREFIX: OnceLock<Regex> = OnceLock::new();
-    let mut normalized = regex(&BLOCK_PREFIX, r"^(?:#{1,6}\s+|[-+*]\s+)")
-        .replace(line.trim(), "")
-        .trim()
+    let mut normalized = regex(&BLOCK_PREFIX, r"^(?:#{1,6}[ \t]+|[-+*][ \t]+)")
+        .replace(trim_ascii_whitespace(line), "")
+        .trim_matches(|character: char| character.is_ascii_whitespace())
         .to_owned();
     loop {
         let mut changed = false;
@@ -102,7 +106,7 @@ fn undecorate(line: &str) -> String {
                 && normalized.len() > 2 * wrapper.len()
             {
                 normalized = normalized[wrapper.len()..normalized.len() - wrapper.len()]
-                    .trim()
+                    .trim_matches(|character: char| character.is_ascii_whitespace())
                     .to_owned();
                 changed = true;
                 break;
@@ -130,11 +134,11 @@ fn normalized_review_body(body: &str) -> String {
     static WHO_METADATA: OnceLock<Regex> = OnceLock::new();
     let disclosure = regex(
         &DISCLOSURE,
-        r"^\[[A-Za-z0-9_.-]+,\s*[A-Za-z0-9_.-]+,\s*[^,\[\]\r\n]+,\s*[A-Za-z0-9_.-]+,\s*(?i-u:role)=[A-Za-z0-9_.-]+\]\r?$",
+        r"^\[[A-Za-z0-9_.-]+,[ \t]*[A-Za-z0-9_.-]+,[ \t]*[^,\[\]\r\n]+,[ \t]*[A-Za-z0-9_.-]+,[ \t]*(?i-u:role)=[A-Za-z0-9_.-]+\]\r?$",
     );
     let review_marker = regex(
         &REVIEW_MARKER,
-        r"^(?i-u:CHANGES-REQUESTED-WITHDRAWN-AT|CHANGES-REQUESTED-AT|APPROVED-AT):\s*(?i-u:claude|codex)\s+(?i-u:[0-9a-f]{40})",
+        r"^(?i-u:CHANGES-REQUESTED-WITHDRAWN-AT|CHANGES-REQUESTED-AT|APPROVED-AT):[ \t]*(?i-u:claude|codex)[ \t]+(?i-u:[0-9a-f]{40})",
     );
     let by_identity = regex(&BY_IDENTITY, r"[ \t]+(?i-u:BY)[ \t]+[A-Za-z0-9_.-]+$");
     let who_metadata = regex(
@@ -145,7 +149,9 @@ fn normalized_review_body(body: &str) -> String {
     let prose_indexes = prose_line_indexes(body)
         .into_iter()
         .collect::<BTreeSet<_>>();
-    let first_nonblank = lines.iter().position(|line| !line.trim().is_empty());
+    let first_nonblank = lines
+        .iter()
+        .position(|line| !trim_ascii_whitespace(line).is_empty());
     let mut normalized = Vec::with_capacity(lines.len());
     for (index, raw) in lines.into_iter().enumerate() {
         if Some(index) == first_nonblank
@@ -180,7 +186,7 @@ pub(crate) fn has_comment_changes_requested(snapshot: &ReviewEvidenceSnapshot) -
     static COMMENT_OBJECTION: OnceLock<Regex> = OnceLock::new();
     let comment_objection = regex(
         &COMMENT_OBJECTION,
-        r"^(?i-u:CHANGES-REQUESTED-AT):\s*(?i-u:claude|codex)\s+(?i-u:[0-9a-f]{40})",
+        r"^(?i-u:CHANGES-REQUESTED-AT):[ \t]*(?i-u:claude|codex)[ \t]+(?i-u:[0-9a-f]{40})",
     );
     snapshot.events.iter().any(|event| {
         matches!(event.kind.as_str(), "issue-comment" | "review-comment")
@@ -201,10 +207,13 @@ pub(crate) struct RetirementRecord {
 pub(crate) fn retirement_record(body: &str) -> Result<Option<RetirementRecord>, String> {
     static TARGET: OnceLock<Regex> = OnceLock::new();
     static WITHDRAWAL: OnceLock<Regex> = OnceLock::new();
-    let target = regex(&TARGET, r"^\s*(?i-u:RETIRES)\s+#?([0-9]{6,})\s*$");
+    let target = regex(
+        &TARGET,
+        r"^[ \t]*(?i-u:RETIRES)[ \t]+#?([0-9]{6,})[ \t]*\r?$",
+    );
     let withdrawal = regex(
         &WITHDRAWAL,
-        r"^(?i-u:CHANGES-REQUESTED-WITHDRAWN-AT):\s*(?P<lane>(?i-u:claude|codex))\s+(?P<head>(?i-u:[0-9a-f]{40}))",
+        r"^(?i-u:CHANGES-REQUESTED-WITHDRAWN-AT):[ \t]*(?P<lane>(?i-u:claude|codex))[ \t]+(?P<head>(?i-u:[0-9a-f]{40}))",
     );
     let lines = prose_lines(body);
     let targets = lines
@@ -1482,6 +1491,111 @@ mod tests {
                 };
                 assert!(has_comment_changes_requested(&snapshot));
             }
+        }
+    }
+
+    #[test]
+    fn non_ascii_whitespace_is_not_review_evidence_syntax() {
+        for space in ["\u{a0}", "\u{2003}"] {
+            let marker = format!("CHANGES-REQUESTED-AT: codex {REBASED_HEAD}");
+            let event = ReviewEvidenceEvent {
+                kind: "issue-comment".into(),
+                identity: "comment-whitespace".into(),
+                author: "reviewer".into(),
+                state: "ACTIVE".into(),
+                head_sha: String::new(),
+                created_at: "2026-09-05T15:03:48Z".into(),
+                updated_at: "2026-09-05T15:03:48Z".into(),
+                last_edited_at: String::new(),
+                body: marker.clone(),
+                retirement_actor_permission: String::new(),
+            };
+            let canonical = ReviewEvidenceSnapshot {
+                head_sha: REBASED_HEAD.into(),
+                review_decision: String::new(),
+                events: vec![event.clone()],
+            };
+            let canonical_digest = review_evidence_digest(&canonical).unwrap();
+            assert!(has_comment_changes_requested(&canonical));
+
+            for malformed_marker in [
+                format!("{space}{marker}"),
+                marker.replacen(": ", &format!(":{space}"), 1),
+                marker.replacen("codex ", &format!("codex{space}"), 1),
+                format!("#{space}{marker}"),
+            ] {
+                let mut malformed = canonical.clone();
+                malformed.events[0].body = malformed_marker;
+                assert!(!has_comment_changes_requested(&malformed));
+                assert_ne!(
+                    review_evidence_digest(&malformed).unwrap(),
+                    canonical_digest
+                );
+            }
+
+            let mut canonical_by = canonical.clone();
+            canonical_by.events[0].body = format!("{marker} BY K");
+            let mut malformed_by = canonical.clone();
+            malformed_by.events[0].body = format!("{marker} BY{space}K");
+            assert_eq!(
+                review_evidence_digest(&canonical_by).unwrap(),
+                canonical_digest
+            );
+            assert!(has_comment_changes_requested(&malformed_by));
+            assert_ne!(
+                review_evidence_digest(&malformed_by).unwrap(),
+                canonical_digest
+            );
+
+            let mut summary = canonical.clone();
+            summary.events[0].body = "substantive result".into();
+            let summary_digest = review_evidence_digest(&summary).unwrap();
+            let mut canonical_disclosure = summary.clone();
+            canonical_disclosure.events[0].body =
+                "[team, reviewer, session, model, role=reviewer]\nsubstantive result".into();
+            let mut malformed_disclosure = summary.clone();
+            malformed_disclosure.events[0].body = format!(
+                "[team,{space}reviewer, session, model, role=reviewer]\nsubstantive result"
+            );
+            assert_eq!(
+                review_evidence_digest(&canonical_disclosure).unwrap(),
+                summary_digest
+            );
+            assert_ne!(
+                review_evidence_digest(&malformed_disclosure).unwrap(),
+                summary_digest
+            );
+
+            let mut canonical_metadata = summary.clone();
+            canonical_metadata.events[0].body =
+                "substantive result\nUnverified --who metadata: K".into();
+            let mut malformed_metadata = summary.clone();
+            malformed_metadata.events[0].body =
+                format!("substantive result\nUnverified --who metadata:{space}K");
+            assert_eq!(
+                review_evidence_digest(&canonical_metadata).unwrap(),
+                summary_digest
+            );
+            assert_ne!(
+                review_evidence_digest(&malformed_metadata).unwrap(),
+                summary_digest
+            );
+
+            let withdrawal = format!("CHANGES-REQUESTED-WITHDRAWN-AT: codex {REBASED_HEAD}");
+            assert!(retirement_record(&format!("{withdrawal}\nRETIRES 123456"))
+                .unwrap()
+                .is_some());
+            let malformed_withdrawal = withdrawal.replacen(": ", &format!(":{space}"), 1);
+            assert!(
+                retirement_record(&format!("{malformed_withdrawal}\nRETIRES 123456"))
+                    .unwrap_err()
+                    .contains("canonical withdrawal")
+            );
+            assert!(
+                retirement_record(&format!("{withdrawal}\nRETIRES{space}123456"))
+                    .unwrap()
+                    .is_none()
+            );
         }
     }
 

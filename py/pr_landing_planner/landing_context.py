@@ -28,30 +28,41 @@ POLICY_PREFIX = "landing-policy:"
 REQUIRED_REVIEW_LANES = ("codex", "claude")
 ALLOWED_RETIREMENT_PERMISSIONS = frozenset(("triage", "write", "maintain", "admin"))
 _AGENT_TOKEN = r"[A-Za-z0-9_.-]+"
+_HORIZONTAL_ASCII_WHITESPACE = r"[ \t]"
+_ASCII_WHITESPACE = " \t\r\n\v\f"
 _ASCII_CASE = re.ASCII | re.IGNORECASE
 
-_RETIREMENT_TARGET = re.compile(r"^\s*RETIRES\s+#?(\d{6,})\s*$", _ASCII_CASE)
+_RETIREMENT_TARGET = re.compile(
+    rf"^{_HORIZONTAL_ASCII_WHITESPACE}*RETIRES{_HORIZONTAL_ASCII_WHITESPACE}+"
+    rf"#?([0-9]{{6,}}){_HORIZONTAL_ASCII_WHITESPACE}*\r?$",
+    _ASCII_CASE,
+)
 _WITHDRAWAL = re.compile(
-    r"^CHANGES-REQUESTED-WITHDRAWN-AT:\s*(?P<lane>claude|codex)\s+"
+    rf"^CHANGES-REQUESTED-WITHDRAWN-AT:{_HORIZONTAL_ASCII_WHITESPACE}*"
+    rf"(?P<lane>claude|codex){_HORIZONTAL_ASCII_WHITESPACE}+"
     r"(?P<head>[0-9a-f]{40})",
     _ASCII_CASE,
 )
-_BLOCK_PREFIX = re.compile(r"^(?:#{1,6}\s+|[-+*]\s+)")
-_FENCE = re.compile(r"^ {0,3}(?P<f>`{3,}|~{3,})\s*(?P<info>.*)$")
+_BLOCK_PREFIX = re.compile(r"^(?:#{1,6}[ \t]+|[-+*][ \t]+)")
+_FENCE = re.compile(r"^ {0,3}(?P<f>`{3,}|~{3,})[ \t]*(?P<info>.*)$")
 _DISCLOSURE = re.compile(
-    r"^\[[A-Za-z0-9_.-]+,\s*[A-Za-z0-9_.-]+,\s*[^,\[\]\r\n]+,\s*"
-    r"[A-Za-z0-9_.-]+,\s*role=[A-Za-z0-9_.-]+\]\r?$",
+    rf"^\[[A-Za-z0-9_.-]+,{_HORIZONTAL_ASCII_WHITESPACE}*"
+    rf"[A-Za-z0-9_.-]+,{_HORIZONTAL_ASCII_WHITESPACE}*[^,\[\]\r\n]+,"
+    rf"{_HORIZONTAL_ASCII_WHITESPACE}*[A-Za-z0-9_.-]+,"
+    rf"{_HORIZONTAL_ASCII_WHITESPACE}*role=[A-Za-z0-9_.-]+\]\r?$",
     _ASCII_CASE,
 )
 _REVIEW_MARKER = re.compile(
     r"^(?:CHANGES-REQUESTED-WITHDRAWN-AT|CHANGES-REQUESTED-AT|APPROVED-AT):"
-    r"\s*(?:claude|codex)\s+[0-9a-f]{40}",
+    rf"{_HORIZONTAL_ASCII_WHITESPACE}*(?:claude|codex)"
+    rf"{_HORIZONTAL_ASCII_WHITESPACE}+[0-9a-f]{{40}}",
     _ASCII_CASE,
 )
 _BY_IDENTITY = re.compile(rf"[ \t]+BY[ \t]+{_AGENT_TOKEN}$", _ASCII_CASE)
 _WHO_METADATA = re.compile(rf"^Unverified --who metadata: {_AGENT_TOKEN}\r?$", re.ASCII)
 _COMMENT_OBJECTION = re.compile(
-    r"^CHANGES-REQUESTED-AT:\s*(?:claude|codex)\s+[0-9a-f]{40}",
+    rf"^CHANGES-REQUESTED-AT:{_HORIZONTAL_ASCII_WHITESPACE}*"
+    rf"(?:claude|codex){_HORIZONTAL_ASCII_WHITESPACE}+[0-9a-f]{{40}}",
     _ASCII_CASE,
 )
 
@@ -94,6 +105,10 @@ def _exact_sha256(value: str) -> bool:
     return len(value) == 64 and all(char in "0123456789abcdef" for char in value)
 
 
+def _ascii_strip(value: str) -> str:
+    return value.strip(_ASCII_WHITESPACE)
+
+
 def _prose_line_indexes(body: str) -> tuple[int, ...]:
     """Return indexes of comment lines outside fenced and indented code blocks."""
 
@@ -102,14 +117,14 @@ def _prose_line_indexes(body: str) -> tuple[int, ...]:
     indented = False
     previous_blank = True
     for index, raw in enumerate(body.split("\n")):
-        blank = not raw.strip()
+        blank = not _ascii_strip(raw)
         if fence:
             match = _FENCE.match(raw)
             if (
                 match is not None
                 and match.group("f")[0] == fence[0]
                 and len(match.group("f")) >= len(fence)
-                and not match.group("info").strip()
+                and not _ascii_strip(match.group("info"))
             ):
                 fence = ""
             previous_blank = blank
@@ -144,7 +159,7 @@ def _prose_lines(body: str) -> tuple[str, ...]:
 
 
 def _undecorate(line: str) -> str:
-    normalized = _BLOCK_PREFIX.sub("", line.strip())
+    normalized = _ascii_strip(_BLOCK_PREFIX.sub("", _ascii_strip(line)))
     while True:
         for wrapper in ("`", "**", "__", "*", "_"):
             if (
@@ -152,7 +167,9 @@ def _undecorate(line: str) -> str:
                 and normalized.endswith(wrapper)
                 and len(normalized) > 2 * len(wrapper)
             ):
-                normalized = normalized[len(wrapper) : -len(wrapper)].strip()
+                normalized = _ascii_strip(
+                    normalized[len(wrapper) : -len(wrapper)]
+                )
                 break
         else:
             return normalized
@@ -197,7 +214,7 @@ def _normalized_review_body(body: str) -> str:
     lines = body.split("\n")
     prose_indexes = frozenset(_prose_line_indexes(body))
     first_nonblank = next(
-        (index for index, line in enumerate(lines) if line.strip()), None
+        (index for index, line in enumerate(lines) if _ascii_strip(line)), None
     )
     normalized: list[str] = []
     for index, raw in enumerate(lines):

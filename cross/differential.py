@@ -8602,18 +8602,19 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
                 raise ValueError(f"review event field {field!r} is not a string")
             return value
 
-        fence_re = re.compile(r"^ {0,3}(?P<f>`{3,}|~{3,})\s*(?P<info>.*)$")
-        block_prefix = re.compile(r"^(?:#{1,6}\s+|[-+*]\s+)")
         ascii_case = re.ASCII | re.IGNORECASE
+        ascii_whitespace = " \t\r\n\v\f"
+        fence_re = re.compile(r"^ {0,3}(?P<f>`{3,}|~{3,})[ \t]*(?P<info>.*)$")
+        block_prefix = re.compile(r"^(?:#{1,6}[ \t]+|[-+*][ \t]+)")
         disclosure = re.compile(
-            r"^\[[A-Za-z0-9_.-]+,\s*[A-Za-z0-9_.-]+,\s*"
-            r"[^,\[\]\r\n]+,\s*[A-Za-z0-9_.-]+,\s*"
+            r"^\[[A-Za-z0-9_.-]+,[ \t]*[A-Za-z0-9_.-]+,[ \t]*"
+            r"[^,\[\]\r\n]+,[ \t]*[A-Za-z0-9_.-]+,[ \t]*"
             r"role=[A-Za-z0-9_.-]+\]\r?$",
             ascii_case,
         )
         review_marker = re.compile(
             r"^(?:CHANGES-REQUESTED-WITHDRAWN-AT|CHANGES-REQUESTED-AT|"
-            r"APPROVED-AT):\s*(?:claude|codex)\s+[0-9a-f]{40}",
+            r"APPROVED-AT):[ \t]*(?:claude|codex)[ \t]+[0-9a-f]{40}",
             ascii_case,
         )
         by_identity = re.compile(
@@ -8623,11 +8624,15 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
             r"^Unverified --who metadata: [A-Za-z0-9_.-]+\r?$", re.ASCII
         )
         withdrawal_marker = re.compile(
-            r"^CHANGES-REQUESTED-WITHDRAWN-AT:\s*"
-            r"(?P<lane>claude|codex)\s+(?P<head>[0-9a-f]{40})",
+            r"^CHANGES-REQUESTED-WITHDRAWN-AT:[ \t]*"
+            r"(?P<lane>claude|codex)[ \t]+(?P<head>[0-9a-f]{40})",
             ascii_case,
         )
-        retirement_target = re.compile(r"^\s*RETIRES\s+#?(\d{6,})\s*$", ascii_case)
+        retirement_target = re.compile(
+            r"^[ \t]*RETIRES[ \t]+#?([0-9]{6,})[ \t]*\r?$", ascii_case
+        )
+        def ascii_strip(value: str) -> str:
+            return value.strip(ascii_whitespace)
 
         def prose_line_indexes(body: str) -> frozenset[int]:
             indexes: set[int] = set()
@@ -8635,14 +8640,14 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
             indented = False
             previous_blank = True
             for index, raw in enumerate(body.split("\n")):
-                blank = not raw.strip()
+                blank = not ascii_strip(raw)
                 if fence:
                     match = fence_re.match(raw)
                     if (
                         match is not None
                         and match.group("f")[0] == fence[0]
                         and len(match.group("f")) >= len(fence)
-                        and not match.group("info").strip()
+                        and not ascii_strip(match.group("info"))
                     ):
                         fence = ""
                     previous_blank = blank
@@ -8669,7 +8674,7 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
             return frozenset(indexes)
 
         def undecorate(line: str) -> str:
-            normalized = block_prefix.sub("", line.strip())
+            normalized = ascii_strip(block_prefix.sub("", ascii_strip(line)))
             while True:
                 for wrapper in ("`", "**", "__", "*", "_"):
                     if (
@@ -8677,9 +8682,9 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
                         and normalized.endswith(wrapper)
                         and len(normalized) > 2 * len(wrapper)
                     ):
-                        normalized = normalized[
-                            len(wrapper) : -len(wrapper)
-                        ].strip()
+                        normalized = ascii_strip(
+                            normalized[len(wrapper) : -len(wrapper)]
+                        )
                         break
                 else:
                     return normalized
@@ -8698,7 +8703,7 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
             lines = body.split("\n")
             prose = prose_line_indexes(body)
             first_nonblank = next(
-                (index for index, line in enumerate(lines) if line.strip()), None
+                (index for index, line in enumerate(lines) if ascii_strip(line)), None
             )
             out: list[str] = []
             for index, raw in enumerate(lines):
@@ -8811,6 +8816,50 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
             rep.ok(f"schema:{engine}/plan")
 
     with tempfile.TemporaryDirectory(prefix="planner-cross-") as tmp:
+        for label, payload, message in (
+            ("empty", "", "empty stdout"),
+            (
+                "non-object-entry",
+                json.dumps([{"number": 1}, "not-an-object"]),
+                "entry 1 is not an object",
+            ),
+            (
+                "limit-reached",
+                json.dumps([{"number": number} for number in range(500)]),
+                "500-item limit",
+            ),
+        ):
+            fake_gh = os.path.join(tmp, f"fake-gh-list-{label}")
+            Path(fake_gh).write_text(
+                "#!/bin/sh\nprintf %s " + shlex.quote(payload) + "\n",
+                encoding="utf-8",
+            )
+            os.chmod(fake_gh, 0o755)
+            py_list, rs_list = _record_same_exit(
+                rep,
+                f"reject:live-list-{label}",
+                py,
+                rs,
+                (
+                    "plan",
+                    "--repo",
+                    "OWNER/NAME",
+                    "--git-dir",
+                    tmp,
+                    "--gh-cmd",
+                    fake_gh,
+                    "--no-archive",
+                ),
+                2,
+            )
+            if message in py_list.stderr and message in rs_list.stderr:
+                rep.ok(f"reject:live-list-{label}-is-explicit")
+            else:
+                rep.bad(
+                    f"reject:live-list-{label}-is-explicit",
+                    f"py={py_list.stderr!r}; rs={rs_list.stderr!r}",
+                )
+
         fixture: dict[str, object] = {
             "repo": "OWNER/NAME",
             "base": "main",
@@ -9569,6 +9618,60 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
                 f"visible={unavailable_visible}",
             )
 
+        for label, conflict_field, conflict_value in (
+            ("local", "base_conflict_paths", ["src/conflict.rs"]),
+            ("github", "mergeable", "CONFLICTING"),
+        ):
+            conflict_pr: dict[str, object] = {
+                "number": 1,
+                "title": "review evidence unavailable with base conflict",
+                "head_ref": "green",
+                "head_sha": "sha-1",
+                "review_decision": "APPROVED",
+                "review_evidence_unavailable": True,
+                "changed_files": ["src/a.rs"],
+                "checks": [
+                    {
+                        "name": "merge-gate",
+                        "status": "COMPLETED",
+                        "conclusion": "SUCCESS",
+                    }
+                ],
+            }
+            conflict_pr[conflict_field] = conflict_value
+            conflict_fixture: dict[str, object] = {
+                "repo": "OWNER/NAME",
+                "base": "main",
+                "prs": [conflict_pr],
+            }
+            conflict_path = os.path.join(tmp, f"review-unavailable-{label}-conflict.json")
+            with open(conflict_path, "w", encoding="utf-8") as handle:
+                json.dump(conflict_fixture, handle)
+            conflict_outcome, _conflict_rs = _record_exact(
+                rep,
+                f"reject:review-evidence-unavailable-before-{label}-base-conflict",
+                py,
+                rs,
+                (
+                    "plan",
+                    "--fixture",
+                    conflict_path,
+                    "--landing-context",
+                    hard_green_path,
+                    "--format",
+                    "json",
+                ),
+                expected=0,
+            )
+            conflict_held, conflict_action = review_disposition(conflict_outcome, 1)
+            if conflict_held is True and conflict_action == "wait":
+                rep.ok(f"reject:review-evidence-unavailable-{label}-conflict-waits")
+            else:
+                rep.bad(
+                    f"reject:review-evidence-unavailable-{label}-conflict-waits",
+                    f"held={conflict_held}; action={conflict_action!r}",
+                )
+
         review_accept, _review_accept_rs = _record_exact(
             rep,
             "accept:exact-review-event-digest",
@@ -9964,6 +10067,95 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
                 ),
                 2,
             )
+        for whitespace_label, non_ascii_space in (
+            ("nbsp", "\u00a0"),
+            ("em-space", "\u2003"),
+        ):
+            source_body = str(review_events[1]["body"])
+            whitespace_variants = (
+                (
+                    "by",
+                    source_body.replace(
+                        "BY release-authority",
+                        f"BY{non_ascii_space}release-authority",
+                    ),
+                ),
+                (
+                    "disclosure",
+                    source_body.replace(
+                        "[team, release-authority, session, model, role=observer]",
+                        "[team,"
+                        f"{non_ascii_space}release-authority, session, model, role=observer]",
+                    ),
+                ),
+                (
+                    "who-metadata",
+                    source_body
+                    + f"\nUnverified --who metadata:{non_ascii_space}K",
+                ),
+            )
+            for grammar, changed_body in whitespace_variants:
+                changed_events = [dict(event) for event in review_events]
+                changed_events[1]["body"] = changed_body
+                changed_digest = review_digest(
+                    review_head, "CHANGES_REQUESTED", changed_events
+                )
+                if changed_digest != base_review_digest:
+                    rep.ok(
+                        f"reject:non-ascii-whitespace-{whitespace_label}-{grammar}-digest"
+                    )
+                else:
+                    rep.bad(
+                        f"reject:non-ascii-whitespace-{whitespace_label}-{grammar}-digest",
+                        "non-ASCII whitespace was normalized as review metadata",
+                    )
+                changed_path = write_review_variant(
+                    f"non-ascii-whitespace-{whitespace_label}-{grammar}",
+                    changed_events,
+                )
+                _record_same_exit(
+                    rep,
+                    f"reject:non-ascii-whitespace-{whitespace_label}-{grammar}-context",
+                    py,
+                    rs,
+                    (
+                        "plan",
+                        "--fixture",
+                        changed_path,
+                        "--landing-context",
+                        review_context_path,
+                    ),
+                    2,
+                )
+
+            for grammar, changed_body in (
+                (
+                    "withdrawal",
+                    source_body.replace(
+                        "WITHDRAWN-AT: codex",
+                        f"WITHDRAWN-AT:{non_ascii_space}codex",
+                    ),
+                ),
+                (
+                    "retirement",
+                    source_body.replace("RETIRES 123456", f"RETIRES{non_ascii_space}123456"),
+                ),
+            ):
+                malformed_events = [dict(event) for event in review_events]
+                malformed_events[1]["body"] = changed_body
+                malformed_path = write_review_variant(
+                    f"non-ascii-whitespace-{whitespace_label}-{grammar}",
+                    malformed_events,
+                )
+                _record_same_exit(
+                    rep,
+                    f"reject:non-ascii-whitespace-{whitespace_label}-{grammar}",
+                    py,
+                    rs,
+                    ("plan", "--fixture", malformed_path),
+                    2,
+                )
+
         malformed_by_digests: list[str] = []
         for label, malformed_by in (
             ("slash", "BY release/authority"),
@@ -10786,6 +10978,73 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
                 "reject:malformed-comment-by-mutations-change-digest",
                 f"digests={malformed_refusal_digests}",
             )
+        for whitespace_label, non_ascii_space in (
+            ("nbsp", "\u00a0"),
+            ("em-space", "\u2003"),
+        ):
+            marker = f"CHANGES-REQUESTED-AT: claude {refused_head}"
+            for grammar, malformed_marker in (
+                (
+                    "before-marker",
+                    f"{non_ascii_space}{marker}",
+                ),
+                (
+                    "after-heading",
+                    f"#{non_ascii_space}{marker}",
+                ),
+                (
+                    "after-colon",
+                    marker.replace(": ", f":{non_ascii_space}"),
+                ),
+                (
+                    "after-lane",
+                    marker.replace("claude ", f"claude{non_ascii_space}"),
+                ),
+            ):
+                refusal_events = [dict(live_shape_events[0])]
+                refusal_events[0]["body"] = str(refusal_events[0]["body"]).replace(
+                    marker, malformed_marker
+                )
+                refusal_digest = review_digest(live_head, "", refusal_events)
+                if refusal_digest != no_later_digest:
+                    rep.ok(
+                        f"reject:non-ascii-whitespace-{whitespace_label}-{grammar}-refusal-digest"
+                    )
+                else:
+                    rep.bad(
+                        f"reject:non-ascii-whitespace-{whitespace_label}-{grammar}-refusal-digest",
+                        "non-ASCII whitespace was accepted as refusal syntax",
+                    )
+                refusal_fixture = dict(no_later_fixture)
+                refusal_pr = dict(no_later_pr)
+                refusal_pr["review_events"] = refusal_events
+                refusal_fixture["prs"] = [refusal_pr]
+                refusal_path = os.path.join(
+                    tmp,
+                    f"comment-refusal-{whitespace_label}-{grammar}.json",
+                )
+                with open(refusal_path, "w", encoding="utf-8") as handle:
+                    json.dump(refusal_fixture, handle)
+                refusal_outcome, _refusal_rs = _record_exact(
+                    rep,
+                    f"reject:non-ascii-whitespace-{whitespace_label}-{grammar}-refusal",
+                    py,
+                    rs,
+                    ("plan", "--fixture", refusal_path, "--format", "json"),
+                    expected=0,
+                )
+                refusal_held, refusal_action = review_disposition(
+                    refusal_outcome, 394
+                )
+                if refusal_held is False and refusal_action == "land-now":
+                    rep.ok(
+                        f"reject:non-ascii-whitespace-{whitespace_label}-{grammar}-unrecognized"
+                    )
+                else:
+                    rep.bad(
+                        f"reject:non-ascii-whitespace-{whitespace_label}-{grammar}-unrecognized",
+                        f"held={refusal_held}; action={refusal_action!r}",
+                    )
         _record_same_exit(
             rep,
             "reject:chronological-withdrawal-no-later-artifact-invalidates-context",
@@ -10890,6 +11149,37 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
             )
 
         null_snapshot_head = dict(review_fixture)
+        for label, malformed_unavailable in (
+            ("null", None),
+            ("integer", 0),
+            ("string", "true"),
+            ("array", []),
+            ("object", {}),
+        ):
+            malformed_unavailable_fixture: dict[str, object] = {
+                "repo": "OWNER/NAME",
+                "base": "main",
+                "prs": [
+                    {
+                        "number": 1,
+                        "review_evidence_unavailable": malformed_unavailable,
+                    }
+                ],
+            }
+            malformed_unavailable_path = os.path.join(
+                tmp, f"malformed-review-evidence-unavailable-{label}.json"
+            )
+            with open(malformed_unavailable_path, "w", encoding="utf-8") as handle:
+                json.dump(malformed_unavailable_fixture, handle)
+            _record_same_exit(
+                rep,
+                f"reject:review-evidence-unavailable-{label}",
+                py,
+                rs,
+                ("plan", "--fixture", malformed_unavailable_path),
+                2,
+            )
+
         null_snapshot_pr = dict(review_pr)
         null_snapshot_pr["review_snapshot_head_sha"] = None
         null_snapshot_head["prs"] = [null_snapshot_pr]
