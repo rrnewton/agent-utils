@@ -37,7 +37,7 @@ _WITHDRAWAL = re.compile(
 _BLOCK_PREFIX = re.compile(r"^(?:#{1,6}\s+|[-+*]\s+)")
 _FENCE = re.compile(r"^ {0,3}(?P<f>`{3,}|~{3,})\s*(?P<info>.*)$")
 _DISCLOSURE = re.compile(
-    r"^\[[A-Za-z0-9_.-]+,\s*[a-z0-9][a-z0-9-]*,\s*[^,\[\]\r\n]+,\s*"
+    r"^\[[A-Za-z0-9_.-]+,\s*[A-Za-z0-9_.-]+,\s*[^,\[\]\r\n]+,\s*"
     r"[A-Za-z0-9_.-]+,\s*role=[A-Za-z0-9_.-]+\]\r?$",
     re.IGNORECASE,
 )
@@ -48,6 +48,11 @@ _REVIEW_MARKER = re.compile(
     re.IGNORECASE,
 )
 _BY_IDENTITY = re.compile(r"[ \t]+BY[ \t]+[a-z0-9][a-z0-9-]*", re.IGNORECASE)
+_COMMENT_OBJECTION = re.compile(
+    r"^CHANGES-REQUESTED-AT:\s*(?:claude|codex)\s+[0-9a-f]{40}"
+    r"(?:[ \t]+BY[ \t]+[a-z0-9][a-z0-9-]*)?$",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -199,6 +204,19 @@ def _normalized_review_body(body: str) -> str:
             line = raw[: claimed_identity.start()] + raw[claimed_identity.end() :]
         normalized.append(line)
     return "\n".join(normalized)
+
+
+def has_comment_changes_requested(snapshot: ReviewEvidenceSnapshot) -> bool:
+    """Return whether the complete snapshot contains a canonical comment refusal."""
+
+    return any(
+        event.kind in ("issue-comment", "review-comment")
+        and any(
+            _COMMENT_OBJECTION.fullmatch(_undecorate(line)) is not None
+            for line in _prose_lines(event.body)
+        )
+        for event in snapshot.events
+    )
 
 
 def review_evidence_digest(snapshot: ReviewEvidenceSnapshot) -> str:

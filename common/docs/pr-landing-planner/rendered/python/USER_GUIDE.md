@@ -190,6 +190,12 @@ that an objection was resolved. The assertion requires both the exact
 producer must copy that field mechanically into its generated context after
 assessing that snapshot; nobody should hand-compute it. The follow-up plan
 refetches the evidence and refuses if either the head or digest differs.
+A canonical `CHANGES-REQUESTED-AT` marker in an issue or inline review comment
+also produces the `changes-requested` hold when GitHub supplies no native review
+and an empty aggregate `reviewDecision`. The uncontexted plan keeps that hold;
+only `review_objections_resolved: true` bound to the matching exact head and
+snapshot digest can clear it. Missing or false context cannot make that pull
+request landable.
 
 The authority decision does not require a `RETIRES` line. For example, an older
 refusal can be discharged by a later valid withdrawal followed by a current-head
@@ -204,7 +210,8 @@ Each event contributes its source kind, stable event identity, state, available
 event head (or the documented empty value for comment sources without one),
 creation/submission timestamp, current version timestamp, native-review
 last-edit timestamp, and body. The digest removes only a fleet disclosure on the
-first nonblank line and an optional `BY` value on an exact review marker. Those
+first nonblank line and an optional `BY` value on an exact review marker. The
+disclosure's agent field uses the canonical `[A-Za-z0-9_.-]+` token grammar. Those
 fields remain in the displayed comment for readers but do not decide authority.
 Every other body byte remains input to the digest, so appending an unresolved
 objection changes it. Inline location fields are part of state, so an
@@ -224,10 +231,11 @@ retirement authority. It cannot by itself discharge the objection, and it does
 not remove unrelated review events or abort the plan. Ordinary event authors
 are optional metadata and are excluded from the digest. A missing stable event
 identity or another promised source field still makes the entire snapshot
-unavailable instead of dropping that event. The field suppresses only the repository host's aggregate
-`CHANGES_REQUESTED` hold, which may remain stale after those records exist. It
-does not grant an approval, satisfy `review_pass_heads`, or override
-`REVIEW_REQUIRED`; absent or false retains the fail-closed hold.
+unavailable instead of dropping that event. The field suppresses only the
+`changes-requested` hold from the repository host's aggregate decision or a
+canonical comment refusal in that exact snapshot. It does not grant an approval,
+satisfy `review_pass_heads`, or override `REVIEW_REQUIRED`; absent or false
+retains the fail-closed hold.
 
 A machine-oriented two-pass flow is therefore: run `plan --format json`
 without a resolution assertion; select the desired PR's exact `head` and

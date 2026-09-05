@@ -8605,7 +8605,7 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
         fence_re = re.compile(r"^ {0,3}(?P<f>`{3,}|~{3,})\s*(?P<info>.*)$")
         block_prefix = re.compile(r"^(?:#{1,6}\s+|[-+*]\s+)")
         disclosure = re.compile(
-            r"^\[[A-Za-z0-9_.-]+,\s*[a-z0-9][a-z0-9-]*,\s*"
+            r"^\[[A-Za-z0-9_.-]+,\s*[A-Za-z0-9_.-]+,\s*"
             r"[^,\[\]\r\n]+,\s*[A-Za-z0-9_.-]+,\s*"
             r"role=[A-Za-z0-9_.-]+\]\r?$",
             re.IGNORECASE,
@@ -9615,12 +9615,21 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
                 ),
             ),
             (
-                "changed-disclosure",
+                "changed-disclosure-underscore",
                 1,
                 "body",
                 str(review_events[1]["body"]).replace(
                     "[team, release-authority, session, model, role=observer]",
-                    "[team, departed, old-session, model, role=observer]",
+                    "[team, departed_reviewer, old-session, model, role=observer]",
+                ),
+            ),
+            (
+                "changed-disclosure-dot",
+                1,
+                "body",
+                str(review_events[1]["body"]).replace(
+                    "[team, release-authority, session, model, role=observer]",
+                    "[team, departed.reviewer, old-session, model, role=observer]",
                 ),
             ),
         ):
@@ -10019,11 +10028,71 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
                 f"held={live_shape_held}; action={live_shape_action!r}",
             )
 
+        live_uncontexted, _live_uncontexted_rs = _record_exact(
+            rep,
+            "reject:chronological-withdrawal-needs-resolution-context",
+            py,
+            rs,
+            ("plan", "--fixture", live_shape_path, "--format", "json"),
+            expected=0,
+        )
+        live_uncontexted_held, live_uncontexted_action = review_disposition(
+            live_uncontexted, 394
+        )
+        if live_uncontexted_held is True and live_uncontexted_action == "wait":
+            rep.ok("reject:chronological-withdrawal-uncontexted-hold")
+        else:
+            rep.bad(
+                "reject:chronological-withdrawal-uncontexted-hold",
+                f"held={live_uncontexted_held}; action={live_uncontexted_action!r}",
+            )
+
+        live_false_context_path = os.path.join(
+            tmp, "chronological-withdrawal-false-context.json"
+        )
+        with open(live_false_context_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "prs": [
+                        {
+                            "pr": 394,
+                            "head_sha": live_head,
+                            "review_objections_resolved": False,
+                        }
+                    ]
+                },
+                handle,
+            )
+        live_false, _live_false_rs = _record_exact(
+            rep,
+            "reject:chronological-withdrawal-false-context",
+            py,
+            rs,
+            (
+                "plan",
+                "--fixture",
+                live_shape_path,
+                "--landing-context",
+                live_false_context_path,
+                "--format",
+                "json",
+            ),
+            expected=0,
+        )
+        live_false_held, live_false_action = review_disposition(live_false, 394)
+        if live_false_held is True and live_false_action == "wait":
+            rep.ok("reject:chronological-withdrawal-false-context-hold")
+        else:
+            rep.bad(
+                "reject:chronological-withdrawal-false-context-hold",
+                f"held={live_false_held}; action={live_false_action!r}",
+            )
+
         live_metadata_events = [dict(event) for event in live_shape_events]
         for event in live_metadata_events:
             body = str(event["body"]).replace(
                 "[team, review-cpuid, unresolved, build-host, role=reviewer]",
-                "[team, departed-reviewer, old-session, other-host, role=reviewer]",
+                "[team, departed.reviewer_v2, old-session, other-host, role=reviewer]",
             )
             event["body"] = re.sub(
                 r"(?m)^((?:CHANGES-REQUESTED-WITHDRAWN-AT|"
@@ -10171,9 +10240,25 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
         no_later_path = os.path.join(tmp, "chronological-no-later-artifact.json")
         with open(no_later_path, "w", encoding="utf-8") as handle:
             json.dump(no_later_fixture, handle)
+        no_later_outcome, _no_later_rs = _record_exact(
+            rep,
+            "reject:chronological-withdrawal-no-later-artifact-held",
+            py,
+            rs,
+            ("plan", "--fixture", no_later_path, "--format", "json"),
+            expected=0,
+        )
+        no_later_held, no_later_action = review_disposition(no_later_outcome, 394)
+        if no_later_held is True and no_later_action == "wait":
+            rep.ok("reject:chronological-withdrawal-no-later-artifact-is-held")
+        else:
+            rep.bad(
+                "reject:chronological-withdrawal-no-later-artifact-is-held",
+                f"held={no_later_held}; action={no_later_action!r}",
+            )
         _record_same_exit(
             rep,
-            "reject:chronological-withdrawal-no-later-artifact",
+            "reject:chronological-withdrawal-no-later-artifact-invalidates-context",
             py,
             rs,
             (

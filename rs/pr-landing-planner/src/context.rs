@@ -120,7 +120,7 @@ fn normalized_review_body(body: &str) -> String {
     static BY_IDENTITY: OnceLock<Regex> = OnceLock::new();
     let disclosure = regex(
         &DISCLOSURE,
-        r"(?i)^\[[A-Za-z0-9_.-]+,\s*[a-z0-9][a-z0-9-]*,\s*[^,\[\]\r\n]+,\s*[A-Za-z0-9_.-]+,\s*role=[A-Za-z0-9_.-]+\]\r?$",
+        r"(?i)^\[[A-Za-z0-9_.-]+,\s*[A-Za-z0-9_.-]+,\s*[^,\[\]\r\n]+,\s*[A-Za-z0-9_.-]+,\s*role=[A-Za-z0-9_.-]+\]\r?$",
     );
     let review_marker = regex(
         &REVIEW_MARKER,
@@ -153,6 +153,20 @@ fn normalized_review_body(body: &str) -> String {
         normalized.push(raw.to_owned());
     }
     normalized.join("\n")
+}
+
+pub(crate) fn has_comment_changes_requested(snapshot: &ReviewEvidenceSnapshot) -> bool {
+    static COMMENT_OBJECTION: OnceLock<Regex> = OnceLock::new();
+    let comment_objection = regex(
+        &COMMENT_OBJECTION,
+        r"(?i)^CHANGES-REQUESTED-AT:\s*(?:claude|codex)\s+[0-9a-f]{40}(?:[ \t]+BY[ \t]+[a-z0-9][a-z0-9-]*)?$",
+    );
+    snapshot.events.iter().any(|event| {
+        matches!(event.kind.as_str(), "issue-comment" | "review-comment")
+            && prose_lines(&event.body)
+                .iter()
+                .any(|line| comment_objection.is_match(&undecorate(line)))
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1231,14 +1245,14 @@ mod tests {
             events: vec![event.clone()],
         };
         let digest = review_evidence_digest(&snapshot).unwrap();
-        let mut metadata_changed = snapshot.clone();
-        metadata_changed.events[0].body = body
-            .replace(
+        for disclosure_agent in ["departed_reviewer", "departed.reviewer"] {
+            let mut metadata_changed = snapshot.clone();
+            metadata_changed.events[0].body = body.replace(
                 "[team, current-reviewer, session, model, role=reviewer]",
-                "[team, departed-reviewer, old-session, other-model, role=reviewer]",
-            )
-            .replace("BY current-reviewer", "BY departed-reviewer");
-        assert_eq!(review_evidence_digest(&metadata_changed).unwrap(), digest);
+                &format!("[team, {disclosure_agent}, old-session, other-model, role=reviewer]"),
+            );
+            assert_eq!(review_evidence_digest(&metadata_changed).unwrap(), digest);
+        }
         let mut metadata_removed = snapshot.clone();
         metadata_removed.events[0].body = body
             .split('\n')

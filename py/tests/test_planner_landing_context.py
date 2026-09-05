@@ -696,13 +696,14 @@ def test_review_marker_attribution_is_metadata_for_every_marker() -> None:
     )
     snapshot = ReviewEvidenceSnapshot(REBASED_HEAD, "", (event,))
     digest = review_evidence_digest(snapshot)
-    metadata_changed = body.replace(
-        "[team, current-reviewer, session, model, role=reviewer]",
-        "[team, departed-reviewer, old-session, other-model, role=reviewer]",
-    ).replace("BY current-reviewer", "BY departed-reviewer")
-    assert review_evidence_digest(
-        replace(snapshot, events=(replace(event, body=metadata_changed),))
-    ) == digest
+    for disclosure_agent in ("departed_reviewer", "departed.reviewer"):
+        metadata_changed = body.replace(
+            "[team, current-reviewer, session, model, role=reviewer]",
+            f"[team, {disclosure_agent}, old-session, other-model, role=reviewer]",
+        )
+        assert review_evidence_digest(
+            replace(snapshot, events=(replace(event, body=metadata_changed),))
+        ) == digest
     metadata_removed = "\n".join(
         line.replace(" BY current-reviewer", "")
         for line in body.split("\n")[1:]
