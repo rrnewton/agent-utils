@@ -8612,13 +8612,21 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
         )
         review_marker = re.compile(
             r"^(?:CHANGES-REQUESTED-WITHDRAWN-AT|CHANGES-REQUESTED-AT|"
-            r"APPROVED-AT):\s*(?:claude|codex)\s+[0-9a-f]{40}"
-            r"(?:[ \t]+BY[ \t]+[a-z0-9][a-z0-9-]*)?$",
+            r"APPROVED-AT):\s*(?:claude|codex)\s+[0-9a-f]{40}",
             re.IGNORECASE,
         )
         by_identity = re.compile(
-            r"[ \t]+BY[ \t]+[a-z0-9][a-z0-9-]*", re.IGNORECASE
+            r"[ \t]+BY[ \t]+[A-Za-z0-9_.-]+$", re.IGNORECASE
         )
+        who_metadata = re.compile(
+            r"^Unverified --who metadata: [A-Za-z0-9_.-]+\r?$"
+        )
+        withdrawal_marker = re.compile(
+            r"^CHANGES-REQUESTED-WITHDRAWN-AT:\s*"
+            r"(?P<lane>claude|codex)\s+(?P<head>[0-9a-f]{40})",
+            re.IGNORECASE,
+        )
+        retirement_target = re.compile(r"^\s*RETIRES\s+#?(\d{6,})\s*$", re.IGNORECASE)
 
         def prose_line_indexes(body: str) -> frozenset[int]:
             indexes: set[int] = set()
@@ -8675,6 +8683,16 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
                 else:
                     return normalized
 
+        def marker_match(pattern: re.Pattern[str], line: str) -> re.Match[str] | None:
+            normalized = undecorate(line)
+            match = pattern.match(normalized)
+            if match is None:
+                return None
+            end = match.end()
+            return (
+                match if end == len(normalized) or normalized[end] in " \t" else None
+            )
+
         def normalized_review_body(body: str) -> str:
             lines = body.split("\n")
             prose = prose_line_indexes(body)
@@ -8685,22 +8703,42 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
             for index, raw in enumerate(lines):
                 if index == first_nonblank and index in prose and disclosure.fullmatch(raw):
                     continue
-                claimed = by_identity.search(raw)
-                if index in prose and review_marker.fullmatch(undecorate(raw)) and claimed:
-                    raw = raw[: claimed.start()] + raw[claimed.end() :]
+                if index in prose and who_metadata.fullmatch(raw):
+                    continue
+                if index in prose and marker_match(review_marker, raw) is not None:
+                    marker_line = undecorate(raw)
+                    claimed = by_identity.search(marker_line)
+                    if claimed is not None:
+                        claimed_text = claimed.group(0)
+                        claimed_start = raw.rfind(claimed_text)
+                        if claimed_start >= 0:
+                            raw = (
+                                raw[:claimed_start]
+                                + raw[claimed_start + len(claimed_text) :]
+                            )
                 out.append(raw)
             return "\n".join(out)
 
         def canonical_event(event: Mapping[str, object]) -> tuple[str, ...]:
             body = event_field(event, "body")
-            targets = re.findall(r"(?im)^\s*RETIRES\s+#?(\d{6,})\s*$", body)
+            lines = body.split("\n")
+            prose = prose_line_indexes(body)
+            targets = [
+                match.group(1)
+                for index, line in enumerate(lines)
+                if index in prose
+                and (match := retirement_target.fullmatch(line)) is not None
+            ]
             if targets:
-                withdrawals = re.findall(
-                    r"(?im)^CHANGES-REQUESTED-WITHDRAWN-AT:\s*"
-                    r"(claude|codex)\s+([0-9a-f]{40})"
-                    r"(?:\s+BY\s+[a-z0-9][a-z0-9-]*)?\s*$",
-                    body,
-                )
+                withdrawals = []
+                for index, line in enumerate(lines):
+                    if index not in prose:
+                        continue
+                    match = marker_match(withdrawal_marker, line)
+                    if match is not None:
+                        withdrawals.append(
+                            (match.group("lane").lower(), match.group("head").lower())
+                        )
                 if len(targets) != 1 or len(withdrawals) != 1:
                     raise ValueError("review retirement is not canonical")
             body = normalized_review_body(body)
@@ -9607,11 +9645,27 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
         for label, event_index, field, value in (
             ("ordinary-author-change", 2, "author", "different-reviewer"),
             (
-                "false-claimed-by",
+                "false-claimed-by-hyphen",
                 1,
                 "body",
                 str(review_events[1]["body"]).replace(
                     "BY release-authority", "BY another-agent"
+                ),
+            ),
+            (
+                "false-claimed-by-underscore",
+                1,
+                "body",
+                str(review_events[1]["body"]).replace(
+                    "BY release-authority", "BY another_agent"
+                ),
+            ),
+            (
+                "false-claimed-by-dot",
+                1,
+                "body",
+                str(review_events[1]["body"]).replace(
+                    "BY release-authority", "BY another.agent"
                 ),
             ),
             (
@@ -9667,6 +9721,208 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
                     f"held={metadata_held}; action={metadata_action!r}",
                 )
 
+        base_review_digest = review_digest(
+            review_head, "CHANGES_REQUESTED", review_events
+        )
+
+        def write_review_variant(
+            label: str, events: list[dict[str, object]]
+        ) -> str:
+            variant = dict(review_fixture)
+            variant_pr = dict(review_pr)
+            variant_pr["review_events"] = events
+            variant["prs"] = [variant_pr]
+            path = os.path.join(tmp, f"review-{label}.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(variant, handle)
+            return path
+
+        def write_review_context(label: str, digest: str) -> str:
+            path = os.path.join(tmp, f"review-{label}-context.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "prs": [
+                            {
+                                "pr": 394,
+                                "head_sha": review_head,
+                                "review_objections_resolved": True,
+                                "review_evidence_digest": digest,
+                            }
+                        ]
+                    },
+                    handle,
+                )
+            return path
+
+        malformed_by_digests: list[str] = []
+        for label, malformed_by in (
+            ("slash", "BY release/authority"),
+            ("space", "BY release authority"),
+            ("colon", "BY: release.authority"),
+            ("compact", "BY/release.authority"),
+        ):
+            malformed_events = [dict(event) for event in review_events]
+            malformed_events[1]["body"] = str(malformed_events[1]["body"]).replace(
+                "BY release-authority", malformed_by
+            )
+            malformed_digest = review_digest(
+                review_head, "CHANGES_REQUESTED", malformed_events
+            )
+            malformed_by_digests.append(malformed_digest)
+            malformed_path = write_review_variant(
+                f"malformed-by-{label}", malformed_events
+            )
+            _record_same_exit(
+                rep,
+                f"reject:review-malformed-by-{label}-preserves-bytes",
+                py,
+                rs,
+                (
+                    "plan",
+                    "--fixture",
+                    malformed_path,
+                    "--landing-context",
+                    review_context_path,
+                ),
+                2,
+            )
+            malformed_context_path = write_review_context(
+                f"malformed-by-{label}", malformed_digest
+            )
+            malformed_outcome, _malformed_rs = _record_exact(
+                rep,
+                f"accept:review-malformed-by-{label}-keeps-withdrawal",
+                py,
+                rs,
+                (
+                    "plan",
+                    "--fixture",
+                    malformed_path,
+                    "--landing-context",
+                    malformed_context_path,
+                    "--format",
+                    "json",
+                ),
+                expected=0,
+            )
+            malformed_held, malformed_action = review_disposition(
+                malformed_outcome, 394
+            )
+            if malformed_held is False and malformed_action == "land-now":
+                rep.ok(f"accept:review-malformed-by-{label}-decision-unchanged")
+            else:
+                rep.bad(
+                    f"accept:review-malformed-by-{label}-decision-unchanged",
+                    f"held={malformed_held}; action={malformed_action!r}",
+                )
+        if (
+            all(value != base_review_digest for value in malformed_by_digests)
+            and len(set(malformed_by_digests)) == len(malformed_by_digests)
+        ):
+            rep.ok("reject:malformed-by-mutations-change-review-digest")
+        else:
+            rep.bad(
+                "reject:malformed-by-mutations-change-review-digest",
+                f"base={base_review_digest}; malformed={malformed_by_digests}",
+            )
+
+        for agent in ("review-agent", "review_agent", "review.agent"):
+            wrapper_events = [dict(event) for event in review_events]
+            for event in wrapper_events:
+                event["body"] = (
+                    f"{event['body']}\nUnverified --who metadata: {agent}"
+                )
+            wrapper_digest = review_digest(
+                review_head, "CHANGES_REQUESTED", wrapper_events
+            )
+            if wrapper_digest == base_review_digest:
+                rep.ok(f"accept:who-metadata-{agent}-digest-unchanged")
+            else:
+                rep.bad(
+                    f"accept:who-metadata-{agent}-digest-unchanged",
+                    f"base={base_review_digest}; wrapper={wrapper_digest}",
+                )
+            wrapper_path = write_review_variant(
+                f"who-metadata-{agent}", wrapper_events
+            )
+            wrapper_outcome, _wrapper_rs = _record_exact(
+                rep,
+                f"accept:who-metadata-{agent}",
+                py,
+                rs,
+                (
+                    "plan",
+                    "--fixture",
+                    wrapper_path,
+                    "--landing-context",
+                    review_context_path,
+                    "--format",
+                    "json",
+                ),
+                expected=0,
+            )
+            wrapper_held, wrapper_action = review_disposition(wrapper_outcome, 394)
+            if wrapper_held is False and wrapper_action == "land-now":
+                rep.ok(f"accept:who-metadata-{agent}-decision-unchanged")
+            else:
+                rep.bad(
+                    f"accept:who-metadata-{agent}-decision-unchanged",
+                    f"held={wrapper_held}; action={wrapper_action!r}",
+                )
+
+        preserved_wrapper_events = [dict(event) for event in review_events]
+        preserved_wrapper_events[0]["body"] = (
+            f"{preserved_wrapper_events[0]['body']}\n"
+            "> Unverified --who metadata: review.agent"
+        )
+        preserved_wrapper_events[1]["body"] = (
+            f"{preserved_wrapper_events[1]['body']}\n"
+            "Unverified --who metadata: review.agent extra"
+        )
+        preserved_wrapper_events[2]["body"] = (
+            f"{preserved_wrapper_events[2]['body']}\n```text\n"
+            "Unverified --who metadata: review.agent\n```"
+        )
+        preserved_wrapper_digest = review_digest(
+            review_head, "CHANGES_REQUESTED", preserved_wrapper_events
+        )
+        changed_preserved_events = [dict(event) for event in preserved_wrapper_events]
+        for event in changed_preserved_events:
+            event["body"] = str(event["body"]).replace(
+                "review.agent", "other_agent"
+            )
+        changed_preserved_digest = review_digest(
+            review_head, "CHANGES_REQUESTED", changed_preserved_events
+        )
+        if (
+            preserved_wrapper_digest != base_review_digest
+            and changed_preserved_digest != preserved_wrapper_digest
+        ):
+            rep.ok("reject:who-metadata-near-match-and-examples-remain-in-digest")
+        else:
+            rep.bad(
+                "reject:who-metadata-near-match-and-examples-remain-in-digest",
+                f"base={base_review_digest}; preserved={preserved_wrapper_digest}; "
+                f"changed={changed_preserved_digest}",
+            )
+        preserved_path = write_review_variant(
+            "who-metadata-preserved", preserved_wrapper_events
+        )
+        _record_same_exit(
+            rep,
+            "reject:who-metadata-near-match-invalidates-context",
+            py,
+            rs,
+            (
+                "plan",
+                "--fixture",
+                preserved_path,
+                "--landing-context",
+                review_context_path,
+            ),
+            2,
+        )
         appended_objection = dict(review_fixture)
         appended_objection_pr = dict(review_pr)
         appended_objection_events = [dict(event) for event in review_events]
@@ -10255,6 +10511,71 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
             rep.bad(
                 "reject:chronological-withdrawal-no-later-artifact-is-held",
                 f"held={no_later_held}; action={no_later_action!r}",
+            )
+        no_later_digest = review_digest(live_head, "", live_shape_events[:1])
+        malformed_refusal_digests: list[str] = []
+        for label, by_suffix, canonical in (
+            ("hyphen", " BY departed-reviewer", True),
+            ("underscore", " BY departed_reviewer", True),
+            ("dot", " BY departed.reviewer", True),
+            ("slash", " BY departed/reviewer", False),
+            ("space", " BY departed reviewer", False),
+            ("missing-agent", " BY", False),
+            ("colon", " BY: departed.reviewer", False),
+            ("compact", " BY/departed.reviewer", False),
+        ):
+            refusal_events = [dict(live_shape_events[0])]
+            marker = f"CHANGES-REQUESTED-AT: claude {refused_head}"
+            refusal_events[0]["body"] = str(refusal_events[0]["body"]).replace(
+                marker, f"{marker}{by_suffix}"
+            )
+            refusal_digest = review_digest(live_head, "", refusal_events)
+            if canonical:
+                if refusal_digest == no_later_digest:
+                    rep.ok(f"accept:comment-refusal-by-{label}-is-metadata")
+                else:
+                    rep.bad(
+                        f"accept:comment-refusal-by-{label}-is-metadata",
+                        f"base={no_later_digest}; changed={refusal_digest}",
+                    )
+            else:
+                malformed_refusal_digests.append(refusal_digest)
+                if refusal_digest != no_later_digest:
+                    rep.ok(f"reject:comment-refusal-by-{label}-bytes-preserved")
+                else:
+                    rep.bad(
+                        f"reject:comment-refusal-by-{label}-bytes-preserved",
+                        "malformed BY text was removed from the digest",
+                    )
+            refusal_fixture = dict(no_later_fixture)
+            refusal_pr = dict(no_later_pr)
+            refusal_pr["review_events"] = refusal_events
+            refusal_fixture["prs"] = [refusal_pr]
+            refusal_path = os.path.join(tmp, f"comment-refusal-by-{label}.json")
+            with open(refusal_path, "w", encoding="utf-8") as handle:
+                json.dump(refusal_fixture, handle)
+            refusal_outcome, _refusal_rs = _record_exact(
+                rep,
+                f"reject:comment-refusal-by-{label}-remains-held",
+                py,
+                rs,
+                ("plan", "--fixture", refusal_path, "--format", "json"),
+                expected=0,
+            )
+            refusal_held, refusal_action = review_disposition(refusal_outcome, 394)
+            if refusal_held is True and refusal_action == "wait":
+                rep.ok(f"reject:comment-refusal-by-{label}-decision-unchanged")
+            else:
+                rep.bad(
+                    f"reject:comment-refusal-by-{label}-decision-unchanged",
+                    f"held={refusal_held}; action={refusal_action!r}",
+                )
+        if len(set(malformed_refusal_digests)) == len(malformed_refusal_digests):
+            rep.ok("reject:malformed-comment-by-mutations-change-digest")
+        else:
+            rep.bad(
+                "reject:malformed-comment-by-mutations-change-digest",
+                f"digests={malformed_refusal_digests}",
             )
         _record_same_exit(
             rep,

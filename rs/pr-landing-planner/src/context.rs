@@ -114,19 +114,33 @@ fn undecorate(line: &str) -> String {
     }
 }
 
+fn marker_matches(pattern: &Regex, line: &str) -> bool {
+    let normalized = undecorate(line);
+    pattern.find(&normalized).is_some_and(|matched| {
+        matched.start() == 0
+            && (matched.end() == normalized.len()
+                || matches!(normalized.as_bytes()[matched.end()], b' ' | b'\t'))
+    })
+}
+
 fn normalized_review_body(body: &str) -> String {
     static DISCLOSURE: OnceLock<Regex> = OnceLock::new();
     static REVIEW_MARKER: OnceLock<Regex> = OnceLock::new();
     static BY_IDENTITY: OnceLock<Regex> = OnceLock::new();
+    static WHO_METADATA: OnceLock<Regex> = OnceLock::new();
     let disclosure = regex(
         &DISCLOSURE,
         r"(?i)^\[[A-Za-z0-9_.-]+,\s*[A-Za-z0-9_.-]+,\s*[^,\[\]\r\n]+,\s*[A-Za-z0-9_.-]+,\s*role=[A-Za-z0-9_.-]+\]\r?$",
     );
     let review_marker = regex(
         &REVIEW_MARKER,
-        r"(?i)^(?:CHANGES-REQUESTED-WITHDRAWN-AT|CHANGES-REQUESTED-AT|APPROVED-AT):\s*(?:claude|codex)\s+[0-9a-f]{40}(?:[ \t]+BY[ \t]+[a-z0-9][a-z0-9-]*)?$",
+        r"(?i)^(?:CHANGES-REQUESTED-WITHDRAWN-AT|CHANGES-REQUESTED-AT|APPROVED-AT):\s*(?:claude|codex)\s+[0-9a-f]{40}",
     );
-    let by_identity = regex(&BY_IDENTITY, r"(?i)[ \t]+BY[ \t]+[a-z0-9][a-z0-9-]*");
+    let by_identity = regex(&BY_IDENTITY, r"(?i)[ \t]+BY[ \t]+[A-Za-z0-9_.-]+$");
+    let who_metadata = regex(
+        &WHO_METADATA,
+        r"^Unverified --who metadata: [A-Za-z0-9_.-]+\r?$",
+    );
     let lines = body.split('\n').collect::<Vec<_>>();
     let prose_indexes = prose_line_indexes(body)
         .into_iter()
@@ -140,14 +154,21 @@ fn normalized_review_body(body: &str) -> String {
         {
             continue;
         }
-        if prose_indexes.contains(&index) && review_marker.is_match(&undecorate(raw)) {
-            if let Some(claimed_identity) = by_identity.find(raw) {
-                normalized.push(format!(
-                    "{}{}",
-                    &raw[..claimed_identity.start()],
-                    &raw[claimed_identity.end()..]
-                ));
-                continue;
+        if prose_indexes.contains(&index) && who_metadata.is_match(raw) {
+            continue;
+        }
+        if prose_indexes.contains(&index) && marker_matches(review_marker, raw) {
+            let marker_line = undecorate(raw);
+            if let Some(claimed_identity) = by_identity.find(&marker_line) {
+                let claimed_text = claimed_identity.as_str();
+                if let Some(claimed_start) = raw.rfind(claimed_text) {
+                    normalized.push(format!(
+                        "{}{}",
+                        &raw[..claimed_start],
+                        &raw[claimed_start + claimed_text.len()..]
+                    ));
+                    continue;
+                }
             }
         }
         normalized.push(raw.to_owned());
@@ -159,13 +180,13 @@ pub(crate) fn has_comment_changes_requested(snapshot: &ReviewEvidenceSnapshot) -
     static COMMENT_OBJECTION: OnceLock<Regex> = OnceLock::new();
     let comment_objection = regex(
         &COMMENT_OBJECTION,
-        r"(?i)^CHANGES-REQUESTED-AT:\s*(?:claude|codex)\s+[0-9a-f]{40}(?:[ \t]+BY[ \t]+[a-z0-9][a-z0-9-]*)?$",
+        r"(?i)^CHANGES-REQUESTED-AT:\s*(?:claude|codex)\s+[0-9a-f]{40}",
     );
     snapshot.events.iter().any(|event| {
         matches!(event.kind.as_str(), "issue-comment" | "review-comment")
             && prose_lines(&event.body)
                 .iter()
-                .any(|line| comment_objection.is_match(&undecorate(line)))
+                .any(|line| marker_matches(comment_objection, line))
     })
 }
 
@@ -183,7 +204,7 @@ pub(crate) fn retirement_record(body: &str) -> Result<Option<RetirementRecord>, 
     let target = regex(&TARGET, r"(?i)^\s*RETIRES\s+#?(\d{6,})\s*$");
     let withdrawal = regex(
         &WITHDRAWAL,
-        r"(?i)^CHANGES-REQUESTED-WITHDRAWN-AT:\s*(?P<lane>claude|codex)\s+(?P<head>[0-9a-f]{40})(?:\s+BY\s+[a-z0-9][a-z0-9-]*)?$",
+        r"(?i)^CHANGES-REQUESTED-WITHDRAWN-AT:\s*(?P<lane>claude|codex)\s+(?P<head>[0-9a-f]{40})",
     );
     let lines = prose_lines(body);
     let targets = lines
@@ -200,7 +221,10 @@ pub(crate) fn retirement_record(body: &str) -> Result<Option<RetirementRecord>, 
     let mut withdrawals = Vec::new();
     for line in &lines {
         let normalized = undecorate(line);
-        if let Some(captures) = withdrawal.captures(&normalized) {
+        if marker_matches(withdrawal, line) {
+            let captures = withdrawal
+                .captures(&normalized)
+                .expect("matched withdrawal");
             withdrawals.push((
                 captures["lane"].to_ascii_lowercase(),
                 captures["head"].to_ascii_lowercase(),
@@ -1189,9 +1213,45 @@ mod tests {
             review_evidence_digest(&hostname_author).unwrap(),
             write_digest
         );
-        let mut false_by = snapshot.clone();
-        false_by.events[0].body = body.replace("BY release-authority", "BY other");
-        assert_eq!(review_evidence_digest(&false_by).unwrap(), write_digest);
+        for claimed_identity in ["other-agent", "other_agent", "other.agent"] {
+            let mut false_by = snapshot.clone();
+            false_by.events[0].body =
+                body.replace("BY release-authority", &format!("BY {claimed_identity}"));
+            assert_eq!(
+                retirement_record(&false_by.events[0].body).unwrap(),
+                Some(record.clone())
+            );
+            assert_eq!(review_evidence_digest(&false_by).unwrap(), write_digest);
+        }
+        let mut malformed_by = snapshot.clone();
+        malformed_by.events[0].body = body.replace("BY release-authority", "BY other/agent");
+        assert_eq!(
+            retirement_record(&malformed_by.events[0].body).unwrap(),
+            Some(record.clone())
+        );
+        let malformed_digest = review_evidence_digest(&malformed_by).unwrap();
+        assert_ne!(malformed_digest, write_digest);
+        let mut mutated_malformed = malformed_by.clone();
+        mutated_malformed.events[0].body = malformed_by.events[0]
+            .body
+            .replace("other/agent", "other agent");
+        assert_ne!(
+            review_evidence_digest(&mutated_malformed).unwrap(),
+            malformed_digest
+        );
+        for malformed_suffix in ["BY: other.agent", "BY/other.agent"] {
+            let mut alternate_malformed = snapshot.clone();
+            alternate_malformed.events[0].body =
+                body.replace("BY release-authority", malformed_suffix);
+            assert_eq!(
+                retirement_record(&alternate_malformed.events[0].body).unwrap(),
+                Some(record.clone())
+            );
+            assert_ne!(
+                review_evidence_digest(&alternate_malformed).unwrap(),
+                write_digest
+            );
+        }
         let mut different_disclosure = snapshot.clone();
         different_disclosure.events[0].body = body.replace(
             "[team, release-authority, session, model, role=observer]",
@@ -1245,12 +1305,26 @@ mod tests {
             events: vec![event.clone()],
         };
         let digest = review_evidence_digest(&snapshot).unwrap();
-        for disclosure_agent in ["departed_reviewer", "departed.reviewer"] {
+        for disclosure_agent in [
+            "departed-reviewer",
+            "departed_reviewer",
+            "departed.reviewer",
+        ] {
             let mut metadata_changed = snapshot.clone();
             metadata_changed.events[0].body = body.replace(
                 "[team, current-reviewer, session, model, role=reviewer]",
                 &format!("[team, {disclosure_agent}, old-session, other-model, role=reviewer]"),
             );
+            assert_eq!(review_evidence_digest(&metadata_changed).unwrap(), digest);
+        }
+        for claimed_identity in [
+            "departed-reviewer",
+            "departed_reviewer",
+            "departed.reviewer",
+        ] {
+            let mut metadata_changed = snapshot.clone();
+            metadata_changed.events[0].body =
+                body.replace("BY current-reviewer", &format!("BY {claimed_identity}"));
             assert_eq!(review_evidence_digest(&metadata_changed).unwrap(), digest);
         }
         let mut metadata_removed = snapshot.clone();
@@ -1261,6 +1335,20 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert_eq!(review_evidence_digest(&metadata_removed).unwrap(), digest);
+        let mut malformed = snapshot.clone();
+        malformed.events[0].body = body.replace("BY current-reviewer", "BY current/reviewer");
+        let malformed_digest = review_evidence_digest(&malformed).unwrap();
+        assert_ne!(malformed_digest, digest);
+        assert!(has_comment_changes_requested(&malformed));
+        let mut mutated_malformed = malformed.clone();
+        mutated_malformed.events[0].body = malformed.events[0]
+            .body
+            .replace("current/reviewer", "current reviewer");
+        assert_ne!(
+            review_evidence_digest(&mutated_malformed).unwrap(),
+            malformed_digest
+        );
+        assert!(has_comment_changes_requested(&mutated_malformed));
         let mut fenced = snapshot.clone();
         fenced.events[0].body =
             format!("{body}\n```text\nAPPROVED-AT: codex {REBASED_HEAD} BY quoted\n```");
@@ -1272,6 +1360,100 @@ mod tests {
             review_evidence_digest(&fenced).unwrap(),
             review_evidence_digest(&changed_fenced).unwrap()
         );
+    }
+
+    #[test]
+    fn unverified_who_metadata_is_optional_only_as_an_exact_prose_line() {
+        let base_body = "The bounds check resolves the objection.";
+        for (kind, state, head_sha) in [
+            ("review", "APPROVED", REBASED_HEAD),
+            ("issue-comment", "ACTIVE", ""),
+            ("review-comment", "ACTIVE", ""),
+        ] {
+            let event = ReviewEvidenceEvent {
+                kind: kind.into(),
+                identity: format!("{kind}-metadata"),
+                author: "reviewer".into(),
+                state: state.into(),
+                head_sha: head_sha.into(),
+                created_at: "2026-09-05T15:03:48Z".into(),
+                updated_at: "2026-09-05T15:03:48Z".into(),
+                last_edited_at: String::new(),
+                body: base_body.into(),
+                retirement_actor_permission: String::new(),
+            };
+            let snapshot = ReviewEvidenceSnapshot {
+                head_sha: REBASED_HEAD.into(),
+                review_decision: "APPROVED".into(),
+                events: vec![event.clone()],
+            };
+            let digest = review_evidence_digest(&snapshot).unwrap();
+            for agent in ["review-agent", "review_agent", "review.agent"] {
+                let mut with_metadata = snapshot.clone();
+                with_metadata.events[0].body =
+                    format!("{base_body}\nUnverified --who metadata: {agent}");
+                assert_eq!(review_evidence_digest(&with_metadata).unwrap(), digest);
+            }
+
+            let preserved_forms = [
+                format!("{base_body}\nUnverified --who metadata: review.agent extra"),
+                format!("{base_body}\n> Unverified --who metadata: review.agent"),
+                format!("{base_body}\n`Unverified --who metadata: review.agent`"),
+                format!("{base_body}\n```text\nUnverified --who metadata: review.agent\n```"),
+                format!("{base_body}\n\n    Unverified --who metadata: review.agent"),
+            ];
+            for preserved in preserved_forms {
+                let mut first = snapshot.clone();
+                first.events[0].body = preserved.clone();
+                let mut second = snapshot.clone();
+                second.events[0].body = preserved.replace("review.agent", "other_agent");
+                assert_ne!(review_evidence_digest(&first).unwrap(), digest);
+                assert_ne!(
+                    review_evidence_digest(&first).unwrap(),
+                    review_evidence_digest(&second).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn comment_refusal_survives_valid_and_malformed_by_metadata() {
+        let marker = format!("CHANGES-REQUESTED-AT: codex {REBASED_HEAD}");
+        for kind in ["issue-comment", "review-comment"] {
+            let event = ReviewEvidenceEvent {
+                kind: kind.into(),
+                identity: format!("{kind}-refusal"),
+                author: "reviewer".into(),
+                state: "ACTIVE".into(),
+                head_sha: String::new(),
+                created_at: "2026-09-05T15:03:48Z".into(),
+                updated_at: "2026-09-05T15:03:48Z".into(),
+                last_edited_at: String::new(),
+                body: marker.clone(),
+                retirement_actor_permission: String::new(),
+            };
+            for suffix in [
+                "",
+                " BY review-agent",
+                " BY review_agent",
+                " BY review.agent",
+                " BY review/agent",
+                " BY review agent",
+                " BY",
+                " BY: review.agent",
+                " BY/review.agent",
+            ] {
+                let snapshot = ReviewEvidenceSnapshot {
+                    head_sha: REBASED_HEAD.into(),
+                    review_decision: String::new(),
+                    events: vec![ReviewEvidenceEvent {
+                        body: format!("{marker}{suffix}"),
+                        ..event.clone()
+                    }],
+                };
+                assert!(has_comment_changes_requested(&snapshot));
+            }
+        }
     }
 
     #[test]

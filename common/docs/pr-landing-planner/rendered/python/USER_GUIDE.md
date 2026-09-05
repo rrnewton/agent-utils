@@ -210,11 +210,18 @@ Each event contributes its source kind, stable event identity, state, available
 event head (or the documented empty value for comment sources without one),
 creation/submission timestamp, current version timestamp, native-review
 last-edit timestamp, and body. The digest removes only a fleet disclosure on the
-first nonblank line and an optional `BY` value on an exact review marker. The
-disclosure's agent field uses the canonical `[A-Za-z0-9_.-]+` token grammar. Those
-fields remain in the displayed comment for readers but do not decide authority.
-Every other body byte remains input to the digest, so appending an unresolved
-objection changes it. Inline location fields are part of state, so an
+first nonblank line, an optional `BY` value on an exact review marker, and an
+exact standalone `Unverified --who metadata: NAME` prose line. These optional
+identity fields use the canonical `[A-Za-z0-9_.-]+` agent-token grammar and are
+normalized for native reviews, issue comments, and inline review comments. They
+remain in the displayed comment for readers but do not decide authority.
+
+Review-marker recognition does not depend on the optional `BY` value. A missing,
+alternate, or malformed `BY` value therefore cannot hide an underlying refusal
+or withdrawal. Only a canonical value is removed from the digest; malformed
+text, near-matches to the standalone metadata line, quoted or code examples, and
+every other body byte remain digest input. Appending an unresolved objection
+therefore changes the digest. Inline location fields are part of state, so an
 outdated/retired comment also changes the digest even when GitHub gives the
 change the same second-resolution timestamp.
 

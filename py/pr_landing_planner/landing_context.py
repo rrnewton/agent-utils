@@ -27,11 +27,12 @@ AGENT_PREFIX = "agent:"
 POLICY_PREFIX = "landing-policy:"
 REQUIRED_REVIEW_LANES = ("codex", "claude")
 ALLOWED_RETIREMENT_PERMISSIONS = frozenset(("triage", "write", "maintain", "admin"))
+_AGENT_TOKEN = r"[A-Za-z0-9_.-]+"
 
 _RETIREMENT_TARGET = re.compile(r"^\s*RETIRES\s+#?(\d{6,})\s*$", re.IGNORECASE)
 _WITHDRAWAL = re.compile(
     r"^CHANGES-REQUESTED-WITHDRAWN-AT:\s*(?P<lane>claude|codex)\s+"
-    r"(?P<head>[0-9a-f]{40})(?:\s+BY\s+[a-z0-9][a-z0-9-]*)?$",
+    r"(?P<head>[0-9a-f]{40})",
     re.IGNORECASE,
 )
 _BLOCK_PREFIX = re.compile(r"^(?:#{1,6}\s+|[-+*]\s+)")
@@ -43,14 +44,15 @@ _DISCLOSURE = re.compile(
 )
 _REVIEW_MARKER = re.compile(
     r"^(?:CHANGES-REQUESTED-WITHDRAWN-AT|CHANGES-REQUESTED-AT|APPROVED-AT):"
-    r"\s*(?:claude|codex)\s+[0-9a-f]{40}"
-    r"(?:[ \t]+BY[ \t]+[a-z0-9][a-z0-9-]*)?$",
+    r"\s*(?:claude|codex)\s+[0-9a-f]{40}",
     re.IGNORECASE,
 )
-_BY_IDENTITY = re.compile(r"[ \t]+BY[ \t]+[a-z0-9][a-z0-9-]*", re.IGNORECASE)
+_BY_IDENTITY = re.compile(
+    rf"[ \t]+BY[ \t]+{_AGENT_TOKEN}$", re.IGNORECASE
+)
+_WHO_METADATA = re.compile(rf"^Unverified --who metadata: {_AGENT_TOKEN}\r?$")
 _COMMENT_OBJECTION = re.compile(
-    r"^CHANGES-REQUESTED-AT:\s*(?:claude|codex)\s+[0-9a-f]{40}"
-    r"(?:[ \t]+BY[ \t]+[a-z0-9][a-z0-9-]*)?$",
+    r"^CHANGES-REQUESTED-AT:\s*(?:claude|codex)\s+[0-9a-f]{40}",
     re.IGNORECASE,
 )
 
@@ -157,6 +159,17 @@ def _undecorate(line: str) -> str:
             return normalized
 
 
+def _marker_match(pattern: re.Pattern[str], line: str) -> re.Match[str] | None:
+    """Match the marker core without interpreting trailing optional metadata."""
+
+    normalized = _undecorate(line)
+    match = pattern.match(normalized)
+    if match is None:
+        return None
+    end = match.end()
+    return match if end == len(normalized) or normalized[end] in " \t" else None
+
+
 def retirement_record(body: str) -> RetirementRecord | None:
     """Return one exact retirement linkage, ignoring optional attribution text."""
 
@@ -167,7 +180,7 @@ def retirement_record(body: str) -> RetirementRecord | None:
     if len(targets) != 1:
         raise ValueError("review evidence retirement must name exactly one target")
     withdrawals = [
-        match for line in lines if (match := _WITHDRAWAL.match(_undecorate(line)))
+        match for line in lines if (match := _marker_match(_WITHDRAWAL, line))
     ]
     if len(withdrawals) != 1:
         raise ValueError("review evidence retirement needs one canonical withdrawal")
@@ -195,13 +208,20 @@ def _normalized_review_body(body: str) -> str:
             and _DISCLOSURE.fullmatch(raw) is not None
         ):
             continue
+        if index in prose_indexes and _WHO_METADATA.fullmatch(raw) is not None:
+            continue
         line = raw
-        if (
-            index in prose_indexes
-            and _REVIEW_MARKER.fullmatch(_undecorate(raw)) is not None
-            and (claimed_identity := _BY_IDENTITY.search(raw)) is not None
-        ):
-            line = raw[: claimed_identity.start()] + raw[claimed_identity.end() :]
+        if index in prose_indexes and _marker_match(_REVIEW_MARKER, raw) is not None:
+            normalized_line = _undecorate(raw)
+            claimed_identity = _BY_IDENTITY.search(normalized_line)
+            if claimed_identity is not None:
+                claimed_text = claimed_identity.group(0)
+                claimed_start = raw.rfind(claimed_text)
+                if claimed_start >= 0:
+                    line = (
+                        raw[:claimed_start]
+                        + raw[claimed_start + len(claimed_text) :]
+                    )
         normalized.append(line)
     return "\n".join(normalized)
 
@@ -212,7 +232,7 @@ def has_comment_changes_requested(snapshot: ReviewEvidenceSnapshot) -> bool:
     return any(
         event.kind in ("issue-comment", "review-comment")
         and any(
-            _COMMENT_OBJECTION.fullmatch(_undecorate(line)) is not None
+            _marker_match(_COMMENT_OBJECTION, line) is not None
             for line in _prose_lines(event.body)
         )
         for event in snapshot.events

@@ -10,6 +10,7 @@ import pytest
 from pr_landing_planner.emit import render_json
 from pr_landing_planner.landing_context import (
     apply_landing_context,
+    has_comment_changes_requested,
     parse_landing_context,
     retirement_record,
     review_evidence_digest,
@@ -638,13 +639,49 @@ def test_retirement_uses_event_author_permission_and_ignores_claimed_identity() 
         snapshot, events=(replace(event, author="devbig014"),)
     )
     assert review_evidence_digest(hostname_author) != write_digest
-    false_by = replace(
+    for claimed_identity in (
+        "other-agent",
+        "other_agent",
+        "other.agent",
+    ):
+        false_by = replace(
+            snapshot,
+            events=(
+                replace(
+                    event,
+                    body=body.replace("BY release-authority", f"BY {claimed_identity}"),
+                ),
+            ),
+        )
+        assert retirement_record(false_by.events[0].body) == record
+        assert review_evidence_digest(false_by) == write_digest
+    malformed_by = replace(
         snapshot,
         events=(
-            replace(event, body=body.replace("BY release-authority", "BY other")),
+            replace(event, body=body.replace("BY release-authority", "BY other/agent")),
         ),
     )
-    assert review_evidence_digest(false_by) == write_digest
+    assert retirement_record(malformed_by.events[0].body) == record
+    malformed_digest = review_evidence_digest(malformed_by)
+    assert malformed_digest != write_digest
+    assert review_evidence_digest(
+        replace(
+            malformed_by,
+            events=(replace(malformed_by.events[0], body=malformed_by.events[0].body.replace("other/agent", "other agent")),),
+        )
+    ) != malformed_digest
+    for malformed_suffix in ("BY: other.agent", "BY/other.agent"):
+        alternate_malformed = replace(
+            snapshot,
+            events=(
+                replace(
+                    event,
+                    body=body.replace("BY release-authority", malformed_suffix),
+                ),
+            ),
+        )
+        assert retirement_record(alternate_malformed.events[0].body) == record
+        assert review_evidence_digest(alternate_malformed) != write_digest
     different_disclosure = replace(
         snapshot,
         events=(
@@ -696,11 +733,24 @@ def test_review_marker_attribution_is_metadata_for_every_marker() -> None:
     )
     snapshot = ReviewEvidenceSnapshot(REBASED_HEAD, "", (event,))
     digest = review_evidence_digest(snapshot)
-    for disclosure_agent in ("departed_reviewer", "departed.reviewer"):
+    for disclosure_agent in (
+        "departed-reviewer",
+        "departed_reviewer",
+        "departed.reviewer",
+    ):
         metadata_changed = body.replace(
             "[team, current-reviewer, session, model, role=reviewer]",
             f"[team, {disclosure_agent}, old-session, other-model, role=reviewer]",
         )
+        assert review_evidence_digest(
+            replace(snapshot, events=(replace(event, body=metadata_changed),))
+        ) == digest
+    for claimed_identity in (
+        "departed-reviewer",
+        "departed_reviewer",
+        "departed.reviewer",
+    ):
+        metadata_changed = body.replace("BY current-reviewer", f"BY {claimed_identity}")
         assert review_evidence_digest(
             replace(snapshot, events=(replace(event, body=metadata_changed),))
         ) == digest
@@ -711,6 +761,22 @@ def test_review_marker_attribution_is_metadata_for_every_marker() -> None:
     assert review_evidence_digest(
         replace(snapshot, events=(replace(event, body=metadata_removed),))
     ) == digest
+    malformed_body = body.replace("BY current-reviewer", "BY current/reviewer")
+    malformed = replace(snapshot, events=(replace(event, body=malformed_body),))
+    malformed_digest = review_evidence_digest(malformed)
+    assert malformed_digest != digest
+    assert has_comment_changes_requested(malformed)
+    mutated_malformed = replace(
+        malformed,
+        events=(
+            replace(
+                malformed.events[0],
+                body=malformed_body.replace("current/reviewer", "current reviewer"),
+            ),
+        ),
+    )
+    assert review_evidence_digest(mutated_malformed) != malformed_digest
+    assert has_comment_changes_requested(mutated_malformed)
     fenced = f"{body}\n```text\nAPPROVED-AT: codex {REBASED_HEAD} BY quoted\n```"
     changed_fenced = fenced.replace("BY quoted", "BY other-quoted")
     assert review_evidence_digest(
@@ -718,6 +784,93 @@ def test_review_marker_attribution_is_metadata_for_every_marker() -> None:
     ) != review_evidence_digest(
         replace(snapshot, events=(replace(event, body=changed_fenced),))
     )
+
+
+@pytest.mark.parametrize(
+    ("kind", "state", "head_sha"),
+    (
+        ("review", "APPROVED", REBASED_HEAD),
+        ("issue-comment", "ACTIVE", ""),
+        ("review-comment", "ACTIVE", ""),
+    ),
+)
+def test_unverified_who_metadata_is_optional_only_as_an_exact_prose_line(
+    kind: str, state: str, head_sha: str
+) -> None:
+    base_body = "The bounds check resolves the objection."
+    event = ReviewEvidenceEvent(
+        kind=kind,
+        identity=f"{kind}-metadata",
+        author="reviewer",
+        state=state,
+        head_sha=head_sha,
+        created_at="2026-09-05T15:03:48Z",
+        updated_at="2026-09-05T15:03:48Z",
+        body=base_body,
+    )
+    snapshot = ReviewEvidenceSnapshot(REBASED_HEAD, "APPROVED", (event,))
+    digest = review_evidence_digest(snapshot)
+    for agent in ("review-agent", "review_agent", "review.agent"):
+        with_metadata = replace(
+            snapshot,
+            events=(
+                replace(
+                    event,
+                    body=f"{base_body}\nUnverified --who metadata: {agent}",
+                ),
+            ),
+        )
+        assert review_evidence_digest(with_metadata) == digest
+
+    preserved_forms = (
+        f"{base_body}\nUnverified --who metadata: review.agent extra",
+        f"{base_body}\n> Unverified --who metadata: review.agent",
+        f"{base_body}\n`Unverified --who metadata: review.agent`",
+        f"{base_body}\n```text\nUnverified --who metadata: review.agent\n```",
+        f"{base_body}\n\n    Unverified --who metadata: review.agent",
+    )
+    for preserved in preserved_forms:
+        first = replace(snapshot, events=(replace(event, body=preserved),))
+        second = replace(
+            snapshot,
+            events=(
+                replace(event, body=preserved.replace("review.agent", "other_agent")),
+            ),
+        )
+        assert review_evidence_digest(first) != digest
+        assert review_evidence_digest(first) != review_evidence_digest(second)
+
+
+@pytest.mark.parametrize("kind", ("issue-comment", "review-comment"))
+def test_comment_refusal_survives_valid_and_malformed_by_metadata(kind: str) -> None:
+    marker = f"CHANGES-REQUESTED-AT: codex {REBASED_HEAD}"
+    event = ReviewEvidenceEvent(
+        kind=kind,
+        identity=f"{kind}-refusal",
+        author="reviewer",
+        state="ACTIVE",
+        head_sha="",
+        created_at="2026-09-05T15:03:48Z",
+        updated_at="2026-09-05T15:03:48Z",
+        body=marker,
+    )
+    for suffix in (
+        "",
+        " BY review-agent",
+        " BY review_agent",
+        " BY review.agent",
+        " BY review/agent",
+        " BY review agent",
+        " BY",
+        " BY: review.agent",
+        " BY/review.agent",
+    ):
+        snapshot = ReviewEvidenceSnapshot(
+            REBASED_HEAD,
+            "",
+            (replace(event, body=f"{marker}{suffix}"),),
+        )
+        assert has_comment_changes_requested(snapshot)
 
 
 def test_unverified_retirement_stays_visible_and_does_not_clear_objection() -> None:
