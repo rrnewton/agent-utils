@@ -2554,3 +2554,47 @@ async fn an_unconfigured_summariser_answers_503_and_names_the_setting_to_add() {
         "an unconfigured server dialled the vendor anyway"
     );
 }
+
+/// Reading a message aloud reports WHERE the wait went.
+///
+/// "Reading is slow" has three candidate causes on this route and they need completely different
+/// work: a round trip to Discord to find the message, a round trip to a vendor to generate the
+/// audio, and the transfer of a file that nothing streams. Guessing between them from a local run
+/// is hopeless, because against fakes both round trips are free — so the split is reported on every
+/// response and can be read off a real deployment against a real message.
+#[tokio::test]
+async fn reading_a_message_aloud_reports_where_the_time_went() {
+    let (harness, _store, ids) = todo_harness();
+
+    let (status, headers, body) = call_bytes(
+        &harness,
+        "POST",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/messages/{}/speak", ids[0]),
+        Some(READ_TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let timing = headers
+        .get("server-timing")
+        .and_then(|v| v.to_str().ok())
+        .expect("the route must say where the time went");
+    // The two round trips are named SEPARATELY. One number for the whole request would say the
+    // thing everybody already knows and none of the thing that decides what to fix.
+    assert!(
+        timing.contains("discord;dur="),
+        "no Discord timing: {timing}"
+    );
+    assert!(timing.contains("tts;dur="), "no vendor timing: {timing}");
+    // And the SIZE, which is the third cause and the one no clock on this server can see: the
+    // reader waits for the last byte of this before hearing the first word of it.
+    assert!(
+        timing.contains(&format!("{} bytes", body.len())),
+        "the timing does not state the size actually returned ({} bytes): {timing}",
+        body.len()
+    );
+    assert!(
+        timing.contains("characters"),
+        "the size is not relatable to how much there was to say: {timing}"
+    );
+}

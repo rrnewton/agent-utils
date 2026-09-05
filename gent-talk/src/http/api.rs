@@ -424,8 +424,20 @@ pub async fn speak(
     Query(query): Query<SpeakQuery>,
 ) -> Result<Response, ApiError> {
     require(&headers, &state, Scope::Read)?;
+    // TIMED IN THREE PARTS, because "reading a message aloud is slow" has three candidate causes
+    // and they are fixed by completely different work. Looking up the message is a round trip to
+    // DISCORD — this route asks for a whole window and finds one message in it. Generating the
+    // audio is a round trip to a VENDOR whose cost grows with how much there is to say. The
+    // transfer is neither, and on a phone it is not small: nothing here streams, so the reader
+    // waits for the last byte of the whole file before the first word is spoken.
+    //
+    // Reported as `Server-Timing`, which a browser shows per request in its own network panel, so
+    // the split can be read off a real deployment against real messages rather than guessed at
+    // from a local run against fakes where both round trips are free.
+    let began = std::time::Instant::now();
     let (_channel, message) =
         ops::message_by_id(&state, &channel_id, &message_id, query.limit).await?;
+    let looked_up_ms = began.elapsed().as_millis();
     // WHAT IS SENT IS NOT THE RAW MESSAGE. Markdown, hashes, snowflakes and ISO timestamps are all
     // noise when spoken — the voice said "asterisk asterisk deploy asterisk asterisk" and spelled
     // out nineteen-digit ids. `speakable::for_speech` is deterministic and costs nothing; see it
@@ -435,10 +447,29 @@ pub async fn speak(
         jiff::Timestamp::now().as_millisecond(),
         &state.config.timezone,
     );
+    let characters = said.chars().count();
+    let asked = std::time::Instant::now();
     let spoken = state
         .speech
         .speak(&state.config.elevenlabs, &said, query.speed)
         .await?;
+    let generated_ms = asked.elapsed().as_millis();
+    let bytes = spoken.audio.len();
+    // At the vendor's default mp3 bitrate this is roughly sixteen kilobytes per second of speech,
+    // so the size is also the plainest available statement of how long the reader is about to
+    // listen for — and of how much has to cross a phone connection before they hear any of it.
+    tracing::info!(
+        message = %message_id,
+        characters,
+        bytes,
+        discord_ms = %looked_up_ms,
+        vendor_ms = %generated_ms,
+        "read a message aloud"
+    );
+    let timing = format!(
+        "discord;dur={looked_up_ms}, tts;dur={generated_ms}, \
+         audio;desc=\"{bytes} bytes for {characters} characters\""
+    );
     Ok((
         [
             (header::CONTENT_TYPE, spoken.content_type.as_str()),
@@ -446,6 +477,11 @@ pub async fn speak(
             // this server authenticates access to, and the reader's own browser re-asking is
             // cheaper to reason about than a proxy holding somebody else's message.
             (header::CACHE_CONTROL, "no-store"),
+            // Not in `http`'s constant list, so named here. One place, one spelling.
+            (
+                header::HeaderName::from_static("server-timing"),
+                timing.as_str(),
+            ),
         ],
         spoken.audio,
     )
