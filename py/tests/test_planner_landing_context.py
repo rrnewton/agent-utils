@@ -599,6 +599,14 @@ def test_retirement_uses_event_author_permission_and_ignores_claimed_identity() 
         "123456", "codex", REBASED_HEAD
     )
     write_digest = review_evidence_digest(snapshot)
+    assert write_digest == "83f83abe9e2e319f0a65a4f100d1b6c91f8a6c0ca29e6797d120166e6cca3b58"
+    appended_objection = replace(
+        snapshot,
+        events=(
+            replace(event, body=f"{body}\nDo not land: the race remains."),
+        ),
+    )
+    assert review_evidence_digest(appended_objection) != write_digest
     assert review_evidence_digest(
         replace(
             snapshot,
@@ -665,6 +673,50 @@ def test_retirement_uses_event_author_permission_and_ignores_claimed_identity() 
                 events=(replace(event, body="ordinary comment"),),
             )
         )
+
+
+def test_review_marker_attribution_is_metadata_for_every_marker() -> None:
+    body = (
+        "[team, current-reviewer, session, model, role=reviewer]\n"
+        f"CHANGES-REQUESTED-AT: codex {REBASED_HEAD} BY current-reviewer\n"
+        f"CHANGES-REQUESTED-WITHDRAWN-AT: codex {REBASED_HEAD} "
+        "BY current-reviewer\n"
+        f"APPROVED-AT: codex {REBASED_HEAD} BY current-reviewer\n"
+        "The objection is resolved by the changed bounds check."
+    )
+    event = ReviewEvidenceEvent(
+        kind="issue-comment",
+        identity="comment-markers",
+        author="current-reviewer",
+        state="ACTIVE",
+        head_sha="",
+        created_at="2026-09-05T15:03:48Z",
+        updated_at="2026-09-05T15:03:48Z",
+        body=body,
+    )
+    snapshot = ReviewEvidenceSnapshot(REBASED_HEAD, "", (event,))
+    digest = review_evidence_digest(snapshot)
+    metadata_changed = body.replace(
+        "[team, current-reviewer, session, model, role=reviewer]",
+        "[team, departed-reviewer, old-session, other-model, role=reviewer]",
+    ).replace("BY current-reviewer", "BY departed-reviewer")
+    assert review_evidence_digest(
+        replace(snapshot, events=(replace(event, body=metadata_changed),))
+    ) == digest
+    metadata_removed = "\n".join(
+        line.replace(" BY current-reviewer", "")
+        for line in body.split("\n")[1:]
+    )
+    assert review_evidence_digest(
+        replace(snapshot, events=(replace(event, body=metadata_removed),))
+    ) == digest
+    fenced = f"{body}\n```text\nAPPROVED-AT: codex {REBASED_HEAD} BY quoted\n```"
+    changed_fenced = fenced.replace("BY quoted", "BY other-quoted")
+    assert review_evidence_digest(
+        replace(snapshot, events=(replace(event, body=fenced),))
+    ) != review_evidence_digest(
+        replace(snapshot, events=(replace(event, body=changed_fenced),))
+    )
 
 
 def test_unverified_retirement_stays_visible_and_does_not_clear_objection() -> None:

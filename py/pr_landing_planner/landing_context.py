@@ -36,6 +36,18 @@ _WITHDRAWAL = re.compile(
 )
 _BLOCK_PREFIX = re.compile(r"^(?:#{1,6}\s+|[-+*]\s+)")
 _FENCE = re.compile(r"^ {0,3}(?P<f>`{3,}|~{3,})\s*(?P<info>.*)$")
+_DISCLOSURE = re.compile(
+    r"^\[[A-Za-z0-9_.-]+,\s*[a-z0-9][a-z0-9-]*,\s*[^,\[\]\r\n]+,\s*"
+    r"[A-Za-z0-9_.-]+,\s*role=[A-Za-z0-9_.-]+\]\r?$",
+    re.IGNORECASE,
+)
+_REVIEW_MARKER = re.compile(
+    r"^(?:CHANGES-REQUESTED-WITHDRAWN-AT|CHANGES-REQUESTED-AT|APPROVED-AT):"
+    r"\s*(?:claude|codex)\s+[0-9a-f]{40}"
+    r"(?:[ \t]+BY[ \t]+[a-z0-9][a-z0-9-]*)?$",
+    re.IGNORECASE,
+)
+_BY_IDENTITY = re.compile(r"[ \t]+BY[ \t]+[a-z0-9][a-z0-9-]*", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -76,14 +88,14 @@ def _exact_sha256(value: str) -> bool:
     return len(value) == 64 and all(char in "0123456789abcdef" for char in value)
 
 
-def _prose_lines(body: str) -> tuple[str, ...]:
-    """Return comment lines outside fenced and indented code blocks."""
+def _prose_line_indexes(body: str) -> tuple[int, ...]:
+    """Return indexes of comment lines outside fenced and indented code blocks."""
 
-    lines: list[str] = []
+    indexes: list[int] = []
     fence = ""
     indented = False
     previous_blank = True
-    for raw in body.split("\n"):
+    for index, raw in enumerate(body.split("\n")):
         blank = not raw.strip()
         if fence:
             match = _FENCE.match(raw)
@@ -113,9 +125,16 @@ def _prose_lines(body: str) -> tuple[str, ...]:
             indented = True
             previous_blank = False
             continue
-        lines.append(raw)
+        indexes.append(index)
         previous_blank = blank
-    return tuple(lines)
+    return tuple(indexes)
+
+
+def _prose_lines(body: str) -> tuple[str, ...]:
+    """Return comment lines outside fenced and indented code blocks."""
+
+    lines = body.split("\n")
+    return tuple(lines[index] for index in _prose_line_indexes(body))
 
 
 def _undecorate(line: str) -> str:
@@ -155,13 +174,31 @@ def retirement_record(body: str) -> RetirementRecord | None:
     )
 
 
-def _digest_body(body: str, retirement: RetirementRecord | None) -> str:
-    if retirement is None:
-        return body
-    return (
-        f"CHANGES-REQUESTED-WITHDRAWN-AT: {retirement.lane} "
-        f"{retirement.head_sha}\nRETIRES {retirement.target_comment_id}"
+def _normalized_review_body(body: str) -> str:
+    """Remove only optional attribution metadata from review evidence."""
+
+    lines = body.split("\n")
+    prose_indexes = frozenset(_prose_line_indexes(body))
+    first_nonblank = next(
+        (index for index, line in enumerate(lines) if line.strip()), None
     )
+    normalized: list[str] = []
+    for index, raw in enumerate(lines):
+        if (
+            index == first_nonblank
+            and index in prose_indexes
+            and _DISCLOSURE.fullmatch(raw) is not None
+        ):
+            continue
+        line = raw
+        if (
+            index in prose_indexes
+            and _REVIEW_MARKER.fullmatch(_undecorate(raw)) is not None
+            and (claimed_identity := _BY_IDENTITY.search(raw)) is not None
+        ):
+            line = raw[: claimed_identity.start()] + raw[claimed_identity.end() :]
+        normalized.append(line)
+    return "\n".join(normalized)
 
 
 def review_evidence_digest(snapshot: ReviewEvidenceSnapshot) -> str:
@@ -177,7 +214,8 @@ def review_evidence_digest(snapshot: ReviewEvidenceSnapshot) -> str:
     ):
         raise ValueError("review evidence snapshot has an unknown aggregate decision")
     normalized = tuple(
-        (event, retirement_record(event.body)) for event in snapshot.events
+        (event, retirement_record(event.body), _normalized_review_body(event.body))
+        for event in snapshot.events
     )
     ordered = sorted(
         normalized,
@@ -190,12 +228,12 @@ def review_evidence_digest(snapshot: ReviewEvidenceSnapshot) -> str:
             item[0].created_at,
             item[0].updated_at,
             item[0].last_edited_at,
-            _digest_body(item[0].body, item[1]),
+            item[2],
             item[0].retirement_actor_permission,
         ),
     )
     seen: set[tuple[str, str]] = set()
-    for event, retirement in ordered:
+    for event, retirement, _body in ordered:
         if not event.kind or not event.identity:
             raise ValueError("review evidence event lacks a stable kind or identity")
         if event.kind not in ("review", "issue-comment", "review-comment"):
@@ -239,7 +277,7 @@ def review_evidence_digest(snapshot: ReviewEvidenceSnapshot) -> str:
         seen.add(key)
     has_changes_requested = any(
         event.kind == "review" and event.state == "CHANGES_REQUESTED"
-        for event, _retirement in ordered
+        for event, _retirement, _body in ordered
     )
     if not snapshot.review_decision and has_changes_requested:
         raise ValueError(
@@ -260,7 +298,7 @@ def review_evidence_digest(snapshot: ReviewEvidenceSnapshot) -> str:
     feed(snapshot.head_sha)
     feed(snapshot.review_decision)
     digest.update(len(ordered).to_bytes(8, "big"))
-    for event, retirement in ordered:
+    for event, _retirement, body in ordered:
         for value in (
             event.kind,
             event.identity,
@@ -270,7 +308,7 @@ def review_evidence_digest(snapshot: ReviewEvidenceSnapshot) -> str:
             event.created_at,
             event.updated_at,
             event.last_edited_at,
-            _digest_body(event.body, retirement),
+            body,
             event.retirement_actor_permission,
         ):
             feed(value)

@@ -24,14 +24,14 @@ fn regex<'a>(slot: &'a OnceLock<Regex>, pattern: &str) -> &'a Regex {
     slot.get_or_init(|| Regex::new(pattern).expect("static review-evidence regex is valid"))
 }
 
-fn prose_lines(body: &str) -> Vec<&str> {
+fn prose_line_indexes(body: &str) -> Vec<usize> {
     static FENCE: OnceLock<Regex> = OnceLock::new();
     let fence_re = regex(&FENCE, r"^ {0,3}(?P<f>`{3,}|~{3,})\s*(?P<info>.*)$");
-    let mut lines = Vec::new();
+    let mut indexes = Vec::new();
     let mut fence = String::new();
     let mut indented = false;
     let mut previous_blank = true;
-    for raw in body.split('\n') {
+    for (index, raw) in body.split('\n').enumerate() {
         let blank = raw.trim().is_empty();
         if !fence.is_empty() {
             if let Some(captures) = fence_re.captures(raw) {
@@ -74,10 +74,18 @@ fn prose_lines(body: &str) -> Vec<&str> {
             previous_blank = false;
             continue;
         }
-        lines.push(raw);
+        indexes.push(index);
         previous_blank = blank;
     }
-    lines
+    indexes
+}
+
+fn prose_lines(body: &str) -> Vec<&str> {
+    let lines = body.split('\n').collect::<Vec<_>>();
+    prose_line_indexes(body)
+        .into_iter()
+        .map(|index| lines[index])
+        .collect()
 }
 
 fn undecorate(line: &str) -> String {
@@ -104,6 +112,47 @@ fn undecorate(line: &str) -> String {
             return normalized;
         }
     }
+}
+
+fn normalized_review_body(body: &str) -> String {
+    static DISCLOSURE: OnceLock<Regex> = OnceLock::new();
+    static REVIEW_MARKER: OnceLock<Regex> = OnceLock::new();
+    static BY_IDENTITY: OnceLock<Regex> = OnceLock::new();
+    let disclosure = regex(
+        &DISCLOSURE,
+        r"(?i)^\[[A-Za-z0-9_.-]+,\s*[a-z0-9][a-z0-9-]*,\s*[^,\[\]\r\n]+,\s*[A-Za-z0-9_.-]+,\s*role=[A-Za-z0-9_.-]+\]\r?$",
+    );
+    let review_marker = regex(
+        &REVIEW_MARKER,
+        r"(?i)^(?:CHANGES-REQUESTED-WITHDRAWN-AT|CHANGES-REQUESTED-AT|APPROVED-AT):\s*(?:claude|codex)\s+[0-9a-f]{40}(?:[ \t]+BY[ \t]+[a-z0-9][a-z0-9-]*)?$",
+    );
+    let by_identity = regex(&BY_IDENTITY, r"(?i)[ \t]+BY[ \t]+[a-z0-9][a-z0-9-]*");
+    let lines = body.split('\n').collect::<Vec<_>>();
+    let prose_indexes = prose_line_indexes(body)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let first_nonblank = lines.iter().position(|line| !line.trim().is_empty());
+    let mut normalized = Vec::with_capacity(lines.len());
+    for (index, raw) in lines.into_iter().enumerate() {
+        if Some(index) == first_nonblank
+            && prose_indexes.contains(&index)
+            && disclosure.is_match(raw)
+        {
+            continue;
+        }
+        if prose_indexes.contains(&index) && review_marker.is_match(&undecorate(raw)) {
+            if let Some(claimed_identity) = by_identity.find(raw) {
+                normalized.push(format!(
+                    "{}{}",
+                    &raw[..claimed_identity.start()],
+                    &raw[claimed_identity.end()..]
+                ));
+                continue;
+            }
+        }
+        normalized.push(raw.to_owned());
+    }
+    normalized.join("\n")
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -244,10 +293,6 @@ pub fn review_evidence_digest(snapshot: &ReviewEvidenceSnapshot) -> Result<Strin
                         .to_owned(),
                 );
             }
-            event.body = format!(
-                "CHANGES-REQUESTED-WITHDRAWN-AT: {} {}\nRETIRES {}",
-                retirement.lane, retirement.head_sha, retirement.target_comment_id
-            );
             if event.retirement_actor_permission.is_empty() {
                 event.author.clear();
             }
@@ -256,6 +301,7 @@ pub fn review_evidence_digest(snapshot: &ReviewEvidenceSnapshot) -> Result<Strin
         } else {
             event.author.clear();
         }
+        event.body = normalized_review_body(&event.body);
         if event.state.is_empty() {
             return Err("review evidence event lacks a state".to_owned());
         }
@@ -1088,6 +1134,16 @@ mod tests {
         assert_eq!(record.lane, "codex");
         assert_eq!(record.head_sha, REBASED_HEAD);
         let write_digest = review_evidence_digest(&snapshot).unwrap();
+        assert_eq!(
+            write_digest,
+            "83f83abe9e2e319f0a65a4f100d1b6c91f8a6c0ca29e6797d120166e6cca3b58"
+        );
+        let mut appended_objection = snapshot.clone();
+        appended_objection.events[0].body = format!("{body}\nDo not land: the race remains.");
+        assert_ne!(
+            review_evidence_digest(&appended_objection).unwrap(),
+            write_digest
+        );
         let mut maintain = snapshot.clone();
         maintain.events[0].retirement_actor_permission = "maintain".into();
         assert_ne!(review_evidence_digest(&maintain).unwrap(), write_digest);
@@ -1146,6 +1202,62 @@ mod tests {
         assert!(review_evidence_digest(&not_retirement)
             .unwrap_err()
             .contains("non-retirement"));
+    }
+
+    #[test]
+    fn review_marker_attribution_is_metadata_for_every_marker() {
+        let body = format!(
+            "[team, current-reviewer, session, model, role=reviewer]\n\
+             CHANGES-REQUESTED-AT: codex {REBASED_HEAD} BY current-reviewer\n\
+             CHANGES-REQUESTED-WITHDRAWN-AT: codex {REBASED_HEAD} BY current-reviewer\n\
+             APPROVED-AT: codex {REBASED_HEAD} BY current-reviewer\n\
+             The objection is resolved by the changed bounds check."
+        );
+        let event = ReviewEvidenceEvent {
+            kind: "issue-comment".into(),
+            identity: "comment-markers".into(),
+            author: "current-reviewer".into(),
+            state: "ACTIVE".into(),
+            head_sha: String::new(),
+            created_at: "2026-09-05T15:03:48Z".into(),
+            updated_at: "2026-09-05T15:03:48Z".into(),
+            last_edited_at: String::new(),
+            body: body.clone(),
+            retirement_actor_permission: String::new(),
+        };
+        let snapshot = ReviewEvidenceSnapshot {
+            head_sha: REBASED_HEAD.into(),
+            review_decision: String::new(),
+            events: vec![event.clone()],
+        };
+        let digest = review_evidence_digest(&snapshot).unwrap();
+        let mut metadata_changed = snapshot.clone();
+        metadata_changed.events[0].body = body
+            .replace(
+                "[team, current-reviewer, session, model, role=reviewer]",
+                "[team, departed-reviewer, old-session, other-model, role=reviewer]",
+            )
+            .replace("BY current-reviewer", "BY departed-reviewer");
+        assert_eq!(review_evidence_digest(&metadata_changed).unwrap(), digest);
+        let mut metadata_removed = snapshot.clone();
+        metadata_removed.events[0].body = body
+            .split('\n')
+            .skip(1)
+            .map(|line| line.replace(" BY current-reviewer", ""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(review_evidence_digest(&metadata_removed).unwrap(), digest);
+        let mut fenced = snapshot.clone();
+        fenced.events[0].body =
+            format!("{body}\n```text\nAPPROVED-AT: codex {REBASED_HEAD} BY quoted\n```");
+        let mut changed_fenced = fenced.clone();
+        changed_fenced.events[0].body = fenced.events[0]
+            .body
+            .replace("BY quoted", "BY other-quoted");
+        assert_ne!(
+            review_evidence_digest(&fenced).unwrap(),
+            review_evidence_digest(&changed_fenced).unwrap()
+        );
     }
 
     #[test]

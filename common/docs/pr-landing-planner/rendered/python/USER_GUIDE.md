@@ -193,8 +193,8 @@ refetches the evidence and refuses if either the head or digest differs.
 
 The authority decision does not require a `RETIRES` line. For example, an older
 refusal can be discharged by a later valid withdrawal followed by a current-head
-approval. The snapshot preserves their timestamps and full bodies so the
-authority can evaluate that chronology.
+approval. The snapshot preserves their timestamps and substantive body text so
+the authority can evaluate that chronology.
 
 
 The digest covers the snapshot head, aggregate review decision, and the sorted
@@ -203,17 +203,20 @@ comments.
 Each event contributes its source kind, stable event identity, state, available
 event head (or the documented empty value for comment sources without one),
 creation/submission timestamp, current version timestamp, native-review
-last-edit timestamp, and body. Inline location fields are part of state, so an
-outdated/retired comment changes the digest even when GitHub gives the change
-the same second-resolution timestamp.
+last-edit timestamp, and body. The digest removes only a fleet disclosure on the
+first nonblank line and an optional `BY` value on an exact review marker. Those
+fields remain in the displayed comment for readers but do not decide authority.
+Every other body byte remains input to the digest, so appending an unresolved
+objection changes it. Inline location fields are part of state, so an
+outdated/retired comment also changes the digest even when GitHub gives the
+change the same second-resolution timestamp.
 
-When an exact `RETIRES` record is present, the digest uses its target comment id,
-review lane, reviewed head, and repository-permission result. Fleet disclosure
-text and an optional `BY` value are retained for readers but are not authority
-and do not change the digest. GitHub's immutable event author is the account
-whose current permission is checked; `triage`, `write`, `maintain`, or `admin`
-is authority. A verified permission and that immutable author are included in
-the digest, so a later permission change invalidates an existing context.
+When an exact `RETIRES` record is present, its target comment id, review lane,
+reviewed head, all other body text, and repository-permission result remain in
+the digest. GitHub's immutable event author is the account whose current
+permission is checked; `triage`, `write`, `maintain`, or `admin` is authority. A
+verified permission and that immutable author are included in the digest, so a
+later permission change invalidates an existing context.
 
 When the event author is unavailable, the permission lookup fails, or the
 author has only read access, the event remains in the snapshot with no

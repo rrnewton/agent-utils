@@ -8602,6 +8602,95 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
                 raise ValueError(f"review event field {field!r} is not a string")
             return value
 
+        fence_re = re.compile(r"^ {0,3}(?P<f>`{3,}|~{3,})\s*(?P<info>.*)$")
+        block_prefix = re.compile(r"^(?:#{1,6}\s+|[-+*]\s+)")
+        disclosure = re.compile(
+            r"^\[[A-Za-z0-9_.-]+,\s*[a-z0-9][a-z0-9-]*,\s*"
+            r"[^,\[\]\r\n]+,\s*[A-Za-z0-9_.-]+,\s*"
+            r"role=[A-Za-z0-9_.-]+\]\r?$",
+            re.IGNORECASE,
+        )
+        review_marker = re.compile(
+            r"^(?:CHANGES-REQUESTED-WITHDRAWN-AT|CHANGES-REQUESTED-AT|"
+            r"APPROVED-AT):\s*(?:claude|codex)\s+[0-9a-f]{40}"
+            r"(?:[ \t]+BY[ \t]+[a-z0-9][a-z0-9-]*)?$",
+            re.IGNORECASE,
+        )
+        by_identity = re.compile(
+            r"[ \t]+BY[ \t]+[a-z0-9][a-z0-9-]*", re.IGNORECASE
+        )
+
+        def prose_line_indexes(body: str) -> frozenset[int]:
+            indexes: set[int] = set()
+            fence = ""
+            indented = False
+            previous_blank = True
+            for index, raw in enumerate(body.split("\n")):
+                blank = not raw.strip()
+                if fence:
+                    match = fence_re.match(raw)
+                    if (
+                        match is not None
+                        and match.group("f")[0] == fence[0]
+                        and len(match.group("f")) >= len(fence)
+                        and not match.group("info").strip()
+                    ):
+                        fence = ""
+                    previous_blank = blank
+                    continue
+                match = fence_re.match(raw)
+                if match is not None:
+                    fence = match.group("f")
+                    indented = False
+                    previous_blank = False
+                    continue
+                if indented:
+                    if blank:
+                        previous_blank = True
+                        continue
+                    if raw.startswith(("    ", "\t")):
+                        continue
+                    indented = False
+                elif previous_blank and raw.startswith(("    ", "\t")) and not blank:
+                    indented = True
+                    previous_blank = False
+                    continue
+                indexes.add(index)
+                previous_blank = blank
+            return frozenset(indexes)
+
+        def undecorate(line: str) -> str:
+            normalized = block_prefix.sub("", line.strip())
+            while True:
+                for wrapper in ("`", "**", "__", "*", "_"):
+                    if (
+                        normalized.startswith(wrapper)
+                        and normalized.endswith(wrapper)
+                        and len(normalized) > 2 * len(wrapper)
+                    ):
+                        normalized = normalized[
+                            len(wrapper) : -len(wrapper)
+                        ].strip()
+                        break
+                else:
+                    return normalized
+
+        def normalized_review_body(body: str) -> str:
+            lines = body.split("\n")
+            prose = prose_line_indexes(body)
+            first_nonblank = next(
+                (index for index, line in enumerate(lines) if line.strip()), None
+            )
+            out: list[str] = []
+            for index, raw in enumerate(lines):
+                if index == first_nonblank and index in prose and disclosure.fullmatch(raw):
+                    continue
+                claimed = by_identity.search(raw)
+                if index in prose and review_marker.fullmatch(undecorate(raw)) and claimed:
+                    raw = raw[: claimed.start()] + raw[claimed.end() :]
+                out.append(raw)
+            return "\n".join(out)
+
         def canonical_event(event: Mapping[str, object]) -> tuple[str, ...]:
             body = event_field(event, "body")
             targets = re.findall(r"(?im)^\s*RETIRES\s+#?(\d{6,})\s*$", body)
@@ -8614,11 +8703,7 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
                 )
                 if len(targets) != 1 or len(withdrawals) != 1:
                     raise ValueError("review retirement is not canonical")
-                lane, retirement_head = withdrawals[0]
-                body = (
-                    f"CHANGES-REQUESTED-WITHDRAWN-AT: {lane.lower()} "
-                    f"{retirement_head.lower()}\nRETIRES {targets[0]}"
-                )
+            body = normalized_review_body(body)
             permission = event_field(event, "retirement_actor_permission")
             author = event_field(event, "author") if permission else ""
             return (
@@ -9548,7 +9633,7 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
             metadata_path = os.path.join(tmp, f"review-metadata-{label}.json")
             with open(metadata_path, "w", encoding="utf-8") as handle:
                 json.dump(metadata_fixture, handle)
-            _record_exact(
+            metadata_outcome, _metadata_rs = _record_exact(
                 rep,
                 f"accept:review-metadata-{label}",
                 py,
@@ -9563,6 +9648,66 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
                     "json",
                 ),
                 expected=0,
+            )
+            metadata_held, metadata_action = review_disposition(metadata_outcome, 394)
+            if metadata_held is False and metadata_action == "land-now":
+                rep.ok(f"accept:review-metadata-{label}-decision-unchanged")
+            else:
+                rep.bad(
+                    f"accept:review-metadata-{label}-decision-unchanged",
+                    f"held={metadata_held}; action={metadata_action!r}",
+                )
+
+        appended_objection = dict(review_fixture)
+        appended_objection_pr = dict(review_pr)
+        appended_objection_events = [dict(event) for event in review_events]
+        appended_objection_events[1]["body"] = (
+            f"{appended_objection_events[1]['body']}\n"
+            "Do not land: the race remains."
+        )
+        appended_objection_pr["review_events"] = appended_objection_events
+        appended_objection["prs"] = [appended_objection_pr]
+        appended_objection_path = os.path.join(tmp, "appended-review-objection.json")
+        with open(appended_objection_path, "w", encoding="utf-8") as handle:
+            json.dump(appended_objection, handle)
+        if review_digest(
+            review_head, "CHANGES_REQUESTED", appended_objection_events
+        ) != review_digest(review_head, "CHANGES_REQUESTED", review_events):
+            rep.ok("reject:appended-objection-changes-review-digest")
+        else:
+            rep.bad(
+                "reject:appended-objection-changes-review-digest",
+                "appended substantive objection was absent from the digest",
+            )
+        _record_same_exit(
+            rep,
+            "reject:appended-objection-invalidates-resolution",
+            py,
+            rs,
+            (
+                "plan",
+                "--fixture",
+                appended_objection_path,
+                "--landing-context",
+                review_context_path,
+            ),
+            2,
+        )
+        appended_uncontexted, _appended_uncontexted_rs = _record_exact(
+            rep,
+            "reject:appended-objection-remains-visible",
+            py,
+            rs,
+            ("plan", "--fixture", appended_objection_path, "--format", "json"),
+            expected=0,
+        )
+        appended_held, appended_action = review_disposition(appended_uncontexted, 394)
+        if appended_held is True and appended_action == "wait":
+            rep.ok("reject:appended-objection-keeps-changes-requested-hold")
+        else:
+            rep.bad(
+                "reject:appended-objection-keeps-changes-requested-hold",
+                f"held={appended_held}; action={appended_action!r}",
             )
 
         missing_author_fixture = dict(review_fixture)
@@ -9759,24 +9904,12 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
                 f"assigned_agent={multiple_agent_value!r}",
             )
 
-        # The planner binds a consuming review authority's decision to the complete
-        # snapshot; it does not require RETIRES. This mirrors the observed sequence of
-        # an older refusal, a later withdrawal/approval, and a final current-head approval.
-        refused_head = "b" * 40
-        repaired_head = "c" * 40
+        # Observed #2950 host shape: issue comments only, no native reviews, and an
+        # empty aggregate reviewDecision. Stable ids, heads, and times are preserved.
+        live_head = "58bf4f5c17880395400ab3cb6482d0de2ee03a84"
+        refused_head = "c3a85da26110fd8dfc31433c8d4109726127703b"
+        repaired_head = "2a18b7bea06cf66f5cf4a973466afa506c0bd2a4"
         live_shape_events: list[dict[str, object]] = [
-            {
-                "kind": "review",
-                "identity": "native-review-refusal",
-                "author": "rrnewton",
-                "state": "CHANGES_REQUESTED",
-                "head_sha": refused_head,
-                "created_at": "2026-09-04T19:14:42Z",
-                "updated_at": "2026-09-04T19:14:42Z",
-                "last_edited_at": "",
-                "body": "substantive objection",
-                "retirement_actor_permission": "",
-            },
             {
                 "kind": "issue-comment",
                 "identity": "comment-5545346256",
@@ -9787,9 +9920,10 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
                 "updated_at": "2026-09-04T19:14:42Z",
                 "last_edited_at": "",
                 "body": (
-                    "[team, review-cpuid, unresolved, devbig014, role=reviewer]\n"
-                    f"CHANGES-REQUESTED-AT: claude {refused_head}\n"
-                    "substantive objection"
+                    "[team, review-cpuid, unresolved, build-host, role=reviewer]\n"
+                    "# Exact-head adversarial review\n\n"
+                    f"CHANGES-REQUESTED-AT: claude {refused_head}\n\n"
+                    "Major: the backend disagreement remains."
                 ),
                 "retirement_actor_permission": "",
             },
@@ -9803,10 +9937,11 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
                 "updated_at": "2026-09-05T15:03:48Z",
                 "last_edited_at": "",
                 "body": (
-                    "[team, review-cpuid, unresolved, devbig014, role=reviewer]\n"
-                    f"CHANGES-REQUESTED-WITHDRAWN-AT: claude {repaired_head}\n"
-                    f"APPROVED-AT: claude {repaired_head}\n"
-                    "the objection is met on the mechanism"
+                    "[team, review-cpuid, unresolved, build-host, role=reviewer]\n"
+                    "# Reassessment at the repaired head\n\n"
+                    f"CHANGES-REQUESTED-WITHDRAWN-AT: claude {repaired_head}\n\n"
+                    f"APPROVED-AT: claude {repaired_head}\n\n"
+                    "It is retired: the objection is met on the mechanism."
                 ),
                 "retirement_actor_permission": "",
             },
@@ -9820,15 +9955,20 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
                 "updated_at": "2026-09-05T15:16:26Z",
                 "last_edited_at": "",
                 "body": (
-                    "[team, review-cpuid, unresolved, devbig014, role=reviewer]\n"
-                    f"APPROVED-AT: claude {review_head}\n"
-                    "the earlier refusal stays withdrawn"
+                    "[team, review-cpuid, unresolved, build-host, role=reviewer]\n"
+                    "# Rebind to the rebased head\n\n"
+                    f"APPROVED-AT: claude {live_head}\n\n"
+                    "My refusal from the earlier head stays retired."
                 ),
                 "retirement_actor_permission": "",
             },
         ]
         assert all("RETIRES" not in str(event["body"]) for event in live_shape_events)
+        assert not any(event["kind"] == "review" for event in live_shape_events)
         live_shape_pr = dict(review_pr)
+        live_shape_pr["head_sha"] = live_head
+        live_shape_pr["review_decision"] = ""
+        live_shape_pr["review_snapshot_review_decision"] = ""
         live_shape_pr["review_events"] = live_shape_events
         live_shape_fixture = dict(review_fixture)
         live_shape_fixture["prs"] = [live_shape_pr]
@@ -9844,10 +9984,10 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
                     "prs": [
                         {
                             "pr": 394,
-                            "head_sha": review_head,
+                            "head_sha": live_head,
                             "review_objections_resolved": True,
                             "review_evidence_digest": review_digest(
-                                review_head, "CHANGES_REQUESTED", live_shape_events
+                                live_head, "", live_shape_events
                             ),
                         }
                     ]
@@ -9879,6 +10019,64 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
                 f"held={live_shape_held}; action={live_shape_action!r}",
             )
 
+        live_metadata_events = [dict(event) for event in live_shape_events]
+        for event in live_metadata_events:
+            body = str(event["body"]).replace(
+                "[team, review-cpuid, unresolved, build-host, role=reviewer]",
+                "[team, departed-reviewer, old-session, other-host, role=reviewer]",
+            )
+            event["body"] = re.sub(
+                r"(?m)^((?:CHANGES-REQUESTED-WITHDRAWN-AT|"
+                r"CHANGES-REQUESTED-AT|APPROVED-AT):\s*"
+                r"(?:claude|codex)\s+[0-9a-f]{40})$",
+                r"\1 BY departed-reviewer",
+                body,
+            )
+        if review_digest(live_head, "", live_metadata_events) == review_digest(
+            live_head, "", live_shape_events
+        ):
+            rep.ok("accept:chronological-withdrawal-attribution-is-metadata")
+        else:
+            rep.bad(
+                "accept:chronological-withdrawal-attribution-is-metadata",
+                "disclosure or BY metadata changed the review digest",
+            )
+        live_metadata_pr = dict(live_shape_pr)
+        live_metadata_pr["review_events"] = live_metadata_events
+        live_metadata_fixture = dict(live_shape_fixture)
+        live_metadata_fixture["prs"] = [live_metadata_pr]
+        live_metadata_path = os.path.join(
+            tmp, "chronological-withdrawal-attribution-metadata.json"
+        )
+        with open(live_metadata_path, "w", encoding="utf-8") as handle:
+            json.dump(live_metadata_fixture, handle)
+        live_metadata_outcome, _live_metadata_rs = _record_exact(
+            rep,
+            "accept:chronological-withdrawal-attribution-metadata",
+            py,
+            rs,
+            (
+                "plan",
+                "--fixture",
+                live_metadata_path,
+                "--landing-context",
+                live_shape_context_path,
+                "--format",
+                "json",
+            ),
+            expected=0,
+        )
+        live_metadata_held, live_metadata_action = review_disposition(
+            live_metadata_outcome, 394
+        )
+        if live_metadata_held is False and live_metadata_action == "land-now":
+            rep.ok("accept:chronological-withdrawal-metadata-keeps-decision")
+        else:
+            rep.bad(
+                "accept:chronological-withdrawal-metadata-keeps-decision",
+                f"held={live_metadata_held}; action={live_metadata_action!r}",
+            )
+
         stale_live_context_path = os.path.join(
             tmp, "chronological-withdrawal-stale-head-context.json"
         )
@@ -9891,7 +10089,7 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
                             "head_sha": repaired_head,
                             "review_objections_resolved": True,
                             "review_evidence_digest": review_digest(
-                                review_head, "CHANGES_REQUESTED", live_shape_events
+                                live_head, "", live_shape_events
                             ),
                         }
                     ]
@@ -9967,28 +10165,26 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
             )
 
         no_later_pr = dict(live_shape_pr)
-        no_later_pr["review_events"] = live_shape_events[:2]
+        no_later_pr["review_events"] = live_shape_events[:1]
         no_later_fixture = dict(live_shape_fixture)
         no_later_fixture["prs"] = [no_later_pr]
         no_later_path = os.path.join(tmp, "chronological-no-later-artifact.json")
         with open(no_later_path, "w", encoding="utf-8") as handle:
             json.dump(no_later_fixture, handle)
-        no_later_outcome, _no_later_rust = _record_exact(
+        _record_same_exit(
             rep,
             "reject:chronological-withdrawal-no-later-artifact",
             py,
             rs,
-            ("plan", "--fixture", no_later_path, "--format", "json"),
-            expected=0,
+            (
+                "plan",
+                "--fixture",
+                no_later_path,
+                "--landing-context",
+                live_shape_context_path,
+            ),
+            2,
         )
-        no_later_held, no_later_action = review_disposition(no_later_outcome, 394)
-        if no_later_held is True and no_later_action == "wait":
-            rep.ok("reject:chronological-withdrawal-no-later-artifact-held")
-        else:
-            rep.bad(
-                "reject:chronological-withdrawal-no-later-artifact-held",
-                f"held={no_later_held}; action={no_later_action!r}",
-            )
 
         mismatched_snapshot = dict(review_fixture)
         mismatched_pr = dict(review_pr)
