@@ -1048,6 +1048,10 @@ function newPage(store = new Map(), script = SCRIPT) {
     restoreCalls: [],
     /** Which message ids were sent to the voice service, in order. */
     speakCalls: [],
+    /** `#read-aloud-latency`: every prepare request, so "ahead of the tap" is testable. */
+    prepareCalls: [],
+    /** Make preparing fail, to prove the tap still works by the older, slower route. */
+    prepareFails: false,
     /** The full path of each read, so a test can see the pace that travelled with it. */
     speakPaths: [],
     /** What the server says a generation cost. `null` is a cache hit or a short message. */
@@ -1384,6 +1388,22 @@ function newPage(store = new Map(), script = SCRIPT) {
             ? { channel: page.channels[at] }
             : { channel: page.channels[at], alias_notice: page.aliasNotice }
         );
+      }
+      // Read-aloud, PREPARED. Recorded, because "the work happens when the mode is turned on and
+      // not when a message is tapped" is a claim about which requests exist and when.
+      if (/\/speech\/prepare$/.test(String(path))) {
+        const asked = JSON.parse((options && options.body) || "{}");
+        page.prepareCalls.push(asked);
+        if (page.prepareFails) {
+          return json(500, { error: "nope", detail: "no" });
+        }
+        return json(200, {
+          prepared: (asked.ids || []).map((id) => ({
+            message_id: id,
+            url: `/api/v1/speech/ticket-for-${id}`,
+          })),
+          expires_in_seconds: 600,
+        });
       }
       // Read-aloud. Bytes rather than JSON, and RECORDED, so a test can prove which message was
       // sent to the vendor and that a refusal sent none.
@@ -5007,7 +5027,7 @@ test("tapping a message in reading mode speaks THAT message", async () => {
   await rows[1].dispatch("click", {});
   await page.settle();
 
-  assert.deepEqual(page.speakCalls, ["1000000000000000002"], "the wrong message was read");
+  assert.deepEqual(readAloudMessages(page), ["1000000000000000002"], "the wrong message was read");
   assert.equal(page.players.length, 1, "no player was built");
   assert.equal(page.players[0].playCount, 1, "the audio was fetched but never played");
   assert.equal(rowState(page, 1).reading, "true", "nothing on screen says which row is speaking");
@@ -5051,6 +5071,10 @@ test("audio that FAILS archives nothing — the archive is how the reader knows 
 
 test("a read that the SERVER refuses archives nothing and says why", async () => {
   const page = newPage();
+  // THE FALLBACK PATH ON PURPOSE. What is under test is a FETCH failing, and a prepared row does
+  // not fetch — it is handed a URL and the failure, if there is one, arrives on the audio element
+  // instead. Preparing is disabled so the wait and the refusal this covers still exist.
+  page.prepareFails = true;
   await signIn(page);
   page.speakStatus = 503;
   const rows = await inReadingMode(page, [message({ id: "1000000000000000001" })]);
@@ -5084,8 +5108,32 @@ test("tapping the message that is PLAYING stops it, and stopping archives nothin
   assert.equal(page.players[0].paused, true, "a second tap did not stop the audio");
   assert.deepEqual(page.dismissCalls, [], "stopping halfway filed the message away");
   assert.equal(rowState(page, 0).reading, "false");
-  // The object URL is released; this mode fetches one per message and never revoking them is a
-  // leak that grows with the backlog.
+  // NOTHING TO RELEASE ON THIS PATH, and releasing something would be the bug. A prepared row plays
+  // a URL belonging to the SERVER; it is not an object URL, this page does not own it, and handing
+  // it to `revokeObjectURL` would be the page confusing the two kinds of URL it now deals in.
+  assert.deepEqual(
+    page.revokedUrls,
+    [],
+    "a server URL was passed to revokeObjectURL, which owns nothing and frees nothing"
+  );
+});
+
+test("...and the blob it fetched IS released, when it had to fetch one", async () => {
+  // The other path, and the leak is real on it: falling back means one object URL per message, and
+  // never revoking them grows with the backlog. Preparing is what usually avoids the fetch; this is
+  // what happens when preparing could not.
+  const page = newPage();
+  page.prepareFails = true;
+  await signIn(page);
+  const rows = await inReadingMode(page, [message({ id: "1000000000000000001" })]);
+
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  assert.ok(page.speakCalls.length > 0, "the fallback never fetched, so nothing is being tested");
+  await rows[0].dispatch("click", {});
+  await page.settle();
+
+  assert.equal(page.players[0].paused, true, "a second tap did not stop the audio");
   assert.equal(page.revokedUrls.length, 1, "the audio URL was never released");
 });
 
@@ -5140,26 +5188,99 @@ test("the reading pace is the AGENT'S until the reader chooses one", async () =>
   await signIn(page);
   const rows = await inReadingMode(page, [message({ id: "1000000000000000001" })]);
 
-  await rows[0].dispatch("click", {});
-  await page.settle();
+  // THE PACE NOW TRAVELS WITH THE PREPARATION, not with the tap. It is chosen when the ticket is
+  // minted so that playing one is a URL and nothing else, which is the whole point of preparing.
   assert.equal(
-    page.speakPaths[0].includes("speed="),
-    false,
+    page.prepareCalls[0].speed,
+    null,
     "an unset pace sent 100%, overriding an agent configured to speak faster"
   );
 
   page.el("read-speed-range").value = "150";
   await page.el("read-speed-range").dispatch("input", {});
-  await rows[0].dispatch("click", {});
   await page.settle();
-  await rows[0].dispatch("click", {});
-  await page.settle();
-  assert.match(
-    page.speakPaths[page.speakPaths.length - 1],
-    /speed=1\.50/,
-    `the chosen pace never reached the server; paths=${JSON.stringify(page.speakPaths)}`
+  // ...and a ticket minted at the OLD pace is thrown away rather than played. A reader who moves
+  // the slider and hears no difference has been given the most confusing possible answer.
+  assert.equal(
+    page.prepareCalls[page.prepareCalls.length - 1].speed,
+    1.5,
+    `the chosen pace never reached the server; calls=${JSON.stringify(page.prepareCalls)}`
+  );
+  assert.ok(
+    page.prepareCalls.length > 1,
+    "changing the pace did not re-prepare, so the old pace would still be played"
   );
   assert.equal(page.storage.get("gent-talk.voice.read-speed"), "150", "the pace was not kept");
+});
+
+test("TURNING READ-ALOUD ON PREPARES EVERY MESSAGE ON SCREEN, BEFORE ANY TAP", async () => {
+  // The owner's ask: the phone already has the text of everything on screen, so the tap should be
+  // the shortest possible path to audio and everything else should already have happened. This is
+  // the "everything else" — one request, when the mode goes on, covering every visible row.
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [
+    message({ id: "1000000000000000001" }),
+    message({ id: "1000000000000000002" }),
+  ]);
+  assert.deepEqual(page.prepareCalls, [], "something was prepared before reading mode was on");
+
+  await page.el("read-aloud").click();
+  await page.settle();
+
+  assert.equal(page.prepareCalls.length, 1, "turning the mode on prepared nothing");
+  assert.deepEqual(
+    page.prepareCalls[0].ids,
+    ["1000000000000000001", "1000000000000000002"],
+    "not every message on screen was prepared"
+  );
+  // AND NOTHING WAS SPENT. Preparing resolves text and mints tickets; it does not generate audio,
+  // so turning the mode on over a long backlog must not bill for a backlog of speech.
+  assert.deepEqual(page.speakCalls, [], "turning the mode on generated audio nobody asked for");
+});
+
+test("...so the tap itself fetches NOTHING and plays the prepared URL straight away", async () => {
+  // The whole latency argument in one assertion. A tap used to fetch the audio and wait for the
+  // last byte of it; now it hands an already-authorised URL to the player and the browser streams.
+  const page = newPage();
+  await signIn(page);
+  const rows = await inReadingMode(page, [message({ id: "1000000000000000001" })]);
+  const preparedBefore = page.prepareCalls.length;
+
+  await rows[0].dispatch("click", {});
+  await page.settle();
+
+  assert.deepEqual(page.speakCalls, [], "the tap still fetched the audio it had already prepared");
+  assert.equal(
+    page.prepareCalls.length,
+    preparedBefore,
+    "the tap re-prepared, so the work moved rather than being done ahead of time"
+  );
+  assert.equal(
+    page.players[0].url,
+    "/api/v1/speech/ticket-for-1000000000000000001",
+    "the player was not handed the prepared URL"
+  );
+  assert.equal(page.players[0].playCount, 1, "nothing was played");
+});
+
+test("...and a message that could not be prepared still reads, by the older slower route", async () => {
+  // Preparing is an OPTIMISATION and has to fail like one. A server too old to know the route, or a
+  // request that lost a race with a scroll, must cost speed and never the feature.
+  const page = newPage();
+  page.prepareFails = true;
+  await signIn(page);
+  const rows = await inReadingMode(page, [message({ id: "1000000000000000001" })]);
+
+  await rows[0].dispatch("click", {});
+  await page.settle();
+
+  assert.deepEqual(
+    page.speakCalls,
+    ["1000000000000000001"],
+    "preparing failed and took read-aloud down with it"
+  );
+  assert.equal(page.players[0].playCount, 1, "nothing was played on the fallback path");
 });
 
 test("with reading mode OFF a tap folds the message and speaks nothing", async () => {
@@ -5172,7 +5293,7 @@ test("with reading mode OFF a tap folds the message and speaks nothing", async (
   await rows[0].dispatch("click", {});
   await page.settle();
 
-  assert.deepEqual(page.speakCalls, [], "a tap outside reading mode spent a vendor call");
+  assert.deepEqual(readAloudMessages(page), [], "a tap outside reading mode spent a vendor call");
   assert.equal(rows[0].getAttribute("data-collapsed"), "false", "the tap did not fold instead");
 });
 
@@ -5396,13 +5517,21 @@ test("A TAP SHOWS IMMEDIATELY, before anything has been fetched", async () => {
   const rows = await inReadingMode(page, [message({ id: "1000000000000000001" })]);
 
   // Deliberately NOT awaited: this is the state of the world mid-flight, which is the whole point.
+  //
+  // WHICH MARK depends on which path the tap took, and BOTH are immediate — that is the claim, not
+  // the particular attribute. On a PREPARED row there is no flight at all: the URL is already in
+  // hand, so the row goes straight to reading rather than pausing at pending. On the fallback path
+  // the audio still has to be fetched, and pending is what covers that wait. A test that demanded
+  // `pending` specifically would now be asserting that the fast path is slow.
   const inFlight = rows[0].dispatch("click", {});
-  assert.equal(rowState(page, 0).pending, "true", "the tap left no mark until the audio arrived");
-  assert.equal(
-    page.el("read-aloud").getAttribute("data-read-state"),
-    "working",
-    "the control does not say a read is in flight"
+  const marked = rowState(page, 0);
+  assert.ok(
+    marked.pending === "true" || marked.reading === "true",
+    `the tap left no mark until the audio arrived: ${JSON.stringify(marked)}`
   );
+  // The CONTROL is not asserted here. It says "working" only while a read is genuinely in flight,
+  // and a prepared tap has no flight — it is already playing, and the control reads "ready" during
+  // playback exactly as it always has. The fallback path's flight is covered by the test below.
 
   await inFlight;
   await page.settle();
@@ -5414,6 +5543,10 @@ test("A TAP SHOWS IMMEDIATELY, before anything has been fetched", async () => {
 
 test("a read that fails says so on the control rather than only in a toast", async () => {
   const page = newPage();
+  // THE FALLBACK PATH ON PURPOSE. What is under test is a FETCH failing, and a prepared row does
+  // not fetch — it is handed a URL and the failure, if there is one, arrives on the audio element
+  // instead. Preparing is disabled so the wait and the refusal this covers still exist.
+  page.prepareFails = true;
   await signIn(page);
   page.speakStatus = 503;
   const rows = await inReadingMode(page, [message({ id: "1000000000000000001" })]);
@@ -5517,6 +5650,10 @@ test("A SECOND TAP ABORTS A READ THAT HAS NOT STARTED, and takes the highlight w
   // did not want it, and the only thing to do is tap the thing they just tapped. Checking only
   // `nowPlaying` made that start a SECOND read, because nothing was playing yet.
   const page = newPage();
+  // THE FALLBACK PATH ON PURPOSE. What is under test is a FETCH failing, and a prepared row does
+  // not fetch — it is handed a URL and the failure, if there is one, arrives on the audio element
+  // instead. Preparing is disabled so the wait and the refusal this covers still exist.
+  page.prepareFails = true;
   await signIn(page);
   const rows = await inReadingMode(page, [message({ id: "1000000000000000001" })]);
 
@@ -6443,6 +6580,28 @@ async function reportFailures(page) {
 
 /** The body of a rendered channel row: the message itself, clamped or not. */
 const bodyOf = (li) => li.descendants().find((node) => node.hasClass("body"));
+
+/**
+ * WHICH MESSAGES WERE ACTUALLY READ ALOUD, by whichever route carried them.
+ *
+ * Read-aloud has two: a prepared ticket, which is what a tap costs now, and a `/speak` fetch, which
+ * is the fallback for a row that was never prepared. Both end in an `<audio>` being handed a URL,
+ * so that is what this reads — the thing the reader would actually have heard, rather than a
+ * request that may or may not have been played.
+ *
+ * Asserting on the fetch alone was how these tests used to be written, and it stopped meaning
+ * anything the moment the fast path existed: it went quiet while the audio still played.
+ */
+function readAloudMessages(page) {
+  return page.players.map((player) => {
+    const prepared = /\/api\/v1\/speech\/ticket-for-(.+)$/.exec(String(player.url || ""));
+    if (prepared) {
+      return prepared[1];
+    }
+    const blob = /^blob:(.+)$/.exec(String(player.url || ""));
+    return blob ? blob[1] : String(player.url || "");
+  });
+}
 
 /** Turn summary mode on the way a thumb does, and let the requests it issues settle. */
 async function turnSummariesOn(page) {

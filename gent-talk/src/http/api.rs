@@ -1786,3 +1786,140 @@ pub async fn message_summary(
 fn no_store<T: IntoResponse>(body: T) -> Response {
     ([(header::CACHE_CONTROL, "no-store")], body).into_response()
 }
+
+/// What read-aloud mode asks for the moment it is turned on.
+#[derive(Debug, Deserialize)]
+pub struct PrepareSpeechRequest {
+    /// The messages currently on screen, in the order they are drawn.
+    pub ids: Vec<String>,
+    /// The pace the reader has chosen, if they have chosen one.
+    pub speed: Option<f64>,
+    /// How many recent messages to look through for those ids.
+    pub limit: Option<u16>,
+}
+
+/// One message, ready to play.
+#[derive(Debug, Serialize)]
+pub struct PreparedSpeech {
+    /// The Discord message id, so the page can hang this on the right row.
+    pub message_id: String,
+    /// Where to play it from. Carries its own authority; see [`crate::speech_tickets`].
+    pub url: String,
+}
+
+/// Everything the page needs to make a tap instant.
+#[derive(Debug, Serialize)]
+pub struct PrepareSpeechResponse {
+    /// One entry per id that resolved. An id this server cannot see is simply absent.
+    pub prepared: Vec<PreparedSpeech>,
+    /// How long these stay playable, so the page knows when to ask again.
+    pub expires_in_seconds: u64,
+}
+
+/// `POST /api/v1/channels/{channel_id}/speech/prepare`
+///
+/// DO THE WORK BEFORE THE TAP, NOT DURING IT.
+///
+/// A tap used to pay for four round trips in series: a window of fifty messages from Discord to
+/// find one by id, the speech normalisation of its text, a lookup of which voice the agent speaks
+/// in, and only then the audio. The reader sat through all of it having already been shown the very
+/// text they were waiting to hear.
+///
+/// This does the first three ONCE, for everything on screen, at the moment read-aloud is switched
+/// on — one Discord window covers every id instead of one window per tap — and hands back a ticket
+/// per message. What is left for the tap is a map lookup and the vendor.
+///
+/// Asking the vendor for its voice here is not incidental: it is also what opens the TLS connection
+/// that the audio request then reuses.
+pub async fn prepare_speech(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(channel_id): Path<String>,
+    Json(request): Json<PrepareSpeechRequest>,
+) -> Result<Json<PrepareSpeechResponse>, ApiError> {
+    require(&headers, &state, Scope::Read)?;
+    let window = ops::messages(&state, &channel_id, request.limit).await?;
+    let now = jiff::Timestamp::now().as_millisecond();
+    let mut prepared = Vec::new();
+    for id in &request.ids {
+        // Silently absent rather than a 404 for the batch. The page sends what it has on screen,
+        // and a row that scrolled out from under the request is not an error the reader did
+        // anything to cause — failing the whole batch over one id would lose the other forty.
+        let Some(message) = window.messages.iter().find(|m| m.id.0 == *id) else {
+            continue;
+        };
+        let said = crate::speakable::for_speech(&message.content, now, &state.config.timezone);
+        if said.trim().is_empty() {
+            continue;
+        }
+        let ticket = state.speech_tickets.mint(crate::speech_tickets::Prepared {
+            channel: window.channel.id.0.clone(),
+            message: message.id.0.clone(),
+            said,
+            speed: crate::elevenlabs::clamp_speed(request.speed),
+        });
+        prepared.push(PreparedSpeech {
+            message_id: message.id.0.clone(),
+            url: format!("/api/v1/speech/{ticket}"),
+        });
+    }
+    // Best effort and deliberately not awaited for correctness: warming the voice makes the first
+    // tap fast, and failing to warm it makes the first tap ordinary rather than broken.
+    let _ = state.speech.speak(&state.config.elevenlabs, "", None).await;
+    Ok(Json(PrepareSpeechResponse {
+        prepared,
+        expires_in_seconds: crate::speech_tickets::TICKET_TTL.as_secs(),
+    }))
+}
+
+/// `GET /api/v1/speech/{ticket}` — the whole of the tap.
+///
+/// NO `Authorization` HEADER, AND THAT IS THE POINT. An `<audio src>` cannot send one, and without
+/// an `<audio src>` the browser cannot stream: it would have to fetch the whole file into a blob
+/// first, which is the wait this change exists to remove. So the ticket carries its own authority.
+/// It is 256 unguessable bits naming one already-resolved message and it expires in minutes; see
+/// [`crate::speech_tickets`] for the whole of that argument.
+///
+/// A GET, unlike `/speak`, because this is now safe to re-issue: the ticket was minted deliberately
+/// and names text this server chose. What a speculative fetch costs is one already-authorised
+/// message being generated slightly early.
+pub async fn play_speech(
+    State(state): State<AppState>,
+    Path(ticket): Path<String>,
+) -> Result<Response, ApiError> {
+    let Some(prepared) = state.speech_tickets.claim(&ticket) else {
+        // The SAME answer for expired and never-existed. Distinguishing them would let a caller
+        // probe for the difference, and neither is something the reader can act on differently.
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "unknown_speech_ticket",
+            "that speech ticket is unknown or has expired; turn read-aloud on again",
+        ));
+    };
+    let began = std::time::Instant::now();
+    let stream = state
+        .speech
+        .speak_stream(&state.config.elevenlabs, &prepared.said, prepared.speed)
+        .await?;
+    // TIME TO FIRST BYTE, which is now the number that matters. The old measurement timed the whole
+    // generation because the reader waited for the whole generation; they no longer do.
+    tracing::info!(
+        message = %prepared.message,
+        channel = %prepared.channel,
+        characters = prepared.said.chars().count(),
+        vendor_ttfb_ms = %began.elapsed().as_millis(),
+        "started streaming a message aloud"
+    );
+    let body = axum::body::Body::from_stream(stream.chunks);
+    Ok((
+        [
+            (header::CONTENT_TYPE, stream.content_type.as_str()),
+            (header::CACHE_CONTROL, "no-store"),
+            // There is no length to seek within and none is claimed. A browser told it may range
+            // over a stream that cannot will ask for one and stall.
+            (header::ACCEPT_RANGES, "none"),
+        ],
+        body,
+    )
+        .into_response())
+}

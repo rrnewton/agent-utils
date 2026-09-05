@@ -51,6 +51,7 @@ pub mod probe;
 pub mod replay;
 pub mod retrieval;
 pub mod speakable;
+pub mod speech_tickets;
 pub mod state;
 pub mod store;
 pub mod summarize;

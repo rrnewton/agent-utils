@@ -43,6 +43,9 @@ axum = { version = "0.8", default-features = false, features = [
     "tokio",
 ] }
 base64 = "0.22"
+bytes = "1"
+# Ticket minting only: 256 bits from the system CSPRNG. Already in the tree transitively.
+getrandom = "0.3"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 # `tzdb-bundle-always` compiles the IANA database into the binary. The runtime image has no
 # `tzdata` package, and a server that fell back to UTC for want of one would silently reproduce
@@ -54,6 +57,9 @@ jiff = { version = "0.2.24", default-features = false, features = [
 reqwest = { version = "0.12", default-features = false, features = [
     "json",
     "rustls-tls",
+    # Read-aloud forwards the vendor's audio to the browser as it arrives rather than buffering the
+    # whole file first, which is what lets playback start before generation has finished.
+    "stream",
 ] }
 rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

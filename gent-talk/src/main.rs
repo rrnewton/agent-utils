@@ -453,6 +453,7 @@ async fn main() -> anyhow::Result<()> {
         elevenlabs,
         speech,
         store,
+        speech_tickets: Arc::new(gent_talk::speech_tickets::SpeechTickets::new()),
         live: Arc::clone(&live),
         summarizer,
         summary_version: summary_version.into(),

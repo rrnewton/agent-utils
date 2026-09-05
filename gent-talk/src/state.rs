@@ -59,6 +59,12 @@ pub struct AppState {
     /// allowlist is the kind of ambiguity this server spends effort avoiding. With ingestion off
     /// nobody publishes, so a subscriber simply waits — and the startup banner says which it is.
     pub live: Arc<LiveHub>,
+    /// Messages resolved for read-aloud BEFORE the reader taps one.
+    ///
+    /// Turning read-aloud on prepares everything on screen; a tap then plays a ticket, which is a
+    /// map lookup and nothing else. See [`crate::speech_tickets`] for why this is a ticket rather
+    /// than the page simply sending the text it already has.
+    pub speech_tickets: Arc<crate::speech_tickets::SpeechTickets>,
 }
 
 impl AppState {

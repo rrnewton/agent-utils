@@ -2598,3 +2598,136 @@ async fn reading_a_message_aloud_reports_where_the_time_went() {
         "the size is not relatable to how much there was to say: {timing}"
     );
 }
+
+/// Turning read-aloud on prepares everything on screen, and a TAP then costs no Discord at all.
+///
+/// This is the whole point of the redesign, so it is asserted as a COUNT rather than as a shape: a
+/// tap used to fetch a window of fifty messages to find one by id, and the way that regresses is
+/// not by disappearing but by quietly coming back. `fetch_count` moving during the play is the
+/// failure, whatever the response looks like.
+#[tokio::test]
+async fn preparing_read_aloud_makes_the_tap_cost_no_discord_round_trip() {
+    let (harness, _store, ids) = todo_harness();
+
+    let (status, prepared) = call(
+        &harness,
+        "POST",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/speech/prepare"),
+        Some(READ_TOKEN),
+        Some(serde_json::json!({ "ids": [ids[0].clone(), ids[1].clone()] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{prepared}");
+    let entries = prepared["prepared"].as_array().expect("an array");
+    assert_eq!(
+        entries.len(),
+        2,
+        "not every visible message was prepared: {prepared}"
+    );
+    assert_eq!(entries[0]["message_id"], ids[0]);
+    let url = entries[0]["url"].as_str().expect("a url").to_owned();
+    assert!(
+        url.starts_with("/api/v1/speech/"),
+        "the ticket is not a playable URL: {url}"
+    );
+    assert!(
+        prepared["expires_in_seconds"].as_u64().unwrap_or(0) > 0,
+        "the page is not told when to ask again: {prepared}"
+    );
+
+    // EVERYTHING BEFORE THE TAP HAS NOW HAPPENED. From here the count must not move.
+    let before = harness.discord.fetch_count();
+    let (status, headers, audio) = call_bytes(&harness, "GET", &url, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!audio.is_empty(), "no audio came back");
+    assert_eq!(
+        harness.discord.fetch_count(),
+        before,
+        "playing a prepared message went back to Discord, which is the wait this removes"
+    );
+    assert_eq!(
+        headers.get("cache-control").and_then(|v| v.to_str().ok()),
+        Some("no-store"),
+        "one person's message must not sit in a shared cache"
+    );
+}
+
+/// The play URL carries its own authority, because an `<audio src>` cannot carry a header.
+///
+/// Asserted BOTH ways round. That it works without a header is the feature; that a wrong ticket
+/// does not is what stops the feature being a hole. `prepare`, which is an ordinary authenticated
+/// route, still refuses an anonymous caller — otherwise anyone could mint their own.
+#[tokio::test]
+async fn a_speech_ticket_plays_without_a_header_and_a_wrong_one_does_not() {
+    let (harness, _store, ids) = todo_harness();
+
+    // Minting is authenticated. This is the door; the ticket is only the key it hands out.
+    let (status, _body) = call(
+        &harness,
+        "POST",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/speech/prepare"),
+        None,
+        Some(serde_json::json!({ "ids": [ids[0].clone()] })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "anyone could mint themselves a ticket"
+    );
+
+    let (status, prepared) = call(
+        &harness,
+        "POST",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/speech/prepare"),
+        Some(READ_TOKEN),
+        Some(serde_json::json!({ "ids": [ids[0].clone()] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let url = prepared["prepared"][0]["url"].as_str().expect("a url");
+
+    // NO TOKEN, and that is the point: this is what an `<audio src>` sends.
+    let (status, _headers, audio) = call_bytes(&harness, "GET", url, None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the audio element could not play it"
+    );
+    assert!(!audio.is_empty());
+
+    // A ticket nobody minted is not playable, however well-formed it looks.
+    let (status, body) = call(
+        &harness,
+        "GET",
+        "/api/v1/speech/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"], "unknown_speech_ticket");
+}
+
+/// A message this server cannot see is left out, and does not take the batch down with it.
+#[tokio::test]
+async fn preparing_a_message_that_scrolled_away_loses_that_one_and_keeps_the_rest() {
+    let (harness, _store, ids) = todo_harness();
+
+    let (status, prepared) = call(
+        &harness,
+        "POST",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/speech/prepare"),
+        Some(READ_TOKEN),
+        Some(serde_json::json!({ "ids": ["999999999999999999", ids[0].clone()] })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "one stale id failed the whole batch: {prepared}"
+    );
+    let entries = prepared["prepared"].as_array().expect("an array");
+    assert_eq!(entries.len(), 1, "{prepared}");
+    assert_eq!(entries[0]["message_id"], ids[0]);
+}

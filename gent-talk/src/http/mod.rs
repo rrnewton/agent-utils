@@ -106,6 +106,19 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/channels/{channel_id}/messages/{message_id}/speak",
             post(api::speak),
         )
+        // Read-aloud, prepared ahead of the tap. `prepare` resolves everything on screen ONCE when
+        // the mode is turned on; `play` is what a tap actually costs, and it is a map lookup and
+        // then the vendor's bytes forwarded as they arrive.
+        //
+        // `play` is deliberately OUTSIDE the authenticated shape of every other route: it is a GET
+        // with no `Authorization` header, because an `<audio src>` cannot send one and without an
+        // `<audio src>` the browser cannot stream. The ticket in the path is the credential. See
+        // `speech_tickets` for why that is a smaller grant than it looks.
+        .route(
+            "/api/v1/channels/{channel_id}/speech/prepare",
+            post(api::prepare_speech),
+        )
+        .route("/api/v1/speech/{ticket}", get(api::play_speech))
         .route("/api/v1/channels/{channel_id}/todo", get(api::todo))
         .route("/api/v1/channels/{channel_id}/dismiss", post(api::dismiss))
         .route("/api/v1/channels/{channel_id}/restore", post(api::restore))

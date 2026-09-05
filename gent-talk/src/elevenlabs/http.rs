@@ -52,6 +52,13 @@ pub const TTS_MODEL: &str = "eleven_turbo_v2_5";
 /// The audio this server asks for, and therefore what it tells the browser it is sending.
 pub const TTS_CONTENT_TYPE: &str = "audio/mpeg";
 
+/// What [`SPEECH_FORMAT`] actually is, told to the browser rather than guessed by it.
+///
+/// The vendor labels the streaming response `audio/mpeg` regardless of the format requested, and a
+/// browser handed Opus-in-Ogg under an mp3 label refuses to play it. This server asked for the
+/// format, so this server is the thing that knows what it is.
+pub const SPEECH_CONTENT_TYPE: &str = "audio/ogg";
+
 /// Build the request that reads text aloud.
 ///
 /// Documented as `POST /v1/text-to-speech/{voice_id}` with the account key in the `xi-api-key`
@@ -63,6 +70,44 @@ pub fn speech_request(api_base: &str, voice_id: &str) -> PreparedRequest {
         method: "POST",
         url: format!(
             "{}/text-to-speech/{}",
+            api_base.trim_end_matches('/'),
+            urlencode(voice_id)
+        ),
+    }
+}
+
+/// The audio format asked of the vendor, and the reason it is not the default.
+///
+/// Sending nothing takes the vendor's default, which is mp3 at 44.1kHz and 128kbit/s — around
+/// sixteen kilobytes for every second of speech. A long message is then more than a megabyte
+/// crossing a phone connection before the reader hears anything. This is one voice reading prose,
+/// not music: 32kbit/s Opus is a quarter of the size and, at that bitrate, audibly BETTER than the
+/// mp3 it replaces, because mp3 is poor down there and Opus was designed for it.
+///
+/// `opus_48000_32` is in the vendor's published format list, and Safari has decoded Opus for years.
+pub const SPEECH_FORMAT: &str = "opus_48000_32";
+
+/// How hard the vendor is asked to trade quality for a faster first byte.
+///
+/// Their scale is 0 (none) to 4. 4 also turns their text normaliser off, which this server
+/// explicitly must not use: `speakable::for_speech` has already rewritten the numbers, dates and
+/// identifiers that a normaliser exists to catch, and 4 would mispronounce whatever it left. 3 is
+/// the most that keeps the normaliser, and the quality cost on one voice reading prose aloud is not
+/// something this use can hear.
+pub const SPEECH_LATENCY_MODE: u8 = 3;
+
+/// `POST /v1/text-to-speech/{voice_id}/stream` — the same generation, delivered as it happens.
+///
+/// A separate function from [`speech_request`] rather than a flag on it, because the two differ in
+/// what the caller must then DO with the response: this one must not be buffered, and a shared
+/// constructor would make forgetting that a silent performance regression rather than a type error.
+#[must_use]
+pub fn speech_stream_request(api_base: &str, voice_id: &str) -> PreparedRequest {
+    PreparedRequest {
+        method: "POST",
+        url: format!(
+            "{}/text-to-speech/{}/stream?output_format={SPEECH_FORMAT}\
+             &optimize_streaming_latency={SPEECH_LATENCY_MODE}",
             api_base.trim_end_matches('/'),
             urlencode(voice_id)
         ),
@@ -471,6 +516,52 @@ impl SpeechProvider for HttpElevenLabsClient {
         Ok(Speech {
             audio: audio.to_vec(),
             content_type,
+        })
+    }
+
+    async fn speak_stream(
+        &self,
+        config: &ElevenLabsConfig,
+        text: &str,
+        speed: Option<f64>,
+    ) -> Result<super::SpeechStream, SpeechError> {
+        use futures_util::StreamExt as _;
+
+        let api_key = speech_key(config)?;
+        // Cached after the first call, and read-aloud mode warms it before the reader taps
+        // anything, so this is a map lookup on the path that matters.
+        let (voice, style) = self.voice_for(config, api_key).await?;
+        if text.trim().is_empty() {
+            return Err(SpeechError::Empty);
+        }
+        let request = speech_stream_request(&config.api_base, voice.as_str());
+        let response = self
+            .client
+            .post(&request.url)
+            .header(API_KEY_HEADER, api_key.expose())
+            .json(&speech_body(text, &style, speed))
+            .send()
+            .await
+            .map_err(|e| SpeechError::Transport(super::redact(&e.to_string(), api_key)))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(SpeechError::from_response(status.as_u16(), &body, api_key));
+        }
+        // NOT read from the response. The vendor labels this `audio/mpeg` whatever was actually
+        // asked for, and a browser handed Opus-in-Ogg under an mp3 label will refuse to play it.
+        // What went out in `output_format` is what is coming back, so that is what is declared.
+        let content_type = SPEECH_CONTENT_TYPE.to_owned();
+        let redaction = api_key.clone();
+        let chunks = response
+            .bytes_stream()
+            .map(move |chunk| {
+                chunk.map_err(|e| SpeechError::Transport(super::redact(&e.to_string(), &redaction)))
+            })
+            .boxed();
+        Ok(super::SpeechStream {
+            content_type,
+            chunks,
         })
     }
 }

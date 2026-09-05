@@ -270,6 +270,27 @@ pub struct Speech {
     pub content_type: String,
 }
 
+/// Audio arriving as it is generated, rather than all at once when it is finished.
+///
+/// The difference this makes is the whole of read-aloud's latency: on the non-streaming endpoint
+/// the vendor generates the entire file before sending a byte, so the reader waits for the last
+/// word to be synthesised before hearing the first. Here the first frames are forwarded to the
+/// browser as they arrive and playback starts against a file that is still being written.
+pub struct SpeechStream {
+    /// What the audio IS, so the browser is told rather than left to sniff.
+    pub content_type: String,
+    /// The audio itself, in whatever chunks the vendor happens to send.
+    pub chunks: futures_util::stream::BoxStream<'static, Result<bytes::Bytes, SpeechError>>,
+}
+
+impl std::fmt::Debug for SpeechStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpeechStream")
+            .field("content_type", &self.content_type)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Turning a message's text into audio.
 #[async_trait]
 pub trait SpeechProvider: Send + Sync {
@@ -288,6 +309,33 @@ pub trait SpeechProvider: Send + Sync {
         text: &str,
         speed: Option<f64>,
     ) -> Result<Speech, SpeechError>;
+
+    /// The same thing, but handed back as it arrives.
+    ///
+    /// # Errors
+    ///
+    /// As [`SpeechProvider::speak`]. A failure that happens PART WAY THROUGH arrives as an error
+    /// item in the stream rather than here, because by then a status and some audio have already
+    /// been sent and there is nothing left to turn into an HTTP error.
+    ///
+    /// The default implementation generates the whole thing and hands it over in one chunk. That is
+    /// the honest behaviour for a provider that cannot stream — a fake, or a future backend without
+    /// the endpoint — and it keeps every such provider correct rather than making them all
+    /// implement a second method to say "no".
+    async fn speak_stream(
+        &self,
+        config: &ElevenLabsConfig,
+        text: &str,
+        speed: Option<f64>,
+    ) -> Result<SpeechStream, SpeechError> {
+        let spoken = self.speak(config, text, speed).await?;
+        Ok(SpeechStream {
+            content_type: spoken.content_type,
+            chunks: Box::pin(futures_util::stream::once(async move {
+                Ok(bytes::Bytes::from(spoken.audio))
+            })),
+        })
+    }
 }
 
 /// The speeds this server will ask a vendor for.

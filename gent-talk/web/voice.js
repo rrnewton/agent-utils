@@ -4152,6 +4152,7 @@ const clampReadSpeed = (value) => {
 
 /** Put the pace on the page and remember it. */
 function applyReadSpeed(value) {
+  const previous = readSpeed;
   readSpeed = value === null ? null : clampReadSpeed(value);
   const shown = readSpeed === null ? 100 : readSpeed;
   el("read-speed-range").value = String(shown);
@@ -4166,6 +4167,14 @@ function applyReadSpeed(value) {
     }
   } catch (_error) {
     // A browser that refuses storage still reads at the chosen pace for this session.
+  }
+  // THE PACE IS BAKED INTO A TICKET. It is chosen at mint time so the tap does not have to send it,
+  // which means a ticket minted at the old pace would read at the old pace however the slider now
+  // looks — the reader moves the control and hears no difference, the most confusing possible
+  // outcome. Throwing them away costs one request and nothing at the vendor.
+  if (readSpeed !== previous) {
+    forgetPreparedSpeech();
+    guardQuietly(prepareSpeech)();
   }
 }
 
@@ -4211,6 +4220,76 @@ function readAlready(id, who) {
 
 /** Is a tap on a message a request to hear it? Session-only, and only in the channel view. */
 let readingMode = false;
+
+/**
+ * Where each visible message can be PLAYED from, resolved before the reader taps anything.
+ *
+ * Message id -> a URL that streams that message's audio. The server minted these when read-aloud
+ * was switched on: it resolved every id on screen against one Discord window, normalised each for
+ * speech, and warmed the voice lookup. What a tap then costs is opening this URL.
+ *
+ * THE URL CARRIES ITS OWN AUTHORITY, which is the only reason any of this works: an `<audio src>`
+ * cannot send an `Authorization` header, and without an `<audio src>` the browser will not stream —
+ * it has to be handed a complete file. That is the wait being removed.
+ *
+ * Empty is not an error. Anything missing falls back to fetching the audio as a blob, which is
+ * exactly what this page did before and is still correct, only slower.
+ */
+const preparedSpeech = new Map();
+
+/** How long the server said its tickets last, so they can be refreshed before they lapse. */
+let preparedUntil = 0;
+
+/**
+ * Resolve everything on screen so a tap does not have to.
+ *
+ * Called when read-aloud is switched on, and again as rows arrive or scroll into reach. Cheap to
+ * repeat: it is one request covering every visible row, against messages the server has usually
+ * just fetched anyway. It spends NOTHING at the vendor — no audio is generated until a tap.
+ */
+async function prepareSpeech() {
+  if (!readingMode || currentView !== "discord") {
+    return;
+  }
+  const channel = el("discord-channel").value;
+  if (!channel) {
+    return;
+  }
+  const ids = [];
+  for (const li of el("discord-log").children) {
+    for (const id of (li.getAttribute("data-ids") || "").split(",")) {
+      if (id && !preparedSpeech.has(id)) {
+        ids.push(id);
+      }
+    }
+  }
+  if (ids.length === 0) {
+    return;
+  }
+  let payload = null;
+  try {
+    payload = await api(
+      `/api/v1/channels/${encodeURIComponent(channel)}/speech/prepare`,
+      { method: "POST", body: { ids, speed: readSpeed === null ? null : readSpeed / 100 } }
+    );
+  } catch (_error) {
+    // PREPARING IS AN OPTIMISATION AND FAILS LIKE ONE. The tap still works without it, by the
+    // older and slower route, so taking the channel away over this would trade a slow feature for
+    // a broken one.
+    return;
+  }
+  for (const entry of (payload && payload.prepared) || []) {
+    preparedSpeech.set(String(entry.message_id), entry.url);
+  }
+  const ttl = (payload && payload.expires_in_seconds) || 0;
+  preparedUntil = Date.now() + ttl * 1000;
+}
+
+/** Forget what was prepared. The pace is baked into a ticket, so changing it invalidates them. */
+function forgetPreparedSpeech() {
+  preparedSpeech.clear();
+  preparedUntil = 0;
+}
 
 /** The message being read right now, and the player reading it. Null when nothing is playing. */
 let nowPlaying = null;
@@ -4365,7 +4444,15 @@ async function readAloud(ids) {
   pendingRead = id;
   setReadState("working");
   renderChannelRows();
+  // THE FAST PATH, and the whole point of preparing: every part already has a URL that streams, so
+  // there is nothing to fetch and nothing to wait for. The player is handed the URL and the browser
+  // starts playing against a response the server is still writing.
+  const ready = parts.map((part) => preparedSpeech.get(part));
+  const streamed = ready.every((url) => typeof url === "string" && url.length > 0);
   let blobs;
+  if (streamed) {
+    blobs = null;
+  } else {
   try {
     blobs = await Promise.all(parts.map((part) => fetchSpeech(channel, part)));
   } catch (error) {
@@ -4381,6 +4468,7 @@ async function readAloud(ids) {
     setStatus(`could not read that message aloud: ${error.message}`);
     throw error;
   }
+  }
   // THE TICKET CHECK, and it is the whole fix. Anything that happened while this was in flight --
   // another tap, a stop, leaving the view -- has already moved the ticket on, and this audio is
   // something nobody is waiting for any more. Dropped before a player exists, because a player
@@ -4390,9 +4478,13 @@ async function readAloud(ids) {
   }
   // The wait is over: it is being READ now, not merely asked for.
   pendingRead = null;
-  const urls = blobs.map((blob) => URL.createObjectURL(blob));
-  const players = urls.map((url) => new Audio(url));
-  nowPlaying = { id, audio: players[0], urls };
+  // `objectUrls` is what has to be REVOKED later, and a streamed URL is not one of them: it belongs
+  // to the server and revoking it would be meaningless. Keeping the two apart is what stops the
+  // cleanup either leaking blobs or throwing on something it does not own.
+  const objectUrls = streamed ? [] : blobs.map((blob) => URL.createObjectURL(blob));
+  const sources = streamed ? ready : objectUrls;
+  const players = sources.map((url) => new Audio(url));
+  nowPlaying = { id, audio: players[0], urls: objectUrls };
   players.forEach((audio, at) => {
     audio.addEventListener("ended", () => {
       // Only if THIS is still the read in progress. The reader may have tapped another message
@@ -7106,6 +7198,14 @@ el("read-aloud").addEventListener("click", () => {
     stopReading();
   }
   setReadState(readingMode ? "ready" : "idle");
+  if (readingMode) {
+    // AHEAD OF THE TAP. This is the request that makes every later tap cheap, and it is issued the
+    // moment the mode is entered rather than when a message is chosen, because the reader is
+    // already looking at the text and has not decided yet which line they want.
+    guardQuietly(prepareSpeech)();
+  } else {
+    forgetPreparedSpeech();
+  }
   setStatus(
     readingMode
       ? "reading mode: tap a message to hear it, and it archives when it finishes."
