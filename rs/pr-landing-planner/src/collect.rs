@@ -254,6 +254,7 @@ pub fn collect_graph(
             is_draft: pr.is_draft,
             mergeable: pr.mergeable,
             review_decision,
+            review_evidence_unavailable: pr.review_evidence_unavailable,
             created_at: pr.created_at,
             updated_at: pr.updated_at,
             additions: pr.additions,
@@ -565,5 +566,31 @@ ancestry: [{before: 1, after: 2}]
         )
         .unwrap();
         assert_eq!(graph.nodes[0].review_decision, "CHANGES_REQUESTED");
+    }
+
+    #[test]
+    fn review_evidence_unavailable_survives_collection() {
+        let value = serde_json::json!({
+            "repo":"r",
+            "base":"main",
+            "prs":[{
+                "number":1,
+                "head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "review_decision":"APPROVED",
+                "review_evidence_unavailable":true,
+                "checks":[{"name":"merge-gate","conclusion":"SUCCESS"}]
+            }]
+        });
+        let (mut host, repo, base) = FakeHost::from_value(&value).unwrap();
+        let mut priority = NonePriority;
+        let classify = ClassifyConfig::default();
+        let graph = collect_graph(
+            &mut host,
+            CollectOptions::new(&repo, &base, &classify, &mut priority),
+        )
+        .unwrap();
+        assert_eq!(graph.nodes[0].review_decision, "APPROVED");
+        assert!(graph.nodes[0].review_evidence_unavailable);
+        assert!(graph.nodes[0].review_evidence_digest.is_empty());
     }
 }

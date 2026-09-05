@@ -372,6 +372,10 @@ fn fake_pr(value: &Value, where_: &str, default_base: &str) -> Result<FakePr, St
                 .unwrap_or(false),
             mergeable: opt_string(&obj, "mergeable", ""),
             review_decision: review_decision.clone(),
+            review_evidence_unavailable: obj
+                .get("review_evidence_unavailable")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
             created_at: opt_string(&obj, "created_at", ""),
             updated_at: opt_string(&obj, "updated_at", ""),
             additions: opt_integer(&obj, "additions", 0, where_, true)?,

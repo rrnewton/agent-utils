@@ -175,6 +175,13 @@ only `review_objections_resolved: true` bound to the matching exact head and
 snapshot digest can clear it. Missing or false context cannot make that pull
 request landable.
 
+If any promised review source cannot be fetched completely, paginated, parsed,
+or assigned a stable event identity, the node reports
+`review_evidence_unavailable: true` and remains held with
+`review-evidence-unavailable`. This state is distinct from a complete snapshot
+containing no events. A clean exact validation record or an aggregate approval
+cannot clear it; the review evidence must be fetched successfully on a later run.
+
 The authority decision does not require a `RETIRES` line. For example, an older
 refusal can be discharged by a later valid withdrawal followed by a current-head
 approval. The snapshot preserves their timestamps and substantive body text so
@@ -190,8 +197,9 @@ creation/submission timestamp, current version timestamp, native-review
 last-edit timestamp, and body. The digest removes only a fleet disclosure on the
 first nonblank line, an optional `BY` value on an exact review marker, and an
 exact standalone `Unverified --who metadata: NAME` prose line. These optional
-identity fields use the canonical `[A-Za-z0-9_.-]+` agent-token grammar and are
-normalized for native reviews, issue comments, and inline review comments. They
+identity fields use the canonical ASCII-only `[A-Za-z0-9_.-]+` agent-token
+grammar and are normalized for native reviews, issue comments, and inline
+review comments. They
 remain in the displayed comment for readers but do not decide authority.
 
 Review-marker recognition does not depend on the optional `BY` value. A missing,

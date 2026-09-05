@@ -130,13 +130,13 @@ fn normalized_review_body(body: &str) -> String {
     static WHO_METADATA: OnceLock<Regex> = OnceLock::new();
     let disclosure = regex(
         &DISCLOSURE,
-        r"(?i)^\[[A-Za-z0-9_.-]+,\s*[A-Za-z0-9_.-]+,\s*[^,\[\]\r\n]+,\s*[A-Za-z0-9_.-]+,\s*role=[A-Za-z0-9_.-]+\]\r?$",
+        r"^\[[A-Za-z0-9_.-]+,\s*[A-Za-z0-9_.-]+,\s*[^,\[\]\r\n]+,\s*[A-Za-z0-9_.-]+,\s*(?i-u:role)=[A-Za-z0-9_.-]+\]\r?$",
     );
     let review_marker = regex(
         &REVIEW_MARKER,
-        r"(?i)^(?:CHANGES-REQUESTED-WITHDRAWN-AT|CHANGES-REQUESTED-AT|APPROVED-AT):\s*(?:claude|codex)\s+[0-9a-f]{40}",
+        r"^(?i-u:CHANGES-REQUESTED-WITHDRAWN-AT|CHANGES-REQUESTED-AT|APPROVED-AT):\s*(?i-u:claude|codex)\s+(?i-u:[0-9a-f]{40})",
     );
-    let by_identity = regex(&BY_IDENTITY, r"(?i)[ \t]+BY[ \t]+[A-Za-z0-9_.-]+$");
+    let by_identity = regex(&BY_IDENTITY, r"[ \t]+(?i-u:BY)[ \t]+[A-Za-z0-9_.-]+$");
     let who_metadata = regex(
         &WHO_METADATA,
         r"^Unverified --who metadata: [A-Za-z0-9_.-]+\r?$",
@@ -180,7 +180,7 @@ pub(crate) fn has_comment_changes_requested(snapshot: &ReviewEvidenceSnapshot) -
     static COMMENT_OBJECTION: OnceLock<Regex> = OnceLock::new();
     let comment_objection = regex(
         &COMMENT_OBJECTION,
-        r"(?i)^CHANGES-REQUESTED-AT:\s*(?:claude|codex)\s+[0-9a-f]{40}",
+        r"^(?i-u:CHANGES-REQUESTED-AT):\s*(?i-u:claude|codex)\s+(?i-u:[0-9a-f]{40})",
     );
     snapshot.events.iter().any(|event| {
         matches!(event.kind.as_str(), "issue-comment" | "review-comment")
@@ -201,10 +201,10 @@ pub(crate) struct RetirementRecord {
 pub(crate) fn retirement_record(body: &str) -> Result<Option<RetirementRecord>, String> {
     static TARGET: OnceLock<Regex> = OnceLock::new();
     static WITHDRAWAL: OnceLock<Regex> = OnceLock::new();
-    let target = regex(&TARGET, r"(?i)^\s*RETIRES\s+#?(\d{6,})\s*$");
+    let target = regex(&TARGET, r"^\s*(?i-u:RETIRES)\s+#?([0-9]{6,})\s*$");
     let withdrawal = regex(
         &WITHDRAWAL,
-        r"(?i)^CHANGES-REQUESTED-WITHDRAWN-AT:\s*(?P<lane>claude|codex)\s+(?P<head>[0-9a-f]{40})",
+        r"^(?i-u:CHANGES-REQUESTED-WITHDRAWN-AT):\s*(?P<lane>(?i-u:claude|codex))\s+(?P<head>(?i-u:[0-9a-f]{40}))",
     );
     let lines = prose_lines(body);
     let targets = lines
@@ -1213,7 +1213,7 @@ mod tests {
             review_evidence_digest(&hostname_author).unwrap(),
             write_digest
         );
-        for claimed_identity in ["other-agent", "other_agent", "other.agent"] {
+        for claimed_identity in ["other-agent", "other_agent", "other.agent", "K"] {
             let mut false_by = snapshot.clone();
             false_by.events[0].body =
                 body.replace("BY release-authority", &format!("BY {claimed_identity}"));
@@ -1251,6 +1251,16 @@ mod tests {
                 review_evidence_digest(&alternate_malformed).unwrap(),
                 write_digest
             );
+        }
+        for non_ascii_identity in ["K", "İ", "ı", "ſ"] {
+            let mut non_ascii = snapshot.clone();
+            non_ascii.events[0].body =
+                body.replace("BY release-authority", &format!("BY {non_ascii_identity}"));
+            assert_eq!(
+                retirement_record(&non_ascii.events[0].body).unwrap(),
+                Some(record.clone())
+            );
+            assert_ne!(review_evidence_digest(&non_ascii).unwrap(), write_digest);
         }
         let mut different_disclosure = snapshot.clone();
         different_disclosure.events[0].body = body.replace(
@@ -1309,6 +1319,7 @@ mod tests {
             "departed-reviewer",
             "departed_reviewer",
             "departed.reviewer",
+            "K",
         ] {
             let mut metadata_changed = snapshot.clone();
             metadata_changed.events[0].body = body.replace(
@@ -1316,6 +1327,14 @@ mod tests {
                 &format!("[team, {disclosure_agent}, old-session, other-model, role=reviewer]"),
             );
             assert_eq!(review_evidence_digest(&metadata_changed).unwrap(), digest);
+        }
+        for non_ascii_identity in ["K", "İ", "ı", "ſ"] {
+            let mut metadata_changed = snapshot.clone();
+            metadata_changed.events[0].body = body.replace(
+                "[team, current-reviewer, session, model, role=reviewer]",
+                &format!("[team, {non_ascii_identity}, session, model, role=reviewer]"),
+            );
+            assert_ne!(review_evidence_digest(&metadata_changed).unwrap(), digest);
         }
         for claimed_identity in [
             "departed-reviewer",
@@ -1388,11 +1407,17 @@ mod tests {
                 events: vec![event.clone()],
             };
             let digest = review_evidence_digest(&snapshot).unwrap();
-            for agent in ["review-agent", "review_agent", "review.agent"] {
+            for agent in ["review-agent", "review_agent", "review.agent", "K"] {
                 let mut with_metadata = snapshot.clone();
                 with_metadata.events[0].body =
                     format!("{base_body}\nUnverified --who metadata: {agent}");
                 assert_eq!(review_evidence_digest(&with_metadata).unwrap(), digest);
+            }
+            for non_ascii_identity in ["K", "İ", "ı", "ſ"] {
+                let mut with_metadata = snapshot.clone();
+                with_metadata.events[0].body =
+                    format!("{base_body}\nUnverified --who metadata: {non_ascii_identity}");
+                assert_ne!(review_evidence_digest(&with_metadata).unwrap(), digest);
             }
 
             let preserved_forms = [
@@ -1442,6 +1467,10 @@ mod tests {
                 " BY",
                 " BY: review.agent",
                 " BY/review.agent",
+                " BY K",
+                " BY İ",
+                " BY ı",
+                " BY ſ",
             ] {
                 let snapshot = ReviewEvidenceSnapshot {
                     head_sha: REBASED_HEAD.into(),

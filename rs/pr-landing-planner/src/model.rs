@@ -325,6 +325,8 @@ pub struct RawPr {
     pub mergeable: String,
     /// Repository-host review-decision token.
     pub review_decision: String,
+    /// Whether the host could not produce the complete exact-head review snapshot.
+    pub review_evidence_unavailable: bool,
     /// Creation timestamp used as a deterministic tie-breaker.
     pub created_at: String,
     /// Last-update timestamp when supplied by the host.
@@ -396,6 +398,8 @@ pub struct PrNode {
     pub mergeable: String,
     /// Repository-host review-decision token.
     pub review_decision: String,
+    /// Whether review evidence collection was incomplete or indeterminate.
+    pub review_evidence_unavailable: bool,
     /// Creation timestamp used as a tie-breaker.
     pub created_at: String,
     /// Last-update timestamp observed from the repository host.

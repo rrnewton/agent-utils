@@ -643,6 +643,7 @@ def test_retirement_uses_event_author_permission_and_ignores_claimed_identity() 
         "other-agent",
         "other_agent",
         "other.agent",
+        "K",
     ):
         false_by = replace(
             snapshot,
@@ -682,6 +683,20 @@ def test_retirement_uses_event_author_permission_and_ignores_claimed_identity() 
         )
         assert retirement_record(alternate_malformed.events[0].body) == record
         assert review_evidence_digest(alternate_malformed) != write_digest
+    for non_ascii_identity in ("K", "İ", "ı", "ſ"):
+        non_ascii = replace(
+            snapshot,
+            events=(
+                replace(
+                    event,
+                    body=body.replace(
+                        "BY release-authority", f"BY {non_ascii_identity}"
+                    ),
+                ),
+            ),
+        )
+        assert retirement_record(non_ascii.events[0].body) == record
+        assert review_evidence_digest(non_ascii) != write_digest
     different_disclosure = replace(
         snapshot,
         events=(
@@ -737,6 +752,7 @@ def test_review_marker_attribution_is_metadata_for_every_marker() -> None:
         "departed-reviewer",
         "departed_reviewer",
         "departed.reviewer",
+        "K",
     ):
         metadata_changed = body.replace(
             "[team, current-reviewer, session, model, role=reviewer]",
@@ -754,6 +770,14 @@ def test_review_marker_attribution_is_metadata_for_every_marker() -> None:
         assert review_evidence_digest(
             replace(snapshot, events=(replace(event, body=metadata_changed),))
         ) == digest
+    for non_ascii_identity in ("K", "İ", "ı", "ſ"):
+        metadata_changed = body.replace(
+            "[team, current-reviewer, session, model, role=reviewer]",
+            f"[team, {non_ascii_identity}, session, model, role=reviewer]",
+        )
+        assert review_evidence_digest(
+            replace(snapshot, events=(replace(event, body=metadata_changed),))
+        ) != digest
     metadata_removed = "\n".join(
         line.replace(" BY current-reviewer", "")
         for line in body.split("\n")[1:]
@@ -810,7 +834,7 @@ def test_unverified_who_metadata_is_optional_only_as_an_exact_prose_line(
     )
     snapshot = ReviewEvidenceSnapshot(REBASED_HEAD, "APPROVED", (event,))
     digest = review_evidence_digest(snapshot)
-    for agent in ("review-agent", "review_agent", "review.agent"):
+    for agent in ("review-agent", "review_agent", "review.agent", "K"):
         with_metadata = replace(
             snapshot,
             events=(
@@ -821,6 +845,19 @@ def test_unverified_who_metadata_is_optional_only_as_an_exact_prose_line(
             ),
         )
         assert review_evidence_digest(with_metadata) == digest
+    for non_ascii_identity in ("K", "İ", "ı", "ſ"):
+        with_metadata = replace(
+            snapshot,
+            events=(
+                replace(
+                    event,
+                    body=(
+                        f"{base_body}\nUnverified --who metadata: {non_ascii_identity}"
+                    ),
+                ),
+            ),
+        )
+        assert review_evidence_digest(with_metadata) != digest
 
     preserved_forms = (
         f"{base_body}\nUnverified --who metadata: review.agent extra",
@@ -864,6 +901,10 @@ def test_comment_refusal_survives_valid_and_malformed_by_metadata(kind: str) -> 
         " BY",
         " BY: review.agent",
         " BY/review.agent",
+        " BY K",
+        " BY İ",
+        " BY ı",
+        " BY ſ",
     ):
         snapshot = ReviewEvidenceSnapshot(
             REBASED_HEAD,

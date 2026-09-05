@@ -741,6 +741,41 @@ fn review_snapshot(
     })
 }
 
+fn raw_pr_from_list_entry(obj: &Map<String, Value>, enrichment: Option<&HostEnrichment>) -> RawPr {
+    let author = obj
+        .get("author")
+        .and_then(Value::as_object)
+        .and_then(|author| author.get("login"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_owned();
+    RawPr {
+        number: integer(obj, "number"),
+        head_ref: string(obj, "headRefName"),
+        base_ref: string(obj, "baseRefName"),
+        api_head_sha: string(obj, "headRefOid"),
+        title: string(obj, "title"),
+        author,
+        is_draft: obj.get("isDraft").and_then(Value::as_bool).unwrap_or(false),
+        mergeable: string(obj, "mergeable"),
+        // Preserve the independently observed light-list decision. Collection
+        // compares it with the later evidence snapshot instead of silently
+        // replacing a non-empty decision with missing or contradictory data.
+        review_decision: string(obj, "reviewDecision"),
+        review_evidence_unavailable: enrichment.is_none(),
+        created_at: string(obj, "createdAt"),
+        updated_at: string(obj, "updatedAt"),
+        additions: integer(obj, "additions"),
+        deletions: integer(obj, "deletions"),
+        labels: labels(obj.get("labels")),
+        checks: enrichment
+            .map(|value| value.checks.clone())
+            .unwrap_or_default(),
+        review_snapshot: enrichment.map(|value| value.review_snapshot.clone()),
+        mechanism_symbols: Vec::new(),
+    }
+}
+
 impl VcsHost for GitHubHost {
     fn list_open_prs(&mut self, repo: &str, _base: Option<&str>) -> Result<Vec<RawPr>, String> {
         let args = self.net(vec![
@@ -777,39 +812,10 @@ impl VcsHost for GitHubHost {
             let Some(obj) = value.as_object() else {
                 continue;
             };
-            let number = integer(obj, "number");
-            let enrichment = enrichments.get(&number);
-            let author = obj
-                .get("author")
-                .and_then(Value::as_object)
-                .and_then(|author| author.get("login"))
-                .and_then(Value::as_str)
-                .unwrap_or("unknown")
-                .to_owned();
-            prs.push(RawPr {
-                number,
-                head_ref: string(obj, "headRefName"),
-                base_ref: string(obj, "baseRefName"),
-                api_head_sha: string(obj, "headRefOid"),
-                title: string(obj, "title"),
-                author,
-                is_draft: obj.get("isDraft").and_then(Value::as_bool).unwrap_or(false),
-                mergeable: string(obj, "mergeable"),
-                // Preserve the independently observed light-list decision. Collection
-                // compares it with the later evidence snapshot instead of silently
-                // replacing a non-empty decision with missing or contradictory data.
-                review_decision: string(obj, "reviewDecision"),
-                created_at: string(obj, "createdAt"),
-                updated_at: string(obj, "updatedAt"),
-                additions: integer(obj, "additions"),
-                deletions: integer(obj, "deletions"),
-                labels: labels(obj.get("labels")),
-                checks: enrichment
-                    .map(|value| value.checks.clone())
-                    .unwrap_or_default(),
-                review_snapshot: enrichment.map(|value| value.review_snapshot.clone()),
-                mechanism_symbols: Vec::new(),
-            });
+            prs.push(raw_pr_from_list_entry(
+                obj,
+                enrichments.get(&integer(obj, "number")),
+            ));
         }
         Ok(prs)
     }
@@ -935,8 +941,8 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::{
-        graphql_connection_from_slurp, inline_comments_from_slurp, repository_permission,
-        review_snapshot, ISSUE_COMMENTS_QUERY, REVIEWS_QUERY,
+        graphql_connection_from_slurp, inline_comments_from_slurp, raw_pr_from_list_entry,
+        repository_permission, review_snapshot, ISSUE_COMMENTS_QUERY, REVIEWS_QUERY,
     };
     use crate::context::review_evidence_digest;
 
@@ -1018,6 +1024,31 @@ mod tests {
         let (head, reviews) = graphql_connection_from_slurp(&raw, 42, "reviews").unwrap();
         assert_eq!(head, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         assert_eq!(reviews.len(), 2);
+    }
+
+    #[test]
+    fn failed_enrichment_is_explicit_in_the_production_list_record() {
+        let value = json!({
+            "number": 42,
+            "headRefName": "feature",
+            "baseRefName": "main",
+            "headRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "title": "title",
+            "author": {"login": "author"},
+            "isDraft": false,
+            "mergeable": "MERGEABLE",
+            "reviewDecision": "APPROVED",
+            "createdAt": "2026-09-05T12:00:00Z",
+            "updatedAt": "2026-09-05T12:00:00Z",
+            "additions": 1,
+            "deletions": 1,
+            "labels": []
+        });
+        let raw = raw_pr_from_list_entry(value.as_object().unwrap(), None);
+        assert!(raw.review_evidence_unavailable);
+        assert!(raw.review_snapshot.is_none());
+        assert!(raw.checks.is_empty());
+        assert_eq!(raw.review_decision, "APPROVED");
     }
 
     #[test]

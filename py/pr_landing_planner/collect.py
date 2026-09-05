@@ -245,6 +245,7 @@ def collect_graph(
                 is_draft=pr.is_draft,
                 mergeable=pr.mergeable,
                 review_decision=review_decision,
+                review_evidence_unavailable=pr.review_evidence_unavailable,
                 created_at=pr.created_at,
                 updated_at=pr.updated_at,
                 additions=pr.additions,

@@ -220,6 +220,7 @@ def test_list_open_prs_enriches_rollup_per_pr(monkeypatch: pytest.MonkeyPatch) -
     assert [p.number for p in prs] == [1, 2]  # order follows the light list, not completion order
     assert all(len(p.checks) == 1 for p in prs)  # every PR got its rollup
     assert all(p.review_snapshot is not None for p in prs)
+    assert all(not p.review_evidence_unavailable for p in prs)
     snapshot = prs[0].review_snapshot
     assert snapshot is not None
     assert {event.kind for event in snapshot.events} == {
@@ -279,6 +280,7 @@ def test_incomplete_native_review_pagination_fails_closed(
     by = {pr.number: pr for pr in prs}
     assert by[1].review_snapshot is not None
     assert by[2].review_snapshot is None
+    assert by[2].review_evidence_unavailable
     assert by[2].checks == ()
     assert "#2" in capsys.readouterr().err
 
@@ -291,6 +293,7 @@ def test_list_open_prs_degrades_failed_rollup(
     by = {p.number: p for p in prs}
     assert len(by[1].checks) == 1  # healthy PR still enriched
     assert by[2].checks == ()  # failed rollup degrades to no checks, PR is NOT dropped
+    assert by[2].review_evidence_unavailable
     err = capsys.readouterr().err
     assert "#2" in err and "evidence enrichment failed" in err  # LOUD note, not silent
 
@@ -305,6 +308,7 @@ def test_missing_stable_review_identity_fails_closed(
     by = {pr.number: pr for pr in prs}
     assert by[1].review_snapshot is not None
     assert by[2].review_snapshot is None
+    assert by[2].review_evidence_unavailable
     assert by[2].checks == ()
     assert "#2" in capsys.readouterr().err
 
@@ -321,6 +325,7 @@ def test_missing_stable_inline_identity_fails_closed(
     by = {pr.number: pr for pr in prs}
     assert by[1].review_snapshot is not None
     assert by[2].review_snapshot is None
+    assert by[2].review_evidence_unavailable
     assert by[2].checks == ()
     assert "#2" in capsys.readouterr().err
 

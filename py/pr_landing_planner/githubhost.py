@@ -553,6 +553,7 @@ class GitHubHost:
                     # compares it with the later evidence snapshot instead of silently
                     # replacing a non-empty decision with missing or contradictory data.
                     review_decision=_str(obj, "reviewDecision"),
+                    review_evidence_unavailable=enrichment is None,
                     created_at=_str(obj, "createdAt"),
                     updated_at=_str(obj, "updatedAt"),
                     additions=_int(obj, "additions"),

@@ -287,6 +287,9 @@ def _fake_pr_from(value: object, where: str, *, default_base: str) -> _FakePr:
         is_draft=_opt_bool(obj, "is_draft", False),
         mergeable=_opt_str(obj, "mergeable", ""),
         review_decision=review_decision,
+        review_evidence_unavailable=_opt_bool(
+            obj, "review_evidence_unavailable", False
+        ),
         created_at=_opt_str(obj, "created_at", ""),
         updated_at=_opt_str(obj, "updated_at", ""),
         additions=_opt_int(obj, "additions", 0, where, nonnegative=True),

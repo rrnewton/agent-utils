@@ -226,6 +226,28 @@ def test_canonical_comment_refusal_holds_without_native_review_decision() -> Non
     assert graph.nodes[0].review_decision == "CHANGES_REQUESTED"
 
 
+def test_review_evidence_unavailable_survives_collection() -> None:
+    fixture: dict[str, object] = {
+        "repo": "R",
+        "base": "integration",
+        "prs": [
+            {
+                "number": 1,
+                "head_sha": "a" * 40,
+                "review_decision": "APPROVED",
+                "review_evidence_unavailable": True,
+                "checks": [{"name": "merge-gate", "conclusion": "SUCCESS"}],
+            }
+        ],
+    }
+    host, _, _ = FakeHost.from_fixture(fixture)
+    graph = collect_graph(host, repo="R", base="integration")
+    node = graph.nodes[0]
+    assert node.review_decision == "APPROVED"
+    assert node.review_evidence_unavailable
+    assert node.review_evidence_digest == ""
+
+
 def test_only_numbers_restricts_selection() -> None:
     graph = collect_graph(
         _host(), repo="OWNER/NAME", base="integration", only=frozenset({1, 3})

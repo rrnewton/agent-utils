@@ -28,32 +28,31 @@ POLICY_PREFIX = "landing-policy:"
 REQUIRED_REVIEW_LANES = ("codex", "claude")
 ALLOWED_RETIREMENT_PERMISSIONS = frozenset(("triage", "write", "maintain", "admin"))
 _AGENT_TOKEN = r"[A-Za-z0-9_.-]+"
+_ASCII_CASE = re.ASCII | re.IGNORECASE
 
-_RETIREMENT_TARGET = re.compile(r"^\s*RETIRES\s+#?(\d{6,})\s*$", re.IGNORECASE)
+_RETIREMENT_TARGET = re.compile(r"^\s*RETIRES\s+#?(\d{6,})\s*$", _ASCII_CASE)
 _WITHDRAWAL = re.compile(
     r"^CHANGES-REQUESTED-WITHDRAWN-AT:\s*(?P<lane>claude|codex)\s+"
     r"(?P<head>[0-9a-f]{40})",
-    re.IGNORECASE,
+    _ASCII_CASE,
 )
 _BLOCK_PREFIX = re.compile(r"^(?:#{1,6}\s+|[-+*]\s+)")
 _FENCE = re.compile(r"^ {0,3}(?P<f>`{3,}|~{3,})\s*(?P<info>.*)$")
 _DISCLOSURE = re.compile(
     r"^\[[A-Za-z0-9_.-]+,\s*[A-Za-z0-9_.-]+,\s*[^,\[\]\r\n]+,\s*"
     r"[A-Za-z0-9_.-]+,\s*role=[A-Za-z0-9_.-]+\]\r?$",
-    re.IGNORECASE,
+    _ASCII_CASE,
 )
 _REVIEW_MARKER = re.compile(
     r"^(?:CHANGES-REQUESTED-WITHDRAWN-AT|CHANGES-REQUESTED-AT|APPROVED-AT):"
     r"\s*(?:claude|codex)\s+[0-9a-f]{40}",
-    re.IGNORECASE,
+    _ASCII_CASE,
 )
-_BY_IDENTITY = re.compile(
-    rf"[ \t]+BY[ \t]+{_AGENT_TOKEN}$", re.IGNORECASE
-)
-_WHO_METADATA = re.compile(rf"^Unverified --who metadata: {_AGENT_TOKEN}\r?$")
+_BY_IDENTITY = re.compile(rf"[ \t]+BY[ \t]+{_AGENT_TOKEN}$", _ASCII_CASE)
+_WHO_METADATA = re.compile(rf"^Unverified --who metadata: {_AGENT_TOKEN}\r?$", re.ASCII)
 _COMMENT_OBJECTION = re.compile(
     r"^CHANGES-REQUESTED-AT:\s*(?:claude|codex)\s+[0-9a-f]{40}",
-    re.IGNORECASE,
+    _ASCII_CASE,
 )
 
 

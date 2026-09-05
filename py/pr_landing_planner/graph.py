@@ -241,6 +241,8 @@ def held_reasons(
         node_reasons: list[str] = []
         if node.is_draft:
             node_reasons.append("draft")
+        if node.review_evidence_unavailable:
+            node_reasons.append("review-evidence-unavailable")
         review = node.review_decision.strip().upper()
         if review == "REVIEW_REQUIRED":
             node_reasons.append("review-required")

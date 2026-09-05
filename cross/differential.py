@@ -8604,29 +8604,30 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
 
         fence_re = re.compile(r"^ {0,3}(?P<f>`{3,}|~{3,})\s*(?P<info>.*)$")
         block_prefix = re.compile(r"^(?:#{1,6}\s+|[-+*]\s+)")
+        ascii_case = re.ASCII | re.IGNORECASE
         disclosure = re.compile(
             r"^\[[A-Za-z0-9_.-]+,\s*[A-Za-z0-9_.-]+,\s*"
             r"[^,\[\]\r\n]+,\s*[A-Za-z0-9_.-]+,\s*"
             r"role=[A-Za-z0-9_.-]+\]\r?$",
-            re.IGNORECASE,
+            ascii_case,
         )
         review_marker = re.compile(
             r"^(?:CHANGES-REQUESTED-WITHDRAWN-AT|CHANGES-REQUESTED-AT|"
             r"APPROVED-AT):\s*(?:claude|codex)\s+[0-9a-f]{40}",
-            re.IGNORECASE,
+            ascii_case,
         )
         by_identity = re.compile(
-            r"[ \t]+BY[ \t]+[A-Za-z0-9_.-]+$", re.IGNORECASE
+            r"[ \t]+BY[ \t]+[A-Za-z0-9_.-]+$", ascii_case
         )
         who_metadata = re.compile(
-            r"^Unverified --who metadata: [A-Za-z0-9_.-]+\r?$"
+            r"^Unverified --who metadata: [A-Za-z0-9_.-]+\r?$", re.ASCII
         )
         withdrawal_marker = re.compile(
             r"^CHANGES-REQUESTED-WITHDRAWN-AT:\s*"
             r"(?P<lane>claude|codex)\s+(?P<head>[0-9a-f]{40})",
-            re.IGNORECASE,
+            ascii_case,
         )
-        retirement_target = re.compile(r"^\s*RETIRES\s+#?(\d{6,})\s*$", re.IGNORECASE)
+        retirement_target = re.compile(r"^\s*RETIRES\s+#?(\d{6,})\s*$", ascii_case)
 
         def prose_line_indexes(body: str) -> frozenset[int]:
             indexes: set[int] = set()
@@ -9497,6 +9498,76 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
                     if isinstance(action_value, str):
                         action = action_value
             return held, action
+        unavailable_fixture = {
+            "repo": "OWNER/NAME",
+            "base": "main",
+            "prs": [
+                {
+                    "number": 1,
+                    "title": "review evidence unavailable",
+                    "head_ref": "green",
+                    "head_sha": "sha-1",
+                    "review_decision": "APPROVED",
+                    "review_evidence_unavailable": True,
+                    "changed_files": ["src/a.rs"],
+                    "checks": [
+                        {
+                            "name": "merge-gate",
+                            "status": "COMPLETED",
+                            "conclusion": "SUCCESS",
+                        }
+                    ],
+                }
+            ],
+        }
+        unavailable_path = os.path.join(tmp, "review-evidence-unavailable.json")
+        with open(unavailable_path, "w", encoding="utf-8") as handle:
+            json.dump(unavailable_fixture, handle)
+        unavailable_outcome, _unavailable_rs = _record_exact(
+            rep,
+            "reject:review-evidence-unavailable-with-clean-validation",
+            py,
+            rs,
+            (
+                "plan",
+                "--fixture",
+                unavailable_path,
+                "--landing-context",
+                hard_green_path,
+                "--format",
+                "json",
+            ),
+            expected=0,
+        )
+        unavailable_held, unavailable_action = review_disposition(
+            unavailable_outcome, 1
+        )
+        unavailable_ok, unavailable_payload = _parsed_json(
+            unavailable_outcome.stdout
+        )
+        unavailable_nodes = (
+            unavailable_payload.get("nodes")
+            if unavailable_ok and isinstance(unavailable_payload, dict)
+            else None
+        )
+        unavailable_visible = (
+            isinstance(unavailable_nodes, list)
+            and len(unavailable_nodes) == 1
+            and isinstance(unavailable_nodes[0], dict)
+            and unavailable_nodes[0].get("review_evidence_unavailable") is True
+        )
+        if (
+            unavailable_held is True
+            and unavailable_action == "wait"
+            and unavailable_visible
+        ):
+            rep.ok("reject:review-evidence-unavailable-remains-visible-and-held")
+        else:
+            rep.bad(
+                "reject:review-evidence-unavailable-remains-visible-and-held",
+                f"held={unavailable_held}; action={unavailable_action!r}; "
+                f"visible={unavailable_visible}",
+            )
 
         review_accept, _review_accept_rs = _record_exact(
             rep,
@@ -9669,6 +9740,14 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
                 ),
             ),
             (
+                "false-claimed-by-ascii-k",
+                1,
+                "body",
+                str(review_events[1]["body"]).replace(
+                    "BY release-authority", "BY K"
+                ),
+            ),
+            (
                 "changed-disclosure-underscore",
                 1,
                 "body",
@@ -9684,6 +9763,15 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
                 str(review_events[1]["body"]).replace(
                     "[team, release-authority, session, model, role=observer]",
                     "[team, departed.reviewer, old-session, model, role=observer]",
+                ),
+            ),
+            (
+                "changed-disclosure-ascii-k",
+                1,
+                "body",
+                str(review_events[1]["body"]).replace(
+                    "[team, release-authority, session, model, role=observer]",
+                    "[team, K, old-session, model, role=observer]",
                 ),
             ),
         ):
@@ -9755,6 +9843,127 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
                 )
             return path
 
+        ascii_k_events = [dict(event) for event in review_events]
+        ascii_k_events[1]["body"] = str(ascii_k_events[1]["body"]).replace(
+            "BY release-authority", "BY K"
+        )
+        ascii_k_digest = review_digest(
+            review_head, "CHANGES_REQUESTED", ascii_k_events
+        )
+        if ascii_k_digest == base_review_digest:
+            rep.ok("accept:ascii-k-by-is-canonical-metadata")
+        else:
+            rep.bad(
+                "accept:ascii-k-by-is-canonical-metadata",
+                f"base={base_review_digest}; ascii_k={ascii_k_digest}",
+            )
+
+        for label, non_ascii_identity in (
+            ("kelvin-sign", "K"),
+            ("capital-dotted-i", "İ"),
+            ("dotless-i", "ı"),
+            ("long-s", "ſ"),
+        ):
+            non_ascii_by_events = [dict(event) for event in review_events]
+            non_ascii_by_events[1]["body"] = str(
+                non_ascii_by_events[1]["body"]
+            ).replace("BY release-authority", f"BY {non_ascii_identity}")
+            non_ascii_by_digest = review_digest(
+                review_head, "CHANGES_REQUESTED", non_ascii_by_events
+            )
+            if non_ascii_by_digest != ascii_k_digest:
+                rep.ok(f"reject:non-ascii-by-{label}-remains-in-digest")
+            else:
+                rep.bad(
+                    f"reject:non-ascii-by-{label}-remains-in-digest",
+                    "non-ASCII identity was normalized as ASCII metadata",
+                )
+            non_ascii_by_path = write_review_variant(
+                f"non-ascii-by-{label}", non_ascii_by_events
+            )
+            _record_same_exit(
+                rep,
+                f"reject:non-ascii-by-{label}-invalidates-context",
+                py,
+                rs,
+                (
+                    "plan",
+                    "--fixture",
+                    non_ascii_by_path,
+                    "--landing-context",
+                    review_context_path,
+                ),
+                2,
+            )
+
+            non_ascii_disclosure_events = [dict(event) for event in review_events]
+            non_ascii_disclosure_events[1]["body"] = str(
+                non_ascii_disclosure_events[1]["body"]
+            ).replace(
+                "[team, release-authority, session, model, role=observer]",
+                f"[team, {non_ascii_identity}, session, model, role=observer]",
+            )
+            non_ascii_disclosure_digest = review_digest(
+                review_head, "CHANGES_REQUESTED", non_ascii_disclosure_events
+            )
+            if non_ascii_disclosure_digest != base_review_digest:
+                rep.ok(f"reject:non-ascii-disclosure-{label}-remains-in-digest")
+            else:
+                rep.bad(
+                    f"reject:non-ascii-disclosure-{label}-remains-in-digest",
+                    "non-ASCII disclosure was normalized as identity metadata",
+                )
+            non_ascii_disclosure_path = write_review_variant(
+                f"non-ascii-disclosure-{label}", non_ascii_disclosure_events
+            )
+            _record_same_exit(
+                rep,
+                f"reject:non-ascii-disclosure-{label}-invalidates-context",
+                py,
+                rs,
+                (
+                    "plan",
+                    "--fixture",
+                    non_ascii_disclosure_path,
+                    "--landing-context",
+                    review_context_path,
+                ),
+                2,
+            )
+
+            non_ascii_wrapper_events = [dict(event) for event in review_events]
+            for event in non_ascii_wrapper_events:
+                event["body"] = (
+                    f"{event['body']}\n"
+                    f"Unverified --who metadata: {non_ascii_identity}"
+                )
+            non_ascii_wrapper_digest = review_digest(
+                review_head, "CHANGES_REQUESTED", non_ascii_wrapper_events
+            )
+            if non_ascii_wrapper_digest != base_review_digest:
+                rep.ok(f"reject:non-ascii-who-metadata-{label}-remains-in-digest")
+            else:
+                rep.bad(
+                    f"reject:non-ascii-who-metadata-{label}-remains-in-digest",
+                    "non-ASCII who metadata was normalized",
+                )
+            non_ascii_wrapper_path = write_review_variant(
+                f"non-ascii-who-metadata-{label}", non_ascii_wrapper_events
+            )
+            _record_same_exit(
+                rep,
+                f"reject:non-ascii-who-metadata-{label}-invalidates-context",
+                py,
+                rs,
+                (
+                    "plan",
+                    "--fixture",
+                    non_ascii_wrapper_path,
+                    "--landing-context",
+                    review_context_path,
+                ),
+                2,
+            )
         malformed_by_digests: list[str] = []
         for label, malformed_by in (
             ("slash", "BY release/authority"),
@@ -9827,7 +10036,7 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
                 f"base={base_review_digest}; malformed={malformed_by_digests}",
             )
 
-        for agent in ("review-agent", "review_agent", "review.agent"):
+        for agent in ("review-agent", "review_agent", "review.agent", "K"):
             wrapper_events = [dict(event) for event in review_events]
             for event in wrapper_events:
                 event["body"] = (

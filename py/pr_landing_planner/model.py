@@ -185,6 +185,8 @@ class RawPr:
     is_draft: bool = False
     mergeable: str = ""
     review_decision: str = ""
+    #: True when the host could not produce the complete exact-head review snapshot.
+    review_evidence_unavailable: bool = False
     created_at: str = ""
     updated_at: str = ""
     additions: int = 0
@@ -233,6 +235,8 @@ class PrNode:
     is_draft: bool = False
     mergeable: str = ""
     review_decision: str = ""
+    #: True when review evidence collection was incomplete or indeterminate.
+    review_evidence_unavailable: bool = False
     created_at: str = ""
     updated_at: str = ""
     additions: int = 0

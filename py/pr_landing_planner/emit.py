@@ -84,6 +84,7 @@ def _node_obj(node: PrNode, held: bool) -> dict[str, object]:
         "validation_authority": node.validation_authority.value,
         "policy_class": node.policy_class.value,
         "review_decision": node.review_decision or None,
+        "review_evidence_unavailable": node.review_evidence_unavailable,
         "review_evidence_digest": node.review_evidence_digest or None,
         "review_objections_resolved": node.review_objections_resolved,
         "review_binding": review_binding(node)[0].value,
