@@ -167,6 +167,10 @@ repository state. It accepts the consuming workspace's decision. Accepted policy
 treated like routine hygiene. Unknown PRs, duplicate entries, and head drift
 are errors.
 
+`assigned_agent` and `agent:` labels are optional routing metadata, not
+authority. One `agent:` label is displayed as the assignment. Multiple distinct
+agent labels leave the assignment empty and do not stop planning.
+
 `review_pass_heads` maps each required review lane (`codex` and `claude`) to the
 exact 40-character lowercase head SHA that reviewer passed. Review labels are
 cache hints: when the review protocol is active, each lane needs both its
@@ -187,26 +191,37 @@ producer must copy that field mechanically into its generated context after
 assessing that snapshot; nobody should hand-compute it. The follow-up plan
 refetches the evidence and refuses if either the head or digest differs.
 
+The authority decision does not require a `RETIRES` line. For example, an older
+refusal can be discharged by a later valid withdrawal followed by a current-head
+approval. The snapshot preserves their timestamps and full bodies so the
+authority can evaluate that chronology.
+
+
 The digest covers the snapshot head, aggregate review decision, and the sorted
 set of explicitly paginated native reviews, issue comments, and inline review
 comments.
-Each event contributes its source kind, stable event identity, stable author
-login, state, available event head (or the documented empty value for comment
-sources without one), creation/submission timestamp, current version timestamp,
-native-review last-edit timestamp, and body. Inline location fields are part of
-state, so an outdated/retired comment changes the digest even when GitHub gives
-the change the same second-resolution timestamp. An exact `RETIRES` record also
-contributes the immutable GitHub actor's current repository permission. The
-actor must match the record's `BY`/five-field disclosure identity, and only
-`triage`, `write`, `maintain`, or `admin` permission is authority. The disclosed
-role is retained as audit metadata; it does not grant or deny authority.
-Missing permission evidence, an API failure, a mismatched actor, or read-only
-access makes the entire snapshot unavailable rather than treating the
-retirement as authoritative. A later permission change changes the digest and
-invalidates an existing context. A missing stable
-event or author identity, or another promised source field, makes the entire
-snapshot unavailable instead of dropping that event. The field suppresses only
-the repository host's aggregate
+Each event contributes its source kind, stable event identity, state, available
+event head (or the documented empty value for comment sources without one),
+creation/submission timestamp, current version timestamp, native-review
+last-edit timestamp, and body. Inline location fields are part of state, so an
+outdated/retired comment changes the digest even when GitHub gives the change
+the same second-resolution timestamp.
+
+When an exact `RETIRES` record is present, the digest uses its target comment id,
+review lane, reviewed head, and repository-permission result. Fleet disclosure
+text and an optional `BY` value are retained for readers but are not authority
+and do not change the digest. GitHub's immutable event author is the account
+whose current permission is checked; `triage`, `write`, `maintain`, or `admin`
+is authority. A verified permission and that immutable author are included in
+the digest, so a later permission change invalidates an existing context.
+
+When the event author is unavailable, the permission lookup fails, or the
+author has only read access, the event remains in the snapshot with no
+retirement authority. It cannot by itself discharge the objection, and it does
+not remove unrelated review events or abort the plan. Ordinary event authors
+are optional metadata and are excluded from the digest. A missing stable event
+identity or another promised source field still makes the entire snapshot
+unavailable instead of dropping that event. The field suppresses only the repository host's aggregate
 `CHANGES_REQUESTED` hold, which may remain stale after those records exist. It
 does not grant an approval, satisfy `review_pass_heads`, or override
 `REVIEW_REQUIRED`; absent or false retains the fail-closed hold.

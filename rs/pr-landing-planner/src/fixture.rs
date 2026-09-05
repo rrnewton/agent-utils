@@ -153,6 +153,18 @@ fn required_review_string(
     Ok(value.to_owned())
 }
 
+fn optional_review_author(
+    obj: &Map<String, Value>,
+    key: &str,
+    where_: &str,
+) -> Result<String, String> {
+    match obj.get(key) {
+        None | Some(Value::Null) => Ok(String::new()),
+        Some(Value::String(value)) => Ok(value.trim().to_owned()),
+        Some(_) => Err(format!("{where_}: field {key:?} must be a string or null")),
+    }
+}
+
 fn required_nullable_review_string(
     obj: &Map<String, Value>,
     key: &str,
@@ -271,7 +283,7 @@ fn review_snapshot(
         let event = object(entry, &role)?;
         let kind = required_review_string(&event, "kind", &role, false)?;
         let identity = required_review_string(&event, "identity", &role, false)?;
-        let author = required_review_string(&event, "author", &role, false)?;
+        let author = optional_review_author(&event, "author", &role)?;
         let state = required_review_string(&event, "state", &role, false)?;
         if kind == "review" && !NATIVE_REVIEW_STATES.contains(&state.as_str()) {
             return Err(format!("{role}: review has unknown state {state:?}"));

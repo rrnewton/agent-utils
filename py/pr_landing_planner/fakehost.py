@@ -71,6 +71,17 @@ def _required_review_str(
     return value
 
 
+def _optional_review_author(
+    m: Mapping[str, object], key: str, where: str
+) -> str:
+    if key not in m or m[key] is None:
+        return ""
+    value = m[key]
+    if not isinstance(value, str):
+        raise FixtureError(f"{where}: field {key!r} must be a string or null")
+    return value.strip()
+
+
 def _required_nullable_review_str(
     m: Mapping[str, object], key: str, where: str
 ) -> str:
@@ -171,7 +182,7 @@ def _review_snapshot_from(
         identity = _required_review_str(
             event, "identity", event_where, allow_empty=False
         )
-        author = _required_review_str(event, "author", event_where, allow_empty=False)
+        author = _optional_review_author(event, "author", event_where)
         state = _required_review_str(event, "state", event_where, allow_empty=False)
         if kind == "review" and state not in NATIVE_REVIEW_STATES:
             raise FixtureError(f"{event_where}: review has unknown state {state!r}")

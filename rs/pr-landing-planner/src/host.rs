@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use serde_json::{Map, Value};
 
 use crate::classify::parse_rollup;
-use crate::context::{retirement_actor, ALLOWED_RETIREMENT_PERMISSIONS};
+use crate::context::{retirement_record, ALLOWED_RETIREMENT_PERMISSIONS};
 use crate::model::{RawPr, ReviewEvidenceEvent, ReviewEvidenceSnapshot, NATIVE_REVIEW_STATES};
 
 #[derive(Clone, Debug)]
@@ -173,14 +173,14 @@ impl GitHubHost {
         graphql_connection_from_slurp(&output.stdout, number, connection)
     }
 
-    fn retirement_permission(&self, repo: &str, actor: &str) -> Result<String, String> {
+    fn retirement_permission(&self, repo: &str, author: &str) -> Result<String, String> {
         let args = self.net(vec![
             self.gh.clone(),
             "api".into(),
-            format!("repos/{repo}/collaborators/{actor}/permission"),
+            format!("repos/{repo}/collaborators/{author}/permission"),
         ]);
         let output = self.run(&args, None, &[0])?;
-        repository_permission(&output.stdout, actor)
+        repository_permission(&output.stdout, author)
     }
 
     fn bind_retirement_permissions(
@@ -188,29 +188,43 @@ impl GitHubHost {
         repo: &str,
         mut snapshot: ReviewEvidenceSnapshot,
     ) -> Result<ReviewEvidenceSnapshot, String> {
-        let mut actors = BTreeSet::new();
+        let mut authors = BTreeSet::new();
         for event in &snapshot.events {
-            let Some(actor) = retirement_actor(&event.body)? else {
+            let Some(retirement) = retirement_record(&event.body)? else {
                 continue;
             };
-            if !event.author.eq_ignore_ascii_case(&actor) {
-                return Err(
-                    "review evidence retirement actor differs from GitHub event author".to_owned(),
-                );
+            if retirement.head_sha == snapshot.head_sha
+                && event.state == "ACTIVE"
+                && !event.author.is_empty()
+            {
+                authors.insert(event.author.clone());
             }
-            actors.insert(actor);
         }
         let mut permissions = BTreeMap::new();
-        for actor in actors {
-            permissions.insert(actor.clone(), self.retirement_permission(repo, &actor)?);
+        for author in authors {
+            let permission = match self.retirement_permission(repo, &author) {
+                Ok(permission) => permission,
+                Err(error) => {
+                    eprintln!(
+                        "pr-landing-planner: NOTE: retirement permission unavailable for {author}: {error}; retaining the events without retirement authority"
+                    );
+                    String::new()
+                }
+            };
+            permissions.insert(author, permission);
         }
         for event in &mut snapshot.events {
-            if let Some(actor) = retirement_actor(&event.body)? {
-                event.retirement_actor_permission = permissions
-                    .get(&actor)
-                    .cloned()
-                    .ok_or_else(|| format!("no repository permission was read for {actor}"))?;
-            }
+            let Some(retirement) = retirement_record(&event.body)? else {
+                continue;
+            };
+            event.retirement_actor_permission = if retirement.head_sha == snapshot.head_sha
+                && event.state == "ACTIVE"
+                && !event.author.is_empty()
+            {
+                permissions.get(&event.author).cloned().unwrap_or_default()
+            } else {
+                String::new()
+            };
         }
         Ok(snapshot)
     }
@@ -339,7 +353,7 @@ fn json_object() -> Value {
     Value::Object(Map::new())
 }
 
-fn repository_permission(bytes: &[u8], expected_actor: &str) -> Result<String, String> {
+fn repository_permission(bytes: &[u8], expected_author: &str) -> Result<String, String> {
     let value: Value = serde_json::from_slice(bytes)
         .map_err(|error| format!("invalid repository permission JSON: {error}"))?;
     let response = value
@@ -350,9 +364,9 @@ fn repository_permission(bytes: &[u8], expected_actor: &str) -> Result<String, S
         .and_then(Value::as_object)
         .ok_or("repository permission response lacks a user object")?;
     let actual_actor = user.get("login").and_then(Value::as_str).unwrap_or("");
-    if actual_actor.is_empty() || !actual_actor.eq_ignore_ascii_case(expected_actor) {
+    if actual_actor.is_empty() || !actual_actor.eq_ignore_ascii_case(expected_author) {
         return Err(
-            "repository permission response actor differs from retirement actor".to_owned(),
+            "repository permission response actor differs from GitHub event author".to_owned(),
         );
     }
     for field in ["role_name", "permission"] {
@@ -364,7 +378,7 @@ fn repository_permission(bytes: &[u8], expected_actor: &str) -> Result<String, S
             return Ok(candidate);
         }
     }
-    Err("retirement actor lacks current triage-or-higher repository permission".to_owned())
+    Err("GitHub event author lacks current triage-or-higher repository permission".to_owned())
 }
 
 fn string(obj: &Map<String, Value>, key: &str) -> String {
@@ -414,15 +428,21 @@ fn required_string(event: &Map<String, Value>, role: &str, key: &str) -> Result<
 }
 
 fn event_author(event: &Map<String, Value>, role: &str, key: &str) -> Result<String, String> {
-    let author = event
-        .get(key)
-        .and_then(Value::as_object)
-        .ok_or_else(|| format!("{role} lacks an author object"))?;
-    let login = author.get("login").and_then(Value::as_str).unwrap_or("");
-    if login.is_empty() {
-        return Err(format!("{role} lacks a stable author login"));
+    let Some(value) = event.get(key) else {
+        return Ok(String::new());
+    };
+    let Some(author) = value.as_object() else {
+        return if value.is_null() {
+            Ok(String::new())
+        } else {
+            Err(format!("{role} author is not an object or null"))
+        };
+    };
+    match author.get("login") {
+        None | Some(Value::Null) => Ok(String::new()),
+        Some(Value::String(login)) => Ok(login.trim().to_owned()),
+        Some(_) => Err(format!("{role} author login is not a string or null")),
     }
-    Ok(login.to_owned())
 }
 
 fn numeric_identity(event: &Map<String, Value>, role: &str) -> Result<String, String> {
@@ -1081,7 +1101,7 @@ mod tests {
         .unwrap();
         assert!(repository_permission(&mismatch, "release-authority")
             .unwrap_err()
-            .contains("differs from retirement actor"));
+            .contains("differs from GitHub event author"));
         assert!(repository_permission(b"{}", "release-authority")
             .unwrap_err()
             .contains("user object"));
@@ -1166,6 +1186,15 @@ mod tests {
                 .unwrap_err()
                 .contains("createdAt")
         );
+        let mut anonymous_reviews = reviews.clone();
+        anonymous_reviews[0]
+            .as_object_mut()
+            .unwrap()
+            .insert("author".to_owned(), Value::Null);
+        let anonymous = review_snapshot(obj, &anonymous_reviews, comments, &inline_comments)
+            .expect("missing event author remains visible");
+        assert!(anonymous.events[0].author.is_empty());
+        assert!(review_evidence_digest(&anonymous).is_ok());
 
         let mut bad_inline = inline_comments;
         bad_inline[0].as_object_mut().unwrap().remove("created_at");

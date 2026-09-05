@@ -28,17 +28,14 @@ POLICY_PREFIX = "landing-policy:"
 REQUIRED_REVIEW_LANES = ("codex", "claude")
 ALLOWED_RETIREMENT_PERMISSIONS = frozenset(("triage", "write", "maintain", "admin"))
 
-_AGENT_ID = re.compile(r"[a-z0-9][a-z0-9-]*\Z", re.IGNORECASE)
-_BRACKET_GROUP = re.compile(r"\[([^\]\n]*)\]")
 _RETIREMENT_TARGET = re.compile(r"^\s*RETIRES\s+#?(\d{6,})\s*$", re.IGNORECASE)
 _WITHDRAWAL = re.compile(
-    r"^CHANGES-REQUESTED-WITHDRAWN-AT:\s*(?:claude|codex)\s+[0-9a-f]{40}"
-    r"(?:\s+BY\s+(?P<actor>[a-z0-9][a-z0-9-]*))?$",
+    r"^CHANGES-REQUESTED-WITHDRAWN-AT:\s*(?P<lane>claude|codex)\s+"
+    r"(?P<head>[0-9a-f]{40})(?:\s+BY\s+[a-z0-9][a-z0-9-]*)?$",
     re.IGNORECASE,
 )
 _BLOCK_PREFIX = re.compile(r"^(?:#{1,6}\s+|[-+*]\s+)")
 _FENCE = re.compile(r"^ {0,3}(?P<f>`{3,}|~{3,})\s*(?P<info>.*)$")
-_ROLE_FIELD = re.compile(r"role=[a-z0-9][a-z0-9_-]*\Z", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -55,6 +52,15 @@ class LandingContext:
     review_objections_resolved: bool = False
     review_evidence_digest: str = ""
     policy_class: PolicyClass | None = None
+
+
+@dataclass(frozen=True)
+class RetirementRecord:
+    """Exact objection-retirement linkage, without optional attribution text."""
+
+    target_comment_id: str
+    lane: str
+    head_sha: str
 
 
 def _str_field(obj: Mapping[str, object], key: str) -> str:
@@ -127,40 +133,8 @@ def _undecorate(line: str) -> str:
             return normalized
 
 
-def _disclosure_actor(body: str) -> str | None:
-    for raw in body.splitlines():
-        if not raw.strip():
-            continue
-        if raw.startswith(("    ", "\t")):
-            return None
-        line = raw.lstrip()
-        if line.startswith(">"):
-            return None
-        offset = 0
-        while True:
-            match = _BRACKET_GROUP.match(line, offset)
-            if match is None:
-                break
-            fields = [field.strip() for field in match.group(1).split(",")]
-            if (
-                len(fields) >= 3
-                and re.fullmatch(r"[a-z0-9]+", fields[0], re.IGNORECASE)
-                and _AGENT_ID.fullmatch(fields[1]) is not None
-            ):
-                if len(fields) != 5 or any(not field for field in fields):
-                    return None
-                if _ROLE_FIELD.fullmatch(fields[4]) is None:
-                    return None
-                return fields[1].lower()
-            offset = match.end()
-            while offset < len(line) and line[offset] in " \t":
-                offset += 1
-        return None
-    return None
-
-
-def retirement_actor(body: str) -> str | None:
-    """Return the asserted actor for one exact retirement, or refuse malformed authority."""
+def retirement_record(body: str) -> RetirementRecord | None:
+    """Return one exact retirement linkage, ignoring optional attribution text."""
 
     lines = _prose_lines(body)
     targets = [match for line in lines if (match := _RETIREMENT_TARGET.match(line))]
@@ -173,15 +147,21 @@ def retirement_actor(body: str) -> str | None:
     ]
     if len(withdrawals) != 1:
         raise ValueError("review evidence retirement needs one canonical withdrawal")
-    actor = _disclosure_actor(body)
-    if actor is None:
-        raise ValueError(
-            "review evidence retirement lacks an exact five-field disclosure"
-        )
-    marker_actor = withdrawals[0].group("actor")
-    if marker_actor is not None and marker_actor.lower() != actor:
-        raise ValueError("review evidence retirement BY identity differs from disclosure")
-    return actor
+    withdrawal = withdrawals[0]
+    return RetirementRecord(
+        target_comment_id=targets[0].group(1),
+        lane=withdrawal.group("lane").lower(),
+        head_sha=withdrawal.group("head").lower(),
+    )
+
+
+def _digest_body(body: str, retirement: RetirementRecord | None) -> str:
+    if retirement is None:
+        return body
+    return (
+        f"CHANGES-REQUESTED-WITHDRAWN-AT: {retirement.lane} "
+        f"{retirement.head_sha}\nRETIRES {retirement.target_comment_id}"
+    )
 
 
 def review_evidence_digest(snapshot: ReviewEvidenceSnapshot) -> str:
@@ -196,40 +176,44 @@ def review_evidence_digest(snapshot: ReviewEvidenceSnapshot) -> str:
         "REVIEW_REQUIRED",
     ):
         raise ValueError("review evidence snapshot has an unknown aggregate decision")
+    normalized = tuple(
+        (event, retirement_record(event.body)) for event in snapshot.events
+    )
     ordered = sorted(
-        snapshot.events,
-        key=lambda event: (
-            event.kind,
-            event.identity,
-            event.author,
-            event.state,
-            event.head_sha,
-            event.created_at,
-            event.updated_at,
-            event.last_edited_at,
-            event.body,
-            event.retirement_actor_permission,
+        normalized,
+        key=lambda item: (
+            item[0].kind,
+            item[0].identity,
+            item[0].author if item[0].retirement_actor_permission else "",
+            item[0].state,
+            item[0].head_sha,
+            item[0].created_at,
+            item[0].updated_at,
+            item[0].last_edited_at,
+            _digest_body(item[0].body, item[1]),
+            item[0].retirement_actor_permission,
         ),
     )
     seen: set[tuple[str, str]] = set()
-    for event in ordered:
+    for event, retirement in ordered:
         if not event.kind or not event.identity:
             raise ValueError("review evidence event lacks a stable kind or identity")
         if event.kind not in ("review", "issue-comment", "review-comment"):
             raise ValueError(f"review evidence event has unknown kind {event.kind!r}")
-        if not event.author:
-            raise ValueError("review evidence event lacks a stable author identity")
-        actor = retirement_actor(event.body)
         permission = event.retirement_actor_permission
-        if actor is None:
+        if retirement is None:
             if permission:
                 raise ValueError(
                     "non-retirement review evidence carries repository permission"
                 )
-        else:
-            if event.author.lower() != actor:
+        elif permission:
+            if retirement.head_sha != snapshot.head_sha or event.state != "ACTIVE":
                 raise ValueError(
-                    "review evidence retirement actor differs from GitHub event author"
+                    "repository permission is bound to an inactive or stale retirement"
+                )
+            if not event.author:
+                raise ValueError(
+                    "review evidence retirement permission lacks a GitHub event author"
                 )
             if permission not in ALLOWED_RETIREMENT_PERMISSIONS:
                 raise ValueError(
@@ -255,7 +239,7 @@ def review_evidence_digest(snapshot: ReviewEvidenceSnapshot) -> str:
         seen.add(key)
     has_changes_requested = any(
         event.kind == "review" and event.state == "CHANGES_REQUESTED"
-        for event in ordered
+        for event, _retirement in ordered
     )
     if not snapshot.review_decision and has_changes_requested:
         raise ValueError(
@@ -266,7 +250,7 @@ def review_evidence_digest(snapshot: ReviewEvidenceSnapshot) -> str:
             "review evidence has a changes-requested aggregate but no matching review"
         )
 
-    digest = hashlib.sha256(b"pr-landing-planner-review-evidence-v2")
+    digest = hashlib.sha256(b"pr-landing-planner-review-evidence-v3")
 
     def feed(value: str) -> None:
         encoded = value.encode("utf-8")
@@ -276,17 +260,17 @@ def review_evidence_digest(snapshot: ReviewEvidenceSnapshot) -> str:
     feed(snapshot.head_sha)
     feed(snapshot.review_decision)
     digest.update(len(ordered).to_bytes(8, "big"))
-    for event in ordered:
+    for event, retirement in ordered:
         for value in (
             event.kind,
             event.identity,
-            event.author,
+            event.author if event.retirement_actor_permission else "",
             event.state,
             event.head_sha,
             event.created_at,
             event.updated_at,
             event.last_edited_at,
-            event.body,
+            _digest_body(event.body, retirement),
             event.retirement_actor_permission,
         ):
             feed(value)
@@ -426,8 +410,19 @@ def _one_label_value(labels: Sequence[str], prefix: str, field: str, pr: int) ->
     return values[0] if values else ""
 
 
+def _optional_agent_label(labels: Sequence[str]) -> str:
+    values = sorted(
+        {
+            label[len(AGENT_PREFIX) :]
+            for label in labels
+            if label.startswith(AGENT_PREFIX) and label != AGENT_PREFIX
+        }
+    )
+    return values[0] if len(values) == 1 else ""
+
+
 def _label_context(node: PrNode) -> PrNode:
-    assigned_agent = _one_label_value(node.labels, AGENT_PREFIX, "agent", node.number)
+    assigned_agent = _optional_agent_label(node.labels)
     policy_raw = _one_label_value(node.labels, POLICY_PREFIX, "landing-policy", node.number)
     try:
         policy = PolicyClass(policy_raw) if policy_raw else PolicyClass.UNCLASSIFIED

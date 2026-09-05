@@ -274,7 +274,7 @@ pub struct ReviewEvidenceEvent {
     pub kind: String,
     /// Stable repository-host identity within that event class.
     pub identity: String,
-    /// Stable repository-host login of the event author.
+    /// Immutable repository-host login when available; authority only with verified permission.
     pub author: String,
     /// Current event state, including dismissal or retirement state when surfaced.
     pub state: String,
@@ -288,7 +288,7 @@ pub struct ReviewEvidenceEvent {
     pub last_edited_at: String,
     /// Event text; included because edits can create or remove an objection.
     pub body: String,
-    /// Current repository permission for an exact retirement's immutable GitHub actor.
+    /// Current repository permission for an exact retirement's immutable GitHub event author.
     /// Empty for every event that is not an exact retirement.
     pub retirement_actor_permission: String,
 }
