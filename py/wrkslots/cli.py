@@ -13467,6 +13467,8 @@ def _validation_checkout_facts(
     *,
     expected_head: str | None = None,
     expected_remote: str | None = None,
+    batch_cleanup: _OwnerlessValidationBatchContext | None = None,
+    fresh_same_uid: bool = False,
 ) -> tuple[str, str]:
     if repository == checkout or _path_is_within(repository, checkout):
         raise Refusal("repository must survive removal and cannot be inside the checkout")
@@ -13500,7 +13502,12 @@ def _validation_checkout_facts(
         raise Refusal("validation checkout remote changed during recovery fetch")
     if not vcs.remote_refs_containing(checkout, remote, head):
         raise Refusal(f"validation checkout HEAD {head} is not contained by remote {remote}")
-    _assert_slot_unused(checkout)
+    if batch_cleanup is None:
+        _assert_slot_unused(checkout)
+    else:
+        batch_cleanup.assert_unused(
+            config, checkout, fresh_same_uid=fresh_same_uid
+        )
     return head, remote_digest
 
 
@@ -13563,6 +13570,7 @@ def _ownerless_validation_journal(
     args: argparse.Namespace,
     coordinator: ProcessIdentity,
     states: Sequence[ActiveState],
+    batch_cleanup: _OwnerlessValidationBatchContext | None = None,
 ) -> tuple[dict[str, object], tuple[str, str] | None]:
     target_kind = "checkout" if args.ownerless_validate_checkout is not None else "cargo-home"
     raw_target = args.ownerless_validate_checkout or args.ownerless_validate_cargo_home
@@ -13599,7 +13607,9 @@ def _ownerless_validation_journal(
         repository_relative, repository = _repository_path(
             config, args.repository, allow_managed=True
         )
-        head, remote_digest = _validation_checkout_facts(config, target, repository)
+        head, remote_digest = _validation_checkout_facts(
+            config, target, repository, batch_cleanup=batch_cleanup
+        )
     else:
         if args.repository is not None:
             raise Refusal("--repository applies only to validation checkouts")
@@ -13630,7 +13640,12 @@ def _ownerless_validation_journal(
 
 
 def _ownerless_validation_inputs(
-    config: Config, raw: Mapping[str, object], *, recheck: bool
+    config: Config,
+    raw: Mapping[str, object],
+    *,
+    recheck: bool,
+    batch_cleanup: _OwnerlessValidationBatchContext | None = None,
+    fresh_same_uid: bool = False,
 ) -> tuple[
     ValidationRecoveryAuthorization,
     Path,
@@ -13747,6 +13762,8 @@ def _ownerless_validation_inputs(
                 repository,
                 expected_head=authorization.head,
                 expected_remote=authorization.remote_url_sha256,
+                batch_cleanup=batch_cleanup,
+                fresh_same_uid=fresh_same_uid,
             )
         else:
             assert authorization.parent_identity is not None
@@ -13778,18 +13795,26 @@ def _recover_ownerless_validation(
     path: Path,
     raw: Mapping[str, object],
     coordinator: ProcessIdentity,
+    *,
+    batch_cleanup: _OwnerlessValidationBatchContext | None = None,
+    emit: bool = True,
 ) -> None:
     if path != _journal_path(config):
         raise StateError("ownerless validation journal filename is invalid")
     _assert_caller_process(coordinator, "coordinator")
     authorization, target, fenced, active, repository = _ownerless_validation_inputs(
-        config, raw, recheck=False
+        config, raw, recheck=False, batch_cleanup=batch_cleanup
     )
     journal = dict(raw)
     if active is not None:
         try:
             authorization, target, fenced, active, repository = (
-                _ownerless_validation_inputs(config, journal, recheck=True)
+                _ownerless_validation_inputs(
+                    config,
+                    journal,
+                    recheck=True,
+                    batch_cleanup=batch_cleanup,
+                )
             )
         except Refusal:
             if active == fenced and not target.exists():
@@ -13809,7 +13834,13 @@ def _recover_ownerless_validation(
             _interrupt_for_test("after-ownerless-validate-path-fence")
         try:
             authorization, target, fenced, active, repository = (
-                _ownerless_validation_inputs(config, journal, recheck=True)
+                _ownerless_validation_inputs(
+                    config,
+                    journal,
+                    recheck=True,
+                    batch_cleanup=batch_cleanup,
+                    fresh_same_uid=True,
+                )
             )
         except Refusal as exc:
             try:
@@ -13858,7 +13889,8 @@ def _recover_ownerless_validation(
         },
     )
     _clear_journal(config, journal)
-    print(f"recovered ownerless validation {authorization.target_kind}={target}")
+    if emit:
+        print(f"recovered ownerless validation {authorization.target_kind}={target}")
 
 
 def _ownerless_agent_authorization_to_obj(
@@ -16414,9 +16446,10 @@ class _ProcessPathCensus:
         record: ActiveRecord | None,
         *,
         ignore_invoking_ancestry: bool = False,
+        ignore_current_process: bool = True,
     ) -> None:
         current_pid = os.getpid()
-        ignored = {current_pid}
+        ignored = {current_pid} if ignore_current_process else set()
         if ignore_invoking_ancestry:
             ancestor = _read_process_parent(current_pid)
             for _ in range(256):
@@ -16450,6 +16483,107 @@ class _ProcessPathCensus:
                 )
 
 
+def _capture_lsof_process_path_census(
+    slot_paths: Sequence[Path], *, budget: _ReadOnlyCommandBudget
+) -> _ProcessPathCensus:
+    """Run the historical lsof proof once for every path in this batch."""
+
+    targets = {path: str(path) for path in slot_paths}
+    if not targets:
+        return _ProcessPathCensus((), (), owner_cgroup_complete=False)
+    lsof = next(
+        (
+            candidate
+            for candidate in (Path("/usr/bin/lsof"), Path("/usr/sbin/lsof"))
+            if candidate.is_file() and os.access(candidate, os.X_OK)
+        ),
+        None,
+    )
+    if lsof is None:
+        raise Refusal("process use is indeterminate because lsof is unavailable")
+    arguments = ["-nP", "-Fpcfn"]
+    for path in targets:
+        arguments.extend(("+D", str(path)))
+    returncode, stdout_bytes, stderr_bytes = _run_same_uid_command(
+        lsof, arguments, budget=budget
+    )
+    stdout = stdout_bytes.decode("utf-8", errors="surrogateescape")
+    stderr = stderr_bytes.decode("utf-8", errors="surrogateescape")
+    if any(not _unrelated_lsof_warnings(stderr, path) for path in targets):
+        detail = stderr.strip().splitlines()
+        raise Refusal(
+            "process use is indeterminate because lsof reported: "
+            + (detail[0] if detail else "an unreadable validation path")
+        )
+    if returncode not in (0, 1):
+        raise Refusal(f"process use is indeterminate because lsof exited {returncode}")
+    current_pid: int | None = None
+    reported_pids: set[int] = set()
+    attributed_pids: set[int] = set()
+    matches: list[tuple[int, str, str, str]] = []
+    for line in stdout.splitlines():
+        if line.startswith("p") and line[1:].isdigit():
+            current_pid = int(line[1:])
+            reported_pids.add(current_pid)
+        elif line.startswith("n") and current_pid is not None:
+            raw_path = line[1:].removesuffix(" (deleted)")
+            observed = Path(raw_path)
+            matched = _matching_absent_validate_target(observed, targets)
+            if matched is not None:
+                _target, slot = matched
+                matches.append((current_pid, slot, "lsof", raw_path))
+                attributed_pids.add(current_pid)
+    unattributed = sorted(reported_pids - attributed_pids)
+    if unattributed:
+        raise Refusal(
+            "process use is indeterminate because batched lsof did not attribute "
+            f"PID {unattributed[0]} to a requested checkout"
+        )
+    lsns = Path("/usr/bin/lsns")
+    if not lsns.is_file() or not os.access(lsns, os.X_OK):
+        raise Refusal("process use is indeterminate because lsns is unavailable")
+    namespace_rc, namespace_stdout, namespace_stderr = _run_root_owned_command(
+        lsns,
+        ("--type", "mnt", "--output", "NS,PID", "--noheadings", "--raw"),
+        budget=budget,
+    )
+    if namespace_rc != 0 or namespace_stderr:
+        detail = (namespace_stderr or namespace_stdout).decode(
+            "utf-8", errors="replace"
+        ).strip().splitlines()
+        raise Refusal(
+            "process use is indeterminate because lsns could not enumerate mount "
+            "namespaces" + (f": {detail[0]}" if detail else "")
+        )
+    try:
+        namespace_lines = namespace_stdout.decode("ascii").splitlines()
+    except UnicodeError as exc:
+        raise Refusal("process use is indeterminate because lsns output is invalid") from exc
+    if not namespace_lines:
+        raise Refusal("process use is indeterminate because lsns found no mount namespaces")
+    mount_matches: list[tuple[int, str, str, str]] = []
+    seen_namespaces: set[int] = set()
+    for line in namespace_lines:
+        budget.remaining_seconds()
+        fields = line.split()
+        if len(fields) != 2 or not all(field.isdigit() for field in fields):
+            raise Refusal("process use is indeterminate because lsns output is malformed")
+        namespace, pid = (int(field) for field in fields)
+        if namespace in seen_namespaces or pid <= 0:
+            raise Refusal("process use is indeterminate because lsns output is malformed")
+        seen_namespaces.add(namespace)
+        pid_dir = Path("/proc") / str(pid)
+        for target, slot in targets.items():
+            uses = _process_mounts_slot(pid_dir, target)
+            if uses:
+                mount_matches.append((pid, slot, "mount", uses[0]))
+    return _ProcessPathCensus(
+        (),
+        (*matches, *mount_matches),
+        owner_cgroup_complete=False,
+    )
+
+
 @dataclasses.dataclass(frozen=True)
 class _PrivateCleanupTarget:
     """One validation slot sealed before its shared destructive census."""
@@ -16467,6 +16601,50 @@ class _PrivateCleanupContext:
     shared_census: _ProcessPathCensus
     census_budget: _ReadOnlyCommandBudget
     same_uid_census_performed: bool = False
+
+
+@dataclasses.dataclass
+class _OwnerlessValidationBatchContext:
+    """Shared full-host evidence plus fresh checks for private ownerless paths."""
+
+    canonical_by_identity: Mapping[_PrivateCleanupIdentity, Path]
+    shared_census: _ProcessPathCensus
+    census_budget: _ReadOnlyCommandBudget
+    same_uid_census_count: int = 0
+
+    def assert_unused(
+        self, config: Config, active: Path, *, fresh_same_uid: bool
+    ) -> None:
+        identity = _private_cleanup_fence_identity(config, active)
+        canonical = self.canonical_by_identity.get(identity)
+        if canonical is None:
+            raise Refusal(
+                f"private validation checkout identity was not in the shared census: {active}"
+            )
+        # The shared census intentionally ignores this wrkslots process. Keep
+        # the ordinary explicit cwd guard for both the canonical and renamed
+        # path without launching another process census.
+        _assert_slot_unused(
+            active,
+            census=_ProcessPathCensus((), (), owner_cgroup_complete=False),
+        )
+        self.shared_census.assert_slot_unused(
+            canonical, None, ignore_current_process=False
+        )
+        if not fresh_same_uid:
+            return
+        self.same_uid_census_count += 1
+        fresh_budget = _ReadOnlyCommandBudget.start(
+            timeout_seconds=self.census_budget.remaining_seconds(),
+            stdout_limit=16 * 1024 * 1024,
+            stderr_limit=64 * 1024,
+            input_limit=_MOUNTINFO_CENSUS_BYTES_LIMIT,
+        )
+        fresh = _capture_same_uid_process_path_census(
+            (active,), budget=fresh_budget
+        )
+        fresh.assert_slot_unused(active, None)
+        self.census_budget.remaining_seconds()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -17578,7 +17756,150 @@ def _cmd_recover_absent_validate_rows(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_recover(args: argparse.Namespace) -> int:
+def _cmd_recover_ownerless_validate_batch(args: argparse.Namespace) -> int:
+    checkouts = tuple(args.checkouts)
+    records = tuple(args.completed_records)
+    repositories = tuple(args.repositories)
+    if not (len(checkouts) == len(records) == len(repositories)):
+        raise Refusal(
+            "recover-ownerless-validate-batch requires the same number of "
+            "--checkout, --completed-record, and --repository arguments"
+        )
+    if len(checkouts) > VALIDATE_REMOVE_BATCH_LIMIT:
+        raise Refusal(
+            "recover-ownerless-validate-batch accepts at most "
+            f"{VALIDATE_REMOVE_BATCH_LIMIT} checkouts"
+        )
+    if len(set(checkouts)) != len(checkouts):
+        raise Refusal(
+            "recover-ownerless-validate-batch received the same checkout more than once"
+        )
+    _require_coordinator_authorized(args, "ownerless validation cleanup")
+    config = _load_config(args.project_root, args.machine)
+    _capture_caller_process(args.coordinator_pid, "coordinator")
+    retained: list[dict[str, object]] = []
+    removed: list[dict[str, object]] = []
+    prepared: list[tuple[str, str, str, Path, _PrivateCleanupIdentity]] = []
+    with _mutation_locks(config, args.wait_lock):
+        _refuse_partial_state(config, allow_validate_batch_seals=True)
+        if _outstanding_journals(config) or _validate_batch_seal_journals(config):
+            raise Refusal(
+                "an interrupted mutation is already recorded; recover it before starting "
+                "ownerless validation batch cleanup"
+            )
+        for checkout, record, repository in zip(
+            checkouts, records, repositories, strict=True
+        ):
+            try:
+                _relative, target, _allowed = _validation_recovery_target(
+                    config, checkout, "checkout"
+                )
+                identity = _private_cleanup_fence_identity(config, target)
+            except (Refusal, StateError) as exc:
+                retained.append({"checkout": checkout, "reason": str(exc)})
+            else:
+                prepared.append((checkout, record, repository, target, identity))
+    identities = [identity for *_prefix, identity in prepared]
+    if len(set(identities)) != len(identities):
+        raise Refusal(
+            "recover-ownerless-validate-batch resolved multiple checkouts to one directory"
+        )
+    census_budget = _ReadOnlyCommandBudget.start(
+        timeout_seconds=_VALIDATE_REMOVE_BATCH_CENSUS_SECONDS,
+        stdout_limit=16 * 1024 * 1024,
+        stderr_limit=64 * 1024,
+        input_limit=_MOUNTINFO_CENSUS_BYTES_LIMIT,
+    )
+    shared_census_count = int(bool(prepared))
+    if prepared:
+        try:
+            shared_census = _capture_lsof_process_path_census(
+                [target for *_prefix, target, _identity in prepared],
+                budget=census_budget,
+            )
+            census_budget.remaining_seconds()
+        except Refusal as exc:
+            retained.extend(
+                {"checkout": checkout, "reason": str(exc)}
+                for checkout, _record, _repository, _target, _identity in prepared
+            )
+            prepared = []
+            shared_census = _ProcessPathCensus((), (), owner_cgroup_complete=False)
+    else:
+        shared_census = _ProcessPathCensus((), (), owner_cgroup_complete=False)
+    batch_cleanup = _OwnerlessValidationBatchContext(
+        {identity: target for *_prefix, target, identity in prepared},
+        shared_census,
+        census_budget,
+    )
+    for index, (checkout, record, repository, target, _identity) in enumerate(prepared):
+        try:
+            census_budget.remaining_seconds()
+            shared_census.assert_slot_unused(target, None)
+            item_args = argparse.Namespace(
+                project_root=args.project_root,
+                machine=args.machine,
+                wait_lock=args.wait_lock,
+                command="recover",
+                coordinator_pid=args.coordinator_pid,
+                coordinator_authorized=True,
+                discard_partial=False,
+                legacy_validate_checkout=checkout,
+                ownerless_validate_checkout=None,
+                ownerless_validate_cargo_home=None,
+                completed_record=record,
+                repository=repository,
+                recovery_note=None,
+                retry_running_hook=False,
+                abort_create=False,
+            )
+            _cmd_recover(
+                item_args,
+                ownerless_batch_cleanup=batch_cleanup,
+                emit=False,
+            )
+        except (Refusal, StateError) as exc:
+            retained.append({"checkout": checkout, "reason": str(exc)})
+            if _outstanding_journals(config) or _validate_batch_seal_journals(config):
+                reason = (
+                    "an interrupted mutation remains after the preceding refusal; "
+                    "recover it before retrying this checkout"
+                )
+                retained.extend(
+                    {"checkout": remaining[0], "reason": reason}
+                    for remaining in prepared[index + 1 :]
+                )
+                break
+        else:
+            removed.append({"checkout": checkout})
+    payload = {
+        "schema": 1,
+        "batch_limit": VALIDATE_REMOVE_BATCH_LIMIT,
+        "process_censuses": shared_census_count,
+        "shared_process_censuses": shared_census_count,
+        "same_uid_process_censuses": batch_cleanup.same_uid_census_count,
+        "requested": len(checkouts),
+        "removed": removed,
+        "retained": retained,
+    }
+    if args.format == "json":
+        print(json.dumps(payload, sort_keys=True))
+    else:
+        print(
+            f"requested={len(checkouts)} removed={len(removed)} "
+            f"retained={len(retained)} process_censuses={shared_census_count}"
+        )
+        for row in retained:
+            print(f"RETAINED: {row['checkout']} reason={row['reason']}")
+    return 0
+
+
+def _cmd_recover(
+    args: argparse.Namespace,
+    *,
+    ownerless_batch_cleanup: _OwnerlessValidationBatchContext | None = None,
+    emit: bool = True,
+) -> int:
     config = _load_config(args.project_root, args.machine)
     coordinator = _capture_caller_process(args.coordinator_pid, "coordinator")
     with _mutation_locks(config, args.wait_lock):
@@ -17665,7 +17986,11 @@ def _cmd_recover(args: argparse.Namespace) -> int:
             )
             before = _global_rows(states, archives)
             journal, _allowed = _ownerless_validation_journal(
-                config, args, coordinator, states
+                config,
+                args,
+                coordinator,
+                states,
+                batch_cleanup=ownerless_batch_cleanup,
             )
             _write_journal(config, journal)
             if legacy_requested:
@@ -17792,7 +18117,14 @@ def _cmd_recover(args: argparse.Namespace) -> int:
                 raise Refusal(
                     "--retry-running-hook and --abort-create apply only to create journals"
                 )
-            _recover_ownerless_validation(config, path, raw, coordinator)
+            _recover_ownerless_validation(
+                config,
+                path,
+                raw,
+                coordinator,
+                batch_cleanup=ownerless_batch_cleanup,
+                emit=emit,
+            )
         elif kind == "ownerless-agent-remove":
             if args.retry_running_hook or args.abort_create:
                 raise Refusal(
@@ -18821,6 +19153,55 @@ usage or audit gate unknown, 3 fail-closed refusal.
         "--coordinator-pid", type=int, metavar="PID"
     )
     recover_ownerless_cache.set_defaults(handler=_cmd_recover_ownerless_agent_cache)
+
+    recover_ownerless_batch = subparsers.add_parser(
+        "recover-ownerless-validate-batch",
+        help="recover one bounded batch of private ownerless validation checkouts",
+        description=(
+            "Require each checkout to already be an owner-controlled mode-700 directory, "
+            "capture one shared all-process path census, and then run the ordinary durable "
+            "ownerless validation recovery for each aligned checkout/record/repository triple. "
+            "A fresh same-UID census is taken at every destructive recheck. Cross-UID entry is "
+            "prevented by the private-directory invariant; ambiguity retains the checkout."
+        ),
+        formatter_class=_HelpFormatter,
+    )
+    recover_ownerless_batch.add_argument(
+        "--checkout",
+        dest="checkouts",
+        action="append",
+        required=True,
+        metavar="PATH",
+        help="project-relative private ownerless validation checkout (repeatable, bounded)",
+    )
+    recover_ownerless_batch.add_argument(
+        "--completed-record",
+        dest="completed_records",
+        action="append",
+        required=True,
+        metavar="PATH",
+        help="aligned terminal validation record (repeatable)",
+    )
+    recover_ownerless_batch.add_argument(
+        "--repository",
+        dest="repositories",
+        action="append",
+        required=True,
+        metavar="PATH",
+        help="aligned source repository (repeatable)",
+    )
+    recover_ownerless_batch.add_argument(
+        "--coordinator-authorized", action="store_true"
+    )
+    recover_ownerless_batch.add_argument(
+        "--coordinator-pid", type=int, required=True, metavar="PID"
+    )
+    recover_ownerless_batch.add_argument(
+        "--format", choices=("human", "json"), default="human"
+    )
+    recover_ownerless_batch.set_defaults(
+        handler=_cmd_recover_ownerless_validate_batch
+    )
 
     recover = subparsers.add_parser(
         "recover",

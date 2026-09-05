@@ -895,17 +895,18 @@ def prepare_legacy_validate_checkout(
     repository: Path,
     *,
     state: str = "completed",
+    name: str = "legacy",
 ) -> tuple[Path, Path]:
-    checkout_path = project / "ignored" / "validate-fresh-legacy"
+    checkout_path = project / "ignored" / f"validate-fresh-{name}"
     checkout_path.parent.mkdir(parents=True, exist_ok=True)
     git(repository, "worktree", "add", "--detach", str(checkout_path), "HEAD")
-    record_path = project / "ignored" / "validate" / "runs" / "validate-legacy.json"
+    record_path = project / "ignored" / "validate" / "runs" / f"validate-{name}.json"
     record_path.parent.mkdir(parents=True, exist_ok=True)
     record_path.write_text(
         json.dumps(
             {
                 "schema_version": 1,
-                "unit": "validate-legacy.service",
+                "unit": f"validate-{name}.service",
                 "checkout": str(checkout_path),
                 "source_checkout": str(repository),
                 "repo": "example/project",
@@ -1084,6 +1085,318 @@ def test_recover_removes_only_evidenced_completed_legacy_validate_checkout(
     config = wrkslots._load_config(str(project), "testhost")
     events = wrkslots._load_events(config)
     assert any(event["kind"] == "ownerless-validate-path-removed" for event in events)
+
+
+def test_ownerless_validate_batch_shares_one_census_and_removes_unheld_checkouts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    first, first_record = prepare_legacy_validate_checkout(
+        project, repository, name="first"
+    )
+    second, second_record = prepare_legacy_validate_checkout(
+        project, repository, name="second"
+    )
+    first.chmod(0o700)
+    second.chmod(0o700)
+    shared_calls: list[tuple[Path, ...]] = []
+    fresh_calls: list[tuple[Path, ...]] = []
+
+    def shared(
+        paths: Sequence[Path], **_kwargs: object
+    ) -> wrkslots._ProcessPathCensus:
+        shared_calls.append(tuple(paths))
+        budget = _kwargs.get("budget")
+        assert isinstance(budget, wrkslots._ReadOnlyCommandBudget)
+        budget.input_remaining = 1
+        return wrkslots._ProcessPathCensus((), (), owner_cgroup_complete=False)
+
+    def fresh(
+        paths: Sequence[Path], **_kwargs: object
+    ) -> wrkslots._ProcessPathCensus:
+        fresh_calls.append(tuple(paths))
+        budget = _kwargs.get("budget")
+        assert isinstance(budget, wrkslots._ReadOnlyCommandBudget)
+        assert budget.input_remaining == wrkslots._MOUNTINFO_CENSUS_BYTES_LIMIT
+        return wrkslots._ProcessPathCensus((), (), owner_cgroup_complete=False)
+
+    monkeypatch.setattr(wrkslots, "_capture_lsof_process_path_census", shared)
+    monkeypatch.setattr(wrkslots, "_capture_same_uid_process_path_census", fresh)
+
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover-ownerless-validate-batch",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--checkout",
+            first.relative_to(project).as_posix(),
+            "--checkout",
+            second.relative_to(project).as_posix(),
+            "--completed-record",
+            first_record.relative_to(project).as_posix(),
+            "--completed-record",
+            second_record.relative_to(project).as_posix(),
+            "--repository",
+            repository.relative_to(project).as_posix(),
+            "--repository",
+            repository.relative_to(project).as_posix(),
+            "--format",
+            "json",
+        ]
+    )
+
+    assert rc == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["process_censuses"] == 1
+    assert report["shared_process_censuses"] == 1
+    assert report["same_uid_process_censuses"] == 2
+    assert report["removed"] == [
+        {"checkout": first.relative_to(project).as_posix()},
+        {"checkout": second.relative_to(project).as_posix()},
+    ]
+    assert report["retained"] == []
+    assert shared_calls == [(first, second)]
+    assert len(fresh_calls) == 2
+    assert not first.exists()
+    assert not second.exists()
+
+
+def test_batched_lsof_census_attributes_live_process_to_exact_checkout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = tmp_path / "validate-fresh-first"
+    second = tmp_path / "validate-fresh-second"
+    first.mkdir()
+    second.mkdir()
+    commands: list[tuple[str, ...]] = []
+
+    def lsof(
+        program: Path,
+        arguments: Sequence[str],
+        *,
+        budget: wrkslots._ReadOnlyCommandBudget,
+        input_data: bytes | None = None,
+    ) -> tuple[int, bytes, bytes]:
+        del budget, input_data
+        commands.append(tuple(arguments))
+        return 0, f"p4242\ncsleep\nfcwd\nn{second}\n".encode(), b""
+
+    def lsns(
+        _program: Path,
+        arguments: Sequence[str],
+        *,
+        budget: wrkslots._ReadOnlyCommandBudget,
+        input_data: bytes | None = None,
+    ) -> tuple[int, bytes, bytes]:
+        del budget, input_data
+        commands.append(tuple(arguments))
+        return 0, b"4026531840 4242\n", b""
+
+    monkeypatch.setattr(wrkslots, "_run_same_uid_command", lsof)
+    monkeypatch.setattr(wrkslots, "_run_root_owned_command", lsns)
+    monkeypatch.setattr(wrkslots, "_process_uids", lambda _pid_dir: None)
+    budget = wrkslots._ReadOnlyCommandBudget.start(
+        timeout_seconds=10,
+        stdout_limit=1024,
+        stderr_limit=1024,
+        input_limit=1024,
+    )
+
+    census = wrkslots._capture_lsof_process_path_census(
+        (first, second), budget=budget
+    )
+
+    census.assert_slot_unused(first, None)
+    with pytest.raises(wrkslots.Refusal, match="live process 4242"):
+        census.assert_slot_unused(second, None)
+    assert commands == [
+        ("-nP", "-Fpcfn", "+D", str(first), "+D", str(second)),
+        ("--type", "mnt", "--output", "NS,PID", "--noheadings", "--raw"),
+    ]
+
+
+def test_ownerless_validate_batch_retains_shared_census_use_but_removes_other(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    held, held_record = prepare_legacy_validate_checkout(
+        project, repository, name="held"
+    )
+    unused, unused_record = prepare_legacy_validate_checkout(
+        project, repository, name="unused"
+    )
+    held.chmod(0o700)
+    unused.chmod(0o700)
+    monkeypatch.setattr(
+        wrkslots,
+        "_capture_lsof_process_path_census",
+        lambda _paths, **_kwargs: wrkslots._ProcessPathCensus(
+            (), ((os.getpid(), str(held), "fd", str(held)),), owner_cgroup_complete=False
+        ),
+    )
+    monkeypatch.setattr(
+        wrkslots,
+        "_capture_same_uid_process_path_census",
+        lambda _paths, **_kwargs: wrkslots._ProcessPathCensus(
+            (), (), owner_cgroup_complete=False
+        ),
+    )
+
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover-ownerless-validate-batch",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--checkout",
+            held.relative_to(project).as_posix(),
+            "--checkout",
+            unused.relative_to(project).as_posix(),
+            "--completed-record",
+            held_record.relative_to(project).as_posix(),
+            "--completed-record",
+            unused_record.relative_to(project).as_posix(),
+            "--repository",
+            repository.relative_to(project).as_posix(),
+            "--repository",
+            repository.relative_to(project).as_posix(),
+            "--format",
+            "json",
+        ]
+    )
+
+    assert rc == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["removed"] == [
+        {"checkout": unused.relative_to(project).as_posix()}
+    ]
+    assert len(report["retained"]) == 1
+    assert report["retained"][0]["checkout"] == held.relative_to(project).as_posix()
+    assert f"live process {os.getpid()}" in report["retained"][0]["reason"]
+    assert held.is_dir()
+    assert not unused.exists()
+
+
+def test_ownerless_validate_batch_fresh_census_catches_late_same_uid_use(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    checkout, record = prepare_legacy_validate_checkout(
+        project, repository, name="late-use"
+    )
+    checkout.chmod(0o700)
+    monkeypatch.setattr(
+        wrkslots,
+        "_capture_lsof_process_path_census",
+        lambda _paths, **_kwargs: wrkslots._ProcessPathCensus(
+            (), (), owner_cgroup_complete=False
+        ),
+    )
+    monkeypatch.setattr(
+        wrkslots,
+        "_capture_same_uid_process_path_census",
+        lambda paths, **_kwargs: wrkslots._ProcessPathCensus(
+            (), ((4343, str(paths[0]), "cwd", str(paths[0])),), owner_cgroup_complete=False
+        ),
+    )
+
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover-ownerless-validate-batch",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--checkout",
+            checkout.relative_to(project).as_posix(),
+            "--completed-record",
+            record.relative_to(project).as_posix(),
+            "--repository",
+            repository.relative_to(project).as_posix(),
+            "--format",
+            "json",
+        ]
+    )
+
+    assert rc == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["removed"] == []
+    assert len(report["retained"]) == 1
+    assert "live process 4343" in report["retained"][0]["reason"]
+    assert report["same_uid_process_censuses"] == 1
+    assert checkout.is_dir()
+
+
+def test_ownerless_validate_batch_refuses_invoking_process_working_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    checkout, record = prepare_legacy_validate_checkout(
+        project, repository, name="caller-cwd"
+    )
+    checkout.chmod(0o700)
+    monkeypatch.setattr(
+        wrkslots,
+        "_capture_lsof_process_path_census",
+        lambda _paths, **_kwargs: wrkslots._ProcessPathCensus(
+            (), (), owner_cgroup_complete=False
+        ),
+    )
+    monkeypatch.setattr(
+        wrkslots,
+        "_capture_same_uid_process_path_census",
+        lambda _paths, **_kwargs: wrkslots._ProcessPathCensus(
+            (), (), owner_cgroup_complete=False
+        ),
+    )
+    previous = Path.cwd()
+    try:
+        os.chdir(checkout)
+        rc = wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "recover-ownerless-validate-batch",
+                "--coordinator-authorized",
+                "--coordinator-pid",
+                str(os.getpid()),
+                "--checkout",
+                checkout.relative_to(project).as_posix(),
+                "--completed-record",
+                record.relative_to(project).as_posix(),
+                "--repository",
+                repository.relative_to(project).as_posix(),
+                "--format",
+                "json",
+            ]
+        )
+    finally:
+        os.chdir(previous)
+
+    assert rc == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["removed"] == []
+    assert len(report["retained"]) == 1
+    assert "wrkslots process is running from inside slot" in report["retained"][0][
+        "reason"
+    ]
+    assert report["same_uid_process_censuses"] == 0
+    assert checkout.is_dir()
 
 
 def test_recover_refuses_legacy_validate_checkout_without_completed_result(
