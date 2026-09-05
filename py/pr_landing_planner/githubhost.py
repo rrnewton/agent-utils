@@ -21,7 +21,7 @@ from dataclasses import dataclass, replace
 from pr_landing_planner.classify import parse_rollup
 from pr_landing_planner.landing_context import (
     ALLOWED_RETIREMENT_PERMISSIONS,
-    retirement_actor,
+    retirement_record,
 )
 from pr_landing_planner.model import (
     CheckRun,
@@ -182,12 +182,16 @@ def _required_string(event: Mapping[str, object], role: str, key: str) -> str:
 
 def _event_author(event: Mapping[str, object], role: str, key: str) -> str:
     value = event.get(key)
+    if value is None:
+        return ""
     if not isinstance(value, dict):
-        raise ValueError(f"{role} lacks an author object")
+        raise ValueError(f"{role} author is not an object or null")
     login = value.get("login")
-    if not isinstance(login, str) or not login:
-        raise ValueError(f"{role} lacks a stable author login")
-    return login
+    if login is None:
+        return ""
+    if not isinstance(login, str):
+        raise ValueError(f"{role} author login is not a string or null")
+    return login.strip()
 
 
 _INLINE_STATE_FIELDS = (
@@ -397,15 +401,15 @@ def _review_snapshot(
     return ReviewEvidenceSnapshot(head, decision, tuple(events))
 
 
-def _repository_permission(raw: object, expected_actor: str) -> str:
+def _repository_permission(raw: object, expected_author: str) -> str:
     response = _event_object(raw, "repository permission response")
     user = _event_object(response.get("user"), "repository permission response.user")
     actual_actor = _required_string(
         user, "repository permission response.user", "login"
     )
-    if actual_actor.lower() != expected_actor.lower():
+    if actual_actor.lower() != expected_author.lower():
         raise ValueError(
-            "repository permission response actor differs from retirement actor"
+            "repository permission response actor differs from GitHub event author"
         )
     role = response.get("role_name")
     permission = response.get("permission")
@@ -418,7 +422,7 @@ def _repository_permission(raw: object, expected_actor: str) -> str:
         if candidate in ALLOWED_RETIREMENT_PERMISSIONS:
             return candidate
     raise ValueError(
-        "retirement actor lacks current triage-or-higher repository permission"
+        "GitHub event author lacks current triage-or-higher repository permission"
     )
 
 
@@ -441,47 +445,66 @@ class GitHubHost:
     def _net(self, cmd: Sequence[str]) -> list[str]:
         return [*self._wrapper, *cmd]
 
-    def _retirement_permission(self, repo: str, actor: str) -> str:
+    def _retirement_permission(self, repo: str, author: str) -> str:
         proc = _run(
             self._net(
                 [
                     self._gh,
                     "api",
-                    f"repos/{repo}/collaborators/{actor}/permission",
+                    f"repos/{repo}/collaborators/{author}/permission",
                 ]
             ),
             cwd=None,
         )
         raw: object = json.loads(proc.stdout) if proc.stdout.strip() else None
-        return _repository_permission(raw, actor)
+        return _repository_permission(raw, author)
 
     def _bind_retirement_permissions(
         self, repo: str, snapshot: ReviewEvidenceSnapshot
     ) -> ReviewEvidenceSnapshot:
-        actors: set[str] = set()
+        authors: set[str] = set()
         for event in snapshot.events:
-            actor = retirement_actor(event.body)
-            if actor is None:
+            retirement = retirement_record(event.body)
+            if (
+                retirement is None
+                or retirement.head_sha != snapshot.head_sha
+                or event.state != "ACTIVE"
+                or not event.author
+            ):
                 continue
-            if event.author.lower() != actor:
-                raise ValueError(
-                    "review evidence retirement actor differs from GitHub event author"
-                )
-            actors.add(actor)
-        permissions = {
-            actor: self._retirement_permission(repo, actor)
-            for actor in sorted(actors)
-        }
+            authors.add(event.author)
+        permissions: dict[str, str] = {}
+        unavailable: list[str] = []
+        for author in sorted(authors):
+            try:
+                permissions[author] = self._retirement_permission(repo, author)
+            except (HostCommandError, ValueError):
+                permissions[author] = ""
+                unavailable.append(author)
+        if unavailable:
+            print(
+                "pr-landing-planner: NOTE: retirement permission unavailable for "
+                + ",".join(unavailable)
+                + "; retaining the events without retirement authority",
+                file=sys.stderr,
+            )
+
+        def permission(event: ReviewEvidenceEvent) -> str:
+            retirement = retirement_record(event.body)
+            if (
+                retirement is None
+                or retirement.head_sha != snapshot.head_sha
+                or event.state != "ACTIVE"
+            ):
+                return ""
+            return permissions.get(event.author, "")
+
         return replace(
             snapshot,
             events=tuple(
                 replace(
                     event,
-                    retirement_actor_permission=(
-                        permissions[actor]
-                        if (actor := retirement_actor(event.body)) is not None
-                        else ""
-                    ),
+                    retirement_actor_permission=permission(event),
                 )
                 for event in snapshot.events
             ),

@@ -190,6 +190,42 @@ def test_matching_review_decisions_are_accepted() -> None:
     assert graph.nodes[0].review_decision == "CHANGES_REQUESTED"
 
 
+def test_canonical_comment_refusal_holds_without_native_review_decision() -> None:
+    head = "a" * 40
+    fixture: dict[str, object] = {
+        "repo": "R",
+        "base": "integration",
+        "prs": [
+            {
+                "number": 1,
+                "head_sha": head,
+                "review_decision": "",
+                "review_snapshot_review_decision": "",
+                "review_events": [
+                    {
+                        "kind": "issue-comment",
+                        "identity": "comment-123456",
+                        "author": "reviewer",
+                        "state": "ACTIVE",
+                        "head_sha": "",
+                        "created_at": "2026-09-04T12:00:00Z",
+                        "updated_at": "2026-09-04T12:00:00Z",
+                        "last_edited_at": "",
+                        "body": (
+                            "[team, reviewer, unresolved, build-host, role=reviewer]\n"
+                            f"CHANGES-REQUESTED-AT: codex {head}\n"
+                            "The race remains."
+                        ),
+                    }
+                ],
+            }
+        ],
+    }
+    host, _, _ = FakeHost.from_fixture(fixture)
+    graph = collect_graph(host, repo="R", base="integration")
+    assert graph.nodes[0].review_decision == "CHANGES_REQUESTED"
+
+
 def test_only_numbers_restricts_selection() -> None:
     graph = collect_graph(
         _host(), repo="OWNER/NAME", base="integration", only=frozenset({1, 3})
