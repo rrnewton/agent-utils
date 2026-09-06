@@ -27,6 +27,9 @@ pub enum TestAttemptOutcome {
     Cancelled,
     /// Attempt could not produce trustworthy execution or accounting evidence.
     InfrastructureError,
+    /// Attempt produced an explicit no-result classification that is neither a
+    /// timeout nor an infrastructure/accounting failure.
+    NoResult,
 }
 
 impl TestAttemptOutcome {
@@ -38,6 +41,7 @@ impl TestAttemptOutcome {
             Self::WallTimeout => "wall_timeout",
             Self::Cancelled => "cancelled",
             Self::InfrastructureError => "infrastructure_error",
+            Self::NoResult => "no_result",
         }
     }
 
@@ -49,6 +53,7 @@ impl TestAttemptOutcome {
             "wall_timeout" => Some(Self::WallTimeout),
             "cancelled" => Some(Self::Cancelled),
             "infrastructure_error" => Some(Self::InfrastructureError),
+            "no_result" => Some(Self::NoResult),
             _ => None,
         }
     }
@@ -110,7 +115,9 @@ pub struct TestResult {
 }
 
 impl TestResult {
-    /// Construct one validated terminal result.
+    /// Construct one retained schema-2 terminal result.
+    ///
+    /// Current schema-3 writers must use [Self::with_attempt_results].
     pub fn new(id: String, passed: bool, attempts: u64) -> Result<Self, String> {
         if id.is_empty() || id.trim() != id {
             return Err("structured-test-results-id must be nonempty and trimmed".into());
@@ -181,16 +188,18 @@ fn parse_result_row(
     if !current {
         return TestResult::new(id, passed, attempts);
     }
-    let Some(attempt_rows) = (match row.get("attempt_results") {
-        Some(Value::Null) => None,
-        Some(Value::Array(rows)) => Some(rows),
-        _ => {
+    let attempt_rows = match row.get("attempt_results") {
+        Some(Value::Array(rows)) => rows,
+        Some(Value::Null) => {
             return Err(format!(
-                "structured-test-results-results[{index}].attempt_results must be an array or null"
+                "structured-test-results-results[{index}].attempt_results must be an array for current schema"
             ));
         }
-    }) else {
-        return TestResult::new(id, passed, attempts);
+        _ => {
+            return Err(format!(
+                "structured-test-results-results[{index}].attempt_results must be an array"
+            ));
+        }
     };
     let mut attempt_results = Vec::with_capacity(attempt_rows.len());
     for (attempt_index, attempt) in attempt_rows.iter().enumerate() {
@@ -263,6 +272,9 @@ impl TestResults {
         results: Vec<TestResult>,
     ) -> Result<Self, String> {
         validate_results(executed_tests, &results)?;
+        for result in &results {
+            validate_result(result, true)?;
+        }
         Ok(Self {
             executed_tests,
             filtered_tests,
@@ -358,7 +370,7 @@ impl TestResults {
         let rows = results
             .iter()
             .map(|result| -> Result<Value, String> {
-                validate_result(result, false)?;
+                validate_result(result, true)?;
                 let attempts = result.attempt_results.as_ref();
                 Ok(serde_json::json!({
                     "id": result.id,
@@ -572,5 +584,26 @@ mod tests {
         assert!(TestResults::from_json_slice(malformed)
             .unwrap_err()
             .contains("requires nonempty trimmed detail"));
+    }
+
+    #[test]
+    fn current_schema_refuses_missing_attempt_results() {
+        let retained = TestResult::new("suite$case".into(), false, 1).unwrap();
+        let error = TestResults::current(1, 0, vec![retained.clone()]).unwrap_err();
+        assert!(error.contains("current row lacks attempt_results"));
+
+        let report = TestResults {
+            executed_tests: 1,
+            filtered_tests: 0,
+            results: Some(vec![retained]),
+        };
+        assert!(report
+            .to_current_json()
+            .unwrap_err()
+            .contains("current row lacks attempt_results"));
+        let bytes = br#"{"schema":3,"executed_tests":1,"filtered_tests":0,"results":[{"id":"suite$case","result":"fail","attempts":1,"attempt_results":null}]}"#;
+        assert!(TestResults::from_json_slice(bytes)
+            .unwrap_err()
+            .contains("must be an array for current schema"));
     }
 }
