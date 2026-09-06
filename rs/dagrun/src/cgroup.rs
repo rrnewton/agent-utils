@@ -516,6 +516,42 @@ fn manual_cpu_child_name(tag: &str) -> io::Result<String> {
     }
     Ok(name)
 }
+fn create_manual_cpu_child(parent: &Path, tag: &str) -> io::Result<ManualCpuCgroup> {
+    let name = manual_cpu_child_name(tag)?;
+    let path = create_fresh_cgroup_dir(parent, &name)?;
+    let child = ManualCpuCgroup::at(path.clone());
+    let validation = (|| -> io::Result<()> {
+        let kill = open_cgroup_writer(&path.join("cgroup.kill"))?;
+        drop(kill);
+        if child.status()? != ManualCpuCgroupStatus::Empty {
+            return Err(io::Error::other(format!(
+                "fresh cgroup {} is already populated",
+                path.display()
+            )));
+        }
+        let usage = child.cpu_usage_usec()?;
+        if usage != 0 {
+            return Err(io::Error::other(format!(
+                "fresh cgroup {} already reports {usage} CPU microseconds",
+                path.display()
+            )));
+        }
+        Ok(())
+    })();
+    if let Err(error) = validation {
+        return match fs::remove_dir(&path) {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "{error}; cannot remove rejected cgroup {}: {cleanup}",
+                    path.display()
+                ),
+            )),
+        };
+    }
+    Ok(child)
+}
 
 fn tokens_contain(text: &str, expected: &str) -> bool {
     text.split_whitespace().any(|token| token == expected)
@@ -530,6 +566,62 @@ fn preserve_primary_error(primary: io::Error, stage: &str, teardown: io::Error) 
 
 fn cgroup_remove_is_retryable(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::DirectoryNotEmpty || error.raw_os_error() == Some(libc::EBUSY)
+}
+/// The current cgroup, borrowed as a parent for independently owned CPU-accounting children.
+///
+/// Unlike `ManualCpuCgroupRoot`, this handle never moves the caller, enables a controller, or
+/// assumes exclusive ownership of the current cgroup. It is therefore safe for concurrent test
+/// supervisors that share one enclosing DAG-step cgroup. Each caller owns only the fresh child
+/// returned by `SharedCpuCgroupParent::create_child`. The borrowed parent is never killed,
+/// removed, or otherwise reconfigured.
+///
+/// CPU accounting does not require writing `cpu.max` or `cgroup.subtree_control`: cgroup v2
+/// exposes a fresh child's cumulative `cpu.stat` counter independently of CPU-rate delegation.
+/// Construction proves that the current parent already has readable CPU accounting; child
+/// creation separately proves that this process may create and manage one child there.
+#[derive(Debug, Clone)]
+pub struct SharedCpuCgroupParent {
+    path: PathBuf,
+}
+
+impl SharedCpuCgroupParent {
+    /// Borrow the current cgroup without changing it or requiring it to contain only this process.
+    pub fn current() -> io::Result<Self> {
+        let path = my_cgroup_path().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "cannot resolve the current cgroup-v2 path from /proc/self/cgroup",
+            )
+        })?;
+        if path == Path::new(CGROUP_ROOT) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "the current process is in the cgroup-v2 root, not a delegated child cgroup",
+            ));
+        }
+        let metadata = fs::metadata(&path)
+            .map_err(|error| cgroup_io_error("cannot inspect current cgroup", &path, error))?;
+        if !metadata.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("current cgroup {} is not a directory", path.display()),
+            ));
+        }
+        // This is an availability check, not a baseline to subtract. Every owned child starts at
+        // a separately verified zero and retains its own counter after a fast child exits.
+        let _ = cpu_usage_usec_at(&path)?;
+        Ok(Self { path })
+    }
+
+    /// Create one fresh child whose lifetime and accounting belong only to this caller.
+    pub fn create_child(&self, tag: &str) -> io::Result<ManualCpuCgroup> {
+        create_manual_cpu_child(&self.path, tag)
+    }
+
+    /// The shared parent. This path is observational only; this type never mutates the parent.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
 }
 
 /// A delegated CPU-cgroup root owned exclusively by the current process.
@@ -683,40 +775,7 @@ impl ManualCpuCgroupRoot {
                 "manual CPU cgroup root was already cleaned",
             ));
         }
-        let name = manual_cpu_child_name(tag)?;
-        let path = create_fresh_cgroup_dir(&self.root, &name)?;
-        let child = ManualCpuCgroup::at(path.clone());
-        let validation = (|| -> io::Result<()> {
-            let kill = open_cgroup_writer(&path.join("cgroup.kill"))?;
-            drop(kill);
-            if child.status()? != ManualCpuCgroupStatus::Empty {
-                return Err(io::Error::other(format!(
-                    "fresh cgroup {} is already populated",
-                    path.display()
-                )));
-            }
-            let usage = child.cpu_usage_usec()?;
-            if usage != 0 {
-                return Err(io::Error::other(format!(
-                    "fresh cgroup {} already reports {usage} CPU microseconds",
-                    path.display()
-                )));
-            }
-            Ok(())
-        })();
-        if let Err(error) = validation {
-            return match fs::remove_dir(&path) {
-                Ok(()) => Err(error),
-                Err(cleanup) => Err(io::Error::new(
-                    error.kind(),
-                    format!(
-                        "{error}; cannot remove rejected cgroup {}: {cleanup}",
-                        path.display()
-                    ),
-                )),
-            };
-        }
-        Ok(child)
+        create_manual_cpu_child(&self.root, tag)
     }
 
     /// Restore the caller to its original cgroup after every child lease has been cleaned.

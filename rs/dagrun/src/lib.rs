@@ -59,7 +59,8 @@ pub use cgroup::{
     expected_outer_cpu_count, expected_scope_runtime_max_s, install_scope_teardown,
     observe_own_containment, promised_unit, run_containment, verify_scope_runtime_max,
     CgroupManager, Cgroups, ContainmentEvidence, ContainmentProof, ManualCpuCgroup,
-    ManualCpuCgroupRoot, ManualCpuCgroupStatus, RunContainment, ScopeAttempt, FORCE_ATTEMPT_ENV,
+    ManualCpuCgroupRoot, ManualCpuCgroupStatus, RunContainment, ScopeAttempt,
+    SharedCpuCgroupParent, FORCE_ATTEMPT_ENV,
 };
 pub use cli::{select_steps_by_labels, select_steps_by_tags};
 pub use estimates::{
