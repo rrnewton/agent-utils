@@ -1494,9 +1494,9 @@ LOADER_REFUSALS: tuple[tuple[str, str, str], ...] = (
     (
         "wrong-structured-result-schema",
         '{"steps":[{"group":"test","job":"counts","cmd":"true",'
-        '"result_manifests":[{"kind":"structured-test-results","schema":3,'
+        '"result_manifests":[{"kind":"structured-test-results","schema":1,'
         '"path_env":"DAGRUN_TEST_COUNTS_PATH","owner":"test.counts"}]}]}',
-        "steps[0].result_manifests[0].schema: structured test results require retained schema 2 or current schema 2, got 3",
+        "steps[0].result_manifests[0].schema: structured test results require retained schema 2 or current schema 3, got 1",
     ),
     (
         "wrong-structured-result-path",
@@ -1589,7 +1589,7 @@ LOADER_ACCEPTANCES: tuple[tuple[str, str], ...] = (
         '"manifest":{"lane":"portable","category":"applications"},'
         '"result_manifests":[{"lane":"portable","category":"applications",'
         '"test":"applications/date","mode":"verify","backend":"ptrace"},'
-        '{"kind":"structured-test-results","schema":2,'
+        '{"kind":"structured-test-results","schema":3,'
         '"path_env":"DAGRUN_TEST_COUNTS_PATH","owner":"a.one"}],'
         '"integration_test_binaries":["unit_alpha"],'
         '"deps":[],"env":{"K":"V"},"networkonly":false,"engine_only":false,"timeout":5,'

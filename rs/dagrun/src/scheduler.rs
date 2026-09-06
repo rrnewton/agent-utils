@@ -1182,6 +1182,7 @@ fn publish_supervisor_failure(
                 executed_tests: None,
                 filtered_tests: None,
                 test_results: None,
+                test_results_error: None,
                 returncode: None,
                 oomed: false,
                 oom_kills: 0,
@@ -2582,6 +2583,13 @@ fn read_structured_test_counts(
     }))
 }
 
+fn test_results_report_failure(counts: &CapturedTestResults) -> bool {
+    counts
+        .results
+        .as_ref()
+        .is_some_and(|results| results.iter().any(|result| !result.passed))
+}
+
 fn resolved_test_counts(
     mode: TestResultsMode,
     path: Option<&std::path::Path>,
@@ -3633,6 +3641,7 @@ fn run_step(ctx: StepCtx) {
     let ok = returncode == Some(0)
         && !timed_out
         && !cpu_timed_out
+        && !test_results_report_failure(&test_counts)
         && structured_test_results_error.is_none();
 
     // Build the per-step profile row (perflog step-profile schema keys + dynamic cpu.* counters).
@@ -3777,6 +3786,7 @@ fn run_step(ctx: StepCtx) {
         };
         if let Some(error) = &structured_test_results_error {
             outcome.reason = format!("STRUCTURED TEST RESULTS REFUSED: {error}");
+            outcome.test_results_error = Some(error.clone());
             outcome.ok = false;
         }
         outcome.test_results = test_counts.results;
@@ -4626,12 +4636,12 @@ mod tests {
             std::process::id(),
             TEST_COUNTS_SEQ.fetch_add(1, Ordering::Relaxed)
         ));
+        let printed = b"running 999 tests\ntest result: ok. 999 passed; 0 failed; 0 filtered out\n";
         std::fs::write(
             &path,
             br#"{"schema":2,"executed_tests":2,"filtered_tests":11,"results":[{"id":"suite$passes","result":"pass","attempts":1},{"id":"suite$recovers","result":"pass","attempts":2}]}"#,
         )
         .unwrap();
-        let printed = b"running 999 tests\ntest result: ok. 999 passed; 0 failed; 0 filtered out\n";
         assert_eq!(
             resolved_test_counts(TestResultsMode::ExplicitNone, None, printed).unwrap(),
             CapturedTestResults {
@@ -4661,7 +4671,29 @@ mod tests {
             br#"{"schema":3,"executed_tests":6,"filtered_tests":0,"results":[{"id":"suite$ordinary","result":"fail","attempts":1,"attempt_results":[{"attempt":1,"outcome":"failed","detail":"exit 7"}]},{"id":"suite$cpu","result":"fail","attempts":1,"attempt_results":[{"attempt":1,"outcome":"cpu_timeout","detail":"used 22000000us CPU"}]},{"id":"suite$wall","result":"fail","attempts":1,"attempt_results":[{"attempt":1,"outcome":"wall_timeout","detail":"ran 57000ms wall"}]},{"id":"suite$cancelled","result":"fail","attempts":1,"attempt_results":[{"attempt":1,"outcome":"cancelled","detail":"cancelled by signal 2"}]},{"id":"suite$infra","result":"fail","attempts":1,"attempt_results":[{"attempt":1,"outcome":"infrastructure_error","detail":"cpu.stat malformed"}]},{"id":"suite$no-result","result":"fail","attempts":1,"attempt_results":[{"attempt":1,"outcome":"no_result","detail":"producer reported cli-error: vector 13"}]}]}"#,
         )
         .unwrap();
-        let current = resolved_test_counts(TestResultsMode::Structured(crate::test_results::CURRENT_SCHEMA), Some(&path), printed).unwrap();
+        let current = resolved_test_counts(
+            TestResultsMode::Structured(crate::test_results::CURRENT_SCHEMA),
+            Some(&path),
+            printed,
+        )
+        .unwrap();
+        assert!(test_results_report_failure(&current));
+        let all_pass = CapturedTestResults {
+            executed: Some(1),
+            filtered: Some(0),
+            results: Some(vec![TestResult::with_attempt_results(
+                "suite$pass".into(),
+                true,
+                vec![crate::test_results::TestAttemptResult::new(
+                    1,
+                    crate::test_results::TestAttemptOutcome::Passed,
+                    None,
+                )
+                .unwrap()],
+            )
+            .unwrap()]),
+        };
+        assert!(!test_results_report_failure(&all_pass));
         let outcomes = current
             .results
             .unwrap()
@@ -4679,6 +4711,22 @@ mod tests {
                 crate::test_results::TestAttemptOutcome::NoResult,
             ]
         );
+        for (schema, bytes) in [
+            (1, br#"{"schema":1,"executed_tests":0,"filtered_tests":0}"#.as_slice()),
+            (2, br#"{"schema":2,"executed_tests":1,"filtered_tests":0,"results":[{"id":"retained","result":"pass","attempts":1}]}"#.as_slice()),
+        ] {
+            std::fs::write(&path, bytes).unwrap();
+            let error = resolved_test_counts(TestResultsMode::Structured(crate::test_results::CURRENT_SCHEMA), Some(&path), printed)
+                .expect_err("a historical schema cannot satisfy a required current producer");
+            assert!(
+                error.contains(&format!("declaration requires schema 3, got {schema}")),
+                "{error}"
+            );
+        }
+        let retained = resolved_test_counts(TestResultsMode::Structured(crate::test_results::RETAINED_RESULTS_SCHEMA), Some(&path), printed).unwrap();
+        assert_eq!(retained.executed, Some(1));
+        assert_eq!(retained.results.unwrap()[0].attempt_results, None);
+
         std::fs::remove_file(&path).unwrap();
         let missing_path = resolved_test_counts(
             TestResultsMode::Structured(crate::test_results::CURRENT_SCHEMA),
@@ -4691,8 +4739,12 @@ mod tests {
                 && missing_path.contains("scheduler-owned path unavailable"),
             "{missing_path}"
         );
-        let missing_file = resolved_test_counts(TestResultsMode::Structured(crate::test_results::CURRENT_SCHEMA), Some(&path), printed)
-            .expect_err("a required producer that wrote no file must refuse");
+        let missing_file = resolved_test_counts(
+            TestResultsMode::Structured(crate::test_results::CURRENT_SCHEMA),
+            Some(&path),
+            printed,
+        )
+        .expect_err("a required producer that wrote no file must refuse");
         assert!(missing_file.contains(path.to_string_lossy().as_ref()));
         assert_eq!(
             resolved_test_counts(TestResultsMode::LegacyStdout, None, printed).unwrap(),
@@ -4704,8 +4756,12 @@ mod tests {
             "clients that have not opted in retain the compatibility parser"
         );
         std::fs::write(&path, br#"{"schema":3,"executed_tests":1}"#).unwrap();
-        let error = resolved_test_counts(TestResultsMode::Structured(crate::test_results::CURRENT_SCHEMA), Some(&path), printed)
-            .expect_err("a malformed current structured result must refuse");
+        let error = resolved_test_counts(
+            TestResultsMode::Structured(crate::test_results::CURRENT_SCHEMA),
+            Some(&path),
+            printed,
+        )
+        .expect_err("a malformed current structured result must refuse");
         assert!(error.contains("malformed structured test results"));
         assert!(error.contains("structured-test-results-filtered_tests"));
         std::fs::remove_file(path).unwrap();
@@ -4751,7 +4807,7 @@ mod tests {
             std::process::id(),
             TEST_COUNTS_SEQ.fetch_add(1, Ordering::Relaxed)
         ));
-        let command = r#"printf '%s\n' "$DAGRUN_TEST_COUNTS_PATH" > "$TEST_MARKER_PATH"; printf '%s' '{"schema":2,"executed_tests":1,"filtered_tests":0,"results":[{"id":"suite$case","result":"pass","attempts":1}]}' > "$DAGRUN_TEST_COUNTS_PATH""#;
+        let command = r#"printf '%s\n' "$DAGRUN_TEST_COUNTS_PATH" > "$TEST_MARKER_PATH"; printf '%s' '{"schema":3,"executed_tests":1,"filtered_tests":0,"results":[{"id":"suite$case","result":"pass","attempts":1,"attempt_results":[{"attempt":1,"outcome":"passed","detail":null}]}]}' > "$DAGRUN_TEST_COUNTS_PATH""#;
         let result = run_without_evidence(&structured_producer(command, &marker));
         assert!(result.ok, "{:#?}", result.outcomes);
         let outcome = &result.outcomes[0];
