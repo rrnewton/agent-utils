@@ -69,6 +69,9 @@ const SCOPE_DRAIN_ATTEMPTS: usize = 50;
 const SCOPE_DRAIN_RETRY: Duration = Duration::from_millis(10);
 const SCOPE_DRAIN_EMPTY_SAMPLES: usize = 2;
 const CONTROLLER_ENABLE_ATTEMPTS: usize = 3;
+/// Bounded wait for `cgroup.kill` to empty a manual child before removal.
+const MANUAL_CPU_ABORT_REMOVE_ATTEMPTS: usize = 500;
+const MANUAL_CPU_ABORT_RETRY: Duration = Duration::from_millis(10);
 
 /// Per-step containment operations used by the scheduler.
 ///
@@ -518,6 +521,17 @@ fn tokens_contain(text: &str, expected: &str) -> bool {
     text.split_whitespace().any(|token| token == expected)
 }
 
+fn preserve_primary_error(primary: io::Error, stage: &str, teardown: io::Error) -> io::Error {
+    io::Error::new(
+        primary.kind(),
+        format!("{primary}; {stage} teardown also failed: {teardown}"),
+    )
+}
+
+fn cgroup_remove_is_retryable(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::DirectoryNotEmpty || error.raw_os_error() == Some(libc::EBUSY)
+}
+
 /// A delegated CPU-cgroup root owned exclusively by the current process.
 ///
 /// Construct this before starting any child process. The constructor refuses unless the caller
@@ -526,6 +540,10 @@ fn tokens_contain(text: &str, expected: &str) -> bool {
 /// library caller from moving or reconfiguring an unrelated process that happens to share its
 /// cgroup. Unlike [`Cgroups::new`], this API is required rather than best-effort: every missing,
 /// malformed, or refused cgroup operation is returned to the caller.
+///
+/// The current delegated cgroup is borrowed: this type never removes it. It owns only the fresh
+/// supervisor and manual child directories created beneath that parent. Cleanup removes every
+/// owned directory and restores the caller to the borrowed parent.
 ///
 /// Call [`ManualCpuCgroupRoot::cleanup`] after every child lease has been finalized and cleaned.
 /// Cleanup disables the controller, moves the caller back, and removes the supervisor cgroup.
@@ -702,6 +720,11 @@ impl ManualCpuCgroupRoot {
     }
 
     /// Restore the caller to its original cgroup after every child lease has been cleaned.
+    ///
+    /// This refuses while any owned child directory remains. Normal completion must therefore
+    /// read final accounting and clean each child first. On an accounting error, use
+    /// [`ManualCpuCgroupRoot::abort_after_accounting_error`], which hard-kills and removes the
+    /// child before restoring the caller; it never converts the accounting error into success.
     pub fn cleanup(&self) -> io::Result<()> {
         if self.cleaned.load(Ordering::Acquire) {
             return Ok(());
@@ -719,7 +742,10 @@ impl ManualCpuCgroupRoot {
                     format!("{} contains a non-UTF-8 child name", self.root.display()),
                 )
             })?;
-            if entry.path().is_dir() && name.starts_with(MANUAL_CPU_CHILD_PREFIX) {
+            let file_type = entry.file_type().map_err(|error| {
+                cgroup_io_error("cannot classify an entry in", &self.root, error)
+            })?;
+            if file_type.is_dir() && name.starts_with(MANUAL_CPU_CHILD_PREFIX) {
                 live_children.push(name.to_string());
             }
         }
@@ -783,20 +809,57 @@ impl ManualCpuCgroupRoot {
                 self.supervisor.display()
             )));
         }
-        if cgroup_status_at(&self.supervisor)? != ManualCpuCgroupStatus::Empty {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                format!(
-                    "supervisor cgroup {} remains populated",
-                    self.supervisor.display()
-                ),
-            ));
-        }
+        // `remove_dir` is the authoritative empty check and does not depend on cgroup.events.
+        // That matters on the error path: an unreadable events file must not make restoration
+        // impossible after the process roster proved that only the caller was present and the
+        // caller was moved back successfully.
         fs::remove_dir(&self.supervisor).map_err(|error| {
             cgroup_io_error("cannot remove supervisor cgroup", &self.supervisor, error)
         })?;
         self.cleaned.store(true, Ordering::Release);
         Ok(())
+    }
+
+    fn abort_after_accounting_error_with<C, R>(
+        &self,
+        child: &ManualCpuCgroup,
+        primary: io::Error,
+        child_cleanup: C,
+        root_cleanup: R,
+    ) -> io::Error
+    where
+        C: FnOnce(&ManualCpuCgroup) -> io::Result<()>,
+        R: FnOnce(&ManualCpuCgroupRoot) -> io::Result<()>,
+    {
+        if let Err(teardown) = child_cleanup(child) {
+            // The child still exists or could still contain a live process. Keep the root and the
+            // caller in place rather than tearing the ownership boundary out from under it.
+            return preserve_primary_error(primary, "child cgroup", teardown);
+        }
+        match root_cleanup(self) {
+            Ok(()) => primary,
+            Err(teardown) => preserve_primary_error(primary, "root cgroup", teardown),
+        }
+    }
+
+    /// Abort after an accounting/status error without losing that original error.
+    ///
+    /// Ordering is deliberate: hard-kill and remove the child first, then disable nested CPU
+    /// delegation, restore the caller to its original cgroup, and remove the supervisor. If child
+    /// teardown cannot be proven complete, root teardown is not attempted and the containment
+    /// boundary remains intact. The returned error is always the original accounting error (same
+    /// [`io::ErrorKind`]); any teardown failure is appended as context rather than replacing it.
+    pub fn abort_after_accounting_error(
+        &self,
+        child: &ManualCpuCgroup,
+        primary: io::Error,
+    ) -> io::Error {
+        self.abort_after_accounting_error_with(
+            child,
+            primary,
+            ManualCpuCgroup::abort_and_cleanup,
+            ManualCpuCgroupRoot::cleanup,
+        )
     }
 
     /// The delegated cgroup beneath which manual children are created.
@@ -963,6 +1026,81 @@ impl ManualCpuCgroup {
         remove(&self.path)?;
         self.cleaned.store(true, Ordering::Release);
         Ok(())
+    }
+
+    fn abort_and_cleanup_with<R, S>(
+        &self,
+        attempts: usize,
+        mut remove: R,
+        mut sleep: S,
+    ) -> io::Result<()>
+    where
+        R: FnMut(&Path) -> io::Result<()>,
+        S: FnMut(Duration),
+    {
+        if self.cleaned.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let kill_error = self.kill().err();
+        let attempts = attempts.max(1);
+        let mut last_remove_error = None;
+        for attempt in 0..attempts {
+            match remove(&self.path) {
+                Ok(()) => {
+                    // Successful removal is stronger evidence than a failed cgroup.kill write:
+                    // the kernel cannot remove a populated cgroup.
+                    self.final_usage_read.store(false, Ordering::Release);
+                    self.cleaned.store(true, Ordering::Release);
+                    return Ok(());
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    self.final_usage_read.store(false, Ordering::Release);
+                    self.cleaned.store(true, Ordering::Release);
+                    return Ok(());
+                }
+                Err(error) if cgroup_remove_is_retryable(&error) => {
+                    last_remove_error = Some(error);
+                    if attempt + 1 < attempts {
+                        sleep(MANUAL_CPU_ABORT_RETRY);
+                    }
+                }
+                Err(error) => {
+                    return Err(match kill_error {
+                        Some(kill) => io::Error::new(
+                            error.kind(),
+                            format!("cgroup.kill failed ({kill}); removal failed ({error})"),
+                        ),
+                        None => error,
+                    });
+                }
+            }
+        }
+        let remove = last_remove_error.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "manual CPU cgroup removal did not complete",
+            )
+        });
+        Err(match kill_error {
+            Some(kill) => io::Error::new(
+                remove.kind(),
+                format!("cgroup.kill failed ({kill}); removal failed ({remove})"),
+            ),
+            None => cgroup_io_error("manual CPU cgroup remained live", &self.path, remove),
+        })
+    }
+
+    /// Hard-kill and remove this child without claiming successful final CPU accounting.
+    ///
+    /// This is only for an error path where `cpu.stat` or `cgroup.events` could not be trusted.
+    /// It does not read, store, or return a CPU value. Removal is retried after `cgroup.kill`
+    /// because task exit and cgroup unpopulation are asynchronous.
+    pub fn abort_and_cleanup(&self) -> io::Result<()> {
+        self.abort_and_cleanup_with(
+            MANUAL_CPU_ABORT_REMOVE_ATTEMPTS,
+            |path| fs::remove_dir(path),
+            thread::sleep,
+        )
     }
 
     /// Remove the empty cgroup after a successful [`ManualCpuCgroup::final_cpu_usage_usec`].
@@ -3430,6 +3568,267 @@ mod tests {
             std::io::ErrorKind::NotFound
         );
         fs::remove_dir_all(path).unwrap();
+    }
+
+    fn planted_manual_root_and_child(
+        name: &str,
+        cpu_stat: Option<&str>,
+        events: Option<&str>,
+    ) -> (PathBuf, ManualCpuCgroupRoot, ManualCpuCgroup) {
+        let root_path = temp_scope(name);
+        let supervisor = root_path.join("manual-cpu-supervisor-fixture");
+        fs::create_dir(&supervisor).unwrap();
+        fs::write(root_path.join("cgroup.procs"), "").unwrap();
+        let child_path = root_path.join("manual-cpu-child-fixture");
+        fs::create_dir(&child_path).unwrap();
+        if let Some(value) = cpu_stat {
+            fs::write(child_path.join("cpu.stat"), value).unwrap();
+        }
+        if let Some(value) = events {
+            fs::write(child_path.join("cgroup.events"), value).unwrap();
+        }
+        fs::write(child_path.join("cgroup.procs"), "").unwrap();
+        fs::write(child_path.join("cgroup.kill"), "").unwrap();
+        let root = ManualCpuCgroupRoot {
+            root: root_path.clone(),
+            supervisor,
+            cleaned: AtomicBool::new(false),
+        };
+        let child = ManualCpuCgroup::at(child_path);
+        (root_path, root, child)
+    }
+
+    fn successful_fake_abort(
+        root: &ManualCpuCgroupRoot,
+        child: &ManualCpuCgroup,
+        primary: std::io::Error,
+    ) -> std::io::Error {
+        root.abort_after_accounting_error_with(
+            child,
+            primary,
+            |child| {
+                let mut removals = 0;
+                child.abort_and_cleanup_with(
+                    2,
+                    |path| {
+                        assert_eq!(fs::read_to_string(path.join("cgroup.kill")).unwrap(), "1");
+                        removals += 1;
+                        if removals == 1 {
+                            return Err(std::io::Error::from_raw_os_error(libc::EBUSY));
+                        }
+                        fs::remove_dir_all(path)
+                    },
+                    |_| {},
+                )
+            },
+            |root| {
+                assert!(
+                    !child.path().exists(),
+                    "the child must be gone before caller restoration begins"
+                );
+                fs::write(root.root.join("cgroup.procs"), "caller-restored")?;
+                fs::remove_dir(&root.supervisor)?;
+                root.cleaned.store(true, Ordering::Release);
+                Ok(())
+            },
+        )
+    }
+
+    #[test]
+    fn missing_cpu_accounting_is_preserved_while_abort_removes_owned_cgroups() {
+        let (root_path, root, child) =
+            planted_manual_root_and_child("manual-abort-missing-cpu", None, Some("populated 1\n"));
+        let primary = child.cpu_usage_usec().unwrap_err();
+        let expected_text = primary.to_string();
+        let returned = successful_fake_abort(&root, &child, primary);
+
+        assert_eq!(returned.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(returned.to_string(), expected_text);
+        assert!(root_path.exists(), "the borrowed parent must remain");
+        assert!(!root.supervisor.exists());
+        assert_eq!(
+            fs::read_to_string(root_path.join("cgroup.procs")).unwrap(),
+            "caller-restored"
+        );
+        assert_eq!(
+            child.cpu_usage_usec().unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        fs::remove_dir_all(root_path).unwrap();
+    }
+
+    #[test]
+    fn malformed_cpu_accounting_is_preserved_while_abort_restores_caller() {
+        let (root_path, root, child) = planted_manual_root_and_child(
+            "manual-abort-malformed-cpu",
+            Some("usage_usec unknown\n"),
+            Some("populated 0\n"),
+        );
+        let primary = child.cpu_usage_usec().unwrap_err();
+        let expected_text = primary.to_string();
+        let returned = successful_fake_abort(&root, &child, primary);
+
+        assert_eq!(returned.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(returned.to_string(), expected_text);
+        assert!(!child.path().exists());
+        assert!(!root.supervisor.exists());
+        assert_eq!(
+            fs::read_to_string(root_path.join("cgroup.procs")).unwrap(),
+            "caller-restored"
+        );
+        fs::remove_dir_all(root_path).unwrap();
+    }
+
+    #[test]
+    fn malformed_status_is_preserved_while_abort_ignores_it_and_restores_caller() {
+        let (root_path, root, child) = planted_manual_root_and_child(
+            "manual-abort-malformed-events",
+            Some("usage_usec 23\n"),
+            Some("populated unknown\n"),
+        );
+        let primary = child.status().unwrap_err();
+        let expected_text = primary.to_string();
+        let returned = successful_fake_abort(&root, &child, primary);
+
+        assert_eq!(returned.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(returned.to_string(), expected_text);
+        assert!(root_path.exists(), "the borrowed parent must remain");
+        assert!(!root.supervisor.exists());
+        assert_eq!(
+            fs::read_to_string(root_path.join("cgroup.procs")).unwrap(),
+            "caller-restored"
+        );
+        fs::remove_dir_all(root_path).unwrap();
+    }
+
+    #[test]
+    fn missing_status_is_preserved_while_abort_restores_caller() {
+        let (root_path, root, child) = planted_manual_root_and_child(
+            "manual-abort-missing-events",
+            Some("usage_usec 23\n"),
+            None,
+        );
+        let primary = child.status().unwrap_err();
+        let expected_text = primary.to_string();
+        let returned = successful_fake_abort(&root, &child, primary);
+
+        assert_eq!(returned.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(returned.to_string(), expected_text);
+        assert!(!child.path().exists());
+        assert!(!root.supervisor.exists());
+        assert_eq!(
+            fs::read_to_string(root_path.join("cgroup.procs")).unwrap(),
+            "caller-restored"
+        );
+        fs::remove_dir_all(root_path).unwrap();
+    }
+
+    #[test]
+    fn failed_child_abort_keeps_the_root_and_does_not_claim_restoration() {
+        let (root_path, root, child) = planted_manual_root_and_child(
+            "manual-abort-child-failure",
+            None,
+            Some("populated 1\n"),
+        );
+        let primary = child.cpu_usage_usec().unwrap_err();
+        let primary_text = primary.to_string();
+        let mut root_cleanup_called = false;
+        let returned = root.abort_after_accounting_error_with(
+            &child,
+            primary,
+            |_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "planted child teardown refusal",
+                ))
+            },
+            |_| {
+                root_cleanup_called = true;
+                Ok(())
+            },
+        );
+
+        assert_eq!(returned.kind(), std::io::ErrorKind::NotFound);
+        assert!(returned.to_string().contains(&primary_text));
+        assert!(returned
+            .to_string()
+            .contains("planted child teardown refusal"));
+        assert!(!root_cleanup_called);
+        assert!(root_path.exists());
+        assert!(child.path().exists());
+        fs::remove_dir_all(root_path).unwrap();
+    }
+
+    #[test]
+    fn failed_root_restore_does_not_replace_the_accounting_error() {
+        let (root_path, root, child) =
+            planted_manual_root_and_child("manual-abort-root-failure", None, Some("populated 1\n"));
+        let primary = child.cpu_usage_usec().unwrap_err();
+        let primary_text = primary.to_string();
+        let returned = root.abort_after_accounting_error_with(
+            &child,
+            primary,
+            |child| child.abort_and_cleanup_with(1, |path| fs::remove_dir_all(path), |_| {}),
+            |_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "planted caller-restore refusal",
+                ))
+            },
+        );
+
+        assert_eq!(returned.kind(), std::io::ErrorKind::NotFound);
+        assert!(returned.to_string().contains(&primary_text));
+        assert!(returned
+            .to_string()
+            .contains("planted caller-restore refusal"));
+        assert!(!child.path().exists());
+        assert!(root_path.exists());
+        fs::remove_dir_all(root_path).unwrap();
+    }
+
+    #[test]
+    fn rejected_partial_child_construction_removes_its_fresh_directory() {
+        let root_path = temp_scope("manual-partial-construction");
+        let supervisor = root_path.join("manual-cpu-supervisor-fixture");
+        fs::create_dir(&supervisor).unwrap();
+        let root = ManualCpuCgroupRoot {
+            root: root_path.clone(),
+            supervisor,
+            cleaned: AtomicBool::new(false),
+        };
+        let error = root.create_child("missing-interfaces").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        let manual_children: Vec<_> = fs::read_dir(&root_path)
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(MANUAL_CPU_CHILD_PREFIX)
+            })
+            .collect();
+        assert!(manual_children.is_empty());
+        fs::remove_dir_all(root_path).unwrap();
+    }
+
+    #[test]
+    fn successful_removal_is_authoritative_even_if_the_kill_file_disappeared() {
+        let (path, child) = planted_manual_cpu_cgroup(
+            "manual-abort-already-empty",
+            Some("usage_usec 0\n"),
+            Some("populated 0\n"),
+        );
+        fs::remove_file(path.join("cgroup.kill")).unwrap();
+        child
+            .abort_and_cleanup_with(1, |path| fs::remove_dir_all(path), |_| {})
+            .unwrap();
+        assert!(!path.exists());
+        assert_eq!(
+            child.status().unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
     }
 
     #[test]

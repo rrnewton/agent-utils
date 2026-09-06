@@ -17,6 +17,16 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
+fn current_cgroup_path() -> std::path::PathBuf {
+    let text = std::fs::read_to_string("/proc/self/cgroup").unwrap();
+    let relative = text
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .expect("the smoke requires the cgroup-v2 unified hierarchy")
+        .trim_start_matches('/');
+    std::path::Path::new("/sys/fs/cgroup").join(relative)
+}
+
 fn wait_for_status(child: &ManualCpuCgroup, wanted: ManualCpuCgroupStatus) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -99,17 +109,25 @@ fn run_inside_boxed_step() {
     assert_ne!(escape_pid, leader_pid);
     wait_for_status(&escape, ManualCpuCgroupStatus::Populated);
 
-    // The command leader is gone and the remaining process called setsid, but cgroup.kill still
-    // reaches it because session and process-group changes do not change cgroup membership.
-    escape.kill().unwrap();
-    wait_for_status(&escape, ManualCpuCgroupStatus::Empty);
-    let escape_cpu_usec = escape.final_cpu_usage_usec().unwrap();
-    assert!(
-        escape_cpu_usec > 0,
-        "the spinning escapee must consume measured CPU"
+    let accounting_error = std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "planted unreadable aggregate CPU accounting",
     );
-    escape.cleanup().unwrap();
-    root.cleanup().unwrap();
+    let expected_error = accounting_error.to_string();
+    let child_path = escape.path().to_path_buf();
+    let borrowed_parent = root.path().to_path_buf();
+    // The command leader is gone and the remaining process called setsid. The accounting-error
+    // path must retain that error while cgroup.kill reaches the escapee, removes the owned child
+    // and supervisor cgroups, and returns this process to the borrowed parent.
+    let returned = root.abort_after_accounting_error(&escape, accounting_error);
+    assert_eq!(returned.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(returned.to_string(), expected_error);
+    assert!(!child_path.exists());
+    assert_eq!(current_cgroup_path(), borrowed_parent);
+    assert_eq!(
+        root.create_child("after-cleanup").unwrap_err().kind(),
+        std::io::ErrorKind::NotFound
+    );
     std::fs::remove_dir_all(scratch).unwrap();
 }
 
