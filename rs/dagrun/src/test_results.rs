@@ -8,9 +8,93 @@ use serde_json::Map;
 use serde_json::Value;
 
 /// Current structured-result schema for this release line.
-pub const CURRENT_SCHEMA: u64 = 2;
+pub const CURRENT_SCHEMA: u64 = 3;
 /// Schema 2 remains readable while result producers migrate atomically.
 pub const RETAINED_RESULTS_SCHEMA: u64 = 2;
+
+/// Classified terminal cause for one test-runner attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TestAttemptOutcome {
+    /// Attempt exited successfully.
+    Passed,
+    /// Attempt exited unsuccessfully without a timeout or external cancellation.
+    Failed,
+    /// Attempt exceeded its per-attempt CPU-time bound.
+    CpuTimeout,
+    /// Attempt exceeded its separate wall-clock backstop.
+    WallTimeout,
+    /// Attempt was stopped by an external signal.
+    Cancelled,
+    /// Attempt could not produce trustworthy execution or accounting evidence.
+    InfrastructureError,
+}
+
+impl TestAttemptOutcome {
+    fn value(self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+            Self::CpuTimeout => "cpu_timeout",
+            Self::WallTimeout => "wall_timeout",
+            Self::Cancelled => "cancelled",
+            Self::InfrastructureError => "infrastructure_error",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "passed" => Some(Self::Passed),
+            "failed" => Some(Self::Failed),
+            "cpu_timeout" => Some(Self::CpuTimeout),
+            "wall_timeout" => Some(Self::WallTimeout),
+            "cancelled" => Some(Self::Cancelled),
+            "infrastructure_error" => Some(Self::InfrastructureError),
+            _ => None,
+        }
+    }
+}
+
+/// One classified attempt retained in the scheduler-consumed result file.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TestAttemptResult {
+    /// One-based attempt number within the named test.
+    pub attempt: u64,
+    /// Machine-readable terminal cause.
+    pub outcome: TestAttemptOutcome,
+    /// Required human-readable cause for non-passing attempts; absent for passes.
+    pub detail: Option<String>,
+}
+
+impl TestAttemptResult {
+    /// Construct and validate one classified attempt.
+    pub fn new(
+        attempt: u64,
+        outcome: TestAttemptOutcome,
+        detail: Option<String>,
+    ) -> Result<Self, String> {
+        if attempt == 0 {
+            return Err("structured-test-results-attempt must be positive".into());
+        }
+        match (outcome, detail.as_deref()) {
+            (TestAttemptOutcome::Passed, None) => {}
+            (TestAttemptOutcome::Passed, Some(_)) => {
+                return Err("structured-test-results passed attempt must not carry detail".into());
+            }
+            (_, Some(detail)) if !detail.is_empty() && detail.trim() == detail => {}
+            _ => {
+                return Err(
+                    "structured-test-results non-passing attempt requires nonempty trimmed detail"
+                        .into(),
+                );
+            }
+        }
+        Ok(Self {
+            attempt,
+            outcome,
+            detail,
+        })
+    }
+}
 
 /// Terminal result of one named test, including how many attempts the test runner made.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -21,6 +105,8 @@ pub struct TestResult {
     pub passed: bool,
     /// Number of attempts made by the test runner; always at least one.
     pub attempts: u64,
+    /// Per-attempt classified causes. `None` is retained schema 2.
+    pub attempt_results: Option<Vec<TestAttemptResult>>,
 }
 
 impl TestResult {
@@ -36,8 +122,123 @@ impl TestResult {
             id,
             passed,
             attempts,
+            attempt_results: None,
         })
     }
+
+    /// Attach complete classified attempt evidence for the current schema.
+    pub fn with_attempt_results(
+        id: String,
+        passed: bool,
+        attempts: Vec<TestAttemptResult>,
+    ) -> Result<Self, String> {
+        let attempt_count = u64::try_from(attempts.len())
+            .map_err(|_| "structured-test-results attempt count does not fit u64".to_string())?;
+        let result = Self {
+            id,
+            passed,
+            attempts: attempt_count,
+            attempt_results: Some(attempts),
+        };
+        validate_result(&result, true)?;
+        Ok(result)
+    }
+}
+
+fn parse_result_row(
+    row: &Map<String, Value>,
+    index: usize,
+    current: bool,
+) -> Result<TestResult, String> {
+    let expected = if current {
+        &["id", "result", "attempts", "attempt_results"][..]
+    } else {
+        &["id", "result", "attempts"][..]
+    };
+    exact_fields(row, expected)?;
+    let id = row
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("structured-test-results-results[{index}].id must be a string"))?
+        .to_string();
+    let passed = match row.get("result").and_then(Value::as_str) {
+        Some("pass") => true,
+        Some("fail") => false,
+        Some(value) => {
+            return Err(format!(
+                "structured-test-results-results[{index}].result has unknown value {value:?}"
+            ));
+        }
+        None => {
+            return Err(format!(
+                "structured-test-results-results[{index}].result must be a string"
+            ));
+        }
+    };
+    let attempts = row.get("attempts").and_then(Value::as_u64).ok_or_else(|| {
+        format!("structured-test-results-results[{index}].attempts must be an unsigned integer")
+    })?;
+    if !current {
+        return TestResult::new(id, passed, attempts);
+    }
+    let Some(attempt_rows) = (match row.get("attempt_results") {
+        Some(Value::Null) => None,
+        Some(Value::Array(rows)) => Some(rows),
+        _ => {
+            return Err(format!(
+                "structured-test-results-results[{index}].attempt_results must be an array or null"
+            ));
+        }
+    }) else {
+        return TestResult::new(id, passed, attempts);
+    };
+    let mut attempt_results = Vec::with_capacity(attempt_rows.len());
+    for (attempt_index, attempt) in attempt_rows.iter().enumerate() {
+        let attempt = attempt.as_object().ok_or_else(|| {
+            format!(
+                "structured-test-results-results[{index}].attempt_results[{attempt_index}] must be an object"
+            )
+        })?;
+        exact_fields(attempt, &["attempt", "outcome", "detail"])?;
+        let number = required_u64(attempt, "attempt")?;
+        let value = attempt
+            .get("outcome")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "structured-test-results-results[{index}].attempt_results[{attempt_index}].outcome must be a string"
+                )
+            })?;
+        let outcome = TestAttemptOutcome::parse(value).ok_or_else(|| {
+            format!(
+                "structured-test-results-results[{index}].attempt_results[{attempt_index}].outcome has unknown value {value:?}"
+            )
+        })?;
+        let detail = match attempt.get("detail") {
+            Some(Value::Null) => None,
+            Some(Value::String(value)) => Some(value.clone()),
+            _ => {
+                return Err(format!(
+                    "structured-test-results-results[{index}].attempt_results[{attempt_index}].detail must be a string or null"
+                ));
+            }
+        };
+        attempt_results.push(
+            TestAttemptResult::new(number, outcome, detail).map_err(|error| {
+                format!(
+                "structured-test-results-results[{index}].attempt_results[{attempt_index}]: {error}"
+            )
+            })?,
+        );
+    }
+    let result = TestResult {
+        id,
+        passed,
+        attempts,
+        attempt_results: Some(attempt_results),
+    };
+    validate_result(&result, false)?;
+    Ok(result)
 }
 
 /// Counts and terminal per-test results captured from one controlled test-runner step.
@@ -69,7 +270,7 @@ impl TestResults {
         })
     }
 
-    /// Read retained schema 1 counts or the complete current schema.
+    /// Read retained schema 1/2 data or the complete current schema.
     pub fn from_json_slice(bytes: &[u8]) -> Result<Self, String> {
         let value: Value = serde_json::from_slice(bytes)
             .map_err(|error| format!("structured-test-results-json: {error}"))?;
@@ -88,7 +289,7 @@ impl TestResults {
                     results: None,
                 })
             }
-            CURRENT_SCHEMA => {
+            2 | CURRENT_SCHEMA => {
                 exact_fields(
                     object,
                     &["schema", "executed_tests", "filtered_tests", "results"],
@@ -104,36 +305,11 @@ impl TestResults {
                     let row = row.as_object().ok_or_else(|| {
                         format!("structured-test-results-results[{index}] must be an object")
                     })?;
-                    exact_fields(row, &["id", "result", "attempts"])?;
-                    let id = row
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| {
-                            format!("structured-test-results-results[{index}].id must be a string")
-                        })?
-                        .to_string();
-                    let passed = match row.get("result").and_then(Value::as_str) {
-                        Some("pass") => true,
-                        Some("fail") => false,
-                        Some(value) => {
-                            return Err(format!(
-                                "structured-test-results-results[{index}].result has unknown value {value:?}"
-                            ));
-                        }
-                        None => {
-                            return Err(format!(
-                                "structured-test-results-results[{index}].result must be a string"
-                            ));
-                        }
-                    };
-                    let attempts = row.get("attempts").and_then(Value::as_u64).ok_or_else(|| {
-                        format!(
-                            "structured-test-results-results[{index}].attempts must be an unsigned integer"
-                        )
-                    })?;
-                    results.push(TestResult::new(id, passed, attempts).map_err(|error| {
-                        format!("structured-test-results-results[{index}]: {error}")
-                    })?);
+                    results.push(
+                        parse_result_row(row, index, schema == CURRENT_SCHEMA).map_err(
+                            |error| format!("structured-test-results-results[{index}]: {error}"),
+                        )?,
+                    );
                 }
                 validate_results(executed_tests, &results)?;
                 Ok(Self {
@@ -153,9 +329,9 @@ impl TestResults {
         bytes: &[u8],
         declared_schema: u64,
     ) -> Result<Self, String> {
-        if declared_schema != CURRENT_SCHEMA {
+        if declared_schema != RETAINED_RESULTS_SCHEMA && declared_schema != CURRENT_SCHEMA {
             return Err(format!(
-                "structured-test-results declaration has unsupported schema {declared_schema}; expected current schema {CURRENT_SCHEMA}"
+                "structured-test-results declaration has unsupported schema {declared_schema}; expected retained schema {RETAINED_RESULTS_SCHEMA} or current schema {CURRENT_SCHEMA}"
             ));
         }
         let value: Value = serde_json::from_slice(bytes)
@@ -181,14 +357,21 @@ impl TestResults {
         validate_results(self.executed_tests, results)?;
         let rows = results
             .iter()
-            .map(|result| {
-                serde_json::json!({
+            .map(|result| -> Result<Value, String> {
+                validate_result(result, false)?;
+                let attempts = result.attempt_results.as_ref();
+                Ok(serde_json::json!({
                     "id": result.id,
                     "result": if result.passed { "pass" } else { "fail" },
                     "attempts": result.attempts,
-                })
+                    "attempt_results": attempts.map(|attempts| attempts.iter().map(|attempt| serde_json::json!({
+                        "attempt": attempt.attempt,
+                        "outcome": attempt.outcome.value(),
+                        "detail": attempt.detail,
+                    })).collect::<Vec<_>>()),
+                }))
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()?;
         serde_json::to_vec(&serde_json::json!({
             "schema": CURRENT_SCHEMA,
             "executed_tests": self.executed_tests,
@@ -251,13 +434,54 @@ fn validate_results(executed_tests: u64, results: &[TestResult]) -> Result<(), S
     }
     let mut ids = BTreeSet::new();
     for result in results {
-        TestResult::new(result.id.clone(), result.passed, result.attempts)?;
+        validate_result(result, false)?;
         if !ids.insert(result.id.as_str()) {
             return Err(format!(
                 "structured-test-results-id is duplicated: {:?}",
                 result.id
             ));
         }
+    }
+
+    Ok(())
+}
+
+fn validate_result(result: &TestResult, require_attempt_results: bool) -> Result<(), String> {
+    TestResult::new(result.id.clone(), result.passed, result.attempts)?;
+    let Some(attempts) = result.attempt_results.as_ref() else {
+        if require_attempt_results {
+            return Err("structured-test-results current row lacks attempt_results".into());
+        }
+        return Ok(());
+    };
+    let attempt_count = u64::try_from(attempts.len())
+        .map_err(|_| "structured-test-results attempt count does not fit u64".to_string())?;
+    if attempt_count != result.attempts {
+        return Err(format!(
+            "structured-test-results has {attempt_count} attempt result(s), expected {}",
+            result.attempts
+        ));
+    }
+    for (index, attempt) in attempts.iter().enumerate() {
+        let expected = u64::try_from(index + 1)
+            .map_err(|_| "structured-test-results attempt index does not fit u64".to_string())?;
+        TestAttemptResult::new(attempt.attempt, attempt.outcome, attempt.detail.clone())?;
+        if attempt.attempt != expected {
+            return Err(format!(
+                "structured-test-results attempt sequence expected {expected}, found {}",
+                attempt.attempt
+            ));
+        }
+    }
+    let terminal_passed = attempts
+        .last()
+        .is_some_and(|attempt| attempt.outcome == TestAttemptOutcome::Passed);
+    if result.passed != terminal_passed {
+        return Err(format!(
+            "structured-test-results terminal pass {} disagrees with final attempt outcome {:?}",
+            result.passed,
+            attempts.last().map(|attempt| attempt.outcome)
+        ));
     }
     Ok(())
 }
@@ -272,9 +496,37 @@ mod tests {
             3,
             7,
             vec![
-                TestResult::new("suite$passes".into(), true, 1).unwrap(),
-                TestResult::new("suite$recovers".into(), true, 2).unwrap(),
-                TestResult::new("suite$fails".into(), false, 1).unwrap(),
+                TestResult::with_attempt_results(
+                    "suite$passes".into(),
+                    true,
+                    vec![TestAttemptResult::new(1, TestAttemptOutcome::Passed, None).unwrap()],
+                )
+                .unwrap(),
+                TestResult::with_attempt_results(
+                    "suite$recovers".into(),
+                    true,
+                    vec![
+                        TestAttemptResult::new(
+                            1,
+                            TestAttemptOutcome::CpuTimeout,
+                            Some("cpu 22s".into()),
+                        )
+                        .unwrap(),
+                        TestAttemptResult::new(2, TestAttemptOutcome::Passed, None).unwrap(),
+                    ],
+                )
+                .unwrap(),
+                TestResult::with_attempt_results(
+                    "suite$fails".into(),
+                    false,
+                    vec![TestAttemptResult::new(
+                        1,
+                        TestAttemptOutcome::Failed,
+                        Some("exit 7".into()),
+                    )
+                    .unwrap()],
+                )
+                .unwrap(),
             ],
         )
         .unwrap();
@@ -296,25 +548,29 @@ mod tests {
 
     #[test]
     fn malformed_current_results_fail_by_field_name() {
-        let missing = br#"{"schema":2,"executed_tests":1,"filtered_tests":0,"results":[{"id":"suite$case","result":"pass"}]}"#;
+        let missing = br#"{"schema":3,"executed_tests":1,"filtered_tests":0,"results":[{"id":"suite$case","result":"pass","attempts":1}]}"#;
         assert!(TestResults::from_json_slice(missing)
             .unwrap_err()
             .contains("structured-test-results-fields"));
-        let unknown = br#"{"schema":2,"executed_tests":1,"filtered_tests":0,"results":[{"id":"suite$case","result":"maybe","attempts":1}]}"#;
+        let unknown = br#"{"schema":3,"executed_tests":1,"filtered_tests":0,"results":[{"id":"suite$case","result":"maybe","attempts":1,"attempt_results":[]}]}"#;
         assert!(TestResults::from_json_slice(unknown)
             .unwrap_err()
             .contains(".result has unknown value"));
-        let incomplete = br#"{"schema":2,"executed_tests":2,"filtered_tests":0,"results":[{"id":"suite$case","result":"pass","attempts":1}]}"#;
+        let incomplete = br#"{"schema":3,"executed_tests":2,"filtered_tests":0,"results":[{"id":"suite$case","result":"pass","attempts":1,"attempt_results":[{"attempt":1,"outcome":"passed","detail":null}]}]}"#;
         assert!(TestResults::from_json_slice(incomplete)
             .unwrap_err()
             .contains("1 terminal row(s), expected exactly 2 executed test(s)"));
-        let duplicate = br#"{"schema":2,"executed_tests":2,"filtered_tests":0,"results":[{"id":"suite$case","result":"pass","attempts":1},{"id":"suite$case","result":"fail","attempts":1}]}"#;
+        let duplicate = br#"{"schema":3,"executed_tests":2,"filtered_tests":0,"results":[{"id":"suite$case","result":"pass","attempts":1,"attempt_results":[{"attempt":1,"outcome":"passed","detail":null}]},{"id":"suite$case","result":"fail","attempts":1,"attempt_results":[{"attempt":1,"outcome":"failed","detail":"exit 1"}]}]}"#;
         assert!(TestResults::from_json_slice(duplicate)
             .unwrap_err()
             .contains("structured-test-results-id is duplicated"));
-        let extra = br#"{"schema":2,"executed_tests":1,"filtered_tests":0,"results":[{"id":"suite$one","result":"pass","attempts":1},{"id":"suite$two","result":"pass","attempts":1}]}"#;
+        let extra = br#"{"schema":3,"executed_tests":1,"filtered_tests":0,"results":[{"id":"suite$one","result":"pass","attempts":1,"attempt_results":[{"attempt":1,"outcome":"passed","detail":null}]},{"id":"suite$two","result":"pass","attempts":1,"attempt_results":[{"attempt":1,"outcome":"passed","detail":null}]}]}"#;
         assert!(TestResults::from_json_slice(extra)
             .unwrap_err()
             .contains("2 terminal row(s), expected exactly 1 executed test(s)"));
+        let malformed = br#"{"schema":3,"executed_tests":1,"filtered_tests":0,"results":[{"id":"suite$case","result":"fail","attempts":1,"attempt_results":[{"attempt":1,"outcome":"cpu_timeout","detail":null}]}]}"#;
+        assert!(TestResults::from_json_slice(malformed)
+            .unwrap_err()
+            .contains("requires nonempty trimmed detail"));
     }
 }
