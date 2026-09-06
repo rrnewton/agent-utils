@@ -18,10 +18,14 @@
 // interactions (env sentinels, slice/unit names, the supervisor drain) are kept identical.
 
 use std::collections::{BTreeMap, HashSet};
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -48,9 +52,14 @@ const EXPECTED_OUTER_CPU_COUNT_ENV: &str = "DAGRUN_EXPECTED_OUTER_CPU_COUNT";
 const SUPERVISOR: &str = "supervisor";
 /// Per-step child cgroup directory prefix (also the normal-exit backstop scan key).
 const STEP_PREFIX: &str = "step-";
+/// Fresh child cgroups created explicitly by a library caller to contain multiple commands.
+const MANUAL_CPU_CHILD_PREFIX: &str = "manual-cpu-child-";
+/// The caller process is moved here while it delegates the CPU controller to those children.
+const MANUAL_CPU_SUPERVISOR_PREFIX: &str = "manual-cpu-supervisor-";
 const MAX_CGROUP_COMPONENT_BYTES: usize = 255;
 /// Prefix for every log/warning line this module prints.
 const LOG_PREFIX: &str = "[dagrun]";
+static NEXT_MANUAL_CPU_CGROUP: AtomicU64 = AtomicU64::new(0);
 /// Fraction of WHOLE-SYSTEM CPU the shared aggregate slice may use (leaves ~10% headroom).
 const DEFAULT_CPU_BUDGET_FRACTION: f64 = 0.90;
 /// Generous last-resort run boundary, leaving memory for neighbours and the OS.
@@ -350,6 +359,623 @@ fn make_dir(path: &Path) -> std::io::Result<()> {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
         Err(e) => Err(e),
+    }
+}
+
+fn cgroup_io_error(action: &str, path: &Path, error: io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!("{action} {}: {error}", path.display()),
+    )
+}
+
+fn read_cgroup_file(path: &Path) -> io::Result<String> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| cgroup_io_error("cannot open", path, error))?;
+    let mut text = String::new();
+    file.read_to_string(&mut text)
+        .map_err(|error| cgroup_io_error("cannot read", path, error))?;
+    Ok(text)
+}
+
+fn open_cgroup_writer(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| cgroup_io_error("cannot open for writing", path, error))
+}
+
+fn write_cgroup_file(path: &Path, value: &[u8]) -> io::Result<()> {
+    let mut file = open_cgroup_writer(path)?;
+    file.write_all(value)
+        .map_err(|error| cgroup_io_error("cannot write", path, error))
+}
+
+fn parse_required_u64_field(text: &str, field: &str, path: &Path) -> io::Result<u64> {
+    let mut value = None;
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        if fields.next() != Some(field) {
+            continue;
+        }
+        let raw = fields.next().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} has '{field}' without a value", path.display()),
+            )
+        })?;
+        if fields.next().is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} has malformed '{field}' data", path.display()),
+            ));
+        }
+        let parsed = raw.parse::<u64>().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} has non-numeric '{field}' value {raw:?}", path.display()),
+            )
+        })?;
+        if value.replace(parsed).is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} has duplicate '{field}' fields", path.display()),
+            ));
+        }
+    }
+    value.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} has no '{field}' field", path.display()),
+        )
+    })
+}
+
+fn cpu_usage_usec_at(path: &Path) -> io::Result<u64> {
+    let stat = path.join("cpu.stat");
+    parse_required_u64_field(&read_cgroup_file(&stat)?, "usage_usec", &stat)
+}
+
+/// Whether a manually managed child cgroup still contains any process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManualCpuCgroupStatus {
+    /// At least one process remains in the child cgroup or one of its descendants.
+    Populated,
+    /// No process remains in the child cgroup or any descendant.
+    Empty,
+}
+
+fn cgroup_status_at(path: &Path) -> io::Result<ManualCpuCgroupStatus> {
+    let events = path.join("cgroup.events");
+    match parse_required_u64_field(&read_cgroup_file(&events)?, "populated", &events)? {
+        0 => Ok(ManualCpuCgroupStatus::Empty),
+        1 => Ok(ManualCpuCgroupStatus::Populated),
+        value => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} has invalid 'populated' value {value}; expected 0 or 1",
+                events.display()
+            ),
+        )),
+    }
+}
+
+fn read_pid_roster(path: &Path) -> io::Result<Vec<u32>> {
+    let text = read_cgroup_file(path)?;
+    text.split_whitespace()
+        .map(|raw| {
+            raw.parse::<u32>().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{} contains non-numeric pid {raw:?}", path.display()),
+                )
+            })
+        })
+        .collect()
+}
+
+fn create_fresh_cgroup_dir(parent: &Path, name: &str) -> io::Result<PathBuf> {
+    if name.len() > MAX_CGROUP_COMPONENT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "encoded cgroup name is {} bytes; maximum is {MAX_CGROUP_COMPONENT_BYTES}",
+                name.len()
+            ),
+        ));
+    }
+    let path = parent.join(name);
+    fs::create_dir(&path)
+        .map_err(|error| cgroup_io_error("cannot create fresh cgroup", &path, error))?;
+    Ok(path)
+}
+
+fn manual_cpu_child_name(tag: &str) -> io::Result<String> {
+    let encoded = sanitize(tag);
+    let encoded = encoded.strip_prefix(STEP_PREFIX).unwrap_or(&encoded);
+    let sequence = NEXT_MANUAL_CPU_CGROUP.fetch_add(1, Ordering::Relaxed);
+    let name = format!(
+        "{MANUAL_CPU_CHILD_PREFIX}{encoded}-{}-{sequence}",
+        std::process::id()
+    );
+    if name.len() > MAX_CGROUP_COMPONENT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "encoded manual CPU cgroup name is {} bytes; maximum is {MAX_CGROUP_COMPONENT_BYTES}",
+                name.len()
+            ),
+        ));
+    }
+    Ok(name)
+}
+
+fn tokens_contain(text: &str, expected: &str) -> bool {
+    text.split_whitespace().any(|token| token == expected)
+}
+
+/// A delegated CPU-cgroup root owned exclusively by the current process.
+///
+/// Construct this before starting any child process. The constructor refuses unless the caller
+/// is the only process in its current cgroup, then moves the caller into a fresh supervisor
+/// child and enables the CPU controller on the vacated root. That exclusivity check prevents a
+/// library caller from moving or reconfiguring an unrelated process that happens to share its
+/// cgroup. Unlike [`Cgroups::new`], this API is required rather than best-effort: every missing,
+/// malformed, or refused cgroup operation is returned to the caller.
+///
+/// Call [`ManualCpuCgroupRoot::cleanup`] after every child lease has been finalized and cleaned.
+/// Cleanup disables the controller, moves the caller back, and removes the supervisor cgroup.
+#[derive(Debug)]
+pub struct ManualCpuCgroupRoot {
+    root: PathBuf,
+    supervisor: PathBuf,
+    cleaned: AtomicBool,
+}
+
+impl ManualCpuCgroupRoot {
+    /// Prepare the current, exclusively owned delegated cgroup for nested CPU accounting.
+    pub fn current() -> io::Result<Self> {
+        let root = my_cgroup_path().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "cannot resolve the current cgroup-v2 path from /proc/self/cgroup",
+            )
+        })?;
+        if root == Path::new(CGROUP_ROOT) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "the current process is in the cgroup-v2 root, not an exclusively delegated cgroup",
+            ));
+        }
+
+        let controllers_path = root.join("cgroup.controllers");
+        let controllers = read_cgroup_file(&controllers_path)?;
+        if !tokens_contain(&controllers, "cpu") {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("{} does not delegate the cpu controller", root.display()),
+            ));
+        }
+        let subtree_control = root.join("cgroup.subtree_control");
+        if tokens_contain(&read_cgroup_file(&subtree_control)?, "cpu") {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "{} already delegates the cpu controller; refusing to assume ownership",
+                    root.display()
+                ),
+            ));
+        }
+
+        let own_pid = std::process::id();
+        let root_procs = root.join("cgroup.procs");
+        let roster = read_pid_roster(&root_procs)?;
+        if roster.as_slice() != [own_pid] {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "{} is not exclusively owned by pid {own_pid}; observed pids {roster:?}",
+                    root.display()
+                ),
+            ));
+        }
+
+        let supervisor_name = format!("{MANUAL_CPU_SUPERVISOR_PREFIX}{own_pid}");
+        let supervisor = create_fresh_cgroup_dir(&root, &supervisor_name)?;
+        let setup = (|| -> io::Result<()> {
+            write_cgroup_file(
+                &supervisor.join("cgroup.procs"),
+                own_pid.to_string().as_bytes(),
+            )?;
+            if my_cgroup_path().as_deref() != Some(supervisor.as_path()) {
+                return Err(io::Error::other(format!(
+                    "pid {own_pid} did not enter supervisor cgroup {}",
+                    supervisor.display()
+                )));
+            }
+            let remaining = read_pid_roster(&root_procs)?;
+            if !remaining.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "{} gained process(es) {remaining:?} while preparing CPU delegation",
+                        root.display()
+                    ),
+                ));
+            }
+            write_cgroup_file(&subtree_control, b"+cpu")?;
+            if !tokens_contain(&read_cgroup_file(&subtree_control)?, "cpu") {
+                return Err(io::Error::other(format!(
+                    "{} did not report cpu after controller delegation",
+                    subtree_control.display()
+                )));
+            }
+            Ok(())
+        })();
+
+        if let Err(error) = setup {
+            let cpu_was_enabled = read_cgroup_file(&subtree_control)
+                .map(|value| tokens_contain(&value, "cpu"))
+                .unwrap_or(false);
+            let mut rollback_errors = Vec::new();
+            if cpu_was_enabled {
+                if let Err(rollback) = write_cgroup_file(&subtree_control, b"-cpu") {
+                    rollback_errors.push(rollback.to_string());
+                }
+            }
+            if my_cgroup_path().as_deref() == Some(supervisor.as_path()) {
+                if let Err(rollback) =
+                    write_cgroup_file(&root_procs, own_pid.to_string().as_bytes())
+                {
+                    rollback_errors.push(rollback.to_string());
+                }
+            }
+            if let Err(rollback) = fs::remove_dir(&supervisor) {
+                rollback_errors
+                    .push(cgroup_io_error("cannot remove", &supervisor, rollback).to_string());
+            }
+            if rollback_errors.is_empty() {
+                return Err(error);
+            }
+            return Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "{error}; rollback also failed: {}",
+                    rollback_errors.join("; ")
+                ),
+            ));
+        }
+
+        Ok(Self {
+            root,
+            supervisor,
+            cleaned: AtomicBool::new(false),
+        })
+    }
+
+    /// Create one fresh child cgroup whose CPU use starts at a kernel-read zero.
+    pub fn create_child(&self, tag: &str) -> io::Result<ManualCpuCgroup> {
+        if self.cleaned.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "manual CPU cgroup root was already cleaned",
+            ));
+        }
+        let name = manual_cpu_child_name(tag)?;
+        let path = create_fresh_cgroup_dir(&self.root, &name)?;
+        let child = ManualCpuCgroup::at(path.clone());
+        let validation = (|| -> io::Result<()> {
+            let kill = open_cgroup_writer(&path.join("cgroup.kill"))?;
+            drop(kill);
+            if child.status()? != ManualCpuCgroupStatus::Empty {
+                return Err(io::Error::other(format!(
+                    "fresh cgroup {} is already populated",
+                    path.display()
+                )));
+            }
+            let usage = child.cpu_usage_usec()?;
+            if usage != 0 {
+                return Err(io::Error::other(format!(
+                    "fresh cgroup {} already reports {usage} CPU microseconds",
+                    path.display()
+                )));
+            }
+            Ok(())
+        })();
+        if let Err(error) = validation {
+            return match fs::remove_dir(&path) {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "{error}; cannot remove rejected cgroup {}: {cleanup}",
+                        path.display()
+                    ),
+                )),
+            };
+        }
+        Ok(child)
+    }
+
+    /// Restore the caller to its original cgroup after every child lease has been cleaned.
+    pub fn cleanup(&self) -> io::Result<()> {
+        if self.cleaned.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let mut live_children = Vec::new();
+        for entry in fs::read_dir(&self.root)
+            .map_err(|error| cgroup_io_error("cannot enumerate", &self.root, error))?
+        {
+            let entry = entry
+                .map_err(|error| cgroup_io_error("cannot read an entry in", &self.root, error))?;
+            let name = entry.file_name();
+            let name = name.to_str().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{} contains a non-UTF-8 child name", self.root.display()),
+                )
+            })?;
+            if entry.path().is_dir() && name.starts_with(MANUAL_CPU_CHILD_PREFIX) {
+                live_children.push(name.to_string());
+            }
+        }
+        if !live_children.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "cannot clean manual CPU cgroup root while child cgroups remain: {}",
+                    live_children.join(", ")
+                ),
+            ));
+        }
+
+        let own_pid = std::process::id();
+        let current = my_cgroup_path().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "cannot resolve current cgroup while cleaning manual CPU root",
+            )
+        })?;
+        let subtree_control = self.root.join("cgroup.subtree_control");
+        if current == self.supervisor {
+            let roster = read_pid_roster(&self.supervisor.join("cgroup.procs"))?;
+            if roster.as_slice() != [own_pid] {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "{} contains pids {roster:?}, not only caller pid {own_pid}",
+                        self.supervisor.display()
+                    ),
+                ));
+            }
+            write_cgroup_file(&subtree_control, b"-cpu")?;
+            if tokens_contain(&read_cgroup_file(&subtree_control)?, "cpu") {
+                return Err(io::Error::other(format!(
+                    "{} still reports cpu after disable",
+                    subtree_control.display()
+                )));
+            }
+            write_cgroup_file(
+                &self.root.join("cgroup.procs"),
+                own_pid.to_string().as_bytes(),
+            )?;
+            let observed = my_cgroup_path().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "cannot verify the caller's cgroup after restoring it",
+                )
+            })?;
+            if observed != self.root {
+                return Err(io::Error::other(format!(
+                    "pid {own_pid} remained in {} after restore",
+                    observed.display()
+                )));
+            }
+        } else if current != self.root {
+            return Err(io::Error::other(format!(
+                "caller moved outside both managed cgroups: current {}, root {}, supervisor {}",
+                current.display(),
+                self.root.display(),
+                self.supervisor.display()
+            )));
+        }
+        if cgroup_status_at(&self.supervisor)? != ManualCpuCgroupStatus::Empty {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "supervisor cgroup {} remains populated",
+                    self.supervisor.display()
+                ),
+            ));
+        }
+        fs::remove_dir(&self.supervisor).map_err(|error| {
+            cgroup_io_error("cannot remove supervisor cgroup", &self.supervisor, error)
+        })?;
+        self.cleaned.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// The delegated cgroup beneath which manual children are created.
+    pub fn path(&self) -> &Path {
+        &self.root
+    }
+}
+
+/// A fresh child cgroup that can account for and hard-kill several direct commands as one unit.
+///
+/// The caller remains responsible for process-group creation, graceful SIGTERM, child waits, and
+/// wall-clock backstops. This type supplies the cgroup-v2 operations that process groups cannot:
+/// a shared CPU counter and a final `cgroup.kill` that reaches `setsid` escapees.
+#[derive(Debug)]
+pub struct ManualCpuCgroup {
+    path: PathBuf,
+    final_usage: AtomicU64,
+    final_usage_read: AtomicBool,
+    cleaned: AtomicBool,
+}
+
+impl ManualCpuCgroup {
+    fn at(path: PathBuf) -> Self {
+        Self {
+            path,
+            final_usage: AtomicU64::new(0),
+            final_usage_read: AtomicBool::new(false),
+            cleaned: AtomicBool::new(false),
+        }
+    }
+
+    /// Arrange for `command` to enter this cgroup in the child, immediately before `exec`.
+    ///
+    /// `cgroup.procs` is opened in the parent. The post-fork hook performs one async-signal-safe
+    /// `write(2)` of the kernel's current-process token and does no path lookup or shell parsing.
+    /// Multiple commands may be attached to the same lease before they are spawned.
+    pub fn attach_command(&self, command: &mut Command) -> io::Result<()> {
+        if self.final_usage_read.load(Ordering::Acquire) || self.cleaned.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot attach a command after final CPU accounting began",
+            ));
+        }
+        let procs_path = self.path.join("cgroup.procs");
+        let procs = open_cgroup_writer(&procs_path)?;
+        // SAFETY: after fork and before exec, the closure invokes only libc::write on a file
+        // descriptor opened above. It performs no allocation, locking, path lookup, or shell
+        // parsing. The owned File keeps the descriptor valid until exec, and O_CLOEXEC closes it
+        // in the executed program. Writing "0" to cgroup.procs means the writing process itself.
+        unsafe {
+            command.pre_exec(move || {
+                let written = libc::write(procs.as_raw_fd(), b"0".as_ptr().cast(), 1);
+                if written == 1 {
+                    Ok(())
+                } else if written < 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    // Avoid formatting or allocation between fork and exec. cgroup.procs accepts
+                    // this one-byte token atomically, so a short successful write is an I/O error.
+                    Err(io::Error::from_raw_os_error(libc::EIO))
+                }
+            });
+        }
+        Ok(())
+    }
+
+    /// Read the exact aggregate CPU consumed by every process in this cgroup, in microseconds.
+    pub fn cpu_usage_usec(&self) -> io::Result<u64> {
+        if self.cleaned.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "manual CPU cgroup was already cleaned",
+            ));
+        }
+        cpu_usage_usec_at(&self.path)
+    }
+
+    /// Read whether any process remains in this cgroup or a descendant.
+    pub fn status(&self) -> io::Result<ManualCpuCgroupStatus> {
+        if self.cleaned.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "manual CPU cgroup was already cleaned",
+            ));
+        }
+        cgroup_status_at(&self.path)
+    }
+
+    /// Hard-kill every remaining process in this cgroup and its descendants.
+    ///
+    /// This is the fallback after the caller's own SIGTERM grace period; this API intentionally
+    /// does not choose or send the graceful signal itself.
+    pub fn kill(&self) -> io::Result<()> {
+        write_cgroup_file(&self.path.join("cgroup.kill"), b"1")
+    }
+
+    /// Read a stable final CPU value after the cgroup becomes empty.
+    ///
+    /// Two equal reads bracketed by empty status checks close the child-exit accounting race. A
+    /// caller must not retain an attached but unspawned `Command` after this point.
+    pub fn final_cpu_usage_usec(&self) -> io::Result<u64> {
+        if self.status()? != ManualCpuCgroupStatus::Empty {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!("cgroup {} is still populated", self.path.display()),
+            ));
+        }
+        let first = self.cpu_usage_usec()?;
+        if self.status()? != ManualCpuCgroupStatus::Empty {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "cgroup {} was repopulated during final read",
+                    self.path.display()
+                ),
+            ));
+        }
+        let second = self.cpu_usage_usec()?;
+        if first != second {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "cgroup {} CPU use changed during final read: {first} -> {second}",
+                    self.path.display()
+                ),
+            ));
+        }
+        self.final_usage.store(second, Ordering::Release);
+        self.final_usage_read.store(true, Ordering::Release);
+        Ok(second)
+    }
+
+    fn cleanup_with<F>(&self, remove: F) -> io::Result<()>
+    where
+        F: FnOnce(&Path) -> io::Result<()>,
+    {
+        if self.cleaned.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if !self.final_usage_read.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "final CPU use must be read before cleaning the cgroup",
+            ));
+        }
+        if self.status()? != ManualCpuCgroupStatus::Empty {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!("cgroup {} is populated during cleanup", self.path.display()),
+            ));
+        }
+        let expected = self.final_usage.load(Ordering::Acquire);
+        let observed = self.cpu_usage_usec()?;
+        if observed != expected {
+            self.final_usage_read.store(false, Ordering::Release);
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "cgroup {} CPU use changed after final read: {expected} -> {observed}",
+                    self.path.display()
+                ),
+            ));
+        }
+        remove(&self.path)?;
+        self.cleaned.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Remove the empty cgroup after a successful [`ManualCpuCgroup::final_cpu_usage_usec`].
+    pub fn cleanup(&self) -> io::Result<()> {
+        self.cleanup_with(|path| {
+            fs::remove_dir(path)
+                .map_err(|error| cgroup_io_error("cannot remove manual CPU cgroup", path, error))
+        })
+    }
+
+    /// Filesystem path used for this fresh cgroup.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 }
 
@@ -2637,6 +3263,173 @@ mod tests {
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    fn planted_manual_cpu_cgroup(
+        name: &str,
+        cpu_stat: Option<&str>,
+        events: Option<&str>,
+    ) -> (PathBuf, ManualCpuCgroup) {
+        let path = temp_scope(name);
+        if let Some(value) = cpu_stat {
+            fs::write(path.join("cpu.stat"), value).unwrap();
+        }
+        if let Some(value) = events {
+            fs::write(path.join("cgroup.events"), value).unwrap();
+        }
+        fs::write(path.join("cgroup.procs"), "").unwrap();
+        fs::write(path.join("cgroup.kill"), "").unwrap();
+        let child = ManualCpuCgroup::at(path.clone());
+        (path, child)
+    }
+
+    #[test]
+    fn manual_cpu_usage_never_invents_zero_for_missing_or_malformed_data() {
+        let (missing, missing_child) =
+            planted_manual_cpu_cgroup("manual-cpu-missing", None, Some("populated 0\n"));
+        assert_eq!(
+            missing_child.cpu_usage_usec().unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        fs::write(missing.join("cpu.stat"), "user_usec 9\n").unwrap();
+        assert_eq!(
+            missing_child.cpu_usage_usec().unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        fs::write(missing.join("cpu.stat"), "usage_usec nope\n").unwrap();
+        assert_eq!(
+            missing_child.cpu_usage_usec().unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        fs::write(missing.join("cpu.stat"), "usage_usec 0\nusage_usec 0\n").unwrap();
+        assert_eq!(
+            missing_child.cpu_usage_usec().unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        fs::write(missing.join("cpu.stat"), "usage_usec 0\nuser_usec 0\n").unwrap();
+        assert_eq!(missing_child.cpu_usage_usec().unwrap(), 0);
+        fs::remove_dir_all(missing).unwrap();
+    }
+
+    #[test]
+    fn manual_cpu_status_requires_one_boolean_populated_field() {
+        let (path, child) =
+            planted_manual_cpu_cgroup("manual-status", Some("usage_usec 0\n"), None);
+        assert_eq!(
+            child.status().unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        fs::write(path.join("cgroup.events"), "frozen 0\n").unwrap();
+        assert_eq!(
+            child.status().unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        fs::write(path.join("cgroup.events"), "populated 2\n").unwrap();
+        assert_eq!(
+            child.status().unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        fs::write(path.join("cgroup.events"), "populated 1\nfrozen 0\n").unwrap();
+        assert_eq!(child.status().unwrap(), ManualCpuCgroupStatus::Populated);
+        fs::write(path.join("cgroup.events"), "populated 0\nfrozen 0\n").unwrap();
+        assert_eq!(child.status().unwrap(), ManualCpuCgroupStatus::Empty);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn manual_cpu_child_directory_must_be_fresh() {
+        let root = temp_scope("manual-fresh");
+        let child = create_fresh_cgroup_dir(&root, "manual-cpu-child-test").unwrap();
+        let error = create_fresh_cgroup_dir(&root, "manual-cpu-child-test").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        fs::remove_dir(child).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn manual_cpu_command_joins_through_the_preopened_pre_exec_fd() {
+        let (path, child) = planted_manual_cpu_cgroup(
+            "manual-pre-exec",
+            Some("usage_usec 0\n"),
+            Some("populated 0\n"),
+        );
+        let mut command = Command::new("/bin/true");
+        child.attach_command(&mut command).unwrap();
+        assert!(command.status().unwrap().success());
+        assert_eq!(fs::read_to_string(path.join("cgroup.procs")).unwrap(), "0");
+
+        fs::remove_file(path.join("cgroup.procs")).unwrap();
+        fs::create_dir(path.join("cgroup.procs")).unwrap();
+        let mut refused = Command::new("/bin/true");
+        assert!(child.attach_command(&mut refused).is_err());
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn manual_cpu_hard_kill_uses_the_cgroup_interface() {
+        let (path, child) =
+            planted_manual_cpu_cgroup("manual-kill", Some("usage_usec 0\n"), Some("populated 1\n"));
+        child.kill().unwrap();
+        assert_eq!(fs::read_to_string(path.join("cgroup.kill")).unwrap(), "1");
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn manual_cpu_cleanup_requires_a_stable_final_read_and_propagates_failure() {
+        let (path, child) = planted_manual_cpu_cgroup(
+            "manual-final",
+            Some("usage_usec 19\nuser_usec 11\n"),
+            Some("populated 0\n"),
+        );
+        let mut remove_called = false;
+        let error = child
+            .cleanup_with(|_| {
+                remove_called = true;
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(!remove_called);
+
+        assert_eq!(child.final_cpu_usage_usec().unwrap(), 19);
+        fs::write(path.join("cpu.stat"), "usage_usec 20\n").unwrap();
+        assert_eq!(
+            child.cleanup_with(|_| Ok(())).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert_eq!(child.final_cpu_usage_usec().unwrap(), 20);
+
+        let planted = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "planted");
+        assert_eq!(
+            child.cleanup_with(|_| Err(planted)).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(child.cpu_usage_usec().unwrap(), 20);
+        child.cleanup_with(|_| Ok(())).unwrap();
+        assert_eq!(
+            child.cpu_usage_usec().unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn manual_cpu_final_read_refuses_a_live_or_disappeared_cgroup() {
+        let (path, child) = planted_manual_cpu_cgroup(
+            "manual-live-final",
+            Some("usage_usec 7\n"),
+            Some("populated 1\n"),
+        );
+        assert_eq!(
+            child.final_cpu_usage_usec().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        fs::remove_file(path.join("cgroup.events")).unwrap();
+        assert_eq!(
+            child.final_cpu_usage_usec().unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
