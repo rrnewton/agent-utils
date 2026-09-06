@@ -5198,6 +5198,129 @@ def _capture_caller_process(pid: int, label: str) -> ProcessIdentity:
     return identity
 
 
+def _pipe_write_holders(fd: int) -> tuple[ProcessIdentity, ...]:
+    """Return exact same-UID processes holding a write end of this anonymous pipe."""
+    try:
+        descriptor = os.fstat(fd)
+        target = os.readlink(f"/proc/self/fd/{fd}")
+    except OSError as exc:
+        raise Refusal(f"cannot inspect host-context removal proof FD {fd}: {exc}") from exc
+    if not stat.S_ISFIFO(descriptor.st_mode) or re.fullmatch(r"pipe:\[[0-9]+\]", target) is None:
+        raise Refusal("host-context removal proof is not an anonymous pipe")
+    holders: dict[int, ProcessIdentity] = {}
+    try:
+        process_directories = tuple(Path("/proc").iterdir())
+    except OSError as exc:
+        raise Refusal(f"cannot enumerate host processes for removal proof: {exc}") from exc
+    for process_directory in process_directories:
+        if not process_directory.name.isdigit():
+            continue
+        try:
+            if process_directory.stat().st_uid != os.geteuid():
+                continue
+            descriptors = tuple((process_directory / "fd").iterdir())
+        except OSError:
+            continue
+        for candidate_fd in descriptors:
+            try:
+                if os.readlink(candidate_fd) != target:
+                    continue
+                flags_line = next(
+                    line
+                    for line in (process_directory / "fdinfo" / candidate_fd.name)
+                    .read_text(encoding="ascii")
+                    .splitlines()
+                    if line.startswith("flags:")
+                )
+                flags = int(flags_line.split()[1], 8)
+            except (OSError, UnicodeError, StopIteration, ValueError):
+                continue
+            if flags & os.O_ACCMODE not in (os.O_WRONLY, os.O_RDWR):
+                continue
+            pid = int(process_directory.name)
+            try:
+                holders[pid] = _read_process_identity(pid)
+            except Refusal:
+                continue
+    return tuple(holders[pid] for pid in sorted(holders))
+
+
+def _capture_remove_handoff_writer(
+    fd: int, coordinator: ProcessIdentity
+) -> ProcessIdentity:
+    for writer in _pipe_write_holders(fd):
+        try:
+            _assert_process_descends_from(writer, coordinator, "removal proof writer")
+        except Refusal:
+            continue
+        return writer
+    raise Refusal(
+        "host-context removal proof has no live writer descended from the coordinator"
+    )
+
+
+def _capture_remove_processes(
+    coordinator_pid: int,
+) -> tuple[ProcessIdentity, ProcessIdentity, ProcessIdentity | None, int | None]:
+    """Capture the durable actor and the process running removal."""
+    runner_raw = os.environ.get("WRKSLOTS_REMOVE_RUNNER_PID")
+    start_raw = os.environ.get("WRKSLOTS_REMOVE_COORDINATOR_START_TICKS")
+    proof_fd_raw = os.environ.get("WRKSLOTS_REMOVE_PROOF_FD")
+    if runner_raw is None and start_raw is None and proof_fd_raw is None:
+        coordinator = _capture_caller_process(coordinator_pid, "coordinator")
+        return coordinator, coordinator, None, None
+    if runner_raw is None or start_raw is None or proof_fd_raw is None:
+        raise Refusal(
+            "host-context removal requires runner PID, coordinator generation, and proof FD"
+        )
+    try:
+        runner_pid = int(runner_raw)
+        expected_start_ticks = int(start_raw)
+        proof_fd = int(proof_fd_raw)
+    except ValueError as exc:
+        raise Refusal(
+            "host-context removal process identities must be decimal integers"
+        ) from exc
+    if runner_pid <= 0 or expected_start_ticks < 0 or proof_fd < 0:
+        raise Refusal("host-context removal process identities are invalid")
+    coordinator = _read_process_identity(coordinator_pid)
+    if coordinator.start_ticks != expected_start_ticks:
+        raise Refusal(
+            f"coordinator PID {coordinator_pid} generation changed before removal"
+        )
+    runner = _capture_caller_process(runner_pid, "removal runner")
+    writer = _capture_remove_handoff_writer(proof_fd, coordinator)
+    return coordinator, runner, writer, proof_fd
+
+
+def _assert_remove_processes(
+    coordinator: ProcessIdentity,
+    runner: ProcessIdentity,
+    writer: ProcessIdentity | None,
+    proof_fd: int | None,
+) -> None:
+    """Recheck both identities after the removal mutation lock is held."""
+    _assert_caller_process(runner, "removal runner")
+    try:
+        current = _read_process_identity(coordinator.pid)
+    except Refusal as exc:
+        raise Refusal(
+            f"coordinator PID {coordinator.pid} exited before the locked removal boundary"
+        ) from exc
+    if current != coordinator:
+        raise Refusal(
+            f"coordinator PID {coordinator.pid} generation changed before the locked "
+            "removal boundary"
+        )
+    if writer is not None:
+        if proof_fd is None or writer not in _pipe_write_holders(proof_fd):
+            raise Refusal(
+                "removal proof writer no longer holds the handoff pipe at the locked "
+                "removal boundary"
+            )
+        _assert_process_descends_from(writer, coordinator, "removal proof writer")
+
+
 def _capture_registration_owner(pid: int) -> ProcessIdentity:
     """Capture an owner now; registration verifies its authority before publication."""
     return _read_process_identity(pid)
@@ -5208,6 +5331,7 @@ def _assert_process_descends_from(
 ) -> None:
     current: int | None = process.pid
     seen: set[int] = set()
+    first = True
     for _ in range(256):
         if current is None or current in seen:
             break
@@ -5216,6 +5340,9 @@ def _assert_process_descends_from(
             candidate = _read_process_identity(current)
         except Refusal:
             candidate = None
+        if first and candidate != process:
+            raise Refusal(f"{label} PID {process.pid} generation changed")
+        first = False
         if candidate == ancestor:
             return
         current = _read_process_parent(current)
@@ -11632,7 +11759,9 @@ def _cmd_remove(
 ) -> int:
     config = _load_config(args.project_root, args.machine)
     _validate_name(args.slot, "slot")
-    coordinator = _capture_caller_process(args.coordinator_pid, "coordinator")
+    coordinator, runner, handoff_writer, proof_fd = _capture_remove_processes(
+        args.coordinator_pid
+    )
     with _mutation_locks(config, args.wait_lock):
         _refuse_partial_state(
             config,
@@ -11654,7 +11783,7 @@ def _cmd_remove(
                 private_cleanup.target.identity,
             )
         _assert_target_record_storage_consistent(config, states, record)
-        _assert_caller_process(coordinator, "coordinator")
+        _assert_remove_processes(coordinator, runner, handoff_writer, proof_fd)
         if args.validate_complete and record.slot_type != "validate":
             raise Refusal(
                 "--validate-complete applies only to a slot created with --slot-type validate. "
@@ -11670,7 +11799,8 @@ def _cmd_remove(
             and record.owner == coordinator
         )
         if live_validate_owner:
-            _assert_caller_process(coordinator, "validate owner")
+            if handoff_writer is None:
+                _assert_caller_process(coordinator, "validate owner")
         else:
             _assert_registered_liveness(config, record)
         if not expired and not args.validate_complete:
@@ -11732,6 +11862,12 @@ def _cmd_remove(
                 "slot": record.slot,
                 "generation": record.generation,
                 "actor": _identity_to_obj(coordinator),
+                "runner": _identity_to_obj(runner),
+                "handoff_writer": (
+                    None
+                    if handoff_writer is None
+                    else _identity_to_obj(handoff_writer)
+                ),
                 "coordinator_authorized": bool(args.coordinator_authorized),
                 "owner_state": owner_state,
                 "registered_liveness": "dead",
@@ -11842,6 +11978,9 @@ def _parse_validate_batch_slot(raw: str) -> tuple[str, int]:
 def _seal_validate_batch_targets(
     config: Config,
     coordinator: ProcessIdentity,
+    runner: ProcessIdentity,
+    handoff_writer: ProcessIdentity | None,
+    proof_fd: int | None,
     requested: Sequence[tuple[str, int]],
     wait_seconds: float,
     retained: list[dict[str, object]],
@@ -11855,7 +11994,7 @@ def _seal_validate_batch_targets(
         states, _archives = _validate_global_state(
             config, require_repository=False
         )
-        _assert_caller_process(coordinator, "coordinator")
+        _assert_remove_processes(coordinator, runner, handoff_writer, proof_fd)
         seal_journal: dict[str, object] = {
             "schema": _VALIDATE_BATCH_SEAL_SCHEMA,
             "kind": "validate-batch-seal",
@@ -11938,7 +12077,9 @@ def _cmd_remove_validate_batch(args: argparse.Namespace) -> int:
     if len({slot for slot, _generation in requested}) != len(requested):
         raise Refusal("remove-validate-batch received the same slot more than once")
     config = _load_config(args.project_root, args.machine)
-    coordinator = _capture_caller_process(args.coordinator_pid, "coordinator")
+    coordinator, runner, handoff_writer, proof_fd = _capture_remove_processes(
+        args.coordinator_pid
+    )
     retained: list[dict[str, object]] = []
     private_targets: dict[str, _PrivateCleanupTarget] = {}
     removed: list[dict[str, object]] = []
@@ -11953,6 +12094,9 @@ def _cmd_remove_validate_batch(args: argparse.Namespace) -> int:
         _seal_validate_batch_targets(
             config,
             coordinator,
+            runner,
+            handoff_writer,
+            proof_fd,
             requested,
             args.wait_lock,
             retained,

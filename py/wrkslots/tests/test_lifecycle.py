@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fnmatch
 import hashlib
 import datetime as dt
@@ -6732,6 +6733,347 @@ def test_later_coordinator_can_complete_reclaim_from_the_record(tmp_path: Path) 
         )
     )
     assert archive["records"][0]["physical_storage"] == "removed"
+
+
+def start_host_context_coordinator() -> tuple[subprocess.Popen[str], int]:
+    read_fd, write_fd = os.pipe()
+    coordinator = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import os,time\n"
+            "while True:\n"
+            " os.write(1, b'x')\n"
+            " time.sleep(0.2)\n",
+        ],
+        text=True,
+        stdout=write_fd,
+        stderr=subprocess.DEVNULL,
+    )
+    os.close(write_fd)
+    return coordinator, read_fd
+
+
+def set_host_context_handoff(
+    monkeypatch: pytest.MonkeyPatch,
+    coordinator: wrkslots.ProcessIdentity,
+    proof_fd: int,
+    *,
+    runner_pid: int | None = None,
+) -> None:
+    monkeypatch.setenv(
+        "WRKSLOTS_REMOVE_RUNNER_PID", str(runner_pid or os.getpid())
+    )
+    monkeypatch.setenv(
+        "WRKSLOTS_REMOVE_COORDINATOR_START_TICKS", str(coordinator.start_ticks)
+    )
+    monkeypatch.setenv("WRKSLOTS_REMOVE_PROOF_FD", str(proof_fd))
+
+
+def test_host_context_runner_preserves_coordinator_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    made = create(project, slot_type="validate", branch=None)
+    assert made.returncode == 0, made.stderr
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+    coordinator, proof_fd = start_host_context_coordinator()
+    try:
+        identity = wrkslots._read_process_identity(coordinator.pid)
+        set_host_context_handoff(monkeypatch, identity, proof_fd)
+
+        removed = wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "remove",
+                "slot01",
+                "--coordinator-pid",
+                str(coordinator.pid),
+                "--expected-generation",
+                "1",
+            ]
+        )
+
+        assert removed == 0
+        events = wrkslots._load_events(wrkslots._load_config(str(project), "testhost"))
+        started = [event for event in events if event["kind"] == "reclaim-started"]
+        assert len(started) == 1
+        payload = started[0]["payload"]
+        assert isinstance(payload, dict)
+        assert payload["actor"] == wrkslots._identity_to_obj(identity)
+        runner = wrkslots._as_mapping(payload["runner"], "test runner")
+        assert runner["pid"] == os.getpid()
+        writer = wrkslots._as_mapping(payload["handoff_writer"], "test writer")
+        assert writer["pid"] == coordinator.pid
+    finally:
+        terminate_process(coordinator)
+        os.close(proof_fd)
+
+
+def test_host_context_runner_rechecks_coordinator_at_locked_removal_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    made = create(project, slot_type="validate", branch=None)
+    assert made.returncode == 0, made.stderr
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+    tree = checkout(project, slot_type="validate")
+    coordinator, proof_fd = start_host_context_coordinator()
+    identity = wrkslots._read_process_identity(coordinator.pid)
+    set_host_context_handoff(monkeypatch, identity, proof_fd)
+    real_mutation_locks = wrkslots._mutation_locks
+
+    @contextlib.contextmanager
+    def terminate_after_lock(
+        config: wrkslots.Config, wait_seconds: float
+    ) -> Iterator[None]:
+        with real_mutation_locks(config, wait_seconds):
+            terminate_process(coordinator)
+            yield
+
+    monkeypatch.setattr(wrkslots, "_mutation_locks", terminate_after_lock)
+
+    removed = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "remove",
+            "slot01",
+            "--coordinator-pid",
+            str(coordinator.pid),
+            "--expected-generation",
+            "1",
+        ]
+    )
+
+    assert removed == 3
+    assert tree.is_dir()
+    assert len(active_slots(project)) == 1
+    events = wrkslots._load_events(wrkslots._load_config(str(project), "testhost"))
+    assert not [event for event in events if event["kind"] == "reclaim-started"]
+    os.close(proof_fd)
+
+
+def test_host_context_runner_rechecks_pipe_writer_at_locked_removal_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    made = create(project, slot_type="validate", branch=None)
+    assert made.returncode == 0, made.stderr
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+    tree = checkout(project, slot_type="validate")
+    proof_writer, proof_fd = start_host_context_coordinator()
+    coordinator = wrkslots._read_process_identity(os.getpid())
+    set_host_context_handoff(monkeypatch, coordinator, proof_fd)
+    real_mutation_locks = wrkslots._mutation_locks
+
+    @contextlib.contextmanager
+    def terminate_writer_after_lock(
+        config: wrkslots.Config, wait_seconds: float
+    ) -> Iterator[None]:
+        with real_mutation_locks(config, wait_seconds):
+            terminate_process(proof_writer)
+            yield
+
+    monkeypatch.setattr(wrkslots, "_mutation_locks", terminate_writer_after_lock)
+    try:
+        removed = wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "remove",
+                "slot01",
+                "--coordinator-pid",
+                str(os.getpid()),
+                "--expected-generation",
+                "1",
+            ]
+        )
+
+        assert removed == 3
+        assert tree.is_dir()
+        assert len(active_slots(project)) == 1
+        events = wrkslots._load_events(
+            wrkslots._load_config(str(project), "testhost")
+        )
+        assert not [event for event in events if event["kind"] == "reclaim-started"]
+    finally:
+        terminate_process(proof_writer)
+        os.close(proof_fd)
+
+
+def test_host_context_runner_requires_complete_identity_handoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("WRKSLOTS_REMOVE_COORDINATOR_START_TICKS", raising=False)
+    monkeypatch.setenv("WRKSLOTS_REMOVE_RUNNER_PID", str(os.getpid()))
+
+    with pytest.raises(wrkslots.Refusal, match="requires runner PID"):
+        wrkslots._capture_remove_processes(os.getpid())
+
+
+def test_host_context_runner_refuses_mismatched_coordinator_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = wrkslots._read_process_identity(os.getpid())
+    monkeypatch.setenv("WRKSLOTS_REMOVE_RUNNER_PID", str(os.getpid()))
+    monkeypatch.setenv(
+        "WRKSLOTS_REMOVE_COORDINATOR_START_TICKS", str(identity.start_ticks + 1)
+    )
+    monkeypatch.setenv("WRKSLOTS_REMOVE_PROOF_FD", "0")
+
+    with pytest.raises(wrkslots.Refusal, match="generation changed"):
+        wrkslots._capture_remove_processes(os.getpid())
+
+
+def test_host_context_runner_must_be_in_invoking_ancestry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sibling = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(120)"],
+        text=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        identity = wrkslots._read_process_identity(os.getpid())
+        monkeypatch.setenv("WRKSLOTS_REMOVE_RUNNER_PID", str(sibling.pid))
+        monkeypatch.setenv(
+            "WRKSLOTS_REMOVE_COORDINATOR_START_TICKS", str(identity.start_ticks)
+        )
+        monkeypatch.setenv("WRKSLOTS_REMOVE_PROOF_FD", "0")
+
+        with pytest.raises(wrkslots.Refusal, match="removal runner PID"):
+            wrkslots._capture_remove_processes(os.getpid())
+    finally:
+        terminate_process(sibling)
+
+
+def test_host_context_runner_validate_batch_preserves_actor_and_runner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    paths = prepare_dead_validate_slots(project, ("batch-host",))
+    stub_validate_batch_censuses(monkeypatch)
+    coordinator, proof_fd = start_host_context_coordinator()
+    try:
+        identity = wrkslots._read_process_identity(coordinator.pid)
+        set_host_context_handoff(monkeypatch, identity, proof_fd)
+
+        removed = wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "remove-validate-batch",
+                "--coordinator-pid",
+                str(coordinator.pid),
+                "--slot",
+                "batch-host=1",
+                "--format",
+                "json",
+            ]
+        )
+
+        assert removed == 0
+        report = json.loads(capsys.readouterr().out)
+        assert report["removed"] == [{"generation": 1, "slot": "batch-host"}]
+        assert not paths["batch-host"].exists()
+        events = wrkslots._load_events(
+            wrkslots._load_config(str(project), "testhost")
+        )
+        started = [event for event in events if event["kind"] == "reclaim-started"]
+        assert len(started) == 1
+        payload = wrkslots._as_mapping(started[0]["payload"], "test payload")
+        assert payload["actor"] == wrkslots._identity_to_obj(identity)
+        runner = wrkslots._as_mapping(payload["runner"], "test runner")
+        assert runner["pid"] == os.getpid()
+    finally:
+        terminate_process(coordinator)
+        os.close(proof_fd)
+
+
+def test_host_context_runner_removes_live_validate_owner_with_pipe_proof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    coordinator, proof_fd = start_host_context_coordinator()
+    try:
+        identity = wrkslots._read_process_identity(coordinator.pid)
+        made = create(project, slot_type="validate", branch=None)
+        assert made.returncode == 0, made.stderr
+        replace_owner(project, identity)
+        set_host_context_handoff(monkeypatch, identity, proof_fd)
+
+        removed = wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "remove",
+                "slot01",
+                "--validate-complete",
+                "--coordinator-pid",
+                str(coordinator.pid),
+                "--expected-generation",
+                "1",
+            ]
+        )
+
+        assert removed == 0
+        assert not checkout(project, slot_type="validate").exists()
+        assert active_slots(project) == []
+    finally:
+        terminate_process(coordinator)
+        os.close(proof_fd)
+
+
+def test_host_context_runner_refuses_live_nonancestor_validate_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    coordinator = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(120)"],
+        text=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    proof_writer, proof_fd = start_host_context_coordinator()
+    try:
+        identity = wrkslots._read_process_identity(coordinator.pid)
+        made = create(project, slot_type="validate", branch=None)
+        assert made.returncode == 0, made.stderr
+        replace_owner(project, identity)
+        set_host_context_handoff(monkeypatch, identity, proof_fd)
+
+        removed = wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "remove",
+                "slot01",
+                "--validate-complete",
+                "--coordinator-pid",
+                str(coordinator.pid),
+                "--expected-generation",
+                "1",
+            ]
+        )
+
+        assert removed == 3
+        assert checkout(project, slot_type="validate").exists()
+        slots = active_slots(project)
+        assert len(slots) == 1
+        slot = wrkslots._as_mapping(slots[0], "test active slot")
+        assert slot["slot"] == "slot01"
+    finally:
+        terminate_process(coordinator)
+        terminate_process(proof_writer)
+        os.close(proof_fd)
 
 
 @pytest.mark.parametrize("liveness", ["alive", "unverifiable"])
