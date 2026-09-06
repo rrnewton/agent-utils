@@ -1052,6 +1052,8 @@ function newPage(store = new Map(), script = SCRIPT) {
     prepareCalls: [],
     /** The lifetime the fake prepare route reports, in the same unit as the real response. */
     speechTicketTtlSeconds: 600,
+    /** Time spent by the fake server before its prepare response reaches the page. */
+    prepareResponseDelayMs: 0,
     /** Lets an expiry test prove playback used the newly prepared URL, not the discarded one. */
     speechTicketSuffix: "",
     /** Make preparing fail, to prove the tap still works by the older, slower route. */
@@ -1247,6 +1249,7 @@ function newPage(store = new Map(), script = SCRIPT) {
     document,
     localStorage,
     Date: FixedDate,
+    performance: { now: () => clockMs },
     window: { AudioContext: function () { return new FakeAudioContext(page); } },
     navigator,
     console,
@@ -1398,6 +1401,7 @@ function newPage(store = new Map(), script = SCRIPT) {
       if (/\/speech\/prepare$/.test(String(path))) {
         const asked = JSON.parse((options && options.body) || "{}");
         page.prepareCalls.push(asked);
+        page.setClock(page.clock() + page.prepareResponseDelayMs);
         if (page.prepareFails) {
           return json(500, { error: "nope", detail: "no" });
         }
@@ -5247,10 +5251,12 @@ test("...so the tap itself fetches NOTHING and plays the prepared URL straight a
   // The whole latency argument in one assertion. A tap used to fetch the audio and wait for the
   // last byte of it; now it hands an already-authorised URL to the player and the browser streams.
   const page = newPage();
+  page.prepareResponseDelayMs = 5_000;
   await signIn(page);
+  const requestedAt = page.clock();
   const rows = await inReadingMode(page, [message({ id: "1000000000000000001" })]);
   const preparedBefore = page.prepareCalls.length;
-  page.setClock(page.clock() + page.speechTicketTtlSeconds * 1000 - 1);
+  page.setClock(requestedAt + page.speechTicketTtlSeconds * 1000 - 1);
 
   await rows[0].dispatch("click", {});
   await page.settle();
@@ -5269,12 +5275,19 @@ test("...so the tap itself fetches NOTHING and plays the prepared URL straight a
   assert.equal(page.players[0].playCount, 1, "nothing was played");
 });
 
-test("an expired prepared URL is refreshed before it is played", async () => {
+test("the prepare response time cannot extend a ticket past its server lifetime", async () => {
   const page = newPage();
+  page.prepareResponseDelayMs = 5_000;
   await signIn(page);
+  const requestedAt = page.clock();
   const rows = await inReadingMode(page, [message({ id: "1000000000000000001" })]);
   const preparedBefore = page.prepareCalls.length;
-  page.setClock(page.clock() + page.speechTicketTtlSeconds * 1000);
+  assert.equal(
+    page.clock(),
+    requestedAt + page.prepareResponseDelayMs,
+    "the fake response did not spend the delay this test needs"
+  );
+  page.setClock(requestedAt + page.speechTicketTtlSeconds * 1000);
   page.speechTicketSuffix = "-refreshed";
 
   await rows[0].dispatch("click", {});

@@ -4237,12 +4237,12 @@ let readingMode = false;
  */
 const preparedSpeech = new Map();
 
-/** How long the server said its tickets last, so they can be refreshed before they lapse. */
+/** The request-start deadline after which a prepared URL is never selected. */
 let preparedUntil = 0;
 
-/** Drop prepared URLs at the same boundary where the server stops accepting their tickets. */
+/** Drop prepared URLs at the earliest point their server tickets might have expired. */
 function discardExpiredPreparedSpeech() {
-  if (preparedSpeech.size === 0 || Date.now() < preparedUntil) {
+  if (preparedSpeech.size === 0 || performance.now() < preparedUntil) {
     return false;
   }
   forgetPreparedSpeech();
@@ -4276,6 +4276,9 @@ async function prepareSpeech() {
   if (ids.length === 0) {
     return;
   }
+  // Tickets can be minted before this request finishes. Counting from here makes server work and
+  // response time shorten, never extend, how long the page can select them.
+  const requestedAt = performance.now();
   let payload = null;
   try {
     payload = await api(
@@ -4292,7 +4295,7 @@ async function prepareSpeech() {
     preparedSpeech.set(String(entry.message_id), entry.url);
   }
   const ttl = (payload && payload.expires_in_seconds) || 0;
-  preparedUntil = Date.now() + ttl * 1000;
+  preparedUntil = requestedAt + ttl * 1000;
 }
 
 /** Forget what was prepared. The pace is baked into a ticket, so changing it invalidates them. */
