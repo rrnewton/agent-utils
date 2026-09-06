@@ -3775,6 +3775,10 @@ fn run_step(ctx: StepCtx) {
                 test_counts.filtered,
             )
         };
+        if let Some(error) = &structured_test_results_error {
+            outcome.reason = format!("STRUCTURED TEST RESULTS REFUSED: {error}");
+            outcome.ok = false;
+        }
         outcome.test_results = test_counts.results;
         if let Some(error) = &structured_test_results_error {
             outcome.ok = false;
@@ -4638,7 +4642,7 @@ mod tests {
         );
         assert_eq!(
             resolved_test_counts(
-                TestResultsMode::Structured(crate::test_results::CURRENT_SCHEMA),
+                TestResultsMode::Structured(crate::test_results::RETAINED_RESULTS_SCHEMA),
                 Some(&path),
                 printed
             )
@@ -4651,6 +4655,28 @@ mod tests {
                     TestResult::new("suite$recovers".into(), true, 2).unwrap(),
                 ]),
             }
+        );
+        std::fs::write(
+            &path,
+            br#"{"schema":3,"executed_tests":5,"filtered_tests":0,"results":[{"id":"suite$ordinary","result":"fail","attempts":1,"attempt_results":[{"attempt":1,"outcome":"failed","detail":"exit 7"}]},{"id":"suite$cpu","result":"fail","attempts":1,"attempt_results":[{"attempt":1,"outcome":"cpu_timeout","detail":"used 22000000us CPU"}]},{"id":"suite$wall","result":"fail","attempts":1,"attempt_results":[{"attempt":1,"outcome":"wall_timeout","detail":"ran 57000ms wall"}]},{"id":"suite$cancelled","result":"fail","attempts":1,"attempt_results":[{"attempt":1,"outcome":"cancelled","detail":"cancelled by signal 2"}]},{"id":"suite$infra","result":"fail","attempts":1,"attempt_results":[{"attempt":1,"outcome":"infrastructure_error","detail":"cpu.stat malformed"}]}]}"#,
+        )
+        .unwrap();
+        let current = resolved_test_counts(Some(crate::test_results::CURRENT_SCHEMA), Some(&path), printed).unwrap();
+        let outcomes = current
+            .results
+            .unwrap()
+            .into_iter()
+            .map(|result| result.attempt_results.unwrap()[0].outcome)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outcomes,
+            vec![
+                crate::test_results::TestAttemptOutcome::Failed,
+                crate::test_results::TestAttemptOutcome::CpuTimeout,
+                crate::test_results::TestAttemptOutcome::WallTimeout,
+                crate::test_results::TestAttemptOutcome::Cancelled,
+                crate::test_results::TestAttemptOutcome::InfrastructureError,
+            ]
         );
         std::fs::remove_file(&path).unwrap();
         assert!(
@@ -4672,6 +4698,12 @@ mod tests {
             },
             "clients that have not opted in retain the compatibility parser"
         );
+        std::fs::write(&path, br#"{"schema":3,"executed_tests":1}"#).unwrap();
+        let error = resolved_test_counts(Some(crate::test_results::CURRENT_SCHEMA), Some(&path), printed)
+            .expect_err("a malformed current structured result must refuse");
+        assert!(error.contains("malformed structured test results"));
+        assert!(error.contains("structured-test-results-filtered_tests"));
+        std::fs::remove_file(path).unwrap();
     }
 
     fn run_without_evidence(cfg: &DagConfig) -> RunResult {
