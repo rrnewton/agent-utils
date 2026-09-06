@@ -4240,6 +4240,15 @@ const preparedSpeech = new Map();
 /** How long the server said its tickets last, so they can be refreshed before they lapse. */
 let preparedUntil = 0;
 
+/** Drop prepared URLs at the same boundary where the server stops accepting their tickets. */
+function discardExpiredPreparedSpeech() {
+  if (preparedSpeech.size === 0 || Date.now() < preparedUntil) {
+    return false;
+  }
+  forgetPreparedSpeech();
+  return true;
+}
+
 /**
  * Resolve everything on screen so a tap does not have to.
  *
@@ -4248,6 +4257,7 @@ let preparedUntil = 0;
  * just fetched anyway. It spends NOTHING at the vendor — no audio is generated until a tap.
  */
 async function prepareSpeech() {
+  discardExpiredPreparedSpeech();
   if (!readingMode || currentView !== "discord") {
     return;
   }
@@ -4444,6 +4454,14 @@ async function readAloud(ids) {
   pendingRead = id;
   setReadState("working");
   renderChannelRows();
+  // Expired server tickets cannot be a fast path. Refresh them once; if preparation fails, the
+  // existing authenticated request below remains the normal fallback.
+  if (discardExpiredPreparedSpeech()) {
+    await prepareSpeech();
+    if (ticket !== readingTicket) {
+      return;
+    }
+  }
   // THE FAST PATH, and the whole point of preparing: every part already has a URL that streams, so
   // there is nothing to fetch and nothing to wait for. The player is handed the URL and the browser
   // starts playing against a response the server is still writing.

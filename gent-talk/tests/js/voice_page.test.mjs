@@ -1050,6 +1050,10 @@ function newPage(store = new Map(), script = SCRIPT) {
     speakCalls: [],
     /** `#read-aloud-latency`: every prepare request, so "ahead of the tap" is testable. */
     prepareCalls: [],
+    /** The lifetime the fake prepare route reports, in the same unit as the real response. */
+    speechTicketTtlSeconds: 600,
+    /** Lets an expiry test prove playback used the newly prepared URL, not the discarded one. */
+    speechTicketSuffix: "",
     /** Make preparing fail, to prove the tap still works by the older, slower route. */
     prepareFails: false,
     /** The full path of each read, so a test can see the pace that travelled with it. */
@@ -1400,9 +1404,9 @@ function newPage(store = new Map(), script = SCRIPT) {
         return json(200, {
           prepared: (asked.ids || []).map((id) => ({
             message_id: id,
-            url: `/api/v1/speech/ticket-for-${id}`,
+            url: `/api/v1/speech/ticket-for-${id}${page.speechTicketSuffix}`,
           })),
-          expires_in_seconds: 600,
+          expires_in_seconds: page.speechTicketTtlSeconds,
         });
       }
       // Read-aloud. Bytes rather than JSON, and RECORDED, so a test can prove which message was
@@ -5246,6 +5250,7 @@ test("...so the tap itself fetches NOTHING and plays the prepared URL straight a
   await signIn(page);
   const rows = await inReadingMode(page, [message({ id: "1000000000000000001" })]);
   const preparedBefore = page.prepareCalls.length;
+  page.setClock(page.clock() + page.speechTicketTtlSeconds * 1000 - 1);
 
   await rows[0].dispatch("click", {});
   await page.settle();
@@ -5262,6 +5267,60 @@ test("...so the tap itself fetches NOTHING and plays the prepared URL straight a
     "the player was not handed the prepared URL"
   );
   assert.equal(page.players[0].playCount, 1, "nothing was played");
+});
+
+test("an expired prepared URL is refreshed before it is played", async () => {
+  const page = newPage();
+  await signIn(page);
+  const rows = await inReadingMode(page, [message({ id: "1000000000000000001" })]);
+  const preparedBefore = page.prepareCalls.length;
+  page.setClock(page.clock() + page.speechTicketTtlSeconds * 1000);
+  page.speechTicketSuffix = "-refreshed";
+
+  await rows[0].dispatch("click", {});
+  await page.settle();
+
+  assert.equal(
+    page.prepareCalls.length,
+    preparedBefore + 1,
+    "the expired prepared URL was reused instead of refreshed"
+  );
+  assert.deepEqual(
+    page.prepareCalls[preparedBefore].ids,
+    ["1000000000000000001"],
+    "the refresh did not prepare the message being read"
+  );
+  assert.deepEqual(page.speakCalls, [], "a successful refresh fell back to the slower route");
+  assert.equal(page.players[0].playCount, 1, "the refreshed URL was not played");
+  assert.equal(
+    page.players[0].url,
+    "/api/v1/speech/ticket-for-1000000000000000001-refreshed",
+    "the discarded prepared URL was played after its replacement arrived"
+  );
+});
+
+test("an expired prepared URL falls back when refresh fails", async () => {
+  const page = newPage();
+  await signIn(page);
+  const rows = await inReadingMode(page, [message({ id: "1000000000000000001" })]);
+  const preparedBefore = page.prepareCalls.length;
+  page.prepareFails = true;
+  page.setClock(page.clock() + page.speechTicketTtlSeconds * 1000);
+
+  await rows[0].dispatch("click", {});
+  await page.settle();
+
+  assert.equal(
+    page.prepareCalls.length,
+    preparedBefore + 1,
+    "the expired prepared URL was not refreshed"
+  );
+  assert.deepEqual(
+    page.speakCalls,
+    ["1000000000000000001"],
+    "a failed refresh reused the stale URL instead of falling back"
+  );
+  assert.equal(page.players[0].playCount, 1, "the fallback audio was not played");
 });
 
 test("...and a message that could not be prepared still reads, by the older slower route", async () => {
