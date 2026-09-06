@@ -227,7 +227,7 @@ def test_structured_result_manifest_roundtrips_with_legacy_cell_selector() -> No
     doc = """{"steps":[{"group":"test","job":"counts","cmd":"true",
         "result_manifests":[
           {"lane":"portable","category":"applications"},
-          {"kind":"structured-test-results","schema":2,
+          {"kind":"structured-test-results","schema":3,
            "path_env":"DAGRUN_TEST_COUNTS_PATH","owner":"test.counts"}
         ]}]}"""
     cfg = dag_from_json(doc)
@@ -245,7 +245,7 @@ def test_structured_result_manifest_roundtrips_with_legacy_cell_selector() -> No
     }
     assert encoded_declarations[1] == {
         "kind": "structured-test-results",
-        "schema": 2,
+        "schema": 3,
         "path_env": "DAGRUN_TEST_COUNTS_PATH",
         "owner": "test.counts",
     }
@@ -257,7 +257,7 @@ def test_structured_result_manifest_roundtrips_with_legacy_cell_selector() -> No
     [
         ({"kind": "future", "schema": 3, "path_env": "DAGRUN_TEST_COUNTS_PATH", "owner": "test.counts"}, "unknown result-manifest kind"),
         ({"kind": "structured-test-results", "schema": "3", "path_env": "DAGRUN_TEST_COUNTS_PATH", "owner": "test.counts"}, "schema: must be an integer"),
-        ({"kind": "structured-test-results", "schema": 3, "path_env": "DAGRUN_TEST_COUNTS_PATH", "owner": "test.counts"}, "got 3"),
+        ({"kind": "structured-test-results", "schema": 1, "path_env": "DAGRUN_TEST_COUNTS_PATH", "owner": "test.counts"}, "got 1"),
         ({"kind": "structured-test-results", "schema": 2, "path_env": "OTHER", "owner": "test.counts"}, "path_env: structured test results require"),
         ({"kind": "structured-test-results", "schema": 2, "path_env": "DAGRUN_TEST_COUNTS_PATH", "owner": ""}, "owner: must be non-empty"),
         ({"kind": "structured-test-results", "schema": 2, "path_env": "DAGRUN_TEST_COUNTS_PATH", "owner": "test.counts", "future": 1}, "unknown field(s) 'future'"),

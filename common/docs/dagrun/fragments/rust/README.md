@@ -53,12 +53,13 @@ There is no process-wide switch that can override the graph's declaration.
 A controlled test framework writes exactly one current JSON object to that path:
 
 ```json
-{"schema":2,"executed_tests":2,"filtered_tests":5,"results":[{"id":"suite$passes","result":"pass","attempts":1},{"id":"suite$recovers","result":"pass","attempts":2}]}
+{"schema":3,"executed_tests":2,"filtered_tests":5,"results":[{"id":"suite$passes","result":"pass","attempts":1,"attempt_results":[{"attempt":1,"outcome":"passed","detail":null}]},{"id":"suite$recovers","result":"pass","attempts":2,"attempt_results":[{"attempt":1,"outcome":"failed","detail":"first attempt exited 1"},{"attempt":2,"outcome":"passed","detail":null}]}]}
 ```
 
-A required result-producing step fails immediately when the file is missing, malformed, or does
-not match its declared schema. Retained schema-1 count-only files remain readable through the
-compatibility parser, but cannot satisfy a schema-2 producer. Printing a line that looks like
+A declared result-producing step fails immediately when the file is missing, malformed, or does
+not match its exact declared schema. Schema-1 count-only files remain readable only through the
+compatibility parser; a schema-2 declaration reads schema 2, while a current schema-3 declaration
+rejects it. Printing a line that looks like
 a libtest summary cannot create receipt evidence in this mode.
 `resource_caps` apply within one runner process by default. To apply the same
 capacities across independent runners, pass `run --resource-caps-path FILE`.

@@ -129,7 +129,10 @@ pub use sweep::{
     machine_topology, parse_cpu_list, parse_target_duration, parse_widths, refine_width_grid,
     stable_topological_order, workload_digest, MachineTopology,
 };
-pub use test_results::{TestAttemptOutcome, TestAttemptResult, TestResult, TestResults, CURRENT_SCHEMA, RETAINED_RESULTS_SCHEMA};
+pub use test_results::{
+    TestAttemptOutcome, TestAttemptResult, TestResult, TestResults, CURRENT_SCHEMA,
+    RETAINED_RESULTS_SCHEMA,
+};
 pub use viz::{to_ascii, to_dot};
 
 /// Command name used in diagnostics and version output.

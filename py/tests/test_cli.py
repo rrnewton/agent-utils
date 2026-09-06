@@ -349,7 +349,7 @@ def test_structured_result_descriptor_lists_but_run_refuses_before_execution(
                         "result_manifests": [
                             {
                                 "kind": "structured-test-results",
-                                "schema": 2,
+                                "schema": 3,
                                 "path_env": "DAGRUN_TEST_COUNTS_PATH",
                                 "owner": "test.counts",
                             }

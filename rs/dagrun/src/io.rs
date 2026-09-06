@@ -1591,7 +1591,7 @@ steps:
             r#"{"description": "d", "steps": [{"group": "g", "job": "j", "desc": "x",
                 "description": "multi\nline", "cmd": "true", "result_manifests": [
                 {"lane":"portable","category":"applications"},
-                {"kind":"structured-test-results","schema":2,
+                {"kind":"structured-test-results","schema":3,
                  "path_env":"DAGRUN_TEST_COUNTS_PATH","owner":"g.j"}]}]}"#,
         )
         .unwrap();
@@ -1712,7 +1712,7 @@ steps:
                  "mode":"run","backend":"kvm"}
              ]},
             {"group":"test","job":"counts","cmd":"true","result_manifests":[
-                {"kind":"structured-test-results","schema":2,
+                {"kind":"structured-test-results","schema":3,
                  "path_env":"DAGRUN_TEST_COUNTS_PATH","owner":"test.counts"}
              ]}
         ]}"#;
@@ -1751,7 +1751,7 @@ steps:
         assert_eq!(
             encoded_steps[4]["result_manifests"][0],
             serde_json::json!({
-                "kind": "structured-test-results", "schema": 2,
+                "kind": "structured-test-results", "schema": 3,
                 "path_env": "DAGRUN_TEST_COUNTS_PATH", "owner": "test.counts"
             })
         );
@@ -1803,8 +1803,8 @@ steps:
                 "schema: must be an integer",
             ),
             (
-                r#"{"kind":"structured-test-results","schema":3,"path_env":"DAGRUN_TEST_COUNTS_PATH","owner":"test.counts"}"#,
-                "got 3",
+                r#"{"kind":"structured-test-results","schema":1,"path_env":"DAGRUN_TEST_COUNTS_PATH","owner":"test.counts"}"#,
+                "got 1",
             ),
             (
                 r#"{"kind":"structured-test-results","schema":2,"path_env":"OTHER","owner":"test.counts"}"#,

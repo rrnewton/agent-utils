@@ -33,7 +33,8 @@ pub enum TestAttemptOutcome {
 }
 
 impl TestAttemptOutcome {
-    fn value(self) -> &'static str {
+    /// Stable schema spelling for this attempt outcome.
+    pub fn value(self) -> &'static str {
         match self {
             Self::Passed => "passed",
             Self::Failed => "failed",
@@ -253,7 +254,7 @@ fn parse_result_row(
 /// Counts and terminal per-test results captured from one controlled test-runner step.
 ///
 /// Schema 1 retained only the two counts. It remains readable with `results == None`,
-/// but only schema 2 is writable and authoritative for individual test results.
+/// schema 2 retained terminal rows without typed attempts; schema 3 is the only current write path.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TestResults {
     /// Tests that executed, according to the controlled runner's aggregate report.
@@ -478,6 +479,12 @@ fn validate_result(result: &TestResult, require_attempt_results: bool) -> Result
         let expected = u64::try_from(index + 1)
             .map_err(|_| "structured-test-results attempt index does not fit u64".to_string())?;
         TestAttemptResult::new(attempt.attempt, attempt.outcome, attempt.detail.clone())?;
+        if attempt.outcome == TestAttemptOutcome::Passed && index + 1 != attempts.len() {
+            return Err(format!(
+                "structured-test-results attempt {} passed before the terminal attempt",
+                attempt.attempt
+            ));
+        }
         if attempt.attempt != expected {
             return Err(format!(
                 "structured-test-results attempt sequence expected {expected}, found {}",
@@ -580,6 +587,10 @@ mod tests {
         assert!(TestResults::from_json_slice(extra)
             .unwrap_err()
             .contains("2 terminal row(s), expected exactly 1 executed test(s)"));
+        let after_pass = br#"{"schema":3,"executed_tests":1,"filtered_tests":0,"results":[{"id":"suite$case","result":"fail","attempts":2,"attempt_results":[{"attempt":1,"outcome":"passed","detail":null},{"attempt":2,"outcome":"failed","detail":"impossible retry"}]}]}"#;
+        assert!(TestResults::from_json_slice(after_pass)
+            .unwrap_err()
+            .contains("passed before the terminal attempt"));
         let malformed = br#"{"schema":3,"executed_tests":1,"filtered_tests":0,"results":[{"id":"suite$case","result":"fail","attempts":1,"attempt_results":[{"attempt":1,"outcome":"cpu_timeout","detail":null}]}]}"#;
         assert!(TestResults::from_json_slice(malformed)
             .unwrap_err()

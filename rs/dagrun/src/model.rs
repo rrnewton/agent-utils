@@ -1758,6 +1758,8 @@ pub struct StepOutcome {
     pub filtered_tests: Option<u64>,
     /// Terminal per-test results from a controlled runner. `None` means they were not recorded.
     pub test_results: Option<Vec<TestResult>>,
+    /// Named refusal from the required structured-result channel.
+    pub test_results_error: Option<String>,
     /// Child process exit code; negative for a Unix signal; `None` if never collected.
     pub returncode: Option<i64>,
     /// Whether this step or one of its descendants hit the step's inner memory limit.
@@ -1795,6 +1797,7 @@ impl StepOutcome {
             executed_tests,
             filtered_tests,
             test_results: None,
+            test_results_error: None,
             returncode,
             oomed: false,
             oom_kills: 0,
@@ -1850,6 +1853,7 @@ impl StepOutcome {
             executed_tests,
             filtered_tests,
             test_results: None,
+            test_results_error: None,
             returncode,
             oomed,
             oom_kills,
@@ -1877,6 +1881,7 @@ impl StepOutcome {
             executed_tests,
             filtered_tests,
             test_results: None,
+            test_results_error: None,
             returncode,
             oomed: false,
             oom_kills: 0,
