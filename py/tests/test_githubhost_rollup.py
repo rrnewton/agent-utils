@@ -38,6 +38,7 @@ def _fake_run_factory(
     retirement_for: frozenset[int] = frozenset(),
     retirement_actor: str = "release-authority",
     retirement_role: str = "observer",
+    retirement_event_author: str | None = "release-authority",
     permission: str = "write",
     permission_login: str = "release-authority",
     fail_permission: bool = False,
@@ -106,9 +107,16 @@ def _fake_run_factory(
                         f"BY {retirement_actor}\n"
                         "RETIRES 123456"
                     )
+                event_author = (
+                    retirement_event_author
+                    if number in retirement_for
+                    else "release-authority"
+                )
                 node = {
                     "id": f"comment-{number}",
-                    "author": {"login": "release-authority"},
+                    "author": (
+                        {"login": event_author} if event_author is not None else None
+                    ),
                     "body": body,
                     "createdAt": "2026-09-04T12:00:00Z",
                     "updatedAt": "2026-09-04T12:00:00Z",
@@ -151,8 +159,9 @@ def _fake_run_factory(
             return _completed(json.dumps(pages))
         if "api" in parts and "/collaborators/" in parts[-1]:
             assert "--paginate" not in parts and "--slurp" not in parts
+            assert retirement_event_author is not None
             assert parts[-1].endswith(
-                f"/collaborators/{retirement_actor}/permission"
+                f"/collaborators/{retirement_event_author}/permission"
             )
             if fail_permission:
                 raise HostCommandError(cmd, 1, "permission unavailable")
@@ -211,6 +220,7 @@ def test_list_open_prs_enriches_rollup_per_pr(monkeypatch: pytest.MonkeyPatch) -
     assert [p.number for p in prs] == [1, 2]  # order follows the light list, not completion order
     assert all(len(p.checks) == 1 for p in prs)  # every PR got its rollup
     assert all(p.review_snapshot is not None for p in prs)
+    assert all(not p.review_evidence_unavailable for p in prs)
     snapshot = prs[0].review_snapshot
     assert snapshot is not None
     assert {event.kind for event in snapshot.events} == {
@@ -219,6 +229,36 @@ def test_list_open_prs_enriches_rollup_per_pr(monkeypatch: pytest.MonkeyPatch) -
         "review-comment",
     }
     assert all(event.head_sha == "" for event in snapshot.events if event.kind != "review")
+@pytest.mark.parametrize(
+    ("stdout", "message"),
+    (
+        ("", "empty stdout"),
+        (json.dumps([{"number": 1}, "not-an-object"]), "entry 1 is not an object"),
+        (
+            json.dumps([{"number": number} for number in range(500)]),
+            "500-item limit",
+        ),
+    ),
+)
+def test_live_list_refuses_when_pr_availability_is_unknown(
+    monkeypatch: pytest.MonkeyPatch, stdout: str, message: str
+) -> None:
+    def list_only(
+        cmd: Sequence[str], cwd: str | None, allowed: tuple[int, ...] = (0,)
+    ) -> subprocess.CompletedProcess[str]:
+        assert "list" in cmd
+        return _completed(stdout)
+
+    monkeypatch.setattr(githubhost, "_run", list_only)
+    with pytest.raises(ValueError, match=message):
+        GitHubHost().list_open_prs("owner/repo", "main")
+
+
+def test_live_list_accepts_an_explicit_empty_array(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(githubhost, "_run", lambda *_args, **_kwargs: _completed("[]"))
+    assert GitHubHost().list_open_prs("owner/repo", "main") == ()
+
+
 
 
 def test_native_reviews_and_issue_comments_include_every_paginated_page(
@@ -270,6 +310,7 @@ def test_incomplete_native_review_pagination_fails_closed(
     by = {pr.number: pr for pr in prs}
     assert by[1].review_snapshot is not None
     assert by[2].review_snapshot is None
+    assert by[2].review_evidence_unavailable
     assert by[2].checks == ()
     assert "#2" in capsys.readouterr().err
 
@@ -282,6 +323,7 @@ def test_list_open_prs_degrades_failed_rollup(
     by = {p.number: p for p in prs}
     assert len(by[1].checks) == 1  # healthy PR still enriched
     assert by[2].checks == ()  # failed rollup degrades to no checks, PR is NOT dropped
+    assert by[2].review_evidence_unavailable
     err = capsys.readouterr().err
     assert "#2" in err and "evidence enrichment failed" in err  # LOUD note, not silent
 
@@ -296,6 +338,7 @@ def test_missing_stable_review_identity_fails_closed(
     by = {pr.number: pr for pr in prs}
     assert by[1].review_snapshot is not None
     assert by[2].review_snapshot is None
+    assert by[2].review_evidence_unavailable
     assert by[2].checks == ()
     assert "#2" in capsys.readouterr().err
 
@@ -312,6 +355,7 @@ def test_missing_stable_inline_identity_fails_closed(
     by = {pr.number: pr for pr in prs}
     assert by[1].review_snapshot is not None
     assert by[2].review_snapshot is None
+    assert by[2].review_evidence_unavailable
     assert by[2].checks == ()
     assert "#2" in capsys.readouterr().err
 
@@ -393,24 +437,32 @@ def test_repository_triage_role_is_authority_despite_read_base_permission() -> N
         "permission_login",
         "fail_permission",
         "retirement_actor",
+        "retirement_event_author",
         "expected_permission_calls",
+        "expected_permission",
+        "expected_note",
     ),
     [
-        ("", "release-authority", False, "release-authority", 1),
-        ("read", "release-authority", False, "release-authority", 1),
-        ("write", "different-actor", False, "release-authority", 1),
-        ("write", "release-authority", True, "release-authority", 1),
-        ("write", "release-authority", False, "different-actor", 0),
+        ("", "release-authority", False, "release-authority", "release-authority", 1, "", True),
+        ("read", "release-authority", False, "release-authority", "release-authority", 1, "", True),
+        ("write", "different-actor", False, "release-authority", "release-authority", 1, "", True),
+        ("write", "release-authority", True, "release-authority", "release-authority", 1, "", True),
+        ("write", "release-authority", False, "different-actor", "release-authority", 1, "write", False),
+        ("write", "devbig014", False, "departed", "devbig014", 1, "write", False),
+        ("write", "release-authority", False, "departed", None, 0, "", False),
     ],
 )
-def test_untrusted_retirement_permission_fails_closed(
+def test_unavailable_retirement_permission_keeps_snapshot_without_authority(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     permission: str,
     permission_login: str,
     fail_permission: bool,
     retirement_actor: str,
+    retirement_event_author: str | None,
     expected_permission_calls: int,
+    expected_permission: str,
+    expected_note: bool,
 ) -> None:
     permission_calls = 0
     fake_run = _fake_run_factory(
@@ -419,6 +471,7 @@ def test_untrusted_retirement_permission_fails_closed(
         permission_login=permission_login,
         fail_permission=fail_permission,
         retirement_actor=retirement_actor,
+        retirement_event_author=retirement_event_author,
         retirement_role="reviewer",
     )
 
@@ -434,10 +487,16 @@ def test_untrusted_retirement_permission_fails_closed(
     prs = GitHubHost().list_open_prs("owner/repo", "main")
     by_number = {pr.number: pr for pr in prs}
     assert by_number[1].review_snapshot is not None
-    assert by_number[2].review_snapshot is None
-    assert by_number[2].checks == ()
+    snapshot = by_number[2].review_snapshot
+    assert snapshot is not None
+    assert len(snapshot.events) == 3
+    retirement = next(event for event in snapshot.events if "RETIRES" in event.body)
+    assert retirement.author == (retirement_event_author or "")
+    assert retirement.retirement_actor_permission == expected_permission
+    assert by_number[2].checks
     assert permission_calls == expected_permission_calls
-    assert "#2" in capsys.readouterr().err
+    has_note = "retirement permission unavailable" in capsys.readouterr().err
+    assert has_note is expected_note
 
 
 def test_production_snapshot_rejects_missing_authority_fields() -> None:
@@ -502,3 +561,11 @@ def test_production_snapshot_rejects_missing_authority_fields() -> None:
                 [malformed] if source is issue else [issue],
                 [malformed] if source is inline else [inline],
             )
+
+    anonymous_review = dict(review)
+    anonymous_review["author"] = None
+    snapshot = githubhost._review_snapshot(
+        view, [anonymous_review], [issue], [inline]
+    )
+    assert snapshot.events[0].author == ""
+    assert review_evidence_digest(snapshot)

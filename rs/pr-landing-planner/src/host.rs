@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use serde_json::{Map, Value};
 
 use crate::classify::parse_rollup;
-use crate::context::{retirement_actor, ALLOWED_RETIREMENT_PERMISSIONS};
+use crate::context::{retirement_record, ALLOWED_RETIREMENT_PERMISSIONS};
 use crate::model::{RawPr, ReviewEvidenceEvent, ReviewEvidenceSnapshot, NATIVE_REVIEW_STATES};
 
 #[derive(Clone, Debug)]
@@ -54,6 +54,7 @@ const LIGHT_FIELDS: [&str; 14] = [
     "labels",
 ];
 const ENRICHMENT_WORKERS: usize = 8;
+const PR_LIST_LIMIT: usize = 500;
 const REVIEWS_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!, $endCursor: String) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
@@ -173,14 +174,14 @@ impl GitHubHost {
         graphql_connection_from_slurp(&output.stdout, number, connection)
     }
 
-    fn retirement_permission(&self, repo: &str, actor: &str) -> Result<String, String> {
+    fn retirement_permission(&self, repo: &str, author: &str) -> Result<String, String> {
         let args = self.net(vec![
             self.gh.clone(),
             "api".into(),
-            format!("repos/{repo}/collaborators/{actor}/permission"),
+            format!("repos/{repo}/collaborators/{author}/permission"),
         ]);
         let output = self.run(&args, None, &[0])?;
-        repository_permission(&output.stdout, actor)
+        repository_permission(&output.stdout, author)
     }
 
     fn bind_retirement_permissions(
@@ -188,29 +189,43 @@ impl GitHubHost {
         repo: &str,
         mut snapshot: ReviewEvidenceSnapshot,
     ) -> Result<ReviewEvidenceSnapshot, String> {
-        let mut actors = BTreeSet::new();
+        let mut authors = BTreeSet::new();
         for event in &snapshot.events {
-            let Some(actor) = retirement_actor(&event.body)? else {
+            let Some(retirement) = retirement_record(&event.body)? else {
                 continue;
             };
-            if !event.author.eq_ignore_ascii_case(&actor) {
-                return Err(
-                    "review evidence retirement actor differs from GitHub event author".to_owned(),
-                );
+            if retirement.head_sha == snapshot.head_sha
+                && event.state == "ACTIVE"
+                && !event.author.is_empty()
+            {
+                authors.insert(event.author.clone());
             }
-            actors.insert(actor);
         }
         let mut permissions = BTreeMap::new();
-        for actor in actors {
-            permissions.insert(actor.clone(), self.retirement_permission(repo, &actor)?);
+        for author in authors {
+            let permission = match self.retirement_permission(repo, &author) {
+                Ok(permission) => permission,
+                Err(error) => {
+                    eprintln!(
+                        "pr-landing-planner: NOTE: retirement permission unavailable for {author}: {error}; retaining the events without retirement authority"
+                    );
+                    String::new()
+                }
+            };
+            permissions.insert(author, permission);
         }
         for event in &mut snapshot.events {
-            if let Some(actor) = retirement_actor(&event.body)? {
-                event.retirement_actor_permission = permissions
-                    .get(&actor)
-                    .cloned()
-                    .ok_or_else(|| format!("no repository permission was read for {actor}"))?;
-            }
+            let Some(retirement) = retirement_record(&event.body)? else {
+                continue;
+            };
+            event.retirement_actor_permission = if retirement.head_sha == snapshot.head_sha
+                && event.state == "ACTIVE"
+                && !event.author.is_empty()
+            {
+                permissions.get(&event.author).cloned().unwrap_or_default()
+            } else {
+                String::new()
+            };
         }
         Ok(snapshot)
     }
@@ -339,7 +354,7 @@ fn json_object() -> Value {
     Value::Object(Map::new())
 }
 
-fn repository_permission(bytes: &[u8], expected_actor: &str) -> Result<String, String> {
+fn repository_permission(bytes: &[u8], expected_author: &str) -> Result<String, String> {
     let value: Value = serde_json::from_slice(bytes)
         .map_err(|error| format!("invalid repository permission JSON: {error}"))?;
     let response = value
@@ -350,9 +365,9 @@ fn repository_permission(bytes: &[u8], expected_actor: &str) -> Result<String, S
         .and_then(Value::as_object)
         .ok_or("repository permission response lacks a user object")?;
     let actual_actor = user.get("login").and_then(Value::as_str).unwrap_or("");
-    if actual_actor.is_empty() || !actual_actor.eq_ignore_ascii_case(expected_actor) {
+    if actual_actor.is_empty() || !actual_actor.eq_ignore_ascii_case(expected_author) {
         return Err(
-            "repository permission response actor differs from retirement actor".to_owned(),
+            "repository permission response actor differs from GitHub event author".to_owned(),
         );
     }
     for field in ["role_name", "permission"] {
@@ -364,7 +379,7 @@ fn repository_permission(bytes: &[u8], expected_actor: &str) -> Result<String, S
             return Ok(candidate);
         }
     }
-    Err("retirement actor lacks current triage-or-higher repository permission".to_owned())
+    Err("GitHub event author lacks current triage-or-higher repository permission".to_owned())
 }
 
 fn string(obj: &Map<String, Value>, key: &str) -> String {
@@ -414,15 +429,21 @@ fn required_string(event: &Map<String, Value>, role: &str, key: &str) -> Result<
 }
 
 fn event_author(event: &Map<String, Value>, role: &str, key: &str) -> Result<String, String> {
-    let author = event
-        .get(key)
-        .and_then(Value::as_object)
-        .ok_or_else(|| format!("{role} lacks an author object"))?;
-    let login = author.get("login").and_then(Value::as_str).unwrap_or("");
-    if login.is_empty() {
-        return Err(format!("{role} lacks a stable author login"));
+    let Some(value) = event.get(key) else {
+        return Ok(String::new());
+    };
+    let Some(author) = value.as_object() else {
+        return if value.is_null() {
+            Ok(String::new())
+        } else {
+            Err(format!("{role} author is not an object or null"))
+        };
+    };
+    match author.get("login") {
+        None | Some(Value::Null) => Ok(String::new()),
+        Some(Value::String(login)) => Ok(login.trim().to_owned()),
+        Some(_) => Err(format!("{role} author login is not a string or null")),
     }
-    Ok(login.to_owned())
 }
 
 fn numeric_identity(event: &Map<String, Value>, role: &str) -> Result<String, String> {
@@ -720,6 +741,70 @@ fn review_snapshot(
         events,
     })
 }
+fn light_pr_entries(bytes: &[u8]) -> Result<Vec<Map<String, Value>>, String> {
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        return Err(
+            "open PR list returned empty stdout; review evidence is unavailable".to_owned(),
+        );
+    }
+    let value: Value = serde_json::from_slice(bytes).map_err(|error| {
+        format!("open PR list returned invalid JSON; review evidence is unavailable: {error}")
+    })?;
+    let entries = value
+        .as_array()
+        .ok_or("open PR list response is not an array; review evidence is unavailable")?;
+    if entries.len() >= PR_LIST_LIMIT {
+        return Err(format!(
+            "open PR list reached the {PR_LIST_LIMIT}-item limit; review evidence may be incomplete"
+        ));
+    }
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            entry.as_object().cloned().ok_or_else(|| {
+                format!(
+                    "open PR list entry {index} is not an object; review evidence is unavailable"
+                )
+            })
+        })
+        .collect()
+}
+
+fn raw_pr_from_list_entry(obj: &Map<String, Value>, enrichment: Option<&HostEnrichment>) -> RawPr {
+    let author = obj
+        .get("author")
+        .and_then(Value::as_object)
+        .and_then(|author| author.get("login"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_owned();
+    RawPr {
+        number: integer(obj, "number"),
+        head_ref: string(obj, "headRefName"),
+        base_ref: string(obj, "baseRefName"),
+        api_head_sha: string(obj, "headRefOid"),
+        title: string(obj, "title"),
+        author,
+        is_draft: obj.get("isDraft").and_then(Value::as_bool).unwrap_or(false),
+        mergeable: string(obj, "mergeable"),
+        // Preserve the independently observed light-list decision. Collection
+        // compares it with the later evidence snapshot instead of silently
+        // replacing a non-empty decision with missing or contradictory data.
+        review_decision: string(obj, "reviewDecision"),
+        review_evidence_unavailable: enrichment.is_none(),
+        created_at: string(obj, "createdAt"),
+        updated_at: string(obj, "updatedAt"),
+        additions: integer(obj, "additions"),
+        deletions: integer(obj, "deletions"),
+        labels: labels(obj.get("labels")),
+        checks: enrichment
+            .map(|value| value.checks.clone())
+            .unwrap_or_default(),
+        review_snapshot: enrichment.map(|value| value.review_snapshot.clone()),
+        mechanism_symbols: Vec::new(),
+    }
+}
 
 impl VcsHost for GitHubHost {
     fn list_open_prs(&mut self, repo: &str, _base: Option<&str>) -> Result<Vec<RawPr>, String> {
@@ -732,64 +817,23 @@ impl VcsHost for GitHubHost {
             "--state".into(),
             "open".into(),
             "--limit".into(),
-            "500".into(),
+            PR_LIST_LIMIT.to_string(),
             "--json".into(),
             LIGHT_FIELDS.join(","),
         ]);
         let output = self.run(&args, None, &[0])?;
-        let value: Value = if String::from_utf8_lossy(&output.stdout).trim().is_empty() {
-            Value::Array(Vec::new())
-        } else {
-            serde_json::from_slice(&output.stdout)
-                .map_err(|error| format!("invalid JSON from gh pr list: {error}"))?
-        };
-        let entries = value
-            .as_array()
-            .ok_or("expected a JSON array from gh pr list")?;
+        let entries = light_pr_entries(&output.stdout)?;
         let numbers = entries
             .iter()
-            .filter_map(Value::as_object)
             .map(|obj| integer(obj, "number"))
             .collect::<Vec<_>>();
         let enrichments = self.fetch_enrichments(repo, &numbers)?;
         let mut prs = Vec::new();
-        for value in entries {
-            let Some(obj) = value.as_object() else {
-                continue;
-            };
-            let number = integer(obj, "number");
-            let enrichment = enrichments.get(&number);
-            let author = obj
-                .get("author")
-                .and_then(Value::as_object)
-                .and_then(|author| author.get("login"))
-                .and_then(Value::as_str)
-                .unwrap_or("unknown")
-                .to_owned();
-            prs.push(RawPr {
-                number,
-                head_ref: string(obj, "headRefName"),
-                base_ref: string(obj, "baseRefName"),
-                api_head_sha: string(obj, "headRefOid"),
-                title: string(obj, "title"),
-                author,
-                is_draft: obj.get("isDraft").and_then(Value::as_bool).unwrap_or(false),
-                mergeable: string(obj, "mergeable"),
-                // Preserve the independently observed light-list decision. Collection
-                // compares it with the later evidence snapshot instead of silently
-                // replacing a non-empty decision with missing or contradictory data.
-                review_decision: string(obj, "reviewDecision"),
-                created_at: string(obj, "createdAt"),
-                updated_at: string(obj, "updatedAt"),
-                additions: integer(obj, "additions"),
-                deletions: integer(obj, "deletions"),
-                labels: labels(obj.get("labels")),
-                checks: enrichment
-                    .map(|value| value.checks.clone())
-                    .unwrap_or_default(),
-                review_snapshot: enrichment.map(|value| value.review_snapshot.clone()),
-                mechanism_symbols: Vec::new(),
-            });
+        for obj in &entries {
+            prs.push(raw_pr_from_list_entry(
+                obj,
+                enrichments.get(&integer(obj, "number")),
+            ));
         }
         Ok(prs)
     }
@@ -915,8 +959,9 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::{
-        graphql_connection_from_slurp, inline_comments_from_slurp, repository_permission,
-        review_snapshot, ISSUE_COMMENTS_QUERY, REVIEWS_QUERY,
+        graphql_connection_from_slurp, inline_comments_from_slurp, light_pr_entries,
+        raw_pr_from_list_entry, repository_permission, review_snapshot, ISSUE_COMMENTS_QUERY,
+        PR_LIST_LIMIT, REVIEWS_QUERY,
     };
     use crate::context::review_evidence_digest;
 
@@ -1001,6 +1046,48 @@ mod tests {
     }
 
     #[test]
+    fn failed_enrichment_is_explicit_in_the_production_list_record() {
+        let value = json!({
+            "number": 42,
+            "headRefName": "feature",
+            "baseRefName": "main",
+            "headRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "title": "title",
+            "author": {"login": "author"},
+            "isDraft": false,
+            "mergeable": "MERGEABLE",
+            "reviewDecision": "APPROVED",
+            "createdAt": "2026-09-05T12:00:00Z",
+            "updatedAt": "2026-09-05T12:00:00Z",
+            "additions": 1,
+            "deletions": 1,
+            "labels": []
+        });
+        let raw = raw_pr_from_list_entry(value.as_object().unwrap(), None);
+        assert!(raw.review_evidence_unavailable);
+        assert!(raw.review_snapshot.is_none());
+        assert!(raw.checks.is_empty());
+        assert_eq!(raw.review_decision, "APPROVED");
+    }
+    #[test]
+    fn production_light_list_refuses_unknown_availability() {
+        assert!(light_pr_entries(b"[]").unwrap().is_empty());
+        assert!(light_pr_entries(b" \t\r\n")
+            .unwrap_err()
+            .contains("empty stdout"));
+
+        let malformed = serde_json::to_vec(&json!([{"number": 1}, "not-an-object"])).unwrap();
+        assert!(light_pr_entries(&malformed)
+            .unwrap_err()
+            .contains("entry 1 is not an object"));
+
+        let capped = serde_json::to_vec(&vec![json!({}); PR_LIST_LIMIT]).unwrap();
+        assert!(light_pr_entries(&capped)
+            .unwrap_err()
+            .contains("500-item limit"));
+    }
+
+    #[test]
     fn incomplete_graphql_connection_fails_closed() {
         let raw = serde_json::to_vec(&json!([{"data":{"repository":{"pullRequest":{
             "headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -1081,7 +1168,7 @@ mod tests {
         .unwrap();
         assert!(repository_permission(&mismatch, "release-authority")
             .unwrap_err()
-            .contains("differs from retirement actor"));
+            .contains("differs from GitHub event author"));
         assert!(repository_permission(b"{}", "release-authority")
             .unwrap_err()
             .contains("user object"));
@@ -1166,6 +1253,15 @@ mod tests {
                 .unwrap_err()
                 .contains("createdAt")
         );
+        let mut anonymous_reviews = reviews.clone();
+        anonymous_reviews[0]
+            .as_object_mut()
+            .unwrap()
+            .insert("author".to_owned(), Value::Null);
+        let anonymous = review_snapshot(obj, &anonymous_reviews, comments, &inline_comments)
+            .expect("missing event author remains visible");
+        assert!(anonymous.events[0].author.is_empty());
+        assert!(review_evidence_digest(&anonymous).is_ok());
 
         let mut bad_inline = inline_comments;
         bad_inline[0].as_object_mut().unwrap().remove("created_at");

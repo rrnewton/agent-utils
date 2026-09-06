@@ -71,6 +71,17 @@ def _required_review_str(
     return value
 
 
+def _optional_review_author(
+    m: Mapping[str, object], key: str, where: str
+) -> str:
+    if key not in m or m[key] is None:
+        return ""
+    value = m[key]
+    if not isinstance(value, str):
+        raise FixtureError(f"{where}: field {key!r} must be a string or null")
+    return value.strip()
+
+
 def _required_nullable_review_str(
     m: Mapping[str, object], key: str, where: str
 ) -> str:
@@ -120,6 +131,15 @@ def _opt_int(
 def _opt_bool(m: Mapping[str, object], key: str, default: bool) -> bool:
     val = m.get(key, default)
     return val if isinstance(val, bool) else default
+
+def _strict_opt_bool(m: Mapping[str, object], key: str, default: bool, where: str) -> bool:
+    if key not in m:
+        return default
+    val = m[key]
+    if not isinstance(val, bool):
+        raise FixtureError(f"{where}: field {key!r} must be a boolean")
+    return val
+
 
 
 def _opt_str_list(m: Mapping[str, object], key: str) -> tuple[str, ...]:
@@ -171,7 +191,7 @@ def _review_snapshot_from(
         identity = _required_review_str(
             event, "identity", event_where, allow_empty=False
         )
-        author = _required_review_str(event, "author", event_where, allow_empty=False)
+        author = _optional_review_author(event, "author", event_where)
         state = _required_review_str(event, "state", event_where, allow_empty=False)
         if kind == "review" and state not in NATIVE_REVIEW_STATES:
             raise FixtureError(f"{event_where}: review has unknown state {state!r}")
@@ -276,6 +296,9 @@ def _fake_pr_from(value: object, where: str, *, default_base: str) -> _FakePr:
         is_draft=_opt_bool(obj, "is_draft", False),
         mergeable=_opt_str(obj, "mergeable", ""),
         review_decision=review_decision,
+        review_evidence_unavailable=_strict_opt_bool(
+            obj, "review_evidence_unavailable", False, where
+        ),
         created_at=_opt_str(obj, "created_at", ""),
         updated_at=_opt_str(obj, "updated_at", ""),
         additions=_opt_int(obj, "additions", 0, where, nonnegative=True),

@@ -24,15 +24,19 @@ fn regex<'a>(slot: &'a OnceLock<Regex>, pattern: &str) -> &'a Regex {
     slot.get_or_init(|| Regex::new(pattern).expect("static review-evidence regex is valid"))
 }
 
-fn prose_lines(body: &str) -> Vec<&str> {
+fn trim_ascii_whitespace(value: &str) -> &str {
+    value.trim_matches(|character: char| character.is_ascii_whitespace())
+}
+
+fn prose_line_indexes(body: &str) -> Vec<usize> {
     static FENCE: OnceLock<Regex> = OnceLock::new();
-    let fence_re = regex(&FENCE, r"^ {0,3}(?P<f>`{3,}|~{3,})\s*(?P<info>.*)$");
-    let mut lines = Vec::new();
+    let fence_re = regex(&FENCE, r"^ {0,3}(?P<f>`{3,}|~{3,})[ \t]*(?P<info>.*)$");
+    let mut indexes = Vec::new();
     let mut fence = String::new();
     let mut indented = false;
     let mut previous_blank = true;
-    for raw in body.split('\n') {
-        let blank = raw.trim().is_empty();
+    for (index, raw) in body.split('\n').enumerate() {
+        let blank = trim_ascii_whitespace(raw).is_empty();
         if !fence.is_empty() {
             if let Some(captures) = fence_re.captures(raw) {
                 let token = captures.name("f").map(|value| value.as_str()).unwrap_or("");
@@ -42,7 +46,7 @@ fn prose_lines(body: &str) -> Vec<&str> {
                     .unwrap_or("");
                 if token.starts_with(&fence[..1])
                     && token.len() >= fence.len()
-                    && info.trim().is_empty()
+                    && trim_ascii_whitespace(info).is_empty()
                 {
                     fence.clear();
                 }
@@ -74,17 +78,25 @@ fn prose_lines(body: &str) -> Vec<&str> {
             previous_blank = false;
             continue;
         }
-        lines.push(raw);
+        indexes.push(index);
         previous_blank = blank;
     }
-    lines
+    indexes
+}
+
+fn prose_lines(body: &str) -> Vec<&str> {
+    let lines = body.split('\n').collect::<Vec<_>>();
+    prose_line_indexes(body)
+        .into_iter()
+        .map(|index| lines[index])
+        .collect()
 }
 
 fn undecorate(line: &str) -> String {
     static BLOCK_PREFIX: OnceLock<Regex> = OnceLock::new();
-    let mut normalized = regex(&BLOCK_PREFIX, r"^(?:#{1,6}\s+|[-+*]\s+)")
-        .replace(line.trim(), "")
-        .trim()
+    let mut normalized = regex(&BLOCK_PREFIX, r"^(?:#{1,6}[ \t]+|[-+*][ \t]+)")
+        .replace(trim_ascii_whitespace(line), "")
+        .trim_matches(|character: char| character.is_ascii_whitespace())
         .to_owned();
     loop {
         let mut changed = false;
@@ -94,7 +106,7 @@ fn undecorate(line: &str) -> String {
                 && normalized.len() > 2 * wrapper.len()
             {
                 normalized = normalized[wrapper.len()..normalized.len() - wrapper.len()]
-                    .trim()
+                    .trim_matches(|character: char| character.is_ascii_whitespace())
                     .to_owned();
                 changed = true;
                 break;
@@ -106,85 +118,137 @@ fn undecorate(line: &str) -> String {
     }
 }
 
-fn disclosure_actor(body: &str) -> Option<String> {
-    static TEAM: OnceLock<Regex> = OnceLock::new();
-    static ACTOR: OnceLock<Regex> = OnceLock::new();
-    static ROLE: OnceLock<Regex> = OnceLock::new();
-    let team = regex(&TEAM, r"(?i)^[a-z0-9]+$");
-    let actor = regex(&ACTOR, r"(?i)^[a-z0-9][a-z0-9-]*$");
-    let role = regex(&ROLE, r"(?i)^role=[a-z0-9][a-z0-9_-]*$");
-    for raw in body.lines() {
-        if raw.trim().is_empty() {
-            continue;
-        }
-        if raw.starts_with("    ") || raw.starts_with('\t') {
-            return None;
-        }
-        let mut rest = raw.trim_start();
-        if rest.starts_with('>') {
-            return None;
-        }
-        while let Some(group) = rest.strip_prefix('[') {
-            let end = group.find(']')?;
-            let fields = group[..end].split(',').map(str::trim).collect::<Vec<_>>();
-            if fields.len() >= 3 && team.is_match(fields[0]) && actor.is_match(fields[1]) {
-                if fields.len() != 5 || fields.iter().any(|field| field.is_empty()) {
-                    return None;
-                }
-                if !role.is_match(fields[4]) {
-                    return None;
-                }
-                return Some(fields[1].to_ascii_lowercase());
-            }
-            rest = group[end + 1..].trim_start_matches([' ', '\t']);
-        }
-        return None;
-    }
-    None
+fn marker_matches(pattern: &Regex, line: &str) -> bool {
+    let normalized = undecorate(line);
+    pattern.find(&normalized).is_some_and(|matched| {
+        matched.start() == 0
+            && (matched.end() == normalized.len()
+                || matches!(normalized.as_bytes()[matched.end()], b' ' | b'\t'))
+    })
 }
 
-/// Actor asserted by one exact objection retirement; malformed authority refuses.
-pub(crate) fn retirement_actor(body: &str) -> Result<Option<String>, String> {
+fn normalized_review_body(body: &str) -> String {
+    static DISCLOSURE: OnceLock<Regex> = OnceLock::new();
+    static REVIEW_MARKER: OnceLock<Regex> = OnceLock::new();
+    static BY_IDENTITY: OnceLock<Regex> = OnceLock::new();
+    static WHO_METADATA: OnceLock<Regex> = OnceLock::new();
+    let disclosure = regex(
+        &DISCLOSURE,
+        r"^\[[A-Za-z0-9_.-]+,[ \t]*[A-Za-z0-9_.-]+,[ \t]*[^,\[\]\r\n]+,[ \t]*[A-Za-z0-9_.-]+,[ \t]*(?i-u:role)=[A-Za-z0-9_.-]+\]\r?$",
+    );
+    let review_marker = regex(
+        &REVIEW_MARKER,
+        r"^(?i-u:CHANGES-REQUESTED-WITHDRAWN-AT|CHANGES-REQUESTED-AT|APPROVED-AT):[ \t]*(?i-u:claude|codex)[ \t]+(?i-u:[0-9a-f]{40})",
+    );
+    let by_identity = regex(&BY_IDENTITY, r"[ \t]+(?i-u:BY)[ \t]+[A-Za-z0-9_.-]+$");
+    let who_metadata = regex(
+        &WHO_METADATA,
+        r"^Unverified --who metadata: [A-Za-z0-9_.-]+\r?$",
+    );
+    let lines = body.split('\n').collect::<Vec<_>>();
+    let prose_indexes = prose_line_indexes(body)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let first_nonblank = lines
+        .iter()
+        .position(|line| !trim_ascii_whitespace(line).is_empty());
+    let mut normalized = Vec::with_capacity(lines.len());
+    for (index, raw) in lines.into_iter().enumerate() {
+        if Some(index) == first_nonblank
+            && prose_indexes.contains(&index)
+            && disclosure.is_match(raw)
+        {
+            continue;
+        }
+        if prose_indexes.contains(&index) && who_metadata.is_match(raw) {
+            continue;
+        }
+        if prose_indexes.contains(&index) && marker_matches(review_marker, raw) {
+            let marker_line = undecorate(raw);
+            if let Some(claimed_identity) = by_identity.find(&marker_line) {
+                let claimed_text = claimed_identity.as_str();
+                if let Some(claimed_start) = raw.rfind(claimed_text) {
+                    normalized.push(format!(
+                        "{}{}",
+                        &raw[..claimed_start],
+                        &raw[claimed_start + claimed_text.len()..]
+                    ));
+                    continue;
+                }
+            }
+        }
+        normalized.push(raw.to_owned());
+    }
+    normalized.join("\n")
+}
+
+pub(crate) fn has_comment_changes_requested(snapshot: &ReviewEvidenceSnapshot) -> bool {
+    static COMMENT_OBJECTION: OnceLock<Regex> = OnceLock::new();
+    let comment_objection = regex(
+        &COMMENT_OBJECTION,
+        r"^(?i-u:CHANGES-REQUESTED-AT):[ \t]*(?i-u:claude|codex)[ \t]+(?i-u:[0-9a-f]{40})",
+    );
+    snapshot.events.iter().any(|event| {
+        matches!(event.kind.as_str(), "issue-comment" | "review-comment")
+            && prose_lines(&event.body)
+                .iter()
+                .any(|line| marker_matches(comment_objection, line))
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RetirementRecord {
+    pub(crate) target_comment_id: String,
+    pub(crate) lane: String,
+    pub(crate) head_sha: String,
+}
+
+/// Exact objection-retirement linkage, without optional attribution text.
+pub(crate) fn retirement_record(body: &str) -> Result<Option<RetirementRecord>, String> {
     static TARGET: OnceLock<Regex> = OnceLock::new();
     static WITHDRAWAL: OnceLock<Regex> = OnceLock::new();
-    let target = regex(&TARGET, r"(?i)^\s*RETIRES\s+#?(\d{6,})\s*$");
+    let target = regex(
+        &TARGET,
+        r"^[ \t]*(?i-u:RETIRES)[ \t]+#?([0-9]{6,})[ \t]*\r?$",
+    );
     let withdrawal = regex(
         &WITHDRAWAL,
-        r"(?i)^CHANGES-REQUESTED-WITHDRAWN-AT:\s*(?:claude|codex)\s+[0-9a-f]{40}(?:\s+BY\s+(?P<actor>[a-z0-9][a-z0-9-]*))?$",
+        r"^(?i-u:CHANGES-REQUESTED-WITHDRAWN-AT):[ \t]*(?P<lane>(?i-u:claude|codex))[ \t]+(?P<head>(?i-u:[0-9a-f]{40}))",
     );
     let lines = prose_lines(body);
-    let targets = lines.iter().filter(|line| target.is_match(line)).count();
-    if targets == 0 {
+    let targets = lines
+        .iter()
+        .filter_map(|line| target.captures(line))
+        .map(|captures| captures[1].to_owned())
+        .collect::<Vec<_>>();
+    if targets.is_empty() {
         return Ok(None);
     }
-    if targets != 1 {
+    if targets.len() != 1 {
         return Err("review evidence retirement must name exactly one target".to_owned());
     }
     let mut withdrawals = Vec::new();
     for line in &lines {
         let normalized = undecorate(line);
-        if let Some(captures) = withdrawal.captures(&normalized) {
-            withdrawals.push(
-                captures
-                    .name("actor")
-                    .map(|value| value.as_str().to_owned()),
-            );
+        if marker_matches(withdrawal, line) {
+            let captures = withdrawal
+                .captures(&normalized)
+                .expect("matched withdrawal");
+            withdrawals.push((
+                captures["lane"].to_ascii_lowercase(),
+                captures["head"].to_ascii_lowercase(),
+            ));
         }
     }
     if withdrawals.len() != 1 {
         return Err("review evidence retirement needs one canonical withdrawal".to_owned());
     }
-    let actor = disclosure_actor(body).ok_or_else(|| {
-        "review evidence retirement lacks an exact five-field disclosure".to_owned()
-    })?;
-    if let Some(marker_actor) = &withdrawals[0] {
-        if !marker_actor.eq_ignore_ascii_case(&actor) {
-            return Err(
-                "review evidence retirement BY identity differs from disclosure".to_owned(),
-            );
-        }
-    }
-    Ok(Some(actor))
+    let (lane, head_sha) = withdrawals.pop().expect("exactly one withdrawal");
+    Ok(Some(RetirementRecord {
+        target_comment_id: targets[0].clone(),
+        lane,
+        head_sha,
+    }))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -237,10 +301,10 @@ pub fn review_evidence_digest(snapshot: &ReviewEvidenceSnapshot) -> Result<Strin
     ) {
         return Err("review evidence snapshot has an unknown aggregate decision".to_owned());
     }
-    let mut events = snapshot.events.clone();
-    events.sort();
+    let mut events = Vec::with_capacity(snapshot.events.len());
     let mut seen = BTreeSet::new();
-    for event in &events {
+    for source in &snapshot.events {
+        let mut event = source.clone();
         if event.kind.is_empty() || event.identity.is_empty() {
             return Err("review evidence event lacks a stable kind or identity".to_owned());
         }
@@ -253,26 +317,38 @@ pub fn review_evidence_digest(snapshot: &ReviewEvidenceSnapshot) -> Result<Strin
                 event.kind
             ));
         }
-        if event.author.is_empty() {
-            return Err("review evidence event lacks a stable author identity".to_owned());
-        }
-        let actor = retirement_actor(&event.body)?;
-        if let Some(actor) = actor {
-            if !event.author.eq_ignore_ascii_case(&actor) {
+        let retirement = retirement_record(&event.body)?;
+        if let Some(retirement) = retirement {
+            if !event.retirement_actor_permission.is_empty()
+                && (retirement.head_sha != snapshot.head_sha || event.state != "ACTIVE")
+            {
                 return Err(
-                    "review evidence retirement actor differs from GitHub event author".to_owned(),
+                    "repository permission is bound to an inactive or stale retirement".to_owned(),
                 );
             }
-            if !ALLOWED_RETIREMENT_PERMISSIONS.contains(&event.retirement_actor_permission.as_str())
+            if !event.retirement_actor_permission.is_empty() && event.author.is_empty() {
+                return Err(
+                    "review evidence retirement permission lacks a GitHub event author".to_owned(),
+                );
+            }
+            if !event.retirement_actor_permission.is_empty()
+                && !ALLOWED_RETIREMENT_PERMISSIONS
+                    .contains(&event.retirement_actor_permission.as_str())
             {
                 return Err(
                     "review evidence retirement lacks current triage-or-higher permission"
                         .to_owned(),
                 );
             }
+            if event.retirement_actor_permission.is_empty() {
+                event.author.clear();
+            }
         } else if !event.retirement_actor_permission.is_empty() {
             return Err("non-retirement review evidence carries repository permission".to_owned());
+        } else {
+            event.author.clear();
         }
+        event.body = normalized_review_body(&event.body);
         if event.state.is_empty() {
             return Err("review evidence event lacks a state".to_owned());
         }
@@ -293,7 +369,9 @@ pub fn review_evidence_digest(snapshot: &ReviewEvidenceSnapshot) -> Result<Strin
                 event.kind, event.identity
             ));
         }
+        events.push(event);
     }
+    events.sort();
     let has_changes_requested = events
         .iter()
         .any(|event| event.kind == "review" && event.state == "CHANGES_REQUESTED");
@@ -315,7 +393,7 @@ pub fn review_evidence_digest(snapshot: &ReviewEvidenceSnapshot) -> Result<Strin
     }
 
     let mut digest = Sha256::new();
-    digest.update(b"pr-landing-planner-review-evidence-v2");
+    digest.update(b"pr-landing-planner-review-evidence-v3");
     feed(&mut digest, &snapshot.head_sha);
     feed(&mut digest, &snapshot.review_decision);
     digest.update((events.len() as u64).to_be_bytes());
@@ -501,8 +579,21 @@ fn one_label_value(
     Ok(values.into_iter().next().unwrap_or_default())
 }
 
+fn optional_agent_label(labels: &[String]) -> String {
+    let values: BTreeSet<_> = labels
+        .iter()
+        .filter_map(|label| label.strip_prefix(AGENT_PREFIX))
+        .filter(|value| !value.is_empty())
+        .collect();
+    if values.len() == 1 {
+        values.into_iter().next().unwrap_or_default().to_owned()
+    } else {
+        String::new()
+    }
+}
+
 fn apply_labels(mut node: PrNode) -> Result<PrNode, String> {
-    node.assigned_agent = one_label_value(&node.labels, AGENT_PREFIX, "agent", node.number)?;
+    node.assigned_agent = optional_agent_label(&node.labels);
     let raw = one_label_value(&node.labels, POLICY_PREFIX, "landing-policy", node.number)?;
     node.policy_class = if raw.is_empty() {
         PolicyClass::Unclassified
@@ -765,9 +856,11 @@ mod tests {
             .contains("locally-validated evidence requires"));
 
         let duplicate = node(2, "head", &["agent:one", "agent:two"]);
-        assert!(apply_landing_context(vec![duplicate], &[])
-            .unwrap_err()
-            .contains("multiple agent labels"));
+        let multiply_labeled = apply_landing_context(vec![duplicate], &[])
+            .unwrap()
+            .remove(0);
+        assert!(multiply_labeled.assigned_agent.is_empty());
+        assert_eq!(multiply_labeled.number, 2);
     }
 
     #[test]
@@ -943,9 +1036,7 @@ mod tests {
             .contains("stable kind or identity"));
         let mut missing_author = snapshot.clone();
         missing_author.events[0].author.clear();
-        assert!(review_evidence_digest(&missing_author)
-            .unwrap_err()
-            .contains("stable author identity"));
+        assert_eq!(review_evidence_digest(&missing_author).unwrap(), digest);
         let mut missing_decision = snapshot.clone();
         missing_decision.review_decision.clear();
         assert!(review_evidence_digest(&missing_decision)
@@ -963,7 +1054,7 @@ mod tests {
             .contains("no matching review"));
         let mut author_changed = snapshot.clone();
         author_changed.events[0].author = "different-reviewer".into();
-        assert_ne!(review_evidence_digest(&author_changed).unwrap(), digest);
+        assert_eq!(review_evidence_digest(&author_changed).unwrap(), digest);
         let mut duplicate = snapshot;
         duplicate.events.push(duplicate.events[0].clone());
         assert!(review_evidence_digest(&duplicate)
@@ -1020,10 +1111,6 @@ mod tests {
                 ..event.clone()
             },
             ReviewEvidenceEvent {
-                author: "different-reviewer".into(),
-                ..event.clone()
-            },
-            ReviewEvidenceEvent {
                 state: "DISMISSED".into(),
                 ..event.clone()
             },
@@ -1051,6 +1138,10 @@ mod tests {
         for mutation in mutations {
             let mut changed = snapshot.clone();
             changed.events = vec![mutation];
+            let mut changed_author = snapshot.clone();
+            changed_author.events[0].author = "different-reviewer".into();
+            assert_eq!(review_evidence_digest(&changed_author).unwrap(), digest);
+
             assert_ne!(review_evidence_digest(&changed).unwrap(), digest);
         }
         let mut changed_head = snapshot.clone();
@@ -1062,7 +1153,7 @@ mod tests {
     }
 
     #[test]
-    fn retirement_permission_is_actor_bound_and_changes_the_digest() {
+    fn retirement_uses_event_author_permission_and_ignores_claimed_identity() {
         let body = format!(
             "[team, release-authority, session, model, role=observer]\n\
              CHANGES-REQUESTED-WITHDRAWN-AT: codex {REBASED_HEAD} BY release-authority\n\
@@ -1085,41 +1176,475 @@ mod tests {
             review_decision: "APPROVED".into(),
             events: vec![event.clone()],
         };
-        assert_eq!(
-            retirement_actor(&body).unwrap().as_deref(),
-            Some("release-authority")
-        );
+        let record = retirement_record(&body).unwrap().unwrap();
+        assert_eq!(record.target_comment_id, "123456");
+        assert_eq!(record.lane, "codex");
+        assert_eq!(record.head_sha, REBASED_HEAD);
         let write_digest = review_evidence_digest(&snapshot).unwrap();
         assert_eq!(
             write_digest,
-            "6cbf2b5d6132e3d81390cb4b1ab1702f6092ad82b1d36e36a010e28b7a2219cb"
+            "83f83abe9e2e319f0a65a4f100d1b6c91f8a6c0ca29e6797d120166e6cca3b58"
+        );
+        let mut appended_objection = snapshot.clone();
+        appended_objection.events[0].body = format!("{body}\nDo not land: the race remains.");
+        assert_ne!(
+            review_evidence_digest(&appended_objection).unwrap(),
+            write_digest
         );
         let mut maintain = snapshot.clone();
         maintain.events[0].retirement_actor_permission = "maintain".into();
         assert_ne!(review_evidence_digest(&maintain).unwrap(), write_digest);
 
-        for permission in ["", "read"] {
-            let mut invalid = snapshot.clone();
-            invalid.events[0].retirement_actor_permission = permission.into();
-            assert!(review_evidence_digest(&invalid)
-                .unwrap_err()
-                .contains("triage-or-higher"));
+        let mut unverified = snapshot.clone();
+        unverified.events[0].author.clear();
+        unverified.events[0].retirement_actor_permission.clear();
+        let unverified_digest = review_evidence_digest(&unverified).unwrap();
+        assert_ne!(unverified_digest, write_digest);
+        unverified.events[0].author = "departed".into();
+        assert_eq!(
+            review_evidence_digest(&unverified).unwrap(),
+            unverified_digest
+        );
+
+        let mut invalid = snapshot.clone();
+        invalid.events[0].retirement_actor_permission = "read".into();
+        assert!(review_evidence_digest(&invalid)
+            .unwrap_err()
+            .contains("triage-or-higher"));
+        let mut missing_author = snapshot.clone();
+        missing_author.events[0].author.clear();
+        assert!(review_evidence_digest(&missing_author)
+            .unwrap_err()
+            .contains("lacks a GitHub event author"));
+        let mut hostname_author = snapshot.clone();
+        hostname_author.events[0].author = "devbig014".into();
+        assert_ne!(
+            review_evidence_digest(&hostname_author).unwrap(),
+            write_digest
+        );
+        for claimed_identity in ["other-agent", "other_agent", "other.agent", "K"] {
+            let mut false_by = snapshot.clone();
+            false_by.events[0].body =
+                body.replace("BY release-authority", &format!("BY {claimed_identity}"));
+            assert_eq!(
+                retirement_record(&false_by.events[0].body).unwrap(),
+                Some(record.clone())
+            );
+            assert_eq!(review_evidence_digest(&false_by).unwrap(), write_digest);
         }
-        let mut mismatched_actor = snapshot.clone();
-        mismatched_actor.events[0].author = "different-actor".into();
-        assert!(review_evidence_digest(&mismatched_actor)
+        let mut malformed_by = snapshot.clone();
+        malformed_by.events[0].body = body.replace("BY release-authority", "BY other/agent");
+        assert_eq!(
+            retirement_record(&malformed_by.events[0].body).unwrap(),
+            Some(record.clone())
+        );
+        let malformed_digest = review_evidence_digest(&malformed_by).unwrap();
+        assert_ne!(malformed_digest, write_digest);
+        let mut mutated_malformed = malformed_by.clone();
+        mutated_malformed.events[0].body = malformed_by.events[0]
+            .body
+            .replace("other/agent", "other agent");
+        assert_ne!(
+            review_evidence_digest(&mutated_malformed).unwrap(),
+            malformed_digest
+        );
+        for malformed_suffix in ["BY: other.agent", "BY/other.agent"] {
+            let mut alternate_malformed = snapshot.clone();
+            alternate_malformed.events[0].body =
+                body.replace("BY release-authority", malformed_suffix);
+            assert_eq!(
+                retirement_record(&alternate_malformed.events[0].body).unwrap(),
+                Some(record.clone())
+            );
+            assert_ne!(
+                review_evidence_digest(&alternate_malformed).unwrap(),
+                write_digest
+            );
+        }
+        for non_ascii_identity in ["K", "İ", "ı", "ſ"] {
+            let mut non_ascii = snapshot.clone();
+            non_ascii.events[0].body =
+                body.replace("BY release-authority", &format!("BY {non_ascii_identity}"));
+            assert_eq!(
+                retirement_record(&non_ascii.events[0].body).unwrap(),
+                Some(record.clone())
+            );
+            assert_ne!(review_evidence_digest(&non_ascii).unwrap(), write_digest);
+        }
+        let mut different_disclosure = snapshot.clone();
+        different_disclosure.events[0].body = body.replace(
+            "[team, release-authority, session, model, role=observer]",
+            "[team, departed, old-session, model, role=observer]",
+        );
+        assert_eq!(
+            review_evidence_digest(&different_disclosure).unwrap(),
+            write_digest
+        );
+        let mut inactive = snapshot.clone();
+        inactive.events[0].state = "MINIMIZED:OUTDATED".into();
+        assert!(review_evidence_digest(&inactive)
             .unwrap_err()
-            .contains("differs from GitHub event author"));
-        let mut mismatched_by = snapshot.clone();
-        mismatched_by.events[0].body = body.replace("BY release-authority", "BY other");
-        assert!(review_evidence_digest(&mismatched_by)
+            .contains("inactive or stale retirement"));
+        let mut stale = snapshot.clone();
+        stale.events[0].body = body.replace(REBASED_HEAD, CHANGED_HEAD);
+        assert!(review_evidence_digest(&stale)
             .unwrap_err()
-            .contains("BY identity differs"));
+            .contains("inactive or stale retirement"));
         let mut not_retirement = snapshot;
         not_retirement.events[0].body = "ordinary comment".into();
         assert!(review_evidence_digest(&not_retirement)
             .unwrap_err()
             .contains("non-retirement"));
+    }
+
+    #[test]
+    fn review_marker_attribution_is_metadata_for_every_marker() {
+        let body = format!(
+            "[team, current-reviewer, session, model, role=reviewer]\n\
+             CHANGES-REQUESTED-AT: codex {REBASED_HEAD} BY current-reviewer\n\
+             CHANGES-REQUESTED-WITHDRAWN-AT: codex {REBASED_HEAD} BY current-reviewer\n\
+             APPROVED-AT: codex {REBASED_HEAD} BY current-reviewer\n\
+             The objection is resolved by the changed bounds check."
+        );
+        let event = ReviewEvidenceEvent {
+            kind: "issue-comment".into(),
+            identity: "comment-markers".into(),
+            author: "current-reviewer".into(),
+            state: "ACTIVE".into(),
+            head_sha: String::new(),
+            created_at: "2026-09-05T15:03:48Z".into(),
+            updated_at: "2026-09-05T15:03:48Z".into(),
+            last_edited_at: String::new(),
+            body: body.clone(),
+            retirement_actor_permission: String::new(),
+        };
+        let snapshot = ReviewEvidenceSnapshot {
+            head_sha: REBASED_HEAD.into(),
+            review_decision: String::new(),
+            events: vec![event.clone()],
+        };
+        let digest = review_evidence_digest(&snapshot).unwrap();
+        for disclosure_agent in [
+            "departed-reviewer",
+            "departed_reviewer",
+            "departed.reviewer",
+            "K",
+        ] {
+            let mut metadata_changed = snapshot.clone();
+            metadata_changed.events[0].body = body.replace(
+                "[team, current-reviewer, session, model, role=reviewer]",
+                &format!("[team, {disclosure_agent}, old-session, other-model, role=reviewer]"),
+            );
+            assert_eq!(review_evidence_digest(&metadata_changed).unwrap(), digest);
+        }
+        for non_ascii_identity in ["K", "İ", "ı", "ſ"] {
+            let mut metadata_changed = snapshot.clone();
+            metadata_changed.events[0].body = body.replace(
+                "[team, current-reviewer, session, model, role=reviewer]",
+                &format!("[team, {non_ascii_identity}, session, model, role=reviewer]"),
+            );
+            assert_ne!(review_evidence_digest(&metadata_changed).unwrap(), digest);
+        }
+        for claimed_identity in [
+            "departed-reviewer",
+            "departed_reviewer",
+            "departed.reviewer",
+        ] {
+            let mut metadata_changed = snapshot.clone();
+            metadata_changed.events[0].body =
+                body.replace("BY current-reviewer", &format!("BY {claimed_identity}"));
+            assert_eq!(review_evidence_digest(&metadata_changed).unwrap(), digest);
+        }
+        let mut metadata_removed = snapshot.clone();
+        metadata_removed.events[0].body = body
+            .split('\n')
+            .skip(1)
+            .map(|line| line.replace(" BY current-reviewer", ""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(review_evidence_digest(&metadata_removed).unwrap(), digest);
+        let mut malformed = snapshot.clone();
+        malformed.events[0].body = body.replace("BY current-reviewer", "BY current/reviewer");
+        let malformed_digest = review_evidence_digest(&malformed).unwrap();
+        assert_ne!(malformed_digest, digest);
+        assert!(has_comment_changes_requested(&malformed));
+        let mut mutated_malformed = malformed.clone();
+        mutated_malformed.events[0].body = malformed.events[0]
+            .body
+            .replace("current/reviewer", "current reviewer");
+        assert_ne!(
+            review_evidence_digest(&mutated_malformed).unwrap(),
+            malformed_digest
+        );
+        assert!(has_comment_changes_requested(&mutated_malformed));
+        let mut fenced = snapshot.clone();
+        fenced.events[0].body =
+            format!("{body}\n```text\nAPPROVED-AT: codex {REBASED_HEAD} BY quoted\n```");
+        let mut changed_fenced = fenced.clone();
+        changed_fenced.events[0].body = fenced.events[0]
+            .body
+            .replace("BY quoted", "BY other-quoted");
+        assert_ne!(
+            review_evidence_digest(&fenced).unwrap(),
+            review_evidence_digest(&changed_fenced).unwrap()
+        );
+    }
+
+    #[test]
+    fn unverified_who_metadata_is_optional_only_as_an_exact_prose_line() {
+        let base_body = "The bounds check resolves the objection.";
+        for (kind, state, head_sha) in [
+            ("review", "APPROVED", REBASED_HEAD),
+            ("issue-comment", "ACTIVE", ""),
+            ("review-comment", "ACTIVE", ""),
+        ] {
+            let event = ReviewEvidenceEvent {
+                kind: kind.into(),
+                identity: format!("{kind}-metadata"),
+                author: "reviewer".into(),
+                state: state.into(),
+                head_sha: head_sha.into(),
+                created_at: "2026-09-05T15:03:48Z".into(),
+                updated_at: "2026-09-05T15:03:48Z".into(),
+                last_edited_at: String::new(),
+                body: base_body.into(),
+                retirement_actor_permission: String::new(),
+            };
+            let snapshot = ReviewEvidenceSnapshot {
+                head_sha: REBASED_HEAD.into(),
+                review_decision: "APPROVED".into(),
+                events: vec![event.clone()],
+            };
+            let digest = review_evidence_digest(&snapshot).unwrap();
+            for agent in ["review-agent", "review_agent", "review.agent", "K"] {
+                let mut with_metadata = snapshot.clone();
+                with_metadata.events[0].body =
+                    format!("{base_body}\nUnverified --who metadata: {agent}");
+                assert_eq!(review_evidence_digest(&with_metadata).unwrap(), digest);
+            }
+            for non_ascii_identity in ["K", "İ", "ı", "ſ"] {
+                let mut with_metadata = snapshot.clone();
+                with_metadata.events[0].body =
+                    format!("{base_body}\nUnverified --who metadata: {non_ascii_identity}");
+                assert_ne!(review_evidence_digest(&with_metadata).unwrap(), digest);
+            }
+
+            let preserved_forms = [
+                format!("{base_body}\nUnverified --who metadata: review.agent extra"),
+                format!("{base_body}\n> Unverified --who metadata: review.agent"),
+                format!("{base_body}\n`Unverified --who metadata: review.agent`"),
+                format!("{base_body}\n```text\nUnverified --who metadata: review.agent\n```"),
+                format!("{base_body}\n\n    Unverified --who metadata: review.agent"),
+            ];
+            for preserved in preserved_forms {
+                let mut first = snapshot.clone();
+                first.events[0].body = preserved.clone();
+                let mut second = snapshot.clone();
+                second.events[0].body = preserved.replace("review.agent", "other_agent");
+                assert_ne!(review_evidence_digest(&first).unwrap(), digest);
+                assert_ne!(
+                    review_evidence_digest(&first).unwrap(),
+                    review_evidence_digest(&second).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn comment_refusal_survives_valid_and_malformed_by_metadata() {
+        let marker = format!("CHANGES-REQUESTED-AT: codex {REBASED_HEAD}");
+        for kind in ["issue-comment", "review-comment"] {
+            let event = ReviewEvidenceEvent {
+                kind: kind.into(),
+                identity: format!("{kind}-refusal"),
+                author: "reviewer".into(),
+                state: "ACTIVE".into(),
+                head_sha: String::new(),
+                created_at: "2026-09-05T15:03:48Z".into(),
+                updated_at: "2026-09-05T15:03:48Z".into(),
+                last_edited_at: String::new(),
+                body: marker.clone(),
+                retirement_actor_permission: String::new(),
+            };
+            for suffix in [
+                "",
+                " BY review-agent",
+                " BY review_agent",
+                " BY review.agent",
+                " BY review/agent",
+                " BY review agent",
+                " BY",
+                " BY: review.agent",
+                " BY/review.agent",
+                " BY K",
+                " BY İ",
+                " BY ı",
+                " BY ſ",
+            ] {
+                let snapshot = ReviewEvidenceSnapshot {
+                    head_sha: REBASED_HEAD.into(),
+                    review_decision: String::new(),
+                    events: vec![ReviewEvidenceEvent {
+                        body: format!("{marker}{suffix}"),
+                        ..event.clone()
+                    }],
+                };
+                assert!(has_comment_changes_requested(&snapshot));
+            }
+        }
+    }
+
+    #[test]
+    fn non_ascii_whitespace_is_not_review_evidence_syntax() {
+        for space in ["\u{a0}", "\u{2003}"] {
+            let marker = format!("CHANGES-REQUESTED-AT: codex {REBASED_HEAD}");
+            let event = ReviewEvidenceEvent {
+                kind: "issue-comment".into(),
+                identity: "comment-whitespace".into(),
+                author: "reviewer".into(),
+                state: "ACTIVE".into(),
+                head_sha: String::new(),
+                created_at: "2026-09-05T15:03:48Z".into(),
+                updated_at: "2026-09-05T15:03:48Z".into(),
+                last_edited_at: String::new(),
+                body: marker.clone(),
+                retirement_actor_permission: String::new(),
+            };
+            let canonical = ReviewEvidenceSnapshot {
+                head_sha: REBASED_HEAD.into(),
+                review_decision: String::new(),
+                events: vec![event.clone()],
+            };
+            let canonical_digest = review_evidence_digest(&canonical).unwrap();
+            assert!(has_comment_changes_requested(&canonical));
+
+            for malformed_marker in [
+                format!("{space}{marker}"),
+                marker.replacen(": ", &format!(":{space}"), 1),
+                marker.replacen("codex ", &format!("codex{space}"), 1),
+                format!("#{space}{marker}"),
+            ] {
+                let mut malformed = canonical.clone();
+                malformed.events[0].body = malformed_marker;
+                assert!(!has_comment_changes_requested(&malformed));
+                assert_ne!(
+                    review_evidence_digest(&malformed).unwrap(),
+                    canonical_digest
+                );
+            }
+
+            let mut canonical_by = canonical.clone();
+            canonical_by.events[0].body = format!("{marker} BY K");
+            let mut malformed_by = canonical.clone();
+            malformed_by.events[0].body = format!("{marker} BY{space}K");
+            assert_eq!(
+                review_evidence_digest(&canonical_by).unwrap(),
+                canonical_digest
+            );
+            assert!(has_comment_changes_requested(&malformed_by));
+            assert_ne!(
+                review_evidence_digest(&malformed_by).unwrap(),
+                canonical_digest
+            );
+
+            let mut summary = canonical.clone();
+            summary.events[0].body = "substantive result".into();
+            let summary_digest = review_evidence_digest(&summary).unwrap();
+            let mut canonical_disclosure = summary.clone();
+            canonical_disclosure.events[0].body =
+                "[team, reviewer, session, model, role=reviewer]\nsubstantive result".into();
+            let mut malformed_disclosure = summary.clone();
+            malformed_disclosure.events[0].body = format!(
+                "[team,{space}reviewer, session, model, role=reviewer]\nsubstantive result"
+            );
+            assert_eq!(
+                review_evidence_digest(&canonical_disclosure).unwrap(),
+                summary_digest
+            );
+            assert_ne!(
+                review_evidence_digest(&malformed_disclosure).unwrap(),
+                summary_digest
+            );
+
+            let mut canonical_metadata = summary.clone();
+            canonical_metadata.events[0].body =
+                "substantive result\nUnverified --who metadata: K".into();
+            let mut malformed_metadata = summary.clone();
+            malformed_metadata.events[0].body =
+                format!("substantive result\nUnverified --who metadata:{space}K");
+            assert_eq!(
+                review_evidence_digest(&canonical_metadata).unwrap(),
+                summary_digest
+            );
+            assert_ne!(
+                review_evidence_digest(&malformed_metadata).unwrap(),
+                summary_digest
+            );
+
+            let withdrawal = format!("CHANGES-REQUESTED-WITHDRAWN-AT: codex {REBASED_HEAD}");
+            assert!(retirement_record(&format!("{withdrawal}\nRETIRES 123456"))
+                .unwrap()
+                .is_some());
+            let malformed_withdrawal = withdrawal.replacen(": ", &format!(":{space}"), 1);
+            assert!(
+                retirement_record(&format!("{malformed_withdrawal}\nRETIRES 123456"))
+                    .unwrap_err()
+                    .contains("canonical withdrawal")
+            );
+            assert!(
+                retirement_record(&format!("{withdrawal}\nRETIRES{space}123456"))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn unverified_retirement_stays_visible_and_does_not_clear_objection() {
+        let observed_at = "2026-09-04T12:00:00Z";
+        let retirement = ReviewEvidenceEvent {
+            kind: "issue-comment".into(),
+            identity: "comment-2".into(),
+            author: String::new(),
+            state: "ACTIVE".into(),
+            head_sha: String::new(),
+            created_at: observed_at.into(),
+            updated_at: observed_at.into(),
+            last_edited_at: String::new(),
+            body: format!(
+                "CHANGES-REQUESTED-WITHDRAWN-AT: codex {REBASED_HEAD} BY departed\nRETIRES 123456"
+            ),
+            retirement_actor_permission: String::new(),
+        };
+        let snapshot = ReviewEvidenceSnapshot {
+            head_sha: REBASED_HEAD.into(),
+            review_decision: "CHANGES_REQUESTED".into(),
+            events: vec![
+                ReviewEvidenceEvent {
+                    kind: "review".into(),
+                    identity: "review-1".into(),
+                    author: "departed-reviewer".into(),
+                    state: "CHANGES_REQUESTED".into(),
+                    head_sha: REBASED_HEAD.into(),
+                    created_at: observed_at.into(),
+                    updated_at: observed_at.into(),
+                    last_edited_at: String::new(),
+                    body: "still unresolved".into(),
+                    retirement_actor_permission: String::new(),
+                },
+                retirement,
+            ],
+        };
+        let digest = review_evidence_digest(&snapshot).unwrap();
+        let mut raw = node(394, REBASED_HEAD, &[]);
+        raw.review_decision = "CHANGES_REQUESTED".into();
+        raw.review_evidence_digest = digest;
+        let applied = apply_landing_context(vec![raw], &[]).unwrap().remove(0);
+        assert!(!applied.review_objections_resolved);
+        assert_eq!(
+            held_reasons(&[applied], &[])[0].reasons,
+            ["changes-requested"]
+        );
     }
 
     #[test]

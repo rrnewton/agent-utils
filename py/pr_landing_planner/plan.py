@@ -51,6 +51,8 @@ DEFAULT_FRESHNESS_MAX_BEHIND: int | None = 0
 
 
 def _held_action(reasons: Sequence[str]) -> tuple[PrAction, str]:
+    if "review-evidence-unavailable" in reasons:
+        return PrAction.WAIT, f"held: {', '.join(reasons)}"
     if "ordering-cycle" in reasons:
         return PrAction.WAIT, "held: ordering-cycle (resolve dependency cycle and rerun)"
     if any(

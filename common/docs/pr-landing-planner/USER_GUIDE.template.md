@@ -22,6 +22,9 @@ network-free, and does not archive a plan unless `--archive-dir` is explicit.
 Duplicate mapping keys, nonpositive or overflowing identifiers, duplicate PR
 identities, negative numeric counters, and relations with self/unknown endpoints
 are rejected instead of being silently normalized.
+When `review_evidence_unavailable` is present on a fixture PR, its value must be
+a boolean; malformed values are rejected.
+
 
 Use fixture mode for evaluation, tests, saved snapshots, and integrations that
 already collect repository-host data.
@@ -39,6 +42,11 @@ pr-landing-planner plan \
 `gh`, fetches exact base and PR heads into private local refs, and uses `git
 merge-tree` to detect real conflicts. It does not check out, rebase, push,
 label, refire, or merge anything.
+The live PR list must be a complete JSON array. An empty successful response,
+a non-object array entry, or a response that reaches the 500-item request limit
+is refused because the planner cannot prove that every open pull request was
+listed.
+
 
 Common collection flags include:
 
@@ -145,6 +153,10 @@ repository state. It accepts the consuming workspace's decision. Accepted policy
 treated like routine hygiene. Unknown PRs, duplicate entries, and head drift
 are errors.
 
+`assigned_agent` and `agent:` labels are optional routing metadata, not
+authority. One `agent:` label is displayed as the assignment. Multiple distinct
+agent labels leave the assignment empty and do not stop planning.
+
 `review_pass_heads` maps each required review lane (`codex` and `claude`) to the
 exact 40-character lowercase head SHA that reviewer passed. Review labels are
 cache hints: when the review protocol is active, each lane needs both its
@@ -164,30 +176,69 @@ that an objection was resolved. The assertion requires both the exact
 producer must copy that field mechanically into its generated context after
 assessing that snapshot; nobody should hand-compute it. The follow-up plan
 refetches the evidence and refuses if either the head or digest differs.
+A canonical `CHANGES-REQUESTED-AT` marker in an issue or inline review comment
+also produces the `changes-requested` hold when GitHub supplies no native review
+and an empty aggregate `reviewDecision`. The uncontexted plan keeps that hold;
+only `review_objections_resolved: true` bound to the matching exact head and
+snapshot digest can clear it. Missing or false context cannot make that pull
+request landable.
+
+If any promised review source cannot be fetched completely, paginated, parsed,
+or assigned a stable event identity, the node reports
+`review_evidence_unavailable: true` and remains held with
+`review-evidence-unavailable`. This state is distinct from a complete snapshot
+containing no events. It always produces `wait`, including when a base conflict
+would otherwise recommend `rebase-then-land`. A clean exact validation record or
+an aggregate approval cannot clear it; review evidence must be fetched later.
+
+The authority decision does not require a `RETIRES` line. For example, an older
+refusal can be discharged by a later valid withdrawal followed by a current-head
+approval. The snapshot preserves their timestamps and substantive body text so
+the authority can evaluate that chronology.
+
 
 The digest covers the snapshot head, aggregate review decision, and the sorted
 set of explicitly paginated native reviews, issue comments, and inline review
 comments.
-Each event contributes its source kind, stable event identity, stable author
-login, state, available event head (or the documented empty value for comment
-sources without one), creation/submission timestamp, current version timestamp,
-native-review last-edit timestamp, and body. Inline location fields are part of
-state, so an outdated/retired comment changes the digest even when GitHub gives
-the change the same second-resolution timestamp. An exact `RETIRES` record also
-contributes the immutable GitHub actor's current repository permission. The
-actor must match the record's `BY`/five-field disclosure identity, and only
-`triage`, `write`, `maintain`, or `admin` permission is authority. The disclosed
-role is retained as audit metadata; it does not grant or deny authority.
-Missing permission evidence, an API failure, a mismatched actor, or read-only
-access makes the entire snapshot unavailable rather than treating the
-retirement as authoritative. A later permission change changes the digest and
-invalidates an existing context. A missing stable
-event or author identity, or another promised source field, makes the entire
-snapshot unavailable instead of dropping that event. The field suppresses only
-the repository host's aggregate
-`CHANGES_REQUESTED` hold, which may remain stale after those records exist. It
-does not grant an approval, satisfy `review_pass_heads`, or override
-`REVIEW_REQUIRED`; absent or false retains the fail-closed hold.
+Each event contributes its source kind, stable event identity, state, available
+event head (or the documented empty value for comment sources without one),
+creation/submission timestamp, current version timestamp, native-review
+last-edit timestamp, and body. The digest removes only a fleet disclosure on the
+first nonblank line, an optional `BY` value on an exact review marker, and an
+exact standalone `Unverified --who metadata: NAME` prose line. These optional
+identity fields use the canonical ASCII-only `[A-Za-z0-9_.-]+` agent-token
+grammar and ASCII space or tab separators. Non-ASCII whitespace is substantive,
+not syntax. Identity metadata is normalized for native reviews, issue comments,
+and inline review comments; it remains in the displayed comment for readers but
+does not decide authority.
+
+Review-marker recognition does not depend on the optional `BY` value. A missing,
+alternate, or malformed `BY` value therefore cannot hide an underlying refusal
+or withdrawal. Only a canonical value is removed from the digest; malformed
+text, near-matches to the standalone metadata line, quoted or code examples, and
+every other body byte remain digest input. Appending an unresolved objection
+therefore changes the digest. Inline location fields are part of state, so an
+outdated/retired comment also changes the digest even when GitHub gives the
+change the same second-resolution timestamp.
+
+When an exact `RETIRES` record is present, its target comment id, review lane,
+reviewed head, all other body text, and repository-permission result remain in
+the digest. GitHub's immutable event author is the account whose current
+permission is checked; `triage`, `write`, `maintain`, or `admin` is authority. A
+verified permission and that immutable author are included in the digest, so a
+later permission change invalidates an existing context.
+
+When the event author is unavailable, the permission lookup fails, or the
+author has only read access, the event remains in the snapshot with no
+retirement authority. It cannot by itself discharge the objection, and it does
+not remove unrelated review events or abort the plan. Ordinary event authors
+are optional metadata and are excluded from the digest. A missing stable event
+identity or another promised source field still makes the entire snapshot
+unavailable instead of dropping that event. The field suppresses only the
+`changes-requested` hold from the repository host's aggregate decision or a
+canonical comment refusal in that exact snapshot. It does not grant an approval,
+satisfy `review_pass_heads`, or override `REVIEW_REQUIRED`; absent or false
+retains the fail-closed hold.
 
 A machine-oriented two-pass flow is therefore: run `plan --format json`
 without a resolution assertion; select the desired PR's exact `head` and
@@ -205,6 +256,9 @@ the required rebase and landing without pre-landing revalidation, while
 post-facto validation remains due. The consuming workspace remains the sole
 authority for that landability decision. Draft state, missing approvals,
 conflicts, ordering constraints, CI state, and policy escalation can hold a PR.
+Unavailable review evidence still produces `wait` when either local merge-tree
+evidence or the repository host also reports a base conflict.
+
 
 Priority defaults to deterministic size and age ordering. `--priority-source
 labels` reads a numeric label matching `--priority-label-pattern`; a configured

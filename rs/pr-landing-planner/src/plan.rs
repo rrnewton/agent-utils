@@ -13,6 +13,12 @@ use crate::model::{
 pub const DEFAULT_FRESHNESS_MAX_BEHIND: Option<i64> = Some(0);
 
 fn held_action(reasons: &[String]) -> (PrAction, String) {
+    if reasons
+        .iter()
+        .any(|reason| reason == "review-evidence-unavailable")
+    {
+        return (PrAction::Wait, format!("held: {}", reasons.join(", ")));
+    }
     if reasons.iter().any(|reason| reason == "ordering-cycle") {
         return (
             PrAction::Wait,
@@ -447,6 +453,37 @@ mod tests {
         );
         assert_eq!(ready.land_now, vec![3, 4]);
         assert_eq!(ready.batch, vec![3]);
+    }
+
+    #[test]
+    fn unavailable_review_evidence_waits_before_base_conflict_rebase() {
+        let mut local = green(4);
+        local.review_evidence_unavailable = true;
+        local.base_conflict_paths = vec!["src/conflict.rs".into()];
+        local.validation_evidence = ValidationEvidence::CleanValidateRecord;
+        local.validation_authority = ValidationAuthority::HardGreen;
+
+        let mut github = green(5);
+        github.review_evidence_unavailable = true;
+        github.mergeable = "CONFLICTING".into();
+        github.validation_evidence = ValidationEvidence::CleanValidateRecord;
+        github.validation_authority = ValidationAuthority::HardGreen;
+
+        let nodes = vec![local, github];
+        let held = held_reasons(&nodes, &[]);
+        let (plan, _) = compute_plan(&nodes, &[], &[], &held, None, 2, false);
+        let by_pr = plan
+            .per_pr_actions
+            .iter()
+            .map(|decision| (decision.pr, decision))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(by_pr[&4].action, PrAction::Wait);
+        assert_eq!(by_pr[&5].action, PrAction::Wait);
+        assert!(by_pr[&4].why.contains("review-evidence-unavailable"));
+        assert!(by_pr[&4].why.contains("local-base-conflict"));
+        assert!(by_pr[&5].why.contains("review-evidence-unavailable"));
+        assert!(by_pr[&5].why.contains("github-base-conflicting"));
+        assert!(plan.land_now.is_empty());
     }
 
     #[test]

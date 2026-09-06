@@ -148,9 +148,11 @@ class ReviewEvidenceEvent:
     updated_at: str = ""
     last_edited_at: str = ""
     body: str = ""
+    #: Immutable repository-host login when available. It is authority only for an
+    #: exact current retirement whose permission was verified.
     author: str = ""
-    #: Current repository permission for an exact retirement's immutable GitHub actor.
-    #: Empty for every event that is not an exact retirement.
+    #: Current repository permission for an exact current retirement's immutable
+    #: repository-host author. Empty for all other events and failed permission checks.
     retirement_actor_permission: str = ""
 
 
@@ -183,6 +185,8 @@ class RawPr:
     is_draft: bool = False
     mergeable: str = ""
     review_decision: str = ""
+    #: True when the host could not produce the complete exact-head review snapshot.
+    review_evidence_unavailable: bool = False
     created_at: str = ""
     updated_at: str = ""
     additions: int = 0
@@ -231,6 +235,8 @@ class PrNode:
     is_draft: bool = False
     mergeable: str = ""
     review_decision: str = ""
+    #: True when review evidence collection was incomplete or indeterminate.
+    review_evidence_unavailable: bool = False
     created_at: str = ""
     updated_at: str = ""
     additions: int = 0

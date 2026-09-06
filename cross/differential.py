@@ -8583,7 +8583,7 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
     def review_digest(
         head: str, decision: str, events: Sequence[Mapping[str, object]]
     ) -> str:
-        digest = hashlib.sha256(b"pr-landing-planner-review-evidence-v2")
+        digest = hashlib.sha256(b"pr-landing-planner-review-evidence-v3")
 
         def feed(value: str) -> None:
             encoded = value.encode("utf-8")
@@ -8592,45 +8592,184 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
 
         def event_field(event: Mapping[str, object], field: str) -> str:
             value = event.get(field)
+            if value is None and field in (
+                "author",
+                "last_edited_at",
+                "retirement_actor_permission",
+            ):
+                return ""
             if not isinstance(value, str):
                 raise ValueError(f"review event field {field!r} is not a string")
             return value
 
+        ascii_case = re.ASCII | re.IGNORECASE
+        ascii_whitespace = " \t\r\n\v\f"
+        fence_re = re.compile(r"^ {0,3}(?P<f>`{3,}|~{3,})[ \t]*(?P<info>.*)$")
+        block_prefix = re.compile(r"^(?:#{1,6}[ \t]+|[-+*][ \t]+)")
+        disclosure = re.compile(
+            r"^\[[A-Za-z0-9_.-]+,[ \t]*[A-Za-z0-9_.-]+,[ \t]*"
+            r"[^,\[\]\r\n]+,[ \t]*[A-Za-z0-9_.-]+,[ \t]*"
+            r"role=[A-Za-z0-9_.-]+\]\r?$",
+            ascii_case,
+        )
+        review_marker = re.compile(
+            r"^(?:CHANGES-REQUESTED-WITHDRAWN-AT|CHANGES-REQUESTED-AT|"
+            r"APPROVED-AT):[ \t]*(?:claude|codex)[ \t]+[0-9a-f]{40}",
+            ascii_case,
+        )
+        by_identity = re.compile(
+            r"[ \t]+BY[ \t]+[A-Za-z0-9_.-]+$", ascii_case
+        )
+        who_metadata = re.compile(
+            r"^Unverified --who metadata: [A-Za-z0-9_.-]+\r?$", re.ASCII
+        )
+        withdrawal_marker = re.compile(
+            r"^CHANGES-REQUESTED-WITHDRAWN-AT:[ \t]*"
+            r"(?P<lane>claude|codex)[ \t]+(?P<head>[0-9a-f]{40})",
+            ascii_case,
+        )
+        retirement_target = re.compile(
+            r"^[ \t]*RETIRES[ \t]+#?([0-9]{6,})[ \t]*\r?$", ascii_case
+        )
+        def ascii_strip(value: str) -> str:
+            return value.strip(ascii_whitespace)
+
+        def prose_line_indexes(body: str) -> frozenset[int]:
+            indexes: set[int] = set()
+            fence = ""
+            indented = False
+            previous_blank = True
+            for index, raw in enumerate(body.split("\n")):
+                blank = not ascii_strip(raw)
+                if fence:
+                    match = fence_re.match(raw)
+                    if (
+                        match is not None
+                        and match.group("f")[0] == fence[0]
+                        and len(match.group("f")) >= len(fence)
+                        and not ascii_strip(match.group("info"))
+                    ):
+                        fence = ""
+                    previous_blank = blank
+                    continue
+                match = fence_re.match(raw)
+                if match is not None:
+                    fence = match.group("f")
+                    indented = False
+                    previous_blank = False
+                    continue
+                if indented:
+                    if blank:
+                        previous_blank = True
+                        continue
+                    if raw.startswith(("    ", "\t")):
+                        continue
+                    indented = False
+                elif previous_blank and raw.startswith(("    ", "\t")) and not blank:
+                    indented = True
+                    previous_blank = False
+                    continue
+                indexes.add(index)
+                previous_blank = blank
+            return frozenset(indexes)
+
+        def undecorate(line: str) -> str:
+            normalized = ascii_strip(block_prefix.sub("", ascii_strip(line)))
+            while True:
+                for wrapper in ("`", "**", "__", "*", "_"):
+                    if (
+                        normalized.startswith(wrapper)
+                        and normalized.endswith(wrapper)
+                        and len(normalized) > 2 * len(wrapper)
+                    ):
+                        normalized = ascii_strip(
+                            normalized[len(wrapper) : -len(wrapper)]
+                        )
+                        break
+                else:
+                    return normalized
+
+        def marker_match(pattern: re.Pattern[str], line: str) -> re.Match[str] | None:
+            normalized = undecorate(line)
+            match = pattern.match(normalized)
+            if match is None:
+                return None
+            end = match.end()
+            return (
+                match if end == len(normalized) or normalized[end] in " \t" else None
+            )
+
+        def normalized_review_body(body: str) -> str:
+            lines = body.split("\n")
+            prose = prose_line_indexes(body)
+            first_nonblank = next(
+                (index for index, line in enumerate(lines) if ascii_strip(line)), None
+            )
+            out: list[str] = []
+            for index, raw in enumerate(lines):
+                if index == first_nonblank and index in prose and disclosure.fullmatch(raw):
+                    continue
+                if index in prose and who_metadata.fullmatch(raw):
+                    continue
+                if index in prose and marker_match(review_marker, raw) is not None:
+                    marker_line = undecorate(raw)
+                    claimed = by_identity.search(marker_line)
+                    if claimed is not None:
+                        claimed_text = claimed.group(0)
+                        claimed_start = raw.rfind(claimed_text)
+                        if claimed_start >= 0:
+                            raw = (
+                                raw[:claimed_start]
+                                + raw[claimed_start + len(claimed_text) :]
+                            )
+                out.append(raw)
+            return "\n".join(out)
+
+        def canonical_event(event: Mapping[str, object]) -> tuple[str, ...]:
+            body = event_field(event, "body")
+            lines = body.split("\n")
+            prose = prose_line_indexes(body)
+            targets = [
+                match.group(1)
+                for index, line in enumerate(lines)
+                if index in prose
+                and (match := retirement_target.fullmatch(line)) is not None
+            ]
+            if targets:
+                withdrawals = []
+                for index, line in enumerate(lines):
+                    if index not in prose:
+                        continue
+                    match = marker_match(withdrawal_marker, line)
+                    if match is not None:
+                        withdrawals.append(
+                            (match.group("lane").lower(), match.group("head").lower())
+                        )
+                if len(targets) != 1 or len(withdrawals) != 1:
+                    raise ValueError("review retirement is not canonical")
+            body = normalized_review_body(body)
+            permission = event_field(event, "retirement_actor_permission")
+            author = event_field(event, "author") if permission else ""
+            return (
+                event_field(event, "kind"),
+                event_field(event, "identity"),
+                author,
+                event_field(event, "state"),
+                event_field(event, "head_sha"),
+                event_field(event, "created_at"),
+                event_field(event, "updated_at"),
+                event_field(event, "last_edited_at"),
+                body,
+                permission,
+            )
+
         feed(head)
         feed(decision)
-        ordered = sorted(
-            events,
-            key=lambda event: tuple(
-                event_field(event, field)
-                for field in (
-                    "kind",
-                    "identity",
-                    "author",
-                    "state",
-                    "head_sha",
-                    "created_at",
-                    "updated_at",
-                    "last_edited_at",
-                    "body",
-                    "retirement_actor_permission",
-                )
-            ),
-        )
+        ordered = sorted(canonical_event(event) for event in events)
         digest.update(len(ordered).to_bytes(8, "big"))
         for event in ordered:
-            for field in (
-                "kind",
-                "identity",
-                "author",
-                "state",
-                "head_sha",
-                "created_at",
-                "updated_at",
-                "last_edited_at",
-                "body",
-                "retirement_actor_permission",
-            ):
-                feed(event_field(event, field))
+            for value in event:
+                feed(value)
         return digest.hexdigest()
 
     _record_exact(rep, "version", py, rs, ("--version",))
@@ -8677,6 +8816,50 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
             rep.ok(f"schema:{engine}/plan")
 
     with tempfile.TemporaryDirectory(prefix="planner-cross-") as tmp:
+        for label, payload, message in (
+            ("empty", "", "empty stdout"),
+            (
+                "non-object-entry",
+                json.dumps([{"number": 1}, "not-an-object"]),
+                "entry 1 is not an object",
+            ),
+            (
+                "limit-reached",
+                json.dumps([{"number": number} for number in range(500)]),
+                "500-item limit",
+            ),
+        ):
+            fake_gh = os.path.join(tmp, f"fake-gh-list-{label}")
+            Path(fake_gh).write_text(
+                "#!/bin/sh\nprintf %s " + shlex.quote(payload) + "\n",
+                encoding="utf-8",
+            )
+            os.chmod(fake_gh, 0o755)
+            py_list, rs_list = _record_same_exit(
+                rep,
+                f"reject:live-list-{label}",
+                py,
+                rs,
+                (
+                    "plan",
+                    "--repo",
+                    "OWNER/NAME",
+                    "--git-dir",
+                    tmp,
+                    "--gh-cmd",
+                    fake_gh,
+                    "--no-archive",
+                ),
+                2,
+            )
+            if message in py_list.stderr and message in rs_list.stderr:
+                rep.ok(f"reject:live-list-{label}-is-explicit")
+            else:
+                rep.bad(
+                    f"reject:live-list-{label}-is-explicit",
+                    f"py={py_list.stderr!r}; rs={rs_list.stderr!r}",
+                )
+
         fixture: dict[str, object] = {
             "repo": "OWNER/NAME",
             "base": "main",
@@ -9364,6 +9547,130 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
                     if isinstance(action_value, str):
                         action = action_value
             return held, action
+        unavailable_fixture = {
+            "repo": "OWNER/NAME",
+            "base": "main",
+            "prs": [
+                {
+                    "number": 1,
+                    "title": "review evidence unavailable",
+                    "head_ref": "green",
+                    "head_sha": "sha-1",
+                    "review_decision": "APPROVED",
+                    "review_evidence_unavailable": True,
+                    "changed_files": ["src/a.rs"],
+                    "checks": [
+                        {
+                            "name": "merge-gate",
+                            "status": "COMPLETED",
+                            "conclusion": "SUCCESS",
+                        }
+                    ],
+                }
+            ],
+        }
+        unavailable_path = os.path.join(tmp, "review-evidence-unavailable.json")
+        with open(unavailable_path, "w", encoding="utf-8") as handle:
+            json.dump(unavailable_fixture, handle)
+        unavailable_outcome, _unavailable_rs = _record_exact(
+            rep,
+            "reject:review-evidence-unavailable-with-clean-validation",
+            py,
+            rs,
+            (
+                "plan",
+                "--fixture",
+                unavailable_path,
+                "--landing-context",
+                hard_green_path,
+                "--format",
+                "json",
+            ),
+            expected=0,
+        )
+        unavailable_held, unavailable_action = review_disposition(
+            unavailable_outcome, 1
+        )
+        unavailable_ok, unavailable_payload = _parsed_json(
+            unavailable_outcome.stdout
+        )
+        unavailable_nodes = (
+            unavailable_payload.get("nodes")
+            if unavailable_ok and isinstance(unavailable_payload, dict)
+            else None
+        )
+        unavailable_visible = (
+            isinstance(unavailable_nodes, list)
+            and len(unavailable_nodes) == 1
+            and isinstance(unavailable_nodes[0], dict)
+            and unavailable_nodes[0].get("review_evidence_unavailable") is True
+        )
+        if (
+            unavailable_held is True
+            and unavailable_action == "wait"
+            and unavailable_visible
+        ):
+            rep.ok("reject:review-evidence-unavailable-remains-visible-and-held")
+        else:
+            rep.bad(
+                "reject:review-evidence-unavailable-remains-visible-and-held",
+                f"held={unavailable_held}; action={unavailable_action!r}; "
+                f"visible={unavailable_visible}",
+            )
+
+        for label, conflict_field, conflict_value in (
+            ("local", "base_conflict_paths", ["src/conflict.rs"]),
+            ("github", "mergeable", "CONFLICTING"),
+        ):
+            conflict_pr: dict[str, object] = {
+                "number": 1,
+                "title": "review evidence unavailable with base conflict",
+                "head_ref": "green",
+                "head_sha": "sha-1",
+                "review_decision": "APPROVED",
+                "review_evidence_unavailable": True,
+                "changed_files": ["src/a.rs"],
+                "checks": [
+                    {
+                        "name": "merge-gate",
+                        "status": "COMPLETED",
+                        "conclusion": "SUCCESS",
+                    }
+                ],
+            }
+            conflict_pr[conflict_field] = conflict_value
+            conflict_fixture: dict[str, object] = {
+                "repo": "OWNER/NAME",
+                "base": "main",
+                "prs": [conflict_pr],
+            }
+            conflict_path = os.path.join(tmp, f"review-unavailable-{label}-conflict.json")
+            with open(conflict_path, "w", encoding="utf-8") as handle:
+                json.dump(conflict_fixture, handle)
+            conflict_outcome, _conflict_rs = _record_exact(
+                rep,
+                f"reject:review-evidence-unavailable-before-{label}-base-conflict",
+                py,
+                rs,
+                (
+                    "plan",
+                    "--fixture",
+                    conflict_path,
+                    "--landing-context",
+                    hard_green_path,
+                    "--format",
+                    "json",
+                ),
+                expected=0,
+            )
+            conflict_held, conflict_action = review_disposition(conflict_outcome, 1)
+            if conflict_held is True and conflict_action == "wait":
+                rep.ok(f"reject:review-evidence-unavailable-{label}-conflict-waits")
+            else:
+                rep.bad(
+                    f"reject:review-evidence-unavailable-{label}-conflict-waits",
+                    f"held={conflict_held}; action={conflict_action!r}",
+                )
 
         review_accept, _review_accept_rs = _record_exact(
             rep,
@@ -9479,7 +9786,6 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
 
         for label, field, value in (
             ("body-change", "body", "changed objection text"),
-            ("author-change", "author", "different-reviewer"),
             ("state-change", "state", "ACTIVE"),
             ("event-head-change", "head_sha", "b" * 40),
             ("creation-time-change", "created_at", "2026-09-04T11:59:59Z"),
@@ -9510,6 +9816,590 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
                 2,
             )
 
+        for label, event_index, field, value in (
+            ("ordinary-author-change", 2, "author", "different-reviewer"),
+            (
+                "false-claimed-by-hyphen",
+                1,
+                "body",
+                str(review_events[1]["body"]).replace(
+                    "BY release-authority", "BY another-agent"
+                ),
+            ),
+            (
+                "false-claimed-by-underscore",
+                1,
+                "body",
+                str(review_events[1]["body"]).replace(
+                    "BY release-authority", "BY another_agent"
+                ),
+            ),
+            (
+                "false-claimed-by-dot",
+                1,
+                "body",
+                str(review_events[1]["body"]).replace(
+                    "BY release-authority", "BY another.agent"
+                ),
+            ),
+            (
+                "false-claimed-by-ascii-k",
+                1,
+                "body",
+                str(review_events[1]["body"]).replace(
+                    "BY release-authority", "BY K"
+                ),
+            ),
+            (
+                "changed-disclosure-underscore",
+                1,
+                "body",
+                str(review_events[1]["body"]).replace(
+                    "[team, release-authority, session, model, role=observer]",
+                    "[team, departed_reviewer, old-session, model, role=observer]",
+                ),
+            ),
+            (
+                "changed-disclosure-dot",
+                1,
+                "body",
+                str(review_events[1]["body"]).replace(
+                    "[team, release-authority, session, model, role=observer]",
+                    "[team, departed.reviewer, old-session, model, role=observer]",
+                ),
+            ),
+            (
+                "changed-disclosure-ascii-k",
+                1,
+                "body",
+                str(review_events[1]["body"]).replace(
+                    "[team, release-authority, session, model, role=observer]",
+                    "[team, K, old-session, model, role=observer]",
+                ),
+            ),
+        ):
+            metadata_fixture = dict(review_fixture)
+            metadata_pr = dict(review_pr)
+            metadata_events = [dict(event) for event in review_events]
+            metadata_events[event_index][field] = value
+            metadata_pr["review_events"] = metadata_events
+            metadata_fixture["prs"] = [metadata_pr]
+            metadata_path = os.path.join(tmp, f"review-metadata-{label}.json")
+            with open(metadata_path, "w", encoding="utf-8") as handle:
+                json.dump(metadata_fixture, handle)
+            metadata_outcome, _metadata_rs = _record_exact(
+                rep,
+                f"accept:review-metadata-{label}",
+                py,
+                rs,
+                (
+                    "plan",
+                    "--fixture",
+                    metadata_path,
+                    "--landing-context",
+                    review_context_path,
+                    "--format",
+                    "json",
+                ),
+                expected=0,
+            )
+            metadata_held, metadata_action = review_disposition(metadata_outcome, 394)
+            if metadata_held is False and metadata_action == "land-now":
+                rep.ok(f"accept:review-metadata-{label}-decision-unchanged")
+            else:
+                rep.bad(
+                    f"accept:review-metadata-{label}-decision-unchanged",
+                    f"held={metadata_held}; action={metadata_action!r}",
+                )
+
+        base_review_digest = review_digest(
+            review_head, "CHANGES_REQUESTED", review_events
+        )
+
+        def write_review_variant(
+            label: str, events: list[dict[str, object]]
+        ) -> str:
+            variant = dict(review_fixture)
+            variant_pr = dict(review_pr)
+            variant_pr["review_events"] = events
+            variant["prs"] = [variant_pr]
+            path = os.path.join(tmp, f"review-{label}.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(variant, handle)
+            return path
+
+        def write_review_context(label: str, digest: str) -> str:
+            path = os.path.join(tmp, f"review-{label}-context.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "prs": [
+                            {
+                                "pr": 394,
+                                "head_sha": review_head,
+                                "review_objections_resolved": True,
+                                "review_evidence_digest": digest,
+                            }
+                        ]
+                    },
+                    handle,
+                )
+            return path
+
+        ascii_k_events = [dict(event) for event in review_events]
+        ascii_k_events[1]["body"] = str(ascii_k_events[1]["body"]).replace(
+            "BY release-authority", "BY K"
+        )
+        ascii_k_digest = review_digest(
+            review_head, "CHANGES_REQUESTED", ascii_k_events
+        )
+        if ascii_k_digest == base_review_digest:
+            rep.ok("accept:ascii-k-by-is-canonical-metadata")
+        else:
+            rep.bad(
+                "accept:ascii-k-by-is-canonical-metadata",
+                f"base={base_review_digest}; ascii_k={ascii_k_digest}",
+            )
+
+        for label, non_ascii_identity in (
+            ("kelvin-sign", "K"),
+            ("capital-dotted-i", "İ"),
+            ("dotless-i", "ı"),
+            ("long-s", "ſ"),
+        ):
+            non_ascii_by_events = [dict(event) for event in review_events]
+            non_ascii_by_events[1]["body"] = str(
+                non_ascii_by_events[1]["body"]
+            ).replace("BY release-authority", f"BY {non_ascii_identity}")
+            non_ascii_by_digest = review_digest(
+                review_head, "CHANGES_REQUESTED", non_ascii_by_events
+            )
+            if non_ascii_by_digest != ascii_k_digest:
+                rep.ok(f"reject:non-ascii-by-{label}-remains-in-digest")
+            else:
+                rep.bad(
+                    f"reject:non-ascii-by-{label}-remains-in-digest",
+                    "non-ASCII identity was normalized as ASCII metadata",
+                )
+            non_ascii_by_path = write_review_variant(
+                f"non-ascii-by-{label}", non_ascii_by_events
+            )
+            _record_same_exit(
+                rep,
+                f"reject:non-ascii-by-{label}-invalidates-context",
+                py,
+                rs,
+                (
+                    "plan",
+                    "--fixture",
+                    non_ascii_by_path,
+                    "--landing-context",
+                    review_context_path,
+                ),
+                2,
+            )
+
+            non_ascii_disclosure_events = [dict(event) for event in review_events]
+            non_ascii_disclosure_events[1]["body"] = str(
+                non_ascii_disclosure_events[1]["body"]
+            ).replace(
+                "[team, release-authority, session, model, role=observer]",
+                f"[team, {non_ascii_identity}, session, model, role=observer]",
+            )
+            non_ascii_disclosure_digest = review_digest(
+                review_head, "CHANGES_REQUESTED", non_ascii_disclosure_events
+            )
+            if non_ascii_disclosure_digest != base_review_digest:
+                rep.ok(f"reject:non-ascii-disclosure-{label}-remains-in-digest")
+            else:
+                rep.bad(
+                    f"reject:non-ascii-disclosure-{label}-remains-in-digest",
+                    "non-ASCII disclosure was normalized as identity metadata",
+                )
+            non_ascii_disclosure_path = write_review_variant(
+                f"non-ascii-disclosure-{label}", non_ascii_disclosure_events
+            )
+            _record_same_exit(
+                rep,
+                f"reject:non-ascii-disclosure-{label}-invalidates-context",
+                py,
+                rs,
+                (
+                    "plan",
+                    "--fixture",
+                    non_ascii_disclosure_path,
+                    "--landing-context",
+                    review_context_path,
+                ),
+                2,
+            )
+
+            non_ascii_wrapper_events = [dict(event) for event in review_events]
+            for event in non_ascii_wrapper_events:
+                event["body"] = (
+                    f"{event['body']}\n"
+                    f"Unverified --who metadata: {non_ascii_identity}"
+                )
+            non_ascii_wrapper_digest = review_digest(
+                review_head, "CHANGES_REQUESTED", non_ascii_wrapper_events
+            )
+            if non_ascii_wrapper_digest != base_review_digest:
+                rep.ok(f"reject:non-ascii-who-metadata-{label}-remains-in-digest")
+            else:
+                rep.bad(
+                    f"reject:non-ascii-who-metadata-{label}-remains-in-digest",
+                    "non-ASCII who metadata was normalized",
+                )
+            non_ascii_wrapper_path = write_review_variant(
+                f"non-ascii-who-metadata-{label}", non_ascii_wrapper_events
+            )
+            _record_same_exit(
+                rep,
+                f"reject:non-ascii-who-metadata-{label}-invalidates-context",
+                py,
+                rs,
+                (
+                    "plan",
+                    "--fixture",
+                    non_ascii_wrapper_path,
+                    "--landing-context",
+                    review_context_path,
+                ),
+                2,
+            )
+        for whitespace_label, non_ascii_space in (
+            ("nbsp", "\u00a0"),
+            ("em-space", "\u2003"),
+        ):
+            source_body = str(review_events[1]["body"])
+            whitespace_variants = (
+                (
+                    "by",
+                    source_body.replace(
+                        "BY release-authority",
+                        f"BY{non_ascii_space}release-authority",
+                    ),
+                ),
+                (
+                    "disclosure",
+                    source_body.replace(
+                        "[team, release-authority, session, model, role=observer]",
+                        "[team,"
+                        f"{non_ascii_space}release-authority, session, model, role=observer]",
+                    ),
+                ),
+                (
+                    "who-metadata",
+                    source_body
+                    + f"\nUnverified --who metadata:{non_ascii_space}K",
+                ),
+            )
+            for grammar, changed_body in whitespace_variants:
+                changed_events = [dict(event) for event in review_events]
+                changed_events[1]["body"] = changed_body
+                changed_digest = review_digest(
+                    review_head, "CHANGES_REQUESTED", changed_events
+                )
+                if changed_digest != base_review_digest:
+                    rep.ok(
+                        f"reject:non-ascii-whitespace-{whitespace_label}-{grammar}-digest"
+                    )
+                else:
+                    rep.bad(
+                        f"reject:non-ascii-whitespace-{whitespace_label}-{grammar}-digest",
+                        "non-ASCII whitespace was normalized as review metadata",
+                    )
+                changed_path = write_review_variant(
+                    f"non-ascii-whitespace-{whitespace_label}-{grammar}",
+                    changed_events,
+                )
+                _record_same_exit(
+                    rep,
+                    f"reject:non-ascii-whitespace-{whitespace_label}-{grammar}-context",
+                    py,
+                    rs,
+                    (
+                        "plan",
+                        "--fixture",
+                        changed_path,
+                        "--landing-context",
+                        review_context_path,
+                    ),
+                    2,
+                )
+
+            for grammar, changed_body in (
+                (
+                    "withdrawal",
+                    source_body.replace(
+                        "WITHDRAWN-AT: codex",
+                        f"WITHDRAWN-AT:{non_ascii_space}codex",
+                    ),
+                ),
+                (
+                    "retirement",
+                    source_body.replace("RETIRES 123456", f"RETIRES{non_ascii_space}123456"),
+                ),
+            ):
+                malformed_events = [dict(event) for event in review_events]
+                malformed_events[1]["body"] = changed_body
+                malformed_path = write_review_variant(
+                    f"non-ascii-whitespace-{whitespace_label}-{grammar}",
+                    malformed_events,
+                )
+                _record_same_exit(
+                    rep,
+                    f"reject:non-ascii-whitespace-{whitespace_label}-{grammar}",
+                    py,
+                    rs,
+                    ("plan", "--fixture", malformed_path),
+                    2,
+                )
+
+        malformed_by_digests: list[str] = []
+        for label, malformed_by in (
+            ("slash", "BY release/authority"),
+            ("space", "BY release authority"),
+            ("colon", "BY: release.authority"),
+            ("compact", "BY/release.authority"),
+        ):
+            malformed_events = [dict(event) for event in review_events]
+            malformed_events[1]["body"] = str(malformed_events[1]["body"]).replace(
+                "BY release-authority", malformed_by
+            )
+            malformed_digest = review_digest(
+                review_head, "CHANGES_REQUESTED", malformed_events
+            )
+            malformed_by_digests.append(malformed_digest)
+            malformed_path = write_review_variant(
+                f"malformed-by-{label}", malformed_events
+            )
+            _record_same_exit(
+                rep,
+                f"reject:review-malformed-by-{label}-preserves-bytes",
+                py,
+                rs,
+                (
+                    "plan",
+                    "--fixture",
+                    malformed_path,
+                    "--landing-context",
+                    review_context_path,
+                ),
+                2,
+            )
+            malformed_context_path = write_review_context(
+                f"malformed-by-{label}", malformed_digest
+            )
+            malformed_outcome, _malformed_rs = _record_exact(
+                rep,
+                f"accept:review-malformed-by-{label}-keeps-withdrawal",
+                py,
+                rs,
+                (
+                    "plan",
+                    "--fixture",
+                    malformed_path,
+                    "--landing-context",
+                    malformed_context_path,
+                    "--format",
+                    "json",
+                ),
+                expected=0,
+            )
+            malformed_held, malformed_action = review_disposition(
+                malformed_outcome, 394
+            )
+            if malformed_held is False and malformed_action == "land-now":
+                rep.ok(f"accept:review-malformed-by-{label}-decision-unchanged")
+            else:
+                rep.bad(
+                    f"accept:review-malformed-by-{label}-decision-unchanged",
+                    f"held={malformed_held}; action={malformed_action!r}",
+                )
+        if (
+            all(value != base_review_digest for value in malformed_by_digests)
+            and len(set(malformed_by_digests)) == len(malformed_by_digests)
+        ):
+            rep.ok("reject:malformed-by-mutations-change-review-digest")
+        else:
+            rep.bad(
+                "reject:malformed-by-mutations-change-review-digest",
+                f"base={base_review_digest}; malformed={malformed_by_digests}",
+            )
+
+        for agent in ("review-agent", "review_agent", "review.agent", "K"):
+            wrapper_events = [dict(event) for event in review_events]
+            for event in wrapper_events:
+                event["body"] = (
+                    f"{event['body']}\nUnverified --who metadata: {agent}"
+                )
+            wrapper_digest = review_digest(
+                review_head, "CHANGES_REQUESTED", wrapper_events
+            )
+            if wrapper_digest == base_review_digest:
+                rep.ok(f"accept:who-metadata-{agent}-digest-unchanged")
+            else:
+                rep.bad(
+                    f"accept:who-metadata-{agent}-digest-unchanged",
+                    f"base={base_review_digest}; wrapper={wrapper_digest}",
+                )
+            wrapper_path = write_review_variant(
+                f"who-metadata-{agent}", wrapper_events
+            )
+            wrapper_outcome, _wrapper_rs = _record_exact(
+                rep,
+                f"accept:who-metadata-{agent}",
+                py,
+                rs,
+                (
+                    "plan",
+                    "--fixture",
+                    wrapper_path,
+                    "--landing-context",
+                    review_context_path,
+                    "--format",
+                    "json",
+                ),
+                expected=0,
+            )
+            wrapper_held, wrapper_action = review_disposition(wrapper_outcome, 394)
+            if wrapper_held is False and wrapper_action == "land-now":
+                rep.ok(f"accept:who-metadata-{agent}-decision-unchanged")
+            else:
+                rep.bad(
+                    f"accept:who-metadata-{agent}-decision-unchanged",
+                    f"held={wrapper_held}; action={wrapper_action!r}",
+                )
+
+        preserved_wrapper_events = [dict(event) for event in review_events]
+        preserved_wrapper_events[0]["body"] = (
+            f"{preserved_wrapper_events[0]['body']}\n"
+            "> Unverified --who metadata: review.agent"
+        )
+        preserved_wrapper_events[1]["body"] = (
+            f"{preserved_wrapper_events[1]['body']}\n"
+            "Unverified --who metadata: review.agent extra"
+        )
+        preserved_wrapper_events[2]["body"] = (
+            f"{preserved_wrapper_events[2]['body']}\n```text\n"
+            "Unverified --who metadata: review.agent\n```"
+        )
+        preserved_wrapper_digest = review_digest(
+            review_head, "CHANGES_REQUESTED", preserved_wrapper_events
+        )
+        changed_preserved_events = [dict(event) for event in preserved_wrapper_events]
+        for event in changed_preserved_events:
+            event["body"] = str(event["body"]).replace(
+                "review.agent", "other_agent"
+            )
+        changed_preserved_digest = review_digest(
+            review_head, "CHANGES_REQUESTED", changed_preserved_events
+        )
+        if (
+            preserved_wrapper_digest != base_review_digest
+            and changed_preserved_digest != preserved_wrapper_digest
+        ):
+            rep.ok("reject:who-metadata-near-match-and-examples-remain-in-digest")
+        else:
+            rep.bad(
+                "reject:who-metadata-near-match-and-examples-remain-in-digest",
+                f"base={base_review_digest}; preserved={preserved_wrapper_digest}; "
+                f"changed={changed_preserved_digest}",
+            )
+        preserved_path = write_review_variant(
+            "who-metadata-preserved", preserved_wrapper_events
+        )
+        _record_same_exit(
+            rep,
+            "reject:who-metadata-near-match-invalidates-context",
+            py,
+            rs,
+            (
+                "plan",
+                "--fixture",
+                preserved_path,
+                "--landing-context",
+                review_context_path,
+            ),
+            2,
+        )
+        appended_objection = dict(review_fixture)
+        appended_objection_pr = dict(review_pr)
+        appended_objection_events = [dict(event) for event in review_events]
+        appended_objection_events[1]["body"] = (
+            f"{appended_objection_events[1]['body']}\n"
+            "Do not land: the race remains."
+        )
+        appended_objection_pr["review_events"] = appended_objection_events
+        appended_objection["prs"] = [appended_objection_pr]
+        appended_objection_path = os.path.join(tmp, "appended-review-objection.json")
+        with open(appended_objection_path, "w", encoding="utf-8") as handle:
+            json.dump(appended_objection, handle)
+        if review_digest(
+            review_head, "CHANGES_REQUESTED", appended_objection_events
+        ) != review_digest(review_head, "CHANGES_REQUESTED", review_events):
+            rep.ok("reject:appended-objection-changes-review-digest")
+        else:
+            rep.bad(
+                "reject:appended-objection-changes-review-digest",
+                "appended substantive objection was absent from the digest",
+            )
+        _record_same_exit(
+            rep,
+            "reject:appended-objection-invalidates-resolution",
+            py,
+            rs,
+            (
+                "plan",
+                "--fixture",
+                appended_objection_path,
+                "--landing-context",
+                review_context_path,
+            ),
+            2,
+        )
+        appended_uncontexted, _appended_uncontexted_rs = _record_exact(
+            rep,
+            "reject:appended-objection-remains-visible",
+            py,
+            rs,
+            ("plan", "--fixture", appended_objection_path, "--format", "json"),
+            expected=0,
+        )
+        appended_held, appended_action = review_disposition(appended_uncontexted, 394)
+        if appended_held is True and appended_action == "wait":
+            rep.ok("reject:appended-objection-keeps-changes-requested-hold")
+        else:
+            rep.bad(
+                "reject:appended-objection-keeps-changes-requested-hold",
+                f"held={appended_held}; action={appended_action!r}",
+            )
+
+        missing_author_fixture = dict(review_fixture)
+        missing_author_pr = dict(review_pr)
+        missing_author_events = [dict(event) for event in review_events]
+        missing_author_events[2].pop("author")
+        missing_author_pr["review_events"] = missing_author_events
+        missing_author_fixture["prs"] = [missing_author_pr]
+        missing_author_path = os.path.join(tmp, "review-metadata-missing-author.json")
+        with open(missing_author_path, "w", encoding="utf-8") as handle:
+            json.dump(missing_author_fixture, handle)
+        _record_exact(
+            rep,
+            "accept:review-metadata-missing-author",
+            py,
+            rs,
+            (
+                "plan",
+                "--fixture",
+                missing_author_path,
+                "--landing-context",
+                review_context_path,
+            ),
+            expected=0,
+        )
+
         changed_permission = dict(review_fixture)
         changed_permission_pr = dict(review_pr)
         changed_permission_events = [dict(event) for event in review_events]
@@ -9536,29 +10426,639 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
             2,
         )
 
-        for label, permission in (("missing", None), ("read-only", "read")):
-            bad_permission = dict(review_fixture)
-            bad_permission_pr = dict(review_pr)
-            bad_permission_events = [dict(event) for event in review_events]
-            if permission is None:
-                bad_permission_events[1].pop("retirement_actor_permission")
-            else:
-                bad_permission_events[1]["retirement_actor_permission"] = permission
-            bad_permission_pr["review_events"] = bad_permission_events
-            bad_permission["prs"] = [bad_permission_pr]
-            bad_permission_path = os.path.join(
-                tmp, f"retirement-actor-permission-{label}.json"
-            )
-            with open(bad_permission_path, "w", encoding="utf-8") as handle:
-                json.dump(bad_permission, handle)
-            _record_same_exit(
+        for label, remove_author in (
+            ("missing-permission", False),
+            ("missing-author-and-permission", True),
+        ):
+            unavailable = dict(review_fixture)
+            unavailable_pr = dict(review_pr)
+            unavailable_events = [dict(event) for event in review_events]
+            unavailable_events[1].pop("retirement_actor_permission")
+            if remove_author:
+                unavailable_events[1].pop("author")
+            unavailable_pr["review_events"] = unavailable_events
+            unavailable["prs"] = [unavailable_pr]
+            unavailable_path = os.path.join(tmp, f"retirement-{label}.json")
+            with open(unavailable_path, "w", encoding="utf-8") as handle:
+                json.dump(unavailable, handle)
+            outcome, _rust_outcome = _record_exact(
                 rep,
-                f"reject:retirement-actor-permission-{label}",
+                f"accept:retirement-{label}-remains-visible",
                 py,
                 rs,
-                ("plan", "--fixture", bad_permission_path),
+                ("plan", "--fixture", unavailable_path, "--format", "json"),
+                expected=0,
+            )
+            unavailable_held, unavailable_action = review_disposition(outcome, 394)
+            if unavailable_held is True and unavailable_action == "wait":
+                rep.ok(f"accept:retirement-{label}-does-not-clear-objection")
+            else:
+                rep.bad(
+                    f"accept:retirement-{label}-does-not-clear-objection",
+                    f"held={unavailable_held}; action={unavailable_action!r}",
+                )
+
+        read_only = dict(review_fixture)
+        read_only_pr = dict(review_pr)
+        read_only_events = [dict(event) for event in review_events]
+        read_only_events[1]["retirement_actor_permission"] = "read"
+        read_only_pr["review_events"] = read_only_events
+        read_only["prs"] = [read_only_pr]
+        read_only_path = os.path.join(tmp, "retirement-permission-read-only.json")
+        with open(read_only_path, "w", encoding="utf-8") as handle:
+            json.dump(read_only, handle)
+        _record_same_exit(
+            rep,
+            "reject:retirement-permission-read-only",
+            py,
+            rs,
+            ("plan", "--fixture", read_only_path),
+            2,
+        )
+
+        for label, event_author in (
+            ("departed-issuer", "departed-reviewer"),
+            ("hostname-issuer", "devbig014"),
+        ):
+            named = dict(review_fixture)
+            named_pr = dict(review_pr)
+            named_events = [dict(event) for event in review_events]
+            named_events[1]["author"] = event_author
+            named_events[1]["body"] = str(named_events[1]["body"]).replace(
+                "BY release-authority", "BY someone-else"
+            )
+            named_pr["review_events"] = named_events
+            named["prs"] = [named_pr]
+            named_path = os.path.join(tmp, f"retirement-{label}.json")
+            with open(named_path, "w", encoding="utf-8") as handle:
+                json.dump(named, handle)
+            named_context_path = os.path.join(tmp, f"retirement-{label}-context.json")
+            with open(named_context_path, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "prs": [
+                            {
+                                "pr": 394,
+                                "head_sha": review_head,
+                                "review_objections_resolved": True,
+                                "review_evidence_digest": review_digest(
+                                    review_head, "CHANGES_REQUESTED", named_events
+                                ),
+                            }
+                        ]
+                    },
+                    handle,
+                )
+            _record_exact(
+                rep,
+                f"accept:retirement-{label}",
+                py,
+                rs,
+                (
+                    "plan",
+                    "--fixture",
+                    named_path,
+                    "--landing-context",
+                    named_context_path,
+                ),
+                expected=0,
+            )
+
+        multiple_agents = dict(review_fixture)
+        multiple_agents_pr = dict(review_pr)
+        multiple_agents_pr["labels"] = ["agent:departed", "agent:replacement"]
+        multiple_agents["prs"] = [multiple_agents_pr]
+        multiple_agents_path = os.path.join(tmp, "multiple-agent-labels.json")
+        with open(multiple_agents_path, "w", encoding="utf-8") as handle:
+            json.dump(multiple_agents, handle)
+        multiple_agents_outcome, _multiple_agents_rust = _record_exact(
+            rep,
+            "accept:multiple-agent-labels-are-metadata",
+            py,
+            rs,
+            (
+                "plan",
+                "--fixture",
+                multiple_agents_path,
+                "--landing-context",
+                review_context_path,
+                "--format",
+                "json",
+            ),
+            expected=0,
+        )
+        multiple_agents_ok, multiple_agents_payload = _parsed_json(
+            multiple_agents_outcome.stdout
+        )
+        multiple_agent_nodes = (
+            multiple_agents_payload.get("nodes")
+            if multiple_agents_ok and isinstance(multiple_agents_payload, dict)
+            else None
+        )
+        multiple_agent_value = (
+            multiple_agent_nodes[0].get("assigned_agent")
+            if isinstance(multiple_agent_nodes, list)
+            and len(multiple_agent_nodes) == 1
+            and isinstance(multiple_agent_nodes[0], dict)
+            else "invalid"
+        )
+        if multiple_agent_value is None:
+            rep.ok("accept:multiple-agent-labels-do-not-assign-authority")
+        else:
+            rep.bad(
+                "accept:multiple-agent-labels-do-not-assign-authority",
+                f"assigned_agent={multiple_agent_value!r}",
+            )
+
+        # Observed #2950 host shape: issue comments only, no native reviews, and an
+        # empty aggregate reviewDecision. Stable ids, heads, and times are preserved.
+        live_head = "58bf4f5c17880395400ab3cb6482d0de2ee03a84"
+        refused_head = "c3a85da26110fd8dfc31433c8d4109726127703b"
+        repaired_head = "2a18b7bea06cf66f5cf4a973466afa506c0bd2a4"
+        live_shape_events: list[dict[str, object]] = [
+            {
+                "kind": "issue-comment",
+                "identity": "comment-5545346256",
+                "author": "rrnewton",
+                "state": "ACTIVE",
+                "head_sha": "",
+                "created_at": "2026-09-04T19:14:42Z",
+                "updated_at": "2026-09-04T19:14:42Z",
+                "last_edited_at": "",
+                "body": (
+                    "[team, review-cpuid, unresolved, build-host, role=reviewer]\n"
+                    "# Exact-head adversarial review\n\n"
+                    f"CHANGES-REQUESTED-AT: claude {refused_head}\n\n"
+                    "Major: the backend disagreement remains."
+                ),
+                "retirement_actor_permission": "",
+            },
+            {
+                "kind": "issue-comment",
+                "identity": "comment-5552679512",
+                "author": "rrnewton",
+                "state": "ACTIVE",
+                "head_sha": "",
+                "created_at": "2026-09-05T15:03:48Z",
+                "updated_at": "2026-09-05T15:03:48Z",
+                "last_edited_at": "",
+                "body": (
+                    "[team, review-cpuid, unresolved, build-host, role=reviewer]\n"
+                    "# Reassessment at the repaired head\n\n"
+                    f"CHANGES-REQUESTED-WITHDRAWN-AT: claude {repaired_head}\n\n"
+                    f"APPROVED-AT: claude {repaired_head}\n\n"
+                    "It is retired: the objection is met on the mechanism."
+                ),
+                "retirement_actor_permission": "",
+            },
+            {
+                "kind": "issue-comment",
+                "identity": "comment-5552753110",
+                "author": "rrnewton",
+                "state": "ACTIVE",
+                "head_sha": "",
+                "created_at": "2026-09-05T15:16:26Z",
+                "updated_at": "2026-09-05T15:16:26Z",
+                "last_edited_at": "",
+                "body": (
+                    "[team, review-cpuid, unresolved, build-host, role=reviewer]\n"
+                    "# Rebind to the rebased head\n\n"
+                    f"APPROVED-AT: claude {live_head}\n\n"
+                    "My refusal from the earlier head stays retired."
+                ),
+                "retirement_actor_permission": "",
+            },
+        ]
+        assert all("RETIRES" not in str(event["body"]) for event in live_shape_events)
+        assert not any(event["kind"] == "review" for event in live_shape_events)
+        live_shape_pr = dict(review_pr)
+        live_shape_pr["head_sha"] = live_head
+        live_shape_pr["review_decision"] = ""
+        live_shape_pr["review_snapshot_review_decision"] = ""
+        live_shape_pr["review_events"] = live_shape_events
+        live_shape_fixture = dict(review_fixture)
+        live_shape_fixture["prs"] = [live_shape_pr]
+        live_shape_path = os.path.join(tmp, "chronological-withdrawal.json")
+        with open(live_shape_path, "w", encoding="utf-8") as handle:
+            json.dump(live_shape_fixture, handle)
+        live_shape_context_path = os.path.join(
+            tmp, "chronological-withdrawal-context.json"
+        )
+        with open(live_shape_context_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "prs": [
+                        {
+                            "pr": 394,
+                            "head_sha": live_head,
+                            "review_objections_resolved": True,
+                            "review_evidence_digest": review_digest(
+                                live_head, "", live_shape_events
+                            ),
+                        }
+                    ]
+                },
+                handle,
+            )
+        live_shape_outcome, _live_shape_rust = _record_exact(
+            rep,
+            "accept:chronological-withdrawal-without-retires",
+            py,
+            rs,
+            (
+                "plan",
+                "--fixture",
+                live_shape_path,
+                "--landing-context",
+                live_shape_context_path,
+                "--format",
+                "json",
+            ),
+            expected=0,
+        )
+        live_shape_held, live_shape_action = review_disposition(live_shape_outcome, 394)
+        if live_shape_held is False and live_shape_action == "land-now":
+            rep.ok("accept:chronological-withdrawal-clears-held-state")
+        else:
+            rep.bad(
+                "accept:chronological-withdrawal-clears-held-state",
+                f"held={live_shape_held}; action={live_shape_action!r}",
+            )
+
+        live_uncontexted, _live_uncontexted_rs = _record_exact(
+            rep,
+            "reject:chronological-withdrawal-needs-resolution-context",
+            py,
+            rs,
+            ("plan", "--fixture", live_shape_path, "--format", "json"),
+            expected=0,
+        )
+        live_uncontexted_held, live_uncontexted_action = review_disposition(
+            live_uncontexted, 394
+        )
+        if live_uncontexted_held is True and live_uncontexted_action == "wait":
+            rep.ok("reject:chronological-withdrawal-uncontexted-hold")
+        else:
+            rep.bad(
+                "reject:chronological-withdrawal-uncontexted-hold",
+                f"held={live_uncontexted_held}; action={live_uncontexted_action!r}",
+            )
+
+        live_false_context_path = os.path.join(
+            tmp, "chronological-withdrawal-false-context.json"
+        )
+        with open(live_false_context_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "prs": [
+                        {
+                            "pr": 394,
+                            "head_sha": live_head,
+                            "review_objections_resolved": False,
+                        }
+                    ]
+                },
+                handle,
+            )
+        live_false, _live_false_rs = _record_exact(
+            rep,
+            "reject:chronological-withdrawal-false-context",
+            py,
+            rs,
+            (
+                "plan",
+                "--fixture",
+                live_shape_path,
+                "--landing-context",
+                live_false_context_path,
+                "--format",
+                "json",
+            ),
+            expected=0,
+        )
+        live_false_held, live_false_action = review_disposition(live_false, 394)
+        if live_false_held is True and live_false_action == "wait":
+            rep.ok("reject:chronological-withdrawal-false-context-hold")
+        else:
+            rep.bad(
+                "reject:chronological-withdrawal-false-context-hold",
+                f"held={live_false_held}; action={live_false_action!r}",
+            )
+
+        live_metadata_events = [dict(event) for event in live_shape_events]
+        for event in live_metadata_events:
+            body = str(event["body"]).replace(
+                "[team, review-cpuid, unresolved, build-host, role=reviewer]",
+                "[team, departed.reviewer_v2, old-session, other-host, role=reviewer]",
+            )
+            event["body"] = re.sub(
+                r"(?m)^((?:CHANGES-REQUESTED-WITHDRAWN-AT|"
+                r"CHANGES-REQUESTED-AT|APPROVED-AT):\s*"
+                r"(?:claude|codex)\s+[0-9a-f]{40})$",
+                r"\1 BY departed-reviewer",
+                body,
+            )
+        if review_digest(live_head, "", live_metadata_events) == review_digest(
+            live_head, "", live_shape_events
+        ):
+            rep.ok("accept:chronological-withdrawal-attribution-is-metadata")
+        else:
+            rep.bad(
+                "accept:chronological-withdrawal-attribution-is-metadata",
+                "disclosure or BY metadata changed the review digest",
+            )
+        live_metadata_pr = dict(live_shape_pr)
+        live_metadata_pr["review_events"] = live_metadata_events
+        live_metadata_fixture = dict(live_shape_fixture)
+        live_metadata_fixture["prs"] = [live_metadata_pr]
+        live_metadata_path = os.path.join(
+            tmp, "chronological-withdrawal-attribution-metadata.json"
+        )
+        with open(live_metadata_path, "w", encoding="utf-8") as handle:
+            json.dump(live_metadata_fixture, handle)
+        live_metadata_outcome, _live_metadata_rs = _record_exact(
+            rep,
+            "accept:chronological-withdrawal-attribution-metadata",
+            py,
+            rs,
+            (
+                "plan",
+                "--fixture",
+                live_metadata_path,
+                "--landing-context",
+                live_shape_context_path,
+                "--format",
+                "json",
+            ),
+            expected=0,
+        )
+        live_metadata_held, live_metadata_action = review_disposition(
+            live_metadata_outcome, 394
+        )
+        if live_metadata_held is False and live_metadata_action == "land-now":
+            rep.ok("accept:chronological-withdrawal-metadata-keeps-decision")
+        else:
+            rep.bad(
+                "accept:chronological-withdrawal-metadata-keeps-decision",
+                f"held={live_metadata_held}; action={live_metadata_action!r}",
+            )
+
+        stale_live_context_path = os.path.join(
+            tmp, "chronological-withdrawal-stale-head-context.json"
+        )
+        with open(stale_live_context_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "prs": [
+                        {
+                            "pr": 394,
+                            "head_sha": repaired_head,
+                            "review_objections_resolved": True,
+                            "review_evidence_digest": review_digest(
+                                live_head, "", live_shape_events
+                            ),
+                        }
+                    ]
+                },
+                handle,
+            )
+        _record_same_exit(
+            rep,
+            "reject:chronological-withdrawal-stale-head",
+            py,
+            rs,
+            (
+                "plan",
+                "--fixture",
+                live_shape_path,
+                "--landing-context",
+                stale_live_context_path,
+            ),
+            2,
+        )
+
+        chronology_cases: tuple[tuple[str, list[dict[str, object]]], ...] = (
+            (
+                "earlier-than-objection",
+                [
+                    *live_shape_events,
+                    {
+                        "kind": "review-comment",
+                        "identity": "later-objection",
+                        "author": "another-reviewer",
+                        "state": "ACTIVE",
+                        "head_sha": "",
+                        "created_at": "2026-09-05T15:17:00Z",
+                        "updated_at": "2026-09-05T15:17:00Z",
+                        "last_edited_at": "",
+                        "body": "later substantive objection",
+                        "retirement_actor_permission": "",
+                    },
+                ],
+            ),
+            (
+                "malformed-later-approval",
+                [
+                    *live_shape_events[:-1],
+                    {
+                        **live_shape_events[-1],
+                        "body": "APPROVED-AT: claude 58bf4f5c",
+                    },
+                ],
+            ),
+        )
+        for label, chronology_events in chronology_cases:
+            changed_live = dict(live_shape_fixture)
+            changed_live_pr = dict(live_shape_pr)
+            changed_live_pr["review_events"] = chronology_events
+            changed_live["prs"] = [changed_live_pr]
+            changed_live_path = os.path.join(tmp, f"chronological-{label}.json")
+            with open(changed_live_path, "w", encoding="utf-8") as handle:
+                json.dump(changed_live, handle)
+            _record_same_exit(
+                rep,
+                f"reject:chronological-withdrawal-{label}",
+                py,
+                rs,
+                (
+                    "plan",
+                    "--fixture",
+                    changed_live_path,
+                    "--landing-context",
+                    live_shape_context_path,
+                ),
                 2,
             )
+
+        no_later_pr = dict(live_shape_pr)
+        no_later_pr["review_events"] = live_shape_events[:1]
+        no_later_fixture = dict(live_shape_fixture)
+        no_later_fixture["prs"] = [no_later_pr]
+        no_later_path = os.path.join(tmp, "chronological-no-later-artifact.json")
+        with open(no_later_path, "w", encoding="utf-8") as handle:
+            json.dump(no_later_fixture, handle)
+        no_later_outcome, _no_later_rs = _record_exact(
+            rep,
+            "reject:chronological-withdrawal-no-later-artifact-held",
+            py,
+            rs,
+            ("plan", "--fixture", no_later_path, "--format", "json"),
+            expected=0,
+        )
+        no_later_held, no_later_action = review_disposition(no_later_outcome, 394)
+        if no_later_held is True and no_later_action == "wait":
+            rep.ok("reject:chronological-withdrawal-no-later-artifact-is-held")
+        else:
+            rep.bad(
+                "reject:chronological-withdrawal-no-later-artifact-is-held",
+                f"held={no_later_held}; action={no_later_action!r}",
+            )
+        no_later_digest = review_digest(live_head, "", live_shape_events[:1])
+        malformed_refusal_digests: list[str] = []
+        for label, by_suffix, canonical in (
+            ("hyphen", " BY departed-reviewer", True),
+            ("underscore", " BY departed_reviewer", True),
+            ("dot", " BY departed.reviewer", True),
+            ("slash", " BY departed/reviewer", False),
+            ("space", " BY departed reviewer", False),
+            ("missing-agent", " BY", False),
+            ("colon", " BY: departed.reviewer", False),
+            ("compact", " BY/departed.reviewer", False),
+        ):
+            refusal_events = [dict(live_shape_events[0])]
+            marker = f"CHANGES-REQUESTED-AT: claude {refused_head}"
+            refusal_events[0]["body"] = str(refusal_events[0]["body"]).replace(
+                marker, f"{marker}{by_suffix}"
+            )
+            refusal_digest = review_digest(live_head, "", refusal_events)
+            if canonical:
+                if refusal_digest == no_later_digest:
+                    rep.ok(f"accept:comment-refusal-by-{label}-is-metadata")
+                else:
+                    rep.bad(
+                        f"accept:comment-refusal-by-{label}-is-metadata",
+                        f"base={no_later_digest}; changed={refusal_digest}",
+                    )
+            else:
+                malformed_refusal_digests.append(refusal_digest)
+                if refusal_digest != no_later_digest:
+                    rep.ok(f"reject:comment-refusal-by-{label}-bytes-preserved")
+                else:
+                    rep.bad(
+                        f"reject:comment-refusal-by-{label}-bytes-preserved",
+                        "malformed BY text was removed from the digest",
+                    )
+            refusal_fixture = dict(no_later_fixture)
+            refusal_pr = dict(no_later_pr)
+            refusal_pr["review_events"] = refusal_events
+            refusal_fixture["prs"] = [refusal_pr]
+            refusal_path = os.path.join(tmp, f"comment-refusal-by-{label}.json")
+            with open(refusal_path, "w", encoding="utf-8") as handle:
+                json.dump(refusal_fixture, handle)
+            refusal_outcome, _refusal_rs = _record_exact(
+                rep,
+                f"reject:comment-refusal-by-{label}-remains-held",
+                py,
+                rs,
+                ("plan", "--fixture", refusal_path, "--format", "json"),
+                expected=0,
+            )
+            refusal_held, refusal_action = review_disposition(refusal_outcome, 394)
+            if refusal_held is True and refusal_action == "wait":
+                rep.ok(f"reject:comment-refusal-by-{label}-decision-unchanged")
+            else:
+                rep.bad(
+                    f"reject:comment-refusal-by-{label}-decision-unchanged",
+                    f"held={refusal_held}; action={refusal_action!r}",
+                )
+        if len(set(malformed_refusal_digests)) == len(malformed_refusal_digests):
+            rep.ok("reject:malformed-comment-by-mutations-change-digest")
+        else:
+            rep.bad(
+                "reject:malformed-comment-by-mutations-change-digest",
+                f"digests={malformed_refusal_digests}",
+            )
+        for whitespace_label, non_ascii_space in (
+            ("nbsp", "\u00a0"),
+            ("em-space", "\u2003"),
+        ):
+            marker = f"CHANGES-REQUESTED-AT: claude {refused_head}"
+            for grammar, malformed_marker in (
+                (
+                    "before-marker",
+                    f"{non_ascii_space}{marker}",
+                ),
+                (
+                    "after-heading",
+                    f"#{non_ascii_space}{marker}",
+                ),
+                (
+                    "after-colon",
+                    marker.replace(": ", f":{non_ascii_space}"),
+                ),
+                (
+                    "after-lane",
+                    marker.replace("claude ", f"claude{non_ascii_space}"),
+                ),
+            ):
+                refusal_events = [dict(live_shape_events[0])]
+                refusal_events[0]["body"] = str(refusal_events[0]["body"]).replace(
+                    marker, malformed_marker
+                )
+                refusal_digest = review_digest(live_head, "", refusal_events)
+                if refusal_digest != no_later_digest:
+                    rep.ok(
+                        f"reject:non-ascii-whitespace-{whitespace_label}-{grammar}-refusal-digest"
+                    )
+                else:
+                    rep.bad(
+                        f"reject:non-ascii-whitespace-{whitespace_label}-{grammar}-refusal-digest",
+                        "non-ASCII whitespace was accepted as refusal syntax",
+                    )
+                refusal_fixture = dict(no_later_fixture)
+                refusal_pr = dict(no_later_pr)
+                refusal_pr["review_events"] = refusal_events
+                refusal_fixture["prs"] = [refusal_pr]
+                refusal_path = os.path.join(
+                    tmp,
+                    f"comment-refusal-{whitespace_label}-{grammar}.json",
+                )
+                with open(refusal_path, "w", encoding="utf-8") as handle:
+                    json.dump(refusal_fixture, handle)
+                refusal_outcome, _refusal_rs = _record_exact(
+                    rep,
+                    f"reject:non-ascii-whitespace-{whitespace_label}-{grammar}-refusal",
+                    py,
+                    rs,
+                    ("plan", "--fixture", refusal_path, "--format", "json"),
+                    expected=0,
+                )
+                refusal_held, refusal_action = review_disposition(
+                    refusal_outcome, 394
+                )
+                if refusal_held is False and refusal_action == "land-now":
+                    rep.ok(
+                        f"reject:non-ascii-whitespace-{whitespace_label}-{grammar}-unrecognized"
+                    )
+                else:
+                    rep.bad(
+                        f"reject:non-ascii-whitespace-{whitespace_label}-{grammar}-unrecognized",
+                        f"held={refusal_held}; action={refusal_action!r}",
+                    )
+        _record_same_exit(
+            rep,
+            "reject:chronological-withdrawal-no-later-artifact-invalidates-context",
+            py,
+            rs,
+            (
+                "plan",
+                "--fixture",
+                no_later_path,
+                "--landing-context",
+                live_shape_context_path,
+            ),
+            2,
+        )
 
         mismatched_snapshot = dict(review_fixture)
         mismatched_pr = dict(review_pr)
@@ -9649,6 +11149,37 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
             )
 
         null_snapshot_head = dict(review_fixture)
+        for label, malformed_unavailable in (
+            ("null", None),
+            ("integer", 0),
+            ("string", "true"),
+            ("array", []),
+            ("object", {}),
+        ):
+            malformed_unavailable_fixture: dict[str, object] = {
+                "repo": "OWNER/NAME",
+                "base": "main",
+                "prs": [
+                    {
+                        "number": 1,
+                        "review_evidence_unavailable": malformed_unavailable,
+                    }
+                ],
+            }
+            malformed_unavailable_path = os.path.join(
+                tmp, f"malformed-review-evidence-unavailable-{label}.json"
+            )
+            with open(malformed_unavailable_path, "w", encoding="utf-8") as handle:
+                json.dump(malformed_unavailable_fixture, handle)
+            _record_same_exit(
+                rep,
+                f"reject:review-evidence-unavailable-{label}",
+                py,
+                rs,
+                ("plan", "--fixture", malformed_unavailable_path),
+                2,
+            )
+
         null_snapshot_pr = dict(review_pr)
         null_snapshot_pr["review_snapshot_head_sha"] = None
         null_snapshot_head["prs"] = [null_snapshot_pr]

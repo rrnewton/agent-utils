@@ -125,6 +125,12 @@ def test_review_decisions_and_ordering_cycles_fail_closed() -> None:
     assert "ordering-cycle" in by[5]
     assert by[6] == ("depends-on-held:#5",)
 
+    unavailable = replace(
+        _node(7, review_decision="APPROVED"), review_evidence_unavailable=True
+    )
+    assert held_reasons((unavailable,), ())[0].reasons == (
+        "review-evidence-unavailable",
+    )
 
 def test_exact_head_objection_resolution_only_clears_changes_requested() -> None:
     resolved = _node(1, review_decision="CHANGES_REQUESTED")

@@ -271,6 +271,9 @@ pub fn held_reasons(nodes: &[PrNode], ordering_edges: &[OrderingEdge]) -> Vec<He
         if node.is_draft {
             why.push("draft".to_owned());
         }
+        if node.review_evidence_unavailable {
+            why.push("review-evidence-unavailable".to_owned());
+        }
         let review = node.review_decision.trim().to_ascii_uppercase();
         match review.as_str() {
             "REVIEW_REQUIRED" => why.push("review-required".to_owned()),
@@ -651,6 +654,16 @@ mod tests {
         assert!(held[&4].contains(&"ordering-cycle".to_owned()));
         assert!(held[&5].contains(&"ordering-cycle".to_owned()));
         assert_eq!(held[&6], vec!["depends-on-held:#5"]);
+
+        let unavailable = PrNode {
+            review_decision: "APPROVED".into(),
+            review_evidence_unavailable: true,
+            ..node(7, 0)
+        };
+        assert_eq!(
+            held_reasons(&[unavailable], &[])[0].reasons,
+            ["review-evidence-unavailable"]
+        );
     }
 
     #[test]

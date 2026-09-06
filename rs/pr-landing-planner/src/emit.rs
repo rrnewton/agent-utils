@@ -43,6 +43,7 @@ fn node_obj(node: &PrNode, held: bool) -> Value {
         "validation_authority": node.validation_authority.as_str(),
         "policy_class": node.policy_class.as_str(),
         "review_decision": (!node.review_decision.is_empty()).then_some(node.review_decision.as_str()),
+        "review_evidence_unavailable": node.review_evidence_unavailable,
         "review_evidence_digest": (!node.review_evidence_digest.is_empty())
             .then_some(node.review_evidence_digest.as_str()),
         "review_objections_resolved": node.review_objections_resolved,

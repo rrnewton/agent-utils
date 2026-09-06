@@ -10,7 +10,7 @@ from pr_landing_planner.collect import (
     CollectionError,
     collect_graph,
 )
-from pr_landing_planner.fakehost import FakeHost
+from pr_landing_planner.fakehost import FakeHost, FixtureError
 
 _FIXTURE: dict[str, object] = {
     "repo": "OWNER/NAME",
@@ -188,6 +188,85 @@ def test_matching_review_decisions_are_accepted() -> None:
     host, _, _ = FakeHost.from_fixture(fixture)
     graph = collect_graph(host, repo="R", base="integration")
     assert graph.nodes[0].review_decision == "CHANGES_REQUESTED"
+
+
+def test_canonical_comment_refusal_holds_without_native_review_decision() -> None:
+    head = "a" * 40
+    fixture: dict[str, object] = {
+        "repo": "R",
+        "base": "integration",
+        "prs": [
+            {
+                "number": 1,
+                "head_sha": head,
+                "review_decision": "",
+                "review_snapshot_review_decision": "",
+                "review_events": [
+                    {
+                        "kind": "issue-comment",
+                        "identity": "comment-123456",
+                        "author": "reviewer",
+                        "state": "ACTIVE",
+                        "head_sha": "",
+                        "created_at": "2026-09-04T12:00:00Z",
+                        "updated_at": "2026-09-04T12:00:00Z",
+                        "last_edited_at": "",
+                        "body": (
+                            "[team, reviewer, unresolved, build-host, role=reviewer]\n"
+                            f"CHANGES-REQUESTED-AT: codex {head}\n"
+                            "The race remains."
+                        ),
+                    }
+                ],
+            }
+        ],
+    }
+    host, _, _ = FakeHost.from_fixture(fixture)
+    graph = collect_graph(host, repo="R", base="integration")
+    assert graph.nodes[0].review_decision == "CHANGES_REQUESTED"
+
+
+def test_review_evidence_unavailable_survives_collection() -> None:
+    fixture: dict[str, object] = {
+        "repo": "R",
+        "base": "integration",
+        "prs": [
+            {
+                "number": 1,
+                "head_sha": "a" * 40,
+                "review_decision": "APPROVED",
+                "review_evidence_unavailable": True,
+                "checks": [{"name": "merge-gate", "conclusion": "SUCCESS"}],
+            }
+        ],
+    }
+    host, _, _ = FakeHost.from_fixture(fixture)
+    graph = collect_graph(host, repo="R", base="integration")
+    node = graph.nodes[0]
+    assert node.review_decision == "APPROVED"
+    assert node.review_evidence_unavailable
+    assert node.review_evidence_digest == ""
+
+@pytest.mark.parametrize("malformed", (None, 0, "true", [], {}))
+def test_review_evidence_unavailable_fixture_field_is_strict_boolean(
+    malformed: object,
+) -> None:
+    fixture: dict[str, object] = {
+        "repo": "R",
+        "base": "integration",
+        "prs": [
+            {
+                "number": 1,
+                "head_sha": "a" * 40,
+                "review_evidence_unavailable": malformed,
+            }
+        ],
+    }
+    with pytest.raises(
+        FixtureError, match="field 'review_evidence_unavailable' must be a boolean"
+    ):
+        FakeHost.from_fixture(fixture)
+
 
 
 def test_only_numbers_restricts_selection() -> None:

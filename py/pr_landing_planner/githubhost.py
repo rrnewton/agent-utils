@@ -21,7 +21,7 @@ from dataclasses import dataclass, replace
 from pr_landing_planner.classify import parse_rollup
 from pr_landing_planner.landing_context import (
     ALLOWED_RETIREMENT_PERMISSIONS,
-    retirement_actor,
+    retirement_record,
 )
 from pr_landing_planner.model import (
     CheckRun,
@@ -62,6 +62,7 @@ LIGHT_FIELDS: tuple[str, ...] = tuple(f for f in GH_FIELDS if f not in _ENRICHME
 #: Concurrency for per-PR checks/review enrichment. Bounded so we never fan out hundreds of ``gh``
 #: processes; the work is network-bound so a small pool already hides most latency.
 _ENRICHMENT_WORKERS = 8
+_PR_LIST_LIMIT = 500
 
 _REVIEWS_QUERY = """
 query($owner: String!, $name: String!, $number: Int!, $endCursor: String) {
@@ -104,6 +105,36 @@ class HostCommandError(RuntimeError):
     def __init__(self, cmd: Sequence[str], returncode: int, stderr: str) -> None:
         super().__init__(f"command failed ({returncode}): {shlex.join(cmd)}\n{stderr.strip()}")
         self.returncode = returncode
+
+def _light_pr_entries(stdout: str) -> tuple[dict[str, object], ...]:
+    if not stdout.strip():
+        raise ValueError(
+            "open PR list returned empty stdout; review evidence is unavailable"
+        )
+    try:
+        raw: object = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"open PR list returned invalid JSON; review evidence is unavailable: {exc}"
+        ) from exc
+    if not isinstance(raw, list):
+        raise ValueError(
+            "open PR list response is not an array; review evidence is unavailable"
+        )
+    if len(raw) >= _PR_LIST_LIMIT:
+        raise ValueError(
+            f"open PR list reached the {_PR_LIST_LIMIT}-item limit; "
+            "review evidence may be incomplete"
+        )
+    entries: list[dict[str, object]] = []
+    for index, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"open PR list entry {index} is not an object; review evidence is unavailable"
+            )
+        entries.append({str(key): value for key, value in entry.items()})
+    return tuple(entries)
+
 
 
 def _run(
@@ -182,12 +213,16 @@ def _required_string(event: Mapping[str, object], role: str, key: str) -> str:
 
 def _event_author(event: Mapping[str, object], role: str, key: str) -> str:
     value = event.get(key)
+    if value is None:
+        return ""
     if not isinstance(value, dict):
-        raise ValueError(f"{role} lacks an author object")
+        raise ValueError(f"{role} author is not an object or null")
     login = value.get("login")
-    if not isinstance(login, str) or not login:
-        raise ValueError(f"{role} lacks a stable author login")
-    return login
+    if login is None:
+        return ""
+    if not isinstance(login, str):
+        raise ValueError(f"{role} author login is not a string or null")
+    return login.strip()
 
 
 _INLINE_STATE_FIELDS = (
@@ -397,15 +432,15 @@ def _review_snapshot(
     return ReviewEvidenceSnapshot(head, decision, tuple(events))
 
 
-def _repository_permission(raw: object, expected_actor: str) -> str:
+def _repository_permission(raw: object, expected_author: str) -> str:
     response = _event_object(raw, "repository permission response")
     user = _event_object(response.get("user"), "repository permission response.user")
     actual_actor = _required_string(
         user, "repository permission response.user", "login"
     )
-    if actual_actor.lower() != expected_actor.lower():
+    if actual_actor.lower() != expected_author.lower():
         raise ValueError(
-            "repository permission response actor differs from retirement actor"
+            "repository permission response actor differs from GitHub event author"
         )
     role = response.get("role_name")
     permission = response.get("permission")
@@ -418,7 +453,7 @@ def _repository_permission(raw: object, expected_actor: str) -> str:
         if candidate in ALLOWED_RETIREMENT_PERMISSIONS:
             return candidate
     raise ValueError(
-        "retirement actor lacks current triage-or-higher repository permission"
+        "GitHub event author lacks current triage-or-higher repository permission"
     )
 
 
@@ -441,47 +476,66 @@ class GitHubHost:
     def _net(self, cmd: Sequence[str]) -> list[str]:
         return [*self._wrapper, *cmd]
 
-    def _retirement_permission(self, repo: str, actor: str) -> str:
+    def _retirement_permission(self, repo: str, author: str) -> str:
         proc = _run(
             self._net(
                 [
                     self._gh,
                     "api",
-                    f"repos/{repo}/collaborators/{actor}/permission",
+                    f"repos/{repo}/collaborators/{author}/permission",
                 ]
             ),
             cwd=None,
         )
         raw: object = json.loads(proc.stdout) if proc.stdout.strip() else None
-        return _repository_permission(raw, actor)
+        return _repository_permission(raw, author)
 
     def _bind_retirement_permissions(
         self, repo: str, snapshot: ReviewEvidenceSnapshot
     ) -> ReviewEvidenceSnapshot:
-        actors: set[str] = set()
+        authors: set[str] = set()
         for event in snapshot.events:
-            actor = retirement_actor(event.body)
-            if actor is None:
+            retirement = retirement_record(event.body)
+            if (
+                retirement is None
+                or retirement.head_sha != snapshot.head_sha
+                or event.state != "ACTIVE"
+                or not event.author
+            ):
                 continue
-            if event.author.lower() != actor:
-                raise ValueError(
-                    "review evidence retirement actor differs from GitHub event author"
-                )
-            actors.add(actor)
-        permissions = {
-            actor: self._retirement_permission(repo, actor)
-            for actor in sorted(actors)
-        }
+            authors.add(event.author)
+        permissions: dict[str, str] = {}
+        unavailable: list[str] = []
+        for author in sorted(authors):
+            try:
+                permissions[author] = self._retirement_permission(repo, author)
+            except (HostCommandError, ValueError):
+                permissions[author] = ""
+                unavailable.append(author)
+        if unavailable:
+            print(
+                "pr-landing-planner: NOTE: retirement permission unavailable for "
+                + ",".join(unavailable)
+                + "; retaining the events without retirement authority",
+                file=sys.stderr,
+            )
+
+        def permission(event: ReviewEvidenceEvent) -> str:
+            retirement = retirement_record(event.body)
+            if (
+                retirement is None
+                or retirement.head_sha != snapshot.head_sha
+                or event.state != "ACTIVE"
+            ):
+                return ""
+            return permissions.get(event.author, "")
+
         return replace(
             snapshot,
             events=tuple(
                 replace(
                     event,
-                    retirement_actor_permission=(
-                        permissions[actor]
-                        if (actor := retirement_actor(event.body)) is not None
-                        else ""
-                    ),
+                    retirement_actor_permission=permission(event),
                 )
                 for event in snapshot.events
             ),
@@ -497,18 +551,13 @@ class GitHubHost:
                     self._gh, "pr", "list",
                     "--repo", repo,
                     "--state", "open",
-                    "--limit", "500",
+                    "--limit", str(_PR_LIST_LIMIT),
                     "--json", ",".join(LIGHT_FIELDS),
                 ]
             ),
             cwd=None,
         )
-        raw: object = json.loads(proc.stdout) if proc.stdout.strip() else []
-        if not isinstance(raw, list):
-            raise HostCommandError(["gh", "pr", "list"], 0, "expected a JSON array from gh")
-        entries: list[dict[str, object]] = [
-            {str(k): v for k, v in entry.items()} for entry in raw if isinstance(entry, dict)
-        ]
+        entries = _light_pr_entries(proc.stdout)
         # ...then enrich each PR's rollup with a small per-PR ``gh pr view``, in parallel.
         numbers = [_int(obj, "number") for obj in entries]
         enrichments = self._fetch_enrichments(repo, numbers)
@@ -530,6 +579,7 @@ class GitHubHost:
                     # compares it with the later evidence snapshot instead of silently
                     # replacing a non-empty decision with missing or contradictory data.
                     review_decision=_str(obj, "reviewDecision"),
+                    review_evidence_unavailable=enrichment is None,
                     created_at=_str(obj, "createdAt"),
                     updated_at=_str(obj, "updatedAt"),
                     additions=_int(obj, "additions"),

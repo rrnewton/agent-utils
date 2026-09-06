@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Sequence
+from pr_landing_planner.graph import held_reasons
 
 from pr_landing_planner.model import (
     CiState,
@@ -167,6 +168,35 @@ def test_held_actions() -> None:
     # Held PRs never appear in land_now or the parallel-safe groups.
     assert plan.land_now == ()
     assert all(1 not in g and 2 not in g and 3 not in g for g in plan.parallel_safe_groups)
+def test_unavailable_review_evidence_waits_before_base_conflict_rebase() -> None:
+    local = dataclasses.replace(
+        _node(4),
+        review_evidence_unavailable=True,
+        base_conflict_paths=("src/conflict.rs",),
+        validation_evidence=ValidationEvidence.CLEAN_VALIDATE_RECORD,
+        validation_authority=ValidationAuthority.HARD_GREEN,
+    )
+    github = dataclasses.replace(
+        _node(5),
+        review_evidence_unavailable=True,
+        mergeable="CONFLICTING",
+        validation_evidence=ValidationEvidence.CLEAN_VALIDATE_RECORD,
+        validation_authority=ValidationAuthority.HARD_GREEN,
+    )
+    nodes = (local, github)
+    held = held_reasons(nodes, ())
+    plan, _ = compute_plan(nodes, (), (), held)
+
+    by_pr = {decision.pr: decision for decision in plan.per_pr_actions}
+    assert by_pr[4].action is PrAction.WAIT
+    assert by_pr[5].action is PrAction.WAIT
+    assert "review-evidence-unavailable" in by_pr[4].why
+    assert "local-base-conflict" in by_pr[4].why
+    assert "review-evidence-unavailable" in by_pr[5].why
+    assert "github-base-conflicting" in by_pr[5].why
+    assert plan.land_now == ()
+
+
 
 
 def test_land_now_and_order_priority() -> None:

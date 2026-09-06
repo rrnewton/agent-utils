@@ -34,6 +34,7 @@ from pr_landing_planner.host import VcsHost
 from pr_landing_planner.landing_context import (
     LandingContext,
     apply_landing_context,
+    has_comment_changes_requested,
     review_evidence_digest,
 )
 from pr_landing_planner.model import (
@@ -228,6 +229,10 @@ def collect_graph(
                 raise CollectionError(
                     f"PR #{pr.number} review evidence is not safely identifiable: {exc}"
                 ) from exc
+            if review_decision in ("", "APPROVED") and has_comment_changes_requested(
+                pr.review_snapshot
+            ):
+                review_decision = "CHANGES_REQUESTED"
         nodes.append(
             PrNode(
                 number=pr.number,
@@ -240,6 +245,7 @@ def collect_graph(
                 is_draft=pr.is_draft,
                 mergeable=pr.mergeable,
                 review_decision=review_decision,
+                review_evidence_unavailable=pr.review_evidence_unavailable,
                 created_at=pr.created_at,
                 updated_at=pr.updated_at,
                 additions=pr.additions,
