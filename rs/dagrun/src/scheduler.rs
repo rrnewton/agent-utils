@@ -4658,10 +4658,10 @@ mod tests {
         );
         std::fs::write(
             &path,
-            br#"{"schema":3,"executed_tests":5,"filtered_tests":0,"results":[{"id":"suite$ordinary","result":"fail","attempts":1,"attempt_results":[{"attempt":1,"outcome":"failed","detail":"exit 7"}]},{"id":"suite$cpu","result":"fail","attempts":1,"attempt_results":[{"attempt":1,"outcome":"cpu_timeout","detail":"used 22000000us CPU"}]},{"id":"suite$wall","result":"fail","attempts":1,"attempt_results":[{"attempt":1,"outcome":"wall_timeout","detail":"ran 57000ms wall"}]},{"id":"suite$cancelled","result":"fail","attempts":1,"attempt_results":[{"attempt":1,"outcome":"cancelled","detail":"cancelled by signal 2"}]},{"id":"suite$infra","result":"fail","attempts":1,"attempt_results":[{"attempt":1,"outcome":"infrastructure_error","detail":"cpu.stat malformed"}]}]}"#,
+            br#"{"schema":3,"executed_tests":6,"filtered_tests":0,"results":[{"id":"suite$ordinary","result":"fail","attempts":1,"attempt_results":[{"attempt":1,"outcome":"failed","detail":"exit 7"}]},{"id":"suite$cpu","result":"fail","attempts":1,"attempt_results":[{"attempt":1,"outcome":"cpu_timeout","detail":"used 22000000us CPU"}]},{"id":"suite$wall","result":"fail","attempts":1,"attempt_results":[{"attempt":1,"outcome":"wall_timeout","detail":"ran 57000ms wall"}]},{"id":"suite$cancelled","result":"fail","attempts":1,"attempt_results":[{"attempt":1,"outcome":"cancelled","detail":"cancelled by signal 2"}]},{"id":"suite$infra","result":"fail","attempts":1,"attempt_results":[{"attempt":1,"outcome":"infrastructure_error","detail":"cpu.stat malformed"}]},{"id":"suite$no-result","result":"fail","attempts":1,"attempt_results":[{"attempt":1,"outcome":"no_result","detail":"producer reported cli-error: vector 13"}]}]}"#,
         )
         .unwrap();
-        let current = resolved_test_counts(Some(crate::test_results::CURRENT_SCHEMA), Some(&path), printed).unwrap();
+        let current = resolved_test_counts(TestResultsMode::Structured(crate::test_results::CURRENT_SCHEMA), Some(&path), printed).unwrap();
         let outcomes = current
             .results
             .unwrap()
@@ -4676,19 +4676,24 @@ mod tests {
                 crate::test_results::TestAttemptOutcome::WallTimeout,
                 crate::test_results::TestAttemptOutcome::Cancelled,
                 crate::test_results::TestAttemptOutcome::InfrastructureError,
+                crate::test_results::TestAttemptOutcome::NoResult,
             ]
         );
         std::fs::remove_file(&path).unwrap();
+        let missing_path = resolved_test_counts(
+            TestResultsMode::Structured(crate::test_results::CURRENT_SCHEMA),
+            None,
+            printed,
+        )
+        .expect_err("a required producer with no path must refuse");
         assert!(
-            resolved_test_counts(
-                TestResultsMode::Structured(crate::test_results::CURRENT_SCHEMA),
-                None,
-                printed
-            )
-            .unwrap_err()
-            .contains("required structured test results were not written"),
-            "a printed banner must not create receipt evidence in structured mode"
+            missing_path.contains("required structured test results were not written")
+                && missing_path.contains("scheduler-owned path unavailable"),
+            "{missing_path}"
         );
+        let missing_file = resolved_test_counts(TestResultsMode::Structured(crate::test_results::CURRENT_SCHEMA), Some(&path), printed)
+            .expect_err("a required producer that wrote no file must refuse");
+        assert!(missing_file.contains(path.to_string_lossy().as_ref()));
         assert_eq!(
             resolved_test_counts(TestResultsMode::LegacyStdout, None, printed).unwrap(),
             CapturedTestResults {
@@ -4699,7 +4704,7 @@ mod tests {
             "clients that have not opted in retain the compatibility parser"
         );
         std::fs::write(&path, br#"{"schema":3,"executed_tests":1}"#).unwrap();
-        let error = resolved_test_counts(Some(crate::test_results::CURRENT_SCHEMA), Some(&path), printed)
+        let error = resolved_test_counts(TestResultsMode::Structured(crate::test_results::CURRENT_SCHEMA), Some(&path), printed)
             .expect_err("a malformed current structured result must refuse");
         assert!(error.contains("malformed structured test results"));
         assert!(error.contains("structured-test-results-filtered_tests"));
