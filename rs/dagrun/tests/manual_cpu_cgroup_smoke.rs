@@ -45,6 +45,82 @@ fn wait_for_status(child: &ManualCpuCgroup, wanted: ManualCpuCgroupStatus) {
     }
 }
 
+fn finite_cpu_burner() -> Command {
+    let mut command = Command::new("/bin/sh");
+    command
+        .args([
+            "-c",
+            "i=0; while [ \"$i\" -lt 200000 ]; do i=$((i + 1)); done",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command
+}
+
+fn wait_bounded(mut child: std::process::Child, label: &str) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => return Err(format!("{label} exited with {status}")),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                let kill = child.kill().err();
+                let reap = child.wait();
+                return Err(format!(
+                    "{label} exceeded its 10-second wall bound; kill={kill:?}, reap={reap:?}"
+                ));
+            }
+            Err(error) => {
+                let kill = child.kill().err();
+                let reap = child.wait();
+                return Err(format!(
+                    "cannot poll {label}: {error}; kill={kill:?}, reap={reap:?}"
+                ));
+            }
+        }
+    }
+}
+
+fn run_aggregate_success_inside_boxed_step() {
+    let borrowed_parent = current_cgroup_path();
+    let root = ManualCpuCgroupRoot::current()
+        .expect("the boxed step must provide an exclusively delegated CPU cgroup");
+    let supervisor = current_cgroup_path();
+    assert_ne!(supervisor, borrowed_parent);
+
+    let aggregate = root.create_child("aggregate-success").unwrap();
+    let aggregate_path = aggregate.path().to_path_buf();
+    let mut first_command = finite_cpu_burner();
+    let mut second_command = finite_cpu_burner();
+    aggregate.attach_command(&mut first_command).unwrap();
+    aggregate.attach_command(&mut second_command).unwrap();
+    let first = first_command.spawn().unwrap();
+    let second = second_command.spawn().unwrap();
+    drop(first_command);
+    drop(second_command);
+
+    let first_result = wait_bounded(first, "first CPU burner");
+    let second_result = wait_bounded(second, "second CPU burner");
+    assert!(
+        first_result.is_ok() && second_result.is_ok(),
+        "attached CPU burners failed: first={first_result:?}, second={second_result:?}"
+    );
+    wait_for_status(&aggregate, ManualCpuCgroupStatus::Empty);
+    let aggregate_cpu_usec = aggregate.final_cpu_usage_usec().unwrap();
+    assert!(
+        aggregate_cpu_usec > 0,
+        "two finite CPU burners must consume positive aggregate CPU time"
+    );
+    aggregate.cleanup().unwrap();
+    assert!(!aggregate_path.exists());
+
+    root.cleanup().unwrap();
+    assert_eq!(current_cgroup_path(), borrowed_parent);
+    assert!(!supervisor.exists());
+}
+
 fn run_inside_boxed_step() {
     let root = ManualCpuCgroupRoot::current()
         .expect("the boxed step must provide an exclusively delegated CPU cgroup");
@@ -134,6 +210,7 @@ fn run_inside_boxed_step() {
 #[test]
 fn manual_cpu_cgroup_contains_fast_exit_and_setsid_escape() {
     if std::env::var(CHILD_ENV).as_deref() == Ok("1") {
+        run_aggregate_success_inside_boxed_step();
         run_inside_boxed_step();
         return;
     }
