@@ -2590,6 +2590,42 @@ fn test_results_report_failure(counts: &CapturedTestResults) -> bool {
         .is_some_and(|results| results.iter().any(|result| !result.passed))
 }
 
+fn structured_test_failure_reason(
+    counts: &CapturedTestResults,
+    returncode: Option<i64>,
+    timed_out: bool,
+    cpu_timed_out: bool,
+    oom: i64,
+    was_aborted: bool,
+) -> Option<String> {
+    if returncode != Some(0) || timed_out || cpu_timed_out || oom != 0 || was_aborted {
+        return None;
+    }
+
+    let result = counts
+        .results
+        .as_ref()?
+        .iter()
+        .find(|result| !result.passed)?;
+    let Some(attempt) = result
+        .attempt_results
+        .as_ref()
+        .and_then(|attempts| attempts.last())
+    else {
+        return Some(format!("STRUCTURED TEST FAILURE: {}", result.id));
+    };
+    let detail = attempt
+        .detail
+        .as_deref()
+        .unwrap_or("typed cause unavailable");
+    Some(format!(
+        "STRUCTURED TEST FAILURE: {} attempt {} {}: {detail}",
+        result.id,
+        attempt.attempt,
+        attempt.outcome.value()
+    ))
+}
+
 fn resolved_test_counts(
     mode: TestResultsMode,
     path: Option<&std::path::Path>,
@@ -3788,6 +3824,15 @@ fn run_step(ctx: StepCtx) {
             outcome.reason = format!("STRUCTURED TEST RESULTS REFUSED: {error}");
             outcome.test_results_error = Some(error.clone());
             outcome.ok = false;
+        } else if let Some(reason) = structured_test_failure_reason(
+            &test_counts,
+            returncode,
+            timed_out,
+            cpu_timed_out,
+            oom,
+            was_aborted,
+        ) {
+            outcome.reason = reason;
         }
         outcome.test_results = test_counts.results;
         let reason = outcome.reason.clone();
@@ -4690,6 +4735,40 @@ mod tests {
             .unwrap()]),
         };
         assert!(!test_results_report_failure(&all_pass));
+        assert_eq!(
+            structured_test_failure_reason(&current, Some(0), false, false, 0, false).as_deref(),
+            Some("STRUCTURED TEST FAILURE: suite$ordinary attempt 1 failed: exit 7")
+        );
+        assert_eq!(
+            structured_test_failure_reason(&current, Some(7), false, false, 0, false),
+            None,
+            "a nonzero producer exit keeps process-failure precedence"
+        );
+        assert_eq!(
+            structured_test_failure_reason(&current, Some(0), true, false, 0, false),
+            None,
+            "a wall timeout keeps outer-wall-timeout precedence"
+        );
+        assert_eq!(
+            structured_test_failure_reason(&current, Some(0), false, true, 0, false),
+            None,
+            "a CPU timeout keeps outer-CPU-timeout precedence"
+        );
+        assert_eq!(
+            structured_test_failure_reason(&current, Some(0), false, false, 1, false),
+            None,
+            "an OOM keeps cgroup-failure precedence"
+        );
+        assert_eq!(
+            structured_test_failure_reason(&current, Some(0), false, false, 0, true),
+            None,
+            "an abort keeps abort precedence"
+        );
+        assert_eq!(
+            structured_test_failure_reason(&all_pass, Some(0), false, false, 0, false),
+            None,
+            "passing structured results do not synthesize a failure reason"
+        );
         let outcomes = current
             .results
             .unwrap()
@@ -4814,6 +4893,68 @@ mod tests {
         let outcome = &result.outcomes[0];
         assert_eq!(outcome.executed_tests, Some(1));
         assert_eq!(outcome.filtered_tests, Some(0));
+        assert_eq!(outcome.returncode, Some(0));
+        assert!(outcome.reason.is_empty());
+        assert_scheduler_owned_path_was_removed(&marker);
+    }
+
+    #[test]
+    fn ordinary_failed_declared_results_replace_the_false_exit_zero_reason() {
+        let marker = std::env::temp_dir().join(format!(
+            "dagrun-no-evidence-ordinary-failed-{}-{}",
+            std::process::id(),
+            TEST_COUNTS_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let command = r#"printf '%s\n' "$DAGRUN_TEST_COUNTS_PATH" > "$TEST_MARKER_PATH"; printf '%s' '{"schema":3,"executed_tests":1,"filtered_tests":0,"results":[{"id":"suite$case","result":"fail","attempts":1,"attempt_results":[{"attempt":1,"outcome":"failed","detail":"guest exited 7"}]}]}' > "$DAGRUN_TEST_COUNTS_PATH""#;
+        let result = run_without_evidence(&structured_producer(command, &marker));
+        assert!(!result.ok, "{:#?}", result.outcomes);
+        let outcome = &result.outcomes[0];
+        assert_eq!(outcome.returncode, Some(0));
+        assert_eq!(
+            outcome.reason,
+            "STRUCTURED TEST FAILURE: suite$case attempt 1 failed: guest exited 7"
+        );
+        assert!(!outcome.reason.contains("exit 0"));
+        let typed = outcome
+            .test_results
+            .as_ref()
+            .and_then(|results| results.first())
+            .expect("failed schema-3 result survives the scheduler");
+        assert_eq!(
+            typed.attempt_results.as_ref().unwrap()[0].outcome,
+            crate::test_results::TestAttemptOutcome::Failed
+        );
+        assert_scheduler_owned_path_was_removed(&marker);
+    }
+
+    #[test]
+    fn failed_declared_results_replace_the_false_exit_zero_reason() {
+        let marker = std::env::temp_dir().join(format!(
+            "dagrun-no-evidence-failed-{}-{}",
+            std::process::id(),
+            TEST_COUNTS_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let command = r#"printf '%s\n' "$DAGRUN_TEST_COUNTS_PATH" > "$TEST_MARKER_PATH"; printf '%s' '{"schema":3,"executed_tests":1,"filtered_tests":0,"results":[{"id":"suite$case","result":"fail","attempts":1,"attempt_results":[{"attempt":1,"outcome":"cpu_timeout","detail":"used 22000000us CPU"}]}]}' > "$DAGRUN_TEST_COUNTS_PATH""#;
+        let result = run_without_evidence(&structured_producer(command, &marker));
+        assert!(!result.ok, "{:#?}", result.outcomes);
+        let outcome = &result.outcomes[0];
+        assert_eq!(outcome.returncode, Some(0));
+        assert_eq!(outcome.executed_tests, Some(1));
+        assert_eq!(
+            outcome.reason,
+            "STRUCTURED TEST FAILURE: suite$case attempt 1 cpu_timeout: used 22000000us CPU"
+        );
+        let typed = outcome
+            .test_results
+            .as_ref()
+            .and_then(|results| results.first())
+            .expect("failed schema-3 result survives the scheduler");
+        assert_eq!(typed.id, "suite$case");
+        assert!(!typed.passed);
+        assert_eq!(
+            typed.attempt_results.as_ref().unwrap()[0].outcome,
+            crate::test_results::TestAttemptOutcome::CpuTimeout
+        );
         assert_scheduler_owned_path_was_removed(&marker);
     }
 
