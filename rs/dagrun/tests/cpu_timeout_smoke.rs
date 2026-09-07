@@ -2,7 +2,9 @@
 //!
 //! `cpu_timeout` is a load-invariant ceiling on consumed user and system CPU. The test runs a
 //! busy-looping step and requires the cgroup monitor to reap it as a `CPU-TIMEOUT` before its much
-//! larger wall timeout. Hosts without delegated cgroup support report an explicit skip.
+//! larger wall timeout. The same step deliberately omits its required structured result, proving
+//! the exact outer reason remains primary while the evidence refusal survives as a second cause.
+//! Hosts without delegated cgroup support report an explicit skip.
 
 use std::io::Write;
 use std::process::Command;
@@ -13,7 +15,10 @@ use std::process::Command;
 /// via a distinct TIMEOUT reason instead of hanging.
 const CPU_DAG: &str = r#"{"steps": [{"group": "cpu", "job": "burn", "desc": "burn CPU past budget",
   "cmd": "while :; do :; done",
-  "cpu_timeout": 1, "timeout": 30}]}"#;
+  "cpu_timeout": 1, "timeout": 30,
+  "result_manifests": [{"kind": "structured-test-results", "schema": 3,
+    "path_env": "DAGRUN_TEST_COUNTS_PATH", "owner": "cpu.burn"}]
+}]}"#;
 
 #[test]
 fn boxing_cpu_timeout_reaps_a_step_past_its_budget() {
@@ -55,9 +60,15 @@ fn boxing_cpu_timeout_reaps_a_step_past_its_budget() {
          {combined}"
     );
     assert!(
-        combined.contains("CPU-TIMEOUT"),
-        "expected a CPU-TIMEOUT report proving the per-step CPU-time budget fired (not the wall \
-         TIMEOUT); the Python runner enforces this, so the Rust runner must too:\n{combined}"
+        combined.contains("CPU-TIMEOUT >1s cpu"),
+        "expected the exact CPU-TIMEOUT reason proving the per-step CPU-time budget fired (not \
+         the wall TIMEOUT); the Python runner enforces this, so the Rust runner must too:\n{combined}"
+    );
+    assert!(
+        combined.contains(
+            "STRUCTURED TEST RESULTS REFUSED: required structured test results were not written"
+        ),
+        "the missing-evidence refusal must survive beside the primary CPU timeout:\n{combined}"
     );
 }
 

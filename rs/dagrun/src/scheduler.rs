@@ -3821,7 +3821,13 @@ fn run_step(ctx: StepCtx) {
             )
         };
         if let Some(error) = &structured_test_results_error {
-            outcome.reason = format!("STRUCTURED TEST RESULTS REFUSED: {error}");
+            // A required-result refusal is a second failure fact.  It is the primary reason only
+            // when the process itself completed successfully.  If an outer guard already killed,
+            // aborted, or rejected the process, preserve that exact reason (including its bound)
+            // and carry the evidence refusal separately in `test_results_error`.
+            if returncode == Some(0) && !timed_out && !cpu_timed_out && oom == 0 && !was_aborted {
+                outcome.reason = format!("STRUCTURED TEST RESULTS REFUSED: {error}");
+            }
             outcome.test_results_error = Some(error.clone());
             outcome.ok = false;
         } else if let Some(reason) = structured_test_failure_reason(
@@ -3896,6 +3902,12 @@ fn run_step(ctx: StepCtx) {
             "[{tag}] \u{2717} FAIL   {} ({dur}s, {reason})",
             step.desc
         )));
+        if let Some(error) = &structured_test_results_error {
+            let evidence_reason = format!("STRUCTURED TEST RESULTS REFUSED: {error}");
+            if reason != evidence_reason {
+                emit(&red(&format!("[{tag}] \u{21b3} {evidence_reason}")));
+            }
+        }
         if oom > 0 {
             emit(&format!(
                 "[{tag}] \u{25b2} MEMORY CAP HIT: OOM-killed at its inner cgroup MemoryMax \
@@ -4854,6 +4866,13 @@ mod tests {
         runner.result(wall)
     }
 
+    fn run_boxed_without_evidence(cfg: &DagConfig, cgroups: BoxedCgroups) -> RunResult {
+        let mut runner = Runner::new(cfg, 1, 1, false, 0, cgroups, None, None, None, None, None);
+        runner.evidence = None;
+        let (_ok, wall) = runner.run();
+        runner.result(wall)
+    }
+
     fn structured_producer(command: &str, marker: &std::path::Path) -> DagConfig {
         let mut producer = step("test", "counts", command, &[], 0.0, &[]);
         producer.env.insert(
@@ -4968,8 +4987,16 @@ mod tests {
         let command = r#"printf '%s\n' "$DAGRUN_TEST_COUNTS_PATH" > "$TEST_MARKER_PATH""#;
         let result = run_without_evidence(&structured_producer(command, &marker));
         assert!(!result.ok);
-        let error = &result.outcomes[0].reason;
-        assert!(error.contains("required structured test results were not written"));
+        let outcome = &result.outcomes[0];
+        let evidence_error = outcome
+            .test_results_error
+            .as_deref()
+            .expect("missing evidence has a typed refusal");
+        assert!(evidence_error.contains("required structured test results were not written"));
+        assert_eq!(
+            outcome.reason,
+            format!("STRUCTURED TEST RESULTS REFUSED: {evidence_error}")
+        );
         assert_scheduler_owned_path_was_removed(&marker);
     }
 
@@ -4983,8 +5010,137 @@ mod tests {
         let command = r#"printf '%s\n' "$DAGRUN_TEST_COUNTS_PATH" > "$TEST_MARKER_PATH"; printf '%s' 'not-json' > "$DAGRUN_TEST_COUNTS_PATH""#;
         let result = run_without_evidence(&structured_producer(command, &marker));
         assert!(!result.ok);
-        let error = &result.outcomes[0].reason;
-        assert!(error.contains("malformed structured test results"));
+        let outcome = &result.outcomes[0];
+        let evidence_error = outcome
+            .test_results_error
+            .as_deref()
+            .expect("malformed evidence has a typed refusal");
+        assert!(evidence_error.contains("malformed structured test results"));
+        assert_eq!(
+            outcome.reason,
+            format!("STRUCTURED TEST RESULTS REFUSED: {evidence_error}")
+        );
+        assert_scheduler_owned_path_was_removed(&marker);
+    }
+
+    fn timeout_collision_config(
+        command: &str,
+        marker: &std::path::Path,
+        cpu_timeout: i64,
+        wall_timeout: i64,
+    ) -> DagConfig {
+        let mut cfg = structured_producer(command, marker);
+        cfg.steps[0].cpu_timeout = cpu_timeout;
+        cfg.steps[0].timeout = wall_timeout;
+        cfg
+    }
+
+    fn assert_outer_reason_and_evidence_refusal(
+        outcome: &StepOutcome,
+        expected_outer_reason: &str,
+        expected_evidence_fragment: &str,
+    ) {
+        assert!(!outcome.ok);
+        assert_eq!(outcome.reason, expected_outer_reason);
+        let evidence_error = outcome
+            .test_results_error
+            .as_deref()
+            .expect("the evidence refusal must survive beside the outer reason");
+        assert!(
+            evidence_error.contains(expected_evidence_fragment),
+            "{evidence_error}"
+        );
+        assert!(
+            !outcome.reason.contains("STRUCTURED TEST RESULTS REFUSED"),
+            "the evidence refusal replaced the exact outer reason: {outcome:#?}"
+        );
+    }
+
+    #[test]
+    fn cpu_timeout_keeps_exact_outer_reason_beside_missing_evidence_refusal() {
+        let marker = std::env::temp_dir().join(format!(
+            "dagrun-cpu-missing-{}-{}",
+            std::process::id(),
+            TEST_COUNTS_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let command = r#"printf '%s\n' "$DAGRUN_TEST_COUNTS_PATH" > "$TEST_MARKER_PATH"; sleep 10"#;
+        let cfg = timeout_collision_config(command, &marker, 1, 5);
+        let cgroups = Arc::new(ProfileCaptureCgroups {
+            cpu_usage_usec: 2_000_000,
+            ..Default::default()
+        });
+        let result = run_boxed_without_evidence(&cfg, Some(cgroups));
+        assert_outer_reason_and_evidence_refusal(
+            &result.outcomes[0],
+            "CPU-TIMEOUT >1s cpu",
+            "required structured test results were not written",
+        );
+        assert!(result.outcomes[0].cpu_timed_out);
+        assert!(!result.outcomes[0].timed_out);
+        assert_scheduler_owned_path_was_removed(&marker);
+    }
+
+    #[test]
+    fn cpu_timeout_keeps_exact_outer_reason_beside_malformed_evidence_refusal() {
+        let marker = std::env::temp_dir().join(format!(
+            "dagrun-cpu-malformed-{}-{}",
+            std::process::id(),
+            TEST_COUNTS_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let command = r#"printf '%s\n' "$DAGRUN_TEST_COUNTS_PATH" > "$TEST_MARKER_PATH"; printf '%s' 'not-json' > "$DAGRUN_TEST_COUNTS_PATH"; sleep 10"#;
+        let cfg = timeout_collision_config(command, &marker, 1, 5);
+        let cgroups = Arc::new(ProfileCaptureCgroups {
+            cpu_usage_usec: 2_000_000,
+            ..Default::default()
+        });
+        let result = run_boxed_without_evidence(&cfg, Some(cgroups));
+        assert_outer_reason_and_evidence_refusal(
+            &result.outcomes[0],
+            "CPU-TIMEOUT >1s cpu",
+            "malformed structured test results",
+        );
+        assert!(result.outcomes[0].cpu_timed_out);
+        assert!(!result.outcomes[0].timed_out);
+        assert_scheduler_owned_path_was_removed(&marker);
+    }
+
+    #[test]
+    fn wall_timeout_keeps_exact_outer_reason_beside_missing_evidence_refusal() {
+        let marker = std::env::temp_dir().join(format!(
+            "dagrun-wall-missing-{}-{}",
+            std::process::id(),
+            TEST_COUNTS_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let command = r#"printf '%s\n' "$DAGRUN_TEST_COUNTS_PATH" > "$TEST_MARKER_PATH"; sleep 10"#;
+        let cfg = timeout_collision_config(command, &marker, 10, 1);
+        let result = run_without_evidence(&cfg);
+        assert_outer_reason_and_evidence_refusal(
+            &result.outcomes[0],
+            "TIMEOUT >1s",
+            "required structured test results were not written",
+        );
+        assert!(!result.outcomes[0].cpu_timed_out);
+        assert!(result.outcomes[0].timed_out);
+        assert_scheduler_owned_path_was_removed(&marker);
+    }
+
+    #[test]
+    fn wall_timeout_keeps_exact_outer_reason_beside_malformed_evidence_refusal() {
+        let marker = std::env::temp_dir().join(format!(
+            "dagrun-wall-malformed-{}-{}",
+            std::process::id(),
+            TEST_COUNTS_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let command = r#"printf '%s\n' "$DAGRUN_TEST_COUNTS_PATH" > "$TEST_MARKER_PATH"; printf '%s' 'not-json' > "$DAGRUN_TEST_COUNTS_PATH"; sleep 10"#;
+        let cfg = timeout_collision_config(command, &marker, 10, 1);
+        let result = run_without_evidence(&cfg);
+        assert_outer_reason_and_evidence_refusal(
+            &result.outcomes[0],
+            "TIMEOUT >1s",
+            "malformed structured test results",
+        );
+        assert!(!result.outcomes[0].cpu_timed_out);
+        assert!(result.outcomes[0].timed_out);
         assert_scheduler_owned_path_was_removed(&marker);
     }
 
@@ -5874,6 +6030,7 @@ mod tests {
         mem_caps: Mutex<Vec<Option<i64>>>,
         scope_build_jobs: Option<i64>,
         readonly_scope_build_jobs: bool,
+        cpu_usage_usec: i64,
     }
 
     impl CgroupManager for ProfileCaptureCgroups {
@@ -5915,9 +6072,9 @@ mod tests {
 
         fn cpu_stats(&self, _tag: &str) -> Option<BTreeMap<String, i64>> {
             Some(BTreeMap::from([
-                ("usage_usec".to_string(), 0),
-                ("user_usec".to_string(), 0),
-                ("system_usec".to_string(), 0),
+                ("usage_usec".to_string(), self.cpu_usage_usec),
+                ("user_usec".to_string(), self.cpu_usage_usec * 3 / 4),
+                ("system_usec".to_string(), self.cpu_usage_usec / 4),
                 ("throttled_usec".to_string(), 0),
             ]))
         }
