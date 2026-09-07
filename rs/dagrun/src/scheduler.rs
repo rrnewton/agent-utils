@@ -2513,10 +2513,24 @@ fn captured_test_counts(bytes: &[u8]) -> CapturedTestResults {
     }
 }
 
-fn structured_test_results_schema(step: &Step) -> Option<u64> {
-    step.structured_test_results_manifest()
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TestResultsMode {
+    LegacyStdout,
+    ExplicitNone,
+    Structured(u64),
+}
+
+fn test_results_mode(step: &Step) -> TestResultsMode {
+    if step.result_manifests.is_none() {
+        return TestResultsMode::LegacyStdout;
+    }
+    match step
+        .structured_test_results_manifest()
         .expect("graph structure is validated before supervisor threads start")
-        .map(|manifest| manifest.schema)
+    {
+        Some(manifest) => TestResultsMode::Structured(manifest.schema),
+        None => TestResultsMode::ExplicitNone,
+    }
 }
 
 fn structured_test_counts_path(
@@ -2569,24 +2583,30 @@ fn read_structured_test_counts(
 }
 
 fn resolved_test_counts(
-    declared_schema: Option<u64>,
+    mode: TestResultsMode,
     path: Option<&std::path::Path>,
     captured: &[u8],
 ) -> Result<CapturedTestResults, String> {
-    if let Some(path) = path {
-        if let Some(counts) = read_structured_test_counts(path, declared_schema)? {
-            return Ok(counts);
+    match mode {
+        TestResultsMode::Structured(schema) => {
+            if let Some(path) = path {
+                if let Some(counts) = read_structured_test_counts(path, Some(schema))? {
+                    return Ok(counts);
+                }
+            }
+            let location = path
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<scheduler-owned path unavailable>".into());
+            Err(format!(
+                "required structured test results were not written to {location}"
+            ))
         }
-    }
-    if declared_schema.is_some() {
-        let location = path
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "<scheduler-owned path unavailable>".into());
-        Err(format!(
-            "required structured test results were not written to {location}"
-        ))
-    } else {
-        Ok(captured_test_counts(captured))
+        TestResultsMode::ExplicitNone => Ok(CapturedTestResults {
+            executed: None,
+            filtered: None,
+            results: None,
+        }),
+        TestResultsMode::LegacyStdout => Ok(captured_test_counts(captured)),
     }
 }
 
@@ -3002,10 +3022,10 @@ fn run_step(ctx: StepCtx) {
     // double-fork escapee once it has left the step's process group AND its parentage. See
     // [`kill_by_nonce`].
     let nonce = mint_step_nonce(&tag);
-    let structured_test_results_schema = structured_test_results_schema(&step);
+    let test_results_mode = test_results_mode(&step);
     let test_counts_path = structured_test_counts_path(
         evidence.as_deref(),
-        structured_test_results_schema.is_some(),
+        matches!(test_results_mode, TestResultsMode::Structured(_)),
         &nonce,
     );
     if let Some(path) = &test_counts_path {
@@ -3595,21 +3615,18 @@ fn run_step(ctx: StepCtx) {
         (cap.tail(), cap.total, cap.dropped())
     };
     let summary = last_line(&combined);
-    let (test_counts, structured_test_results_error) = match resolved_test_counts(
-        structured_test_results_schema,
-        test_counts_path.as_deref(),
-        &combined,
-    ) {
-        Ok(counts) => (counts, None),
-        Err(error) => (
-            CapturedTestResults {
-                executed: None,
-                filtered: None,
-                results: None,
-            },
-            Some(error),
-        ),
-    };
+    let (test_counts, structured_test_results_error) =
+        match resolved_test_counts(test_results_mode, test_counts_path.as_deref(), &combined) {
+            Ok(counts) => (counts, None),
+            Err(error) => (
+                CapturedTestResults {
+                    executed: None,
+                    filtered: None,
+                    results: None,
+                },
+                Some(error),
+            ),
+        };
     if let Some(path) = &test_counts_path {
         let _ = std::fs::remove_file(path);
     }
@@ -4547,11 +4564,14 @@ mod tests {
     fn current_results_are_required_only_for_declared_result_producers() {
         let mut build = step("build", "compile", "true", &[], 1.0, &[]);
         build.result_manifests = Some(Vec::new());
-        assert_eq!(structured_test_results_schema(&build), None);
+        assert_eq!(test_results_mode(&build), TestResultsMode::ExplicitNone);
 
         let absent_or_null = step("test", "unmarked", "true", &[], 1.0, &[]);
         assert!(absent_or_null.result_manifests.is_none());
-        assert_eq!(structured_test_results_schema(&absent_or_null), None);
+        assert_eq!(
+            test_results_mode(&absent_or_null),
+            TestResultsMode::LegacyStdout
+        );
 
         let declaration = crate::model::DagManifest {
             lane: "portable".into(),
@@ -4563,11 +4583,17 @@ mod tests {
         let mut legacy_manifest_only = step("e2e", "legacy", "true", &[], 1.0, &[]);
         legacy_manifest_only.manifest = Some(declaration.clone());
         assert!(legacy_manifest_only.result_manifests.is_none());
-        assert_eq!(structured_test_results_schema(&legacy_manifest_only), None);
+        assert_eq!(
+            test_results_mode(&legacy_manifest_only),
+            TestResultsMode::LegacyStdout
+        );
 
         let mut explicit_producer = step("e2e", "suite", "true", &[], 1.0, &[]);
         explicit_producer.result_manifests = Some(vec![declaration.into()]);
-        assert_eq!(structured_test_results_schema(&explicit_producer), None);
+        assert_eq!(
+            test_results_mode(&explicit_producer),
+            TestResultsMode::ExplicitNone
+        );
 
         explicit_producer.result_manifests.as_mut().unwrap().push(
             crate::model::ResultManifest::StructuredTestResults(
@@ -4575,8 +4601,8 @@ mod tests {
             ),
         );
         assert_eq!(
-            structured_test_results_schema(&explicit_producer),
-            Some(crate::test_results::CURRENT_SCHEMA)
+            test_results_mode(&explicit_producer),
+            TestResultsMode::Structured(crate::test_results::CURRENT_SCHEMA)
         );
 
         explicit_producer.result_manifests =
@@ -4584,8 +4610,8 @@ mod tests {
                 crate::model::StructuredTestResultsManifest::current("e2e.suite"),
             )]);
         assert_eq!(
-            structured_test_results_schema(&explicit_producer),
-            Some(crate::test_results::CURRENT_SCHEMA)
+            test_results_mode(&explicit_producer),
+            TestResultsMode::Structured(crate::test_results::CURRENT_SCHEMA)
         );
     }
 
@@ -4603,8 +4629,16 @@ mod tests {
         .unwrap();
         let printed = b"running 999 tests\ntest result: ok. 999 passed; 0 failed; 0 filtered out\n";
         assert_eq!(
+            resolved_test_counts(TestResultsMode::ExplicitNone, None, printed).unwrap(),
+            CapturedTestResults {
+                executed: None,
+                filtered: None,
+                results: None,
+            }
+        );
+        assert_eq!(
             resolved_test_counts(
-                Some(crate::test_results::CURRENT_SCHEMA),
+                TestResultsMode::Structured(crate::test_results::CURRENT_SCHEMA),
                 Some(&path),
                 printed
             )
@@ -4620,13 +4654,17 @@ mod tests {
         );
         std::fs::remove_file(&path).unwrap();
         assert!(
-            resolved_test_counts(Some(crate::test_results::CURRENT_SCHEMA), None, printed)
-                .unwrap_err()
-                .contains("required structured test results were not written"),
+            resolved_test_counts(
+                TestResultsMode::Structured(crate::test_results::CURRENT_SCHEMA),
+                None,
+                printed
+            )
+            .unwrap_err()
+            .contains("required structured test results were not written"),
             "a printed banner must not create receipt evidence in structured mode"
         );
         assert_eq!(
-            resolved_test_counts(None, None, printed).unwrap(),
+            resolved_test_counts(TestResultsMode::LegacyStdout, None, printed).unwrap(),
             CapturedTestResults {
                 executed: Some(999),
                 filtered: Some(0),
