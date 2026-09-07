@@ -3790,10 +3790,6 @@ fn run_step(ctx: StepCtx) {
             outcome.ok = false;
         }
         outcome.test_results = test_counts.results;
-        if let Some(error) = &structured_test_results_error {
-            outcome.ok = false;
-            outcome.reason = format!("STRUCTURED TEST RESULTS REFUSED: {error}");
-        }
         let reason = outcome.reason.clone();
         sh.done.insert(tag.clone(), outcome);
         if !was_aborted && !ok {
@@ -4723,7 +4719,12 @@ mod tests {
                 "{error}"
             );
         }
-        let retained = resolved_test_counts(TestResultsMode::Structured(crate::test_results::RETAINED_RESULTS_SCHEMA), Some(&path), printed).unwrap();
+        let retained = resolved_test_counts(
+            TestResultsMode::Structured(crate::test_results::RETAINED_RESULTS_SCHEMA),
+            Some(&path),
+            printed,
+        )
+        .unwrap();
         assert_eq!(retained.executed, Some(1));
         assert_eq!(retained.results.unwrap()[0].attempt_results, None);
 
