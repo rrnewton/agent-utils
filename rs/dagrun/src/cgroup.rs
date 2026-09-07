@@ -99,7 +99,8 @@ pub trait CgroupManager: Send + Sync {
         mem_max: Option<i64>,
         cpu_count: Option<i64>,
     ) -> String;
-    /// SIGKILL the step's whole cgroup subtree (`cgroup.kill`); `true` if the write landed.
+    /// SIGKILL the step's whole cgroup subtree (`cgroup.kill`); `true` only after the write
+    /// landed and `cgroup.events` proved the subtree unpopulated.
     fn kill(&self, tag: &str) -> bool;
     /// Remove the step's now-empty child cgroup dir (best-effort).
     fn cleanup(&self, tag: &str);
@@ -157,8 +158,9 @@ pub trait CgroupManager: Send + Sync {
     fn cpu_pressure(&self, tag: &str) -> Option<BTreeMap<String, f64>>;
     /// Current descendant thread count from the step's `cgroup.threads`.
     fn thread_count(&self, tag: &str) -> Option<i64>;
-    /// NORMAL-EXIT backstop: `cgroup.kill` + `rmdir` every remaining step child cgroup.
-    fn kill_all_remaining(&self) -> i64;
+    /// NORMAL-EXIT backstop: `cgroup.kill` + `rmdir` every remaining step child cgroup. `None`
+    /// means the manager could not prove that every owned cgroup was found and emptied.
+    fn kill_all_remaining(&self) -> Option<i64>;
 }
 
 /// Shell prologue that migrates the step's bash leader into `child` before it forks anything.
@@ -465,6 +467,53 @@ fn cgroup_status_at(path: &Path) -> io::Result<ManualCpuCgroupStatus> {
             ),
         )),
     }
+}
+
+fn kill_cgroup_and_wait_empty_with<K, Q, S>(
+    attempts: usize,
+    mut kill: K,
+    mut status: Q,
+    mut sleep: S,
+) -> io::Result<()>
+where
+    K: FnMut() -> io::Result<()>,
+    Q: FnMut() -> io::Result<ManualCpuCgroupStatus>,
+    S: FnMut(Duration),
+{
+    kill()?;
+    for attempt in 0..attempts.max(1) {
+        match status()? {
+            ManualCpuCgroupStatus::Empty => return Ok(()),
+            ManualCpuCgroupStatus::Populated if attempt + 1 < attempts.max(1) => {
+                sleep(MANUAL_CPU_ABORT_RETRY);
+            }
+            ManualCpuCgroupStatus::Populated => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "cgroup remained populated after cgroup.kill",
+                ));
+            }
+        }
+    }
+    unreachable!("the bounded cgroup status loop executes at least once")
+}
+
+fn kill_cgroup_and_wait_empty(path: &Path) -> io::Result<()> {
+    kill_cgroup_and_wait_empty_with(
+        MANUAL_CPU_ABORT_REMOVE_ATTEMPTS,
+        || write_cgroup_file(&path.join("cgroup.kill"), b"1"),
+        || cgroup_status_at(path),
+        thread::sleep,
+    )
+    .map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "cgroup.kill could not prove {} unpopulated: {error}",
+                path.display()
+            ),
+        )
+    })
 }
 
 fn read_pid_roster(path: &Path) -> io::Result<Vec<u32>> {
@@ -2865,16 +2914,13 @@ impl CgroupManager for Cgroups {
             Some(c) if self.enabled => c,
             _ => return false,
         };
-        match fs::write(child.join("cgroup.kill"), "1") {
-            Ok(()) => true,
-            Err(e) => {
-                warn(&format!(
-                    "step {tag}: cgroup.kill write failed ({e}); falling back to process-group \
-                     kill for this step"
-                ));
-                false
-            }
+        if let Err(error) = kill_cgroup_and_wait_empty(&child) {
+            warn(&format!(
+                "step {tag}: cgroup teardown was not proven complete ({error})"
+            ));
+            return false;
         }
+        true
     }
 
     fn cleanup(&self, tag: &str) {
@@ -3011,18 +3057,35 @@ impl CgroupManager for Cgroups {
         Some(text.lines().filter(|l| !l.is_empty()).count() as i64)
     }
 
-    fn kill_all_remaining(&self) -> i64 {
+    fn kill_all_remaining(&self) -> Option<i64> {
         let root = match (&self.root, self.enabled) {
             (Some(r), true) => r,
-            _ => return 0,
+            _ => return None,
         };
         let entries = match fs::read_dir(root) {
             Ok(e) => e,
-            Err(_) => return 0,
+            Err(error) => {
+                warn(&format!(
+                    "backstop: cannot inspect {} for remaining step cgroups ({error})",
+                    root.display()
+                ));
+                return None;
+            }
         };
         let mut n = 0;
-        for entry in entries.flatten() {
-            let path = entry.path();
+        let mut proven = true;
+        for entry in entries {
+            let path = match entry {
+                Ok(entry) => entry.path(),
+                Err(error) => {
+                    proven = false;
+                    warn(&format!(
+                        "backstop: cannot inspect a child of {} ({error})",
+                        root.display()
+                    ));
+                    continue;
+                }
+            };
             if !path.is_dir() {
                 continue;
             }
@@ -3033,16 +3096,22 @@ impl CgroupManager for Cgroups {
             if !is_step {
                 continue;
             }
-            n += 1;
-            if let Err(e) = fs::write(path.join("cgroup.kill"), "1") {
-                warn(&format!(
-                    "backstop: cgroup.kill on {} failed ({e}); a leftover orphan may survive",
-                    path.display()
-                ));
+            match kill_cgroup_and_wait_empty(&path) {
+                Ok(()) => {
+                    n += 1;
+                    let _ = fs::remove_dir(&path);
+                }
+                Err(error) => {
+                    proven = false;
+                    warn(&format!(
+                        "backstop: cgroup teardown on {} was not proven complete ({error}); a \
+                         leftover orphan may survive",
+                        path.display(),
+                    ));
+                }
             }
-            let _ = fs::remove_dir(&path);
         }
-        n
+        proven.then_some(n)
     }
 }
 
@@ -3180,8 +3249,8 @@ mod tests {
         fn cpu_pressure(&self, _t: &str) -> Option<BTreeMap<String, f64>> {
             None
         }
-        fn kill_all_remaining(&self) -> i64 {
-            0
+        fn kill_all_remaining(&self) -> Option<i64> {
+            Some(0)
         }
     }
 
@@ -3531,6 +3600,58 @@ mod tests {
         fs::write(path.join("cgroup.events"), "populated 0\nfrozen 0\n").unwrap();
         assert_eq!(child.status().unwrap(), ManualCpuCgroupStatus::Empty);
         fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn cgroup_kill_requires_observed_empty_status() {
+        let mut killed = 0;
+        let mut slept = 0;
+        let mut states = VecDeque::from([
+            ManualCpuCgroupStatus::Populated,
+            ManualCpuCgroupStatus::Empty,
+        ]);
+        kill_cgroup_and_wait_empty_with(
+            3,
+            || {
+                killed += 1;
+                Ok(())
+            },
+            || Ok(states.pop_front().unwrap()),
+            |_| slept += 1,
+        )
+        .unwrap();
+        assert_eq!(killed, 1);
+        assert_eq!(slept, 1);
+
+        let error = kill_cgroup_and_wait_empty_with(
+            2,
+            || Ok(()),
+            || Ok(ManualCpuCgroupStatus::Populated),
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn cgroup_kill_propagates_write_and_status_failures() {
+        let denied = std::io::ErrorKind::PermissionDenied;
+        let write_error = kill_cgroup_and_wait_empty_with(
+            1,
+            || Err(std::io::Error::new(denied, "planted write refusal")),
+            || Ok(ManualCpuCgroupStatus::Empty),
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(write_error.kind(), denied);
+        let status_error = kill_cgroup_and_wait_empty_with(
+            1,
+            || Ok(()),
+            || Err(std::io::Error::new(denied, "planted status refusal")),
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(status_error.kind(), denied);
     }
 
     #[test]
@@ -3995,7 +4116,7 @@ mod tests {
             assert!(!cg.kill("g.j"));
             assert_eq!(cg.oom_kills("g.j"), 0);
             assert_eq!(cg.peak_bytes("g.j"), None);
-            assert_eq!(cg.kill_all_remaining(), 0);
+            assert_eq!(cg.kill_all_remaining(), None);
         }
     }
 
@@ -4109,6 +4230,19 @@ mod tests {
             root: Some(root),
             containment: Containment::Full,
         }
+    }
+
+    #[test]
+    fn final_backstop_refuses_an_unreadable_cgroup_root() {
+        let root = temp_scope("backstop-unreadable");
+        let cg = planted_manager(root.clone());
+        fs::remove_dir(&root).unwrap();
+
+        assert_eq!(
+            cg.kill_all_remaining(),
+            None,
+            "an unreadable root is not proof that zero cgroups remain"
+        );
     }
 
     #[test]
@@ -4308,8 +4442,8 @@ mod tests {
             fn thread_count(&self, _t: &str) -> Option<i64> {
                 None
             }
-            fn kill_all_remaining(&self) -> i64 {
-                0
+            fn kill_all_remaining(&self) -> Option<i64> {
+                Some(0)
             }
         }
         assert_eq!(Quiet.applied_memory_max("g.job"), None);

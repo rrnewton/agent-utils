@@ -21,13 +21,16 @@
 // Boxing: when a [`crate::cgroup::CgroupManager`] is supplied (the default `run` path), each
 // step is wrapped so its bash leader self-moves into a per-step child cgroup with an inner
 // `memory.max` cap. Teardown gives every process group one bounded SIGTERM diagnostic window,
-// then writes the step's `cgroup.kill` (a setsid-proof atomic SIGKILL of the whole subtree) and
-// follows with killpg as a belt-and-suspenders. Without a manager the step runs unboxed and uses
-// process-group plus best-effort `/proc` ownership sweeps. Per-step measurement rows are collected
+// then writes the step's `cgroup.kill` and proves the subtree empty. That cgroup proof is
+// authoritative and skips all numeric PID/group signals. Without a manager the step runs unboxed
+// and uses process-group plus best-effort `/proc` ownership sweeps while its unreaped leader pins
+// the group generation. Per-step measurement rows are collected
 // for the perf-log sink either way.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs::File;
 use std::io::{BufReader, IsTerminal, Read};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
@@ -426,8 +429,9 @@ const JOIN_WAIT: Duration = Duration::from_secs(15);
 struct Shared {
     done: HashMap<String, StepOutcome>,
     running: HashSet<String>,
-    /// tag -> the in-flight child's pid (== its process-group id), so a sibling that FAILS can
-    /// eager-reap it without sharing the `Child` handle across threads.
+    /// tag -> the in-flight child's pid (== its process-group id) only while its generation is
+    /// pinned by a live child or an unreaped zombie. A sibling may eager-reap only identities in
+    /// this map; losing the pidfd/WNOWAIT proof withdraws the entry before cancellation proceeds.
     running_pids: HashMap<String, u32>,
     /// Tags killed by eager-exit (labelled ABORTED, not FAIL).
     aborted: HashSet<String>,
@@ -711,31 +715,80 @@ fn kill_by_nonce(nonce: &str) -> usize {
     killed.len()
 }
 
-/// Wait for an already-reaped child to exit, giving up after `limit`.
+fn open_child_pidfd(pid: u32) -> Option<File> {
+    let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if descriptor == -1 {
+        warn(&format!(
+            "[scheduler] cannot open pidfd for step leader {pid}: {}; post-exit numeric teardown \
+             will be refused if cgroup proof is unavailable",
+            std::io::Error::last_os_error()
+        ));
+        return None;
+    }
+    Some(unsafe { File::from_raw_fd(descriptor as libc::c_int) })
+}
+
+fn child_exited_unreaped(pidfd: &File, pid: u32) -> Result<bool, std::io::Error> {
+    loop {
+        let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PIDFD,
+                pidfd.as_raw_fd() as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            return Ok(unsafe { info.si_pid() } != 0);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(std::io::Error::new(
+                error.kind(),
+                format!("waitid(P_PIDFD) for step leader {pid} failed: {error}"),
+            ));
+        }
+    }
+}
+
+fn sigchld_children_are_waitable() -> bool {
+    let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
+    if unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut action) } == -1 {
+        return false;
+    }
+    // A custom handler can call waitpid(-1) and consume this child between observations. Only
+    // the default disposition plus ordinary zombie retention makes WNOWAIT a stable PID/PGID pin.
+    action.sa_flags & libc::SA_NOCLDWAIT == 0 && action.sa_sigaction == libc::SIG_DFL
+}
+
+/// Wait for an exact direct child to exit, giving up after `limit`.
 ///
-/// Returns the real exit status when the child dies in time, and a fabricated killed status when it
-/// does not. Reporting a killed status for a process that is still alive is deliberate and is the
-/// lesser evil: the alternative is the scheduler blocking indefinitely, which reports NOTHING and
-/// loses the whole run's measurements along with it. The survivor is named so the leak is visible
-/// rather than inferred.
-fn wait_bounded(child: &mut std::process::Child, tag: &str, limit: Duration) -> ExitStatus {
+/// Returns only a status observed from the child. Timeout and ECHILD/error are `None`; inventing a
+/// SIGKILL result would turn an explicitly unproven teardown into false process evidence.
+fn wait_bounded(child: &mut std::process::Child, tag: &str, limit: Duration) -> Option<ExitStatus> {
     let deadline = Instant::now() + limit;
     loop {
         match child.try_wait() {
-            Ok(Some(st)) => return st,
+            Ok(Some(st)) => return Some(st),
             Ok(None) => {
                 if Instant::now() >= deadline {
                     eprintln!(
                         "[scheduler] WARNING: step {tag} did not exit within {}s of being killed; \
-                         abandoning the wait and reporting it as killed. Its process tree may \
-                         still be running.",
+                         abandoning the wait without inventing an exit status. Its process tree \
+                         may still be running.",
                         limit.as_secs()
                     );
-                    return ExitStatus::from_raw(9);
+                    return None;
                 }
                 thread::sleep(POLL_INTERVAL);
             }
-            Err(_) => return ExitStatus::from_raw(9),
+            Err(error) => {
+                warn(&format!(
+                    "[scheduler] cannot reap exact step child {tag}: {error}"
+                ));
+                return None;
+            }
         }
     }
 }
@@ -1035,6 +1088,16 @@ fn uncount_process(sh: &mut Shared, tag: &str) {
     }
 }
 
+fn withdraw_process_identity(sh: &mut Shared, tag: &str) {
+    sh.running_pids.remove(tag);
+    sh.running_nonces.remove(tag);
+}
+
+fn detach_process_identity(sh: &mut Shared, tag: &str) {
+    withdraw_process_identity(sh, tag);
+    uncount_process(sh, tag);
+}
+
 /// Hand back everything `step`'s admission took, EXACTLY ONCE. Returns whether this call did it.
 ///
 /// Every release site -- spawn failure, normal completion, and the supervisor-panic paths added
@@ -1130,11 +1193,16 @@ fn trip_fail_fast(sh: &mut Shared, cgroups: &BoxedCgroups, keep_going: bool, fai
             sh.aborted.insert(other.clone());
         }
     }
-    let others: Vec<(String, u32, Option<String>)> = sh
-        .running_pids
+    let others: Vec<(String, Option<u32>, Option<String>)> = candidates
         .iter()
-        .filter(|(tag, _)| candidates.contains(*tag) && !spared.contains(*tag))
-        .map(|(tag, pid)| (tag.clone(), *pid, sh.running_nonces.get(tag).cloned()))
+        .filter(|tag| !spared.contains(*tag))
+        .map(|tag| {
+            (
+                tag.clone(),
+                sh.running_pids.get(tag).copied(),
+                sh.running_nonces.get(tag).cloned(),
+            )
+        })
         .collect();
     reap_many(cgroups, &others);
 }
@@ -1695,12 +1763,18 @@ impl Runner {
                     sh.run_cpu_accounting_failed = cpu_accounting_lost;
                     sh.failed = true;
                     sh.stop = true;
-                    let cut: Vec<(String, u32, Option<String>)> = sh
-                        .running_pids
+                    let cut: Vec<(String, Option<u32>, Option<String>)> = sh
+                        .running
                         .iter()
-                        .map(|(k, v)| (k.clone(), *v, sh.running_nonces.get(k).cloned()))
+                        .map(|tag| {
+                            (
+                                tag.clone(),
+                                sh.running_pids.get(tag).copied(),
+                                sh.running_nonces.get(tag).cloned(),
+                            )
+                        })
                         .collect();
-                    let names: Vec<String> = cut.iter().map(|(t, _, _)| t.clone()).collect();
+                    let names: Vec<String> = cut.iter().map(|(tag, _, _)| tag.clone()).collect();
                     let shown_names = if names.is_empty() {
                         "<none running>".to_string()
                     } else {
@@ -2091,12 +2165,19 @@ impl Runner {
         // step left behind lives there). Does NOT stop the outer scope, so a green run stays green.
         if let Some(cg) = &self.cgroups {
             if cg.enabled() {
-                let leftover = cg.kill_all_remaining();
-                if leftover > 0 {
-                    emit(&format!(
+                match cg.kill_all_remaining() {
+                    Some(leftover) if leftover > 0 => emit(&format!(
                         "[scheduler] reaped {leftover} leftover step cgroup(s) on exit (setsid \
                          orphans a step left behind)."
-                    ));
+                    )),
+                    Some(_) => {}
+                    None => {
+                        emit(
+                            "[scheduler] ERROR: CONTAINMENT UNPROVEN: the final cgroup backstop \
+                             could not prove every owned step subtree empty.",
+                        );
+                        lock_shared(&self.shared).failed = true;
+                    }
                 }
             }
         }
@@ -2728,7 +2809,13 @@ struct StepCtx {
 /// cgroup's kill failed, so the unboxed path — which has exactly the same weakness — degraded in
 /// silence. A step running without enforceable containment must say so once, or "unbounded" is
 /// invisible in the log.
-fn hard_reap(cgroups: &BoxedCgroups, tag: &str, pid: u32, nonce: Option<&str>) {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PostExitReap {
+    Gone,
+    Unproven,
+}
+
+fn hard_reap(cgroups: &BoxedCgroups, tag: &str, pid: u32, nonce: Option<&str>) -> PostExitReap {
     let contained = match cgroups {
         Some(cg) if cg.enabled() => {
             if cg.kill(tag) {
@@ -2754,20 +2841,18 @@ fn hard_reap(cgroups: &BoxedCgroups, tag: &str, pid: u32, nonce: Option<&str>) {
             false
         }
     };
-    let _ = signal_group(pid, libc::SIGKILL);
-    if !contained {
-        let swept = kill_descendants(pid);
-        if swept > 0 {
-            eprintln!(
-                "[scheduler] step {tag}: killed {swept} descendant(s) the process-group kill \
-                 missed (setsid/double-fork escapees)."
-            );
-        }
+    if contained {
+        return PostExitReap::Gone;
     }
-    // FINAL BACKSTOP, RUN ON EVERY PATH — boxed and unboxed alike. Boxed, it should find nothing
-    // and costs one `/proc` walk; that it runs anyway is the point, because "cgroup.kill returned
-    // success" is a claim about a write, not evidence that the subtree is empty. Unboxed it is the
-    // only best-effort mechanism that reaches an environment-preserving double-fork escapee.
+    let _ = signal_group(pid, libc::SIGKILL);
+    let swept = kill_descendants(pid);
+    if swept > 0 {
+        eprintln!(
+            "[scheduler] step {tag}: killed {swept} descendant(s) the process-group kill \
+             missed (setsid/double-fork escapees)."
+        );
+    }
+    // The ownership nonce is the final best-effort fallback only when no cgroup proof exists.
     if let Some(n) = nonce {
         let swept = kill_by_nonce(n);
         if swept > 0 {
@@ -2778,20 +2863,71 @@ fn hard_reap(cgroups: &BoxedCgroups, tag: &str, pid: u32, nonce: Option<&str>) {
             );
         }
     }
+    if matches!(cgroups, Some(cgroup) if cgroup.enabled()) {
+        PostExitReap::Unproven
+    } else {
+        PostExitReap::Gone
+    }
 }
 
-fn reap(cgroups: &BoxedCgroups, tag: &str, pid: u32, nonce: Option<&str>) {
+/// Tear down descendants without a stable numeric leader identity.
+///
+/// At this point the numeric process-group ID is not known to be pinned by its
+/// leader, so no signal may use that number. Only a cgroup kill followed by an
+/// observed `populated 0` can prove the subtree gone.
+fn reap_without_stable_identity(cgroups: &BoxedCgroups, tag: &str) -> PostExitReap {
+    match cgroups {
+        Some(cgroup) if cgroup.enabled() && cgroup.kill(tag) => PostExitReap::Gone,
+        Some(cgroup) if cgroup.enabled() => {
+            eprintln!(
+                "[scheduler] WARNING: step {tag} has no stable numeric process identity and its \
+                 cgroup teardown was not proven; refusing a numeric process-group fallback."
+            );
+            PostExitReap::Unproven
+        }
+        _ => {
+            if !UNBOXED_REAP_WARNED.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "[scheduler] WARNING: an UNBOXED step has no stable numeric process identity; \
+                     refusing a numeric process-group fallback. Descendant containment is unproven."
+                );
+            }
+            PostExitReap::Unproven
+        }
+    }
+}
+
+fn reap(cgroups: &BoxedCgroups, tag: &str, pid: u32, nonce: Option<&str>) -> PostExitReap {
     // Give the original group one bounded chance to identify in-flight work, then hard-stop every
     // ownership handle. `terminate_groups` ignores zombies instead of charging them the full grace.
     terminate_groups(&[pid]);
-    hard_reap(cgroups, tag, pid, nonce);
+    hard_reap(cgroups, tag, pid, nonce)
 }
 
 /// Cancel several in-flight steps under one shared grace instead of `N * REAP_TERM_GRACE`.
-fn reap_many(cgroups: &BoxedCgroups, steps: &[(String, u32, Option<String>)]) {
-    terminate_groups(&steps.iter().map(|(_, pid, _)| *pid).collect::<Vec<_>>());
+fn reap_many(cgroups: &BoxedCgroups, steps: &[(String, Option<u32>, Option<String>)]) {
+    if let Some(cgroup) = cgroups.as_ref().filter(|cgroup| cgroup.enabled()) {
+        for (tag, _, _) in steps {
+            if !cgroup.kill(tag) {
+                eprintln!(
+                    "[scheduler] WARNING: cgroup teardown for in-flight step {tag} was not \
+                     proven; refusing a concurrent numeric signal from a non-owning thread."
+                );
+            }
+        }
+        return;
+    }
+    let anchored = steps
+        .iter()
+        .filter_map(|(_, pid, _)| *pid)
+        .collect::<Vec<_>>();
+    terminate_groups(&anchored);
     for (tag, pid, nonce) in steps {
-        hard_reap(cgroups, tag, *pid, nonce.as_deref());
+        if let Some(pid) = pid {
+            hard_reap(cgroups, tag, *pid, nonce.as_deref());
+        } else {
+            let _ = reap_without_stable_identity(cgroups, tag);
+        }
     }
 }
 
@@ -3178,21 +3314,32 @@ fn run_step(ctx: StepCtx) {
         }
     };
     let pid = child.id();
+    let mut child_pidfd = open_child_pidfd(pid);
+    let mut numeric_identity_anchored;
     let abort_after_spawn = {
         let mut sh = lock_shared(&shared);
-        sh.running_pids.insert(tag.clone(), pid);
-        sh.running_nonces.insert(tag.clone(), nonce.clone());
+        numeric_identity_anchored = child_pidfd.is_some() && sigchld_children_are_waitable();
+        if numeric_identity_anchored {
+            sh.running_pids.insert(tag.clone(), pid);
+            sh.running_nonces.insert(tag.clone(), nonce.clone());
+        }
         sh.active_processes += 1;
         sh.counted_processes.insert(tag.clone());
         sh.max_concurrent_steps = sh.max_concurrent_steps.max(sh.active_processes);
         sh.aborted.contains(&tag)
     };
-    if abort_after_spawn {
+    let teardown_after_spawn = if abort_after_spawn {
         // A peer can fail after this tag was admitted but before its Popen registered. The
         // failing thread marks every pre-admitted tag aborted; honor that mark immediately so the
         // registration race cannot turn eager-exit into a full sibling wait.
-        reap(&cgroups, &tag, pid, Some(&nonce));
-    }
+        if numeric_identity_anchored {
+            Some(reap(&cgroups, &tag, pid, Some(&nonce)))
+        } else {
+            Some(reap_without_stable_identity(&cgroups, &tag))
+        }
+    } else {
+        None
+    };
 
     // ONE stream object shared by stdout and stderr, so the tracker sees the step's output in a
     // single order and a harness that reports progress on stderr is attributed just as well.
@@ -3458,7 +3605,6 @@ fn run_step(ctx: StepCtx) {
                         continue;
                     }
 
-                    cpu_flag.store(true, Ordering::Relaxed);
                     if source == CPU_SOURCE_PROCFS {
                         eprintln!(
                             "[scheduler] \u{26a0} step {t:?} exceeded its CPU budget \
@@ -3486,7 +3632,7 @@ fn run_step(ctx: StepCtx) {
                     if let Ok(mut slot) = mculprit.lock() {
                         *slot = Some(culprit);
                     }
-                    reap(&cg, &t, mpid, Some(&mnonce));
+                    cpu_flag.store(true, Ordering::Release);
                     return;
                 }
             }));
@@ -3505,60 +3651,132 @@ fn run_step(ctx: StepCtx) {
 
     // Wait for the child, enforcing the per-step timeout by polling.
     let mut timed_out = false;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(st)) => break st,
-            Ok(None) => {
-                // `wall_timeout` likewise: the deadline is not even compared when the
-                // registry says this engine does not enforce one on this lane, so the
-                // advertisement and the wait agree by construction rather than by two people
-                // remembering. The deadline itself is the DERIVED backstop, not `step.timeout`.
-                if crate::capabilities::is_enforced("wall_timeout", lane)
-                    && start.elapsed().as_secs() as i64 >= wall_budget
-                {
-                    timed_out = true;
-                    // Freeze test + process evidence BEFORE SIGTERM. The subsequent reap retains
-                    // the existing gentle TERM/flush window and only then escalates to SIGKILL.
-                    let c = capture_termination_evidence(
-                        &evidence,
-                        &sink,
-                        &tag,
-                        pid,
-                        &nonce,
-                        TerminationBoundary {
-                            event: "step_timeout",
-                            unit: BudgetUnit::WallSeconds,
-                            limit_s: wall_budget,
-                            measured_s: start.elapsed().as_secs_f64(),
-                            wall_elapsed_s: start.elapsed().as_secs_f64(),
-                        },
-                    );
-                    if let Ok(mut slot) = termination_culprit.lock() {
-                        *slot = Some(c);
-                    }
-                    reap(&cgroups, &tag, pid, Some(&nonce));
-                    break wait_bounded(&mut child, &tag, POST_REAP_WAIT);
+    let mut reaped_status = None;
+    let mut teardown_before_wait = teardown_after_spawn;
+    let mut wait_complete = false;
+    if teardown_before_wait.is_some() {
+        let mut sh = lock_shared(&shared);
+        detach_process_identity(&mut sh, &tag);
+        drop(sh);
+        reaped_status = wait_bounded(&mut child, &tag, POST_REAP_WAIT);
+        wait_complete = true;
+    }
+    while !wait_complete {
+        let exited = match child_pidfd.as_ref() {
+            Some(pidfd) => {
+                let mut sh = lock_shared(&shared);
+                if !sigchld_children_are_waitable() {
+                    numeric_identity_anchored = false;
+                    withdraw_process_identity(&mut sh, &tag);
                 }
-                thread::sleep(POLL_INTERVAL);
+                match child_exited_unreaped(pidfd, pid) {
+                    Ok(exited) => exited,
+                    Err(error) => {
+                        numeric_identity_anchored = false;
+                        withdraw_process_identity(&mut sh, &tag);
+                        drop(sh);
+                        warn(&format!("[scheduler] {error}"));
+                        child_pidfd = None;
+                        continue;
+                    }
+                }
             }
-            Err(_) => {
-                break child
-                    .wait()
-                    .unwrap_or_else(|_| std::process::ExitStatus::from_raw(9))
+            None => {
+                let mut sh = lock_shared(&shared);
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        detach_process_identity(&mut sh, &tag);
+                        reaped_status = Some(status);
+                        true
+                    }
+                    Ok(None) => false,
+                    Err(_) => {
+                        detach_process_identity(&mut sh, &tag);
+                        true
+                    }
+                }
             }
+        };
+        if exited {
+            break;
         }
-    };
+        if cpu_exceeded.load(Ordering::Acquire) {
+            let teardown = if numeric_identity_anchored {
+                reap(&cgroups, &tag, pid, Some(&nonce))
+            } else {
+                reap_without_stable_identity(&cgroups, &tag)
+            };
+            teardown_before_wait = Some(teardown);
+            {
+                let mut sh = lock_shared(&shared);
+                detach_process_identity(&mut sh, &tag);
+            }
+            reaped_status = wait_bounded(&mut child, &tag, POST_REAP_WAIT);
+            wait_complete = true;
+            continue;
+        }
+        // `wall_timeout` likewise: the deadline is not even compared when the
+        // registry says this engine does not enforce one on this lane, so the
+        // advertisement and the wait agree by construction rather than by two people
+        // remembering. The deadline itself is the DERIVED backstop, not `step.timeout`.
+        if crate::capabilities::is_enforced("wall_timeout", lane)
+            && start.elapsed().as_secs() as i64 >= wall_budget
+        {
+            timed_out = true;
+            // Freeze test + process evidence BEFORE SIGTERM. The subsequent reap retains
+            // the existing gentle TERM/flush window and only then escalates to SIGKILL.
+            let c = capture_termination_evidence(
+                &evidence,
+                &sink,
+                &tag,
+                pid,
+                &nonce,
+                TerminationBoundary {
+                    event: "step_timeout",
+                    unit: BudgetUnit::WallSeconds,
+                    limit_s: wall_budget,
+                    measured_s: start.elapsed().as_secs_f64(),
+                    wall_elapsed_s: start.elapsed().as_secs_f64(),
+                },
+            );
+            if let Ok(mut slot) = termination_culprit.lock() {
+                *slot = Some(c);
+            }
+            let teardown = if numeric_identity_anchored {
+                reap(&cgroups, &tag, pid, Some(&nonce))
+            } else {
+                reap_without_stable_identity(&cgroups, &tag)
+            };
+            teardown_before_wait = Some(teardown);
+            {
+                let mut sh = lock_shared(&shared);
+                detach_process_identity(&mut sh, &tag);
+            }
+            reaped_status = wait_bounded(&mut child, &tag, POST_REAP_WAIT);
+            wait_complete = true;
+            continue;
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
 
     // The child has exited. Stop counting it before teardown and reader joins, which can outlive
     // the child when a grandchild keeps an output pipe open.
     {
         let mut sh = lock_shared(&shared);
-        uncount_process(&mut sh, &tag);
+        detach_process_identity(&mut sh, &tag);
     }
 
-    // Reap the whole tree (cgroup.kill + killpg) so orphan grandchildren die now and the readers
-    // see EOF; then stop the monitor and join the reader threads.
-    reap(&cgroups, &tag, pid, Some(&nonce));
+    let post_exit_reap = match teardown_before_wait {
+        Some(teardown) => teardown,
+        None if numeric_identity_anchored => {
+            // WNOWAIT retained the leader zombie, pinning PID==PGID while the
+            // teardown uses that generation. Reap the leader only afterward.
+            let teardown = reap(&cgroups, &tag, pid, Some(&nonce));
+            reaped_status = child.wait().ok();
+            teardown
+        }
+        None => reap_without_stable_identity(&cgroups, &tag),
+    };
     let _ = monitor_stop.send(());
     if let Some(m) = monitor {
         join_bounded(m, &tag, "monitor", JOIN_WAIT);
@@ -3661,10 +3879,10 @@ fn run_step(ctx: StepCtx) {
 
     let elapsed = start.elapsed().as_secs_f64();
     let dur = elapsed.round() as i64;
-    let returncode: Option<i64> = match status.code() {
-        Some(c) => Some(c as i64),
-        None => status.signal().map(|s| -(s as i64)),
-    };
+    let returncode: Option<i64> = reaped_status.and_then(|status| match status.code() {
+        Some(code) => Some(code as i64),
+        None => status.signal().map(|signal| -(signal as i64)),
+    });
     // The step's captured output -- both pipes, in arrival order -- for the summary + failure
     // detail. ONE tail, because there is one ring (see `step_capture`).
     let (combined, captured_total, captured_dropped) = {
@@ -3689,11 +3907,13 @@ fn run_step(ctx: StepCtx) {
     if let Some(path) = &test_counts_path {
         let _ = std::fs::remove_file(path);
     }
+    let teardown_unproven = post_exit_reap == PostExitReap::Unproven;
     let ok = returncode == Some(0)
         && !timed_out
         && !cpu_timed_out
         && !test_results_report_failure(&test_counts)
-        && structured_test_results_error.is_none();
+        && structured_test_results_error.is_none()
+        && !teardown_unproven;
 
     // Build the per-step profile row (perflog step-profile schema keys + dynamic cpu.* counters).
     let mut row: ProfileRow = BTreeMap::new();
@@ -3854,6 +4074,17 @@ fn run_step(ctx: StepCtx) {
             was_aborted,
         ) {
             outcome.reason = reason;
+        }
+        if teardown_unproven {
+            let containment_reason =
+                "CONTAINMENT UNPROVEN: no stable teardown authority proved the process tree gone";
+            if outcome.reason.is_empty() {
+                outcome.reason = containment_reason.to_string();
+            } else {
+                outcome.reason.push_str("; ");
+                outcome.reason.push_str(containment_reason);
+            }
+            outcome.ok = false;
         }
         outcome.test_results = test_counts.results;
         let reason = outcome.reason.clone();
@@ -6099,9 +6330,40 @@ mod tests {
             None
         }
 
-        fn kill_all_remaining(&self) -> i64 {
-            0
+        fn kill_all_remaining(&self) -> Option<i64> {
+            Some(0)
         }
+    }
+
+    #[test]
+    fn post_exit_cgroup_proof_never_signals_a_reused_group_number() {
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30");
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut decoy = command.spawn().unwrap();
+        let stale_leader = decoy.id();
+
+        let proven: BoxedCgroups = Some(Arc::new(ProfileCaptureCgroups::default()));
+        hard_reap(&proven, "test.decoy", stale_leader, None);
+        assert!(decoy.try_wait().unwrap().is_none());
+
+        assert_eq!(
+            reap_without_stable_identity(&None, "test.decoy"),
+            PostExitReap::Unproven
+        );
+        assert!(decoy.try_wait().unwrap().is_none());
+        assert_eq!(
+            unsafe { libc::kill(-(stale_leader as libc::pid_t), libc::SIGKILL) },
+            0
+        );
+        decoy.wait().unwrap();
     }
 
     struct TimeseriesCgroups {
@@ -6170,8 +6432,8 @@ mod tests {
             (!self.cleaned.load(Ordering::Relaxed)).then_some(3)
         }
 
-        fn kill_all_remaining(&self) -> i64 {
-            0
+        fn kill_all_remaining(&self) -> Option<i64> {
+            Some(0)
         }
     }
 
@@ -6341,16 +6603,26 @@ mod tests {
         assert_eq!(next.duration_since(start), Duration::from_millis(200));
     }
 
+    static NEXT_RUN_CPU_FAKE: AtomicU64 = AtomicU64::new(0);
+
     struct RunCpuCgroups {
         usage_usec: std::sync::atomic::AtomicI64,
         increment_per_read_usec: i64,
+        pid_file: PathBuf,
     }
 
     impl RunCpuCgroups {
         fn new(usage_usec: i64, increment_per_read_usec: i64) -> Self {
+            let sequence = NEXT_RUN_CPU_FAKE.fetch_add(1, Ordering::Relaxed);
+            let pid_file = std::env::temp_dir().join(format!(
+                "dagrun-run-cpu-fake-{}-{sequence}.pid",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&pid_file);
             Self {
                 usage_usec: std::sync::atomic::AtomicI64::new(usage_usec),
                 increment_per_read_usec,
+                pid_file,
             }
         }
     }
@@ -6367,10 +6639,34 @@ mod tests {
             _mem_max: Option<i64>,
             _cpu_count: Option<i64>,
         ) -> String {
-            cmd.to_string()
+            format!("printf '%s\\n' \"$$\" > {}; {cmd}", self.pid_file.display())
         }
 
         fn kill(&self, _tag: &str) -> bool {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let pid = loop {
+                if let Some(pid) = std::fs::read_to_string(&self.pid_file)
+                    .ok()
+                    .and_then(|value| value.trim().parse::<u32>().ok())
+                {
+                    break pid;
+                }
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                thread::sleep(Duration::from_millis(1));
+            };
+            if !signal_group(pid, libc::SIGKILL) {
+                return false;
+            }
+            let groups = HashSet::from([pid]);
+            while Instant::now() < deadline {
+                match live_process_groups(&groups) {
+                    Some(live) if live.is_empty() => return true,
+                    Some(_) => thread::sleep(Duration::from_millis(1)),
+                    None => return false,
+                }
+            }
             false
         }
 
@@ -6403,8 +6699,14 @@ mod tests {
             None
         }
 
-        fn kill_all_remaining(&self) -> i64 {
-            0
+        fn kill_all_remaining(&self) -> Option<i64> {
+            Some(0)
+        }
+    }
+
+    impl Drop for RunCpuCgroups {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.pid_file);
         }
     }
 
@@ -6576,7 +6878,7 @@ mod tests {
         }
 
         fn kill(&self, _tag: &str) -> bool {
-            false
+            true
         }
 
         fn cleanup(&self, _tag: &str) {}
@@ -6611,8 +6913,8 @@ mod tests {
             None
         }
 
-        fn kill_all_remaining(&self) -> i64 {
-            0
+        fn kill_all_remaining(&self) -> Option<i64> {
+            Some(0)
         }
     }
 
@@ -7849,8 +8151,8 @@ mod tests {
             panic!("planted defect in the monitor's first cgroup read");
         }
 
-        fn kill_all_remaining(&self) -> i64 {
-            0
+        fn kill_all_remaining(&self) -> Option<i64> {
+            Some(0)
         }
     }
 

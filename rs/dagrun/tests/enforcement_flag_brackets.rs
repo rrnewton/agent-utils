@@ -14,7 +14,10 @@
 //! anything. The library's own unit tests take the matching `with_registry_pinned` turn.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use dagrun::capabilities::{
     enforcement_manifest, with_lane_registry_override, with_registry_override, Lane,
@@ -26,9 +29,28 @@ use dagrun::CgroupManager;
 /// A boxed manager whose cgroup reports a fixed OOM-kill count and a fixed consumed CPU time.
 /// Both readings are what a guard that only fires on a cgroup measurement needs in order to be
 /// observable without a real cgroup.
+static NEXT_SYNTHETIC_READING: AtomicU64 = AtomicU64::new(0);
+
 struct SyntheticReadings {
     oom_kills: i64,
     cpu_usage_usec: i64,
+    pid_file: PathBuf,
+}
+
+impl SyntheticReadings {
+    fn new(oom_kills: i64, cpu_usage_usec: i64) -> Self {
+        let sequence = NEXT_SYNTHETIC_READING.fetch_add(1, Ordering::Relaxed);
+        let pid_file = std::env::temp_dir().join(format!(
+            "dagrun-enforcement-fake-{}-{sequence}.pid",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&pid_file);
+        Self {
+            oom_kills,
+            cpu_usage_usec,
+            pid_file,
+        }
+    }
 }
 
 impl CgroupManager for SyntheticReadings {
@@ -43,10 +65,37 @@ impl CgroupManager for SyntheticReadings {
         _mem_max: Option<i64>,
         _cpu_count: Option<i64>,
     ) -> String {
-        cmd.to_string()
+        format!("printf '%s\\n' \"$$\" > {}; {cmd}", self.pid_file.display())
     }
 
     fn kill(&self, _tag: &str) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let pid = loop {
+            if let Some(pid) = std::fs::read_to_string(&self.pid_file)
+                .ok()
+                .and_then(|value| value.trim().parse::<i32>().ok())
+            {
+                break pid;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+        while Instant::now() < deadline {
+            let live = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| stat.rsplit_once(')').map(|(_, fields)| fields.to_string()))
+                .and_then(|fields| fields.split_whitespace().next().map(str::to_string))
+                .is_some_and(|state| state != "Z");
+            if !live {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
         false
     }
 
@@ -90,8 +139,14 @@ impl CgroupManager for SyntheticReadings {
         None
     }
 
-    fn kill_all_remaining(&self) -> i64 {
-        0
+    fn kill_all_remaining(&self) -> Option<i64> {
+        Some(0)
+    }
+}
+
+impl Drop for SyntheticReadings {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.pid_file);
     }
 }
 
@@ -155,12 +210,7 @@ fn scheduler_guards_follow_their_published_capability_flags() {
 
     // ---- oom_detection: the post-step memory.events read ---------------------------------
     let failing = one_step("exit 1", 30, 0);
-    let ooming = || {
-        Arc::new(SyntheticReadings {
-            oom_kills: 2,
-            cpu_usage_usec: 0,
-        })
-    };
+    let ooming = || Arc::new(SyntheticReadings::new(2, 0));
     assert!(enforcement_manifest().contains("\"oom_detection\":true"));
     let enforced = run_dag_boxed_limited(&failing, 1, 1, false, 0, Some(ooming()));
     assert!(
@@ -185,12 +235,7 @@ fn scheduler_guards_follow_their_published_capability_flags() {
     // The wall ceiling is generous here, so only the CPU-time guard can cut this step.
     let burning = one_step("sleep 4", 60, 1);
     // Ten CPU-seconds already consumed, against a one-second budget.
-    let hot = || {
-        Arc::new(SyntheticReadings {
-            oom_kills: 0,
-            cpu_usage_usec: 10_000_000,
-        })
-    };
+    let hot = || Arc::new(SyntheticReadings::new(0, 10_000_000));
     assert!(enforcement_manifest().contains("\"cpu_timeout\":true"));
     let enforced = run_dag_boxed_limited(&burning, 1, 1, false, 0, Some(hot()));
     assert!(!enforced.ok);
@@ -238,10 +283,7 @@ fn scheduler_guards_follow_their_published_capability_flags() {
             1,
             false,
             0,
-            Some(Arc::new(SyntheticReadings {
-                oom_kills: 0,
-                cpu_usage_usec: 0,
-            })),
+            Some(Arc::new(SyntheticReadings::new(0, 0))),
         );
         assert!(
             !boxed.ok,

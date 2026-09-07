@@ -13,7 +13,9 @@
 //! population nobody has measured.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 const DAG: &str =
     r#"{"steps":[{"group":"g","job":"j","cmd":"echo hi","timeout":30,"cpu_timeout":600}]}"#;
@@ -43,6 +45,24 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
     }
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn process_start_time(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
+}
+
+fn exact_process_is_present(pid: u32, start_time: u64) -> bool {
+    process_start_time(pid) == Some(start_time)
 }
 
 struct Out {
@@ -456,4 +476,133 @@ fn every_containment_state_reaches_the_banner_and_the_durable_journal() {
     } else {
         eprintln!("skipping run-boxed case: no usable systemd --user scope on this host");
     }
+}
+
+/// Exercise the production direct-cgroup path with a real descendant that has left the leader's
+/// process group. The release handshake makes the parent observe `populated 1` before the leader
+/// exits and normal-exit teardown kills the matching payload.
+#[test]
+fn direct_cgroup_kills_matching_contained_payload_and_proves_empty() {
+    let fixture = Fixture::new("direct_matching_kill");
+    let pid_file = fixture.dir.join("payload.pid");
+    let cgroup_file = fixture.dir.join("payload.cgroup");
+    let release_file = fixture.dir.join("leader.release");
+    let late_marker = fixture.dir.join("payload.late");
+    let payload = format!(
+        "echo $$ > {}; sed -n 's|^0::|/sys/fs/cgroup|p' /proc/self/cgroup > {}; \
+         sleep 60; printf late > {}",
+        shell_quote(&pid_file.to_string_lossy()),
+        shell_quote(&cgroup_file.to_string_lossy()),
+        shell_quote(&late_marker.to_string_lossy()),
+    );
+    let command = format!(
+        "setsid /bin/sh -c {} </dev/null >/dev/null 2>&1 & \
+         while [ ! -s {} ] || [ ! -s {} ]; do sleep 0.01; done; \
+         while [ ! -e {} ]; do sleep 0.01; done",
+        shell_quote(&payload),
+        shell_quote(&pid_file.to_string_lossy()),
+        shell_quote(&cgroup_file.to_string_lossy()),
+        shell_quote(&release_file.to_string_lossy()),
+    );
+    let dag = fixture.dir.join("matching.json");
+    let document = serde_json::json!({
+        "steps": [{
+            "group": "containment",
+            "job": "matching",
+            "cmd": command,
+            "timeout": 30,
+            "cpu_timeout": 600
+        }]
+    });
+    std::fs::write(&dag, serde_json::to_vec(&document).unwrap()).unwrap();
+
+    let mut runner = runner_command();
+    runner
+        .args([
+            "run",
+            "--dag",
+            dag.to_str().unwrap(),
+            "--max-steps",
+            "1",
+            "--no-profile",
+        ])
+        .env("CI", "1")
+        .env("DAGRUN_DIRECT_CGROUP", "1")
+        .env("DAGRUN_NO_STEP_LOGS", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = runner.spawn().expect("failed to spawn dagrun");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while (!pid_file.is_file() || !cgroup_file.is_file()) && Instant::now() < deadline {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let observation = if pid_file.is_file() && cgroup_file.is_file() {
+        let pid: u32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let start_time = process_start_time(pid);
+        let cgroup = PathBuf::from(std::fs::read_to_string(&cgroup_file).unwrap().trim());
+        let populated = std::fs::read_to_string(cgroup.join("cgroup.events"))
+            .ok()
+            .is_some_and(|events| events.lines().any(|line| line == "populated 1"));
+        Some((pid, start_time, cgroup, populated))
+    } else {
+        None
+    };
+    std::fs::write(&release_file, b"release\n").unwrap();
+
+    let output = child.wait_with_output().expect("failed to wait for dagrun");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if !text.contains("teardown ACTIVE via direct cgroupfs") {
+        let explicit_unavailable = text.contains(
+            "DAGRUN_DIRECT_CGROUP=1 but direct cgroupfs containment could not be established",
+        );
+        let expected_refusal = text.contains("cgroup boxing was NOT ESTABLISHED")
+            || text.contains("cgroup boxing could not be established");
+        assert!(
+            output.status.code() == Some(3)
+                && explicit_unavailable
+                && expected_refusal
+                && observation.is_none(),
+            "missing direct-cgroup banner was not the expected host refusal (status={:?}):\n{text}",
+            output.status.code()
+        );
+        eprintln!("skipping direct contained-payload case: explicit cgroupfs-unavailable refusal");
+        return;
+    }
+
+    assert!(
+        output.status.success(),
+        "matching contained-payload run failed:\n{text}"
+    );
+    let (pid, start_time, cgroup, populated) =
+        observation.expect("contained payload was never observed");
+    assert!(
+        populated,
+        "matching payload cgroup was not observed populated"
+    );
+    let start_time = start_time.expect("payload must be live before leader release");
+    assert!(
+        !exact_process_is_present(pid, start_time),
+        "the exact matching contained payload survived cgroup teardown"
+    );
+    assert!(
+        !late_marker.exists(),
+        "the contained payload survived long enough to publish its late marker"
+    );
+    assert!(
+        !cgroup.exists(),
+        "the step cgroup remained after kill + populated=0 proof: {}",
+        cgroup.display()
+    );
 }
