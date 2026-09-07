@@ -160,8 +160,6 @@ pub const STEP_NONCE_ENV: &str = "DAGRUN_STEP";
 /// environment, so a DAG cannot redirect the evidence to a stale or shared
 /// file. The file format is documented in the crate README.
 pub const TEST_COUNTS_PATH_ENV: &str = "DAGRUN_TEST_COUNTS_PATH";
-/// Require structured test counts and disable test-count parsing from stdout.
-pub const REQUIRE_STRUCTURED_TEST_COUNTS_ENV: &str = "DAGRUN_REQUIRE_STRUCTURED_TEST_COUNTS";
 const MAX_COMPONENT_BYTES: usize = 255;
 
 /// Monotonic per-process counter making each step's nonce unique within this runner.

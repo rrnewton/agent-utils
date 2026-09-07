@@ -7,7 +7,10 @@ use std::path::Path;
 use serde_json::Map;
 use serde_json::Value;
 
-const CURRENT_SCHEMA: u64 = 2;
+/// Current structured-result schema for this release line.
+pub const CURRENT_SCHEMA: u64 = 2;
+/// Schema 2 remains readable while result producers migrate atomically.
+pub const RETAINED_RESULTS_SCHEMA: u64 = 2;
 
 /// Terminal result of one named test, including how many attempts the test runner made.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -143,6 +146,30 @@ impl TestResults {
                 "structured-test-results-schema: unsupported schema {other}"
             )),
         }
+    }
+
+    /// Read the exact wire schema declared by the owning DAG step.
+    pub fn from_declared_schema_json_slice(
+        bytes: &[u8],
+        declared_schema: u64,
+    ) -> Result<Self, String> {
+        if declared_schema != CURRENT_SCHEMA {
+            return Err(format!(
+                "structured-test-results declaration has unsupported schema {declared_schema}; expected current schema {CURRENT_SCHEMA}"
+            ));
+        }
+        let value: Value = serde_json::from_slice(bytes)
+            .map_err(|error| format!("structured-test-results-json: {error}"))?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| "structured-test-results must be an object".to_string())?;
+        let observed_schema = required_u64(object, "schema")?;
+        if observed_schema != declared_schema {
+            return Err(format!(
+                "structured-test-results-schema: declaration requires schema {declared_schema}, got {observed_schema}"
+            ));
+        }
+        Self::from_json_slice(bytes)
     }
 
     /// Serialize the current shape, refusing retained count-only evidence.

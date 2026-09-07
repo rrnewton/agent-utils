@@ -50,8 +50,7 @@ pub use ambient::{
 pub use attribution::{
     bind_process_tests, culprit_columns, default_log_dir, mint_step_nonce, process_snapshot,
     recognize, Culprit, InFlightTest, ProcessObservation, RunEvidence, StepStream, TestEvent,
-    TestTracker, LOG_DIR_ENV, NO_LOGS_ENV, REQUIRE_STRUCTURED_TEST_COUNTS_ENV, STEP_NONCE_ENV,
-    TEST_COUNTS_PATH_ENV,
+    TestTracker, LOG_DIR_ENV, NO_LOGS_ENV, STEP_NONCE_ENV, TEST_COUNTS_PATH_ENV,
 };
 pub use capabilities::{enforcement_manifest, is_enforced, Capability, Lane, ENFORCEMENT_REGISTRY};
 #[allow(deprecated)]
@@ -87,9 +86,10 @@ pub use model::{
     resolved_wall_timeout, result_manifest_owner, step_classification, step_failure_reason,
     step_width_is_resizable, undeclared_resource_demands, validate_cmdtype_config,
     validate_jobs_env_config, write_domain_violations, CmdType, DagConfig, DagManifest,
-    ResourceHint, RunResult, Step, StepClass, StepOutcome, WriteDomainGuarantee, WriteDomainPolicy,
-    DAGRUN_EXTRA_ARGS_ENV, DAG_CONFIG_FIELDS, DEFAULT_JOBS_FLAG, DEFAULT_STEP_TIMEOUT,
-    JOBS_ENV_ENV, WALL_CPU_BACKSTOP_FACTOR,
+    ResourceHint, ResultManifest, RunResult, Step, StepClass, StepOutcome,
+    StructuredTestResultsManifest, WriteDomainGuarantee, WriteDomainPolicy, DAGRUN_EXTRA_ARGS_ENV,
+    DAG_CONFIG_FIELDS, DEFAULT_JOBS_FLAG, DEFAULT_STEP_TIMEOUT, JOBS_ENV_ENV,
+    STRUCTURED_TEST_RESULTS_KIND, WALL_CPU_BACKSTOP_FACTOR,
 };
 pub use perflog::{
     append_step_profiles, append_step_timeseries, PerfWindow, STEP_TIMESERIES_COLUMNS,
@@ -128,7 +128,7 @@ pub use sweep::{
     machine_topology, parse_cpu_list, parse_target_duration, parse_widths, refine_width_grid,
     stable_topological_order, workload_digest, MachineTopology,
 };
-pub use test_results::{TestResult, TestResults};
+pub use test_results::{TestResult, TestResults, CURRENT_SCHEMA, RETAINED_RESULTS_SCHEMA};
 pub use viz::{to_ascii, to_dot};
 
 /// Command name used in diagnostics and version output.

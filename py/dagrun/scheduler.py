@@ -2278,6 +2278,19 @@ def run_dag_limited(
             file=sys.stderr,
         )
         return RunResult(ok=False, wall_s=0.0)
+    structured_result_steps = [
+        step.tag
+        for step in cfg.steps
+        if step.structured_test_results_manifest() is not None
+    ]
+    if structured_result_steps:
+        print(
+            "[scheduler] ERROR: REFUSING to run before any node starts: the Python runner "
+            "does not implement structured test-result capture for step(s): "
+            + ", ".join(structured_result_steps),
+            file=sys.stderr,
+        )
+        return RunResult(ok=False, wall_s=0.0)
     resolved_max_cpus = _resolve_max_cpus_argument(max_cpus, cpu_jobs)
     if error := _self_managed_width_error(cfg, resolved_max_cpus):
         print(

@@ -1462,7 +1462,7 @@ LOADER_REFUSALS: tuple[tuple[str, str, str], ...] = (
         "result-manifests-not-a-list",
         '{"steps":[{"group":"a","job":"one","cmd":"true",'
         '"result_manifests":{"lane":"portable","category":"applications"}}]}',
-        "steps[0].result_manifests: must be a list of manifest selectors or null",
+        "steps[0].result_manifests: must be a list of result declarations or null",
     ),
     (
         "incomplete-result-manifest-selector",
@@ -1482,6 +1482,44 @@ LOADER_REFUSALS: tuple[tuple[str, str, str], ...] = (
         '{"steps":[{"group":"a","job":"one","cmd":"true",'
         '"result_manifests":[{"lane":"portable","category":"applications"},'
         '{"lane":"portable","category":"applications"}]}]}',
+        "steps[0].result_manifests: duplicate selector at index 1",
+    ),
+    (
+        "unknown-result-manifest-kind",
+        '{"steps":[{"group":"test","job":"counts","cmd":"true",'
+        '"result_manifests":[{"kind":"future","schema":3,'
+        '"path_env":"DAGRUN_TEST_COUNTS_PATH","owner":"test.counts"}]}]}',
+        "steps[0].result_manifests[0].kind: unknown result-manifest kind 'future'",
+    ),
+    (
+        "wrong-structured-result-schema",
+        '{"steps":[{"group":"test","job":"counts","cmd":"true",'
+        '"result_manifests":[{"kind":"structured-test-results","schema":3,'
+        '"path_env":"DAGRUN_TEST_COUNTS_PATH","owner":"test.counts"}]}]}',
+        "steps[0].result_manifests[0].schema: structured test results require retained schema 2 or current schema 2, got 3",
+    ),
+    (
+        "wrong-structured-result-path",
+        '{"steps":[{"group":"test","job":"counts","cmd":"true",'
+        '"result_manifests":[{"kind":"structured-test-results","schema":2,'
+        '"path_env":"OTHER","owner":"test.counts"}]}]}',
+        "steps[0].result_manifests[0].path_env: structured test results require "
+        "'DAGRUN_TEST_COUNTS_PATH', got 'OTHER'",
+    ),
+    (
+        "wrong-structured-result-owner",
+        '{"steps":[{"group":"test","job":"counts","cmd":"true",'
+        '"result_manifests":[{"kind":"structured-test-results","schema":2,'
+        '"path_env":"DAGRUN_TEST_COUNTS_PATH","owner":"other.step"}]}]}',
+        "step test.counts: structured test-result owner 'other.step' must equal the containing step tag",
+    ),
+    (
+        "duplicate-structured-result-declarations",
+        '{"steps":[{"group":"test","job":"counts","cmd":"true",'
+        '"result_manifests":[{"kind":"structured-test-results","schema":2,'
+        '"path_env":"DAGRUN_TEST_COUNTS_PATH","owner":"test.counts"},'
+        '{"kind":"structured-test-results","schema":2,'
+        '"path_env":"DAGRUN_TEST_COUNTS_PATH","owner":"test.counts"}]}]}',
         "steps[0].result_manifests: duplicate selector at index 1",
     ),
     (
@@ -1550,7 +1588,9 @@ LOADER_ACCEPTANCES: tuple[tuple[str, str], ...] = (
         '{"steps":[{"group":"a","job":"one","desc":"d","description":"long","cmd":"true",'
         '"manifest":{"lane":"portable","category":"applications"},'
         '"result_manifests":[{"lane":"portable","category":"applications",'
-        '"test":"applications/date","mode":"verify","backend":"ptrace"}],'
+        '"test":"applications/date","mode":"verify","backend":"ptrace"},'
+        '{"kind":"structured-test-results","schema":2,'
+        '"path_env":"DAGRUN_TEST_COUNTS_PATH","owner":"a.one"}],'
         '"integration_test_binaries":["unit_alpha"],'
         '"deps":[],"env":{"K":"V"},"networkonly":false,"engine_only":false,"timeout":5,'
         '"cpu_timeout":3,"cmdtype":"generic-with-flag","jobs_flag":"-j","jobs_env":"J","explains":[],'

@@ -23,13 +23,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use crate::attribution::TEST_COUNTS_PATH_ENV;
 use serde_json::Value;
 
 use crate::model::{
     graph_structure_violations, resolve_jobs_env, validate_cmdtype_config, write_domain_violations,
-    CmdType, DagConfig, DagManifest, IntentionalSkipReason, ResourceHint, Step, StepClass,
-    WriteDomainGuarantee, WriteDomainPolicy, DEFAULT_JOBS_FLAG,
+    CmdType, DagConfig, DagManifest, IntentionalSkipReason, ResourceHint, ResultManifest, Step,
+    StepClass, StructuredTestResultsManifest, WriteDomainGuarantee, WriteDomainPolicy,
+    DEFAULT_JOBS_FLAG, STRUCTURED_TEST_RESULTS_KIND,
 };
+use crate::test_results::{CURRENT_SCHEMA, RETAINED_RESULTS_SCHEMA};
 
 const DEFAULT_MEM_CAP_FLOOR: i64 = 8 * 1024 * 1024 * 1024;
 
@@ -200,6 +203,8 @@ const HINT_KEYS: [&str; 8] = [
 
 /// Every key a per-step manifest selector may carry.
 const MANIFEST_KEYS: [&str; 5] = ["backend", "category", "lane", "mode", "test"];
+/// Every key a structured test-result declaration must carry.
+const STRUCTURED_TEST_RESULTS_KEYS: [&str; 4] = ["kind", "owner", "path_env", "schema"];
 
 /// Every key the top-level `write_domain_policy` object may carry. Closed: a misspelled
 /// `require_explicit` turns a fail-closed policy into no policy at all, silently.
@@ -382,10 +387,49 @@ fn manifest_from(value: Option<&Value>, where_: &str) -> Result<Option<DagManife
     }
 }
 
+fn result_manifest_value_from(value: &Value, where_: &str) -> Result<ResultManifest, DagJsonError> {
+    let object = as_obj(value, where_)?;
+    if !object.contains_key("kind") {
+        return manifest_value_from(value, where_).map(ResultManifest::ManifestCell);
+    }
+    refuse_unknown_keys(object, &STRUCTURED_TEST_RESULTS_KEYS, where_)?;
+    let kind = req_str(object, "kind", where_)?;
+    if kind != STRUCTURED_TEST_RESULTS_KIND {
+        return Err(err(format!(
+            "{where_}.kind: unknown result-manifest kind '{kind}'"
+        )));
+    }
+    let schema = object
+        .get("schema")
+        .and_then(number_as_int)
+        .ok_or_else(|| err(format!("{where_}.schema: must be an integer")))?;
+    if schema != RETAINED_RESULTS_SCHEMA as i64 && schema != CURRENT_SCHEMA as i64 {
+        return Err(err(format!(
+            "{where_}.schema: structured test results require retained schema {RETAINED_RESULTS_SCHEMA} or current schema {CURRENT_SCHEMA}, got {schema}"
+        )));
+    }
+    let path_env = req_str(object, "path_env", where_)?;
+    if path_env != TEST_COUNTS_PATH_ENV {
+        return Err(err(format!(
+            "{where_}.path_env: structured test results require '{TEST_COUNTS_PATH_ENV}', got '{path_env}'"
+        )));
+    }
+    let owner = req_str(object, "owner", where_)?;
+    if owner.is_empty() {
+        return Err(err(format!("{where_}.owner: must be non-empty")));
+    }
+    let manifest = if schema == CURRENT_SCHEMA as i64 {
+        StructuredTestResultsManifest::current(owner)
+    } else {
+        StructuredTestResultsManifest::retained_schema2(owner)
+    };
+    Ok(ResultManifest::StructuredTestResults(manifest))
+}
+
 fn result_manifests_from(
     value: Option<&Value>,
     where_: &str,
-) -> Result<Option<Vec<DagManifest>>, DagJsonError> {
+) -> Result<Option<Vec<ResultManifest>>, DagJsonError> {
     let Some(value) = value else {
         return Ok(None);
     };
@@ -394,13 +438,13 @@ fn result_manifests_from(
     }
     let Value::Array(values) = value else {
         return Err(err(format!(
-            "{where_}: must be a list of manifest selectors or null"
+            "{where_}: must be a list of result declarations or null"
         )));
     };
     let mut manifests = Vec::with_capacity(values.len());
     for (index, value) in values.iter().enumerate() {
         let item_where = format!("{where_}[{index}]");
-        let manifest = manifest_value_from(value, &item_where)?;
+        let manifest = result_manifest_value_from(value, &item_where)?;
         if manifests.contains(&manifest) {
             return Err(err(format!(
                 "{where_}: duplicate selector at index {index}"
@@ -1119,7 +1163,33 @@ fn emit_manifest(s: &mut String, manifest: &DagManifest, base: usize) {
     s.push('}');
 }
 
-fn emit_manifest_list(s: &mut String, manifests: &[DagManifest], base: usize) {
+fn emit_result_manifest(s: &mut String, manifest: &ResultManifest, base: usize) {
+    match manifest {
+        ResultManifest::ManifestCell(manifest) => emit_manifest(s, manifest, base),
+        ResultManifest::StructuredTestResults(manifest) => {
+            let key = " ".repeat(base + 2);
+            s.push_str("{\n");
+            s.push_str(&key);
+            s.push_str(&format!(
+                "\"kind\": {},\n",
+                json_str(STRUCTURED_TEST_RESULTS_KIND)
+            ));
+            s.push_str(&key);
+            s.push_str(&format!("\"schema\": {},\n", manifest.schema));
+            s.push_str(&key);
+            s.push_str(&format!(
+                "\"path_env\": {},\n",
+                json_str(TEST_COUNTS_PATH_ENV)
+            ));
+            s.push_str(&key);
+            s.push_str(&format!("\"owner\": {}\n", json_str(&manifest.owner)));
+            s.push_str(&" ".repeat(base));
+            s.push('}');
+        }
+    }
+}
+
+fn emit_manifest_list(s: &mut String, manifests: &[ResultManifest], base: usize) {
     if manifests.is_empty() {
         s.push_str("[]");
         return;
@@ -1127,7 +1197,7 @@ fn emit_manifest_list(s: &mut String, manifests: &[DagManifest], base: usize) {
     s.push_str("[\n");
     for (index, manifest) in manifests.iter().enumerate() {
         s.push_str(&" ".repeat(base + 2));
-        emit_manifest(s, manifest, base + 2);
+        emit_result_manifest(s, manifest, base + 2);
         s.push_str(if index + 1 < manifests.len() {
             ",\n"
         } else {
@@ -1519,12 +1589,20 @@ steps:
     fn yaml_emit_round_trips() {
         let cfg = dag_from_json(
             r#"{"description": "d", "steps": [{"group": "g", "job": "j", "desc": "x",
-                "description": "multi\nline", "cmd": "true"}]}"#,
+                "description": "multi\nline", "cmd": "true", "result_manifests": [
+                {"lane":"portable","category":"applications"},
+                {"kind":"structured-test-results","schema":2,
+                 "path_env":"DAGRUN_TEST_COUNTS_PATH","owner":"g.j"}]}]}"#,
         )
         .unwrap();
         // dag_to_yaml output need not match Python, but must round-trip back to the same DagConfig.
         let back = dag_from_yaml(&dag_to_yaml(&cfg)).unwrap();
         assert_eq!(dag_to_json(&cfg), dag_to_json(&back));
+        assert_eq!(back.steps[0].effective_result_manifests().len(), 1);
+        assert_eq!(
+            back.steps[0].structured_test_results_manifest().unwrap(),
+            Some(&StructuredTestResultsManifest::current("g.j"))
+        );
     }
 
     #[test]
@@ -1632,6 +1710,10 @@ steps:
                 {"lane":"portable","category":"applications","mode":"verify","backend":"ptrace"},
                 {"lane":"portable","category":"c-programs","test":"c-programs/add-key-enosys",
                  "mode":"run","backend":"kvm"}
+             ]},
+            {"group":"test","job":"counts","cmd":"true","result_manifests":[
+                {"kind":"structured-test-results","schema":2,
+                 "path_env":"DAGRUN_TEST_COUNTS_PATH","owner":"test.counts"}
              ]}
         ]}"#;
         let cfg = dag_from_json(doc).unwrap();
@@ -1644,20 +1726,35 @@ steps:
         assert_eq!(cfg.steps[3].effective_result_manifests().len(), 2);
         assert_eq!(
             cfg.steps[3].result_manifests.as_ref().unwrap()[1],
-            DagManifest {
+            ResultManifest::ManifestCell(DagManifest {
                 lane: "portable".into(),
                 category: "c-programs".into(),
                 test: Some("c-programs/add-key-enosys".into()),
                 mode: Some("run".into()),
                 backend: Some("kvm".into()),
-            }
+            })
         );
+        assert_eq!(
+            cfg.steps[4]
+                .structured_test_results_manifest()
+                .unwrap()
+                .unwrap(),
+            &StructuredTestResultsManifest::current("test.counts")
+        );
+        assert!(cfg.steps[4].effective_result_manifests().is_empty());
         let encoded = dag_to_json(&cfg);
         let encoded_value: Value = serde_json::from_str(&encoded).unwrap();
         let encoded_steps = encoded_value["steps"].as_array().unwrap();
         assert!(encoded_steps[0].get("result_manifests").is_none());
         assert!(encoded_steps[1].get("result_manifests").is_none());
         assert_eq!(encoded_steps[2]["result_manifests"], serde_json::json!([]));
+        assert_eq!(
+            encoded_steps[4]["result_manifests"][0],
+            serde_json::json!({
+                "kind": "structured-test-results", "schema": 2,
+                "path_env": "DAGRUN_TEST_COUNTS_PATH", "owner": "test.counts"
+            })
+        );
         assert_eq!(dag_to_json(&dag_from_json(&encoded).unwrap()), encoded);
     }
 
@@ -1666,7 +1763,7 @@ steps:
         for (value, expected) in [
             (
                 r#"{"lane":"portable","category":"applications"}"#,
-                "result_manifests: must be a list of manifest selectors or null",
+                "result_manifests: must be a list of result declarations or null",
             ),
             (r#"[null]"#, "result_manifests[0]: expected an object"),
             (
@@ -1688,6 +1785,46 @@ steps:
         ] {
             let input = format!(
                 r#"{{"steps":[{{"group":"e2e","job":"results","cmd":"true","result_manifests":{value}}}]}}"#
+            );
+            let error = dag_from_json(&input).unwrap_err().to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn structured_result_manifests_refuse_wrong_contract_and_owner() {
+        for (declaration, expected) in [
+            (
+                r#"{"kind":"future","schema":3,"path_env":"DAGRUN_TEST_COUNTS_PATH","owner":"test.counts"}"#,
+                "unknown result-manifest kind",
+            ),
+            (
+                r#"{"kind":"structured-test-results","schema":"3","path_env":"DAGRUN_TEST_COUNTS_PATH","owner":"test.counts"}"#,
+                "schema: must be an integer",
+            ),
+            (
+                r#"{"kind":"structured-test-results","schema":3,"path_env":"DAGRUN_TEST_COUNTS_PATH","owner":"test.counts"}"#,
+                "got 3",
+            ),
+            (
+                r#"{"kind":"structured-test-results","schema":2,"path_env":"OTHER","owner":"test.counts"}"#,
+                "path_env: structured test results require",
+            ),
+            (
+                r#"{"kind":"structured-test-results","schema":2,"path_env":"DAGRUN_TEST_COUNTS_PATH","owner":""}"#,
+                "owner: must be non-empty",
+            ),
+            (
+                r#"{"kind":"structured-test-results","schema":2,"path_env":"DAGRUN_TEST_COUNTS_PATH","owner":"test.counts","future":1}"#,
+                "unknown field(s) 'future'",
+            ),
+            (
+                r#"{"kind":"structured-test-results","schema":2,"path_env":"DAGRUN_TEST_COUNTS_PATH","owner":"other.step"}"#,
+                "owner 'other.step' must equal the containing step tag",
+            ),
+        ] {
+            let input = format!(
+                r#"{{"steps":[{{"group":"test","job":"counts","cmd":"true","result_manifests":[{declaration}]}}]}}"#
             );
             let error = dag_from_json(&input).unwrap_err().to_string();
             assert!(error.contains(expected), "{error}");

@@ -333,6 +333,45 @@ def test_run_exit_codes() -> None:
         assert _capture(["run", "--dag", str(bad), "-q", _ACF])[0] == 1
 
 
+def test_structured_result_descriptor_lists_but_run_refuses_before_execution(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "ran"
+    dag = tmp_path / "structured.json"
+    dag.write_text(
+        json.dumps(
+            {
+                "steps": [
+                    {
+                        "group": "test",
+                        "job": "counts",
+                        "cmd": f"touch {shlex.quote(str(marker))}",
+                        "result_manifests": [
+                            {
+                                "kind": "structured-test-results",
+                                "schema": 2,
+                                "path_env": "DAGRUN_TEST_COUNTS_PATH",
+                                "owner": "test.counts",
+                            }
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    list_rc, listed, list_error = _capture(["list", "--dag", str(dag)])
+    assert list_rc == 0, list_error
+    assert "test.counts" in listed
+
+    run_rc, _, run_error = _capture(["run", "--dag", str(dag), "-q", _ACF])
+    assert run_rc == 1
+    assert "REFUSING to run before any node starts" in run_error
+    assert "Python runner does not implement structured test-result capture" in run_error
+    assert not marker.exists()
+
+
 def test_nested_run_refuses_by_outer_run_and_override_is_explicit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

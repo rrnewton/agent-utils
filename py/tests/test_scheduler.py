@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import subprocess
 import tempfile
 import threading
@@ -19,6 +20,7 @@ from dagrun.model import (
     IntentionalSkipReason,
     ResourceHint,
     Step,
+    StructuredTestResultsManifest,
     graph_structure_violations,
 )
 from dagrun.protocols import RunResult
@@ -489,6 +491,28 @@ def test_ungrantable_cap_refuses_before_anything_runs(
     err = capsys.readouterr().err
     assert "REFUSING to run before any node starts" in err, err
     assert "demands gpu=4 but resource_caps declares gpu=1" in err, err
+
+
+def test_python_runner_refuses_structured_results_before_any_node_starts(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    marker = tmp_path / "ran"
+    producer = _step("test", "counts", f"touch {marker}")
+    producer.result_manifests = [
+        StructuredTestResultsManifest.current("test.counts")
+    ]
+    cfg = DagConfig(steps=(producer,))
+
+    result = _run_dag_bounded(cfg)
+
+    assert result.ok is False
+    assert result.outcomes == () or result.outcomes == []
+    assert not marker.exists(), "the unsupported Python path must refuse before execution"
+    error = capsys.readouterr().err
+    assert "REFUSING to run before any node starts" in error
+    assert "Python runner does not implement structured test-result capture" in error
+    assert "test.counts" in error
 
 
 def test_a_cap_declared_as_zero_stays_the_deliberate_block_the_guide_documents(

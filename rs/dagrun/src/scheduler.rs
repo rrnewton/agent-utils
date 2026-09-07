@@ -42,7 +42,7 @@ use crate::ambient::{capture_ambient_snapshot, PsiReading};
 use crate::attribution::{
     bind_process_tests, capture_max_bytes, capture_truncation_notice, default_log_dir,
     mint_step_nonce, process_snapshot, recognize, Culprit, RunEvidence, StepStream, TestEvent,
-    REQUIRE_STRUCTURED_TEST_COUNTS_ENV, STEP_NONCE_ENV, TEST_COUNTS_PATH_ENV,
+    STEP_NONCE_ENV, TEST_COUNTS_PATH_ENV,
 };
 use crate::cgroup::CgroupManager;
 use crate::model::{
@@ -2513,41 +2513,80 @@ fn captured_test_counts(bytes: &[u8]) -> CapturedTestResults {
     }
 }
 
-fn structured_test_counts_path(evidence: Option<&RunEvidence>) -> Option<std::path::PathBuf> {
-    let evidence = evidence?;
+fn structured_test_results_schema(step: &Step) -> Option<u64> {
+    step.structured_test_results_manifest()
+        .expect("graph structure is validated before supervisor threads start")
+        .map(|manifest| manifest.schema)
+}
+
+fn structured_test_counts_path(
+    evidence: Option<&RunEvidence>,
+    required: bool,
+    nonce: &str,
+) -> Option<std::path::PathBuf> {
+    if !required {
+        return None;
+    }
     let sequence = TEST_COUNTS_SEQ.fetch_add(1, Ordering::Relaxed);
-    Some(evidence.dir().join(format!(
-        ".test-counts-{}-{sequence}.json",
-        std::process::id()
+    let directory = evidence
+        .map(|evidence| evidence.dir().to_path_buf())
+        .unwrap_or_else(std::env::temp_dir);
+    Some(directory.join(format!(
+        ".dagrun-test-counts-{}-{sequence}-{nonce}.json",
+        std::process::id(),
     )))
 }
 
-fn read_structured_test_counts(path: &std::path::Path) -> Option<CapturedTestResults> {
-    let bytes = std::fs::read(path).ok()?;
-    let report = TestResults::from_json_slice(&bytes).ok()?;
-    Some(CapturedTestResults {
+fn read_structured_test_counts(
+    path: &std::path::Path,
+    declared_schema: Option<u64>,
+) -> Result<Option<CapturedTestResults>, String> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "cannot read structured test results {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    let report = match declared_schema {
+        Some(schema) => TestResults::from_declared_schema_json_slice(&bytes, schema),
+        None => TestResults::from_json_slice(&bytes),
+    }
+    .map_err(|error| {
+        format!(
+            "malformed structured test results {}: {error}",
+            path.display()
+        )
+    })?;
+    Ok(Some(CapturedTestResults {
         executed: Some(report.executed_tests),
         filtered: Some(report.filtered_tests),
         results: report.results,
-    })
+    }))
 }
 
 fn resolved_test_counts(
-    structured_required: bool,
+    declared_schema: Option<u64>,
     path: Option<&std::path::Path>,
     captured: &[u8],
-) -> CapturedTestResults {
-    if let Some(counts) = path.and_then(read_structured_test_counts) {
-        return counts;
-    }
-    if structured_required {
-        CapturedTestResults {
-            executed: None,
-            filtered: None,
-            results: None,
+) -> Result<CapturedTestResults, String> {
+    if let Some(path) = path {
+        if let Some(counts) = read_structured_test_counts(path, declared_schema)? {
+            return Ok(counts);
         }
+    }
+    if declared_schema.is_some() {
+        let location = path
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "<scheduler-owned path unavailable>".into());
+        Err(format!(
+            "required structured test results were not written to {location}"
+        ))
     } else {
-        captured_test_counts(captured)
+        Ok(captured_test_counts(captured))
     }
 }
 
@@ -2963,9 +3002,12 @@ fn run_step(ctx: StepCtx) {
     // double-fork escapee once it has left the step's process group AND its parentage. See
     // [`kill_by_nonce`].
     let nonce = mint_step_nonce(&tag);
-    let structured_test_counts_required =
-        std::env::var(REQUIRE_STRUCTURED_TEST_COUNTS_ENV).is_ok_and(|value| value == "1");
-    let test_counts_path = structured_test_counts_path(evidence.as_deref());
+    let structured_test_results_schema = structured_test_results_schema(&step);
+    let test_counts_path = structured_test_counts_path(
+        evidence.as_deref(),
+        structured_test_results_schema.is_some(),
+        &nonce,
+    );
     if let Some(path) = &test_counts_path {
         match std::fs::remove_file(path) {
             Ok(()) => {}
@@ -3000,7 +3042,7 @@ fn run_step(ctx: StepCtx) {
     cmd.env(STEP_NONCE_ENV, &nonce);
     cmd.env_remove(TEST_COUNTS_PATH_ENV);
     if let Some(path) = &test_counts_path {
-        cmd.env(TEST_COUNTS_PATH_ENV, path);
+        cmd.env(TEST_COUNTS_PATH_ENV, path.as_path());
     }
     // Own process group (pgid == child pid) so teardown can reap the whole tree with a
     // negative-pid kill without ever touching the runner's own group.
@@ -3544,8 +3586,6 @@ fn run_step(ctx: StepCtx) {
         Some(c) => Some(c as i64),
         None => status.signal().map(|s| -(s as i64)),
     };
-    let ok = returncode == Some(0) && !timed_out && !cpu_timed_out;
-
     // The step's captured output -- both pipes, in arrival order -- for the summary + failure
     // detail. ONE tail, because there is one ring (see `step_capture`).
     let (combined, captured_total, captured_dropped) = {
@@ -3555,14 +3595,28 @@ fn run_step(ctx: StepCtx) {
         (cap.tail(), cap.total, cap.dropped())
     };
     let summary = last_line(&combined);
-    let test_counts = resolved_test_counts(
-        structured_test_counts_required,
+    let (test_counts, structured_test_results_error) = match resolved_test_counts(
+        structured_test_results_schema,
         test_counts_path.as_deref(),
         &combined,
-    );
+    ) {
+        Ok(counts) => (counts, None),
+        Err(error) => (
+            CapturedTestResults {
+                executed: None,
+                filtered: None,
+                results: None,
+            },
+            Some(error),
+        ),
+    };
     if let Some(path) = &test_counts_path {
         let _ = std::fs::remove_file(path);
     }
+    let ok = returncode == Some(0)
+        && !timed_out
+        && !cpu_timed_out
+        && structured_test_results_error.is_none();
 
     // Build the per-step profile row (perflog step-profile schema keys + dynamic cpu.* counters).
     let mut row: ProfileRow = BTreeMap::new();
@@ -3705,6 +3759,10 @@ fn run_step(ctx: StepCtx) {
             )
         };
         outcome.test_results = test_counts.results;
+        if let Some(error) = &structured_test_results_error {
+            outcome.ok = false;
+            outcome.reason = format!("STRUCTURED TEST RESULTS REFUSED: {error}");
+        }
         let reason = outcome.reason.clone();
         sh.done.insert(tag.clone(), outcome);
         if !was_aborted && !ok {
@@ -4486,6 +4544,52 @@ mod tests {
     }
 
     #[test]
+    fn current_results_are_required_only_for_declared_result_producers() {
+        let mut build = step("build", "compile", "true", &[], 1.0, &[]);
+        build.result_manifests = Some(Vec::new());
+        assert_eq!(structured_test_results_schema(&build), None);
+
+        let absent_or_null = step("test", "unmarked", "true", &[], 1.0, &[]);
+        assert!(absent_or_null.result_manifests.is_none());
+        assert_eq!(structured_test_results_schema(&absent_or_null), None);
+
+        let declaration = crate::model::DagManifest {
+            lane: "portable".into(),
+            category: "unit".into(),
+            test: Some("suite".into()),
+            mode: Some("test".into()),
+            backend: Some("native".into()),
+        };
+        let mut legacy_manifest_only = step("e2e", "legacy", "true", &[], 1.0, &[]);
+        legacy_manifest_only.manifest = Some(declaration.clone());
+        assert!(legacy_manifest_only.result_manifests.is_none());
+        assert_eq!(structured_test_results_schema(&legacy_manifest_only), None);
+
+        let mut explicit_producer = step("e2e", "suite", "true", &[], 1.0, &[]);
+        explicit_producer.result_manifests = Some(vec![declaration.into()]);
+        assert_eq!(structured_test_results_schema(&explicit_producer), None);
+
+        explicit_producer.result_manifests.as_mut().unwrap().push(
+            crate::model::ResultManifest::StructuredTestResults(
+                crate::model::StructuredTestResultsManifest::current("e2e.suite"),
+            ),
+        );
+        assert_eq!(
+            structured_test_results_schema(&explicit_producer),
+            Some(crate::test_results::CURRENT_SCHEMA)
+        );
+
+        explicit_producer.result_manifests =
+            Some(vec![crate::model::ResultManifest::StructuredTestResults(
+                crate::model::StructuredTestResultsManifest::current("e2e.suite"),
+            )]);
+        assert_eq!(
+            structured_test_results_schema(&explicit_producer),
+            Some(crate::test_results::CURRENT_SCHEMA)
+        );
+    }
+
+    #[test]
     fn structured_counts_replace_printed_banners_when_required() {
         let path = std::env::temp_dir().join(format!(
             "dagrun-structured-counts-{}-{}.json",
@@ -4499,7 +4603,12 @@ mod tests {
         .unwrap();
         let printed = b"running 999 tests\ntest result: ok. 999 passed; 0 failed; 0 filtered out\n";
         assert_eq!(
-            resolved_test_counts(true, Some(&path), printed),
+            resolved_test_counts(
+                Some(crate::test_results::CURRENT_SCHEMA),
+                Some(&path),
+                printed
+            )
+            .unwrap(),
             CapturedTestResults {
                 executed: Some(2),
                 filtered: Some(11),
@@ -4510,17 +4619,14 @@ mod tests {
             }
         );
         std::fs::remove_file(&path).unwrap();
-        assert_eq!(
-            resolved_test_counts(true, None, printed),
-            CapturedTestResults {
-                executed: None,
-                filtered: None,
-                results: None,
-            },
+        assert!(
+            resolved_test_counts(Some(crate::test_results::CURRENT_SCHEMA), None, printed)
+                .unwrap_err()
+                .contains("required structured test results were not written"),
             "a printed banner must not create receipt evidence in structured mode"
         );
         assert_eq!(
-            resolved_test_counts(false, None, printed),
+            resolved_test_counts(None, None, printed).unwrap(),
             CapturedTestResults {
                 executed: Some(999),
                 filtered: Some(0),
@@ -4528,6 +4634,85 @@ mod tests {
             },
             "clients that have not opted in retain the compatibility parser"
         );
+    }
+
+    fn run_without_evidence(cfg: &DagConfig) -> RunResult {
+        let mut runner = Runner::new(cfg, 1, 1, false, 0, None, None, None, None, None, None);
+        runner.evidence = None;
+        let (_ok, wall) = runner.run();
+        runner.result(wall)
+    }
+
+    fn structured_producer(command: &str, marker: &std::path::Path) -> DagConfig {
+        let mut producer = step("test", "counts", command, &[], 0.0, &[]);
+        producer.env.insert(
+            "TEST_MARKER_PATH".into(),
+            marker.to_string_lossy().into_owned(),
+        );
+        producer.result_manifests =
+            Some(vec![crate::model::ResultManifest::StructuredTestResults(
+                crate::model::StructuredTestResultsManifest::current("test.counts"),
+            )]);
+        DagConfig {
+            steps: vec![producer],
+            ..Default::default()
+        }
+    }
+
+    fn assert_scheduler_owned_path_was_removed(marker: &std::path::Path) {
+        let path = std::fs::read_to_string(marker).expect("producer observed scheduler path");
+        assert!(!path.trim().is_empty());
+        assert!(
+            !std::path::Path::new(path.trim()).exists(),
+            "scheduler-owned result path survived the run: {path:?}"
+        );
+        std::fs::remove_file(marker).unwrap();
+    }
+
+    #[test]
+    fn declared_results_use_scheduler_owned_path_without_run_evidence() {
+        let marker = std::env::temp_dir().join(format!(
+            "dagrun-no-evidence-success-{}-{}",
+            std::process::id(),
+            TEST_COUNTS_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let command = r#"printf '%s\n' "$DAGRUN_TEST_COUNTS_PATH" > "$TEST_MARKER_PATH"; printf '%s' '{"schema":2,"executed_tests":1,"filtered_tests":0,"results":[{"id":"suite$case","result":"pass","attempts":1}]}' > "$DAGRUN_TEST_COUNTS_PATH""#;
+        let result = run_without_evidence(&structured_producer(command, &marker));
+        assert!(result.ok, "{:#?}", result.outcomes);
+        let outcome = &result.outcomes[0];
+        assert_eq!(outcome.executed_tests, Some(1));
+        assert_eq!(outcome.filtered_tests, Some(0));
+        assert_scheduler_owned_path_was_removed(&marker);
+    }
+
+    #[test]
+    fn missing_declared_results_refuse_without_run_evidence() {
+        let marker = std::env::temp_dir().join(format!(
+            "dagrun-no-evidence-missing-{}-{}",
+            std::process::id(),
+            TEST_COUNTS_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let command = r#"printf '%s\n' "$DAGRUN_TEST_COUNTS_PATH" > "$TEST_MARKER_PATH""#;
+        let result = run_without_evidence(&structured_producer(command, &marker));
+        assert!(!result.ok);
+        let error = &result.outcomes[0].reason;
+        assert!(error.contains("required structured test results were not written"));
+        assert_scheduler_owned_path_was_removed(&marker);
+    }
+
+    #[test]
+    fn malformed_declared_results_refuse_without_run_evidence() {
+        let marker = std::env::temp_dir().join(format!(
+            "dagrun-no-evidence-malformed-{}-{}",
+            std::process::id(),
+            TEST_COUNTS_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let command = r#"printf '%s\n' "$DAGRUN_TEST_COUNTS_PATH" > "$TEST_MARKER_PATH"; printf '%s' 'not-json' > "$DAGRUN_TEST_COUNTS_PATH""#;
+        let result = run_without_evidence(&structured_producer(command, &marker));
+        assert!(!result.ok);
+        let error = &result.outcomes[0].reason;
+        assert!(error.contains("malformed structured test results"));
+        assert_scheduler_owned_path_was_removed(&marker);
     }
 
     #[test]

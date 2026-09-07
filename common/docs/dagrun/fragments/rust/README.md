@@ -46,20 +46,20 @@ so the process snapshot can bind each child to its test. Ordinary `cargo test`
 runs several tests inside one shared binary; its process tree alone does not
 identify the live test and remains explicitly unattributed.
 
-For receipt-bearing validation, set `DAGRUN_REQUIRE_STRUCTURED_TEST_COUNTS=1`.
-The runner then exports a scheduler-owned `DAGRUN_TEST_COUNTS_PATH` to each
-step and does not derive functional counts from human-readable output. A
-controlled test framework writes exactly one JSON object to that path:
+A step declares structured test evidence in `result_manifests`. The runner then exports a
+scheduler-owned `DAGRUN_TEST_COUNTS_PATH` to that step and requires a current result there.
+Steps without that typed declaration do not receive the path and do not owe this evidence.
+There is no process-wide switch that can override the graph's declaration.
+A controlled test framework writes exactly one current JSON object to that path:
 
 ```json
 {"schema":2,"executed_tests":2,"filtered_tests":5,"results":[{"id":"suite$passes","result":"pass","attempts":1},{"id":"suite$recovers","result":"pass","attempts":2}]}
 ```
 
-A missing or malformed file leaves the counts and individual results unknown.
-Retained schema-1 count-only files remain readable but have no current write
-path and provide no individual-result authority. Printing a line that looks
-like a libtest summary cannot create receipt evidence in this mode.
-
+A required result-producing step fails immediately when the file is missing, malformed, or does
+not match its declared schema. Retained schema-1 count-only files remain readable through the
+compatibility parser, but cannot satisfy a schema-2 producer. Printing a line that looks like
+a libtest summary cannot create receipt evidence in this mode.
 `resource_caps` apply within one runner process by default. To apply the same
 capacities across independent runners, pass `run --resource-caps-path FILE`.
 `DAGRUN_RESOURCE_CAPS_PATH=FILE` is the secondary route for launchers where a

@@ -8,6 +8,7 @@
 // and the [`step_failure_reason`] precedence + strings are kept identical to the Python
 // build so the two are cross-differential-testable.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashSet;
@@ -340,6 +341,59 @@ impl DagManifest {
     }
 }
 
+/// Fixed wire identity for the per-step structured test-result artifact.
+pub const STRUCTURED_TEST_RESULTS_KIND: &str = "structured-test-results";
+
+/// A typed declaration that one step owns the scheduler-provided structured test-result path.
+///
+/// Kind and path are fixed by the variant. Schema is explicit because a graph migration must bind
+/// the scheduler to the exact wire shape its producer writes. Owner binds the declaration to one
+/// exact step. Both fields are checked structurally before run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructuredTestResultsManifest {
+    /// Exact supported wire schema for the selected release line.
+    pub schema: u64,
+    /// Exact `group.job` tag of the step that owns this result.
+    pub owner: String,
+}
+
+impl StructuredTestResultsManifest {
+    /// Declare current structured test results owned by one exact step tag.
+    pub fn current(owner: impl Into<String>) -> Self {
+        Self {
+            schema: crate::test_results::CURRENT_SCHEMA,
+            owner: owner.into(),
+        }
+    }
+
+    /// Temporarily declare retained schema-2 results while a producer migration is atomic.
+    pub fn retained_schema2(owner: impl Into<String>) -> Self {
+        Self {
+            schema: crate::test_results::RETAINED_RESULTS_SCHEMA,
+            owner: owner.into(),
+        }
+    }
+}
+
+/// One current-result declaration.
+///
+/// Existing manifest-cell selectors retain their established JSON shape. Structured test
+/// results use a tagged shape because a Cargo/Nextest result is not a manifest cell and must not
+/// be represented by invented lane/category values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResultManifest {
+    /// Existing manifest-cell result selector.
+    ManifestCell(DagManifest),
+    /// Per-step structured test results at the scheduler path channel.
+    StructuredTestResults(StructuredTestResultsManifest),
+}
+
+impl From<DagManifest> for ResultManifest {
+    fn from(value: DagManifest) -> Self {
+        Self::ManifestCell(value)
+    }
+}
+
 /// One node in the DAG: a shell command plus its dependencies and resource hint.
 #[derive(Debug, Clone)]
 pub struct Step {
@@ -366,11 +420,12 @@ pub struct Step {
     /// `None` means the serialized step did not declare this field. A present list is authoritative
     /// only when the consuming audit also verifies that the command executes the same targets.
     pub integration_test_binaries: Option<Vec<String>>,
-    /// Manifest selectors whose result rows this step produces.
+    /// Typed result declarations owned by this step.
     ///
-    /// `None` preserves the singular [`Step::manifest`] declaration. `Some(vec![])` is
-    /// authoritative and explicitly declares that the step produces no manifest results.
-    pub result_manifests: Option<Vec<DagManifest>>,
+    /// `None` preserves the singular [`Step::manifest`] cell-selector declaration.
+    /// `Some(vec![])` is authoritative and explicitly declares that the step produces no current
+    /// results. Structured test evidence is a distinct variant, not a fabricated manifest cell.
+    pub result_manifests: Option<Vec<ResultManifest>>,
     /// Tags (`"group.job"`) this step depends on.
     pub deps: Vec<String>,
     /// Environment variables added to the step process.
@@ -436,12 +491,63 @@ impl Step {
         format!("{}.{}", self.group, self.job)
     }
 
-    /// The result selectors declared by this step, preserving the singular fallback.
-    pub fn effective_result_manifests(&self) -> &[DagManifest] {
+    /// The manifest-cell selectors declared by this step, preserving the singular fallback.
+    pub fn effective_result_manifests(&self) -> Cow<'_, [DagManifest]> {
         match self.result_manifests.as_deref() {
-            Some(manifests) => manifests,
-            None => self.manifest.as_slice(),
+            Some(manifests) => Cow::Owned(
+                manifests
+                    .iter()
+                    .filter_map(|manifest| match manifest {
+                        ResultManifest::ManifestCell(manifest) => Some(manifest.clone()),
+                        ResultManifest::StructuredTestResults(_) => None,
+                    })
+                    .collect(),
+            ),
+            None => Cow::Borrowed(self.manifest.as_slice()),
         }
+    }
+
+    /// The structured test-result declaration, when this step has one.
+    ///
+    /// Multiple declarations and an owner that differs from the containing step are refused here
+    /// as well as by graph validation, so a direct caller cannot silently select the first one.
+    pub fn structured_test_results_manifest(
+        &self,
+    ) -> Result<Option<&StructuredTestResultsManifest>, String> {
+        let mut structured = self
+            .result_manifests
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|manifest| match manifest {
+                ResultManifest::StructuredTestResults(manifest) => Some(manifest),
+                ResultManifest::ManifestCell(_) => None,
+            });
+        let first = structured.next();
+        if structured.next().is_some() {
+            return Err(format!(
+                "step {}: declares structured test results more than once",
+                self.tag()
+            ));
+        }
+        if let Some(manifest) = first {
+            if manifest.schema != crate::test_results::RETAINED_RESULTS_SCHEMA
+                && manifest.schema != crate::test_results::CURRENT_SCHEMA
+            {
+                return Err(format!(
+                    "step {}: structured test-result schema {} is unsupported; expected retained schema {} or current schema {}",
+                    self.tag(), manifest.schema, crate::test_results::RETAINED_RESULTS_SCHEMA, crate::test_results::CURRENT_SCHEMA
+                ));
+            }
+            if manifest.owner != self.tag() {
+                return Err(format!(
+                    "step {}: structured test-result owner '{}' must equal the containing step tag",
+                    self.tag(),
+                    manifest.owner
+                ));
+            }
+        }
+        Ok(first)
     }
 
     /// Whether this step is exempt from eager-exit given the set of tags that genuinely FAILED.
@@ -1528,6 +1634,12 @@ pub fn graph_structure_violations(cfg: &DagConfig) -> Vec<String> {
             }
         }
     }
+
+    for step in &cfg.steps {
+        if let Err(error) = step.structured_test_results_manifest() {
+            bad.push(error);
+        }
+    }
     bad
 }
 
@@ -1951,7 +2063,8 @@ mod tests {
                 test: None,
                 mode: Some("verify".into()),
                 backend: Some("ptrace".into()),
-            }]),
+            }
+            .into()]),
             ..bare_step("true", None)
         };
 
@@ -1995,13 +2108,68 @@ mod tests {
         let exact = Step {
             group: "e2e".into(),
             job: "exact".into(),
-            result_manifests: Some(vec![exact_result()]),
+            result_manifests: Some(vec![exact_result().into()]),
             ..bare_step("true", None)
         };
+
+        let structured = Step {
+            group: "test".into(),
+            job: "counts".into(),
+            result_manifests: Some(vec![ResultManifest::StructuredTestResults(
+                StructuredTestResultsManifest::current("test.counts"),
+            )]),
+            ..bare_step("true", None)
+        };
+        assert!(structured.effective_result_manifests().is_empty());
+        assert_eq!(
+            structured
+                .structured_test_results_manifest()
+                .expect("structured declaration")
+                .expect("present structured declaration")
+                .owner,
+            "test.counts"
+        );
         let error = result_manifest_owner(&[broad, exact], &exact_result()).unwrap_err();
         assert!(
             error.contains("multiple owning steps in the selected DAG: e2e.broad, e2e.exact"),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn structured_result_manifest_owner_and_cardinality_are_structural() {
+        let declaration = |owner: &str| {
+            ResultManifest::StructuredTestResults(StructuredTestResultsManifest::current(owner))
+        };
+        let wrong_owner = Step {
+            group: "test".into(),
+            job: "counts".into(),
+            result_manifests: Some(vec![declaration("other.step")]),
+            ..bare_step("true", None)
+        };
+        assert_eq!(
+            graph_structure_violations(&DagConfig {
+                steps: vec![wrong_owner],
+                ..DagConfig::default()
+            }),
+            vec![
+                "step test.counts: structured test-result owner 'other.step' must equal the containing step tag"
+                    .to_string()
+            ]
+        );
+
+        let duplicate = Step {
+            group: "test".into(),
+            job: "counts".into(),
+            result_manifests: Some(vec![declaration("test.counts"), declaration("test.counts")]),
+            ..bare_step("true", None)
+        };
+        assert_eq!(
+            graph_structure_violations(&DagConfig {
+                steps: vec![duplicate],
+                ..DagConfig::default()
+            }),
+            vec!["step test.counts: declares structured test results more than once".to_string()]
         );
     }
 

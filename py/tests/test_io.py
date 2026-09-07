@@ -14,6 +14,7 @@ from dagrun.model import (
     ResourceHint,
     Step,
     StepClass,
+    StructuredTestResultsManifest,
     WriteDomainGuarantee,
     WriteDomainPolicy,
     result_manifest_owner,
@@ -189,7 +190,7 @@ def test_result_manifests_roundtrip_preserves_absent_null_and_explicit_empty() -
     [
         (
             '{"lane":"portable","category":"applications"}',
-            "result_manifests: must be a list of manifest selectors or null",
+            "result_manifests: must be a list of result declarations or null",
         ),
         ("[null]", "result_manifests[0]: expected an object"),
         (
@@ -218,6 +219,68 @@ def test_result_manifests_refuse_malformed_and_duplicate_selectors(
         dag_from_json(
             '{"steps":[{"group":"e2e","job":"results","cmd":"true",'
             f'"result_manifests":{value}}}]}}'
+        )
+    assert message in str(raised.value)
+
+
+def test_structured_result_manifest_roundtrips_with_legacy_cell_selector() -> None:
+    doc = """{"steps":[{"group":"test","job":"counts","cmd":"true",
+        "result_manifests":[
+          {"lane":"portable","category":"applications"},
+          {"kind":"structured-test-results","schema":2,
+           "path_env":"DAGRUN_TEST_COUNTS_PATH","owner":"test.counts"}
+        ]}]}"""
+    cfg = dag_from_json(doc)
+    assert cfg.steps[0].effective_result_manifests() == (
+        DagManifest(lane="portable", category="applications"),
+    )
+    assert cfg.steps[0].structured_test_results_manifest() == (
+        StructuredTestResultsManifest.current("test.counts")
+    )
+    encoded = dag_to_json(cfg)
+    encoded_declarations = json.loads(encoded)["steps"][0]["result_manifests"]
+    assert encoded_declarations[0] == {
+        "lane": "portable",
+        "category": "applications",
+    }
+    assert encoded_declarations[1] == {
+        "kind": "structured-test-results",
+        "schema": 2,
+        "path_env": "DAGRUN_TEST_COUNTS_PATH",
+        "owner": "test.counts",
+    }
+    assert dag_to_json(dag_from_json(encoded)) == encoded
+
+
+@pytest.mark.parametrize(
+    ("declaration", "message"),
+    [
+        ({"kind": "future", "schema": 3, "path_env": "DAGRUN_TEST_COUNTS_PATH", "owner": "test.counts"}, "unknown result-manifest kind"),
+        ({"kind": "structured-test-results", "schema": "3", "path_env": "DAGRUN_TEST_COUNTS_PATH", "owner": "test.counts"}, "schema: must be an integer"),
+        ({"kind": "structured-test-results", "schema": 3, "path_env": "DAGRUN_TEST_COUNTS_PATH", "owner": "test.counts"}, "got 3"),
+        ({"kind": "structured-test-results", "schema": 2, "path_env": "OTHER", "owner": "test.counts"}, "path_env: structured test results require"),
+        ({"kind": "structured-test-results", "schema": 2, "path_env": "DAGRUN_TEST_COUNTS_PATH", "owner": ""}, "owner: must be non-empty"),
+        ({"kind": "structured-test-results", "schema": 2, "path_env": "DAGRUN_TEST_COUNTS_PATH", "owner": "test.counts", "future": 1}, "unknown field(s) 'future'"),
+        ({"kind": "structured-test-results", "schema": 2, "path_env": "DAGRUN_TEST_COUNTS_PATH", "owner": "other.step"}, "owner 'other.step' must equal the containing step tag"),
+    ],
+)
+def test_structured_result_manifest_refuses_wrong_contract(
+    declaration: dict[str, object], message: str
+) -> None:
+    with pytest.raises(DagJsonError) as raised:
+        dag_from_json(
+            json.dumps(
+                {
+                    "steps": [
+                        {
+                            "group": "test",
+                            "job": "counts",
+                            "cmd": "true",
+                            "result_manifests": [declaration],
+                        }
+                    ]
+                }
+            )
         )
     assert message in str(raised.value)
 

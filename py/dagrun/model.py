@@ -227,6 +227,33 @@ class DagManifest:
         return f"{self.lane}/{self.category}/{self.test}/{self.mode}/{self.backend}"
 
 
+STRUCTURED_TEST_RESULTS_KIND = "structured-test-results"
+STRUCTURED_TEST_RESULTS_CURRENT_SCHEMA = 2
+STRUCTURED_TEST_RESULTS_RETAINED_SCHEMA = 2
+STRUCTURED_TEST_RESULTS_PATH_ENV = "DAGRUN_TEST_COUNTS_PATH"
+
+
+@dataclass(frozen=True)
+class StructuredTestResultsManifest:
+    """One step's exact-schema structured test-result path declaration."""
+
+    schema: int
+    owner: str
+
+    @classmethod
+    def current(cls, owner: str) -> "StructuredTestResultsManifest":
+        """Declare results in this release line's current schema."""
+        return cls(schema=STRUCTURED_TEST_RESULTS_CURRENT_SCHEMA, owner=owner)
+
+    @classmethod
+    def retained_schema2(cls, owner: str) -> "StructuredTestResultsManifest":
+        """Temporarily declare retained schema-2 producer output."""
+        return cls(schema=STRUCTURED_TEST_RESULTS_RETAINED_SCHEMA, owner=owner)
+
+
+ResultManifest = DagManifest | StructuredTestResultsManifest
+
+
 @dataclass
 class Step:
     """One node in the DAG: a shell command plus its dependencies and resource hint."""
@@ -308,10 +335,11 @@ class Step:
     # Exact Cargo integration-test binary targets executed by this step. ``None`` preserves
     # historical graphs; a present list is checked against the command by the registration audit.
     integration_test_binaries: list[str] | None = None
-    # Result selectors produced by this step. ``None`` preserves the existing singular
-    # ``manifest`` fallback; ``[]`` explicitly declares that this step produces no results.
+    # Typed result declarations produced by this step. ``None`` preserves the existing singular
+    # manifest-cell fallback; ``[]`` explicitly declares that this step produces no results.
+    # Structured test evidence is not represented by a fabricated manifest cell.
     # Kept after every established field so existing positional Step(...) calls stay compatible.
-    result_manifests: list[DagManifest] | None = None
+    result_manifests: list[ResultManifest] | None = None
 
     def explains_a_failure_in(self, failed: Container[str]) -> bool:
         """Whether this step is exempt from eager-exit given the set of tags that FAILED.
@@ -332,11 +360,43 @@ class Step:
         """Return authoritative selectors, falling back to the singular declaration."""
 
         if self.result_manifests is not None:
-            return tuple(self.result_manifests)
+            return tuple(
+                manifest
+                for manifest in self.result_manifests
+                if isinstance(manifest, DagManifest)
+            )
         if self.manifest is not None:
             return (self.manifest,)
         return ()
 
+
+    def structured_test_results_manifest(
+        self,
+    ) -> StructuredTestResultsManifest | None:
+        """Return one valid structured-result declaration or refuse ambiguity."""
+
+        structured = [
+            manifest
+            for manifest in self.result_manifests or ()
+            if isinstance(manifest, StructuredTestResultsManifest)
+        ]
+        if len(structured) > 1:
+            raise ValueError(
+                f"step {self.tag}: declares structured test results more than once"
+            )
+        if structured and structured[0].schema not in {
+            STRUCTURED_TEST_RESULTS_RETAINED_SCHEMA,
+            STRUCTURED_TEST_RESULTS_CURRENT_SCHEMA,
+        }:
+            raise ValueError(
+                f"step {self.tag}: structured test-result schema {structured[0].schema} is unsupported"
+            )
+        if structured and structured[0].owner != self.tag:
+            raise ValueError(
+                f"step {self.tag}: structured test-result owner {structured[0].owner!r} "
+                "must equal the containing step tag"
+            )
+        return structured[0] if structured else None
 
 def result_manifest_owner(steps: Sequence[Step], result: DagManifest) -> Step:
     """Resolve one exact manifest result to its unique owner among selected steps."""
@@ -1184,6 +1244,11 @@ def graph_structure_violations(cfg: DagConfig) -> list[str]:
                     f"step {step.tag}: demands {name}={count} but resource_caps declares "
                     f"{name}={cap}, so it can never be admitted"
                 )
+    for step in cfg.steps:
+        try:
+            step.structured_test_results_manifest()
+        except ValueError as error:
+            bad.append(str(error))
     return bad
 
 

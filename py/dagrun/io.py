@@ -21,13 +21,19 @@ if TYPE_CHECKING:
 
 from dagrun.model import (
     DEFAULT_JOBS_FLAG,
+    STRUCTURED_TEST_RESULTS_KIND,
+    STRUCTURED_TEST_RESULTS_PATH_ENV,
+    STRUCTURED_TEST_RESULTS_CURRENT_SCHEMA,
+    STRUCTURED_TEST_RESULTS_RETAINED_SCHEMA,
     CmdType,
     DagConfig,
     DagManifest,
     IntentionalSkipReason,
     ResourceHint,
+    ResultManifest,
     Step,
     StepClass,
+    StructuredTestResultsManifest,
     WriteDomainGuarantee,
     WriteDomainPolicy,
     graph_structure_violations,
@@ -588,6 +594,7 @@ HINT_KEYS: frozenset[str] = frozenset(
 
 MANIFEST_KEYS: frozenset[str] = frozenset({"lane", "category", "test", "mode", "backend"})
 
+STRUCTURED_TEST_RESULTS_KEYS = frozenset({"kind", "schema", "path_env", "owner"})
 
 def _manifest_value_from(value: object, where: str) -> DagManifest:
     obj = _as_obj(value, where)
@@ -613,14 +620,45 @@ def _manifest_from(value: object, where: str) -> DagManifest | None:
     return _manifest_value_from(value, where)
 
 
-def _result_manifests_from(value: object, where: str) -> list[DagManifest] | None:
+def _result_manifest_value_from(value: object, where: str) -> ResultManifest:
+    obj = _as_obj(value, where)
+    if "kind" not in obj:
+        return _manifest_value_from(value, where)
+    _refuse_unknown_keys(obj, STRUCTURED_TEST_RESULTS_KEYS, where)
+    kind = _req_str(obj, "kind", where)
+    if kind != STRUCTURED_TEST_RESULTS_KIND:
+        raise DagJsonError(f"{where}.kind: unknown result-manifest kind {kind!r}")
+    schema = obj.get("schema")
+    if isinstance(schema, bool) or not isinstance(schema, int):
+        raise DagJsonError(f"{where}.schema: must be an integer")
+    if schema not in {STRUCTURED_TEST_RESULTS_RETAINED_SCHEMA, STRUCTURED_TEST_RESULTS_CURRENT_SCHEMA}:
+        raise DagJsonError(
+            f"{where}.schema: structured test results require retained schema "
+            f"{STRUCTURED_TEST_RESULTS_RETAINED_SCHEMA} or current schema "
+            f"{STRUCTURED_TEST_RESULTS_CURRENT_SCHEMA}, got {schema}"
+        )
+    path_env = _req_str(obj, "path_env", where)
+    if path_env != STRUCTURED_TEST_RESULTS_PATH_ENV:
+        raise DagJsonError(
+            f"{where}.path_env: structured test results require "
+            f"{STRUCTURED_TEST_RESULTS_PATH_ENV!r}, got {path_env!r}"
+        )
+    owner = _req_str(obj, "owner", where)
+    if not owner:
+        raise DagJsonError(f"{where}.owner: must be non-empty")
+    if schema == STRUCTURED_TEST_RESULTS_CURRENT_SCHEMA:
+        return StructuredTestResultsManifest.current(owner)
+    return StructuredTestResultsManifest.retained_schema2(owner)
+
+
+def _result_manifests_from(value: object, where: str) -> list[ResultManifest] | None:
     if value is None:
         return None
     if not isinstance(value, list):
-        raise DagJsonError(f"{where}: must be a list of manifest selectors or null")
-    manifests: list[DagManifest] = []
+        raise DagJsonError(f"{where}: must be a list of result declarations or null")
+    manifests: list[ResultManifest] = []
     for index, item in enumerate(value):
-        manifest = _manifest_value_from(item, f"{where}[{index}]")
+        manifest = _result_manifest_value_from(item, f"{where}[{index}]")
         if manifest in manifests:
             raise DagJsonError(f"{where}: duplicate selector at index {index}")
         manifests.append(manifest)
@@ -877,6 +915,18 @@ def _manifest_to_json(manifest: DagManifest) -> dict[str, object]:
     }
     return {key: value for key, value in obj.items() if value is not None}
 
+def _result_manifest_to_json(manifest: ResultManifest) -> dict[str, object]:
+    if isinstance(manifest, DagManifest):
+        return _manifest_to_json(manifest)
+    if isinstance(manifest, StructuredTestResultsManifest):
+        return {
+            "kind": STRUCTURED_TEST_RESULTS_KIND,
+            "schema": manifest.schema,
+            "path_env": STRUCTURED_TEST_RESULTS_PATH_ENV,
+            "owner": manifest.owner,
+        }
+    raise TypeError(f"unknown result manifest {manifest!r}")
+
 
 def _step_to_json(step: Step) -> dict[str, object]:
     obj: dict[str, object] = {
@@ -889,7 +939,7 @@ def _step_to_json(step: Step) -> dict[str, object]:
         "cmdtype": step.cmdtype.value,
         "manifest": _manifest_to_json(step.manifest) if step.manifest is not None else None,
         "result_manifests": (
-            [_manifest_to_json(manifest) for manifest in step.result_manifests]
+            [_result_manifest_to_json(manifest) for manifest in step.result_manifests]
             if step.result_manifests is not None
             else None
         ),
