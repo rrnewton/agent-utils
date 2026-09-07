@@ -69,6 +69,7 @@ const F_UTIME: usize = 11;
 const F_STIME: usize = 12;
 const F_CUTIME: usize = 13;
 const F_CSTIME: usize = 14;
+const F_STARTTIME: usize = 19;
 
 /// Clock ticks per second (`sysconf(_SC_CLK_TCK)`), the unit of the `stat` CPU fields.
 fn clk_tck() -> f64 {
@@ -93,16 +94,29 @@ fn stat_fields(pid_dir: &Path) -> Option<Vec<String>> {
         .split_whitespace()
         .map(str::to_string)
         .collect();
-    if fields.len() <= F_CSTIME {
+    if fields.len() <= F_STARTTIME {
         return None;
     }
     Some(fields)
 }
 
+#[derive(Clone, Copy)]
+struct ProcessCpuSample {
+    process_group_id: u32,
+    start_time_ticks: u64,
+    cpu_ticks: u64,
+}
+
+struct CpuSnapshotData {
+    groups: HashMap<u32, u64>,
+    processes: HashMap<u32, ProcessCpuSample>,
+}
+
 /// Aggregate one procfs snapshot by process group.
-fn scan_group_ticks(proc_root: &Path) -> Option<HashMap<u32, u64>> {
+fn scan_group_ticks(proc_root: &Path) -> Option<CpuSnapshotData> {
     let entries = fs::read_dir(proc_root).ok()?;
     let mut groups = HashMap::new();
+    let mut processes = HashMap::new();
     for entry in entries.flatten() {
         let path: PathBuf = entry.path();
         let name = entry.file_name();
@@ -110,7 +124,13 @@ fn scan_group_ticks(proc_root: &Path) -> Option<HashMap<u32, u64>> {
         if !name.chars().all(|c| c.is_ascii_digit()) || name.is_empty() {
             continue;
         }
+        let Ok(pid) = name.parse::<u32>() else {
+            continue;
+        };
         let Some(fields) = stat_fields(&path) else {
+            continue;
+        };
+        let Ok(start_time_ticks) = fields[F_STARTTIME].parse::<u64>() else {
             continue;
         };
         let Ok(pgrp) = fields[F_PGRP].parse::<u32>() else {
@@ -136,13 +156,23 @@ fn scan_group_ticks(proc_root: &Path) -> Option<HashMap<u32, u64>> {
             .entry(pgrp)
             .and_modify(|sum: &mut u64| *sum = sum.saturating_add(ticks))
             .or_insert(ticks);
+        processes.insert(
+            pid,
+            ProcessCpuSample {
+                process_group_id: pgrp,
+                start_time_ticks,
+                cpu_ticks: ticks,
+            },
+        );
     }
-    Some(groups)
+    Some(CpuSnapshotData { groups, processes })
 }
 
 struct Snapshot {
     captured: Instant,
+    generation: u64,
     groups: HashMap<u32, u64>,
+    processes: HashMap<u32, ProcessCpuSample>,
 }
 
 // All active uncontained steps share one short-lived procfs snapshot. Without this cache, N
@@ -152,27 +182,157 @@ struct Snapshot {
 const SNAPSHOT_TTL: Duration = Duration::from_millis(500);
 static SNAPSHOT: OnceLock<Mutex<Option<Snapshot>>> = OnceLock::new();
 
-/// Lower bound of CPU-seconds observed for process group `pgid` from live procfs.
-pub fn subtree_cpu_seconds(pgid: u32) -> Option<f64> {
+fn refresh_snapshot(cache: &mut Option<Snapshot>, proc_root: &Path) -> bool {
+    let generation = cache
+        .as_ref()
+        .map_or(1, |snapshot| snapshot.generation.saturating_add(1));
+    let Some(data) = scan_group_ticks(proc_root) else {
+        return false;
+    };
+    *cache = Some(Snapshot {
+        captured: Instant::now(),
+        generation,
+        groups: data.groups,
+        processes: data.processes,
+    });
+    true
+}
+
+fn group_cpu_seconds(snapshot: &Snapshot, pgid: u32) -> Option<f64> {
+    snapshot
+        .groups
+        .get(&pgid)
+        .map(|ticks| *ticks as f64 / clk_tck())
+}
+
+fn cached_subtree_cpu_seconds(
+    pgid: u32,
+    proc_root: &Path,
+    cache: &Mutex<Option<Snapshot>>,
+) -> Option<f64> {
     if pgid <= 1 {
         return None;
     }
     let now = Instant::now();
-    let mut cache = SNAPSHOT
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
+    let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
     let fresh = cache
         .as_ref()
         .is_some_and(|snapshot| now.duration_since(snapshot.captured) <= SNAPSHOT_TTL);
-    if !fresh {
-        *cache = scan_group_ticks(Path::new("/proc")).map(|groups| Snapshot {
-            captured: Instant::now(),
-            groups,
-        });
+    if !fresh && !refresh_snapshot(&mut cache, proc_root) {
+        return None;
     }
-    let ticks = cache.as_ref()?.groups.get(&pgid)?;
-    Some(*ticks as f64 / clk_tck())
+    group_cpu_seconds(cache.as_ref()?, pgid)
+}
+
+/// Lower bound of CPU-seconds observed for process group `pgid` from live procfs.
+pub fn subtree_cpu_seconds(pgid: u32) -> Option<f64> {
+    cached_subtree_cpu_seconds(
+        pgid,
+        Path::new("/proc"),
+        SNAPSHOT.get_or_init(|| Mutex::new(None)),
+    )
+}
+
+/// Identity and cache generation for a process-group CPU reading whose helper
+/// process must be excluded from every subsequent observation.
+///
+/// The caller must ensure, directly or through an owned supervisor, that the
+/// exact helper remains unreaped and therefore PID-pinned for this handle's
+/// lifetime. Linux start times are tick-granular, not durable IDs by themselves.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProcessGroupCpuAnchor {
+    process_group_id: u32,
+    sentinel_pid: u32,
+    sentinel_start_time_ticks: u64,
+    generation: u64,
+}
+
+fn anchored_group_cpu_seconds(snapshot: &Snapshot, anchor: ProcessGroupCpuAnchor) -> Option<f64> {
+    if snapshot.generation < anchor.generation {
+        return None;
+    }
+    let sentinel = snapshot.processes.get(&anchor.sentinel_pid)?;
+    if sentinel.process_group_id != anchor.process_group_id
+        || sentinel.start_time_ticks != anchor.sentinel_start_time_ticks
+    {
+        return None;
+    }
+    snapshot
+        .groups
+        .get(&anchor.process_group_id)?
+        .checked_sub(sentinel.cpu_ticks)
+        .map(|ticks| ticks as f64 / clk_tck())
+}
+
+fn anchor_subtree_cpu_seconds_with_cache(
+    process_group_id: u32,
+    sentinel_pid: u32,
+    sentinel_start_time_ticks: u64,
+    proc_root: &Path,
+    cache: &Mutex<Option<Snapshot>>,
+) -> Option<(ProcessGroupCpuAnchor, f64)> {
+    if process_group_id <= 1 {
+        return None;
+    }
+    let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
+    if !refresh_snapshot(&mut cache, proc_root) {
+        return None;
+    }
+    let snapshot = cache.as_ref()?;
+    let anchor = ProcessGroupCpuAnchor {
+        process_group_id,
+        sentinel_pid,
+        sentinel_start_time_ticks,
+        generation: snapshot.generation,
+    };
+    anchored_group_cpu_seconds(snapshot, anchor).map(|seconds| (anchor, seconds))
+}
+
+fn anchored_subtree_cpu_seconds_with_cache(
+    anchor: ProcessGroupCpuAnchor,
+    proc_root: &Path,
+    cache: &Mutex<Option<Snapshot>>,
+) -> Option<f64> {
+    let now = Instant::now();
+    let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
+    let usable = cache.as_ref().is_some_and(|snapshot| {
+        now.duration_since(snapshot.captured) <= SNAPSHOT_TTL
+            && anchored_group_cpu_seconds(snapshot, anchor).is_some()
+    });
+    if !usable && !refresh_snapshot(&mut cache, proc_root) {
+        return None;
+    }
+    anchored_group_cpu_seconds(cache.as_ref()?, anchor)
+}
+
+/// Establish a generation-checked process-group CPU anchor with one forced
+/// snapshot after the helper's identity is known. The caller must ensure,
+/// directly or through an owned supervisor, that the helper stays unreaped and
+/// PID-pinned until all reads through the returned handle are complete.
+pub fn anchor_subtree_cpu_seconds(
+    process_group_id: u32,
+    sentinel_pid: u32,
+    sentinel_start_time_ticks: u64,
+) -> Option<(ProcessGroupCpuAnchor, f64)> {
+    anchor_subtree_cpu_seconds_with_cache(
+        process_group_id,
+        sentinel_pid,
+        sentinel_start_time_ticks,
+        Path::new("/proc"),
+        SNAPSHOT.get_or_init(|| Mutex::new(None)),
+    )
+}
+
+/// Read process-group CPU from the anchor's cache generation or a newer one,
+/// excluding only the helper generation captured by the anchor. This remains
+/// generation-safe only while the caller upholds [`ProcessGroupCpuAnchor`]'s
+/// unreaped-child lifetime requirement.
+pub fn anchored_subtree_cpu_seconds(anchor: ProcessGroupCpuAnchor) -> Option<f64> {
+    anchored_subtree_cpu_seconds_with_cache(
+        anchor,
+        Path::new("/proc"),
+        SNAPSHOT.get_or_init(|| Mutex::new(None)),
+    )
 }
 
 /// [`subtree_cpu_seconds`] against an explicit procfs root, without the live snapshot cache.
@@ -180,8 +340,8 @@ pub fn subtree_cpu_seconds_in(pgid: u32, proc_root: &Path) -> Option<f64> {
     if pgid <= 1 {
         return None;
     }
-    let groups = scan_group_ticks(proc_root)?;
-    let ticks = groups.get(&pgid)?;
+    let snapshot = scan_group_ticks(proc_root)?;
+    let ticks = snapshot.groups.get(&pgid)?;
     Some(*ticks as f64 / clk_tck())
 }
 
@@ -221,6 +381,17 @@ mod tests {
     /// depending on live process timing. The layout deliberately includes a comm with a
     /// space and a ')' in it, which is the exact case a naive whitespace split gets wrong.
     fn write_stat(root: &Path, pid: u32, comm: &str, pgrp: u32, cpu: [u64; 4]) {
+        write_stat_with_start(root, pid, comm, pgrp, cpu, 1);
+    }
+
+    fn write_stat_with_start(
+        root: &Path,
+        pid: u32,
+        comm: &str,
+        pgrp: u32,
+        cpu: [u64; 4],
+        start_time_ticks: u64,
+    ) {
         let dir = root.join(pid.to_string());
         fs::create_dir_all(&dir).unwrap();
         let mut f = vec![format!("{pid}"), format!("({comm})"), "R".into()];
@@ -235,6 +406,10 @@ mod tests {
         f.push(cpu[1].to_string()); // stime
         f.push(cpu[2].to_string()); // cutime
         f.push(cpu[3].to_string()); // cstime
+        for _ in 0..4 {
+            f.push("0".into()); // priority..itrealvalue fillers
+        }
+        f.push(start_time_ticks.to_string()); // starttime
         fs::write(dir.join("stat"), f.join(" ")).unwrap();
     }
 
@@ -277,10 +452,111 @@ mod tests {
     }
 
     #[test]
+    fn stat_with_cpu_fields_but_no_start_time_is_unknown() {
+        let tmp = TmpRoot::new("short-starttime");
+        let dir = tmp.path().join("100");
+        fs::create_dir_all(&dir).unwrap();
+        let fields = [
+            "R", "1", "100", "0", "0", "0", "0", "0", "0", "0", "0", "1", "2", "3", "4",
+        ];
+        assert_eq!(fields.len(), F_CSTIME + 1);
+        fs::write(
+            dir.join("stat"),
+            format!("100 (short) {}", fields.join(" ")),
+        )
+        .unwrap();
+        assert_eq!(
+            subtree_cpu_seconds_in(100, tmp.path()),
+            None,
+            "a stat line without starttime must be skipped rather than indexed"
+        );
+    }
+
+    #[test]
     fn refuses_degenerate_pgids() {
         // pgid 0 means "my own group" and 1 is init; either would attribute unrelated CPU
         // to the step and reap it spuriously, so both must be refused, not measured.
         assert_eq!(subtree_cpu_seconds(0), None);
         assert_eq!(subtree_cpu_seconds(1), None);
+    }
+
+    #[test]
+    fn anchor_forces_a_new_generation_and_excludes_only_its_exact_sentinel() {
+        let tmp = TmpRoot::new("anchor");
+        let cache = Mutex::new(None);
+        write_stat(tmp.path(), 100, "leader", 100, [20, 0, 0, 0]);
+        assert_eq!(
+            cached_subtree_cpu_seconds(100, tmp.path(), &cache),
+            Some(20.0 / clk_tck())
+        );
+
+        write_stat(tmp.path(), 100, "leader", 100, [30, 0, 0, 0]);
+        write_stat(tmp.path(), 101, "sentinel", 100, [7, 0, 0, 0]);
+        assert_eq!(
+            cached_subtree_cpu_seconds(100, tmp.path(), &cache),
+            Some(20.0 / clk_tck()),
+            "ordinary reads must still demonstrate the stale pre-anchor snapshot"
+        );
+        let (anchor, initial) =
+            anchor_subtree_cpu_seconds_with_cache(100, 101, 1, tmp.path(), &cache).unwrap();
+        assert_eq!(initial, 30.0 / clk_tck());
+        assert_eq!(
+            anchored_subtree_cpu_seconds_with_cache(anchor, tmp.path(), &cache),
+            Some(30.0 / clk_tck())
+        );
+    }
+
+    #[test]
+    fn anchor_rejects_missing_or_recycled_sentinel_generation() {
+        let tmp = TmpRoot::new("anchor-stale");
+        let cache = Mutex::new(None);
+        write_stat(tmp.path(), 100, "leader", 100, [30, 0, 0, 0]);
+        write_stat(tmp.path(), 101, "sentinel", 100, [7, 0, 0, 0]);
+        let (anchor, _) =
+            anchor_subtree_cpu_seconds_with_cache(100, 101, 1, tmp.path(), &cache).unwrap();
+
+        write_stat_with_start(tmp.path(), 101, "sentinel", 100, [7, 0, 0, 0], 2);
+        assert!(refresh_snapshot(&mut cache.lock().unwrap(), tmp.path()));
+        assert_eq!(
+            anchored_subtree_cpu_seconds_with_cache(anchor, tmp.path(), &cache),
+            None
+        );
+
+        fs::remove_dir_all(tmp.path().join("101")).unwrap();
+        assert!(refresh_snapshot(&mut cache.lock().unwrap(), tmp.path()));
+        assert_eq!(
+            anchored_subtree_cpu_seconds_with_cache(anchor, tmp.path(), &cache),
+            None
+        );
+    }
+
+    #[test]
+    fn anchor_generations_advance_and_a_matching_sentinel_outlives_its_leader() {
+        let tmp = TmpRoot::new("anchor-generation");
+        let cache = Mutex::new(None);
+        write_stat(tmp.path(), 100, "leader-a", 100, [30, 0, 0, 0]);
+        write_stat_with_start(tmp.path(), 101, "sentinel-a", 100, [7, 0, 0, 0], 11);
+        write_stat(tmp.path(), 200, "leader-b", 200, [40, 0, 0, 0]);
+        write_stat_with_start(tmp.path(), 201, "sentinel-b", 200, [9, 0, 0, 0], 22);
+
+        let (first, first_cpu) =
+            anchor_subtree_cpu_seconds_with_cache(100, 101, 11, tmp.path(), &cache).unwrap();
+        let (second, second_cpu) =
+            anchor_subtree_cpu_seconds_with_cache(200, 201, 22, tmp.path(), &cache).unwrap();
+        assert!(second.generation > first.generation);
+        assert_eq!(first_cpu, 30.0 / clk_tck());
+        assert_eq!(second_cpu, 40.0 / clk_tck());
+
+        fs::remove_dir_all(tmp.path().join("100")).unwrap();
+        assert!(refresh_snapshot(&mut cache.lock().unwrap(), tmp.path()));
+        assert_eq!(
+            anchored_subtree_cpu_seconds_with_cache(first, tmp.path(), &cache),
+            Some(0.0),
+            "the exact sentinel keeps the anchored generation valid after leader exit"
+        );
+        assert_eq!(
+            anchored_subtree_cpu_seconds_with_cache(second, tmp.path(), &cache),
+            Some(40.0 / clk_tck())
+        );
     }
 }
