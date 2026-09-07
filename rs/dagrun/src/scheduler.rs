@@ -1306,6 +1306,21 @@ fn emitted_containing(needle: &str) -> Vec<String> {
         .collect()
 }
 
+/// Print a required-result refusal when it is an additional terminal cause.
+///
+/// The primary reason keeps precedence (for example, an outer run-budget cancellation or a peer
+/// cancellation). The result-file refusal still has to be visible at the terminal boundary, but
+/// must not be printed twice when it is already the primary reason.
+fn emit_distinct_test_results_error(tag: &str, primary_reason: &str, error: Option<&str>) {
+    let Some(error) = error else {
+        return;
+    };
+    let evidence_reason = format!("STRUCTURED TEST RESULTS REFUSED: {error}");
+    if primary_reason != evidence_reason {
+        emit(&red(&format!("[{tag}] \u{21b3} {evidence_reason}")));
+    }
+}
+
 /// The searchable signpost printed immediately before a failing step's output.
 ///
 /// A CONSTANT PREFIX, then the step tag: `DAGRUN STEP ERROR [group.job]`. Both greps therefore
@@ -3860,11 +3875,13 @@ fn run_step(ctx: StepCtx) {
              by a failure of its own or of a peer)",
             step.desc
         ));
+        emit_distinct_test_results_error(&tag, &reason, structured_test_results_error.as_deref());
     } else if was_aborted {
         emit(&format!(
             "[{tag}] \u{2298} ABORT  {} ({dur}s \u{2014} eager-exit after another step failed; --keep-going would continue independent work)",
             step.desc
         ));
+        emit_distinct_test_results_error(&tag, &reason, structured_test_results_error.as_deref());
     } else if ok {
         let extra = if !summary.is_empty() && verbosity >= 1 {
             format!("  [{summary}]")
@@ -3902,12 +3919,7 @@ fn run_step(ctx: StepCtx) {
             "[{tag}] \u{2717} FAIL   {} ({dur}s, {reason})",
             step.desc
         )));
-        if let Some(error) = &structured_test_results_error {
-            let evidence_reason = format!("STRUCTURED TEST RESULTS REFUSED: {error}");
-            if reason != evidence_reason {
-                emit(&red(&format!("[{tag}] \u{21b3} {evidence_reason}")));
-            }
-        }
+        emit_distinct_test_results_error(&tag, &reason, structured_test_results_error.as_deref());
         if oom > 0 {
             emit(&format!(
                 "[{tag}] \u{25b2} MEMORY CAP HIT: OOM-killed at its inner cgroup MemoryMax \

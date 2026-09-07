@@ -12,6 +12,10 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+# The structured-result reader must observe mapping entries before they are
+# collapsed into a `serde_json::Value`, so duplicate keys can never overwrite
+# the evidence that preceded them.
+serde = "1"
 # JSON parsing only (no `#[derive(Deserialize)]`): the strict reader in io.rs applies the format's
 # exact type narrowing by hand, and serialization is hand-rolled to preserve the public wire
 # contract byte-for-byte (key order, 2-space indent, and float formatting), which a derive plus
