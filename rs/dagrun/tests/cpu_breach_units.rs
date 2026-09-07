@@ -105,8 +105,8 @@ impl CgroupManager for OverBudgetCgroups {
         None
     }
 
-    fn kill_all_remaining(&self) -> i64 {
-        0
+    fn kill_all_remaining(&self) -> Option<i64> {
+        Some(0)
     }
 }
 
