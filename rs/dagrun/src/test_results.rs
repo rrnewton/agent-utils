@@ -1,11 +1,111 @@
 //! Structured per-step test results written by controlled test runners.
 
 use std::collections::BTreeSet;
+use std::fmt;
 use std::fs;
 use std::path::Path;
 
+use serde::de::{self, MapAccess, SeqAccess, Visitor};
+use serde::Deserialize;
 use serde_json::Map;
 use serde_json::Value;
+
+/// A JSON value decoded while every mapping entry is still observable.
+///
+/// `serde_json::Value` keeps only the last occurrence of a repeated object key. That behavior is
+/// unsafe for result evidence: a later `"result":"pass"` or `"outcome":"passed"` could erase an
+/// earlier failure before the strict field checks see it. This visitor rejects a repeated key at
+/// every object depth before constructing the corresponding [`Value::Object`].
+struct UniqueJsonValue(Value);
+
+impl<'de> Deserialize<'de> for UniqueJsonValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(UniqueJsonValueVisitor)
+    }
+}
+
+struct UniqueJsonValueVisitor;
+
+impl<'de> Visitor<'de> for UniqueJsonValueVisitor {
+    type Value = UniqueJsonValue;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON value whose object keys are unique")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(Value::Bool(value)))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(Value::Number(value.into())))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(Value::Number(value.into())))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        serde_json::Number::from_f64(value)
+            .map(Value::Number)
+            .map(UniqueJsonValue)
+            .ok_or_else(|| E::custom("non-finite numbers are not supported"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(Value::String(value.to_owned())))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(Value::String(value)))
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(Value::Null))
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(Value::Null))
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(value) = sequence.next_element::<UniqueJsonValue>()? {
+            values.push(value.0);
+        }
+        Ok(UniqueJsonValue(Value::Array(values)))
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut values = Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if values.contains_key(&key) {
+                return Err(de::Error::custom(format!("duplicate key {key:?}")));
+            }
+            let value = map.next_value::<UniqueJsonValue>()?;
+            values.insert(key, value.0);
+        }
+        Ok(UniqueJsonValue(Value::Object(values)))
+    }
+}
+
+fn parse_unique_json_value(bytes: &[u8]) -> Result<Value, String> {
+    serde_json::from_slice::<UniqueJsonValue>(bytes)
+        .map(|value| value.0)
+        .map_err(|error| format!("structured-test-results-json: {error}"))
+}
 
 /// Current structured-result schema for this release line.
 pub const CURRENT_SCHEMA: u64 = 3;
@@ -285,8 +385,7 @@ impl TestResults {
 
     /// Read retained schema 1/2 data or the complete current schema.
     pub fn from_json_slice(bytes: &[u8]) -> Result<Self, String> {
-        let value: Value = serde_json::from_slice(bytes)
-            .map_err(|error| format!("structured-test-results-json: {error}"))?;
+        let value = parse_unique_json_value(bytes)?;
         let object = value
             .as_object()
             .ok_or_else(|| "structured-test-results must be an object".to_string())?;
@@ -347,8 +446,7 @@ impl TestResults {
                 "structured-test-results declaration has unsupported schema {declared_schema}; expected retained schema {RETAINED_RESULTS_SCHEMA} or current schema {CURRENT_SCHEMA}"
             ));
         }
-        let value: Value = serde_json::from_slice(bytes)
-            .map_err(|error| format!("structured-test-results-json: {error}"))?;
+        let value = parse_unique_json_value(bytes)?;
         let object = value
             .as_object()
             .ok_or_else(|| "structured-test-results must be an object".to_string())?;
@@ -595,6 +693,50 @@ mod tests {
         assert!(TestResults::from_json_slice(malformed)
             .unwrap_err()
             .contains("requires nonempty trimmed detail"));
+    }
+
+    #[test]
+    fn current_schema_refuses_duplicate_keys_at_every_object_depth_in_both_orders() {
+        let cases: &[(&str, &[u8])] = &[
+            (
+                "top-level retained then current schema",
+                br#"{"schema":2,"schema":3,"executed_tests":1,"filtered_tests":0,"results":[{"id":"suite$case","result":"pass","attempts":1,"attempt_results":[{"attempt":1,"outcome":"passed","detail":null}]}]}"#,
+            ),
+            (
+                "top-level current then retained schema",
+                br#"{"schema":3,"schema":2,"executed_tests":1,"filtered_tests":0,"results":[{"id":"suite$case","result":"pass","attempts":1,"attempt_results":[{"attempt":1,"outcome":"passed","detail":null}]}]}"#,
+            ),
+            (
+                "result failure overwritten by pass",
+                br#"{"schema":3,"executed_tests":1,"filtered_tests":0,"results":[{"id":"suite$case","result":"fail","result":"pass","attempts":1,"attempt_results":[{"attempt":1,"outcome":"passed","detail":null}]}]}"#,
+            ),
+            (
+                "result pass overwritten by failure",
+                br#"{"schema":3,"executed_tests":1,"filtered_tests":0,"results":[{"id":"suite$case","result":"pass","result":"fail","attempts":1,"attempt_results":[{"attempt":1,"outcome":"failed","detail":"exit 7"}]}]}"#,
+            ),
+            (
+                "attempt failure overwritten by pass",
+                br#"{"schema":3,"executed_tests":1,"filtered_tests":0,"results":[{"id":"suite$case","result":"pass","attempts":1,"attempt_results":[{"attempt":1,"outcome":"failed","outcome":"passed","detail":null}]}]}"#,
+            ),
+            (
+                "attempt pass overwritten by failure",
+                br#"{"schema":3,"executed_tests":1,"filtered_tests":0,"results":[{"id":"suite$case","result":"fail","attempts":1,"attempt_results":[{"attempt":1,"outcome":"passed","outcome":"failed","detail":"exit 7"}]}]}"#,
+            ),
+        ];
+        for (name, bytes) in cases {
+            let error = TestResults::from_json_slice(bytes).unwrap_err();
+            assert!(error.contains("duplicate key"), "{name}: {error}");
+        }
+    }
+
+    #[test]
+    fn strict_json_reader_still_refuses_trailing_input() {
+        let bytes = br#"{"schema":3,"executed_tests":1,"filtered_tests":0,"results":[{"id":"suite$case","result":"pass","attempts":1,"attempt_results":[{"attempt":1,"outcome":"passed","detail":null}]}]} {}"#;
+        let error = TestResults::from_json_slice(bytes).unwrap_err();
+        assert!(
+            error.contains("trailing characters"),
+            "the duplicate-safe decoder must retain serde_json's trailing-input refusal: {error}"
+        );
     }
 
     #[test]
