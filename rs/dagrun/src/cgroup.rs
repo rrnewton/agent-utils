@@ -18,14 +18,20 @@
 // interactions (env sentinels, slice/unit names, the supervisor drain) are kept identical.
 
 use std::collections::{BTreeMap, HashSet};
+use std::ffi::{CStr, CString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
+use std::os::fd::FromRawFd;
+#[cfg(test)]
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -400,6 +406,162 @@ fn write_cgroup_file(path: &Path, value: &[u8]) -> io::Result<()> {
         .map_err(|error| cgroup_io_error("cannot write", path, error))
 }
 
+fn open_cgroup_file_at(
+    directory: &File,
+    name: &CStr,
+    display_path: &Path,
+    flags: libc::c_int,
+) -> io::Result<File> {
+    // SAFETY: `name` is NUL-terminated, `directory` remains open for the returned file's
+    // construction, and a successful openat returns a new owned descriptor.
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            flags | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if descriptor == -1 {
+        return Err(cgroup_io_error(
+            "cannot open pinned cgroup control",
+            display_path,
+            io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: `descriptor` is a fresh descriptor returned by openat above.
+    Ok(unsafe { File::from_raw_fd(descriptor) })
+}
+
+fn read_cgroup_file_at(directory: &File, name: &CStr, display_path: &Path) -> io::Result<String> {
+    let mut file = open_cgroup_file_at(directory, name, display_path, libc::O_RDONLY)?;
+    let mut text = String::new();
+    file.read_to_string(&mut text).map_err(|error| {
+        cgroup_io_error("cannot read pinned cgroup control", display_path, error)
+    })?;
+    Ok(text)
+}
+
+fn open_directory(path: &Path, purpose: &str) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| cgroup_io_error(purpose, path, error))
+}
+
+#[cfg(test)]
+fn cgroup_basename(path: &Path) -> io::Result<CString> {
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("cgroup path {} has no child basename", path.display()),
+        )
+    })?;
+    if name.as_bytes().is_empty() || name == "." || name == ".." {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "cgroup path {} has an invalid child basename",
+                path.display()
+            ),
+        ));
+    }
+    CString::new(name.as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("cgroup path {} contains a NUL byte", path.display()),
+        )
+    })
+}
+
+fn open_directory_at(parent: &File, name: &CStr, path: &Path) -> io::Result<File> {
+    let descriptor = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+        )
+    };
+    if descriptor == -1 {
+        return Err(cgroup_io_error(
+            "cannot pin manual CPU cgroup child",
+            path,
+            io::Error::last_os_error(),
+        ));
+    }
+    Ok(unsafe { File::from_raw_fd(descriptor) })
+}
+
+fn directory_entry_stat(parent: &File, name: &CStr, path: &Path) -> io::Result<Option<libc::stat>> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let result = unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result == -1 {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(cgroup_io_error(
+            "cannot identify manual CPU cgroup child",
+            path,
+            error,
+        ));
+    }
+    Ok(Some(unsafe { stat.assume_init() }))
+}
+
+fn create_directory_at(parent: &File, name: &CStr, path: &Path) -> io::Result<()> {
+    let result = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o755) };
+    if result == -1 {
+        return Err(cgroup_io_error(
+            "cannot create fresh cgroup",
+            path,
+            io::Error::last_os_error(),
+        ));
+    }
+    Ok(())
+}
+
+fn remove_directory_at(parent: &File, name: &CStr, path: &Path) -> io::Result<()> {
+    remove_directory_at_with(parent, name, path, |parent_fd, name| unsafe {
+        libc::unlinkat(parent_fd, name.as_ptr(), libc::AT_REMOVEDIR)
+    })
+}
+
+fn remove_directory_at_with(
+    parent: &File,
+    name: &CStr,
+    path: &Path,
+    unlink: impl FnOnce(libc::c_int, &CStr) -> libc::c_int,
+) -> io::Result<()> {
+    let result = unlink(parent.as_raw_fd(), name);
+    if result == -1 {
+        return Err(cgroup_io_error(
+            "cannot remove manual CPU cgroup",
+            path,
+            io::Error::last_os_error(),
+        ));
+    }
+    Ok(())
+}
+
+fn write_cgroup_file_at(
+    directory: &File,
+    name: &CStr,
+    display_path: &Path,
+    value: &[u8],
+) -> io::Result<()> {
+    let mut file = open_cgroup_file_at(directory, name, display_path, libc::O_WRONLY)?;
+    file.write_all(value)
+        .map_err(|error| cgroup_io_error("cannot write pinned cgroup control", display_path, error))
+}
+
 fn parse_required_u64_field(text: &str, field: &str, path: &Path) -> io::Result<u64> {
     let mut value = None;
     for line in text.lines() {
@@ -438,11 +600,6 @@ fn parse_required_u64_field(text: &str, field: &str, path: &Path) -> io::Result<
             format!("{} has no '{field}' field", path.display()),
         )
     })
-}
-
-fn cpu_usage_usec_at(path: &Path) -> io::Result<u64> {
-    let stat = path.join("cpu.stat");
-    parse_required_u64_field(&read_cgroup_file(&stat)?, "usage_usec", &stat)
 }
 
 /// Whether a manually managed child cgroup still contains any process.
@@ -565,12 +722,40 @@ fn manual_cpu_child_name(tag: &str) -> io::Result<String> {
     }
     Ok(name)
 }
-fn create_manual_cpu_child(parent: &Path, tag: &str) -> io::Result<ManualCpuCgroup> {
+fn create_manual_cpu_child(
+    parent_path: &Path,
+    parent_directory: &File,
+    tag: &str,
+) -> io::Result<ManualCpuCgroup> {
     let name = manual_cpu_child_name(tag)?;
-    let path = create_fresh_cgroup_dir(parent, &name)?;
-    let child = ManualCpuCgroup::at(path.clone());
+    let path = parent_path.join(&name);
+    let name = CString::new(name).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "manual CPU cgroup name for {} contains a NUL byte",
+                path.display()
+            ),
+        )
+    })?;
+    let retained_parent = parent_directory.try_clone().map_err(|error| {
+        cgroup_io_error("cannot retain manual CPU cgroup parent", parent_path, error)
+    })?;
+    create_directory_at(parent_directory, &name, &path)?;
+    let child = match ManualCpuCgroup::at_parent(path.clone(), retained_parent, name) {
+        Ok(child) => child,
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "{error}; refusing to unlink unverified cgroup entry {}",
+                    path.display()
+                ),
+            ));
+        }
+    };
     let validation = (|| -> io::Result<()> {
-        let kill = open_cgroup_writer(&path.join("cgroup.kill"))?;
+        let kill = child.open_control_writer(c"cgroup.kill")?;
         drop(kill);
         if child.status()? != ManualCpuCgroupStatus::Empty {
             return Err(io::Error::other(format!(
@@ -588,7 +773,7 @@ fn create_manual_cpu_child(parent: &Path, tag: &str) -> io::Result<ManualCpuCgro
         Ok(())
     })();
     if let Err(error) = validation {
-        return match fs::remove_dir(&path) {
+        return match child.remove_bound_directory() {
             Ok(()) => Err(error),
             Err(cleanup) => Err(io::Error::new(
                 error.kind(),
@@ -599,6 +784,7 @@ fn create_manual_cpu_child(parent: &Path, tag: &str) -> io::Result<ManualCpuCgro
             )),
         };
     }
+    child.verify_parent_entry_identity()?;
     Ok(child)
 }
 
@@ -614,7 +800,10 @@ fn preserve_primary_error(primary: io::Error, stage: &str, teardown: io::Error) 
 }
 
 fn cgroup_remove_is_retryable(error: &io::Error) -> bool {
-    error.kind() == io::ErrorKind::DirectoryNotEmpty || error.raw_os_error() == Some(libc::EBUSY)
+    matches!(
+        error.kind(),
+        io::ErrorKind::DirectoryNotEmpty | io::ErrorKind::ResourceBusy
+    ) || error.raw_os_error() == Some(libc::EBUSY)
 }
 /// The current cgroup, borrowed as a parent for independently owned CPU-accounting children.
 ///
@@ -631,9 +820,33 @@ fn cgroup_remove_is_retryable(error: &io::Error) -> bool {
 #[derive(Debug, Clone)]
 pub struct SharedCpuCgroupParent {
     path: PathBuf,
+    directory: Arc<File>,
 }
 
 impl SharedCpuCgroupParent {
+    fn at(path: PathBuf) -> io::Result<Self> {
+        let directory = open_directory(&path, "cannot pin shared CPU cgroup parent")?;
+        let pinned = directory.metadata().map_err(|error| {
+            cgroup_io_error("cannot identify shared CPU cgroup parent", &path, error)
+        })?;
+        let named = fs::symlink_metadata(&path).map_err(|error| {
+            cgroup_io_error("cannot verify shared CPU cgroup parent", &path, error)
+        })?;
+        if !named.is_dir() || named.dev() != pinned.dev() || named.ino() != pinned.ino() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "shared CPU cgroup parent path {} does not name its pinned directory",
+                    path.display()
+                ),
+            ));
+        }
+        Ok(Self {
+            path,
+            directory: Arc::new(directory),
+        })
+    }
+
     /// Borrow the current cgroup without changing it or requiring it to contain only this process.
     pub fn current() -> io::Result<Self> {
         let path = my_cgroup_path().ok_or_else(|| {
@@ -648,23 +861,21 @@ impl SharedCpuCgroupParent {
                 "the current process is in the cgroup-v2 root, not a delegated child cgroup",
             ));
         }
-        let metadata = fs::metadata(&path)
-            .map_err(|error| cgroup_io_error("cannot inspect current cgroup", &path, error))?;
-        if !metadata.is_dir() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("current cgroup {} is not a directory", path.display()),
-            ));
-        }
+        let parent = Self::at(path)?;
         // This is an availability check, not a baseline to subtract. Every owned child starts at
         // a separately verified zero and retains its own counter after a fast child exits.
-        let _ = cpu_usage_usec_at(&path)?;
-        Ok(Self { path })
+        let stat = parent.path.join("cpu.stat");
+        let _ = parse_required_u64_field(
+            &read_cgroup_file_at(&parent.directory, c"cpu.stat", &stat)?,
+            "usage_usec",
+            &stat,
+        )?;
+        Ok(parent)
     }
 
     /// Create one fresh child whose lifetime and accounting belong only to this caller.
     pub fn create_child(&self, tag: &str) -> io::Result<ManualCpuCgroup> {
-        create_manual_cpu_child(&self.path, tag)
+        create_manual_cpu_child(&self.path, &self.directory, tag)
     }
 
     /// The shared parent. This path is observational only; this type never mutates the parent.
@@ -691,6 +902,7 @@ impl SharedCpuCgroupParent {
 #[derive(Debug)]
 pub struct ManualCpuCgroupRoot {
     root: PathBuf,
+    root_directory: File,
     supervisor: PathBuf,
     cleaned: AtomicBool,
 }
@@ -710,6 +922,7 @@ impl ManualCpuCgroupRoot {
                 "the current process is in the cgroup-v2 root, not an exclusively delegated cgroup",
             ));
         }
+        let root_directory = open_directory(&root, "cannot pin manual CPU cgroup root")?;
 
         let controllers_path = root.join("cgroup.controllers");
         let controllers = read_cgroup_file(&controllers_path)?;
@@ -811,6 +1024,7 @@ impl ManualCpuCgroupRoot {
 
         Ok(Self {
             root,
+            root_directory,
             supervisor,
             cleaned: AtomicBool::new(false),
         })
@@ -824,7 +1038,7 @@ impl ManualCpuCgroupRoot {
                 "manual CPU cgroup root was already cleaned",
             ));
         }
-        create_manual_cpu_child(&self.root, tag)
+        create_manual_cpu_child(&self.root, &self.root_directory, tag)
     }
 
     /// Restore the caller to its original cgroup after every child lease has been cleaned.
@@ -984,19 +1198,130 @@ impl ManualCpuCgroupRoot {
 #[derive(Debug)]
 pub struct ManualCpuCgroup {
     path: PathBuf,
+    parent_directory: File,
+    basename: CString,
+    directory: File,
+    device: u64,
+    inode: u64,
     final_usage: AtomicU64,
     final_usage_read: AtomicBool,
     cleaned: AtomicBool,
 }
 
 impl ManualCpuCgroup {
-    fn at(path: PathBuf) -> Self {
-        Self {
+    #[cfg(test)]
+    fn at(path: PathBuf) -> io::Result<Self> {
+        let parent = path.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("manual CPU cgroup path {} has no parent", path.display()),
+            )
+        })?;
+        let parent_directory = open_directory(parent, "cannot pin manual CPU cgroup parent")?;
+        let basename = cgroup_basename(&path)?;
+        Self::at_parent(path, parent_directory, basename)
+    }
+
+    fn at_parent(path: PathBuf, parent_directory: File, basename: CString) -> io::Result<Self> {
+        let directory = open_directory_at(&parent_directory, &basename, &path)?;
+        let metadata = directory
+            .metadata()
+            .map_err(|error| cgroup_io_error("cannot identify manual CPU cgroup", &path, error))?;
+        let child = Self {
             path,
+            parent_directory,
+            basename,
+            directory,
+            device: metadata.dev(),
+            inode: metadata.ino(),
             final_usage: AtomicU64::new(0),
             final_usage_read: AtomicBool::new(false),
             cleaned: AtomicBool::new(false),
+        };
+        child.verify_parent_entry_identity()?;
+        Ok(child)
+    }
+
+    fn control_path(&self, name: &str) -> PathBuf {
+        self.path.join(name)
+    }
+
+    fn read_control(&self, name: &CStr) -> io::Result<String> {
+        let display = self.control_path(&name.to_string_lossy());
+        read_cgroup_file_at(&self.directory, name, &display)
+    }
+
+    fn open_control_writer(&self, name: &CStr) -> io::Result<File> {
+        let display = self.control_path(&name.to_string_lossy());
+        open_cgroup_file_at(&self.directory, name, &display, libc::O_WRONLY)
+    }
+
+    fn write_control(&self, name: &CStr, value: &[u8]) -> io::Result<()> {
+        let display = self.control_path(&name.to_string_lossy());
+        write_cgroup_file_at(&self.directory, name, &display, value)
+    }
+
+    fn verify_parent_entry_identity(&self) -> io::Result<()> {
+        let Some(metadata) =
+            directory_entry_stat(&self.parent_directory, &self.basename, &self.path)?
+        else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "manual CPU cgroup entry {} no longer exists",
+                    self.path.display()
+                ),
+            ));
+        };
+        if metadata.st_mode & libc::S_IFMT != libc::S_IFDIR
+            || metadata.st_dev != self.device
+            || metadata.st_ino != self.inode
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "manual CPU cgroup parent entry {} no longer names the pinned directory",
+                    self.path.display()
+                ),
+            ));
         }
+        Ok(())
+    }
+
+    fn verify_pinned_directory_unlinked(&self) -> io::Result<()> {
+        let metadata = self.directory.metadata().map_err(|error| {
+            cgroup_io_error("cannot verify removed manual CPU cgroup", &self.path, error)
+        })?;
+        if metadata.nlink() != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "pinned manual CPU cgroup {} remains linked after removal",
+                    self.path.display()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn verify_parent_entry_absent(&self) -> io::Result<()> {
+        match directory_entry_stat(&self.parent_directory, &self.basename, &self.path)? {
+            None => Ok(()),
+            Some(_) => Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "manual CPU cgroup parent entry {} exists after removal",
+                    self.path.display()
+                ),
+            )),
+        }
+    }
+
+    fn remove_bound_directory(&self) -> io::Result<()> {
+        self.verify_parent_entry_identity()?;
+        remove_directory_at(&self.parent_directory, &self.basename, &self.path)?;
+        self.verify_pinned_directory_unlinked()?;
+        self.verify_parent_entry_absent()
     }
 
     /// Arrange for `command` to enter this cgroup in the child, immediately before `exec`.
@@ -1011,8 +1336,8 @@ impl ManualCpuCgroup {
                 "cannot attach a command after final CPU accounting began",
             ));
         }
-        let procs_path = self.path.join("cgroup.procs");
-        let procs = open_cgroup_writer(&procs_path)?;
+        self.verify_parent_entry_identity()?;
+        let procs = self.open_control_writer(c"cgroup.procs")?;
         // SAFETY: after fork and before exec, the closure invokes only libc::write on a file
         // descriptor opened above. It performs no allocation, locking, path lookup, or shell
         // parsing. The owned File keeps the descriptor valid until exec, and O_CLOEXEC closes it
@@ -1042,7 +1367,8 @@ impl ManualCpuCgroup {
                 "manual CPU cgroup was already cleaned",
             ));
         }
-        cpu_usage_usec_at(&self.path)
+        let stat = self.control_path("cpu.stat");
+        parse_required_u64_field(&self.read_control(c"cpu.stat")?, "usage_usec", &stat)
     }
 
     /// Read whether any process remains in this cgroup or a descendant.
@@ -1053,7 +1379,19 @@ impl ManualCpuCgroup {
                 "manual CPU cgroup was already cleaned",
             ));
         }
-        cgroup_status_at(&self.path)
+        let events = self.control_path("cgroup.events");
+        match parse_required_u64_field(&self.read_control(c"cgroup.events")?, "populated", &events)?
+        {
+            0 => Ok(ManualCpuCgroupStatus::Empty),
+            1 => Ok(ManualCpuCgroupStatus::Populated),
+            value => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{} has invalid 'populated' value {value}; expected 0 or 1",
+                    events.display()
+                ),
+            )),
+        }
     }
 
     /// Hard-kill every remaining process in this cgroup and its descendants.
@@ -1061,7 +1399,7 @@ impl ManualCpuCgroup {
     /// This is the fallback after the caller's own SIGTERM grace period; this API intentionally
     /// does not choose or send the graceful signal itself.
     pub fn kill(&self) -> io::Result<()> {
-        write_cgroup_file(&self.path.join("cgroup.kill"), b"1")
+        self.write_control(c"cgroup.kill", b"1")
     }
 
     /// Read a stable final CPU value after the cgroup becomes empty.
@@ -1102,7 +1440,7 @@ impl ManualCpuCgroup {
 
     fn cleanup_with<F>(&self, remove: F) -> io::Result<()>
     where
-        F: FnOnce(&Path) -> io::Result<()>,
+        F: FnOnce(&File, &CStr, &Path) -> io::Result<()>,
     {
         if self.cleaned.load(Ordering::Acquire) {
             return Ok(());
@@ -1114,6 +1452,7 @@ impl ManualCpuCgroup {
             ));
         }
         if self.status()? != ManualCpuCgroupStatus::Empty {
+            self.final_usage_read.store(false, Ordering::Release);
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 format!("cgroup {} is populated during cleanup", self.path.display()),
@@ -1131,9 +1470,101 @@ impl ManualCpuCgroup {
                 ),
             ));
         }
-        remove(&self.path)?;
+        self.verify_parent_entry_identity()?;
+        remove(&self.parent_directory, &self.basename, &self.path)?;
+        self.verify_pinned_directory_unlinked()?;
+        self.verify_parent_entry_absent()?;
         self.cleaned.store(true, Ordering::Release);
         Ok(())
+    }
+
+    fn kill_and_cleanup_with<R, S, H>(
+        &self,
+        attempts: usize,
+        mut remove: R,
+        mut sleep: S,
+        mut after_empty: H,
+    ) -> io::Result<u64>
+    where
+        R: FnMut(&File, &CStr, &Path) -> io::Result<()>,
+        S: FnMut(Duration),
+        H: FnMut(usize),
+    {
+        if self.cleaned.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "manual CPU cgroup was already cleaned",
+            ));
+        }
+        let attempts = attempts.max(1);
+        for attempt in 0..attempts {
+            self.kill()?;
+            if self.status()? == ManualCpuCgroupStatus::Populated {
+                if attempt + 1 < attempts {
+                    sleep(MANUAL_CPU_ABORT_RETRY);
+                    continue;
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "cgroup.kill could not prove {} unpopulated",
+                        self.path.display()
+                    ),
+                ));
+            }
+
+            // A caller may use this seam to exercise the real kernel race between the final
+            // empty observation and rmdir. Production passes a no-op.
+            after_empty(attempt);
+            let usage = match self.final_cpu_usage_usec() {
+                Ok(usage) => usage,
+                Err(error)
+                    if error.kind() == io::ErrorKind::WouldBlock && attempt + 1 < attempts =>
+                {
+                    self.final_usage_read.store(false, Ordering::Release);
+                    sleep(MANUAL_CPU_ABORT_RETRY);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            match self.cleanup_with(|parent, name, path| remove(parent, name, path)) {
+                Ok(()) => return Ok(usage),
+                Err(error)
+                    if (error.kind() == io::ErrorKind::WouldBlock
+                        || cgroup_remove_is_retryable(&error))
+                        && attempt + 1 < attempts =>
+                {
+                    self.final_usage_read.store(false, Ordering::Release);
+                    sleep(MANUAL_CPU_ABORT_RETRY);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "cgroup.kill could not finalize and remove {}",
+                self.path.display()
+            ),
+        ))
+    }
+
+    /// Hard-kill this exact cgroup, observe `cgroup.events populated=0`, retain a stable final
+    /// CPU value, and remove the directory before returning.
+    ///
+    /// A process that enters after an empty observation either makes removal fail with EBUSY,
+    /// causing the whole kill/observe/remove sequence to restart, or loses the race to rmdir and
+    /// cannot enter the offlined cgroup through an already-open `cgroup.procs` descriptor.
+    /// Every control operation uses the child directory pinned beneath its pinned parent. Cleanup
+    /// removes that exact parent entry with `unlinkat` and requires the pinned child's link count
+    /// to reach zero before reporting success.
+    pub fn kill_and_cleanup(&self) -> io::Result<u64> {
+        self.kill_and_cleanup_with(
+            MANUAL_CPU_ABORT_REMOVE_ATTEMPTS,
+            remove_directory_at,
+            thread::sleep,
+            |_| {},
+        )
     }
 
     fn abort_and_cleanup_with<R, S>(
@@ -1143,7 +1574,7 @@ impl ManualCpuCgroup {
         mut sleep: S,
     ) -> io::Result<()>
     where
-        R: FnMut(&Path) -> io::Result<()>,
+        R: FnMut(&File, &CStr, &Path) -> io::Result<()>,
         S: FnMut(Duration),
     {
         if self.cleaned.load(Ordering::Acquire) {
@@ -1153,15 +1584,20 @@ impl ManualCpuCgroup {
         let attempts = attempts.max(1);
         let mut last_remove_error = None;
         for attempt in 0..attempts {
-            match remove(&self.path) {
+            self.verify_parent_entry_identity()?;
+            match remove(&self.parent_directory, &self.basename, &self.path) {
                 Ok(()) => {
                     // Successful removal is stronger evidence than a failed cgroup.kill write:
                     // the kernel cannot remove a populated cgroup.
                     self.final_usage_read.store(false, Ordering::Release);
+                    self.verify_pinned_directory_unlinked()?;
+                    self.verify_parent_entry_absent()?;
                     self.cleaned.store(true, Ordering::Release);
                     return Ok(());
                 }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    self.verify_pinned_directory_unlinked()?;
+                    self.verify_parent_entry_absent()?;
                     self.final_usage_read.store(false, Ordering::Release);
                     self.cleaned.store(true, Ordering::Release);
                     return Ok(());
@@ -1206,17 +1642,14 @@ impl ManualCpuCgroup {
     pub fn abort_and_cleanup(&self) -> io::Result<()> {
         self.abort_and_cleanup_with(
             MANUAL_CPU_ABORT_REMOVE_ATTEMPTS,
-            |path| fs::remove_dir(path),
+            remove_directory_at,
             thread::sleep,
         )
     }
 
     /// Remove the empty cgroup after a successful [`ManualCpuCgroup::final_cpu_usage_usec`].
     pub fn cleanup(&self) -> io::Result<()> {
-        self.cleanup_with(|path| {
-            fs::remove_dir(path)
-                .map_err(|error| cgroup_io_error("cannot remove manual CPU cgroup", path, error))
-        })
+        self.cleanup_with(remove_directory_at)
     }
 
     /// Filesystem path used for this fresh cgroup.
@@ -3118,6 +3551,7 @@ impl CgroupManager for Cgroups {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::os::unix::process::ExitStatusExt;
 
     #[test]
     fn scope_drain_waits_past_first_empty_sample_for_late_member() {
@@ -3545,7 +3979,7 @@ mod tests {
         }
         fs::write(path.join("cgroup.procs"), "").unwrap();
         fs::write(path.join("cgroup.kill"), "").unwrap();
-        let child = ManualCpuCgroup::at(path.clone());
+        let child = ManualCpuCgroup::at(path.clone()).unwrap();
         (path, child)
     }
 
@@ -3657,10 +4091,18 @@ mod tests {
     #[test]
     fn manual_cpu_child_directory_must_be_fresh() {
         let root = temp_scope("manual-fresh");
-        let child = create_fresh_cgroup_dir(&root, "manual-cpu-child-test").unwrap();
-        let error = create_fresh_cgroup_dir(&root, "manual-cpu-child-test").unwrap_err();
+        let parent = open_directory(&root, "test parent").unwrap();
+        let name = c"manual-cpu-child-test";
+        let child = root.join(name.to_string_lossy().as_ref());
+        create_directory_at(&parent, name, &child).unwrap();
+        let error = create_directory_at(&parent, name, &child).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
-        fs::remove_dir(child).unwrap();
+        remove_directory_at(&parent, name, &child).unwrap();
+        assert_eq!(
+            fs::metadata(&child).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        drop(parent);
         fs::remove_dir(root).unwrap();
     }
 
@@ -3693,6 +4135,228 @@ mod tests {
     }
 
     #[test]
+    fn pinned_manual_cpu_cgroup_rejects_a_replaced_path_without_redirecting_controls() {
+        let (path, child) = planted_manual_cpu_cgroup(
+            "manual-path-identity",
+            Some("usage_usec 17\n"),
+            Some("populated 0\n"),
+        );
+        let original = path.with_extension("pinned-original");
+        let _ = fs::remove_dir_all(&original);
+        fs::rename(&path, &original).unwrap();
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("cpu.stat"), "usage_usec 999\n").unwrap();
+        fs::write(path.join("cgroup.events"), "populated 0\n").unwrap();
+        fs::write(path.join("cgroup.procs"), "").unwrap();
+        fs::write(path.join("cgroup.kill"), "").unwrap();
+
+        child.kill().unwrap();
+        assert_eq!(
+            fs::read_to_string(original.join("cgroup.kill")).unwrap(),
+            "1"
+        );
+        assert_eq!(fs::read_to_string(path.join("cgroup.kill")).unwrap(), "");
+        assert_eq!(child.final_cpu_usage_usec().unwrap(), 17);
+        let mut remove_called = false;
+        let error = child
+            .cleanup_with(|_, _, _| {
+                remove_called = true;
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(!remove_called);
+
+        fs::remove_dir_all(path).unwrap();
+        fs::remove_dir_all(original).unwrap();
+    }
+
+    #[test]
+    fn pinned_parent_routes_child_creation_without_following_a_replaced_path() {
+        let parent_path = temp_scope("manual-parent-identity");
+        let parent = SharedCpuCgroupParent::at(parent_path.clone()).unwrap();
+        let original = parent_path.with_extension("pinned-original");
+        let _ = fs::remove_dir_all(&original);
+        fs::rename(&parent_path, &original).unwrap();
+        fs::create_dir(&parent_path).unwrap();
+
+        let error = parent.create_child("parent-replaced").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(
+            fs::read_dir(&parent_path).unwrap().next().is_none(),
+            "child creation was redirected through the replaced parent path"
+        );
+        assert!(
+            fs::read_dir(&original).unwrap().next().is_none(),
+            "rejected child construction leaked its verified directory"
+        );
+
+        fs::remove_dir(parent_path).unwrap();
+        fs::remove_dir(original).unwrap();
+    }
+
+    #[test]
+    fn cleanup_refuses_when_a_swap_leaves_the_pinned_inode_linked() {
+        let (path, child) = planted_manual_cpu_cgroup(
+            "manual-removal-race",
+            Some("usage_usec 23\n"),
+            Some("populated 0\n"),
+        );
+        assert_eq!(child.final_cpu_usage_usec().unwrap(), 23);
+        let original = path.with_extension("pinned-original");
+        let _ = fs::remove_dir_all(&original);
+
+        let error = child
+            .cleanup_with(|parent, name, path| {
+                fs::rename(path, &original)?;
+                fs::create_dir(path)?;
+                remove_directory_at(parent, name, path)
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(original.is_dir());
+        assert!(
+            !path.exists(),
+            "the decoy entry was not removed by unlinkat"
+        );
+        child.kill().unwrap();
+        assert_eq!(
+            fs::read_to_string(original.join("cgroup.kill")).unwrap(),
+            "1"
+        );
+
+        fs::remove_dir_all(original).unwrap();
+    }
+
+    #[test]
+    fn wrapped_busy_unlink_is_retried_before_cleanup_succeeds() {
+        let (path, child) = planted_manual_cpu_cgroup(
+            "manual-busy-removal",
+            Some("usage_usec 29\n"),
+            Some("populated 0\n"),
+        );
+        let mut removals = 0;
+        let usage = child
+            .kill_and_cleanup_with(
+                2,
+                |parent, name, path| {
+                    removals += 1;
+                    if removals == 1 {
+                        return remove_directory_at_with(parent, name, path, |_, _| {
+                            unsafe {
+                                *libc::__errno_location() = libc::EBUSY;
+                            }
+                            -1
+                        });
+                    }
+                    fs::remove_dir_all(path)
+                },
+                |_| {},
+                |_| {},
+            )
+            .unwrap();
+
+        assert_eq!(usage, 29);
+        assert_eq!(removals, 2);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn strict_finalizer_kills_a_real_join_after_its_first_empty_observation() {
+        let parent = match SharedCpuCgroupParent::current() {
+            Ok(parent) => parent,
+            Err(error) => {
+                eprintln!(
+                    "HOST LIMITATION: strict late-join cgroup control needs a writable cgroup-v2 parent: {error}"
+                );
+                return;
+            }
+        };
+        let child = match parent.create_child("late-join-finalizer") {
+            Ok(child) => child,
+            Err(error) => {
+                eprintln!(
+                    "HOST LIMITATION: strict late-join cgroup control cannot create a child: {error}"
+                );
+                return;
+            }
+        };
+        let cgroup_path = child.path().to_path_buf();
+        let markers = temp_scope("manual-late-join-markers");
+        let ready = markers.join("ready");
+        let late = markers.join("late");
+        let script = format!(
+            "printf ready > {}; sleep 0.5; printf late > {}; sleep 30",
+            shell_quote(&ready.to_string_lossy()),
+            shell_quote(&late.to_string_lossy())
+        );
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", &script])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        child.attach_command(&mut command).unwrap();
+        let mut command = Some(command);
+        let mut participant = None;
+        let mut joined_after_empty = false;
+
+        let _final_cpu = child
+            .kill_and_cleanup_with(
+                MANUAL_CPU_ABORT_REMOVE_ATTEMPTS,
+                remove_directory_at,
+                thread::sleep,
+                |attempt| {
+                    if attempt != 0 {
+                        return;
+                    }
+                    let mut prepared = command.take().expect("late participant starts once");
+                    let spawned = prepared.spawn().expect("late participant must attach");
+                    drop(prepared);
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while !ready.is_file() && Instant::now() < deadline {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    assert!(
+                        ready.is_file(),
+                        "late participant did not reach its barrier"
+                    );
+                    let membership =
+                        fs::read_to_string(format!("/proc/{}/cgroup", spawned.id())).unwrap();
+                    let relative = membership
+                        .lines()
+                        .find_map(|line| line.strip_prefix("0::"))
+                        .expect("participant has a cgroup-v2 membership");
+                    assert_eq!(
+                        Path::new(CGROUP_ROOT).join(relative.trim_start_matches('/')),
+                        cgroup_path
+                    );
+                    assert_eq!(child.status().unwrap(), ManualCpuCgroupStatus::Populated);
+                    participant = Some(spawned);
+                    joined_after_empty = true;
+                },
+            )
+            .unwrap();
+
+        assert!(joined_after_empty);
+        let status = participant
+            .expect("late participant was spawned")
+            .wait()
+            .unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        thread::sleep(Duration::from_millis(600));
+        assert!(
+            !late.exists(),
+            "late participant survived strict cgroup cleanup"
+        );
+        assert!(
+            !cgroup_path.exists(),
+            "strict finalizer did not remove the exact owned cgroup"
+        );
+        fs::remove_dir_all(markers).unwrap();
+    }
+
+    #[test]
     fn manual_cpu_cleanup_requires_a_stable_final_read_and_propagates_failure() {
         let (path, child) = planted_manual_cpu_cgroup(
             "manual-final",
@@ -3701,7 +4365,7 @@ mod tests {
         );
         let mut remove_called = false;
         let error = child
-            .cleanup_with(|_| {
+            .cleanup_with(|_, _, _| {
                 remove_called = true;
                 Ok(())
             })
@@ -3712,23 +4376,27 @@ mod tests {
         assert_eq!(child.final_cpu_usage_usec().unwrap(), 19);
         fs::write(path.join("cpu.stat"), "usage_usec 20\n").unwrap();
         assert_eq!(
-            child.cleanup_with(|_| Ok(())).unwrap_err().kind(),
+            child.cleanup_with(|_, _, _| Ok(())).unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
         );
         assert_eq!(child.final_cpu_usage_usec().unwrap(), 20);
 
         let planted = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "planted");
         assert_eq!(
-            child.cleanup_with(|_| Err(planted)).unwrap_err().kind(),
+            child
+                .cleanup_with(|_, _, _| Err(planted))
+                .unwrap_err()
+                .kind(),
             std::io::ErrorKind::PermissionDenied
         );
         assert_eq!(child.cpu_usage_usec().unwrap(), 20);
-        child.cleanup_with(|_| Ok(())).unwrap();
+        child
+            .cleanup_with(|_, _, path| fs::remove_dir_all(path))
+            .unwrap();
         assert_eq!(
             child.cpu_usage_usec().unwrap_err().kind(),
             std::io::ErrorKind::NotFound
         );
-        fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
@@ -3771,10 +4439,11 @@ mod tests {
         fs::write(child_path.join("cgroup.kill"), "").unwrap();
         let root = ManualCpuCgroupRoot {
             root: root_path.clone(),
+            root_directory: open_directory(&root_path, "test root").unwrap(),
             supervisor,
             cleaned: AtomicBool::new(false),
         };
-        let child = ManualCpuCgroup::at(child_path);
+        let child = ManualCpuCgroup::at(child_path).unwrap();
         (root_path, root, child)
     }
 
@@ -3790,7 +4459,7 @@ mod tests {
                 let mut removals = 0;
                 child.abort_and_cleanup_with(
                     2,
-                    |path| {
+                    |_, _, path| {
                         assert_eq!(fs::read_to_string(path.join("cgroup.kill")).unwrap(), "1");
                         removals += 1;
                         if removals == 1 {
@@ -3948,7 +4617,7 @@ mod tests {
         let returned = root.abort_after_accounting_error_with(
             &child,
             primary,
-            |child| child.abort_and_cleanup_with(1, |path| fs::remove_dir_all(path), |_| {}),
+            |child| child.abort_and_cleanup_with(1, |_, _, path| fs::remove_dir_all(path), |_| {}),
             |_| {
                 Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
@@ -3974,6 +4643,7 @@ mod tests {
         fs::create_dir(&supervisor).unwrap();
         let root = ManualCpuCgroupRoot {
             root: root_path.clone(),
+            root_directory: open_directory(&root_path, "test root").unwrap(),
             supervisor,
             cleaned: AtomicBool::new(false),
         };
@@ -4002,7 +4672,7 @@ mod tests {
         );
         fs::remove_file(path.join("cgroup.kill")).unwrap();
         child
-            .abort_and_cleanup_with(1, |path| fs::remove_dir_all(path), |_| {})
+            .abort_and_cleanup_with(1, |_, _, path| fs::remove_dir_all(path), |_| {})
             .unwrap();
         assert!(!path.exists());
         assert_eq!(
