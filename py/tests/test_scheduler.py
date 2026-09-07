@@ -507,7 +507,7 @@ def test_python_runner_refuses_structured_results_before_any_node_starts(
     result = _run_dag_bounded(cfg)
 
     assert result.ok is False
-    assert result.outcomes == () or result.outcomes == []
+    assert result.outcomes == ()
     assert not marker.exists(), "the unsupported Python path must refuse before execution"
     error = capsys.readouterr().err
     assert "REFUSING to run before any node starts" in error
