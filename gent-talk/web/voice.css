@@ -2302,3 +2302,19 @@ textarea {
     background: var(--accent);
   }
 }
+
+/* The divider inside the Channels group, between "this channel" and "add another".
+   One group, two acts, and without a rule the second reads as more of the first. */
+.settings-rule {
+  border: none;
+  border-top: 1px solid var(--edge);
+  margin: 0.9rem 0 0.2rem;
+  width: 100%;
+}
+
+/* `h3` exists on this screen only inside the Channels group, for the same reason: it is a heading
+   BELOW a group heading, and it must not compete with the `h2` above it. */
+.settings-group h3 {
+  font-size: 0.85rem;
+  margin: 0.2rem 0 0;
+}

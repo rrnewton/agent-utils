@@ -32,7 +32,7 @@
 pub mod access_layer;
 pub mod api;
 
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::Router;
 
 use crate::state::AppState;
@@ -119,6 +119,10 @@ pub fn router(state: AppState) -> Router {
             post(api::prepare_speech),
         )
         .route("/api/v1/speech/{ticket}", get(api::play_speech))
+        // Adding a channel from inside the app. WRITE scope, and deliberately NO MCP tool: this
+        // widens what the bridge can read, and what it can say. See `api::add_channel`.
+        .route("/api/v1/channels", post(api::add_channel))
+        .route("/api/v1/channels/{channel_id}", delete(api::remove_channel))
         .route("/api/v1/channels/{channel_id}/todo", get(api::todo))
         .route("/api/v1/channels/{channel_id}/dismiss", post(api::dismiss))
         .route("/api/v1/channels/{channel_id}/restore", post(api::restore))

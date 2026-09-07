@@ -453,11 +453,42 @@ async fn main() -> anyhow::Result<()> {
         elevenlabs,
         speech,
         store,
+        added_channels: Arc::new(std::sync::RwLock::new(Vec::new())),
         speech_tickets: Arc::new(gent_talk::speech_tickets::SpeechTickets::new()),
         live: Arc::clone(&live),
         summarizer,
         summary_version: summary_version.into(),
     };
+    // CHANNELS THE OWNER ADDED FROM INSIDE THE APP, brought back into the allowlist before the
+    // server answers anything. They were probed when they were added; they are not probed again
+    // here, because a channel the bot has since been removed from should fail the request that
+    // touches it rather than stop the whole bridge from starting over somebody else's change.
+    match state.store.added_channels().await {
+        Ok(added) => {
+            let restored: Vec<_> = added
+                .into_iter()
+                .map(|row| gent_talk::model::ChannelInfo {
+                    id: row.channel,
+                    label: row.label,
+                    writable: row.writable,
+                    alias: None,
+                    // Added in the app, which is what makes it removable there.
+                    added: true,
+                })
+                .collect();
+            if !restored.is_empty() {
+                tracing::info!(added = restored.len(), "restored channels added in the app");
+            }
+            if let Ok(mut slot) = state.added_channels.write() {
+                *slot = restored;
+            }
+        }
+        // A store that is absent is the ordinary state of a deployment that never set
+        // `storage.path`, and it means there is nothing to restore rather than that something is
+        // wrong. A real backend failure degrades the same way and says so, for the same reason an
+        // unreadable alias does not stop the channel being read.
+        Err(error) => tracing::warn!(%error, "could not restore channels added in the app"),
+    }
     if poll_seconds > 0 {
         tokio::spawn(gent_talk::live::poll_forever(
             discord,

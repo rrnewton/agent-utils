@@ -880,10 +880,7 @@ pub async fn ask(
     Json(request): Json<AskRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require(&headers, &state, Scope::Write)?;
-    let info = state
-        .channel(&channel_id)
-        .cloned()
-        .ok_or(OpError::UnknownChannel)?;
+    let info = state.channel(&channel_id).ok_or(OpError::UnknownChannel)?;
     match state.agent.ask(&info.id, &request.question).await {
         Ok(answer) => Ok(Json(serde_json::json!({ "answer": answer }))),
         Err(error) => Err(ApiError::new(
@@ -1922,4 +1919,162 @@ pub async fn play_speech(
         body,
     )
         .into_response())
+}
+
+/// Adding a channel from inside the app.
+#[derive(Debug, Deserialize)]
+pub struct AddChannelRequest {
+    /// The Discord snowflake, as copied from the client with Developer Mode on.
+    pub id: String,
+    /// What to call it. The configured channels get theirs from the file; this one gets it here.
+    pub label: String,
+    /// Whether the bridge may POST here. Defaults to false, and see [`add_channel`] for why.
+    #[serde(default)]
+    pub writable: bool,
+}
+
+/// What happened when a channel was added.
+#[derive(Debug, Serialize)]
+pub struct AddChannelResponse {
+    /// The channel now in the allowlist.
+    pub channel: ChannelInfo,
+    /// Every channel, so the page can redraw its pickers from one answer.
+    pub channels: Vec<ChannelInfo>,
+}
+
+/// `POST /api/v1/channels` — add a channel without editing a file or redeploying.
+///
+/// WRITE SCOPE, AND NO MCP TOOL. Adding a channel widens what this bridge can read, and if
+/// `writable` is set, what it can say. That is the operator's decision and nobody else's — least of
+/// all the voice agent's, which would otherwise be able to grant itself a new place to post in the
+/// middle of a conversation. The same reasoning that keeps `set_alias` out of the tool manifest
+/// applies here with more force, so this route is reachable from the app and from nothing else.
+///
+/// THE CHANNEL IS PROBED BEFORE IT IS ACCEPTED. Adding the bot to a Discord SERVER is not the same
+/// as adding it to a private CHANNEL, and a snowflake with a typo in it looks identical to a
+/// correct one. So this reads a message before agreeing, and hands back the probe's own words when
+/// it cannot — the same sentences the startup check uses, rather than a second opinion about the
+/// same failure.
+pub async fn add_channel(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<AddChannelRequest>,
+) -> Result<Response, ApiError> {
+    require(&headers, &state, Scope::Write)?;
+    let id = request.id.trim();
+    let label = request.label.trim();
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_digit()) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_channel_id",
+            "a Discord channel id is 17 to 20 digits. In Discord, turn on Developer Mode and \
+             right-click the channel, then Copy Channel ID.",
+        ));
+    }
+    if label.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_channel_label",
+            "give the channel a name so it can be told apart in the picker",
+        ));
+    }
+    if state.channel(id).is_some() {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "channel_already_present",
+            "that channel is already in the list",
+        ));
+    }
+
+    let candidate = ChannelInfo {
+        id: crate::model::ChannelId(id.to_owned()),
+        label: label.to_owned(),
+        writable: request.writable,
+        alias: None,
+        added: true,
+    };
+    // The same read the startup check makes, against the one channel being added.
+    let report =
+        crate::probe::probe_channels(state.discord.as_ref(), std::slice::from_ref(&candidate))
+            .await;
+    let outcome = report.outcomes.first().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "channel_unprobed",
+            "the channel could not be checked",
+        )
+    })?;
+    if !matches!(outcome.diagnosis, crate::probe::Diagnosis::Readable { .. }) {
+        return Err(ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "channel_unreadable",
+            // The PROBE'S own remedy, not a sentence written here. One explanation of "the bot
+            // cannot see this channel", used by the startup check and by this route alike.
+            outcome.diagnosis.remedy().to_string(),
+        ));
+    }
+
+    state
+        .store
+        .add_channel(
+            &candidate.id,
+            &candidate.label,
+            candidate.writable,
+            jiff::Timestamp::now().as_millisecond(),
+        )
+        .await?;
+    // The store first, then the live list. Written the other way round, a store that refused would
+    // leave a channel reachable until the next restart and then silently gone.
+    if let Ok(mut added) = state.added_channels.write() {
+        added.push(candidate.clone());
+    }
+    tracing::info!(channel = %candidate.id, writable = candidate.writable, "channel added in the app");
+    Ok(no_store(Json(AddChannelResponse {
+        channel: candidate,
+        channels: ops::channels(&state).await,
+    })))
+}
+
+/// `DELETE /api/v1/channels/{channel_id}` — take back a channel added in the app.
+///
+/// ONLY ONE THAT WAS ADDED HERE. A configured channel comes from a file this server reads and does
+/// not write, so "removing" one would last until the next restart and then undo itself — which is
+/// worse than refusing, because the reader would believe it had gone.
+pub async fn remove_channel(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(channel_id): Path<String>,
+) -> Result<Response, ApiError> {
+    require(&headers, &state, Scope::Write)?;
+    if state
+        .config
+        .channels
+        .iter()
+        .any(|c| c.id.as_str() == channel_id)
+    {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "channel_is_configured",
+            "that channel comes from this server's configuration file, so it cannot be removed \
+             from the app. Take it out of the file and restart.",
+        ));
+    }
+    state
+        .store
+        .remove_added_channel(&crate::model::ChannelId(channel_id.clone()))
+        .await?;
+    if let Ok(mut added) = state.added_channels.write() {
+        added.retain(|c| c.id.as_str() != channel_id);
+    }
+    tracing::info!(channel = %channel_id, "channel removed in the app");
+    Ok(no_store(Json(AddChannelResponse {
+        channel: ChannelInfo {
+            id: crate::model::ChannelId(channel_id),
+            label: String::new(),
+            writable: false,
+            alias: None,
+            added: true,
+        },
+        channels: ops::channels(&state).await,
+    })))
 }

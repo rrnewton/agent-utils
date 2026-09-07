@@ -615,6 +615,7 @@ mod tests {
             label: label.to_owned(),
             writable,
             alias: None,
+            added: false,
         }
     }
 

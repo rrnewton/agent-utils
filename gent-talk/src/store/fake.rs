@@ -56,6 +56,8 @@ struct State {
     dismissals: BTreeMap<(String, String), (u64, i64)>,
     /// Channel to `(alias, when it was set)`. `#39 channel-alias`.
     aliases: BTreeMap<String, (String, i64)>,
+    /// Channels added from inside the app: id -> (label, writable, added_at_ms).
+    added: BTreeMap<String, (String, bool, i64)>,
     next_summary_seq: u64,
     fail_next: Option<String>,
     appended: usize,
@@ -324,6 +326,45 @@ impl StateStore for FakeStore {
             .remove(channel.as_str())
             .map(|_| ())
             .ok_or(StoreError::NotFound)
+    }
+
+    async fn added_channels(&self) -> Result<Vec<crate::store::AddedChannel>, StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        Ok(state
+            .added
+            .iter()
+            .map(
+                |(channel, (label, writable, added_at_ms))| crate::store::AddedChannel {
+                    channel: ChannelId(channel.clone()),
+                    label: label.clone(),
+                    writable: *writable,
+                    added_at_ms: *added_at_ms,
+                },
+            )
+            .collect())
+    }
+
+    async fn add_channel(
+        &self,
+        channel: &ChannelId,
+        label: &str,
+        writable: bool,
+        at_ms: i64,
+    ) -> Result<(), StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        state
+            .added
+            .insert(channel.0.clone(), (label.to_owned(), writable, at_ms));
+        Ok(())
+    }
+
+    async fn remove_added_channel(&self, channel: &ChannelId) -> Result<(), StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        state.added.remove(channel.as_str());
+        Ok(())
     }
 
     async fn channel_aliases(&self) -> Result<Vec<ChannelAlias>, StoreError> {

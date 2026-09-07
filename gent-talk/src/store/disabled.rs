@@ -80,6 +80,18 @@ impl StateStore for DisabledStore {
         refuse()
     }
 
+    async fn added_channels(&self) -> Result<Vec<crate::store::AddedChannel>, StoreError> {
+        refuse()
+    }
+
+    async fn add_channel(&self, _: &ChannelId, _: &str, _: bool, _: i64) -> Result<(), StoreError> {
+        refuse()
+    }
+
+    async fn remove_added_channel(&self, _: &ChannelId) -> Result<(), StoreError> {
+        refuse()
+    }
+
     async fn set_channel_alias(&self, _: &ChannelId, _: &str) -> Result<ChannelAlias, StoreError> {
         refuse()
     }

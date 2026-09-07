@@ -112,20 +112,15 @@ async fn allowed(state: &AppState, channel_id: &str) -> Result<ChannelInfo, OpEr
 /// which are about to learn the alias from the write they are making. Everything that RENDERS a
 /// channel name goes through [`allowed`] instead.
 fn configured(state: &AppState, channel_id: &str) -> Result<ChannelInfo, OpError> {
-    state
-        .channel(channel_id)
-        .cloned()
-        .ok_or(OpError::UnknownChannel)
+    state.channel(channel_id).ok_or(OpError::UnknownChannel)
 }
 
 /// The channels this server is configured for, wearing the operator's own names. Read scope.
 pub async fn channels(state: &AppState) -> Vec<ChannelInfo> {
     let aliases = aliases(state).await;
     state
-        .config
-        .channels
-        .iter()
-        .cloned()
+        .all_channels()
+        .into_iter()
         .map(|mut channel| {
             channel.alias = aliases.get(channel.id.as_str()).cloned();
             channel

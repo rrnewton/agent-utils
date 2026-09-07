@@ -6836,15 +6836,89 @@ function fillChannelSelect(id) {
   }
 }
 
+/**
+ * Whether Remove is offered for this channel, and it is offered for exactly one kind.
+ *
+ * A channel from the configuration file cannot be taken out from the app: that file is read at
+ * startup and never written, so it would come back on the next restart. The SERVER refuses it too —
+ * this only avoids putting up a button whose entire outcome is a refusal.
+ */
+function renderRemoveChannel(channel) {
+  const removable = channel !== null && channel.added === true;
+  el("remove-channel").hidden = !removable;
+  el("remove-channel-state").textContent = removable
+    ? ""
+    : "This one is in the server's configuration file, so it is removed by editing that.";
+}
+
+/** Add the channel named in the form, and put the answer where it can be read. */
+async function addChannel() {
+  const id = el("new-channel-id").value.trim();
+  const label = el("new-channel-label").value.trim();
+  const said = el("add-channel-state");
+  if (!id || !label) {
+    said.textContent = "Both the id and a name are needed.";
+    return;
+  }
+  said.textContent = "Checking that the bot can read it…";
+  let payload = null;
+  try {
+    payload = await api("/api/v1/channels", {
+      method: "POST",
+      body: { id, label, writable: el("new-channel-writable").checked },
+    });
+  } catch (error) {
+    // THE SERVER'S OWN SENTENCE, not a rewrite of it. It is the one that knows whether this was a
+    // typo, a channel the bot was never added to, or a token that has stopped working, and it says
+    // which — a second explanation written here could only be vaguer.
+    said.textContent = error.message;
+    return;
+  }
+  // Redrawn from the answer rather than from a re-read: the server hands back the whole list
+  // precisely so the two pickers and the editor cannot disagree about what exists.
+  knownChannels = payload.channels || knownChannels;
+  fillChannelSelect("discord-channel");
+  fillChannelSelect("settings-channel");
+  el("settings-channel").value = id;
+  renderAliasEditor();
+  el("new-channel-id").value = "";
+  el("new-channel-label").value = "";
+  el("new-channel-writable").checked = false;
+  said.textContent = `Added. "${label}" is now in the channel picker.`;
+}
+
+/** Take back a channel that was added here. */
+async function removeChannel() {
+  const id = el("settings-channel").value;
+  const channel = knownChannel(id);
+  if (!channel || channel.added !== true) {
+    return;
+  }
+  const said = el("remove-channel-state");
+  let payload = null;
+  try {
+    payload = await api(`/api/v1/channels/${encodeURIComponent(id)}`, { method: "DELETE" });
+  } catch (error) {
+    said.textContent = error.message;
+    return;
+  }
+  knownChannels = payload.channels || [];
+  fillChannelSelect("discord-channel");
+  fillChannelSelect("settings-channel");
+  renderAliasEditor();
+  said.textContent = "Removed. It is no longer in the picker.";
+}
+
 /** What the editor says about the channel it is pointed at, including the label underneath. */
 function renderAliasEditor() {
-  const channel = knownChannel(el("alias-channel").value);
+  const channel = knownChannel(el("settings-channel").value);
   if (!channel) {
     el("channel-alias").value = "";
     el("alias-state").textContent = "This server has no channels configured.";
     return;
   }
   el("channel-alias").value = channel.alias || "";
+  renderRemoveChannel(channel);
   // The configured label is named either way. It is what clearing goes back to, and without it
   // on screen the owner cannot tell what he would be returning to.
   el("alias-state").textContent = channel.alias
@@ -6891,18 +6965,18 @@ function adoptChannel(payload) {
   }
   el("alias-note").textContent = (payload && payload.alias_notice) || "";
   fillChannelSelect("discord-channel");
-  fillChannelSelect("alias-channel");
+  fillChannelSelect("settings-channel");
   renderAliasEditor();
   restateChannelSeam();
 }
 
 function aliasPath() {
-  const channel = el("alias-channel").value;
+  const channel = el("settings-channel").value;
   return `/api/v1/channels/${encodeURIComponent(channel)}/alias`;
 }
 
 async function saveAlias() {
-  if (!knownChannel(el("alias-channel").value)) {
+  if (!knownChannel(el("settings-channel").value)) {
     return;
   }
   const payload = await api(aliasPath(), {
@@ -6914,7 +6988,7 @@ async function saveAlias() {
 }
 
 async function clearChannelAlias() {
-  if (!knownChannel(el("alias-channel").value)) {
+  if (!knownChannel(el("settings-channel").value)) {
     return;
   }
   const payload = await api(aliasPath(), { method: "DELETE" });
@@ -6954,7 +7028,7 @@ function applyClientConfig(config) {
   // rule, so the name in the bar and the name in Settings are one answer rather than two.
   knownChannels = config.channels || [];
   fillChannelSelect("discord-channel");
-  fillChannelSelect("alias-channel");
+  fillChannelSelect("settings-channel");
   renderAliasEditor();
   if (knownChannels.length > 0) {
     select.value = knownChannels[0].id;
@@ -7342,7 +7416,9 @@ el("discord-channel").addEventListener(
 );
 // `#39 channel-alias`. Pointing the editor at another channel shows THAT channel's name; it does
 // not change which channel the Discord view is reading, which is the picker on the bar.
-el("alias-channel").addEventListener("change", renderAliasEditor);
+el("settings-channel").addEventListener("change", renderAliasEditor);
+el("add-channel").addEventListener("click", guardQuietly(addChannel));
+el("remove-channel").addEventListener("click", guardQuietly(removeChannel));
 el("save-alias").addEventListener("click", guardQuietly(saveAlias));
 el("clear-alias").addEventListener("click", guardQuietly(clearChannelAlias));
 el("load-older").addEventListener("click", guardQuietly(loadOlder));

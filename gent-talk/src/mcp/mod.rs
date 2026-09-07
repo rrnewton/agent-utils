@@ -286,12 +286,14 @@ mod tests {
                 label: "lead team".to_owned(),
                 writable: true,
                 alias: None,
+                added: false,
             },
             ChannelInfo {
                 id: ChannelId("222".to_owned()),
                 label: "build noise".to_owned(),
                 writable: false,
                 alias: None,
+                added: false,
             },
         ]
     }
@@ -363,6 +365,7 @@ mod tests {
             label: "build noise".to_owned(),
             writable: false,
             alias: None,
+            added: false,
         }];
         let manifest = tool_manifest(&read_only);
         let post = manifest

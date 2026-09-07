@@ -267,6 +267,19 @@ pub struct ChannelAlias {
     pub set_at_ms: i64,
 }
 
+/// A channel the owner added from inside the app.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AddedChannel {
+    /// The Discord snowflake.
+    pub channel: ChannelId,
+    /// The name to show, as the owner typed it when adding.
+    pub label: String,
+    /// Whether the bridge may POST here, chosen explicitly when it was added.
+    pub writable: bool,
+    /// When it was added, for the record rather than for any policy.
+    pub added_at_ms: i64,
+}
+
 /// Validate an operator-supplied alias, returning the text as it will be stored.
 ///
 /// Surrounding whitespace is trimmed, because a trailing space is invisible in a text field and
@@ -574,6 +587,38 @@ pub trait StateStore: Send + Sync {
     /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on a read
     /// failure.
     async fn channel_aliases(&self) -> Result<Vec<ChannelAlias>, StoreError>;
+
+    /// Channels the owner added from inside the app, oldest first.
+    ///
+    /// These join the configured ones in the allowlist. They are kept apart from those because
+    /// only these can be removed again from the app: the configured ones are a fact about a file
+    /// this server reads and does not write, and quietly "removing" one would last until restart
+    /// and then come back.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] when the backend cannot be read.
+    async fn added_channels(&self) -> Result<Vec<AddedChannel>, StoreError>;
+
+    /// Add a channel, or update the one already stored under that id.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] when the backend cannot be written.
+    async fn add_channel(
+        &self,
+        channel: &ChannelId,
+        label: &str,
+        writable: bool,
+        at_ms: i64,
+    ) -> Result<(), StoreError>;
+
+    /// Forget an added channel. Removing one that was never added is not an error.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] when the backend cannot be written.
+    async fn remove_added_channel(&self, channel: &ChannelId) -> Result<(), StoreError>;
 
     /// Give a channel a local name, replacing any alias it already had.
     ///

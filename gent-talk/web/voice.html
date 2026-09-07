@@ -434,14 +434,22 @@
               "build noise" is not what anyone says either. The three things it deliberately is
               NOT are stated in Help, and they are the whole point of the feature.
             -->
-            <section class="settings-group">
+            <!--
+              THE PER-CHANNEL SECTION, and the only one on this screen.
+              Everything else here is a setting about the app; everything in here is a setting about
+              ONE channel, and which one is chosen once at the top rather than separately by each
+              control. Before this the alias editor carried its own picker, which read as a quirk of
+              renaming rather than as the shape of the screen — and there was nowhere at all to put
+              a second per-channel control.
+            -->
+            <section class="settings-group" id="channel-settings">
               <div class="group-head">
-                <h2>What to call a channel</h2>
-                <button class="help-link" id="help-link-channel-alias" type="button" data-help="channel-alias" aria-label="About channel names" title="What this changes, and what it does not">?</button>
+                <h2>Channels</h2>
+                <button class="help-link" id="help-link-channel-alias" type="button" data-help="channel-alias" aria-label="About channels" title="What this changes, and what it does not">?</button>
               </div>
-              <p class="hint">Your own name for a channel. Not a rename in Discord.</p>
-              <label for="alias-channel">Channel</label>
-              <select id="alias-channel" aria-describedby="alias-state"></select>
+              <p class="hint">Everything below is about the one channel chosen here.</p>
+              <label for="settings-channel">Channel</label>
+              <select id="settings-channel" aria-describedby="alias-state"></select>
               <label for="channel-alias">Call it</label>
               <input
                 id="channel-alias"
@@ -459,6 +467,52 @@
                 would be a second thing that can drift from the one the server actually enforces.
               -->
               <p id="alias-note" class="hint"></p>
+
+              <!--
+                Removing is only offered for a channel that was ADDED here. One from the
+                configuration file cannot be taken out from the app: the file is read at startup and
+                never written, so it would come back on the next restart. The server refuses that
+                too — this only avoids offering a button whose whole outcome is a refusal.
+              -->
+              <button id="remove-channel" class="secondary" type="button" hidden>Remove this channel</button>
+              <p id="remove-channel-state" class="hint" aria-live="polite"></p>
+
+              <hr class="settings-rule" />
+
+              <h3>Add a channel</h3>
+              <p class="hint">
+                In Discord: User Settings → Advanced → Developer Mode, then right-click the channel
+                → Copy Channel ID. The bot has to already be able to see it.
+              </p>
+              <label for="new-channel-id">Channel ID</label>
+              <input
+                id="new-channel-id"
+                type="text"
+                inputmode="numeric"
+                maxlength="20"
+                autocomplete="off"
+                placeholder="17 to 20 digits"
+                aria-describedby="add-channel-state"
+              />
+              <label for="new-channel-label">Call it</label>
+              <input
+                id="new-channel-label"
+                type="text"
+                maxlength="60"
+                autocomplete="off"
+                aria-describedby="add-channel-state"
+              />
+              <!--
+                OFF BY DEFAULT, and it is the one control on this screen that widens what the bridge
+                can SAY rather than what it can read. Left as a deliberate act rather than a
+                convenience.
+              -->
+              <label class="row" for="new-channel-writable">
+                <input id="new-channel-writable" type="checkbox" />
+                <span>Let the bridge post here</span>
+              </label>
+              <button id="add-channel" class="secondary" type="button">Add this channel</button>
+              <p id="add-channel-state" class="hint" aria-live="polite"></p>
             </section>
 
             <section class="settings-group">
@@ -823,6 +877,32 @@
             </article>
 
             <article id="help-channel-alias" class="help-entry">
+              <h2>Channels</h2>
+              <p class="hint">
+                Everything in this group is about <strong>one channel</strong> — the one chosen at
+                the top of it. Every other setting on the screen applies to the whole app.
+              </p>
+              <p class="hint">
+                <strong>Adding a channel</strong> needs its id: in Discord, turn on
+                <em>User Settings → Advanced → Developer Mode</em>, then right-click the channel and
+                choose <em>Copy Channel ID</em>. The bot must already be able to see it — adding the
+                bot to a <em>server</em> is not the same as adding it to a private
+                <em>channel</em>, and that is the usual reason this fails. The channel is
+                <strong>read before it is accepted</strong>, so a mistyped id or a channel the bot
+                cannot see is refused straight away rather than joining the list and failing later.
+              </p>
+              <p class="hint">
+                <strong>Let the bridge post here</strong> is off unless you turn it on, and it is
+                the one switch that widens what this bridge can <em>say</em> rather than what it can
+                read. Leaving it off means the channel can be read and replied to from this app but
+                is not somewhere the agent can be told to post.
+              </p>
+              <p class="hint">
+                A channel added here can be <strong>removed</strong> here. One that came from the
+                server's configuration file cannot: that file is read when the server starts and is
+                never written by it, so removing it from the app would last until the next restart
+                and then undo itself.
+              </p>
               <h2>What to call a channel</h2>
               <p class="hint">
                 Give a channel a name of your own. This app then uses it everywhere it would have

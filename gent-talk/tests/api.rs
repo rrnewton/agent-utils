@@ -13,6 +13,7 @@ use axum::http::{Request, StatusCode};
 use gent_talk::discord::fake::FakeDiscord;
 use gent_talk::http::router;
 use gent_talk::model::ChannelId;
+use gent_talk::store::StateStore as _;
 use gent_talk::testing::{READ_CHANNEL, READ_TOKEN, WRITE_CHANNEL, WRITE_TOKEN};
 use http_body_util::BodyExt as _;
 use serde_json::Value;
@@ -2730,4 +2731,235 @@ async fn preparing_a_message_that_scrolled_away_loses_that_one_and_keeps_the_res
     let entries = prepared["prepared"].as_array().expect("an array");
     assert_eq!(entries.len(), 1, "{prepared}");
     assert_eq!(entries[0]["message_id"], ids[0]);
+}
+
+/// A channel can be added from inside the app, and is reachable the moment it is.
+///
+/// The point of the feature is that adding one needs no file edit and no redeploy, so the test is
+/// not "the row was stored" but "a channel-scoped route now answers for it".
+#[tokio::test]
+async fn a_channel_added_in_the_app_joins_the_allowlist_immediately() {
+    let (harness, store, _ids) = todo_harness();
+    let fresh = "3333333333333333333";
+    // The bot has to be able to READ it, so give it something to read. See the refusal test below
+    // for what happens when it cannot.
+    harness.discord.seed(
+        &ChannelId(fresh.to_owned()),
+        "codex-eng",
+        "hello from the new channel",
+    );
+
+    // Before: not configured, so it does not exist as far as this server is concerned.
+    let (status, _body) = call(
+        &harness,
+        "GET",
+        &format!("/api/v1/channels/{fresh}/messages"),
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "the channel was reachable before it was added"
+    );
+
+    let (status, added) = call(
+        &harness,
+        "POST",
+        "/api/v1/channels",
+        Some(WRITE_TOKEN),
+        Some(serde_json::json!({ "id": fresh, "label": "second team" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{added}");
+    assert_eq!(added["channel"]["label"], "second team");
+    assert_eq!(
+        added["channel"]["writable"], false,
+        "an added channel must not be postable unless that was asked for"
+    );
+    // The whole list comes back, so the page redraws its pickers from one answer.
+    let listed = added["channels"].as_array().expect("an array");
+    assert!(
+        listed.iter().any(|c| c["id"] == fresh),
+        "the new channel is missing from the list the page redraws from: {added}"
+    );
+
+    // After: the ordinary read route answers for it.
+    let (status, body) = call(
+        &harness,
+        "GET",
+        &format!("/api/v1/channels/{fresh}/messages"),
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // ...and it survives a restart, because the store is what carries it across one.
+    assert_eq!(store.added_channels().await.expect("read back").len(), 1);
+}
+
+/// A channel the bot cannot read is REFUSED, in the probe's own words.
+///
+/// Adding the bot to a Discord server is not the same as adding it to a private channel, and a
+/// mistyped snowflake looks exactly like a correct one. Accepting either would put a channel in the
+/// list that fails every later request, which is the confusing version of this.
+#[tokio::test]
+async fn adding_a_channel_the_bot_cannot_read_is_refused_and_says_why() {
+    let (harness, store, _ids) = todo_harness();
+
+    let (status, body) = call(
+        &harness,
+        "POST",
+        "/api/v1/channels",
+        Some(WRITE_TOKEN),
+        Some(serde_json::json!({ "id": "4444444444444444444", "label": "not mine" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(body["error"], "channel_unreadable");
+    assert!(
+        body["detail"].as_str().is_some_and(|d| !d.is_empty()),
+        "the refusal says nothing a person could act on: {body}"
+    );
+    assert!(
+        store.added_channels().await.expect("read back").is_empty(),
+        "a channel that failed its probe was stored anyway"
+    );
+}
+
+/// The obvious mistakes are caught before Discord is asked anything.
+#[tokio::test]
+async fn adding_a_channel_checks_the_shape_of_what_it_was_given() {
+    let (harness, _store, _ids) = todo_harness();
+    let add = |body: Value| {
+        call(
+            &harness,
+            "POST",
+            "/api/v1/channels",
+            Some(WRITE_TOKEN),
+            Some(body),
+        )
+    };
+
+    let (status, body) = add(serde_json::json!({ "id": "not-a-snowflake", "label": "x" })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "invalid_channel_id");
+    assert!(
+        body["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("Developer Mode")),
+        "the refusal does not say where to get an id: {body}"
+    );
+
+    let (status, body) =
+        add(serde_json::json!({ "id": "5555555555555555555", "label": "  " })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "invalid_channel_label");
+
+    // Already there — including the ones from the configuration file.
+    let (status, body) = add(serde_json::json!({ "id": WRITE_CHANNEL, "label": "again" })).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], "channel_already_present");
+}
+
+/// Adding a channel is the OWNER's act: read scope cannot do it.
+#[tokio::test]
+async fn adding_or_removing_a_channel_needs_write_scope() {
+    let (harness, _store, _ids) = todo_harness();
+
+    let (status, _body) = call(
+        &harness,
+        "POST",
+        "/api/v1/channels",
+        Some(READ_TOKEN),
+        Some(serde_json::json!({ "id": "6666666666666666666", "label": "sneaky" })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read token widened the allowlist"
+    );
+
+    let (status, _body) = call(
+        &harness,
+        "DELETE",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}"),
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read token narrowed the allowlist"
+    );
+}
+
+/// An added channel can be taken back; a CONFIGURED one cannot.
+#[tokio::test]
+async fn only_a_channel_added_in_the_app_can_be_removed_from_it() {
+    let (harness, store, _ids) = todo_harness();
+    let fresh = "7777777777777777777";
+    harness
+        .discord
+        .seed(&ChannelId(fresh.to_owned()), "codex-eng", "hello");
+    let (status, _added) = call(
+        &harness,
+        "POST",
+        "/api/v1/channels",
+        Some(WRITE_TOKEN),
+        Some(serde_json::json!({ "id": fresh, "label": "second team" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // A configured channel is a fact about a file this server does not write. Pretending to remove
+    // it would last until the next restart and then undo itself.
+    let (status, body) = call(
+        &harness,
+        "DELETE",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}"),
+        Some(WRITE_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], "channel_is_configured");
+
+    let (status, body) = call(
+        &harness,
+        "DELETE",
+        &format!("/api/v1/channels/{fresh}"),
+        Some(WRITE_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        !body["channels"]
+            .as_array()
+            .expect("an array")
+            .iter()
+            .any(|c| c["id"] == fresh),
+        "the removed channel is still in the list: {body}"
+    );
+    assert!(store.added_channels().await.expect("read back").is_empty());
+
+    // ...and it stops being reachable, which is the part that matters.
+    let (status, _body) = call(
+        &harness,
+        "GET",
+        &format!("/api/v1/channels/{fresh}/messages"),
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a removed channel is still readable"
+    );
 }

@@ -65,6 +65,13 @@ pub struct AppState {
     /// map lookup and nothing else. See [`crate::speech_tickets`] for why this is a ticket rather
     /// than the page simply sending the text it already has.
     pub speech_tickets: Arc<crate::speech_tickets::SpeechTickets>,
+    /// Channels the owner added from inside the app, joined onto the configured allowlist.
+    ///
+    /// Held in memory as well as in the store because the allowlist is consulted on every
+    /// channel-scoped request, including from [`AppState::channel`], which is synchronous by
+    /// design. Loaded once at startup and kept in step by the add and remove routes; the store is
+    /// what makes it survive a restart, not what is read on the hot path.
+    pub added_channels: Arc<std::sync::RwLock<Vec<ChannelInfo>>>,
 }
 
 impl AppState {
@@ -73,9 +80,34 @@ impl AppState {
     /// A channel that is not configured does not exist as far as this server is concerned. This is
     /// the allowlist: the bot may be in many channels, but only these are reachable through the
     /// API, so a guessed snowflake cannot turn the bridge into a general-purpose Discord reader.
+    /// Configured channels are searched first, then the ones added from inside the app. A
+    /// configured entry WINS: the file is the operator's standing statement, and an added row that
+    /// shadowed it could silently change whether the bridge may post somewhere.
     #[must_use]
-    pub fn channel(&self, id: &str) -> Option<&ChannelInfo> {
-        self.config.channels.iter().find(|c| c.id.as_str() == id)
+    pub fn channel(&self, id: &str) -> Option<ChannelInfo> {
+        if let Some(found) = self.config.channels.iter().find(|c| c.id.as_str() == id) {
+            return Some(found.clone());
+        }
+        self.added_channels
+            .read()
+            .ok()?
+            .iter()
+            .find(|c| c.id.as_str() == id)
+            .cloned()
+    }
+
+    /// Every channel this server will answer for: configured first, then added, in that order.
+    #[must_use]
+    pub fn all_channels(&self) -> Vec<ChannelInfo> {
+        let mut all = self.config.channels.clone();
+        if let Ok(added) = self.added_channels.read() {
+            for channel in added.iter() {
+                if !all.iter().any(|c| c.id == channel.id) {
+                    all.push(channel.clone());
+                }
+            }
+        }
+        all
     }
 
     /// Resolve a caller-requested fetch size against the configured default and ceiling.

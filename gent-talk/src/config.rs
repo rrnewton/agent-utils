@@ -584,6 +584,8 @@ impl Config {
                     // Configuration carries no alias: the operator's local name lives in the
                     // store, and `crate::ops` overlays it. `#39 channel-alias`.
                     alias: None,
+                    // From the file, so not removable from the app.
+                    added: false,
                 })
                 .collect(),
         };
@@ -1048,6 +1050,7 @@ fn parse_channel_spec(spec: &str) -> Result<Vec<ChannelInfo>, ConfigError> {
             label: label.to_owned(),
             writable,
             alias: None,
+            added: false,
         });
     }
     Ok(out)

@@ -121,6 +121,22 @@ pub const MIGRATIONS: &[&str] = &[
         set_at_ms  INTEGER NOT NULL
     ) STRICT;
     ",
+    // Channels the OWNER added from inside the app, as opposed to the ones in the configuration
+    // file. Both end up in the same allowlist; only these can be removed again from the app,
+    // because the others are a fact about a file this server does not write.
+    //
+    // `writable` is stored rather than assumed. Adding a channel the bridge may POST to is a
+    // bigger act than adding one it may read, and which of the two was chosen has to survive a
+    // restart — inferring it later would be inventing an answer to a question the owner already
+    // answered.
+    "
+    CREATE TABLE added_channels (
+        channel_id TEXT    PRIMARY KEY NOT NULL,
+        label      TEXT    NOT NULL,
+        writable   INTEGER NOT NULL,
+        added_at_ms INTEGER NOT NULL
+    ) STRICT;
+    ",
 ];
 
 /// A [`StateStore`] backed by one SQLite file.
@@ -663,6 +679,66 @@ impl StateStore for SqliteStore {
                 })
                 .map_err(backend)?;
             rows.collect::<Result<Vec<_>, _>>().map_err(backend)
+        })
+        .await
+    }
+
+    async fn added_channels(&self) -> Result<Vec<crate::store::AddedChannel>, StoreError> {
+        self.with_connection(|connection| {
+            let mut statement = connection
+                .prepare(
+                    "SELECT channel_id, label, writable, added_at_ms FROM added_channels
+                     ORDER BY added_at_ms ASC, channel_id ASC",
+                )
+                .map_err(backend)?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok(crate::store::AddedChannel {
+                        channel: ChannelId(row.get::<_, String>(0)?),
+                        label: row.get::<_, String>(1)?,
+                        writable: row.get::<_, i64>(2)? != 0,
+                        added_at_ms: row.get::<_, i64>(3)?,
+                    })
+                })
+                .map_err(backend)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(backend)
+        })
+        .await
+    }
+
+    async fn add_channel(
+        &self,
+        channel: &ChannelId,
+        label: &str,
+        writable: bool,
+        at_ms: i64,
+    ) -> Result<(), StoreError> {
+        let channel = channel.0.clone();
+        let label = label.to_owned();
+        self.with_connection(move |connection| {
+            connection
+                .execute(
+                    "INSERT INTO added_channels (channel_id, label, writable, added_at_ms)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(channel_id) DO UPDATE SET label = ?2, writable = ?3",
+                    rusqlite::params![channel, label, i64::from(writable), at_ms],
+                )
+                .map_err(backend)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn remove_added_channel(&self, channel: &ChannelId) -> Result<(), StoreError> {
+        let channel = channel.0.clone();
+        self.with_connection(move |connection| {
+            connection
+                .execute(
+                    "DELETE FROM added_channels WHERE channel_id = ?1",
+                    rusqlite::params![channel],
+                )
+                .map_err(backend)?;
+            Ok(())
         })
         .await
     }

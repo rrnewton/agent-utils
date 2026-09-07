@@ -231,6 +231,15 @@ pub struct ChannelInfo {
     /// — the startup banner, the preflight probe — still names the label the operator wrote.
     #[serde(default)]
     pub alias: Option<String>,
+    /// Whether this channel was added from inside the app rather than named in the configuration
+    /// file.
+    ///
+    /// The page needs it for one decision: only an added channel can be REMOVED from the app. A
+    /// configured one comes from a file this server reads and never writes, so taking it out here
+    /// would last until the next restart and then undo itself — the server refuses that, and this
+    /// is what stops the app offering a button whose whole outcome is a refusal.
+    #[serde(default)]
+    pub added: bool,
 }
 
 impl ChannelInfo {
@@ -316,6 +325,7 @@ mod tests {
             label: "build noise".to_owned(),
             writable: false,
             alias: None,
+            added: false,
         };
         assert_eq!(
             channel.display_name(),

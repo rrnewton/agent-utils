@@ -953,6 +953,12 @@ function newPage(store = new Map(), script = SCRIPT) {
      * aliases existed sees what it always saw.
      */
     channels: [{ ...CHANNEL }],
+    /** Every add request, so "the id and name reached the server" is testable. */
+    addChannelCalls: [],
+    /** Every remove request. */
+    removeChannelCalls: [],
+    /** Make adding fail the way the server does when the bot cannot read the channel. */
+    addChannelError: null,
     /** Every alias write the page made, in order, as `METHOD body`. */
     aliasCalls: [],
     /** How many times the page read a step of the channel. */
@@ -1354,6 +1360,30 @@ function newPage(store = new Map(), script = SCRIPT) {
       // `#39 channel-alias`. A real little store again, for the same reason the to-do overlay is
       // one: every claim worth making here is that the page shows what the SERVER stored, which a
       // canned body could not distinguish from the page showing what was typed.
+      // Adding and removing a channel. A real little store, like the alias one below and for the
+      // same reason: what is worth asserting is that the page redraws from what the SERVER now
+      // says exists, which a canned body could not tell apart from the page trusting the form.
+      if (String(path) === "/api/v1/channels" && (options && options.method) === "POST") {
+        const asked = JSON.parse(options.body || "{}");
+        page.addChannelCalls.push(asked);
+        if (page.addChannelError) {
+          return json(502, { error: "channel_unreadable", detail: page.addChannelError });
+        }
+        const created = {
+          id: String(asked.id),
+          label: String(asked.label),
+          writable: asked.writable === true,
+          added: true,
+        };
+        page.channels = [...page.channels, created];
+        return json(200, { channel: created, channels: page.channels });
+      }
+      const removal = /^\/api\/v1\/channels\/([^/]+)$/.exec(String(path));
+      if (removal && (options && options.method) === "DELETE") {
+        page.removeChannelCalls.push(removal[1]);
+        page.channels = page.channels.filter((c) => String(c.id) !== removal[1]);
+        return json(200, { channel: { id: removal[1] }, channels: page.channels });
+      }
       const alias = /^\/api\/v1\/channels\/([^/]+)\/alias$/.exec(String(path));
       if (alias) {
         const method = (options && options.method) || "GET";
@@ -12488,11 +12518,144 @@ const ALIASED = { ...CHANNEL, alias: "the build channel" };
 /** The text of each option in a picker, in order. */
 const optionText = (page, id) => [...page.el(id).children].map((option) => option.textContent);
 
+test("A CHANNEL CAN BE ADDED FROM INSIDE THE APP, AND APPEARS IN THE PICKER", async () => {
+  // The whole point: a second channel without editing a file or redeploying. What is asserted is
+  // not that a request went out but that the channel is now SWITCHABLE — the picker is the feature.
+  const page = newPage();
+  await signIn(page);
+  await page.el("open-settings").click();
+  assert.equal(
+    page.el("discord-channel").children.length,
+    1,
+    "the fixture already has more than one channel, so adding one proves nothing"
+  );
+
+  page.el("new-channel-id").value = "1110000000000000002";
+  page.el("new-channel-label").value = "second team";
+  await page.el("add-channel").click();
+  await page.settle();
+
+  assert.deepEqual(
+    page.addChannelCalls,
+    [{ id: "1110000000000000002", label: "second team", writable: false }],
+    "the id and name did not reach the server, or writable defaulted ON"
+  );
+  const options = page.el("discord-channel").children.map((o) => o.value);
+  assert.deepEqual(
+    options,
+    ["1110000000000000001", "1110000000000000002"],
+    "the new channel is not in the picker, so it cannot be switched to"
+  );
+  assert.match(page.el("add-channel-state").text(), /Added/, "nothing said it worked");
+  assert.equal(page.el("new-channel-id").value, "", "the form kept the id it had just used");
+});
+
+test("...and letting the bridge POST there is a deliberate act, off by default", async () => {
+  // The one control on this screen that widens what the bridge can SAY rather than what it reads.
+  const page = newPage();
+  await signIn(page);
+  await page.el("open-settings").click();
+  page.el("new-channel-id").value = "1110000000000000003";
+  page.el("new-channel-label").value = "writable one";
+  page.el("new-channel-writable").checked = true;
+  await page.el("add-channel").click();
+  await page.settle();
+
+  assert.equal(
+    page.addChannelCalls[0].writable,
+    true,
+    "the reader asked for a writable channel and got a read-only one"
+  );
+});
+
+test("...and a channel the bot cannot read is refused IN THE SERVER'S OWN WORDS", async () => {
+  // The server knows whether this was a typo, a channel the bot was never added to, or a token
+  // that has stopped working. A sentence written in the page could only be vaguer than that one.
+  const page = newPage();
+  page.addChannelError = "the bot is not in that channel; add it there, not only to the server";
+  await signIn(page);
+  await page.el("open-settings").click();
+  page.el("new-channel-id").value = "1110000000000000009";
+  page.el("new-channel-label").value = "not mine";
+  await page.el("add-channel").click();
+  await page.settle();
+
+  assert.match(
+    page.el("add-channel-state").text(),
+    /not in that channel/,
+    "the reason was replaced with a vaguer one of the page's own"
+  );
+  assert.equal(
+    page.el("discord-channel").children.length,
+    1,
+    "a channel that was refused was added to the picker anyway"
+  );
+});
+
+test("REMOVE IS OFFERED FOR A CHANNEL ADDED HERE, AND NOT FOR ONE FROM THE FILE", async () => {
+  // A configured channel is read from a file this server never writes, so removing it from the app
+  // would last until the next restart and then undo itself. Not offering the button is the honest
+  // version of a refusal the server makes anyway.
+  const page = newPage();
+  await signIn(page);
+  await page.el("open-settings").click();
+  assert.equal(
+    page.el("remove-channel").hidden,
+    true,
+    "a configured channel was offered a Remove button that cannot work"
+  );
+  assert.match(page.el("remove-channel-state").text(), /configuration file/);
+
+  page.el("new-channel-id").value = "1110000000000000004";
+  page.el("new-channel-label").value = "temporary";
+  await page.el("add-channel").click();
+  await page.settle();
+  assert.equal(page.el("remove-channel").hidden, false, "an added channel cannot be removed");
+
+  await page.el("remove-channel").click();
+  await page.settle();
+  assert.deepEqual(page.removeChannelCalls, ["1110000000000000004"]);
+  assert.deepEqual(
+    page.el("discord-channel").children.map((o) => o.value),
+    ["1110000000000000001"],
+    "the removed channel is still in the picker"
+  );
+});
+
+test("the per-channel settings are all under ONE channel selector", async () => {
+  // The reorganisation, asserted as structure rather than as prose: the alias controls and the
+  // remove control both live inside the group the selector heads, so choosing a channel once is
+  // what scopes them. Before this the alias editor carried its own picker and there was nowhere
+  // for a second per-channel control to go.
+  const page = newPage();
+  await signIn(page);
+  await page.el("open-settings").click();
+  // Read off the MARKUP rather than the fixture's DOM: the fixture knows which ids exist but not
+  // how they nest, and nesting is exactly the claim. The group is sliced out of web/voice.html and
+  // every per-channel control has to be inside that slice.
+  const start = HTML.indexOf('<section class="settings-group" id="channel-settings">');
+  assert.ok(start > 0, "the per-channel group is gone from the markup");
+  const group = HTML.slice(start, HTML.indexOf("</section>", start));
+  for (const id of ["settings-channel", "channel-alias", "save-alias", "remove-channel", "add-channel"]) {
+    assert.ok(group.includes(`id="${id}"`), `${id} is not under the channel selector`);
+  }
+  // ...and ONE selector means one CHANNEL selector. Counting `<select>` elements would count
+  // `bar-placement`, which is a global setting that happens to be a dropdown; what makes a picker a
+  // channel picker is that the page fills it from the channel list. There are exactly two of those
+  // on the whole page: the one in the control bar, and this one.
+  const filled = [...SCRIPT_CODE.matchAll(/fillChannelSelect\("([^"]+)"\)/g)].map((m) => m[1]);
+  assert.deepEqual(
+    [...new Set(filled)].sort(),
+    ["discord-channel", "settings-channel"],
+    "a second channel picker was filled, so choosing one no longer scopes the section"
+  );
+});
+
 /** Open Settings, point the editor at a channel, type a name, and press Save. */
 async function renameFrom(page, channelId, typed) {
   await page.el("open-settings").click();
-  page.el("alias-channel").value = channelId;
-  await page.el("alias-channel").dispatch("change");
+  page.el("settings-channel").value = channelId;
+  await page.el("settings-channel").dispatch("change");
   page.el("channel-alias").value = typed;
   await page.el("save-alias").click();
   await page.settle();
@@ -12543,7 +12706,7 @@ test("SAVING A NAME IN SETTINGS RENAMES THE CHANNEL EVERYWHERE ON THIS PAGE AT O
     "exactly one write, carrying what was typed"
   );
   assert.deepStrictEqual(optionText(page, "discord-channel"), ["the build channel"]);
-  assert.deepStrictEqual(optionText(page, "alias-channel"), ["the build channel"]);
+  assert.deepStrictEqual(optionText(page, "settings-channel"), ["the build channel"]);
   assert.match(
     page.el("channel-summary").text(),
     /the build channel/,
