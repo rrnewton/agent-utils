@@ -19,6 +19,8 @@ use gent_talk::discord::fake::FakeDiscord;
 use gent_talk::http::router;
 use gent_talk::live::LiveHub;
 use gent_talk::model::ChannelId;
+use gent_talk::state::AppState;
+use gent_talk::store::StateStore as _;
 use gent_talk::testing::{READ_CHANNEL, READ_TOKEN, WRITE_CHANNEL, WRITE_TOKEN};
 use http_body_util::BodyExt as _;
 use tower::ServiceExt as _;
@@ -27,6 +29,7 @@ struct Harness {
     router: axum::Router,
     discord: Arc<FakeDiscord>,
     live: Arc<LiveHub>,
+    state: AppState,
 }
 
 fn harness() -> Harness {
@@ -36,7 +39,41 @@ fn harness() -> Harness {
         router: router(state.clone()),
         discord,
         live,
+        state,
     }
+}
+
+async fn add_channel(harness: &Harness, id: &str, label: &str) -> StatusCode {
+    harness
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/channels")
+                .header("authorization", format!("Bearer {WRITE_TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "id": id, "label": label }).to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("router responds")
+        .status()
+}
+
+async fn wait_for_fetches(discord: &FakeDiscord, minimum: usize) {
+    for _ in 0..100 {
+        if discord.fetch_count() >= minimum {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!(
+        "the poller made {} fetches, fewer than the expected {minimum}",
+        discord.fetch_count()
+    );
 }
 
 /// Ingest whatever the fake currently holds for `channel`, exactly as a poll tick would.
@@ -117,6 +154,89 @@ async fn read_to_end(body: &mut Body) -> String {
             text.push_str(&String::from_utf8_lossy(data));
         }
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_channel_added_while_the_poller_is_running_publishes_new_messages() {
+    let harness = harness();
+    let interval = Duration::from_secs(10);
+    let poller = tokio::spawn(gent_talk::live::poll_forever(
+        harness.state.clone(),
+        50,
+        interval,
+    ));
+    wait_for_fetches(harness.discord.as_ref(), 2).await;
+
+    let fresh = ChannelId("3333333333333333333".to_owned());
+    harness
+        .discord
+        .seed(&fresh, "codex-eng", "present when the channel was added");
+    assert_eq!(
+        add_channel(&harness, fresh.as_str(), "second team").await,
+        StatusCode::OK
+    );
+    let after_add_probe = harness.discord.fetch_count();
+
+    tokio::time::advance(interval).await;
+    wait_for_fetches(harness.discord.as_ref(), after_add_probe + 3).await;
+    let mut subscription = harness.live.subscribe(&fresh, None);
+    assert!(
+        subscription.replay.is_empty(),
+        "the first poll of a newly added channel must seed its cursor, not publish its history"
+    );
+
+    harness
+        .discord
+        .seed(&fresh, "codex-eng", "arrived after the channel was added");
+    let before_live_tick = harness.discord.fetch_count();
+    tokio::time::advance(interval).await;
+    wait_for_fetches(harness.discord.as_ref(), before_live_tick + 3).await;
+    let published = subscription.receiver.try_recv().expect(
+        "the running poller did not publish a message from the channel added through the API",
+    );
+    assert_eq!(
+        published.message.content,
+        "arrived after the channel was added"
+    );
+    poller.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_channel_restored_at_startup_is_polled_and_publishes_new_messages() {
+    let (state, discord, store) = gent_talk::testing::state_with_store();
+    let fresh = ChannelId("4444444444444444444".to_owned());
+    store
+        .add_channel(&fresh, "restored team", false, 1)
+        .await
+        .expect("store added channel");
+    assert_eq!(
+        state
+            .restore_added_channels()
+            .await
+            .expect("restore channels"),
+        1
+    );
+    discord.seed(&fresh, "codex-eng", "present at startup");
+
+    let interval = Duration::from_secs(10);
+    let poller = tokio::spawn(gent_talk::live::poll_forever(state.clone(), 50, interval));
+    wait_for_fetches(discord.as_ref(), 3).await;
+    let mut subscription = state.live.subscribe(&fresh, None);
+    assert!(
+        subscription.replay.is_empty(),
+        "the startup poll must seed the restored channel instead of replaying old history"
+    );
+
+    discord.seed(&fresh, "codex-eng", "arrived after restart");
+    let before_live_tick = discord.fetch_count();
+    tokio::time::advance(interval).await;
+    wait_for_fetches(discord.as_ref(), before_live_tick + 3).await;
+    let published = subscription
+        .receiver
+        .try_recv()
+        .expect("the poller did not publish a message from the restored channel");
+    assert_eq!(published.message.content, "arrived after restart");
+    poller.abort();
 }
 
 /// The `data:` payloads of every complete event in `text`, parsed.

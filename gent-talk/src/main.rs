@@ -443,7 +443,6 @@ async fn main() -> anyhow::Result<()> {
     let bind = config.bind;
     let speech: Arc<dyn SpeechProvider> = Arc::clone(&elevenlabs_client) as Arc<dyn SpeechProvider>;
     let elevenlabs: Arc<dyn SignedUrlProvider> = elevenlabs_client;
-    let live_channels: Vec<_> = config.channels.iter().map(|c| c.id.clone()).collect();
     let live_limit = config.discord.default_fetch_limit;
     let state = AppState {
         config: Arc::new(config),
@@ -463,24 +462,10 @@ async fn main() -> anyhow::Result<()> {
     // server answers anything. They were probed when they were added; they are not probed again
     // here, because a channel the bot has since been removed from should fail the request that
     // touches it rather than stop the whole bridge from starting over somebody else's change.
-    match state.store.added_channels().await {
-        Ok(added) => {
-            let restored: Vec<_> = added
-                .into_iter()
-                .map(|row| gent_talk::model::ChannelInfo {
-                    id: row.channel,
-                    label: row.label,
-                    writable: row.writable,
-                    alias: None,
-                    // Added in the app, which is what makes it removable there.
-                    added: true,
-                })
-                .collect();
-            if !restored.is_empty() {
-                tracing::info!(added = restored.len(), "restored channels added in the app");
-            }
-            if let Ok(mut slot) = state.added_channels.write() {
-                *slot = restored;
+    match state.restore_added_channels().await {
+        Ok(restored) => {
+            if restored > 0 {
+                tracing::info!(added = restored, "restored channels added in the app");
             }
         }
         // A store that is absent is the ordinary state of a deployment that never set
@@ -491,9 +476,7 @@ async fn main() -> anyhow::Result<()> {
     }
     if poll_seconds > 0 {
         tokio::spawn(gent_talk::live::poll_forever(
-            discord,
-            live,
-            live_channels,
+            state.clone(),
             live_limit,
             std::time::Duration::from_secs(poll_seconds),
         ));

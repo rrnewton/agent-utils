@@ -75,6 +75,36 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Restore channels previously added from inside the app into the live allowlist.
+    ///
+    /// The store is read once at startup. Keeping this operation on [`AppState`] makes the same
+    /// restored set visible to request handlers, diagnostics, and the live poller instead of
+    /// requiring each consumer to rebuild its own copy.
+    pub async fn restore_added_channels(&self) -> Result<usize, crate::store::StoreError> {
+        let restored: Vec<_> = self
+            .store
+            .added_channels()
+            .await?
+            .into_iter()
+            .map(|row| ChannelInfo {
+                id: row.channel,
+                label: row.label,
+                writable: row.writable,
+                alias: None,
+                // Added in the app, which is what makes it removable there.
+                added: true,
+            })
+            .collect();
+        let count = restored.len();
+        let mut slot = self.added_channels.write().map_err(|_| {
+            crate::store::StoreError::Backend(
+                "the in-memory added-channel allowlist lock is poisoned".to_owned(),
+            )
+        })?;
+        *slot = restored;
+        Ok(count)
+    }
+
     /// Look up a configured channel.
     ///
     /// A channel that is not configured does not exist as far as this server is concerned. This is

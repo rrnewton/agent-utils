@@ -330,6 +330,41 @@ async fn a_channel_the_bot_cannot_see_names_the_snowflake_the_label_and_the_invi
 }
 
 #[tokio::test]
+async fn a_channel_added_in_the_app_is_included_in_on_demand_diagnostics() {
+    let (state, discord, store) = gent_talk::testing::state_with_store();
+    let added = ChannelId("7777777777777777777".to_owned());
+    discord.seed(&added, "codex-eng", "readable after restart");
+    store
+        .add_channel(&added, "added team", false, 1)
+        .await
+        .expect("store added channel");
+    assert_eq!(
+        state
+            .restore_added_channels()
+            .await
+            .expect("restore channels"),
+        1
+    );
+
+    let body = report(state).await;
+    let channels = checks(&body, "discord.channel");
+    assert_eq!(
+        channels.len(),
+        3,
+        "diagnostics omitted the channel added in the app: {body:#}"
+    );
+    let added_check = channels
+        .into_iter()
+        .find(|check| check["subject"] == added.as_str())
+        .unwrap_or_else(|| panic!("diagnostics did not name the added channel: {body:#}"));
+    assert_eq!(added_check["status"], "pass", "{added_check:#}");
+    assert!(
+        text(added_check, "title").contains("added team"),
+        "diagnostics lost the added channel label: {added_check:#}"
+    );
+}
+
+#[tokio::test]
 async fn a_channel_whose_messages_come_back_blank_warns_about_the_message_content_intent() {
     // The one misconfiguration Discord reports as a SUCCESS, and therefore the one a report is
     // most valuable for. A warning, not a failure: a message can legitimately be attachment-only.

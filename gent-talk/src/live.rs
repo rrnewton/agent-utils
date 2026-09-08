@@ -52,7 +52,7 @@
 //! for, and [`backoff`] is the outer one, which never waits LESS than Discord's outstanding
 //! request. There is one notion of "slow down" here, applied at two scales.
 //!
-//! **The backoff is not decoration, and it is not left to be read.** [`poll_loop`] sleeping longer
+//! **The backoff is not decoration, and it is not left to be read.** [`poll_forever`] sleeping longer
 //! after a failure is pinned by a test that measures the loop's own elapsed time against a healthy
 //! control, because deleting the one line that applies it changes no other assertion in this
 //! suite: a hammering loop still fetches, still publishes and still recovers.
@@ -105,6 +105,7 @@ use tokio::sync::broadcast;
 
 use crate::discord::{DiscordClient, DiscordError};
 use crate::model::{sort_oldest_first, ChannelId, Message, MessageId};
+use crate::state::AppState;
 
 /// How many published messages each channel keeps for replay after a dropped connection.
 ///
@@ -495,41 +496,77 @@ pub fn backoff(interval: Duration, failures: u32, max: Duration) -> Duration {
 /// staleness once it clears.
 pub const MAX_BACKOFF_INTERVALS: u32 = 16;
 
-/// Poll every channel forever, publishing into `hub`.
+/// Poll every currently allowed channel forever, publishing into `state.live`.
 ///
 /// Never returns and never gives up. A channel that fails backs off and is tried again; it does
 /// not take the loop down with it, and it does not advance its own cursor, so nothing is skipped
-/// once it recovers. Spawned by `main` and cancelled only by the process exiting.
-pub async fn poll_forever(
-    discord: std::sync::Arc<dyn DiscordClient>,
-    hub: std::sync::Arc<LiveHub>,
-    channels: Vec<ChannelId>,
+/// once it recovers. The allowlist is read from [`AppState::all_channels`] on every tick so a
+/// channel added in the app starts being polled without restarting the server. Cursor and backoff
+/// state for a removed channel is discarded before the next fetch. Spawned by `main` and
+/// cancelled only by the process exiting.
+pub async fn poll_forever(state: AppState, limit: u16, interval: Duration) {
+    let mut cursors = BTreeMap::new();
+    poll_state_loop(&state, limit, interval, &mut cursors, None).await;
+}
+
+async fn poll_state_loop(
+    state: &AppState,
     limit: u16,
     interval: Duration,
+    cursors: &mut BTreeMap<ChannelId, Option<u64>>,
+    ticks: Option<u32>,
 ) {
-    let mut cursors = BTreeMap::new();
-    poll_loop(
-        discord.as_ref(),
-        hub.as_ref(),
-        &channels,
+    poll_loop_with_channels(
+        state.discord.as_ref(),
+        state.live.as_ref(),
+        || {
+            state
+                .all_channels()
+                .into_iter()
+                .map(|channel| channel.id)
+                .collect()
+        },
         limit,
         interval,
-        &mut cursors,
-        None,
+        cursors,
+        ticks,
     )
     .await;
 }
 
-/// The body of [`poll_forever`], with the cursors handed in and a tick budget.
+/// The body of the static-channel polling tests, with the cursors handed in and a tick budget.
 ///
 /// `ticks: None` is the production case and never returns. The cursors are the caller's so that a
 /// test can stop the loop, change the channel underneath it, and start it again WHERE IT LEFT OFF
 /// — which is the only way to state "an error did not lose the cursor" as an assertion rather than
 /// as a comment.
+#[cfg(test)]
 async fn poll_loop(
     discord: &dyn DiscordClient,
     hub: &LiveHub,
     channels: &[ChannelId],
+    limit: u16,
+    interval: Duration,
+    cursors: &mut BTreeMap<ChannelId, Option<u64>>,
+    ticks: Option<u32>,
+) {
+    let channels = channels.to_vec();
+    poll_loop_with_channels(
+        discord,
+        hub,
+        || channels.clone(),
+        limit,
+        interval,
+        cursors,
+        ticks,
+    )
+    .await;
+}
+
+async fn poll_loop_with_channels(
+    discord: &dyn DiscordClient,
+    hub: &LiveHub,
+    mut channels: impl FnMut() -> Vec<ChannelId>,
     limit: u16,
     interval: Duration,
     cursors: &mut BTreeMap<ChannelId, Option<u64>>,
@@ -540,8 +577,16 @@ async fn poll_loop(
     let mut behind: BTreeMap<ChannelId, bool> = BTreeMap::new();
     let mut remaining = ticks;
     loop {
+        let channels = channels();
+        let current: BTreeSet<_> = channels.iter().cloned().collect();
+        // Removal is durable state, not a pause. If the same channel is added later it must seed
+        // from Discord again instead of resuming an old cursor and publishing the intervening
+        // history as if it had just arrived.
+        cursors.retain(|channel, _| current.contains(channel));
+        failures.retain(|channel, _| current.contains(channel));
+        behind.retain(|channel, _| current.contains(channel));
         let mut wait = interval;
-        for channel in channels {
+        for channel in &channels {
             let cursor = cursors.entry(channel.clone()).or_default();
             let failed = failures.entry(channel.clone()).or_insert(0);
             match poll_once(discord, hub, channel, limit, cursor).await {
@@ -814,6 +859,59 @@ mod tests {
         assert!(
             receiver.try_recv().is_err(),
             "and it must be published ONCE, not once per tick"
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_a_channel_discards_its_cursor_before_it_is_added_again() {
+        let (state, fake) = crate::testing::state();
+        let channel = ChannelId("3333333333333333333".to_owned());
+        fake.seed(&channel, "codex", "present before the first poll");
+        state
+            .added_channels
+            .write()
+            .expect("added-channel allowlist")
+            .push(crate::model::ChannelInfo {
+                id: channel.clone(),
+                label: "temporary".to_owned(),
+                writable: false,
+                alias: None,
+                added: true,
+            });
+        let mut cursors = BTreeMap::new();
+        poll_state_loop(&state, 50, Duration::ZERO, &mut cursors, Some(1)).await;
+        assert!(
+            cursors.contains_key(&channel),
+            "the channel was never polled"
+        );
+
+        state
+            .added_channels
+            .write()
+            .expect("added-channel allowlist")
+            .clear();
+        poll_state_loop(&state, 50, Duration::ZERO, &mut cursors, Some(1)).await;
+        assert!(
+            !cursors.contains_key(&channel),
+            "a removed channel kept its cursor"
+        );
+
+        fake.seed(&channel, "codex", "arrived while removed");
+        state
+            .added_channels
+            .write()
+            .expect("added-channel allowlist")
+            .push(crate::model::ChannelInfo {
+                id: channel.clone(),
+                label: "temporary again".to_owned(),
+                writable: false,
+                alias: None,
+                added: true,
+            });
+        poll_state_loop(&state, 50, Duration::ZERO, &mut cursors, Some(1)).await;
+        assert!(
+            state.live.subscribe(&channel, None).replay.is_empty(),
+            "re-adding a channel published messages from while it was removed"
         );
     }
 

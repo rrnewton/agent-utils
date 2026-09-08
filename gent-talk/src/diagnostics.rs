@@ -334,12 +334,10 @@ async fn discord_token(state: &AppState, deadline: &Deadline) -> Check {
 
 /// Can the bot read each configured channel? The five causes, told apart.
 async fn discord_channels(state: &AppState, deadline: &Deadline) -> Vec<Check> {
-    let report = probe::probe_channels_within(
-        state.discord.as_ref(),
-        &state.config.channels,
-        Some(deadline.budget()),
-    )
-    .await;
+    let channels = state.all_channels();
+    let report =
+        probe::probe_channels_within(state.discord.as_ref(), &channels, Some(deadline.budget()))
+            .await;
     report
         .outcomes
         .into_iter()
