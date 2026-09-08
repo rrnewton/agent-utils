@@ -1288,6 +1288,32 @@ impl ManualCpuCgroup {
         Ok(())
     }
 
+    fn verify_pinned_directory_offline(&self) -> io::Result<()> {
+        let events_path = self.control_path("cgroup.events");
+        match open_cgroup_file_at(
+            &self.directory,
+            c"cgroup.events",
+            &events_path,
+            libc::O_RDONLY,
+        ) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "cannot prove pinned manual CPU cgroup {} was offlined: {error}",
+                    self.path.display()
+                ),
+            )),
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "pinned manual CPU cgroup {} remains active after removal",
+                    self.path.display()
+                ),
+            )),
+        }
+    }
+
     fn verify_parent_entry_absent(&self) -> io::Result<()> {
         match directory_entry_stat(&self.parent_directory, &self.basename, &self.path)? {
             None => Ok(()),
@@ -1317,6 +1343,7 @@ impl ManualCpuCgroup {
     fn remove_bound_directory(&self) -> io::Result<()> {
         self.verify_parent_entry_identity()?;
         remove_directory_at(&self.parent_directory, &self.basename, &self.path)?;
+        self.verify_pinned_directory_offline()?;
         self.verify_parent_entry_absent()
     }
 
@@ -1468,6 +1495,7 @@ impl ManualCpuCgroup {
         }
         self.verify_parent_entry_identity()?;
         remove(&self.parent_directory, &self.basename, &self.path)?;
+        self.verify_pinned_directory_offline()?;
         self.verify_parent_entry_absent()?;
         self.cleaned.store(true, Ordering::Release);
         Ok(())
@@ -1554,6 +1582,8 @@ impl ManualCpuCgroup {
     /// verifies that the parent entry still names that child immediately before `unlinkat`, then
     /// requires the same name to be absent before reporting success. It deliberately does not use
     /// the open directory's link count: kernfs synthesizes a positive count for removed cgroups.
+    /// Instead, a fresh lookup of mandatory `cgroup.events` through the pinned child must prove
+    /// that the exact cgroup is offline.
     pub fn kill_and_cleanup(&self) -> io::Result<u64> {
         self.kill_and_cleanup_with(
             MANUAL_CPU_ABORT_REMOVE_ATTEMPTS,
@@ -1586,11 +1616,13 @@ impl ManualCpuCgroup {
                     // Successful removal is stronger evidence than a failed cgroup.kill write:
                     // the kernel cannot remove a populated cgroup.
                     self.final_usage_read.store(false, Ordering::Release);
+                    self.verify_pinned_directory_offline()?;
                     self.verify_parent_entry_absent()?;
                     self.cleaned.store(true, Ordering::Release);
                     return Ok(());
                 }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    self.verify_pinned_directory_offline()?;
                     self.verify_parent_entry_absent()?;
                     self.final_usage_read.store(false, Ordering::Release);
                     self.cleaned.store(true, Ordering::Release);
@@ -3977,6 +4009,12 @@ mod tests {
         (path, child)
     }
 
+    fn remove_planted_manual_controls(path: &Path) {
+        for name in ["cpu.stat", "cgroup.events", "cgroup.procs", "cgroup.kill"] {
+            fs::remove_file(path.join(name)).unwrap();
+        }
+    }
+
     #[test]
     fn manual_cpu_usage_never_invents_zero_for_missing_or_malformed_data() {
         let (missing, missing_child) =
@@ -4198,14 +4236,22 @@ mod tests {
         );
         let displaced = path.with_extension("still-linked");
         let _ = fs::remove_dir_all(&displaced);
+        let pinned = child.directory.try_clone().unwrap();
+        assert_eq!(child.final_cpu_usage_usec().unwrap(), 23);
 
-        // Ordinary filesystems clear st_nlink after rmdir, while kernfs refreshes every open
-        // directory inode to `subdirs + 2` even after cgroup removal. Moving this fixture out of
-        // the expected namespace injects that nonzero-link state without teaching production to
-        // branch on a filesystem-specific counter.
-        fs::rename(&path, &displaced).unwrap();
-        assert_ne!(child.directory.metadata().unwrap().nlink(), 0);
-        child.verify_parent_entry_absent().unwrap();
+        child
+            .cleanup_with(|_, _, path| {
+                // Ordinary filesystems clear st_nlink after rmdir, while kernfs refreshes every
+                // open directory inode to `subdirs + 2` even after cgroup removal. Move this
+                // fixture out of the expected namespace and remove its mandatory control files to
+                // inject the kernfs state without teaching production to inspect st_nlink.
+                fs::rename(path, &displaced)?;
+                remove_planted_manual_controls(&displaced);
+                assert_ne!(pinned.metadata().unwrap().nlink(), 0);
+                Ok(())
+            })
+            .unwrap();
+        assert!(!path.exists());
 
         fs::remove_dir_all(displaced).unwrap();
     }
@@ -4223,6 +4269,7 @@ mod tests {
         let error = child
             .cleanup_with(|_, _, _| {
                 remove_called = true;
+                remove_planted_manual_controls(&path);
                 Ok(())
             })
             .unwrap_err();
@@ -4237,7 +4284,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_refuses_when_removal_leaves_a_replacement_entry() {
+    fn cleanup_refuses_when_a_swap_leaves_the_pinned_inode_active() {
         let (path, child) = planted_manual_cpu_cgroup(
             "manual-removal-race",
             Some("usage_usec 23\n"),
@@ -4248,8 +4295,40 @@ mod tests {
         let _ = fs::remove_dir_all(&original);
 
         let error = child
+            .cleanup_with(|parent, name, path| {
+                fs::rename(path, &original)?;
+                fs::create_dir(path)?;
+                remove_directory_at(parent, name, path)
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("remains active after removal"));
+        assert!(original.is_dir());
+        assert!(!path.exists(), "the decoy entry was removed by unlinkat");
+        child.kill().unwrap();
+        assert_eq!(
+            fs::read_to_string(original.join("cgroup.kill")).unwrap(),
+            "1"
+        );
+
+        fs::remove_dir_all(original).unwrap();
+    }
+
+    #[test]
+    fn cleanup_refuses_when_removal_leaves_a_replacement_entry() {
+        let (path, child) = planted_manual_cpu_cgroup(
+            "manual-removal-replacement",
+            Some("usage_usec 23\n"),
+            Some("populated 0\n"),
+        );
+        assert_eq!(child.final_cpu_usage_usec().unwrap(), 23);
+        let original = path.with_extension("pinned-original");
+        let _ = fs::remove_dir_all(&original);
+
+        let error = child
             .cleanup_with(|_, _, path| {
                 fs::rename(path, &original)?;
+                remove_planted_manual_controls(&original);
                 fs::create_dir(path)?;
                 Ok(())
             })
@@ -4257,11 +4336,6 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(original.is_dir());
         assert!(path.is_dir(), "the replacement entry must remain visible");
-        child.kill().unwrap();
-        assert_eq!(
-            fs::read_to_string(original.join("cgroup.kill")).unwrap(),
-            "1"
-        );
 
         fs::remove_dir_all(path).unwrap();
         fs::remove_dir_all(original).unwrap();
@@ -4392,6 +4466,7 @@ mod tests {
             !cgroup_path.exists(),
             "strict finalizer did not remove the exact owned cgroup"
         );
+        child.verify_pinned_directory_offline().unwrap();
         fs::remove_dir_all(markers).unwrap();
     }
 
