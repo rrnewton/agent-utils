@@ -2837,14 +2837,13 @@ def test_existing_unregistered_flag_retains_and_warns_without_treating_path_free
     audit_payload = json.loads(audited.stdout)
     assert audit_payload["attention_count"] == 1
     assert audit_payload["attention_slots"] == ["historical"]
+    assert audit_payload["summary"] == "1 worktree slot(s) need coordinator attention"
 
     gated = raw_command(project, "audit", "--gate")
     assert gated.returncode == 1
     assert "state=actionable" in gated.stdout
-    assert (
-        "summary=1 worktree slot(s) need coordinator attention: historical"
-        in gated.stdout
-    )
+    assert "summary=1 worktree slot(s) need coordinator attention" in gated.stdout
+    assert "summary=1 worktree slot(s) need coordinator attention:" not in gated.stdout
     assert "ACTION:" in gated.stdout
     assert orphan.is_dir()
 
@@ -11036,7 +11035,8 @@ def test_audit_reports_deletable_blocked_held_and_the_leak_invariant(
     captured = capsys.readouterr()
     assert gate_code == 1
     assert "state=actionable" in captured.out
-    assert "summary=1 worktree slot(s) need coordinator attention: slot01" in captured.out
+    assert "summary=1 worktree slot(s) need coordinator attention" in captured.out
+    assert "summary=1 worktree slot(s) need coordinator attention:" not in captured.out
     assert "ACTION:" in captured.out
 
     def scan_failed(*_args: object, **_kwargs: object) -> None:
@@ -11182,6 +11182,84 @@ def test_audit_uses_one_process_path_census_for_all_rows(
     assert rows["unused"]["verdict"] == "DELETABLE"
     assert rows["in-use"]["verdict"] == "BLOCKED"
     assert any("live process 12345" in reason for reason in rows["in-use"]["reasons"])
+
+
+def test_audit_reuses_one_git_worktree_list_for_shared_repository(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    for index in (1, 2):
+        made = create(
+            project,
+            slot=f"slot{index:02d}",
+            agent=f"codex-{index}",
+            branch=f"codex/task-{index}",
+        )
+        assert made.returncode == 0, made.stderr
+    calls: list[Path] = []
+    original = wrkslots._GitVcs.listed_worktrees
+
+    def counted(vcs: wrkslots._GitVcs, source: Path) -> set[Path]:
+        calls.append(source)
+        return original(vcs, source)
+
+    monkeypatch.setattr(wrkslots._GitVcs, "listed_worktrees", counted)
+    monkeypatch.setattr(
+        wrkslots,
+        "_capture_process_path_census",
+        lambda _paths: wrkslots._ProcessPathCensus((), ()),
+    )
+
+    assert (
+        wrkslots.main(
+            ["--project-root", str(project), "audit", "--format", "json"]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert len(payload["slots"]) == 2
+    assert calls == [repository]
+
+
+def test_git_operation_paths_uses_one_git_query(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    merge_head = checkout / ".git" / "MERGE_HEAD"
+    merge_head.parent.mkdir()
+    merge_head.write_text("0" * 40 + "\n", encoding="ascii")
+    paths = (
+        merge_head,
+        checkout / ".git" / "CHERRY_PICK_HEAD",
+        checkout / ".git" / "REVERT_HEAD",
+        checkout / ".git" / "BISECT_LOG",
+        checkout / ".git" / "rebase-apply",
+        checkout / ".git" / "rebase-merge",
+        checkout / ".git" / "sequencer",
+    )
+    calls: list[tuple[Path, tuple[str, ...]]] = []
+    vcs = wrkslots._GitVcs()
+
+    def run(
+        repository: Path,
+        arguments: Sequence[str],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append((repository, tuple(arguments)))
+        return subprocess.CompletedProcess(
+            arguments, 0, "".join(f"{path}\n" for path in paths), ""
+        )
+
+    monkeypatch.setattr(vcs, "_run", run)
+
+    assert vcs.operation_paths(checkout) == [merge_head]
+    assert len(calls) == 1
+    assert calls[0][0] == checkout
+    assert calls[0][1].count("--git-path") == len(paths)
 
 
 def test_remove_validates_the_target_without_unrelated_storage(

@@ -4713,10 +4713,16 @@ class _GitVcs:
             "rebase-merge",
             "sequencer",
         )
-        found: list[Path] = []
+        arguments: list[str] = ["rev-parse"]
         for name in names:
-            result = self._run(checkout, ["rev-parse", "--git-path", name])
-            candidate = Path(result.stdout.strip())
+            arguments.extend(("--git-path", name))
+        result = self._run(checkout, arguments)
+        paths = result.stdout.splitlines()
+        if len(paths) != len(names):
+            raise Refusal("Git returned an incomplete operation-path inventory")
+        found: list[Path] = []
+        for raw_path in paths:
+            candidate = Path(raw_path)
             if not candidate.is_absolute():
                 candidate = checkout / candidate
             if candidate.exists() or candidate.is_symlink():
@@ -4910,6 +4916,71 @@ class _GitVcs:
             )
         if self.repository_root(checkout) != checkout.absolute():
             raise Refusal(f"Git did not repair nested repository worktree {checkout}")
+
+
+class _AuditGitVcs(_GitVcs):
+    """One consistent set of reusable Git observations for an audit sweep."""
+
+    def __init__(self) -> None:
+        self._common_directories: dict[Path, Path] = {}
+        self._repository_roots: dict[Path, Path] = {}
+        self._worktree_lists: dict[Path, frozenset[Path]] = {}
+        self._verified_worktrees: dict[tuple[Path, Path], str] = {}
+        self._ordinary_histories: set[Path] = set()
+        self._tracked_cache_paths: dict[
+            tuple[Path, tuple[str, ...]], tuple[str, ...]
+        ] = {}
+        self._submodule_paths: dict[Path, tuple[str, ...]] = {}
+
+    def common_directory(self, repository: Path) -> Path:
+        key = repository.absolute()
+        if key not in self._common_directories:
+            self._common_directories[key] = super().common_directory(repository)
+        return self._common_directories[key]
+
+    def repository_root(self, repository: Path) -> Path:
+        key = repository.absolute()
+        if key not in self._repository_roots:
+            self._repository_roots[key] = super().repository_root(repository)
+        return self._repository_roots[key]
+
+    def listed_worktrees(self, repository: Path) -> set[Path]:
+        common = self.common_directory(repository)
+        if common not in self._worktree_lists:
+            self._worktree_lists[common] = frozenset(
+                super().listed_worktrees(repository)
+            )
+        return set(self._worktree_lists[common])
+
+    def verify_existing_worktree(self, repository: Path, checkout: Path) -> str:
+        key = (repository.absolute(), checkout.absolute())
+        if key not in self._verified_worktrees:
+            self._verified_worktrees[key] = super().verify_existing_worktree(
+                repository, checkout
+            )
+        return self._verified_worktrees[key]
+
+    def assert_ordinary_history(self, checkout: Path) -> None:
+        common = self.common_directory(checkout)
+        if common not in self._ordinary_histories:
+            super().assert_ordinary_history(checkout)
+            self._ordinary_histories.add(common)
+
+    def tracked_cache_paths(
+        self, checkout: Path, cache_globs: Sequence[str]
+    ) -> tuple[str, ...]:
+        key = (checkout.absolute(), tuple(cache_globs))
+        if key not in self._tracked_cache_paths:
+            self._tracked_cache_paths[key] = super().tracked_cache_paths(
+                checkout, cache_globs
+            )
+        return self._tracked_cache_paths[key]
+
+    def submodule_paths(self, checkout: Path) -> tuple[str, ...]:
+        key = checkout.absolute()
+        if key not in self._submodule_paths:
+            self._submodule_paths[key] = super().submodule_paths(checkout)
+        return self._submodule_paths[key]
 
 
 def _resolved_repository_path(
@@ -8818,16 +8889,16 @@ def _cache_directories_for_path(
 
 
 def _cache_directories_for_checkout(
-    config: Config, checkout: Checkout
+    config: Config, checkout: Checkout, *, vcs: _GitVcs | None = None
 ) -> tuple[CacheDirectory, ...]:
     checkout_path = _stored_path(config, checkout.path, "checkout path")
-    vcs = _GitVcs()
+    selected_vcs = vcs or _GitVcs()
     _relative, repository = _stored_repository_path(config, checkout.repository)
     return _cache_directories_for_path(
         config,
         checkout_path,
         checkout.name,
-        vcs,
+        selected_vcs,
         _cache_globs_for(config, checkout.name),
         repository,
     )
@@ -8856,20 +8927,28 @@ def _unregistered_cache_roots(config: Config, slot: str) -> tuple[Path, ...]:
 
 
 def _cache_directories(
-    config: Config, checkouts: Sequence[Checkout]
+    config: Config,
+    checkouts: Sequence[Checkout],
+    *,
+    vcs: _GitVcs | None = None,
 ) -> tuple[CacheDirectory, ...]:
     return tuple(
         path
         for checkout in checkouts
-        for path in _cache_directories_for_checkout(config, checkout)
+        for path in _cache_directories_for_checkout(config, checkout, vcs=vcs)
     )
 
 
 def _cache_slot_directories(
-    config: Config, cache_slot: CacheSlot
+    config: Config,
+    cache_slot: CacheSlot,
+    *,
+    vcs: _GitVcs | None = None,
 ) -> tuple[CacheDirectory, ...]:
-    registered = _cache_directories(config, cache_slot.checkouts)
-    vcs = _GitVcs()
+    selected_vcs = vcs or _GitVcs()
+    registered = _cache_directories(
+        config, cache_slot.checkouts, vcs=selected_vcs
+    )
     roots = (
         _unregistered_cache_roots(config, cache_slot.slot)
         if cache_slot.state == "unregistered"
@@ -8888,7 +8967,7 @@ def _cache_slot_directories(
                 config,
                 root,
                 label,
-                vcs,
+                selected_vcs,
                 config.cache_globs,
             )
         )
@@ -9458,9 +9537,11 @@ def _audit_record(
     config: Config,
     record: ActiveRecord,
     *,
+    vcs: _GitVcs | None = None,
     process_census: _ProcessPathCensus | None = None,
     process_census_error: str | None = None,
 ) -> tuple[dict[str, object], bool]:
+    selected_vcs = vcs or _GitVcs()
     owner_state, owner_detail = _process_state(record.owner)
     liveness_state, liveness_detail = _registered_liveness_state(config, record)
     heartbeat_age, heartbeat_expired = _heartbeat_diagnosis(record)
@@ -9474,7 +9555,9 @@ def _audit_record(
     try:
         cache_bytes = sum(
             _allocated_cache_bytes(config, cache)
-            for cache in _cache_directories(config, record.checkouts)
+            for cache in _cache_directories(
+                config, record.checkouts, vcs=selected_vcs
+            )
         )
     except Refusal as exc:
         cache_error = str(exc)
@@ -9515,24 +9598,26 @@ def _audit_record(
         _assert_record_paths(config, record)
         _assert_slot_contents(config, record)
         _assert_handoff_read(config, record, slot_path)
-        vcs = _GitVcs()
         for checkout in record.checkouts:
             path = _stored_path(config, checkout.path, "checkout path")
             repository = _stored_repository_path(config, checkout.repository)[1]
-            vcs.verify_existing_worktree(repository, path)
-            if vcs.branch(path) != checkout.branch:
+            selected_vcs.verify_existing_worktree(repository, path)
+            if selected_vcs.branch(path) != checkout.branch:
                 raise Refusal(f"checkout {checkout.name} branch changed")
             if record.slot_type == "agent":
-                operations = vcs.operation_paths(path)
+                operations = selected_vcs.operation_paths(path)
                 if operations:
                     raise Refusal(
                         f"checkout {checkout.name} has an unfinished Git operation: "
                         f"{operations[0]}"
                     )
-                vcs.assert_ordinary_history(path)
-                vcs.assert_ordinary_index(path)
-                _assert_cache_policy_untracked(config, checkout, vcs)
-            if vcs.remote_url_sha256(path, checkout.remote) != checkout.remote_url_sha256:
+                selected_vcs.assert_ordinary_history(path)
+                selected_vcs.assert_ordinary_index(path)
+                _assert_cache_policy_untracked(config, checkout, selected_vcs)
+            if (
+                selected_vcs.remote_url_sha256(path, checkout.remote)
+                != checkout.remote_url_sha256
+            ):
                 raise Refusal(f"checkout {checkout.name} remote URL changed")
     except Refusal as exc:
         reasons.append(str(exc))
@@ -9639,10 +9724,12 @@ def _cmd_audit(args: argparse.Namespace) -> int:
         journal_slots = {slot.slot: slot for slot in _all_journal_cache_slots(config)}
         rows: list[dict[str, object]] = []
         running_agent_count = 0
+        audit_vcs = _AuditGitVcs()
         for record in records:
             row, running = _audit_record(
                 config,
                 record,
+                vcs=audit_vcs,
                 process_census=process_census,
                 process_census_error=process_census_error,
             )
@@ -9710,7 +9797,9 @@ def _cmd_audit(args: argparse.Namespace) -> int:
                     )
                     cache_bytes = sum(
                         _allocated_cache_bytes(config, cache)
-                        for cache in _cache_slot_directories(config, unregistered)
+                        for cache in _cache_slot_directories(
+                            config, unregistered, vcs=audit_vcs
+                        )
                     )
                 except Refusal as exc:
                     cache_error = str(exc)
@@ -9863,15 +9952,12 @@ def _cmd_audit(args: argparse.Namespace) -> int:
     unknown_names = [str(row["slot"]) for row in unknown]
     if attention_names:
         gate_state = "actionable"
-        summary = (
-            f"{len(attention_names)} worktree slot(s) need coordinator attention: "
-            + ", ".join(attention_names)
-        )
+        summary = f"{len(attention_names)} worktree slot(s) need coordinator attention"
     elif unknown_names:
         gate_state = "unknown"
         summary = (
             f"could not determine reclaim state for {len(unknown_names)} worktree "
-            "slot(s): " + ", ".join(unknown_names)
+            "slot(s)"
         )
     else:
         gate_state = "ok"
