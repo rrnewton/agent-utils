@@ -2237,6 +2237,35 @@ struct WprofStopOutcome {
     error: String,
 }
 
+fn stop_wprof_at_window_boundary(
+    config: &CaptureConfig,
+    profiler: &PinnedProcess,
+    cwd: &Path,
+    signal_timeout: Duration,
+) -> WprofStopOutcome {
+    // The profiler can exit after the controller's last in-window poll but before the deadline
+    // branch runs. Observe the pinned identity once more before signaling so an exit that already
+    // happened is not misclassified as a signal or artifact failure.
+    if profiler.exited(Duration::ZERO).unwrap_or(false) {
+        return WprofStopOutcome {
+            error: "wprof exited before the profiling window ended".to_string(),
+            ..WprofStopOutcome::default()
+        };
+    }
+    match send_pinned_wprof_signal(config, profiler, "INT", cwd, signal_timeout) {
+        Ok(()) => WprofStopOutcome {
+            sent: true,
+            error: String::new(),
+            ..WprofStopOutcome::default()
+        },
+        Err(problem) => WprofStopOutcome {
+            sent: false,
+            error: problem,
+            ..WprofStopOutcome::default()
+        },
+    }
+}
+
 fn start_wprof_stop_controller(
     config: CaptureConfig,
     profiler: PinnedProcess,
@@ -2293,18 +2322,7 @@ fn start_wprof_stop_controller(
                         .min(Duration::from_millis(10)),
                 );
             }
-            match send_pinned_wprof_signal(&config, &profiler, "INT", &cwd, signal_timeout) {
-                Ok(()) => WprofStopOutcome {
-                    sent: true,
-                    error: String::new(),
-                    ..WprofStopOutcome::default()
-                },
-                Err(problem) => WprofStopOutcome {
-                    sent: false,
-                    error: problem,
-                    ..WprofStopOutcome::default()
-                },
-            }
+            stop_wprof_at_window_boundary(&config, &profiler, &cwd, signal_timeout)
         })
         .map_err(|error| error.to_string())
 }
@@ -3085,6 +3103,73 @@ mod tests {
             no_ack.reads >= 1,
             "ordinary no-ack waits remain deadline-bounded"
         );
+    }
+
+    #[test]
+    fn wprof_window_boundary_observes_a_completed_pidfd_before_signaling() {
+        let root = temp_dir("wprof-boundary-exit");
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "IFS= read -r gate; exit 0"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let profiler = pin_process(i32::try_from(child.id()).unwrap(), false).unwrap();
+
+        // The pipe release and pidfd poll are an exact happens-before barrier: the child has
+        // exited, but remains unreaped and PID-pinned, before the boundary decision is allowed.
+        child.stdin.take().unwrap().write_all(b"go\n").unwrap();
+        assert!(profiler.exited(Duration::from_secs(1)).unwrap());
+        let outcome = stop_wprof_at_window_boundary(
+            &CaptureConfig::new(&root),
+            &profiler,
+            &root,
+            Duration::from_secs(1),
+        );
+        let status = child.wait().unwrap();
+
+        assert!(status.success());
+        assert!(!outcome.sent);
+        assert_eq!(
+            outcome.error,
+            "wprof exited before the profiling window ended"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn wprof_window_boundary_signals_a_still_running_process() {
+        let root = temp_dir("wprof-boundary-running");
+        let mut child = Command::new("/bin/sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let profiler = pin_process(i32::try_from(child.id()).unwrap(), false).unwrap();
+        assert!(!profiler.exited(Duration::ZERO).unwrap());
+
+        let outcome = stop_wprof_at_window_boundary(
+            &CaptureConfig::new(&root),
+            &profiler,
+            &root,
+            Duration::from_secs(1),
+        );
+        let status = wait_child(&mut child, Duration::from_secs(1)).unwrap();
+        if status.is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+
+        assert!(outcome.sent, "{}", outcome.error);
+        assert!(outcome.error.is_empty());
+        assert_eq!(
+            status.and_then(|status| status.signal()),
+            Some(libc::SIGINT)
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
