@@ -1288,29 +1288,26 @@ impl ManualCpuCgroup {
         Ok(())
     }
 
-    fn verify_pinned_directory_unlinked(&self) -> io::Result<()> {
-        let metadata = self.directory.metadata().map_err(|error| {
-            cgroup_io_error("cannot verify removed manual CPU cgroup", &self.path, error)
-        })?;
-        if metadata.nlink() != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "pinned manual CPU cgroup {} remains linked after removal",
-                    self.path.display()
-                ),
-            ));
-        }
-        Ok(())
-    }
-
     fn verify_parent_entry_absent(&self) -> io::Result<()> {
         match directory_entry_stat(&self.parent_directory, &self.basename, &self.path)? {
             None => Ok(()),
+            Some(metadata)
+                if metadata.st_mode & libc::S_IFMT == libc::S_IFDIR
+                    && metadata.st_dev == self.device
+                    && metadata.st_ino == self.inode =>
+            {
+                Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "manual CPU cgroup parent entry {} still names the pinned directory after removal",
+                        self.path.display()
+                    ),
+                ))
+            }
             Some(_) => Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
+                io::ErrorKind::InvalidData,
                 format!(
-                    "manual CPU cgroup parent entry {} exists after removal",
+                    "manual CPU cgroup parent entry {} was replaced during removal",
                     self.path.display()
                 ),
             )),
@@ -1320,7 +1317,6 @@ impl ManualCpuCgroup {
     fn remove_bound_directory(&self) -> io::Result<()> {
         self.verify_parent_entry_identity()?;
         remove_directory_at(&self.parent_directory, &self.basename, &self.path)?;
-        self.verify_pinned_directory_unlinked()?;
         self.verify_parent_entry_absent()
     }
 
@@ -1472,7 +1468,6 @@ impl ManualCpuCgroup {
         }
         self.verify_parent_entry_identity()?;
         remove(&self.parent_directory, &self.basename, &self.path)?;
-        self.verify_pinned_directory_unlinked()?;
         self.verify_parent_entry_absent()?;
         self.cleaned.store(true, Ordering::Release);
         Ok(())
@@ -1556,8 +1551,9 @@ impl ManualCpuCgroup {
     /// causing the whole kill/observe/remove sequence to restart, or loses the race to rmdir and
     /// cannot enter the offlined cgroup through an already-open `cgroup.procs` descriptor.
     /// Every control operation uses the child directory pinned beneath its pinned parent. Cleanup
-    /// removes that exact parent entry with `unlinkat` and requires the pinned child's link count
-    /// to reach zero before reporting success.
+    /// verifies that the parent entry still names that child immediately before `unlinkat`, then
+    /// requires the same name to be absent before reporting success. It deliberately does not use
+    /// the open directory's link count: kernfs synthesizes a positive count for removed cgroups.
     pub fn kill_and_cleanup(&self) -> io::Result<u64> {
         self.kill_and_cleanup_with(
             MANUAL_CPU_ABORT_REMOVE_ATTEMPTS,
@@ -1590,13 +1586,11 @@ impl ManualCpuCgroup {
                     // Successful removal is stronger evidence than a failed cgroup.kill write:
                     // the kernel cannot remove a populated cgroup.
                     self.final_usage_read.store(false, Ordering::Release);
-                    self.verify_pinned_directory_unlinked()?;
                     self.verify_parent_entry_absent()?;
                     self.cleaned.store(true, Ordering::Release);
                     return Ok(());
                 }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    self.verify_pinned_directory_unlinked()?;
                     self.verify_parent_entry_absent()?;
                     self.final_usage_read.store(false, Ordering::Release);
                     self.cleaned.store(true, Ordering::Release);
@@ -4196,7 +4190,54 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_refuses_when_a_swap_leaves_the_pinned_inode_linked() {
+    fn post_unlink_namespace_absence_accepts_a_nonzero_pinned_link_count() {
+        let (path, child) = planted_manual_cpu_cgroup(
+            "manual-kernfs-link-count",
+            Some("usage_usec 23\n"),
+            Some("populated 0\n"),
+        );
+        let displaced = path.with_extension("still-linked");
+        let _ = fs::remove_dir_all(&displaced);
+
+        // Ordinary filesystems clear st_nlink after rmdir, while kernfs refreshes every open
+        // directory inode to `subdirs + 2` even after cgroup removal. Moving this fixture out of
+        // the expected namespace injects that nonzero-link state without teaching production to
+        // branch on a filesystem-specific counter.
+        fs::rename(&path, &displaced).unwrap();
+        assert_ne!(child.directory.metadata().unwrap().nlink(), 0);
+        child.verify_parent_entry_absent().unwrap();
+
+        fs::remove_dir_all(displaced).unwrap();
+    }
+
+    #[test]
+    fn cleanup_refuses_when_success_leaves_the_pinned_namespace_entry() {
+        let (path, child) = planted_manual_cpu_cgroup(
+            "manual-removal-still-present",
+            Some("usage_usec 23\n"),
+            Some("populated 0\n"),
+        );
+        assert_eq!(child.final_cpu_usage_usec().unwrap(), 23);
+        let mut remove_called = false;
+
+        let error = child
+            .cleanup_with(|_, _, _| {
+                remove_called = true;
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(error
+            .to_string()
+            .contains("still names the pinned directory"));
+        assert!(remove_called);
+        assert!(path.is_dir());
+
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn cleanup_refuses_when_removal_leaves_a_replacement_entry() {
         let (path, child) = planted_manual_cpu_cgroup(
             "manual-removal-race",
             Some("usage_usec 23\n"),
@@ -4207,24 +4248,22 @@ mod tests {
         let _ = fs::remove_dir_all(&original);
 
         let error = child
-            .cleanup_with(|parent, name, path| {
+            .cleanup_with(|_, _, path| {
                 fs::rename(path, &original)?;
                 fs::create_dir(path)?;
-                remove_directory_at(parent, name, path)
+                Ok(())
             })
             .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(original.is_dir());
-        assert!(
-            !path.exists(),
-            "the decoy entry was not removed by unlinkat"
-        );
+        assert!(path.is_dir(), "the replacement entry must remain visible");
         child.kill().unwrap();
         assert_eq!(
             fs::read_to_string(original.join("cgroup.kill")).unwrap(),
             "1"
         );
 
+        fs::remove_dir_all(path).unwrap();
         fs::remove_dir_all(original).unwrap();
     }
 
