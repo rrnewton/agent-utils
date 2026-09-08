@@ -382,7 +382,14 @@ def run_tick(
     if state.enabled:
         planned: list[Reminder | str] = []
         for rem in config.reminders:
-            if not is_due(rem.name, rem.cadence_secs, now, fired):
+            if not is_due(
+                rem.name,
+                rem.cadence_secs,
+                now,
+                fired,
+                rem.cadence_offset_secs,
+                rem.cadence_window_secs,
+            ):
                 continue
             if not _flags_satisfied(rem.requires_flags, state.flags):
                 # Flag-suppressed: do NOT consume the cadence, so it fires promptly once enabled.

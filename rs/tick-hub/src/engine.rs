@@ -143,7 +143,10 @@ fn eval_gate(
     let Some(gate) = gate else {
         return Ok((GateOutcome::Fire, IndexMap::new()));
     };
-    let result = runner.run(&gate.cmd);
+    let result = runner.run(
+        &gate.cmd,
+        gate.timeout_secs.and_then(|secs| u64::try_from(secs).ok()),
+    );
     interpret_gate_result(gate, result)
 }
 
@@ -653,7 +656,14 @@ fn run_tick_inner(
     if state.enabled {
         let mut planned = Vec::new();
         for reminder in &config.reminders {
-            if !is_due(&reminder.name, reminder.cadence_secs, now, fired) {
+            if !is_due(
+                &reminder.name,
+                reminder.cadence_secs,
+                now,
+                fired,
+                reminder.cadence_offset_secs,
+                reminder.cadence_window_secs,
+            ) {
                 continue;
             }
             if !reminder
@@ -817,7 +827,7 @@ mod tests {
     }
 
     impl GateRunner for FakeGate {
-        fn run(&self, cmd: &str) -> GateResult {
+        fn run(&self, cmd: &str, _timeout_secs: Option<u64>) -> GateResult {
             self.calls.lock().unwrap().push(cmd.to_string());
             self.outcomes
                 .get(cmd)
@@ -1023,6 +1033,7 @@ mod tests {
             when: GateWhen::Always,
             capture: true,
             parallel: false,
+            timeout_secs: None,
         });
         let config = TickConfig {
             reminders: vec![reminder],
@@ -1634,7 +1645,7 @@ mod tests {
     }
 
     impl GateRunner for RecordingGate {
-        fn run(&self, cmd: &str) -> GateResult {
+        fn run(&self, cmd: &str, _timeout_secs: Option<u64>) -> GateResult {
             self.seen_at_call
                 .lock()
                 .unwrap()

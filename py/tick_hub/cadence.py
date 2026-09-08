@@ -35,25 +35,83 @@ def unresolved_render_state_keys(name: str) -> tuple[str, str]:
     return base + UNRESOLVED_RENDER_COUNT_SUFFIX, base + UNRESOLVED_RENDER_FIRST_SUFFIX
 
 
-def is_due(name: str, cadence_secs: int, now: int, last_fired: Mapping[str, int]) -> bool:
+def scheduled_instant(cadence_secs: int, offset_secs: int, now: int) -> int:
+    """The most recent absolute instant at or before ``now`` for this phased cadence.
+
+    The instants are ``... , offset, offset + cadence, offset + 2*cadence, ...``. Derived from the
+    clock alone, so a restart mid-cycle and a replay at a pinned ``now`` both land on the same
+    instant -- there is no tick counter to lose."""
+    return ((now - offset_secs) // cadence_secs) * cadence_secs + offset_secs
+
+
+def is_due(
+    name: str,
+    cadence_secs: int,
+    now: int,
+    last_fired: Mapping[str, int],
+    offset_secs: int | None = None,
+    window_secs: int | None = None,
+) -> bool:
     """True iff the named reminder should be checked this tick.
 
     A cadence of :data:`~tick_hub.model.EVERY_TICK` (0) is always due. Otherwise the reminder is due
     when at least ``cadence_secs`` have elapsed since it last fired; a reminder with no recorded
-    last-fired epoch has never run and is due."""
+    last-fired epoch has never run and is due.
+
+    ``offset_secs`` PHASES the cadence against absolute time. When it is ``None`` the elapsed rule
+    above applies exactly as before -- callers that configure no offset see no behaviour change.
+    When it is set, the reminder is due once per ``cadence_secs`` window, at the first check at or
+    after :func:`scheduled_instant`. Two reminders sharing a cadence but given different offsets
+    therefore never come due on the same tick, which is the point: it lets an expensive cohort be
+    spread across the ticks inside one cadence period without any reminder running less often.
+
+    ⚠️ A REMINDER THAT WAS CUT OFF IS STILL DUE. Dueness is decided from the last-fired epoch, and
+    a reminder that did not complete never records one. Phasing does not and must not change that:
+    it moves WHEN a reminder is checked, never whether a check that did not happen counts as done.
+    """
     if cadence_secs <= EVERY_TICK:
         return True
     last = last_fired.get(name)
     if last is None:
+        # ⚠️ NEVER FIRED IS DUE, PHASE OR NO PHASE, AND THAT IS LOAD-BEARING ELSEWHERE.
+        # The pending report calls this with an EMPTY fired-state precisely so every
+        # reminder answers "due", which is what makes it a complete inventory rather than
+        # a view of one phase. Narrowing it here would quietly shrink that report.
+        # RESIDUAL, ACCEPTED AND NOT HIDDEN: a reminder that has never once completed --
+        # wrkslots_audit ends NO_RESULT every tick and records no epoch -- is therefore
+        # offered on both phases until it completes once. That is one cheap gate, not the
+        # cohort pile-up this phasing exists to stop; a reminder that HAS completed and is
+        # later cut off is bounded by the window below.
         return True
-    return (now - last) >= cadence_secs
+    if offset_secs is None:
+        return (now - last) >= cadence_secs
+    instant = scheduled_instant(cadence_secs, offset_secs, now)
+    if last >= instant:
+        return False
+    if window_secs is not None and (now - instant) >= window_secs:
+        # Past this phase's window. The reminder is still UNFINISHED -- no epoch was
+        # recorded and its next instant will offer it again -- but it is not carried
+        # onto the following phase's tick, which exists to run the other half.
+        return False
+    return True
 
 
 def due_reminders(
     reminders: Sequence[Reminder], now: int, last_fired: Mapping[str, int]
 ) -> list[Reminder]:
     """The subset of ``reminders`` due this tick, in registration order (pure)."""
-    return [r for r in reminders if is_due(r.name, r.cadence_secs, now, last_fired)]
+    return [
+        r
+        for r in reminders
+        if is_due(
+            r.name,
+            r.cadence_secs,
+            now,
+            last_fired,
+            r.cadence_offset_secs,
+            r.cadence_window_secs,
+        )
+    ]
 
 
 def load_fired_state(path: Path) -> dict[str, int]:

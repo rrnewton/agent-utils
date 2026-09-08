@@ -80,6 +80,10 @@ pub struct Gate {
     pub capture: bool,
     /// Whether this gate may start early and overlap other due gate commands.
     pub parallel: bool,
+    /// Seconds this gate's command may run before it is terminated and reported as
+    /// NO-SIGNAL. `None` uses the runner's default. Appended so existing positional
+    /// construction is unaffected.
+    pub timeout_secs: Option<i64>,
 }
 
 impl Gate {
@@ -90,6 +94,7 @@ impl Gate {
             when: GateWhen::Success,
             capture: false,
             parallel: false,
+            timeout_secs: None,
         }
     }
 }
@@ -145,6 +150,15 @@ pub struct Reminder {
     /// Reminders whose explicit no-result makes this reminder's silence unevaluable.
     /// Dependencies never prevent this reminder's gate from running or suppress a real emission.
     pub depends_on: Vec<String>,
+    /// Optional phase for `cadence_secs`, in seconds past each cadence boundary. When set,
+    /// the reminder is due at the largest instant `T <= now` with `T % cadence == offset`,
+    /// and only if it has not fired since. Derived from absolute time, so the phase survives
+    /// a restart and is identical on replay. `None` keeps the plain elapsed rule.
+    pub cadence_offset_secs: Option<i64>,
+    /// How long after that instant the reminder may still be offered. Without it a reminder
+    /// that did not complete is offered on every later tick, including the other phase's --
+    /// the pile-up phasing exists to prevent. It never marks a missed reminder done.
+    pub cadence_window_secs: Option<i64>,
 }
 
 impl Reminder {
@@ -157,6 +171,8 @@ impl Reminder {
             requires_flags: Vec::new(),
             gate: None,
             depends_on: Vec::new(),
+            cadence_offset_secs: None,
+            cadence_window_secs: None,
         }
     }
 }

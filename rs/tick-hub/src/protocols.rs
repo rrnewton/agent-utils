@@ -38,7 +38,12 @@ impl GateResult {
 /// Runs a reminder gate command.
 pub trait GateRunner: Sync {
     /// Execute `cmd` and report its exit code and stdout.
-    fn run(&self, cmd: &str) -> GateResult;
+    ///
+    /// `timeout_secs` overrides the runner's own bound for this one command; `None` keeps the
+    /// runner default. A gate that declares a bound and is not held to it would be worse than
+    /// one that declares none, so the bound travels with the command rather than being
+    /// advisory configuration.
+    fn run(&self, cmd: &str, timeout_secs: Option<u64>) -> GateResult;
 }
 
 /// Measures the age of the newest file matching a glob.

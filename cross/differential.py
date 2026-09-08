@@ -7890,6 +7890,96 @@ def compare_cpuset_alloc() -> int:
     return 0
 
 
+def compare_tick_hub_phased_cadence(
+    py: Sequence[str], rs: Sequence[str], rep: Report
+) -> None:
+    """Phased cadences and per-gate timeouts must mean the same thing in both editions.
+
+    These live HERE, in the mandatory differential, rather than in a pytest case that skips
+    when the Rust binary is absent. The normal order runs the Python suite before cargo
+    builds anything, so such a case passes by skipping on a clean checkout -- it would have
+    reported success for exactly the one-edition regression it exists to catch. This harness
+    resolves the binary through the tracked launcher and RAISES when it cannot, so absence
+    is a failure rather than a quiet pass.
+    """
+    phased: dict[str, object] = {
+        "reminders": [
+            {
+                "name": "phase_a",
+                "cadence_secs": 3600,
+                "cadence_offset_secs": 0,
+                "cadence_window_secs": 1800,
+                "emit": {"kind": "note", "title": "a"},
+            },
+            {
+                "name": "phase_b",
+                "cadence_secs": 3600,
+                "cadence_offset_secs": 1800,
+                "emit": {"kind": "note", "title": "b"},
+            },
+            {"name": "plain", "cadence_secs": 3600, "emit": {"kind": "note", "title": "p"}},
+        ]
+    }
+    bounded: dict[str, object] = {
+        "reminders": [
+            {
+                "name": "bounded",
+                "cadence_secs": 3600,
+                "gate": {
+                    "cmd": "true",
+                    "when": "failure",
+                    "capture": True,
+                    "timeout_secs": 90,
+                    "parallel": True,
+                },
+                "emit": {"kind": "note", "title": "b"},
+            }
+        ]
+    }
+    # Each must be refused by BOTH editions. A shape one takes and the other rejects splits
+    # the contract just as surely as a parse failure, only more quietly.
+    refusals: dict[str, dict[str, object]] = {
+        "offset_at_cadence": {"reminders": [{"name": "r", "cadence_secs": 3600,
+            "cadence_offset_secs": 3600, "emit": {"kind": "note", "title": "t"}}]},
+        "offset_on_every_tick": {"reminders": [{"name": "r", "cadence_secs": 0,
+            "cadence_offset_secs": 5, "emit": {"kind": "note", "title": "t"}}]},
+        "window_without_offset": {"reminders": [{"name": "r", "cadence_secs": 3600,
+            "cadence_window_secs": 60, "emit": {"kind": "note", "title": "t"}}]},
+        "window_beyond_cadence": {"reminders": [{"name": "r", "cadence_secs": 3600,
+            "cadence_offset_secs": 0, "cadence_window_secs": 3601,
+            "emit": {"kind": "note", "title": "t"}}]},
+        "gate_timeout_zero": {"reminders": [{"name": "r", "cadence_secs": 3600,
+            "gate": {"cmd": "true", "timeout_secs": 0},
+            "emit": {"kind": "note", "title": "t"}}]},
+    }
+    with tempfile.TemporaryDirectory(prefix="tick-hub-phase-") as tmp:
+        for label, config in (("phased", phased), ("gate-timeout", bounded)):
+            path = os.path.join(tmp, f"{label}.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(config, handle, ensure_ascii=False)
+            for subcommand in ("list", "json"):
+                _record_exact(
+                    rep,
+                    f"phase:{label}/{subcommand}",
+                    py,
+                    rs,
+                    (subcommand, "--config", path),
+                    expected=0,
+                )
+        for label, refusal in sorted(refusals.items()):
+            path = os.path.join(tmp, f"refuse-{label}.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(refusal, handle, ensure_ascii=False)
+            _record_exact(
+                rep,
+                f"phase:refuse/{label}",
+                py,
+                rs,
+                ("list", "--config", path),
+                expected=2,
+            )
+
+
 def compare_tick_hub(rand_count: int, seed: int) -> int:
     tool = "tick-hub"
     py = py_command_for(tool)
@@ -7898,6 +7988,7 @@ def compare_tick_hub(rand_count: int, seed: int) -> int:
 
     _record_exact(rep, "version", py, rs, ("--version",))
     compare_package_guides(tool, py, rs, rep)
+    compare_tick_hub_phased_cadence(py, rs, rep)
     for engine, command in (("py", py), ("rs", rs)):
         top = run(command, ("--help",))
         required = ("tick", "state", "list", "json", "yaml", "quickstart", "--userguide")

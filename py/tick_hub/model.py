@@ -88,7 +88,19 @@ class Reminder:
 
     ``cadence_secs`` is how often the reminder is CHECKED (``0`` = every tick);
     the check runs when at least that many seconds have elapsed since it last
-    ran. ``requires_flags`` names caller-state flags that must all be truthy for
+    ran. ``cadence_offset_secs`` optionally PHASES that cadence against absolute
+    time so reminders sharing a cadence need not come due on the same tick: the
+    reminder becomes due at the largest instant ``T <= now`` satisfying
+    ``T % cadence_secs == cadence_offset_secs``, and only if it has not fired
+    since that instant. Absolute time is deliberate -- the phase is a property of
+    the clock, not of how many ticks have run, so it survives a restart and is
+    identical on replay. ``cadence_window_secs`` bounds how long
+    after that instant the reminder may still be offered, so one that did not
+    complete is retried on its OWN phase instead of on every following tick --
+    without it a cut-off cohort lands wholesale on the tick meant to carry the
+    other half. It does not make a missed reminder count as done: no epoch is
+    recorded and it is offered again at its next instant. Leaving both ``None``
+    keeps the plain elapsed rule unchanged. ``requires_flags`` names caller-state flags that must all be truthy for
     the reminder to run at all (the generic analog of gating on a runtime toggle
     like "am I the ops driver?" or "is benchmarking enabled?"). ``depends_on``
     names other reminders whose explicit ``NO_RESULT`` makes this reminder's
@@ -103,6 +115,12 @@ class Reminder:
     requires_flags: Sequence[str] = field(default_factory=tuple)
     gate: Gate | None = None
     depends_on: Sequence[str] = field(default_factory=tuple)
+    # ⚠️ APPENDED, NOT INSERTED. Placing these before requires_flags/gate/depends_on
+    # would silently rebind existing POSITIONAL callers: Reminder(name, emit, 3600,
+    # ("flag",)) would hand the flags tuple to cadence_offset_secs and typecheck fine.
+    # New fields on a public dataclass go last.
+    cadence_offset_secs: int | None = None
+    cadence_window_secs: int | None = None
 
 
 @dataclass(frozen=True)
