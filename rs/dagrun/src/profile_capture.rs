@@ -1676,8 +1676,8 @@ fn wait_until(origin: Instant, offset_s: f64, finished: &AtomicBool) -> bool {
 }
 
 fn send_perf_command(
-    control: &mut File,
-    ack: &mut File,
+    control: &mut impl Write,
+    ack: &mut impl Read,
     command: &[u8],
     timeout: Duration,
     finished: &AtomicBool,
@@ -1688,9 +1688,13 @@ fn send_perf_command(
     let deadline = Instant::now() + timeout;
     let mut buffered = Vec::new();
     let mut chunk = [0u8; 256];
-    while Instant::now() < deadline && !finished.load(Ordering::Acquire) {
+    loop {
+        // `finish` can race with this controller after perf has written its acknowledgement but
+        // before this thread is scheduled to consume it. The production acknowledgement file is
+        // nonblocking, so make one final read before honoring either cancellation or the deadline.
+        // This preserves a completed handshake without waiting when no acknowledgement is ready.
         match ack.read(&mut chunk) {
-            Ok(0) => thread::sleep(Duration::from_millis(5)),
+            Ok(0) => {}
             Ok(count) => {
                 buffered.extend_from_slice(&chunk[..count]);
                 if let Some(newline) = buffered.iter().position(|byte| *byte == b'\n') {
@@ -1701,13 +1705,14 @@ fn send_perf_command(
                         .eq(b"ack".iter().copied());
                 }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(5));
-            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(_) => return false,
         }
+        if finished.load(Ordering::Acquire) || Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(5));
     }
-    false
 }
 
 fn create_fifo(path: &Path) -> std::io::Result<()> {
@@ -2912,6 +2917,28 @@ mod tests {
     use super::*;
     use crate::estimates::SpeedupLevel;
 
+    #[derive(Default)]
+    struct NoAck {
+        reads: usize,
+    }
+
+    impl Read for NoAck {
+        fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.reads += 1;
+            Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+        }
+    }
+
+    struct BrokenAck;
+
+    impl Read for BrokenAck {
+        fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other(
+                "planted acknowledgement read failure",
+            ))
+        }
+    }
+
     fn temp_dir(label: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "dagrun-profile-capture-{label}-{}-{}",
@@ -2948,6 +2975,116 @@ mod tests {
             diagnostic: String::new(),
             sudo: Vec::new(),
         }
+    }
+
+    #[test]
+    fn perf_command_drains_an_ack_written_before_finish() {
+        use std::os::unix::net::UnixStream;
+        use std::sync::Barrier;
+
+        let (mut ack, mut writer) = UnixStream::pair().unwrap();
+        ack.set_nonblocking(true).unwrap();
+        let written = Arc::new(Barrier::new(2));
+        let writer_written = Arc::clone(&written);
+        let child = thread::spawn(move || {
+            writer.write_all(b"ack\n").unwrap();
+            writer_written.wait();
+        });
+
+        // The barrier makes the ordering exact: the acknowledgement is already in the socket,
+        // then finish becomes observable, and only then may the controller consume it. The old
+        // pre-read cancellation check discarded this completed disable handshake.
+        written.wait();
+        let finished = AtomicBool::new(true);
+        let mut control = Vec::new();
+        let acknowledged = send_perf_command(
+            &mut control,
+            &mut ack,
+            b"disable\n",
+            Duration::from_secs(1),
+            &finished,
+        );
+        child.join().expect("acknowledgement writer must be reaped");
+        assert!(acknowledged);
+        assert_eq!(control, b"disable\n");
+    }
+
+    #[test]
+    fn perf_command_final_read_preserves_ready_ack_at_deadline() {
+        let finished = AtomicBool::new(false);
+        let mut control = Vec::new();
+        let mut ack = std::io::Cursor::new(b"ack\n".to_vec());
+        assert!(send_perf_command(
+            &mut control,
+            &mut ack,
+            b"enable\n",
+            Duration::ZERO,
+            &finished,
+        ));
+        assert_eq!(control, b"enable\n");
+    }
+
+    #[test]
+    fn perf_command_final_read_still_refuses_missing_or_invalid_ack() {
+        let finished = AtomicBool::new(true);
+
+        let mut control = Vec::new();
+        let mut eof = std::io::Cursor::new(Vec::<u8>::new());
+        assert!(!send_perf_command(
+            &mut control,
+            &mut eof,
+            b"disable\n",
+            Duration::from_secs(1),
+            &finished,
+        ));
+
+        let mut control = Vec::new();
+        let mut no_ack = NoAck::default();
+        assert!(!send_perf_command(
+            &mut control,
+            &mut no_ack,
+            b"disable\n",
+            Duration::from_secs(1),
+            &finished,
+        ));
+        assert_eq!(
+            no_ack.reads, 1,
+            "finish permits exactly one nonblocking drain"
+        );
+
+        let mut control = Vec::new();
+        let mut malformed = std::io::Cursor::new(b"not-an-ack\n".to_vec());
+        assert!(!send_perf_command(
+            &mut control,
+            &mut malformed,
+            b"disable\n",
+            Duration::from_secs(1),
+            &finished,
+        ));
+
+        let mut control = Vec::new();
+        assert!(!send_perf_command(
+            &mut control,
+            &mut BrokenAck,
+            b"disable\n",
+            Duration::from_secs(1),
+            &finished,
+        ));
+
+        let running = AtomicBool::new(false);
+        let mut control = Vec::new();
+        let mut no_ack = NoAck::default();
+        assert!(!send_perf_command(
+            &mut control,
+            &mut no_ack,
+            b"disable\n",
+            Duration::from_millis(10),
+            &running,
+        ));
+        assert!(
+            no_ack.reads >= 1,
+            "ordinary no-ack waits remain deadline-bounded"
+        );
     }
 
     #[test]
