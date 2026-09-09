@@ -51,18 +51,61 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
-fn process_start_time(pid: u32) -> Option<u64> {
+fn process_state_and_start_time(pid: u32) -> Option<(char, u64)> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    stat.rsplit_once(')')?
-        .1
-        .split_whitespace()
-        .nth(19)?
-        .parse()
-        .ok()
+    let mut fields = stat.rsplit_once(')')?.1.split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    let start_time = fields.nth(18)?.parse().ok()?;
+    Some((state, start_time))
 }
 
-fn exact_process_is_present(pid: u32, start_time: u64) -> bool {
-    process_start_time(pid) == Some(start_time)
+fn process_start_time(pid: u32) -> Option<u64> {
+    process_state_and_start_time(pid).map(|(_, start_time)| start_time)
+}
+
+fn exact_process_can_still_run(pid: u32, start_time: u64) -> bool {
+    matches!(
+        process_state_and_start_time(pid),
+        Some((state, observed))
+            if observed == start_time && !matches!(state, 'Z' | 'X' | 'x')
+    )
+}
+
+#[test]
+fn exact_process_liveness_distinguishes_running_from_killed_unreaped() {
+    let mut child = Command::new("/bin/sleep")
+        .arg("60")
+        .spawn()
+        .expect("failed to spawn liveness control");
+    let pid = child.id();
+    let start_time = process_start_time(pid).expect("live child must expose a start time");
+    assert!(
+        exact_process_can_still_run(pid, start_time),
+        "a matching non-zombie process must remain a live-survivor failure"
+    );
+
+    child.kill().expect("failed to stop liveness control");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut observed_state = None;
+    while Instant::now() < deadline {
+        observed_state = process_state_and_start_time(pid).map(|(state, _)| state);
+        if observed_state == Some('Z') {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let zombie_is_live = exact_process_can_still_run(pid, start_time);
+    child.wait().expect("failed to reap liveness control");
+
+    assert_eq!(
+        Some('Z'),
+        observed_state,
+        "a killed child must be observed before it is reaped"
+    );
+    assert!(
+        !zombie_is_live,
+        "a zombie cannot execute and is not a survivor"
+    );
 }
 
 struct Out {
@@ -606,7 +649,7 @@ fn direct_cgroup_kills_matching_contained_payload_and_proves_empty() {
     );
     let (pid, start_time, cgroup) = observation.expect("contained payload was never observed");
     assert!(
-        !exact_process_is_present(pid, start_time),
+        !exact_process_can_still_run(pid, start_time),
         "the exact matching contained payload survived cgroup teardown"
     );
     assert!(
