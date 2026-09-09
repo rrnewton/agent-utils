@@ -533,28 +533,36 @@ fn direct_cgroup_kills_matching_contained_payload_and_proves_empty() {
         .stderr(Stdio::piped());
     let mut child = runner.spawn().expect("failed to spawn dagrun");
 
+    let read_observation = || -> Option<(u32, u64, PathBuf)> {
+        let pid: u32 = std::fs::read_to_string(&pid_file)
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
+        let start_time = process_start_time(pid)?;
+        let cgroup_text = std::fs::read_to_string(&cgroup_file).ok()?;
+        let cgroup_text = cgroup_text.trim();
+        if cgroup_text.is_empty() {
+            return None;
+        }
+        let cgroup = PathBuf::from(cgroup_text);
+        let populated = std::fs::read_to_string(cgroup.join("cgroup.events"))
+            .ok()
+            .is_some_and(|events| events.lines().any(|line| line == "populated 1"));
+        populated.then_some((pid, start_time, cgroup))
+    };
     let deadline = Instant::now() + Duration::from_secs(5);
-    while (!pid_file.is_file() || !cgroup_file.is_file()) && Instant::now() < deadline {
+    let mut observation = None;
+    while Instant::now() < deadline {
         if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        if let Some(current) = read_observation() {
+            observation = Some(current);
             break;
         }
         thread::sleep(Duration::from_millis(10));
     }
-    let observation = if pid_file.is_file() && cgroup_file.is_file() {
-        let pid: u32 = std::fs::read_to_string(&pid_file)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        let start_time = process_start_time(pid);
-        let cgroup = PathBuf::from(std::fs::read_to_string(&cgroup_file).unwrap().trim());
-        let populated = std::fs::read_to_string(cgroup.join("cgroup.events"))
-            .ok()
-            .is_some_and(|events| events.lines().any(|line| line == "populated 1"));
-        Some((pid, start_time, cgroup, populated))
-    } else {
-        None
-    };
     std::fs::write(&release_file, b"release\n").unwrap();
 
     let output = child.wait_with_output().expect("failed to wait for dagrun");
@@ -585,13 +593,7 @@ fn direct_cgroup_kills_matching_contained_payload_and_proves_empty() {
         output.status.success(),
         "matching contained-payload run failed:\n{text}"
     );
-    let (pid, start_time, cgroup, populated) =
-        observation.expect("contained payload was never observed");
-    assert!(
-        populated,
-        "matching payload cgroup was not observed populated"
-    );
-    let start_time = start_time.expect("payload must be live before leader release");
+    let (pid, start_time, cgroup) = observation.expect("contained payload was never observed");
     assert!(
         !exact_process_is_present(pid, start_time),
         "the exact matching contained payload survived cgroup teardown"
