@@ -412,6 +412,18 @@ pub struct GuestLaunch {
 struct GuestLaunchState {
     launch: Mutex<Option<GuestLaunch>>,
     ready: Condvar,
+    #[cfg(test)]
+    controller: Mutex<GuestLaunchControllerObservation>,
+    #[cfg(test)]
+    controller_ready: Condvar,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct GuestLaunchControllerObservation {
+    launch_observed: bool,
+    finished: bool,
+    error: String,
 }
 
 /// Cloneable one-shot notification used to anchor profiler windows to guest launch.
@@ -474,6 +486,8 @@ impl GuestLaunchSignal {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         loop {
             if let Some(launch) = launch.as_ref() {
+                #[cfg(test)]
+                self.record_controller_launch_observed();
                 return Some(launch.clone());
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -499,6 +513,82 @@ impl GuestLaunchSignal {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .is_some()
+    }
+
+    #[cfg(test)]
+    fn record_controller_launch_observed(&self) {
+        let mut observation = self
+            .state
+            .controller
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        observation.launch_observed = true;
+        self.state.controller_ready.notify_all();
+    }
+
+    #[cfg(test)]
+    fn record_controller_finished(&self, error: &str) {
+        let mut observation = self
+            .state
+            .controller
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        observation.finished = true;
+        observation.error.clear();
+        observation.error.push_str(error);
+        self.state.controller_ready.notify_all();
+    }
+
+    #[cfg(test)]
+    fn wait_for_controller_launch(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut observation = self
+            .state
+            .controller
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while !observation.launch_observed {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let (next, timeout_result) = self
+                .state
+                .controller_ready
+                .wait_timeout(observation, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            observation = next;
+            if timeout_result.timed_out() && !observation.launch_observed {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[cfg(test)]
+    fn wait_for_controller_finish(&self, timeout: Duration) -> Option<String> {
+        let deadline = Instant::now() + timeout;
+        let mut observation = self
+            .state
+            .controller
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while !observation.finished {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            let (next, timeout_result) = self
+                .state
+                .controller_ready
+                .wait_timeout(observation, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            observation = next;
+            if timeout_result.timed_out() && !observation.finished {
+                return None;
+            }
+        }
+        Some(observation.error.clone())
     }
 }
 
@@ -2289,6 +2379,10 @@ fn start_wprof_stop_controller(
                     Err(mpsc::TryRecvError::Empty) => {}
                 }
                 if profiler.exited(Duration::ZERO).unwrap_or(false) {
+                    #[cfg(test)]
+                    guest_launch.record_controller_finished(
+                        "wprof exited before the profiling window opened",
+                    );
                     return WprofStopOutcome {
                         error: "wprof exited before the profiling window opened".to_string(),
                         ..WprofStopOutcome::default()
@@ -2311,6 +2405,10 @@ fn start_wprof_stop_controller(
                     Err(mpsc::TryRecvError::Empty) => {}
                 }
                 if profiler.exited(Duration::ZERO).unwrap_or(false) {
+                    #[cfg(test)]
+                    guest_launch.record_controller_finished(
+                        "wprof exited before the profiling window ended",
+                    );
                     return WprofStopOutcome {
                         error: "wprof exited before the profiling window ended".to_string(),
                         ..WprofStopOutcome::default()
@@ -3540,21 +3638,24 @@ while :; do sleep 0.01; done
         let fake = root.join("early-wprof");
         let descendant_path = root.join("descendant.pid");
         let late_path = root.join("descendant.late");
+        let exit_path = root.join("exit-now");
         fs::write(
             &fake,
             r#"#!/bin/sh
 child_file=''
 late_file=''
+exit_file=''
 for arg in "$@"; do
   case "$arg" in
     --child-file=*) child_file=${arg#--child-file=} ;;
     --late-file=*) late_file=${arg#--late-file=} ;;
+    --exit-file=*) exit_file=${arg#--exit-file=} ;;
   esac
 done
 ( sleep 30; printf 'late\n' > "$late_file" ) </dev/null >/dev/null 2>&1 &
 printf '%s\n' "$!" > "$child_file"
 printf 'Running in flight recorder mode, press Ctrl-C to stop...\n'
-sleep 0.02
+while [ ! -e "$exit_file" ]; do sleep 0.01; done
 exit 0
 "#,
         )
@@ -3570,6 +3671,9 @@ exit 0
         config
             .wprof_args
             .push(format!("--late-file={}", late_path.display()));
+        config
+            .wprof_args
+            .push(format!("--exit-file={}", exit_path.display()));
         let preflight = BTreeMap::from([(CaptureKind::Wprof, usable(CaptureKind::Wprof, &fake))]);
         let mut descendant_identity = None;
         let mut run = |request: &IsolatedTrialRequest| {
@@ -3584,7 +3688,20 @@ exit 0
             let (_, start_time) = process_state_and_start_time(descendant)
                 .expect("the escaped descendant must be live before teardown");
             descendant_identity = Some((descendant, start_time));
-            thread::sleep(Duration::from_millis(130));
+            assert!(
+                request
+                    .guest_launch
+                    .wait_for_controller_launch(Duration::from_secs(2)),
+                "the stop controller did not observe the guest launch"
+            );
+            fs::write(&exit_path, b"exit\n").unwrap();
+            assert_eq!(
+                request
+                    .guest_launch
+                    .wait_for_controller_finish(Duration::from_secs(2))
+                    .as_deref(),
+                Some("wprof exited before the profiling window ended")
+            );
             Ok(IsolatedTrialResult {
                 returncode: 0,
                 wall_s: 0.13,
@@ -3594,9 +3711,10 @@ exit 0
         let error = capture_with_preflight(&selection(0.12), &config, &mut run, |_| Ok(preflight))
             .unwrap_err();
         let manifest = error.manifest.unwrap();
-        assert!(manifest.trials[0]
-            .error
-            .contains("wprof exited before the profiling window ended"));
+        assert_eq!(
+            manifest.trials[0].error,
+            "wprof exited before the profiling window ended; wprof produced incomplete artifacts"
+        );
         assert_eq!(
             manifest.trials[0].profiler_returncode,
             Some(0),
@@ -3611,6 +3729,62 @@ exit 0
             !late_path.exists(),
             "the escaped descendant produced late output"
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn wprof_exit_before_guest_launch_stays_a_pre_window_failure() {
+        let root = temp_dir("wprof-exit-before-launch");
+        let fake = root.join("early-wprof");
+        let exit_path = root.join("exit-now");
+        fs::write(
+            &fake,
+            r#"#!/bin/sh
+exit_file=''
+for arg in "$@"; do
+  case "$arg" in --exit-file=*) exit_file=${arg#--exit-file=} ;; esac
+done
+printf 'Running in flight recorder mode, press Ctrl-C to stop...\n'
+while [ ! -e "$exit_file" ]; do sleep 0.01; done
+exit 0
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut config = CaptureConfig::new(&root);
+        config.wprof_windows = 1;
+        config.wprof_window_s = 0.02;
+        config.profiler_exit_grace_s = 0.05;
+        config
+            .wprof_args
+            .push(format!("--exit-file={}", exit_path.display()));
+        let preflight = BTreeMap::from([(CaptureKind::Wprof, usable(CaptureKind::Wprof, &fake))]);
+        let mut run = |request: &IsolatedTrialRequest| {
+            fs::write(&exit_path, b"exit\n").unwrap();
+            assert_eq!(
+                request
+                    .guest_launch
+                    .wait_for_controller_finish(Duration::from_secs(2))
+                    .as_deref(),
+                Some("wprof exited before the profiling window opened")
+            );
+            request
+                .notify_guest_launched(&request.step, std::process::id(), Instant::now())
+                .unwrap();
+            Ok(IsolatedTrialResult {
+                returncode: 0,
+                wall_s: 0.0,
+                detail: String::new(),
+            })
+        };
+        let error = capture_with_preflight(&selection(0.12), &config, &mut run, |_| Ok(preflight))
+            .unwrap_err();
+        let manifest = error.manifest.unwrap();
+        assert_eq!(
+            manifest.trials[0].error,
+            "wprof exited before the profiling window opened; wprof produced incomplete artifacts"
+        );
+        assert_eq!(manifest.trials[0].profiler_returncode, Some(0));
         fs::remove_dir_all(root).unwrap();
     }
 
