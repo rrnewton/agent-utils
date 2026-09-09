@@ -4334,6 +4334,148 @@ def test_ownerless_cleanup_accepts_current_pass_with_failed_writeback(
     assert not target.exists()
 
 
+def current_terminal_validation_record(
+    *, schema: int = 4, status: str = "PASSED"
+) -> dict[str, object]:
+    outcomes = {
+        "PASSED": ("success", 0, 7, 7),
+        "FAILED": ("failure", 1, 7, 6),
+        "COULD_NOT_RUN": ("no-result", 75, None, None),
+    }
+    result, exit_code, executed_tests, passed_tests = outcomes[status]
+    record: dict[str, object] = {
+        "state": "completed",
+        "result": result,
+        "final_validate_status": status,
+        "exit_code": exit_code,
+        "service_result_schema": schema,
+        "selection_mode": "full",
+        "executed_tests": executed_tests,
+        "passed_tests": passed_tests,
+        "scorecard_writeback": {"status": "completed"},
+    }
+    if schema == 5:
+        record["detail"] = "guest execution failed" if status == "COULD_NOT_RUN" else None
+    return record
+
+
+def test_current_validation_record_requires_authoritative_counts() -> None:
+    record = current_terminal_validation_record()
+    assert wrkslots._validation_record_is_terminal(record, target_kind="cargo-home")
+
+    mutations: tuple[tuple[str, object], ...] = (
+        ("service_result_schema", 4.0),
+        ("service_result_schema", True),
+        ("service_result_schema", 6),
+        ("passed_tests", None),
+        ("passed_tests", 6),
+        ("passed_tests", True),
+        ("executed_tests", 7.0),
+        ("selection_mode", ""),
+        ("scorecard_writeback", {"status": "failed", "error": ""}),
+        ("detail", None),
+        ("result", "failure"),
+    )
+    for field, value in mutations:
+        changed = dict(record)
+        changed[field] = value
+        assert not wrkslots._validation_record_is_terminal(
+            changed, target_kind="cargo-home"
+        ), (field, value)
+
+    for field in (
+        "selection_mode",
+        "executed_tests",
+        "passed_tests",
+        "scorecard_writeback",
+    ):
+        changed = dict(record)
+        del changed[field]
+        assert not wrkslots._validation_record_is_terminal(
+            changed, target_kind="cargo-home"
+        ), field
+
+
+def test_current_validation_record_preserves_failed_writeback_exit() -> None:
+    record = current_terminal_validation_record()
+    record["scorecard_writeback"] = {
+        "status": "failed",
+        "error": "could not publish scorecard",
+    }
+    record["exit_code"] = 75
+    assert wrkslots._validation_record_is_terminal(record, target_kind="cargo-home")
+
+    record["exit_code"] = 0
+    assert not wrkslots._validation_record_is_terminal(
+        record, target_kind="cargo-home"
+    )
+
+
+def test_schema_five_terminal_record_requires_status_appropriate_detail() -> None:
+    record = current_terminal_validation_record(schema=5, status="COULD_NOT_RUN")
+    assert wrkslots._validation_record_is_terminal(record, target_kind="cargo-home")
+
+    for detail in (None, "", [], ["guest execution failed"]):
+        changed = dict(record)
+        changed["detail"] = detail
+        assert not wrkslots._validation_record_is_terminal(
+            changed, target_kind="cargo-home"
+        ), detail
+    missing = dict(record)
+    del missing["detail"]
+    assert not wrkslots._validation_record_is_terminal(
+        missing, target_kind="cargo-home"
+    )
+
+    passed = current_terminal_validation_record(schema=5)
+    assert wrkslots._validation_record_is_terminal(passed, target_kind="cargo-home")
+    passed["detail"] = "unexpected"
+    assert not wrkslots._validation_record_is_terminal(
+        passed, target_kind="cargo-home"
+    )
+
+
+@pytest.mark.parametrize(
+    ("schema", "status", "missing"),
+    ((4, "PASSED", "passed_tests"), (5, "COULD_NOT_RUN", "detail")),
+)
+def test_ownerless_cleanup_retains_incomplete_current_validation_record(
+    tmp_path: Path, schema: int, status: str, missing: str
+) -> None:
+    project, _repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    target = project / "worktrees" / "validate" / f"validate-cargo-schema-{schema}"
+    target.mkdir(parents=True)
+    record = prepare_terminal_validation_record(
+        project,
+        target,
+        field="cargo_home",
+        name=f"validate-schema-{schema}",
+    )
+    value = json.loads(record.read_text())
+    value.update(current_terminal_validation_record(schema=schema, status=status))
+    del value[missing]
+    record.write_text(json.dumps(value), encoding="utf-8")
+
+    refused = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--ownerless-validate-cargo-home",
+        target.relative_to(project).as_posix(),
+        "--completed-record",
+        record.relative_to(project).as_posix(),
+    )
+
+    assert refused.returncode == 3
+    assert "does not contain an evidenced terminal result" in refused.stderr
+    assert target.is_dir()
+
+
 def test_ownerless_cleanup_rejects_non_authoritative_service_result_schema(
     tmp_path: Path,
 ) -> None:
