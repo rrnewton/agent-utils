@@ -4349,7 +4349,9 @@ def current_terminal_validation_record(
         "final_validate_status": status,
         "exit_code": exit_code,
         "service_result_schema": schema,
+        "result_source": "validation-service-result",
         "selection_mode": "full",
+        "executed_nodes": 12,
         "executed_tests": executed_tests,
         "passed_tests": passed_tests,
         "scorecard_writeback": {"status": "completed"},
@@ -4371,9 +4373,12 @@ def test_current_validation_record_requires_authoritative_counts() -> None:
         ("passed_tests", 6),
         ("passed_tests", True),
         ("executed_tests", 7.0),
+        ("executed_nodes", -1),
+        ("executed_nodes", True),
         ("selection_mode", ""),
         ("scorecard_writeback", {"status": "failed", "error": ""}),
         ("detail", None),
+        ("result_source", "durable-log"),
         ("result", "failure"),
     )
     for field, value in mutations:
@@ -4385,6 +4390,8 @@ def test_current_validation_record_requires_authoritative_counts() -> None:
 
     for field in (
         "selection_mode",
+        "result_source",
+        "executed_nodes",
         "executed_tests",
         "passed_tests",
         "scorecard_writeback",
@@ -4437,7 +4444,12 @@ def test_schema_five_terminal_record_requires_status_appropriate_detail() -> Non
 
 @pytest.mark.parametrize(
     ("schema", "status", "missing"),
-    ((4, "PASSED", "passed_tests"), (5, "COULD_NOT_RUN", "detail")),
+    (
+        (4, "PASSED", "passed_tests"),
+        (4, "PASSED", "executed_nodes"),
+        (4, "PASSED", "result_source"),
+        (5, "COULD_NOT_RUN", "detail"),
+    ),
 )
 def test_ownerless_cleanup_retains_incomplete_current_validation_record(
     tmp_path: Path, schema: int, status: str, missing: str
