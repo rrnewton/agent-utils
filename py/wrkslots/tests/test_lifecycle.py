@@ -2529,6 +2529,8 @@ def test_current_validation_record_requires_authoritative_counts() -> None:
         ("service_result_schema", 4.0),
         ("service_result_schema", True),
         ("service_result_schema", 6),
+        ("exit_code", False),
+        ("exit_code", 0.0),
         ("passed_tests", None),
         ("passed_tests", 6),
         ("passed_tests", True),
@@ -2576,6 +2578,13 @@ def test_current_validation_record_preserves_failed_writeback_exit() -> None:
     assert not wrkslots._validation_record_is_terminal(
         record, target_kind="cargo-home"
     )
+
+    failed = current_terminal_validation_record(status="FAILED")
+    for exit_code in (True, 1.0):
+        failed["exit_code"] = exit_code
+        assert not wrkslots._validation_record_is_terminal(
+            failed, target_kind="cargo-home"
+        ), exit_code
 
 
 def test_schema_five_terminal_record_requires_status_appropriate_detail() -> None:
@@ -2630,6 +2639,46 @@ def test_ownerless_cleanup_retains_incomplete_current_validation_record(
     value = json.loads(record.read_text())
     value.update(current_terminal_validation_record(schema=schema, status=status))
     del value[missing]
+    record.write_text(json.dumps(value), encoding="utf-8")
+
+    refused = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--ownerless-validate-cargo-home",
+        target.relative_to(project).as_posix(),
+        "--completed-record",
+        record.relative_to(project).as_posix(),
+    )
+
+    assert refused.returncode == 3
+    assert "does not contain an evidenced terminal result" in refused.stderr
+    assert target.is_dir()
+
+
+@pytest.mark.parametrize(
+    ("status", "exit_code"), (("PASSED", False), ("FAILED", True))
+)
+def test_ownerless_cleanup_retains_boolean_current_validation_exit(
+    tmp_path: Path, status: str, exit_code: bool
+) -> None:
+    project, _repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    target = project / "worktrees" / "validate" / f"validate-cargo-{status.lower()}"
+    target.mkdir(parents=True)
+    record = prepare_terminal_validation_record(
+        project,
+        target,
+        field="cargo_home",
+        name=f"validate-{status.lower()}",
+    )
+    value = json.loads(record.read_text())
+    value.update(current_terminal_validation_record(status=status))
+    value["exit_code"] = exit_code
     record.write_text(json.dumps(value), encoding="utf-8")
 
     refused = command(

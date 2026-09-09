@@ -13698,7 +13698,12 @@ def _current_validation_result_is_terminal(
         expected_exit = 75
     else:
         expected_exit = {"PASSED": 0, "FAILED": 1, "COULD_NOT_RUN": 75}[status]
-    return record.get("exit_code") == expected_exit
+    exit_code = record.get("exit_code")
+    return (
+        isinstance(exit_code, int)
+        and not isinstance(exit_code, bool)
+        and exit_code == expected_exit
+    )
 
 
 def _validation_record_is_terminal(
