@@ -2967,6 +2967,35 @@ mod tests {
         path
     }
 
+    fn process_state_and_start_time(pid: i32) -> Option<(char, u64)> {
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let mut fields = stat.rsplit_once(')')?.1.split_whitespace();
+        let state = fields.next()?.chars().next()?;
+        let start_time = fields.nth(18)?.parse().ok()?;
+        Some((state, start_time))
+    }
+
+    fn exact_process_can_still_run(pid: i32, start_time: u64) -> bool {
+        matches!(
+            process_state_and_start_time(pid),
+            Some((state, observed))
+                if observed == start_time && !matches!(state, 'Z' | 'X' | 'x')
+        )
+    }
+
+    fn wait_for_exact_process_to_stop(pid: i32, start_time: u64, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if !exact_process_can_still_run(pid, start_time) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     fn selection(expected_wall_s: f64) -> SweetSpotSelection {
         SweetSpotSelection {
             step: "build.app".to_string(),
@@ -3510,14 +3539,19 @@ while :; do sleep 0.01; done
         let root = temp_dir("wprof-early-exit");
         let fake = root.join("early-wprof");
         let descendant_path = root.join("descendant.pid");
+        let late_path = root.join("descendant.late");
         fs::write(
             &fake,
             r#"#!/bin/sh
 child_file=''
+late_file=''
 for arg in "$@"; do
-  case "$arg" in --child-file=*) child_file=${arg#--child-file=} ;; esac
+  case "$arg" in
+    --child-file=*) child_file=${arg#--child-file=} ;;
+    --late-file=*) late_file=${arg#--late-file=} ;;
+  esac
 done
-sleep 30 &
+( sleep 30; printf 'late\n' > "$late_file" ) </dev/null >/dev/null 2>&1 &
 printf '%s\n' "$!" > "$child_file"
 printf 'Running in flight recorder mode, press Ctrl-C to stop...\n'
 sleep 0.02
@@ -3533,11 +3567,23 @@ exit 0
         config
             .wprof_args
             .push(format!("--child-file={}", descendant_path.display()));
+        config
+            .wprof_args
+            .push(format!("--late-file={}", late_path.display()));
         let preflight = BTreeMap::from([(CaptureKind::Wprof, usable(CaptureKind::Wprof, &fake))]);
+        let mut descendant_identity = None;
         let mut run = |request: &IsolatedTrialRequest| {
             request
                 .notify_guest_launched(&request.step, std::process::id(), Instant::now())
                 .unwrap();
+            let descendant = fs::read_to_string(&descendant_path)
+                .unwrap()
+                .trim()
+                .parse::<i32>()
+                .unwrap();
+            let (_, start_time) = process_state_and_start_time(descendant)
+                .expect("the escaped descendant must be live before teardown");
+            descendant_identity = Some((descendant, start_time));
             thread::sleep(Duration::from_millis(130));
             Ok(IsolatedTrialResult {
                 returncode: 0,
@@ -3551,18 +3597,58 @@ exit 0
         assert!(manifest.trials[0]
             .error
             .contains("wprof exited before the profiling window ended"));
-        let descendant = fs::read_to_string(&descendant_path)
-            .unwrap()
-            .trim()
-            .parse::<i32>()
-            .unwrap();
-        // SAFETY: signal 0 performs existence/permission checking only.
-        assert_eq!(unsafe { libc::kill(descendant, 0) }, -1);
         assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::ESRCH)
+            manifest.trials[0].profiler_returncode,
+            Some(0),
+            "the direct wprof child must be reaped with its real exit status"
+        );
+        let (descendant, start_time) = descendant_identity.unwrap();
+        assert!(
+            wait_for_exact_process_to_stop(descendant, start_time, Duration::from_secs(2)),
+            "the exact escaped descendant remained runnable after process-group teardown"
+        );
+        assert!(
+            !late_path.exists(),
+            "the escaped descendant produced late output"
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn exact_process_liveness_distinguishes_running_from_killed_unreaped() {
+        let mut child = Command::new("/bin/sleep").arg("60").spawn().unwrap();
+        let pid = i32::try_from(child.id()).unwrap();
+        let (_, start_time) = process_state_and_start_time(pid).unwrap();
+        assert!(
+            exact_process_can_still_run(pid, start_time),
+            "a live same-generation child must remain a teardown failure"
+        );
+
+        child.kill().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let observed_state = loop {
+            if let Some((state, observed_start)) = process_state_and_start_time(pid) {
+                if observed_start == start_time && matches!(state, 'Z' | 'X' | 'x') {
+                    break state;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the killed child did not reach a terminal process state"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert!(matches!(observed_state, 'Z' | 'X' | 'x'));
+        assert!(
+            !exact_process_can_still_run(pid, start_time),
+            "a killed-but-unreaped child cannot execute"
+        );
+
+        child.wait().unwrap();
+        assert!(
+            process_state_and_start_time(pid).is_none(),
+            "waiting for the direct child must reap its /proc entry"
+        );
     }
 
     #[test]
