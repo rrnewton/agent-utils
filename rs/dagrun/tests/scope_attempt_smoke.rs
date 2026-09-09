@@ -486,6 +486,8 @@ fn direct_cgroup_kills_matching_contained_payload_and_proves_empty() {
     let fixture = Fixture::new("direct_matching_kill");
     let pid_file = fixture.dir.join("payload.pid");
     let cgroup_file = fixture.dir.join("payload.cgroup");
+    let ready_file = fixture.dir.join("payload.ready");
+    let ready_tmp = fixture.dir.join("payload.ready.tmp");
     let release_file = fixture.dir.join("leader.release");
     let late_marker = fixture.dir.join("payload.late");
     let payload = format!(
@@ -498,10 +500,14 @@ fn direct_cgroup_kills_matching_contained_payload_and_proves_empty() {
     let command = format!(
         "setsid /bin/sh -c {} </dev/null >/dev/null 2>&1 & \
          while [ ! -s {} ] || [ ! -s {} ]; do sleep 0.01; done; \
+         printf 'ready\\n' > {} && mv {} {}; \
          while [ ! -e {} ]; do sleep 0.01; done",
         shell_quote(&payload),
         shell_quote(&pid_file.to_string_lossy()),
         shell_quote(&cgroup_file.to_string_lossy()),
+        shell_quote(&ready_tmp.to_string_lossy()),
+        shell_quote(&ready_tmp.to_string_lossy()),
+        shell_quote(&ready_file.to_string_lossy()),
         shell_quote(&release_file.to_string_lossy()),
     );
     let dag = fixture.dir.join("matching.json");
@@ -557,9 +563,14 @@ fn direct_cgroup_kills_matching_contained_payload_and_proves_empty() {
         if child.try_wait().unwrap().is_some() {
             break;
         }
-        if let Some(current) = read_observation() {
-            observation = Some(current);
-            break;
+        let ready = std::fs::read_to_string(&ready_file)
+            .ok()
+            .is_some_and(|contents| contents == "ready\n");
+        if ready {
+            if let Some(current) = read_observation() {
+                observation = Some(current);
+                break;
+            }
         }
         thread::sleep(Duration::from_millis(10));
     }
