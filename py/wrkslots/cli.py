@@ -13602,6 +13602,95 @@ def _validation_record_process_is_dead(record: Mapping[str, object]) -> bool:
     return current_boot != boot_id or process is None or process.start_ticks != start_ticks
 
 
+def _current_validation_result_is_terminal(
+    record: Mapping[str, object], *, schema: int, status: str
+) -> bool:
+    """Require every current result field that makes cleanup authoritative."""
+
+    expected_results = {
+        "PASSED": "success",
+        "FAILED": "failure",
+        "COULD_NOT_RUN": "no-result",
+    }
+    expected_result = expected_results.get(status)
+    if expected_result is None or record.get("result") != expected_result:
+        return False
+    if "selection_mode" not in record:
+        return False
+    selection_mode = record.get("selection_mode")
+    if selection_mode is not None and (
+        not isinstance(selection_mode, str) or not selection_mode.strip()
+    ):
+        return False
+    if (
+        "scorecard_writeback" not in record
+        or "executed_tests" not in record
+        or "passed_tests" not in record
+    ):
+        return False
+    writeback = record.get("scorecard_writeback")
+    if writeback is not None:
+        if not isinstance(writeback, dict):
+            return False
+        if writeback == {"status": "completed"}:
+            pass
+        elif (
+            set(writeback) == {"status", "error"}
+            and writeback.get("status") == "failed"
+            and isinstance(writeback.get("error"), str)
+            and bool(str(writeback["error"]).strip())
+        ):
+            pass
+        else:
+            return False
+    executed_tests = record.get("executed_tests")
+    passed_tests = record.get("passed_tests")
+    if executed_tests is not None and (
+        not isinstance(executed_tests, int)
+        or isinstance(executed_tests, bool)
+        or executed_tests < 0
+    ):
+        return False
+    if passed_tests is not None and (
+        not isinstance(passed_tests, int)
+        or isinstance(passed_tests, bool)
+        or passed_tests < 0
+    ):
+        return False
+    if (executed_tests is None) != (passed_tests is None):
+        return False
+    if (
+        executed_tests is not None
+        and passed_tests is not None
+        and passed_tests > executed_tests
+    ):
+        return False
+    if status == "PASSED" and (
+        passed_tests is None or passed_tests != executed_tests
+    ):
+        return False
+    if schema == 5:
+        if "detail" not in record:
+            return False
+        detail = record.get("detail")
+        if status == "COULD_NOT_RUN":
+            if not isinstance(detail, str) or not detail.strip():
+                return False
+        elif detail is not None:
+            return False
+    elif "detail" in record:
+        return False
+    if (
+        status == "PASSED"
+        and isinstance(writeback, dict)
+        and writeback.get("status") == "failed"
+    ):
+        expected_exit = 75
+    else:
+        expected_exit = {"PASSED": 0, "FAILED": 1, "COULD_NOT_RUN": 75}[status]
+    return record.get("exit_code") == expected_exit
+
+
 def _validation_record_is_terminal(
     record: Mapping[str, object], *, target_kind: str
 ) -> bool:
@@ -13632,8 +13721,18 @@ def _validation_record_is_terminal(
     status = record.get("final_validate_status")
     expected_exit = exits.get(status) if isinstance(status, str) else None
     schema = record.get("service_result_schema")
+    if schema is not None and (
+        not isinstance(schema, int)
+        or isinstance(schema, bool)
+        or schema not in {1, 2, 3, 4, 5}
+    ):
+        return False
     if schema in {1, 2}:
         expected_exit = None
+    elif schema in {4, 5} and isinstance(status, str):
+        return _current_validation_result_is_terminal(
+            record, schema=schema, status=status
+        )
     elif schema == 3:
         writeback = record.get("scorecard_writeback")
         failed = bool(
