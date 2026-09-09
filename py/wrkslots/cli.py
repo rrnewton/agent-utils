@@ -13615,6 +13615,8 @@ def _current_validation_result_is_terminal(
     expected_result = expected_results.get(status)
     if expected_result is None or record.get("result") != expected_result:
         return False
+    if record.get("result_source") != "validation-service-result":
+        return False
     if "selection_mode" not in record:
         return False
     selection_mode = record.get("selection_mode")
@@ -13623,7 +13625,8 @@ def _current_validation_result_is_terminal(
     ):
         return False
     if (
-        "scorecard_writeback" not in record
+        "executed_nodes" not in record
+        or "scorecard_writeback" not in record
         or "executed_tests" not in record
         or "passed_tests" not in record
     ):
@@ -13643,6 +13646,13 @@ def _current_validation_result_is_terminal(
             pass
         else:
             return False
+    executed_nodes = record.get("executed_nodes")
+    if (
+        not isinstance(executed_nodes, int)
+        or isinstance(executed_nodes, bool)
+        or executed_nodes < 0
+    ):
+        return False
     executed_tests = record.get("executed_tests")
     passed_tests = record.get("passed_tests")
     if executed_tests is not None and (
