@@ -441,6 +441,7 @@ class ValidationRecoveryAuthorization:
     head: str | None = None
     remote_url_sha256: str | None = None
     parent_identity: tuple[int, int, int] | None = None
+    stable_identity: _PrivateCleanupIdentity | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -5734,6 +5735,7 @@ def _assert_slot_unused(
     census: _ProcessPathCensus | None = None,
     fallback_census: _ProcessPathCensus | None = None,
     proc_root: Path = Path("/proc"),
+    ignore_current_process: bool = True,
 ) -> None:
     try:
         current_directory = Path.cwd().resolve(strict=True)
@@ -5748,6 +5750,7 @@ def _assert_slot_unused(
             slot_path,
             record,
             ignore_invoking_ancestry=ignore_invoking_ancestry,
+            ignore_current_process=ignore_current_process,
         )
         return
     lsof = next(
@@ -9322,6 +9325,7 @@ def _remove_cache_directory(
     *,
     allow_git_metadata: bool = False,
     expected_identity: tuple[int, int, int] | None = None,
+    expected_stable_identity: _PrivateCleanupIdentity | None = None,
 ) -> int:
     path = cache.path
     opened = _open_cache_directory(config, cache)
@@ -9337,6 +9341,14 @@ def _remove_cache_directory(
             mount_id,
         ):
             raise Refusal(f"cache directory identity changed before cleanup: {path}")
+        if (
+            expected_stable_identity is not None
+            and _fd_private_cleanup_identity(cache_fd, str(path))
+            != expected_stable_identity
+        ):
+            raise Refusal(
+                f"cache directory stable file-handle identity changed before cleanup: {path}"
+            )
         # Complete a read-only traversal before deletion begins. The destructive
         # traversal repeats every identity check so replacements still fail closed.
         _allocated_open_directory(
@@ -10599,14 +10611,17 @@ def _remove_fenced_directory(config: Config, fenced_slot: Path) -> None:
     _fsync_directory(fenced_slot.parent)
 
 
-def _assert_cleanup_fence_root_trusted(config: Config, fenced_slot: Path) -> None:
+def _assert_cleanup_fence_root_trusted(
+    config: Config, fenced_slot: Path, *, managed_root: Path | None = None
+) -> None:
     """Require a path namespace that another ordinary UID cannot rewrite."""
 
+    root = config.root if managed_root is None else managed_root
     try:
-        relative_parent = fenced_slot.parent.relative_to(config.root)
+        relative_parent = fenced_slot.parent.relative_to(root)
     except ValueError as exc:
-        raise Refusal(f"cleanup fence escapes the project root: {fenced_slot}") from exc
-    current = config.root
+        raise Refusal(f"cleanup fence escapes its managed root: {fenced_slot}") from exc
+    current = root
     for component in (None, *relative_parent.parts):
         if component is not None:
             current /= component
@@ -10692,11 +10707,17 @@ def _seal_cleanup_path_private(
 
 
 def _private_cleanup_path_identity(
-    config: Config, path: Path, *, allowed_modes: AbstractSet[int]
+    config: Config,
+    path: Path,
+    *,
+    allowed_modes: AbstractSet[int],
+    managed_root: Path | None = None,
 ) -> tuple[int, int, int, str]:
     """Prove an owned path's mode and return its stable directory identity."""
 
-    _assert_cleanup_fence_root_trusted(config, path)
+    _assert_cleanup_fence_root_trusted(
+        config, path, managed_root=managed_root
+    )
     try:
         metadata = path.stat(follow_symlinks=False)
     except OSError as exc:
@@ -13454,9 +13475,43 @@ def _recover_legacy_validate_remove(
     )
 
 
+def _frozen_validation_directory(config: Config) -> Path:
+    return config.root.parent / f".{config.root.name}-frozen-validate"
+
+
 def _validation_recovery_target(
     config: Config, raw: str, target_kind: str
 ) -> tuple[str, Path, tuple[str, str] | None]:
+    if target_kind == "frozen-checkout":
+        supplied = Path(raw)
+        if not supplied.is_absolute():
+            raise Refusal(
+                "frozen validation checkout is not an absolute path; pass the exact "
+                "absolute checkout path and retry"
+            )
+        if ".." in supplied.parts:
+            raise Refusal(
+                "frozen validation checkout path contains '..'; pass its normalized exact "
+                "absolute path and retry"
+            )
+        target = Path(os.path.normpath(raw))
+        frozen_root = _frozen_validation_directory(config)
+        allowed = (
+            target.parent == frozen_root
+            and target.name.startswith("validate-fresh-")
+        )
+        if not allowed:
+            raise Refusal(
+                "frozen checkout path is outside the exact sibling validation directory: "
+                f"{target}; preserve it or move it under {frozen_root}/validate-fresh-* "
+                "before retrying"
+            )
+        _validate_name(target.name, "validation recovery path name")
+        _ensure_no_symlink_components(
+            config.root.parent, target, "frozen validation recovery path"
+        )
+        return str(target), target, None
+
     relative, target = _relative_inside(config.root, raw, "validation recovery path")
     validate_root = _validate_slots_directory(config)
     if target_kind == "checkout":
@@ -13487,12 +13542,16 @@ def _terminal_validation_record(
     target_kind: str,
     *,
     expected_digest: str | None = None,
-) -> tuple[str, str]:
+    repository: Path | None = None,
+    expected_target: str | None = None,
+) -> tuple[str, str, str | None]:
     relative, path = _relative_inside(config.root, raw, "terminal validation record")
     if Path(relative).parent != Path("ignored/validate/runs") or path.suffix != ".json":
         raise Refusal("terminal validation record must be an ignored/validate/runs/*.json file")
     try:
-        contents = path.read_bytes()
+        contents = _read_bounded_regular_file(
+            path, "terminal validation record", 16 * 1024 * 1024
+        )
         value = json.loads(contents)
     except (OSError, json.JSONDecodeError) as exc:
         raise Refusal(f"terminal validation record is unreadable: {path}: {exc}") from exc
@@ -13500,32 +13559,80 @@ def _terminal_validation_record(
     if expected_digest is not None and digest != expected_digest:
         raise Refusal("terminal validation record changed after recovery was authorized")
     record = _as_mapping(value, "terminal validation record")
-    field = "checkout" if target_kind == "checkout" else "cargo_home"
+    field = (
+        "checkout"
+        if target_kind in {"checkout", "frozen-checkout"}
+        else "cargo_home"
+    )
     recorded = record.get(field)
     if not isinstance(recorded, str) or Path(recorded).resolve() != target:
         raise Refusal(f"terminal validation record does not name this exact {field}")
-    if target_kind == "checkout" and record.get("temporary_checkout") is False:
+    if target_kind in {"checkout", "frozen-checkout"} and record.get(
+        "temporary_checkout"
+    ) is False:
         raise Refusal("terminal validation record says the checkout is not temporary")
+    record_target: str | None = None
+    if target_kind == "frozen-checkout":
+        if (
+            record.get("schema_version") != 1
+            or record.get("kind") != "frozen-validate"
+            or record.get("producer") != "ci-hub/validate/run_registry.py"
+            or record.get("admission") != "frozen-validate"
+            or record.get("validation_kind") != "frozen-validate"
+            or record.get("temporary_checkout") is not True
+        ):
+            raise Refusal(
+                "terminal validation record is not an authoritative frozen-validation "
+                "handle; preserve the checkout and pass its current frozen run handle"
+            )
+        source = record.get("source_checkout")
+        if (
+            repository is None
+            or not isinstance(source, str)
+            or Path(source).resolve() != repository
+        ):
+            raise Refusal(
+                "terminal validation record does not name the exact source checkout; "
+                "preserve the checkout and pass the recorded source repository"
+            )
+        raw_target = record.get("target")
+        if not isinstance(raw_target, str) or not SHA_RE.fullmatch(raw_target):
+            raise Refusal(
+                "terminal validation record has no exact target commit; preserve the "
+                "checkout and repair or replace the run handle"
+            )
+        record_target = raw_target
+        if expected_target is not None and record_target != expected_target:
+            raise Refusal(
+                "terminal validation record target changed after authorization; preserve "
+                "the checkout and restore the authorized record before retrying"
+            )
     if not _validation_record_is_terminal(record, target_kind=target_kind):
         raise Refusal(
             "validation record does not contain an evidenced terminal result; no path was "
             "removed. Let validate-run finish recording the result or preserve the path"
         )
-    return relative, digest
+    return relative, digest, record_target
 
 
 def _validation_record_has_typed_admission(record: Mapping[str, object]) -> bool:
     """Return whether a current validation handle records a complete admission result."""
 
     kind = record.get("kind")
+    frozen = kind == "frozen-validate"
     if (
         type(record.get("schema_version")) is not int
         or record.get("schema_version") != 1
         or not isinstance(kind, str)
-        or kind not in {"validate", "reverie-validate"}
+        or kind not in {"validate", "reverie-validate", "frozen-validate"}
         or record.get("producer") != "ci-hub/validate/run_registry.py"
-        or record.get("admission") != "ci-hub validate-lock"
+        or record.get("admission")
+        != ("frozen-validate" if frozen else "ci-hub validate-lock")
         or record.get("temporary_checkout") is not True
+        or (
+            frozen
+            and record.get("validation_kind") != "frozen-validate"
+        )
     ):
         return False
     raw = record.get("admission_result")
@@ -13620,7 +13727,7 @@ def _validation_record_is_terminal(
         return True
     if state != "completed":
         return bool(
-            target_kind == "cargo-home"
+            target_kind in {"cargo-home", "frozen-checkout"}
             and state == "unknown"
             and record.get("result") == "unknown"
             and isinstance(record.get("detail"), str)
@@ -13656,7 +13763,11 @@ def _recordless_validation_evidence(
 ) -> Mapping[str, object]:
     if note is None or not note.strip():
         raise Refusal("recordless validation recovery requires a non-empty --recovery-note")
-    field = "checkout" if target_kind == "checkout" else "cargo_home"
+    field = (
+        "checkout"
+        if target_kind in {"checkout", "frozen-checkout"}
+        else "cargo_home"
+    )
     records = config.root / "ignored" / "validate" / "runs"
     if records.is_symlink() or (records.exists() and not records.is_dir()):
         raise Refusal(f"retained validation record directory is unsafe: {records}")
@@ -13699,6 +13810,7 @@ def _validation_checkout_facts(
     expected_remote: str | None = None,
     batch_cleanup: _OwnerlessValidationBatchContext | None = None,
     fresh_same_uid: bool = False,
+    standalone: bool = False,
 ) -> tuple[str, str]:
     if repository == checkout or _path_is_within(repository, checkout):
         raise Refusal("repository must survive removal and cannot be inside the checkout")
@@ -13709,9 +13821,23 @@ def _validation_checkout_facts(
     if (checkout / "HANDOFF.md").exists() or (checkout / "HANDOFF.md").is_symlink():
         raise Refusal(f"validation checkout contains HANDOFF.md: {checkout}")
     vcs = _GitVcs()
-    head = vcs.verify_existing_worktree(repository, checkout)
+    if standalone:
+        if (
+            vcs.repository_root(checkout) != checkout.absolute()
+            or (checkout / ".git").is_symlink()
+            or not (checkout / ".git").is_dir()
+        ):
+            raise Refusal(
+                f"frozen validation checkout is not a standalone Git clone: {checkout}"
+            )
+        head = vcs.head(checkout)
+    else:
+        head = vcs.verify_existing_worktree(repository, checkout)
     if expected_head is not None and head != expected_head:
-        raise Refusal("validation checkout HEAD changed after recovery was authorized")
+        raise Refusal(
+            "validation checkout HEAD changed after recovery was authorized; preserve the "
+            "checkout and restore the recorded target before retrying"
+        )
     vcs.assert_ordinary_history(checkout)
     vcs.assert_ordinary_index(checkout)
     _assert_cache_policy_untracked_path(
@@ -13725,6 +13851,11 @@ def _validation_checkout_facts(
     remote = config.default_remote
     landed_ref = _landed_ref_for_remote(config, remote)
     remote_digest = vcs.remote_url_sha256(checkout, remote)
+    if standalone and vcs.remote_url_sha256(repository, remote) != remote_digest:
+        raise Refusal(
+            "frozen validation checkout remote differs from its recorded source checkout; "
+            "preserve both checkouts and repair their origin binding before retrying"
+        )
     if expected_remote is not None and remote_digest != expected_remote:
         raise Refusal("validation checkout remote changed after recovery was authorized")
     vcs.fetch_remote(checkout, remote, landed_ref)
@@ -13733,7 +13864,17 @@ def _validation_checkout_facts(
     if not vcs.remote_refs_containing(checkout, remote, head):
         raise Refusal(f"validation checkout HEAD {head} is not contained by remote {remote}")
     if batch_cleanup is None:
-        _assert_slot_unused(checkout)
+        if standalone:
+            census = _capture_process_path_census(
+                (checkout,), include_owner_cgroups=False
+            )
+            _assert_slot_unused(
+                checkout,
+                census=census,
+                ignore_current_process=False,
+            )
+        else:
+            _assert_slot_unused(checkout)
     else:
         batch_cleanup.assert_unused(
             config, checkout, fresh_same_uid=fresh_same_uid
@@ -13757,19 +13898,33 @@ def _validation_cargo_facts(path: Path) -> tuple[int, int, int]:
 def _validation_authorization_to_obj(
     value: ValidationRecoveryAuthorization,
 ) -> dict[str, object]:
-    return {
+    encoded = {
         **dataclasses.asdict(value),
         "identity": list(value.identity),
         "actor": _identity_to_obj(value.actor),
         "evidence": dict(value.evidence),
         "parent_identity": None if value.parent_identity is None else list(value.parent_identity),
     }
+    if value.stable_identity is None:
+        encoded.pop("stable_identity")
+    else:
+        encoded["stable_identity"] = list(value.stable_identity)
+    return encoded
 
 
 def _validation_authorization_from_obj(value: object) -> ValidationRecoveryAuthorization:
     raw = _as_mapping(value, "validation recovery authorization")
-    required = {field.name for field in dataclasses.fields(ValidationRecoveryAuthorization)}
-    _exact_keys(raw, required, set(), "validation recovery authorization")
+    required = {
+        field.name
+        for field in dataclasses.fields(ValidationRecoveryAuthorization)
+        if field.name != "stable_identity"
+    }
+    _exact_keys(
+        raw,
+        required,
+        {"stable_identity"},
+        "validation recovery authorization",
+    )
     actor = _identity_from_obj(raw["actor"], "validation recovery actor")
     if actor is None or raw["no_authored_work"] is not True or raw["no_live_use"] is not True:
         raise StateError("validation recovery authorization is incomplete")
@@ -13780,6 +13935,13 @@ def _validation_authorization_from_obj(value: object) -> ValidationRecoveryAutho
     )
     if len(identity) != 3 or (parent is not None and len(parent) != 3):
         raise StateError("validation recovery directory identity must have three fields")
+    stable = (
+        None
+        if raw.get("stable_identity") is None
+        else _private_cleanup_identity_from_obj(
+            raw["stable_identity"], "validation stable path identity"
+        )
+    )
     return ValidationRecoveryAuthorization(
         target_kind=_as_str(raw["target_kind"], "validation target kind"),
         path=_as_str(raw["path"], "validation path"),
@@ -13792,6 +13954,7 @@ def _validation_authorization_from_obj(value: object) -> ValidationRecoveryAutho
         head=None if raw["head"] is None else _as_str(raw["head"], "validation HEAD"),
         remote_url_sha256=None if raw["remote_url_sha256"] is None else _as_str(raw["remote_url_sha256"], "validation remote digest"),
         parent_identity=parent,
+        stable_identity=stable,
     )
 
 
@@ -13802,24 +13965,58 @@ def _ownerless_validation_journal(
     states: Sequence[ActiveState],
     batch_cleanup: _OwnerlessValidationBatchContext | None = None,
 ) -> tuple[dict[str, object], tuple[str, str] | None]:
-    target_kind = "checkout" if args.ownerless_validate_checkout is not None else "cargo-home"
-    raw_target = args.ownerless_validate_checkout or args.ownerless_validate_cargo_home
+    frozen_checkout = getattr(args, "frozen_validate_checkout", None)
+    target_kind = (
+        "frozen-checkout"
+        if frozen_checkout is not None
+        else "checkout"
+        if args.ownerless_validate_checkout is not None
+        else "cargo-home"
+    )
+    raw_target = (
+        frozen_checkout
+        or args.ownerless_validate_checkout
+        or args.ownerless_validate_cargo_home
+    )
     assert raw_target is not None
+    if target_kind == "frozen-checkout" and args.completed_record is None:
+        raise Refusal(
+            "frozen validation checkout recovery requires --completed-record; pass the "
+            "terminal frozen run handle and retry"
+        )
     relative, target, allowed = _validation_recovery_target(config, raw_target, target_kind)
     for state in states:
         for record in state.slots:
             slot_path = _slot_directory(config, record.slot, record.slot_type)
             if target == slot_path or _path_is_within(target, slot_path):
                 raise Refusal(f"validation path belongs to registered slot {record.slot}")
+    repository_relative: str | None = None
+    repository: Path | None = None
+    if target_kind in {"checkout", "frozen-checkout"}:
+        if args.repository is None:
+            raise Refusal("validation checkout recovery requires --repository")
+        repository_relative, repository = _repository_path(
+            config, args.repository, allow_managed=True
+        )
+    elif args.repository is not None:
+        raise Refusal("--repository applies only to validation checkouts")
+
+    record_target: str | None = None
     if args.completed_record is not None:
-        record_path, digest = _terminal_validation_record(
-            config, args.completed_record, target, target_kind
+        record_path, digest, record_target = _terminal_validation_record(
+            config,
+            args.completed_record,
+            target,
+            target_kind,
+            repository=repository,
         )
         evidence: Mapping[str, object] = {
             "kind": "terminal-record",
             "path": record_path,
             "sha256": digest,
         }
+        if record_target is not None:
+            evidence = {**evidence, "target": record_target}
         if args.recovery_note is not None:
             raise Refusal("--completed-record cannot be combined with --recovery-note")
     else:
@@ -13827,18 +14024,32 @@ def _ownerless_validation_journal(
             config, target, target_kind, args.recovery_note
         )
     identity = _open_directory_identity(target, "validation recovery path")
-    repository_relative: str | None = None
+    stable_identity: _PrivateCleanupIdentity | None = None
     head: str | None = None
     remote_digest: str | None = None
     parent_identity: tuple[int, int, int] | None = None
-    if target_kind == "checkout":
-        if args.repository is None:
-            raise Refusal("validation checkout recovery requires --repository")
-        repository_relative, repository = _repository_path(
-            config, args.repository, allow_managed=True
-        )
+    if target_kind in {"checkout", "frozen-checkout"}:
+        assert repository is not None
+        if target_kind == "frozen-checkout":
+            frozen_root = _frozen_validation_directory(config)
+            stable_identity = _private_cleanup_path_identity(
+                config,
+                target,
+                allowed_modes={0o700},
+                managed_root=frozen_root,
+            )
+            parent_identity = _open_directory_identity(
+                frozen_root, "frozen validation checkout parent"
+            )
+            if stable_identity[:2] != identity[:2] or identity[2] != parent_identity[2]:
+                raise Refusal("frozen validation checkout identity or mount changed")
         head, remote_digest = _validation_checkout_facts(
-            config, target, repository, batch_cleanup=batch_cleanup
+            config,
+            target,
+            repository,
+            expected_head=record_target,
+            batch_cleanup=batch_cleanup,
+            standalone=target_kind == "frozen-checkout",
         )
     else:
         if args.repository is not None:
@@ -13856,15 +14067,21 @@ def _ownerless_validation_journal(
         head=head,
         remote_url_sha256=remote_digest,
         parent_identity=parent_identity,
+        stable_identity=stable_identity,
     )
     fenced = target.with_name(f".{target.name}.ownerless-validate.{uuid.uuid4().hex}")
+    fenced_value = (
+        str(fenced)
+        if target_kind == "frozen-checkout"
+        else fenced.relative_to(config.root).as_posix()
+    )
     return {
         "schema": SCHEMA,
         "kind": "ownerless-validate-remove",
         "machine": config.machine,
         "slot": target.name,
         "phase": "prepared",
-        "fenced": fenced.relative_to(config.root).as_posix(),
+        "fenced": fenced_value,
         "authorization": _validation_authorization_to_obj(authorization),
     }, allowed
 
@@ -13901,9 +14118,19 @@ def _ownerless_validation_inputs(
     )
     if _as_str(raw["slot"], "ownerless validation slot") != target.name:
         raise StateError("ownerless validation journal slot differs from its path")
-    _relative, fenced = _relative_inside(
-        config.root, _as_str(raw["fenced"], "fenced validation path"), "fenced path"
-    )
+    raw_fenced = _as_str(raw["fenced"], "fenced validation path")
+    if authorization.target_kind == "frozen-checkout":
+        fenced = Path(raw_fenced)
+        if not fenced.is_absolute():
+            raise StateError("fenced frozen validation path must be absolute")
+        fenced = Path(os.path.normpath(raw_fenced))
+        if fenced.parent != _frozen_validation_directory(config):
+            raise StateError("fenced frozen validation path has the wrong parent")
+        _ensure_no_symlink_components(
+            config.root.parent, fenced, "fenced frozen validation path"
+        )
+    else:
+        _relative, fenced = _relative_inside(config.root, raw_fenced, "fenced path")
     prefix = f".{target.name}.ownerless-validate."
     if (
         fenced.parent != target.parent
@@ -13921,21 +14148,60 @@ def _ownerless_validation_inputs(
     active = target if target_present else fenced if fenced_present else None
     if phase == "removed" and active is not None:
         raise Refusal("validation path reappeared after removal was recorded")
-    if active is not None and (
-        active.is_symlink()
-        or not active.is_dir()
-        or _open_directory_identity(active, "validation path") != authorization.identity
-    ):
-        raise Refusal("validation path identity changed; preserve it")
+    if active is not None:
+        if (
+            active.is_symlink()
+            or not active.is_dir()
+            or _open_directory_identity(active, "validation path")
+            != authorization.identity
+        ):
+            raise Refusal("validation path identity changed; preserve it")
+        if authorization.target_kind == "frozen-checkout":
+            if authorization.stable_identity is None:
+                raise StateError(
+                    "frozen validation authorization has no stable file-handle identity"
+                )
+            observed_stable = _private_cleanup_path_identity(
+                config,
+                active,
+                allowed_modes={0o700},
+                managed_root=_frozen_validation_directory(config),
+            )
+            if observed_stable != authorization.stable_identity:
+                raise Refusal(
+                    "frozen validation path file-handle identity changed; preserve every "
+                    "candidate path and inspect the interrupted journal before retrying"
+                )
     repository: Path | None = None
-    if authorization.target_kind == "checkout":
+    if authorization.target_kind in {"checkout", "frozen-checkout"}:
         if (
             authorization.repository is None
             or authorization.head is None
             or authorization.remote_url_sha256 is None
-            or authorization.parent_identity is not None
         ):
             raise StateError("validation checkout authorization is incomplete")
+        if authorization.target_kind == "checkout" and (
+            authorization.parent_identity is not None
+            or authorization.stable_identity is not None
+        ):
+            raise StateError("ordinary validation checkout has frozen-path identity")
+        if authorization.target_kind == "frozen-checkout" and (
+            authorization.parent_identity is None
+            or authorization.stable_identity is None
+        ):
+            raise StateError("frozen validation checkout authorization is incomplete")
+        if (
+            authorization.target_kind == "frozen-checkout"
+            and _open_directory_identity(
+                _frozen_validation_directory(config),
+                "frozen validation checkout parent",
+            )
+            != authorization.parent_identity
+        ):
+            raise Refusal(
+                "frozen validation checkout parent identity changed; preserve the checkout "
+                "and restore the original sibling directory before retrying"
+            )
         _stored, repository = _repository_path(
             config, authorization.repository, allow_managed=True
         )
@@ -13947,6 +14213,7 @@ def _ownerless_validation_inputs(
             or authorization.head is not None
             or authorization.remote_url_sha256 is not None
             or authorization.parent_identity is None
+            or authorization.stable_identity is not None
         ):
             raise StateError("validation Cargo-home authorization is incomplete")
     else:
@@ -13954,7 +14221,24 @@ def _ownerless_validation_inputs(
     evidence = authorization.evidence
     kind = _as_str(evidence.get("kind"), "validation recovery evidence.kind")
     if kind == "terminal-record":
-        _exact_keys(evidence, {"kind", "path", "sha256"}, set(), "terminal evidence")
+        _exact_keys(
+            evidence,
+            {"kind", "path", "sha256"},
+            (
+                {"target"}
+                if authorization.target_kind == "frozen-checkout"
+                else set()
+            ),
+            "terminal evidence",
+        )
+        if authorization.target_kind == "frozen-checkout":
+            evidence_target = _as_str(
+                evidence.get("target"), "terminal evidence.target"
+            )
+            if evidence_target != authorization.head:
+                raise StateError(
+                    "frozen terminal evidence target differs from authorized HEAD"
+                )
         if recheck:
             _terminal_validation_record(
                 config,
@@ -13962,6 +14246,8 @@ def _ownerless_validation_inputs(
                 target,
                 authorization.target_kind,
                 expected_digest=_as_str(evidence["sha256"], "terminal evidence.sha256"),
+                repository=repository,
+                expected_target=authorization.head,
             )
     elif kind == "coordinator-determination":
         _exact_keys(
@@ -13982,9 +14268,9 @@ def _ownerless_validation_inputs(
     else:
         raise StateError(f"unknown validation recovery evidence kind {kind!r}")
     if recheck and active is not None:
-        if authorization.target_kind == "checkout":
+        if authorization.target_kind in {"checkout", "frozen-checkout"}:
             assert repository is not None
-            if active == fenced:
+            if active == fenced and authorization.target_kind == "checkout":
                 _GitVcs().repair_worktree(repository, fenced)
             _validation_checkout_facts(
                 config,
@@ -13994,6 +14280,7 @@ def _ownerless_validation_inputs(
                 expected_remote=authorization.remote_url_sha256,
                 batch_cleanup=batch_cleanup,
                 fresh_same_uid=fresh_same_uid,
+                standalone=authorization.target_kind == "frozen-checkout",
             )
         else:
             assert authorization.parent_identity is not None
@@ -14087,6 +14374,7 @@ def _recover_ownerless_validation(
             _GitVcs().remove_worktree(repository, fenced, force=True)
         else:
             assert authorization.parent_identity is not None
+            _interrupt_for_test("after-ownerless-validate-final-check")
             _remove_cache_directory(
                 config,
                 CacheDirectory(
@@ -14098,6 +14386,11 @@ def _recover_ownerless_validation(
                 ),
                 allow_git_metadata=True,
                 expected_identity=authorization.identity,
+                expected_stable_identity=(
+                    authorization.stable_identity
+                    if authorization.target_kind == "frozen-checkout"
+                    else None
+                ),
             )
         journal["phase"] = "removed"
         _write_journal(config, journal)
@@ -16845,15 +17138,21 @@ class _OwnerlessValidationBatchContext:
     def assert_unused(
         self, config: Config, active: Path, *, fresh_same_uid: bool
     ) -> None:
-        identity = _private_cleanup_fence_identity(config, active)
+        managed_root = (
+            _frozen_validation_directory(config)
+            if active.parent == _frozen_validation_directory(config)
+            else None
+        )
+        identity = _private_cleanup_path_identity(
+            config, active, allowed_modes={0o700}, managed_root=managed_root
+        )
         canonical = self.canonical_by_identity.get(identity)
         if canonical is None:
             raise Refusal(
                 f"private validation checkout identity was not in the shared census: {active}"
             )
-        # The shared census intentionally ignores this wrkslots process. Keep
-        # the ordinary explicit cwd guard for both the canonical and renamed
-        # path without launching another process census.
+        # Keep the ordinary explicit cwd guard for both the canonical and
+        # renamed path without launching another process census.
         _assert_slot_unused(
             active,
             census=_ProcessPathCensus((), (), owner_cgroup_complete=False),
@@ -16873,7 +17172,7 @@ class _OwnerlessValidationBatchContext:
         fresh = _capture_same_uid_process_path_census(
             (active,), budget=fresh_budget
         )
-        fresh.assert_slot_unused(active, None)
+        fresh.assert_slot_unused(active, None, ignore_current_process=False)
         self.census_budget.remaining_seconds()
 
 
@@ -17987,7 +18286,15 @@ def _cmd_recover_absent_validate_rows(args: argparse.Namespace) -> int:
 
 
 def _cmd_recover_ownerless_validate_batch(args: argparse.Namespace) -> int:
-    checkouts = tuple(args.checkouts)
+    ordinary_checkouts = tuple(args.checkouts or ())
+    frozen_checkouts = tuple(args.frozen_validate_checkouts or ())
+    if bool(ordinary_checkouts) == bool(frozen_checkouts):
+        raise Refusal(
+            "recover-ownerless-validate-batch requires exactly one of --checkout or "
+            "--frozen-validate-checkout; choose the matching validation storage kind and retry"
+        )
+    frozen = bool(frozen_checkouts)
+    checkouts = frozen_checkouts if frozen else ordinary_checkouts
     records = tuple(args.completed_records)
     repositories = tuple(args.repositories)
     if not (len(checkouts) == len(records) == len(repositories)):
@@ -18022,9 +18329,18 @@ def _cmd_recover_ownerless_validate_batch(args: argparse.Namespace) -> int:
         ):
             try:
                 _relative, target, _allowed = _validation_recovery_target(
-                    config, checkout, "checkout"
+                    config,
+                    checkout,
+                    "frozen-checkout" if frozen else "checkout",
                 )
-                identity = _private_cleanup_fence_identity(config, target)
+                identity = _private_cleanup_path_identity(
+                    config,
+                    target,
+                    allowed_modes={0o700},
+                    managed_root=(
+                        _frozen_validation_directory(config) if frozen else None
+                    ),
+                )
             except (Refusal, StateError) as exc:
                 retained.append({"checkout": checkout, "reason": str(exc)})
             else:
@@ -18065,7 +18381,9 @@ def _cmd_recover_ownerless_validate_batch(args: argparse.Namespace) -> int:
     for index, (checkout, record, repository, target, _identity) in enumerate(prepared):
         try:
             census_budget.remaining_seconds()
-            shared_census.assert_slot_unused(target, None)
+            shared_census.assert_slot_unused(
+                target, None, ignore_current_process=False
+            )
             item_args = argparse.Namespace(
                 project_root=args.project_root,
                 machine=args.machine,
@@ -18077,12 +18395,16 @@ def _cmd_recover_ownerless_validate_batch(args: argparse.Namespace) -> int:
                 legacy_validate_checkout=checkout,
                 ownerless_validate_checkout=None,
                 ownerless_validate_cargo_home=None,
+                frozen_validate_checkout=checkout if frozen else None,
                 completed_record=record,
                 repository=repository,
                 recovery_note=None,
                 retry_running_hook=False,
                 abort_create=False,
             )
+            if frozen:
+                item_args.legacy_validate_checkout = None
+                item_args.ownerless_validate_checkout = None
             _cmd_recover(
                 item_args,
                 ownerless_batch_cleanup=batch_cleanup,
@@ -18159,6 +18481,7 @@ def _cmd_recover(
             for value in (
                 args.ownerless_validate_checkout,
                 args.ownerless_validate_cargo_home,
+                args.frozen_validate_checkout,
             )
         ):
             raise Refusal("legacy and ownerless validation path flags cannot be combined")
@@ -18173,6 +18496,7 @@ def _cmd_recover(
             for value in (
                 args.ownerless_validate_checkout,
                 args.ownerless_validate_cargo_home,
+                args.frozen_validate_checkout,
                 args.completed_record,
                 args.repository,
                 args.recovery_note,
@@ -18185,6 +18509,7 @@ def _cmd_recover(
                 for value in (
                     args.ownerless_validate_checkout,
                     args.ownerless_validate_cargo_home,
+                    args.frozen_validate_checkout,
                 )
             ) != 1:
                 raise Refusal(
@@ -18200,9 +18525,28 @@ def _cmd_recover(
                     "operation first"
                 )
             states, archives = _validate_global_state(config)
-            raw_target = args.ownerless_validate_checkout or args.ownerless_validate_cargo_home
-            target_kind = "checkout" if args.ownerless_validate_checkout else "cargo-home"
+            raw_target = (
+                args.frozen_validate_checkout
+                or args.ownerless_validate_checkout
+                or args.ownerless_validate_cargo_home
+            )
+            target_kind = (
+                "frozen-checkout"
+                if args.frozen_validate_checkout
+                else "checkout"
+                if args.ownerless_validate_checkout
+                else "cargo-home"
+            )
             assert raw_target is not None
+            if target_kind == "frozen-checkout" and (
+                args.completed_record is None
+                or args.repository is None
+                or args.recovery_note is not None
+            ):
+                raise Refusal(
+                    "--frozen-validate-checkout requires --completed-record and "
+                    "--repository; provide the terminal run handle and its source checkout"
+                )
             _relative, _target, allowed = _validation_recovery_target(
                 config, raw_target, target_kind
             )
@@ -19396,13 +19740,25 @@ usage or audit gate unknown, 3 fail-closed refusal.
         ),
         formatter_class=_HelpFormatter,
     )
-    recover_ownerless_batch.add_argument(
+    ownerless_batch_targets = recover_ownerless_batch.add_mutually_exclusive_group(
+        required=True
+    )
+    ownerless_batch_targets.add_argument(
         "--checkout",
         dest="checkouts",
         action="append",
-        required=True,
         metavar="PATH",
         help="project-relative private ownerless validation checkout (repeatable, bounded)",
+    )
+    ownerless_batch_targets.add_argument(
+        "--frozen-validate-checkout",
+        dest="frozen_validate_checkouts",
+        action="append",
+        metavar="PATH",
+        help=(
+            "absolute standalone checkout directly below the exact sibling "
+            ".<project>-frozen-validate directory (repeatable, bounded)"
+        ),
     )
     recover_ownerless_batch.add_argument(
         "--completed-record",
@@ -19474,6 +19830,14 @@ usage or audit gate unknown, 3 fail-closed refusal.
         "--ownerless-validate-cargo-home",
         metavar="PATH",
         help="project-relative unregistered validate-cargo-* directory",
+    )
+    ownerless.add_argument(
+        "--frozen-validate-checkout",
+        metavar="PATH",
+        help=(
+            "absolute standalone validate-fresh-* clone under the exact sibling "
+            ".<project>-frozen-validate directory"
+        ),
     )
     recover.add_argument(
         "--completed-record",

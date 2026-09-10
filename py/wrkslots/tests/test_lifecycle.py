@@ -132,6 +132,7 @@ def test_same_uid_census(_paths, **_kwargs):
 
 cli._assert_slot_unused = test_slot_unused
 cli._capture_process_path_census = test_census
+cli._capture_lsof_process_path_census = test_census
 cli._capture_same_uid_process_path_census = test_same_uid_census
 raise SystemExit(cli.main(sys.argv[1:]))
 """
@@ -674,6 +675,7 @@ def stub_validate_batch_censuses(
         return wrkslots._ProcessPathCensus((), ())
 
     monkeypatch.setattr(wrkslots, "_capture_process_path_census", shared)
+    monkeypatch.setattr(wrkslots, "_capture_lsof_process_path_census", shared)
     monkeypatch.setattr(wrkslots, "_capture_same_uid_process_path_census", fresh)
 
 
@@ -953,6 +955,69 @@ def prepare_terminal_validation_record(
     return record_path
 
 
+def prepare_frozen_validation_checkout(
+    project: Path,
+    repository: Path,
+    *,
+    name: str = "frozen",
+) -> tuple[Path, Path, str]:
+    """Create the exact standalone checkout and terminal handle used by frozen runs."""
+
+    target_sha = git(repository, "rev-parse", "HEAD").stdout.strip()
+    origin_url = git(repository, "remote", "get-url", "origin").stdout.strip()
+    parent = project.parent / f".{project.name}-frozen-validate"
+    parent.mkdir(mode=0o700)
+    checkout = parent / f"validate-fresh-{name}"
+    subprocess.run(
+        ["git", "clone", "--no-checkout", "--no-tags", str(repository), str(checkout)],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    git(checkout, "remote", "set-url", "origin", origin_url)
+    git(checkout, "checkout", "--detach", target_sha)
+    checkout.chmod(0o700)
+    record = project / "ignored" / "validate" / "runs" / f"validate-{name}.json"
+    record.parent.mkdir(parents=True, exist_ok=True)
+    record.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "frozen-validate",
+                "producer": "ci-hub/validate/run_registry.py",
+                "admission": "frozen-validate",
+                "validation_kind": "frozen-validate",
+                "temporary_checkout": True,
+                "checkout": str(checkout),
+                "source_checkout": str(repository),
+                "target": target_sha,
+                "state": "unknown",
+                "result": "unknown",
+                "exit_code": 1,
+                "final_validate_status": "FAILED",
+                "service_result_schema": 3,
+                "scorecard_writeback": {"status": "completed"},
+                "detail": "historical service result needs remeasurement",
+                "admission_result": {
+                    "state": "admitted",
+                    "recorded_at": "2026-09-08T11:28:07+00:00",
+                    "run_number": 1,
+                },
+                "process_identity": {
+                    "pid": os.getpid(),
+                    "start_ticks": 1,
+                    "boot_id": "historical-boot",
+                },
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return checkout, record, target_sha
+
+
 def test_init_is_idempotent_and_installs_relative_symlink(tmp_path: Path) -> None:
     project = tmp_path / "project"
     project.mkdir()
@@ -1165,6 +1230,601 @@ def test_ownerless_validate_batch_shares_one_census_and_removes_unheld_checkouts
     assert len(fresh_calls) == 2
     assert not first.exists()
     assert not second.exists()
+
+
+def test_ownerless_validate_batch_removes_terminal_frozen_checkout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    checkout, record, target_sha = prepare_frozen_validation_checkout(
+        project, repository
+    )
+    stub_validate_batch_censuses(monkeypatch)
+
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover-ownerless-validate-batch",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--frozen-validate-checkout",
+            str(checkout),
+            "--completed-record",
+            record.relative_to(project).as_posix(),
+            "--repository",
+            repository.relative_to(project).as_posix(),
+            "--format",
+            "json",
+        ]
+    )
+
+    assert rc == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["retained"] == []
+    assert report["removed"] == [{"checkout": str(checkout)}]
+    assert report["shared_process_censuses"] == 1
+    assert report["same_uid_process_censuses"] == 1
+    assert not checkout.exists()
+    config = wrkslots._load_config(str(project), "testhost")
+    assert not wrkslots._journal_path(config).exists()
+    assert list(control_directory(project).glob("*.journal")) == []
+    assert not list(checkout.parent.glob(f".{checkout.name}.ownerless-validate.*"))
+    removal_events = [
+        item
+        for item in wrkslots._load_events(config)
+        if item["kind"] == "ownerless-validate-path-removed"
+    ]
+    assert len(removal_events) == 1
+    event = removal_events[0]
+    payload = wrkslots._as_mapping(event["payload"], "test removal payload")
+    authorization = wrkslots._as_mapping(
+        payload["authorization"], "test removal authorization"
+    )
+    assert authorization["target_kind"] == "frozen-checkout"
+    assert authorization["head"] == target_sha
+    evidence = wrkslots._as_mapping(
+        authorization["evidence"], "test removal evidence"
+    )
+    assert evidence["target"] == target_sha
+    assert len(
+        wrkslots._as_list(
+            authorization["stable_identity"], "test stable identity"
+        )
+    ) == 4
+
+
+def test_frozen_validate_batch_closes_operation_owned_fds_before_censuses(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    checkout, record, _target_sha = prepare_frozen_validation_checkout(
+        project, repository, name="closed-fds"
+    )
+    census_stages: list[str] = []
+
+    def assert_no_target_fd(paths: Sequence[Path], *, stage: str) -> None:
+        assert len(paths) == 1
+        target = paths[0]
+        target_fds: list[str] = []
+        for entry in (Path("/proc") / "self" / "fd").iterdir():
+            try:
+                observed = Path(os.readlink(entry).removesuffix(" (deleted)"))
+            except OSError:
+                continue
+            if observed == target or target in observed.parents:
+                target_fds.append(f"{entry.name}={observed}")
+        assert target_fds == []
+        census_stages.append(stage)
+
+    def shared(
+        paths: Sequence[Path], **_kwargs: object
+    ) -> wrkslots._ProcessPathCensus:
+        assert_no_target_fd(paths, stage="shared")
+        return wrkslots._ProcessPathCensus((), (), owner_cgroup_complete=False)
+
+    def fresh(
+        paths: Sequence[Path], **_kwargs: object
+    ) -> wrkslots._ProcessPathCensus:
+        assert_no_target_fd(paths, stage="fresh")
+        return wrkslots._ProcessPathCensus((), (), owner_cgroup_complete=False)
+
+    monkeypatch.setattr(wrkslots, "_capture_lsof_process_path_census", shared)
+    monkeypatch.setattr(
+        wrkslots, "_capture_same_uid_process_path_census", fresh
+    )
+
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover-ownerless-validate-batch",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--frozen-validate-checkout",
+            str(checkout),
+            "--completed-record",
+            record.relative_to(project).as_posix(),
+            "--repository",
+            repository.relative_to(project).as_posix(),
+            "--format",
+            "json",
+        ]
+    )
+
+    assert rc == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["removed"] == [{"checkout": str(checkout)}]
+    assert report["retained"] == []
+    assert census_stages == ["shared", "fresh"]
+    config = wrkslots._load_config(str(project), "testhost")
+    assert list(control_directory(project).glob("*.journal")) == []
+    assert len(
+        [
+            item
+            for item in wrkslots._load_events(config)
+            if item["kind"] == "ownerless-validate-path-removed"
+        ]
+    ) == 1
+
+
+def test_frozen_validate_batch_does_not_ignore_current_process_census_use(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    checkout, record, _target_sha = prepare_frozen_validation_checkout(
+        project, repository, name="self-use"
+    )
+
+    monkeypatch.setattr(
+        wrkslots,
+        "_capture_lsof_process_path_census",
+        lambda paths, **_kwargs: wrkslots._ProcessPathCensus(
+            (),
+            ((os.getpid(), str(paths[0]), "fd", str(paths[0])),),
+            owner_cgroup_complete=False,
+        ),
+    )
+    monkeypatch.setattr(
+        wrkslots,
+        "_capture_same_uid_process_path_census",
+        lambda _paths, **_kwargs: wrkslots._ProcessPathCensus(
+            (), (), owner_cgroup_complete=False
+        ),
+    )
+
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover-ownerless-validate-batch",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--frozen-validate-checkout",
+            str(checkout),
+            "--completed-record",
+            record.relative_to(project).as_posix(),
+            "--repository",
+            repository.relative_to(project).as_posix(),
+            "--format",
+            "json",
+        ]
+    )
+
+    assert rc == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["removed"] == []
+    assert f"live process {os.getpid()}" in report["retained"][0]["reason"]
+    assert checkout.is_dir()
+    assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
+    assert not any(
+        item["kind"] == "ownerless-validate-path-removed"
+        for item in wrkslots._load_events(
+            wrkslots._load_config(str(project), "testhost")
+        )
+    )
+
+
+def test_frozen_validate_batch_fresh_census_does_not_ignore_current_process(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    checkout, record, _target_sha = prepare_frozen_validation_checkout(
+        project, repository, name="late-self-use"
+    )
+    monkeypatch.setattr(
+        wrkslots,
+        "_capture_lsof_process_path_census",
+        lambda _paths, **_kwargs: wrkslots._ProcessPathCensus(
+            (), (), owner_cgroup_complete=False
+        ),
+    )
+    monkeypatch.setattr(
+        wrkslots,
+        "_capture_same_uid_process_path_census",
+        lambda paths, **_kwargs: wrkslots._ProcessPathCensus(
+            (),
+            ((os.getpid(), str(paths[0]), "fd", str(paths[0])),),
+            owner_cgroup_complete=False,
+        ),
+    )
+
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover-ownerless-validate-batch",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--frozen-validate-checkout",
+            str(checkout),
+            "--completed-record",
+            record.relative_to(project).as_posix(),
+            "--repository",
+            repository.relative_to(project).as_posix(),
+            "--format",
+            "json",
+        ]
+    )
+
+    assert rc == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["removed"] == []
+    assert report["same_uid_process_censuses"] == 1
+    assert f"live process {os.getpid()}" in report["retained"][0]["reason"]
+    assert checkout.is_dir()
+    assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
+    assert not any(
+        item["kind"] == "ownerless-validate-path-removed"
+        for item in wrkslots._load_events(
+            wrkslots._load_config(str(project), "testhost")
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "relative",
+    (
+        "validate-fresh-wrong-parent",
+        ".project-frozen-validate/not-a-validation-checkout",
+        ".project-frozen-validate/nested/validate-fresh-too-deep",
+    ),
+)
+def test_frozen_validate_checkout_refuses_every_noncanonical_path(
+    tmp_path: Path, relative: str
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    candidate = tmp_path / relative
+    candidate.mkdir(parents=True)
+    refused = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--frozen-validate-checkout",
+        str(candidate),
+        "--completed-record",
+        "ignored/validate/runs/unused.json",
+        "--repository",
+        repository.relative_to(project).as_posix(),
+    )
+
+    assert refused.returncode == 3
+    assert "outside the exact sibling validation directory" in refused.stderr
+    assert "preserve it or move it under" in refused.stderr
+    assert candidate.is_dir()
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement", "message"),
+    (
+        ("kind", "validate", "authoritative frozen-validation handle"),
+        ("admission", "ci-hub validate-lock", "authoritative frozen-validation handle"),
+        ("validation_kind", "validate", "authoritative frozen-validation handle"),
+        ("producer", "another producer", "authoritative frozen-validation handle"),
+        ("temporary_checkout", False, "checkout is not temporary"),
+        ("checkout", "/tmp/not-the-checkout", "exact checkout"),
+        ("target", "0" * 40, "HEAD changed"),
+        ("source_checkout", "/tmp/not-the-source", "exact source checkout"),
+    ),
+)
+def test_frozen_validate_checkout_binds_terminal_record_fields(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    field: str,
+    replacement: object,
+    message: str,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    checkout, record, _target_sha = prepare_frozen_validation_checkout(
+        project, repository, name=field.replace("_", "-")
+    )
+    value = json.loads(record.read_text(encoding="utf-8"))
+    value[field] = replacement
+    record.write_text(json.dumps(value), encoding="utf-8")
+    stub_validate_batch_censuses(monkeypatch)
+
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover-ownerless-validate-batch",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--frozen-validate-checkout",
+            str(checkout),
+            "--completed-record",
+            record.relative_to(project).as_posix(),
+            "--repository",
+            repository.relative_to(project).as_posix(),
+            "--format",
+            "json",
+        ]
+    )
+
+    assert rc == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["removed"] == []
+    assert message in report["retained"][0]["reason"]
+    assert checkout.is_dir()
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    (
+        "after-ownerless-validate-journal",
+        "after-ownerless-validate-path-fence-before-journal",
+        "after-ownerless-validate-path-fence",
+        "after-ownerless-validate-remove",
+    ),
+)
+def test_frozen_validate_checkout_recovers_each_durable_crash_boundary(
+    tmp_path: Path, boundary: str
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    checkout, record, _target_sha = prepare_frozen_validation_checkout(
+        project, repository, name=boundary.removeprefix("after-")
+    )
+    arguments = (
+        "recover",
+        "--coordinator-authorized",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--frozen-validate-checkout",
+        str(checkout),
+        "--completed-record",
+        record.relative_to(project).as_posix(),
+        "--repository",
+        repository.relative_to(project).as_posix(),
+    )
+    interrupted = raw_command_with_census_authority_stub(
+        project,
+        *arguments,
+        env={"WRKSLOTS_TEST_INTERRUPT": boundary},
+    )
+    assert interrupted.returncode == 86, interrupted.stderr
+    journal = control_directory(project) / "ACTIVE.testhost.journal"
+    assert journal.is_file()
+
+    resumed = raw_command_with_census_authority_stub(
+        project, "recover", "--coordinator-pid", str(os.getpid())
+    )
+
+    assert resumed.returncode == 0, resumed.stderr
+    assert not checkout.exists()
+    assert not journal.exists()
+    assert list(control_directory(project).glob("*.journal")) == []
+    removal_events = [
+        item
+        for item in wrkslots._load_events(
+            wrkslots._load_config(str(project), "testhost")
+        )
+        if item["kind"] == "ownerless-validate-path-removed"
+    ]
+    assert len(removal_events) == 1
+
+
+def test_frozen_validate_recovery_refuses_changed_terminal_record_digest(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    checkout, record, _target_sha = prepare_frozen_validation_checkout(
+        project, repository, name="record-changed"
+    )
+    interrupted = raw_command_with_census_authority_stub(
+        project,
+        "recover",
+        "--coordinator-authorized",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--frozen-validate-checkout",
+        str(checkout),
+        "--completed-record",
+        record.relative_to(project).as_posix(),
+        "--repository",
+        repository.relative_to(project).as_posix(),
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-ownerless-validate-journal"},
+    )
+    assert interrupted.returncode == 86, interrupted.stderr
+    value = json.loads(record.read_text(encoding="utf-8"))
+    value["detail"] = "changed after authorization"
+    record.write_text(json.dumps(value), encoding="utf-8")
+
+    refused = raw_command_with_census_authority_stub(
+        project, "recover", "--coordinator-pid", str(os.getpid())
+    )
+
+    assert refused.returncode == 3
+    assert "record changed after recovery was authorized" in refused.stderr
+    assert checkout.is_dir()
+    assert (control_directory(project) / "ACTIVE.testhost.journal").is_file()
+
+
+def test_frozen_validate_refuses_replacement_after_final_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    checkout, record, _target_sha = prepare_frozen_validation_checkout(
+        project, repository, name="final-replacement"
+    )
+    stub_validate_batch_censuses(monkeypatch)
+    replacement: Path | None = None
+    original: Path | None = None
+
+    def replace_after_final_check(point: str) -> None:
+        nonlocal replacement, original
+        if point != "after-ownerless-validate-final-check" or replacement is not None:
+            return
+        fenced = next(
+            checkout.parent.glob(f".{checkout.name}.ownerless-validate.*")
+        )
+        original = checkout.parent / "preserved-original"
+        fenced.rename(original)
+        fenced.mkdir(mode=0o700)
+        (fenced / "replacement").write_text("preserve me\n", encoding="utf-8")
+        replacement = fenced
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", replace_after_final_check)
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover-ownerless-validate-batch",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--frozen-validate-checkout",
+            str(checkout),
+            "--completed-record",
+            record.relative_to(project).as_posix(),
+            "--repository",
+            repository.relative_to(project).as_posix(),
+            "--format",
+            "json",
+        ]
+    )
+
+    assert rc == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["removed"] == []
+    assert "identity changed before cleanup" in report["retained"][0]["reason"]
+    assert original is not None and (original / ".git").is_dir()
+    assert replacement is not None and (replacement / "replacement").is_file()
+    config = wrkslots._load_config(str(project), "testhost")
+    assert wrkslots._journal_path(config).is_file()
+    assert not any(
+        item["kind"] == "ownerless-validate-path-removed"
+        for item in wrkslots._load_events(config)
+    )
+
+
+@pytest.mark.parametrize("changed_binding", ["file-handle", "parent-mount"])
+def test_frozen_validate_recovery_refuses_changed_identity_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    changed_binding: str,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    checkout, record, _target_sha = prepare_frozen_validation_checkout(
+        project, repository, name=changed_binding
+    )
+    stub_validate_batch_censuses(monkeypatch)
+
+    class Interrupted(RuntimeError):
+        pass
+
+    def interrupt(point: str) -> None:
+        if point == "after-ownerless-validate-journal":
+            raise Interrupted
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", interrupt)
+    with pytest.raises(Interrupted):
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "recover",
+                "--coordinator-authorized",
+                "--coordinator-pid",
+                str(os.getpid()),
+                "--frozen-validate-checkout",
+                str(checkout),
+                "--completed-record",
+                record.relative_to(project).as_posix(),
+                "--repository",
+                repository.relative_to(project).as_posix(),
+            ]
+        )
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _point: None)
+    capsys.readouterr()
+
+    if changed_binding == "file-handle":
+        original_file_handle = wrkslots._fd_file_handle
+
+        def changed_file_handle(fd: int, label: str) -> tuple[int, str]:
+            handle_type, handle = original_file_handle(fd, label)
+            replacement = ("0" if handle[0] != "0" else "1") + handle[1:]
+            return handle_type, replacement
+
+        monkeypatch.setattr(wrkslots, "_fd_file_handle", changed_file_handle)
+        expected = "file-handle identity changed"
+    else:
+        original_open_identity = wrkslots._open_directory_identity
+
+        def changed_parent_mount(path: Path, label: str) -> tuple[int, int, int]:
+            identity = original_open_identity(path, label)
+            if path == checkout.parent:
+                return identity[0], identity[1], identity[2] + 1
+            return identity
+
+        monkeypatch.setattr(
+            wrkslots, "_open_directory_identity", changed_parent_mount
+        )
+        expected = "parent identity changed"
+
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover",
+            "--coordinator-pid",
+            str(os.getpid()),
+        ]
+    )
+
+    assert rc == 3
+    assert expected in capsys.readouterr().err
+    assert checkout.is_dir()
+    assert (control_directory(project) / "ACTIVE.testhost.journal").is_file()
+
+
+@pytest.mark.parametrize("flag", ["-h", "--help"])
+@pytest.mark.parametrize("subcommand", ["recover", "recover-ownerless-validate-batch"])
+def test_frozen_validate_checkout_flag_is_documented_in_both_help_forms(
+    tmp_path: Path, subcommand: str, flag: str
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    helped = raw_command(project, subcommand, flag)
+
+    assert helped.returncode == 0
+    assert "--frozen-validate-checkout" in helped.stdout
 
 
 def test_batched_lsof_census_attributes_live_process_to_exact_checkout(
