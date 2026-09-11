@@ -14274,6 +14274,10 @@ def _validation_record_is_terminal(
     cleanup fact does not promote the unknown verdict to passed or failed.
     """
 
+    schema = record.get("service_result_schema")
+    if record.get("result_source") == "validation-service-result" and schema is None:
+        return False
+
     state = record.get("state")
     if not isinstance(state, str):
         return False
@@ -14292,7 +14296,6 @@ def _validation_record_is_terminal(
     exits = {"PASSED": 0, "FAILED": 1, "COULD_NOT_RUN": 75}
     status = record.get("final_validate_status")
     expected_exit = exits.get(status) if isinstance(status, str) else None
-    schema = record.get("service_result_schema")
     if schema is not None and (
         not isinstance(schema, int)
         or isinstance(schema, bool)
