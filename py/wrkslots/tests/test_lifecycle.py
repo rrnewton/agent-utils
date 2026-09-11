@@ -14158,6 +14158,41 @@ def run_absent_agent_recovery(
     return wrkslots.main(args)
 
 
+def test_multiline_stopped_systemd_unit_allows_absent_recovery_dry_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    agent_record = prepare_absent_agent_row(project, repository)
+    validate_record = prepare_absent_validate_row(
+        project, repository, slot="gone-validate", agent="validate-a"
+    )
+    validate_input = write_absent_validate_input(project, [validate_record])
+    config = wrkslots._load_config(str(project), "testhost")
+    before = [
+        wrkslots._record_to_obj(record) for record in wrkslots._load_active(config).slots
+    ]
+    paths = (
+        *wrkslots._absent_validate_row_paths(config, agent_record),
+        *wrkslots._absent_validate_row_paths(config, validate_record),
+    )
+    set_liveness(project, "dead")
+    monkeypatch.setattr(wrkslots, "_short_hostname", lambda: "testhost")
+    monkeypatch.setattr(wrkslots, "_absent_validate_process_snapshot", lambda: ())
+    monkeypatch.setattr(
+        wrkslots,
+        "_absent_validate_privileged_path_match",
+        lambda _processes, _targets, _budget=None: None,
+    )
+    install_multiline_systemd_snapshot(monkeypatch, paths)
+
+    assert run_absent_agent_recovery(project, agent_record, apply=False) == 0
+    assert run_absent_validate_recovery(project, validate_input, apply=False) == 0
+    after = [
+        wrkslots._record_to_obj(record) for record in wrkslots._load_active(config).slots
+    ]
+    assert after == before
+
+
 def test_recover_absent_agent_row_preserves_commit_before_registry_repair(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -16509,6 +16544,54 @@ def test_user_systemd_uses_validated_bus_and_absolute_binary(
     assert kwargs["stdout_limit"] == 1024 * 1024
     assert kwargs["stderr_limit"] == 64 * 1024
     assert kwargs["env_overrides"] == {"XDG_RUNTIME_DIR": "/run/user/123"}
+
+
+def install_multiline_systemd_snapshot(
+    monkeypatch: pytest.MonkeyPatch, paths: Sequence[Path]
+) -> str:
+    path_commands = "\n".join(f"mkdir -p {path}" for path in paths)
+    exec_start = (
+        "{ path=/usr/bin/bash ; argv[]=/usr/bin/bash -c set -euo pipefail\n"
+        f"{path_commands}\n"
+        "writer_body='\n"
+        f"  printf 'ready\\n' > {paths[0]}/writer-ready\n"
+        "'\n"
+        "writer=$!\n"
+        " ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; "
+        "code=(null) ; status=0/0 }"
+    )
+
+    def systemctl(arguments: Sequence[str], _budget: object) -> str:
+        if arguments[0] == "list-units":
+            return "fixture.service loaded failed failed multiline fixture\n"
+        if arguments[0] == "list-jobs":
+            return "No jobs running.\n"
+        assert arguments[0] == "show"
+        return (
+            "Id=fixture.service\n"
+            "LoadState=loaded\n"
+            "ActiveState=failed\n"
+            "SubState=failed\n"
+            "MainPID=0\n"
+            f"ExecStart={exec_start}\n"
+            "ControlGroup=\n"
+            "WorkingDirectory=\n"
+        )
+
+    monkeypatch.setattr(wrkslots, "_run_user_systemctl", systemctl)
+    return exec_start
+
+
+def test_user_systemd_snapshot_preserves_multiline_execstart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = Path("/src/target/cgroup-probe")
+    exec_start = install_multiline_systemd_snapshot(monkeypatch, (target,))
+    snapshot = wrkslots._user_systemd_snapshot()
+
+    assert len(snapshot) == 1
+    assert snapshot[0]["ExecStart"] == exec_start
+    assert str(target) in snapshot[0]["ExecStart"]
 
 
 def test_bounded_read_only_command_refuses_output_and_time_overruns() -> None:
