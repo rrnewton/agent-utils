@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import re
+import subprocess
 import sys
 import zipfile
 from pathlib import Path
@@ -12,6 +13,41 @@ import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _collect_lifecycle_tests(mark_expression: str | None = None) -> set[str]:
+    command = [
+        sys.executable,
+        "-m",
+        "pytest",
+        "--collect-only",
+        "-q",
+        "--strict-markers",
+        "-p",
+        "no:cacheprovider",
+        "-c",
+        "pyproject.toml",
+        "--rootdir=.",
+        "wrkslots/tests/test_lifecycle.py",
+    ]
+    if mark_expression is not None:
+        command.extend(("-m", mark_expression))
+    environment = os.environ.copy()
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    completed = subprocess.run(
+        command,
+        cwd=REPO_ROOT / "py",
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr or completed.stdout
+    return {
+        line
+        for line in completed.stdout.splitlines()
+        if line.startswith("wrkslots/tests/test_lifecycle.py::")
+    }
 
 
 def _load_script(name: str) -> ModuleType:
@@ -349,3 +385,75 @@ def test_package_indexes_name_real_check_commands() -> None:
     assert "check-python-packages:" in makefile
     assert "check-rust-packages:" in makefile
     assert "python" not in rust_index.lower()
+
+
+def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
+    all_tests = _collect_lifecycle_tests()
+    ordinary = _collect_lifecycle_tests("ordinary_environment")
+    mapped = _collect_lifecycle_tests("not ordinary_environment")
+    mapped_root = _collect_lifecycle_tests("mapped_root_namespace")
+
+    assert ordinary.isdisjoint(mapped)
+    assert ordinary | mapped == all_tests
+    assert len(all_tests) == 505
+    assert len(ordinary) == 54
+    assert len(mapped) == 451
+    assert {
+        node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
+    } == {
+        "test_adopt_refuses_pid_outside_invoking_process_ancestry",
+        "test_frozen_parser_and_consumer_use_exact_real_projection_shape",
+        "test_frozen_parser_failures_preserve_checkout_without_journal",
+        "test_frozen_parser_reads_immutable_initial_snapshot_during_live_restore",
+        "test_frozen_parser_refuses_each_module_tampered_before_or_after_inspect",
+        "test_frozen_parser_refuses_record_mutation_after_inspect",
+        "test_frozen_validate_batch_closes_operation_owned_fds_before_censuses",
+        "test_frozen_validate_batch_fresh_census_does_not_ignore_current_process",
+        "test_frozen_validate_checkout_binds_terminal_record_fields",
+        "test_frozen_validate_checkout_recovers_each_durable_crash_boundary",
+        "test_frozen_validate_recovery_refuses_absent_fenced_path",
+        "test_frozen_validate_recovery_refuses_absent_prepared_path_twice",
+        "test_frozen_validate_recovery_refuses_changed_identity_binding",
+        "test_frozen_validate_recovery_refuses_changed_terminal_record_digest",
+        "test_frozen_validate_refuses_disappearance_after_final_check",
+        "test_frozen_validate_refuses_fenced_replacement_after_final_check",
+        "test_frozen_validate_refuses_replacement_after_final_check",
+        "test_frozen_validate_rejects_counterfeit_minimal_terminal_records",
+        "test_lock_conflict_refuses_without_state_change",
+        "test_ownerless_validate_batch_removes_terminal_frozen_checkout",
+        "test_process_entering_after_final_scan_before_path_move_is_not_deleted",
+        "test_remove_refuses_live_process_using_slot",
+        "test_root_owned_executable_accepts_host_root_helper",
+    }
+
+    negative = (
+        "wrkslots/tests/test_lifecycle.py::"
+        "test_root_owned_executable_rejects_namespace_root_without_host_root"
+    )
+    assert mapped_root == {negative}
+    assert negative in mapped
+    assert negative not in ordinary
+
+    replay_test = (
+        "wrkslots/tests/test_lifecycle.py::"
+        "test_doctor_replays_hold_events_once_per_machine"
+    )
+    assert replay_test in mapped
+    assert replay_test not in ordinary
+    assert replay_test not in mapped_root
+
+    makefile = re.sub(
+        r"\s+",
+        " ",
+        (REPO_ROOT / "Makefile").read_text(encoding="utf-8").replace("\\\n", " "),
+    )
+    assert (
+        "unshare --user --map-root-user --pid --fork --mount-proc "
+        "python3 -m pytest -q -c pyproject.toml --rootdir=. "
+        "wrkslots/tests/test_lifecycle.py -m 'not ordinary_environment'"
+    ) in makefile
+    assert (
+        "python3 -m pytest -q -c pyproject.toml --rootdir=. "
+        "wrkslots/tests/test_lifecycle.py -m ordinary_environment"
+    ) in makefile
+    assert "wrkslots/tests/test_lifecycle.py::" not in makefile
