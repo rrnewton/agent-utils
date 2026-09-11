@@ -12518,6 +12518,82 @@ const ALIASED = { ...CHANNEL, alias: "the build channel" };
 /** The text of each option in a picker, in order. */
 const optionText = (page, id) => [...page.el(id).children].map((option) => option.textContent);
 
+test("THE CHANNEL BOX IS SMALL WHEN IT IS DOING NOTHING", async () => {
+  // The owner's complaint about the first version: a rename box, an id box, a name box and a
+  // checkbox all standing open at once, which on a phone is most of a screen of text entry for two
+  // acts performed rarely. At rest the box is a picker, one line of fact, and the verbs.
+  const page = newPage();
+  await signIn(page);
+  await page.el("open-settings").click();
+
+  assert.equal(page.el("rename-fields").hidden, true, "the rename field is open before it is asked for");
+  assert.equal(page.el("add-channel-fields").hidden, true, "the add form is open before it is asked for");
+  // ...and the verbs ARE there, or the box would be a dead end rather than a compact one.
+  for (const id of ["rename-channel", "open-add-channel"]) {
+    assert.equal(page.el(id).hidden, false, `${id} is not offered`);
+  }
+  // One line saying what this channel is, including where it came from — which is what explains
+  // the absence of a Remove button rather than leaving it unexplained.
+  assert.match(page.el("channel-facts").text(), /lead team/, "the box does not say what channel this is");
+  assert.match(page.el("channel-facts").text(), /configuration file/, "the box does not say where it came from");
+});
+
+test("...Rename opens the field, and Cancel closes it without keeping what was typed", async () => {
+  const page = newPage();
+  await signIn(page);
+  await page.el("open-settings").click();
+
+  await page.el("rename-channel").click();
+  assert.equal(page.el("rename-fields").hidden, false, "Rename opened nothing");
+  assert.equal(
+    page.el("rename-channel").getAttribute("aria-expanded"),
+    "true",
+    "the disclosure does not say it is open, so a screen reader cannot tell"
+  );
+
+  page.el("channel-alias").value = "typed but not saved";
+  await page.el("cancel-rename").click();
+  assert.equal(page.el("rename-fields").hidden, true, "Cancel left the field open");
+  assert.deepEqual(page.aliasCalls, [], "Cancel saved the name anyway");
+
+  // Re-opening shows what the SERVER says, not what was abandoned.
+  await page.el("rename-channel").click();
+  assert.notEqual(
+    page.el("channel-alias").value,
+    "typed but not saved",
+    "an abandoned rename came back the next time the panel opened"
+  );
+});
+
+test("...only one panel is open at a time, and changing channel closes both", async () => {
+  // Both panels are text entry, and two open at once is the full-height form this replaced.
+  const page = newPage();
+  await signIn(page);
+  await page.el("open-settings").click();
+
+  await page.el("rename-channel").click();
+  await page.el("open-add-channel").click();
+  assert.equal(page.el("rename-fields").hidden, true, "opening Add left Rename open underneath it");
+  assert.equal(page.el("add-channel-fields").hidden, false);
+
+  // A half-typed name belongs to the channel that was chosen when it was typed. Carrying it to a
+  // different one is worse than losing it.
+  page.el("new-channel-id").value = "1110000000000000007";
+  page.el("new-channel-label").value = "another";
+  await page.el("add-channel").click();
+  await page.settle();
+  assert.equal(page.el("add-channel-fields").hidden, true, "the form stayed open after it succeeded");
+
+  await page.el("rename-channel").click();
+  page.el("settings-channel").value = "1110000000000000007";
+  await page.el("settings-channel").dispatch("change");
+  assert.equal(
+    page.el("rename-fields").hidden,
+    true,
+    "a rename panel opened against one channel survived a change to another"
+  );
+});
+
 test("A CHANNEL CAN BE ADDED FROM INSIDE THE APP, AND APPEARS IN THE PICKER", async () => {
   // The whole point: a second channel without editing a file or redeploying. What is asserted is
   // not that a request went out but that the channel is now SWITCHABLE — the picker is the feature.
@@ -12530,6 +12606,8 @@ test("A CHANNEL CAN BE ADDED FROM INSIDE THE APP, AND APPEARS IN THE PICKER", as
     "the fixture already has more than one channel, so adding one proves nothing"
   );
 
+  await page.el("open-add-channel").click();
+  assert.equal(page.el("add-channel-fields").hidden, false, "Add a channel did not open the form");
   page.el("new-channel-id").value = "1110000000000000002";
   page.el("new-channel-label").value = "second team";
   await page.el("add-channel").click();
@@ -12555,6 +12633,7 @@ test("...and letting the bridge POST there is a deliberate act, off by default",
   const page = newPage();
   await signIn(page);
   await page.el("open-settings").click();
+  await page.el("open-add-channel").click();
   page.el("new-channel-id").value = "1110000000000000003";
   page.el("new-channel-label").value = "writable one";
   page.el("new-channel-writable").checked = true;
@@ -12575,6 +12654,7 @@ test("...and a channel the bot cannot read is refused IN THE SERVER'S OWN WORDS"
   page.addChannelError = "the bot is not in that channel; add it there, not only to the server";
   await signIn(page);
   await page.el("open-settings").click();
+  await page.el("open-add-channel").click();
   page.el("new-channel-id").value = "1110000000000000009";
   page.el("new-channel-label").value = "not mine";
   await page.el("add-channel").click();
@@ -12606,6 +12686,7 @@ test("REMOVE IS OFFERED FOR A CHANNEL ADDED HERE, AND NOT FOR ONE FROM THE FILE"
   );
   assert.match(page.el("remove-channel-state").text(), /configuration file/);
 
+  await page.el("open-add-channel").click();
   page.el("new-channel-id").value = "1110000000000000004";
   page.el("new-channel-label").value = "temporary";
   await page.el("add-channel").click();
@@ -12656,6 +12737,11 @@ async function renameFrom(page, channelId, typed) {
   await page.el("open-settings").click();
   page.el("settings-channel").value = channelId;
   await page.el("settings-channel").dispatch("change");
+  // THROUGH THE BUTTON, because that is the only way a thumb reaches the field: the rename input
+  // is behind a disclosure and a test that typed into it while it was hidden would pass against a
+  // page where the disclosure never opened.
+  await page.el("rename-channel").click();
+  assert.equal(page.el("rename-fields").hidden, false, "Rename did not open the field");
   page.el("channel-alias").value = typed;
   await page.el("save-alias").click();
   await page.settle();

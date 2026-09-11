@@ -6844,11 +6844,12 @@ function fillChannelSelect(id) {
  * this only avoids putting up a button whose entire outcome is a refusal.
  */
 function renderRemoveChannel(channel) {
-  const removable = channel !== null && channel.added === true;
+  const removable = channel !== null && channel !== undefined && channel.added === true;
   el("remove-channel").hidden = !removable;
-  el("remove-channel-state").textContent = removable
-    ? ""
-    : "This one is in the server's configuration file, so it is removed by editing that.";
+  el("remove-channel-state").textContent =
+    removable || !channel
+      ? ""
+      : "This one is in the server's configuration file, so it is removed by editing that.";
 }
 
 /** Add the channel named in the form, and put the answer where it can be read. */
@@ -6884,6 +6885,7 @@ async function addChannel() {
   el("new-channel-id").value = "";
   el("new-channel-label").value = "";
   el("new-channel-writable").checked = false;
+  showChannelPanel(null);
   said.textContent = `Added. "${label}" is now in the channel picker.`;
 }
 
@@ -6914,16 +6916,44 @@ function renderAliasEditor() {
   const channel = knownChannel(el("settings-channel").value);
   if (!channel) {
     el("channel-alias").value = "";
-    el("alias-state").textContent = "This server has no channels configured.";
+    el("channel-facts").textContent = "This server has no channels configured.";
+    el("alias-state").textContent = "";
+    renderRemoveChannel(null);
     return;
   }
   el("channel-alias").value = channel.alias || "";
   renderRemoveChannel(channel);
-  // The configured label is named either way. It is what clearing goes back to, and without it
-  // on screen the owner cannot tell what he would be returning to.
-  el("alias-state").textContent = channel.alias
+  // ONE LINE, ALWAYS VISIBLE, saying what this channel is. The configured label is named either
+  // way: it is what clearing a name goes back to, and without it on screen the owner cannot tell
+  // what he would be returning to. Where the channel CAME FROM is here too, because it is what
+  // decides whether Remove is offered, and a missing button explains itself badly.
+  const named = channel.alias
     ? `Called "${channel.alias}" here. The configured label is "${channel.label}".`
     : `No name of your own yet. The configured label is "${channel.label}".`;
+  const origin = channel.added
+    ? "Added in this app."
+    : "From the server's configuration file.";
+  el("channel-facts").textContent = `${named} ${origin}`;
+  // The same sentence inside the rename panel, where it is what the input is described by.
+  el("alias-state").textContent = named;
+}
+
+/**
+ * Open one of the channel box's two panels, or neither.
+ *
+ * ONE AT A TIME. Both are text entry and the box lives on a phone; two open at once is the
+ * full-height form this replaced. Passing `null` closes both, which is what changing channel does —
+ * a half-typed name for the channel you just navigated away from is not a draft worth keeping.
+ */
+function showChannelPanel(which) {
+  for (const [panel, opener] of [
+    ["rename-fields", "rename-channel"],
+    ["add-channel-fields", "open-add-channel"],
+  ]) {
+    const open = panel === which;
+    el(panel).hidden = !open;
+    el(opener).setAttribute("aria-expanded", open ? "true" : "false");
+  }
 }
 
 /**
@@ -7416,7 +7446,33 @@ el("discord-channel").addEventListener(
 );
 // `#39 channel-alias`. Pointing the editor at another channel shows THAT channel's name; it does
 // not change which channel the Discord view is reading, which is the picker on the bar.
-el("settings-channel").addEventListener("change", renderAliasEditor);
+// Changing channel closes whatever was open: the panels belong to the channel that was chosen
+// when they were opened, and carrying a half-typed name across to a different one is worse than
+// losing it.
+el("settings-channel").addEventListener("change", () => {
+  showChannelPanel(null);
+  renderAliasEditor();
+});
+el("rename-channel").addEventListener("click", () => {
+  showChannelPanel("rename-fields");
+  el("channel-alias").focus();
+});
+el("cancel-rename").addEventListener("click", () => {
+  // Back to what the server says, not to what was typed. Cancel means the typing did not happen.
+  renderAliasEditor();
+  showChannelPanel(null);
+});
+el("open-add-channel").addEventListener("click", () => {
+  showChannelPanel("add-channel-fields");
+  el("new-channel-id").focus();
+});
+el("cancel-add-channel").addEventListener("click", () => {
+  el("new-channel-id").value = "";
+  el("new-channel-label").value = "";
+  el("new-channel-writable").checked = false;
+  el("add-channel-state").textContent = "";
+  showChannelPanel(null);
+});
 el("add-channel").addEventListener("click", guardQuietly(addChannel));
 el("remove-channel").addEventListener("click", guardQuietly(removeChannel));
 el("save-alias").addEventListener("click", guardQuietly(saveAlias));

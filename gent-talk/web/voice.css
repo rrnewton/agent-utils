@@ -2318,3 +2318,12 @@ textarea {
   font-size: 0.85rem;
   margin: 0.2rem 0 0;
 }
+
+/* The verbs in the channel box, on one line while they fit. They are the resting state of that
+   group: the fields each belongs to appear underneath only when one is pressed. */
+.channel-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin: 0.4rem 0 0;
+}

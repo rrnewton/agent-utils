@@ -442,77 +442,101 @@
               renaming rather than as the shape of the screen — and there was nowhere at all to put
               a second per-channel control.
             -->
+            <!--
+              THE PER-CHANNEL BOX, and the only one on this screen.
+              Everything else here is a setting about the app; everything in here is about ONE
+              channel, chosen once at the top rather than separately by each control.
+
+              IT IS SMALL WHEN IT IS DOING NOTHING. The first version laid every field out at once
+              — a rename box, an id box, a name box, a checkbox — and on a phone that is most of a
+              screen of text entry standing open for two acts that are each performed rarely. So
+              what is always visible is the picker, one line saying what this channel IS, and the
+              verbs. The fields belong to the verb and appear with it.
+            -->
             <section class="settings-group" id="channel-settings">
               <div class="group-head">
                 <h2>Channels</h2>
                 <button class="help-link" id="help-link-channel-alias" type="button" data-help="channel-alias" aria-label="About channels" title="What this changes, and what it does not">?</button>
               </div>
-              <p class="hint">Everything below is about the one channel chosen here.</p>
               <label for="settings-channel">Channel</label>
-              <select id="settings-channel" aria-describedby="alias-state"></select>
-              <label for="channel-alias">Call it</label>
-              <input
-                id="channel-alias"
-                type="text"
-                maxlength="60"
-                autocomplete="off"
-                aria-describedby="alias-state"
-              />
-              <p id="alias-state" class="hint" aria-live="polite"></p>
-              <button id="save-alias" class="secondary" type="button">Save this name</button>
-              <button id="clear-alias" class="secondary" type="button">Use the configured label</button>
-              <!--
-                The SERVER's own standing statement about what an alias is, quoted and never
-                rewritten — the same rule `#inbox-note` follows. A second copy of a policy here
-                would be a second thing that can drift from the one the server actually enforces.
-              -->
-              <p id="alias-note" class="hint"></p>
+              <select id="settings-channel" aria-describedby="channel-facts"></select>
+              <!-- What this channel IS: the name in force, and where it came from. -->
+              <p id="channel-facts" class="hint" aria-live="polite"></p>
 
-              <!--
-                Removing is only offered for a channel that was ADDED here. One from the
-                configuration file cannot be taken out from the app: the file is read at startup and
-                never written, so it would come back on the next restart. The server refuses that
-                too — this only avoids offering a button whose whole outcome is a refusal.
-              -->
-              <button id="remove-channel" class="secondary" type="button" hidden>Remove this channel</button>
+              <div class="channel-actions">
+                <button id="rename-channel" class="secondary" type="button" aria-expanded="false" aria-controls="rename-fields">Rename</button>
+                <!--
+                  Removing is only offered for a channel that was ADDED here. One from the
+                  configuration file cannot be taken out from the app: the file is read at startup
+                  and never written, so it would come back on the next restart. The server refuses
+                  that too — this only avoids offering a button whose whole outcome is a refusal.
+                -->
+                <button id="remove-channel" class="secondary" type="button" hidden>Remove</button>
+                <button id="open-add-channel" class="secondary" type="button" aria-expanded="false" aria-controls="add-channel-fields">Add a channel</button>
+              </div>
               <p id="remove-channel-state" class="hint" aria-live="polite"></p>
 
-              <hr class="settings-rule" />
+              <div id="rename-fields" hidden>
+                <label for="channel-alias">Call it</label>
+                <input
+                  id="channel-alias"
+                  type="text"
+                  maxlength="60"
+                  autocomplete="off"
+                  aria-describedby="alias-state"
+                />
+                <p id="alias-state" class="hint" aria-live="polite"></p>
+                <div class="channel-actions">
+                  <button id="save-alias" class="secondary" type="button">Save</button>
+                  <button id="clear-alias" class="secondary" type="button">Use the configured label</button>
+                  <button id="cancel-rename" class="secondary" type="button">Cancel</button>
+                </div>
+                <!--
+                  The SERVER's own standing statement about what an alias is, quoted and never
+                  rewritten — the same rule `#inbox-note` follows. A second copy of a policy here
+                  would be a second thing that can drift from the one the server actually enforces.
+                -->
+                <p id="alias-note" class="hint"></p>
+              </div>
 
-              <h3>Add a channel</h3>
-              <p class="hint">
-                In Discord: User Settings → Advanced → Developer Mode, then right-click the channel
-                → Copy Channel ID. The bot has to already be able to see it.
-              </p>
-              <label for="new-channel-id">Channel ID</label>
-              <input
-                id="new-channel-id"
-                type="text"
-                inputmode="numeric"
-                maxlength="20"
-                autocomplete="off"
-                placeholder="17 to 20 digits"
-                aria-describedby="add-channel-state"
-              />
-              <label for="new-channel-label">Call it</label>
-              <input
-                id="new-channel-label"
-                type="text"
-                maxlength="60"
-                autocomplete="off"
-                aria-describedby="add-channel-state"
-              />
-              <!--
-                OFF BY DEFAULT, and it is the one control on this screen that widens what the bridge
-                can SAY rather than what it can read. Left as a deliberate act rather than a
-                convenience.
-              -->
-              <label class="row" for="new-channel-writable">
-                <input id="new-channel-writable" type="checkbox" />
-                <span>Let the bridge post here</span>
-              </label>
-              <button id="add-channel" class="secondary" type="button">Add this channel</button>
-              <p id="add-channel-state" class="hint" aria-live="polite"></p>
+              <div id="add-channel-fields" hidden>
+                <p class="hint">
+                  In Discord: User Settings → Advanced → Developer Mode, then right-click the
+                  channel → Copy Channel ID. The bot has to already be able to see it.
+                </p>
+                <label for="new-channel-id">Channel ID</label>
+                <input
+                  id="new-channel-id"
+                  type="text"
+                  inputmode="numeric"
+                  maxlength="20"
+                  autocomplete="off"
+                  placeholder="17 to 20 digits"
+                  aria-describedby="add-channel-state"
+                />
+                <label for="new-channel-label">Call it</label>
+                <input
+                  id="new-channel-label"
+                  type="text"
+                  maxlength="60"
+                  autocomplete="off"
+                  aria-describedby="add-channel-state"
+                />
+                <!--
+                  OFF BY DEFAULT, and it is the one control in here that widens what the bridge can
+                  SAY rather than what it can read. Left as a deliberate act rather than a
+                  convenience.
+                -->
+                <label class="row" for="new-channel-writable">
+                  <input id="new-channel-writable" type="checkbox" />
+                  <span>Let the bridge post here</span>
+                </label>
+                <div class="channel-actions">
+                  <button id="add-channel" class="secondary" type="button">Add</button>
+                  <button id="cancel-add-channel" class="secondary" type="button">Cancel</button>
+                </div>
+                <p id="add-channel-state" class="hint" aria-live="polite"></p>
+              </div>
             </section>
 
             <section class="settings-group">
