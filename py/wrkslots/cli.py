@@ -17927,14 +17927,25 @@ def _user_systemd_snapshot() -> tuple[Mapping[str, str], ...]:
         budget,
     )
     blocks = [block for block in shown.split("\n\n") if block.strip()]
+    property_names = frozenset(properties)
+    multiline_properties = frozenset(
+        name for name in properties if name.startswith("Exec")
+    )
     parsed: dict[str, dict[str, str]] = {}
     for block in blocks:
         values: dict[str, str] = {}
+        current_property: str | None = None
         for line in block.splitlines():
             key, separator, value = line.partition("=")
-            if not separator or key in values:
+            if separator and key in property_names:
+                if key in values:
+                    raise Refusal(f"cannot parse user-systemd properties: {line!r}")
+                values[key] = value
+                current_property = key
+                continue
+            if current_property not in multiline_properties:
                 raise Refusal(f"cannot parse user-systemd properties: {line!r}")
-            values[key] = value
+            values[current_property] += f"\n{line}"
         if "Id" not in values:
             raise Refusal("user-systemd property block has no unit identity")
         for name in properties:
