@@ -213,7 +213,6 @@ def install_frozen_validation_parser(
         return production_authority(config)
 
     monkeypatch.setattr(wrkslots, "_frozen_validation_authority_commit", fixture_authority)
-    monkeypatch.setattr(wrkslots, "_has_identity_user_namespace", lambda: True)
 
 
 def command(
@@ -306,7 +305,6 @@ cli._capture_lsof_process_path_census = test_census
 cli._capture_same_uid_process_path_census = test_same_uid_census
 cli._production_frozen_validation_authority_commit = cli._frozen_validation_authority_commit
 cli._frozen_validation_authority_commit = test_frozen_authority
-cli._has_identity_user_namespace = lambda: True
 raise SystemExit(cli.main(sys.argv[1:]))
 """
     argv = [
@@ -1282,6 +1280,7 @@ def run_frozen_validation_batch(
     )
 
 
+@pytest.mark.ordinary_environment
 def test_frozen_parser_and_consumer_use_exact_real_projection_shape(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1582,6 +1581,7 @@ def test_ownerless_validate_batch_shares_one_census_and_removes_unheld_checkouts
     assert not second.exists()
 
 
+@pytest.mark.ordinary_environment
 def test_ownerless_validate_batch_removes_terminal_frozen_checkout(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1647,6 +1647,7 @@ def test_ownerless_validate_batch_removes_terminal_frozen_checkout(
     ) == 4
 
 
+@pytest.mark.ordinary_environment
 def test_frozen_validate_batch_closes_operation_owned_fds_before_censuses(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1784,6 +1785,7 @@ def test_frozen_validate_batch_does_not_ignore_current_process_census_use(
     )
 
 
+@pytest.mark.ordinary_environment
 def test_frozen_validate_batch_fresh_census_does_not_ignore_current_process(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1911,6 +1913,7 @@ def test_frozen_validate_checkout_refuses_noncanonical_lexical_aliases(
     assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
 
 
+@pytest.mark.ordinary_environment
 @pytest.mark.parametrize(
     ("field", "replacement", "message"),
     (
@@ -1970,6 +1973,7 @@ def test_frozen_validate_checkout_binds_terminal_record_fields(
     assert checkout.is_dir()
 
 
+@pytest.mark.ordinary_environment
 @pytest.mark.parametrize(
     ("state", "result"),
     (
@@ -2128,6 +2132,7 @@ def test_frozen_parser_authority_requires_both_enclosing_gitlinks(
         )
 
 
+@pytest.mark.ordinary_environment
 @pytest.mark.parametrize(
     "relative",
     wrkslots._FROZEN_VALIDATION_PARSER_FILES,
@@ -2216,6 +2221,7 @@ def test_frozen_parser_refuses_each_module_tampered_before_or_after_inspect(
     )
 
 
+@pytest.mark.ordinary_environment
 @pytest.mark.parametrize(
     ("failure", "expected"),
     (
@@ -2303,6 +2309,7 @@ def test_frozen_parser_failures_preserve_checkout_without_journal(
     )
 
 
+@pytest.mark.ordinary_environment
 @pytest.mark.parametrize("mutation", ("append", "checkout"))
 def test_frozen_parser_refuses_record_mutation_after_inspect(
     tmp_path: Path,
@@ -2370,6 +2377,7 @@ def test_frozen_parser_refuses_record_mutation_after_inspect(
     )
 
 
+@pytest.mark.ordinary_environment
 def test_frozen_parser_reads_immutable_initial_snapshot_during_live_restore(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2451,6 +2459,7 @@ def test_frozen_parser_reads_immutable_initial_snapshot_during_live_restore(
     assert record.read_bytes() == initial
 
 
+@pytest.mark.ordinary_environment
 @pytest.mark.parametrize(
     "boundary",
     (
@@ -2531,6 +2540,7 @@ def test_frozen_validate_checkout_recovers_each_durable_crash_boundary(
     assert len(removal_events) == 1
 
 
+@pytest.mark.ordinary_environment
 def test_frozen_validate_recovery_refuses_changed_terminal_record_digest(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2567,6 +2577,7 @@ def test_frozen_validate_recovery_refuses_changed_terminal_record_digest(
     assert (control_directory(project) / "ACTIVE.testhost.journal").is_file()
 
 
+@pytest.mark.ordinary_environment
 def test_frozen_validate_refuses_replacement_after_final_check(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2625,6 +2636,7 @@ def test_frozen_validate_refuses_replacement_after_final_check(
     )
 
 
+@pytest.mark.ordinary_environment
 def test_frozen_validate_refuses_fenced_replacement_after_final_check(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2685,6 +2697,7 @@ def test_frozen_validate_refuses_fenced_replacement_after_final_check(
     )
 
 
+@pytest.mark.ordinary_environment
 def test_frozen_validate_refuses_disappearance_after_final_check(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2776,6 +2789,7 @@ def test_frozen_validate_refuses_disappearance_after_final_check(
     )
 
 
+@pytest.mark.ordinary_environment
 def test_frozen_validate_recovery_refuses_absent_fenced_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2832,6 +2846,7 @@ def test_frozen_validate_recovery_refuses_absent_fenced_path(
     )
 
 
+@pytest.mark.ordinary_environment
 def test_frozen_validate_recovery_refuses_absent_prepared_path_twice(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2914,6 +2929,7 @@ def test_frozen_validate_recovery_refuses_absent_prepared_path_twice(
     )
 
 
+@pytest.mark.ordinary_environment
 @pytest.mark.parametrize("changed_binding", ["file-handle", "parent-mount"])
 def test_frozen_validate_recovery_refuses_changed_identity_binding(
     tmp_path: Path,
@@ -4905,6 +4921,7 @@ def test_create_preserves_every_unrelated_row_and_directory(tmp_path: Path) -> N
     assert checkout(project, "slot02").is_dir()
 
 
+@pytest.mark.ordinary_environment
 def test_lock_conflict_refuses_without_state_change(tmp_path: Path) -> None:
     project, _repository, _remote = make_project(tmp_path)
     before = (project / "worktrees" / "ACTIVE.testhost.json").read_bytes()
@@ -5215,6 +5232,7 @@ def test_crash_after_git_removal_before_journal_update_recovers(tmp_path: Path) 
     assert not (project / "worktrees" / "slot01").exists()
 
 
+@pytest.mark.ordinary_environment
 def test_process_entering_after_final_scan_before_path_move_is_not_deleted(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -9228,6 +9246,7 @@ def test_unbound_owner_remains_unreclaimable_after_recovery_note(
     assert checkout(project).is_dir()
 
 
+@pytest.mark.ordinary_environment
 def test_adopt_refuses_pid_outside_invoking_process_ancestry(tmp_path: Path) -> None:
     project, _repository, _remote = make_project(tmp_path)
     made = create(project, bind_owner=False)
@@ -9254,6 +9273,7 @@ def test_adopt_refuses_pid_outside_invoking_process_ancestry(tmp_path: Path) -> 
         terminate_process(sleeper)
 
 
+@pytest.mark.ordinary_environment
 def test_remove_refuses_live_process_using_slot(tmp_path: Path) -> None:
     project, repository, _remote = make_project(tmp_path)
     made = create(project)
@@ -16228,6 +16248,7 @@ def test_bounded_read_only_command_refuses_output_and_time_overruns() -> None:
         )
 
 
+@pytest.mark.mapped_root_namespace
 def test_root_owned_executable_rejects_namespace_root_without_host_root(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -16244,6 +16265,7 @@ def test_root_owned_executable_rejects_namespace_root_without_host_root(
         wrkslots._root_owned_executable(helper, "attacker helper")
 
 
+@pytest.mark.ordinary_environment
 def test_root_owned_executable_accepts_host_root_helper() -> None:
     if not wrkslots._has_identity_user_namespace():
         pytest.skip("requires the initial identity user namespace")
