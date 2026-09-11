@@ -4537,6 +4537,99 @@ def test_ownerless_cleanup_retains_boolean_current_validation_exit(
     assert target.is_dir()
 
 
+@pytest.mark.parametrize(
+    ("schema_form", "status", "exit_code"),
+    (
+        ("omitted", "PASSED", 0),
+        ("null", "PASSED", 0),
+        ("omitted", "PASSED", False),
+        ("null", "FAILED", True),
+    ),
+)
+def test_ownerless_cleanup_retains_current_result_without_schema(
+    tmp_path: Path, schema_form: str, status: str, exit_code: object
+) -> None:
+    project, _repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    target = project / "worktrees" / "validate" / "validate-cargo-current"
+    target.mkdir(parents=True)
+    record = prepare_terminal_validation_record(
+        project,
+        target,
+        field="cargo_home",
+        name=f"validate-current-{schema_form}",
+    )
+    value = json.loads(record.read_text())
+    value.update(current_terminal_validation_record(status=status))
+    value["exit_code"] = exit_code
+    if schema_form == "omitted":
+        del value["service_result_schema"]
+    else:
+        value["service_result_schema"] = None
+    assert value["result_source"] == "validation-service-result"
+    record.write_text(json.dumps(value), encoding="utf-8")
+
+    refused = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--ownerless-validate-cargo-home",
+        target.relative_to(project).as_posix(),
+        "--completed-record",
+        record.relative_to(project).as_posix(),
+    )
+
+    assert refused.returncode == 3
+    assert "does not contain an evidenced terminal result" in refused.stderr
+    assert target.is_dir()
+
+
+def test_ownerless_cleanup_accepts_schema_less_durable_log_record(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    target = project / "worktrees" / "validate" / "validate-cargo-historical"
+    target.mkdir(parents=True)
+    record = prepare_terminal_validation_record(
+        project,
+        target,
+        field="cargo_home",
+        name="validate-historical-durable-log",
+    )
+    value = json.loads(record.read_text())
+    value.update(
+        result="success",
+        result_source="durable-log",
+        executed_nodes=None,
+        executed_tests=None,
+        passed_tests=None,
+    )
+    assert "service_result_schema" not in value
+    record.write_text(json.dumps(value), encoding="utf-8")
+
+    recovered = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--ownerless-validate-cargo-home",
+        target.relative_to(project).as_posix(),
+        "--completed-record",
+        record.relative_to(project).as_posix(),
+    )
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert not target.exists()
+
+
 def test_ownerless_cleanup_rejects_non_authoritative_service_result_schema(
     tmp_path: Path,
 ) -> None:
