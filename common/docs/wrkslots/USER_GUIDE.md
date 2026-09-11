@@ -50,6 +50,14 @@ inputs.
 and tells the caller to ask the coordinator. This prevents accidental self-allocation; it does not
 pretend that same-user processes have different operating-system permissions.
 
+When `create` receives `--owner-pid`, that live owner may be the invoking process or one of its
+ancestors, as in ordinary self-binding. It may instead be another child of the verified invoking
+coordinator, which lets the coordinator create a slot already assigned to a live agent. The tool
+captures both exact process generations before creating anything and rechecks the owner and the
+coordinator relationship before publishing the row. A live process outside both relationships is
+refused. Omitting `--owner-pid` retains the separate flow in which the owner immediately runs
+`adopt` itself.
+
 `--coordinator-authorized` on `remove` and `read-handoff` is optional provenance. It is required
 when `recover` starts a new cleanup for an unregistered validation path, because that operation has
 no ACTIVE row naming who allocated it. Resuming the durable journal does not require the original

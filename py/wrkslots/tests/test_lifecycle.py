@@ -364,6 +364,46 @@ def terminate_process(process: subprocess.Popen[str]) -> None:
         process.wait(timeout=10)
 
 
+def spawn_process_outside_coordinator() -> int:
+    """Start a live same-user process whose current ancestry excludes this test."""
+    launcher = (
+        "import os, subprocess; "
+        "child = subprocess.Popen(['sleep', '60'], stdin=subprocess.DEVNULL, "
+        "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); "
+        "print(os.getpid(), child.pid, flush=True)"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", launcher],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    launcher_pid, process_pid = (int(value) for value in completed.stdout.split())
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        if wrkslots._read_process_parent(process_pid) != launcher_pid:
+            return process_pid
+        time.sleep(0.01)
+    raise AssertionError(f"process {process_pid} was not reparented")
+
+
+def terminate_process_id(process_id: int) -> None:
+    try:
+        os.kill(process_id, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        if not Path(f"/proc/{process_id}").exists():
+            return
+        time.sleep(0.01)
+    try:
+        os.kill(process_id, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
 def initialize(
     project: Path,
     *,
@@ -1397,6 +1437,41 @@ def test_create_without_coordinator_authorization_names_boundary_and_remedy(
     assert not checkout(project).exists()
     assert active_slots(project) == []
     assert sorted(path.read_bytes() for path in events.glob("*.json")) == before
+
+
+def test_create_binds_another_child_of_the_invoking_coordinator(tmp_path: Path) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    owner = subprocess.Popen(["sleep", "60"], cwd=project, text=True)
+    try:
+        created = create(project, owner_pid=owner.pid)
+
+        assert created.returncode == 0, created.stderr
+        row = active_slots(project)[0]
+        assert isinstance(row, dict)
+        recorded_owner = row["owner"]
+        assert isinstance(recorded_owner, dict)
+        assert recorded_owner["pid"] == owner.pid
+    finally:
+        terminate_process(owner)
+
+
+def test_create_refuses_live_owner_outside_the_invoking_coordinator(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    owner_pid = spawn_process_outside_coordinator()
+    try:
+        refused = create(project, owner_pid=owner_pid)
+
+        assert refused.returncode == 3
+        assert (
+            f"owner PID {owner_pid} does not descend from coordinator PID {os.getpid()}"
+            in refused.stderr
+        )
+        assert not checkout(project).exists()
+        assert active_slots(project) == []
+    finally:
+        terminate_process_id(owner_pid)
 
 
 def test_recover_removes_only_evidenced_completed_legacy_validate_checkout(
@@ -4973,6 +5048,7 @@ def test_create_refuses_owner_generation_change_before_publication(
     monkeypatch.setattr(
         wrkslots, "_capture_caller_process", lambda _pid, _label: current
     )
+    monkeypatch.setattr(wrkslots, "_capture_registration_owner", lambda _pid: current)
     monkeypatch.setattr(wrkslots, "_assert_caller_process", lambda _identity, _label: None)
     monkeypatch.setattr(wrkslots, "_read_process_identity", lambda _pid: reused)
     returncode = wrkslots.main(

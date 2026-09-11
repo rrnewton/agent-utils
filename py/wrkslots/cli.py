@@ -5447,6 +5447,22 @@ def _assert_registration_owner_authorized(
             ) from caller_refusal
 
 
+def _assert_create_owner_authorized(
+    owner: ProcessIdentity, coordinator: ProcessIdentity
+) -> None:
+    """Require self-binding or a live owner descended from the coordinator.
+
+    Registration can additionally require the owner's cwd inside an existing
+    slot. Creation cannot: the slot path does not exist when this check first
+    runs, so the verified coordinator relationship is the available evidence.
+    """
+    try:
+        _assert_caller_process(owner, "owner")
+        return
+    except Refusal:
+        _assert_process_descends_from(owner, coordinator, "owner")
+
+
 def _registered_liveness_state(config: Config, record: ActiveRecord) -> tuple[str, str]:
     env = {
         "LC_ALL": "C",
@@ -7530,13 +7546,15 @@ def _cmd_create(args: argparse.Namespace) -> int:
     if not args.task or not args.purpose:
         raise Refusal("task and purpose must be non-empty")
     owner = (
-        _capture_caller_process(args.owner_pid, "owner")
+        _capture_registration_owner(args.owner_pid)
         if args.owner_pid is not None
         else None
     )
     coordinator_lease = _capture_caller_process(
         args.coordinator_pid, "coordinator"
     )
+    if owner is not None:
+        _assert_create_owner_authorized(owner, coordinator_lease)
     vcs = _GitVcs()
     with _mutation_locks(config, args.wait_lock):
         _refuse_partial_state(config)
@@ -7642,7 +7660,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                     "owner process generation changed during create; "
                     "recovery journal is preserved"
                 )
-            _assert_caller_process(confirmed_owner, "owner")
+            _assert_create_owner_authorized(confirmed_owner, coordinator_lease)
         confirmed_coordinator = _read_process_identity(coordinator_lease.pid)
         if confirmed_coordinator != coordinator_lease:
             raise Refusal(
@@ -19572,7 +19590,11 @@ usage or audit gate unknown, 3 fail-closed refusal.
         "--owner-pid",
         type=int,
         metavar="PID",
-        help="live owner PID to bind; omit only when the owner will immediately adopt",
+        help=(
+            "live owner PID to bind; it must be in the invoking process ancestry or "
+            "another child of the invoking coordinator; omit only when the owner will "
+            "immediately adopt"
+        ),
     )
     create.add_argument(
         "--coordinator-pid",
