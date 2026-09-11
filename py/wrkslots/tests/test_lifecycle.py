@@ -13434,6 +13434,65 @@ def test_audit_reuses_one_git_worktree_list_for_shared_repository(
     assert calls == [repository]
 
 
+def test_audit_does_not_replay_event_log_per_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(
+        project, slot="slot01", agent="codex-1", branch="codex/one"
+    ).returncode == 0
+    assert create(
+        project, slot="slot02", agent="codex-2", branch="codex/two"
+    ).returncode == 0
+    held = command(project, "hold", "slot01", "--reason", "retain")
+    assert held.returncode == 0, held.stderr
+    handoff = slots_directory(project) / "slot02" / "HANDOFF.md"
+    handoff.write_text("resume here\n", encoding="utf-8")
+    read = raw_command(
+        project,
+        "read-handoff",
+        "slot02",
+        "--coordinator-pid",
+        str(os.getpid()),
+    )
+    assert read.returncode == 0, read.stderr
+
+    calls: list[str] = []
+    original = wrkslots._load_events
+
+    def counted(
+        config: wrkslots.Config, machine: str | None = None
+    ) -> tuple[dict[str, object], ...]:
+        calls.append(machine or config.machine)
+        return original(config, machine)
+
+    monkeypatch.setattr(wrkslots, "_load_events", counted)
+    monkeypatch.setattr(
+        wrkslots,
+        "_capture_process_path_census",
+        lambda _paths: wrkslots._ProcessPathCensus((), ()),
+    )
+
+    assert (
+        wrkslots.main(
+            ["--project-root", str(project), "audit", "--format", "json"]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    rows = {row["slot"]: row for row in payload["slots"]}
+
+    # Active state, archived state, audit row observations, and recovery
+    # journals each inspect the log once; neither audit row adds another pass.
+    assert calls == ["testhost"] * 4
+    assert rows["slot01"]["verdict"] == "HELD"
+    assert not any(
+        "unread HANDOFF.md" in reason for reason in rows["slot02"]["reasons"]
+    )
+
+
 def test_git_operation_paths_uses_one_git_query(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

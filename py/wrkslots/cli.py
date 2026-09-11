@@ -1519,13 +1519,17 @@ def _load_record_holds(
 
 
 def _load_hold(
-    config: Config, slot: str, machine: str | None = None
+    config: Config,
+    slot: str,
+    machine: str | None = None,
+    *,
+    events: Sequence[Mapping[str, object]] | None = None,
 ) -> dict[str, object] | None:
     selected = machine or config.machine
-    events = _load_events(config, selected)
-    if not events:
+    selected_events = _load_events(config, selected) if events is None else events
+    if not selected_events:
         return _load_hold_snapshot(config, slot, selected)
-    return _holds_from_events(events, selected, {slot}).get(slot)
+    return _holds_from_events(selected_events, selected, {slot}).get(slot)
 
 
 def _assert_not_held(config: Config, record: ActiveRecord) -> None:
@@ -3171,9 +3175,17 @@ def _pending_operation_from_events(
     return pending
 
 
-def _recorded_handoff_digest(config: Config, record: ActiveRecord) -> str | None:
+def _recorded_handoff_digest(
+    config: Config,
+    record: ActiveRecord,
+    *,
+    events: Sequence[Mapping[str, object]] | None = None,
+) -> str | None:
     digest: str | None = None
-    for event in _load_events(config, record.machine):
+    selected_events = (
+        _load_events(config, record.machine) if events is None else events
+    )
+    for event in selected_events:
         if event.get("kind") != "handoff-read":
             continue
         payload = _as_mapping(event["payload"], "handoff-read event payload")
@@ -6684,7 +6696,13 @@ def _assert_slot_contents_values(
     return slot_path
 
 
-def _assert_handoff_read(config: Config, record: ActiveRecord, slot_path: Path) -> None:
+def _assert_handoff_read(
+    config: Config,
+    record: ActiveRecord,
+    slot_path: Path,
+    *,
+    events: Sequence[Mapping[str, object]] | None = None,
+) -> None:
     if record.slot_type != "agent":
         return
     handoff = slot_path / "HANDOFF.md"
@@ -6705,7 +6723,7 @@ def _assert_handoff_read(config: Config, record: ActiveRecord, slot_path: Path) 
             "'wrkslots read-handoff', then retry remove"
         ) from exc
     digest = hashlib.sha256(contents).hexdigest()
-    if _recorded_handoff_digest(config, record) != digest:
+    if _recorded_handoff_digest(config, record, events=events) != digest:
         raise Refusal(
             f"slot {record.slot} contains an unread HANDOFF.md. state: REFUSED -- no "
             "checkout was salvaged or removed. remedy: run 'wrkslots read-handoff "
@@ -9665,6 +9683,7 @@ def _audit_record(
     config: Config,
     record: ActiveRecord,
     *,
+    events: Sequence[Mapping[str, object]],
     vcs: _GitVcs | None = None,
     process_census: _ProcessPathCensus | None = None,
     process_census_error: str | None = None,
@@ -9677,7 +9696,7 @@ def _audit_record(
         liveness_state == "dead"
         and owner_state == "dead"
     )
-    hold = _load_hold(config, record.slot, record.machine)
+    hold = _load_hold(config, record.slot, record.machine, events=events)
     cache_bytes = 0
     cache_error: str | None = None
     try:
@@ -9725,7 +9744,7 @@ def _audit_record(
     try:
         _assert_record_paths(config, record)
         _assert_slot_contents(config, record)
-        _assert_handoff_read(config, record, slot_path)
+        _assert_handoff_read(config, record, slot_path, events=events)
         for checkout in record.checkouts:
             path = _stored_path(config, checkout.path, "checkout path")
             repository = _stored_repository_path(config, checkout.repository)[1]
@@ -9834,6 +9853,9 @@ def _cmd_audit(args: argparse.Namespace) -> int:
         _refuse_partial_state(config, allow_validate_batch_seals=True)
         states, _archives = _validate_global_state(config)
         records = [record for state in states for record in state.slots]
+        event_logs = {
+            state.machine: _load_events(config, state.machine) for state in states
+        }
         seal_targets, seal_errors = _audit_validate_batch_seal_evidence(config)
         seal_by_slot = {
             (machine, slot): (generation, path)
@@ -9857,6 +9879,7 @@ def _cmd_audit(args: argparse.Namespace) -> int:
             row, running = _audit_record(
                 config,
                 record,
+                events=event_logs[record.machine],
                 vcs=audit_vcs,
                 process_census=process_census,
                 process_census_error=process_census_error,
