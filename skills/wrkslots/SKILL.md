@@ -196,11 +196,13 @@ For a registered agent row whose directory is already absent, use
 `record_sha256`. It publishes and reads back every recorded checkout commit before removing an exact
 stale Git registration, then archives before changing ACTIVE. If every current local branch tip was
 already preserved, pass one exact `--rescued-current-tip NAME=refs/rescue/EXACT-REF` per checkout.
-That explicit mode freshly reads each rescue ref, requires the recorded HEAD to be its ancestor and
-each delta commit to be landed or patch-equivalent, and requires the checkout path and Git
-registration to be absent. It archives the row without pushing, moving, or deleting any Git ref,
-registration, or checkout path. Without the complete explicit proof, the strict recorded-HEAD path
-still applies. For a real unregistered agent
+Pair each with `--landed-commit NAME=40_HEX_SHA`. That explicit mode freshly reads each rescue ref,
+requires the recorded HEAD to be an ancestor of its current tip, requires the whole current-tip tree
+to equal the exact supplied landed commit tree, proves that commit is an ancestor of freshly
+verified landed main, and requires the checkout path and Git registration to be absent. Its
+read-only plan prints all four bound identities. It archives the row without pushing, moving, or
+deleting any Git ref, registration, or checkout path. Without the complete explicit proof, the
+strict recorded-HEAD path still applies. For a real unregistered agent
 worktree, use `recover-ownerless-agent-worktree` with its exact path, repository, HEAD, branch,
 remote, and remote URL digest. This path deliberately records no owner, task, or handoff. If
 HANDOFF.md exists, read it and supply its exact `--handoff-sha256`; the command rechecks and

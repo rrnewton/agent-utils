@@ -285,21 +285,25 @@ could not be inspected because storage was already absent.
 
 The default remains strict when a recorded local branch has moved. If every current branch tip was
 separately preserved, opt into the no-Git-mutation path by naming each checkout's exact existing
-remote rescue ref:
+remote rescue ref and exact landed commit:
 
 ```sh
 wrkslots recover-absent-agent-row SLOT --expected-generation N \
   --record-sha256 SHA256 \
-  --rescued-current-tip NAME=refs/rescue/EXACT-REF
+  --rescued-current-tip NAME=refs/rescue/EXACT-REF \
+  --landed-commit NAME=40_HEX_SHA
 ```
 
-This explicit mode requires an entry for every checkout, freshly reads each rescue ref from the
-recorded remote and requires it to equal the current local branch tip, verifies the local landed
-tracking ref against a fresh read of its remote branch without fetching, requires the recorded HEAD
-to be an ancestor of the current tip, and requires every intervening commit to be contained by or
-patch-equivalent to that landed ref. The checkout path and Git worktree registration must already be
-absent. The command never pushes, moves, or deletes a branch, ref, registration, or checkout path in
-this mode; it only archives and removes the exact bound registry row when applied.
+This explicit mode requires paired entries for every checkout. It freshly reads each rescue ref
+from the recorded remote and requires it to equal the current local branch tip, verifies the local
+landed tracking ref against a fresh read of its remote branch without fetching, requires the
+recorded HEAD to be an ancestor of the current tip, requires the entire current-tip tree to equal
+the supplied landed commit's tree, and requires that exact landed commit to be an ancestor of the
+verified landed main. The read-only plan prints every checkout, current tip, rescue ref, and landed
+commit; the same landed commit is retained in the journal and archive receipt. The checkout path
+and Git worktree registration must already be absent. The command never pushes, moves, or deletes a
+branch, ref, registration, or checkout path in this mode; it only archives and removes the exact
+bound registry row when applied.
 
 An unregistered agent worktree is recovered without assigning it an owner, task, or handoff. Supply
 the exact path and the Git identities established during inspection:

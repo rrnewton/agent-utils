@@ -487,6 +487,7 @@ class AbsentAgentRescuedTip:
     checkout: str
     head: str
     remote_ref: str
+    landed_commit: str
 
 
 @dataclasses.dataclass(frozen=True)
@@ -4720,38 +4721,17 @@ class _GitVcs:
             )
         return result.returncode == 0
 
-    def commits_between(
-        self, checkout: Path, ancestor: str, descendant: str
-    ) -> tuple[str, ...]:
-        if not SHA_RE.fullmatch(ancestor) or not SHA_RE.fullmatch(descendant):
-            raise Refusal("commit range requires two full lowercase Git commits")
-        result = self._run(
-            checkout,
-            ["rev-list", "--reverse", "--topo-order", f"{ancestor}..{descendant}"],
-        )
-        commits = tuple(line for line in result.stdout.splitlines() if line)
-        if any(not SHA_RE.fullmatch(commit) for commit in commits):
-            raise Refusal("Git returned an invalid commit while inspecting moved branch history")
-        return commits
-
-    def is_patch_equivalent(self, checkout: Path, commit: str, landed_ref: str) -> bool:
+    def commit_tree(self, checkout: Path, commit: str, label: str) -> str:
         if not SHA_RE.fullmatch(commit):
-            raise Refusal(f"cannot compare invalid commit {commit!r}")
-        self.verify_ref(checkout, landed_ref, "landed ref")
-        parents = self._run(checkout, ["rev-list", "--parents", "-n", "1", commit])
-        parts = parents.stdout.strip().split()
-        if not parts or parts[0] != commit:
-            raise Refusal(f"Git returned invalid ancestry for commit {commit}")
-        if len(parts) != 2:
-            return False
-        result = self._run(
-            checkout,
-            ["cherry", landed_ref, commit, parts[1]],
-        )
-        lines = [line.split() for line in result.stdout.splitlines() if line.strip()]
-        if len(lines) != 1 or len(lines[0]) != 2 or lines[0][1] != commit:
-            return False
-        return lines[0][0] == "-"
+            raise Refusal(f"{label} must be one full lowercase Git commit")
+        resolved = self.verify_ref(checkout, commit, label)
+        if resolved != commit:
+            raise Refusal(f"{label} did not resolve to the exact supplied commit {commit}")
+        result = self._run(checkout, ["rev-parse", "--verify", f"{commit}^{{tree}}"])
+        tree = result.stdout.strip()
+        if not SHA_RE.fullmatch(tree):
+            raise Refusal(f"Git returned an invalid tree for {label} {commit}")
+        return tree
 
     def remove_worktree(
         self, repository: Path, checkout: Path, *, force: bool = False
@@ -14436,7 +14416,12 @@ def _absent_agent_rescued_tip_from_obj(
     raw: object, label: str
 ) -> AbsentAgentRescuedTip:
     value = _as_mapping(raw, label)
-    _exact_keys(value, {"checkout", "head", "remote_ref"}, set(), label)
+    _exact_keys(
+        value,
+        {"checkout", "head", "remote_ref", "landed_commit"},
+        set(),
+        label,
+    )
     checkout = _validate_name(
         _as_str(value["checkout"], f"{label}.checkout"), "checkout name"
     )
@@ -14448,10 +14433,16 @@ def _absent_agent_rescued_tip_from_obj(
     )
     if not remote_ref.startswith("refs/rescue/"):
         raise Refusal(f"{label}.remote_ref must be under refs/rescue/")
+    landed_commit = _as_str(value["landed_commit"], f"{label}.landed_commit")
+    if not SHA_RE.fullmatch(landed_commit):
+        raise StateError(
+            f"{label}.landed_commit must be a full lowercase Git commit"
+        )
     return AbsentAgentRescuedTip(
         checkout=checkout,
         head=head,
         remote_ref=remote_ref,
+        landed_commit=landed_commit,
     )
 
 
@@ -14481,18 +14472,29 @@ def _resolve_absent_agent_rescued_tips(
     config: Config,
     record: ActiveRecord,
     rescue_refs: Mapping[str, str],
+    landed_commits: Mapping[str, str],
     vcs: _GitVcs,
 ) -> tuple[AbsentAgentRescuedTip, ...]:
     checkouts = {checkout.name: checkout for checkout in record.checkouts}
-    unknown = sorted(set(rescue_refs) - set(checkouts))
+    named = set(rescue_refs) | set(landed_commits)
+    unknown = sorted(named - set(checkouts))
     if unknown:
         raise Refusal(
-            "--rescued-current-tip names unknown checkout(s): " + ", ".join(unknown)
+            "moved-tip proof names unknown checkout(s): " + ", ".join(unknown)
         )
-    missing = sorted(set(checkouts) - set(rescue_refs))
-    if rescue_refs and missing:
+    missing_rescues = sorted(set(landed_commits) - set(rescue_refs))
+    missing_landings = sorted(set(rescue_refs) - set(landed_commits))
+    if missing_rescues or missing_landings:
+        details = []
+        if missing_rescues:
+            details.append("missing --rescued-current-tip for " + ", ".join(missing_rescues))
+        if missing_landings:
+            details.append("missing --landed-commit for " + ", ".join(missing_landings))
+        raise Refusal("each moved-tip proof requires both inputs: " + "; ".join(details))
+    missing = sorted(set(checkouts) - named)
+    if named and missing:
         raise Refusal(
-            "explicit rescued-current-tip mode requires every checkout; missing: "
+            "explicit moved-tip mode requires every checkout; missing: "
             + ", ".join(missing)
         )
     resolved: list[AbsentAgentRescuedTip] = []
@@ -14503,6 +14505,11 @@ def _resolve_absent_agent_rescued_tips(
         remote_ref = _validate_full_ref(remote_ref, "remote rescue ref")
         if not remote_ref.startswith("refs/rescue/"):
             raise Refusal("remote rescue ref must be under refs/rescue/")
+        landed_commit = landed_commits[checkout.name]
+        if not SHA_RE.fullmatch(landed_commit):
+            raise Refusal(
+                f"--landed-commit for {checkout.name!r} must be one full lowercase Git commit"
+            )
         _stored, repository = _stored_repository_path(config, checkout.repository)
         branch_head = vcs.verify_ref(
             repository,
@@ -14514,6 +14521,7 @@ def _resolve_absent_agent_rescued_tips(
                 checkout=checkout.name,
                 head=branch_head,
                 remote_ref=remote_ref,
+                landed_commit=landed_commit,
             )
         )
     return tuple(resolved)
@@ -14656,14 +14664,30 @@ def _absent_agent_checkout_receipts(
                     f"or missing: local {landed_head}, remote "
                     f"{remote_landed_head or 'no commit'}"
                 )
-            for commit in vcs.commits_between(repository, checkout.head, branch_head):
-                if vcs.is_ancestor(repository, commit, checkout.landed_ref):
-                    continue
-                if vcs.is_patch_equivalent(repository, commit, checkout.landed_ref):
-                    continue
+            landed_commit = vcs.verify_ref(
+                repository, rescued.landed_commit, "supplied landed commit"
+            )
+            if landed_commit != rescued.landed_commit:
                 raise Refusal(
-                    f"moved branch commit {commit} for {checkout.name} is neither an "
-                    f"ancestor of {checkout.landed_ref} nor patch-equivalent to it"
+                    f"supplied landed commit for {checkout.name} did not resolve exactly: "
+                    f"expected {rescued.landed_commit}, found {landed_commit}"
+                )
+            if not vcs.is_ancestor(repository, landed_commit, remote_landed_head):
+                raise Refusal(
+                    f"supplied landed commit {landed_commit} for {checkout.name} is not "
+                    f"an ancestor of freshly verified landed main {remote_landed_head}"
+                )
+            current_tree = vcs.commit_tree(
+                repository, branch_head, "rescued current branch tip"
+            )
+            landed_tree = vcs.commit_tree(
+                repository, landed_commit, "supplied landed commit"
+            )
+            if current_tree != landed_tree:
+                raise Refusal(
+                    f"rescued current branch tip {branch_head} for {checkout.name} has tree "
+                    f"{current_tree}, not supplied landed commit {landed_commit} tree "
+                    f"{landed_tree}"
                 )
         path = _stored_path(config, checkout.path, "agent checkout path").absolute()
         registration = vcs.worktree_registration(repository, path)
@@ -14714,6 +14738,7 @@ def _absent_agent_planned_receipts(
         }
         if rescued is not None:
             receipt["landed_ref"] = checkout.landed_ref
+            receipt["landed_commit"] = rescued.landed_commit
         receipts.append(receipt)
     return tuple(receipts)
 
@@ -14995,11 +15020,29 @@ def _recover_absent_agent_row(
     print(f"recovered absent agent row={item.slot}")
 
 
+def _print_absent_agent_plan(
+    item: AbsentAgentRow,
+    rescued_tips: Sequence[AbsentAgentRescuedTip],
+    *,
+    detail: str,
+) -> None:
+    print(
+        f"ROW machine={item.machine} slot={item.slot} generation={item.generation} "
+        f"outcome=planned detail={detail}"
+    )
+    for tip in rescued_tips:
+        print(
+            f"PROOF checkout={tip.checkout} current_tip={tip.head} "
+            f"rescue_ref={tip.remote_ref} landed_commit={tip.landed_commit}"
+        )
+
+
 def _cmd_recover_absent_agent_row(args: argparse.Namespace) -> int:
     config = _load_config(args.project_root, args.machine)
     rescue_refs = _assignments(
         args.rescued_current_tip, "--rescued-current-tip"
     )
+    landed_commits = _assignments(args.landed_commit, "--landed-commit")
     item = AbsentAgentRow(
         machine=config.machine,
         slot=_validate_name(args.slot, "slot"),
@@ -15035,12 +15078,20 @@ def _cmd_recover_absent_agent_row(args: argparse.Namespace) -> int:
             journal_rescue_refs = {
                 tip.checkout: tip.remote_ref for tip in journal_rescued_tips
             }
-            if rescue_refs and rescue_refs != journal_rescue_refs:
+            journal_landed_commits = {
+                tip.checkout: tip.landed_commit for tip in journal_rescued_tips
+            }
+            if (rescue_refs or landed_commits) and (
+                rescue_refs != journal_rescue_refs
+                or landed_commits != journal_landed_commits
+            ):
                 raise Refusal(
-                    "--rescued-current-tip differs from the interrupted recovery"
+                    "moved-tip proof differs from the interrupted recovery"
                 )
             if not args.apply:
-                print(f"ROW machine={item.machine} slot={item.slot} outcome=planned detail=resume")
+                _print_absent_agent_plan(
+                    item, journal_rescued_tips, detail="resume"
+                )
                 return 0
             assert coordinator is not None
             _recover_absent_agent_row(config, path, raw, coordinator)
@@ -15072,13 +15123,12 @@ def _cmd_recover_absent_agent_row(args: argparse.Namespace) -> int:
         _validate_absent_agent_row(record, item)
         vcs = _GitVcs()
         rescued_tips = _resolve_absent_agent_rescued_tips(
-            config, record, rescue_refs, vcs
+            config, record, rescue_refs, landed_commits, vcs
         )
         _assert_absent_agent_safe(config, record, rescued_tips)
         if not args.apply:
-            print(
-                f"ROW machine={item.machine} slot={item.slot} generation={item.generation} "
-                "outcome=planned detail=physical-storage-absent"
+            _print_absent_agent_plan(
+                item, rescued_tips, detail="physical-storage-absent"
             )
             return 0
         assert coordinator is not None
@@ -18829,9 +18879,10 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "pushes every recorded checkout HEAD to an individual rescue ref and reads it "
             "back, removes only exact stale Git worktree registrations, archives the absent "
             "storage and its limitations, and only then removes the ACTIVE row. An explicit "
-            "--rescued-current-tip accepts a moved local branch only after independently "
-            "verifying its pre-existing remote rescue and landed content; that mode never "
-            "moves or removes the branch, rescue ref, worktree registration, or path."
+            "--rescued-current-tip plus --landed-commit accepts a moved local branch only "
+            "after independently verifying its pre-existing remote rescue, exact landed "
+            "tree, and landed-main ancestry; that mode never moves or removes the branch, "
+            "rescue ref, worktree registration, or path."
         ),
         formatter_class=_HelpFormatter,
     )
@@ -18847,10 +18898,19 @@ usage or audit gate unknown, 3 fail-closed refusal.
         action="append",
         metavar="NAME=REMOTE-REF",
         help=(
-            "explicitly accept current local branch tips only when every checkout names an "
-            "exact existing refs/rescue/... ref that reads back at its tip and every "
-            "added commit is contained by or patch-equivalent to the recorded landed ref; "
-            "this mode performs no Git ref, registration, or path mutation (repeatable)"
+            "bind every checkout's current local branch tip to an exact existing "
+            "refs/rescue/... ref that reads back at that tip; requires one matching "
+            "--landed-commit per checkout (repeatable)"
+        ),
+    )
+    recover_absent_agent.add_argument(
+        "--landed-commit",
+        action="append",
+        metavar="NAME=SHA",
+        help=(
+            "bind every rescued checkout to one full exact landed commit whose tree equals "
+            "the rescued tip and which is an ancestor of freshly verified landed main; "
+            "explicit mode performs no Git ref, registration, or path mutation (repeatable)"
         ),
     )
     recover_absent_agent.add_argument("--apply", action="store_true")
