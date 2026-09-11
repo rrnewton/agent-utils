@@ -19,7 +19,7 @@ import subprocess
 import sys
 import textwrap
 import time
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence, Set as AbstractSet
 from dataclasses import replace
 from pathlib import Path
 
@@ -5001,6 +5001,59 @@ def test_default_doctor_classifies_storage_against_all_machine_rows(
         "slot02",
     }
     assert global_payload["findings"] == []
+
+
+def test_doctor_replays_hold_events_once_per_machine(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, _repository, _remote = make_project(tmp_path, machine="testhost")
+    first = create(
+        project,
+        slot="slot01",
+        agent="codex-1",
+        branch="codex/one",
+    )
+    second = create(
+        project,
+        slot="slot02",
+        agent="codex-2",
+        branch="codex/two",
+    )
+    assert first.returncode == 0, first.stderr
+    assert second.returncode == 0, second.stderr
+    held_then_released = command(project, "hold", "slot01", "--reason", "inspect")
+    assert held_then_released.returncode == 0, held_then_released.stderr
+    released = command(project, "unhold", "slot01")
+    assert released.returncode == 0, released.stderr
+    held = command(project, "hold", "slot02", "--reason", "retain")
+    assert held.returncode == 0, held.stderr
+
+    calls: list[tuple[str, frozenset[str]]] = []
+    original = wrkslots._holds_from_events
+
+    def counted(
+        events: Sequence[Mapping[str, object]],
+        machine: str,
+        slots: AbstractSet[str],
+    ) -> dict[str, dict[str, object]]:
+        calls.append((machine, frozenset(slots)))
+        return original(events, machine, slots)
+
+    monkeypatch.setattr(wrkslots, "_holds_from_events", counted)
+    rc = wrkslots.main(
+        ["--project-root", str(project), "doctor", "--format", "json"]
+    )
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    rows = {row["slot"]: row for row in payload["active"]}
+    assert rows["slot01"]["held"] is False
+    assert rows["slot01"]["hold_reason"] is None
+    assert rows["slot02"]["held"] is True
+    assert rows["slot02"]["hold_reason"] == "retain"
+    assert calls == [("testhost", frozenset({"slot01", "slot02"}))]
 
 
 def test_interrupted_create_requires_and_supports_recovery(tmp_path: Path) -> None:

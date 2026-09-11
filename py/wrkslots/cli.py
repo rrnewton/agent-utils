@@ -1449,6 +1449,75 @@ def _load_hold_snapshot(
     return dict(raw)
 
 
+@dataclasses.dataclass(frozen=True)
+class _HoldResult:
+    value: dict[str, object] | None
+    error: str | None = None
+
+
+def _holds_from_events(
+    events: Sequence[Mapping[str, object]],
+    machine: str,
+    slots: AbstractSet[str],
+) -> dict[str, dict[str, object]]:
+    """Replay one machine's hold events once for all requested slots."""
+
+    holds: dict[str, dict[str, object]] = {}
+    for event in events:
+        payload = _as_mapping(event["payload"], "append-only event.payload")
+        kind = event.get("kind")
+        if kind == "state-imported":
+            for item in _as_list(payload.get("holds", []), "imported holds"):
+                candidate = dict(_as_mapping(item, "imported hold"))
+                slot = candidate.get("slot")
+                if isinstance(slot, str) and slot in slots:
+                    holds[slot] = candidate
+        else:
+            slot = payload.get("slot")
+            if not isinstance(slot, str) or slot not in slots:
+                continue
+            if kind == "slot-held":
+                holds[slot] = {
+                    "schema": HOLD_SCHEMA,
+                    "machine": machine,
+                    "slot": slot,
+                    "held_at": event["recorded_at"],
+                    "reason": payload.get("reason"),
+                }
+            elif kind == "slot-hold-released":
+                holds.pop(slot, None)
+    return holds
+
+
+def _load_record_holds(
+    config: Config, states: Sequence[ActiveState]
+) -> dict[tuple[str, str], _HoldResult]:
+    """Load every active record's hold while replaying each machine log once."""
+
+    results: dict[tuple[str, str], _HoldResult] = {}
+    for state in states:
+        slots = {record.slot for record in state.slots}
+        try:
+            events = _load_events(config, state.machine)
+            if events:
+                holds = _holds_from_events(events, state.machine, slots)
+                for slot in slots:
+                    results[(state.machine, slot)] = _HoldResult(holds.get(slot))
+                continue
+        except Refusal as exc:
+            for slot in slots:
+                results[(state.machine, slot)] = _HoldResult(None, str(exc))
+            continue
+        for slot in slots:
+            try:
+                hold = _load_hold_snapshot(config, slot, state.machine)
+            except Refusal as exc:
+                results[(state.machine, slot)] = _HoldResult(None, str(exc))
+            else:
+                results[(state.machine, slot)] = _HoldResult(hold)
+    return results
+
+
 def _load_hold(
     config: Config, slot: str, machine: str | None = None
 ) -> dict[str, object] | None:
@@ -1456,25 +1525,7 @@ def _load_hold(
     events = _load_events(config, selected)
     if not events:
         return _load_hold_snapshot(config, slot, selected)
-    hold: dict[str, object] | None = None
-    for event in events:
-        payload = _as_mapping(event["payload"], "append-only event.payload")
-        if event.get("kind") == "state-imported":
-            for item in _as_list(payload.get("holds", []), "imported holds"):
-                candidate = dict(_as_mapping(item, "imported hold"))
-                if candidate.get("slot") == slot:
-                    hold = candidate
-        elif payload.get("slot") == slot and event.get("kind") == "slot-held":
-            hold = {
-                "schema": HOLD_SCHEMA,
-                "machine": selected,
-                "slot": slot,
-                "held_at": event["recorded_at"],
-                "reason": payload.get("reason"),
-            }
-        elif payload.get("slot") == slot and event.get("kind") == "slot-hold-released":
-            hold = None
-    return hold
+    return _holds_from_events(events, selected, {slot}).get(slot)
 
 
 def _assert_not_held(config: Config, record: ActiveRecord) -> None:
@@ -10169,6 +10220,7 @@ def _status_record(
     config: Config,
     record: ActiveRecord,
     *,
+    hold_result: _HoldResult,
     tolerate_hold_error: bool = False,
     storage_inconsistencies: Sequence[StorageInconsistency] = (),
 ) -> dict[str, object]:
@@ -10179,14 +10231,10 @@ def _status_record(
     value["owner_detail"] = process_detail
     value["heartbeat_age_seconds"] = int(age)
     value["heartbeat_expired"] = expired
-    try:
-        hold = _load_hold(config, record.slot, record.machine)
-        hold_error: str | None = None
-    except Refusal as exc:
-        if not tolerate_hold_error:
-            raise
-        hold = None
-        hold_error = str(exc)
+    hold = hold_result.value
+    hold_error = hold_result.error
+    if hold_error is not None and not tolerate_hold_error:
+        raise Refusal(hold_error)
     value["held"] = hold is not None
     value["hold_reason"] = None if hold is None else hold["reason"]
     value["hold_error"] = hold_error
@@ -10196,7 +10244,11 @@ def _status_record(
     return value
 
 
-def _slot_findings(config: Config, states: Sequence[ActiveState]) -> list[dict[str, object]]:
+def _slot_findings(
+    config: Config,
+    states: Sequence[ActiveState],
+    hold_results: Mapping[tuple[str, str], _HoldResult],
+) -> list[dict[str, object]]:
     """Every storage and operational diagnosis, without authorizing mutation."""
 
     findings = [
@@ -10222,10 +10274,9 @@ def _slot_findings(config: Config, states: Sequence[ActiveState]) -> list[dict[s
 
     for state in states:
         for record in state.slots:
-            try:
-                _load_hold(config, record.slot, record.machine)
-            except Refusal as exc:
-                note("invalid-hold", record.slot, state.machine, str(exc))
+            hold_result = hold_results[(record.machine, record.slot)]
+            if hold_result.error is not None:
+                note("invalid-hold", record.slot, state.machine, hold_result.error)
             process_state, process_detail = _process_state(record.owner)
             if process_state == "dead":
                 note(
@@ -10277,7 +10328,8 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
             if args.all_machines
             else [state for state in all_states if state.machine == config.machine]
         )
-        all_findings = _slot_findings(config, all_states)
+        hold_results = _load_record_holds(config, all_states)
+        all_findings = _slot_findings(config, all_states, hold_results)
         findings = (
             all_findings
             if args.all_machines
@@ -10288,7 +10340,12 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
             ]
         )
         rows = [
-            _status_record(config, record, tolerate_hold_error=True)
+            _status_record(
+                config,
+                record,
+                hold_result=hold_results[(record.machine, record.slot)],
+                tolerate_hold_error=True,
+            )
             for state in states
             for record in state.slots
         ]
@@ -10354,6 +10411,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
             if args.all_machines
             else [state for state in all_states if state.machine == config.machine]
         )
+        hold_results = _load_record_holds(config, states)
         ordinary_journals = _outstanding_journals(config)
         seal_journals = _validate_batch_seal_journals(config)
         journals = [
@@ -10369,6 +10427,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
             _status_record(
                 config,
                 record,
+                hold_result=hold_results[(record.machine, record.slot)],
                 storage_inconsistencies=tuple(
                     item
                     for item in storage_inconsistencies
