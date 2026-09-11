@@ -12,6 +12,12 @@ disallow_any_decorated = true
 warn_unreachable = true
 show_error_codes = true
 
+[tool.pytest.ini_options]
+markers = [
+    "ordinary_environment: requires host-visible process identities or the initial identity user namespace",
+    "mapped_root_namespace: requires uid 0 in a nonidentity user namespace",
+]
+
 # The test suite imports pytest, whose pytest.approx support pulls in numpy's
 # type stubs transitively. Some numpy releases use syntax newer than our 3.10
 # target. This project does not import numpy, so do not follow those stubs.
