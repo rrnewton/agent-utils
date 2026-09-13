@@ -209,12 +209,16 @@ _LEGACY_VALIDATE_JOURNAL_REQUIRED = frozenset(
 _OWNERLESS_VALIDATE_JOURNAL_REQUIRED = frozenset(
     {"schema", "kind", "machine", "slot", "phase", "fenced", "authorization"}
 )
+_OWNERLESS_VALIDATE_JOURNAL_OPTIONAL = frozenset({"exclusion"})
 _OWNERLESS_VALIDATION_PHASES = frozenset(
     {"prepared", "fenced", "removing", "removed"}
 )
 _OWNERLESS_VALIDATION_EXCLUSION_ENTRY = "checkout"
-_FCHMODAT2_X86_64 = 452
-_AT_EMPTY_PATH = 0x1000
+_OWNERLESS_VALIDATION_EXCLUSION_SCHEMA = 1
+_OWNERLESS_VALIDATION_EXCLUSION_PHASES = frozenset(
+    {"guard-created", "payload-moved"}
+)
+_OWNERLESS_VALIDATION_EXCLUSION_ROOTS = (Path("/data/misc"),)
 _OWNERLESS_AGENT_JOURNAL_REQUIRED = frozenset(
     {
         "schema",
@@ -543,6 +547,19 @@ class ValidationRecoveryAuthorization:
     removal_proof: _ValidationRemovalProof | None = None
     proof_original_mode: int | None = None
     proof_private_identity: _PrivateCleanupIdentity | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class _OwnerlessValidationExclusionRecord:
+    """Durable identities for one root-owned validation exclusion guard."""
+
+    phase: str
+    root: Path
+    root_identity: tuple[int, int, int]
+    guard: Path
+    guard_identity: tuple[int, int, int]
+    source_alias: Path
+    payload_identity: tuple[int, int]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -5148,7 +5165,7 @@ def _validate_journal_shape(
         _exact_keys(
             raw,
             _OWNERLESS_VALIDATE_JOURNAL_REQUIRED,
-            set(),
+            _OWNERLESS_VALIDATE_JOURNAL_OPTIONAL,
             "ownerless validation journal",
         )
         phase = _as_str(raw["phase"], "ownerless validation journal.phase")
@@ -5156,6 +5173,10 @@ def _validate_journal_shape(
             raise StateError(f"unknown ownerless validation phase {phase!r}")
         _as_str(raw["fenced"], "ownerless validation journal.fenced")
         _validation_authorization_from_obj(raw["authorization"])
+        if "exclusion" in raw:
+            _ownerless_validation_paths(
+                dataclasses.replace(config, machine=machine), raw
+            )
     elif kind == "ownerless-agent-remove":
         _ownerless_agent_journal_inputs(dataclasses.replace(config, machine=machine), raw)
     elif kind == "ownerless-agent-cache-relocate":
@@ -16295,7 +16316,7 @@ def _ownerless_validation_paths(
     _exact_keys(
         raw,
         _OWNERLESS_VALIDATE_JOURNAL_REQUIRED,
-        set(),
+        _OWNERLESS_VALIDATE_JOURNAL_OPTIONAL,
         "ownerless validation journal",
     )
     if (
@@ -16333,6 +16354,8 @@ def _ownerless_validation_paths(
     phase = _as_str(raw["phase"], "ownerless validation journal.phase")
     if phase not in _OWNERLESS_VALIDATION_PHASES:
         raise StateError(f"unknown ownerless validation phase {phase!r}")
+    if "exclusion" in raw:
+        _ownerless_validation_exclusion_from_obj(config, fenced, raw["exclusion"])
     return authorization, target, fenced, phase
 
 
@@ -16614,175 +16637,524 @@ def _rollback_validation_fence(
     _clear_journal(config, rollback_journal)
 
 
-def _ownerless_validation_exclusion_paths(fenced: Path) -> tuple[Path, Path]:
-    """Derive the one recovery-visible exclusion directory for a fence."""
+def _directory_identity_obj(identity: tuple[int, int, int]) -> list[int]:
+    return list(identity)
 
+
+def _directory_identity_from_obj(value: object, label: str) -> tuple[int, int, int]:
+    fields = _as_list(value, label)
+    if len(fields) != 3:
+        raise StateError(f"{label} must contain device, inode, and mount id")
+    return (
+        _as_int(fields[0], f"{label}[0]", minimum=1),
+        _as_int(fields[1], f"{label}[1]", minimum=1),
+        _as_int(fields[2], f"{label}[2]", minimum=1),
+    )
+
+
+def _ownerless_validation_exclusion_name(config: Config, fenced: Path) -> str:
     token = fenced.name.rsplit(".", 1)[-1]
     if re.fullmatch(r"[0-9a-f]{32}", token) is None:
         raise StateError("fenced validation path has no exclusion identity")
-    container = fenced.with_name(f".ownerless-validation-exclusion.{token}")
-    return container, container / _OWNERLESS_VALIDATION_EXCLUSION_ENTRY
+    context = hashlib.sha256(
+        os.fsencode(str(config.root)) + b"\0" + os.fsencode(str(fenced))
+    ).hexdigest()[:16]
+    return f".wrkslots-ownerless-validation.{token}.{context}"
 
 
-def _fchmod_path_handle(descriptor: int, mode: int, label: str) -> None:
-    """Change an O_PATH-referenced inode without resolving a mutable pathname."""
+def _ownerless_validation_exclusion_to_obj(
+    value: _OwnerlessValidationExclusionRecord,
+) -> dict[str, object]:
+    return {
+        "schema": _OWNERLESS_VALIDATION_EXCLUSION_SCHEMA,
+        "phase": value.phase,
+        "root": str(value.root),
+        "root_identity": _directory_identity_obj(value.root_identity),
+        "guard": str(value.guard),
+        "guard_identity": _directory_identity_obj(value.guard_identity),
+        "source_alias": str(value.source_alias),
+        "payload_identity": list(value.payload_identity),
+    }
 
-    if os.uname().machine != "x86_64":
-        raise Refusal(
-            f"cannot restore {label}: fchmodat2 is only bound on supported x86_64 Linux"
-        )
-    libc = ctypes.CDLL(None, use_errno=True)
-    result = libc.syscall(
-        ctypes.c_long(_FCHMODAT2_X86_64),
-        ctypes.c_int(descriptor),
-        ctypes.c_char_p(b""),
-        ctypes.c_uint(mode),
-        ctypes.c_int(_AT_EMPTY_PATH),
+
+def _ownerless_validation_exclusion_from_obj(
+    config: Config,
+    fenced: Path,
+    value: object,
+) -> _OwnerlessValidationExclusionRecord:
+    raw = _as_mapping(value, "ownerless validation exclusion")
+    _exact_keys(
+        raw,
+        {
+            "schema",
+            "phase",
+            "root",
+            "root_identity",
+            "guard",
+            "guard_identity",
+            "source_alias",
+            "payload_identity",
+        },
+        set(),
+        "ownerless validation exclusion",
     )
-    if result != 0:
-        error = ctypes.get_errno()
-        raise Refusal(
-            f"cannot restore {label} permissions through its file handle: "
-            f"{os.strerror(error)}"
+    if (
+        _as_int(raw["schema"], "ownerless validation exclusion.schema")
+        != _OWNERLESS_VALIDATION_EXCLUSION_SCHEMA
+    ):
+        raise StateError("ownerless validation exclusion schema is unsupported")
+    phase = _as_str(raw["phase"], "ownerless validation exclusion.phase")
+    if phase not in _OWNERLESS_VALIDATION_EXCLUSION_PHASES:
+        raise StateError(f"unknown ownerless validation exclusion phase {phase!r}")
+    root = Path(_as_str(raw["root"], "ownerless validation exclusion.root"))
+    guard = Path(_as_str(raw["guard"], "ownerless validation exclusion.guard"))
+    source_alias = Path(
+        _as_str(raw["source_alias"], "ownerless validation exclusion.source_alias")
+    )
+    if (
+        root not in _OWNERLESS_VALIDATION_EXCLUSION_ROOTS
+        or not root.is_absolute()
+        or guard != root / _ownerless_validation_exclusion_name(config, fenced)
+        or not source_alias.is_absolute()
+        or ".." in source_alias.parts
+        or any("\n" in str(path) or "\0" in str(path) for path in (root, guard, source_alias))
+    ):
+        raise StateError("ownerless validation exclusion paths are not canonical")
+    payload_identity_values = _as_list(
+        raw["payload_identity"], "ownerless validation exclusion.payload_identity"
+    )
+    if len(payload_identity_values) != 2:
+        raise StateError(
+            "ownerless validation exclusion payload identity must contain device and inode"
         )
+    return _OwnerlessValidationExclusionRecord(
+        phase=phase,
+        root=root,
+        root_identity=_directory_identity_from_obj(
+            raw["root_identity"], "ownerless validation exclusion.root_identity"
+        ),
+        guard=guard,
+        guard_identity=_directory_identity_from_obj(
+            raw["guard_identity"], "ownerless validation exclusion.guard_identity"
+        ),
+        source_alias=source_alias,
+        payload_identity=(
+            _as_int(
+                payload_identity_values[0],
+                "ownerless validation exclusion.payload_identity[0]",
+                minimum=1,
+            ),
+            _as_int(
+                payload_identity_values[1],
+                "ownerless validation exclusion.payload_identity[1]",
+                minimum=1,
+            ),
+        ),
+    )
+
+
+def _self_mountinfo_records() -> tuple[tuple[int, str, Path, Path, str, str], ...]:
+    """Parse the fields needed to map one bind-mounted path onto another view."""
+
+    try:
+        lines = Path("/proc/self/mountinfo").read_text(
+            encoding="utf-8", errors="surrogateescape"
+        ).splitlines()
+    except OSError as exc:
+        raise Refusal(f"cannot read mount layout for validation exclusion: {exc}") from exc
+    records: list[tuple[int, str, Path, Path, str, str]] = []
+    for line in lines:
+        left, separator, right = line.partition(" - ")
+        fields = left.split()
+        right_fields = right.split()
+        if not separator or len(fields) < 5 or len(right_fields) < 2:
+            raise Refusal("mount layout is malformed while preparing validation exclusion")
+        try:
+            mount_id = int(fields[0])
+        except ValueError as exc:
+            raise Refusal("mount layout has a non-numeric mount id") from exc
+        root = _mountinfo_path(fields[3])
+        mount_point = _mountinfo_path(fields[4])
+        if not root.is_absolute() or not mount_point.is_absolute():
+            raise Refusal("mount layout contains a relative path")
+        records.append(
+            (
+                mount_id,
+                fields[2],
+                root,
+                mount_point,
+                right_fields[0],
+                right_fields[1],
+            )
+        )
+    return tuple(records)
+
+
+def _mountinfo_record_for_path(
+    path: Path,
+    records: Sequence[tuple[int, str, Path, Path, str, str]],
+    label: str,
+) -> tuple[int, str, Path, Path, str, str]:
+    matches = [record for record in records if _path_is_within(path, record[3])]
+    if not matches:
+        raise Refusal(f"cannot identify the mount containing {label}: {path}")
+    depth = max(len(record[3].parts) for record in matches)
+    closest = [record for record in matches if len(record[3].parts) == depth]
+    if len(closest) != 1:
+        raise Refusal(f"mount layout is ambiguous for {label}: {path}")
+    return closest[0]
+
+
+def _mount_alias_path(
+    path: Path,
+    destination_root: Path,
+    records: Sequence[tuple[int, str, Path, Path, str, str]],
+) -> Path:
+    """Derive one path on a peer mount from mount roots and mount points."""
+
+    source = _mountinfo_record_for_path(path.parent, records, "validation path")
+    destination = _mountinfo_record_for_path(
+        destination_root, records, "validation exclusion root"
+    )
+    if source[0] == destination[0]:
+        return path
+    if (source[1], source[4], source[5]) != (
+        destination[1],
+        destination[4],
+        destination[5],
+    ):
+        raise Refusal("validation exclusion root is on another filesystem")
+    source_inside_filesystem = source[2] / path.parent.relative_to(source[3])
+    try:
+        alias_parent_relative = source_inside_filesystem.relative_to(destination[2])
+    except ValueError as exc:
+        raise Refusal(
+            "validation path is outside the filesystem view containing the exclusion root"
+        ) from exc
+    alias_parent = destination[3] / alias_parent_relative
+    return alias_parent / path.name
+
+
+def _path_alias_on_mount(
+    path: Path,
+    destination_root: Path,
+    records: Sequence[tuple[int, str, Path, Path, str, str]],
+) -> Path:
+    """Map path onto destination_root and authenticate both parent spellings."""
+
+    alias = _mount_alias_path(path, destination_root, records)
+    alias_parent = alias.parent
+    try:
+        source_parent = path.parent.stat(follow_symlinks=False)
+        alias_parent_metadata = alias_parent.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise Refusal(f"cannot authenticate validation path mount alias: {exc}") from exc
+    if (
+        not stat.S_ISDIR(source_parent.st_mode)
+        or not stat.S_ISDIR(alias_parent_metadata.st_mode)
+        or (source_parent.st_dev, source_parent.st_ino)
+        != (alias_parent_metadata.st_dev, alias_parent_metadata.st_ino)
+    ):
+        raise Refusal("validation path mount alias names another parent directory")
+    return alias
+
+
+def _trusted_validation_exclusion_root(
+    fenced: Path,
+) -> tuple[Path, tuple[int, int, int], Path]:
+    """Select one root-owned sticky path with an unambiguous same-filesystem view."""
+
+    records = _self_mountinfo_records()
+    direct: list[tuple[Path, tuple[int, int, int], Path]] = []
+    aliases: list[tuple[Path, tuple[int, int, int], Path]] = []
+    source_mount = _mountinfo_record_for_path(fenced.parent, records, "validation path")
+    for candidate in _OWNERLESS_VALIDATION_EXCLUSION_ROOTS:
+        try:
+            metadata = candidate.stat(follow_symlinks=False)
+            resolved = candidate.resolve(strict=True)
+            descriptor = os.open(
+                candidate,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+        except OSError:
+            continue
+        try:
+            identity = (
+                metadata.st_dev,
+                metadata.st_ino,
+                _fd_mount_id(descriptor, str(candidate)),
+            )
+        finally:
+            os.close(descriptor)
+        if (
+            resolved != candidate
+            or not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != 0
+            or metadata.st_gid != 0
+            or stat.S_IMODE(metadata.st_mode) != 0o1777
+        ):
+            continue
+        try:
+            source_alias = _path_alias_on_mount(fenced, candidate, records)
+        except Refusal:
+            continue
+        destination_mount = _mountinfo_record_for_path(
+            candidate, records, "validation exclusion root"
+        )
+        entry = (candidate, identity, source_alias)
+        if destination_mount[0] == source_mount[0]:
+            direct.append(entry)
+        else:
+            aliases.append(entry)
+    selected = direct if direct else aliases
+    if len(selected) != 1:
+        raise Refusal(
+            "validation exclusion requires exactly one trusted root-owned, same-filesystem "
+            f"sticky parent; found {len(selected)}"
+        )
+    return selected[0]
+
+
+def _root_validation_exclusion_command(
+    program: Path,
+    arguments: Sequence[str],
+    label: str,
+    *,
+    allow_stdout: bool = False,
+) -> bytes:
+    budget = _ReadOnlyCommandBudget.start(
+        timeout_seconds=15,
+        stdout_limit=64 * 1024,
+        stderr_limit=64 * 1024,
+    )
+    returncode, stdout, stderr = _run_root_owned_command(
+        program, arguments, budget=budget
+    )
+    if returncode != 0 or stderr or (stdout and not allow_stdout):
+        detail = (stderr or stdout).decode("utf-8", errors="replace").strip().splitlines()
+        suffix = f": {detail[0]}" if detail else f" (exit {returncode})"
+        raise Refusal(f"verified root context could not {label}{suffix}")
+    return stdout
+
+
+def _assert_verified_root_context() -> None:
+    stdout = _root_validation_exclusion_command(
+        Path("/usr/bin/id"), ("-u",), "identify itself", allow_stdout=True
+    )
+    if stdout != b"0\n":
+        raise Refusal("validation exclusion command did not run as uid 0")
+
+
+def _root_validation_path_metadata(path: Path, label: str) -> os.stat_result:
+    stdout = _root_validation_exclusion_command(
+        Path("/usr/bin/stat"),
+        ("--format=%d:%i:%f:%u:%g", "--", str(path)),
+        f"inspect {label}",
+        allow_stdout=True,
+    )
+    try:
+        device, inode, raw_mode, uid, gid = stdout.decode("ascii").strip().split(":")
+        values = (int(device), int(inode), int(raw_mode, 16), int(uid), int(gid))
+    except (UnicodeError, ValueError) as exc:
+        raise Refusal(f"verified root context returned malformed {label} metadata") from exc
+    return os.stat_result((values[2], values[1], values[0], 0, values[3], values[4], 0, 0, 0, 0))
+
+
+def _root_validation_directory_names(path: Path) -> list[str]:
+    stdout = _root_validation_exclusion_command(
+        Path("/usr/bin/find"),
+        (str(path), "-mindepth", "1", "-maxdepth", "1", "-printf", "%f\\0"),
+        "enumerate the validation exclusion guard",
+        allow_stdout=True,
+    )
+    try:
+        names = stdout.decode("utf-8", errors="strict").split("\0")
+    except UnicodeError as exc:
+        raise Refusal("validation exclusion guard contains a non-UTF-8 name") from exc
+    if names and names[-1] == "":
+        names.pop()
+    if any(not name or "/" in name or "\0" in name for name in names):
+        raise Refusal("validation exclusion guard contains a malformed name")
+    return sorted(names)
 
 
 def _restore_ownerless_validation_exclusion(
     config: Config,
     raw: Mapping[str, object],
-) -> None:
-    """Restore a crash-interrupted exclusion move before ordinary recovery."""
+) -> dict[str, object]:
+    """Restore a crash-interrupted root-owned exclusion before ordinary recovery."""
 
     authorization, target, fenced, phase = _ownerless_validation_paths(config, raw)
-    container, payload = _ownerless_validation_exclusion_paths(fenced)
+    exclusion_value = raw.get("exclusion")
+    if exclusion_value is None:
+        # An unrecorded guard can exist only if the process died between root mkdir
+        # and the durable identity write. Never infer authority over it from its name.
+        for root in _OWNERLESS_VALIDATION_EXCLUSION_ROOTS:
+            guard = root / _ownerless_validation_exclusion_name(config, fenced)
+            if guard.exists() or guard.is_symlink():
+                raise Refusal(
+                    "unrecorded validation exclusion guard exists; preserve it for "
+                    "inspection"
+                )
+        return dict(raw)
+    exclusion = _ownerless_validation_exclusion_from_obj(
+        config, fenced, exclusion_value
+    )
+    if phase != "removing":
+        raise StateError(
+            "validation exclusion record exists outside the removing phase"
+        )
+    expected_alias = _path_alias_on_mount(
+        fenced, exclusion.root, _self_mountinfo_records()
+    )
+    if expected_alias != exclusion.source_alias:
+        raise Refusal("validation exclusion mount alias changed since it was recorded")
+    _assert_verified_root_context()
     try:
-        metadata = container.stat(follow_symlinks=False)
-    except FileNotFoundError:
-        return
+        root_fd = os.open(
+            exclusion.root,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
     except OSError as exc:
         raise Refusal(
-            f"cannot inspect validation exclusion directory {container}: {exc}"
+            f"cannot open validation exclusion root {exclusion.root}: {exc}"
         ) from exc
-    if phase != "removing":
-        raise Refusal(
-            "validation exclusion directory exists outside the removing phase; "
-            "preserve it and inspect the journal"
-        )
-    if (
-        not stat.S_ISDIR(metadata.st_mode)
-        or container.is_symlink()
-        or metadata.st_uid != os.getuid()
-        or stat.S_IMODE(metadata.st_mode) not in {0, 0o700}
-    ):
-        raise Refusal(
-            f"validation exclusion directory is absent or unsafe: {container}"
-        )
-    assert authorization.parent_identity is not None
-    parent_fd, name, parent_mount_id = _open_parent_directory(
-        fenced.parent,
-        container,
-        "validation exclusion directory",
-        expected_root_identity=authorization.parent_identity,
-    )
-    path_fd: int | None = None
-    container_fd: int | None = None
-    payload_fd: int | None = None
     try:
+        root_metadata = os.fstat(root_fd)
+        root_identity = (
+            root_metadata.st_dev,
+            root_metadata.st_ino,
+            _fd_mount_id(root_fd, str(exclusion.root)),
+        )
+        if (
+            root_identity != exclusion.root_identity
+            or root_metadata.st_uid != 0
+            or root_metadata.st_gid != 0
+            or stat.S_IMODE(root_metadata.st_mode) != 0o1777
+        ):
+            raise Refusal("validation exclusion root identity or permissions changed")
         try:
-            path_fd = os.open(
-                name,
-                os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
-                dir_fd=parent_fd,
+            guard_metadata = os.stat(
+                exclusion.guard.name, dir_fd=root_fd, follow_symlinks=False
             )
-            path_metadata = os.fstat(path_fd)
-            if (path_metadata.st_dev, path_metadata.st_ino) != (
-                metadata.st_dev,
-                metadata.st_ino,
-            ):
+        except FileNotFoundError:
+            restored_candidates = [
+                candidate
+                for candidate in (target, fenced)
+                if candidate.is_dir()
+                and not candidate.is_symlink()
+                and _open_directory_identity(candidate, "restored validation path")
+                == authorization.identity
+            ]
+            if len(restored_candidates) != 1:
                 raise Refusal(
-                    f"validation exclusion directory identity changed: {container}"
+                    "recorded validation exclusion guard disappeared before recovery"
                 )
-            _fchmod_path_handle(path_fd, 0o700, "validation exclusion directory")
-            container_fd = os.open(
-                name,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
-                dir_fd=parent_fd,
-            )
+            restored = dict(raw)
+            restored.pop("exclusion", None)
+            _write_journal(config, restored)
+            return restored
         except OSError as exc:
             raise Refusal(
-                f"cannot reopen validation exclusion directory {container}: {exc}"
+                f"cannot inspect validation exclusion guard {exclusion.guard}: {exc}"
             ) from exc
-        opened = os.fstat(container_fd)
+        observed_guard_identity = (
+            guard_metadata.st_dev,
+            guard_metadata.st_ino,
+            exclusion.root_identity[2],
+        )
         if (
-            (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino)
-            or opened.st_uid != os.getuid()
-            or _fd_mount_id(container_fd, str(container)) != parent_mount_id
+            observed_guard_identity != exclusion.guard_identity
+            or not stat.S_ISDIR(guard_metadata.st_mode)
+            or guard_metadata.st_uid != 0
+            or guard_metadata.st_gid != 0
+            or stat.S_IMODE(guard_metadata.st_mode) not in {0, 0o755}
         ):
-            raise Refusal(
-                f"validation exclusion directory identity changed: {container}"
-            )
-        names = _directory_names(container_fd, container)
+            raise Refusal("validation exclusion guard identity or ownership changed")
+        names = _root_validation_directory_names(exclusion.guard)
         target_present = target.exists() or target.is_symlink()
         fenced_present = fenced.exists() or fenced.is_symlink()
-        if names == [] and fenced_present and not target_present:
-            pass
-        elif names == [_OWNERLESS_VALIDATION_EXCLUSION_ENTRY] and not (
-            target_present or fenced_present
-        ):
-            try:
-                payload_fd = os.open(
-                    _OWNERLESS_VALIDATION_EXCLUSION_ENTRY,
-                    os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
-                    dir_fd=container_fd,
-                )
-            except OSError as exc:
-                raise Refusal(
-                    f"cannot reopen excluded validation checkout {payload}: {exc}"
-                ) from exc
-            observed = os.fstat(payload_fd)
-            observed_identity = (
-                observed.st_dev,
-                observed.st_ino,
-                _fd_mount_id(payload_fd, str(payload)),
+        if target_present and fenced_present:
+            raise Refusal(
+                "canonical and fenced validation paths both exist during exclusion "
+                "recovery"
             )
-            if observed_identity != authorization.identity:
+        restored_path = target if target_present else fenced if fenced_present else None
+        if names == [] and restored_path is not None:
+            if (
+                restored_path.is_symlink()
+                or not restored_path.is_dir()
+                or _open_directory_identity(restored_path, "restored validation path")
+                != authorization.identity
+            ):
+                raise Refusal("restored validation path identity changed")
+        elif names == [_OWNERLESS_VALIDATION_EXCLUSION_ENTRY]:
+            payload = exclusion.guard / _OWNERLESS_VALIDATION_EXCLUSION_ENTRY
+            payload_metadata = _root_validation_path_metadata(
+                payload, "excluded validation checkout"
+            )
+            if (
+                not stat.S_ISDIR(payload_metadata.st_mode)
+                or (payload_metadata.st_dev, payload_metadata.st_ino)
+                != exclusion.payload_identity
+                or exclusion.payload_identity != authorization.identity[:2]
+            ):
                 raise Refusal(
                     "excluded validation checkout identity changed; preserve it"
                 )
+            if target_present:
+                destination = fenced
+                destination_alias = exclusion.source_alias
+            elif fenced_present:
+                destination = target
+                destination_alias = _path_alias_on_mount(
+                    target, exclusion.root, _self_mountinfo_records()
+                )
+            else:
+                destination = fenced
+                destination_alias = exclusion.source_alias
+            _root_validation_exclusion_command(
+                Path("/usr/bin/mv"),
+                (
+                    "--no-clobber",
+                    "--no-target-directory",
+                    "--",
+                    str(payload),
+                    str(destination_alias),
+                ),
+                "restore the excluded validation checkout",
+            )
             if (
-                authorization.stable_identity is not None
-                and _fd_private_cleanup_identity(payload_fd, str(payload))
-                != authorization.stable_identity
+                not destination.is_dir()
+                or destination.is_symlink()
+                or _open_directory_identity(destination, "restored validation checkout")
+                != authorization.identity
             ):
                 raise Refusal(
-                    "excluded validation checkout stable identity changed; preserve it"
+                    "excluded validation checkout was not restored to its exact identity"
                 )
-            os.rename(
-                _OWNERLESS_VALIDATION_EXCLUSION_ENTRY,
-                fenced.name,
-                src_dir_fd=container_fd,
-                dst_dir_fd=parent_fd,
-            )
-            os.fsync(container_fd)
-            os.fsync(parent_fd)
         else:
             raise Refusal(
                 "validation exclusion state is ambiguous; preserve every path"
             )
-        os.rmdir(name, dir_fd=parent_fd)
-        os.fsync(parent_fd)
-    except OSError as exc:
-        raise Refusal(
-            f"cannot restore validation exclusion directory {container}: {exc}"
-        ) from exc
+        _root_validation_exclusion_command(
+            Path("/usr/bin/rmdir"),
+            ("--", str(exclusion.guard)),
+            "remove the empty validation exclusion guard",
+        )
+        try:
+            os.stat(exclusion.guard.name, dir_fd=root_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise Refusal("validation exclusion guard remains after recovery")
+        os.fsync(root_fd)
+        restored = dict(raw)
+        restored.pop("exclusion", None)
+        _write_journal(config, restored)
+        return restored
     finally:
-        if payload_fd is not None:
-            os.close(payload_fd)
-        if container_fd is not None:
-            os.close(container_fd)
-        if path_fd is not None:
-            os.close(path_fd)
-        os.close(parent_fd)
+        os.close(root_fd)
 
 
 def _begin_ownerless_validation_exclusion(
@@ -16790,74 +17162,172 @@ def _begin_ownerless_validation_exclusion(
     target: Path,
     fenced: Path,
     authorization: ValidationRecoveryAuthorization,
+    journal: dict[str, object],
 ) -> _OwnerlessValidationExclusion:
-    """Move a validation tree behind a non-searchable same-UID path barrier."""
+    """Move a validation tree behind a root-owned, non-searchable path guard."""
 
     if target.exists() or target.is_symlink():
         raise Refusal(f"canonical validation path reappeared before cleanup: {target}")
     if not fenced.is_dir() or fenced.is_symlink():
         raise Refusal(f"fenced validation path disappeared before exclusion: {fenced}")
-    container, payload = _ownerless_validation_exclusion_paths(fenced)
+    root, root_identity, source_alias = _trusted_validation_exclusion_root(fenced)
+    guard = root / _ownerless_validation_exclusion_name(config, fenced)
+    payload = guard / _OWNERLESS_VALIDATION_EXCLUSION_ENTRY
     assert authorization.parent_identity is not None
-    parent_fd, name, parent_mount_id = _open_parent_directory(
+    source_parent_fd, source_name, _source_parent_mount_id = _open_parent_directory(
         fenced.parent,
-        container,
-        "validation exclusion directory",
+        fenced,
+        "fenced validation checkout",
         expected_root_identity=authorization.parent_identity,
     )
-    container_fd: int | None = None
+    root_fd: int | None = None
+    guard_fd: int | None = None
     payload_fd: int | None = None
     try:
+        _assert_verified_root_context()
         try:
-            os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            root_fd = os.open(
+                root,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+        except OSError as exc:
+            raise Refusal(f"cannot open validation exclusion root {root}: {exc}") from exc
+        opened_root = os.fstat(root_fd)
+        if (
+            (
+                opened_root.st_dev,
+                opened_root.st_ino,
+                _fd_mount_id(root_fd, str(root)),
+            )
+            != root_identity
+            or opened_root.st_uid != 0
+            or opened_root.st_gid != 0
+            or stat.S_IMODE(opened_root.st_mode) != 0o1777
+        ):
+            raise Refusal("validation exclusion root identity changed before use")
+        try:
+            os.stat(guard.name, dir_fd=root_fd, follow_symlinks=False)
         except FileNotFoundError:
             pass
         except OSError as exc:
             raise Refusal(
-                f"cannot inspect validation exclusion directory {container}: {exc}"
+                f"cannot inspect validation exclusion guard {guard}: {exc}"
             ) from exc
         else:
-            raise Refusal(f"validation exclusion directory already exists: {container}")
-        os.mkdir(name, mode=0o700, dir_fd=parent_fd)
-        os.fsync(parent_fd)
-        container_fd = os.open(
-            name,
-            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
-            dir_fd=parent_fd,
-        )
-        container_metadata = os.fstat(container_fd)
-        if (
-            not stat.S_ISDIR(container_metadata.st_mode)
-            or container_metadata.st_uid != os.getuid()
-            or stat.S_IMODE(container_metadata.st_mode) != 0o700
-            or _fd_mount_id(container_fd, str(container)) != parent_mount_id
-        ):
-            raise Refusal(
-                f"validation exclusion directory is not owner-controlled: {container}"
-            )
-        _interrupt_for_test("after-ownerless-validate-exclusion-directory")
-        os.rename(
-            fenced.name,
-            _OWNERLESS_VALIDATION_EXCLUSION_ENTRY,
-            src_dir_fd=parent_fd,
-            dst_dir_fd=container_fd,
-        )
-        os.fsync(container_fd)
-        os.fsync(parent_fd)
-        _interrupt_for_test("after-ownerless-validate-exclusion-move")
+            raise Refusal(f"validation exclusion guard already exists: {guard}")
         payload_fd = os.open(
-            _OWNERLESS_VALIDATION_EXCLUSION_ENTRY,
+            source_name,
             os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
-            dir_fd=container_fd,
+            dir_fd=source_parent_fd,
         )
         payload_metadata = os.fstat(payload_fd)
         payload_identity = (
             payload_metadata.st_dev,
             payload_metadata.st_ino,
-            _fd_mount_id(payload_fd, str(payload)),
+            _fd_mount_id(payload_fd, str(fenced)),
         )
-        if payload_identity != authorization.identity:
+        if (
+            not stat.S_ISDIR(payload_metadata.st_mode)
+            or payload_identity != authorization.identity
+        ):
+            raise Refusal("validation checkout identity changed before exclusion")
+        alias_metadata = source_alias.stat(follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(alias_metadata.st_mode)
+            or (alias_metadata.st_dev, alias_metadata.st_ino)
+            != (payload_metadata.st_dev, payload_metadata.st_ino)
+        ):
+            raise Refusal("validation checkout mount alias names another inode")
+        _root_validation_exclusion_command(
+            Path("/usr/bin/mkdir"),
+            ("--mode=0755", "--", str(guard)),
+            "create the validation exclusion guard",
+        )
+        guard_fd = os.open(
+            guard.name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=root_fd,
+        )
+        guard_metadata = os.fstat(guard_fd)
+        guard_identity = (
+            guard_metadata.st_dev,
+            guard_metadata.st_ino,
+            _fd_mount_id(guard_fd, str(guard)),
+        )
+        if (
+            not stat.S_ISDIR(guard_metadata.st_mode)
+            or guard_metadata.st_uid != 0
+            or guard_metadata.st_gid != 0
+            or stat.S_IMODE(guard_metadata.st_mode) != 0o755
+            or guard_identity[2] != root_identity[2]
+        ):
+            raise Refusal("validation exclusion guard is not root-owned and private")
+        exclusion_record = _OwnerlessValidationExclusionRecord(
+            phase="guard-created",
+            root=root,
+            root_identity=root_identity,
+            guard=guard,
+            guard_identity=guard_identity,
+            source_alias=source_alias,
+            payload_identity=authorization.identity[:2],
+        )
+        journal["exclusion"] = _ownerless_validation_exclusion_to_obj(
+            exclusion_record
+        )
+        _write_journal(config, journal)
+        os.fsync(root_fd)
+        _interrupt_for_test("after-ownerless-validate-exclusion-directory")
+        _root_validation_exclusion_command(
+            Path("/usr/bin/chmod"),
+            ("000", "--", str(guard)),
+            "seal the validation exclusion guard",
+        )
+        sealed = os.fstat(guard_fd)
+        path_sealed = os.stat(guard.name, dir_fd=root_fd, follow_symlinks=False)
+        if (
+            (sealed.st_dev, sealed.st_ino) != guard_identity[:2]
+            or (path_sealed.st_dev, path_sealed.st_ino) != guard_identity[:2]
+            or sealed.st_uid != 0
+            or sealed.st_gid != 0
+            or stat.S_IMODE(sealed.st_mode) != 0
+            or stat.S_IMODE(path_sealed.st_mode) != 0
+        ):
+            raise Refusal("validation exclusion guard did not become root-owned mode 000")
+        _interrupt_for_test("after-ownerless-validate-exclusion-seal")
+        _root_validation_exclusion_command(
+            Path("/usr/bin/mv"),
+            (
+                "--no-clobber",
+                "--no-target-directory",
+                "--",
+                str(source_alias),
+                str(payload),
+            ),
+            "move the validation checkout behind its exclusion guard",
+        )
+        os.fsync(guard_fd)
+        os.fsync(source_parent_fd)
+        _interrupt_for_test("after-ownerless-validate-exclusion-move")
+        moved_metadata = _root_validation_path_metadata(
+            payload, "excluded validation checkout"
+        )
+        if (
+            not stat.S_ISDIR(moved_metadata.st_mode)
+            or (moved_metadata.st_dev, moved_metadata.st_ino)
+            != authorization.identity[:2]
+            or (os.fstat(payload_fd).st_dev, os.fstat(payload_fd).st_ino)
+            != authorization.identity[:2]
+        ):
             raise Refusal("validation checkout identity changed during exclusion")
+        _assert_parent_entry_absent(
+            source_parent_fd, fenced.parent, fenced, "fenced validation path"
+        )
+        try:
+            source_alias.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise Refusal("validation checkout mount alias remains after exclusion move")
         if (
             authorization.stable_identity is not None
             and _fd_private_cleanup_identity(payload_fd, str(payload))
@@ -16866,40 +17336,44 @@ def _begin_ownerless_validation_exclusion(
             raise Refusal(
                 "validation checkout stable identity changed during exclusion"
             )
-        os.fchmod(container_fd, 0)
-        os.fsync(container_fd)
-        sealed = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        if (sealed.st_dev, sealed.st_ino) != (
-            container_metadata.st_dev,
-            container_metadata.st_ino,
-        ) or stat.S_IMODE(sealed.st_mode) != 0:
-            raise Refusal(
-                f"validation exclusion directory did not become non-searchable: {container}"
-            )
-        _interrupt_for_test("after-ownerless-validate-exclusion-seal")
+        exclusion_record = dataclasses.replace(
+            exclusion_record, phase="payload-moved"
+        )
+        journal["exclusion"] = _ownerless_validation_exclusion_to_obj(
+            exclusion_record
+        )
+        _write_journal(config, journal)
         return _OwnerlessValidationExclusion(
-            container=container,
+            root=root,
+            guard=guard,
             payload=payload,
-            parent_fd=parent_fd,
-            container_fd=container_fd,
+            source_alias=source_alias,
+            root_fd=root_fd,
+            source_parent_fd=source_parent_fd,
+            guard_fd=guard_fd,
             payload_fd=payload_fd,
+            record=exclusion_record,
         )
     except BaseException:
         if payload_fd is not None:
             os.close(payload_fd)
-        if container_fd is not None:
-            os.close(container_fd)
-        os.close(parent_fd)
+        if guard_fd is not None:
+            os.close(guard_fd)
+        if root_fd is not None:
+            os.close(root_fd)
+        os.close(source_parent_fd)
         raise
 
 
 def _assert_current_process_only_holds_excluded_payload(
-    payload: Path,
-    payload_fd: int,
-) -> None:
+    exclusion: _OwnerlessValidationExclusion,
+    target: Path,
+    fenced: Path,
+) -> tuple[int, str, str, str] | None:
     """Permit only the remover's exact payload descriptor in its own process."""
 
-    targets = {payload: str(payload)}
+    paths = (exclusion.payload, exclusion.source_alias, fenced, target)
+    targets = {path: str(path) for path in paths}
     base = Path("/proc/self")
     for name in ("cwd", "root", "exe"):
         try:
@@ -16912,6 +17386,7 @@ def _assert_current_process_only_holds_excluded_payload(
                 f"cleanup process unexpectedly uses excluded validation path: {name}={raw}"
             )
     expected_seen = False
+    expected_census_match: tuple[int, str, str, str] | None = None
     try:
         descriptors = tuple((base / "fd").iterdir())
     except OSError as exc:
@@ -16921,11 +17396,19 @@ def _assert_current_process_only_holds_excluded_payload(
             raw = os.readlink(descriptor)
         except FileNotFoundError:
             continue
+        if descriptor.name == str(exclusion.payload_fd):
+            metadata = os.fstat(exclusion.payload_fd)
+            if (metadata.st_dev, metadata.st_ino) != exclusion.record.payload_identity:
+                raise Refusal("cleanup process payload descriptor changed identity")
+            expected_seen = True
+            observed = Path(os.path.normpath(raw.removesuffix(" (deleted)")))
+            matched = _matching_absent_validate_target(observed, targets)
+            if matched is not None:
+                _target, slot = matched
+                expected_census_match = (os.getpid(), slot, "link", raw)
+            continue
         observed = Path(os.path.normpath(raw.removesuffix(" (deleted)")))
         if _matching_absent_validate_target(observed, targets) is None:
-            continue
-        if descriptor.name == str(payload_fd) and observed == payload:
-            expected_seen = True
             continue
         raise Refusal(
             "cleanup process has an unexpected descriptor into the excluded "
@@ -16946,10 +17429,13 @@ def _assert_current_process_only_holds_excluded_payload(
             raise Refusal(
                 "cleanup process maps a file from the excluded validation path"
             )
+    return expected_census_match
 
 
 def _assert_excluded_validation_unused(
     exclusion: _OwnerlessValidationExclusion,
+    target: Path,
+    fenced: Path,
     batch_cleanup: _OwnerlessValidationBatchContext | None,
 ) -> None:
     """Census after the namespace move while ordinary same-UID entry is denied."""
@@ -16969,18 +17455,24 @@ def _assert_excluded_validation_unused(
             stderr_limit=64 * 1024,
             input_limit=_MOUNTINFO_CENSUS_BYTES_LIMIT,
         )
-    _assert_current_process_only_holds_excluded_payload(
-        exclusion.payload, exclusion.payload_fd
+    expected_match = _assert_current_process_only_holds_excluded_payload(
+        exclusion, target, fenced
     )
-    fresh = _capture_same_uid_process_path_census((exclusion.payload,), budget=budget)
-    fresh.assert_slot_unused(
-        exclusion.payload,
-        None,
-        ignore_current_process=True,
+    census_paths = tuple(
+        dict.fromkeys((exclusion.payload, exclusion.source_alias, fenced, target))
     )
-    _assert_current_process_only_holds_excluded_payload(
-        exclusion.payload, exclusion.payload_fd
-    )
+    fresh = _capture_same_uid_process_path_census(census_paths, budget=budget)
+    matches = list(fresh.matches)
+    if expected_match is not None and expected_match in matches:
+        matches.remove(expected_match)
+    filtered = dataclasses.replace(fresh, matches=tuple(matches))
+    for census_path in census_paths:
+        filtered.assert_slot_unused(
+            census_path,
+            None,
+            ignore_current_process=False,
+        )
+    _assert_current_process_only_holds_excluded_payload(exclusion, target, fenced)
     if batch_cleanup is not None:
         batch_cleanup.census_budget.remaining_seconds()
 
@@ -17089,7 +17581,7 @@ def _remove_excluded_validation_tree(
     fenced: Path,
     authorization: ValidationRecoveryAuthorization,
 ) -> int:
-    """Delete the authorized payload through held FDs, then remove its barrier."""
+    """Delete the authorized payload through its FD, then remove the root guard."""
 
     _assert_excluded_validation_tree_bound(exclusion, target, fenced, authorization)
     _original, _mount_id, size = _clear_bound_cache_directory(
@@ -17099,33 +17591,30 @@ def _remove_excluded_validation_tree(
         expected_identity=authorization.identity,
         expected_stable_identity=authorization.stable_identity,
     )
+    _assert_excluded_validation_tree_bound(exclusion, target, fenced, authorization)
+    _root_validation_exclusion_command(
+        Path("/usr/bin/rmdir"),
+        ("--", str(exclusion.payload)),
+        "remove the empty excluded validation checkout",
+    )
     try:
-        os.fchmod(exclusion.container_fd, 0o700)
-        os.fsync(exclusion.container_fd)
-        current_payload = os.stat(
-            _OWNERLESS_VALIDATION_EXCLUSION_ENTRY,
-            dir_fd=exclusion.container_fd,
-            follow_symlinks=False,
-        )
-        payload_metadata = os.fstat(exclusion.payload_fd)
-        if not stat.S_ISDIR(current_payload.st_mode) or (
-            current_payload.st_dev,
-            current_payload.st_ino,
-        ) != (payload_metadata.st_dev, payload_metadata.st_ino):
-            raise Refusal(
-                "excluded validation checkout identity changed before removal"
-            )
-        os.rmdir(
-            _OWNERLESS_VALIDATION_EXCLUSION_ENTRY,
-            dir_fd=exclusion.container_fd,
-        )
-        os.fsync(exclusion.container_fd)
-        os.rmdir(exclusion.container.name, dir_fd=exclusion.parent_fd)
-        os.fsync(exclusion.parent_fd)
+        os.fsync(exclusion.guard_fd)
     except OSError as exc:
-        raise Refusal(
-            f"cannot remove excluded validation checkout {exclusion.payload}: {exc}"
-        ) from exc
+        raise Refusal(f"cannot sync emptied validation exclusion guard: {exc}") from exc
+    _root_validation_exclusion_command(
+        Path("/usr/bin/rmdir"),
+        ("--", str(exclusion.guard)),
+        "remove the empty validation exclusion guard",
+    )
+    try:
+        os.stat(exclusion.guard.name, dir_fd=exclusion.root_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise Refusal(f"cannot recheck removed validation exclusion guard: {exc}") from exc
+    else:
+        raise Refusal("validation exclusion guard remains after removal")
+    os.fsync(exclusion.root_fd)
     return size
 
 
@@ -17137,29 +17626,58 @@ def _assert_excluded_validation_tree_bound(
 ) -> None:
     """Recheck all names and identities before destructive traversal starts."""
 
-    container_metadata = os.fstat(exclusion.container_fd)
-    if stat.S_IMODE(container_metadata.st_mode) != 0:
-        raise Refusal("validation exclusion directory became searchable before cleanup")
+    root_metadata = os.fstat(exclusion.root_fd)
+    root_identity = (
+        root_metadata.st_dev,
+        root_metadata.st_ino,
+        _fd_mount_id(exclusion.root_fd, str(exclusion.root)),
+    )
+    if (
+        root_identity != exclusion.record.root_identity
+        or root_metadata.st_uid != 0
+        or root_metadata.st_gid != 0
+        or stat.S_IMODE(root_metadata.st_mode) != 0o1777
+    ):
+        raise Refusal("validation exclusion root identity or permissions changed")
+    guard_metadata = os.fstat(exclusion.guard_fd)
+    if (
+        (
+            guard_metadata.st_dev,
+            guard_metadata.st_ino,
+            _fd_mount_id(exclusion.guard_fd, str(exclusion.guard)),
+        )
+        != exclusion.record.guard_identity
+        or guard_metadata.st_uid != 0
+        or guard_metadata.st_gid != 0
+        or stat.S_IMODE(guard_metadata.st_mode) != 0
+    ):
+        raise Refusal("validation exclusion guard became accessible before cleanup")
     try:
-        current_container = os.stat(
-            exclusion.container.name,
-            dir_fd=exclusion.parent_fd,
+        current_guard = os.stat(
+            exclusion.guard.name,
+            dir_fd=exclusion.root_fd,
             follow_symlinks=False,
         )
     except OSError as exc:
         raise Refusal(
-            f"validation exclusion directory disappeared before cleanup: {exc}"
+            f"validation exclusion guard disappeared before cleanup: {exc}"
         ) from exc
-    if (current_container.st_dev, current_container.st_ino) != (
-        container_metadata.st_dev,
-        container_metadata.st_ino,
-    ):
-        raise Refusal("validation exclusion directory identity changed before cleanup")
+    if (
+        current_guard.st_dev,
+        current_guard.st_ino,
+    ) != exclusion.record.guard_identity[:2]:
+        raise Refusal("validation exclusion guard identity changed before cleanup")
     _assert_parent_entry_absent(
-        exclusion.parent_fd, target.parent, target, "canonical validation path"
+        exclusion.source_parent_fd,
+        target.parent,
+        target,
+        "canonical validation path",
     )
     _assert_parent_entry_absent(
-        exclusion.parent_fd, fenced.parent, fenced, "fenced validation path"
+        exclusion.source_parent_fd,
+        fenced.parent,
+        fenced,
+        "fenced validation path",
     )
     payload_metadata = os.fstat(exclusion.payload_fd)
     payload_identity = (
@@ -17169,6 +17687,21 @@ def _assert_excluded_validation_tree_bound(
     )
     if payload_identity != authorization.identity:
         raise Refusal("excluded validation checkout identity changed before cleanup")
+    root_payload = _root_validation_path_metadata(
+        exclusion.payload, "excluded validation checkout"
+    )
+    if (
+        not stat.S_ISDIR(root_payload.st_mode)
+        or (root_payload.st_dev, root_payload.st_ino)
+        != exclusion.record.payload_identity
+    ):
+        raise Refusal("excluded validation checkout path changed before cleanup")
+    try:
+        exclusion.source_alias.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        pass
+    else:
+        raise Refusal("validation checkout mount alias reappeared before cleanup")
     if (
         authorization.stable_identity is not None
         and _fd_private_cleanup_identity(exclusion.payload_fd, str(exclusion.payload))
@@ -17195,7 +17728,7 @@ def _recover_ownerless_validation(
         config, raw
     )
     if initial_authorization.target_kind != "checkout":
-        _restore_ownerless_validation_exclusion(config, raw)
+        raw = _restore_ownerless_validation_exclusion(config, raw)
     authorization, target, fenced, active, repository = _ownerless_validation_inputs(
         config, raw, recheck=False, batch_cleanup=batch_cleanup
     )
@@ -17337,9 +17870,11 @@ def _recover_ownerless_validation(
             destructive_started = False
             try:
                 exclusion = _begin_ownerless_validation_exclusion(
-                    config, target, fenced, authorization
+                    config, target, fenced, authorization, journal
                 )
-                _assert_excluded_validation_unused(exclusion, batch_cleanup)
+                _assert_excluded_validation_unused(
+                    exclusion, target, fenced, batch_cleanup
+                )
                 _recheck_excluded_validation_producer(
                     config,
                     authorization.removal_proof,
@@ -17351,7 +17886,7 @@ def _recover_ownerless_validation(
                     exclusion, target, fenced, authorization
                 )
                 _assert_current_process_only_holds_excluded_payload(
-                    exclusion.payload, exclusion.payload_fd
+                    exclusion, target, fenced
                 )
                 destructive_started = True
                 _remove_excluded_validation_tree(
@@ -17359,15 +17894,6 @@ def _recover_ownerless_validation(
                 )
             except (Refusal, StateError) as exc:
                 if exclusion is not None:
-                    if not destructive_started:
-                        try:
-                            os.fchmod(exclusion.container_fd, 0o700)
-                            os.fsync(exclusion.container_fd)
-                        except OSError as restore_mode:
-                            raise Refusal(
-                                f"{exc}; exclusion mode restoration failed: "
-                                f"{restore_mode}"
-                            ) from restore_mode
                     exclusion.close()
                     exclusion = None
                 if not destructive_started:
@@ -17389,6 +17915,7 @@ def _recover_ownerless_validation(
             finally:
                 if exclusion is not None:
                     exclusion.close()
+            journal.pop("exclusion", None)
         journal["phase"] = "removed"
         _write_journal(config, journal)
         _interrupt_for_test("after-ownerless-validate-remove")
@@ -20208,16 +20735,25 @@ class _OwnerlessValidationBatchContext:
 
 @dataclasses.dataclass
 class _OwnerlessValidationExclusion:
-    """An ownerless validation tree hidden behind a non-searchable directory."""
+    """An ownerless validation tree hidden behind a root-owned directory."""
 
-    container: Path
+    root: Path
+    guard: Path
     payload: Path
-    parent_fd: int
-    container_fd: int
+    source_alias: Path
+    root_fd: int
+    source_parent_fd: int
+    guard_fd: int
     payload_fd: int
+    record: _OwnerlessValidationExclusionRecord
 
     def close(self) -> None:
-        for descriptor in (self.payload_fd, self.container_fd, self.parent_fd):
+        for descriptor in (
+            self.payload_fd,
+            self.guard_fd,
+            self.source_parent_fd,
+            self.root_fd,
+        ):
             with contextlib.suppress(OSError):
                 os.close(descriptor)
 

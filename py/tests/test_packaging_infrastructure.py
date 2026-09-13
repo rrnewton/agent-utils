@@ -395,9 +395,9 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
 
     assert ordinary.isdisjoint(mapped)
     assert ordinary | mapped == all_tests
-    assert len(all_tests) == 563
-    assert len(ordinary) == 61
-    assert len(mapped) == 502
+    assert len(all_tests) == 572
+    assert len(ordinary) == 66
+    assert len(mapped) == 506
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {
@@ -412,15 +412,19 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
         "test_frozen_validate_batch_fresh_census_does_not_ignore_current_process",
         "test_frozen_validate_detects_pre_exclusion_same_uid_holder_and_rolls_back",
         "test_frozen_validate_excludes_late_same_uid_checkout_entry",
+        "test_frozen_validate_sealed_guard_fd_cannot_open_late_payload",
         "test_frozen_validate_checkout_binds_terminal_record_fields",
         "test_frozen_validate_checkout_recovers_each_durable_crash_boundary",
+        "test_frozen_validate_recovery_refuses_exclusion_identity_tampering",
         "test_frozen_validate_recovery_refuses_absent_fenced_path",
         "test_frozen_validate_recovery_refuses_absent_prepared_path_twice",
         "test_frozen_validate_recovery_refuses_changed_identity_binding",
         "test_frozen_validate_recovery_refuses_changed_terminal_record_digest",
         "test_frozen_validate_refuses_disappearance_after_final_check",
+        "test_frozen_validate_refuses_cross_device_exclusion_root",
         "test_frozen_validate_refuses_fenced_replacement_after_final_check",
         "test_frozen_validate_refuses_replacement_after_final_check",
+        "test_frozen_validate_refuses_when_verified_root_context_is_unavailable",
         "test_frozen_validate_rejects_counterfeit_minimal_terminal_records",
         "test_lock_conflict_refuses_without_state_change",
         "test_ownerless_validate_batch_removes_terminal_frozen_checkout",
