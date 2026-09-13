@@ -37,6 +37,97 @@ VERSION = __version__
 SCHEMA = 2
 VALIDATE_REMOVE_BATCH_LIMIT = 8
 _VALIDATE_BATCH_SEAL_SCHEMA = 1
+_VALIDATION_REMOVAL_PROOF_SCHEMA = 1
+_VALIDATION_REMOVAL_PROOF_BYTES_LIMIT = 64 * 1024
+_VALIDATION_REMOVAL_ARTIFACT_BYTES_LIMIT = 16 * 1024 * 1024
+_VALIDATION_REMOVAL_ARTIFACT_ROLES = frozenset(
+    {"run-record", "service-result", "producer-schema", "scorecard-handoff"}
+)
+_VALIDATION_SERVICE_RESULT_SUFFIX = ".service-result.json"
+_VALIDATION_SERVICE_RESULT_SCHEMA_PATH = Path(
+    "ci/manifest-plan/validation-service-result-schema.json"
+)
+_VALIDATION_UNIT_RE = re.compile(r"validate-[A-Za-z0-9_.@:-]+\.service")
+_VALIDATION_SCORECARD_PATHS = (
+    "SCORECARD.md",
+    "ci/compat-envelope/cells.json",
+)
+_VALIDATION_SERVICE_RESULT_FIELDS = {
+    1: (
+        "schema_version",
+        "commit",
+        "profile",
+        "final_validate_status",
+        "exit_code",
+        "executed_nodes",
+        "executed_tests",
+    ),
+    2: (
+        "schema_version",
+        "commit",
+        "profile",
+        "final_validate_status",
+        "exit_code",
+        "executed_nodes",
+        "executed_tests",
+        "scorecard_writeback",
+    ),
+    3: (
+        "schema_version",
+        "commit",
+        "profile",
+        "selection_mode",
+        "final_validate_status",
+        "exit_code",
+        "executed_nodes",
+        "executed_tests",
+        "scorecard_writeback",
+    ),
+    4: (
+        "schema_version",
+        "commit",
+        "profile",
+        "selection_mode",
+        "final_validate_status",
+        "exit_code",
+        "executed_nodes",
+        "executed_tests",
+        "passed_tests",
+        "scorecard_writeback",
+    ),
+    5: (
+        "schema_version",
+        "commit",
+        "profile",
+        "selection_mode",
+        "final_validate_status",
+        "detail",
+        "exit_code",
+        "executed_nodes",
+        "executed_tests",
+        "passed_tests",
+        "scorecard_writeback",
+    ),
+}
+_VALIDATION_RESULT_OUTCOMES = {
+    "PASSED": ("success", 0),
+    "FAILED": ("failure", 1),
+    "COULD_NOT_RUN": ("no-result", 75),
+}
+_VALIDATION_SCORECARD_WRITEBACK_SCHEMA = {
+    "nullable": True,
+    "variants": {
+        "completed": ["status"],
+        "failed": ["status", "error"],
+    },
+}
+
+
+def _historical_validation_result_detail(schema: int) -> str:
+    return (
+        "validation-service-result-schema_version: historical schema "
+        f"{schema} is readable but has no current authority"
+    )
 
 
 class _ValidateBatchSealRecoveryKind(enum.Enum):
@@ -96,6 +187,7 @@ _FINISH_JOURNAL_OPTIONAL = frozenset(
         "validate_complete",
         "original_mode",
         "private_census_identity",
+        "validation_removal_proof",
     }
 )
 _LEGACY_VALIDATE_JOURNAL_REQUIRED = frozenset(
@@ -445,6 +537,9 @@ class ValidationRecoveryAuthorization:
     remote_url_sha256: str | None = None
     parent_identity: tuple[int, int, int] | None = None
     stable_identity: _PrivateCleanupIdentity | None = None
+    removal_proof: _ValidationRemovalProof | None = None
+    proof_original_mode: int | None = None
+    proof_private_identity: _PrivateCleanupIdentity | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -511,6 +606,37 @@ class _RetainedValidationHandle:
     pid: int | None
     start_ticks: int | None
     boot_id: str | None
+
+
+@dataclasses.dataclass(frozen=True)
+class _RegularFileIdentity:
+    """One regular file generation bound to its exact bytes."""
+
+    device: int
+    inode: int
+    size: int
+    sha256: str
+
+
+@dataclasses.dataclass(frozen=True)
+class _ValidationRemovalArtifact:
+    """One required artifact named by a validation-removal proof."""
+
+    role: str
+    path: str
+    identity: _RegularFileIdentity
+
+
+@dataclasses.dataclass(frozen=True)
+class _ValidationRemovalProof:
+    """Immutable snapshot rechecked at a validation checkout's deletion boundary."""
+
+    manifest_path: str
+    manifest_identity: _RegularFileIdentity
+    slot: str
+    generation: int
+    checkout: str
+    artifacts: tuple[_ValidationRemovalArtifact, ...]
 
 
 def _utc_now() -> str:
@@ -847,6 +973,89 @@ def _read_bounded_regular_file(path: Path, label: str, limit: int) -> bytes:
     return contents
 
 
+def _read_regular_file_identity(
+    path: Path, label: str, limit: int
+) -> tuple[bytes, _RegularFileIdentity]:
+    """Read one bounded regular file and bind the bytes to its open inode."""
+
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise Refusal(f"cannot read {label} {path}: {exc}") from exc
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise Refusal(f"{label} is not a regular file: {path}")
+        if before.st_size > limit:
+            raise Refusal(f"{label} exceeds the {limit}-byte safety bound: {path}")
+        chunks: list[bytes] = []
+        remaining = limit + 1
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 64 * 1024))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        contents = b"".join(chunks)
+        after = os.fstat(descriptor)
+        try:
+            path_after = path.stat(follow_symlinks=False)
+        except OSError as exc:
+            raise Refusal(f"cannot recheck {label} path {path}: {exc}") from exc
+    except Refusal:
+        raise
+    except OSError as exc:
+        raise Refusal(f"cannot read {label} {path}: {exc}") from exc
+    finally:
+        os.close(descriptor)
+    if len(contents) > limit:
+        raise Refusal(f"{label} exceeds the {limit}-byte safety bound: {path}")
+    stable_fields = (
+        "st_dev",
+        "st_ino",
+        "st_mode",
+        "st_size",
+        "st_mtime_ns",
+        "st_ctime_ns",
+    )
+    if any(getattr(before, field) != getattr(after, field) for field in stable_fields):
+        raise Refusal(f"{label} changed while it was read: {path}")
+    if any(
+        getattr(after, field) != getattr(path_after, field)
+        for field in stable_fields
+    ):
+        raise Refusal(f"{label} path changed while it was read: {path}")
+    if len(contents) != after.st_size:
+        raise Refusal(f"{label} size changed while it was read: {path}")
+    return contents, _RegularFileIdentity(
+        device=after.st_dev,
+        inode=after.st_ino,
+        size=after.st_size,
+        sha256=hashlib.sha256(contents).hexdigest(),
+    )
+
+
+def _strict_json_object(contents: bytes, label: str) -> Mapping[str, object]:
+    """Decode a JSON object while refusing duplicate keys at every depth."""
+
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        value: dict[str, object] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError(f"duplicate key {key!r}")
+            value[key] = item
+        return value
+
+    try:
+        value = json.loads(contents, object_pairs_hook=unique_object)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise Refusal(f"{label} is malformed JSON: {exc}") from exc
+    return _as_mapping(value, label)
+
+
 def _refuse_symlink(path: Path, label: str) -> None:
     try:
         if path.is_symlink():
@@ -888,6 +1097,991 @@ def _ensure_no_symlink_components(root: Path, path: Path, label: str) -> None:
                 raise Refusal(f"{label} crosses a symlink: {current}")
         except OSError as exc:
             raise Refusal(f"cannot inspect {label} path {current}: {exc}") from exc
+
+
+def _canonical_managed_file_path(
+    config: Config,
+    raw: str,
+    label: str,
+    *,
+    allow_frozen: bool = False,
+) -> tuple[str, Path]:
+    """Resolve one exact managed file spelling without accepting aliases."""
+
+    candidate = Path(raw)
+    if candidate.is_absolute():
+        if not allow_frozen or raw != os.path.normpath(raw) or ".." in candidate.parts:
+            raise Refusal(f"{label} is not a canonical managed path: {raw!r}")
+        frozen_root = _frozen_validation_directory(config)
+        if not _path_is_within(candidate, frozen_root):
+            raise Refusal(f"{label} is outside the managed validation roots: {raw!r}")
+        _ensure_no_symlink_components(config.root.parent, candidate, label)
+        return raw, candidate
+    relative, path = _relative_inside(config.root, raw, label)
+    if relative != raw:
+        raise Refusal(
+            f"{label} must use its canonical project-relative spelling: {relative!r}"
+        )
+    return relative, path
+
+
+def _managed_file_reference(config: Config, path: Path) -> str:
+    """Render an already-bounded managed path in its one accepted spelling."""
+
+    try:
+        return path.relative_to(config.root).as_posix()
+    except ValueError:
+        frozen_root = _frozen_validation_directory(config)
+        if not path.is_absolute() or not _path_is_within(path, frozen_root):
+            raise Refusal(f"validation proof path is outside the managed roots: {path}")
+        return str(path)
+
+
+def _regular_file_identity_to_obj(identity: _RegularFileIdentity) -> dict[str, object]:
+    return {
+        "identity": [identity.device, identity.inode],
+        "size": identity.size,
+        "sha256": identity.sha256,
+    }
+
+
+def _regular_file_identity_from_obj(
+    value: Mapping[str, object], label: str
+) -> _RegularFileIdentity:
+    identity = _as_list(value.get("identity"), f"{label}.identity")
+    if len(identity) != 2:
+        raise StateError(f"{label}.identity must contain device and inode")
+    digest = _as_str(value.get("sha256"), f"{label}.sha256")
+    if not DIGEST_RE.fullmatch(digest):
+        raise StateError(f"{label}.sha256 must be 64 lowercase hexadecimal digits")
+    return _RegularFileIdentity(
+        device=_as_int(identity[0], f"{label}.identity[0]", minimum=0),
+        inode=_as_int(identity[1], f"{label}.identity[1]", minimum=1),
+        size=_as_int(value.get("size"), f"{label}.size", minimum=0),
+        sha256=digest,
+    )
+
+
+def _validation_removal_artifact_to_obj(
+    artifact: _ValidationRemovalArtifact,
+) -> dict[str, object]:
+    return {
+        "role": artifact.role,
+        "path": artifact.path,
+        **_regular_file_identity_to_obj(artifact.identity),
+    }
+
+
+def _validation_removal_manifest_to_obj(
+    proof: _ValidationRemovalProof,
+) -> dict[str, object]:
+    return {
+        "schema": _VALIDATION_REMOVAL_PROOF_SCHEMA,
+        "kind": "validation-removal-proof",
+        "slot": proof.slot,
+        "generation": proof.generation,
+        "checkout": proof.checkout,
+        "artifacts": [
+            _validation_removal_artifact_to_obj(artifact)
+            for artifact in proof.artifacts
+        ],
+    }
+
+
+def _validation_removal_proof_to_obj(
+    proof: _ValidationRemovalProof,
+) -> dict[str, object]:
+    return {
+        "manifest": {
+            "path": proof.manifest_path,
+            **_regular_file_identity_to_obj(proof.manifest_identity),
+        },
+        **_validation_removal_manifest_to_obj(proof),
+    }
+
+
+def _validation_removal_artifacts_from_obj(
+    value: object, label: str
+) -> tuple[_ValidationRemovalArtifact, ...]:
+    artifacts: list[_ValidationRemovalArtifact] = []
+    for index, item in enumerate(_as_list(value, label)):
+        row_label = f"{label}[{index}]"
+        raw = _as_mapping(item, row_label)
+        _exact_keys(
+            raw,
+            {"role", "path", "identity", "size", "sha256"},
+            set(),
+            row_label,
+        )
+        role = _as_str(raw["role"], f"{row_label}.role")
+        artifacts.append(
+            _ValidationRemovalArtifact(
+                role=role,
+                path=_as_str(raw["path"], f"{row_label}.path"),
+                identity=_regular_file_identity_from_obj(raw, row_label),
+            )
+        )
+    roles = [artifact.role for artifact in artifacts]
+    if len(roles) != len(set(roles)):
+        raise StateError("validation removal proof repeats an artifact role")
+    if set(roles) != _VALIDATION_REMOVAL_ARTIFACT_ROLES:
+        raise StateError(
+            "validation removal proof must name exactly run-record, service-result, "
+            "producer-schema, and scorecard-handoff artifacts"
+        )
+    paths = [artifact.path for artifact in artifacts]
+    if len(paths) != len(set(paths)):
+        raise StateError("validation removal proof repeats an artifact path")
+    return tuple(artifacts)
+
+
+def _validation_removal_manifest_fields(
+    value: Mapping[str, object], label: str
+) -> tuple[str, int, str, tuple[_ValidationRemovalArtifact, ...]]:
+    _exact_keys(
+        value,
+        {"schema", "kind", "slot", "generation", "checkout", "artifacts"},
+        set(),
+        label,
+    )
+    if _as_int(value["schema"], f"{label}.schema") != _VALIDATION_REMOVAL_PROOF_SCHEMA:
+        raise StateError("unsupported validation removal proof schema")
+    if _as_str(value["kind"], f"{label}.kind") != "validation-removal-proof":
+        raise StateError("validation removal proof has the wrong kind")
+    slot = _validate_name(_as_str(value["slot"], f"{label}.slot"), "slot")
+    generation = _as_int(value["generation"], f"{label}.generation", minimum=1)
+    checkout = _as_str(value["checkout"], f"{label}.checkout")
+    artifacts = _validation_removal_artifacts_from_obj(
+        value["artifacts"], f"{label}.artifacts"
+    )
+    return slot, generation, checkout, artifacts
+
+
+def _validation_removal_proof_from_obj(
+    value: object, label: str = "validation removal proof"
+) -> _ValidationRemovalProof:
+    raw = _as_mapping(value, label)
+    _exact_keys(
+        raw,
+        {
+            "manifest",
+            "schema",
+            "kind",
+            "slot",
+            "generation",
+            "checkout",
+            "artifacts",
+        },
+        set(),
+        label,
+    )
+    manifest = _as_mapping(raw["manifest"], f"{label}.manifest")
+    _exact_keys(
+        manifest,
+        {"path", "identity", "size", "sha256"},
+        set(),
+        f"{label}.manifest",
+    )
+    manifest_payload = {
+        key: raw[key]
+        for key in ("schema", "kind", "slot", "generation", "checkout", "artifacts")
+    }
+    slot, generation, checkout, artifacts = _validation_removal_manifest_fields(
+        manifest_payload, label
+    )
+    return _ValidationRemovalProof(
+        manifest_path=_as_str(manifest["path"], f"{label}.manifest.path"),
+        manifest_identity=_regular_file_identity_from_obj(
+            manifest, f"{label}.manifest"
+        ),
+        slot=slot,
+        generation=generation,
+        checkout=checkout,
+        artifacts=artifacts,
+    )
+
+
+def _assert_regular_file_identity(
+    expected: _RegularFileIdentity,
+    observed: _RegularFileIdentity,
+    label: str,
+) -> None:
+    if (observed.device, observed.inode) != (expected.device, expected.inode):
+        raise Refusal(f"{label} regular-file identity changed")
+    if observed.size != expected.size:
+        raise Refusal(f"{label} size changed")
+    if observed.sha256 != expected.sha256:
+        raise Refusal(f"{label} changed bytes")
+
+
+def _validation_proof_manifest_path(config: Config, raw: str) -> tuple[str, Path]:
+    relative, path = _canonical_managed_file_path(
+        config, raw, "validation removal proof manifest"
+    )
+    proof_root = Path("ignored/validate/removal-proofs")
+    relative_path = Path(relative)
+    if (
+        relative_path.suffix != ".json"
+        or not _path_is_within(relative_path, proof_root)
+        or relative_path == proof_root
+    ):
+        raise Refusal(
+            "validation removal proof manifest must be a JSON file under "
+            "ignored/validate/removal-proofs"
+        )
+    return relative, path
+
+
+def _validation_run_record_argument(config: Config, raw: str) -> tuple[str, Path]:
+    relative, path = _canonical_managed_file_path(
+        config, raw, "completed validation run-record"
+    )
+    if (
+        Path(relative).parent != Path("ignored/validate/runs")
+        or path.suffix != ".json"
+        or path.name.endswith(_VALIDATION_SERVICE_RESULT_SUFFIX)
+    ):
+        raise Refusal(
+            "completed validation run-record must be one canonical "
+            "ignored/validate/runs/*.json handle, not a service-result sidecar"
+        )
+    return relative, path
+
+
+def _proof_artifact_path(
+    config: Config,
+    artifact: _ValidationRemovalArtifact,
+    *,
+    canonical_slot: Path,
+    active_slot: Path,
+) -> Path:
+    candidate = Path(artifact.path)
+    canonical = candidate if candidate.is_absolute() else config.root / candidate
+    if _path_is_within(canonical, canonical_slot):
+        relative = canonical.relative_to(canonical_slot)
+        active = active_slot / relative
+        _ensure_no_symlink_components(active_slot, active, artifact.role)
+        return active
+    _relative, external = _canonical_managed_file_path(
+        config, artifact.path, artifact.role
+    )
+    return external
+
+
+def _validate_proof_artifact_paths(
+    config: Config,
+    artifacts: Sequence[_ValidationRemovalArtifact],
+    *,
+    canonical_slot: Path,
+    canonical_checkout: Path,
+) -> tuple[tuple[_ValidationRemovalArtifact, Path], ...]:
+    resolved: list[tuple[_ValidationRemovalArtifact, Path]] = []
+    for artifact in artifacts:
+        allow_frozen = artifact.role == "producer-schema"
+        relative, path = _canonical_managed_file_path(
+            config,
+            artifact.path,
+            f"validation removal {artifact.role}",
+            allow_frozen=allow_frozen,
+        )
+        del relative
+        inside_checkout = _path_is_within(path, canonical_checkout)
+        if artifact.role == "producer-schema":
+            if not inside_checkout or path == canonical_checkout:
+                raise Refusal(
+                    "validation removal producer-schema must be inside the exact checkout"
+                )
+        elif _path_is_within(path, canonical_slot):
+            raise Refusal(
+                f"validation removal {artifact.role} must remain outside the target"
+            )
+        if artifact.role == "scorecard-handoff" and path.name != "handoff.json":
+            raise Refusal(
+                "validation removal scorecard-handoff must name the exact "
+                "handoff.json regular file"
+            )
+        resolved.append((artifact, path))
+    return tuple(resolved)
+
+
+def _validation_removal_artifact(
+    artifacts: Sequence[_ValidationRemovalArtifact], role: str
+) -> _ValidationRemovalArtifact:
+    return next(artifact for artifact in artifacts if artifact.role == role)
+
+
+def _validation_removal_record_path(
+    config: Config, artifact: _ValidationRemovalArtifact
+) -> tuple[str, Path]:
+    relative, path = _canonical_managed_file_path(
+        config, artifact.path, "validation removal run-record"
+    )
+    if (
+        Path(relative).parent != Path("ignored/validate/runs")
+        or path.suffix != ".json"
+        or path.name.endswith(_VALIDATION_SERVICE_RESULT_SUFFIX)
+    ):
+        raise Refusal(
+            "validation removal run-record must be one canonical "
+            "ignored/validate/runs/*.json handle, not a service-result sidecar"
+        )
+    return relative, path
+
+
+def _validation_removal_record_fields(
+    config: Config,
+    record_path: Path,
+    record: Mapping[str, object],
+    *,
+    canonical_checkout: Path,
+    expected_head: str,
+    expected_slot: str,
+    expected_generation: int | None,
+) -> tuple[str, int, dict[str, Path]]:
+    schema = record.get("service_result_schema")
+    if (
+        not isinstance(schema, int)
+        or isinstance(schema, bool)
+        or schema not in {1, 2, 3, 4, 5}
+    ):
+        raise Refusal(
+            "validation removal run-record has no supported service-result identity"
+        )
+    historical = schema in {1, 2, 3}
+    expected_state = "unknown" if historical else "completed"
+    if record.get("state") != expected_state:
+        raise Refusal(
+            "validation removal run-record state does not match its service-result "
+            "schema"
+        )
+    if not _validation_record_has_typed_admission(record):
+        raise Refusal(
+            "validation removal run-record has no canonical producer admission"
+        )
+    if expected_generation is not None and (
+        record.get("wrkslots_slot") != expected_slot
+        or type(record.get("wrkslots_generation")) is not int
+        or record.get("wrkslots_generation") != expected_generation
+    ):
+        raise Refusal(
+            "validation removal run-record does not name the exact slot generation"
+        )
+    unit = record.get("unit")
+    if not isinstance(unit, str) or _VALIDATION_UNIT_RE.fullmatch(unit) is None:
+        raise Refusal(
+            "validation removal run-record has no canonical validate-*.service unit"
+        )
+    unit_name = unit.removesuffix(".service")
+    if record_path.name != f"{unit_name}.json":
+        raise Refusal(
+            "validation removal run-record path does not match its exact unit"
+        )
+    if record.get("checkout") != str(canonical_checkout):
+        raise Refusal(
+            "validation removal run-record does not name the exact checkout"
+        )
+    if record.get("target") != expected_head:
+        raise Refusal(
+            "validation removal run-record target does not match the checkout HEAD"
+        )
+    expected_source = (
+        "historical-validation-service-result"
+        if historical
+        else "validation-service-result"
+    )
+    if record.get("result_source") != expected_source:
+        raise Refusal(
+            "validation removal run-record has no supported service-result identity"
+        )
+    if schema == 1:
+        if "scorecard_writeback" in record:
+            raise Refusal(
+                "validation removal historical schema-1 run-record must not derive "
+                "scorecard writeback"
+            )
+    elif record.get("scorecard_writeback") != {"status": "completed"}:
+        raise Refusal(
+            "validation removal run-record has no completed scorecard writeback"
+        )
+    scorecard_directory = (
+        config.root
+        / "ignored"
+        / "validate"
+        / "scorecard-writebacks"
+        / unit_name
+    )
+    if record.get("scorecard_handoff") != str(scorecard_directory):
+        raise Refusal(
+            "validation removal run-record does not name its canonical scorecard handoff"
+        )
+    return unit_name, schema, {
+        "run-record": record_path,
+        "service-result": record_path.with_name(
+            f"{record_path.stem}{_VALIDATION_SERVICE_RESULT_SUFFIX}"
+        ),
+        "producer-schema": canonical_checkout / _VALIDATION_SERVICE_RESULT_SCHEMA_PATH,
+        "scorecard-handoff": scorecard_directory / "handoff.json",
+    }
+
+
+def _validation_service_result_schema(
+    contents: bytes, schema: int
+) -> tuple[str, ...]:
+    producer_schema = _strict_json_object(
+        contents, "validation removal producer-schema"
+    )
+    schema_fields = _VALIDATION_SERVICE_RESULT_FIELDS[schema]
+    expected_schema_keys = {"schema_version", "fields", "outcomes"}
+    if schema >= 2:
+        expected_schema_keys.add("scorecard_writeback")
+    outcome_exit_field = "exit_code" if schema == 1 else "validation_exit_code"
+    expected_outcomes = {
+        "PASSED": {
+            outcome_exit_field: 0,
+            "state": "completed",
+            "result": "success",
+        },
+        "FAILED": {
+            outcome_exit_field: 1,
+            "state": "completed",
+            "result": "failure",
+        },
+        "COULD_NOT_RUN": {
+            outcome_exit_field: 75,
+            "state": "completed",
+            "result": "no-result",
+        },
+    }
+    if (
+        set(producer_schema) != expected_schema_keys
+        or type(producer_schema.get("schema_version")) is not int
+        or producer_schema.get("schema_version") != schema
+        or producer_schema.get("fields") != list(schema_fields)
+        or not _json_equal(producer_schema.get("outcomes"), expected_outcomes)
+        or (
+            schema >= 2
+            and not _json_equal(
+                producer_schema.get("scorecard_writeback"),
+                _VALIDATION_SCORECARD_WRITEBACK_SCHEMA,
+            )
+        )
+    ):
+        raise Refusal(
+            "validation removal producer-schema does not match the run-record schema"
+        )
+    return schema_fields
+
+
+def _validation_scorecard_writeback(
+    value: object, label: str
+) -> Mapping[str, object] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise Refusal(f"{label} must be an object or null")
+    if value.get("status") == "completed" and set(value) == {"status"}:
+        return value
+    error = value.get("error")
+    if (
+        value.get("status") == "failed"
+        and set(value) == {"status", "error"}
+        and isinstance(error, str)
+        and bool(error.strip())
+    ):
+        return value
+    raise Refusal(
+        f"{label} must be null, completed, or failed with a nonempty error"
+    )
+
+
+def _validation_optional_count(value: object, label: str) -> int | None:
+    if value is None:
+        return None
+    return _as_int(value, label, minimum=0)
+
+
+def _validation_service_result_projection(
+    contents: bytes,
+    *,
+    schema: int,
+    schema_fields: Sequence[str],
+    expected_commit: object,
+) -> Mapping[str, object]:
+    service_result = _strict_json_object(
+        contents, "validation removal service-result"
+    )
+    if set(service_result) != set(schema_fields):
+        raise Refusal(
+            "validation removal service-result fields do not match the producer schema"
+        )
+    if (
+        type(service_result.get("schema_version")) is not int
+        or service_result.get("schema_version") != schema
+    ):
+        raise Refusal(
+            "validation removal service-result schema differs from the run-record"
+        )
+    if service_result.get("commit") != expected_commit:
+        raise Refusal(
+            "validation removal service-result commit differs from the run-record"
+        )
+    profile = service_result.get("profile")
+    if not isinstance(profile, str) or not profile.strip():
+        raise Refusal("validation removal service-result profile must be nonempty text")
+    status = service_result.get("final_validate_status")
+    if not isinstance(status, str) or status not in _VALIDATION_RESULT_OUTCOMES:
+        raise Refusal(
+            "validation removal service-result final status is unsupported"
+        )
+    result, expected_exit = _VALIDATION_RESULT_OUTCOMES[status]
+    writeback: Mapping[str, object] | None = None
+    if schema >= 2:
+        writeback = _validation_scorecard_writeback(
+            service_result.get("scorecard_writeback"),
+            "validation removal service-result scorecard_writeback",
+        )
+        if status == "PASSED" and writeback is not None:
+            if writeback.get("status") == "failed":
+                expected_exit = 75
+    exit_code = _as_int(
+        service_result.get("exit_code"),
+        "validation removal service-result exit_code",
+    )
+    if exit_code != expected_exit:
+        raise Refusal(
+            "validation removal service-result exit_code disagrees with its outcome"
+        )
+    executed_nodes = _as_int(
+        service_result.get("executed_nodes"),
+        "validation removal service-result executed_nodes",
+        minimum=0,
+    )
+    executed_tests = _validation_optional_count(
+        service_result.get("executed_tests"),
+        "validation removal service-result executed_tests",
+    )
+    historical = schema in {1, 2, 3}
+    projection: dict[str, object] = {
+        "state": "unknown" if historical else "completed",
+        "result": "unknown" if historical else result,
+        "result_source": (
+            "historical-validation-service-result"
+            if historical
+            else "validation-service-result"
+        ),
+        "final_validate_status": status,
+        "exit_code": exit_code,
+        "executed_nodes": executed_nodes,
+        "executed_tests": executed_tests,
+    }
+    if historical:
+        projection["passed_tests"] = None
+        projection["detail"] = _historical_validation_result_detail(schema)
+    if schema >= 2:
+        projection["scorecard_writeback"] = writeback
+    if schema >= 3:
+        selection_mode = service_result.get("selection_mode")
+        if selection_mode is not None and (
+            not isinstance(selection_mode, str) or not selection_mode.strip()
+        ):
+            raise Refusal(
+                "validation removal service-result selection_mode must be nonempty "
+                "text or null"
+            )
+        projection["selection_mode"] = selection_mode
+    if schema >= 4:
+        passed_tests = _validation_optional_count(
+            service_result.get("passed_tests"),
+            "validation removal service-result passed_tests",
+        )
+        if (executed_tests is None) != (passed_tests is None):
+            raise Refusal(
+                "validation removal service-result test counts are incomplete"
+            )
+        if (
+            executed_tests is not None
+            and passed_tests is not None
+            and passed_tests > executed_tests
+        ):
+            raise Refusal(
+                "validation removal service-result passed_tests exceeds executed_tests"
+            )
+        if status == "PASSED" and (
+            passed_tests is None or passed_tests != executed_tests
+        ):
+            raise Refusal(
+                "validation removal service-result PASSED counts disagree"
+            )
+        projection["passed_tests"] = passed_tests
+    if schema == 5:
+        detail = service_result.get("detail")
+        if detail is not None:
+            if (
+                not isinstance(detail, list)
+                or not detail
+                or any(
+                    not isinstance(line, str) or not line.strip()
+                    for line in detail
+                )
+                or status != "COULD_NOT_RUN"
+            ):
+                raise Refusal(
+                    "validation removal service-result detail violates its schema"
+                )
+            projection["detail"] = "\n".join(detail)
+        elif status == "COULD_NOT_RUN":
+            projection["detail"] = (
+                "validation reported COULD_NOT_RUN without detail"
+            )
+        else:
+            projection["detail"] = None
+    return projection
+
+
+def _validation_scorecard_file_rows(
+    value: object, label: str
+) -> tuple[tuple[str, int, str], ...]:
+    raw_rows = _as_list(value, label)
+    if len(raw_rows) != len(_VALIDATION_SCORECARD_PATHS):
+        raise Refusal(
+            f"{label} must identify exactly SCORECARD.md and "
+            "ci/compat-envelope/cells.json"
+        )
+    rows: dict[str, tuple[str, int, str]] = {}
+    for index, value in enumerate(raw_rows):
+        row_label = f"{label}[{index}]"
+        row = _as_mapping(value, row_label)
+        _exact_keys(row, {"path", "sha256", "size"}, set(), row_label)
+        path = _as_str(row["path"], f"{row_label}.path")
+        digest = _as_str(row["sha256"], f"{row_label}.sha256")
+        size = _as_int(row["size"], f"{row_label}.size", minimum=0)
+        if path not in _VALIDATION_SCORECARD_PATHS or path in rows:
+            raise Refusal(f"{row_label} has an unknown or duplicate path")
+        if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise Refusal(f"{row_label} has no lowercase SHA-256")
+        rows[path] = (path, size, digest)
+    if set(rows) != set(_VALIDATION_SCORECARD_PATHS):
+        raise Refusal(
+            f"{label} must identify exactly SCORECARD.md and "
+            "ci/compat-envelope/cells.json"
+        )
+    return tuple(rows[path] for path in _VALIDATION_SCORECARD_PATHS)
+
+
+def _validate_scorecard_handoff_file_set(path: Path) -> None:
+    directory = path.parent
+    if directory.is_symlink() or not directory.is_dir():
+        raise Refusal(
+            f"validation removal scorecard-handoff is not a regular directory: "
+            f"{directory}"
+        )
+    try:
+        observed = {
+            item.relative_to(directory).as_posix()
+            for item in directory.rglob("*")
+            if item.is_file() or item.is_symlink()
+        }
+    except OSError as exc:
+        raise Refusal(
+            f"cannot inspect validation removal scorecard-handoff {directory}: {exc}"
+        ) from exc
+    expected = {"handoff.json", *_VALIDATION_SCORECARD_PATHS}
+    if observed != expected:
+        raise Refusal(
+            "validation removal scorecard-handoff has an invalid file set: "
+            f"{directory}"
+        )
+
+
+def _validate_validation_removal_payloads(
+    config: Config,
+    contents: Mapping[str, bytes],
+    record: Mapping[str, object],
+    *,
+    unit_name: str,
+    schema: int,
+    scorecard_handoff_path: Path,
+) -> None:
+    schema_fields = _validation_service_result_schema(
+        contents["producer-schema"], schema
+    )
+    projection = _validation_service_result_projection(
+        contents["service-result"],
+        schema=schema,
+        schema_fields=schema_fields,
+        expected_commit=record.get("target"),
+    )
+    if schema < 3 and "selection_mode" in record:
+        raise Refusal(
+            "validation removal historical run-record unexpectedly carries "
+            "selection_mode"
+        )
+    for field, expected in projection.items():
+        if not _json_equal(record.get(field), expected):
+            raise Refusal(
+                f"validation removal service-result {field} differs from the "
+                "run-record"
+            )
+
+    scorecard = _strict_json_object(
+        contents["scorecard-handoff"], "validation removal scorecard-handoff"
+    )
+    _exact_keys(
+        scorecard,
+        {"schema_version", "target", "unit", "writeback_completed", "files"},
+        set(),
+        "validation removal scorecard-handoff",
+    )
+    if (
+        type(scorecard["schema_version"]) is not int
+        or scorecard["schema_version"] != 1
+        or scorecard["target"] != record.get("target")
+        or scorecard["unit"] != unit_name
+        or scorecard["writeback_completed"] is not True
+    ):
+        raise Refusal(
+            "validation removal scorecard-handoff does not match the run-record unit"
+        )
+    _validate_scorecard_handoff_file_set(scorecard_handoff_path)
+    record_files = _validation_scorecard_file_rows(
+        record.get("scorecard_writeback_files"),
+        "validation removal run-record scorecard_writeback_files",
+    )
+    handoff_files = _validation_scorecard_file_rows(
+        scorecard["files"], "validation removal scorecard-handoff files"
+    )
+    if handoff_files != record_files:
+        raise Refusal(
+            "validation removal scorecard-handoff files differ from run-record"
+        )
+    for relative, size, digest in handoff_files:
+        path = scorecard_handoff_path.parent / relative
+        _ensure_no_symlink_components(config.root, path, "retained scorecard file")
+        _payload, observed = _read_regular_file_identity(
+            path,
+            "retained scorecard file",
+            _VALIDATION_REMOVAL_ARTIFACT_BYTES_LIMIT,
+        )
+        if observed.size != size:
+            raise Refusal(
+                f"retained scorecard file size differs from declared identity: {path}"
+            )
+        if observed.sha256 != digest:
+            raise Refusal(f"retained scorecard file changed bytes: {path}")
+
+
+def _verify_validation_removal_artifacts(
+    config: Config,
+    artifacts: Sequence[_ValidationRemovalArtifact],
+    *,
+    canonical_slot: Path,
+    active_slot: Path,
+    canonical_checkout: Path,
+    expected_head: str,
+    expected_slot: str,
+    expected_generation: int | None,
+    target_kind: str,
+    repository: Path | None,
+    expected_run_record: Path | None,
+) -> None:
+    run_artifact = _validation_removal_artifact(artifacts, "run-record")
+    run_relative, run_path = _validation_removal_record_path(config, run_artifact)
+    if (
+        expected_run_record is not None
+        and run_path != expected_run_record
+    ):
+        raise Refusal(
+            "validation removal proof run-record differs from --completed-record"
+        )
+    _terminal_validation_record(
+        config,
+        run_relative,
+        canonical_checkout,
+        target_kind,
+        expected_digest=run_artifact.identity.sha256,
+        repository=repository,
+        expected_target=expected_head,
+        allow_historical_service_result=True,
+    )
+    run_contents, observed_run = _read_regular_file_identity(
+        run_path,
+        "validation removal run-record",
+        _VALIDATION_REMOVAL_ARTIFACT_BYTES_LIMIT,
+    )
+    _assert_regular_file_identity(
+        run_artifact.identity, observed_run, "run-record"
+    )
+    record = _strict_json_object(run_contents, "validation removal run-record")
+    unit_name, schema, expected_paths = _validation_removal_record_fields(
+        config,
+        run_path,
+        record,
+        canonical_checkout=canonical_checkout,
+        expected_head=expected_head,
+        expected_slot=expected_slot,
+        expected_generation=expected_generation,
+    )
+    resolved = _validate_proof_artifact_paths(
+        config,
+        artifacts,
+        canonical_slot=canonical_slot,
+        canonical_checkout=canonical_checkout,
+    )
+    contents: dict[str, bytes] = {}
+    active_paths: dict[str, Path] = {}
+    identities: dict[tuple[int, int], str] = {}
+    for artifact, canonical_path in resolved:
+        expected_path = expected_paths[artifact.role]
+        if canonical_path != expected_path:
+            raise Refusal(
+                f"validation removal {artifact.role} path does not match the "
+                "run-record"
+            )
+        active_path = _proof_artifact_path(
+            config,
+            artifact,
+            canonical_slot=canonical_slot,
+            active_slot=active_slot,
+        )
+        payload, observed = _read_regular_file_identity(
+            active_path,
+            f"validation removal {artifact.role}",
+            _VALIDATION_REMOVAL_ARTIFACT_BYTES_LIMIT,
+        )
+        _assert_regular_file_identity(artifact.identity, observed, artifact.role)
+        identity = (observed.device, observed.inode)
+        duplicate_role = identities.get(identity)
+        if duplicate_role is not None:
+            raise Refusal(
+                "validation removal artifacts share one regular-file identity: "
+                f"{duplicate_role} and {artifact.role}"
+            )
+        identities[identity] = artifact.role
+        contents[artifact.role] = payload
+        active_paths[artifact.role] = active_path
+    _validate_validation_removal_payloads(
+        config,
+        contents,
+        record,
+        unit_name=unit_name,
+        schema=schema,
+        scorecard_handoff_path=active_paths["scorecard-handoff"],
+    )
+
+
+def _load_validation_removal_proof(
+    config: Config,
+    raw_manifest: str,
+    *,
+    expected_slot: str,
+    expected_generation: int | None,
+    canonical_slot: Path,
+    canonical_checkout: Path,
+    expected_run_record: Path,
+    expected_head: str,
+    target_kind: str = "checkout",
+    repository: Path | None = None,
+) -> _ValidationRemovalProof:
+    manifest_relative, manifest_path = _validation_proof_manifest_path(
+        config, raw_manifest
+    )
+    if _path_is_within(manifest_path, canonical_slot):
+        raise Refusal("validation removal proof manifest must remain outside the target")
+    contents, manifest_identity = _read_regular_file_identity(
+        manifest_path,
+        "validation removal proof manifest",
+        _VALIDATION_REMOVAL_PROOF_BYTES_LIMIT,
+    )
+    manifest = _strict_json_object(contents, "validation removal proof manifest")
+    slot, generation, checkout, declared = _validation_removal_manifest_fields(
+        manifest, "validation removal proof manifest"
+    )
+    if slot != expected_slot:
+        raise Refusal(
+            f"validation removal proof names slot {slot!r}, expected {expected_slot!r}"
+        )
+    if expected_generation is not None and generation != expected_generation:
+        raise Refusal(
+            f"validation removal proof names generation {generation}, expected "
+            f"{expected_generation}"
+        )
+    expected_checkout = _managed_file_reference(config, canonical_checkout)
+    if checkout != expected_checkout:
+        raise Refusal(
+            "validation removal proof does not name the exact checkout: "
+            f"expected {expected_checkout!r}"
+        )
+    _verify_validation_removal_artifacts(
+        config,
+        declared,
+        canonical_slot=canonical_slot,
+        active_slot=canonical_slot,
+        canonical_checkout=canonical_checkout,
+        expected_head=expected_head,
+        expected_slot=expected_slot,
+        expected_generation=expected_generation,
+        target_kind=target_kind,
+        repository=repository,
+        expected_run_record=expected_run_record,
+    )
+    return _ValidationRemovalProof(
+        manifest_path=manifest_relative,
+        manifest_identity=manifest_identity,
+        slot=slot,
+        generation=generation,
+        checkout=checkout,
+        artifacts=declared,
+    )
+
+
+def _recheck_validation_removal_proof(
+    config: Config,
+    proof: _ValidationRemovalProof,
+    *,
+    expected_slot: str,
+    expected_generation: int | None,
+    canonical_slot: Path,
+    active_slot: Path,
+    canonical_checkout: Path,
+    expected_head: str,
+    target_kind: str = "checkout",
+    repository: Path | None = None,
+) -> None:
+    if proof.slot != expected_slot or (
+        expected_generation is not None and proof.generation != expected_generation
+    ):
+        raise StateError("journaled validation removal proof has the wrong slot generation")
+    if proof.checkout != _managed_file_reference(config, canonical_checkout):
+        raise StateError("journaled validation removal proof names another checkout")
+    manifest_relative, manifest_path = _validation_proof_manifest_path(
+        config, proof.manifest_path
+    )
+    if manifest_relative != proof.manifest_path:
+        raise StateError("journaled validation removal proof path is not canonical")
+    contents, observed_manifest = _read_regular_file_identity(
+        manifest_path,
+        "validation removal proof manifest",
+        _VALIDATION_REMOVAL_PROOF_BYTES_LIMIT,
+    )
+    _assert_regular_file_identity(
+        proof.manifest_identity, observed_manifest, "validation removal proof manifest"
+    )
+    manifest = _strict_json_object(contents, "validation removal proof manifest")
+    if dict(manifest) != _validation_removal_manifest_to_obj(proof):
+        raise Refusal("validation removal proof manifest changed after authorization")
+    _verify_validation_removal_artifacts(
+        config,
+        proof.artifacts,
+        canonical_slot=canonical_slot,
+        active_slot=active_slot,
+        canonical_checkout=canonical_checkout,
+        expected_head=expected_head,
+        expected_slot=expected_slot,
+        expected_generation=expected_generation,
+        target_kind=target_kind,
+        repository=repository,
+        expected_run_record=None,
+    )
 
 
 def _ensure_no_mount_components(root: Path, path: Path, label: str) -> None:
@@ -3908,6 +5102,22 @@ def _validate_journal_shape(
             if "original_mode" not in raw:
                 raise StateError(
                     "finish journal private census identity has no original mode"
+                )
+        if "validation_removal_proof" in raw:
+            proof = _validation_removal_proof_from_obj(
+                raw["validation_removal_proof"],
+                "finish journal.validation_removal_proof",
+            )
+            if (
+                record.slot_type != "validate"
+                or len(record.checkouts) != 1
+                or proof.slot != record.slot
+                or proof.generation != record.generation
+                or "private_census_identity" not in raw
+            ):
+                raise StateError(
+                    "finish journal validation removal proof does not match one "
+                    "privately sealed validation checkout"
                 )
     elif kind == "legacy-validate-remove":
         _exact_keys(
@@ -10566,6 +11776,10 @@ def _finish_journal_payload(
         payload["private_census_identity"] = list(
             finish.private_cleanup.target.identity
         )
+    if finish.validation_removal_proof is not None:
+        payload["validation_removal_proof"] = _validation_removal_proof_to_obj(
+            finish.validation_removal_proof
+        )
     return payload
 
 
@@ -10671,6 +11885,21 @@ def _checkout_at_slot(
     )
     relative = path.relative_to(config.root).as_posix()
     return dataclasses.replace(checkout, path=relative), path
+
+
+def _single_validation_checkout(
+    config: Config, record: ActiveRecord, slot_path: Path
+) -> tuple[Path, Path]:
+    """Return canonical and relocated paths for a proof-bound validation checkout."""
+
+    if record.slot_type != "validate" or len(record.checkouts) != 1:
+        raise Refusal(
+            "validation removal proof requires one exact checkout in a validate slot"
+        )
+    checkout = record.checkouts[0]
+    canonical = _stored_path(config, checkout.path, "validation checkout path")
+    _moved, active = _checkout_at_slot(config, record, checkout, slot_path)
+    return canonical, active
 
 
 def _repair_checkout_at_slot(
@@ -10794,10 +12023,13 @@ def _seal_cleanup_path_private(
     fenced_slot: Path,
     *,
     before_seal: Callable[[int, _PrivateCleanupIdentity], None] | None = None,
+    managed_root: Path | None = None,
 ) -> tuple[int, _PrivateCleanupIdentity]:
     """Seal one cleanup path and return its prior mode and stable identity."""
 
-    _assert_cleanup_fence_root_trusted(config, fenced_slot)
+    _assert_cleanup_fence_root_trusted(
+        config, fenced_slot, managed_root=managed_root
+    )
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
     try:
         descriptor = os.open(fenced_slot, flags)
@@ -10894,11 +12126,19 @@ def _private_cleanup_path_identity(
 
 
 def _private_cleanup_fence_identity(
-    config: Config, fenced_slot: Path
+    config: Config,
+    fenced_slot: Path,
+    *,
+    managed_root: Path | None = None,
 ) -> tuple[int, int, int, str]:
     """Prove the private fence invariant and return its stable directory identity."""
 
-    return _private_cleanup_path_identity(config, fenced_slot, allowed_modes={0o700})
+    return _private_cleanup_path_identity(
+        config,
+        fenced_slot,
+        allowed_modes={0o700},
+        managed_root=managed_root,
+    )
 
 
 def _upgrade_legacy_private_cleanup_identity(
@@ -11044,10 +12284,12 @@ def _reestablish_private_cleanup_fence(
     path: Path,
     original_mode: int,
     expected_identity: _PrivateCleanupIdentity,
+    *,
+    managed_root: Path | None = None,
 ) -> None:
     """Verify an interrupted target and re-seal an exactly restored mode."""
 
-    _assert_cleanup_fence_root_trusted(config, path)
+    _assert_cleanup_fence_root_trusted(config, path, managed_root=managed_root)
     try:
         metadata = path.stat(follow_symlinks=False)
     except OSError as exc:
@@ -11056,7 +12298,12 @@ def _reestablish_private_cleanup_fence(
         raise Refusal(f"interrupted cleanup fence is not a real directory: {path}")
     mode = stat.S_IMODE(metadata.st_mode)
     if mode == 0o700:
-        if _private_cleanup_fence_identity(config, path) != expected_identity:
+        if (
+            _private_cleanup_fence_identity(
+                config, path, managed_root=managed_root
+            )
+            != expected_identity
+        ):
             raise Refusal(f"interrupted cleanup fence identity changed: {path}")
         return
     if mode != original_mode:
@@ -11072,7 +12319,10 @@ def _reestablish_private_cleanup_fence(
             raise Refusal(f"interrupted cleanup fence identity changed: {path}")
 
     sealed_mode, sealed_identity = _seal_cleanup_path_private(
-        config, path, before_seal=verify_before_seal
+        config,
+        path,
+        before_seal=verify_before_seal,
+        managed_root=managed_root,
     )
     if sealed_mode != original_mode or sealed_identity != expected_identity:
         raise StateError(f"interrupted cleanup fence changed while resealing: {path}")
@@ -11578,6 +12828,11 @@ def _finish_remove_paths(
     vcs: _GitVcs,
     finish: _FinishContext,
 ) -> dict[str, object]:
+    if (
+        finish.validation_removal_proof is not None
+        and finish.private_cleanup is None
+    ):
+        raise StateError("validation removal proof requires a private cleanup fence")
     removed_values = _as_list(journal["removed"], "journal.removed")
     removed = {_as_str(item, "journal.removed item") for item in removed_values}
     all_names = {item.name for item in record.checkouts}
@@ -11719,6 +12974,23 @@ def _finish_remove_paths(
                 )
                 # Do not begin destructive work after the batch evidence deadline.
                 finish.private_cleanup.census_budget.remaining_seconds()
+            if finish.validation_removal_proof is not None:
+                canonical_checkout, _active_checkout = _single_validation_checkout(
+                    config, record, fenced_slot
+                )
+                _recheck_validation_removal_proof(
+                    config,
+                    finish.validation_removal_proof,
+                    expected_slot=record.slot,
+                    expected_generation=record.generation,
+                    canonical_slot=_slot_directory(
+                        config, record.slot, record.slot_type
+                    ),
+                    active_slot=fenced_slot,
+                    canonical_checkout=canonical_checkout,
+                    expected_head=record.checkouts[0].head,
+                )
+                _interrupt_for_test("after-validation-removal-proof-recheck")
             for checkout in moved_checkouts:
                 for cache in _cache_directories_for_checkout(config, checkout):
                     _remove_cache_directory(
@@ -12009,10 +13281,44 @@ def _cmd_remove(
     args: argparse.Namespace,
     *,
     private_cleanup: _PrivateCleanupContext | None = None,
+    validation_removal_proof: _ValidationRemovalProof | None = None,
     emit: bool = True,
 ) -> int:
     config = _load_config(args.project_root, args.machine)
     _validate_name(args.slot, "slot")
+    proof_manifest = getattr(args, "validation_proof_manifest", None)
+    completed_record = getattr(args, "completed_record", None)
+    if (proof_manifest is None) != (completed_record is None):
+        raise Refusal(
+            "--validation-proof-manifest and --completed-record must be supplied "
+            "together for registered validation removal"
+        )
+    if proof_manifest is not None and private_cleanup is None:
+        assert completed_record is not None
+        batch_args = argparse.Namespace(**vars(args))
+        batch_args.command = "remove-validate-batch"
+        batch_args.slots = [f"{args.slot}={args.expected_generation}"]
+        batch_args.validation_proof_manifests = [proof_manifest]
+        batch_args.completed_records = [completed_record]
+        batch_args.format = "json"
+        payload = _remove_validate_batch(batch_args)
+        retained = _as_list(payload["retained"], "validation removal result.retained")
+        if retained:
+            row = _as_mapping(retained[0], "validation removal result.retained[0]")
+            raise Refusal(
+                _as_str(row["reason"], "validation removal result.retained[0].reason")
+            )
+        removed = _as_list(payload["removed"], "validation removal result.removed")
+        if len(removed) != 1:
+            raise StateError("single validation proof removal produced no exact result")
+        if emit:
+            print(
+                f"removed and archived slot={args.slot} "
+                f"generation={args.expected_generation}"
+            )
+        return 0
+    if proof_manifest is not None:
+        raise StateError("validation proof manifest was supplied twice")
     coordinator, runner, handoff_writer, proof_fd = _capture_remove_processes(
         args.coordinator_pid
     )
@@ -12196,6 +13502,7 @@ def _cmd_remove(
                 validate_complete=bool(args.validate_complete),
                 allow_live_validate_owner=live_validate_owner,
                 private_cleanup=private_cleanup,
+                validation_removal_proof=validation_removal_proof,
             ),
         )
         after_states, after_archives = _validate_global_state(
@@ -12239,6 +13546,9 @@ def _seal_validate_batch_targets(
     wait_seconds: float,
     retained: list[dict[str, object]],
     private_targets: dict[str, _PrivateCleanupTarget],
+    proof_manifests: Mapping[str, str],
+    completed_records: Mapping[str, Path],
+    removal_proofs: dict[str, _ValidationRemovalProof],
 ) -> None:
     """Preflight and seal each eligible target while the mutation locks are held."""
 
@@ -12281,6 +13591,26 @@ def _seal_validate_batch_targets(
                         f"owner is {owner_state}: {owner_detail}"
                     )
                 slot_path = _assert_slot_contents(config, record)
+                proof_manifest = proof_manifests.get(slot)
+                if proof_manifest is not None:
+                    canonical_checkout, _active_checkout = _single_validation_checkout(
+                        config, record, slot_path
+                    )
+                    checkout = record.checkouts[0]
+                    _repository_relative, repository = _stored_repository_path(
+                        config, checkout.repository
+                    )
+                    removal_proofs[slot] = _load_validation_removal_proof(
+                        config,
+                        proof_manifest,
+                        expected_slot=slot,
+                        expected_generation=generation,
+                        canonical_slot=slot_path,
+                        canonical_checkout=canonical_checkout,
+                        expected_run_record=completed_records[slot],
+                        expected_head=checkout.head,
+                        repository=repository,
+                    )
 
                 def record_before_seal(
                     original_mode: int,
@@ -12321,7 +13651,7 @@ def _seal_validate_batch_targets(
                 )
 
 
-def _cmd_remove_validate_batch(args: argparse.Namespace) -> int:
+def _remove_validate_batch(args: argparse.Namespace) -> dict[str, object]:
     requested = tuple(_parse_validate_batch_slot(raw) for raw in args.slots)
     if len(requested) > VALIDATE_REMOVE_BATCH_LIMIT:
         raise Refusal(
@@ -12331,11 +13661,65 @@ def _cmd_remove_validate_batch(args: argparse.Namespace) -> int:
     if len({slot for slot, _generation in requested}) != len(requested):
         raise Refusal("remove-validate-batch received the same slot more than once")
     config = _load_config(args.project_root, args.machine)
+    raw_proofs = tuple(getattr(args, "validation_proof_manifests", ()) or ())
+    raw_records = tuple(getattr(args, "completed_records", ()) or ())
+    if bool(raw_proofs) != bool(raw_records):
+        raise Refusal(
+            "remove-validate-batch requires --validation-proof-manifest and "
+            "--completed-record together"
+        )
+    if raw_proofs and len(raw_proofs) != len(requested):
+        raise Refusal(
+            "remove-validate-batch requires one --validation-proof-manifest for "
+            "each --slot when any proof is supplied"
+        )
+    if raw_records and len(raw_records) != len(requested):
+        raise Refusal(
+            "remove-validate-batch requires one --completed-record for each --slot "
+            "when any proof is supplied"
+        )
+    canonical_proofs = tuple(
+        _validation_proof_manifest_path(config, raw)[0] for raw in raw_proofs
+    )
+    if len(canonical_proofs) != len(set(canonical_proofs)):
+        raise Refusal(
+            "remove-validate-batch received the same validation proof manifest more "
+            "than once"
+        )
+    canonical_records = tuple(
+        _validation_run_record_argument(config, raw)[1] for raw in raw_records
+    )
+    if len(canonical_records) != len(set(canonical_records)):
+        raise Refusal(
+            "remove-validate-batch received the same completed run-record more than "
+            "once"
+        )
+    proof_manifests = (
+        {
+            slot: proof
+            for (slot, _generation), proof in zip(
+                requested, canonical_proofs, strict=True
+            )
+        }
+        if canonical_proofs
+        else {}
+    )
+    completed_records = (
+        {
+            slot: record
+            for (slot, _generation), record in zip(
+                requested, canonical_records, strict=True
+            )
+        }
+        if canonical_records
+        else {}
+    )
     coordinator, runner, handoff_writer, proof_fd = _capture_remove_processes(
         args.coordinator_pid
     )
     retained: list[dict[str, object]] = []
     private_targets: dict[str, _PrivateCleanupTarget] = {}
+    removal_proofs: dict[str, _ValidationRemovalProof] = {}
     removed: list[dict[str, object]] = []
     same_uid_census_count = 0
     census_budget = _ReadOnlyCommandBudget.start(
@@ -12355,6 +13739,9 @@ def _cmd_remove_validate_batch(args: argparse.Namespace) -> int:
             args.wait_lock,
             retained,
             private_targets,
+            proof_manifests,
+            completed_records,
+            removal_proofs,
         )
         private_paths = [
             private_target.path for private_target in private_targets.values()
@@ -12407,6 +13794,8 @@ def _cmd_remove_validate_batch(args: argparse.Namespace) -> int:
             item_args.slot = slot
             item_args.expected_generation = generation
             item_args.validate_complete = True
+            item_args.validation_proof_manifest = None
+            item_args.completed_record = None
             private_cleanup = _PrivateCleanupContext(
                 target, privileged_census, census_budget
             )
@@ -12415,6 +13804,7 @@ def _cmd_remove_validate_batch(args: argparse.Namespace) -> int:
                 _cmd_remove(
                     item_args,
                     private_cleanup=private_cleanup,
+                    validation_removal_proof=removal_proofs.get(slot),
                     emit=False,
                 )
             except (Refusal, StateError) as exc:
@@ -12460,14 +13850,21 @@ def _cmd_remove_validate_batch(args: argparse.Namespace) -> int:
         "removed": removed,
         "retained": retained,
     }
+    return payload
+
+
+def _cmd_remove_validate_batch(args: argparse.Namespace) -> int:
+    payload = _remove_validate_batch(args)
     if args.format == "json":
         print(json.dumps(payload, sort_keys=True))
     else:
         print(
-            f"requested={len(requested)} removed={len(removed)} "
-            f"retained={len(retained)} process_censuses={shared_census_count}"
+            f"requested={payload['requested']} removed={len(_as_list(payload['removed'], 'removed'))} "
+            f"retained={len(_as_list(payload['retained'], 'retained'))} "
+            f"process_censuses={payload['process_censuses']}"
         )
-        for row in retained:
+        for value in _as_list(payload["retained"], "retained"):
+            row = _as_mapping(value, "retained item")
             print(f"RETAINED: {row['slot']} reason={row['reason']}")
     return 0
 
@@ -13249,6 +14646,39 @@ def _recover_finish(
     private_identity = _finish_private_census_identity(raw)
     if private_identity is not None and original_mode is None:
         raise StateError("private finish journal has no original directory mode")
+    removal_proof = (
+        None
+        if raw.get("validation_removal_proof") is None
+        else _validation_removal_proof_from_obj(
+            raw["validation_removal_proof"],
+            "finish journal.validation_removal_proof",
+        )
+    )
+    if removal_proof is not None:
+        if private_identity is None:
+            raise StateError(
+                "validation removal proof has no private cleanup identity"
+            )
+        canonical_slot = _slot_directory(config, record.slot, record.slot_type)
+        canonical_checkout, _active_checkout = _single_validation_checkout(
+            config, record, canonical_slot
+        )
+        if (
+            removal_proof.slot != record.slot
+            or removal_proof.generation != record.generation
+            or removal_proof.checkout
+            != _managed_file_reference(config, canonical_checkout)
+        ):
+            raise StateError(
+                "finish journal validation removal proof names another slot generation"
+            )
+        _validation_proof_manifest_path(config, removal_proof.manifest_path)
+        _validate_proof_artifact_paths(
+            config,
+            removal_proof.artifacts,
+            canonical_slot=canonical_slot,
+            canonical_checkout=canonical_checkout,
+        )
     if validate_complete and record.slot_type != "validate":
         raise StateError("agent finish journal cannot claim validate completion")
     if record.slot_type == "agent" and salvage:
@@ -13386,6 +14816,7 @@ def _recover_finish(
                 validate_complete=validate_complete,
                 allow_live_validate_owner=live_validate_owner,
                 private_cleanup=private_cleanup,
+                validation_removal_proof=removal_proof,
             ),
         )
     else:
@@ -13582,9 +15013,12 @@ def _recover_legacy_validate_remove(
                 "preserve it and do not resume deletion"
             )
         _assert_slot_unused(checkout)
-        vcs.remove_worktree(repository, checkout, force=True)
-        _interrupt_for_test("after-legacy-validate-remove")
-        listed = vcs.listed_worktrees(repository)
+        raise Refusal(
+            "legacy validation removal journal has no bounded validation removal proof. "
+            "state: REFUSED -- the checkout was retained. remedy: preserve this legacy "
+            "journal and use a supported ownerless validation recovery only after the "
+            "journal conflict is resolved without deleting the checkout"
+        )
     if checkout.absolute() in listed:
         raise Refusal(
             f"Git still registers removed legacy validation checkout {checkout}. state: "
@@ -14018,6 +15452,7 @@ def _terminal_validation_record(
     expected_digest: str | None = None,
     repository: Path | None = None,
     expected_target: str | None = None,
+    allow_historical_service_result: bool = False,
 ) -> tuple[str, str, str | None]:
     relative, path = _relative_inside(config.root, raw, "terminal validation record")
     if Path(relative).parent != Path("ignored/validate/runs") or path.suffix != ".json":
@@ -14080,7 +15515,11 @@ def _terminal_validation_record(
             raise Refusal(
                 "canonical frozen validation record projection does not bind this handle"
             )
-    if not _validation_record_is_terminal(record, target_kind=target_kind):
+    if not _validation_record_is_terminal(
+        record,
+        target_kind=target_kind,
+        allow_historical_service_result=allow_historical_service_result,
+    ):
         raise Refusal(
             "validation record does not contain an evidenced terminal result; no path was "
             "removed. Let validate-run finish recording the result or preserve the path"
@@ -14286,8 +15725,59 @@ def _current_validation_result_is_terminal(
     )
 
 
+def _historical_validation_result_is_terminal(
+    record: Mapping[str, object], *, schema: int
+) -> bool:
+    """Recognize the exact non-authoritative projection of a finished sidecar."""
+
+    status = record.get("final_validate_status")
+    outcome = (
+        _VALIDATION_RESULT_OUTCOMES.get(status)
+        if isinstance(status, str)
+        else None
+    )
+    if outcome is None:
+        return False
+    expected_exit = outcome[1]
+    exit_code = record.get("exit_code")
+    executed_nodes = record.get("executed_nodes")
+    executed_tests = record.get("executed_tests")
+    if (
+        record.get("state") != "unknown"
+        or record.get("result") != "unknown"
+        or record.get("result_source") != "historical-validation-service-result"
+        or record.get("detail") != _historical_validation_result_detail(schema)
+        or record.get("passed_tests") is not None
+        or type(exit_code) is not int
+        or exit_code != expected_exit
+        or type(executed_nodes) is not int
+        or executed_nodes < 0
+        or (
+            executed_tests is not None
+            and (type(executed_tests) is not int or executed_tests < 0)
+        )
+    ):
+        return False
+    if schema == 1:
+        if "scorecard_writeback" in record:
+            return False
+    elif record.get("scorecard_writeback") != {"status": "completed"}:
+        return False
+    if schema == 3:
+        if "selection_mode" not in record:
+            return False
+        selection_mode = record.get("selection_mode")
+        return selection_mode is None or (
+            isinstance(selection_mode, str) and bool(selection_mode.strip())
+        )
+    return "selection_mode" not in record
+
+
 def _validation_record_is_terminal(
-    record: Mapping[str, object], *, target_kind: str
+    record: Mapping[str, object],
+    *,
+    target_kind: str,
+    allow_historical_service_result: bool = False,
 ) -> bool:
     """Return whether one retained validation handle proves execution has stopped.
 
@@ -14300,6 +15790,12 @@ def _validation_record_is_terminal(
     schema = record.get("service_result_schema")
     if record.get("result_source") == "validation-service-result" and schema is None:
         return False
+    if (
+        allow_historical_service_result
+        and type(schema) is int
+        and schema in {1, 2, 3}
+    ):
+        return _historical_validation_result_is_terminal(record, schema=schema)
 
     state = record.get("state")
     if not isinstance(state, str):
@@ -14488,31 +15984,58 @@ def _validation_cargo_facts(path: Path) -> tuple[int, int, int]:
 def _validation_authorization_to_obj(
     value: ValidationRecoveryAuthorization,
 ) -> dict[str, object]:
-    encoded = {
-        **dataclasses.asdict(value),
+    encoded: dict[str, object] = {
+        "target_kind": value.target_kind,
+        "path": value.path,
         "identity": list(value.identity),
         "actor": _identity_to_obj(value.actor),
         "evidence": dict(value.evidence),
+        "no_authored_work": value.no_authored_work,
+        "no_live_use": value.no_live_use,
+        "repository": value.repository,
+        "head": value.head,
+        "remote_url_sha256": value.remote_url_sha256,
         "parent_identity": None if value.parent_identity is None else list(value.parent_identity),
     }
-    if value.stable_identity is None:
-        encoded.pop("stable_identity")
-    else:
+    if value.stable_identity is not None:
         encoded["stable_identity"] = list(value.stable_identity)
+    if value.removal_proof is not None:
+        encoded["removal_proof"] = _validation_removal_proof_to_obj(
+            value.removal_proof
+        )
+        encoded["proof_original_mode"] = value.proof_original_mode
+        encoded["proof_private_identity"] = (
+            None
+            if value.proof_private_identity is None
+            else list(value.proof_private_identity)
+        )
     return encoded
 
 
 def _validation_authorization_from_obj(value: object) -> ValidationRecoveryAuthorization:
     raw = _as_mapping(value, "validation recovery authorization")
     required = {
-        field.name
-        for field in dataclasses.fields(ValidationRecoveryAuthorization)
-        if field.name != "stable_identity"
+        "target_kind",
+        "path",
+        "identity",
+        "actor",
+        "evidence",
+        "no_authored_work",
+        "no_live_use",
+        "repository",
+        "head",
+        "remote_url_sha256",
+        "parent_identity",
     }
     _exact_keys(
         raw,
         required,
-        {"stable_identity"},
+        {
+            "stable_identity",
+            "removal_proof",
+            "proof_original_mode",
+            "proof_private_identity",
+        },
         "validation recovery authorization",
     )
     actor = _identity_from_obj(raw["actor"], "validation recovery actor")
@@ -14532,6 +16055,40 @@ def _validation_authorization_from_obj(value: object) -> ValidationRecoveryAutho
             raw["stable_identity"], "validation stable path identity"
         )
     )
+    removal_proof = (
+        None
+        if raw.get("removal_proof") is None
+        else _validation_removal_proof_from_obj(
+            raw["removal_proof"], "validation recovery removal proof"
+        )
+    )
+    proof_mode_raw = raw.get("proof_original_mode")
+    proof_original_mode = (
+        None
+        if proof_mode_raw is None
+        else _as_int(
+            proof_mode_raw,
+            "validation recovery proof original mode",
+            minimum=0,
+        )
+    )
+    if proof_original_mode is not None and proof_original_mode > 0o7777:
+        raise StateError("validation recovery proof original mode exceeds permission bits")
+    proof_identity_raw = raw.get("proof_private_identity")
+    proof_private_identity = (
+        None
+        if proof_identity_raw is None
+        else _private_cleanup_identity_from_obj(
+            proof_identity_raw,
+            "validation recovery proof private identity",
+        )
+    )
+    if removal_proof is None and (
+        proof_original_mode is not None or proof_private_identity is not None
+    ):
+        raise StateError("validation recovery has a proof seal without a proof")
+    if (proof_original_mode is None) != (proof_private_identity is None):
+        raise StateError("validation recovery proof seal is incomplete")
     return ValidationRecoveryAuthorization(
         target_kind=_as_str(raw["target_kind"], "validation target kind"),
         path=_as_str(raw["path"], "validation path"),
@@ -14545,6 +16102,9 @@ def _validation_authorization_from_obj(value: object) -> ValidationRecoveryAutho
         remote_url_sha256=None if raw["remote_url_sha256"] is None else _as_str(raw["remote_url_sha256"], "validation remote digest"),
         parent_identity=parent,
         stable_identity=stable,
+        removal_proof=removal_proof,
+        proof_original_mode=proof_original_mode,
+        proof_private_identity=proof_private_identity,
     )
 
 
@@ -14591,6 +16151,8 @@ def _ownerless_validation_journal(
     elif args.repository is not None:
         raise Refusal("--repository applies only to validation checkouts")
 
+    proof_manifest = getattr(args, "validation_proof_manifest", None)
+    record_path: str | None = None
     record_target: str | None = None
     if args.completed_record is not None:
         record_path, digest, record_target = _terminal_validation_record(
@@ -14599,6 +16161,7 @@ def _ownerless_validation_journal(
             target,
             target_kind,
             repository=repository,
+            allow_historical_service_result=proof_manifest is not None,
         )
         evidence: Mapping[str, object] = {
             "kind": "terminal-record",
@@ -14645,6 +16208,29 @@ def _ownerless_validation_journal(
         if args.repository is not None:
             raise Refusal("--repository applies only to validation checkouts")
         parent_identity = _validation_cargo_facts(target)
+    removal_proof: _ValidationRemovalProof | None = None
+    if proof_manifest is not None:
+        if target_kind == "cargo-home":
+            raise Refusal(
+                "--validation-proof-manifest applies only to validation checkouts"
+            )
+        if record_path is None:
+            raise Refusal(
+                "validation removal proof requires the matching --completed-record"
+            )
+        assert head is not None
+        removal_proof = _load_validation_removal_proof(
+            config,
+            proof_manifest,
+            expected_slot=target.name,
+            expected_generation=None,
+            canonical_slot=target,
+            canonical_checkout=target,
+            expected_run_record=config.root / record_path,
+            expected_head=head,
+            target_kind=target_kind,
+            repository=repository,
+        )
     authorization = ValidationRecoveryAuthorization(
         target_kind=target_kind,
         path=relative,
@@ -14658,6 +16244,7 @@ def _ownerless_validation_journal(
         remote_url_sha256=remote_digest,
         parent_identity=parent_identity,
         stable_identity=stable_identity,
+        removal_proof=removal_proof,
     )
     fenced = target.with_name(f".{target.name}.ownerless-validate.{uuid.uuid4().hex}")
     fenced_value = (
@@ -14731,6 +16318,24 @@ def _ownerless_validation_inputs(
     phase = _as_str(raw["phase"], "ownerless validation journal.phase")
     if phase not in _OWNERLESS_VALIDATION_PHASES:
         raise StateError(f"unknown ownerless validation phase {phase!r}")
+    removal_proof = authorization.removal_proof
+    if removal_proof is not None:
+        if authorization.target_kind == "cargo-home":
+            raise StateError("validation Cargo-home authorization cannot carry a proof")
+        if (
+            removal_proof.slot != target.name
+            or removal_proof.checkout != _managed_file_reference(config, target)
+        ):
+            raise StateError(
+                "validation recovery proof names another checkout"
+            )
+        _validation_proof_manifest_path(config, removal_proof.manifest_path)
+        _validate_proof_artifact_paths(
+            config,
+            removal_proof.artifacts,
+            canonical_slot=target,
+            canonical_checkout=target,
+        )
     target_present = target.exists() or target.is_symlink()
     fenced_present = fenced.exists() or fenced.is_symlink()
     if target_present and fenced_present:
@@ -14767,6 +16372,36 @@ def _ownerless_validation_inputs(
                     "frozen validation path file-handle identity changed; preserve every "
                     "candidate path and inspect the interrupted journal before retrying"
                 )
+        if authorization.proof_private_identity is not None:
+            managed_root = (
+                _frozen_validation_directory(config)
+                if authorization.target_kind == "frozen-checkout"
+                else None
+            )
+            assert authorization.proof_original_mode is not None
+            allowed_modes = {0o700}
+            if phase == "prepared" and active == target:
+                allowed_modes.add(authorization.proof_original_mode)
+            observed_private = _private_cleanup_path_identity(
+                config,
+                active,
+                allowed_modes=allowed_modes,
+                managed_root=managed_root,
+            )
+            if observed_private != authorization.proof_private_identity:
+                raise Refusal(
+                    "validation proof cleanup fence identity changed; preserve the "
+                    "checkout"
+                )
+    if (
+        removal_proof is not None
+        and authorization.proof_private_identity is None
+        and (phase != "prepared" or active != target)
+    ):
+        raise StateError(
+            "validation removal proof reached a destructive phase without a private "
+            "cleanup identity"
+        )
     repository: Path | None = None
     if authorization.target_kind in {"checkout", "frozen-checkout"}:
         if (
@@ -14834,6 +16469,18 @@ def _ownerless_validation_inputs(
                 raise StateError(
                     "frozen terminal evidence target differs from authorized HEAD"
                 )
+        if removal_proof is not None:
+            proof_run_record = next(
+                artifact
+                for artifact in removal_proof.artifacts
+                if artifact.role == "run-record"
+            )
+            if proof_run_record.path != _as_str(
+                evidence["path"], "terminal evidence.path"
+            ):
+                raise StateError(
+                    "validation removal proof run-record differs from terminal evidence"
+                )
         if recheck:
             _terminal_validation_record(
                 config,
@@ -14843,6 +16490,7 @@ def _ownerless_validation_inputs(
                 expected_digest=_as_str(evidence["sha256"], "terminal evidence.sha256"),
                 repository=repository,
                 expected_target=authorization.head,
+                allow_historical_service_result=removal_proof is not None,
             )
     elif kind == "coordinator-determination":
         _exact_keys(
@@ -14862,6 +16510,8 @@ def _ownerless_validation_inputs(
             )
     else:
         raise StateError(f"unknown validation recovery evidence kind {kind!r}")
+    if removal_proof is not None and kind != "terminal-record":
+        raise StateError("validation removal proof requires terminal record evidence")
     if recheck and active is not None:
         if authorization.target_kind in {"checkout", "frozen-checkout"}:
             assert repository is not None
@@ -14881,6 +16531,21 @@ def _ownerless_validation_inputs(
             assert authorization.parent_identity is not None
             if _validation_cargo_facts(active) != authorization.parent_identity:
                 raise Refusal("validation Cargo-home parent identity changed")
+        if removal_proof is not None and fresh_same_uid:
+            assert authorization.head is not None
+            _recheck_validation_removal_proof(
+                config,
+                removal_proof,
+                expected_slot=target.name,
+                expected_generation=None,
+                canonical_slot=target,
+                active_slot=active,
+                canonical_checkout=target,
+                expected_head=authorization.head,
+                target_kind=authorization.target_kind,
+                repository=repository,
+            )
+            _interrupt_for_test("after-ownerless-validation-proof-recheck")
     return authorization, target, fenced, active, repository
 
 
@@ -14896,10 +16561,24 @@ def _rollback_validation_fence(
         raise Refusal("cannot safely roll back validation path fence; preserve both paths")
     os.rename(fenced, target)
     _fsync_directory(target.parent)
+    rollback_journal = {**journal, "phase": "prepared"}
+    _write_journal(config, rollback_journal)
+    if authorization.removal_proof is not None:
+        if (
+            authorization.proof_original_mode is None
+            or authorization.proof_private_identity is None
+        ):
+            raise StateError("validation proof cleanup fence is incomplete")
+        _restore_private_cleanup_path(
+            target,
+            authorization.proof_original_mode,
+            authorization.proof_private_identity,
+            allow_missing=False,
+        )
     if authorization.target_kind == "checkout":
         assert repository is not None
         _GitVcs().repair_worktree(repository, target)
-    _clear_journal(config, journal)
+    _clear_journal(config, rollback_journal)
 
 
 def _recover_ownerless_validation(
@@ -14934,6 +16613,67 @@ def _recover_ownerless_validation(
                     config, target, fenced, authorization, repository, journal
                 )
             raise
+        if authorization.removal_proof is not None:
+            managed_root = (
+                _frozen_validation_directory(config)
+                if authorization.target_kind == "frozen-checkout"
+                else None
+            )
+            if authorization.proof_private_identity is None:
+                if active != target:
+                    raise StateError(
+                        "validation proof cleanup reached a fenced path before its "
+                        "private identity was recorded"
+                    )
+                sealed_authorization: list[ValidationRecoveryAuthorization] = []
+
+                def record_proof_seal(
+                    original_mode: int,
+                    identity: _PrivateCleanupIdentity,
+                ) -> None:
+                    updated = dataclasses.replace(
+                        authorization,
+                        proof_original_mode=original_mode,
+                        proof_private_identity=identity,
+                    )
+                    journal["authorization"] = _validation_authorization_to_obj(
+                        updated
+                    )
+                    _write_journal(config, journal)
+                    sealed_authorization.append(updated)
+                    _interrupt_for_test(
+                        "after-ownerless-validation-proof-seal-planned"
+                    )
+
+                original_mode, private_identity = _seal_cleanup_path_private(
+                    config,
+                    active,
+                    before_seal=record_proof_seal,
+                    managed_root=managed_root,
+                )
+                if not sealed_authorization:
+                    raise StateError(
+                        "validation proof cleanup did not record its private seal"
+                    )
+                authorization = sealed_authorization[0]
+                if (
+                    authorization.proof_original_mode != original_mode
+                    or authorization.proof_private_identity != private_identity
+                ):
+                    raise StateError(
+                        "validation proof cleanup seal changed after it was recorded"
+                    )
+            else:
+                assert authorization.proof_original_mode is not None
+                assert active is not None
+                _reestablish_private_cleanup_fence(
+                    config,
+                    active,
+                    authorization.proof_original_mode,
+                    authorization.proof_private_identity,
+                    managed_root=managed_root,
+                )
+            _interrupt_for_test("after-ownerless-validation-proof-seal")
         if active == target:
             os.rename(target, fenced)
             _fsync_directory(target.parent)
@@ -17818,6 +19558,7 @@ class _FinishContext:
     validate_complete: bool = False
     allow_live_validate_owner: bool = False
     private_cleanup: _PrivateCleanupContext | None = None
+    validation_removal_proof: _ValidationRemovalProof | None = None
 
 
 def _capture_process_path_census(
@@ -18929,10 +20670,18 @@ def _cmd_recover_ownerless_validate_batch(args: argparse.Namespace) -> int:
     checkouts = frozen_checkouts if frozen else ordinary_checkouts
     records = tuple(args.completed_records)
     repositories = tuple(args.repositories)
+    proof_manifests = tuple(
+        getattr(args, "validation_proof_manifests", ()) or ()
+    )
     if not (len(checkouts) == len(records) == len(repositories)):
         raise Refusal(
             "recover-ownerless-validate-batch requires the same number of "
             "--checkout, --completed-record, and --repository arguments"
+        )
+    if proof_manifests and len(proof_manifests) != len(checkouts):
+        raise Refusal(
+            "recover-ownerless-validate-batch requires one "
+            "--validation-proof-manifest for each checkout when any proof is supplied"
         )
     if len(checkouts) > VALIDATE_REMOVE_BATCH_LIMIT:
         raise Refusal(
@@ -18945,10 +20694,26 @@ def _cmd_recover_ownerless_validate_batch(args: argparse.Namespace) -> int:
         )
     _require_coordinator_authorized(args, "ownerless validation cleanup")
     config = _load_config(args.project_root, args.machine)
+    canonical_proofs = tuple(
+        _validation_proof_manifest_path(config, raw)[0]
+        for raw in proof_manifests
+    )
+    if len(canonical_proofs) != len(set(canonical_proofs)):
+        raise Refusal(
+            "recover-ownerless-validate-batch received the same validation proof "
+            "manifest more than once"
+        )
+    aligned_proofs: tuple[str | None, ...] = (
+        tuple(canonical_proofs)
+        if canonical_proofs
+        else tuple(None for _checkout in checkouts)
+    )
     _capture_caller_process(args.coordinator_pid, "coordinator")
     retained: list[dict[str, object]] = []
     removed: list[dict[str, object]] = []
-    prepared: list[tuple[str, str, str, Path, _PrivateCleanupIdentity]] = []
+    prepared: list[
+        tuple[str, str, str, str | None, Path, _PrivateCleanupIdentity]
+    ] = []
     with _mutation_locks(config, args.wait_lock):
         _refuse_partial_state(config, allow_validate_batch_seals=True)
         if _outstanding_journals(config) or _validate_batch_seal_journals(config):
@@ -18956,8 +20721,12 @@ def _cmd_recover_ownerless_validate_batch(args: argparse.Namespace) -> int:
                 "an interrupted mutation is already recorded; recover it before starting "
                 "ownerless validation batch cleanup"
             )
-        for checkout, record, repository in zip(
-            checkouts, records, repositories, strict=True
+        for checkout, record, repository, proof_manifest in zip(
+            checkouts,
+            records,
+            repositories,
+            aligned_proofs,
+            strict=True,
         ):
             try:
                 _relative, target, _allowed = _validation_recovery_target(
@@ -18976,7 +20745,16 @@ def _cmd_recover_ownerless_validate_batch(args: argparse.Namespace) -> int:
             except (Refusal, StateError) as exc:
                 retained.append({"checkout": checkout, "reason": str(exc)})
             else:
-                prepared.append((checkout, record, repository, target, identity))
+                prepared.append(
+                    (
+                        checkout,
+                        record,
+                        repository,
+                        proof_manifest,
+                        target,
+                        identity,
+                    )
+                )
     identities = [identity for *_prefix, identity in prepared]
     if len(set(identities)) != len(identities):
         raise Refusal(
@@ -18999,7 +20777,7 @@ def _cmd_recover_ownerless_validate_batch(args: argparse.Namespace) -> int:
         except Refusal as exc:
             retained.extend(
                 {"checkout": checkout, "reason": str(exc)}
-                for checkout, _record, _repository, _target, _identity in prepared
+                for checkout, _record, _repository, _proof, _target, _identity in prepared
             )
             prepared = []
             shared_census = _ProcessPathCensus((), (), owner_cgroup_complete=False)
@@ -19010,7 +20788,14 @@ def _cmd_recover_ownerless_validate_batch(args: argparse.Namespace) -> int:
         shared_census,
         census_budget,
     )
-    for index, (checkout, record, repository, target, _identity) in enumerate(prepared):
+    for index, (
+        checkout,
+        record,
+        repository,
+        proof_manifest,
+        target,
+        _identity,
+    ) in enumerate(prepared):
         try:
             census_budget.remaining_seconds()
             shared_census.assert_slot_unused(
@@ -19030,6 +20815,7 @@ def _cmd_recover_ownerless_validate_batch(args: argparse.Namespace) -> int:
                 frozen_validate_checkout=checkout if frozen else None,
                 completed_record=record,
                 repository=repository,
+                validation_proof_manifest=proof_manifest,
                 recovery_note=None,
                 retry_running_hook=False,
                 abort_create=False,
@@ -19132,6 +20918,7 @@ def _cmd_recover(
                 args.completed_record,
                 args.repository,
                 args.recovery_note,
+                getattr(args, "validation_proof_manifest", None),
             )
         )
         if requested_ownerless:
@@ -20189,6 +21976,23 @@ usage or audit gate unknown, 3 fail-closed refusal.
         metavar="N",
         help="current slot generation",
     )
+    remove.add_argument(
+        "--validation-proof-manifest",
+        metavar="PATH",
+        help=(
+            "canonical ignored/validate/removal-proofs/*.json manifest binding the "
+            "external run record, service-result sidecar, producer schema, and exact "
+            "scorecard handoff; this routes validation removal through a private seal"
+        ),
+    )
+    remove.add_argument(
+        "--completed-record",
+        metavar="PATH",
+        help=(
+            "exact canonical ignored/validate/runs/*.json completed record named by "
+            "the validation removal proof"
+        ),
+    )
     remove.set_defaults(handler=_cmd_remove)
 
     remove_validate_batch = subparsers.add_parser(
@@ -20226,6 +22030,26 @@ usage or audit gate unknown, 3 fail-closed refusal.
         required=True,
         metavar="PID",
         help="live current coordinator PID recorded with each operation",
+    )
+    remove_validate_batch.add_argument(
+        "--validation-proof-manifest",
+        dest="validation_proof_manifests",
+        action="append",
+        metavar="PATH",
+        help=(
+            "proof manifest aligned positionally with --slot; when supplied, repeat "
+            "exactly once for every requested slot"
+        ),
+    )
+    remove_validate_batch.add_argument(
+        "--completed-record",
+        dest="completed_records",
+        action="append",
+        metavar="PATH",
+        help=(
+            "completed ignored/validate/runs/*.json record aligned positionally "
+            "with --slot and --validation-proof-manifest"
+        ),
     )
     remove_validate_batch.add_argument(
         "--format", choices=("human", "json"), default="human"
@@ -20413,6 +22237,16 @@ usage or audit gate unknown, 3 fail-closed refusal.
         help="aligned source repository (repeatable)",
     )
     recover_ownerless_batch.add_argument(
+        "--validation-proof-manifest",
+        dest="validation_proof_manifests",
+        action="append",
+        metavar="PATH",
+        help=(
+            "proof manifest aligned positionally with each checkout; when supplied, "
+            "repeat exactly once for every checkout"
+        ),
+    )
+    recover_ownerless_batch.add_argument(
         "--coordinator-authorized", action="store_true"
     )
     recover_ownerless_batch.add_argument(
@@ -20487,6 +22321,14 @@ usage or audit gate unknown, 3 fail-closed refusal.
         "--repository",
         metavar="PATH",
         help="project-relative source repository that owns the historical Git worktree",
+    )
+    recover.add_argument(
+        "--validation-proof-manifest",
+        metavar="PATH",
+        help=(
+            "canonical ignored/validate/removal-proofs/*.json manifest for this "
+            "ownerless or frozen validation checkout"
+        ),
     )
     recover.add_argument(
         "--recovery-note",

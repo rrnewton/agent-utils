@@ -79,7 +79,8 @@ FIELDS = frozenset({
     "pane_id", "pane_role", "pane_title", "parent_checkout_head", "pr",
     "process_identity", "producer", "qualifying_receipt", "repo", "result",
     "result_record", "result_source", "safe_ci_dag_runner_log_dir", "schema_version",
-    "service_result_schema", "source_checkout",
+    "scorecard_handoff", "scorecard_writeback", "scorecard_writeback_files",
+    "selection_mode", "service_result_schema", "source_checkout",
     "started_at", "state", "tab_id", "target",
     "target_contains_current_main_before_launch", "temporary_checkout", "unit",
     "validate_lock_child_deadline_seconds", "validation_kind", "workspace_id",
@@ -863,6 +864,376 @@ def prepare_dead_validate_slots(project: Path, slots: Sequence[str]) -> dict[str
     }
 
 
+def prepare_validation_removal_proof(
+    project: Path,
+    slot: str,
+    *,
+    generation: int = 1,
+    checkout_path: Path | None = None,
+    run_record: Path | None = None,
+    producer_schema: Path | None = None,
+) -> tuple[Path, dict[str, Path]]:
+    """Create one exact four-artifact proof for a managed validation checkout."""
+
+    registered_checkout = checkout_path is None
+    if checkout_path is None:
+        checkout_path = checkout(project, slot=slot, slot_type="validate")
+    if run_record is None:
+        run_record = (
+            project / "ignored" / "validate" / "runs" / f"validate-{slot}.json"
+        )
+    if producer_schema is None:
+        producer_schema = (
+            checkout_path
+            / "ci"
+            / "manifest-plan"
+            / "validation-service-result-schema.json"
+        )
+    schema_value: object = json.loads(producer_schema.read_text(encoding="utf-8"))
+    assert isinstance(schema_value, dict)
+    schema_version = schema_value.get("schema_version")
+    assert isinstance(schema_version, int) and not isinstance(schema_version, bool)
+
+    if run_record.exists():
+        record_value: object = json.loads(run_record.read_text(encoding="utf-8"))
+        assert isinstance(record_value, dict)
+        record = record_value
+    else:
+        record = {}
+    unit = record.get("unit", f"validate-{slot}.service")
+    assert isinstance(unit, str) and unit.startswith("validate-")
+    unit_name = unit.removesuffix(".service")
+    assert run_record.name == f"{unit_name}.json"
+    target = git(checkout_path, "rev-parse", "HEAD").stdout.strip()
+    handoff_directory = (
+        project
+        / "ignored"
+        / "validate"
+        / "scorecard-writebacks"
+        / unit_name
+    )
+    scorecard_payloads = {
+        "SCORECARD.md": b"# Validation scorecard\n\nExact test fixture.\n",
+        "ci/compat-envelope/cells.json": b'{"cells":[]}\n',
+    }
+    scorecard_rows: list[dict[str, object]] = []
+    for relative, payload in scorecard_payloads.items():
+        path = handoff_directory / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+        scorecard_rows.append(
+            {
+                "path": relative,
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "size": len(payload),
+            }
+        )
+
+    historical = schema_version in {1, 2, 3}
+    record.update(
+        {
+            "schema_version": 1,
+            "kind": record.get("kind", "validate"),
+            "producer": "ci-hub/validate/run_registry.py",
+            "admission": record.get("admission", "ci-hub validate-lock"),
+            "admission_result": record.get(
+                "admission_result",
+                {
+                    "state": "admitted",
+                    "recorded_at": "2026-09-08T11:28:07+00:00",
+                    "run_number": 1,
+                },
+            ),
+            "temporary_checkout": True,
+            "unit": unit,
+            "checkout": str(checkout_path),
+            "target": target,
+            "state": "unknown" if historical else "completed",
+            "result": "unknown" if historical else "success",
+            "result_source": (
+                "historical-validation-service-result"
+                if historical
+                else "validation-service-result"
+            ),
+            "service_result_schema": schema_version,
+            "final_validate_status": "PASSED",
+            "exit_code": 0,
+            "executed_nodes": 1,
+            "executed_tests": 1,
+            "scorecard_writeback_files": scorecard_rows,
+            "scorecard_handoff": str(handoff_directory),
+        }
+    )
+    if schema_version >= 3:
+        record["selection_mode"] = "full"
+    else:
+        record.pop("selection_mode", None)
+    if schema_version >= 2:
+        record["scorecard_writeback"] = {"status": "completed"}
+    else:
+        record.pop("scorecard_writeback", None)
+    if schema_version >= 4:
+        record["passed_tests"] = 1
+    elif historical and registered_checkout:
+        record["passed_tests"] = None
+    else:
+        record.pop("passed_tests", None)
+    if historical:
+        record["detail"] = (
+            "validation-service-result-schema_version: historical schema "
+            f"{schema_version} is readable but has no current authority"
+        )
+    elif schema_version == 5 or record.get("kind") == "frozen-validate":
+        record["detail"] = None
+    else:
+        record.pop("detail", None)
+    if registered_checkout:
+        record["wrkslots_slot"] = slot
+        record["wrkslots_generation"] = generation
+    run_record.parent.mkdir(parents=True, exist_ok=True)
+    run_record.write_text(
+        json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+    service_result = {
+        "schema_version": schema_version,
+        "commit": target,
+        "profile": "full",
+        "selection_mode": "full",
+        "final_validate_status": "PASSED",
+        "detail": None,
+        "exit_code": 0,
+        "executed_nodes": 1,
+        "executed_tests": 1,
+        "passed_tests": 1,
+        "scorecard_writeback": {"status": "completed"},
+    }
+    schema_fields = schema_value.get("fields")
+    assert isinstance(schema_fields, list)
+    service_result = {
+        field: service_result[field]
+        for field in schema_fields
+        if isinstance(field, str)
+    }
+    artifacts = {
+        "run-record": run_record,
+        "service-result": run_record.with_name(
+            f"{run_record.stem}.service-result.json"
+        ),
+        "producer-schema": producer_schema,
+        "scorecard-handoff": handoff_directory / "handoff.json",
+    }
+    artifacts["service-result"].write_text(
+        json.dumps(service_result, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    artifacts["scorecard-handoff"].write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "target": target,
+                "unit": unit_name,
+                "writeback_completed": True,
+                "files": scorecard_rows,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    rows = []
+    for role, path in artifacts.items():
+        metadata = path.stat()
+        payload = path.read_bytes()
+        rows.append(
+            {
+                "role": role,
+                "path": (
+                    path.relative_to(project).as_posix()
+                    if path.is_relative_to(project)
+                    else str(path)
+                ),
+                "identity": [metadata.st_dev, metadata.st_ino],
+                "size": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            }
+        )
+    manifest = (
+        project
+        / "ignored"
+        / "validate"
+        / "removal-proofs"
+        / f"{slot}-{generation}.json"
+    )
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "kind": "validation-removal-proof",
+                "slot": slot,
+                "generation": generation,
+                "checkout": (
+                    checkout_path.relative_to(project).as_posix()
+                    if checkout_path.is_relative_to(project)
+                    else str(checkout_path)
+                ),
+                "artifacts": rows,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    if registered_checkout:
+        slot_root = wrkslots._slot_directory(
+            wrkslots._load_config(str(project), "testhost"), slot, "validate"
+        )
+        assert slot_root in checkout_path.parents or slot_root == checkout_path
+    return manifest, artifacts
+
+
+def validation_service_result_schema(schema_version: int = 4) -> dict[str, object]:
+    fields = {
+        1: [
+            "schema_version",
+            "commit",
+            "profile",
+            "final_validate_status",
+            "exit_code",
+            "executed_nodes",
+            "executed_tests",
+        ],
+        2: [
+            "schema_version",
+            "commit",
+            "profile",
+            "final_validate_status",
+            "exit_code",
+            "executed_nodes",
+            "executed_tests",
+            "scorecard_writeback",
+        ],
+        3: [
+            "schema_version",
+            "commit",
+            "profile",
+            "selection_mode",
+            "final_validate_status",
+            "exit_code",
+            "executed_nodes",
+            "executed_tests",
+            "scorecard_writeback",
+        ],
+        4: [
+            "schema_version",
+            "commit",
+            "profile",
+            "selection_mode",
+            "final_validate_status",
+            "exit_code",
+            "executed_nodes",
+            "executed_tests",
+            "passed_tests",
+            "scorecard_writeback",
+        ],
+        5: [
+            "schema_version",
+            "commit",
+            "profile",
+            "selection_mode",
+            "final_validate_status",
+            "detail",
+            "exit_code",
+            "executed_nodes",
+            "executed_tests",
+            "passed_tests",
+            "scorecard_writeback",
+        ],
+    }[schema_version]
+    exit_field = "exit_code" if schema_version == 1 else "validation_exit_code"
+    result: dict[str, object] = {
+        "schema_version": schema_version,
+        "fields": fields,
+        "outcomes": {
+            "PASSED": {exit_field: 0, "state": "completed", "result": "success"},
+            "FAILED": {exit_field: 1, "state": "completed", "result": "failure"},
+            "COULD_NOT_RUN": {
+                exit_field: 75,
+                "state": "completed",
+                "result": "no-result",
+            },
+        },
+    }
+    if schema_version >= 2:
+        result["scorecard_writeback"] = {
+            "nullable": True,
+            "variants": {
+                "completed": ["status"],
+                "failed": ["status", "error"],
+            },
+        }
+    return result
+
+
+def commit_validation_removal_schema(
+    repository: Path, *, schema_version: int = 4
+) -> None:
+    schema = (
+        repository
+        / "ci"
+        / "manifest-plan"
+        / "validation-service-result-schema.json"
+    )
+    schema.parent.mkdir(parents=True, exist_ok=True)
+    schema.write_text(
+        json.dumps(
+            validation_service_result_schema(schema_version),
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    git(repository, "add", schema.relative_to(repository).as_posix())
+    git(repository, "commit", "-m", "add validation result schema")
+    git(repository, "push", "origin", "main")
+
+
+def rebind_validation_removal_artifact(
+    project: Path, manifest: Path, role: str, path: Path
+) -> None:
+    value: object = json.loads(manifest.read_text(encoding="utf-8"))
+    assert isinstance(value, dict)
+    rows = value["artifacts"]
+    assert isinstance(rows, list)
+    row = next(
+        item
+        for item in rows
+        if isinstance(item, dict) and item.get("role") == role
+    )
+    metadata = path.stat()
+    payload = path.read_bytes()
+    row.update(
+        {
+            "path": (
+                path.relative_to(project).as_posix()
+                if path.is_relative_to(project)
+                else str(path)
+            ),
+            "identity": [metadata.st_dev, metadata.st_ino],
+            "size": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }
+    )
+    manifest.write_text(
+        json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+
 def stub_validate_batch_censuses(
     monkeypatch: pytest.MonkeyPatch,
     privileged: Callable[[Sequence[Path]], wrkslots._ProcessPathCensus] | None = None,
@@ -1235,6 +1606,10 @@ def prepare_frozen_validation_checkout(
                 "result_source": "validation-service-result",
                 "safe_ci_dag_runner_log_dir": str(project / "ignored" / "validate" / "artifacts" / name / "safe-ci-dag-runner"),
                 "schema_version": 1,
+                "scorecard_handoff": None,
+                "scorecard_writeback": None,
+                "scorecard_writeback_files": [],
+                "selection_mode": None,
                 "service_result_schema": 3,
                 "source_checkout": str(repository),
                 "started_at": "2026-09-08T11:28:07+00:00",
@@ -2541,6 +2916,63 @@ def test_frozen_validate_checkout_recovers_each_durable_crash_boundary(
 
 
 @pytest.mark.ordinary_environment
+def test_frozen_validate_batch_accepts_exact_validation_removal_proof(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    commit_validation_removal_schema(repository, schema_version=3)
+    checkout, record, _target_sha = prepare_frozen_validation_checkout(
+        project,
+        repository,
+        monkeypatch=monkeypatch,
+        name="proof",
+    )
+    manifest, _artifacts = prepare_validation_removal_proof(
+        project,
+        checkout.name,
+        checkout_path=checkout,
+        run_record=record,
+    )
+    stub_validate_batch_censuses(monkeypatch)
+    monkeypatch.setattr(
+        wrkslots,
+        "_root_owned_executable",
+        lambda path, _label: wrkslots._TrustedExecutablePath(
+            path.resolve(strict=True), ()
+        ),
+    )
+
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover-ownerless-validate-batch",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--frozen-validate-checkout",
+            str(checkout),
+            "--completed-record",
+            record.relative_to(project).as_posix(),
+            "--repository",
+            repository.relative_to(project).as_posix(),
+            "--validation-proof-manifest",
+            manifest.relative_to(project).as_posix(),
+            "--format",
+            "json",
+        ]
+    )
+
+    assert rc == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["retained"] == [], report
+    assert report["removed"] == [{"checkout": str(checkout)}]
+    assert not checkout.exists()
+
+
+@pytest.mark.ordinary_environment
 def test_frozen_validate_recovery_refuses_changed_terminal_record_digest(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3320,7 +3752,7 @@ def test_recover_resumes_legacy_validate_removal_after_checkout_disappears(
     assert active_slots(project) == []
 
 
-def test_recover_resumes_literal_preupgrade_legacy_journal_without_new_authority(
+def test_recover_refuses_literal_preupgrade_legacy_journal_without_proof(
     tmp_path: Path,
 ) -> None:
     project, repository, _remote = make_project(tmp_path)
@@ -3346,13 +3778,15 @@ def test_recover_resumes_literal_preupgrade_legacy_journal_without_new_authority
     }
     wrkslots._write_journal(config, old_journal)
 
-    recovered = raw_command(
+    refused = raw_command(
         project, "recover", "--coordinator-pid", str(os.getpid())
     )
 
-    assert recovered.returncode == 0, recovered.stderr
-    assert not checkout_path.exists()
-    assert checkout_path.absolute() not in wrkslots._GitVcs().listed_worktrees(repository)
+    assert refused.returncode == 3
+    assert "has no bounded validation removal proof" in refused.stderr
+    assert checkout_path.is_dir()
+    assert checkout_path.absolute() in wrkslots._GitVcs().listed_worktrees(repository)
+    assert (control_directory(project) / "ACTIVE.testhost.journal").is_file()
 
 
 def test_preupgrade_legacy_journal_rechecks_handoff_before_removal(
@@ -3448,6 +3882,180 @@ def test_recover_ownerless_validate_checkout_removes_clean_terminal_worktree(
     assert not target.exists()
     assert target.absolute() not in wrkslots._GitVcs().listed_worktrees(repository)
     assert active_slots(project) == []
+
+
+@pytest.mark.parametrize("schema_version", (2, 4))
+def test_legacy_validate_checkout_accepts_exact_validation_removal_proof(
+    tmp_path: Path, schema_version: int
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    commit_validation_removal_schema(repository, schema_version=schema_version)
+    checkout_path, record_path = prepare_legacy_validate_checkout(
+        project, repository, name="proof"
+    )
+    manifest, _artifacts = prepare_validation_removal_proof(
+        project,
+        checkout_path.name,
+        checkout_path=checkout_path,
+        run_record=record_path,
+    )
+
+    recovered = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--legacy-validate-checkout",
+        checkout_path.relative_to(project).as_posix(),
+        "--completed-record",
+        record_path.relative_to(project).as_posix(),
+        "--repository",
+        repository.relative_to(project).as_posix(),
+        "--validation-proof-manifest",
+        manifest.relative_to(project).as_posix(),
+    )
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert not checkout_path.exists()
+    assert checkout_path.absolute() not in wrkslots._GitVcs().listed_worktrees(
+        repository
+    )
+
+
+def test_ownerless_validation_rechecks_proof_after_private_seal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    commit_validation_removal_schema(repository)
+    target = project / "worktrees" / "validate" / "review-checkout"
+    target.parent.mkdir(parents=True)
+    git(repository, "worktree", "add", "--detach", str(target), "origin/main")
+    record = prepare_terminal_validation_record(project, target, field="checkout")
+    manifest, artifacts = prepare_validation_removal_proof(
+        project,
+        target.name,
+        checkout_path=target,
+        run_record=record,
+    )
+    original_recheck = wrkslots._recheck_validation_removal_proof
+
+    def change_result_before_recheck(
+        config: wrkslots.Config,
+        proof: wrkslots._ValidationRemovalProof,
+        *,
+        expected_slot: str,
+        expected_generation: int | None,
+        canonical_slot: Path,
+        active_slot: Path,
+        canonical_checkout: Path,
+        expected_head: str,
+        target_kind: str = "checkout",
+        repository: Path | None = None,
+    ) -> None:
+        contents = artifacts["service-result"].read_bytes()
+        artifacts["service-result"].write_bytes(b"X" + contents[1:])
+        original_recheck(
+            config,
+            proof,
+            expected_slot=expected_slot,
+            expected_generation=expected_generation,
+            canonical_slot=canonical_slot,
+            active_slot=active_slot,
+            canonical_checkout=canonical_checkout,
+            expected_head=expected_head,
+            target_kind=target_kind,
+            repository=repository,
+        )
+
+    monkeypatch.setattr(
+        wrkslots, "_recheck_validation_removal_proof", change_result_before_recheck
+    )
+
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--ownerless-validate-checkout",
+            target.relative_to(project).as_posix(),
+            "--completed-record",
+            record.relative_to(project).as_posix(),
+            "--repository",
+            repository.relative_to(project).as_posix(),
+            "--validation-proof-manifest",
+            manifest.relative_to(project).as_posix(),
+        ]
+    )
+
+    assert rc == 3
+    assert "service-result changed bytes" in capsys.readouterr().err
+    assert target.is_dir()
+    assert stat.S_IMODE(target.stat().st_mode) != 0o700
+    assert target.absolute() in wrkslots._GitVcs().listed_worktrees(repository)
+    assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
+
+
+def test_ownerless_validation_proof_seal_recovers_after_interruption(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    commit_validation_removal_schema(repository)
+    target = project / "worktrees" / "validate" / "review-checkout"
+    target.parent.mkdir(parents=True)
+    git(repository, "worktree", "add", "--detach", str(target), "origin/main")
+    record = prepare_terminal_validation_record(project, target, field="checkout")
+    manifest, _artifacts = prepare_validation_removal_proof(
+        project,
+        target.name,
+        checkout_path=target,
+        run_record=record,
+    )
+    arguments = (
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--ownerless-validate-checkout",
+        target.relative_to(project).as_posix(),
+        "--completed-record",
+        record.relative_to(project).as_posix(),
+        "--repository",
+        repository.relative_to(project).as_posix(),
+        "--validation-proof-manifest",
+        manifest.relative_to(project).as_posix(),
+    )
+
+    interrupted = command(
+        project,
+        *arguments,
+        env={
+            "WRKSLOTS_TEST_INTERRUPT": "after-ownerless-validation-proof-seal"
+        },
+    )
+    assert interrupted.returncode == 86
+    assert target.is_dir()
+    assert stat.S_IMODE(target.stat().st_mode) == 0o700
+    assert (control_directory(project) / "ACTIVE.testhost.journal").is_file()
+
+    recovered = raw_command(
+        project, "recover", "--coordinator-pid", str(os.getpid())
+    )
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert not target.exists()
+    assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
 
 
 def test_ownerless_validation_blocking_status_ignores_only_explicit_safe_roots() -> None:
@@ -6604,13 +7212,932 @@ def test_validate_complete_still_refuses_live_path_use_after_owner_dies(
         terminate_process(user)
 
 
+def test_validate_remove_accepts_exact_validation_removal_proof(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    commit_validation_removal_schema(repository)
+    slot_path = prepare_dead_validate_slots(project, ("slot01",))["slot01"]
+    manifest, artifacts = prepare_validation_removal_proof(project, "slot01")
+
+    stub_validate_batch_censuses(monkeypatch)
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "remove",
+            "slot01",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--expected-generation",
+            "1",
+            "--validation-proof-manifest",
+            manifest.relative_to(project).as_posix(),
+            "--completed-record",
+            artifacts["run-record"].relative_to(project).as_posix(),
+        ]
+    )
+
+    assert rc == 0, capsys.readouterr().err
+    assert not slot_path.exists()
+    assert artifacts["scorecard-handoff"].is_file()
+    assert (
+        artifacts["scorecard-handoff"].parent / "SCORECARD.md"
+    ).is_file()
+    assert (
+        artifacts["scorecard-handoff"].parent
+        / "ci"
+        / "compat-envelope"
+        / "cells.json"
+    ).is_file()
+    assert active_slots(project) == []
+
+
+def test_validate_remove_accepts_schema_five_no_result_detail_projection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    commit_validation_removal_schema(repository, schema_version=5)
+    slot_path = prepare_dead_validate_slots(project, ("slot01",))["slot01"]
+    manifest, artifacts = prepare_validation_removal_proof(project, "slot01")
+
+    record_value: object = json.loads(
+        artifacts["run-record"].read_text(encoding="utf-8")
+    )
+    result_value: object = json.loads(
+        artifacts["service-result"].read_text(encoding="utf-8")
+    )
+    assert isinstance(record_value, dict)
+    assert isinstance(result_value, dict)
+    detail = ["validation host unavailable", "retry on another host"]
+    record_value.update(
+        {
+            "result": "no-result",
+            "final_validate_status": "COULD_NOT_RUN",
+            "detail": "\n".join(detail),
+            "exit_code": 75,
+            "executed_tests": None,
+            "passed_tests": None,
+        }
+    )
+    result_value.update(
+        {
+            "final_validate_status": "COULD_NOT_RUN",
+            "detail": detail,
+            "exit_code": 75,
+            "executed_tests": None,
+            "passed_tests": None,
+        }
+    )
+    artifacts["run-record"].write_text(
+        json.dumps(record_value, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    artifacts["service-result"].write_text(
+        json.dumps(result_value, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    rebind_validation_removal_artifact(
+        project, manifest, "run-record", artifacts["run-record"]
+    )
+    rebind_validation_removal_artifact(
+        project, manifest, "service-result", artifacts["service-result"]
+    )
+
+    stub_validate_batch_censuses(monkeypatch)
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "remove",
+            "slot01",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--expected-generation",
+            "1",
+            "--validation-proof-manifest",
+            manifest.relative_to(project).as_posix(),
+            "--completed-record",
+            artifacts["run-record"].relative_to(project).as_posix(),
+        ]
+    )
+
+    assert rc == 0, capsys.readouterr().err
+    assert not slot_path.exists()
+    assert active_slots(project) == []
+
+
+@pytest.mark.parametrize("schema_version", (1, 2, 3))
+def test_validate_remove_accepts_historical_service_result_projection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    schema_version: int,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    commit_validation_removal_schema(repository, schema_version=schema_version)
+    slot_path = prepare_dead_validate_slots(project, ("slot01",))["slot01"]
+    manifest, artifacts = prepare_validation_removal_proof(project, "slot01")
+    record: object = json.loads(
+        artifacts["run-record"].read_text(encoding="utf-8")
+    )
+    assert isinstance(record, dict)
+    assert record["state"] == "unknown"
+    assert record["result"] == "unknown"
+    assert record["result_source"] == "historical-validation-service-result"
+    assert record["detail"] == (
+        "validation-service-result-schema_version: historical schema "
+        f"{schema_version} is readable but has no current authority"
+    )
+    assert record["passed_tests"] is None
+    assert ("selection_mode" in record) is (schema_version == 3)
+    assert ("scorecard_writeback" in record) is (schema_version >= 2)
+
+    stub_validate_batch_censuses(monkeypatch)
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "remove",
+            "slot01",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--expected-generation",
+            "1",
+            "--validation-proof-manifest",
+            manifest.relative_to(project).as_posix(),
+            "--completed-record",
+            artifacts["run-record"].relative_to(project).as_posix(),
+        ]
+    )
+
+    assert rc == 0, capsys.readouterr().err
+    assert not slot_path.exists()
+    assert active_slots(project) == []
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    (
+        ("result_source", "validation-service-result"),
+        ("state", "completed"),
+        ("result", "success"),
+        ("detail", "historical result"),
+        ("passed_tests", 0),
+    ),
+)
+def test_validate_remove_refuses_changed_historical_projection(
+    tmp_path: Path,
+    field: str,
+    replacement: object,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    commit_validation_removal_schema(repository, schema_version=3)
+    slot_path = prepare_dead_validate_slots(project, ("slot01",))["slot01"]
+    manifest, artifacts = prepare_validation_removal_proof(project, "slot01")
+    record: object = json.loads(
+        artifacts["run-record"].read_text(encoding="utf-8")
+    )
+    assert isinstance(record, dict)
+    record[field] = replacement
+    artifacts["run-record"].write_text(
+        json.dumps(record, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    rebind_validation_removal_artifact(
+        project, manifest, "run-record", artifacts["run-record"]
+    )
+
+    refused = command(
+        project,
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        "--validation-proof-manifest",
+        manifest.relative_to(project).as_posix(),
+        "--completed-record",
+        artifacts["run-record"].relative_to(project).as_posix(),
+    )
+
+    assert refused.returncode == 3
+    assert "does not contain an evidenced terminal result" in refused.stderr
+    assert slot_path.is_dir()
+    assert active_slots(project)
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement", "message"),
+    (
+        ("slot", "another-slot", "names slot"),
+        ("generation", 2, "names generation"),
+    ),
+)
+def test_validate_remove_refuses_proof_for_another_slot_generation(
+    tmp_path: Path,
+    field: str,
+    replacement: object,
+    message: str,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    commit_validation_removal_schema(repository)
+    slot_path = prepare_dead_validate_slots(project, ("slot01",))["slot01"]
+    manifest, artifacts = prepare_validation_removal_proof(project, "slot01")
+    value = json.loads(manifest.read_text(encoding="utf-8"))
+    value[field] = replacement
+    manifest.write_text(json.dumps(value), encoding="utf-8")
+
+    refused = command(
+        project,
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        "--validation-proof-manifest",
+        manifest.relative_to(project).as_posix(),
+        "--completed-record",
+        artifacts["run-record"].relative_to(project).as_posix(),
+    )
+
+    assert refused.returncode == 3
+    assert message in refused.stderr
+    assert slot_path.is_dir()
+    assert active_slots(project)
+
+
+def test_validate_remove_refuses_malformed_proof_without_sealing(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    commit_validation_removal_schema(repository)
+    slot_path = prepare_dead_validate_slots(project, ("slot01",))["slot01"]
+    manifest, artifacts = prepare_validation_removal_proof(project, "slot01")
+    contents = manifest.read_text(encoding="utf-8")
+    manifest.write_text(
+        contents.replace('"schema": 1,', '"schema": 1, "schema": 1,', 1),
+        encoding="utf-8",
+    )
+
+    refused = command(
+        project,
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        "--validation-proof-manifest",
+        manifest.relative_to(project).as_posix(),
+        "--completed-record",
+        artifacts["run-record"].relative_to(project).as_posix(),
+    )
+
+    assert refused.returncode == 3
+    assert "malformed JSON" in refused.stderr
+    assert "duplicate key" in refused.stderr
+    assert slot_path.is_dir()
+    assert stat.S_IMODE(slot_path.stat().st_mode) != 0o700
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("cross-slot-service", "service-result path does not match"),
+        ("cross-slot-record", "differs from --completed-record"),
+        ("record-generation", "exact slot generation"),
+        ("path-swap", "scorecard-handoff"),
+        ("hardlink", "share one regular-file identity"),
+        ("noncanonical-schema", "producer-schema path does not match"),
+        ("noncanonical-handoff", "scorecard-handoff path does not match"),
+    ),
+)
+def test_validate_remove_refuses_noncanonical_proof_role_binding(
+    tmp_path: Path,
+    mutation: str,
+    message: str,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    commit_validation_removal_schema(repository)
+    slots = (
+        ("slot01", "slot02")
+        if mutation.startswith("cross-slot")
+        else ("slot01",)
+    )
+    slot_path = prepare_dead_validate_slots(project, slots)["slot01"]
+    manifest, artifacts = prepare_validation_removal_proof(project, "slot01")
+
+    if mutation in {"cross-slot-service", "cross-slot-record"}:
+        _other_manifest, other_artifacts = prepare_validation_removal_proof(
+            project, "slot02"
+        )
+        rebind_validation_removal_artifact(
+            project,
+            manifest,
+            (
+                "service-result"
+                if mutation == "cross-slot-service"
+                else "run-record"
+            ),
+            other_artifacts[
+                "service-result"
+                if mutation == "cross-slot-service"
+                else "run-record"
+            ],
+        )
+    elif mutation == "record-generation":
+        record_value: object = json.loads(
+            artifacts["run-record"].read_text(encoding="utf-8")
+        )
+        assert isinstance(record_value, dict)
+        record_value["wrkslots_generation"] = 2
+        artifacts["run-record"].write_text(
+            json.dumps(record_value, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        rebind_validation_removal_artifact(
+            project, manifest, "run-record", artifacts["run-record"]
+        )
+    elif mutation == "path-swap":
+        value: object = json.loads(manifest.read_text(encoding="utf-8"))
+        assert isinstance(value, dict)
+        rows = value["artifacts"]
+        assert isinstance(rows, list)
+        by_role = {
+            str(row["role"]): row for row in rows if isinstance(row, dict)
+        }
+        service = by_role["service-result"]
+        handoff = by_role["scorecard-handoff"]
+        keys = ("path", "identity", "size", "sha256")
+        service_values = {key: service[key] for key in keys}
+        for key in keys:
+            service[key] = handoff[key]
+            handoff[key] = service_values[key]
+        manifest.write_text(
+            json.dumps(value, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    elif mutation == "hardlink":
+        service_result = artifacts["service-result"]
+        service_result.unlink()
+        os.link(artifacts["run-record"], service_result)
+        rebind_validation_removal_artifact(
+            project, manifest, "service-result", service_result
+        )
+    elif mutation == "noncanonical-schema":
+        noncanonical = artifacts["producer-schema"].with_name(
+            "other-validation-service-result-schema.json"
+        )
+        shutil.copyfile(artifacts["producer-schema"], noncanonical)
+        rebind_validation_removal_artifact(
+            project, manifest, "producer-schema", noncanonical
+        )
+    elif mutation == "noncanonical-handoff":
+        noncanonical = (
+            project
+            / "ignored"
+            / "validate"
+            / "scorecard-writebacks"
+            / "validate-other"
+            / "handoff.json"
+        )
+        noncanonical.parent.mkdir(parents=True)
+        shutil.copyfile(artifacts["scorecard-handoff"], noncanonical)
+        rebind_validation_removal_artifact(
+            project, manifest, "scorecard-handoff", noncanonical
+        )
+    else:
+        raise AssertionError(mutation)
+
+    refused = command(
+        project,
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        "--validation-proof-manifest",
+        manifest.relative_to(project).as_posix(),
+        "--completed-record",
+        artifacts["run-record"].relative_to(project).as_posix(),
+    )
+
+    assert refused.returncode == 3
+    assert message in refused.stderr
+    assert slot_path.is_dir()
+    assert stat.S_IMODE(slot_path.stat().st_mode) != 0o700
+    assert active_slots(project)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("missing-retained-file", "invalid file set"),
+        ("handoff-record-mismatch", "differ from run-record"),
+        ("extra-file", "invalid file set"),
+        ("extra-symlink", "invalid file set"),
+    ),
+)
+def test_validate_remove_refuses_incomplete_scorecard_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    mutation: str,
+    message: str,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    commit_validation_removal_schema(repository)
+    slot_path = prepare_dead_validate_slots(project, ("slot01",))["slot01"]
+    manifest, artifacts = prepare_validation_removal_proof(project, "slot01")
+    if mutation == "missing-retained-file":
+        (artifacts["scorecard-handoff"].parent / "SCORECARD.md").unlink()
+    elif mutation == "handoff-record-mismatch":
+        record_value: object = json.loads(
+            artifacts["run-record"].read_text(encoding="utf-8")
+        )
+        assert isinstance(record_value, dict)
+        rows = record_value["scorecard_writeback_files"]
+        assert isinstance(rows, list) and isinstance(rows[0], dict)
+        rows[0]["sha256"] = "0" * 64
+        artifacts["run-record"].write_text(
+            json.dumps(record_value, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        rebind_validation_removal_artifact(
+            project, manifest, "run-record", artifacts["run-record"]
+        )
+    elif mutation == "extra-file":
+        (artifacts["scorecard-handoff"].parent / "unexpected.txt").write_text(
+            "unexpected\n", encoding="utf-8"
+        )
+    elif mutation == "extra-symlink":
+        (artifacts["scorecard-handoff"].parent / "unexpected-link").symlink_to(
+            "SCORECARD.md"
+        )
+    else:
+        raise AssertionError(mutation)
+    stub_validate_batch_censuses(monkeypatch)
+
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "remove",
+            "slot01",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--expected-generation",
+            "1",
+            "--validation-proof-manifest",
+            manifest.relative_to(project).as_posix(),
+            "--completed-record",
+            artifacts["run-record"].relative_to(project).as_posix(),
+        ]
+    )
+
+    assert rc == 3
+    assert message in capsys.readouterr().err
+    assert slot_path.is_dir()
+    assert active_slots(project)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("record-generation", "exact slot generation"),
+        ("record-projection", "does not contain an evidenced terminal result"),
+        ("producer-passed-exit", "producer-schema does not match"),
+        ("producer-failed-exit", "producer-schema does not match"),
+        ("producer-nullable", "producer-schema does not match"),
+        ("handoff-schema", "scorecard-handoff does not match"),
+    ),
+)
+def test_validate_remove_refuses_boolean_aliases_in_typed_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    mutation: str,
+    message: str,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    schema_version = 3 if mutation == "record-projection" else 4
+    commit_validation_removal_schema(repository, schema_version=schema_version)
+    slot_path = prepare_dead_validate_slots(project, ("slot01",))["slot01"]
+    manifest, artifacts = prepare_validation_removal_proof(project, "slot01")
+
+    if mutation in {"record-generation", "record-projection"}:
+        record_value: object = json.loads(
+            artifacts["run-record"].read_text(encoding="utf-8")
+        )
+        assert isinstance(record_value, dict)
+        if mutation == "record-generation":
+            record_value["wrkslots_generation"] = True
+        else:
+            record_value["exit_code"] = False
+            record_value["executed_nodes"] = True
+        artifacts["run-record"].write_text(
+            json.dumps(record_value, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        rebind_validation_removal_artifact(
+            project, manifest, "run-record", artifacts["run-record"]
+        )
+    elif mutation.startswith("producer-"):
+        schema_value: object = json.loads(
+            artifacts["producer-schema"].read_text(encoding="utf-8")
+        )
+        assert isinstance(schema_value, dict)
+        outcomes = schema_value["outcomes"]
+        writeback = schema_value["scorecard_writeback"]
+        assert isinstance(outcomes, dict) and isinstance(outcomes["PASSED"], dict)
+        assert isinstance(outcomes["FAILED"], dict)
+        assert isinstance(writeback, dict)
+        if mutation == "producer-passed-exit":
+            outcomes["PASSED"]["validation_exit_code"] = False
+        elif mutation == "producer-failed-exit":
+            outcomes["FAILED"]["validation_exit_code"] = True
+        elif mutation == "producer-nullable":
+            writeback["nullable"] = 1
+        else:
+            raise AssertionError(mutation)
+        artifacts["producer-schema"].write_text(
+            json.dumps(schema_value, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        rebind_validation_removal_artifact(
+            project, manifest, "producer-schema", artifacts["producer-schema"]
+        )
+    elif mutation == "handoff-schema":
+        handoff_value: object = json.loads(
+            artifacts["scorecard-handoff"].read_text(encoding="utf-8")
+        )
+        assert isinstance(handoff_value, dict)
+        handoff_value["schema_version"] = True
+        artifacts["scorecard-handoff"].write_text(
+            json.dumps(handoff_value, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        rebind_validation_removal_artifact(
+            project,
+            manifest,
+            "scorecard-handoff",
+            artifacts["scorecard-handoff"],
+        )
+    else:
+        raise AssertionError(mutation)
+
+    stub_validate_batch_censuses(monkeypatch)
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "remove",
+            "slot01",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--expected-generation",
+            "1",
+            "--validation-proof-manifest",
+            manifest.relative_to(project).as_posix(),
+            "--completed-record",
+            artifacts["run-record"].relative_to(project).as_posix(),
+        ]
+    )
+
+    assert rc == 3
+    assert message in capsys.readouterr().err
+    assert slot_path.is_dir()
+    assert active_slots(project)
+
+
+def test_validation_service_result_projection_refuses_passed_without_counts() -> None:
+    payload = json.dumps(
+        {
+            "schema_version": 4,
+            "commit": "a" * 40,
+            "profile": "full",
+            "selection_mode": "full",
+            "final_validate_status": "PASSED",
+            "exit_code": 0,
+            "executed_nodes": 1,
+            "executed_tests": None,
+            "passed_tests": None,
+            "scorecard_writeback": {"status": "completed"},
+        }
+    ).encode()
+
+    with pytest.raises(wrkslots.Refusal, match="PASSED counts disagree"):
+        wrkslots._validation_service_result_projection(
+            payload,
+            schema=4,
+            schema_fields=wrkslots._VALIDATION_SERVICE_RESULT_FIELDS[4],
+            expected_commit="a" * 40,
+        )
+
+
+@pytest.mark.parametrize("mutation", ("extra", "missing", "wrong-type"))
+def test_validate_remove_refuses_service_result_field_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    mutation: str,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    commit_validation_removal_schema(repository, schema_version=5)
+    slot_path = prepare_dead_validate_slots(project, ("slot01",))["slot01"]
+    manifest, artifacts = prepare_validation_removal_proof(project, "slot01")
+    result_value: object = json.loads(
+        artifacts["service-result"].read_text(encoding="utf-8")
+    )
+    assert isinstance(result_value, dict)
+    if mutation == "extra":
+        result_value["undeclared"] = "field"
+    elif mutation == "missing":
+        del result_value["detail"]
+    elif mutation == "wrong-type":
+        result_value["schema_version"] = 5.0
+    else:
+        raise AssertionError(mutation)
+    artifacts["service-result"].write_text(
+        json.dumps(result_value, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    rebind_validation_removal_artifact(
+        project, manifest, "service-result", artifacts["service-result"]
+    )
+    stub_validate_batch_censuses(monkeypatch)
+
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "remove",
+            "slot01",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--expected-generation",
+            "1",
+            "--validation-proof-manifest",
+            manifest.relative_to(project).as_posix(),
+            "--completed-record",
+            artifacts["run-record"].relative_to(project).as_posix(),
+        ]
+    )
+
+    assert rc == 3
+    error = capsys.readouterr().err
+    assert (
+        "service-result fields" in error
+        if mutation != "wrong-type"
+        else "service-result schema differs" in error
+    )
+    assert slot_path.is_dir()
+    assert active_slots(project)
+
+
+@pytest.mark.parametrize("disagreement", ("count", "duplicate"))
+def test_validate_batch_refuses_proof_list_disagreement_before_sealing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    disagreement: str,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    commit_validation_removal_schema(repository)
+    slot_paths = prepare_dead_validate_slots(project, ("slot01", "slot02"))
+    prepared = [
+        prepare_validation_removal_proof(project, slot)
+        for slot in ("slot01", "slot02")
+    ]
+    manifests = [item[0] for item in prepared]
+    records = [item[1]["run-record"] for item in prepared]
+    supplied = [manifests[0]] if disagreement == "count" else [manifests[0]] * 2
+    monkeypatch.setattr(
+        wrkslots,
+        "_capture_process_path_census",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("batch disagreement must refuse before census")
+        ),
+    )
+
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "remove-validate-batch",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--slot",
+            "slot01=1",
+            "--slot",
+            "slot02=1",
+            *[
+                value
+                for manifest in supplied
+                for value in (
+                    "--validation-proof-manifest",
+                    manifest.relative_to(project).as_posix(),
+                )
+            ],
+            *[
+                value
+                for record in records
+                for value in (
+                    "--completed-record",
+                    record.relative_to(project).as_posix(),
+                )
+            ],
+            "--format",
+            "json",
+        ]
+    )
+
+    assert rc == 3
+    assert disagreement in (
+        "count" if "requires one" in capsys.readouterr().err else "duplicate"
+    )
+    assert all(path.is_dir() for path in slot_paths.values())
+    assert all(stat.S_IMODE(path.stat().st_mode) != 0o700 for path in slot_paths.values())
+
+
+def test_validate_removal_proof_survives_registered_finish_recovery(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    commit_validation_removal_schema(repository)
+    slot_path = prepare_dead_validate_slots(project, ("slot01",))["slot01"]
+    manifest, artifacts = prepare_validation_removal_proof(project, "slot01")
+    arguments = (
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        "--validation-proof-manifest",
+        manifest.relative_to(project).as_posix(),
+        "--completed-record",
+        artifacts["run-record"].relative_to(project).as_posix(),
+    )
+
+    interrupted = raw_command_with_census_authority_stub(
+        project,
+        *arguments,
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-validation-removal-proof-recheck"},
+    )
+    assert interrupted.returncode == 86
+    assert (control_directory(project) / "ACTIVE.testhost.journal").is_file()
+
+    recovered = raw_command_with_census_authority_stub(
+        project, "recover", "--coordinator-pid", str(os.getpid())
+    )
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert not slot_path.exists()
+    assert active_slots(project) == []
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("changed-bytes", "changed bytes"),
+        ("changed-path", "regular-file identity changed"),
+        ("missing", "cannot read"),
+        pytest.param(
+            "unreadable",
+            "cannot read",
+            marks=pytest.mark.ordinary_environment,
+        ),
+        ("symlink", "crosses a symlink"),
+        ("nonregular", "not a regular file"),
+        ("stale-manifest", "regular-file identity changed"),
+        ("retained-file-bytes", "retained scorecard file changed bytes"),
+        ("retained-extra-file", "invalid file set"),
+        ("retained-extra-symlink", "invalid file set"),
+    ),
+)
+def test_validate_batch_rechecks_external_proof_after_private_seal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    mutation: str,
+    message: str,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    commit_validation_removal_schema(repository)
+    slot_path = prepare_dead_validate_slots(project, ("slot01",))["slot01"]
+    manifest, artifacts = prepare_validation_removal_proof(project, "slot01")
+
+    def shared(
+        _paths: Sequence[Path],
+        *,
+        budget: wrkslots._ReadOnlyCommandBudget,
+        include_owner_cgroups: bool = True,
+    ) -> wrkslots._ProcessPathCensus:
+        del budget, include_owner_cgroups
+        return wrkslots._ProcessPathCensus((), ())
+
+    def mutate_at_final_boundary(
+        _paths: Sequence[Path], *, budget: wrkslots._ReadOnlyCommandBudget
+    ) -> wrkslots._ProcessPathCensus:
+        del budget
+        run_record = artifacts["run-record"]
+        if mutation == "changed-bytes":
+            service_result = artifacts["service-result"]
+            contents = service_result.read_bytes()
+            assert b'"profile": "full"' in contents
+            service_result.write_bytes(
+                contents.replace(b'"profile": "full"', b'"profile": "evil"', 1)
+            )
+        elif mutation == "changed-path":
+            contents = run_record.read_bytes()
+            run_record.unlink()
+            run_record.write_bytes(contents)
+        elif mutation == "missing":
+            run_record.unlink()
+        elif mutation == "unreadable":
+            run_record.chmod(0)
+        elif mutation == "symlink":
+            replacement = run_record.with_name("replacement-run-record.json")
+            replacement.write_bytes(run_record.read_bytes())
+            run_record.unlink()
+            run_record.symlink_to(replacement)
+        elif mutation == "nonregular":
+            run_record.unlink()
+            run_record.mkdir()
+        elif mutation == "stale-manifest":
+            contents = manifest.read_bytes()
+            manifest.unlink()
+            manifest.write_bytes(contents)
+        elif mutation == "retained-file-bytes":
+            scorecard = artifacts["scorecard-handoff"].parent / "SCORECARD.md"
+            contents = scorecard.read_bytes()
+            scorecard.write_bytes(b"!" + contents[1:])
+        elif mutation == "retained-extra-file":
+            (artifacts["scorecard-handoff"].parent / "unexpected.txt").write_text(
+                "unexpected\n", encoding="utf-8"
+            )
+        elif mutation == "retained-extra-symlink":
+            (artifacts["scorecard-handoff"].parent / "unexpected-link").symlink_to(
+                "SCORECARD.md"
+            )
+        else:
+            raise AssertionError(mutation)
+        return wrkslots._ProcessPathCensus((), ())
+
+    monkeypatch.setattr(wrkslots, "_capture_process_path_census", shared)
+    monkeypatch.setattr(
+        wrkslots, "_capture_same_uid_process_path_census", mutate_at_final_boundary
+    )
+    args = argparse.Namespace(
+        project_root=str(project),
+        machine=None,
+        wait_lock=0,
+        command="remove-validate-batch",
+        coordinator_authorized=True,
+        coordinator_pid=os.getpid(),
+        slots=["slot01=1"],
+        validation_proof_manifests=[manifest.relative_to(project).as_posix()],
+        completed_records=[
+            artifacts["run-record"].relative_to(project).as_posix()
+        ],
+        format="json",
+    )
+
+    assert wrkslots._cmd_remove_validate_batch(args) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["removed"] == []
+    assert len(report["retained"]) == 1
+    assert message in report["retained"][0]["reason"]
+    assert slot_path.is_dir()
+    assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
+    assert active_slots(project)
+
+
 def test_validate_batch_shares_one_census_and_retains_each_refusal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    project, _repository, _remote = make_project(tmp_path)
+    project, repository, _remote = make_project(tmp_path)
+    commit_validation_removal_schema(repository)
     slot_paths = prepare_dead_validate_slots(project, ("unused", "in-use"))
+    proofs = {
+        slot: prepare_validation_removal_proof(project, slot)
+        for slot in ("unused", "in-use")
+    }
     in_use = slot_paths["in-use"]
     calls: list[tuple[Path, ...]] = []
     census_order: list[str] = []
@@ -6653,6 +8180,14 @@ def test_validate_batch_shares_one_census_and_retains_each_refusal(
             "in-use=1",
             "--slot",
             "unused=1",
+            "--validation-proof-manifest",
+            proofs["in-use"][0].relative_to(project).as_posix(),
+            "--validation-proof-manifest",
+            proofs["unused"][0].relative_to(project).as_posix(),
+            "--completed-record",
+            proofs["in-use"][1]["run-record"].relative_to(project).as_posix(),
+            "--completed-record",
+            proofs["unused"][1]["run-record"].relative_to(project).as_posix(),
             "--format",
             "json",
         ]
@@ -6913,11 +8448,18 @@ def test_validate_batch_deadline_between_targets_never_enters_later_removals(
         args: argparse.Namespace,
         *,
         private_cleanup: wrkslots._PrivateCleanupContext | None = None,
+        validation_removal_proof: wrkslots._ValidationRemovalProof | None = None,
         emit: bool = True,
     ) -> int:
         nonlocal monotonic_now
+        assert validation_removal_proof is None
         entered.append(args.slot)
-        result = original_remove(args, private_cleanup=private_cleanup, emit=emit)
+        result = original_remove(
+            args,
+            private_cleanup=private_cleanup,
+            validation_removal_proof=validation_removal_proof,
+            emit=emit,
+        )
         assert private_cleanup is not None
         monotonic_now = private_cleanup.census_budget.deadline + 1.0
         return result

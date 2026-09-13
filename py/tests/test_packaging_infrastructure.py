@@ -395,9 +395,9 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
 
     assert ordinary.isdisjoint(mapped)
     assert ordinary | mapped == all_tests
-    assert len(all_tests) == 506
-    assert len(ordinary) == 54
-    assert len(mapped) == 452
+    assert len(all_tests) == 558
+    assert len(ordinary) == 56
+    assert len(mapped) == 502
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {
@@ -408,6 +408,7 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
         "test_frozen_parser_refuses_each_module_tampered_before_or_after_inspect",
         "test_frozen_parser_refuses_record_mutation_after_inspect",
         "test_frozen_validate_batch_closes_operation_owned_fds_before_censuses",
+        "test_frozen_validate_batch_accepts_exact_validation_removal_proof",
         "test_frozen_validate_batch_fresh_census_does_not_ignore_current_process",
         "test_frozen_validate_checkout_binds_terminal_record_fields",
         "test_frozen_validate_checkout_recovers_each_durable_crash_boundary",
@@ -424,6 +425,7 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
         "test_process_entering_after_final_scan_before_path_move_is_not_deleted",
         "test_remove_refuses_live_process_using_slot",
         "test_root_owned_executable_accepts_host_root_helper",
+        "test_validate_batch_rechecks_external_proof_after_private_seal",
     }
 
     negative = (
