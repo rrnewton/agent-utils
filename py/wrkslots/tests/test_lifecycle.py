@@ -394,12 +394,15 @@ def install_mapped_validation_exclusion_fixture(
 
 
 def validation_exclusion_command_arguments(
-    project: Path, args: Sequence[str]
+    project: Path,
+    args: Sequence[str],
+    *,
+    add_coordinator_authorization: bool,
 ) -> list[str]:
     command_args = list(args)
-    if command_args and command_args[0] == "recover":
-        if "--coordinator-authorized" not in command_args:
-            command_args.append("--coordinator-authorized")
+    if add_coordinator_authorization:
+        assert "--coordinator-authorized" not in command_args
+        command_args.append("--coordinator-authorized")
     return ["--project-root", str(project), *command_args]
 
 
@@ -408,11 +411,16 @@ def in_process_validation_exclusion_command(
     monkeypatch: pytest.MonkeyPatch,
     request: pytest.FixtureRequest,
     *args: str,
+    add_coordinator_authorization: bool,
 ) -> subprocess.CompletedProcess[str]:
     """Run cleanup with an isolated root fixture inside the mapped test namespace."""
 
     root = install_mapped_validation_exclusion_fixture(project, monkeypatch, request)
-    argv = validation_exclusion_command_arguments(project, args)
+    argv = validation_exclusion_command_arguments(
+        project,
+        args,
+        add_coordinator_authorization=add_coordinator_authorization,
+    )
     assert str(root) not in argv
     stdout = io.StringIO()
     stderr = io.StringIO()
@@ -432,11 +440,16 @@ def forked_validation_exclusion_command(
     request: pytest.FixtureRequest,
     *args: str,
     interrupt: str,
+    add_coordinator_authorization: bool,
 ) -> subprocess.CompletedProcess[str]:
     """Crash an in-process mapped-root cleanup without crossing an exec boundary."""
 
     root = install_mapped_validation_exclusion_fixture(project, monkeypatch, request)
-    argv = validation_exclusion_command_arguments(project, args)
+    argv = validation_exclusion_command_arguments(
+        project,
+        args,
+        add_coordinator_authorization=add_coordinator_authorization,
+    )
     assert str(root) not in argv
     child = os.fork()
     if child == 0:
@@ -5344,7 +5357,23 @@ def test_recover_ownerless_validate_cargo_home_requires_terminal_or_manual_evide
         target.relative_to(project).as_posix(),
         "--completed-record",
         record.relative_to(project).as_posix(),
+        add_coordinator_authorization=True,
     )
+    assert recovered.args == [
+        sys.executable,
+        "-m",
+        "wrkslots",
+        "--project-root",
+        str(project),
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--ownerless-validate-cargo-home",
+        target.relative_to(project).as_posix(),
+        "--completed-record",
+        record.relative_to(project).as_posix(),
+        "--coordinator-authorized",
+    ]
     assert recovered.returncode == 0, recovered.stderr
     assert not target.exists()
     assert active_slots(project) == []
@@ -5380,6 +5409,7 @@ def test_ownerless_cargo_cleanup_ignores_an_unrelated_missing_slot(
         target.relative_to(project).as_posix(),
         "--completed-record",
         record.relative_to(project).as_posix(),
+        add_coordinator_authorization=True,
     )
 
     assert recovered.returncode == 0, recovered.stderr
@@ -5420,6 +5450,7 @@ def test_ownerless_cargo_home_allows_nested_git_cache_and_records_determination(
         target.relative_to(project).as_posix(),
         "--recovery-note",
         "the historical run handle is absent",
+        add_coordinator_authorization=True,
     )
 
     assert recovered.returncode == 0, recovered.stderr
@@ -5541,6 +5572,7 @@ def test_ownerless_cleanup_accepts_noncompleted_terminal_record(
         target.relative_to(project).as_posix(),
         "--completed-record",
         record.relative_to(project).as_posix(),
+        add_coordinator_authorization=True,
     )
 
     assert recovered.returncode == 0, recovered.stderr
@@ -5643,6 +5675,7 @@ def test_ownerless_cleanup_accepts_unknown_record_after_exact_process_exits(
         target.relative_to(project).as_posix(),
         "--completed-record",
         record.relative_to(project).as_posix(),
+        add_coordinator_authorization=True,
     )
 
     assert recovered.returncode == 0, recovered.stderr
@@ -5864,6 +5897,7 @@ def test_ownerless_cleanup_accepts_current_pass_with_failed_writeback(
         target.relative_to(project).as_posix(),
         "--completed-record",
         record.relative_to(project).as_posix(),
+        add_coordinator_authorization=True,
     )
 
     assert recovered.returncode == 0, recovered.stderr
@@ -6164,6 +6198,7 @@ def test_ownerless_cleanup_accepts_schema_less_durable_log_record(
         target.relative_to(project).as_posix(),
         "--completed-record",
         record.relative_to(project).as_posix(),
+        add_coordinator_authorization=True,
     )
 
     assert recovered.returncode == 0, recovered.stderr
@@ -6297,7 +6332,23 @@ def test_ownerless_cleanup_resumes_after_fence_before_journal_update(
         "--completed-record",
         record.relative_to(project).as_posix(),
         interrupt="after-ownerless-validate-path-fence-before-journal",
+        add_coordinator_authorization=True,
     )
+    assert interrupted.args == [
+        sys.executable,
+        "-m",
+        "wrkslots",
+        "--project-root",
+        str(project),
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--ownerless-validate-cargo-home",
+        target.relative_to(project).as_posix(),
+        "--completed-record",
+        record.relative_to(project).as_posix(),
+        "--coordinator-authorized",
+    ]
     assert interrupted.returncode == 86
     journal = json.loads(
         (control_directory(project) / "ACTIVE.testhost.journal").read_text()
@@ -6313,6 +6364,7 @@ def test_ownerless_cleanup_resumes_after_fence_before_journal_update(
         "recover",
         "--coordinator-pid",
         str(os.getpid()),
+        add_coordinator_authorization=False,
     )
 
     assert resumed.returncode == 0, resumed.stderr
@@ -6402,6 +6454,7 @@ def test_ownerless_validate_recovery_resumes_without_reauthorizing(
         "--completed-record",
         record.relative_to(project).as_posix(),
         interrupt="after-ownerless-validate-remove",
+        add_coordinator_authorization=True,
     )
     assert interrupted.returncode == 86
     assert not target.exists()
@@ -6419,7 +6472,18 @@ def test_ownerless_validate_recovery_resumes_without_reauthorizing(
         "recover",
         "--coordinator-pid",
         str(os.getpid()),
+        add_coordinator_authorization=False,
     )
+    assert resumed.args == [
+        sys.executable,
+        "-m",
+        "wrkslots",
+        "--project-root",
+        str(project),
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+    ]
     assert resumed.returncode == 0, resumed.stderr
     assert not journal.exists()
 
@@ -6459,6 +6523,7 @@ def test_ownerless_recovery_keeps_unrelated_drift_visible_in_status(
         target.relative_to(project).as_posix(),
         "--recovery-note",
         "no retained run handle",
+        add_coordinator_authorization=False,
     )
     assert recovered.returncode == 0, recovered.stderr
     assert not target.exists()
