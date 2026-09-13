@@ -3068,6 +3068,102 @@ def test_frozen_validate_batch_accepts_exact_validation_removal_proof(
 
 
 @pytest.mark.ordinary_environment
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("external-bytes", "service-result changed bytes"),
+        ("external-inode", "scorecard-handoff regular-file identity changed"),
+    ),
+)
+def test_frozen_validate_rebinds_external_proof_after_exclusion_census(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    mutation: str,
+    message: str,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    commit_validation_removal_schema(repository, schema_version=3)
+    checkout, record, _target_sha = prepare_frozen_validation_checkout(
+        project,
+        repository,
+        monkeypatch=monkeypatch,
+        name=f"proof-{mutation}",
+    )
+    manifest, artifacts = prepare_validation_removal_proof(
+        project,
+        checkout.name,
+        checkout_path=checkout,
+        run_record=record,
+    )
+    stub_validate_batch_censuses(monkeypatch)
+    observed_guards: list[Path] = []
+
+    def mutate_during_exclusion_census(
+        _paths: Sequence[Path], *, budget: wrkslots._ReadOnlyCommandBudget
+    ) -> wrkslots._ProcessPathCensus:
+        del budget
+        observed_guards.append(validation_exclusion_guard(project))
+        if mutation == "external-bytes":
+            service_result = artifacts["service-result"]
+            contents = service_result.read_bytes()
+            assert b'"profile": "full"' in contents
+            service_result.write_bytes(
+                contents.replace(b'"profile": "full"', b'"profile": "evil"', 1)
+            )
+        elif mutation == "external-inode":
+            handoff = artifacts["scorecard-handoff"]
+            replacement = handoff.with_name("replacement-handoff.json")
+            replacement.write_bytes(handoff.read_bytes())
+            os.replace(replacement, handoff)
+        else:
+            raise AssertionError(mutation)
+        return wrkslots._ProcessPathCensus((), ())
+
+    monkeypatch.setattr(
+        wrkslots,
+        "_capture_same_uid_process_path_census",
+        mutate_during_exclusion_census,
+    )
+
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover-ownerless-validate-batch",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--frozen-validate-checkout",
+            str(checkout),
+            "--completed-record",
+            record.relative_to(project).as_posix(),
+            "--repository",
+            repository.relative_to(project).as_posix(),
+            "--validation-proof-manifest",
+            manifest.relative_to(project).as_posix(),
+            "--format",
+            "json",
+        ]
+    )
+
+    assert rc == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["removed"] == []
+    assert len(report["retained"]) == 1
+    assert message in report["retained"][0]["reason"]
+    assert checkout.is_dir()
+    assert (checkout / ".git").is_dir()
+    assert len(observed_guards) == 1 and not observed_guards[0].exists()
+    config = wrkslots._load_config(str(project), "testhost")
+    assert not wrkslots._journal_path(config).exists()
+    assert not any(
+        item["kind"] == "ownerless-validate-path-removed"
+        for item in wrkslots._load_events(config)
+    )
+
+
+@pytest.mark.ordinary_environment
 def test_frozen_validate_excludes_late_same_uid_checkout_entry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

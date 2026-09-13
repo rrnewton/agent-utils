@@ -1903,6 +1903,7 @@ def _verify_validation_removal_artifacts(
     target_kind: str,
     repository: Path | None,
     expected_run_record: Path | None,
+    active_slot_fd: int | None = None,
 ) -> None:
     run_artifact = _validation_removal_artifact(artifacts, "run-record")
     run_relative, run_path = _validation_removal_record_path(config, run_artifact)
@@ -1957,17 +1958,33 @@ def _verify_validation_removal_artifacts(
                 f"validation removal {artifact.role} path does not match the "
                 "run-record"
             )
-        active_path = _proof_artifact_path(
-            config,
-            artifact,
-            canonical_slot=canonical_slot,
-            active_slot=active_slot,
-        )
-        payload, observed = _read_regular_file_identity(
-            active_path,
-            f"validation removal {artifact.role}",
-            _VALIDATION_REMOVAL_ARTIFACT_BYTES_LIMIT,
-        )
+        if artifact.role == "producer-schema" and active_slot_fd is not None:
+            try:
+                relative = canonical_path.relative_to(canonical_slot)
+            except ValueError as exc:
+                raise StateError(
+                    "validation removal producer-schema is outside its canonical "
+                    "checkout"
+                ) from exc
+            payload, observed = _read_regular_file_identity_beneath(
+                active_slot_fd,
+                relative,
+                "validation removal producer-schema",
+                _VALIDATION_REMOVAL_ARTIFACT_BYTES_LIMIT,
+            )
+            active_path = canonical_path
+        else:
+            active_path = _proof_artifact_path(
+                config,
+                artifact,
+                canonical_slot=canonical_slot,
+                active_slot=active_slot,
+            )
+            payload, observed = _read_regular_file_identity(
+                active_path,
+                f"validation removal {artifact.role}",
+                _VALIDATION_REMOVAL_ARTIFACT_BYTES_LIMIT,
+            )
         _assert_regular_file_identity(artifact.identity, observed, artifact.role)
         identity = (observed.device, observed.inode)
         duplicate_role = identities.get(identity)
@@ -2066,6 +2083,7 @@ def _recheck_validation_removal_proof(
     expected_head: str,
     target_kind: str = "checkout",
     repository: Path | None = None,
+    active_slot_fd: int | None = None,
 ) -> None:
     if proof.slot != expected_slot or (
         expected_generation is not None and proof.generation != expected_generation
@@ -2101,6 +2119,7 @@ def _recheck_validation_removal_proof(
         target_kind=target_kind,
         repository=repository,
         expected_run_record=None,
+        active_slot_fd=active_slot_fd,
     )
 
 
@@ -17542,36 +17561,33 @@ def _read_regular_file_identity_beneath(
     )
 
 
-def _recheck_excluded_validation_producer(
+def _recheck_excluded_validation_proof(
     config: Config,
-    proof: _ValidationRemovalProof | None,
+    authorization: ValidationRecoveryAuthorization,
     canonical_slot: Path,
+    repository: Path | None,
     payload_fd: int,
 ) -> None:
-    """Rebind the sole proof artifact inside the now-excluded checkout."""
+    """Rebind every proof artifact after excluding the checkout from new use."""
 
+    proof = authorization.removal_proof
     if proof is None:
         return
-    producer = _validation_removal_artifact(proof.artifacts, "producer-schema")
-    _relative, canonical = _canonical_managed_file_path(
+    if authorization.head is None:
+        raise StateError("validation checkout authorization has no exact HEAD")
+    _recheck_validation_removal_proof(
         config,
-        producer.path,
-        "validation removal producer-schema",
-        allow_frozen=True,
+        proof,
+        expected_slot=canonical_slot.name,
+        expected_generation=None,
+        canonical_slot=canonical_slot,
+        active_slot=canonical_slot,
+        canonical_checkout=canonical_slot,
+        expected_head=authorization.head,
+        target_kind=authorization.target_kind,
+        repository=repository,
+        active_slot_fd=payload_fd,
     )
-    try:
-        relative = canonical.relative_to(canonical_slot)
-    except ValueError as exc:
-        raise StateError(
-            "validation removal producer-schema is outside its canonical checkout"
-        ) from exc
-    _payload, observed = _read_regular_file_identity_beneath(
-        payload_fd,
-        relative,
-        "validation removal producer-schema",
-        _VALIDATION_REMOVAL_ARTIFACT_BYTES_LIMIT,
-    )
-    _assert_regular_file_identity(producer.identity, observed, producer.role)
 
 
 def _remove_excluded_validation_tree(
@@ -17875,10 +17891,11 @@ def _recover_ownerless_validation(
                 _assert_excluded_validation_unused(
                     exclusion, target, fenced, batch_cleanup
                 )
-                _recheck_excluded_validation_producer(
+                _recheck_excluded_validation_proof(
                     config,
-                    authorization.removal_proof,
+                    authorization,
                     target,
+                    repository,
                     exclusion.payload_fd,
                 )
                 _interrupt_for_test("after-ownerless-validate-final-check")

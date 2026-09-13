@@ -395,8 +395,8 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
 
     assert ordinary.isdisjoint(mapped)
     assert ordinary | mapped == all_tests
-    assert len(all_tests) == 572
-    assert len(ordinary) == 66
+    assert len(all_tests) == 574
+    assert len(ordinary) == 68
     assert len(mapped) == 506
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
@@ -420,6 +420,7 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
         "test_frozen_validate_recovery_refuses_absent_prepared_path_twice",
         "test_frozen_validate_recovery_refuses_changed_identity_binding",
         "test_frozen_validate_recovery_refuses_changed_terminal_record_digest",
+        "test_frozen_validate_rebinds_external_proof_after_exclusion_census",
         "test_frozen_validate_refuses_disappearance_after_final_check",
         "test_frozen_validate_refuses_cross_device_exclusion_root",
         "test_frozen_validate_refuses_fenced_replacement_after_final_check",
