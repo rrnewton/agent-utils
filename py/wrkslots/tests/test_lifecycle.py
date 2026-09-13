@@ -8,6 +8,7 @@ import fnmatch
 import hashlib
 import datetime as dt
 import errno
+import io
 import itertools
 import json
 import os
@@ -251,6 +252,206 @@ def raw_command(
         capture_output=True,
         check=False,
         env=process_env,
+    )
+
+
+_VALIDATION_EXCLUSION_GUARD_PREFIX = ".wrkslots-ownerless-validation."
+_MAPPED_VALIDATION_EXCLUSION_PROJECTS: set[Path] = set()
+
+
+def mapped_validation_exclusion_guard_identities(
+    roots: Sequence[Path],
+) -> dict[Path, tuple[int, int, int, int, int]]:
+    """Snapshot exclusion guards without searching unrelated temporary trees."""
+
+    result: dict[Path, tuple[int, int, int, int, int]] = {}
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for child in root.iterdir():
+            if not child.name.startswith(_VALIDATION_EXCLUSION_GUARD_PREFIX):
+                continue
+            metadata = child.stat(follow_symlinks=False)
+            result[child] = (
+                metadata.st_dev,
+                metadata.st_ino,
+                stat.S_IMODE(metadata.st_mode),
+                metadata.st_uid,
+                metadata.st_gid,
+            )
+    return result
+
+
+def install_mapped_validation_exclusion_fixture(
+    project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> Path:
+    """Install a trusted root fixture only in this test interpreter."""
+
+    if os.geteuid() != 0 or wrkslots._has_identity_user_namespace():
+        raise AssertionError(
+            "validation exclusion fixture requires mapped namespace root"
+        )
+    root = project.parent / ".wrkslots-validation-exclusion"
+    if project in _MAPPED_VALIDATION_EXCLUSION_PROJECTS:
+        return root
+    root.mkdir(mode=0o1777, exist_ok=True)
+    root.chmod(0o1777)
+    metadata = root.stat(follow_symlinks=False)
+    assert metadata.st_uid == 0
+    assert metadata.st_gid == 0
+    assert stat.S_IMODE(metadata.st_mode) == 0o1777
+    mount_rows = wrkslots._self_mountinfo_records()
+    deduplicated: dict[
+        tuple[str, Path, Path, str, str],
+        tuple[int, str, Path, Path, str, str],
+    ] = {}
+    for row in mount_rows:
+        deduplicated[(row[1], row[2], row[3], row[4], row[5])] = row
+
+    production_roots = wrkslots._OWNERLESS_VALIDATION_EXCLUSION_ROOTS
+    observed_roots = (*production_roots, root)
+    assert all(
+        candidate == Path("/data/misc") or candidate.is_relative_to(Path("/tmp"))
+        for candidate in observed_roots
+    )
+    guards_before = mapped_validation_exclusion_guard_identities(observed_roots)
+
+    def run_as_namespace_root(
+        program: Path,
+        arguments: Sequence[str],
+        *,
+        input_data: bytes | None = None,
+        budget: wrkslots._ReadOnlyCommandBudget | None = None,
+    ) -> tuple[int, bytes, bytes]:
+        selected_budget = budget or wrkslots._ReadOnlyCommandBudget.start(
+            timeout_seconds=60,
+            stdout_limit=16 * 1024 * 1024,
+            stderr_limit=64 * 1024,
+        )
+        selected_budget.reserve_input(0 if input_data is None else len(input_data))
+        completed = subprocess.run(
+            [str(program), *arguments],
+            input=input_data,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            cwd="/",
+            env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"},
+            timeout=selected_budget.remaining_seconds(),
+        )
+        selected_budget.consume_output(completed.stdout, completed.stderr)
+        return completed.returncode, completed.stdout, completed.stderr
+
+    monkeypatch.setattr(wrkslots, "_OWNERLESS_VALIDATION_EXCLUSION_ROOTS", (root,))
+    monkeypatch.setattr(
+        wrkslots, "_self_mountinfo_records", lambda: tuple(deduplicated.values())
+    )
+    monkeypatch.setattr(wrkslots, "_run_root_owned_command", run_as_namespace_root)
+    monkeypatch.setattr(wrkslots, "_run_same_uid_command", run_as_namespace_root)
+    _MAPPED_VALIDATION_EXCLUSION_PROJECTS.add(project)
+
+    def restore_created_guard() -> None:
+        try:
+            guards_during_teardown = mapped_validation_exclusion_guard_identities(
+                observed_roots
+            )
+            created = set(guards_during_teardown).difference(guards_before)
+            assert all(guard.parent == root for guard in created)
+            if created:
+                assert len(created) == 1
+                guard = created.pop()
+                journal_path = control_directory(project) / "ACTIVE.testhost.journal"
+                assert journal_path.is_file()
+                journal_value = json.loads(journal_path.read_text(encoding="utf-8"))
+                assert isinstance(journal_value, dict)
+                config = wrkslots._load_config(str(project), "testhost")
+                _authorization, _target, fenced, phase = (
+                    wrkslots._ownerless_validation_paths(config, journal_value)
+                )
+                assert phase == "removing"
+                exclusion_value = journal_value.get("exclusion")
+                assert exclusion_value is not None
+                exclusion = wrkslots._ownerless_validation_exclusion_from_obj(
+                    config, fenced, exclusion_value
+                )
+                assert exclusion.guard == guard
+                assert guards_during_teardown[guard][:2] == exclusion.guard_identity[:2]
+                restored = wrkslots._restore_ownerless_validation_exclusion(
+                    config, journal_value
+                )
+                assert "exclusion" not in restored
+            assert (
+                mapped_validation_exclusion_guard_identities(observed_roots)
+                == guards_before
+            )
+        finally:
+            _MAPPED_VALIDATION_EXCLUSION_PROJECTS.discard(project)
+
+    request.addfinalizer(restore_created_guard)
+    return root
+
+
+def validation_exclusion_command_arguments(
+    project: Path, args: Sequence[str]
+) -> list[str]:
+    command_args = list(args)
+    if command_args and command_args[0] == "recover":
+        if "--coordinator-authorized" not in command_args:
+            command_args.append("--coordinator-authorized")
+    return ["--project-root", str(project), *command_args]
+
+
+def in_process_validation_exclusion_command(
+    project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+    *args: str,
+) -> subprocess.CompletedProcess[str]:
+    """Run cleanup with an isolated root fixture inside the mapped test namespace."""
+
+    root = install_mapped_validation_exclusion_fixture(project, monkeypatch, request)
+    argv = validation_exclusion_command_arguments(project, args)
+    assert str(root) not in argv
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        returncode = wrkslots.main(argv)
+    return subprocess.CompletedProcess(
+        [sys.executable, "-m", "wrkslots", *argv],
+        returncode,
+        stdout.getvalue(),
+        stderr.getvalue(),
+    )
+
+
+def forked_validation_exclusion_command(
+    project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+    *args: str,
+    interrupt: str,
+) -> subprocess.CompletedProcess[str]:
+    """Crash an in-process mapped-root cleanup without crossing an exec boundary."""
+
+    root = install_mapped_validation_exclusion_fixture(project, monkeypatch, request)
+    argv = validation_exclusion_command_arguments(project, args)
+    assert str(root) not in argv
+    child = os.fork()
+    if child == 0:
+        os.environ["WRKSLOTS_TEST_INTERRUPT"] = interrupt
+        try:
+            returncode = wrkslots.main(argv)
+        except BaseException:
+            os._exit(255)
+        os._exit(returncode)
+    _pid, status = os.waitpid(child, 0)
+    return subprocess.CompletedProcess(
+        [sys.executable, "-m", "wrkslots", *argv],
+        os.waitstatus_to_exitcode(status),
+        "",
+        "",
     )
 
 
@@ -3478,6 +3679,87 @@ def test_validation_exclusion_mount_alias_refuses_mutated_layout(
         )
 
 
+def test_mapped_validation_exclusion_fixture_is_selected_only_in_process(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    production_roots = wrkslots._OWNERLESS_VALIDATION_EXCLUSION_ROOTS
+    assert production_roots == (Path("/data/misc"),)
+    root = install_mapped_validation_exclusion_fixture(project, monkeypatch, request)
+    fenced = project / "worktrees" / "validate" / "fixture-fenced"
+    fenced.parent.mkdir(parents=True, exist_ok=True)
+
+    selected, _identity, alias = wrkslots._trusted_validation_exclusion_root(fenced)
+
+    assert root not in production_roots
+    assert selected == root
+    assert alias == fenced
+
+
+def test_mapped_namespace_cannot_select_real_validation_exclusion_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    production_roots = wrkslots._OWNERLESS_VALIDATION_EXCLUSION_ROOTS
+    assert production_roots == (Path("/data/misc"),)
+    metadata = production_roots[0].stat(follow_symlinks=False)
+    assert metadata.st_uid == 65534
+    assert metadata.st_uid != os.geteuid()
+    monkeypatch.setenv("WRKSLOTS_VALIDATION_EXCLUSION_ROOT", str(tmp_path))
+    assert wrkslots._OWNERLESS_VALIDATION_EXCLUSION_ROOTS == production_roots
+
+    with pytest.raises(wrkslots.Refusal):
+        wrkslots._trusted_validation_exclusion_root(tmp_path / "fixture-fenced")
+    with pytest.raises(
+        wrkslots.Refusal, match="find is not a root-owned, non-writable executable"
+    ):
+        wrkslots._run_same_uid_command(
+            Path("/usr/bin/find"),
+            (str(tmp_path), "-maxdepth", "0"),
+            budget=wrkslots._ReadOnlyCommandBudget.start(
+                timeout_seconds=5,
+                stdout_limit=4096,
+                stderr_limit=4096,
+            ),
+        )
+
+    parsers = [wrkslots._build_parser()]
+    option_strings: set[str] = set()
+    while parsers:
+        parser = parsers.pop()
+        for action in parser._actions:
+            option_strings.update(action.option_strings)
+            choices = getattr(action, "choices", None)
+            if isinstance(choices, dict):
+                parsers.extend(choices.values())
+    assert "--validation-exclusion-root" not in option_strings
+
+    install_mapped_validation_exclusion_fixture(project, monkeypatch, request)
+    census = wrkslots._capture_same_uid_process_path_census(
+        (tmp_path / "not-in-use",),
+        budget=wrkslots._ReadOnlyCommandBudget.start(
+            timeout_seconds=5,
+            stdout_limit=16 * 1024 * 1024,
+            stderr_limit=64 * 1024,
+            input_limit=wrkslots._MOUNTINFO_CENSUS_BYTES_LIMIT,
+        ),
+    )
+    assert census.matches == ()
+    assert census.owner_cgroup_complete is False
+    assert all(
+        isinstance(process, wrkslots._AbsentProcessObservation)
+        and process.pid > 0
+        and process.start_ticks > 0
+        and isinstance(process.cgroup_path, str)
+        and process.mount_namespace.startswith("mnt:[")
+        for process in census.processes
+    )
+
+
 @pytest.mark.ordinary_environment
 def test_frozen_validate_detects_pre_exclusion_same_uid_holder_and_rolls_back(
     tmp_path: Path,
@@ -5026,6 +5308,8 @@ def test_ownerless_checkout_preserves_clean_unpublished_commit(tmp_path: Path) -
 
 def test_recover_ownerless_validate_cargo_home_requires_terminal_or_manual_evidence(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
 ) -> None:
     project, _repository, _remote = make_project(
         tmp_path,
@@ -5049,8 +5333,10 @@ def test_recover_ownerless_validate_cargo_home_requires_terminal_or_manual_evide
     assert target.is_dir()
 
     record = prepare_terminal_validation_record(project, target, field="cargo_home")
-    recovered = command(
+    recovered = in_process_validation_exclusion_command(
         project,
+        monkeypatch,
+        request,
         "recover",
         "--coordinator-pid",
         str(os.getpid()),
@@ -5066,6 +5352,8 @@ def test_recover_ownerless_validate_cargo_home_requires_terminal_or_manual_evide
 
 def test_ownerless_cargo_cleanup_ignores_an_unrelated_missing_slot(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
 ) -> None:
     project, _repository, _remote = make_project(
         tmp_path,
@@ -5081,8 +5369,10 @@ def test_ownerless_cargo_cleanup_ignores_an_unrelated_missing_slot(
     target.mkdir(parents=True)
     record = prepare_terminal_validation_record(project, target, field="cargo_home")
 
-    recovered = command(
+    recovered = in_process_validation_exclusion_command(
         project,
+        monkeypatch,
+        request,
         "recover",
         "--coordinator-pid",
         str(os.getpid()),
@@ -5103,6 +5393,8 @@ def test_ownerless_cargo_cleanup_ignores_an_unrelated_missing_slot(
 
 def test_ownerless_cargo_home_allows_nested_git_cache_and_records_determination(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
 ) -> None:
     project, _repository, _remote = make_project(
         tmp_path,
@@ -5117,8 +5409,10 @@ def test_ownerless_cargo_home_allows_nested_git_cache_and_records_determination(
     records.mkdir(parents=True)
     (records / ".historical.json.lock").write_text("not JSON\n", encoding="utf-8")
 
-    recovered = command(
+    recovered = in_process_validation_exclusion_command(
         project,
+        monkeypatch,
+        request,
         "recover",
         "--coordinator-pid",
         str(os.getpid()),
@@ -5220,7 +5514,10 @@ def test_manual_ownerless_cleanup_cannot_override_matching_running_record(
 
 @pytest.mark.parametrize("state", ["killed", "not-run", "refused"])
 def test_ownerless_cleanup_accepts_noncompleted_terminal_record(
-    tmp_path: Path, state: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+    state: str,
 ) -> None:
     project, _repository, _remote = make_project(
         tmp_path,
@@ -5233,8 +5530,10 @@ def test_ownerless_cleanup_accepts_noncompleted_terminal_record(
         project, target, field="cargo_home", state=state, name=f"validate-{state}"
     )
 
-    recovered = command(
+    recovered = in_process_validation_exclusion_command(
         project,
+        monkeypatch,
+        request,
         "recover",
         "--coordinator-pid",
         str(os.getpid()),
@@ -5280,7 +5579,10 @@ def test_ownerless_cleanup_refuses_unknown_record(
 
 @pytest.mark.parametrize("admission_state", ("admitted", "refused"))
 def test_ownerless_cleanup_accepts_unknown_record_after_exact_process_exits(
-    tmp_path: Path, admission_state: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+    admission_state: str,
 ) -> None:
     project, _repository, _remote = make_project(
         tmp_path,
@@ -5330,8 +5632,10 @@ def test_ownerless_cleanup_accepts_unknown_record_after_exact_process_exits(
     )
     record.write_text(json.dumps(value), encoding="utf-8")
 
-    recovered = command(
+    recovered = in_process_validation_exclusion_command(
         project,
+        monkeypatch,
+        request,
         "recover",
         "--coordinator-pid",
         str(os.getpid()),
@@ -5530,6 +5834,8 @@ def test_unknown_validation_record_rejects_malformed_discriminator_types(
 
 def test_ownerless_cleanup_accepts_current_pass_with_failed_writeback(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
 ) -> None:
     project, _repository, _remote = make_project(
         tmp_path,
@@ -5547,8 +5853,10 @@ def test_ownerless_cleanup_accepts_current_pass_with_failed_writeback(
     )
     record.write_text(json.dumps(value), encoding="utf-8")
 
-    recovered = command(
+    recovered = in_process_validation_exclusion_command(
         project,
+        monkeypatch,
+        request,
         "recover",
         "--coordinator-pid",
         str(os.getpid()),
@@ -5818,6 +6126,8 @@ def test_ownerless_cleanup_retains_current_result_without_schema(
 
 def test_ownerless_cleanup_accepts_schema_less_durable_log_record(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
 ) -> None:
     project, _repository, _remote = make_project(
         tmp_path,
@@ -5843,8 +6153,10 @@ def test_ownerless_cleanup_accepts_schema_less_durable_log_record(
     assert "service_result_schema" not in value
     record.write_text(json.dumps(value), encoding="utf-8")
 
-    recovered = command(
+    recovered = in_process_validation_exclusion_command(
         project,
+        monkeypatch,
+        request,
         "recover",
         "--coordinator-pid",
         str(os.getpid()),
@@ -5961,6 +6273,8 @@ def test_cache_removal_refuses_replacement_of_fenced_target(tmp_path: Path) -> N
 
 def test_ownerless_cleanup_resumes_after_fence_before_journal_update(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
 ) -> None:
     project, _repository, _remote = make_project(
         tmp_path,
@@ -5971,8 +6285,10 @@ def test_ownerless_cleanup_resumes_after_fence_before_journal_update(
     target.mkdir(parents=True)
     (target / "cache-entry").write_text("regenerable\n", encoding="utf-8")
     record = prepare_terminal_validation_record(project, target, field="cargo_home")
-    interrupted = command(
+    interrupted = forked_validation_exclusion_command(
         project,
+        monkeypatch,
+        request,
         "recover",
         "--coordinator-pid",
         str(os.getpid()),
@@ -5980,9 +6296,7 @@ def test_ownerless_cleanup_resumes_after_fence_before_journal_update(
         target.relative_to(project).as_posix(),
         "--completed-record",
         record.relative_to(project).as_posix(),
-        env={
-            "WRKSLOTS_TEST_INTERRUPT": "after-ownerless-validate-path-fence-before-journal"
-        },
+        interrupt="after-ownerless-validate-path-fence-before-journal",
     )
     assert interrupted.returncode == 86
     journal = json.loads(
@@ -5992,7 +6306,14 @@ def test_ownerless_cleanup_resumes_after_fence_before_journal_update(
     assert not target.exists()
     assert fenced.is_dir()
 
-    resumed = raw_command(project, "recover", "--coordinator-pid", str(os.getpid()))
+    resumed = in_process_validation_exclusion_command(
+        project,
+        monkeypatch,
+        request,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+    )
 
     assert resumed.returncode == 0, resumed.stderr
     assert not target.exists()
@@ -6056,6 +6377,8 @@ def test_ownerless_cleanup_rolls_back_when_process_enters_fenced_path(
 
 def test_ownerless_validate_recovery_resumes_without_reauthorizing(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
 ) -> None:
     project, _repository, _remote = make_project(
         tmp_path,
@@ -6067,8 +6390,10 @@ def test_ownerless_validate_recovery_resumes_without_reauthorizing(
     (target / "cache-entry").write_text("regenerable\n", encoding="utf-8")
     record = prepare_terminal_validation_record(project, target, field="cargo_home")
 
-    interrupted = command(
+    interrupted = forked_validation_exclusion_command(
         project,
+        monkeypatch,
+        request,
         "recover",
         "--coordinator-pid",
         str(os.getpid()),
@@ -6076,7 +6401,7 @@ def test_ownerless_validate_recovery_resumes_without_reauthorizing(
         target.relative_to(project).as_posix(),
         "--completed-record",
         record.relative_to(project).as_posix(),
-        env={"WRKSLOTS_TEST_INTERRUPT": "after-ownerless-validate-remove"},
+        interrupt="after-ownerless-validate-remove",
     )
     assert interrupted.returncode == 86
     assert not target.exists()
@@ -6087,8 +6412,10 @@ def test_ownerless_validate_recovery_resumes_without_reauthorizing(
     # later retention pass removes that external record.
     record.unlink()
 
-    resumed = raw_command(
+    resumed = in_process_validation_exclusion_command(
         project,
+        monkeypatch,
+        request,
         "recover",
         "--coordinator-pid",
         str(os.getpid()),
@@ -6099,6 +6426,8 @@ def test_ownerless_validate_recovery_resumes_without_reauthorizing(
 
 def test_ownerless_recovery_keeps_unrelated_drift_visible_in_status(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
 ) -> None:
     project, _repository, _remote = make_project(
         tmp_path,
@@ -6117,8 +6446,10 @@ def test_ownerless_recovery_keeps_unrelated_drift_visible_in_status(
     assert before.returncode == 0, before.stderr
     assert "registry_storage=INCONSISTENT" in before.stdout
     assert "target=agent/validate-cargo-target" in before.stdout
-    recovered = raw_command(
+    recovered = in_process_validation_exclusion_command(
         project,
+        monkeypatch,
+        request,
         "--allow-existing-unregistered-worktrees",
         "recover",
         "--coordinator-authorized",
