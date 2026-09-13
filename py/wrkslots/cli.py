@@ -37,6 +37,12 @@ VERSION = __version__
 SCHEMA = 2
 VALIDATE_REMOVE_BATCH_LIMIT = 8
 _VALIDATE_BATCH_SEAL_SCHEMA = 1
+_VALIDATION_REMOVAL_PROOF_SCHEMA = 1
+_VALIDATION_REMOVAL_PROOF_BYTES_LIMIT = 64 * 1024
+_VALIDATION_REMOVAL_ARTIFACT_BYTES_LIMIT = 16 * 1024 * 1024
+_VALIDATION_REMOVAL_ARTIFACT_ROLES = frozenset(
+    {"run-record", "service-result", "producer-schema", "scorecard-handoff"}
+)
 
 
 class _ValidateBatchSealRecoveryKind(enum.Enum):
@@ -96,6 +102,7 @@ _FINISH_JOURNAL_OPTIONAL = frozenset(
         "validate_complete",
         "original_mode",
         "private_census_identity",
+        "validation_removal_proof",
     }
 )
 _LEGACY_VALIDATE_JOURNAL_REQUIRED = frozenset(
@@ -445,6 +452,9 @@ class ValidationRecoveryAuthorization:
     remote_url_sha256: str | None = None
     parent_identity: tuple[int, int, int] | None = None
     stable_identity: _PrivateCleanupIdentity | None = None
+    removal_proof: _ValidationRemovalProof | None = None
+    proof_original_mode: int | None = None
+    proof_private_identity: _PrivateCleanupIdentity | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -511,6 +521,37 @@ class _RetainedValidationHandle:
     pid: int | None
     start_ticks: int | None
     boot_id: str | None
+
+
+@dataclasses.dataclass(frozen=True)
+class _RegularFileIdentity:
+    """One regular file generation bound to its exact bytes."""
+
+    device: int
+    inode: int
+    size: int
+    sha256: str
+
+
+@dataclasses.dataclass(frozen=True)
+class _ValidationRemovalArtifact:
+    """One required artifact named by a validation-removal proof."""
+
+    role: str
+    path: str
+    identity: _RegularFileIdentity
+
+
+@dataclasses.dataclass(frozen=True)
+class _ValidationRemovalProof:
+    """Immutable snapshot rechecked at a validation checkout's deletion boundary."""
+
+    manifest_path: str
+    manifest_identity: _RegularFileIdentity
+    slot: str
+    generation: int
+    checkout: str
+    artifacts: tuple[_ValidationRemovalArtifact, ...]
 
 
 def _utc_now() -> str:
@@ -847,6 +888,89 @@ def _read_bounded_regular_file(path: Path, label: str, limit: int) -> bytes:
     return contents
 
 
+def _read_regular_file_identity(
+    path: Path, label: str, limit: int
+) -> tuple[bytes, _RegularFileIdentity]:
+    """Read one bounded regular file and bind the bytes to its open inode."""
+
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise Refusal(f"cannot read {label} {path}: {exc}") from exc
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise Refusal(f"{label} is not a regular file: {path}")
+        if before.st_size > limit:
+            raise Refusal(f"{label} exceeds the {limit}-byte safety bound: {path}")
+        chunks: list[bytes] = []
+        remaining = limit + 1
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 64 * 1024))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        contents = b"".join(chunks)
+        after = os.fstat(descriptor)
+        try:
+            path_after = path.stat(follow_symlinks=False)
+        except OSError as exc:
+            raise Refusal(f"cannot recheck {label} path {path}: {exc}") from exc
+    except Refusal:
+        raise
+    except OSError as exc:
+        raise Refusal(f"cannot read {label} {path}: {exc}") from exc
+    finally:
+        os.close(descriptor)
+    if len(contents) > limit:
+        raise Refusal(f"{label} exceeds the {limit}-byte safety bound: {path}")
+    stable_fields = (
+        "st_dev",
+        "st_ino",
+        "st_mode",
+        "st_size",
+        "st_mtime_ns",
+        "st_ctime_ns",
+    )
+    if any(getattr(before, field) != getattr(after, field) for field in stable_fields):
+        raise Refusal(f"{label} changed while it was read: {path}")
+    if any(
+        getattr(after, field) != getattr(path_after, field)
+        for field in stable_fields
+    ):
+        raise Refusal(f"{label} path changed while it was read: {path}")
+    if len(contents) != after.st_size:
+        raise Refusal(f"{label} size changed while it was read: {path}")
+    return contents, _RegularFileIdentity(
+        device=after.st_dev,
+        inode=after.st_ino,
+        size=after.st_size,
+        sha256=hashlib.sha256(contents).hexdigest(),
+    )
+
+
+def _strict_json_object(contents: bytes, label: str) -> Mapping[str, object]:
+    """Decode a JSON object while refusing duplicate keys at every depth."""
+
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        value: dict[str, object] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError(f"duplicate key {key!r}")
+            value[key] = item
+        return value
+
+    try:
+        value = json.loads(contents, object_pairs_hook=unique_object)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise Refusal(f"{label} is malformed JSON: {exc}") from exc
+    return _as_mapping(value, label)
+
+
 def _refuse_symlink(path: Path, label: str) -> None:
     try:
         if path.is_symlink():
@@ -888,6 +1012,420 @@ def _ensure_no_symlink_components(root: Path, path: Path, label: str) -> None:
                 raise Refusal(f"{label} crosses a symlink: {current}")
         except OSError as exc:
             raise Refusal(f"cannot inspect {label} path {current}: {exc}") from exc
+
+
+def _canonical_managed_file_path(
+    config: Config,
+    raw: str,
+    label: str,
+    *,
+    allow_frozen: bool = False,
+) -> tuple[str, Path]:
+    """Resolve one exact managed file spelling without accepting aliases."""
+
+    candidate = Path(raw)
+    if candidate.is_absolute():
+        if not allow_frozen or raw != os.path.normpath(raw) or ".." in candidate.parts:
+            raise Refusal(f"{label} is not a canonical managed path: {raw!r}")
+        frozen_root = _frozen_validation_directory(config)
+        if not _path_is_within(candidate, frozen_root):
+            raise Refusal(f"{label} is outside the managed validation roots: {raw!r}")
+        _ensure_no_symlink_components(config.root.parent, candidate, label)
+        return raw, candidate
+    relative, path = _relative_inside(config.root, raw, label)
+    if relative != raw:
+        raise Refusal(
+            f"{label} must use its canonical project-relative spelling: {relative!r}"
+        )
+    return relative, path
+
+
+def _managed_file_reference(config: Config, path: Path) -> str:
+    """Render an already-bounded managed path in its one accepted spelling."""
+
+    try:
+        return path.relative_to(config.root).as_posix()
+    except ValueError:
+        frozen_root = _frozen_validation_directory(config)
+        if not path.is_absolute() or not _path_is_within(path, frozen_root):
+            raise Refusal(f"validation proof path is outside the managed roots: {path}")
+        return str(path)
+
+
+def _regular_file_identity_to_obj(identity: _RegularFileIdentity) -> dict[str, object]:
+    return {
+        "identity": [identity.device, identity.inode],
+        "size": identity.size,
+        "sha256": identity.sha256,
+    }
+
+
+def _regular_file_identity_from_obj(
+    value: Mapping[str, object], label: str
+) -> _RegularFileIdentity:
+    identity = _as_list(value.get("identity"), f"{label}.identity")
+    if len(identity) != 2:
+        raise StateError(f"{label}.identity must contain device and inode")
+    digest = _as_str(value.get("sha256"), f"{label}.sha256")
+    if not DIGEST_RE.fullmatch(digest):
+        raise StateError(f"{label}.sha256 must be 64 lowercase hexadecimal digits")
+    return _RegularFileIdentity(
+        device=_as_int(identity[0], f"{label}.identity[0]", minimum=0),
+        inode=_as_int(identity[1], f"{label}.identity[1]", minimum=1),
+        size=_as_int(value.get("size"), f"{label}.size", minimum=0),
+        sha256=digest,
+    )
+
+
+def _validation_removal_artifact_to_obj(
+    artifact: _ValidationRemovalArtifact,
+) -> dict[str, object]:
+    return {
+        "role": artifact.role,
+        "path": artifact.path,
+        **_regular_file_identity_to_obj(artifact.identity),
+    }
+
+
+def _validation_removal_manifest_to_obj(
+    proof: _ValidationRemovalProof,
+) -> dict[str, object]:
+    return {
+        "schema": _VALIDATION_REMOVAL_PROOF_SCHEMA,
+        "kind": "validation-removal-proof",
+        "slot": proof.slot,
+        "generation": proof.generation,
+        "checkout": proof.checkout,
+        "artifacts": [
+            _validation_removal_artifact_to_obj(artifact)
+            for artifact in proof.artifacts
+        ],
+    }
+
+
+def _validation_removal_proof_to_obj(
+    proof: _ValidationRemovalProof,
+) -> dict[str, object]:
+    return {
+        "manifest": {
+            "path": proof.manifest_path,
+            **_regular_file_identity_to_obj(proof.manifest_identity),
+        },
+        **_validation_removal_manifest_to_obj(proof),
+    }
+
+
+def _validation_removal_artifacts_from_obj(
+    value: object, label: str
+) -> tuple[_ValidationRemovalArtifact, ...]:
+    artifacts: list[_ValidationRemovalArtifact] = []
+    for index, item in enumerate(_as_list(value, label)):
+        row_label = f"{label}[{index}]"
+        raw = _as_mapping(item, row_label)
+        _exact_keys(
+            raw,
+            {"role", "path", "identity", "size", "sha256"},
+            set(),
+            row_label,
+        )
+        role = _as_str(raw["role"], f"{row_label}.role")
+        artifacts.append(
+            _ValidationRemovalArtifact(
+                role=role,
+                path=_as_str(raw["path"], f"{row_label}.path"),
+                identity=_regular_file_identity_from_obj(raw, row_label),
+            )
+        )
+    roles = [artifact.role for artifact in artifacts]
+    if len(roles) != len(set(roles)):
+        raise StateError("validation removal proof repeats an artifact role")
+    if set(roles) != _VALIDATION_REMOVAL_ARTIFACT_ROLES:
+        raise StateError(
+            "validation removal proof must name exactly run-record, service-result, "
+            "producer-schema, and scorecard-handoff artifacts"
+        )
+    paths = [artifact.path for artifact in artifacts]
+    if len(paths) != len(set(paths)):
+        raise StateError("validation removal proof repeats an artifact path")
+    return tuple(artifacts)
+
+
+def _validation_removal_manifest_fields(
+    value: Mapping[str, object], label: str
+) -> tuple[str, int, str, tuple[_ValidationRemovalArtifact, ...]]:
+    _exact_keys(
+        value,
+        {"schema", "kind", "slot", "generation", "checkout", "artifacts"},
+        set(),
+        label,
+    )
+    if _as_int(value["schema"], f"{label}.schema") != _VALIDATION_REMOVAL_PROOF_SCHEMA:
+        raise StateError("unsupported validation removal proof schema")
+    if _as_str(value["kind"], f"{label}.kind") != "validation-removal-proof":
+        raise StateError("validation removal proof has the wrong kind")
+    slot = _validate_name(_as_str(value["slot"], f"{label}.slot"), "slot")
+    generation = _as_int(value["generation"], f"{label}.generation", minimum=1)
+    checkout = _as_str(value["checkout"], f"{label}.checkout")
+    artifacts = _validation_removal_artifacts_from_obj(
+        value["artifacts"], f"{label}.artifacts"
+    )
+    return slot, generation, checkout, artifacts
+
+
+def _validation_removal_proof_from_obj(
+    value: object, label: str = "validation removal proof"
+) -> _ValidationRemovalProof:
+    raw = _as_mapping(value, label)
+    _exact_keys(
+        raw,
+        {
+            "manifest",
+            "schema",
+            "kind",
+            "slot",
+            "generation",
+            "checkout",
+            "artifacts",
+        },
+        set(),
+        label,
+    )
+    manifest = _as_mapping(raw["manifest"], f"{label}.manifest")
+    _exact_keys(
+        manifest,
+        {"path", "identity", "size", "sha256"},
+        set(),
+        f"{label}.manifest",
+    )
+    manifest_payload = {
+        key: raw[key]
+        for key in ("schema", "kind", "slot", "generation", "checkout", "artifacts")
+    }
+    slot, generation, checkout, artifacts = _validation_removal_manifest_fields(
+        manifest_payload, label
+    )
+    return _ValidationRemovalProof(
+        manifest_path=_as_str(manifest["path"], f"{label}.manifest.path"),
+        manifest_identity=_regular_file_identity_from_obj(
+            manifest, f"{label}.manifest"
+        ),
+        slot=slot,
+        generation=generation,
+        checkout=checkout,
+        artifacts=artifacts,
+    )
+
+
+def _assert_regular_file_identity(
+    expected: _RegularFileIdentity,
+    observed: _RegularFileIdentity,
+    label: str,
+) -> None:
+    if (observed.device, observed.inode) != (expected.device, expected.inode):
+        raise Refusal(f"{label} regular-file identity changed")
+    if observed.size != expected.size:
+        raise Refusal(f"{label} size changed")
+    if observed.sha256 != expected.sha256:
+        raise Refusal(f"{label} changed bytes")
+
+
+def _validation_proof_manifest_path(config: Config, raw: str) -> tuple[str, Path]:
+    relative, path = _canonical_managed_file_path(
+        config, raw, "validation removal proof manifest"
+    )
+    proof_root = Path("ignored/validate/removal-proofs")
+    relative_path = Path(relative)
+    if (
+        relative_path.suffix != ".json"
+        or not _path_is_within(relative_path, proof_root)
+        or relative_path == proof_root
+    ):
+        raise Refusal(
+            "validation removal proof manifest must be a JSON file under "
+            "ignored/validate/removal-proofs"
+        )
+    return relative, path
+
+
+def _proof_artifact_path(
+    config: Config,
+    artifact: _ValidationRemovalArtifact,
+    *,
+    canonical_slot: Path,
+    active_slot: Path,
+) -> Path:
+    candidate = Path(artifact.path)
+    canonical = candidate if candidate.is_absolute() else config.root / candidate
+    if _path_is_within(canonical, canonical_slot):
+        relative = canonical.relative_to(canonical_slot)
+        active = active_slot / relative
+        _ensure_no_symlink_components(active_slot, active, artifact.role)
+        return active
+    _relative, external = _canonical_managed_file_path(
+        config, artifact.path, artifact.role
+    )
+    return external
+
+
+def _validate_proof_artifact_paths(
+    config: Config,
+    artifacts: Sequence[_ValidationRemovalArtifact],
+    *,
+    canonical_slot: Path,
+    canonical_checkout: Path,
+) -> tuple[tuple[_ValidationRemovalArtifact, Path], ...]:
+    resolved: list[tuple[_ValidationRemovalArtifact, Path]] = []
+    for artifact in artifacts:
+        allow_frozen = artifact.role == "producer-schema"
+        relative, path = _canonical_managed_file_path(
+            config,
+            artifact.path,
+            f"validation removal {artifact.role}",
+            allow_frozen=allow_frozen,
+        )
+        del relative
+        inside_checkout = _path_is_within(path, canonical_checkout)
+        if artifact.role == "producer-schema":
+            if not inside_checkout or path == canonical_checkout:
+                raise Refusal(
+                    "validation removal producer-schema must be inside the exact checkout"
+                )
+        elif _path_is_within(path, canonical_slot):
+            raise Refusal(
+                f"validation removal {artifact.role} must remain outside the target"
+            )
+        if artifact.role == "scorecard-handoff" and path.name != "handoff.json":
+            raise Refusal(
+                "validation removal scorecard-handoff must name the exact "
+                "handoff.json regular file"
+            )
+        resolved.append((artifact, path))
+    return tuple(resolved)
+
+
+def _load_validation_removal_proof(
+    config: Config,
+    raw_manifest: str,
+    *,
+    expected_slot: str,
+    expected_generation: int | None,
+    canonical_slot: Path,
+    canonical_checkout: Path,
+    expected_run_record: Path | None = None,
+) -> _ValidationRemovalProof:
+    manifest_relative, manifest_path = _validation_proof_manifest_path(
+        config, raw_manifest
+    )
+    if _path_is_within(manifest_path, canonical_slot):
+        raise Refusal("validation removal proof manifest must remain outside the target")
+    contents, manifest_identity = _read_regular_file_identity(
+        manifest_path,
+        "validation removal proof manifest",
+        _VALIDATION_REMOVAL_PROOF_BYTES_LIMIT,
+    )
+    manifest = _strict_json_object(contents, "validation removal proof manifest")
+    slot, generation, checkout, declared = _validation_removal_manifest_fields(
+        manifest, "validation removal proof manifest"
+    )
+    if slot != expected_slot:
+        raise Refusal(
+            f"validation removal proof names slot {slot!r}, expected {expected_slot!r}"
+        )
+    if expected_generation is not None and generation != expected_generation:
+        raise Refusal(
+            f"validation removal proof names generation {generation}, expected "
+            f"{expected_generation}"
+        )
+    expected_checkout = _managed_file_reference(config, canonical_checkout)
+    if checkout != expected_checkout:
+        raise Refusal(
+            "validation removal proof does not name the exact checkout: "
+            f"expected {expected_checkout!r}"
+        )
+    resolved = _validate_proof_artifact_paths(
+        config,
+        declared,
+        canonical_slot=canonical_slot,
+        canonical_checkout=canonical_checkout,
+    )
+    artifacts: list[_ValidationRemovalArtifact] = []
+    for artifact, path in resolved:
+        _contents, observed = _read_regular_file_identity(
+            path,
+            f"validation removal {artifact.role}",
+            _VALIDATION_REMOVAL_ARTIFACT_BYTES_LIMIT,
+        )
+        _assert_regular_file_identity(artifact.identity, observed, artifact.role)
+        artifacts.append(artifact)
+    if expected_run_record is not None:
+        run_record = next(
+            artifact for artifact in artifacts if artifact.role == "run-record"
+        )
+        if run_record.path != _managed_file_reference(config, expected_run_record):
+            raise Refusal(
+                "validation removal proof run-record differs from --completed-record"
+            )
+    return _ValidationRemovalProof(
+        manifest_path=manifest_relative,
+        manifest_identity=manifest_identity,
+        slot=slot,
+        generation=generation,
+        checkout=checkout,
+        artifacts=tuple(artifacts),
+    )
+
+
+def _recheck_validation_removal_proof(
+    config: Config,
+    proof: _ValidationRemovalProof,
+    *,
+    expected_slot: str,
+    expected_generation: int | None,
+    canonical_slot: Path,
+    active_slot: Path,
+    canonical_checkout: Path,
+) -> None:
+    if proof.slot != expected_slot or (
+        expected_generation is not None and proof.generation != expected_generation
+    ):
+        raise StateError("journaled validation removal proof has the wrong slot generation")
+    if proof.checkout != _managed_file_reference(config, canonical_checkout):
+        raise StateError("journaled validation removal proof names another checkout")
+    manifest_relative, manifest_path = _validation_proof_manifest_path(
+        config, proof.manifest_path
+    )
+    if manifest_relative != proof.manifest_path:
+        raise StateError("journaled validation removal proof path is not canonical")
+    contents, observed_manifest = _read_regular_file_identity(
+        manifest_path,
+        "validation removal proof manifest",
+        _VALIDATION_REMOVAL_PROOF_BYTES_LIMIT,
+    )
+    _assert_regular_file_identity(
+        proof.manifest_identity, observed_manifest, "validation removal proof manifest"
+    )
+    manifest = _strict_json_object(contents, "validation removal proof manifest")
+    if dict(manifest) != _validation_removal_manifest_to_obj(proof):
+        raise Refusal("validation removal proof manifest changed after authorization")
+    _validate_proof_artifact_paths(
+        config,
+        proof.artifacts,
+        canonical_slot=canonical_slot,
+        canonical_checkout=canonical_checkout,
+    )
+    for artifact in proof.artifacts:
+        path = _proof_artifact_path(
+            config,
+            artifact,
+            canonical_slot=canonical_slot,
+            active_slot=active_slot,
+        )
+        _contents, observed = _read_regular_file_identity(
+            path,
+            f"validation removal {artifact.role}",
+            _VALIDATION_REMOVAL_ARTIFACT_BYTES_LIMIT,
+        )
+        _assert_regular_file_identity(artifact.identity, observed, artifact.role)
 
 
 def _ensure_no_mount_components(root: Path, path: Path, label: str) -> None:
@@ -3908,6 +4446,22 @@ def _validate_journal_shape(
             if "original_mode" not in raw:
                 raise StateError(
                     "finish journal private census identity has no original mode"
+                )
+        if "validation_removal_proof" in raw:
+            proof = _validation_removal_proof_from_obj(
+                raw["validation_removal_proof"],
+                "finish journal.validation_removal_proof",
+            )
+            if (
+                record.slot_type != "validate"
+                or len(record.checkouts) != 1
+                or proof.slot != record.slot
+                or proof.generation != record.generation
+                or "private_census_identity" not in raw
+            ):
+                raise StateError(
+                    "finish journal validation removal proof does not match one "
+                    "privately sealed validation checkout"
                 )
     elif kind == "legacy-validate-remove":
         _exact_keys(
@@ -10566,6 +11120,10 @@ def _finish_journal_payload(
         payload["private_census_identity"] = list(
             finish.private_cleanup.target.identity
         )
+    if finish.validation_removal_proof is not None:
+        payload["validation_removal_proof"] = _validation_removal_proof_to_obj(
+            finish.validation_removal_proof
+        )
     return payload
 
 
@@ -10671,6 +11229,21 @@ def _checkout_at_slot(
     )
     relative = path.relative_to(config.root).as_posix()
     return dataclasses.replace(checkout, path=relative), path
+
+
+def _single_validation_checkout(
+    config: Config, record: ActiveRecord, slot_path: Path
+) -> tuple[Path, Path]:
+    """Return canonical and relocated paths for a proof-bound validation checkout."""
+
+    if record.slot_type != "validate" or len(record.checkouts) != 1:
+        raise Refusal(
+            "validation removal proof requires one exact checkout in a validate slot"
+        )
+    checkout = record.checkouts[0]
+    canonical = _stored_path(config, checkout.path, "validation checkout path")
+    _moved, active = _checkout_at_slot(config, record, checkout, slot_path)
+    return canonical, active
 
 
 def _repair_checkout_at_slot(
@@ -10794,10 +11367,13 @@ def _seal_cleanup_path_private(
     fenced_slot: Path,
     *,
     before_seal: Callable[[int, _PrivateCleanupIdentity], None] | None = None,
+    managed_root: Path | None = None,
 ) -> tuple[int, _PrivateCleanupIdentity]:
     """Seal one cleanup path and return its prior mode and stable identity."""
 
-    _assert_cleanup_fence_root_trusted(config, fenced_slot)
+    _assert_cleanup_fence_root_trusted(
+        config, fenced_slot, managed_root=managed_root
+    )
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
     try:
         descriptor = os.open(fenced_slot, flags)
@@ -10894,11 +11470,19 @@ def _private_cleanup_path_identity(
 
 
 def _private_cleanup_fence_identity(
-    config: Config, fenced_slot: Path
+    config: Config,
+    fenced_slot: Path,
+    *,
+    managed_root: Path | None = None,
 ) -> tuple[int, int, int, str]:
     """Prove the private fence invariant and return its stable directory identity."""
 
-    return _private_cleanup_path_identity(config, fenced_slot, allowed_modes={0o700})
+    return _private_cleanup_path_identity(
+        config,
+        fenced_slot,
+        allowed_modes={0o700},
+        managed_root=managed_root,
+    )
 
 
 def _upgrade_legacy_private_cleanup_identity(
@@ -11044,10 +11628,12 @@ def _reestablish_private_cleanup_fence(
     path: Path,
     original_mode: int,
     expected_identity: _PrivateCleanupIdentity,
+    *,
+    managed_root: Path | None = None,
 ) -> None:
     """Verify an interrupted target and re-seal an exactly restored mode."""
 
-    _assert_cleanup_fence_root_trusted(config, path)
+    _assert_cleanup_fence_root_trusted(config, path, managed_root=managed_root)
     try:
         metadata = path.stat(follow_symlinks=False)
     except OSError as exc:
@@ -11056,7 +11642,12 @@ def _reestablish_private_cleanup_fence(
         raise Refusal(f"interrupted cleanup fence is not a real directory: {path}")
     mode = stat.S_IMODE(metadata.st_mode)
     if mode == 0o700:
-        if _private_cleanup_fence_identity(config, path) != expected_identity:
+        if (
+            _private_cleanup_fence_identity(
+                config, path, managed_root=managed_root
+            )
+            != expected_identity
+        ):
             raise Refusal(f"interrupted cleanup fence identity changed: {path}")
         return
     if mode != original_mode:
@@ -11072,7 +11663,10 @@ def _reestablish_private_cleanup_fence(
             raise Refusal(f"interrupted cleanup fence identity changed: {path}")
 
     sealed_mode, sealed_identity = _seal_cleanup_path_private(
-        config, path, before_seal=verify_before_seal
+        config,
+        path,
+        before_seal=verify_before_seal,
+        managed_root=managed_root,
     )
     if sealed_mode != original_mode or sealed_identity != expected_identity:
         raise StateError(f"interrupted cleanup fence changed while resealing: {path}")
@@ -11578,6 +12172,11 @@ def _finish_remove_paths(
     vcs: _GitVcs,
     finish: _FinishContext,
 ) -> dict[str, object]:
+    if (
+        finish.validation_removal_proof is not None
+        and finish.private_cleanup is None
+    ):
+        raise StateError("validation removal proof requires a private cleanup fence")
     removed_values = _as_list(journal["removed"], "journal.removed")
     removed = {_as_str(item, "journal.removed item") for item in removed_values}
     all_names = {item.name for item in record.checkouts}
@@ -11719,6 +12318,22 @@ def _finish_remove_paths(
                 )
                 # Do not begin destructive work after the batch evidence deadline.
                 finish.private_cleanup.census_budget.remaining_seconds()
+            if finish.validation_removal_proof is not None:
+                canonical_checkout, _active_checkout = _single_validation_checkout(
+                    config, record, fenced_slot
+                )
+                _recheck_validation_removal_proof(
+                    config,
+                    finish.validation_removal_proof,
+                    expected_slot=record.slot,
+                    expected_generation=record.generation,
+                    canonical_slot=_slot_directory(
+                        config, record.slot, record.slot_type
+                    ),
+                    active_slot=fenced_slot,
+                    canonical_checkout=canonical_checkout,
+                )
+                _interrupt_for_test("after-validation-removal-proof-recheck")
             for checkout in moved_checkouts:
                 for cache in _cache_directories_for_checkout(config, checkout):
                     _remove_cache_directory(
@@ -12009,10 +12624,36 @@ def _cmd_remove(
     args: argparse.Namespace,
     *,
     private_cleanup: _PrivateCleanupContext | None = None,
+    validation_removal_proof: _ValidationRemovalProof | None = None,
     emit: bool = True,
 ) -> int:
     config = _load_config(args.project_root, args.machine)
     _validate_name(args.slot, "slot")
+    proof_manifest = getattr(args, "validation_proof_manifest", None)
+    if proof_manifest is not None and private_cleanup is None:
+        batch_args = argparse.Namespace(**vars(args))
+        batch_args.command = "remove-validate-batch"
+        batch_args.slots = [f"{args.slot}={args.expected_generation}"]
+        batch_args.validation_proof_manifests = [proof_manifest]
+        batch_args.format = "json"
+        payload = _remove_validate_batch(batch_args)
+        retained = _as_list(payload["retained"], "validation removal result.retained")
+        if retained:
+            row = _as_mapping(retained[0], "validation removal result.retained[0]")
+            raise Refusal(
+                _as_str(row["reason"], "validation removal result.retained[0].reason")
+            )
+        removed = _as_list(payload["removed"], "validation removal result.removed")
+        if len(removed) != 1:
+            raise StateError("single validation proof removal produced no exact result")
+        if emit:
+            print(
+                f"removed and archived slot={args.slot} "
+                f"generation={args.expected_generation}"
+            )
+        return 0
+    if proof_manifest is not None:
+        raise StateError("validation proof manifest was supplied twice")
     coordinator, runner, handoff_writer, proof_fd = _capture_remove_processes(
         args.coordinator_pid
     )
@@ -12196,6 +12837,7 @@ def _cmd_remove(
                 validate_complete=bool(args.validate_complete),
                 allow_live_validate_owner=live_validate_owner,
                 private_cleanup=private_cleanup,
+                validation_removal_proof=validation_removal_proof,
             ),
         )
         after_states, after_archives = _validate_global_state(
@@ -12239,6 +12881,8 @@ def _seal_validate_batch_targets(
     wait_seconds: float,
     retained: list[dict[str, object]],
     private_targets: dict[str, _PrivateCleanupTarget],
+    proof_manifests: Mapping[str, str],
+    removal_proofs: dict[str, _ValidationRemovalProof],
 ) -> None:
     """Preflight and seal each eligible target while the mutation locks are held."""
 
@@ -12281,6 +12925,19 @@ def _seal_validate_batch_targets(
                         f"owner is {owner_state}: {owner_detail}"
                     )
                 slot_path = _assert_slot_contents(config, record)
+                proof_manifest = proof_manifests.get(slot)
+                if proof_manifest is not None:
+                    canonical_checkout, _active_checkout = _single_validation_checkout(
+                        config, record, slot_path
+                    )
+                    removal_proofs[slot] = _load_validation_removal_proof(
+                        config,
+                        proof_manifest,
+                        expected_slot=slot,
+                        expected_generation=generation,
+                        canonical_slot=slot_path,
+                        canonical_checkout=canonical_checkout,
+                    )
 
                 def record_before_seal(
                     original_mode: int,
@@ -12321,7 +12978,7 @@ def _seal_validate_batch_targets(
                 )
 
 
-def _cmd_remove_validate_batch(args: argparse.Namespace) -> int:
+def _remove_validate_batch(args: argparse.Namespace) -> dict[str, object]:
     requested = tuple(_parse_validate_batch_slot(raw) for raw in args.slots)
     if len(requested) > VALIDATE_REMOVE_BATCH_LIMIT:
         raise Refusal(
@@ -12331,11 +12988,36 @@ def _cmd_remove_validate_batch(args: argparse.Namespace) -> int:
     if len({slot for slot, _generation in requested}) != len(requested):
         raise Refusal("remove-validate-batch received the same slot more than once")
     config = _load_config(args.project_root, args.machine)
+    raw_proofs = tuple(getattr(args, "validation_proof_manifests", ()) or ())
+    if raw_proofs and len(raw_proofs) != len(requested):
+        raise Refusal(
+            "remove-validate-batch requires one --validation-proof-manifest for "
+            "each --slot when any proof is supplied"
+        )
+    canonical_proofs = tuple(
+        _validation_proof_manifest_path(config, raw)[0] for raw in raw_proofs
+    )
+    if len(canonical_proofs) != len(set(canonical_proofs)):
+        raise Refusal(
+            "remove-validate-batch received the same validation proof manifest more "
+            "than once"
+        )
+    proof_manifests = (
+        {
+            slot: proof
+            for (slot, _generation), proof in zip(
+                requested, canonical_proofs, strict=True
+            )
+        }
+        if canonical_proofs
+        else {}
+    )
     coordinator, runner, handoff_writer, proof_fd = _capture_remove_processes(
         args.coordinator_pid
     )
     retained: list[dict[str, object]] = []
     private_targets: dict[str, _PrivateCleanupTarget] = {}
+    removal_proofs: dict[str, _ValidationRemovalProof] = {}
     removed: list[dict[str, object]] = []
     same_uid_census_count = 0
     census_budget = _ReadOnlyCommandBudget.start(
@@ -12355,6 +13037,8 @@ def _cmd_remove_validate_batch(args: argparse.Namespace) -> int:
             args.wait_lock,
             retained,
             private_targets,
+            proof_manifests,
+            removal_proofs,
         )
         private_paths = [
             private_target.path for private_target in private_targets.values()
@@ -12407,6 +13091,7 @@ def _cmd_remove_validate_batch(args: argparse.Namespace) -> int:
             item_args.slot = slot
             item_args.expected_generation = generation
             item_args.validate_complete = True
+            item_args.validation_proof_manifest = None
             private_cleanup = _PrivateCleanupContext(
                 target, privileged_census, census_budget
             )
@@ -12415,6 +13100,7 @@ def _cmd_remove_validate_batch(args: argparse.Namespace) -> int:
                 _cmd_remove(
                     item_args,
                     private_cleanup=private_cleanup,
+                    validation_removal_proof=removal_proofs.get(slot),
                     emit=False,
                 )
             except (Refusal, StateError) as exc:
@@ -12460,14 +13146,21 @@ def _cmd_remove_validate_batch(args: argparse.Namespace) -> int:
         "removed": removed,
         "retained": retained,
     }
+    return payload
+
+
+def _cmd_remove_validate_batch(args: argparse.Namespace) -> int:
+    payload = _remove_validate_batch(args)
     if args.format == "json":
         print(json.dumps(payload, sort_keys=True))
     else:
         print(
-            f"requested={len(requested)} removed={len(removed)} "
-            f"retained={len(retained)} process_censuses={shared_census_count}"
+            f"requested={payload['requested']} removed={len(_as_list(payload['removed'], 'removed'))} "
+            f"retained={len(_as_list(payload['retained'], 'retained'))} "
+            f"process_censuses={payload['process_censuses']}"
         )
-        for row in retained:
+        for value in _as_list(payload["retained"], "retained"):
+            row = _as_mapping(value, "retained item")
             print(f"RETAINED: {row['slot']} reason={row['reason']}")
     return 0
 
@@ -13249,6 +13942,39 @@ def _recover_finish(
     private_identity = _finish_private_census_identity(raw)
     if private_identity is not None and original_mode is None:
         raise StateError("private finish journal has no original directory mode")
+    removal_proof = (
+        None
+        if raw.get("validation_removal_proof") is None
+        else _validation_removal_proof_from_obj(
+            raw["validation_removal_proof"],
+            "finish journal.validation_removal_proof",
+        )
+    )
+    if removal_proof is not None:
+        if private_identity is None:
+            raise StateError(
+                "validation removal proof has no private cleanup identity"
+            )
+        canonical_slot = _slot_directory(config, record.slot, record.slot_type)
+        canonical_checkout, _active_checkout = _single_validation_checkout(
+            config, record, canonical_slot
+        )
+        if (
+            removal_proof.slot != record.slot
+            or removal_proof.generation != record.generation
+            or removal_proof.checkout
+            != _managed_file_reference(config, canonical_checkout)
+        ):
+            raise StateError(
+                "finish journal validation removal proof names another slot generation"
+            )
+        _validation_proof_manifest_path(config, removal_proof.manifest_path)
+        _validate_proof_artifact_paths(
+            config,
+            removal_proof.artifacts,
+            canonical_slot=canonical_slot,
+            canonical_checkout=canonical_checkout,
+        )
     if validate_complete and record.slot_type != "validate":
         raise StateError("agent finish journal cannot claim validate completion")
     if record.slot_type == "agent" and salvage:
@@ -13386,6 +14112,7 @@ def _recover_finish(
                 validate_complete=validate_complete,
                 allow_live_validate_owner=live_validate_owner,
                 private_cleanup=private_cleanup,
+                validation_removal_proof=removal_proof,
             ),
         )
     else:
@@ -13582,9 +14309,12 @@ def _recover_legacy_validate_remove(
                 "preserve it and do not resume deletion"
             )
         _assert_slot_unused(checkout)
-        vcs.remove_worktree(repository, checkout, force=True)
-        _interrupt_for_test("after-legacy-validate-remove")
-        listed = vcs.listed_worktrees(repository)
+        raise Refusal(
+            "legacy validation removal journal has no bounded validation removal proof. "
+            "state: REFUSED -- the checkout was retained. remedy: preserve this legacy "
+            "journal and use a supported ownerless validation recovery only after the "
+            "journal conflict is resolved without deleting the checkout"
+        )
     if checkout.absolute() in listed:
         raise Refusal(
             f"Git still registers removed legacy validation checkout {checkout}. state: "
@@ -14488,31 +15218,58 @@ def _validation_cargo_facts(path: Path) -> tuple[int, int, int]:
 def _validation_authorization_to_obj(
     value: ValidationRecoveryAuthorization,
 ) -> dict[str, object]:
-    encoded = {
-        **dataclasses.asdict(value),
+    encoded: dict[str, object] = {
+        "target_kind": value.target_kind,
+        "path": value.path,
         "identity": list(value.identity),
         "actor": _identity_to_obj(value.actor),
         "evidence": dict(value.evidence),
+        "no_authored_work": value.no_authored_work,
+        "no_live_use": value.no_live_use,
+        "repository": value.repository,
+        "head": value.head,
+        "remote_url_sha256": value.remote_url_sha256,
         "parent_identity": None if value.parent_identity is None else list(value.parent_identity),
     }
-    if value.stable_identity is None:
-        encoded.pop("stable_identity")
-    else:
+    if value.stable_identity is not None:
         encoded["stable_identity"] = list(value.stable_identity)
+    if value.removal_proof is not None:
+        encoded["removal_proof"] = _validation_removal_proof_to_obj(
+            value.removal_proof
+        )
+        encoded["proof_original_mode"] = value.proof_original_mode
+        encoded["proof_private_identity"] = (
+            None
+            if value.proof_private_identity is None
+            else list(value.proof_private_identity)
+        )
     return encoded
 
 
 def _validation_authorization_from_obj(value: object) -> ValidationRecoveryAuthorization:
     raw = _as_mapping(value, "validation recovery authorization")
     required = {
-        field.name
-        for field in dataclasses.fields(ValidationRecoveryAuthorization)
-        if field.name != "stable_identity"
+        "target_kind",
+        "path",
+        "identity",
+        "actor",
+        "evidence",
+        "no_authored_work",
+        "no_live_use",
+        "repository",
+        "head",
+        "remote_url_sha256",
+        "parent_identity",
     }
     _exact_keys(
         raw,
         required,
-        {"stable_identity"},
+        {
+            "stable_identity",
+            "removal_proof",
+            "proof_original_mode",
+            "proof_private_identity",
+        },
         "validation recovery authorization",
     )
     actor = _identity_from_obj(raw["actor"], "validation recovery actor")
@@ -14532,6 +15289,40 @@ def _validation_authorization_from_obj(value: object) -> ValidationRecoveryAutho
             raw["stable_identity"], "validation stable path identity"
         )
     )
+    removal_proof = (
+        None
+        if raw.get("removal_proof") is None
+        else _validation_removal_proof_from_obj(
+            raw["removal_proof"], "validation recovery removal proof"
+        )
+    )
+    proof_mode_raw = raw.get("proof_original_mode")
+    proof_original_mode = (
+        None
+        if proof_mode_raw is None
+        else _as_int(
+            proof_mode_raw,
+            "validation recovery proof original mode",
+            minimum=0,
+        )
+    )
+    if proof_original_mode is not None and proof_original_mode > 0o7777:
+        raise StateError("validation recovery proof original mode exceeds permission bits")
+    proof_identity_raw = raw.get("proof_private_identity")
+    proof_private_identity = (
+        None
+        if proof_identity_raw is None
+        else _private_cleanup_identity_from_obj(
+            proof_identity_raw,
+            "validation recovery proof private identity",
+        )
+    )
+    if removal_proof is None and (
+        proof_original_mode is not None or proof_private_identity is not None
+    ):
+        raise StateError("validation recovery has a proof seal without a proof")
+    if (proof_original_mode is None) != (proof_private_identity is None):
+        raise StateError("validation recovery proof seal is incomplete")
     return ValidationRecoveryAuthorization(
         target_kind=_as_str(raw["target_kind"], "validation target kind"),
         path=_as_str(raw["path"], "validation path"),
@@ -14545,6 +15336,9 @@ def _validation_authorization_from_obj(value: object) -> ValidationRecoveryAutho
         remote_url_sha256=None if raw["remote_url_sha256"] is None else _as_str(raw["remote_url_sha256"], "validation remote digest"),
         parent_identity=parent,
         stable_identity=stable,
+        removal_proof=removal_proof,
+        proof_original_mode=proof_original_mode,
+        proof_private_identity=proof_private_identity,
     )
 
 
@@ -14591,6 +15385,7 @@ def _ownerless_validation_journal(
     elif args.repository is not None:
         raise Refusal("--repository applies only to validation checkouts")
 
+    record_path: str | None = None
     record_target: str | None = None
     if args.completed_record is not None:
         record_path, digest, record_target = _terminal_validation_record(
@@ -14645,6 +15440,26 @@ def _ownerless_validation_journal(
         if args.repository is not None:
             raise Refusal("--repository applies only to validation checkouts")
         parent_identity = _validation_cargo_facts(target)
+    proof_manifest = getattr(args, "validation_proof_manifest", None)
+    removal_proof: _ValidationRemovalProof | None = None
+    if proof_manifest is not None:
+        if target_kind == "cargo-home":
+            raise Refusal(
+                "--validation-proof-manifest applies only to validation checkouts"
+            )
+        if record_path is None:
+            raise Refusal(
+                "validation removal proof requires the matching --completed-record"
+            )
+        removal_proof = _load_validation_removal_proof(
+            config,
+            proof_manifest,
+            expected_slot=target.name,
+            expected_generation=None,
+            canonical_slot=target,
+            canonical_checkout=target,
+            expected_run_record=config.root / record_path,
+        )
     authorization = ValidationRecoveryAuthorization(
         target_kind=target_kind,
         path=relative,
@@ -14658,6 +15473,7 @@ def _ownerless_validation_journal(
         remote_url_sha256=remote_digest,
         parent_identity=parent_identity,
         stable_identity=stable_identity,
+        removal_proof=removal_proof,
     )
     fenced = target.with_name(f".{target.name}.ownerless-validate.{uuid.uuid4().hex}")
     fenced_value = (
@@ -14731,6 +15547,24 @@ def _ownerless_validation_inputs(
     phase = _as_str(raw["phase"], "ownerless validation journal.phase")
     if phase not in _OWNERLESS_VALIDATION_PHASES:
         raise StateError(f"unknown ownerless validation phase {phase!r}")
+    removal_proof = authorization.removal_proof
+    if removal_proof is not None:
+        if authorization.target_kind == "cargo-home":
+            raise StateError("validation Cargo-home authorization cannot carry a proof")
+        if (
+            removal_proof.slot != target.name
+            or removal_proof.checkout != _managed_file_reference(config, target)
+        ):
+            raise StateError(
+                "validation recovery proof names another checkout"
+            )
+        _validation_proof_manifest_path(config, removal_proof.manifest_path)
+        _validate_proof_artifact_paths(
+            config,
+            removal_proof.artifacts,
+            canonical_slot=target,
+            canonical_checkout=target,
+        )
     target_present = target.exists() or target.is_symlink()
     fenced_present = fenced.exists() or fenced.is_symlink()
     if target_present and fenced_present:
@@ -14767,6 +15601,36 @@ def _ownerless_validation_inputs(
                     "frozen validation path file-handle identity changed; preserve every "
                     "candidate path and inspect the interrupted journal before retrying"
                 )
+        if authorization.proof_private_identity is not None:
+            managed_root = (
+                _frozen_validation_directory(config)
+                if authorization.target_kind == "frozen-checkout"
+                else None
+            )
+            assert authorization.proof_original_mode is not None
+            allowed_modes = {0o700}
+            if phase == "prepared" and active == target:
+                allowed_modes.add(authorization.proof_original_mode)
+            observed_private = _private_cleanup_path_identity(
+                config,
+                active,
+                allowed_modes=allowed_modes,
+                managed_root=managed_root,
+            )
+            if observed_private != authorization.proof_private_identity:
+                raise Refusal(
+                    "validation proof cleanup fence identity changed; preserve the "
+                    "checkout"
+                )
+    if (
+        removal_proof is not None
+        and authorization.proof_private_identity is None
+        and (phase != "prepared" or active != target)
+    ):
+        raise StateError(
+            "validation removal proof reached a destructive phase without a private "
+            "cleanup identity"
+        )
     repository: Path | None = None
     if authorization.target_kind in {"checkout", "frozen-checkout"}:
         if (
@@ -14834,6 +15698,18 @@ def _ownerless_validation_inputs(
                 raise StateError(
                     "frozen terminal evidence target differs from authorized HEAD"
                 )
+        if removal_proof is not None:
+            proof_run_record = next(
+                artifact
+                for artifact in removal_proof.artifacts
+                if artifact.role == "run-record"
+            )
+            if proof_run_record.path != _as_str(
+                evidence["path"], "terminal evidence.path"
+            ):
+                raise StateError(
+                    "validation removal proof run-record differs from terminal evidence"
+                )
         if recheck:
             _terminal_validation_record(
                 config,
@@ -14862,6 +15738,8 @@ def _ownerless_validation_inputs(
             )
     else:
         raise StateError(f"unknown validation recovery evidence kind {kind!r}")
+    if removal_proof is not None and kind != "terminal-record":
+        raise StateError("validation removal proof requires terminal record evidence")
     if recheck and active is not None:
         if authorization.target_kind in {"checkout", "frozen-checkout"}:
             assert repository is not None
@@ -14881,6 +15759,17 @@ def _ownerless_validation_inputs(
             assert authorization.parent_identity is not None
             if _validation_cargo_facts(active) != authorization.parent_identity:
                 raise Refusal("validation Cargo-home parent identity changed")
+        if removal_proof is not None and fresh_same_uid:
+            _recheck_validation_removal_proof(
+                config,
+                removal_proof,
+                expected_slot=target.name,
+                expected_generation=None,
+                canonical_slot=target,
+                active_slot=active,
+                canonical_checkout=target,
+            )
+            _interrupt_for_test("after-ownerless-validation-proof-recheck")
     return authorization, target, fenced, active, repository
 
 
@@ -14896,10 +15785,24 @@ def _rollback_validation_fence(
         raise Refusal("cannot safely roll back validation path fence; preserve both paths")
     os.rename(fenced, target)
     _fsync_directory(target.parent)
+    rollback_journal = {**journal, "phase": "prepared"}
+    _write_journal(config, rollback_journal)
+    if authorization.removal_proof is not None:
+        if (
+            authorization.proof_original_mode is None
+            or authorization.proof_private_identity is None
+        ):
+            raise StateError("validation proof cleanup fence is incomplete")
+        _restore_private_cleanup_path(
+            target,
+            authorization.proof_original_mode,
+            authorization.proof_private_identity,
+            allow_missing=False,
+        )
     if authorization.target_kind == "checkout":
         assert repository is not None
         _GitVcs().repair_worktree(repository, target)
-    _clear_journal(config, journal)
+    _clear_journal(config, rollback_journal)
 
 
 def _recover_ownerless_validation(
@@ -14934,6 +15837,67 @@ def _recover_ownerless_validation(
                     config, target, fenced, authorization, repository, journal
                 )
             raise
+        if authorization.removal_proof is not None:
+            managed_root = (
+                _frozen_validation_directory(config)
+                if authorization.target_kind == "frozen-checkout"
+                else None
+            )
+            if authorization.proof_private_identity is None:
+                if active != target:
+                    raise StateError(
+                        "validation proof cleanup reached a fenced path before its "
+                        "private identity was recorded"
+                    )
+                sealed_authorization: list[ValidationRecoveryAuthorization] = []
+
+                def record_proof_seal(
+                    original_mode: int,
+                    identity: _PrivateCleanupIdentity,
+                ) -> None:
+                    updated = dataclasses.replace(
+                        authorization,
+                        proof_original_mode=original_mode,
+                        proof_private_identity=identity,
+                    )
+                    journal["authorization"] = _validation_authorization_to_obj(
+                        updated
+                    )
+                    _write_journal(config, journal)
+                    sealed_authorization.append(updated)
+                    _interrupt_for_test(
+                        "after-ownerless-validation-proof-seal-planned"
+                    )
+
+                original_mode, private_identity = _seal_cleanup_path_private(
+                    config,
+                    active,
+                    before_seal=record_proof_seal,
+                    managed_root=managed_root,
+                )
+                if not sealed_authorization:
+                    raise StateError(
+                        "validation proof cleanup did not record its private seal"
+                    )
+                authorization = sealed_authorization[0]
+                if (
+                    authorization.proof_original_mode != original_mode
+                    or authorization.proof_private_identity != private_identity
+                ):
+                    raise StateError(
+                        "validation proof cleanup seal changed after it was recorded"
+                    )
+            else:
+                assert authorization.proof_original_mode is not None
+                assert active is not None
+                _reestablish_private_cleanup_fence(
+                    config,
+                    active,
+                    authorization.proof_original_mode,
+                    authorization.proof_private_identity,
+                    managed_root=managed_root,
+                )
+            _interrupt_for_test("after-ownerless-validation-proof-seal")
         if active == target:
             os.rename(target, fenced)
             _fsync_directory(target.parent)
@@ -17818,6 +18782,7 @@ class _FinishContext:
     validate_complete: bool = False
     allow_live_validate_owner: bool = False
     private_cleanup: _PrivateCleanupContext | None = None
+    validation_removal_proof: _ValidationRemovalProof | None = None
 
 
 def _capture_process_path_census(
@@ -18929,10 +19894,18 @@ def _cmd_recover_ownerless_validate_batch(args: argparse.Namespace) -> int:
     checkouts = frozen_checkouts if frozen else ordinary_checkouts
     records = tuple(args.completed_records)
     repositories = tuple(args.repositories)
+    proof_manifests = tuple(
+        getattr(args, "validation_proof_manifests", ()) or ()
+    )
     if not (len(checkouts) == len(records) == len(repositories)):
         raise Refusal(
             "recover-ownerless-validate-batch requires the same number of "
             "--checkout, --completed-record, and --repository arguments"
+        )
+    if proof_manifests and len(proof_manifests) != len(checkouts):
+        raise Refusal(
+            "recover-ownerless-validate-batch requires one "
+            "--validation-proof-manifest for each checkout when any proof is supplied"
         )
     if len(checkouts) > VALIDATE_REMOVE_BATCH_LIMIT:
         raise Refusal(
@@ -18945,10 +19918,26 @@ def _cmd_recover_ownerless_validate_batch(args: argparse.Namespace) -> int:
         )
     _require_coordinator_authorized(args, "ownerless validation cleanup")
     config = _load_config(args.project_root, args.machine)
+    canonical_proofs = tuple(
+        _validation_proof_manifest_path(config, raw)[0]
+        for raw in proof_manifests
+    )
+    if len(canonical_proofs) != len(set(canonical_proofs)):
+        raise Refusal(
+            "recover-ownerless-validate-batch received the same validation proof "
+            "manifest more than once"
+        )
+    aligned_proofs: tuple[str | None, ...] = (
+        tuple(canonical_proofs)
+        if canonical_proofs
+        else tuple(None for _checkout in checkouts)
+    )
     _capture_caller_process(args.coordinator_pid, "coordinator")
     retained: list[dict[str, object]] = []
     removed: list[dict[str, object]] = []
-    prepared: list[tuple[str, str, str, Path, _PrivateCleanupIdentity]] = []
+    prepared: list[
+        tuple[str, str, str, str | None, Path, _PrivateCleanupIdentity]
+    ] = []
     with _mutation_locks(config, args.wait_lock):
         _refuse_partial_state(config, allow_validate_batch_seals=True)
         if _outstanding_journals(config) or _validate_batch_seal_journals(config):
@@ -18956,8 +19945,12 @@ def _cmd_recover_ownerless_validate_batch(args: argparse.Namespace) -> int:
                 "an interrupted mutation is already recorded; recover it before starting "
                 "ownerless validation batch cleanup"
             )
-        for checkout, record, repository in zip(
-            checkouts, records, repositories, strict=True
+        for checkout, record, repository, proof_manifest in zip(
+            checkouts,
+            records,
+            repositories,
+            aligned_proofs,
+            strict=True,
         ):
             try:
                 _relative, target, _allowed = _validation_recovery_target(
@@ -18976,7 +19969,16 @@ def _cmd_recover_ownerless_validate_batch(args: argparse.Namespace) -> int:
             except (Refusal, StateError) as exc:
                 retained.append({"checkout": checkout, "reason": str(exc)})
             else:
-                prepared.append((checkout, record, repository, target, identity))
+                prepared.append(
+                    (
+                        checkout,
+                        record,
+                        repository,
+                        proof_manifest,
+                        target,
+                        identity,
+                    )
+                )
     identities = [identity for *_prefix, identity in prepared]
     if len(set(identities)) != len(identities):
         raise Refusal(
@@ -18999,7 +20001,7 @@ def _cmd_recover_ownerless_validate_batch(args: argparse.Namespace) -> int:
         except Refusal as exc:
             retained.extend(
                 {"checkout": checkout, "reason": str(exc)}
-                for checkout, _record, _repository, _target, _identity in prepared
+                for checkout, _record, _repository, _proof, _target, _identity in prepared
             )
             prepared = []
             shared_census = _ProcessPathCensus((), (), owner_cgroup_complete=False)
@@ -19010,7 +20012,14 @@ def _cmd_recover_ownerless_validate_batch(args: argparse.Namespace) -> int:
         shared_census,
         census_budget,
     )
-    for index, (checkout, record, repository, target, _identity) in enumerate(prepared):
+    for index, (
+        checkout,
+        record,
+        repository,
+        proof_manifest,
+        target,
+        _identity,
+    ) in enumerate(prepared):
         try:
             census_budget.remaining_seconds()
             shared_census.assert_slot_unused(
@@ -19030,6 +20039,7 @@ def _cmd_recover_ownerless_validate_batch(args: argparse.Namespace) -> int:
                 frozen_validate_checkout=checkout if frozen else None,
                 completed_record=record,
                 repository=repository,
+                validation_proof_manifest=proof_manifest,
                 recovery_note=None,
                 retry_running_hook=False,
                 abort_create=False,
@@ -19132,6 +20142,7 @@ def _cmd_recover(
                 args.completed_record,
                 args.repository,
                 args.recovery_note,
+                getattr(args, "validation_proof_manifest", None),
             )
         )
         if requested_ownerless:
@@ -20189,6 +21200,15 @@ usage or audit gate unknown, 3 fail-closed refusal.
         metavar="N",
         help="current slot generation",
     )
+    remove.add_argument(
+        "--validation-proof-manifest",
+        metavar="PATH",
+        help=(
+            "canonical ignored/validate/removal-proofs/*.json manifest binding the "
+            "external run record, service-result sidecar, producer schema, and exact "
+            "scorecard handoff; this routes validation removal through a private seal"
+        ),
+    )
     remove.set_defaults(handler=_cmd_remove)
 
     remove_validate_batch = subparsers.add_parser(
@@ -20226,6 +21246,16 @@ usage or audit gate unknown, 3 fail-closed refusal.
         required=True,
         metavar="PID",
         help="live current coordinator PID recorded with each operation",
+    )
+    remove_validate_batch.add_argument(
+        "--validation-proof-manifest",
+        dest="validation_proof_manifests",
+        action="append",
+        metavar="PATH",
+        help=(
+            "proof manifest aligned positionally with --slot; when supplied, repeat "
+            "exactly once for every requested slot"
+        ),
     )
     remove_validate_batch.add_argument(
         "--format", choices=("human", "json"), default="human"
@@ -20413,6 +21443,16 @@ usage or audit gate unknown, 3 fail-closed refusal.
         help="aligned source repository (repeatable)",
     )
     recover_ownerless_batch.add_argument(
+        "--validation-proof-manifest",
+        dest="validation_proof_manifests",
+        action="append",
+        metavar="PATH",
+        help=(
+            "proof manifest aligned positionally with each checkout; when supplied, "
+            "repeat exactly once for every checkout"
+        ),
+    )
+    recover_ownerless_batch.add_argument(
         "--coordinator-authorized", action="store_true"
     )
     recover_ownerless_batch.add_argument(
@@ -20487,6 +21527,14 @@ usage or audit gate unknown, 3 fail-closed refusal.
         "--repository",
         metavar="PATH",
         help="project-relative source repository that owns the historical Git worktree",
+    )
+    recover.add_argument(
+        "--validation-proof-manifest",
+        metavar="PATH",
+        help=(
+            "canonical ignored/validate/removal-proofs/*.json manifest for this "
+            "ownerless or frozen validation checkout"
+        ),
     )
     recover.add_argument(
         "--recovery-note",

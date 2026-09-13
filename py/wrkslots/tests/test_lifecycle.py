@@ -863,6 +863,105 @@ def prepare_dead_validate_slots(project: Path, slots: Sequence[str]) -> dict[str
     }
 
 
+def prepare_validation_removal_proof(
+    project: Path,
+    slot: str,
+    *,
+    generation: int = 1,
+    checkout_path: Path | None = None,
+    run_record: Path | None = None,
+    producer_schema: Path | None = None,
+) -> tuple[Path, dict[str, Path]]:
+    """Create one exact four-artifact proof for a managed validation checkout."""
+
+    registered_checkout = checkout_path is None
+    if checkout_path is None:
+        checkout_path = checkout(project, slot=slot, slot_type="validate")
+    if run_record is None:
+        run_record = project / "ignored" / "validate" / "runs" / f"{slot}.json"
+    if producer_schema is None:
+        producer_schema = checkout_path / "validation-service-result-schema.json"
+    artifacts = {
+        "run-record": run_record,
+        "service-result": (
+            project / "ignored" / "validate" / "runs" / f"{slot}.service-result.json"
+        ),
+        "producer-schema": producer_schema,
+        "scorecard-handoff": (
+            project
+            / "ignored"
+            / "validate"
+            / "scorecard-writebacks"
+            / slot
+            / "handoff.json"
+        ),
+    }
+    for role, path in artifacts.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            path.write_text(f"{role} for {slot}\n", encoding="utf-8")
+
+    rows = []
+    for role, path in artifacts.items():
+        metadata = path.stat()
+        payload = path.read_bytes()
+        rows.append(
+            {
+                "role": role,
+                "path": (
+                    path.relative_to(project).as_posix()
+                    if path.is_relative_to(project)
+                    else str(path)
+                ),
+                "identity": [metadata.st_dev, metadata.st_ino],
+                "size": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            }
+        )
+    manifest = (
+        project
+        / "ignored"
+        / "validate"
+        / "removal-proofs"
+        / f"{slot}-{generation}.json"
+    )
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "kind": "validation-removal-proof",
+                "slot": slot,
+                "generation": generation,
+                "checkout": (
+                    checkout_path.relative_to(project).as_posix()
+                    if checkout_path.is_relative_to(project)
+                    else str(checkout_path)
+                ),
+                "artifacts": rows,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    if registered_checkout:
+        slot_root = wrkslots._slot_directory(
+            wrkslots._load_config(str(project), "testhost"), slot, "validate"
+        )
+        assert slot_root in checkout_path.parents or slot_root == checkout_path
+    return manifest, artifacts
+
+
+def commit_validation_removal_schema(repository: Path) -> None:
+    schema = repository / "validation-service-result-schema.json"
+    schema.write_text('{"schema": 1}\n', encoding="utf-8")
+    git(repository, "add", schema.name)
+    git(repository, "commit", "-m", "add validation result schema")
+    git(repository, "push", "origin", "main")
+
+
 def stub_validate_batch_censuses(
     monkeypatch: pytest.MonkeyPatch,
     privileged: Callable[[Sequence[Path]], wrkslots._ProcessPathCensus] | None = None,
@@ -2541,6 +2640,64 @@ def test_frozen_validate_checkout_recovers_each_durable_crash_boundary(
 
 
 @pytest.mark.ordinary_environment
+def test_frozen_validate_batch_accepts_exact_validation_removal_proof(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    commit_validation_removal_schema(repository)
+    checkout, record, _target_sha = prepare_frozen_validation_checkout(
+        project,
+        repository,
+        monkeypatch=monkeypatch,
+        name="proof",
+    )
+    manifest, _artifacts = prepare_validation_removal_proof(
+        project,
+        checkout.name,
+        checkout_path=checkout,
+        run_record=record,
+        producer_schema=checkout / "validation-service-result-schema.json",
+    )
+    stub_validate_batch_censuses(monkeypatch)
+    monkeypatch.setattr(
+        wrkslots,
+        "_root_owned_executable",
+        lambda path, _label: wrkslots._TrustedExecutablePath(
+            path.resolve(strict=True), ()
+        ),
+    )
+
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover-ownerless-validate-batch",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--frozen-validate-checkout",
+            str(checkout),
+            "--completed-record",
+            record.relative_to(project).as_posix(),
+            "--repository",
+            repository.relative_to(project).as_posix(),
+            "--validation-proof-manifest",
+            manifest.relative_to(project).as_posix(),
+            "--format",
+            "json",
+        ]
+    )
+
+    assert rc == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["retained"] == [], report
+    assert report["removed"] == [{"checkout": str(checkout)}]
+    assert not checkout.exists()
+
+
+@pytest.mark.ordinary_environment
 def test_frozen_validate_recovery_refuses_changed_terminal_record_digest(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3320,7 +3477,7 @@ def test_recover_resumes_legacy_validate_removal_after_checkout_disappears(
     assert active_slots(project) == []
 
 
-def test_recover_resumes_literal_preupgrade_legacy_journal_without_new_authority(
+def test_recover_refuses_literal_preupgrade_legacy_journal_without_proof(
     tmp_path: Path,
 ) -> None:
     project, repository, _remote = make_project(tmp_path)
@@ -3346,13 +3503,15 @@ def test_recover_resumes_literal_preupgrade_legacy_journal_without_new_authority
     }
     wrkslots._write_journal(config, old_journal)
 
-    recovered = raw_command(
+    refused = raw_command(
         project, "recover", "--coordinator-pid", str(os.getpid())
     )
 
-    assert recovered.returncode == 0, recovered.stderr
-    assert not checkout_path.exists()
-    assert checkout_path.absolute() not in wrkslots._GitVcs().listed_worktrees(repository)
+    assert refused.returncode == 3
+    assert "has no bounded validation removal proof" in refused.stderr
+    assert checkout_path.is_dir()
+    assert checkout_path.absolute() in wrkslots._GitVcs().listed_worktrees(repository)
+    assert (control_directory(project) / "ACTIVE.testhost.journal").is_file()
 
 
 def test_preupgrade_legacy_journal_rechecks_handoff_before_removal(
@@ -3448,6 +3607,176 @@ def test_recover_ownerless_validate_checkout_removes_clean_terminal_worktree(
     assert not target.exists()
     assert target.absolute() not in wrkslots._GitVcs().listed_worktrees(repository)
     assert active_slots(project) == []
+
+
+def test_legacy_validate_checkout_accepts_exact_validation_removal_proof(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    commit_validation_removal_schema(repository)
+    checkout_path, record_path = prepare_legacy_validate_checkout(
+        project, repository, name="proof"
+    )
+    manifest, _artifacts = prepare_validation_removal_proof(
+        project,
+        checkout_path.name,
+        checkout_path=checkout_path,
+        run_record=record_path,
+        producer_schema=checkout_path / "validation-service-result-schema.json",
+    )
+
+    recovered = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--legacy-validate-checkout",
+        checkout_path.relative_to(project).as_posix(),
+        "--completed-record",
+        record_path.relative_to(project).as_posix(),
+        "--repository",
+        repository.relative_to(project).as_posix(),
+        "--validation-proof-manifest",
+        manifest.relative_to(project).as_posix(),
+    )
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert not checkout_path.exists()
+    assert checkout_path.absolute() not in wrkslots._GitVcs().listed_worktrees(
+        repository
+    )
+
+
+def test_ownerless_validation_rechecks_proof_after_private_seal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    commit_validation_removal_schema(repository)
+    target = project / "worktrees" / "validate" / "review-checkout"
+    target.parent.mkdir(parents=True)
+    git(repository, "worktree", "add", "--detach", str(target), "origin/main")
+    record = prepare_terminal_validation_record(project, target, field="checkout")
+    manifest, artifacts = prepare_validation_removal_proof(
+        project,
+        target.name,
+        checkout_path=target,
+        run_record=record,
+        producer_schema=target / "validation-service-result-schema.json",
+    )
+    original_recheck = wrkslots._recheck_validation_removal_proof
+
+    def change_result_before_recheck(
+        config: wrkslots.Config,
+        proof: wrkslots._ValidationRemovalProof,
+        *,
+        expected_slot: str,
+        expected_generation: int | None,
+        canonical_slot: Path,
+        active_slot: Path,
+        canonical_checkout: Path,
+    ) -> None:
+        contents = artifacts["service-result"].read_bytes()
+        artifacts["service-result"].write_bytes(b"X" + contents[1:])
+        original_recheck(
+            config,
+            proof,
+            expected_slot=expected_slot,
+            expected_generation=expected_generation,
+            canonical_slot=canonical_slot,
+            active_slot=active_slot,
+            canonical_checkout=canonical_checkout,
+        )
+
+    monkeypatch.setattr(
+        wrkslots, "_recheck_validation_removal_proof", change_result_before_recheck
+    )
+
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--ownerless-validate-checkout",
+            target.relative_to(project).as_posix(),
+            "--completed-record",
+            record.relative_to(project).as_posix(),
+            "--repository",
+            repository.relative_to(project).as_posix(),
+            "--validation-proof-manifest",
+            manifest.relative_to(project).as_posix(),
+        ]
+    )
+
+    assert rc == 3
+    assert "service-result changed bytes" in capsys.readouterr().err
+    assert target.is_dir()
+    assert stat.S_IMODE(target.stat().st_mode) != 0o700
+    assert target.absolute() in wrkslots._GitVcs().listed_worktrees(repository)
+    assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
+
+
+def test_ownerless_validation_proof_seal_recovers_after_interruption(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    commit_validation_removal_schema(repository)
+    target = project / "worktrees" / "validate" / "review-checkout"
+    target.parent.mkdir(parents=True)
+    git(repository, "worktree", "add", "--detach", str(target), "origin/main")
+    record = prepare_terminal_validation_record(project, target, field="checkout")
+    manifest, _artifacts = prepare_validation_removal_proof(
+        project,
+        target.name,
+        checkout_path=target,
+        run_record=record,
+        producer_schema=target / "validation-service-result-schema.json",
+    )
+    arguments = (
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--ownerless-validate-checkout",
+        target.relative_to(project).as_posix(),
+        "--completed-record",
+        record.relative_to(project).as_posix(),
+        "--repository",
+        repository.relative_to(project).as_posix(),
+        "--validation-proof-manifest",
+        manifest.relative_to(project).as_posix(),
+    )
+
+    interrupted = command(
+        project,
+        *arguments,
+        env={
+            "WRKSLOTS_TEST_INTERRUPT": "after-ownerless-validation-proof-seal"
+        },
+    )
+    assert interrupted.returncode == 86
+    assert target.is_dir()
+    assert stat.S_IMODE(target.stat().st_mode) == 0o700
+    assert (control_directory(project) / "ACTIVE.testhost.journal").is_file()
+
+    recovered = raw_command(
+        project, "recover", "--coordinator-pid", str(os.getpid())
+    )
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert not target.exists()
+    assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
 
 
 def test_ownerless_validation_blocking_status_ignores_only_explicit_safe_roots() -> None:
@@ -6604,6 +6933,284 @@ def test_validate_complete_still_refuses_live_path_use_after_owner_dies(
         terminate_process(user)
 
 
+def test_validate_remove_accepts_exact_validation_removal_proof(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    slot_path = prepare_dead_validate_slots(project, ("slot01",))["slot01"]
+    manifest, _artifacts = prepare_validation_removal_proof(project, "slot01")
+
+    stub_validate_batch_censuses(monkeypatch)
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "remove",
+            "slot01",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--expected-generation",
+            "1",
+            "--validation-proof-manifest",
+            manifest.relative_to(project).as_posix(),
+        ]
+    )
+
+    assert rc == 0, capsys.readouterr().err
+    assert not slot_path.exists()
+    assert active_slots(project) == []
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement", "message"),
+    (
+        ("slot", "another-slot", "names slot"),
+        ("generation", 2, "names generation"),
+    ),
+)
+def test_validate_remove_refuses_proof_for_another_slot_generation(
+    tmp_path: Path,
+    field: str,
+    replacement: object,
+    message: str,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    slot_path = prepare_dead_validate_slots(project, ("slot01",))["slot01"]
+    manifest, _artifacts = prepare_validation_removal_proof(project, "slot01")
+    value = json.loads(manifest.read_text(encoding="utf-8"))
+    value[field] = replacement
+    manifest.write_text(json.dumps(value), encoding="utf-8")
+
+    refused = command(
+        project,
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        "--validation-proof-manifest",
+        manifest.relative_to(project).as_posix(),
+    )
+
+    assert refused.returncode == 3
+    assert message in refused.stderr
+    assert slot_path.is_dir()
+    assert active_slots(project)
+
+
+def test_validate_remove_refuses_malformed_proof_without_sealing(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    slot_path = prepare_dead_validate_slots(project, ("slot01",))["slot01"]
+    manifest, _artifacts = prepare_validation_removal_proof(project, "slot01")
+    contents = manifest.read_text(encoding="utf-8")
+    manifest.write_text(
+        contents.replace('"schema": 1,', '"schema": 1, "schema": 1,', 1),
+        encoding="utf-8",
+    )
+
+    refused = command(
+        project,
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        "--validation-proof-manifest",
+        manifest.relative_to(project).as_posix(),
+    )
+
+    assert refused.returncode == 3
+    assert "malformed JSON" in refused.stderr
+    assert "duplicate key" in refused.stderr
+    assert slot_path.is_dir()
+    assert stat.S_IMODE(slot_path.stat().st_mode) != 0o700
+
+
+@pytest.mark.parametrize("disagreement", ("count", "duplicate"))
+def test_validate_batch_refuses_proof_list_disagreement_before_sealing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    disagreement: str,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    slot_paths = prepare_dead_validate_slots(project, ("slot01", "slot02"))
+    manifests = [
+        prepare_validation_removal_proof(project, slot)[0]
+        for slot in ("slot01", "slot02")
+    ]
+    supplied = [manifests[0]] if disagreement == "count" else [manifests[0]] * 2
+    monkeypatch.setattr(
+        wrkslots,
+        "_capture_process_path_census",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("batch disagreement must refuse before census")
+        ),
+    )
+
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "remove-validate-batch",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--slot",
+            "slot01=1",
+            "--slot",
+            "slot02=1",
+            *[
+                value
+                for manifest in supplied
+                for value in (
+                    "--validation-proof-manifest",
+                    manifest.relative_to(project).as_posix(),
+                )
+            ],
+            "--format",
+            "json",
+        ]
+    )
+
+    assert rc == 3
+    assert disagreement in (
+        "count" if "requires one" in capsys.readouterr().err else "duplicate"
+    )
+    assert all(path.is_dir() for path in slot_paths.values())
+    assert all(stat.S_IMODE(path.stat().st_mode) != 0o700 for path in slot_paths.values())
+
+
+def test_validate_removal_proof_survives_registered_finish_recovery(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    slot_path = prepare_dead_validate_slots(project, ("slot01",))["slot01"]
+    manifest, _artifacts = prepare_validation_removal_proof(project, "slot01")
+    arguments = (
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        "--validation-proof-manifest",
+        manifest.relative_to(project).as_posix(),
+    )
+
+    interrupted = raw_command_with_census_authority_stub(
+        project,
+        *arguments,
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-validation-removal-proof-recheck"},
+    )
+    assert interrupted.returncode == 86
+    assert (control_directory(project) / "ACTIVE.testhost.journal").is_file()
+
+    recovered = raw_command_with_census_authority_stub(
+        project, "recover", "--coordinator-pid", str(os.getpid())
+    )
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert not slot_path.exists()
+    assert active_slots(project) == []
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("changed-bytes", "changed bytes"),
+        ("changed-path", "regular-file identity changed"),
+        ("missing", "cannot read"),
+        ("unreadable", "cannot read"),
+        ("symlink", "crosses a symlink"),
+        ("nonregular", "not a regular file"),
+        ("stale-manifest", "regular-file identity changed"),
+    ),
+)
+def test_validate_batch_rechecks_external_proof_after_private_seal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    mutation: str,
+    message: str,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    slot_path = prepare_dead_validate_slots(project, ("slot01",))["slot01"]
+    manifest, artifacts = prepare_validation_removal_proof(project, "slot01")
+
+    def shared(
+        _paths: Sequence[Path],
+        *,
+        budget: wrkslots._ReadOnlyCommandBudget,
+        include_owner_cgroups: bool = True,
+    ) -> wrkslots._ProcessPathCensus:
+        del budget, include_owner_cgroups
+        return wrkslots._ProcessPathCensus((), ())
+
+    def mutate_at_final_boundary(
+        _paths: Sequence[Path], *, budget: wrkslots._ReadOnlyCommandBudget
+    ) -> wrkslots._ProcessPathCensus:
+        del budget
+        run_record = artifacts["run-record"]
+        if mutation == "changed-bytes":
+            contents = run_record.read_bytes()
+            run_record.write_bytes(b"X" + contents[1:])
+        elif mutation == "changed-path":
+            contents = run_record.read_bytes()
+            run_record.unlink()
+            run_record.write_bytes(contents)
+        elif mutation == "missing":
+            run_record.unlink()
+        elif mutation == "unreadable":
+            run_record.chmod(0)
+        elif mutation == "symlink":
+            replacement = run_record.with_name("replacement-run-record.json")
+            replacement.write_bytes(run_record.read_bytes())
+            run_record.unlink()
+            run_record.symlink_to(replacement)
+        elif mutation == "nonregular":
+            run_record.unlink()
+            run_record.mkdir()
+        elif mutation == "stale-manifest":
+            contents = manifest.read_bytes()
+            manifest.unlink()
+            manifest.write_bytes(contents)
+        else:
+            raise AssertionError(mutation)
+        return wrkslots._ProcessPathCensus((), ())
+
+    monkeypatch.setattr(wrkslots, "_capture_process_path_census", shared)
+    monkeypatch.setattr(
+        wrkslots, "_capture_same_uid_process_path_census", mutate_at_final_boundary
+    )
+    args = argparse.Namespace(
+        project_root=str(project),
+        machine=None,
+        wait_lock=0,
+        command="remove-validate-batch",
+        coordinator_authorized=True,
+        coordinator_pid=os.getpid(),
+        slots=["slot01=1"],
+        validation_proof_manifests=[manifest.relative_to(project).as_posix()],
+        format="json",
+    )
+
+    assert wrkslots._cmd_remove_validate_batch(args) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["removed"] == []
+    assert len(report["retained"]) == 1
+    assert message in report["retained"][0]["reason"]
+    assert slot_path.is_dir()
+    assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
+    assert active_slots(project)
+
+
 def test_validate_batch_shares_one_census_and_retains_each_refusal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -6611,6 +7218,10 @@ def test_validate_batch_shares_one_census_and_retains_each_refusal(
 ) -> None:
     project, _repository, _remote = make_project(tmp_path)
     slot_paths = prepare_dead_validate_slots(project, ("unused", "in-use"))
+    proof_manifests = {
+        slot: prepare_validation_removal_proof(project, slot)[0]
+        for slot in ("unused", "in-use")
+    }
     in_use = slot_paths["in-use"]
     calls: list[tuple[Path, ...]] = []
     census_order: list[str] = []
@@ -6653,6 +7264,10 @@ def test_validate_batch_shares_one_census_and_retains_each_refusal(
             "in-use=1",
             "--slot",
             "unused=1",
+            "--validation-proof-manifest",
+            proof_manifests["in-use"].relative_to(project).as_posix(),
+            "--validation-proof-manifest",
+            proof_manifests["unused"].relative_to(project).as_posix(),
             "--format",
             "json",
         ]
