@@ -439,9 +439,15 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
         "wrkslots/tests/test_lifecycle.py::"
         "test_root_owned_executable_rejects_namespace_root_without_host_root"
     )
-    assert mapped_root == {negative}
+    exclusion_root = (
+        "wrkslots/tests/test_lifecycle.py::"
+        "test_validation_exclusion_fixture_preserves_host_root_boundary"
+    )
+    assert mapped_root == {negative, exclusion_root}
     assert negative in mapped
     assert negative not in ordinary
+    assert exclusion_root in mapped
+    assert exclusion_root not in ordinary
 
     replay_test = (
         "wrkslots/tests/test_lifecycle.py::"

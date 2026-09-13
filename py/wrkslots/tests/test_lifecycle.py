@@ -259,7 +259,7 @@ _VALIDATION_EXCLUSION_GUARD_PREFIX = ".wrkslots-ownerless-validation."
 _MAPPED_VALIDATION_EXCLUSION_PROJECTS: set[Path] = set()
 
 
-def mapped_validation_exclusion_guard_identities(
+def validation_exclusion_guard_identities(
     roots: Sequence[Path],
 ) -> dict[Path, tuple[int, int, int, int, int]]:
     """Snapshot exclusion guards without searching unrelated temporary trees."""
@@ -282,22 +282,113 @@ def mapped_validation_exclusion_guard_identities(
     return result
 
 
-def install_mapped_validation_exclusion_fixture(
+def install_validation_exclusion_fixture(
     project: Path,
     monkeypatch: pytest.MonkeyPatch,
     request: pytest.FixtureRequest,
 ) -> Path:
-    """Install a trusted root fixture only in this test interpreter."""
+    """Install a trusted-root fixture only in this test interpreter.
 
-    if os.geteuid() != 0 or wrkslots._has_identity_user_namespace():
+    The fast local lifecycle partition runs as root in a mapped user namespace,
+    while hosted CI can forbid that namespace and fall back to an ordinary
+    identity-namespace process.  In the latter environment, use the same
+    passwordless, root-owned command boundary as production instead of assuming
+    that ``/data/misc`` exists or that the test interpreter is namespace root.
+    """
+
+    identity_namespace = wrkslots._has_identity_user_namespace()
+    mapped_namespace_root = os.geteuid() == 0 and not identity_namespace
+    identity_namespace_user = os.geteuid() != 0 and identity_namespace
+    if not mapped_namespace_root and not identity_namespace_user:
         raise AssertionError(
-            "validation exclusion fixture requires mapped namespace root"
+            "validation exclusion fixture requires mapped namespace root or an "
+            "ordinary user in the initial identity namespace"
         )
-    root = project.parent / ".wrkslots-validation-exclusion"
+    token = hashlib.sha256(os.fsencode(str(project))).hexdigest()[:24]
+    root = Path("/tmp") / f".wrkslots-validation-exclusion.{token}"
     if project in _MAPPED_VALIDATION_EXCLUSION_PROJECTS:
         return root
-    root.mkdir(mode=0o1777, exist_ok=True)
-    root.chmod(0o1777)
+    if mapped_namespace_root:
+        root.mkdir(mode=0o1777)
+        root.chmod(0o1777)
+    else:
+        wrkslots._root_validation_exclusion_command(
+            Path("/usr/bin/mkdir"),
+            ("--mode=1777", "--", str(root)),
+            "create the validation exclusion fixture root",
+        )
+
+    setup_complete = False
+    observed_roots: tuple[Path, ...] = (root,)
+    guards_before: dict[Path, tuple[int, int, int, int, int]] = {}
+
+    def remove_empty_fixture_root() -> None:
+        if not root.exists():
+            return
+        assert root.is_dir() and not root.is_symlink()
+        entries = tuple(root.iterdir())
+        assert entries == (), (
+            "refusing to remove nonempty validation exclusion fixture root: "
+            f"{root}: {entries}"
+        )
+        if mapped_namespace_root:
+            root.rmdir()
+        else:
+            wrkslots._root_validation_exclusion_command(
+                Path("/usr/bin/rmdir"),
+                ("--", str(root)),
+                "remove the validation exclusion fixture root",
+            )
+        assert not root.exists()
+
+    def restore_created_guard() -> None:
+        try:
+            if setup_complete:
+                guards_during_teardown = validation_exclusion_guard_identities(
+                    observed_roots
+                )
+                created = set(guards_during_teardown).difference(guards_before)
+                assert all(guard.parent == root for guard in created)
+                if created:
+                    assert len(created) == 1
+                    guard = created.pop()
+                    journal_path = control_directory(project) / "ACTIVE.testhost.journal"
+                    assert journal_path.is_file()
+                    journal_value = json.loads(
+                        journal_path.read_text(encoding="utf-8")
+                    )
+                    assert isinstance(journal_value, dict)
+                    config = wrkslots._load_config(str(project), "testhost")
+                    _authorization, _target, fenced, phase = (
+                        wrkslots._ownerless_validation_paths(config, journal_value)
+                    )
+                    assert phase == "removing"
+                    exclusion_value = journal_value.get("exclusion")
+                    assert exclusion_value is not None
+                    exclusion = wrkslots._ownerless_validation_exclusion_from_obj(
+                        config, fenced, exclusion_value
+                    )
+                    assert exclusion.guard == guard
+                    assert (
+                        guards_during_teardown[guard][:2]
+                        == exclusion.guard_identity[:2]
+                    )
+                    restored = wrkslots._restore_ownerless_validation_exclusion(
+                        config, journal_value
+                    )
+                    assert "exclusion" not in restored
+                assert (
+                    validation_exclusion_guard_identities(observed_roots)
+                    == guards_before
+                )
+            remove_empty_fixture_root()
+        finally:
+            _MAPPED_VALIDATION_EXCLUSION_PROJECTS.discard(project)
+
+    # Register cleanup immediately after creation.  If later fixture setup
+    # fails, an empty root is removed; any unexpected contents are retained.
+    request.addfinalizer(restore_created_guard)
+
     metadata = root.stat(follow_symlinks=False)
     assert metadata.st_uid == 0
     assert metadata.st_gid == 0
@@ -316,7 +407,7 @@ def install_mapped_validation_exclusion_fixture(
         candidate == Path("/data/misc") or candidate.is_relative_to(Path("/tmp"))
         for candidate in observed_roots
     )
-    guards_before = mapped_validation_exclusion_guard_identities(observed_roots)
+    guards_before = validation_exclusion_guard_identities(observed_roots)
 
     def run_as_namespace_root(
         program: Path,
@@ -348,48 +439,15 @@ def install_mapped_validation_exclusion_fixture(
     monkeypatch.setattr(
         wrkslots, "_self_mountinfo_records", lambda: tuple(deduplicated.values())
     )
-    monkeypatch.setattr(wrkslots, "_run_root_owned_command", run_as_namespace_root)
-    monkeypatch.setattr(wrkslots, "_run_same_uid_command", run_as_namespace_root)
+    if mapped_namespace_root:
+        monkeypatch.setattr(
+            wrkslots, "_run_root_owned_command", run_as_namespace_root
+        )
+        monkeypatch.setattr(
+            wrkslots, "_run_same_uid_command", run_as_namespace_root
+        )
     _MAPPED_VALIDATION_EXCLUSION_PROJECTS.add(project)
-
-    def restore_created_guard() -> None:
-        try:
-            guards_during_teardown = mapped_validation_exclusion_guard_identities(
-                observed_roots
-            )
-            created = set(guards_during_teardown).difference(guards_before)
-            assert all(guard.parent == root for guard in created)
-            if created:
-                assert len(created) == 1
-                guard = created.pop()
-                journal_path = control_directory(project) / "ACTIVE.testhost.journal"
-                assert journal_path.is_file()
-                journal_value = json.loads(journal_path.read_text(encoding="utf-8"))
-                assert isinstance(journal_value, dict)
-                config = wrkslots._load_config(str(project), "testhost")
-                _authorization, _target, fenced, phase = (
-                    wrkslots._ownerless_validation_paths(config, journal_value)
-                )
-                assert phase == "removing"
-                exclusion_value = journal_value.get("exclusion")
-                assert exclusion_value is not None
-                exclusion = wrkslots._ownerless_validation_exclusion_from_obj(
-                    config, fenced, exclusion_value
-                )
-                assert exclusion.guard == guard
-                assert guards_during_teardown[guard][:2] == exclusion.guard_identity[:2]
-                restored = wrkslots._restore_ownerless_validation_exclusion(
-                    config, journal_value
-                )
-                assert "exclusion" not in restored
-            assert (
-                mapped_validation_exclusion_guard_identities(observed_roots)
-                == guards_before
-            )
-        finally:
-            _MAPPED_VALIDATION_EXCLUSION_PROJECTS.discard(project)
-
-    request.addfinalizer(restore_created_guard)
+    setup_complete = True
     return root
 
 
@@ -413,9 +471,9 @@ def in_process_validation_exclusion_command(
     *args: str,
     add_coordinator_authorization: bool,
 ) -> subprocess.CompletedProcess[str]:
-    """Run cleanup with an isolated root fixture inside the mapped test namespace."""
+    """Run cleanup with an isolated trusted-root fixture."""
 
-    root = install_mapped_validation_exclusion_fixture(project, monkeypatch, request)
+    root = install_validation_exclusion_fixture(project, monkeypatch, request)
     argv = validation_exclusion_command_arguments(
         project,
         args,
@@ -442,9 +500,9 @@ def forked_validation_exclusion_command(
     interrupt: str,
     add_coordinator_authorization: bool,
 ) -> subprocess.CompletedProcess[str]:
-    """Crash an in-process mapped-root cleanup without crossing an exec boundary."""
+    """Crash an in-process cleanup without crossing an exec boundary."""
 
-    root = install_mapped_validation_exclusion_fixture(project, monkeypatch, request)
+    root = install_validation_exclusion_fixture(project, monkeypatch, request)
     argv = validation_exclusion_command_arguments(
         project,
         args,
@@ -3692,7 +3750,7 @@ def test_validation_exclusion_mount_alias_refuses_mutated_layout(
         )
 
 
-def test_mapped_validation_exclusion_fixture_is_selected_only_in_process(
+def test_validation_exclusion_fixture_is_selected_only_in_process(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     request: pytest.FixtureRequest,
@@ -3700,7 +3758,13 @@ def test_mapped_validation_exclusion_fixture_is_selected_only_in_process(
     project, _repository, _remote = make_project(tmp_path)
     production_roots = wrkslots._OWNERLESS_VALIDATION_EXCLUSION_ROOTS
     assert production_roots == (Path("/data/misc"),)
-    root = install_mapped_validation_exclusion_fixture(project, monkeypatch, request)
+    if os.geteuid() != 0 and wrkslots._has_identity_user_namespace():
+        unavailable = tmp_path / "missing-data-misc"
+        assert not unavailable.exists()
+        monkeypatch.setattr(
+            wrkslots, "_OWNERLESS_VALIDATION_EXCLUSION_ROOTS", (unavailable,)
+        )
+    root = install_validation_exclusion_fixture(project, monkeypatch, request)
     fenced = project / "worktrees" / "validate" / "fixture-fenced"
     fenced.parent.mkdir(parents=True, exist_ok=True)
 
@@ -3711,7 +3775,8 @@ def test_mapped_validation_exclusion_fixture_is_selected_only_in_process(
     assert alias == fenced
 
 
-def test_mapped_namespace_cannot_select_real_validation_exclusion_root(
+@pytest.mark.mapped_root_namespace
+def test_validation_exclusion_fixture_preserves_host_root_boundary(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     request: pytest.FixtureRequest,
@@ -3719,26 +3784,54 @@ def test_mapped_namespace_cannot_select_real_validation_exclusion_root(
     project, _repository, _remote = make_project(tmp_path)
     production_roots = wrkslots._OWNERLESS_VALIDATION_EXCLUSION_ROOTS
     assert production_roots == (Path("/data/misc"),)
-    metadata = production_roots[0].stat(follow_symlinks=False)
-    assert metadata.st_uid == 65534
-    assert metadata.st_uid != os.geteuid()
+    identity_namespace = wrkslots._has_identity_user_namespace()
+    mapped_namespace_root = os.geteuid() == 0 and not identity_namespace
+    if mapped_namespace_root:
+        host_root = Path("/tmp")
+        metadata = host_root.stat(follow_symlinks=False)
+        assert metadata.st_uid == 65534
+        assert metadata.st_uid != os.geteuid()
+        monkeypatch.setattr(
+            wrkslots, "_OWNERLESS_VALIDATION_EXCLUSION_ROOTS", (host_root,)
+        )
+    else:
+        assert os.geteuid() != 0
+        assert identity_namespace
+        unavailable = tmp_path / "missing-data-misc"
+        assert not unavailable.exists()
+        monkeypatch.setattr(
+            wrkslots, "_OWNERLESS_VALIDATION_EXCLUSION_ROOTS", (unavailable,)
+        )
+    expected_roots = wrkslots._OWNERLESS_VALIDATION_EXCLUSION_ROOTS
     monkeypatch.setenv("WRKSLOTS_VALIDATION_EXCLUSION_ROOT", str(tmp_path))
-    assert wrkslots._OWNERLESS_VALIDATION_EXCLUSION_ROOTS == production_roots
+    assert wrkslots._OWNERLESS_VALIDATION_EXCLUSION_ROOTS == expected_roots
 
     with pytest.raises(wrkslots.Refusal):
         wrkslots._trusted_validation_exclusion_root(tmp_path / "fixture-fenced")
-    with pytest.raises(
-        wrkslots.Refusal, match="find is not a root-owned, non-writable executable"
-    ):
-        wrkslots._run_same_uid_command(
+    budget = wrkslots._ReadOnlyCommandBudget.start(
+        timeout_seconds=5,
+        stdout_limit=4096,
+        stderr_limit=4096,
+    )
+    if mapped_namespace_root:
+        with pytest.raises(
+            wrkslots.Refusal,
+            match="find is not a root-owned, non-writable executable",
+        ):
+            wrkslots._run_same_uid_command(
+                Path("/usr/bin/find"),
+                (str(tmp_path), "-maxdepth", "0"),
+                budget=budget,
+            )
+    else:
+        returncode, stdout, stderr = wrkslots._run_same_uid_command(
             Path("/usr/bin/find"),
             (str(tmp_path), "-maxdepth", "0"),
-            budget=wrkslots._ReadOnlyCommandBudget.start(
-                timeout_seconds=5,
-                stdout_limit=4096,
-                stderr_limit=4096,
-            ),
+            budget=budget,
         )
+        assert returncode == 0
+        assert stdout == os.fsencode(str(tmp_path)) + b"\n"
+        assert stderr == b""
 
     parsers = [wrkslots._build_parser()]
     option_strings: set[str] = set()
@@ -3751,7 +3844,7 @@ def test_mapped_namespace_cannot_select_real_validation_exclusion_root(
                 parsers.extend(choices.values())
     assert "--validation-exclusion-root" not in option_strings
 
-    install_mapped_validation_exclusion_fixture(project, monkeypatch, request)
+    install_validation_exclusion_fixture(project, monkeypatch, request)
     census = wrkslots._capture_same_uid_process_path_census(
         (tmp_path / "not-in-use",),
         budget=wrkslots._ReadOnlyCommandBudget.start(
@@ -3768,9 +3861,17 @@ def test_mapped_namespace_cannot_select_real_validation_exclusion_root(
         and process.pid > 0
         and process.start_ticks > 0
         and isinstance(process.cgroup_path, str)
-        and process.mount_namespace.startswith("mnt:[")
+        and (
+            process.mount_namespace.startswith("mnt:[")
+            or process.mount_namespace == f"pid:{process.pid}"
+        )
         for process in census.processes
     )
+    if mapped_namespace_root:
+        assert all(
+            process.mount_namespace.startswith("mnt:[")
+            for process in census.processes
+        )
 
 
 @pytest.mark.ordinary_environment
@@ -9040,6 +9141,25 @@ def test_validate_batch_rechecks_external_proof_after_private_seal(
     slot_path = prepare_dead_validate_slots(project, ("slot01",))["slot01"]
     manifest, artifacts = prepare_validation_removal_proof(project, "slot01")
 
+    def replace_with_same_bytes_and_distinct_identity(path: Path) -> None:
+        contents = path.read_bytes()
+        original = path.stat(follow_symlinks=False)
+        replacement = path.with_name(f".{path.name}.replacement")
+        assert not replacement.exists()
+        replacement.write_bytes(contents)
+        replacement_identity = replacement.stat(follow_symlinks=False)
+        assert (replacement_identity.st_dev, replacement_identity.st_ino) != (
+            original.st_dev,
+            original.st_ino,
+        )
+        os.replace(replacement, path)
+        rebound = path.stat(follow_symlinks=False)
+        assert (rebound.st_dev, rebound.st_ino) == (
+            replacement_identity.st_dev,
+            replacement_identity.st_ino,
+        )
+        assert path.read_bytes() == contents
+
     def shared(
         _paths: Sequence[Path],
         *,
@@ -9062,9 +9182,7 @@ def test_validate_batch_rechecks_external_proof_after_private_seal(
                 contents.replace(b'"profile": "full"', b'"profile": "evil"', 1)
             )
         elif mutation == "changed-path":
-            contents = run_record.read_bytes()
-            run_record.unlink()
-            run_record.write_bytes(contents)
+            replace_with_same_bytes_and_distinct_identity(run_record)
         elif mutation == "missing":
             run_record.unlink()
         elif mutation == "unreadable":
@@ -9078,9 +9196,7 @@ def test_validate_batch_rechecks_external_proof_after_private_seal(
             run_record.unlink()
             run_record.mkdir()
         elif mutation == "stale-manifest":
-            contents = manifest.read_bytes()
-            manifest.unlink()
-            manifest.write_bytes(contents)
+            replace_with_same_bytes_and_distinct_identity(manifest)
         elif mutation == "retained-file-bytes":
             scorecard = artifacts["scorecard-handoff"].parent / "SCORECARD.md"
             contents = scorecard.read_bytes()
