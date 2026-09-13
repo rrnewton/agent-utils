@@ -395,8 +395,8 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
 
     assert ordinary.isdisjoint(mapped)
     assert ordinary | mapped == all_tests
-    assert len(all_tests) == 558
-    assert len(ordinary) == 56
+    assert len(all_tests) == 563
+    assert len(ordinary) == 61
     assert len(mapped) == 502
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
@@ -410,6 +410,8 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
         "test_frozen_validate_batch_closes_operation_owned_fds_before_censuses",
         "test_frozen_validate_batch_accepts_exact_validation_removal_proof",
         "test_frozen_validate_batch_fresh_census_does_not_ignore_current_process",
+        "test_frozen_validate_detects_pre_exclusion_same_uid_holder_and_rolls_back",
+        "test_frozen_validate_excludes_late_same_uid_checkout_entry",
         "test_frozen_validate_checkout_binds_terminal_record_fields",
         "test_frozen_validate_checkout_recovers_each_durable_crash_boundary",
         "test_frozen_validate_recovery_refuses_absent_fenced_path",

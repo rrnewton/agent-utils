@@ -2842,6 +2842,9 @@ def test_frozen_parser_reads_immutable_initial_snapshot_during_live_restore(
         "after-ownerless-validate-path-fence-before-journal",
         "after-ownerless-validate-path-fence",
         "after-ownerless-validate-removing",
+        "after-ownerless-validate-exclusion-directory",
+        "after-ownerless-validate-exclusion-move",
+        "after-ownerless-validate-exclusion-seal",
         "after-ownerless-validate-remove",
         "after-ownerless-validate-removal-event",
     ),
@@ -2883,6 +2886,9 @@ def test_frozen_validate_checkout_recovers_each_durable_crash_boundary(
         "after-ownerless-validate-path-fence-before-journal": "prepared",
         "after-ownerless-validate-path-fence": "fenced",
         "after-ownerless-validate-removing": "removing",
+        "after-ownerless-validate-exclusion-directory": "removing",
+        "after-ownerless-validate-exclusion-move": "removing",
+        "after-ownerless-validate-exclusion-seal": "removing",
         "after-ownerless-validate-remove": "removed",
         "after-ownerless-validate-removal-event": "removed",
     }[boundary]
@@ -2973,6 +2979,171 @@ def test_frozen_validate_batch_accepts_exact_validation_removal_proof(
 
 
 @pytest.mark.ordinary_environment
+def test_frozen_validate_excludes_late_same_uid_checkout_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    commit_validation_removal_schema(repository, schema_version=3)
+    checkout, record, _target_sha = prepare_frozen_validation_checkout(
+        project, repository, monkeypatch=monkeypatch, name="late-same-uid"
+    )
+    manifest, _artifacts = prepare_validation_removal_proof(
+        project,
+        checkout.name,
+        checkout_path=checkout,
+        run_record=record,
+    )
+    stub_validate_batch_censuses(monkeypatch)
+    attempted: list[tuple[int, int, int, str]] = []
+
+    def enter_after_final_check(point: str) -> None:
+        if point != "after-ownerless-validate-final-check":
+            return
+        container = next(checkout.parent.glob(".ownerless-validation-exclusion.*"))
+        payload = container / wrkslots._OWNERLESS_VALIDATION_EXCLUSION_ENTRY
+        entered = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import os,sys; "
+                "\ntry: os.chdir(sys.argv[1])"
+                "\nexcept PermissionError: raise SystemExit(77)"
+                "\nraise SystemExit(0)",
+                str(payload),
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        attempted.append(
+            (
+                os.getuid(),
+                container.stat(follow_symlinks=False).st_uid,
+                stat.S_IMODE(container.stat(follow_symlinks=False).st_mode),
+                str(entered.returncode),
+            )
+        )
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", enter_after_final_check)
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover-ownerless-validate-batch",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--frozen-validate-checkout",
+            str(checkout),
+            "--completed-record",
+            record.relative_to(project).as_posix(),
+            "--repository",
+            repository.relative_to(project).as_posix(),
+            "--validation-proof-manifest",
+            manifest.relative_to(project).as_posix(),
+            "--format",
+            "json",
+        ]
+    )
+
+    assert rc == 0
+    assert attempted == [(os.getuid(), os.getuid(), 0, "77")]
+    report = json.loads(capsys.readouterr().out)
+    assert report["retained"] == []
+    assert report["removed"] == [{"checkout": str(checkout)}]
+    assert not checkout.exists()
+
+
+@pytest.mark.ordinary_environment
+def test_frozen_validate_detects_pre_exclusion_same_uid_holder_and_rolls_back(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    checkout, record, _target_sha = prepare_frozen_validation_checkout(
+        project, repository, monkeypatch=monkeypatch, name="pre-exclusion-holder"
+    )
+    stub_validate_batch_censuses(monkeypatch)
+    holder: subprocess.Popen[str] | None = None
+
+    def enter_before_exclusion_move(point: str) -> None:
+        nonlocal holder
+        if (
+            point != "after-ownerless-validate-exclusion-directory"
+            or holder is not None
+        ):
+            return
+        fenced = next(checkout.parent.glob(f".{checkout.name}.ownerless-validate.*"))
+        holder = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import os,sys,time; os.chdir(sys.argv[1]); "
+                "print(os.getcwd(), flush=True); time.sleep(60)",
+                str(fenced),
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert holder.stdout is not None
+        assert holder.stdout.readline().strip() == str(fenced)
+
+    def observe_holder(
+        paths: Sequence[Path], *, budget: wrkslots._ReadOnlyCommandBudget
+    ) -> wrkslots._ProcessPathCensus:
+        del budget
+        assert holder is not None
+        payload = paths[0]
+        observed = os.readlink(f"/proc/{holder.pid}/cwd")
+        return wrkslots._ProcessPathCensus(
+            (), ((holder.pid, str(payload), "link", observed),)
+        )
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", enter_before_exclusion_move)
+    monkeypatch.setattr(
+        wrkslots, "_capture_same_uid_process_path_census", observe_holder
+    )
+    try:
+        rc = wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "recover-ownerless-validate-batch",
+                "--coordinator-authorized",
+                "--coordinator-pid",
+                str(os.getpid()),
+                "--frozen-validate-checkout",
+                str(checkout),
+                "--completed-record",
+                record.relative_to(project).as_posix(),
+                "--repository",
+                repository.relative_to(project).as_posix(),
+                "--format",
+                "json",
+            ]
+        )
+
+        assert rc == 0
+        report = json.loads(capsys.readouterr().out)
+        assert report["removed"] == []
+        assert "live process" in report["retained"][0]["reason"]
+        assert checkout.is_dir()
+        assert holder is not None
+        assert Path(os.readlink(f"/proc/{holder.pid}/cwd")) == checkout
+        assert not list(checkout.parent.glob(".ownerless-validation-exclusion.*"))
+        assert not wrkslots._journal_path(
+            wrkslots._load_config(str(project), "testhost")
+        ).exists()
+    finally:
+        if holder is not None:
+            terminate_process(holder)
+
+
+@pytest.mark.ordinary_environment
 def test_frozen_validate_recovery_refuses_changed_terminal_record_digest(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3027,7 +3198,8 @@ def test_frozen_validate_refuses_replacement_after_final_check(
         nonlocal replacement, original
         if point != "after-ownerless-validate-final-check" or replacement is not None:
             return
-        original = next(checkout.parent.glob(f".{checkout.name}.ownerless-validate.*"))
+        container = next(checkout.parent.glob(".ownerless-validation-exclusion.*"))
+        original = container / wrkslots._OWNERLESS_VALIDATION_EXCLUSION_ENTRY
         checkout.mkdir(mode=0o700)
         (checkout / "replacement").write_text("preserve me\n", encoding="utf-8")
         replacement = checkout
@@ -3086,7 +3258,7 @@ def test_frozen_validate_refuses_fenced_replacement_after_final_check(
         nonlocal replacement, original
         if point != "after-ownerless-validate-final-check" or replacement is not None:
             return
-        fenced = next(checkout.parent.glob(f".{checkout.name}.ownerless-validate.*"))
+        fenced = next(checkout.parent.glob(".ownerless-validation-exclusion.*"))
         original = checkout.parent / "preserved-fenced-original"
         fenced.rename(original)
         fenced.mkdir(mode=0o700)
@@ -3119,7 +3291,12 @@ def test_frozen_validate_refuses_fenced_replacement_after_final_check(
     report = json.loads(capsys.readouterr().out)
     assert report["removed"] == []
     assert "identity changed before cleanup" in report["retained"][0]["reason"]
-    assert original is not None and (original / ".git").is_dir()
+    assert (
+        original is not None
+        and (
+            original / wrkslots._OWNERLESS_VALIDATION_EXCLUSION_ENTRY / ".git"
+        ).is_dir()
+    )
     assert replacement is not None and (replacement / "replacement").is_file()
     config = wrkslots._load_config(str(project), "testhost")
     assert wrkslots._journal_path(config).is_file()
@@ -3154,7 +3331,7 @@ def test_frozen_validate_refuses_disappearance_after_final_check(
         nonlocal preserved
         if point != "after-ownerless-validate-final-check" or preserved is not None:
             return
-        fenced = next(checkout.parent.glob(f".{checkout.name}.ownerless-validate.*"))
+        fenced = next(checkout.parent.glob(".ownerless-validation-exclusion.*"))
         preserved = checkout.parent / "preserved-disappeared-original"
         fenced.rename(preserved)
 
@@ -3182,13 +3359,16 @@ def test_frozen_validate_refuses_disappearance_after_final_check(
     report = json.loads(capsys.readouterr().out)
     assert report["removed"] == []
     assert "disappeared before cleanup" in report["retained"][0]["reason"]
-    assert preserved is not None and (preserved / ".git").is_dir()
+    assert preserved is not None and (
+        preserved / wrkslots._OWNERLESS_VALIDATION_EXCLUSION_ENTRY / ".git"
+    ).is_dir()
     assert wrkslots._open_directory_identity(
-        preserved, "preserved test checkout"
+        preserved / wrkslots._OWNERLESS_VALIDATION_EXCLUSION_ENTRY,
+        "preserved test checkout",
     ) == expected_identity
     assert wrkslots._private_cleanup_path_identity(
         config,
-        preserved,
+        preserved / wrkslots._OWNERLESS_VALIDATION_EXCLUSION_ENTRY,
         allowed_modes={0o700},
         managed_root=wrkslots._frozen_validation_directory(config),
     ) == expected_stable_identity
@@ -3207,11 +3387,12 @@ def test_frozen_validate_refuses_disappearance_after_final_check(
     assert "removal outcome is UNKNOWN" in resumed.stderr
     assert json.loads(journal.read_text(encoding="utf-8"))["phase"] == "removing"
     assert wrkslots._open_directory_identity(
-        preserved, "preserved test checkout"
+        preserved / wrkslots._OWNERLESS_VALIDATION_EXCLUSION_ENTRY,
+        "preserved test checkout",
     ) == expected_identity
     assert wrkslots._private_cleanup_path_identity(
         config,
-        preserved,
+        preserved / wrkslots._OWNERLESS_VALIDATION_EXCLUSION_ENTRY,
         allowed_modes={0o700},
         managed_root=wrkslots._frozen_validation_directory(config),
     ) == expected_stable_identity
