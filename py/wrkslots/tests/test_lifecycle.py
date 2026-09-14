@@ -3755,7 +3755,11 @@ def test_frozen_validate_rejects_counterfeit_minimal_terminal_records(
 @pytest.mark.parametrize(
     ("failure", "message"),
     (
-        ("config-root", "project root is not the authenticated outer authority"),
+        ("config-root", "project root does not share the authenticated outer authority"),
+        ("consumer-root", "agent-utils superproject is not a Git worktree root"),
+        ("authority-root", "consumer superproject is not a Git worktree root"),
+        ("agent-superproject", "Git returned a relative path"),
+        ("outer-superproject", "Git returned a relative path"),
         ("agent-gitlink", "agent-utils HEAD differs"),
         ("outer-gitlink", "enclosing checkout HEAD differs"),
     ),
@@ -3768,10 +3772,13 @@ def test_frozen_parser_authority_requires_both_enclosing_gitlinks(
 ) -> None:
     authority = tmp_path / "project"
     consumer = authority / "consumer-a"
-    common = consumer / ".git" / "modules" / "agent-utils"
-    agent_checkout = tmp_path / "slots" / "agent-utils-checkout"
+    agent_checkout = consumer / "agent-utils"
+    common = authority / ".git"
+    wrong_root = tmp_path / "wrong-root"
+    other_common = wrong_root / ".git"
     loaded = agent_checkout / "py" / "wrkslots" / "cli.py"
     common.mkdir(parents=True)
+    other_common.mkdir(parents=True)
     loaded.parent.mkdir(parents=True)
     loaded.write_text("# fixture\n", encoding="utf-8")
     authority.mkdir(exist_ok=True)
@@ -3780,11 +3787,28 @@ def test_frozen_parser_authority_requires_both_enclosing_gitlinks(
     def fake_git_text(
         repository: Path, arguments: Sequence[str], *, label: str
     ) -> str:
-        del repository, label
+        del label
         if "--show-toplevel" in arguments:
-            return str(agent_checkout)
+            if repository == consumer and failure == "consumer-root":
+                return str(authority)
+            if repository == authority and failure == "authority-root":
+                return str(authority.parent)
+            return {
+                loaded.parent: str(agent_checkout),
+                consumer: str(consumer),
+                authority: str(authority),
+                wrong_root: str(wrong_root),
+            }[repository]
+        if "--show-superproject-working-tree" in arguments:
+            if repository == agent_checkout and failure == "agent-superproject":
+                return "relative-consumer"
+            if repository == consumer and failure == "outer-superproject":
+                return "relative-authority"
+            return {agent_checkout: str(consumer), consumer: str(authority)}[
+                repository
+            ]
         if "--git-common-dir" in arguments:
-            return str(common)
+            return str(other_common if repository == wrong_root else common)
         raise AssertionError(arguments)
 
     agent_head = "a" * 40
@@ -3815,8 +3839,7 @@ def test_frozen_parser_authority_requires_both_enclosing_gitlinks(
     monkeypatch.setattr(wrkslots, "_trusted_git_text", fake_git_text)
     monkeypatch.setattr(wrkslots, "_trusted_git_head", fake_head)
     monkeypatch.setattr(wrkslots, "_trusted_gitlink", fake_gitlink)
-    config_root = tmp_path / "wrong-root" if failure == "config-root" else authority
-    config_root.mkdir(exist_ok=True)
+    config_root = wrong_root if failure == "config-root" else authority
 
     with pytest.raises(wrkslots.Refusal, match=message):
         wrkslots._frozen_validation_authority_commit(
@@ -3832,6 +3855,171 @@ def test_frozen_parser_authority_requires_both_enclosing_gitlinks(
                 liveness_command=config_root / "liveness.py",
             )
         )
+
+
+def test_frozen_parser_authority_accepts_linked_outer_worktree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary = tmp_path / "project"
+    authority = tmp_path / "slots" / "tool-root"
+    consumer = authority / "consumer"
+    agent_checkout = consumer / "agent-utils"
+    loaded = agent_checkout / "py" / "wrkslots" / "cli.py"
+    common = primary / ".git"
+    loaded.parent.mkdir(parents=True)
+    loaded.write_text("# fixture\n", encoding="utf-8")
+    common.mkdir(parents=True)
+    monkeypatch.setattr(wrkslots, "__file__", str(loaded))
+
+    def fake_git_text(
+        repository: Path, arguments: Sequence[str], *, label: str
+    ) -> str:
+        del label
+        operation = arguments[-1]
+        if operation == "--show-toplevel":
+            return {
+                loaded.parent: str(agent_checkout),
+                consumer: str(consumer),
+                authority: str(authority),
+                primary: str(primary),
+            }[repository]
+        if operation == "--show-superproject-working-tree":
+            return {agent_checkout: str(consumer), consumer: str(authority)}[
+                repository
+            ]
+        if operation == "--git-common-dir":
+            return {
+                authority: str(common),
+                primary: str(common),
+            }[repository]
+        raise AssertionError((repository, arguments))
+
+    agent_head = "a" * 40
+    consumer_head = "b" * 40
+    authority_head = "c" * 40
+
+    monkeypatch.setattr(wrkslots, "_trusted_git_text", fake_git_text)
+    monkeypatch.setattr(
+        wrkslots,
+        "_trusted_git_head",
+        lambda repository, _label: {
+            agent_checkout: agent_head,
+            consumer: consumer_head,
+            authority: authority_head,
+        }[repository],
+    )
+
+    def fake_gitlink(
+        repository: Path,
+        _commit: str,
+        relative: str,
+        *,
+        label: str,
+    ) -> str:
+        del label
+        return {
+            (consumer, "agent-utils"): agent_head,
+            (authority, "consumer"): consumer_head,
+        }[(repository, relative)]
+
+    monkeypatch.setattr(wrkslots, "_trusted_gitlink", fake_gitlink)
+    config = wrkslots.Config(
+        root=primary,
+        config_path=primary / "wrkslots.toml",
+        worktrees=primary / "worktrees",
+        control=primary / "worktrees",
+        machine="testhost",
+        default_remote="origin",
+        default_landed_ref="refs/remotes/origin/main",
+        heartbeat_ttl_seconds=60,
+        liveness_command=primary / "liveness.py",
+    )
+
+    assert wrkslots._frozen_validation_authority_commit(config) == (
+        authority,
+        authority_head,
+    )
+
+
+@pytest.mark.ordinary_environment
+def test_frozen_parser_authority_accepts_real_nested_linked_worktree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent_source = tmp_path / "agent-source"
+    agent_source.mkdir()
+    git(agent_source, "init", "--initial-branch=main")
+    git(agent_source, "config", "user.name", "Wrkslots Test")
+    git(agent_source, "config", "user.email", "wrkslots@example.invalid")
+    source_module = agent_source / "py" / "wrkslots" / "cli.py"
+    source_module.parent.mkdir(parents=True)
+    source_module.write_text("# fixture\n", encoding="utf-8")
+    git(agent_source, "add", "--", source_module.relative_to(agent_source).as_posix())
+    git(agent_source, "commit", "-m", "agent fixture")
+
+    consumer_source = tmp_path / "consumer-source"
+    consumer_source.mkdir()
+    git(consumer_source, "init", "--initial-branch=main")
+    git(consumer_source, "config", "user.name", "Wrkslots Test")
+    git(consumer_source, "config", "user.email", "wrkslots@example.invalid")
+    git(
+        consumer_source,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        str(agent_source),
+        "agent-utils",
+    )
+    git(consumer_source, "commit", "-am", "consumer fixture")
+
+    primary = tmp_path / "project"
+    primary.mkdir()
+    git(primary, "init", "--initial-branch=main")
+    git(primary, "config", "user.name", "Wrkslots Test")
+    git(primary, "config", "user.email", "wrkslots@example.invalid")
+    git(
+        primary,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        str(consumer_source),
+        "consumer",
+    )
+    git(primary, "commit", "-am", "outer fixture")
+
+    authority = tmp_path / "slots" / "tool-root"
+    authority.parent.mkdir()
+    git(primary, "worktree", "add", "--detach", str(authority), "HEAD")
+    git(
+        authority,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "update",
+        "--init",
+        "--recursive",
+    )
+    loaded = authority / "consumer" / "agent-utils" / "py" / "wrkslots" / "cli.py"
+    monkeypatch.setattr(wrkslots, "__file__", str(loaded))
+    config = wrkslots.Config(
+        root=primary,
+        config_path=primary / "wrkslots.toml",
+        worktrees=primary / "worktrees",
+        control=primary / "worktrees",
+        machine="testhost",
+        default_remote="origin",
+        default_landed_ref="refs/remotes/origin/main",
+        heartbeat_ttl_seconds=60,
+        liveness_command=primary / "liveness.py",
+    )
+
+    assert wrkslots._frozen_validation_authority_commit(config) == (
+        authority,
+        git(authority, "rev-parse", "HEAD").stdout.strip(),
+    )
 
 
 @pytest.mark.ordinary_environment

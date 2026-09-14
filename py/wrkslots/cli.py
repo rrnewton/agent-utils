@@ -16418,6 +16418,49 @@ def _trusted_git_text(
     return value
 
 
+def _trusted_git_directory(
+    repository: Path, arguments: Sequence[str], *, label: str
+) -> Path:
+    """Return one canonical absolute directory reported by trusted Git."""
+
+    raw = _trusted_git_text(repository, arguments, label=label)
+    path = Path(raw)
+    if not path.is_absolute():
+        raise Refusal(f"cannot authenticate {label}: Git returned a relative path")
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise Refusal(f"cannot authenticate {label}: {exc}") from exc
+    if path != resolved or not path.is_dir():
+        raise Refusal(
+            f"cannot authenticate {label}: Git returned a non-canonical directory"
+        )
+    return path
+
+
+def _trusted_git_toplevel(repository: Path, *, label: str) -> Path:
+    return _trusted_git_directory(
+        repository,
+        ("rev-parse", "--path-format=absolute", "--show-toplevel"),
+        label=label,
+    )
+
+
+def _trusted_git_superproject(repository: Path, *, label: str) -> Path:
+    superproject = _trusted_git_directory(
+        repository,
+        (
+            "rev-parse",
+            "--path-format=absolute",
+            "--show-superproject-working-tree",
+        ),
+        label=f"{label} superproject checkout",
+    )
+    if _trusted_git_toplevel(superproject, label=label) != superproject:
+        raise Refusal(f"{label} superproject is not a Git worktree root")
+    return superproject
+
+
 def _trusted_git_head(repository: Path, label: str) -> str:
     head = _trusted_git_text(
         repository, ("rev-parse", "--verify", "HEAD^{commit}"), label=label
@@ -16445,42 +16488,61 @@ def _trusted_gitlink(
     return match.group(1).decode("ascii")
 
 
-def _frozen_validation_authority_commit(config: Config) -> tuple[Path, str]:
-    """Bind parser authority through both enclosing, pinned repository Gitlinks."""
+def _frozen_validation_authority_chain(config: Config) -> tuple[Path, Path, Path]:
+    """Return the authenticated outer, consumer, and agent-utils checkouts."""
 
     loaded = Path(__file__).resolve(strict=True)
-    agent_checkout = Path(
-        _trusted_git_text(
-            loaded.parent,
-            ("rev-parse", "--path-format=absolute", "--show-toplevel"),
-            label="loaded agent-utils checkout",
-        )
+    agent_checkout = _trusted_git_toplevel(
+        loaded.parent, label="loaded agent-utils checkout"
     )
     try:
         loaded.relative_to(agent_checkout)
     except ValueError as exc:
         raise Refusal("loaded wrkslots module is outside its authenticated checkout") from exc
-    common = Path(
-        _trusted_git_text(
-            agent_checkout,
-            ("rev-parse", "--path-format=absolute", "--git-common-dir"),
-            label="agent-utils common Git directory",
-        )
+    consumer = _trusted_git_superproject(
+        agent_checkout, label="agent-utils"
     )
-    if common.name != "agent-utils" or common.parent.name != "modules":
+    authority = _trusted_git_superproject(
+        consumer, label="consumer"
+    )
+    config_root = _trusted_git_toplevel(
+        config.root,
+        label="frozen validation recovery project root",
+    )
+    if config_root != config.root.resolve():
+        raise Refusal("frozen validation recovery project root is not a Git worktree root")
+    authority_common = _trusted_git_directory(
+        authority,
+        ("rev-parse", "--path-format=absolute", "--git-common-dir"),
+        label="outer authority common Git directory",
+    )
+    config_common = _trusted_git_directory(
+        config_root,
+        ("rev-parse", "--path-format=absolute", "--git-common-dir"),
+        label="frozen validation recovery common Git directory",
+    )
+    if config_common != authority_common:
         raise Refusal(
-            "loaded agent-utils checkout is not an enclosing checkout's pinned submodule"
+            "frozen validation recovery project root does not share the authenticated "
+            "outer authority Git repository"
         )
-    consumer_git_directory = common.parent.parent
-    if consumer_git_directory.name != ".git":
-        raise Refusal("cannot derive the enclosing consumer checkout")
-    consumer = consumer_git_directory.parent
-    authority = consumer.parent
-    if config.root.resolve(strict=True) != authority.resolve(strict=True):
-        raise Refusal(
-            "frozen validation recovery project root is not the authenticated outer "
-            "authority checkout"
-        )
+
+    try:
+        agent_relative = agent_checkout.relative_to(consumer).as_posix()
+        consumer_relative = consumer.relative_to(authority).as_posix()
+    except ValueError as exc:
+        raise Refusal("authenticated submodule checkout is outside its superproject") from exc
+    if agent_relative in {"", "."} or consumer_relative in {"", "."}:
+        raise Refusal("authenticated submodule checkout has an invalid Gitlink path")
+    return authority, consumer, agent_checkout
+
+
+def _frozen_validation_authority_commit(config: Config) -> tuple[Path, str]:
+    """Bind parser authority through both enclosing, pinned repository Gitlinks."""
+
+    authority, consumer, agent_checkout = _frozen_validation_authority_chain(config)
+    agent_relative = agent_checkout.relative_to(consumer).as_posix()
+    consumer_relative = consumer.relative_to(authority).as_posix()
 
     agent_head = _trusted_git_head(agent_checkout, "agent-utils HEAD")
     consumer_head = _trusted_git_head(consumer, "enclosing consumer HEAD")
@@ -16488,7 +16550,7 @@ def _frozen_validation_authority_commit(config: Config) -> tuple[Path, str]:
         _trusted_gitlink(
             consumer,
             consumer_head,
-            common.name,
+            agent_relative,
             label="enclosing consumer agent-utils Gitlink",
         )
         != agent_head
@@ -16501,7 +16563,7 @@ def _frozen_validation_authority_commit(config: Config) -> tuple[Path, str]:
         _trusted_gitlink(
             authority,
             authority_head,
-            consumer.name,
+            consumer_relative,
             label="outer authority consumer Gitlink",
         )
         != consumer_head
