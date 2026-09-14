@@ -18,12 +18,11 @@
 // interactions (env sentinels, slice/unit names, the supervisor drain) are kept identical.
 
 use std::collections::{BTreeMap, HashSet};
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, OsStr};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
-#[cfg(test)]
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
@@ -40,6 +39,7 @@ use crate::sizing::{cpu_count, mem_available_bytes};
 
 /// cgroup-v2 unified hierarchy mount point (Linux-only, matching the target).
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+const CGROUP2_SUPER_MAGIC: u64 = 0x6367_7270;
 /// Shared parent slice for ALL concurrent runs (one aggregate CPUQuota bounds their sum).
 const SLICE_NAME: &str = "dagrun.slice";
 /// Prefix for the per-run transient scope unit (`<prefix>-<pid>`).
@@ -805,6 +805,131 @@ fn cgroup_remove_is_retryable(error: &io::Error) -> bool {
         io::ErrorKind::DirectoryNotEmpty | io::ErrorKind::ResourceBusy
     ) || error.raw_os_error() == Some(libc::EBUSY)
 }
+
+fn require_cgroup_filesystem(file: &File) -> io::Result<()> {
+    let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: fstatfs initializes the supplied storage on success; the borrowed
+    // descriptor remains open throughout the call.
+    if unsafe { libc::fstatfs(file.as_raw_fd(), filesystem.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { filesystem.assume_init() }.f_type as u64 != CGROUP2_SUPER_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "delegated parent descriptor is not on cgroup-v2",
+        ));
+    }
+    Ok(())
+}
+
+fn require_cgroup_directory(directory: &File) -> io::Result<()> {
+    let metadata = directory.metadata()?;
+    if !metadata.is_dir() || metadata.nlink() == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "delegated cgroup descriptor must hold a live directory",
+        ));
+    }
+    require_cgroup_filesystem(directory)
+}
+
+fn read_delegated_control(directory: &File, name: &CStr, path: &Path) -> io::Result<String> {
+    let file = open_cgroup_file_at(directory, name, path, libc::O_RDONLY | libc::O_NONBLOCK)?;
+    require_cgroup_filesystem(&file)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "delegated cgroup control is not a regular cgroup-v2 file",
+        ));
+    }
+    const MAX_CONTROL_BYTES: u64 = 1024 * 1024;
+    let mut text = String::new();
+    file.take(MAX_CONTROL_BYTES + 1).read_to_string(&mut text)?;
+    if text.len() as u64 > MAX_CONTROL_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "delegated cgroup control exceeds the complete-read bound",
+        ));
+    }
+    Ok(text)
+}
+
+fn delegated_child_name(name: &OsStr) -> io::Result<CString> {
+    let bytes = name.as_bytes();
+    if bytes.is_empty()
+        || bytes.len() > MAX_CGROUP_COMPONENT_BYTES
+        || bytes == b"."
+        || bytes == b".."
+        || bytes.contains(&b'/')
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "delegated cgroup child must be one nonempty normal path component",
+        ));
+    }
+    CString::new(bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "delegated cgroup child contains a NUL byte",
+        )
+    })
+}
+
+fn open_delegated_child(ancestor: &File, name: &CStr) -> io::Result<File> {
+    #[repr(C)]
+    struct OpenHow {
+        flags: u64,
+        mode: u64,
+        resolve: u64,
+    }
+    // Linux openat2: remain beneath this held ancestor, without symlinks or a
+    // mount crossing. In particular, a bind mount cannot present the hierarchy
+    // root as an apparent child of the supplied ancestor.
+    let how = OpenHow {
+        flags: (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64,
+        mode: 0,
+        resolve: 0x08 | 0x04 | 0x01, // RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV
+    };
+    // SAFETY: the directory and NUL-terminated name remain live, and OpenHow
+    // has the kernel's three-u64 layout. A successful call owns a new fd.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            ancestor.as_raw_fd(),
+            name.as_ptr(),
+            &how as *const OpenHow,
+            std::mem::size_of::<OpenHow>(),
+        )
+    };
+    if fd == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // No weaker fallback is permitted when the kernel refuses safe resolution.
+    Ok(unsafe { File::from_raw_fd(fd as libc::c_int) })
+}
+
+fn current_cgroup_membership() -> io::Result<(String, PathBuf)> {
+    let text = fs::read_to_string("/proc/self/cgroup")?;
+    let mut entries = text.lines().filter_map(|line| line.strip_prefix("0::"));
+    let relative = entries.next().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "missing cgroup-v2 membership")
+    })?;
+    if entries.next().is_some()
+        || !relative.starts_with('/')
+        || (relative != "/"
+            && relative[1..]
+                .split('/')
+                .any(|part| part.is_empty() || part == "." || part == ".."))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "current cgroup-v2 membership is not one absolute normal path",
+        ));
+    }
+    let path = Path::new(CGROUP_ROOT).join(&relative[1..]);
+    Ok((text, path))
+}
+
 /// The current cgroup, borrowed as a parent for independently owned CPU-accounting children.
 ///
 /// Unlike `ManualCpuCgroupRoot`, this handle never moves the caller, enables a controller, or
@@ -871,6 +996,91 @@ impl SharedCpuCgroupParent {
             &stat,
         )?;
         Ok(parent)
+    }
+
+    /// Borrow the current cgroup using a held ancestor received across exec.
+    ///
+    /// The child name must resolve strictly beneath that ancestor on the same
+    /// cgroup-v2 mount. Matching the held child to current membership proves a
+    /// delegated namespace root without accepting the real hierarchy root.
+    /// The caller should close its transport descriptor after this import;
+    /// the returned handle retains only the current directory descriptor,
+    /// with close-on-exec set.
+    pub fn from_delegated_ancestor(ancestor: &File, child_name: &OsStr) -> io::Result<Self> {
+        let name = delegated_child_name(child_name)?;
+        require_cgroup_directory(ancestor)?;
+        let directory = open_delegated_child(ancestor, &name)?;
+        require_cgroup_directory(&directory)?;
+        let above = ancestor.metadata()?;
+        let below = directory.metadata()?;
+        if above.dev() != below.dev() || above.ino() == below.ino() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "delegated cgroup is not a distinct child on the ancestor's filesystem",
+            ));
+        }
+        let (_, path) = current_cgroup_membership()?;
+        let parent = Self {
+            path,
+            directory: Arc::new(directory),
+        };
+        parent.verify_current()?;
+        let stat = parent.path.join("cpu.stat");
+        let _ = parse_required_u64_field(
+            &read_delegated_control(&parent.directory, c"cpu.stat", &stat)?,
+            "usage_usec",
+            &stat,
+        )?;
+        Ok(parent)
+    }
+
+    /// Recheck that this retained parent is still the caller's current cgroup.
+    /// This reads kernel membership and held/named directory identities; it
+    /// never moves a process or changes a controller.
+    pub fn verify_current(&self) -> io::Result<()> {
+        require_cgroup_directory(&self.directory)?;
+        let (before, current) = current_cgroup_membership()?;
+        if current != self.path {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "current membership no longer names the retained cgroup parent",
+            ));
+        }
+        let held = self.directory.metadata()?;
+        let check_named = || -> io::Result<()> {
+            let named = fs::symlink_metadata(&current)?;
+            if !named.is_dir() || named.dev() != held.dev() || named.ino() != held.ino() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "current cgroup path does not name the retained parent inode",
+                ));
+            }
+            Ok(())
+        };
+        check_named()?;
+        let roster = read_delegated_control(
+            &self.directory,
+            c"cgroup.procs",
+            &self.path.join("cgroup.procs"),
+        )?;
+        let members = roster
+            .split_whitespace()
+            .map(|pid| pid.parse::<u32>())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if !members.contains(&std::process::id()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "current process is absent from the retained cgroup parent's roster",
+            ));
+        }
+        if current_cgroup_membership()?.0 != before {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "current cgroup membership changed during parent verification",
+            ));
+        }
+        check_named()
     }
 
     /// Create one fresh child whose lifetime and accounting belong only to this caller.
@@ -4193,6 +4403,105 @@ mod tests {
 
         fs::remove_dir(parent_path).unwrap();
         fs::remove_dir(original).unwrap();
+    }
+
+    #[test]
+    fn delegated_parent_refuses_non_child_names_before_opening() {
+        let root = temp_scope("delegated-names");
+        let ancestor = File::open(&root).unwrap();
+        let too_long = vec![b'x'; MAX_CGROUP_COMPONENT_BYTES + 1];
+        for bytes in [
+            b"".as_slice(),
+            b".",
+            b"..",
+            b"/",
+            b"/child",
+            b"../child",
+            b"child/..",
+            b"child/other",
+            b"child\0other",
+            too_long.as_slice(),
+        ] {
+            let error =
+                SharedCpuCgroupParent::from_delegated_ancestor(&ancestor, OsStr::from_bytes(bytes))
+                    .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::InvalidInput,
+                "{bytes:?}: {error}"
+            );
+            assert!(error.to_string().starts_with("delegated cgroup child"));
+        }
+        assert_eq!(
+            delegated_child_name(OsStr::new("worker-17.scope"))
+                .unwrap()
+                .to_bytes(),
+            b"worker-17.scope"
+        );
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn delegated_parent_refuses_regular_files_and_ordinary_directories() {
+        let root = temp_scope("delegated-not-cgroup");
+        let file_path = root.join("file");
+        fs::write(&file_path, b"not a cgroup").unwrap();
+        let error = SharedCpuCgroupParent::from_delegated_ancestor(
+            &File::open(&file_path).unwrap(),
+            OsStr::new("child"),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("must hold a live directory"));
+        let error = SharedCpuCgroupParent::from_delegated_ancestor(
+            &File::open(&root).unwrap(),
+            OsStr::new("child"),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("not on cgroup-v2"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn delegated_child_resolution_refuses_symlinks_and_escape() {
+        let root = temp_scope("delegated-openat2");
+        fs::create_dir(root.join("child")).unwrap();
+        std::os::unix::fs::symlink("child", root.join("link")).unwrap();
+        let ancestor = File::open(&root).unwrap();
+        let child = open_delegated_child(&ancestor, c"child").unwrap();
+        assert_eq!(
+            child.metadata().unwrap().ino(),
+            fs::metadata(root.join("child")).unwrap().ino()
+        );
+        assert_ne!(
+            unsafe { libc::fcntl(child.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+        assert_eq!(
+            open_delegated_child(&ancestor, c"link")
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ENOTDIR)
+        );
+        assert_eq!(
+            open_delegated_child(&ancestor, c"..")
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EXDEV)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn delegated_child_resolution_refuses_a_mount_crossing() {
+        let ancestor = File::open("/").unwrap();
+        assert_eq!(
+            open_delegated_child(&ancestor, c"proc")
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EXDEV)
+        );
     }
 
     #[test]
