@@ -21,9 +21,11 @@ type, task and purpose, owner process identity, coordinator history, heartbeat t
 1. `init` creates configuration, an empty machine history, the managed directories, and a
    project-local command symlink. It records the project command that distinguishes dead, alive,
    and unverifiable owners.
-2. The coordinator runs `create --slot-type agent --coordinator-authorized` for authored work, or
-   `create --slot-type validate --coordinator-authorized` for disposable validation. The flag is a
-   reminder and recorded provenance, not a permission boundary between same-user processes.
+2. The coordinator assigns the slot. The coordinator or assigned agent runs
+   `create --slot-type agent --coordinator-authorized` for authored work, or
+   `create --slot-type validate --coordinator-authorized` for disposable validation. An assigned
+   agent supplies its own `--owner-pid`. The flag is a reminder and recorded provenance, not a
+   permission boundary between same-user processes.
 3. The exact owner runs `heartbeat` to renew the slot while work continues.
 4. An owner that has clean, published work may run `finish` to record validation and continuation
    evidence. A departed owner is not required to return: later reclaim can salvage from the recorded
@@ -43,20 +45,24 @@ type, task and purpose, owner process identity, coordinator history, heartbeat t
 Run `wrkslots quickstart` for copyable commands and `wrkslots COMMAND --help` for exact effects and
 inputs.
 
-## Creation is coordinator-owned guidance
+## Coordinator assignment and creation
 
 `create`, `register`, and `import-existing --apply` require both `--slot-type` and
 `--coordinator-authorized`. Omitting either refuses before any worktree or lifecycle record changes
 and tells the caller to ask the coordinator. This prevents accidental self-allocation; it does not
 pretend that same-user processes have different operating-system permissions.
 
-When `create` receives `--owner-pid`, that live owner may be the invoking process or one of its
-ancestors, as in ordinary self-binding. It may instead be another child of the verified invoking
-coordinator, which lets the coordinator create a slot already assigned to a live agent. The tool
-captures both exact process generations before creating anything and rechecks the owner and the
-coordinator relationship before publishing the row. A live process outside both relationships is
-refused. Omitting `--owner-pid` retains the separate flow in which the owner immediately runs
-`adopt` itself.
+An assigned agent can run `create` with `--owner-pid` naming itself or an ancestor of the command.
+Its live `--coordinator-pid` may run separately, including in another terminal pane; process
+ancestry is not evidence of that assignment. The explicit flag records the assignment, while
+the owner ancestry check prevents the agent from binding an unrelated process as owner.
+
+The coordinator can instead invoke `create` to bind another live child owner. That path requires
+the coordinator to be in the command's ancestry and the owner to descend from the coordinator.
+Omitting `--owner-pid` also requires an invoking coordinator; the owner then immediately runs
+`adopt` itself. Both exact process identities are checked after acquiring the mutation lock and
+again before publishing the row. If either identity changes during provisioning, creation
+refuses publication and retains the recovery journal.
 
 `--coordinator-authorized` on `remove` and `read-handoff` is optional provenance. It is required
 when `recover` starts a new cleanup for an unregistered validation path, because that operation has
@@ -128,6 +134,12 @@ For each `--repo NAME=PATH`, `create` uses the configured `origin` by default. S
 `--remote NAME=REMOTE` to choose another configured remote and `--remote-url NAME=URL` when the
 caller must verify its exact fetch URL. Wrkslots records a SHA-256 identity and refuses if the URL
 changes.
+
+When `with-proxy` is installed on `PATH`, Wrkslots uses it for Git fetches, pushes, remote ref
+readback, and post-provision hooks. The hook's children, including recursive submodule commands,
+inherit the wrapper's environment. A wrapper failure stops the operation; Wrkslots does not retry
+without it. On hosts without `with-proxy`, commands use the caller's network environment. Local
+Git inspection uses no wrapper, and Wrkslots does not change global Git or proxy configuration.
 
 A repository path is resolved from the configured project root, not from the caller's current
 directory, and must be relative. Use an ordinary path inside the project root, or path components of

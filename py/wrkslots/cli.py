@@ -20,6 +20,7 @@ import os
 import re
 import selectors
 import shlex
+import shutil
 import signal
 import socket
 import stat
@@ -750,6 +751,13 @@ def _validate_remote(value: str) -> str:
 def _require_coordinator_authorized(args: argparse.Namespace, action: str) -> None:
     if getattr(args, "coordinator_authorized", False):
         return
+    if action == "worktree creation":
+        raise Refusal(
+            "worktree creation requires a coordinator assignment. state: REFUSED -- "
+            "no worktree or lifecycle record was changed. remedy: ask the coordinator "
+            "to assign the slot; an assigned agent may rerun with "
+            "--coordinator-authorized and its own --owner-pid"
+        )
     raise Refusal(
         f"{action} is coordinator-owned. state: REFUSED -- no worktree or lifecycle "
         "record was changed. remedy: ask the coordinator to perform the operation; a "
@@ -6626,6 +6634,13 @@ def _append_record(state: ActiveState, record: ActiveRecord) -> ActiveState:
     return ActiveState(state.machine, state.revision + 1, (*state.slots, record))
 
 
+def _with_proxy(command: Sequence[str], env: Mapping[str, str]) -> list[str]:
+    """Use the host's network wrapper when installed, without a direct retry."""
+
+    wrapper = shutil.which("with-proxy", path=env.get("PATH"))
+    return [str(Path(wrapper).absolute()), *command] if wrapper is not None else list(command)
+
+
 class _GitVcs:
     """The small Git boundary used by slot operations."""
 
@@ -6650,17 +6665,20 @@ class _GitVcs:
         env["GIT_NO_REPLACE_OBJECTS"] = "1"
         if env_overrides:
             env.update(env_overrides)
+        command = [
+            "git",
+            "--no-replace-objects",
+            "-c",
+            "core.useReplaceRefs=false",
+            "-C",
+            str(repository),
+            *args,
+        ]
+        if args and args[0] in {"fetch", "push", "ls-remote"}:
+            command = _with_proxy(command, env)
         try:
             completed = subprocess.run(
-                [
-                    "git",
-                    "--no-replace-objects",
-                    "-c",
-                    "core.useReplaceRefs=false",
-                    "-C",
-                    str(repository),
-                    *args,
-                ],
+                command,
                 text=True,
                 capture_output=True,
                 check=False,
@@ -7691,19 +7709,39 @@ def _assert_registration_owner_authorized(
 
 
 def _assert_create_owner_authorized(
-    owner: ProcessIdentity, coordinator: ProcessIdentity
+    owner: ProcessIdentity | None, coordinator: ProcessIdentity
 ) -> None:
-    """Require self-binding or a live owner descended from the coordinator.
+    """Permit self-binding or allocation by the invoking coordinator.
 
-    Registration can additionally require the owner's cwd inside an existing
-    slot. Creation cannot: the slot path does not exist when this check first
-    runs, so the verified coordinator relationship is the available evidence.
+    A delegated agent may run beside its coordinator, for example in another
+    terminal pane. Its own ancestry proves the owner it can bind. Creating an
+    unbound slot or assigning another owner still requires the coordinator to
+    invoke the command, and that other owner must descend from the coordinator.
     """
-    try:
-        _assert_caller_process(owner, "owner")
-        return
-    except Refusal:
+    if owner is not None:
+        try:
+            _assert_caller_process(owner, "owner")
+            return
+        except Refusal:
+            pass
+    _assert_caller_process(coordinator, "coordinator")
+    if owner is not None:
         _assert_process_descends_from(owner, coordinator, "owner")
+
+
+def _assert_create_processes(
+    owner: ProcessIdentity | None, coordinator: ProcessIdentity, *, stage: str
+) -> None:
+    for label, identity in (("owner", owner), ("coordinator", coordinator)):
+        if identity is None:
+            continue
+        try:
+            confirmed = _read_process_identity(identity.pid)
+        except Refusal as exc:
+            raise Refusal(f"{label} process changed {stage}: {exc}") from exc
+        if confirmed != identity:
+            raise Refusal(f"{label} process generation changed {stage}")
+    _assert_create_owner_authorized(owner, coordinator)
 
 
 def _registered_liveness_state(config: Config, record: ActiveRecord) -> tuple[str, str]:
@@ -9804,7 +9842,7 @@ def _run_post_provision_hooks(
         )
         try:
             completed = subprocess.run(
-                ["/bin/sh", "-c", command],
+                _with_proxy(["/bin/sh", "-c", command], env),
                 cwd=path,
                 env=env,
                 text=True,
@@ -9856,13 +9894,13 @@ def _cmd_create(args: argparse.Namespace) -> int:
         if args.owner_pid is not None
         else None
     )
-    coordinator_lease = _capture_caller_process(
-        args.coordinator_pid, "coordinator"
-    )
-    if owner is not None:
-        _assert_create_owner_authorized(owner, coordinator_lease)
+    coordinator_lease = _read_process_identity(args.coordinator_pid)
+    _assert_create_owner_authorized(owner, coordinator_lease)
     vcs = _GitVcs()
     with _mutation_locks(config, args.wait_lock):
+        _assert_create_processes(
+            owner, coordinator_lease, stage="before create mutation"
+        )
         _refuse_partial_state(config)
         states, archives = _validate_global_state(config)
         interrupted_creates = _classify_create_journals(
@@ -9984,25 +10022,11 @@ def _cmd_create(args: argparse.Namespace) -> int:
         )
         for checkout in created:
             _assert_checkout_identity_unchanged(config, checkout, vcs)
-        if owner is not None:
-            try:
-                confirmed_owner = _read_process_identity(owner.pid)
-            except Refusal as exc:
-                raise Refusal(
-                    f"owner process changed during create; recovery journal is preserved: {exc}"
-                ) from exc
-            if confirmed_owner != owner:
-                raise Refusal(
-                    "owner process generation changed during create; "
-                    "recovery journal is preserved"
-                )
-            _assert_create_owner_authorized(confirmed_owner, coordinator_lease)
-        confirmed_coordinator = _read_process_identity(coordinator_lease.pid)
-        if confirmed_coordinator != coordinator_lease:
-            raise Refusal(
-                "coordinator process generation changed during create; recovery journal is preserved"
-            )
-        _assert_caller_process(confirmed_coordinator, "coordinator")
+        _assert_create_processes(
+            owner,
+            coordinator_lease,
+            stage="during create; recovery journal is preserved",
+        )
         heartbeat_at = _utc_now()
         _write_journal(
             config,
@@ -24639,8 +24663,8 @@ usage or audit gate unknown, 3 fail-closed refusal.
         "--coordinator-authorized",
         action="store_true",
         help=(
-            "confirm that the coordinator assigned this slot; agents should ask the "
-            "coordinator instead of passing this flag on their own"
+            "confirm that the coordinator assigned this slot; an assigned agent may "
+            "create it with its own --owner-pid"
         ),
     )
     create.add_argument("--agent", required=True, metavar="AGENT", help="registered agent name")
@@ -24658,9 +24682,10 @@ usage or audit gate unknown, 3 fail-closed refusal.
         type=int,
         metavar="PID",
         help=(
-            "live owner PID to bind; it must be in the invoking process ancestry or "
-            "another child of the invoking coordinator; omit only when the owner will "
-            "immediately adopt"
+            "live owner PID to bind; the owner may be in this command's ancestry "
+            "even when its assigned coordinator runs separately, or another child "
+            "of the invoking coordinator; omit only when the coordinator creates "
+            "the slot and the owner will immediately adopt"
         ),
     )
     create.add_argument(
@@ -24668,7 +24693,10 @@ usage or audit gate unknown, 3 fail-closed refusal.
         type=int,
         required=True,
         metavar="PID",
-        help="live coordinator PID; it must be an ancestor of this command",
+        help=(
+            "live assigned coordinator PID; it must be an ancestor of this command "
+            "unless the owner is in this command's ancestry"
+        ),
     )
     _add_repo_options(create)
     create.add_argument(

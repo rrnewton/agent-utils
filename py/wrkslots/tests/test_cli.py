@@ -72,6 +72,8 @@ def test_every_command_help_explains_effect_and_inputs() -> None:
     assert "--remote-url NAME=URL" in create
     normalized_create = " ".join(create.split())
     assert "another child of the invoking coordinator" in normalized_create
+    assert "even when its assigned coordinator runs separately" in normalized_create
+    assert "unless the owner is in this command's ancestry" in normalized_create
     assert "or ../NAME path components for one direct sibling" in normalized_create
     assert (
         "absolute paths, other parent traversal, and symlink components are refused"

@@ -395,13 +395,14 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
 
     assert ordinary.isdisjoint(mapped)
     assert ordinary | mapped == all_tests
-    assert len(all_tests) == 644
-    assert len(ordinary) == 97
-    assert len(mapped) == 547
+    assert len(all_tests) == 653
+    assert len(ordinary) == 98
+    assert len(mapped) == 555
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {
         "test_adopt_refuses_pid_outside_invoking_process_ancestry",
+        "test_create_binds_owner_running_beside_its_assigned_coordinator",
         "test_current_frozen_result_without_removal_proof_blocks_entry",
         "test_direct_current_frozen_recovery_refuses_lost_journal_proof",
         "test_direct_current_frozen_recovery_refuses_tampered_proof",

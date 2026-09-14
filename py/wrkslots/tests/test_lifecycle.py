@@ -2938,9 +2938,11 @@ def test_create_without_coordinator_authorization_names_boundary_and_remedy(
     )
 
     assert refused.returncode == 3
-    assert "worktree creation is coordinator-owned" in refused.stderr
+    assert "worktree creation requires a coordinator assignment" in refused.stderr
     assert "no worktree or lifecycle record was changed" in refused.stderr
     assert "ask the coordinator" in refused.stderr
+    assert "an assigned agent may rerun" in refused.stderr
+    assert "its own --owner-pid" in refused.stderr
     assert refused.stdout == ""
     assert not checkout(project).exists()
     assert active_slots(project) == []
@@ -2961,6 +2963,217 @@ def test_create_binds_another_child_of_the_invoking_coordinator(tmp_path: Path) 
         assert recorded_owner["pid"] == owner.pid
     finally:
         terminate_process(owner)
+
+
+def delegated_create_arguments(coordinator_pid: int, owner_pid: int | None) -> list[str]:
+    arguments = [
+        "create",
+        "slot01",
+        "--slot-type",
+        "agent",
+        "--coordinator-authorized",
+        "--agent",
+        "codex-1",
+        "--task",
+        "task-slot01",
+        "--purpose",
+        "test slot01",
+        "--coordinator-pid",
+        str(coordinator_pid),
+        "--repo",
+        "product=repo",
+        "--branch",
+        "product=codex/task",
+    ]
+    if owner_pid is not None:
+        arguments.extend(("--owner-pid", str(owner_pid)))
+    return arguments
+
+
+@pytest.mark.ordinary_environment
+def test_create_binds_owner_running_beside_its_assigned_coordinator(tmp_path: Path) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    coordinator = subprocess.Popen(["sleep", "60"], text=True)
+    script = """
+import contextlib, io, json, os, sys
+from wrkslots import cli
+arguments = json.loads(sys.argv[1]) + ['--owner-pid', str(os.getpid())]
+output = io.StringIO()
+with contextlib.redirect_stdout(output):
+    result = cli.main(arguments)
+print(json.dumps({'result': result, 'output': output.getvalue()}), flush=True)
+sys.stdin.readline()
+raise SystemExit(result)
+"""
+    arguments = ["--project-root", str(project)] + delegated_create_arguments(
+        coordinator.pid, None
+    )
+    owner = subprocess.Popen(
+        [sys.executable, "-c", script, json.dumps(arguments)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=source_environment(),
+    )
+    try:
+        assert owner.stdout is not None
+        report = json.loads(owner.stdout.readline())
+        assert report["result"] == 0, report
+        assert wrkslots._read_process_parent(owner.pid) == os.getpid()
+        assert wrkslots._read_process_parent(coordinator.pid) == os.getpid()
+        row = active_slots(project)[0]
+        assert isinstance(row, dict)
+        assert row["owner"] == wrkslots._identity_to_obj(
+            wrkslots._read_process_identity(owner.pid)
+        )
+        assert row["coordinator_lease"] == wrkslots._identity_to_obj(
+            wrkslots._read_process_identity(coordinator.pid)
+        )
+        assert (
+            git(checkout(project), "symbolic-ref", "--short", "HEAD").stdout.strip()
+            == "codex/task"
+        )
+        registrations = git(repository, "worktree", "list", "--porcelain").stdout
+        assert f"worktree {checkout(project)}\n" in registrations
+        assert not create_journal_path(project).exists()
+        stdout, stderr = owner.communicate("done\n", timeout=10)
+        assert owner.returncode == 0, (stdout, stderr)
+    finally:
+        terminate_process(owner)
+        terminate_process(coordinator)
+
+
+@pytest.mark.parametrize("bind_unrelated_owner", (False, True))
+def test_create_refuses_borrowed_coordinator_without_self_binding(
+    tmp_path: Path, bind_unrelated_owner: bool
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    coordinator = subprocess.Popen(["sleep", "60"], text=True)
+    try:
+        refused = command(
+            project,
+            *delegated_create_arguments(
+                coordinator.pid,
+                coordinator.pid if bind_unrelated_owner else None,
+            ),
+        )
+        assert refused.returncode == 3
+        assert (
+            f"coordinator PID {coordinator.pid} is not in the invoking process ancestry"
+            in refused.stderr
+        )
+        assert not checkout(project).exists()
+        assert active_slots(project) == []
+        assert not create_journal_path(project).exists()
+    finally:
+        terminate_process(coordinator)
+
+
+def test_create_refuses_dead_assigned_coordinator_before_mutation(tmp_path: Path) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    coordinator = subprocess.Popen(["sleep", "60"], text=True)
+    terminate_process(coordinator)
+
+    refused = command(
+        project, *delegated_create_arguments(coordinator.pid, os.getpid())
+    )
+
+    assert refused.returncode == 3
+    assert "not live" in refused.stderr
+    assert not checkout(project).exists()
+    assert active_slots(project) == []
+    assert not create_journal_path(project).exists()
+
+
+def test_interrupted_delegated_create_recovers_after_assigned_coordinator_exits(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    coordinator = subprocess.Popen(["sleep", "60"], text=True)
+    coordinator_identity = wrkslots._identity_to_obj(
+        wrkslots._read_process_identity(coordinator.pid)
+    )
+    try:
+        interrupted = command(
+            project,
+            *delegated_create_arguments(coordinator.pid, os.getpid()),
+            env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"},
+        )
+        assert interrupted.returncode == 86, interrupted.stderr
+        assert active_slots(project) == []
+        assert create_journal_path(project).exists()
+    finally:
+        terminate_process(coordinator)
+
+    recovered = command(
+        project, "recover", "--coordinator-pid", str(os.getpid()), "--slot", "slot01"
+    )
+
+    assert recovered.returncode == 0, recovered.stderr
+    row = active_slots(project)[0]
+    assert isinstance(row, dict)
+    assert row["coordinator_lease"] == coordinator_identity
+    assert row["owner"] == wrkslots._identity_to_obj(
+        wrkslots._read_process_identity(os.getpid())
+    )
+    assert checkout(project).is_dir()
+    assert not create_journal_path(project).exists()
+
+
+@pytest.mark.parametrize("boundary", ("mutation", "publication"))
+@pytest.mark.parametrize("change", ("exit", "generation"))
+def test_create_rechecks_assigned_coordinator_at_mutation_and_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    boundary: str,
+    change: str,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    coordinator = subprocess.Popen(["sleep", "60"], text=True)
+    captured = wrkslots._read_process_identity(coordinator.pid)
+    original_read = wrkslots._read_process_identity
+    original_locks = wrkslots._mutation_locks
+    mutation_started = False
+
+    @contextlib.contextmanager
+    def observe_lock(config: wrkslots.Config, wait_seconds: float) -> Iterator[None]:
+        nonlocal mutation_started
+        with original_locks(config, wait_seconds):
+            mutation_started = True
+            yield
+
+    def changed_process(pid: int) -> wrkslots.ProcessIdentity:
+        reached_boundary = (
+            mutation_started if boundary == "mutation" else checkout(project).exists()
+        )
+        if pid == coordinator.pid and reached_boundary:
+            if change == "exit":
+                raise wrkslots.Refusal(f"owner PID {pid} is not live")
+            return replace(captured, start_ticks=captured.start_ticks + 1)
+        return original_read(pid)
+
+    monkeypatch.setattr(wrkslots, "_mutation_locks", observe_lock)
+    monkeypatch.setattr(wrkslots, "_read_process_identity", changed_process)
+    try:
+        result = wrkslots.main(
+            ["--project-root", str(project)]
+            + delegated_create_arguments(coordinator.pid, os.getpid())
+        )
+        error = capsys.readouterr().err
+        assert result == 3
+        expected = (
+            "coordinator process changed"
+            if change == "exit"
+            else "coordinator process generation changed"
+        )
+        assert expected in error
+        assert active_slots(project) == []
+        assert checkout(project).exists() == (boundary == "publication")
+        assert create_journal_path(project).exists() == (boundary == "publication")
+    finally:
+        terminate_process(coordinator)
 
 
 def test_create_refuses_live_owner_outside_the_invoking_coordinator(
@@ -9094,20 +9307,15 @@ def test_create_refuses_owner_generation_change_before_publication(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     project, _repository, _remote = make_project(tmp_path)
-    current = wrkslots._read_process_identity(os.getpid())
-    reused = wrkslots.ProcessIdentity(
-        pid=current.pid,
-        start_ticks=current.start_ticks + 1,
-        boot_id=current.boot_id,
-        host_id=current.host_id,
-        cgroup_path=current.cgroup_path,
-    )
-    monkeypatch.setattr(
-        wrkslots, "_capture_caller_process", lambda _pid, _label: current
-    )
-    monkeypatch.setattr(wrkslots, "_capture_registration_owner", lambda _pid: current)
-    monkeypatch.setattr(wrkslots, "_assert_caller_process", lambda _identity, _label: None)
-    monkeypatch.setattr(wrkslots, "_read_process_identity", lambda _pid: reused)
+    original_read = wrkslots._read_process_identity
+
+    def changed_after_checkout(pid: int) -> wrkslots.ProcessIdentity:
+        identity = original_read(pid)
+        if pid == os.getpid() and checkout(project).exists():
+            return replace(identity, start_ticks=identity.start_ticks + 1)
+        return identity
+
+    monkeypatch.setattr(wrkslots, "_read_process_identity", changed_after_checkout)
     returncode = wrkslots.main(
         [
             "--project-root",
