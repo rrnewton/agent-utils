@@ -520,15 +520,29 @@ class _CreateJournalClassification:
     slot_path: Path
     planned: tuple[PlannedCheckout, ...]
     created: tuple[Checkout, ...]
+    observed: tuple[Checkout, ...]
     dirty_checkouts: tuple[str, ...]
+    owner_state: str
     owner_detail: str
+    coordinator_state: str
     coordinator_detail: str
     state: str
 
     def to_obj(self) -> dict[str, object]:
         return {
             "agent": self.agent,
+            "checkouts": [
+                {
+                    "branch": checkout.branch,
+                    "dirty": checkout.name in self.dirty_checkouts,
+                    "head": checkout.head,
+                    "name": checkout.name,
+                    "path": checkout.path,
+                }
+                for checkout in self.observed
+            ],
             "coordinator": self.coordinator_detail,
+            "coordinator_state": self.coordinator_state,
             "created": len(self.created),
             "dirty_checkouts": list(self.dirty_checkouts),
             "journal": str(self.path),
@@ -540,7 +554,11 @@ class _CreateJournalClassification:
             },
             "machine": self.machine,
             "owner": self.owner_detail,
+            "owner_state": self.owner_state,
             "planned": len(self.planned),
+            "registry_state": (
+                "exact-active" if self.state == "completed-create" else "absent"
+            ),
             "slot": self.slot,
             "slot_path": str(self.slot_path),
             "slot_type": self.slot_type,
@@ -5575,6 +5593,7 @@ def _create_journal_items(
     Path,
     tuple[PlannedCheckout, ...],
     tuple[Checkout, ...],
+    tuple[Checkout, ...],
     tuple[str, ...],
 ]:
     machine = _as_str(raw["machine"], "create journal.machine")
@@ -5595,18 +5614,6 @@ def _create_journal_items(
         for record in archive.records
     ):
         raise StateError(f"create journal for slot {slot!r} conflicts with an archive")
-    owner = _identity_from_obj(raw["owner"], "create journal.owner")
-    coordinator = _identity_from_obj(
-        raw["coordinator_lease"], "create journal.coordinator_lease"
-    )
-    owner_state, owner_detail = _process_state(owner)
-    coordinator_state, coordinator_detail = _process_state(coordinator)
-    if not completed and (owner_state != "live" or coordinator_state != "live"):
-        raise Refusal(
-            f"create journal for slot {slot!r} is not positively live: "
-            f"owner={owner_state} ({owner_detail}); coordinator={coordinator_state} "
-            f"({coordinator_detail})"
-        )
     planned = tuple(
         _planned_from_obj(item, f"create journal.planned[{index}]")
         for index, item in enumerate(
@@ -5700,6 +5707,7 @@ def _create_journal_items(
             )
     slot_path = _slot_directory(config, slot, slot_type)
     created_by_name = {item.name: item for item in created}
+    observed: list[Checkout] = []
     dirty: list[str] = []
     expected_entries: set[str] = set()
     vcs = _GitVcs()
@@ -5757,11 +5765,19 @@ def _create_journal_items(
             )
         if destination.is_symlink() or not destination.is_dir():
             raise StateError(f"create journal checkout is missing or unsafe: {destination}")
-        if (
-            vcs.verify_existing_worktree(repository, destination) != recorded.head
-            or vcs.branch(destination) != recorded.branch
-        ):
-            raise StateError(f"create journal checkout {item.name} changed identity")
+        observed_head = vcs.verify_existing_worktree(repository, destination)
+        observed_branch = vcs.branch(destination)
+        if observed_branch != recorded.branch:
+            raise StateError(
+                f"create journal checkout {item.name} changed its registered branch"
+            )
+        observed.append(
+            dataclasses.replace(
+                recorded,
+                head=observed_head,
+                containing_remote_refs=(),
+            )
+        )
         if vcs.status(
             destination, _cache_globs_for(config, item.name), refresh_index=False
         ):
@@ -5796,6 +5812,7 @@ def _create_journal_items(
         slot_path,
         planned,
         created,
+        tuple(observed),
         tuple(dirty),
     )
 
@@ -5814,18 +5831,36 @@ def _classify_create_journal(
             f"interrupted {raw.get('kind')!r} mutation {path.name} cannot coexist "
             "with a new create"
         )
-    machine, slot, agent, slot_type, slot_path, planned, created, dirty = (
-        _create_journal_items(
-            config, raw, states, archives, completed=completed
-        )
-    )
     owner = _identity_from_obj(raw["owner"], "create journal.owner")
     coordinator = _identity_from_obj(
         raw["coordinator_lease"], "create journal.coordinator_lease"
     )
     owner_state, owner_detail = _process_state(owner)
     coordinator_state, coordinator_detail = _process_state(coordinator)
-    if not completed and (owner_state != "live" or coordinator_state != "live"):
+    if not completed:
+        if "indeterminate" in {owner_state, coordinator_state}:
+            raise Refusal(
+                f"create journal for slot {raw.get('slot')!r} process state is "
+                f"indeterminate: owner={owner_state} ({owner_detail}); "
+                f"coordinator={coordinator_state} ({coordinator_detail})"
+            )
+        if owner_state != coordinator_state or owner_state not in {"live", "dead"}:
+            raise Refusal(
+                f"create journal for slot {raw.get('slot')!r} has disagreeing process "
+                f"state: owner={owner_state} ({owner_detail}); "
+                f"coordinator={coordinator_state} ({coordinator_detail})"
+            )
+    machine, slot, agent, slot_type, slot_path, planned, created, observed, dirty = (
+        _create_journal_items(
+            config, raw, states, archives, completed=completed
+        )
+    )
+    rebound_owner_state, _rebound_owner_detail = _process_state(owner)
+    rebound_coordinator_state, _rebound_coordinator_detail = _process_state(coordinator)
+    if not completed and (
+        rebound_owner_state != owner_state
+        or rebound_coordinator_state != coordinator_state
+    ):
         raise Refusal(f"create journal for slot {slot!r} changed liveness while read")
     rebound, rebound_identity = _read_regular_file_identity(
         path, "recovery journal", 1024 * 1024
@@ -5845,10 +5880,13 @@ def _classify_create_journal(
         slot_path,
         planned,
         created,
+        observed,
         dirty,
+        owner_state,
         owner_detail,
+        coordinator_state,
         coordinator_detail,
-        "completed-create" if completed else "live-incomplete-create",
+        "completed-create" if completed else f"{owner_state}-incomplete-create",
     )
 
 
@@ -5881,6 +5919,7 @@ def _assert_create_journal_classifications_stable(
     config: Config,
     rows: Sequence[_CreateJournalClassification],
     states: Sequence[ActiveState],
+    archives: Sequence[ArchiveState],
 ) -> None:
     if tuple(row.path for row in rows) != tuple(_outstanding_journals(config)):
         raise Refusal("recovery journal set changed while it was classified")
@@ -5895,6 +5934,35 @@ def _assert_create_journal_classifications_stable(
         if completed != (row.state == "completed-create"):
             raise Refusal(
                 f"create journal completion changed while it was classified: {row.path}"
+            )
+        if not completed:
+            owner = _identity_from_obj(raw["owner"], "create journal.owner")
+            coordinator = _identity_from_obj(
+                raw["coordinator_lease"], "create journal.coordinator_lease"
+            )
+            if (
+                _process_state(owner)[0] != row.owner_state
+                or _process_state(coordinator)[0] != row.coordinator_state
+            ):
+                raise Refusal(
+                    f"create journal liveness changed while it was classified: {row.path}"
+                )
+        (
+            _machine,
+            _slot,
+            _agent,
+            _slot_type,
+            _slot_path,
+            _planned,
+            _created,
+            observed,
+            dirty,
+        ) = _create_journal_items(
+            config, raw, states, archives, completed=completed
+        )
+        if observed != row.observed or dirty != row.dirty_checkouts:
+            raise Refusal(
+                f"create journal checkout state changed while it was classified: {row.path}"
             )
 
 
@@ -9940,7 +10008,9 @@ def _cmd_classify_create_journals(args: argparse.Namespace) -> int:
         raise Refusal("active registry changed while create journals were classified")
     if before_paths != tuple(row.path for row in rows):
         raise Refusal("recovery journal set changed before it was classified")
-    _assert_create_journal_classifications_stable(config, rows, after_states)
+    _assert_create_journal_classifications_stable(
+        config, rows, after_states, after_archives
+    )
     payload = {
         "blocking": False,
         "journals": [row.to_obj() for row in rows],
@@ -9950,7 +10020,7 @@ def _cmd_classify_create_journals(args: argparse.Namespace) -> int:
             "slot_path": str(_slot_directory(config, slot, slot_type)),
             "slot_type": slot_type,
         },
-        "schema": 1,
+        "schema": 2,
     }
     if args.format == "json":
         print(json.dumps(payload, sort_keys=True))
@@ -9959,10 +10029,14 @@ def _cmd_classify_create_journals(args: argparse.Namespace) -> int:
             row.state == "live-incomplete-create" for row in rows
         )
         completed = sum(row.state == "completed-create" for row in rows)
+        dead_incomplete = sum(
+            row.state == "dead-incomplete-create" for row in rows
+        )
         print(
             f"NONBLOCKING: journals={len(rows)} "
             f"live-incomplete-create={live_incomplete} "
-            f"completed-create={completed}; all are unrelated to requested "
+            f"completed-create={completed} "
+            f"dead-incomplete-create={dead_incomplete}; all are unrelated to requested "
             f"{slot_type} slot {slot}"
         )
         for row in rows:
@@ -23556,7 +23630,7 @@ def _cmd_classify_ownerless_validate_batch(args: argparse.Namespace) -> int:
     if before_paths != tuple(row.path for row in create_rows):
         raise Refusal("recovery journal set changed before validation classification")
     _assert_create_journal_classifications_stable(
-        config, create_rows, after_states
+        config, create_rows, after_states, after_archives
     )
     payload = {
         "classifications": results,
