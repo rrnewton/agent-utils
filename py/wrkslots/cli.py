@@ -508,6 +508,47 @@ class PlannedCheckout:
 
 
 @dataclasses.dataclass(frozen=True)
+class _CreateJournalClassification:
+    """Read-only evidence for one trusted create journal and its target."""
+
+    path: Path
+    file_identity: _RegularFileIdentity
+    machine: str
+    slot: str
+    agent: str
+    slot_type: str
+    slot_path: Path
+    planned: tuple[PlannedCheckout, ...]
+    created: tuple[Checkout, ...]
+    dirty_checkouts: tuple[str, ...]
+    owner_detail: str
+    coordinator_detail: str
+    state: str
+
+    def to_obj(self) -> dict[str, object]:
+        return {
+            "agent": self.agent,
+            "coordinator": self.coordinator_detail,
+            "created": len(self.created),
+            "dirty_checkouts": list(self.dirty_checkouts),
+            "journal": str(self.path),
+            "journal_identity": {
+                "device": self.file_identity.device,
+                "inode": self.file_identity.inode,
+                "sha256": self.file_identity.sha256,
+                "size": self.file_identity.size,
+            },
+            "machine": self.machine,
+            "owner": self.owner_detail,
+            "planned": len(self.planned),
+            "slot": self.slot,
+            "slot_path": str(self.slot_path),
+            "slot_type": self.slot_type,
+            "state": self.state,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
 class CacheSlot:
     """One registered or unregistered slot considered for cache cleanup."""
 
@@ -2446,6 +2487,7 @@ def _config_is_authoritative_candidate(root: Path, config_path: Path) -> bool:
         or any(control.glob("ACTIVE.*.json"))
         or any(control.glob("ARCHIVED.*.json"))
         or any(control.glob("ACTIVE.*.journal"))
+        or any(control.glob("CREATE.*.journal"))
         or any(control.glob("VALIDATE-BATCH-SEAL.*.journal"))
         or any(control.glob("EVENTS.*"))
     )
@@ -2644,6 +2686,19 @@ def _journal_path(config: Config, machine: str | None = None) -> Path:
     selected = machine or config.machine
     _validate_name(selected, "machine")
     return config.control / f"ACTIVE.{selected}.journal"
+
+
+def _create_journal_path(
+    config: Config, slot: str, machine: str | None = None
+) -> Path:
+    """Return the collision-free journal path for one create target."""
+
+    selected = machine or config.machine
+    _validate_name(selected, "machine")
+    _validate_name(slot, "slot")
+    return config.control / (
+        f"CREATE.{len(selected)}.{selected}.{len(slot)}.{slot}.journal"
+    )
 
 
 def _validate_batch_seal_journal_path(
@@ -4359,18 +4414,21 @@ def _write_journal(
     payload: Mapping[str, object],
     *,
     event_writer: _EventWriter | None = None,
+    journal_path: Path | None = None,
 ) -> None:
     _ensure_event_log(config)
     writer = event_writer or _event_writer(config, config.machine)
+    selected_path = journal_path or _journal_path(config)
     writer.append(
         "operation-progress-recorded",
         {
             "slot": payload.get("slot"),
             "operation": payload.get("kind"),
+            "journal_path": selected_path.name,
             "journal": dict(payload),
         },
     )
-    _atomic_write_json(_journal_path(config), dict(payload))
+    _atomic_write_json(selected_path, dict(payload))
 
 
 def _clear_journal(
@@ -4378,33 +4436,100 @@ def _clear_journal(
     payload: Mapping[str, object],
     *,
     event_writer: _EventWriter | None = None,
+    journal_path: Path | None = None,
 ) -> None:
     _ensure_event_log(config)
     writer = event_writer or _event_writer(config, config.machine)
+    selected_path = journal_path or _journal_path(config)
     writer.append(
         "operation-completed",
-        {"slot": payload.get("slot"), "operation": payload.get("kind")},
+        {
+            "slot": payload.get("slot"),
+            "operation": payload.get("kind"),
+            "journal_path": selected_path.name,
+        },
     )
-    path = _journal_path(config)
-    if path.exists() or path.is_symlink():
-        _remove_control_file(path)
+    _interrupt_for_test("after-operation-completed")
+    if selected_path.exists() or selected_path.is_symlink():
+        _remove_control_file(selected_path)
 
 
-def _pending_operation_from_events(
+def _operation_event_journal_path(
+    config: Config,
+    machine: str,
+    payload: Mapping[str, object],
+    *,
+    journal: Mapping[str, object] | None = None,
+) -> Path:
+    raw_name = payload.get("journal_path")
+    if raw_name is None:
+        return _journal_path(config, machine)
+    name = _as_str(raw_name, "append-only operation journal_path")
+    if Path(name).name != name:
+        raise StateError("append-only operation journal_path is not a filename")
+    operation = _as_str(payload.get("operation"), "append-only operation kind")
+    slot = _validate_name(
+        _as_str(payload.get("slot"), "append-only operation slot"), "slot"
+    )
+    expected = (
+        _create_journal_path(config, slot, machine)
+        if operation == "create" and name.startswith("CREATE.")
+        else _journal_path(config, machine)
+    )
+    selected = config.control / name
+    if selected != expected:
+        raise StateError(
+            "append-only operation journal_path does not match its operation identity"
+        )
+    if journal is not None and (
+        journal.get("kind") != operation
+        or journal.get("slot") != slot
+        or journal.get("machine") != machine
+    ):
+        raise StateError(
+            "append-only operation event does not match its embedded journal"
+        )
+    return selected
+
+
+def _pending_operations_from_events(
     config: Config, machine: str
-) -> Mapping[str, object] | None:
-    pending: Mapping[str, object] | None = None
+) -> Mapping[Path, Mapping[str, object]]:
+    pending: dict[Path, Mapping[str, object]] = {}
     for event in _load_events(config, machine):
         kind = _as_str(event["kind"], "append-only event.kind")
         payload = _as_mapping(event["payload"], "append-only event.payload")
         if kind == "operation-progress-recorded":
-            pending = _as_mapping(payload.get("journal"), "append-only operation journal")
-        elif kind == "operation-completed" and pending is not None:
+            journal_value = _as_mapping(
+                payload.get("journal"), "append-only operation journal"
+            )
+            path = _operation_event_journal_path(
+                config, machine, payload, journal=journal_value
+            )
+            identity = (journal_value.get("kind"), journal_value.get("slot"))
+            for existing_path, existing in pending.items():
+                if existing_path != path and (
+                    existing.get("kind"), existing.get("slot")
+                ) == identity:
+                    raise StateError(
+                        "append-only history has the same pending operation under "
+                        "multiple journal paths"
+                    )
+            pending[path] = journal_value
+        elif kind == "operation-completed":
+            path = _operation_event_journal_path(config, machine, payload)
+            current = pending.get(path)
+            if current is None:
+                continue
             if (
-                payload.get("slot") == pending.get("slot")
-                and payload.get("operation") == pending.get("kind")
+                payload.get("slot") == current.get("slot")
+                and payload.get("operation") == current.get("kind")
             ):
-                pending = None
+                del pending[path]
+            else:
+                raise StateError(
+                    "append-only completion does not match its pending operation"
+                )
     return pending
 
 
@@ -5030,12 +5155,17 @@ def _validate_journal_shape(
     if _as_int(raw.get("schema"), "recovery journal.schema") != SCHEMA:
         raise StateError("unsupported recovery journal schema")
     machine = _as_str(raw.get("machine"), "recovery journal.machine")
-    if path != _journal_path(config, machine):
-        raise StateError("recovery journal filename does not match its machine")
     kind = _as_str(raw.get("kind"), "recovery journal.kind")
     slot = _validate_name(
         _as_str(raw.get("slot"), "recovery journal.slot"), "slot"
     )
+    expected_paths = {_journal_path(config, machine)}
+    if kind == "create":
+        expected_paths.add(_create_journal_path(config, slot, machine))
+    if path not in expected_paths:
+        raise StateError(
+            "recovery journal filename does not match its machine, operation, and slot"
+        )
     if kind == "create":
         _exact_keys(
             raw, _CREATE_JOURNAL_REQUIRED, _CREATE_JOURNAL_OPTIONAL, "create journal"
@@ -5216,6 +5346,615 @@ def _validate_journal_shape(
         raise StateError(f"unsupported recovery journal kind {kind!r}")
 
 
+def _completed_create_record(
+    config: Config, raw: Mapping[str, object]
+) -> ActiveRecord:
+    """Reconstruct the only ACTIVE row that can discharge a completed create."""
+
+    machine = _as_str(raw["machine"], "create journal.machine")
+    slot = _validate_name(_as_str(raw["slot"], "create journal.slot"), "slot")
+    agent = _validate_name(_as_str(raw["agent"], "create journal.agent"), "agent")
+    slot_type = _as_str(raw.get("slot_type", "agent"), "create journal.slot_type")
+    if slot_type not in SLOT_TYPES:
+        raise StateError("create journal has an invalid slot type")
+    planned = tuple(
+        _planned_from_obj(item, f"create journal.planned[{index}]")
+        for index, item in enumerate(
+            _as_list(raw["planned"], "create journal.planned")
+        )
+    )
+    created = tuple(
+        _checkout_from_obj(item, f"create journal.created[{index}]")
+        for index, item in enumerate(
+            _as_list(raw["created"], "create journal.created")
+        )
+    )
+    if len(created) != len(planned):
+        raise StateError("completed create journal has an incomplete checkout plan")
+    for item, checkout in zip(planned, created, strict=True):
+        if (
+            checkout.name,
+            checkout.path,
+            checkout.repository,
+            checkout.branch,
+            checkout.start_point,
+            checkout.remote,
+            checkout.remote_url_sha256,
+            checkout.landed_ref,
+            checkout.head,
+        ) != (
+            item.name,
+            item.destination,
+            item.repository,
+            item.branch,
+            item.start_point,
+            item.remote,
+            item.remote_url_sha256,
+            item.landed_ref,
+            item.start_point,
+        ):
+            raise StateError("completed create journal differs from its checkout plan")
+    hooks = _string_tuple(
+        raw.get("post_provision_hooks", []),
+        "create journal.post_provision_hooks",
+        _validate_hook,
+        unique=False,
+    )
+    if hooks != config.post_provision_hooks:
+        raise StateError("create journal post-provision hooks differ from configuration")
+    if (
+        _as_int(raw.get("hook_progress", 0), "create journal.hook_progress")
+        != len(planned) * len(hooks)
+        or raw.get("hook_failure") is not None
+    ):
+        raise StateError("completed create journal has unfinished post-provision hooks")
+    heartbeat_ttl_seconds = _as_int(
+        raw["heartbeat_ttl_seconds"],
+        "create journal.heartbeat_ttl_seconds",
+        minimum=1,
+    )
+    if heartbeat_ttl_seconds != config.heartbeat_ttl_seconds:
+        raise StateError("create journal heartbeat TTL differs from configuration")
+    owner = _identity_from_obj(raw["owner"], "create journal.owner")
+    coordinator = _identity_from_obj(
+        raw["coordinator_lease"], "create journal.coordinator_lease"
+    )
+    if coordinator is None:
+        raise StateError("create journal has no coordinator lease")
+    created_at = _as_str(raw["created_at"], "create journal.created_at")
+    heartbeat_at = _as_str(raw["heartbeat_at"], "create journal.heartbeat_at")
+    _parse_timestamp(created_at, "create journal.created_at")
+    _parse_timestamp(heartbeat_at, "create journal.heartbeat_at")
+    task = _as_str(raw["task"], "create journal.task")
+    purpose = _as_str(raw["purpose"], "create journal.purpose")
+    if not task or not purpose:
+        raise StateError("create journal has an empty task or purpose")
+    return ActiveRecord(
+        slot=slot,
+        agent=agent,
+        task=task,
+        purpose=purpose,
+        slot_type=slot_type,
+        machine=machine,
+        generation=1,
+        created_at=created_at,
+        heartbeat_at=heartbeat_at,
+        heartbeat_ttl_seconds=heartbeat_ttl_seconds,
+        owner=owner,
+        coordinator_lease=coordinator,
+        coordinator_recovery_note=None,
+        handoff=None,
+        checkouts=created,
+    )
+
+
+def _scoped_create_journal_completed(
+    config: Config,
+    path: Path,
+    raw: Mapping[str, object],
+    states: Sequence[ActiveState] | None = None,
+) -> bool:
+    """Verify event-first provenance and return whether publication completed."""
+
+    machine = _as_str(raw["machine"], "create journal.machine")
+    slot = _validate_name(_as_str(raw["slot"], "create journal.slot"), "slot")
+    if path != _create_journal_path(config, slot, machine):
+        raise StateError("scoped create journal filename does not match its target")
+    recorded: Mapping[str, object] | None = None
+    completed = False
+    for event in _load_events(config, machine):
+        event_kind = _as_str(event["kind"], "append-only event.kind")
+        if event_kind not in {"operation-progress-recorded", "operation-completed"}:
+            continue
+        payload = _as_mapping(event["payload"], "append-only event.payload")
+        journal = (
+            _as_mapping(payload.get("journal"), "append-only operation journal")
+            if event_kind == "operation-progress-recorded"
+            else None
+        )
+        event_path = _operation_event_journal_path(
+            config, machine, payload, journal=journal
+        )
+        if event_path != path:
+            continue
+        if event_kind == "operation-progress-recorded":
+            if completed:
+                raise StateError(
+                    "scoped create journal path was reused after completion"
+                )
+            assert journal is not None
+            recorded = journal
+            continue
+        if recorded is None:
+            raise StateError(
+                "scoped create completion has no preceding progress evidence"
+            )
+        if completed:
+            continue
+        completed = True
+    if recorded is None:
+        raise StateError(
+            "scoped create journal has no matching append-only progress evidence"
+        )
+    if not _json_equal(raw, recorded):
+        raise StateError(
+            "scoped create journal differs from append-only progress evidence"
+        )
+    if completed:
+        expected = _completed_create_record(config, raw)
+        selected_states = (
+            tuple(states)
+            if states is not None
+            else tuple(_load_all_active(config, require_repository=False))
+        )
+        matches = [
+            record
+            for state in selected_states
+            if state.machine == expected.machine
+            for record in state.slots
+            if record.slot == expected.slot
+        ]
+        if len(matches) != 1 or _record_to_obj(matches[0]) != _record_to_obj(expected):
+            raise StateError(
+                "completed scoped create journal has no exact durable ACTIVE row"
+            )
+    return completed
+
+
+def _validate_journal_provenance(
+    config: Config,
+    path: Path,
+    raw: Mapping[str, object],
+    states: Sequence[ActiveState] | None = None,
+) -> bool:
+    """Validate journal bytes against their required durable provenance."""
+
+    _validate_journal_shape(config, path, raw)
+    machine = _as_str(raw.get("machine"), "recovery journal.machine")
+    if path == _journal_path(config, machine):
+        pending = _pending_journal_for_path(config, path)
+        if pending is not None and not _json_equal(raw, pending):
+            raise StateError(
+                "standalone recovery journal differs from append-only operation evidence"
+            )
+        return False
+    if raw.get("kind") == "create":
+        return _scoped_create_journal_completed(config, path, raw, states)
+    raise StateError("only create journals may use a scoped journal path")
+
+
+def _read_stable_physical_journal(
+    config: Config,
+    path: Path,
+    states: Sequence[ActiveState] | None = None,
+) -> tuple[Mapping[str, object], _RegularFileIdentity, bool]:
+    if not path.exists() and not path.is_symlink():
+        raise StateError(
+            f"recovery journal {path} is missing while append-only history still names it"
+        )
+    contents, identity = _read_regular_file_identity(
+        path, "recovery journal", 1024 * 1024
+    )
+    raw = _strict_json_object(contents, "recovery journal")
+    completed = _validate_journal_provenance(config, path, raw, states)
+    return raw, identity, completed
+
+
+def _create_journal_items(
+    config: Config,
+    raw: Mapping[str, object],
+    states: Sequence[ActiveState],
+    archives: Sequence[ArchiveState],
+    *,
+    completed: bool,
+) -> tuple[
+    str,
+    str,
+    str,
+    str,
+    Path,
+    tuple[PlannedCheckout, ...],
+    tuple[Checkout, ...],
+    tuple[str, ...],
+]:
+    machine = _as_str(raw["machine"], "create journal.machine")
+    slot = _validate_name(_as_str(raw["slot"], "create journal.slot"), "slot")
+    agent = _validate_name(_as_str(raw["agent"], "create journal.agent"), "agent")
+    slot_type = _as_str(raw.get("slot_type", "agent"), "create journal.slot_type")
+    if slot_type not in SLOT_TYPES:
+        raise StateError("create journal has an invalid slot type")
+    if not completed and any(
+        record.slot == slot for state in states for record in state.slots
+    ):
+        raise StateError(
+            f"create journal for slot {slot!r} has already reached ACTIVE publication"
+        )
+    if any(
+        record.get("slot") == slot
+        for archive in archives
+        for record in archive.records
+    ):
+        raise StateError(f"create journal for slot {slot!r} conflicts with an archive")
+    owner = _identity_from_obj(raw["owner"], "create journal.owner")
+    coordinator = _identity_from_obj(
+        raw["coordinator_lease"], "create journal.coordinator_lease"
+    )
+    owner_state, owner_detail = _process_state(owner)
+    coordinator_state, coordinator_detail = _process_state(coordinator)
+    if not completed and (owner_state != "live" or coordinator_state != "live"):
+        raise Refusal(
+            f"create journal for slot {slot!r} is not positively live: "
+            f"owner={owner_state} ({owner_detail}); coordinator={coordinator_state} "
+            f"({coordinator_detail})"
+        )
+    planned = tuple(
+        _planned_from_obj(item, f"create journal.planned[{index}]")
+        for index, item in enumerate(
+            _as_list(raw["planned"], "create journal.planned")
+        )
+    )
+    created = tuple(
+        _checkout_from_obj(item, f"create journal.created[{index}]")
+        for index, item in enumerate(
+            _as_list(raw["created"], "create journal.created")
+        )
+    )
+    if not planned or len({item.name for item in planned}) != len(planned):
+        raise StateError("create journal has an empty or duplicate checkout plan")
+    if len({item.name for item in created}) != len(created):
+        raise StateError("create journal has duplicate completed checkouts")
+    if [item.name for item in created] != [
+        item.name for item in planned[: len(created)]
+    ]:
+        raise StateError("create journal's completed checkouts are not a planned prefix")
+    hooks = _string_tuple(
+        raw.get("post_provision_hooks", []),
+        "create journal.post_provision_hooks",
+        _validate_hook,
+        unique=False,
+    )
+    if hooks != config.post_provision_hooks:
+        raise StateError("create journal post-provision hooks differ from configuration")
+    if raw.get("failure_policy") != "leave-for-inspection":
+        raise StateError("create journal has an unsupported hook failure policy")
+    progress = _as_int(raw.get("hook_progress", 0), "create journal.hook_progress")
+    if progress > len(created) * len(hooks):
+        raise StateError("create journal ran hooks for an unrecorded checkout")
+    failure_raw = raw.get("hook_failure")
+    if failure_raw is not None:
+        failure = _as_mapping(failure_raw, "create journal.hook_failure")
+        _exact_keys(
+            failure,
+            {"checkout", "hook_index", "command", "status"},
+            {"returncode", "detail"},
+            "create journal.hook_failure",
+        )
+        if (
+            not hooks
+            or progress >= len(planned) * len(hooks)
+            or len(created) != len(planned)
+        ):
+            raise StateError("create journal hook failure is inconsistent with progress")
+        hook_index = progress % len(hooks)
+        failure_status = _as_str(
+            failure["status"], "create journal.hook_failure.status"
+        )
+        if (
+            _as_str(
+                failure["checkout"], "create journal.hook_failure.checkout"
+            )
+            != planned[progress // len(hooks)].name
+            or _as_int(
+                failure["hook_index"], "create journal.hook_failure.hook_index"
+            )
+            != hook_index
+            or _as_str(
+                failure["command"], "create journal.hook_failure.command"
+            )
+            != hooks[hook_index]
+            or failure_status not in {"running", "failed", "failed-to-start"}
+        ):
+            raise StateError("create journal hook failure does not match its progress")
+        if failure_status == "running":
+            if "returncode" in failure or "detail" in failure:
+                raise StateError(
+                    "running create hook records impossible completion details"
+                )
+        elif failure_status == "failed":
+            returncode = failure.get("returncode")
+            if (
+                not isinstance(returncode, int)
+                or isinstance(returncode, bool)
+                or returncode == 0
+                or "detail" in failure
+            ):
+                raise StateError("failed create hook has invalid completion details")
+        elif (
+            "returncode" in failure
+            or not _as_str(
+                failure.get("detail"), "create journal.hook_failure.detail"
+            ).strip()
+        ):
+            raise StateError(
+                "failed-to-start create hook has invalid completion details"
+            )
+    slot_path = _slot_directory(config, slot, slot_type)
+    created_by_name = {item.name: item for item in created}
+    dirty: list[str] = []
+    expected_entries: set[str] = set()
+    vcs = _GitVcs()
+    for item in planned:
+        expected_path, destination = _checkout_path(config, slot, item.name, slot_type)
+        if item.destination != expected_path:
+            raise StateError(
+                f"create journal destination for {item.name} does not match slot {slot}"
+            )
+        _stored_repository, repository = _stored_repository_path(
+            config, item.repository
+        )
+        if item.landed_ref != _landed_ref_for_remote(config, item.remote):
+            raise StateError(
+                f"create journal target for {item.name} differs from configured authority"
+            )
+        if vcs.remote_url_sha256(repository, item.remote) != item.remote_url_sha256:
+            raise Refusal(f"create journal remote changed for {item.name}")
+        recorded = created_by_name.get(item.name)
+        if recorded is None:
+            if destination.exists() or destination.is_symlink():
+                raise StateError(f"create journal has an unrecorded path at {destination}")
+            if destination.absolute() in vcs.listed_worktrees(repository):
+                raise StateError(
+                    f"create journal has an unrecorded Git worktree at {destination}"
+                )
+            if vcs.branch_exists(repository, item.branch):
+                raise StateError(
+                    f"create journal has an unrecorded branch {item.branch!r}"
+                )
+            continue
+        expected = (
+            item.destination,
+            item.repository,
+            item.branch,
+            item.start_point,
+            item.remote,
+            item.remote_url_sha256,
+            item.landed_ref,
+            item.start_point,
+        )
+        actual = (
+            recorded.path,
+            recorded.repository,
+            recorded.branch,
+            recorded.start_point,
+            recorded.remote,
+            recorded.remote_url_sha256,
+            recorded.landed_ref,
+            recorded.head,
+        )
+        if actual != expected:
+            raise StateError(
+                f"create journal's completed checkout {item.name} differs from its plan"
+            )
+        if destination.is_symlink() or not destination.is_dir():
+            raise StateError(f"create journal checkout is missing or unsafe: {destination}")
+        if (
+            vcs.verify_existing_worktree(repository, destination) != recorded.head
+            or vcs.branch(destination) != recorded.branch
+        ):
+            raise StateError(f"create journal checkout {item.name} changed identity")
+        if vcs.status(
+            destination, _cache_globs_for(config, item.name), refresh_index=False
+        ):
+            dirty.append(item.name)
+        expected_entries.add(item.name)
+    if slot_path.exists() or slot_path.is_symlink():
+        if slot_path.is_symlink() or not slot_path.is_dir():
+            raise StateError(f"create journal slot path is unsafe: {slot_path}")
+        if config.layout == "nested" and {
+            entry.name for entry in slot_path.iterdir()
+        } != expected_entries:
+            raise StateError(f"create journal slot {slot!r} contains unrecorded paths")
+    elif created:
+        raise StateError(f"create journal has checkouts below missing slot {slot!r}")
+    for state in states:
+        for record in state.slots:
+            if completed and state.machine == machine and record.slot == slot:
+                continue
+            active_path = _slot_directory(config, record.slot, record.slot_type)
+            if _path_is_within(slot_path, active_path) or _path_is_within(
+                active_path, slot_path
+            ):
+                raise StateError(
+                    f"create journal slot {slot!r} overlaps active slot "
+                    f"{state.machine}/{record.slot}"
+                )
+    return (
+        machine,
+        slot,
+        agent,
+        slot_type,
+        slot_path,
+        planned,
+        created,
+        tuple(dirty),
+    )
+
+
+def _classify_create_journal(
+    config: Config,
+    path: Path,
+    states: Sequence[ActiveState],
+    archives: Sequence[ArchiveState],
+) -> _CreateJournalClassification:
+    raw, identity, completed = _read_stable_physical_journal(
+        config, path, states
+    )
+    if raw.get("kind") != "create":
+        raise Refusal(
+            f"interrupted {raw.get('kind')!r} mutation {path.name} cannot coexist "
+            "with a new create"
+        )
+    machine, slot, agent, slot_type, slot_path, planned, created, dirty = (
+        _create_journal_items(
+            config, raw, states, archives, completed=completed
+        )
+    )
+    owner = _identity_from_obj(raw["owner"], "create journal.owner")
+    coordinator = _identity_from_obj(
+        raw["coordinator_lease"], "create journal.coordinator_lease"
+    )
+    owner_state, owner_detail = _process_state(owner)
+    coordinator_state, coordinator_detail = _process_state(coordinator)
+    if not completed and (owner_state != "live" or coordinator_state != "live"):
+        raise Refusal(f"create journal for slot {slot!r} changed liveness while read")
+    rebound, rebound_identity = _read_regular_file_identity(
+        path, "recovery journal", 1024 * 1024
+    )
+    if (
+        rebound_identity != identity
+        or _strict_json_object(rebound, "recovery journal") != raw
+    ):
+        raise Refusal(f"create journal changed while it was classified: {path}")
+    return _CreateJournalClassification(
+        path,
+        identity,
+        machine,
+        slot,
+        agent,
+        slot_type,
+        slot_path,
+        planned,
+        created,
+        dirty,
+        owner_detail,
+        coordinator_detail,
+        "completed-create" if completed else "live-incomplete-create",
+    )
+
+
+def _classify_create_journals(
+    config: Config,
+    states: Sequence[ActiveState],
+    archives: Sequence[ArchiveState],
+) -> tuple[_CreateJournalClassification, ...]:
+    rows = tuple(
+        _classify_create_journal(config, path, states, archives)
+        for path in _outstanding_journals(config)
+    )
+    seen_slots: set[tuple[str, str]] = set()
+    seen_agents: set[str] = set()
+    for row in rows:
+        key = (row.machine, row.slot)
+        if key in seen_slots:
+            raise StateError(
+                f"multiple interrupted creates claim {row.machine}/{row.slot}"
+            )
+        seen_slots.add(key)
+        if row.slot_type == "agent" and row.agent in seen_agents:
+            raise StateError(f"multiple interrupted creates claim agent {row.agent!r}")
+        if row.slot_type == "agent":
+            seen_agents.add(row.agent)
+    return rows
+
+
+def _assert_create_journal_classifications_stable(
+    config: Config,
+    rows: Sequence[_CreateJournalClassification],
+    states: Sequence[ActiveState],
+) -> None:
+    if tuple(row.path for row in rows) != tuple(_outstanding_journals(config)):
+        raise Refusal("recovery journal set changed while it was classified")
+    for row in rows:
+        contents, identity = _read_regular_file_identity(
+            row.path, "recovery journal", 1024 * 1024
+        )
+        if identity != row.file_identity:
+            raise Refusal(f"create journal changed while it was classified: {row.path}")
+        raw = _strict_json_object(contents, "recovery journal")
+        completed = _validate_journal_provenance(config, row.path, raw, states)
+        if completed != (row.state == "completed-create"):
+            raise Refusal(
+                f"create journal completion changed while it was classified: {row.path}"
+            )
+
+
+def _assert_interrupted_creates_unrelated(
+    config: Config,
+    rows: Sequence[_CreateJournalClassification],
+    *,
+    slot: str,
+    agent: str,
+    slot_type: str,
+    plan: Sequence[PlannedCheckout] = (),
+) -> None:
+    target = _slot_directory(config, slot, slot_type)
+    for row in rows:
+        if row.slot == slot:
+            raise Refusal(
+                f"interrupted create already targets slot {slot!r}; recover that exact slot"
+            )
+        if slot_type == row.slot_type == "agent" and row.agent == agent:
+            raise Refusal(
+                f"interrupted create already belongs to agent {agent!r}; recover it first"
+            )
+        if _path_is_within(target, row.slot_path) or _path_is_within(
+            row.slot_path, target
+        ):
+            raise Refusal(
+                f"requested slot path {target} overlaps interrupted create "
+                f"{row.machine}/{row.slot}"
+            )
+        for requested in plan:
+            requested_repository = _stored_repository_path(
+                config, requested.repository
+            )[1]
+            requested_path = _stored_path(
+                config, requested.destination, "checkout destination"
+            )
+            for existing in row.planned:
+                existing_repository = _stored_repository_path(
+                    config, existing.repository
+                )[1]
+                existing_path = _stored_path(
+                    config, existing.destination, "create journal checkout destination"
+                )
+                if _path_is_within(requested_path, existing_path) or _path_is_within(
+                    existing_path, requested_path
+                ):
+                    raise Refusal(
+                        f"checkout destination {requested_path} overlaps interrupted "
+                        f"create {row.machine}/{row.slot}/{existing.name}"
+                    )
+                if (
+                    requested_repository == existing_repository
+                    and requested.branch == existing.branch
+                ):
+                    raise Refusal(
+                        f"branch {requested.branch!r} is claimed by interrupted create "
+                        f"{row.machine}/{row.slot}"
+                    )
+
+
 def _journal_inconsistencies(
     config: Config, journals: Sequence[Path]
 ) -> tuple[StorageInconsistency, ...]:
@@ -5223,26 +5962,24 @@ def _journal_inconsistencies(
 
     findings: list[StorageInconsistency] = []
     for path in journals:
-        machine = path.name.removeprefix("ACTIVE.").removesuffix(".journal")
+        legacy_name = re.fullmatch(
+            r"ACTIVE\.([A-Za-z0-9][A-Za-z0-9._-]{0,63})\.journal", path.name
+        )
+        machine: str | None = None if legacy_name is None else legacy_name.group(1)
         try:
-            pending = _pending_operation_from_events(config, machine)
             if path.exists() or path.is_symlink():
                 raw = _as_mapping(
                     _read_json(path, "recovery journal"), "recovery journal"
                 )
-            elif pending is not None:
-                raw = pending
             else:
-                raise StateError("journal has neither standalone nor append-only evidence")
-            _validate_journal_shape(config, path, raw)
-            if (
-                pending is not None
-                and (path.exists() or path.is_symlink())
-                and not _json_equal(raw, pending)
-            ):
-                raise StateError(
-                    "standalone recovery journal differs from append-only operation evidence"
-                )
+                pending_only = _pending_journal_for_path(config, path)
+                if pending_only is None:
+                    raise StateError(
+                        "journal has neither standalone nor append-only evidence"
+                    )
+                raw = pending_only
+            machine = _as_str(raw.get("machine"), "recovery journal.machine")
+            _validate_journal_provenance(config, path, raw)
         except (Refusal, StateError) as exc:
             findings.append(
                 StorageInconsistency(
@@ -8130,6 +8867,7 @@ def _refuse_partial_state(
     leftovers = sorted(config.control.glob("ACTIVE.*.json.tmp.*"))
     leftovers += sorted(config.control.glob("ARCHIVED.*.json.tmp.*"))
     leftovers += sorted(config.control.glob("ACTIVE.*.journal.tmp.*"))
+    leftovers += sorted(config.control.glob("CREATE.*.journal.tmp.*"))
     leftovers += sorted(
         config.control.glob("VALIDATE-BATCH-SEAL.*.journal.tmp.*")
     )
@@ -8150,13 +8888,31 @@ def _refuse_partial_state(
 
 def _outstanding_journals(config: Config) -> list[Path]:
     paths = {path for path in config.control.glob("ACTIVE.*.journal")}
+    paths.update(config.control.glob("CREATE.*.journal"))
     for directory in config.control.glob("EVENTS.*"):
         if not directory.is_dir() or directory.is_symlink():
             continue
         machine = directory.name.removeprefix("EVENTS.")
-        if _pending_operation_from_events(config, machine) is not None:
-            paths.add(_journal_path(config, machine))
+        paths.update(_pending_operations_from_events(config, machine))
     return sorted(paths)
+
+
+def _pending_journal_for_path(
+    config: Config, path: Path
+) -> Mapping[str, object] | None:
+    matches: list[Mapping[str, object]] = []
+    for directory in config.control.glob("EVENTS.*"):
+        if not directory.is_dir() or directory.is_symlink():
+            continue
+        machine = directory.name.removeprefix("EVENTS.")
+        pending = _pending_operations_from_events(config, machine).get(path)
+        if pending is not None:
+            matches.append(pending)
+    if len(matches) > 1:
+        raise StateError(
+            f"multiple append-only histories claim pending journal {path}"
+        )
+    return matches[0] if matches else None
 
 
 def _assert_no_journal(config: Config) -> None:
@@ -8167,25 +8923,59 @@ def _assert_no_journal(config: Config) -> None:
         )
 
 
-def _load_journal(config: Config) -> tuple[Path, Mapping[str, object]]:
+def _create_journal_path_for_slot(config: Config, slot: str) -> Path:
+    """Select one legacy or scoped create journal by its validated slot identity."""
+
+    matches: list[Path] = []
+    for path in _outstanding_journals(config):
+        if path.exists() or path.is_symlink():
+            raw = _as_mapping(
+                _read_json(path, "recovery journal"), "recovery journal"
+            )
+        else:
+            pending = _pending_journal_for_path(config, path)
+            if pending is None:
+                raise StateError(
+                    f"journal has neither standalone nor append-only evidence: {path}"
+                )
+            raw = pending
+        _validate_journal_shape(config, path, raw)
+        if raw.get("kind") == "create" and raw.get("slot") == slot:
+            matches.append(path)
+    if not matches:
+        raise Refusal(f"no interrupted create is recorded for slot {slot!r}")
+    if len(matches) != 1:
+        raise StateError(f"multiple interrupted creates claim slot {slot!r}")
+    return matches[0]
+
+
+def _load_journal(
+    config: Config, *, selected_path: Path | None = None
+) -> tuple[Path, Mapping[str, object]]:
     journals = _outstanding_journals(config)
     if not journals:
         raise Refusal("no interrupted mutation is recorded")
-    if len(journals) != 1:
+    if selected_path is not None:
+        if selected_path not in journals:
+            raise Refusal(f"no interrupted mutation is recorded in {selected_path}")
+        path = selected_path
+    elif len(journals) != 1:
         raise StateError(
-            "multiple interrupted mutations are present; inspect every journal before continuing"
+            "multiple interrupted mutations are present; select one exact create slot "
+            "with '--slot SLOT' or inspect every journal before continuing"
         )
-    path = journals[0]
+    else:
+        path = journals[0]
     if path.exists() or path.is_symlink():
         raw = _as_mapping(_read_json(path, "recovery journal"), "recovery journal")
     else:
-        machine = path.name.removeprefix("ACTIVE.").removesuffix(".journal")
-        pending = _pending_operation_from_events(config, machine)
+        pending = _pending_journal_for_path(config, path)
         if pending is None:
             raise StateError(
                 f"append-only log names no pending operation for missing journal {path}"
             )
         raw = pending
+    _validate_journal_provenance(config, path, raw)
     return path, raw
 
 
@@ -8365,6 +9155,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
                             existing_worktrees_path, existing_layout
                         )
                         journals = sorted(existing_control.glob("ACTIVE.*.journal"))
+                        journals += sorted(existing_control.glob("CREATE.*.journal"))
                         if journals:
                             raise Refusal(
                                 f"cannot change configuration while recovery journal "
@@ -8813,7 +9604,7 @@ def _run_post_provision_hooks(
             "status": "running",
         }
         journal["hook_failure"] = attempt
-        _write_journal(config, journal)
+        _write_journal(config, journal, journal_path=journal_path)
         env = os.environ.copy()
         env.update(
             {
@@ -8840,7 +9631,7 @@ def _run_post_provision_hooks(
             attempt["status"] = "failed-to-start"
             attempt["detail"] = str(exc)
             journal["hook_failure"] = attempt
-            _write_journal(config, journal)
+            _write_journal(config, journal, journal_path=journal_path)
             raise Refusal(
                 f"post-provision hook {hook_index + 1} for checkout {checkout.name} "
                 f"could not start: {exc}; slot was left for inspection with journal "
@@ -8850,7 +9641,7 @@ def _run_post_provision_hooks(
             attempt["status"] = "failed"
             attempt["returncode"] = completed.returncode
             journal["hook_failure"] = attempt
-            _write_journal(config, journal)
+            _write_journal(config, journal, journal_path=journal_path)
             if completed.stdout:
                 print("post-provision hook stdout:", file=sys.stderr)
                 print(completed.stdout, end="" if completed.stdout.endswith("\n") else "\n", file=sys.stderr)
@@ -8864,7 +9655,7 @@ def _run_post_provision_hooks(
             )
         journal["hook_progress"] = step + 1
         journal["hook_failure"] = None
-        _write_journal(config, journal)
+        _write_journal(config, journal, journal_path=journal_path)
     return total
 
 
@@ -8889,8 +9680,17 @@ def _cmd_create(args: argparse.Namespace) -> int:
     vcs = _GitVcs()
     with _mutation_locks(config, args.wait_lock):
         _refuse_partial_state(config)
-        _assert_no_journal(config)
         states, archives = _validate_global_state(config)
+        interrupted_creates = _classify_create_journals(
+            config, states, archives
+        )
+        _assert_interrupted_creates_unrelated(
+            config,
+            interrupted_creates,
+            slot=args.slot,
+            agent=args.agent,
+            slot_type=args.slot_type,
+        )
         before = _global_rows(states, archives)
         _ensure_state_shard(config)
         state = _load_active(config)
@@ -8900,6 +9700,14 @@ def _cmd_create(args: argparse.Namespace) -> int:
         if slot_path.exists() or slot_path.is_symlink():
             raise Refusal(f"slot path already exists: {slot_path}")
         plan = _create_plan(config, args, vcs)
+        _assert_interrupted_creates_unrelated(
+            config,
+            interrupted_creates,
+            slot=args.slot,
+            agent=args.agent,
+            slot_type=args.slot_type,
+            plan=plan,
+        )
         plan_repositories = tuple(
             _stored_repository_path(config, item.repository)[1] for item in plan
         )
@@ -8909,11 +9717,22 @@ def _cmd_create(args: argparse.Namespace) -> int:
         _assert_create_target_clear(
             config, states, args.slot, args.slot_type, plan, vcs
         )
+        interrupted_creates = _classify_create_journals(
+            config, states, archives
+        )
+        _assert_interrupted_creates_unrelated(
+            config,
+            interrupted_creates,
+            slot=args.slot,
+            agent=args.agent,
+            slot_type=args.slot_type,
+            plan=plan,
+        )
         _warn_retained_storage_inconsistencies(storage_inconsistencies)
         slot_path.parent.mkdir(parents=True, exist_ok=True)
         created_at = _utc_now()
         heartbeat_at = created_at
-        journal_path = _journal_path(config)
+        journal_path = _create_journal_path(config, args.slot)
         created: list[Checkout] = []
         _write_journal(
             config,
@@ -8928,6 +9747,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 heartbeat_at=heartbeat_at,
                 hook_progress=0,
             ),
+            journal_path=journal_path,
         )
         if config.layout == "nested":
             slot_path.mkdir(mode=0o755)
@@ -8961,6 +9781,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                     heartbeat_at=heartbeat_at,
                     hook_progress=0,
                 ),
+                journal_path=journal_path,
             )
             _interrupt_for_test("after-create-worktree")
         hook_journal = _create_journal_payload(
@@ -9012,6 +9833,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 heartbeat_at=heartbeat_at,
                 hook_progress=hook_progress,
             ),
+            journal_path=journal_path,
         )
         record = ActiveRecord(
             slot=args.slot,
@@ -9046,6 +9868,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
         _clear_journal(
             config,
             _as_mapping(_read_json(journal_path, "create journal"), "create journal"),
+            journal_path=journal_path,
         )
         after_states, after_archives = _validate_global_state(config)
         _assert_only_slot_changed(
@@ -9094,6 +9917,60 @@ def _cmd_create(args: argparse.Namespace) -> int:
             )
         if owner is None:
             print("owner_process=unbound; run 'wrkslots adopt' before heartbeat or finish")
+    return 0
+
+
+def _cmd_classify_create_journals(args: argparse.Namespace) -> int:
+    """Classify existing create journals without locks, authorization, or writes."""
+
+    config = _load_config(args.project_root, args.machine)
+    slot_type = _require_slot_type(args, "create-journal classification")
+    slot = _validate_name(args.slot, "slot")
+    agent = _validate_name(args.agent, "agent")
+    _refuse_partial_state(config)
+    before_states, before_archives = _validate_global_state(config)
+    before_rows = _global_rows(before_states, before_archives)
+    before_paths = tuple(_outstanding_journals(config))
+    rows = _classify_create_journals(config, before_states, before_archives)
+    _assert_interrupted_creates_unrelated(
+        config, rows, slot=slot, agent=agent, slot_type=slot_type
+    )
+    after_states, after_archives = _validate_global_state(config)
+    if before_rows != _global_rows(after_states, after_archives):
+        raise Refusal("active registry changed while create journals were classified")
+    if before_paths != tuple(row.path for row in rows):
+        raise Refusal("recovery journal set changed before it was classified")
+    _assert_create_journal_classifications_stable(config, rows, after_states)
+    payload = {
+        "blocking": False,
+        "journals": [row.to_obj() for row in rows],
+        "requested": {
+            "agent": agent,
+            "slot": slot,
+            "slot_path": str(_slot_directory(config, slot, slot_type)),
+            "slot_type": slot_type,
+        },
+        "schema": 1,
+    }
+    if args.format == "json":
+        print(json.dumps(payload, sort_keys=True))
+    else:
+        live_incomplete = sum(
+            row.state == "live-incomplete-create" for row in rows
+        )
+        completed = sum(row.state == "completed-create" for row in rows)
+        print(
+            f"NONBLOCKING: journals={len(rows)} "
+            f"live-incomplete-create={live_incomplete} "
+            f"completed-create={completed}; all are unrelated to requested "
+            f"{slot_type} slot {slot}"
+        )
+        for row in rows:
+            dirty = ",".join(row.dirty_checkouts) or "none"
+            print(
+                f"JOURNAL: state={row.state} machine={row.machine} slot={row.slot} "
+                f"agent={row.agent} dirty_checkouts={dirty} journal={row.path}"
+            )
     return 0
 
 
@@ -10331,19 +11208,24 @@ def _cache_slot_directories(
     return (*registered, *unregistered)
 
 
-def _journal_cache_slot(config: Config, machine: str | None = None) -> CacheSlot | None:
-    selected_machine = machine or config.machine
-    path = _journal_path(config, selected_machine)
-    if not path.exists() and not path.is_symlink():
-        return None
-    raw = _as_mapping(_read_json(path, "cache recovery journal"), "cache recovery journal")
+def _journal_cache_slot(config: Config, path: Path) -> CacheSlot:
+    if path.exists() or path.is_symlink():
+        raw = _as_mapping(
+            _read_json(path, "cache recovery journal"), "cache recovery journal"
+        )
+    else:
+        pending = _pending_journal_for_path(config, path)
+        if pending is None:
+            raise StateError(
+                f"journal has neither standalone nor append-only evidence: {path}"
+            )
+        raw = pending
+    _validate_journal_provenance(config, path, raw)
+    selected_machine = _as_str(
+        raw.get("machine"), "cache recovery journal.machine"
+    )
     if _as_int(raw.get("schema"), "cache recovery journal.schema") != SCHEMA:
         raise StateError("unsupported cache recovery journal schema")
-    if (
-        _as_str(raw.get("machine"), "cache recovery journal.machine")
-        != selected_machine
-    ):
-        raise StateError("cache recovery journal belongs to a different machine")
     kind = _as_str(raw.get("kind"), "cache recovery journal.kind")
     slot = _validate_name(
         _as_str(raw.get("slot"), "cache recovery journal.slot"), "slot"
@@ -10423,13 +11305,7 @@ def _all_journal_cache_slots(config: Config) -> tuple[CacheSlot, ...]:
     slots: list[CacheSlot] = []
     seen: dict[str, str] = {}
     for path in _outstanding_journals(config):
-        match = re.fullmatch(
-            r"ACTIVE\.([A-Za-z0-9][A-Za-z0-9._-]{0,63})\.journal", path.name
-        )
-        if match is None:
-            raise StateError(f"invalid recovery journal filename: {path}")
-        cache_slot = _journal_cache_slot(config, match.group(1))
-        assert cache_slot is not None
+        cache_slot = _journal_cache_slot(config, path)
         previous = seen.get(cache_slot.slot)
         if previous is not None:
             raise StateError(
@@ -11599,6 +12475,7 @@ def _slot_findings(
     leftovers = sorted(config.control.glob("ACTIVE.*.json.tmp.*"))
     leftovers += sorted(config.control.glob("ARCHIVED.*.json.tmp.*"))
     leftovers += sorted(config.control.glob("ACTIVE.*.journal.tmp.*"))
+    leftovers += sorted(config.control.glob("CREATE.*.journal.tmp.*"))
     for event_directory in sorted(config.control.glob("EVENTS.*")):
         if event_directory.is_dir() and not event_directory.is_symlink():
             leftovers += sorted(event_directory.glob("*.json.tmp.*"))
@@ -13945,6 +14822,7 @@ def _recover_partial_updates(config: Config, discard: bool) -> bool:
     leftovers = sorted(config.control.glob("ACTIVE.*.json.tmp.*"))
     leftovers += sorted(config.control.glob("ARCHIVED.*.json.tmp.*"))
     leftovers += sorted(config.control.glob("ACTIVE.*.journal.tmp.*"))
+    leftovers += sorted(config.control.glob("CREATE.*.journal.tmp.*"))
     leftovers += sorted(
         config.control.glob("VALIDATE-BATCH-SEAL.*.journal.tmp.*")
     )
@@ -14026,6 +14904,7 @@ def _recover_partial_updates(config: Config, discard: bool) -> bool:
         archive_match = re.fullmatch(
             r"ARCHIVED\.([A-Za-z0-9][A-Za-z0-9._-]{0,63})\.json", target.name
         )
+        scoped_create = re.fullmatch(r"CREATE\..+\.journal", target.name)
         if not target.exists() and not target.is_symlink():
             matches = sorted(leftover.parent.glob(f"{target.name}.tmp.*"))
             if len(matches) != 1:
@@ -14034,10 +14913,20 @@ def _recover_partial_updates(config: Config, discard: bool) -> bool:
                 )
             raw = _as_mapping(_read_json(leftover, "initial state temp file"), "initial state temp file")
             machine_match = active_match or archive_match
-            if machine_match is None:
+            if machine_match is None and scoped_create is None:
                 raise StateError(
                     f"cannot promote temp file without a durable target: {leftover}"
                 )
+            if scoped_create is not None:
+                _validate_journal_shape(config, target, raw)
+                os.replace(leftover, target)
+                _fsync_directory(target.parent)
+                print(
+                    f"recovered scoped create journal {target.name} "
+                    f"from {leftover.name}"
+                )
+                continue
+            assert machine_match is not None
             if (
                 _as_int(raw.get("schema"), "initial state schema") != SCHEMA
                 or _as_str(raw.get("machine"), "initial state machine")
@@ -14237,6 +15126,7 @@ def _abort_create(
     _clear_journal(
         config,
         _as_mapping(_read_json(journal_path, "create journal"), "create journal"),
+        journal_path=journal_path,
     )
     print(f"aborted incomplete create slot={slot}; removed provisional worktrees and branches")
 
@@ -14255,7 +15145,12 @@ def _recover_create(
         raw, _CREATE_JOURNAL_REQUIRED, _CREATE_JOURNAL_OPTIONAL, "create journal"
     )
     machine = _as_str(raw["machine"], "create journal.machine")
-    if machine != config.machine or path != _journal_path(config, machine):
+    if machine != config.machine or path not in {
+        _journal_path(config, machine),
+        _create_journal_path(
+            config, _as_str(raw["slot"], "create journal.slot"), machine
+        ),
+    }:
         raise StateError(
             f"create journal filename does not match machine {config.machine}"
         )
@@ -14493,7 +15388,7 @@ def _recover_create(
                 raise Refusal(
                     f"create recovery found changed HEAD for {checkout.name}; preserve it for inspection"
                 )
-        _clear_journal(config, raw)
+        _clear_journal(config, raw, journal_path=path)
         print(f"recovered create: active state was durable; cleared journal for {slot}")
         return
     if abort_create:
@@ -14550,7 +15445,7 @@ def _recover_create(
         created.append(checkout)
         updated_journal = dict(raw)
         updated_journal["created"] = [_checkout_to_obj(value) for value in created]
-        _write_journal(config, updated_journal)
+        _write_journal(config, updated_journal, journal_path=path)
     if config.layout == "nested":
         actual = {entry.name for entry in slot_path.iterdir()}
         expected = {item.name for item in plan}
@@ -14565,7 +15460,7 @@ def _recover_create(
     updated_journal["hook_progress"] = hook_progress
     updated_journal["hook_failure"] = None
     updated_journal["failure_policy"] = "leave-for-inspection"
-    _write_journal(config, updated_journal)
+    _write_journal(config, updated_journal, journal_path=path)
     hook_progress = _run_post_provision_hooks(
         config,
         created,
@@ -14605,7 +15500,7 @@ def _recover_create(
             "recovery_actor": _identity_to_obj(recovery_actor),
         },
     )
-    _clear_journal(config, updated_journal)
+    _clear_journal(config, updated_journal, journal_path=path)
     print(f"recovered create: registered slot={slot} checkouts={len(created)}")
 
 
@@ -16224,7 +17119,9 @@ def _validation_checkout_facts(
     _assert_cache_policy_untracked_path(
         config, "ownerless-validation", checkout, vcs, config.cache_globs
     )
-    preserve_checkout_git_state = remote_observation_repository is not None
+    preserve_checkout_git_state = (
+        remote_observation_repository is not None or not require_remote_containment
+    )
     status = _ownerless_validation_blocking_status(
         vcs.status(
             checkout,
@@ -16465,6 +17362,8 @@ def _ownerless_validation_journal(
     coordinator: ProcessIdentity,
     states: Sequence[ActiveState],
     batch_cleanup: _OwnerlessValidationBatchContext | None = None,
+    *,
+    require_remote_containment: bool = True,
 ) -> tuple[dict[str, object], tuple[str, str] | None]:
     frozen_checkout = getattr(args, "frozen_validate_checkout", None)
     target_kind = (
@@ -16559,6 +17458,7 @@ def _ownerless_validation_journal(
             expected_head=record_target,
             batch_cleanup=batch_cleanup,
             standalone=target_kind == "frozen-checkout",
+            require_remote_containment=require_remote_containment,
         )
     else:
         if args.repository is not None:
@@ -22448,6 +23348,240 @@ def _cmd_recover_ownerless_validate_batch(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_classify_ownerless_validate_batch(args: argparse.Namespace) -> int:
+    """Classify retained validation checkouts without locks or writes."""
+
+    ordinary = tuple(args.checkouts or ())
+    frozen_values = tuple(args.frozen_validate_checkouts or ())
+    if bool(ordinary) == bool(frozen_values):
+        raise Refusal(
+            "classify-ownerless-validate-batch requires exactly one of --checkout or "
+            "--frozen-validate-checkout"
+        )
+    frozen = bool(frozen_values)
+    checkouts = frozen_values if frozen else ordinary
+    records = tuple(args.completed_records)
+    repositories = tuple(args.repositories)
+    proofs = tuple(args.validation_proof_manifests or ())
+    if not (len(checkouts) == len(records) == len(repositories)):
+        raise Refusal(
+            "classify-ownerless-validate-batch requires the same number of "
+            "checkout, completed-record, and repository arguments"
+        )
+    if proofs and len(proofs) != len(checkouts):
+        raise Refusal(
+            "classify-ownerless-validate-batch requires one proof per checkout"
+        )
+    if len(checkouts) > VALIDATE_REMOVE_BATCH_LIMIT:
+        raise Refusal(
+            "classify-ownerless-validate-batch accepts at most "
+            f"{VALIDATE_REMOVE_BATCH_LIMIT} checkouts"
+        )
+    if len(set(checkouts)) != len(checkouts):
+        raise Refusal(
+            "classify-ownerless-validate-batch received a duplicate checkout"
+        )
+    config = _load_config(args.project_root, args.machine)
+    canonical_proofs = tuple(
+        _validation_proof_manifest_path(config, value)[0] for value in proofs
+    )
+    if len(canonical_proofs) != len(set(canonical_proofs)):
+        raise Refusal("classify-ownerless-validate-batch received a duplicate proof")
+    aligned_proofs: tuple[str | None, ...] = (
+        canonical_proofs
+        if canonical_proofs
+        else tuple(None for _checkout in checkouts)
+    )
+    _refuse_partial_state(config, allow_validate_batch_seals=True)
+    if _validate_batch_seal_journals(config):
+        raise Refusal(
+            "an interrupted validation-batch seal is recorded; recover it before admission"
+        )
+    before_states, before_archives = _validate_global_state(config)
+    before_rows = _global_rows(before_states, before_archives)
+    before_paths = tuple(_outstanding_journals(config))
+    create_rows = _classify_create_journals(
+        config, before_states, before_archives
+    )
+    prepared: list[
+        tuple[str, str, str, str | None, Path, _PrivateCleanupIdentity]
+    ] = []
+    results: list[dict[str, object]] = []
+    for checkout, record, repository, proof in zip(
+        checkouts, records, repositories, aligned_proofs, strict=True
+    ):
+        try:
+            _relative, target, _allowed = _validation_recovery_target(
+                config,
+                checkout,
+                "frozen-checkout" if frozen else "checkout",
+            )
+            if any(
+                _path_is_within(target, row.slot_path)
+                or _path_is_within(row.slot_path, target)
+                for row in create_rows
+            ):
+                raise Refusal("validation path overlaps an interrupted create")
+            identity = _private_cleanup_path_identity(
+                config,
+                target,
+                allowed_modes={0o700},
+                managed_root=(
+                    _frozen_validation_directory(config) if frozen else None
+                ),
+            )
+        except (Refusal, StateError) as exc:
+            results.append(
+                {
+                    "blocks_entry": True,
+                    "checkout": checkout,
+                    "reason": str(exc),
+                    "state": "could-not-classify",
+                }
+            )
+        else:
+            prepared.append((checkout, record, repository, proof, target, identity))
+    identities = [identity for *_prefix, identity in prepared]
+    if len(set(identities)) != len(identities):
+        raise Refusal(
+            "classify-ownerless-validate-batch resolved multiple checkouts to one directory"
+        )
+    budget = _ReadOnlyCommandBudget.start(
+        timeout_seconds=_VALIDATE_REMOVE_BATCH_CENSUS_SECONDS,
+        stdout_limit=16 * 1024 * 1024,
+        stderr_limit=64 * 1024,
+        input_limit=_MOUNTINFO_CENSUS_BYTES_LIMIT,
+    )
+    census_count = int(bool(prepared))
+    if prepared:
+        try:
+            census = _capture_lsof_process_path_census(
+                [target for *_prefix, target, _identity in prepared], budget=budget
+            )
+            budget.remaining_seconds()
+        except Refusal as exc:
+            results.extend(
+                {
+                    "blocks_entry": True,
+                    "checkout": checkout,
+                    "reason": str(exc),
+                    "state": "could-not-classify",
+                }
+                for checkout, _record, _repo, _proof, _target, _identity in prepared
+            )
+            prepared = []
+            census = _ProcessPathCensus((), (), owner_cgroup_complete=False)
+    else:
+        census = _ProcessPathCensus((), (), owner_cgroup_complete=False)
+    batch = _OwnerlessValidationBatchContext(
+        {identity: target for *_prefix, target, identity in prepared},
+        census,
+        budget,
+    )
+    actor = _read_process_identity(os.getpid())
+    for checkout, record, repository, proof, target, _identity in prepared:
+        try:
+            budget.remaining_seconds()
+            census.assert_slot_unused(target, None, ignore_current_process=False)
+            if frozen and proof is None:
+                historical = _frozen_no_proof_disposition(
+                    config,
+                    target,
+                    record,
+                    repository,
+                    batch_cleanup=batch,
+                )
+                if (
+                    historical.disposition
+                    is _FrozenNoProofDisposition.HISTORICAL_NONBLOCKING
+                ):
+                    results.append(
+                        {
+                            "blocks_entry": False,
+                            "checkout": checkout,
+                            "reason": (
+                                f"historical schema {historical.historical_schema} "
+                                "validation is exact and inactive; it remains retained"
+                            ),
+                            "state": "historical-retained",
+                        }
+                    )
+                    continue
+                if historical.disposition is _FrozenNoProofDisposition.BLOCKS_ENTRY:
+                    raise Refusal(
+                        "frozen validation has no typed removal proof and cannot "
+                        "be classified as historical"
+                    )
+            item_args = argparse.Namespace(
+                ownerless_validate_checkout=None if frozen else checkout,
+                ownerless_validate_cargo_home=None,
+                frozen_validate_checkout=checkout if frozen else None,
+                completed_record=record,
+                repository=repository,
+                validation_proof_manifest=proof,
+                recovery_note=None,
+            )
+            _ownerless_validation_journal(
+                config,
+                item_args,
+                actor,
+                before_states,
+                batch_cleanup=batch,
+                require_remote_containment=False,
+            )
+        except (Refusal, StateError) as exc:
+            results.append(
+                {
+                    "blocks_entry": True,
+                    "checkout": checkout,
+                    "reason": str(exc),
+                    "state": "could-not-classify",
+                }
+            )
+        else:
+            results.append(
+                {
+                    "blocks_entry": False,
+                    "checkout": checkout,
+                    "reason": (
+                        "terminal validation is exact and unused; read-only "
+                        "classification left it retained"
+                    ),
+                    "state": "terminal-retained",
+                }
+            )
+    after_states, after_archives = _validate_global_state(config)
+    if before_rows != _global_rows(after_states, after_archives):
+        raise Refusal("active registry changed during validation classification")
+    if before_paths != tuple(row.path for row in create_rows):
+        raise Refusal("recovery journal set changed before validation classification")
+    _assert_create_journal_classifications_stable(
+        config, create_rows, after_states
+    )
+    payload = {
+        "classifications": results,
+        "create_journals": [row.to_obj() for row in create_rows],
+        "process_censuses": census_count,
+        "requested": len(checkouts),
+        "schema": 1,
+    }
+    if args.format == "json":
+        print(json.dumps(payload, sort_keys=True))
+    else:
+        blocking = sum(result["blocks_entry"] is True for result in results)
+        print(
+            f"requested={len(checkouts)} blocking={blocking} "
+            f"nonblocking={len(results) - blocking} process_censuses={census_count}"
+        )
+        for result in results:
+            print(
+                f"{result['state']}: {result['checkout']} "
+                f"blocks_entry={str(result['blocks_entry']).lower()} "
+                f"reason={result['reason']}"
+            )
+    return 0
+
+
 def _cmd_recover(
     args: argparse.Namespace,
     *,
@@ -22505,6 +23639,11 @@ def _cmd_recover(
                 getattr(args, "validation_proof_manifest", None),
             )
         )
+        if getattr(args, "slot", None) is not None and requested_ownerless:
+            raise Refusal(
+                "--slot selects an interrupted create and cannot be combined "
+                "with validation cleanup flags"
+            )
         if requested_ownerless:
             _require_coordinator_authorized(args, "ownerless validation cleanup")
             if sum(
@@ -22585,7 +23724,13 @@ def _cmd_recover(
                     recovery_kind=_ValidateBatchSealRecoveryKind.SEAL_ONLY,
                 )
                 return 0
-            path, raw = _load_journal(config)
+            selected_slot = getattr(args, "slot", None)
+            selected_path = (
+                _create_journal_path_for_slot(config, selected_slot)
+                if selected_slot is not None
+                else None
+            )
+            path, raw = _load_journal(config, selected_path=selected_path)
         _ensure_event_log(config)
         _write_event_file(
             config,
@@ -23197,6 +24342,25 @@ usage or audit gate unknown, 3 fail-closed refusal.
     create.add_argument("--format", choices=("human", "json"), default="human")
     create.set_defaults(handler=_cmd_create)
 
+    classify_create = subparsers.add_parser(
+        "classify-create-journals",
+        help="prove whether interrupted creates are unrelated to one new slot",
+        description=(
+            "Read and verify every outstanding create journal, its exact process "
+            "generations, Git worktrees, and dirty state without taking a mutation lock "
+            "or changing registry, journal, or checkout bytes. Missing, malformed, "
+            "ambiguous, non-create, or overlapping state refuses."
+        ),
+        formatter_class=_HelpFormatter,
+    )
+    classify_create.add_argument("slot", help="prospective slot name")
+    classify_create.add_argument("--slot-type", choices=SLOT_TYPES, required=True)
+    classify_create.add_argument("--agent", required=True, metavar="AGENT")
+    classify_create.add_argument(
+        "--format", choices=("human", "json"), default="human"
+    )
+    classify_create.set_defaults(handler=_cmd_classify_create_journals)
+
     register = subparsers.add_parser(
         "register",
         help="register already-created live worktrees",
@@ -23772,6 +24936,55 @@ usage or audit gate unknown, 3 fail-closed refusal.
     )
     recover_ownerless_cache.set_defaults(handler=_cmd_recover_ownerless_agent_cache)
 
+    classify_ownerless_batch = subparsers.add_parser(
+        "classify-ownerless-validate-batch",
+        help="classify retained validation checkouts without removing them",
+        description=(
+            "Read terminal validation evidence and one shared process census without "
+            "taking mutation locks, writing a journal, or removing any path. Each "
+            "checkout is reported as blocking or nonblocking for unrelated admission."
+        ),
+        formatter_class=_HelpFormatter,
+    )
+    classify_targets = classify_ownerless_batch.add_mutually_exclusive_group(
+        required=True
+    )
+    classify_targets.add_argument(
+        "--checkout", dest="checkouts", action="append", metavar="PATH"
+    )
+    classify_targets.add_argument(
+        "--frozen-validate-checkout",
+        dest="frozen_validate_checkouts",
+        action="append",
+        metavar="PATH",
+    )
+    classify_ownerless_batch.add_argument(
+        "--completed-record",
+        dest="completed_records",
+        action="append",
+        required=True,
+        metavar="PATH",
+    )
+    classify_ownerless_batch.add_argument(
+        "--repository",
+        dest="repositories",
+        action="append",
+        required=True,
+        metavar="PATH",
+    )
+    classify_ownerless_batch.add_argument(
+        "--validation-proof-manifest",
+        dest="validation_proof_manifests",
+        action="append",
+        metavar="PATH",
+    )
+    classify_ownerless_batch.add_argument(
+        "--format", choices=("human", "json"), default="human"
+    )
+    classify_ownerless_batch.set_defaults(
+        handler=_cmd_classify_ownerless_validate_batch
+    )
+
     recover_ownerless_batch = subparsers.add_parser(
         "recover-ownerless-validate-batch",
         help="recover one bounded batch of private ownerless validation checkouts",
@@ -23854,6 +25067,14 @@ usage or audit gate unknown, 3 fail-closed refusal.
         formatter_class=_HelpFormatter,
     )
     recover.add_argument("--coordinator-pid", type=int, required=True, metavar="PID", help="live current coordinator PID recorded with recovery")
+    recover.add_argument(
+        "--slot",
+        metavar="SLOT",
+        help=(
+            "select one exact interrupted create when multiple scoped journals exist; "
+            "other recovery kinds remain selected by their singleton journal"
+        ),
+    )
     recover.add_argument(
         "--coordinator-authorized", action="store_true",
         help=(

@@ -963,6 +963,37 @@ def control_directory(project: Path) -> Path:
     return slots.parent if config.get("layout", "nested") == "flat" else slots
 
 
+def create_journal_path(
+    project: Path, slot: str = "slot01", machine: str = "testhost"
+) -> Path:
+    config = wrkslots._load_config(str(project), machine)
+    return wrkslots._create_journal_path(config, slot, machine)
+
+
+def install_legacy_create_journal_with_matching_event(
+    project: Path, slot: str = "slot01", machine: str = "testhost"
+) -> Path:
+    config = wrkslots._load_config(str(project), machine)
+    scoped = create_journal_path(project, slot, machine)
+    raw: object = json.loads(scoped.read_text(encoding="utf-8"))
+    assert isinstance(raw, dict)
+    legacy = wrkslots._journal_path(config, machine)
+    os.replace(scoped, legacy)
+    shutil.rmtree(wrkslots._event_directory(config, machine))
+    wrkslots._ensure_event_log(config, machine)
+    wrkslots._write_event_file(
+        config,
+        machine,
+        "operation-progress-recorded",
+        {
+            "slot": raw["slot"],
+            "operation": raw["kind"],
+            "journal": raw,
+        },
+    )
+    return legacy
+
+
 def active(project: Path, machine: str = "testhost") -> dict[str, object]:
     path = control_directory(project) / f"ACTIVE.{machine}.json"
     value: object = json.loads(path.read_text(encoding="utf-8"))
@@ -2597,6 +2628,7 @@ def test_direct_current_frozen_recovery_refuses_lost_journal_proof(
     journal.write_text(
         json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
+    shutil.rmtree(control_directory(project) / "EVENTS.testhost")
     monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _point: None)
 
     refused = wrkslots.main(
@@ -3049,6 +3081,113 @@ def test_ownerless_validate_batch_shares_one_census_and_removes_unheld_checkouts
     assert len(fresh_calls) == 2
     assert not first.exists()
     assert not second.exists()
+
+
+def test_ownerless_batch_classification_is_read_only_beside_live_dirty_create(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    interrupted = create(
+        project, env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"}
+    )
+    assert interrupted.returncode == 86
+    legacy = control_directory(project) / "ACTIVE.testhost.journal"
+    os.replace(create_journal_path(project), legacy)
+    shutil.rmtree(control_directory(project) / "EVENTS.testhost")
+    (checkout(project) / "unfinished.txt").write_text(
+        "preserve this\n", encoding="utf-8"
+    )
+    retained, record = prepare_legacy_validate_checkout(
+        project, repository, name="classification"
+    )
+    retained.chmod(0o700)
+    before = legacy.read_bytes()
+    inode = legacy.stat(follow_symlinks=False).st_ino
+
+    sibling = subprocess.Popen(["sleep", "60"], text=True)
+    try:
+        refused = command(
+            project,
+            "recover-ownerless-validate-batch",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(sibling.pid),
+            "--checkout",
+            retained.relative_to(project).as_posix(),
+            "--completed-record",
+            record.relative_to(project).as_posix(),
+            "--repository",
+            repository.relative_to(project).as_posix(),
+        )
+    finally:
+        terminate_process(sibling)
+    assert refused.returncode == 3
+    assert "not in the invoking process ancestry" in refused.stderr
+    assert retained.is_dir()
+    assert legacy.read_bytes() == before
+    assert legacy.stat(follow_symlinks=False).st_ino == inode
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("classification attempted a mutation")
+
+    status_refreshes: list[bool] = []
+    original_status = wrkslots._GitVcs.status
+
+    def observe_status(
+        vcs: wrkslots._GitVcs,
+        target: Path,
+        cache_globs: Sequence[str] = (),
+        *,
+        refresh_index: bool = True,
+    ) -> str:
+        status_refreshes.append(refresh_index)
+        return original_status(
+            vcs, target, cache_globs, refresh_index=refresh_index
+        )
+
+    empty_census = lambda _paths, **_kwargs: wrkslots._ProcessPathCensus((), ())
+    monkeypatch.setattr(wrkslots, "_mutation_locks", forbidden)
+    for name in (
+        "_atomic_write_json",
+        "_clear_journal",
+        "_remove_control_file",
+        "_write_active_state",
+        "_write_archive_state",
+        "_write_event_file",
+        "_write_journal",
+    ):
+        monkeypatch.setattr(wrkslots, name, forbidden)
+    monkeypatch.setattr(wrkslots._GitVcs, "status", observe_status)
+    monkeypatch.setattr(wrkslots, "_capture_lsof_process_path_census", empty_census)
+    monkeypatch.setattr(
+        wrkslots, "_capture_same_uid_process_path_census", empty_census
+    )
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "classify-ownerless-validate-batch",
+            "--checkout",
+            retained.relative_to(project).as_posix(),
+            "--completed-record",
+            record.relative_to(project).as_posix(),
+            "--repository",
+            repository.relative_to(project).as_posix(),
+            "--format",
+            "json",
+        ]
+    )
+    assert rc == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["classifications"][0]["blocks_entry"] is False
+    assert report["classifications"][0]["state"] == "terminal-retained"
+    assert report["create_journals"][0]["dirty_checkouts"] == ["product"]
+    assert status_refreshes and not any(status_refreshes)
+    assert retained.is_dir()
+    assert legacy.read_bytes() == before
+    assert legacy.stat(follow_symlinks=False).st_ino == inode
 
 
 @pytest.mark.ordinary_environment
@@ -7726,7 +7865,7 @@ def test_recovery_reconstructs_a_missing_journal_from_event_history(
         env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"},
     )
     assert interrupted.returncode == 86
-    journal = project / "worktrees" / "ACTIVE.testhost.journal"
+    journal = create_journal_path(project)
     assert journal.is_file()
     journal.unlink()
 
@@ -7976,23 +8115,622 @@ def test_interrupted_create_requires_and_supports_recovery(tmp_path: Path) -> No
     assert interrupted.returncode == 86
     assert checkout(project).is_dir()
     assert not active_slots(project)
-    assert (project / "worktrees" / "ACTIVE.testhost.journal").is_file()
-    refused = create(
+    journal = create_journal_path(project)
+    assert journal.is_file()
+    second = create(
         project,
         slot="slot02",
         agent="codex-2",
         branch="codex/other",
     )
-    assert refused.returncode == 3
-    assert "recover" in refused.stderr
+    assert second.returncode == 0, second.stderr
+    assert journal.is_file()
 
     recovered = command(
-        project, "recover", "--coordinator-pid", str(os.getpid())
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot",
+        "slot01",
     )
 
     assert recovered.returncode == 0, recovered.stderr
+    assert len(active_slots(project)) == 2
+    assert not journal.exists()
+
+
+def test_live_dirty_legacy_create_stays_exact_while_unrelated_creates_succeed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    interrupted = create(
+        project, env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"}
+    )
+    assert interrupted.returncode == 86
+    legacy = control_directory(project) / "ACTIVE.testhost.journal"
+    os.replace(create_journal_path(project), legacy)
+    shutil.rmtree(control_directory(project) / "EVENTS.testhost")
+    dirty = checkout(project) / "unfinished.txt"
+    dirty.write_text("authored work\n", encoding="utf-8")
+    before = legacy.read_bytes()
+    before_stat = legacy.stat(follow_symlinks=False)
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("read-only classification attempted a mutation")
+
+    monkeypatch.setattr(wrkslots, "_mutation_locks", forbidden)
+    for name in (
+        "_atomic_write_json",
+        "_clear_journal",
+        "_remove_control_file",
+        "_write_active_state",
+        "_write_archive_state",
+        "_write_event_file",
+        "_write_journal",
+    ):
+        monkeypatch.setattr(wrkslots, name, forbidden)
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "classify-create-journals",
+            "slot02",
+            "--slot-type",
+            "agent",
+            "--agent",
+            "codex-2",
+            "--format",
+            "json",
+        ]
+    )
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["journals"][0]["dirty_checkouts"] == ["product"]
+    assert legacy.read_bytes() == before
+    assert legacy.stat(follow_symlinks=False).st_ino == before_stat.st_ino
+    config = wrkslots._load_config(str(project), "testhost")
+    assert wrkslots._journal_cache_slot(config, legacy).slot == "slot01"
+    status = command(project, "status", "--all-machines", "--format", "json")
+    assert status.returncode == 0, status.stderr
+    assert not any(
+        item["kind"] == "journal-unreadable"
+        for item in json.loads(status.stdout)["registry_storage_inconsistencies"]
+    )
+    monkeypatch.undo()
+
+    agent_create = create(
+        project,
+        slot="slot02",
+        agent="codex-2",
+        branch="codex/two",
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"},
+    )
+    validate_create = create(
+        project,
+        slot="validate02",
+        agent="validate-2",
+        branch=None,
+        slot_type="validate",
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"},
+    )
+    assert agent_create.returncode == 86, agent_create.stderr
+    assert validate_create.returncode == 86, validate_create.stderr
+    assert create_journal_path(project, "slot02").is_file()
+    assert create_journal_path(project, "validate02").is_file()
+    for slot in ("slot02", "validate02"):
+        recovered = command(
+            project,
+            "recover",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--slot",
+            slot,
+        )
+        assert recovered.returncode == 0, recovered.stderr
+    assert legacy.read_bytes() == before
+    assert legacy.stat(follow_symlinks=False).st_ino == before_stat.st_ino
+    assert dirty.read_text(encoding="utf-8") == "authored work\n"
+
+
+def test_matching_legacy_create_event_is_trusted_by_every_consumer(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    interrupted = create(
+        project, env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"}
+    )
+    assert interrupted.returncode == 86, interrupted.stderr
+    legacy = install_legacy_create_journal_with_matching_event(project)
+
+    classified = command(
+        project,
+        "classify-create-journals",
+        "slot02",
+        "--slot-type",
+        "agent",
+        "--agent",
+        "codex-2",
+    )
+    assert classified.returncode == 0, classified.stderr
+    assert (
+        "journals=1 live-incomplete-create=1 completed-create=0"
+        in classified.stdout
+    )
+    assert "JOURNAL: state=live-incomplete-create" in classified.stdout
+
+    config = wrkslots._load_config(str(project), "testhost")
+    assert wrkslots._journal_cache_slot(config, legacy).slot == "slot01"
+    status = command(project, "status", "--all-machines", "--format", "json")
+    assert status.returncode == 0, status.stderr
+    assert not any(
+        item["kind"] == "journal-unreadable"
+        for item in json.loads(status.stdout)["registry_storage_inconsistencies"]
+    )
+    audit = command(project, "audit", "--format", "json")
+    assert audit.returncode == 0, audit.stderr
+
+    recovered = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot",
+        "slot01",
+    )
+    assert recovered.returncode == 0, recovered.stderr
+    assert not legacy.exists()
     assert len(active_slots(project)) == 1
-    assert not (project / "worktrees" / "ACTIVE.testhost.journal").exists()
+
+
+def test_changed_legacy_create_journal_refuses_every_consumer(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    interrupted = create(
+        project, env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"}
+    )
+    assert interrupted.returncode == 86, interrupted.stderr
+    legacy = install_legacy_create_journal_with_matching_event(project)
+    other_create = create(
+        project,
+        slot="slot02",
+        agent="codex-2",
+        branch="codex/two",
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"},
+    )
+    assert other_create.returncode == 86, other_create.stderr
+    other = create_journal_path(project, "slot02")
+
+    raw: object = json.loads(legacy.read_text(encoding="utf-8"))
+    assert isinstance(raw, dict)
+    raw["purpose"] = "altered after append-only publication"
+    legacy.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n")
+    expected = "standalone recovery journal differs from append-only operation evidence"
+    legacy_bytes = legacy.read_bytes()
+    legacy_inode = legacy.stat(follow_symlinks=False).st_ino
+    other_bytes = other.read_bytes()
+    other_inode = other.stat(follow_symlinks=False).st_ino
+
+    classified = command(
+        project,
+        "classify-create-journals",
+        "slot03",
+        "--slot-type",
+        "agent",
+        "--agent",
+        "codex-3",
+    )
+    assert classified.returncode == 3
+    assert expected in classified.stderr
+
+    config = wrkslots._load_config(str(project), "testhost")
+    with pytest.raises(wrkslots.StateError, match=expected):
+        wrkslots._journal_cache_slot(config, legacy)
+
+    status = command(project, "status", "--all-machines", "--format", "json")
+    assert status.returncode == 0, status.stderr
+    assert any(
+        item["kind"] == "journal-unreadable" and expected in item["detail"]
+        for item in json.loads(status.stdout)["registry_storage_inconsistencies"]
+    )
+    audit = command(project, "audit", "--format", "json")
+    assert audit.returncode == 3
+    assert expected in audit.stderr
+    recovered = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot",
+        "slot01",
+    )
+    assert recovered.returncode == 3
+    assert expected in recovered.stderr
+    assert legacy.read_bytes() == legacy_bytes
+    assert legacy.stat(follow_symlinks=False).st_ino == legacy_inode
+    assert other.read_bytes() == other_bytes
+    assert other.stat(follow_symlinks=False).st_ino == other_inode
+
+
+def test_create_refuses_same_target_and_duplicate_journals_without_overwrite(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    interrupted = create(
+        project, env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"}
+    )
+    assert interrupted.returncode == 86
+    journal = create_journal_path(project)
+    before = journal.read_bytes()
+    same_target = create(
+        project, slot="slot01", agent="codex-2", branch="codex/two"
+    )
+    assert same_target.returncode == 3
+    assert "already targets slot" in same_target.stderr
+    legacy = control_directory(project) / "ACTIVE.testhost.journal"
+    legacy.write_bytes(before)
+    duplicate = create(
+        project, slot="slot02", agent="codex-2", branch="codex/two"
+    )
+    assert duplicate.returncode == 3
+    assert "multiple interrupted creates claim" in duplicate.stderr
+    assert journal.read_bytes() == legacy.read_bytes() == before
+
+
+def test_scoped_create_journal_names_encode_machine_and_slot_boundaries(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    config = wrkslots._load_config(str(project), "testhost")
+
+    first = wrkslots._create_journal_path(config, "b", "a.1")
+    second = wrkslots._create_journal_path(config, "1.b", "a")
+
+    assert first != second
+    assert first.name == "CREATE.3.a.1.1.b.journal"
+    assert second.name == "CREATE.1.a.3.1.b.journal"
+
+
+@pytest.mark.parametrize("damage", ("missing", "malformed", "cross-target"))
+def test_read_only_create_classification_refuses_untrusted_journal_before_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    damage: str,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    interrupted = create(
+        project, env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"}
+    )
+    assert interrupted.returncode == 86
+    journal = create_journal_path(project)
+    if damage == "missing":
+        journal.unlink()
+    elif damage == "malformed":
+        journal.write_text("{broken\n", encoding="utf-8")
+    else:
+        legacy = control_directory(project) / "ACTIVE.testhost.journal"
+        os.replace(journal, legacy)
+        journal = legacy
+        shutil.rmtree(control_directory(project) / "EVENTS.testhost")
+        value = json.loads(journal.read_text(encoding="utf-8"))
+        value["planned"][0]["destination"] = "worktrees/slot02/product"
+        journal.write_text(json.dumps(value) + "\n", encoding="utf-8")
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("classification attempted a mutation")
+
+    monkeypatch.setattr(wrkslots, "_mutation_locks", forbidden)
+    monkeypatch.setattr(wrkslots, "_write_journal", forbidden)
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "classify-create-journals",
+            "slot02",
+            "--slot-type",
+            "agent",
+            "--agent",
+            "codex-2",
+        ]
+    )
+    assert rc == 3
+    assert {
+        "missing": "missing while append-only history still names it",
+        "malformed": "malformed JSON",
+        "cross-target": "does not match slot",
+    }[damage] in capsys.readouterr().err
+
+
+def test_two_scoped_create_journals_recover_only_by_exact_slot(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    for slot, agent, branch in (
+        ("slot01", "codex-1", "codex/one"),
+        ("slot02", "codex-2", "codex/two"),
+    ):
+        interrupted = create(
+            project,
+            slot=slot,
+            agent=agent,
+            branch=branch,
+            env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"},
+        )
+        assert interrupted.returncode == 86, interrupted.stderr
+    first = create_journal_path(project, "slot01")
+    second = create_journal_path(project, "slot02")
+    audit = command(project, "audit", "--format", "json")
+    assert audit.returncode == 0, audit.stderr
+    audit_rows = json.loads(audit.stdout)["slots"]
+    assert {row["slot"] for row in audit_rows} == {"slot01", "slot02"}
+    assert {row["owner_state"] for row in audit_rows} == {"create-journal"}
+    status = command(project, "status", "--all-machines", "--format", "json")
+    assert status.returncode == 0, status.stderr
+    assert not any(
+        item["kind"] == "journal-unreadable"
+        for item in json.loads(status.stdout)["registry_storage_inconsistencies"]
+    )
+    ambiguous = command(
+        project, "recover", "--coordinator-pid", str(os.getpid())
+    )
+    assert ambiguous.returncode == 3
+    assert "select one exact" in ambiguous.stderr
+    for slot, selected, retained in (
+        ("slot01", first, second),
+        ("slot02", second, None),
+    ):
+        recovered = command(
+            project,
+            "recover",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--slot",
+            slot,
+        )
+        assert recovered.returncode == 0, recovered.stderr
+        assert not selected.exists()
+        if retained is not None:
+            assert retained.is_file()
+    rows = active_slots(project)
+    assert all(isinstance(row, dict) for row in rows)
+    assert {row["slot"] for row in rows if isinstance(row, dict)} == {
+        "slot01",
+        "slot02",
+    }
+
+
+def test_exact_slot_recovery_selects_legacy_create_beside_scoped_create(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    first = create(
+        project, env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"}
+    )
+    assert first.returncode == 86
+    legacy = control_directory(project) / "ACTIVE.testhost.journal"
+    os.replace(create_journal_path(project), legacy)
+    shutil.rmtree(control_directory(project) / "EVENTS.testhost")
+    second = create(
+        project,
+        slot="slot02",
+        agent="codex-2",
+        branch="codex/two",
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"},
+    )
+    assert second.returncode == 86, second.stderr
+    second_journal = create_journal_path(project, "slot02")
+
+    recovered = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot",
+        "slot01",
+    )
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert not legacy.exists()
+    assert second_journal.is_file()
+
+
+@pytest.mark.parametrize(
+    ("damage", "expected"),
+    (
+        ("missing-events", "no matching append-only progress evidence"),
+        ("tampered-journal", "differs from append-only progress evidence"),
+    ),
+)
+def test_untrusted_scoped_create_journal_refuses_every_reader(
+    tmp_path: Path, damage: str, expected: str
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    for slot, agent, branch in (
+        ("slot01", "codex-1", "codex/one"),
+        ("slot02", "codex-2", "codex/two"),
+    ):
+        interrupted = create(
+            project,
+            slot=slot,
+            agent=agent,
+            branch=branch,
+            env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"},
+        )
+        assert interrupted.returncode == 86, interrupted.stderr
+    target = create_journal_path(project, "slot01")
+    other = create_journal_path(project, "slot02")
+    if damage == "missing-events":
+        shutil.rmtree(control_directory(project) / "EVENTS.testhost")
+    else:
+        raw = json.loads(target.read_text(encoding="utf-8"))
+        raw["purpose"] = "tampered after append-only publication"
+        target.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n")
+    target_bytes = target.read_bytes()
+    target_inode = target.stat(follow_symlinks=False).st_ino
+    other_bytes = other.read_bytes()
+    other_inode = other.stat(follow_symlinks=False).st_ino
+
+    classified = command(
+        project,
+        "classify-create-journals",
+        "slot03",
+        "--slot-type",
+        "agent",
+        "--agent",
+        "codex-3",
+    )
+    assert classified.returncode == 3
+    assert expected in classified.stderr
+
+    config = wrkslots._load_config(str(project), "testhost")
+    with pytest.raises((wrkslots.Refusal, wrkslots.StateError), match=expected):
+        wrkslots._journal_cache_slot(config, target)
+
+    status = command(project, "status", "--all-machines", "--format", "json")
+    assert status.returncode == 0, status.stderr
+    findings = json.loads(status.stdout)["registry_storage_inconsistencies"]
+    assert any(
+        item["kind"] == "journal-unreadable" and expected in item["detail"]
+        for item in findings
+    )
+
+    audit = command(project, "audit", "--format", "json")
+    assert audit.returncode == 3
+    assert expected in audit.stderr
+    recovered = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot",
+        "slot01",
+    )
+    assert recovered.returncode == 3
+    assert expected in recovered.stderr
+    assert target.read_bytes() == target_bytes
+    assert target.stat(follow_symlinks=False).st_ino == target_inode
+    assert other.read_bytes() == other_bytes
+    assert other.stat(follow_symlinks=False).st_ino == other_inode
+
+
+def test_completed_scoped_create_journal_requires_exact_active_row(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    interrupted = create(
+        project,
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-operation-completed"},
+    )
+    assert interrupted.returncode == 86, interrupted.stderr
+    journal = create_journal_path(project)
+    assert journal.is_file()
+    assert len(active_slots(project)) == 1
+
+    classified = command(
+        project,
+        "classify-create-journals",
+        "slot02",
+        "--slot-type",
+        "agent",
+        "--agent",
+        "codex-2",
+        "--format",
+        "json",
+    )
+    assert classified.returncode == 0, classified.stderr
+    report = json.loads(classified.stdout)
+    assert report["journals"][0]["state"] == "completed-create"
+    human = command(
+        project,
+        "classify-create-journals",
+        "slot02",
+        "--slot-type",
+        "agent",
+        "--agent",
+        "codex-2",
+    )
+    assert human.returncode == 0, human.stderr
+    assert (
+        "journals=1 live-incomplete-create=0 completed-create=1" in human.stdout
+    )
+    assert "JOURNAL: state=completed-create" in human.stdout
+
+    config = wrkslots._load_config(str(project), "testhost")
+    cache_slot = wrkslots._journal_cache_slot(config, journal)
+    assert cache_slot.slot == "slot01"
+    status = command(project, "status", "--all-machines", "--format", "json")
+    assert status.returncode == 0, status.stderr
+    assert not any(
+        item["kind"] == "journal-unreadable"
+        for item in json.loads(status.stdout)["registry_storage_inconsistencies"]
+    )
+    audit = command(project, "audit", "--format", "json")
+    assert audit.returncode == 0, audit.stderr
+
+    raw = json.loads(journal.read_text(encoding="utf-8"))
+    states = wrkslots._load_all_active(config, require_repository=False)
+    altered = [
+        replace(
+            state,
+            slots=tuple(
+                replace(record, purpose="different")
+                if record.slot == "slot01"
+                else record
+                for record in state.slots
+            ),
+        )
+        for state in states
+    ]
+    with pytest.raises(
+        wrkslots.StateError,
+        match="no exact durable ACTIVE row",
+    ):
+        wrkslots._scoped_create_journal_completed(
+            config, journal, raw, altered
+        )
+
+    recovered = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot",
+        "slot01",
+    )
+    assert recovered.returncode == 0, recovered.stderr
+    assert not journal.exists()
+    assert len(active_slots(project)) == 1
+
+
+def test_destructive_recover_still_refuses_nonancestor_coordinator(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    interrupted = create(
+        project, env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"}
+    )
+    assert interrupted.returncode == 86
+    journal = create_journal_path(project)
+    before = journal.read_bytes()
+    sibling = subprocess.Popen(["sleep", "60"], text=True)
+    try:
+        refused = command(
+            project,
+            "recover",
+            "--coordinator-pid",
+            str(sibling.pid),
+            "--slot",
+            "slot01",
+        )
+    finally:
+        terminate_process(sibling)
+    assert refused.returncode == 3
+    assert "not in the invoking process ancestry" in refused.stderr
+    assert journal.read_bytes() == before
 
 
 def test_create_refuses_owner_generation_change_before_publication(
@@ -8046,7 +8784,7 @@ def test_create_refuses_owner_generation_change_before_publication(
     assert "owner process generation changed during create" in captured.err
     assert checkout(project).is_dir()
     assert active_slots(project) == []
-    assert (project / "worktrees" / "ACTIVE.testhost.journal").is_file()
+    assert create_journal_path(project).is_file()
 
 
 def test_interrupted_finish_recovers_archive_and_removal(tmp_path: Path) -> None:
@@ -8380,6 +9118,7 @@ def test_changed_finish_journal_cannot_redirect_deletion(tmp_path: Path) -> None
     journal = json.loads(journal_path.read_text(encoding="utf-8"))
     journal["record"]["checkouts"][0]["path"] = "worktrees/slot02/product"
     journal_path.write_text(json.dumps(journal, indent=2) + "\n", encoding="utf-8")
+    shutil.rmtree(control_directory(project) / "EVENTS.testhost")
 
     refused = command(
         project,
@@ -8404,6 +9143,7 @@ def test_changed_finish_phase_cannot_deregister_present_slot(tmp_path: Path) -> 
     journal["phase"] = "removed"
     journal["removed"] = ["product"]
     journal_path.write_text(json.dumps(journal, indent=2) + "\n", encoding="utf-8")
+    shutil.rmtree(control_directory(project) / "EVENTS.testhost")
 
     refused = command(
         project,
@@ -10975,6 +11715,7 @@ def test_finish_recovery_upgrades_legacy_mount_namespace_identity(
     seal["targets"][0]["identity"] = legacy_identity
     finish_path.write_text(json.dumps(finish, indent=2) + "\n", encoding="utf-8")
     seal_path.write_text(json.dumps(seal, indent=2) + "\n", encoding="utf-8")
+    shutil.rmtree(control_directory(project) / "EVENTS.testhost")
     monkeypatch.setattr(wrkslots, "_fd_mount_id", lambda _fd, _label: 3503)
 
     assert (
@@ -11012,6 +11753,7 @@ def test_destructive_legacy_identity_upgrade_refuses_dirty_checkout(
     seal["targets"][0]["identity"] = legacy_identity
     finish_path.write_text(json.dumps(finish, indent=2) + "\n", encoding="utf-8")
     seal_path.write_text(json.dumps(seal, indent=2) + "\n", encoding="utf-8")
+    shutil.rmtree(control_directory(project) / "EVENTS.testhost")
     finish_before = finish_path.read_bytes()
     seal_before = seal_path.read_bytes()
     retained = slot_path / "product" / "seed.txt"
@@ -11054,6 +11796,7 @@ def test_legacy_identity_upgrade_refuses_changed_head_with_same_inode(
     seal["targets"][0]["identity"] = legacy_identity
     finish_path.write_text(json.dumps(finish, indent=2) + "\n", encoding="utf-8")
     seal_path.write_text(json.dumps(seal, indent=2) + "\n", encoding="utf-8")
+    shutil.rmtree(control_directory(project) / "EVENTS.testhost")
     finish_before = finish_path.read_bytes()
     seal_before = seal_path.read_bytes()
     commit_local(slot_path / "product", "seed.txt", "different\n", "different head")
@@ -13531,7 +14274,10 @@ def test_recover_accepts_legacy_absolute_sibling_create_journal(
         env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"},
     )
     assert interrupted.returncode == 86
+    scoped_path = create_journal_path(project)
     journal_path = control_directory(project) / "ACTIVE.testhost.journal"
+    os.replace(scoped_path, journal_path)
+    shutil.rmtree(control_directory(project) / "EVENTS.testhost")
     journal = json.loads(journal_path.read_text(encoding="utf-8"))
     legacy_repository = str(sibling.resolve())
     journal["planned"][0]["repository"] = legacy_repository
@@ -14182,8 +14928,8 @@ def test_create_recovery_refuses_journal_filename_for_another_machine(
         project, env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"}
     )
     assert interrupted.returncode == 86
-    original = project / "worktrees" / "ACTIVE.testhost.journal"
-    changed = project / "worktrees" / "ACTIVE.machine-b.journal"
+    original = create_journal_path(project)
+    changed = project / "worktrees" / "CREATE.9.machine-b.6.slot01.journal"
     os.replace(original, changed)
 
     refused = command(
@@ -14392,7 +15138,7 @@ def test_changed_create_journal_cannot_redirect_recovery(tmp_path: Path) -> None
         env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"},
     )
     assert interrupted.returncode == 86
-    journal_path = project / "worktrees" / "ACTIVE.testhost.journal"
+    journal_path = create_journal_path(project)
     journal = json.loads(journal_path.read_text(encoding="utf-8"))
     journal["planned"][0]["destination"] = "repo/redirected"
     journal_path.write_text(json.dumps(journal, indent=2) + "\n", encoding="utf-8")
@@ -14402,7 +15148,7 @@ def test_changed_create_journal_cannot_redirect_recovery(tmp_path: Path) -> None
     )
 
     assert refused.returncode == 3
-    assert "does not match slot" in refused.stderr
+    assert "differs from append-only progress evidence" in refused.stderr
     assert checkout(project).is_dir()
     assert repository.is_dir()
     assert not (repository / "redirected").exists()
@@ -15338,7 +16084,7 @@ def test_status_reports_malformed_journal_without_hiding_roster(
         branch="codex/blocked-by-journal",
     )
     assert refused.returncode == 3
-    assert "interrupted mutation recorded" in refused.stderr
+    assert "recovery journal is malformed JSON" in refused.stderr
     assert not checkout(project, "slot02").exists()
 
 
@@ -15760,7 +16506,7 @@ def test_failed_post_provision_hook_is_loud_and_recovery_resumes_hooks(
     assert "recover" in output.lower()
     assert checkout(project).is_dir()
     assert active_slots(project) == []
-    journal = control_directory(project) / "ACTIVE.testhost.journal"
+    journal = create_journal_path(project)
     assert journal.is_file()
     assert attempts.read_text(encoding="utf-8") == "first\nsecond\n"
     audit = command(project, "audit", "--format", "json")
@@ -15778,6 +16524,10 @@ def test_failed_post_provision_hook_is_loud_and_recovery_resumes_hooks(
 
     allow.write_text("retry may proceed\n", encoding="utf-8")
     interrupted_state = json.loads(journal.read_text(encoding="utf-8"))
+    legacy = control_directory(project) / "ACTIVE.testhost.journal"
+    os.replace(journal, legacy)
+    journal = legacy
+    shutil.rmtree(control_directory(project) / "EVENTS.testhost")
     interrupted_state["hook_progress"] = 2
     journal.write_text(
         json.dumps(interrupted_state, indent=2, sort_keys=True) + "\n",
@@ -15835,7 +16585,7 @@ def test_failed_post_provision_hook_can_be_explicitly_aborted(
     )
     refused = create(project)
     assert refused.returncode == 3
-    journal = control_directory(project) / "ACTIVE.testhost.journal"
+    journal = create_journal_path(project)
     assert journal.is_file()
     assert checkout(project).is_dir()
 
@@ -16073,7 +16823,7 @@ def test_abort_create_refuses_and_preserves_untracked_source_from_failed_hook(
     assert refused.returncode == 3
     tree = checkout(project)
     source = tree / "important-source.txt"
-    journal = control_directory(project) / "ACTIVE.testhost.journal"
+    journal = create_journal_path(project)
     assert source.read_text(encoding="utf-8") == "preserve me\n"
 
     aborted = command(
