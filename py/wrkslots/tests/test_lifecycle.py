@@ -4292,12 +4292,10 @@ def test_frozen_validate_recovery_refuses_exclusion_identity_tampering(
     )
 
     assert refused.returncode == 3
-    expected = (
-        "guard identity or ownership changed"
-        if mutation == "guard-identity"
-        else "mount alias changed"
+    assert (
+        "standalone recovery journal differs from append-only operation evidence"
+        in refused.stderr
     )
-    assert expected in refused.stderr
     assert not checkout.exists()
     journal.write_bytes(original)
 
@@ -6285,7 +6283,10 @@ def test_ownerless_checkout_refuses_remote_change_during_fetch(
     )
 
     assert returncode == 3
-    assert "remote changed during recovery fetch" in capsys.readouterr().err
+    assert (
+        "validation checkout remote changed during recovery inspection"
+        in capsys.readouterr().err
+    )
     assert target.is_dir()
     assert target.absolute() in wrkslots._GitVcs().listed_worktrees(repository)
     assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
@@ -8233,6 +8234,160 @@ def test_live_dirty_legacy_create_stays_exact_while_unrelated_creates_succeed(
     assert legacy.read_bytes() == before
     assert legacy.stat(follow_symlinks=False).st_ino == before_stat.st_ino
     assert dirty.read_text(encoding="utf-8") == "authored work\n"
+
+
+def test_dead_dirty_create_is_classified_without_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    interrupted = create(
+        project, env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"}
+    )
+    assert interrupted.returncode == 86
+    journal = create_journal_path(project)
+    advanced = checkout(project) / "advanced.txt"
+    advanced.write_text("new committed work\n", encoding="utf-8")
+    git(checkout(project), "add", "advanced.txt")
+    git(checkout(project), "commit", "-m", "advance interrupted slot")
+    observed_head = git(checkout(project), "rev-parse", "HEAD").stdout.strip()
+    dirty = checkout(project) / "unfinished.txt"
+    dirty.write_text("authored work\n", encoding="utf-8")
+
+    before = {
+        path.relative_to(project).as_posix(): (
+            path.read_bytes(),
+            path.stat(follow_symlinks=False).st_ino,
+            path.stat(follow_symlinks=False).st_mtime_ns,
+        )
+        for path in project.rglob("*")
+        if path.is_file() and not path.is_symlink()
+    }
+
+    real_process_state = wrkslots._process_state
+
+    def dead_process_state(
+        identity: wrkslots.ProcessIdentity | None,
+    ) -> tuple[str, str]:
+        if identity is not None and identity.pid == os.getpid():
+            return "dead", f"PID {identity.pid} generation exited"
+        return real_process_state(identity)
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("read-only classification attempted a mutation")
+
+    monkeypatch.setattr(wrkslots, "_process_state", dead_process_state)
+    monkeypatch.setattr(wrkslots, "_mutation_locks", forbidden)
+    for name in (
+        "_atomic_write_json",
+        "_clear_journal",
+        "_remove_control_file",
+        "_write_active_state",
+        "_write_archive_state",
+        "_write_event_file",
+        "_write_journal",
+    ):
+        monkeypatch.setattr(wrkslots, name, forbidden)
+
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "classify-create-journals",
+            "slot02",
+            "--slot-type",
+            "validate",
+            "--agent",
+            "validate-slot02",
+            "--format",
+            "json",
+        ]
+    )
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["schema"] == 2
+    assert payload["requested"] == {
+        "agent": "validate-slot02",
+        "slot": "slot02",
+        "slot_path": str(slots_directory(project) / "validate" / "slot02"),
+        "slot_type": "validate",
+    }
+    row = payload["journals"][0]
+    assert row["state"] == "dead-incomplete-create"
+    assert row["owner_state"] == "dead"
+    assert row["coordinator_state"] == "dead"
+    assert row["slot_path"] == str(slots_directory(project) / "slot01")
+    assert row["dirty_checkouts"] == ["product"]
+    assert row["checkouts"] == [
+        {
+            "branch": "codex/task",
+            "dirty": True,
+            "head": observed_head,
+            "name": "product",
+            "path": "worktrees/slot01/product",
+        }
+    ]
+
+    after = {
+        path.relative_to(project).as_posix(): (
+            path.read_bytes(),
+            path.stat(follow_symlinks=False).st_ino,
+            path.stat(follow_symlinks=False).st_mtime_ns,
+        )
+        for path in project.rglob("*")
+        if path.is_file() and not path.is_symlink()
+    }
+    assert after == before
+    assert journal.is_file()
+    assert dirty.read_text(encoding="utf-8") == "authored work\n"
+
+
+def test_indeterminate_create_process_state_refuses_classification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    interrupted = create(
+        project, env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"}
+    )
+    assert interrupted.returncode == 86
+    journal = create_journal_path(project)
+    before = (
+        journal.read_bytes(),
+        journal.stat(follow_symlinks=False).st_ino,
+        journal.stat(follow_symlinks=False).st_mtime_ns,
+    )
+
+    monkeypatch.setattr(
+        wrkslots,
+        "_process_state",
+        lambda _identity: ("indeterminate", "process table is unreadable"),
+    )
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "classify-create-journals",
+            "slot02",
+            "--slot-type",
+            "validate",
+            "--agent",
+            "validate-slot02",
+            "--format",
+            "json",
+        ]
+    )
+
+    assert rc == 3
+    assert "process state is indeterminate" in capsys.readouterr().err
+    assert before == (
+        journal.read_bytes(),
+        journal.stat(follow_symlinks=False).st_ino,
+        journal.stat(follow_symlinks=False).st_mtime_ns,
+    )
 
 
 def test_matching_legacy_create_event_is_trusted_by_every_consumer(
