@@ -2506,6 +2506,7 @@ def _config_is_authoritative_candidate(root: Path, config_path: Path) -> bool:
         or any(control.glob("ARCHIVED.*.json"))
         or any(control.glob("ACTIVE.*.journal"))
         or any(control.glob("CREATE.*.journal"))
+        or any(control.glob("FINISH.*.journal"))
         or any(control.glob("VALIDATE-BATCH-SEAL.*.journal"))
         or any(control.glob("EVENTS.*"))
     )
@@ -2716,6 +2717,19 @@ def _create_journal_path(
     _validate_name(slot, "slot")
     return config.control / (
         f"CREATE.{len(selected)}.{selected}.{len(slot)}.{slot}.journal"
+    )
+
+
+def _finish_journal_path(
+    config: Config, slot: str, machine: str | None = None
+) -> Path:
+    """Return the collision-free journal path for one finish target."""
+
+    selected = machine or config.machine
+    _validate_name(selected, "machine")
+    _validate_name(slot, "slot")
+    return config.control / (
+        f"FINISH.{len(selected)}.{selected}.{len(slot)}.{slot}.journal"
     )
 
 
@@ -4489,11 +4503,12 @@ def _operation_event_journal_path(
     slot = _validate_name(
         _as_str(payload.get("slot"), "append-only operation slot"), "slot"
     )
-    expected = (
-        _create_journal_path(config, slot, machine)
-        if operation == "create" and name.startswith("CREATE.")
-        else _journal_path(config, machine)
-    )
+    if operation == "create" and name.startswith("CREATE."):
+        expected = _create_journal_path(config, slot, machine)
+    elif operation == "finish" and name.startswith("FINISH."):
+        expected = _finish_journal_path(config, slot, machine)
+    else:
+        expected = _journal_path(config, machine)
     selected = config.control / name
     if selected != expected:
         raise StateError(
@@ -5180,6 +5195,8 @@ def _validate_journal_shape(
     expected_paths = {_journal_path(config, machine)}
     if kind == "create":
         expected_paths.add(_create_journal_path(config, slot, machine))
+    elif kind == "finish":
+        expected_paths.add(_finish_journal_path(config, slot, machine))
     if path not in expected_paths:
         raise StateError(
             "recovery journal filename does not match its machine, operation, and slot"
@@ -5251,6 +5268,20 @@ def _validate_journal_shape(
         record = _record_from_obj(raw["record"], "finish journal.record")
         if record.machine != machine or record.slot != slot:
             raise StateError("finish journal record does not match its shard or slot")
+        if path == _finish_journal_path(config, slot, machine) and (
+            record.slot_type != "validate"
+            or raw.get("validate_complete") is not True
+            or any(
+                field in raw
+                for field in (
+                    "private_census_identity",
+                    "validation_removal_proof",
+                )
+            )
+        ):
+            raise StateError(
+                "scoped finish journal is not a direct completed-validation removal"
+            )
         mode = _as_str(raw["mode"], "finish journal.mode")
         actor = _as_str(raw["actor"], "finish journal.actor")
         if mode != "remove" or actor != "coordinator":
@@ -5466,18 +5497,19 @@ def _completed_create_record(
     )
 
 
-def _scoped_create_journal_completed(
+def _scoped_operation_journal_completed(
     config: Config,
     path: Path,
     raw: Mapping[str, object],
-    states: Sequence[ActiveState] | None = None,
+    operation: str,
 ) -> bool:
-    """Verify event-first provenance and return whether publication completed."""
+    """Verify event-first provenance for one collision-free journal path."""
 
-    machine = _as_str(raw["machine"], "create journal.machine")
-    slot = _validate_name(_as_str(raw["slot"], "create journal.slot"), "slot")
-    if path != _create_journal_path(config, slot, machine):
-        raise StateError("scoped create journal filename does not match its target")
+    label = f"scoped {operation} journal"
+    machine = _as_str(raw["machine"], f"{operation} journal.machine")
+    slot = _validate_name(
+        _as_str(raw["slot"], f"{operation} journal.slot"), "slot"
+    )
     recorded: Mapping[str, object] | None = None
     completed = False
     for event in _load_events(config, machine):
@@ -5497,27 +5529,35 @@ def _scoped_create_journal_completed(
             continue
         if event_kind == "operation-progress-recorded":
             if completed:
-                raise StateError(
-                    "scoped create journal path was reused after completion"
-                )
+                raise StateError(f"{label} path was reused after completion")
             assert journal is not None
             recorded = journal
             continue
         if recorded is None:
-            raise StateError(
-                "scoped create completion has no preceding progress evidence"
-            )
+            raise StateError(f"scoped {operation} completion has no preceding progress evidence")
         if completed:
             continue
         completed = True
     if recorded is None:
-        raise StateError(
-            "scoped create journal has no matching append-only progress evidence"
-        )
+        raise StateError(f"{label} has no matching append-only progress evidence")
     if not _json_equal(raw, recorded):
-        raise StateError(
-            "scoped create journal differs from append-only progress evidence"
-        )
+        raise StateError(f"{label} differs from append-only progress evidence")
+    return completed
+
+
+def _scoped_create_journal_completed(
+    config: Config,
+    path: Path,
+    raw: Mapping[str, object],
+    states: Sequence[ActiveState] | None = None,
+) -> bool:
+    """Verify event-first provenance and return whether publication completed."""
+
+    machine = _as_str(raw["machine"], "create journal.machine")
+    slot = _validate_name(_as_str(raw["slot"], "create journal.slot"), "slot")
+    if path != _create_journal_path(config, slot, machine):
+        raise StateError("scoped create journal filename does not match its target")
+    completed = _scoped_operation_journal_completed(config, path, raw, "create")
     if completed:
         expected = _completed_create_record(config, raw)
         selected_states = (
@@ -5558,7 +5598,13 @@ def _validate_journal_provenance(
         return False
     if raw.get("kind") == "create":
         return _scoped_create_journal_completed(config, path, raw, states)
-    raise StateError("only create journals may use a scoped journal path")
+    if raw.get("kind") == "finish":
+        machine = _as_str(raw["machine"], "finish journal.machine")
+        slot = _validate_name(_as_str(raw["slot"], "finish journal.slot"), "slot")
+        if path != _finish_journal_path(config, slot, machine):
+            raise StateError("scoped finish journal filename does not match its target")
+        return _scoped_operation_journal_completed(config, path, raw, "finish")
+    raise StateError("only create and finish journals may use a scoped journal path")
 
 
 def _read_stable_physical_journal(
@@ -5829,7 +5875,7 @@ def _classify_create_journal(
     if raw.get("kind") != "create":
         raise Refusal(
             f"interrupted {raw.get('kind')!r} mutation {path.name} cannot coexist "
-            "with a new create"
+            "with an operation that permits only verified disjoint create journals"
         )
     owner = _identity_from_obj(raw["owner"], "create journal.owner")
     coordinator = _identity_from_obj(
@@ -5894,10 +5940,13 @@ def _classify_create_journals(
     config: Config,
     states: Sequence[ActiveState],
     archives: Sequence[ArchiveState],
+    *,
+    excluded_paths: AbstractSet[Path] = frozenset(),
 ) -> tuple[_CreateJournalClassification, ...]:
     rows = tuple(
         _classify_create_journal(config, path, states, archives)
         for path in _outstanding_journals(config)
+        if path not in excluded_paths
     )
     seen_slots: set[tuple[str, str]] = set()
     seen_agents: set[str] = set()
@@ -5920,8 +5969,13 @@ def _assert_create_journal_classifications_stable(
     rows: Sequence[_CreateJournalClassification],
     states: Sequence[ActiveState],
     archives: Sequence[ArchiveState],
+    *,
+    excluded_paths: AbstractSet[Path] = frozenset(),
 ) -> None:
-    if tuple(row.path for row in rows) != tuple(_outstanding_journals(config)):
+    outstanding = tuple(
+        path for path in _outstanding_journals(config) if path not in excluded_paths
+    )
+    if tuple(row.path for row in rows) != outstanding:
         raise Refusal("recovery journal set changed while it was classified")
     for row in rows:
         contents, identity = _read_regular_file_identity(
@@ -6021,6 +6075,65 @@ def _assert_interrupted_creates_unrelated(
                         f"branch {requested.branch!r} is claimed by interrupted create "
                         f"{row.machine}/{row.slot}"
                     )
+
+
+def _assert_interrupted_creates_unrelated_to_record(
+    config: Config,
+    rows: Sequence[_CreateJournalClassification],
+    record: ActiveRecord,
+) -> None:
+    """Require every classified create to be disjoint from one active record."""
+
+    _assert_interrupted_creates_unrelated(
+        config,
+        rows,
+        slot=record.slot,
+        agent=record.agent,
+        slot_type=record.slot_type,
+        plan=tuple(
+            PlannedCheckout(
+                name=item.name,
+                destination=item.path,
+                repository=item.repository,
+                branch=item.branch,
+                start_point=item.start_point,
+                remote=item.remote,
+                remote_url_sha256=item.remote_url_sha256,
+                landed_ref=item.landed_ref,
+            )
+            for item in record.checkouts
+        ),
+    )
+
+
+def _classify_disjoint_create_journals_for_record(
+    config: Config,
+    states: Sequence[ActiveState],
+    archives: Sequence[ArchiveState],
+    record: ActiveRecord,
+    *,
+    excluded_paths: AbstractSet[Path] = frozenset(),
+) -> tuple[_CreateJournalClassification, ...]:
+    rows = _classify_create_journals(
+        config, states, archives, excluded_paths=excluded_paths
+    )
+    _assert_interrupted_creates_unrelated_to_record(config, rows, record)
+    return rows
+
+
+def _recheck_disjoint_create_journals_for_record(
+    config: Config,
+    rows: Sequence[_CreateJournalClassification],
+    states: Sequence[ActiveState],
+    archives: Sequence[ArchiveState],
+    record: ActiveRecord,
+    *,
+    excluded_paths: AbstractSet[Path] = frozenset(),
+) -> None:
+    _assert_create_journal_classifications_stable(
+        config, rows, states, archives, excluded_paths=excluded_paths
+    )
+    _assert_interrupted_creates_unrelated_to_record(config, rows, record)
 
 
 def _journal_inconsistencies(
@@ -8936,6 +9049,7 @@ def _refuse_partial_state(
     leftovers += sorted(config.control.glob("ARCHIVED.*.json.tmp.*"))
     leftovers += sorted(config.control.glob("ACTIVE.*.journal.tmp.*"))
     leftovers += sorted(config.control.glob("CREATE.*.journal.tmp.*"))
+    leftovers += sorted(config.control.glob("FINISH.*.journal.tmp.*"))
     leftovers += sorted(
         config.control.glob("VALIDATE-BATCH-SEAL.*.journal.tmp.*")
     )
@@ -8957,6 +9071,7 @@ def _refuse_partial_state(
 def _outstanding_journals(config: Config) -> list[Path]:
     paths = {path for path in config.control.glob("ACTIVE.*.journal")}
     paths.update(config.control.glob("CREATE.*.journal"))
+    paths.update(config.control.glob("FINISH.*.journal"))
     for directory in config.control.glob("EVENTS.*"):
         if not directory.is_dir() or directory.is_symlink():
             continue
@@ -8991,8 +9106,8 @@ def _assert_no_journal(config: Config) -> None:
         )
 
 
-def _create_journal_path_for_slot(config: Config, slot: str) -> Path:
-    """Select one legacy or scoped create journal by its validated slot identity."""
+def _journal_path_for_slot(config: Config, slot: str) -> Path:
+    """Select one legacy or scoped mutation journal by validated slot identity."""
 
     matches: list[Path] = []
     for path in _outstanding_journals(config):
@@ -9008,12 +9123,12 @@ def _create_journal_path_for_slot(config: Config, slot: str) -> Path:
                 )
             raw = pending
         _validate_journal_shape(config, path, raw)
-        if raw.get("kind") == "create" and raw.get("slot") == slot:
+        if raw.get("kind") in {"create", "finish"} and raw.get("slot") == slot:
             matches.append(path)
     if not matches:
-        raise Refusal(f"no interrupted create is recorded for slot {slot!r}")
+        raise Refusal(f"no interrupted mutation is recorded for slot {slot!r}")
     if len(matches) != 1:
-        raise StateError(f"multiple interrupted creates claim slot {slot!r}")
+        raise StateError(f"multiple interrupted mutations claim slot {slot!r}")
     return matches[0]
 
 
@@ -9029,7 +9144,7 @@ def _load_journal(
         path = selected_path
     elif len(journals) != 1:
         raise StateError(
-            "multiple interrupted mutations are present; select one exact create slot "
+            "multiple interrupted mutations are present; select one exact slot "
             "with '--slot SLOT' or inspect every journal before continuing"
         )
     else:
@@ -9224,6 +9339,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
                         )
                         journals = sorted(existing_control.glob("ACTIVE.*.journal"))
                         journals += sorted(existing_control.glob("CREATE.*.journal"))
+                        journals += sorted(existing_control.glob("FINISH.*.journal"))
                         if journals:
                             raise Refusal(
                                 f"cannot change configuration while recovery journal "
@@ -12550,6 +12666,7 @@ def _slot_findings(
     leftovers += sorted(config.control.glob("ARCHIVED.*.json.tmp.*"))
     leftovers += sorted(config.control.glob("ACTIVE.*.journal.tmp.*"))
     leftovers += sorted(config.control.glob("CREATE.*.journal.tmp.*"))
+    leftovers += sorted(config.control.glob("FINISH.*.journal.tmp.*"))
     for event_directory in sorted(config.control.glob("EVENTS.*")):
         if event_directory.is_dir() and not event_directory.is_symlink():
             leftovers += sorted(event_directory.glob("*.json.tmp.*"))
@@ -13749,6 +13866,8 @@ def _rollback_path_fence(
     record: ActiveRecord,
     journal: dict[str, object],
     vcs: _GitVcs,
+    *,
+    journal_path: Path,
 ) -> None:
     removed = {
         _as_str(item, "journal.removed item")
@@ -13778,7 +13897,7 @@ def _rollback_path_fence(
     except OSError as exc:
         raise Refusal(f"cannot restore path fence {fenced} to {original}: {exc}") from exc
     journal["phase"] = "prepared"
-    _write_journal(config, journal)
+    _write_journal(config, journal, journal_path=journal_path)
     for checkout in record.checkouts:
         # Rollback preserves the checkout; it does not authorize deletion. Repair
         # Git's path registration without requiring the content to still match the
@@ -13786,7 +13905,7 @@ def _rollback_path_fence(
         # returned to its canonical path for inspection.
         _repair_registration_at_slot(config, record, checkout, original, vcs)
     _remove_fenced_directory(config, fenced)
-    _clear_journal(config, journal)
+    _clear_journal(config, journal, journal_path=journal_path)
 
 
 def _begin_or_resume_path_fence(
@@ -13795,6 +13914,8 @@ def _begin_or_resume_path_fence(
     journal: dict[str, object],
     vcs: _GitVcs,
     finish: _FinishContext,
+    *,
+    journal_path: Path,
 ) -> tuple[dict[str, object], Path]:
     original = _slot_directory(config, record.slot, record.slot_type)
     fenced = _finish_fenced_slot(config, record, journal)
@@ -13839,7 +13960,7 @@ def _begin_or_resume_path_fence(
         if path.exists() or path.is_symlink():
             _repair_registration_at_slot(config, record, checkout, fenced, vcs)
     journal["phase"] = "fenced"
-    _write_journal(config, journal)
+    _write_journal(config, journal, journal_path=journal_path)
     _interrupt_for_test("after-path-fence")
     return journal, fenced
 
@@ -13850,6 +13971,8 @@ def _finish_remove_paths(
     journal: dict[str, object],
     vcs: _GitVcs,
     finish: _FinishContext,
+    *,
+    journal_path: Path,
 ) -> dict[str, object]:
     if (
         finish.validation_removal_proof is not None
@@ -13867,6 +13990,7 @@ def _finish_remove_paths(
         journal,
         vcs,
         finish,
+        journal_path=journal_path,
     )
     private_fence_identity = (
         None
@@ -13906,7 +14030,7 @@ def _finish_remove_paths(
                 vcs.delete_branch_at(repository, checkout.branch, checkout.head)
         removed.update(item.name for item in missing_after_remove)
         journal["removed"] = sorted(removed)
-        _write_journal(config, journal)
+        _write_journal(config, journal, journal_path=journal_path)
     remaining = tuple(present)
     if remaining:
         if not fenced_slot.is_dir() or fenced_slot.is_symlink():
@@ -14026,7 +14150,13 @@ def _finish_remove_paths(
         except Refusal as exc:
             if not removed:
                 try:
-                    _rollback_path_fence(config, record, journal, vcs)
+                    _rollback_path_fence(
+                        config,
+                        record,
+                        journal,
+                        vcs,
+                        journal_path=journal_path,
+                    )
                 except Refusal as rollback:
                     raise Refusal(
                         f"{exc}; path-fence rollback failed: {rollback}; run 'wrkslots recover'"
@@ -14060,7 +14190,7 @@ def _finish_remove_paths(
             vcs.delete_branch_at(repository, checkout.branch, checkout.head)
         removed.add(checkout.name)
         journal["removed"] = sorted(removed)
-        _write_journal(config, journal)
+        _write_journal(config, journal, journal_path=journal_path)
         _interrupt_for_test("after-remove-worktree")
     if _record_layout(config, record) == "nested" and record.slot_type == "agent":
         handoff = fenced_slot / "HANDOFF.md"
@@ -14100,7 +14230,7 @@ def _finish_remove_paths(
     _remove_fenced_directory(config, fenced_slot)
     _interrupt_for_test("after-remove-fenced-directory")
     journal["phase"] = "removed"
-    _write_journal(config, journal)
+    _write_journal(config, journal, journal_path=journal_path)
     return journal
 
 
@@ -14142,6 +14272,8 @@ def _finish_state_update(
     state: ActiveState,
     record: ActiveRecord,
     journal: Mapping[str, object],
+    *,
+    journal_path: Path,
 ) -> None:
     current_slots = {item.slot: item for item in state.slots}
     current = current_slots.get(record.slot)
@@ -14164,7 +14296,7 @@ def _finish_state_update(
             evidence={"archive_id": entry["archive_id"]},
             require_repository=False,
         )
-    _clear_journal(config, journal)
+    _clear_journal(config, journal, journal_path=journal_path)
 
 
 def _begin_finish(
@@ -14172,6 +14304,8 @@ def _begin_finish(
     state: ActiveState,
     record: ActiveRecord,
     finish: _FinishContext,
+    *,
+    journal_path: Path,
 ) -> None:
     vcs = _GitVcs()
     _load_archive(config, require_repository=False)
@@ -14214,7 +14348,7 @@ def _begin_finish(
         phase="prepared",
         finish=finish,
     )
-    _write_journal(config, journal)
+    _write_journal(config, journal, journal_path=journal_path)
     _interrupt_for_test("after-finish-journal")
     try:
         journal = _finish_remove_paths(
@@ -14223,6 +14357,7 @@ def _begin_finish(
             journal,
             vcs,
             finish,
+            journal_path=journal_path,
         )
     except Refusal:
         canonical = _slot_directory(config, final_record.slot, final_record.slot_type)
@@ -14234,9 +14369,15 @@ def _begin_finish(
             and not fenced.is_symlink()
             and not _as_list(journal["removed"], "journal.removed")
         ):
-            _clear_journal(config, journal)
+            _clear_journal(config, journal, journal_path=journal_path)
         raise
-    _finish_state_update(config, state, final_record, journal)
+    _finish_state_update(
+        config,
+        state,
+        final_record,
+        journal,
+        journal_path=journal_path,
+    )
 
 
 def _cmd_finish(args: argparse.Namespace) -> int:
@@ -14345,12 +14486,14 @@ def _cmd_remove(
     coordinator, runner, handoff_writer, proof_fd = _capture_remove_processes(
         args.coordinator_pid
     )
+    scoped_validation_finish = bool(args.validate_complete) and private_cleanup is None
     with _mutation_locks(config, args.wait_lock):
         _refuse_partial_state(
             config,
             allow_validate_batch_seals=private_cleanup is not None,
         )
-        _assert_no_journal(config)
+        if not scoped_validation_finish:
+            _assert_no_journal(config)
         states, archives = _validate_global_state(
             config, require_repository=False
         )
@@ -14372,6 +14515,11 @@ def _cmd_remove(
                 "--validate-complete applies only to a slot created with --slot-type validate. "
                 "state: REFUSED -- no checkout was salvaged or removed. remedy: omit the flag "
                 "and satisfy the ordinary agent-slot reclaim conditions"
+            )
+        create_rows: tuple[_CreateJournalClassification, ...] = ()
+        if scoped_validation_finish:
+            create_rows = _classify_disjoint_create_journals_for_record(
+                config, states, archives, record
             )
         _assert_not_held(config, record)
         age, expired = _heartbeat_diagnosis(record)
@@ -14434,6 +14582,28 @@ def _cmd_remove(
             ignore_invoking_ancestry=live_validate_owner,
             census=None if private_cleanup is None else private_cleanup.shared_census,
         )
+        if scoped_validation_finish:
+            boundary_states, boundary_archives = _validate_global_state(
+                config, require_repository=False
+            )
+            boundary_state = next(
+                item for item in boundary_states if item.machine == config.machine
+            )
+            boundary_record = _find_record(boundary_state, record.slot)
+            if _record_to_obj(boundary_record) != _record_to_obj(record):
+                raise Refusal(
+                    f"slot {record.slot} changed while interrupted creates were classified"
+                )
+            _assert_target_record_storage_consistent(
+                config, boundary_states, boundary_record
+            )
+            _recheck_disjoint_create_journals_for_record(
+                config,
+                create_rows,
+                boundary_states,
+                boundary_archives,
+                boundary_record,
+            )
         _ensure_event_log(
             config, record.machine, require_repository=False
         )
@@ -14526,6 +14696,11 @@ def _cmd_remove(
                 allow_live_validate_owner=live_validate_owner,
                 private_cleanup=private_cleanup,
                 validation_removal_proof=validation_removal_proof,
+            ),
+            journal_path=(
+                _finish_journal_path(config, record.slot)
+                if scoped_validation_finish
+                else _journal_path(config)
             ),
         )
         after_states, after_archives = _validate_global_state(
@@ -14897,6 +15072,7 @@ def _recover_partial_updates(config: Config, discard: bool) -> bool:
     leftovers += sorted(config.control.glob("ARCHIVED.*.json.tmp.*"))
     leftovers += sorted(config.control.glob("ACTIVE.*.journal.tmp.*"))
     leftovers += sorted(config.control.glob("CREATE.*.journal.tmp.*"))
+    leftovers += sorted(config.control.glob("FINISH.*.journal.tmp.*"))
     leftovers += sorted(
         config.control.glob("VALIDATE-BATCH-SEAL.*.journal.tmp.*")
     )
@@ -15640,11 +15816,14 @@ def _recover_finish(
     _exact_keys(
         raw, _FINISH_JOURNAL_REQUIRED, _FINISH_JOURNAL_OPTIONAL, "finish journal"
     )
-    if path != _journal_path(config):
-        raise StateError(f"finish journal filename does not match machine {config.machine}")
     record = _record_from_obj(raw["record"], "finish journal.record")
     if record.machine != config.machine:
         raise StateError("finish journal record belongs to a different machine")
+    if path not in {
+        _journal_path(config),
+        _finish_journal_path(config, record.slot),
+    }:
+        raise StateError(f"finish journal filename does not match machine {config.machine}")
     journal_slot = _as_str(raw["slot"], "finish journal.slot")
     if journal_slot != record.slot:
         raise StateError("finish journal slot does not match its recorded active state")
@@ -15749,7 +15928,7 @@ def _recover_finish(
             raise StateError("durable archive entry differs from the finish journal")
         _assert_physical_slot_removed(config, record, _GitVcs(), raw)
         _atomic_write_json(_archive_path(config), _archive_to_obj(archive))
-        _clear_journal(config, raw)
+        _clear_journal(config, raw, journal_path=path)
         print(f"recovered finish: cleared completed journal for {record.slot}")
         return
     if current is None:
@@ -15832,7 +16011,13 @@ def _recover_finish(
                 except Refusal as exc:
                     if identity_verified and census_path == fenced and not removed_names:
                         try:
-                            _rollback_path_fence(config, record, journal, _GitVcs())
+                            _rollback_path_fence(
+                                config,
+                                record,
+                                journal,
+                                _GitVcs(),
+                                journal_path=path,
+                            )
                         except Refusal as rollback:
                             raise Refusal(
                                 f"{exc}; path-fence rollback failed: {rollback}"
@@ -15859,12 +16044,19 @@ def _recover_finish(
                 private_cleanup=private_cleanup,
                 validation_removal_proof=removal_proof,
             ),
+            journal_path=path,
         )
     else:
         if set(removed_names) != {checkout.name for checkout in record.checkouts}:
             raise StateError("removed finish phase does not name every checkout")
         _assert_physical_slot_removed(config, record, _GitVcs(), journal)
-    _finish_state_update(config, state, record, journal)
+    _finish_state_update(
+        config,
+        state,
+        record,
+        journal,
+        journal_path=path,
+    )
     print(f"recovered finish: archived and removed slot={record.slot}")
 
 
@@ -23715,7 +23907,7 @@ def _cmd_recover(
         )
         if getattr(args, "slot", None) is not None and requested_ownerless:
             raise Refusal(
-                "--slot selects an interrupted create and cannot be combined "
+                "--slot selects an interrupted mutation and cannot be combined "
                 "with validation cleanup flags"
             )
         if requested_ownerless:
@@ -23800,11 +23992,35 @@ def _cmd_recover(
                 return 0
             selected_slot = getattr(args, "slot", None)
             selected_path = (
-                _create_journal_path_for_slot(config, selected_slot)
+                _journal_path_for_slot(config, selected_slot)
                 if selected_slot is not None
                 else None
             )
             path, raw = _load_journal(config, selected_path=selected_path)
+        kind_hint = _as_str(raw.get("kind"), "journal.kind")
+        if kind_hint == "finish":
+            recovery_states, recovery_archives = (
+                _validate_global_state_for_finish_recovery(config, raw)
+            )
+            recovery_record = _record_from_obj(
+                raw.get("record"), "finish journal.record"
+            )
+            excluded = frozenset({path})
+            coexisting_creates = _classify_disjoint_create_journals_for_record(
+                config,
+                recovery_states,
+                recovery_archives,
+                recovery_record,
+                excluded_paths=excluded,
+            )
+            _recheck_disjoint_create_journals_for_record(
+                config,
+                coexisting_creates,
+                recovery_states,
+                recovery_archives,
+                recovery_record,
+                excluded_paths=excluded,
+            )
         _ensure_event_log(config)
         _write_event_file(
             config,
@@ -23824,7 +24040,7 @@ def _cmd_recover(
             raise Refusal(
                 f"journal belongs to machine {machine}; rerun with --machine {machine}"
             )
-        kind = _as_str(raw.get("kind"), "journal.kind")
+        kind = kind_hint
         seal_journals = _validate_batch_seal_journals(config)
         if seal_journals:
             if kind != "finish":
@@ -25145,8 +25361,8 @@ usage or audit gate unknown, 3 fail-closed refusal.
         "--slot",
         metavar="SLOT",
         help=(
-            "select one exact interrupted create when multiple scoped journals exist; "
-            "other recovery kinds remain selected by their singleton journal"
+            "select one exact interrupted create or finish when multiple scoped "
+            "journals exist; other recovery kinds remain selected by their singleton journal"
         ),
     )
     recover.add_argument(

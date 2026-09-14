@@ -970,6 +970,13 @@ def create_journal_path(
     return wrkslots._create_journal_path(config, slot, machine)
 
 
+def finish_journal_path(
+    project: Path, slot: str = "slot01", machine: str = "testhost"
+) -> Path:
+    config = wrkslots._load_config(str(project), machine)
+    return wrkslots._finish_journal_path(config, slot, machine)
+
+
 def install_legacy_create_journal_with_matching_event(
     project: Path, slot: str = "slot01", machine: str = "testhost"
 ) -> Path:
@@ -8547,6 +8554,11 @@ def test_scoped_create_journal_names_encode_machine_and_slot_boundaries(
     assert first != second
     assert first.name == "CREATE.3.a.1.1.b.journal"
     assert second.name == "CREATE.1.a.3.1.b.journal"
+    finish_first = wrkslots._finish_journal_path(config, "b", "a.1")
+    finish_second = wrkslots._finish_journal_path(config, "1.b", "a")
+    assert finish_first != finish_second
+    assert finish_first.name == "FINISH.3.a.1.1.b.journal"
+    assert finish_second.name == "FINISH.1.a.3.1.b.journal"
 
 
 @pytest.mark.parametrize("damage", ("missing", "malformed", "cross-target"))
@@ -18037,6 +18049,365 @@ def test_remove_validates_the_target_without_unrelated_storage(
         isinstance(row, dict) and row.get("slot") == "missing"
         for row in active_slots(project)
     )
+
+
+def prepare_validation_remove_beside_create(
+    tmp_path: Path, *, legacy_journal: bool = False
+) -> tuple[Path, Path]:
+    project, _repository, _remote = make_project(tmp_path)
+    made = create(project, slot="target", slot_type="validate", branch=None)
+    assert made.returncode == 0, made.stderr
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+    interrupted = create(
+        project,
+        slot="unrelated",
+        agent="other",
+        branch="other/unrelated",
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"},
+    )
+    assert interrupted.returncode == 86, interrupted.stderr
+    journal = create_journal_path(project, "unrelated")
+    if legacy_journal:
+        config = wrkslots._load_config(str(project), "testhost")
+        raw = json.loads(journal.read_text(encoding="utf-8"))
+        wrkslots._clear_journal(config, raw, journal_path=journal)
+        journal = wrkslots._journal_path(config)
+        wrkslots._write_journal(config, raw, journal_path=journal)
+    return project, journal
+
+
+def remove_completed_validation(project: Path, slot: str = "target") -> int:
+    return wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "remove",
+            slot,
+            "--validate-complete",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--expected-generation",
+            "1",
+        ]
+    )
+
+
+def stable_file(path: Path) -> tuple[bytes, int, int]:
+    metadata = path.stat(follow_symlinks=False)
+    return path.read_bytes(), metadata.st_ino, metadata.st_mtime_ns
+
+
+class _FinishInterrupted(RuntimeError):
+    pass
+
+
+def interrupt_after_finish_journal(point: str) -> None:
+    if point == "after-finish-journal":
+        raise _FinishInterrupted
+
+
+@pytest.mark.parametrize(
+    ("create_state", "legacy_journal"),
+    (("live", False), ("dead", False), ("live", True), ("dead", True)),
+)
+def test_remove_completed_validation_with_unrelated_interrupted_create(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    create_state: str,
+    legacy_journal: bool,
+) -> None:
+    project, journal = prepare_validation_remove_beside_create(
+        tmp_path, legacy_journal=legacy_journal
+    )
+    unfinished = checkout(project, slot="unrelated") / "unfinished.txt"
+    unfinished.write_text("authored work\n", encoding="utf-8")
+    journal_before = stable_file(journal)
+    unfinished_before = stable_file(unfinished)
+    slot_before = checkout(project, slot="unrelated").stat(follow_symlinks=False)
+    if create_state == "dead":
+        original = wrkslots._process_state
+        monkeypatch.setattr(
+            wrkslots,
+            "_process_state",
+            lambda identity: (
+                ("dead", "test process exited")
+                if identity is not None and identity.pid == os.getpid()
+                else original(identity)
+            ),
+        )
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", lambda *_a, **_k: None)
+
+    assert remove_completed_validation(project) == 0, capsys.readouterr().err
+    assert not checkout(project, slot="target", slot_type="validate").exists()
+    assert stable_file(journal) == journal_before
+    assert stable_file(unfinished) == unfinished_before
+    slot_after = checkout(project, slot="unrelated").stat(follow_symlinks=False)
+    assert (slot_after.st_ino, slot_after.st_mtime_ns) == (
+        slot_before.st_ino,
+        slot_before.st_mtime_ns,
+    )
+
+
+@pytest.mark.parametrize("change_create", (False, True))
+def test_recover_exact_scoped_finish_beside_unrelated_create(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    change_create: bool,
+) -> None:
+    project, create_journal = prepare_validation_remove_beside_create(
+        tmp_path, legacy_journal=True
+    )
+    create_before = stable_file(create_journal)
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        wrkslots, "_interrupt_for_test", interrupt_after_finish_journal
+    )
+    with pytest.raises(_FinishInterrupted):
+        remove_completed_validation(project)
+    finish_journal = finish_journal_path(project, "target")
+    assert finish_journal.is_file()
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _point: None)
+    if change_create:
+        raw = json.loads(create_journal.read_text(encoding="utf-8"))
+        raw["purpose"] = "changed before exact recovery"
+        create_journal.write_text(
+            json.dumps(raw, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        create_before = stable_file(create_journal)
+
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--slot",
+            "target",
+        ]
+    )
+    if change_create:
+        assert rc == 3
+        assert (
+            "standalone recovery journal differs from append-only operation evidence"
+            in capsys.readouterr().err
+        )
+        assert finish_journal.is_file()
+        assert checkout(project, slot="target", slot_type="validate").is_dir()
+        assert stable_file(create_journal) == create_before
+        return
+
+    assert rc == 0
+    assert not finish_journal.exists()
+    assert not checkout(project, slot="target", slot_type="validate").exists()
+    assert stable_file(create_journal) == create_before
+
+
+def test_remove_rechecks_unrelated_create_before_first_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, journal = prepare_validation_remove_beside_create(tmp_path)
+    active = control_directory(project) / "ACTIVE.testhost.json"
+    active_before = active.read_bytes()
+
+    def change_journal(*_args: object, **_kwargs: object) -> None:
+        raw = json.loads(journal.read_text(encoding="utf-8"))
+        raw["purpose"] = "changed during removal classification"
+        journal.write_text(json.dumps(raw, sort_keys=True) + "\n", encoding="utf-8")
+
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", change_journal)
+
+    assert remove_completed_validation(project) == 3
+    assert "changed while it was classified" in capsys.readouterr().err
+    assert active.read_bytes() == active_before
+    assert checkout(project, slot="target", slot_type="validate").is_dir()
+    assert not finish_journal_path(project, "target").exists()
+
+
+@pytest.mark.parametrize(
+    ("collision", "expected"),
+    (
+        ("slot", "already targets slot 'target'"),
+        ("path", "requested slot path"),
+        ("branch", "is claimed by interrupted create"),
+    ),
+)
+def test_remove_refuses_interrupted_create_collision_before_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    collision: str,
+    expected: str,
+) -> None:
+    project, journal = prepare_validation_remove_beside_create(tmp_path)
+    config = wrkslots._load_config(str(project), "testhost")
+    states, archives = wrkslots._validate_global_state(
+        config, require_repository=False
+    )
+    record = wrkslots._find_record(
+        next(state for state in states if state.machine == config.machine), "target"
+    )
+    row = wrkslots._classify_create_journals(config, states, archives)[0]
+    if collision == "slot":
+        conflicting = replace(row, slot=record.slot)
+    elif collision == "path":
+        conflicting = replace(
+            row, slot_path=wrkslots._slot_directory(config, record.slot, record.slot_type)
+        )
+    else:
+        target_checkout = record.checkouts[0]
+        conflicting = replace(
+            row,
+            planned=(replace(row.planned[0], repository=target_checkout.repository,
+                             branch=target_checkout.branch),),
+        )
+    active = control_directory(project) / "ACTIVE.testhost.json"
+    active_before, journal_before = active.read_bytes(), stable_file(journal)
+    monkeypatch.setattr(
+        wrkslots, "_classify_create_journals", lambda *_a, **_k: (conflicting,)
+    )
+    monkeypatch.setattr(
+        wrkslots,
+        "_write_event_file",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("collision reached mutation")
+        ),
+    )
+
+    assert remove_completed_validation(project) == 3
+    assert expected in capsys.readouterr().err
+    assert active.read_bytes() == active_before
+    assert stable_file(journal) == journal_before
+    assert checkout(project, slot="target", slot_type="validate").is_dir()
+
+
+@pytest.mark.parametrize(
+    ("damage", "expected"),
+    (
+        ("malformed", "malformed JSON"),
+        ("provenance", "differs from append-only progress evidence"),
+        ("indeterminate", "process state is indeterminate"),
+        ("disagreeing", "has disagreeing process state"),
+    ),
+)
+def test_remove_refuses_untrusted_create_journal_before_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    damage: str,
+    expected: str,
+) -> None:
+    project, journal = prepare_validation_remove_beside_create(tmp_path)
+    if damage == "malformed":
+        journal.write_text("{broken\n", encoding="utf-8")
+    elif damage == "provenance":
+        raw = json.loads(journal.read_text(encoding="utf-8"))
+        raw["purpose"] = "changed after append-only publication"
+        journal.write_text(json.dumps(raw, sort_keys=True) + "\n", encoding="utf-8")
+    elif damage == "indeterminate":
+        monkeypatch.setattr(
+            wrkslots,
+            "_process_state",
+            lambda _identity: ("indeterminate", "process table unavailable"),
+        )
+    else:
+        states = iter((("live", "owner is live"), ("dead", "coordinator exited")))
+        monkeypatch.setattr(wrkslots, "_process_state", lambda _identity: next(states))
+    active = control_directory(project) / "ACTIVE.testhost.json"
+    active_before = active.read_bytes()
+    monkeypatch.setattr(
+        wrkslots,
+        "_write_event_file",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("untrusted journal reached mutation")
+        ),
+    )
+
+    assert remove_completed_validation(project) == 3
+    assert expected in capsys.readouterr().err
+    assert active.read_bytes() == active_before
+    assert checkout(project, slot="target", slot_type="validate").is_dir()
+    assert not finish_journal_path(project, "target").exists()
+
+
+def test_remove_refuses_unrelated_finish_journal_before_target_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    for slot in ("target", "other"):
+        made = create(project, slot=slot, slot_type="validate", branch=None)
+        assert made.returncode == 0, made.stderr
+    mark_owner_dead(project)
+    config = wrkslots._load_config(str(project), "testhost")
+    state = wrkslots._load_active(config)
+    other = wrkslots._find_record(state, "other")
+    assert other.owner is not None
+    dead_other = replace(other, owner=replace(other.owner, boot_id="finished-boot"))
+    wrkslots._write_active_state(
+        config,
+        wrkslots._replace_record(state, dead_other),
+        action="test-owner-exited",
+        slot="other",
+    )
+    set_liveness(project, "dead")
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        wrkslots, "_interrupt_for_test", interrupt_after_finish_journal
+    )
+    with pytest.raises(_FinishInterrupted):
+        remove_completed_validation(project, "other")
+    other_journal = finish_journal_path(project, "other")
+    active = control_directory(project) / "ACTIVE.testhost.json"
+    active_before = active.read_bytes()
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _point: None)
+
+    assert remove_completed_validation(project) == 3
+    assert "interrupted 'finish' mutation" in capsys.readouterr().err
+    assert active.read_bytes() == active_before
+    assert checkout(project, slot="target", slot_type="validate").is_dir()
+    assert other_journal.is_file()
+
+
+@pytest.mark.parametrize(
+    ("obstruction", "expected"),
+    (("partial", "partial atomic update found"),
+     ("batch-seal", "interrupted validation-batch seal")),
+)
+def test_scoped_validation_remove_keeps_global_recovery_obstructions(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    obstruction: str,
+    expected: str,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    made = create(project, slot="target", slot_type="validate", branch=None)
+    assert made.returncode == 0, made.stderr
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+    config = wrkslots._load_config(str(project), "testhost")
+    path = (
+        finish_journal_path(project, "other").with_suffix(".journal.tmp.crash")
+        if obstruction == "partial"
+        else wrkslots._validate_batch_seal_journal_path(config)
+    )
+    path.write_text("{}\n", encoding="utf-8")
+    active = control_directory(project) / "ACTIVE.testhost.json"
+    active_before = active.read_bytes()
+
+    assert remove_completed_validation(project) == 3
+    assert expected in capsys.readouterr().err
+    assert path.is_file()
+    assert active.read_bytes() == active_before
+    assert checkout(project, slot="target", slot_type="validate").is_dir()
 
 
 def test_remove_ignores_unrelated_unavailable_repository(
