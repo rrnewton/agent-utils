@@ -5886,7 +5886,13 @@ class _GitVcs:
         _validate_ref(branch, "branch")
         return branch
 
-    def status(self, checkout: Path, cache_globs: Sequence[str] = ()) -> str:
+    def status(
+        self,
+        checkout: Path,
+        cache_globs: Sequence[str] = (),
+        *,
+        refresh_index: bool = True,
+    ) -> str:
         pathspecs = ["."]
         for pattern in cache_globs:
             pathspecs.append(f":(exclude,glob){pattern}")
@@ -5901,6 +5907,9 @@ class _GitVcs:
                 "--",
                 *pathspecs,
             ],
+            env_overrides=(
+                None if refresh_index else {"GIT_OPTIONAL_LOCKS": "0"}
+            ),
         )
         return result.stdout
 
@@ -15516,6 +15525,7 @@ def _terminal_validation_record(
     repository: Path | None = None,
     expected_target: str | None = None,
     allow_historical_service_result: bool = False,
+    frozen_removal_proof_supplied: bool | None = None,
 ) -> tuple[str, str, str | None]:
     relative, path = _relative_inside(config.root, raw, "terminal validation record")
     if Path(relative).parent != Path("ignored/validate/runs") or path.suffix != ".json":
@@ -15544,6 +15554,20 @@ def _terminal_validation_record(
             raise Refusal("terminal validation record says the checkout is not temporary")
     record_target: str | None = None
     if target_kind == "frozen-checkout":
+        if (
+            frozen_removal_proof_supplied is False
+            and not (
+                type(record.get("service_result_schema")) is int
+                and record.get("service_result_schema") in {1, 2, 3}
+                and record.get("result_source") == "validation-service-result"
+            )
+        ):
+            raise Refusal(
+                "direct frozen validation recovery requires "
+                "--validation-proof-manifest for current or historical-projection "
+                "records; use the bounded batch command to classify a pre-proof "
+                "historical checkout without removing it"
+            )
         record_target = _frozen_validation_record_binding(
             record,
             target,
@@ -15907,6 +15931,212 @@ def _validation_record_is_terminal(
     return expected_exit is not None and record.get("exit_code") == expected_exit
 
 
+class _FrozenNoProofDisposition(enum.Enum):
+    BLOCKS_ENTRY = "blocks-entry"
+    HISTORICAL_NONBLOCKING = "historical-nonblocking"
+    LEGACY_RECOVERY = "legacy-recovery"
+
+
+@dataclasses.dataclass(frozen=True)
+class _FrozenNoProofClassification:
+    disposition: _FrozenNoProofDisposition
+    historical_schema: int | None = None
+
+
+def _frozen_no_proof_disposition(
+    config: Config,
+    checkout: Path,
+    raw_record: str,
+    raw_repository: str,
+    *,
+    batch_cleanup: _OwnerlessValidationBatchContext,
+) -> _FrozenNoProofClassification:
+    """Prove one old frozen run is inert without authorizing its deletion.
+
+    Historical schema-2/3 producers did not retain the four-artifact removal
+    proof required by current cleanup.  Such a checkout must remain on disk,
+    but it need not prevent an unrelated validation from starting when every
+    fact other than deletion authority is still readable and exact.  The
+    distinct legacy result-source case keeps its existing recovery behavior;
+    current and malformed shapes block entry.  This is a read-only
+    classification: it neither creates a proof nor grants authority to remove
+    the checkout or qualify the historical result.
+    """
+
+    record_relative, record_path = _validation_run_record_argument(
+        config, raw_record
+    )
+    record_contents, record_identity = _read_regular_file_identity(
+        record_path,
+        "historical frozen validation run-record",
+        _VALIDATION_REMOVAL_ARTIFACT_BYTES_LIMIT,
+    )
+    record = _strict_json_object(
+        record_contents, "historical frozen validation run-record"
+    )
+    _repository_relative, repository = _repository_path(
+        config, raw_repository, allow_managed=True
+    )
+    schema = record.get("service_result_schema")
+    result_source = record.get("result_source")
+    if (
+        type(schema) is int
+        and schema in {1, 2, 3}
+        and result_source == "validation-service-result"
+    ):
+        return _FrozenNoProofClassification(
+            _FrozenNoProofDisposition.LEGACY_RECOVERY
+        )
+    if (
+        type(schema) is not int
+        or schema not in {2, 3}
+        or result_source != "historical-validation-service-result"
+    ):
+        _terminal_validation_record(
+            config,
+            record_relative,
+            checkout,
+            "frozen-checkout",
+            repository=repository,
+        )
+        return _FrozenNoProofClassification(
+            _FrozenNoProofDisposition.BLOCKS_ENTRY
+        )
+    if (
+        record.get("kind") != "frozen-validate"
+        or record.get("materialized_target") is not False
+        or "scorecard_handoff" in record
+        or "scorecard_writeback_files" in record
+    ):
+        raise Refusal(
+            "historical frozen validation without a removal proof does not match "
+            "the pre-proof non-materialized shape"
+        )
+    if not _validation_record_process_is_dead(record):
+        raise Refusal(
+            "historical frozen validation process state is live or uncertain"
+        )
+
+    _record_relative, record_digest, record_target = _terminal_validation_record(
+        config,
+        record_relative,
+        checkout,
+        "frozen-checkout",
+        repository=repository,
+        allow_historical_service_result=True,
+    )
+    if record_target is None:
+        raise StateError("historical frozen validation has no exact target")
+    _validation_checkout_facts(
+        config,
+        checkout,
+        repository,
+        expected_head=record_target,
+        batch_cleanup=batch_cleanup,
+        fresh_same_uid=False,
+        standalone=True,
+        remote_observation_repository=repository,
+        require_remote_containment=False,
+    )
+
+    producer_path = checkout / _VALIDATION_SERVICE_RESULT_SCHEMA_PATH
+    sidecar_path = record_path.with_name(
+        f"{record_path.stem}{_VALIDATION_SERVICE_RESULT_SUFFIX}"
+    )
+    _ensure_no_symlink_components(
+        checkout, producer_path, "historical frozen validation producer schema"
+    )
+    producer_contents, producer_identity = _read_regular_file_identity(
+        producer_path,
+        "historical frozen validation producer schema",
+        _VALIDATION_REMOVAL_ARTIFACT_BYTES_LIMIT,
+    )
+    sidecar_contents, sidecar_identity = _read_regular_file_identity(
+        sidecar_path,
+        "historical frozen validation service-result",
+        _VALIDATION_REMOVAL_ARTIFACT_BYTES_LIMIT,
+    )
+    schema_fields = _validation_service_result_schema(producer_contents, schema)
+    projection = _validation_service_result_projection(
+        sidecar_contents,
+        schema=schema,
+        schema_fields=schema_fields,
+        expected_commit=record_target,
+    )
+    for field, expected in projection.items():
+        if field not in record or not _json_equal(record[field], expected):
+            raise Refusal(
+                f"historical frozen validation service-result {field} differs "
+                "from the run-record"
+            )
+    if projection.get("scorecard_writeback") != {"status": "completed"}:
+        raise Refusal(
+            "historical frozen validation has no completed scorecard writeback"
+        )
+
+    # The decision is made only after a fresh same-UID census and a second read
+    # of every authority-bearing file.  Any changed or unreadable observation
+    # remains an entry blocker; no destructive action follows this proof.
+    batch_cleanup.assert_unused(config, checkout, fresh_same_uid=True)
+    rebound_record, rebound_record_identity = _read_regular_file_identity(
+        record_path,
+        "historical frozen validation run-record",
+        _VALIDATION_REMOVAL_ARTIFACT_BYTES_LIMIT,
+    )
+    rebound_producer, rebound_producer_identity = _read_regular_file_identity(
+        producer_path,
+        "historical frozen validation producer schema",
+        _VALIDATION_REMOVAL_ARTIFACT_BYTES_LIMIT,
+    )
+    rebound_sidecar, rebound_sidecar_identity = _read_regular_file_identity(
+        sidecar_path,
+        "historical frozen validation service-result",
+        _VALIDATION_REMOVAL_ARTIFACT_BYTES_LIMIT,
+    )
+    _assert_regular_file_identity(
+        record_identity,
+        rebound_record_identity,
+        "historical frozen validation run-record",
+    )
+    _assert_regular_file_identity(
+        producer_identity,
+        rebound_producer_identity,
+        "historical frozen validation producer schema",
+    )
+    _assert_regular_file_identity(
+        sidecar_identity,
+        rebound_sidecar_identity,
+        "historical frozen validation service-result",
+    )
+    if (
+        rebound_record != record_contents
+        or rebound_producer != producer_contents
+        or rebound_sidecar != sidecar_contents
+    ):
+        raise Refusal(
+            "historical frozen validation evidence changed during entry classification"
+        )
+    _terminal_validation_record(
+        config,
+        record_relative,
+        checkout,
+        "frozen-checkout",
+        expected_digest=record_digest,
+        repository=repository,
+        expected_target=record_target,
+        allow_historical_service_result=True,
+    )
+    if _GitVcs().head(checkout) != record_target:
+        raise Refusal(
+            "historical frozen validation checkout HEAD changed during entry "
+            "classification"
+        )
+    return _FrozenNoProofClassification(
+        _FrozenNoProofDisposition.HISTORICAL_NONBLOCKING,
+        historical_schema=schema,
+    )
+
+
 def _recordless_validation_evidence(
     config: Config, target: Path, target_kind: str, note: str | None
 ) -> Mapping[str, object]:
@@ -15960,6 +16190,8 @@ def _validation_checkout_facts(
     batch_cleanup: _OwnerlessValidationBatchContext | None = None,
     fresh_same_uid: bool = False,
     standalone: bool = False,
+    remote_observation_repository: Path | None = None,
+    require_remote_containment: bool = True,
 ) -> tuple[str, str]:
     if repository == checkout or _path_is_within(repository, checkout):
         raise Refusal("repository must survive removal and cannot be inside the checkout")
@@ -15992,26 +16224,82 @@ def _validation_checkout_facts(
     _assert_cache_policy_untracked_path(
         config, "ownerless-validation", checkout, vcs, config.cache_globs
     )
+    preserve_checkout_git_state = remote_observation_repository is not None
     status = _ownerless_validation_blocking_status(
-        vcs.status(checkout, config.cache_globs), ("ignored", *config.cache_globs)
+        vcs.status(
+            checkout,
+            config.cache_globs,
+            refresh_index=not preserve_checkout_git_state,
+        ),
+        ("ignored", *config.cache_globs),
     )
     if status:
         raise Refusal(f"validation checkout is dirty ({status.splitlines()[0]}); preserve it")
     remote = config.default_remote
     landed_ref = _landed_ref_for_remote(config, remote)
     remote_digest = vcs.remote_url_sha256(checkout, remote)
-    if standalone and vcs.remote_url_sha256(repository, remote) != remote_digest:
+    repository_remote_digest = (
+        vcs.remote_url_sha256(repository, remote)
+        if standalone or remote_observation_repository is not None
+        else None
+    )
+    if standalone and repository_remote_digest != remote_digest:
         raise Refusal(
             "frozen validation checkout remote differs from its recorded source checkout; "
             "preserve both checkouts and repair their origin binding before retrying"
         )
     if expected_remote is not None and remote_digest != expected_remote:
         raise Refusal("validation checkout remote changed after recovery was authorized")
-    vcs.fetch_remote(checkout, remote, landed_ref)
-    if vcs.remote_url_sha256(checkout, remote) != remote_digest:
-        raise Refusal("validation checkout remote changed during recovery fetch")
-    if not vcs.remote_refs_containing(checkout, remote, head):
-        raise Refusal(f"validation checkout HEAD {head} is not contained by remote {remote}")
+    remote_observer = checkout
+    if remote_observation_repository is not None:
+        remote_observer = remote_observation_repository
+        if remote_observer == checkout or _path_is_within(remote_observer, checkout):
+            raise StateError(
+                "retained validation checkout cannot supply its own remote observation"
+            )
+        if vcs.repository_root(remote_observer) != remote_observer.absolute():
+            raise Refusal(
+                "validation source repository is not its Git checkout root; preserve the "
+                "retained checkout and repair the recorded source repository"
+            )
+        observer_common = vcs.common_directory(remote_observer)
+        retained_common = vcs.common_directory(checkout)
+        if (
+            observer_common == retained_common
+            or _path_is_within(observer_common, checkout)
+        ):
+            raise Refusal(
+                "validation source repository shares Git storage with the retained "
+                "checkout and cannot provide a non-mutating remote observation"
+            )
+        observer_status = _ownerless_validation_blocking_status(
+            vcs.status(remote_observer, config.cache_globs),
+            ("ignored", *config.cache_globs),
+        )
+        if observer_status:
+            raise Refusal(
+                "validation source repository is dirty and cannot provide the remote "
+                f"observation ({observer_status.splitlines()[0]})"
+            )
+        vcs.assert_ordinary_history(remote_observer)
+        vcs.assert_ordinary_index(remote_observer)
+        if vcs.remote_url_sha256(remote_observer, remote) != remote_digest:
+            raise Refusal(
+                "validation source repository remote differs from the retained checkout"
+            )
+    # Remote containment is preservation evidence for deletion.  The historical
+    # path that deliberately retains the checkout needs exact local binding,
+    # not a remote copy of a commit that the checkout continues to preserve.
+    if require_remote_containment:
+        vcs.fetch_remote(remote_observer, remote, landed_ref)
+        if vcs.remote_url_sha256(checkout, remote) != remote_digest:
+            raise Refusal("validation checkout remote changed during recovery inspection")
+        if vcs.remote_url_sha256(remote_observer, remote) != remote_digest:
+            raise Refusal("validation source repository remote changed during recovery fetch")
+        if not vcs.remote_refs_containing(remote_observer, remote, head):
+            raise Refusal(
+                f"validation checkout HEAD {head} is not contained by remote {remote}"
+            )
     if batch_cleanup is None:
         if standalone:
             census = _capture_process_path_census(
@@ -16225,6 +16513,11 @@ def _ownerless_validation_journal(
             target_kind,
             repository=repository,
             allow_historical_service_result=proof_manifest is not None,
+            frozen_removal_proof_supplied=(
+                proof_manifest is not None
+                if target_kind == "frozen-checkout"
+                else None
+            ),
         )
         evidence: Mapping[str, object] = {
             "kind": "terminal-record",
@@ -16566,6 +16859,11 @@ def _ownerless_validation_inputs(
                 repository=repository,
                 expected_target=authorization.head,
                 allow_historical_service_result=removal_proof is not None,
+                frozen_removal_proof_supplied=(
+                    removal_proof is not None
+                    if authorization.target_kind == "frozen-checkout"
+                    else None
+                ),
             )
     elif kind == "coordinator-determination":
         _exact_keys(
@@ -21970,7 +22268,13 @@ def _cmd_recover_ownerless_validate_batch(args: argparse.Namespace) -> int:
                     ),
                 )
             except (Refusal, StateError) as exc:
-                retained.append({"checkout": checkout, "reason": str(exc)})
+                retained.append(
+                    {
+                        "blocks_entry": True,
+                        "checkout": checkout,
+                        "reason": str(exc),
+                    }
+                )
             else:
                 prepared.append(
                     (
@@ -22003,7 +22307,11 @@ def _cmd_recover_ownerless_validate_batch(args: argparse.Namespace) -> int:
             census_budget.remaining_seconds()
         except Refusal as exc:
             retained.extend(
-                {"checkout": checkout, "reason": str(exc)}
+                {
+                    "blocks_entry": True,
+                    "checkout": checkout,
+                    "reason": str(exc),
+                }
                 for checkout, _record, _repository, _proof, _target, _identity in prepared
             )
             prepared = []
@@ -22028,6 +22336,41 @@ def _cmd_recover_ownerless_validate_batch(args: argparse.Namespace) -> int:
             shared_census.assert_slot_unused(
                 target, None, ignore_current_process=False
             )
+            if frozen and proof_manifest is None:
+                classification = _frozen_no_proof_disposition(
+                    config,
+                    target,
+                    record,
+                    repository,
+                    batch_cleanup=batch_cleanup,
+                )
+                if (
+                    classification.disposition
+                    is not _FrozenNoProofDisposition.LEGACY_RECOVERY
+                ):
+                    nonblocking = (
+                        classification.disposition
+                        is _FrozenNoProofDisposition.HISTORICAL_NONBLOCKING
+                    )
+                    historical_schema = classification.historical_schema
+                    if nonblocking and historical_schema is None:
+                        raise StateError(
+                            "historical frozen validation classification lost its schema"
+                        )
+                    retained.append(
+                        {
+                            "blocks_entry": not nonblocking,
+                            "checkout": checkout,
+                            "reason": (
+                                f"historical schema {historical_schema} frozen validation has no "
+                                "removal proof; the inactive checkout remains retained"
+                                if nonblocking
+                                else "frozen validation has no typed removal proof; "
+                                "the checkout remains retained and blocks entry"
+                            ),
+                        }
+                    )
+                    continue
             item_args = argparse.Namespace(
                 project_root=args.project_root,
                 machine=args.machine,
@@ -22056,21 +22399,31 @@ def _cmd_recover_ownerless_validate_batch(args: argparse.Namespace) -> int:
                 emit=False,
             )
         except (Refusal, StateError) as exc:
-            retained.append({"checkout": checkout, "reason": str(exc)})
+            retained.append(
+                {
+                    "blocks_entry": True,
+                    "checkout": checkout,
+                    "reason": str(exc),
+                }
+            )
             if _outstanding_journals(config) or _validate_batch_seal_journals(config):
                 reason = (
                     "an interrupted mutation remains after the preceding refusal; "
                     "recover it before retrying this checkout"
                 )
                 retained.extend(
-                    {"checkout": remaining[0], "reason": reason}
+                    {
+                        "blocks_entry": True,
+                        "checkout": remaining[0],
+                        "reason": reason,
+                    }
                     for remaining in prepared[index + 1 :]
                 )
                 break
         else:
             removed.append({"checkout": checkout})
     payload = {
-        "schema": 1,
+        "schema": 2,
         "batch_limit": VALIDATE_REMOVE_BATCH_LIMIT,
         "process_censuses": shared_census_count,
         "shared_process_censuses": shared_census_count,
@@ -22087,7 +22440,11 @@ def _cmd_recover_ownerless_validate_batch(args: argparse.Namespace) -> int:
             f"retained={len(retained)} process_censuses={shared_census_count}"
         )
         for row in retained:
-            print(f"RETAINED: {row['checkout']} reason={row['reason']}")
+            print(
+                f"RETAINED: {row['checkout']} "
+                f"blocks_entry={str(row['blocks_entry']).lower()} "
+                f"reason={row['reason']}"
+            )
     return 0
 
 

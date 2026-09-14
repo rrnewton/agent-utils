@@ -1918,6 +1918,130 @@ def prepare_frozen_validation_checkout(
     return checkout, record, target_sha
 
 
+def prepare_run1773_historical_frozen_checkout(
+    project: Path,
+    repository: Path,
+    *,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str = "run1773",
+    target_contained_by_remote: bool = True,
+    service_result_schema: int = 3,
+) -> tuple[Path, Path, Path, str]:
+    """Create run 1773's shape, optionally using the sibling schema-2 contract."""
+
+    assert service_result_schema in {2, 3}
+    commit_validation_removal_schema(
+        repository, schema_version=service_result_schema
+    )
+    if not target_contained_by_remote:
+        marker = repository / "historical-unpublished-target.txt"
+        marker.write_text("retained historical target\n", encoding="utf-8")
+        git(repository, "add", marker.name)
+        git(repository, "commit", "-m", "create uncontained historical target")
+    checkout, record, target_sha = prepare_frozen_validation_checkout(
+        project, repository, monkeypatch=monkeypatch, name=name
+    )
+    value: object = json.loads(record.read_text(encoding="utf-8"))
+    assert isinstance(value, dict)
+    value.update(
+        {
+            "materialized_target": False,
+            "state": "unknown",
+            "result": "unknown",
+            "result_source": "historical-validation-service-result",
+            "detail": wrkslots._historical_validation_result_detail(
+                service_result_schema
+            ),
+            "final_validate_status": "FAILED",
+            "exit_code": 1,
+            "executed_nodes": 14,
+            "executed_tests": None,
+            "passed_tests": None,
+            "service_result_schema": service_result_schema,
+            "scorecard_writeback": {"status": "completed"},
+        }
+    )
+    if service_result_schema == 3:
+        value["selection_mode"] = "only"
+    else:
+        value.pop("selection_mode", None)
+    value.pop("scorecard_handoff", None)
+    value.pop("scorecard_writeback_files", None)
+    record.write_text(
+        json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    sidecar = record.with_name(
+        f"{record.stem}{wrkslots._VALIDATION_SERVICE_RESULT_SUFFIX}"
+    )
+    service_result = {
+        "schema_version": service_result_schema,
+        "commit": target_sha,
+        "profile": "only-portable",
+        "final_validate_status": "FAILED",
+        "exit_code": 1,
+        "executed_nodes": 14,
+        "executed_tests": None,
+        "scorecard_writeback": {"status": "completed"},
+    }
+    if service_result_schema == 3:
+        service_result["selection_mode"] = "only"
+    sidecar.write_text(
+        json.dumps(service_result, indent=2, sort_keys=True)
+        + "\n",
+        encoding="utf-8",
+    )
+
+    def canonical_record(
+        _config: wrkslots.Config, _path: Path, contents: bytes
+    ) -> tuple[Mapping[str, object], Mapping[str, object]]:
+        parsed = wrkslots._strict_json_object(
+            contents, "run1773 frozen validation fixture"
+        )
+        assert parsed.get("schema_version") == 1
+        assert parsed.get("kind") == "frozen-validate"
+        assert parsed.get("producer") == "ci-hub/validate/run_registry.py"
+        assert parsed.get("admission") == "frozen-validate"
+        assert parsed.get("validation_kind") == "frozen-validate"
+        return (
+            {
+                "schema_version": parsed["schema_version"],
+                "kind": parsed["kind"],
+                "state": parsed["state"],
+                "target": parsed["target"],
+                "repo": parsed["repo"],
+            },
+            parsed,
+        )
+
+    monkeypatch.setattr(
+        wrkslots, "_canonical_frozen_validation_record", canonical_record
+    )
+    return checkout, record, sidecar, target_sha
+
+
+def stub_canonical_frozen_record_parser(
+    monkeypatch: pytest.MonkeyPatch, *, label: str
+) -> None:
+    def canonical_record(
+        _config: wrkslots.Config, _path: Path, contents: bytes
+    ) -> tuple[Mapping[str, object], Mapping[str, object]]:
+        parsed = wrkslots._strict_json_object(contents, label)
+        return (
+            {
+                "schema_version": parsed["schema_version"],
+                "kind": parsed["kind"],
+                "state": parsed["state"],
+                "target": parsed["target"],
+                "repo": parsed["repo"],
+            },
+            parsed,
+        )
+
+    monkeypatch.setattr(
+        wrkslots, "_canonical_frozen_validation_record", canonical_record
+    )
+
+
 def run_frozen_validation_batch(
     project: Path, repository: Path, checkout: Path, record: Path
 ) -> int:
@@ -1939,6 +2063,691 @@ def run_frozen_validation_batch(
             "json",
         ]
     )
+
+
+def git_metadata_snapshot(checkout: Path) -> dict[str, tuple[int, int, int, str]]:
+    """Capture retained Git metadata without following links or reading atime."""
+
+    git_directory = checkout / ".git"
+    snapshot: dict[str, tuple[int, int, int, str]] = {}
+    for path in (git_directory, *sorted(git_directory.rglob("*"))):
+        metadata = path.lstat()
+        relative = path.relative_to(git_directory).as_posix()
+        if path.is_symlink():
+            payload = os.readlink(path)
+        elif path.is_file():
+            payload = hashlib.sha256(path.read_bytes()).hexdigest()
+        else:
+            payload = ""
+        snapshot[relative] = (
+            stat.S_IFMT(metadata.st_mode),
+            metadata.st_size,
+            metadata.st_mtime_ns,
+            payload,
+        )
+    return snapshot
+
+
+@pytest.mark.ordinary_environment
+def test_run1773_historical_frozen_checkout_is_retained_without_blocking_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    checkout, record, _sidecar, target_sha = (
+        prepare_run1773_historical_frozen_checkout(
+            project,
+            repository,
+            monkeypatch=monkeypatch,
+            target_contained_by_remote=False,
+        )
+    )
+    assert not git(
+        repository,
+        "branch",
+        "--remotes",
+        "--contains",
+        target_sha,
+    ).stdout.strip()
+    stub_validate_batch_censuses(monkeypatch)
+    git_before = git_metadata_snapshot(checkout)
+
+    rc = run_frozen_validation_batch(project, repository, checkout, record)
+
+    assert rc == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["schema"] == 2
+    assert report["removed"] == []
+    assert report["retained"] == [
+        {
+            "blocks_entry": False,
+            "checkout": str(checkout),
+            "reason": (
+                "historical schema 3 frozen validation has no removal proof; "
+                "the inactive checkout remains retained"
+            ),
+        }
+    ]
+    assert report["shared_process_censuses"] == 1
+    assert report["same_uid_process_censuses"] == 1
+    assert checkout.is_dir()
+    assert git_metadata_snapshot(checkout) == git_before
+    config = wrkslots._load_config(str(project), "testhost")
+    assert not wrkslots._journal_path(config).exists()
+    assert not any(
+        item["kind"] == "ownerless-validate-path-removed"
+        for item in wrkslots._load_events(config)
+    )
+
+
+@pytest.mark.ordinary_environment
+def test_historical_frozen_retention_reports_schema_two_exactly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    checkout, record, _sidecar, _target_sha = (
+        prepare_run1773_historical_frozen_checkout(
+            project,
+            repository,
+            monkeypatch=monkeypatch,
+            name="historical-schema-two",
+            service_result_schema=2,
+        )
+    )
+    stub_validate_batch_censuses(monkeypatch)
+
+    rc = run_frozen_validation_batch(project, repository, checkout, record)
+
+    assert rc == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["removed"] == []
+    assert report["retained"] == [
+        {
+            "blocks_entry": False,
+            "checkout": str(checkout),
+            "reason": (
+                "historical schema 2 frozen validation has no removal proof; "
+                "the inactive checkout remains retained"
+            ),
+        }
+    ]
+
+
+@pytest.mark.ordinary_environment
+@pytest.mark.parametrize(
+    ("field", "replacement", "message"),
+    (
+        ("target", "0" * 40, "HEAD changed"),
+        ("source_checkout", "/tmp/not-the-source", "exact source checkout"),
+    ),
+)
+def test_uncontained_historical_frozen_retention_binds_head_and_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    field: str,
+    replacement: str,
+    message: str,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    checkout, record, _sidecar, target_sha = (
+        prepare_run1773_historical_frozen_checkout(
+            project,
+            repository,
+            monkeypatch=monkeypatch,
+            name=f"binding-{field.replace('_', '-')}",
+            target_contained_by_remote=False,
+        )
+    )
+    assert not git(
+        repository, "branch", "--remotes", "--contains", target_sha
+    ).stdout.strip()
+    value: object = json.loads(record.read_text(encoding="utf-8"))
+    assert isinstance(value, dict)
+    value[field] = replacement
+    record.write_text(
+        json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    stub_validate_batch_censuses(monkeypatch)
+
+    rc = run_frozen_validation_batch(project, repository, checkout, record)
+
+    assert rc == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["removed"] == []
+    assert len(report["retained"]) == 1
+    assert report["retained"][0]["blocks_entry"] is True
+    assert message in report["retained"][0]["reason"]
+    assert checkout.is_dir()
+
+
+@pytest.mark.ordinary_environment
+def test_uncontained_current_frozen_checkout_still_cannot_be_removed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    commit_validation_removal_schema(repository, schema_version=5)
+    marker = repository / "current-unpublished-target.txt"
+    marker.write_text("preserve current target\n", encoding="utf-8")
+    git(repository, "add", marker.name)
+    git(repository, "commit", "-m", "create uncontained current target")
+    checkout, record, target_sha = prepare_frozen_validation_checkout(
+        project,
+        repository,
+        monkeypatch=monkeypatch,
+        name="current-uncontained",
+    )
+    manifest, _artifacts = prepare_validation_removal_proof(
+        project,
+        checkout.name,
+        checkout_path=checkout,
+        run_record=record,
+    )
+    stub_canonical_frozen_record_parser(
+        monkeypatch, label="uncontained current frozen validation fixture"
+    )
+    stub_validate_batch_censuses(monkeypatch)
+    assert not git(
+        repository, "branch", "--remotes", "--contains", target_sha
+    ).stdout.strip()
+
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover-ownerless-validate-batch",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--frozen-validate-checkout",
+            str(checkout),
+            "--completed-record",
+            record.relative_to(project).as_posix(),
+            "--repository",
+            repository.relative_to(project).as_posix(),
+            "--validation-proof-manifest",
+            manifest.relative_to(project).as_posix(),
+            "--format",
+            "json",
+        ]
+    )
+
+    assert rc == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["removed"] == []
+    assert len(report["retained"]) == 1
+    assert report["retained"][0]["blocks_entry"] is True
+    assert "not contained by remote origin" in report["retained"][0]["reason"]
+    assert checkout.is_dir()
+
+
+@pytest.mark.ordinary_environment
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    (
+        ("service_result_schema", "missing"),
+        ("service_result_schema", None),
+        ("service_result_schema", True),
+        ("service_result_schema", 4),
+        ("materialized_target", "missing"),
+        ("materialized_target", None),
+        ("materialized_target", True),
+        ("scorecard_handoff", None),
+        ("scorecard_writeback_files", None),
+    ),
+)
+def test_historical_frozen_entry_classification_fails_closed_on_shape_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    field: str,
+    replacement: object,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    checkout, record, _sidecar, _target_sha = (
+        prepare_run1773_historical_frozen_checkout(
+            project,
+            repository,
+            monkeypatch=monkeypatch,
+            name=f"shape-{field.replace('_', '-')}",
+        )
+    )
+    value: object = json.loads(record.read_text(encoding="utf-8"))
+    assert isinstance(value, dict)
+    if replacement == "missing":
+        value.pop(field)
+    else:
+        value[field] = replacement
+    record.write_text(
+        json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    stub_validate_batch_censuses(monkeypatch)
+
+    rc = run_frozen_validation_batch(project, repository, checkout, record)
+
+    assert rc == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["removed"] == []
+    assert len(report["retained"]) == 1
+    assert report["retained"][0]["blocks_entry"] is True
+    assert checkout.is_dir()
+
+
+@pytest.mark.ordinary_environment
+@pytest.mark.parametrize("schema", (4, 5))
+def test_current_frozen_result_without_removal_proof_blocks_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    schema: int,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    commit_validation_removal_schema(repository, schema_version=schema)
+    checkout, record, _target_sha = prepare_frozen_validation_checkout(
+        project,
+        repository,
+        monkeypatch=monkeypatch,
+        name=f"current-schema-{schema}",
+    )
+    _manifest, _artifacts = prepare_validation_removal_proof(
+        project,
+        checkout.name,
+        checkout_path=checkout,
+        run_record=record,
+    )
+    if schema == 4:
+        value: object = json.loads(record.read_text(encoding="utf-8"))
+        assert isinstance(value, dict)
+        value.pop("detail", None)
+        record.write_text(
+            json.dumps(value, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+    def canonical_record(
+        _config: wrkslots.Config, _path: Path, contents: bytes
+    ) -> tuple[Mapping[str, object], Mapping[str, object]]:
+        parsed = wrkslots._strict_json_object(
+            contents, "current frozen validation fixture"
+        )
+        return (
+            {
+                "schema_version": parsed["schema_version"],
+                "kind": parsed["kind"],
+                "state": parsed["state"],
+                "target": parsed["target"],
+                "repo": parsed["repo"],
+            },
+            parsed,
+        )
+
+    monkeypatch.setattr(
+        wrkslots, "_canonical_frozen_validation_record", canonical_record
+    )
+    stub_validate_batch_censuses(monkeypatch)
+
+    rc = run_frozen_validation_batch(project, repository, checkout, record)
+
+    assert rc == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["removed"] == []
+    assert len(report["retained"]) == 1
+    assert report["retained"][0]["blocks_entry"] is True
+    assert "no typed removal proof" in report["retained"][0]["reason"]
+    assert checkout.is_dir()
+
+
+@pytest.mark.ordinary_environment
+def test_direct_current_frozen_recovery_requires_removal_proof(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    commit_validation_removal_schema(repository, schema_version=5)
+    checkout, record, _target_sha = prepare_frozen_validation_checkout(
+        project, repository, monkeypatch=monkeypatch, name="current-direct-no-proof"
+    )
+    _manifest, _artifacts = prepare_validation_removal_proof(
+        project,
+        checkout.name,
+        checkout_path=checkout,
+        run_record=record,
+    )
+    stub_canonical_frozen_record_parser(
+        monkeypatch, label="current direct frozen validation fixture"
+    )
+
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--frozen-validate-checkout",
+            str(checkout),
+            "--completed-record",
+            record.relative_to(project).as_posix(),
+            "--repository",
+            repository.relative_to(project).as_posix(),
+        ]
+    )
+
+    assert rc == 3
+    assert "requires --validation-proof-manifest" in capsys.readouterr().err
+    assert checkout.is_dir()
+    assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
+
+
+@pytest.mark.ordinary_environment
+def test_direct_historical_projection_cannot_use_batch_only_nonblocking_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    checkout, record, _sidecar, _target_sha = (
+        prepare_run1773_historical_frozen_checkout(
+            project, repository, monkeypatch=monkeypatch, name="historical-direct"
+        )
+    )
+    stub_canonical_frozen_record_parser(
+        monkeypatch, label="direct historical frozen validation fixture"
+    )
+
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--frozen-validate-checkout",
+            str(checkout),
+            "--completed-record",
+            record.relative_to(project).as_posix(),
+            "--repository",
+            repository.relative_to(project).as_posix(),
+        ]
+    )
+
+    assert rc == 3
+    assert "bounded batch command" in capsys.readouterr().err
+    assert checkout.is_dir()
+    assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
+
+
+@pytest.mark.ordinary_environment
+@pytest.mark.parametrize("schema", (1, 2, 3))
+def test_direct_frozen_recovery_preserves_proofless_legacy_schemas(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    schema: int,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    checkout, record, _target_sha = prepare_frozen_validation_checkout(
+        project,
+        repository,
+        monkeypatch=monkeypatch,
+        name=f"legacy-schema-{schema}",
+    )
+    value: object = json.loads(record.read_text(encoding="utf-8"))
+    assert isinstance(value, dict)
+    value["service_result_schema"] = schema
+    record.write_text(
+        json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    stub_canonical_frozen_record_parser(
+        monkeypatch, label="direct legacy frozen validation fixture"
+    )
+    stub_validate_batch_censuses(monkeypatch)
+
+    recovered = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--frozen-validate-checkout",
+            str(checkout),
+            "--completed-record",
+            record.relative_to(project).as_posix(),
+            "--repository",
+            repository.relative_to(project).as_posix(),
+        ]
+    )
+
+    assert recovered == 0
+    assert not checkout.exists()
+
+
+@pytest.mark.ordinary_environment
+@pytest.mark.parametrize("mutation", ("missing", "null"))
+def test_direct_current_frozen_recovery_refuses_lost_journal_proof(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    mutation: str,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    commit_validation_removal_schema(repository, schema_version=5)
+    checkout, record, _target_sha = prepare_frozen_validation_checkout(
+        project,
+        repository,
+        monkeypatch=monkeypatch,
+        name=f"current-journal-{mutation}",
+    )
+    manifest, _artifacts = prepare_validation_removal_proof(
+        project,
+        checkout.name,
+        checkout_path=checkout,
+        run_record=record,
+    )
+    stub_canonical_frozen_record_parser(
+        monkeypatch, label="journaled current frozen validation fixture"
+    )
+    stub_validate_batch_censuses(monkeypatch)
+
+    class Interrupted(RuntimeError):
+        pass
+
+    def interrupt(point: str) -> None:
+        if point == "after-ownerless-validate-journal":
+            raise Interrupted
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", interrupt)
+    with pytest.raises(Interrupted):
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "recover",
+                "--coordinator-authorized",
+                "--coordinator-pid",
+                str(os.getpid()),
+                "--frozen-validate-checkout",
+                str(checkout),
+                "--completed-record",
+                record.relative_to(project).as_posix(),
+                "--repository",
+                repository.relative_to(project).as_posix(),
+                "--validation-proof-manifest",
+                manifest.relative_to(project).as_posix(),
+            ]
+        )
+    journal = control_directory(project) / "ACTIVE.testhost.journal"
+    value: object = json.loads(journal.read_text(encoding="utf-8"))
+    assert isinstance(value, dict)
+    authorization = value["authorization"]
+    assert isinstance(authorization, dict)
+    if mutation == "missing":
+        authorization.pop("removal_proof")
+    else:
+        authorization["removal_proof"] = None
+    journal.write_text(
+        json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _point: None)
+
+    refused = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover",
+            "--coordinator-pid",
+            str(os.getpid()),
+        ]
+    )
+
+    assert refused == 3
+    assert "requires --validation-proof-manifest" in capsys.readouterr().err
+    assert checkout.is_dir()
+    assert journal.is_file()
+
+
+@pytest.mark.ordinary_environment
+def test_direct_current_frozen_recovery_refuses_tampered_proof(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    commit_validation_removal_schema(repository, schema_version=5)
+    checkout, record, _target_sha = prepare_frozen_validation_checkout(
+        project, repository, monkeypatch=monkeypatch, name="current-tampered-proof"
+    )
+    manifest, _artifacts = prepare_validation_removal_proof(
+        project,
+        checkout.name,
+        checkout_path=checkout,
+        run_record=record,
+    )
+    stub_canonical_frozen_record_parser(
+        monkeypatch, label="tampered current frozen validation fixture"
+    )
+    stub_validate_batch_censuses(monkeypatch)
+    value: object = json.loads(manifest.read_text(encoding="utf-8"))
+    assert isinstance(value, dict)
+    value["checkout"] = str(checkout.with_name("another-checkout"))
+    manifest.write_text(
+        json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--frozen-validate-checkout",
+            str(checkout),
+            "--completed-record",
+            record.relative_to(project).as_posix(),
+            "--repository",
+            repository.relative_to(project).as_posix(),
+            "--validation-proof-manifest",
+            manifest.relative_to(project).as_posix(),
+        ]
+    )
+
+    assert rc == 3
+    assert "does not name the exact checkout" in capsys.readouterr().err
+    assert checkout.is_dir()
+    assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
+
+
+@pytest.mark.ordinary_environment
+def test_historical_frozen_live_process_identity_blocks_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    checkout, record, _sidecar, _target_sha = (
+        prepare_run1773_historical_frozen_checkout(
+            project, repository, monkeypatch=monkeypatch, name="live-process"
+        )
+    )
+    identity = wrkslots._read_process_identity(os.getpid())
+    value: object = json.loads(record.read_text(encoding="utf-8"))
+    assert isinstance(value, dict)
+    value["process_identity"] = {
+        "pid": identity.pid,
+        "start_ticks": identity.start_ticks,
+        "boot_id": identity.boot_id,
+    }
+    record.write_text(
+        json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    stub_validate_batch_censuses(monkeypatch)
+
+    rc = run_frozen_validation_batch(project, repository, checkout, record)
+
+    assert rc == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["removed"] == []
+    assert len(report["retained"]) == 1
+    assert report["retained"][0]["blocks_entry"] is True
+    assert "process state is live or uncertain" in report["retained"][0]["reason"]
+    assert checkout.is_dir()
+
+
+@pytest.mark.ordinary_environment
+@pytest.mark.parametrize("artifact", ("service-result", "producer-schema"))
+def test_historical_frozen_entry_classification_fails_closed_on_evidence_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    artifact: str,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    checkout, record, sidecar, _target_sha = (
+        prepare_run1773_historical_frozen_checkout(
+            project,
+            repository,
+            monkeypatch=monkeypatch,
+            name=f"changed-{artifact}",
+        )
+    )
+    if artifact == "service-result":
+        value: object = json.loads(sidecar.read_text(encoding="utf-8"))
+        assert isinstance(value, dict)
+        value["executed_nodes"] = 15
+        sidecar.write_text(
+            json.dumps(value, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    else:
+        producer = checkout / wrkslots._VALIDATION_SERVICE_RESULT_SCHEMA_PATH
+        value = json.loads(producer.read_text(encoding="utf-8"))
+        assert isinstance(value, dict)
+        value["schema_version"] = 2
+        producer.write_text(
+            json.dumps(value, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    stub_validate_batch_censuses(monkeypatch)
+
+    rc = run_frozen_validation_batch(project, repository, checkout, record)
+
+    assert rc == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["removed"] == []
+    assert len(report["retained"]) == 1
+    assert report["retained"][0]["blocks_entry"] is True
+    assert checkout.is_dir()
 
 
 @pytest.mark.ordinary_environment
@@ -2392,6 +3201,82 @@ def test_frozen_validate_batch_closes_operation_owned_fds_before_censuses(
     ) == 1
 
 
+@pytest.mark.ordinary_environment
+def test_historical_frozen_entry_classification_closes_operation_owned_fds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    checkout, record, _sidecar, _target_sha = (
+        prepare_run1773_historical_frozen_checkout(
+            project, repository, monkeypatch=monkeypatch, name="closed-fds"
+        )
+    )
+    census_stages: list[str] = []
+
+    def assert_expected_target_fds(paths: Sequence[Path], *, stage: str) -> None:
+        target_fds: list[str] = []
+        for entry in (Path("/proc") / "self" / "fd").iterdir():
+            try:
+                observed = Path(os.readlink(entry).removesuffix(" (deleted)"))
+            except OSError:
+                continue
+            if any(observed == target or target in observed.parents for target in paths):
+                target_fds.append(f"{entry.name}={observed}")
+        assert len(paths) == 1
+        assert target_fds == []
+        census_stages.append(stage)
+
+    def shared(
+        paths: Sequence[Path], **_kwargs: object
+    ) -> wrkslots._ProcessPathCensus:
+        assert_expected_target_fds(paths, stage="shared")
+        return wrkslots._ProcessPathCensus((), (), owner_cgroup_complete=False)
+
+    def fresh(
+        paths: Sequence[Path], **_kwargs: object
+    ) -> wrkslots._ProcessPathCensus:
+        assert_expected_target_fds(paths, stage="fresh")
+        return wrkslots._ProcessPathCensus((), (), owner_cgroup_complete=False)
+
+    monkeypatch.setattr(wrkslots, "_capture_lsof_process_path_census", shared)
+    monkeypatch.setattr(
+        wrkslots, "_capture_same_uid_process_path_census", fresh
+    )
+
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover-ownerless-validate-batch",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--frozen-validate-checkout",
+            str(checkout),
+            "--completed-record",
+            record.relative_to(project).as_posix(),
+            "--repository",
+            repository.relative_to(project).as_posix(),
+            "--format",
+            "json",
+        ]
+    )
+
+    assert rc == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["removed"] == []
+    assert report["retained"][0]["blocks_entry"] is False
+    assert census_stages == ["shared", "fresh"]
+    config = wrkslots._load_config(str(project), "testhost")
+    assert list(control_directory(project).glob("*.journal")) == []
+    assert not any(
+        item["kind"] == "ownerless-validate-path-removed"
+        for item in wrkslots._load_events(config)
+    )
+
+
 def test_frozen_validate_batch_does_not_ignore_current_process_census_use(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2441,6 +3326,7 @@ def test_frozen_validate_batch_does_not_ignore_current_process_census_use(
     assert rc == 0
     report = json.loads(capsys.readouterr().out)
     assert report["removed"] == []
+    assert report["retained"][0]["blocks_entry"] is True
     assert f"live process {os.getpid()}" in report["retained"][0]["reason"]
     assert checkout.is_dir()
     assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
@@ -2459,8 +3345,10 @@ def test_frozen_validate_batch_fresh_census_does_not_ignore_current_process(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     project, repository, _remote = make_project(tmp_path)
-    checkout, record, _target_sha = prepare_frozen_validation_checkout(
-        project, repository, monkeypatch=monkeypatch, name="late-self-use"
+    checkout, record, _sidecar, _target_sha = (
+        prepare_run1773_historical_frozen_checkout(
+            project, repository, monkeypatch=monkeypatch, name="late-self-use"
+        )
     )
     monkeypatch.setattr(
         wrkslots,
@@ -2502,6 +3390,7 @@ def test_frozen_validate_batch_fresh_census_does_not_ignore_current_process(
     report = json.loads(capsys.readouterr().out)
     assert report["removed"] == []
     assert report["same_uid_process_censuses"] == 1
+    assert report["retained"][0]["blocks_entry"] is True
     assert f"live process {os.getpid()}" in report["retained"][0]["reason"]
     assert checkout.is_dir()
     assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
