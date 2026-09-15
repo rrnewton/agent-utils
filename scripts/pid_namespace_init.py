@@ -36,7 +36,7 @@ def _reap(primary: int, status: int | None) -> tuple[int | None, bool]:
             continue
         if pid == 0:
             return status, True
-        if pid == primary:
+        if pid == primary and status is None:
             status = raw_status
     # A busy producer must not prevent the caller from handling cancellation or
     # checking cleanup deadlines. The next batch discovers whether any remain.
