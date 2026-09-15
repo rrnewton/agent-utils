@@ -301,6 +301,36 @@ def test_a_peak_below_its_cap_is_not_reported_as_touching_it(tmp_path: Path) -> 
     assert row["memory_events_max"] == "0"
 
 
+def test_an_oom_kill_cannot_be_a_false_exit_zero_pass(tmp_path: Path) -> None:
+    """A surviving producer's exit zero cannot erase an observed descendant OOM kill."""
+    for kills in (0, 2):
+        store = tmp_path / f"kills-{kills}"
+        cfg = DagConfig(steps=(_step("survivor", "true"),))
+        cgroups = _PlantedCgroups({"g.survivor": (4096, "4096", {"oom_kill": kills})})
+        result = run_dag(
+            cfg,
+            jobs=1,
+            cgroups=cgroups,
+            metrics=CsvMetricsSink(store, git_sha="deadbee"),
+            verbosity=0,
+        )
+        outcome = result.outcomes[0]
+        expected_ok = kills == 0
+        assert result.ok == expected_ok, outcome
+        assert outcome.ok == expected_ok
+        assert outcome.returncode == 0
+        assert outcome.oomed == (kills > 0)
+        assert outcome.oom_kills == kills
+        assert not outcome.timed_out and not outcome.cpu_timed_out and not outcome.aborted
+        assert outcome.reason == (
+            "" if expected_ok else "OOM-KILLED (hit inner MemoryMax; 2 oom_kill event(s))"
+        )
+        row = _by_step(store)["g.survivor"]
+        assert row["ok"] == ("true" if expected_ok else "false")
+        assert row["returncode"] == "0"
+        assert row["oom_kills"] == row["memory_events_oom_kill"] == str(kills)
+
+
 def test_an_unbounded_step_says_max_and_an_unmeasured_one_says_nothing(
     tmp_path: Path,
 ) -> None:

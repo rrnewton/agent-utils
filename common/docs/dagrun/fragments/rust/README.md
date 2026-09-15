@@ -81,6 +81,7 @@ failed test cannot become a pass because its framework process exited zero.
 This additive API adds `TestResult.attempt_results` and
 `StepOutcome.test_results_error`: downstream exhaustive struct patterns need
 `..` or the new field, and struct literals must initialize the optional field.
+
 `resource_caps` apply within one runner process by default. To apply the same
 capacities across independent runners, pass `run --resource-caps-path FILE`.
 `DAGRUN_RESOURCE_CAPS_PATH=FILE` is the secondary route for launchers where a

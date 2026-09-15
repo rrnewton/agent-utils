@@ -1852,7 +1852,7 @@ class Runner:
         elapsed = time.time() - start
         dur = round(elapsed)
         returncode = proc.returncode
-        ok = returncode == 0 and not timed_out and not cpu_timed_out
+        ok = returncode == 0 and not timed_out and not cpu_timed_out and oom == 0
         summary = captured.last_line()
         culprit: Culprit | None = (
             termination_culprit or sink.culprit()
