@@ -1132,6 +1132,10 @@ fn signal_name(sig: i64) -> String {
 /// Failure-reason precedence is:
 /// OOM > CPU-timeout > timeout > pids-guard > detail-capture-failure > signal > exit code.
 ///
+/// This function formats outer process and resource failures. The scheduler reports a
+/// structured-result refusal or terminal test failure when no outer failure takes precedence;
+/// a simultaneous required-result refusal is retained separately in `test_results_error`.
+///
 /// A negative `returncode` means the child received a Unix signal; that must never be
 /// reported as an OOM.
 #[allow(clippy::too_many_arguments)]
