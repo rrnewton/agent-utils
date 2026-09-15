@@ -86,13 +86,17 @@ check-test-suite-selector:
 # remain host-visible or exercise the initial identity user namespace. Run that
 # partition outside unshare. If unprivileged namespaces are unavailable, run the
 # original single pytest command; availability changes cost, never coverage.
+# Resolve the real interpreter before unshare: a Python launcher that forks
+# cannot itself serve as the namespace init that reaps adopted children.
 test:
 ifneq ($(TEST_SUITE),rust)
 	@cd py && \
 	if command -v unshare >/dev/null 2>&1 \
 		&& unshare --user --map-root-user --pid --fork --mount-proc true >/dev/null 2>&1; then \
 		python3 -m pytest -q --ignore=wrkslots/tests/test_lifecycle.py && \
+		test_python="$$(python3 -c 'import os, sys; print(os.path.realpath(sys.executable))')" && \
 		unshare --user --map-root-user --pid --fork --mount-proc \
+			"$$test_python" ../scripts/pid_namespace_init.py -- \
 			python3 -m pytest -q -c pyproject.toml --rootdir=. wrkslots/tests/test_lifecycle.py \
 			-m 'not ordinary_environment' && \
 		python3 -m pytest -q -c pyproject.toml --rootdir=. \
