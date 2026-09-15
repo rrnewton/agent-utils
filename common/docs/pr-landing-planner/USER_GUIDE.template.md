@@ -248,12 +248,18 @@ missing or stale digest reports this remedy and fails closed.
 
 ## Freshness, holds, priority, and batching
 
-A branch behind the fetched base must rebase before landing. The default
-`--freshness-max-behind 0` expresses that requirement; another value is an
-explicit caller override. A clean validation record with caller-supplied
-soft-green authority survives as validation evidence: the planner recommends
-the required rebase and landing without pre-landing revalidation, while
-post-facto validation remains due. The consuming workspace remains the sole
+Being behind the fetched base is NOT by itself a reason to rebase before
+landing, so the default applies no freshness reroute. Follow the consuming
+workspace's own validation-authority rule, which states it with its reasoning:
+"A lagging ancestor is legitimate; requiring the tip made the verdict a property
+of WHEN you looked rather than of the tree." `--freshness-max-behind N` remains
+available for a caller that genuinely wants a bound. A real conflict is a
+separate question, decided by the conflict graph and by mergeability rather than
+by this counter. A clean validation record with caller-supplied
+soft-green authority survives as validation evidence. When a caller HAS set a
+freshness bound and a pull request exceeds it, the planner recommends the rebase
+and landing without pre-landing revalidation, while post-facto validation remains
+due; with no bound set, such a pull request is simply landable. The consuming workspace remains the sole
 authority for that landability decision. Draft state, missing approvals,
 conflicts, ordering constraints, CI state, and policy escalation can hold a PR.
 Unavailable review evidence still produces `wait` when either local merge-tree

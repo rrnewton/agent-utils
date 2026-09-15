@@ -770,8 +770,13 @@ mod tests {
             authorized.validation_authority,
             ValidationAuthority::SoftGreen
         );
-        let (plan, _) = compute_plan(
-            &[authorized],
+        // Explicit bound: this case is about the soft-green authority path, and
+        // being behind is no longer a reroute reason by default.
+        let one = std::slice::from_ref(&authorized);
+        let (plan, _) = compute_plan(one, &[], &[], &[], Some(0), 2, false);
+        assert_eq!(plan.per_pr_actions[0].action, PrAction::RebaseThenLand);
+        let (default_plan, _) = compute_plan(
+            one,
             &[],
             &[],
             &[],
@@ -779,7 +784,7 @@ mod tests {
             2,
             false,
         );
-        assert_eq!(plan.per_pr_actions[0].action, PrAction::RebaseThenLand);
+        assert_eq!(default_plan.per_pr_actions[0].action, PrAction::LandNow);
         assert!(plan.per_pr_actions[0]
             .why
             .contains("without pre-landing revalidation"));

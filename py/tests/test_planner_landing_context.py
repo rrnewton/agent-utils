@@ -186,10 +186,15 @@ def test_clean_record_keeps_exact_head_and_delegates_older_base_to_authority() -
         [replace(_node(1), commits_behind=5)], earlier_green
     )[0]
     assert authorized.validation_authority is ValidationAuthority.SOFT_GREEN
-    plan, _ = compute_plan([authorized], [], [], [])
+    # Explicit freshness bound: this case is about the soft-green authority path,
+    # and being behind is no longer a reroute reason by default.
+    plan, _ = compute_plan([authorized], [], [], [], freshness_max_behind=0)
     decision = plan.per_pr_actions[0]
     assert decision.action is PrAction.REBASE_THEN_LAND
     assert "without pre-landing revalidation" in decision.why
+
+    default_plan, _ = compute_plan([authorized], [], [], [])
+    assert default_plan.per_pr_actions[0].action is PrAction.LAND_NOW
 
     hard_green_on_other_base = parse_landing_context(
         {

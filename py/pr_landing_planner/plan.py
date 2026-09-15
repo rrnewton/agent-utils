@@ -47,7 +47,25 @@ from pr_landing_planner.model import (
     ValidationEvidence,
 )
 
-DEFAULT_FRESHNESS_MAX_BEHIND: int | None = 0
+# Default freshness policy: being behind the fetched base is NOT by itself a
+# reason to rebase before landing, so no freshness reroute is applied.
+#
+# Follow the consuming workspace's own validation-authority rule, which states
+# this with its reasoning: "A lagging ancestor is legitimate; requiring the tip
+# made the verdict a property of WHEN you looked rather than of the tree."
+# That is the single statement of the rule; this comment quotes it rather than
+# paraphrasing it, because a paraphrase is what drifts.
+#
+# A default of 0 is not merely the conservative choice: it reroutes EVERY branch
+# behind the base to REBASE_THEN_LAND, and on a busy repository essentially
+# nothing is ever not behind, so LAND_NOW becomes close to unreachable. A bound
+# nobody can satisfy does not prevent anything; it just routes every row through
+# a rebase the rule does not ask for.
+#
+# A real conflict is a separate question, decided by the conflict graph and by
+# mergeability, not by this counter. The knob is retained so a caller that
+# genuinely wants a freshness bound can set one.
+DEFAULT_FRESHNESS_MAX_BEHIND: int | None = None
 
 
 def _held_action(reasons: Sequence[str]) -> tuple[PrAction, str]:

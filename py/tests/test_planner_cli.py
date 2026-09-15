@@ -105,9 +105,21 @@ def test_plan_json_is_valid_and_has_schema() -> None:
     assert obj["repository"] == "OWNER/NAME"
     assert set(obj["plan"]) >= {"parallel_safe_groups", "land_now", "order", "per_pr_actions"}
     assert 1043 in obj["plan"]["land_now"]
+    # Behind the base is not a reroute reason by default...
     behind = next(item for item in obj["plan"]["per_pr_actions"] if item["pr"] == 987)
-    assert behind["action"] == "rebase-then-land"
-    assert "rebase before landing" in behind["why"]
+    assert behind["action"] == "land-now"
+    # ...but a caller that asks for a freshness bound still gets the reroute and
+    # its wording, so this keeps that path covered rather than dropping it.
+    rc_strict, out_strict, _ = _capture(
+        ["plan", "--fixture", DEMO, "--flaky-signatures", FLAKY, "--format", "json",
+         "--freshness-max-behind", "0"]
+    )
+    assert rc_strict == 0
+    behind_strict = next(
+        item for item in json.loads(out_strict)["plan"]["per_pr_actions"] if item["pr"] == 987
+    )
+    assert behind_strict["action"] == "rebase-then-land"
+    assert "rebase before landing" in behind_strict["why"]
     assert 1049 in obj["diagnostics"]["flaky_reds"]
     assert obj["diagnostics"]["outage_suspected"] is True
     # Deterministic: identical bytes on a second run.

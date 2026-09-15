@@ -9,8 +9,25 @@ use crate::model::{
     ValidationEvidence,
 };
 
-/// Default freshness policy. Any branch behind the fetched base must rebase before landing.
-pub const DEFAULT_FRESHNESS_MAX_BEHIND: Option<i64> = Some(0);
+/// Default freshness policy: being behind the fetched base is NOT by itself a
+/// reason to rebase before landing, so no freshness reroute is applied.
+///
+/// Follow the consuming workspace's own validation-authority rule, which states
+/// this with its reasoning: "A lagging ancestor is legitimate; requiring the tip
+/// made the verdict a property of WHEN you looked rather than of the tree."
+/// That is the single statement of the rule; this comment quotes it rather than
+/// paraphrasing it, because a paraphrase is what drifts.
+///
+/// A default of `Some(0)` is not merely the conservative choice: it reroutes
+/// EVERY branch behind the base to `RebaseThenLand`, and on a busy repository
+/// essentially nothing is ever not behind, so `LandNow` becomes close to
+/// unreachable. A bound nobody can satisfy does not prevent anything; it just
+/// routes every row through a rebase the rule does not ask for.
+///
+/// A real conflict is a separate question, decided by the conflict graph and by
+/// mergeability, not by this counter. The knob is retained so a caller that
+/// genuinely wants a freshness bound can set one.
+pub const DEFAULT_FRESHNESS_MAX_BEHIND: Option<i64> = None;
 
 fn held_action(reasons: &[String]) -> (PrAction, String) {
     if reasons
@@ -345,12 +362,15 @@ mod tests {
         policy.policy_class = PolicyClass::GatePolicy;
         let mut behind = green(3);
         behind.commits_behind = 1;
+        // Explicit bound: this table is about evidence and policy, not freshness,
+        // and being behind is no longer a reroute reason by default. `behind`
+        // exists here to keep RebaseThenLand covered in the table.
         let (plan, _) = compute_plan(
             &[evidence, policy, behind],
             &[],
             &[],
             &[],
-            DEFAULT_FRESHNESS_MAX_BEHIND,
+            Some(0),
             2,
             false,
         );
@@ -504,7 +524,9 @@ mod tests {
         evidence.validation_evidence = ValidationEvidence::CleanValidateRecord;
         evidence.validation_authority = ValidationAuthority::SoftGreen;
         evidence.commits_behind = 3;
-        let (evidence_plan, _) = compute_plan(
+        // Main moving under a validated branch is not a landing obstacle: by
+        // default a soft-green ancestor lands.
+        let (default_plan, _) = compute_plan(
             &[evidence.clone()],
             &[],
             &[],
@@ -513,6 +535,11 @@ mod tests {
             2,
             false,
         );
+        assert_eq!(default_plan.per_pr_actions[0].action, PrAction::LandNow);
+
+        // The reroute and its exact wording are retained for a caller that asks.
+        let (evidence_plan, _) =
+            compute_plan(&[evidence.clone()], &[], &[], &[], Some(0), 2, false);
         let decision = &evidence_plan.per_pr_actions[0];
         assert_eq!(decision.action, PrAction::RebaseThenLand);
         assert!(decision.why.contains("soft-green authority"));
@@ -521,15 +548,7 @@ mod tests {
         assert!(decision.why.contains("post-facto validation remains due"));
 
         evidence.commits_behind = 0;
-        let (fresh_plan, _) = compute_plan(
-            &[evidence],
-            &[],
-            &[],
-            &[],
-            DEFAULT_FRESHNESS_MAX_BEHIND,
-            2,
-            false,
-        );
+        let (fresh_plan, _) = compute_plan(&[evidence], &[], &[], &[], Some(0), 2, false);
         let fresh_decision = &fresh_plan.per_pr_actions[0];
         assert_eq!(fresh_decision.action, PrAction::LandNow);
         assert!(!fresh_decision.why.contains("rebase"));

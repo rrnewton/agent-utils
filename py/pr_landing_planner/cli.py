@@ -212,7 +212,7 @@ def _quickstart(c: Palette) -> str:
   --conflict-detector {{merge-tree,file-overlap}}   merge-tree (real conflicts) is the default
   --gate-check NAME                               required-check name (default: {DEFAULT_GATE_CHECK})
   --flaky-signatures FILE                         name/text regexes marking a red as flaky
-  --freshness-max-behind N                        caller override (default: 0; any behind branch rebases)
+  --freshness-max-behind N                        caller override (default: none; being behind is not a rebase reason)
   --priority-source {{none,labels,command}}         ordering priority (default: none)
   --batch                                         also propose one green, conflict/dependency-free batch
   --archive-dir DIR / --no-archive                archive the plan JSON to disk (on by default for
@@ -473,7 +473,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--freshness-max-behind",
         type=_nonnegative_i64_arg,
         default=DEFAULT_FRESHNESS_MAX_BEHIND,
-        help="caller override (default: 0): a green PR more than N commits behind => rebase-then-land",
+        help="caller override (default: none): a green PR more than N commits behind => rebase-then-land",
     )
     plan_p.add_argument(
         "--priority-source",

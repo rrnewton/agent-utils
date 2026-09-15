@@ -70,7 +70,10 @@ def test_fusion_table_actions() -> None:
         _node(8, state=CiState.NO_RESULT),
         _node(9, state=CiState.NO_RESULT),
     ]
-    plan, _ = compute_plan(nodes, [], [], [])
+    # freshness_max_behind is explicit because this table is about CI state, not
+    # freshness: being behind is no longer a reroute reason by default, and node 2
+    # exists here to keep REBASE_THEN_LAND covered in the table.
+    plan, _ = compute_plan(nodes, [], [], [], freshness_max_behind=0)
     acts = plan.per_pr_actions
     assert _action(acts, 1) is PrAction.LAND_NOW
     assert _action(acts, 2) is PrAction.REBASE_THEN_LAND
@@ -84,9 +87,19 @@ def test_fusion_table_actions() -> None:
 
 
 def test_freshness_threshold() -> None:
+    """The knob still works; the DEFAULT no longer applies it.
+
+    Being behind the base is not by itself a rebase reason -- see the
+    OWNER-APPROVED RULE block in the consuming repository, referenced from
+    DEFAULT_FRESHNESS_MAX_BEHIND. A caller that wants a bound still gets one.
+
+    This covers strictly more than the previous version did: when the default was
+    0, the default case and the explicit-0 case were indistinguishable, so neither
+    asserted that the caller's value was the one being applied.
+    """
     nodes = [_node(1, behind=3)]
     plan_default, _ = compute_plan(nodes, [], [], [])
-    assert _action(plan_default.per_pr_actions, 1) is PrAction.REBASE_THEN_LAND
+    assert _action(plan_default.per_pr_actions, 1) is PrAction.LAND_NOW
     plan_strict, _ = compute_plan(nodes, [], [], [], freshness_max_behind=0)
     assert _action(plan_strict.per_pr_actions, 1) is PrAction.REBASE_THEN_LAND
     plan_loose, _ = compute_plan(nodes, [], [], [], freshness_max_behind=5)
@@ -128,13 +141,22 @@ def test_gate_policy_escalation_precedes_hold_state() -> None:
     assert plan.land_now == ()
 
 
-def test_main_advancing_requires_rebase_without_prelanding_revalidation() -> None:
+def test_main_advancing_does_not_by_itself_require_a_rebase() -> None:
+    """Main moving under a validated branch is not a landing obstacle.
+
+    A clean validate record with soft-green authority lands from an ancestor. The
+    rebase-then-land wording is retained and still asserted, but only for a caller
+    that explicitly asks for a freshness bound.
+    """
     validated = dataclasses.replace(
         _node(13, behind=2),
         validation_evidence=ValidationEvidence.CLEAN_VALIDATE_RECORD,
         validation_authority=ValidationAuthority.SOFT_GREEN,
     )
-    plan, _ = compute_plan([validated], [], [], [])
+    default_plan, _ = compute_plan([validated], [], [], [])
+    assert default_plan.per_pr_actions[0].action is PrAction.LAND_NOW
+
+    plan, _ = compute_plan([validated], [], [], [], freshness_max_behind=0)
     decision = plan.per_pr_actions[0]
     assert decision.action is PrAction.REBASE_THEN_LAND
     assert "soft-green authority" in decision.why
@@ -142,7 +164,9 @@ def test_main_advancing_requires_rebase_without_prelanding_revalidation() -> Non
     assert "without pre-landing revalidation" in decision.why
     assert "post-facto validation remains due" in decision.why
 
-    fresh_plan, _ = compute_plan([dataclasses.replace(validated, commits_behind=0)], [], [], [])
+    fresh_plan, _ = compute_plan(
+        [dataclasses.replace(validated, commits_behind=0)], [], [], [], freshness_max_behind=0
+    )
     assert fresh_plan.per_pr_actions[0].action is PrAction.LAND_NOW
 
     unproven = dataclasses.replace(
