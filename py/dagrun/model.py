@@ -230,6 +230,7 @@ class DagManifest:
 STRUCTURED_TEST_RESULTS_KIND = "structured-test-results"
 STRUCTURED_TEST_RESULTS_CURRENT_SCHEMA = 2
 STRUCTURED_TEST_RESULTS_RETAINED_SCHEMA = 2
+STRUCTURED_TEST_RESULTS_CLASSIFIED_SCHEMA = 3
 STRUCTURED_TEST_RESULTS_PATH_ENV = "DAGRUN_TEST_COUNTS_PATH"
 
 
@@ -239,6 +240,11 @@ class StructuredTestResultsManifest:
 
     schema: int
     owner: str
+
+    @classmethod
+    def classified(cls, owner: str) -> "StructuredTestResultsManifest":
+        """Explicitly require complete classified attempts (schema 3)."""
+        return cls(schema=STRUCTURED_TEST_RESULTS_CLASSIFIED_SCHEMA, owner=owner)
 
     @classmethod
     def current(cls, owner: str) -> "StructuredTestResultsManifest":
@@ -387,6 +393,7 @@ class Step:
         if structured and structured[0].schema not in {
             STRUCTURED_TEST_RESULTS_RETAINED_SCHEMA,
             STRUCTURED_TEST_RESULTS_CURRENT_SCHEMA,
+            STRUCTURED_TEST_RESULTS_CLASSIFIED_SCHEMA,
         }:
             raise ValueError(
                 f"step {self.tag}: structured test-result schema {structured[0].schema} is unsupported"

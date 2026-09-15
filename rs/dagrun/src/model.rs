@@ -358,6 +358,14 @@ pub struct StructuredTestResultsManifest {
 }
 
 impl StructuredTestResultsManifest {
+    /// Explicitly require complete classified per-attempt results (schema 3).
+    pub fn classified(owner: impl Into<String>) -> Self {
+        Self {
+            schema: crate::test_results::CLASSIFIED_RESULTS_SCHEMA,
+            owner: owner.into(),
+        }
+    }
+
     /// Declare current structured test results owned by one exact step tag.
     pub fn current(owner: impl Into<String>) -> Self {
         Self {
@@ -533,10 +541,11 @@ impl Step {
         if let Some(manifest) = first {
             if manifest.schema != crate::test_results::RETAINED_RESULTS_SCHEMA
                 && manifest.schema != crate::test_results::CURRENT_SCHEMA
+                && manifest.schema != crate::test_results::CLASSIFIED_RESULTS_SCHEMA
             {
                 return Err(format!(
-                    "step {}: structured test-result schema {} is unsupported; expected retained schema {} or current schema {}",
-                    self.tag(), manifest.schema, crate::test_results::RETAINED_RESULTS_SCHEMA, crate::test_results::CURRENT_SCHEMA
+                    "step {}: structured test-result schema {} is unsupported; expected default schema {} or classified schema {}",
+                    self.tag(), manifest.schema, crate::test_results::CURRENT_SCHEMA, crate::test_results::CLASSIFIED_RESULTS_SCHEMA
                 ));
             }
             if manifest.owner != self.tag() {
@@ -1758,6 +1767,8 @@ pub struct StepOutcome {
     pub filtered_tests: Option<u64>,
     /// Terminal per-test results from a controlled runner. `None` means they were not recorded.
     pub test_results: Option<Vec<TestResult>>,
+    /// Required-result refusal, preserved separately from any outer failure cause.
+    pub test_results_error: Option<String>,
     /// Child process exit code; negative for a Unix signal; `None` if never collected.
     pub returncode: Option<i64>,
     /// Whether this step or one of its descendants hit the step's inner memory limit.
@@ -1795,6 +1806,7 @@ impl StepOutcome {
             executed_tests,
             filtered_tests,
             test_results: None,
+            test_results_error: None,
             returncode,
             oomed: false,
             oom_kills: 0,
@@ -1850,6 +1862,7 @@ impl StepOutcome {
             executed_tests,
             filtered_tests,
             test_results: None,
+            test_results_error: None,
             returncode,
             oomed,
             oom_kills,
@@ -1877,6 +1890,7 @@ impl StepOutcome {
             executed_tests,
             filtered_tests,
             test_results: None,
+            test_results_error: None,
             returncode,
             oomed: false,
             oom_kills: 0,

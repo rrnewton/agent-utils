@@ -32,7 +32,7 @@ use crate::model::{
     StepClass, StructuredTestResultsManifest, WriteDomainGuarantee, WriteDomainPolicy,
     DEFAULT_JOBS_FLAG, STRUCTURED_TEST_RESULTS_KIND,
 };
-use crate::test_results::{CURRENT_SCHEMA, RETAINED_RESULTS_SCHEMA};
+use crate::test_results::{CLASSIFIED_RESULTS_SCHEMA, CURRENT_SCHEMA};
 
 const DEFAULT_MEM_CAP_FLOOR: i64 = 8 * 1024 * 1024 * 1024;
 
@@ -403,9 +403,9 @@ fn result_manifest_value_from(value: &Value, where_: &str) -> Result<ResultManif
         .get("schema")
         .and_then(number_as_int)
         .ok_or_else(|| err(format!("{where_}.schema: must be an integer")))?;
-    if schema != RETAINED_RESULTS_SCHEMA as i64 && schema != CURRENT_SCHEMA as i64 {
+    if schema != CURRENT_SCHEMA as i64 && schema != CLASSIFIED_RESULTS_SCHEMA as i64 {
         return Err(err(format!(
-            "{where_}.schema: structured test results require retained schema {RETAINED_RESULTS_SCHEMA} or current schema {CURRENT_SCHEMA}, got {schema}"
+            "{where_}.schema: structured test results require default schema {CURRENT_SCHEMA} or classified schema {CLASSIFIED_RESULTS_SCHEMA}, got {schema}"
         )));
     }
     let path_env = req_str(object, "path_env", where_)?;
@@ -421,7 +421,7 @@ fn result_manifest_value_from(value: &Value, where_: &str) -> Result<ResultManif
     let manifest = if schema == CURRENT_SCHEMA as i64 {
         StructuredTestResultsManifest::current(owner)
     } else {
-        StructuredTestResultsManifest::retained_schema2(owner)
+        StructuredTestResultsManifest::classified(owner)
     };
     Ok(ResultManifest::StructuredTestResults(manifest))
 }
@@ -1759,6 +1759,34 @@ steps:
     }
 
     #[test]
+    fn classified_result_manifest_is_explicit_and_roundtrips() {
+        let doc = r#"{"steps":[{"group":"test","job":"counts","cmd":"true","result_manifests":[{"kind":"structured-test-results","schema":3,"path_env":"DAGRUN_TEST_COUNTS_PATH","owner":"test.counts"}]}]}"#;
+        let cfg = dag_from_json(doc).unwrap();
+        assert_eq!(
+            cfg.steps[0]
+                .structured_test_results_manifest()
+                .unwrap()
+                .unwrap(),
+            &StructuredTestResultsManifest::classified("test.counts")
+        );
+        assert_eq!(
+            StructuredTestResultsManifest::current("test.counts").schema,
+            2
+        );
+        assert_eq!(
+            StructuredTestResultsManifest::retained_schema2("test.counts").schema,
+            2
+        );
+        let encoded = dag_to_json(&cfg);
+        assert_eq!(
+            serde_json::from_str::<Value>(&encoded).unwrap()["steps"][0]["result_manifests"][0]
+                ["schema"],
+            3
+        );
+        assert_eq!(dag_to_json(&dag_from_json(&encoded).unwrap()), encoded);
+    }
+
+    #[test]
     fn result_manifests_refuse_malformed_and_duplicate_selectors() {
         for (value, expected) in [
             (
@@ -1803,8 +1831,8 @@ steps:
                 "schema: must be an integer",
             ),
             (
-                r#"{"kind":"structured-test-results","schema":3,"path_env":"DAGRUN_TEST_COUNTS_PATH","owner":"test.counts"}"#,
-                "got 3",
+                r#"{"kind":"structured-test-results","schema":4,"path_env":"DAGRUN_TEST_COUNTS_PATH","owner":"test.counts"}"#,
+                "got 4",
             ),
             (
                 r#"{"kind":"structured-test-results","schema":2,"path_env":"OTHER","owner":"test.counts"}"#,

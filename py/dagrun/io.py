@@ -24,7 +24,7 @@ from dagrun.model import (
     STRUCTURED_TEST_RESULTS_KIND,
     STRUCTURED_TEST_RESULTS_PATH_ENV,
     STRUCTURED_TEST_RESULTS_CURRENT_SCHEMA,
-    STRUCTURED_TEST_RESULTS_RETAINED_SCHEMA,
+    STRUCTURED_TEST_RESULTS_CLASSIFIED_SCHEMA,
     CmdType,
     DagConfig,
     DagManifest,
@@ -631,11 +631,11 @@ def _result_manifest_value_from(value: object, where: str) -> ResultManifest:
     schema = obj.get("schema")
     if isinstance(schema, bool) or not isinstance(schema, int):
         raise DagJsonError(f"{where}.schema: must be an integer")
-    if schema not in {STRUCTURED_TEST_RESULTS_RETAINED_SCHEMA, STRUCTURED_TEST_RESULTS_CURRENT_SCHEMA}:
+    if schema not in {STRUCTURED_TEST_RESULTS_CURRENT_SCHEMA, STRUCTURED_TEST_RESULTS_CLASSIFIED_SCHEMA}:
         raise DagJsonError(
-            f"{where}.schema: structured test results require retained schema "
-            f"{STRUCTURED_TEST_RESULTS_RETAINED_SCHEMA} or current schema "
-            f"{STRUCTURED_TEST_RESULTS_CURRENT_SCHEMA}, got {schema}"
+            f"{where}.schema: structured test results require default schema "
+            f"{STRUCTURED_TEST_RESULTS_CURRENT_SCHEMA} or classified schema "
+            f"{STRUCTURED_TEST_RESULTS_CLASSIFIED_SCHEMA}, got {schema}"
         )
     path_env = _req_str(obj, "path_env", where)
     if path_env != STRUCTURED_TEST_RESULTS_PATH_ENV:
@@ -648,7 +648,7 @@ def _result_manifest_value_from(value: object, where: str) -> ResultManifest:
         raise DagJsonError(f"{where}.owner: must be non-empty")
     if schema == STRUCTURED_TEST_RESULTS_CURRENT_SCHEMA:
         return StructuredTestResultsManifest.current(owner)
-    return StructuredTestResultsManifest.retained_schema2(owner)
+    return StructuredTestResultsManifest.classified(owner)
 
 
 def _result_manifests_from(value: object, where: str) -> list[ResultManifest] | None:

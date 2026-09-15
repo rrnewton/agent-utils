@@ -60,6 +60,27 @@ A required result-producing step fails immediately when the file is missing, mal
 not match its declared schema. Retained schema-1 count-only files remain readable through the
 compatibility parser, but cannot satisfy a schema-2 producer. Printing a line that looks like
 a libtest summary cannot create receipt evidence in this mode.
+
+Schema 2 remains the default: `TestResult::new`, `TestResults::current`, and
+`StructuredTestResultsManifest::current` retain their existing output. Frameworks
+with complete native attempt records may explicitly select
+`StructuredTestResultsManifest::classified` and write schema 3 with
+`TestResult::with_attempt_results` and `TestResults::classified().write_classified(...)`.
+Each attempt records its one-based index, outcome (`passed`, `failed`, `cpu_timeout`,
+`wall_timeout`, `cancelled`, `infrastructure_error`, or `no_result`), and detail.
+Every nonpass requires a nonempty trimmed detail; a pass has null detail. The
+complete consecutive history must agree with its terminal pass/fail result.
+Executed counts still count named tests, not attempts.
+
+Readers require the exact declared schema. Terminal-only rows cannot be promoted into
+classified evidence, and schema-2 writers refuse to discard typed causes.
+Duplicate JSON keys, missing causes, and contradictory histories refuse.
+`StepOutcome.test_results_error` retains a required-result refusal separately
+from a simultaneous process, CPU, wall, OOM or cancellation cause. A terminal
+failed test cannot become a pass because its framework process exited zero.
+This additive API adds `TestResult.attempt_results` and
+`StepOutcome.test_results_error`: downstream exhaustive struct patterns need
+`..` or the new field, and struct literals must initialize the optional field.
 `resource_caps` apply within one runner process by default. To apply the same
 capacities across independent runners, pass `run --resource-caps-path FILE`.
 `DAGRUN_RESOURCE_CAPS_PATH=FILE` is the secondary route for launchers where a
