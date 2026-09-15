@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
+import importlib.util
 from pathlib import Path
 import shutil
 import signal
 import subprocess
 import sys
 import time
+from typing import cast
 
 import pytest
 
@@ -51,14 +54,45 @@ def direct_children(parent: int) -> list[int]:
     return [int(pid) for pid in result.stdout.split()]
 
 
-def namespace_init_pid(process: subprocess.Popen[str]) -> int:
+@dataclass(frozen=True)
+class NamespaceInit:
+    pid: int
+    pidfd: int
+
+
+def bind_direct_child(parent: int, pid: int) -> NamespaceInit | None:
+    try:
+        pidfd = os.pidfd_open(pid)
+    except ProcessLookupError:
+        return None
+    try:
+        # Verify after opening: a recycled number cannot bind a foreign
+        # process merely because it appeared in an earlier child census.
+        status = Path(f"/proc/{pid}/status").read_text()
+        if f"PPid:\t{parent}\n" not in status:
+            os.close(pidfd)
+            return None
+    except (FileNotFoundError, ProcessLookupError):
+        os.close(pidfd)
+        return None
+    except BaseException:
+        os.close(pidfd)
+        raise
+    return NamespaceInit(pid, pidfd)
+
+
+def namespace_init_process(process: subprocess.Popen[str]) -> NamespaceInit:
     children = direct_children(process.pid)
     assert len(children) == 1, children
-    pid = children[0]
-    status = Path(f"/proc/{pid}/status").read_text()
-    assert f"PPid:\t{process.pid}\n" in status
-    assert Path(f"/proc/{pid}/exe").resolve() == Path(PYTHON)
-    return pid
+    child = bind_direct_child(process.pid, children[0])
+    assert child is not None, "namespace init exited before identity binding"
+    try:
+        assert Path(f"/proc/{child.pid}/exe").resolve() == Path(PYTHON)
+        signal.pidfd_send_signal(child.pidfd, 0)
+    except BaseException:
+        os.close(child.pidfd)
+        raise
+    return child
 
 
 def wait_ready(process: subprocess.Popen[str], ready: Path) -> None:
@@ -69,27 +103,181 @@ def wait_ready(process: subprocess.Popen[str], ready: Path) -> None:
         time.sleep(0.01)
 
 
-def finish_owned(process: subprocess.Popen[str], init_pid: int | None) -> None:
-    if process.poll() is None:
-        if init_pid is not None:
-            try:
-                os.kill(init_pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-        else:
-            children = direct_children(process.pid)
-            for pid in children:
+def finish_owned(process: subprocess.Popen[str], init: NamespaceInit | None) -> None:
+    try:
+        if process.poll() is None:
+            if init is not None:
                 try:
-                    status = Path(f"/proc/{pid}/status").read_text()
-                    assert f"PPid:\t{process.pid}\n" in status
-                    os.kill(pid, signal.SIGKILL)
+                    signal.pidfd_send_signal(init.pidfd, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-                except FileNotFoundError:
-                    pass
-            if not children:
-                process.kill()
-        process.communicate(timeout=5)
+            else:
+                children = direct_children(process.pid)
+                for pid in children:
+                    child = bind_direct_child(process.pid, pid)
+                    if child is None:
+                        continue
+                    try:
+                        signal.pidfd_send_signal(child.pidfd, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    finally:
+                        os.close(child.pidfd)
+                if not children:
+                    process.kill()
+            process.communicate(timeout=5)
+    finally:
+        if init is not None:
+            os.close(init.pidfd)
+
+
+class PendingParent:
+    """Model unshare after reaping init, before publishing its own exit."""
+
+    pid = -1
+
+    def __init__(self, fail_communicate: bool = False) -> None:
+        self.fail_communicate = fail_communicate
+        self.communicated = False
+
+    def poll(self) -> None:
+        return None
+
+    def communicate(self, timeout: float) -> tuple[str, str]:
+        assert timeout == 5
+        self.communicated = True
+        if self.fail_communicate:
+            raise RuntimeError("retained communicate failure")
+        return "", ""
+
+
+@pytest.mark.parametrize("fail_communicate", [False, True])
+def test_cleanup_uses_retained_pidfd_and_closes_it_on_every_path(
+    monkeypatch: pytest.MonkeyPatch, fail_communicate: bool
+) -> None:
+    parent = PendingParent(fail_communicate)
+    signals: list[tuple[int, int]] = []
+    closed: list[int] = []
+
+    def no_numeric_signal(_pid: int, _signal: int) -> None:
+        pytest.fail("cached numeric PID may now refer to a foreign process")
+
+    def signal_descriptor(pidfd: int, signum: int) -> None:
+        signals.append((pidfd, signum))
+
+    monkeypatch.setattr(os, "kill", no_numeric_signal)
+    monkeypatch.setattr(signal, "pidfd_send_signal", signal_descriptor)
+    monkeypatch.setattr(os, "close", closed.append)
+    identity = NamespaceInit(pid=4711, pidfd=91)
+    if fail_communicate:
+        with pytest.raises(RuntimeError, match="retained communicate failure"):
+            finish_owned(cast(subprocess.Popen[str], parent), identity)
+    else:
+        finish_owned(cast(subprocess.Popen[str], parent), identity)
+    assert signals == [(91, signal.SIGKILL)]
+    assert closed == [91]
+    assert parent.communicated
+
+
+def test_reaped_pidfd_does_not_fall_back_to_numeric_signalling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    child = subprocess.Popen(
+        [PYTHON, "-c", "import sys; sys.stdin.buffer.read(1)"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    pidfd: int | None = None
+    try:
+        pidfd = os.pidfd_open(child.pid)
+        child.communicate(input="x", timeout=5)
+        assert child.returncode == 0
+        with pytest.raises(ProcessLookupError):
+            signal.pidfd_send_signal(pidfd, 0)
+
+        def no_numeric_signal(_pid: int, _signal: int) -> None:
+            pytest.fail("an exited pidfd must never fall back to a recycled numeric PID")
+
+        parent = PendingParent()
+        retained_fd = pidfd
+        # Transfer ownership before the call: finish_owned closes even when
+        # its communicate path raises, so this finally must not close it twice.
+        pidfd = None
+        with monkeypatch.context() as context:
+            context.setattr(os, "kill", no_numeric_signal)
+            finish_owned(cast(subprocess.Popen[str], parent), NamespaceInit(child.pid, retained_fd))
+        assert parent.communicated
+        with pytest.raises(OSError, match="Bad file descriptor"):
+            os.fstat(retained_fd)
+    finally:
+        if pidfd is not None:
+            os.close(pidfd)
+        # Popen owns this child's unreaped wait status. Its kill method checks
+        # poll first; once reaped, no numeric signal is sent on this path.
+        if child.poll() is None:
+            child.kill()
+            child.communicate(timeout=5)
+
+
+@pytest.mark.parametrize("mismatch", ["parent", "executable"])
+def test_identity_mismatch_closes_pidfd_without_signalling(
+    monkeypatch: pytest.MonkeyPatch, mismatch: str
+) -> None:
+    opened: list[int] = []
+    real_open = os.pidfd_open
+
+    def track_open(pid: int) -> int:
+        fd = real_open(pid)
+        opened.append(fd)
+        return fd
+
+    def no_signal(_pidfd: int, _signal: int) -> None:
+        pytest.fail("an unverified process must not be signalled")
+
+    monkeypatch.setattr(os, "pidfd_open", track_open)
+    monkeypatch.setattr(signal, "pidfd_send_signal", no_signal)
+    if mismatch == "parent":
+        assert bind_direct_child(-1, os.getpid()) is None
+    else:
+        parent = PendingParent()
+        parent.pid = os.getppid()
+        monkeypatch.setattr(sys.modules[__name__], "direct_children", lambda _parent: [os.getpid()])
+        monkeypatch.setattr(sys.modules[__name__], "PYTHON", "/not-the-verified-interpreter")
+        with pytest.raises(AssertionError):
+            namespace_init_process(cast(subprocess.Popen[str], parent))
+    assert len(opened) == 1
+    with pytest.raises(OSError, match="Bad file descriptor"):
+        os.fstat(opened[0])
+
+
+def test_primary_wait_status_is_immutable_after_pid_reuse_across_batches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = importlib.util.spec_from_file_location("namespace_init_status_control", INIT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    primary = 2
+    failure = 7 << 8
+    waits = iter([(primary, failure)] + [(99, 0)] * (module.REAP_BATCH_SIZE - 1) + [(primary, 0), None])
+
+    class Waits:
+        WNOHANG = os.WNOHANG
+
+        @staticmethod
+        def waitpid(pid: int, options: int) -> tuple[int, int]:
+            assert pid == -1 and options == os.WNOHANG
+            event = next(waits)
+            if event is None:
+                raise ChildProcessError
+            return event
+
+    monkeypatch.setattr(module, "os", Waits)
+    first = module._reap(primary, None)
+    assert first == (failure, True)
+    assert module._reap(primary, first[0]) == (failure, False)
 
 
 def test_refuses_outside_namespace_pid_one(tmp_path: Path) -> None:
@@ -238,16 +426,16 @@ while True:
     time.sleep(1)
 """
     process = subprocess.Popen([*namespace_argv, code], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    init_pid: int | None = None
+    init: NamespaceInit | None = None
     try:
         wait_ready(process, ready)
-        init_pid = namespace_init_pid(process)
+        init = namespace_init_process(process)
         # Repeated cancellation must not restart the grace period. A quiet
         # process must terminate while signals continue, not after they stop.
         deadline = time.monotonic() + 5
         while process.poll() is None and time.monotonic() < deadline:
             try:
-                os.kill(init_pid, signal.SIGTERM)
+                signal.pidfd_send_signal(init.pidfd, signal.SIGTERM)
             except ProcessLookupError:
                 break
             time.sleep(0.05)
@@ -256,7 +444,7 @@ while True:
         assert process.returncode == expected, (stdout, stderr)
         assert "cancellation signal 15" in stderr
     finally:
-        finish_owned(process, init_pid)
+        finish_owned(process, init)
 
 
 def test_later_cancellation_preserves_primary_failure_during_orphan_cleanup(
@@ -282,10 +470,10 @@ while not Path({str(ready)!r}).exists():
 raise SystemExit(7)
 """
     process = subprocess.Popen([*namespace_argv, code], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    init_pid: int | None = None
+    init: NamespaceInit | None = None
     try:
         wait_ready(process, ready)
-        init_pid = namespace_init_pid(process)
+        init = namespace_init_process(process)
         # The orphan's readiness does not prove the foreground status was
         # collected. Observe its namespace PID disappear from this init's
         # direct children before testing cancellation during orphan cleanup.
@@ -293,7 +481,7 @@ raise SystemExit(7)
         deadline = time.monotonic() + 3
         while True:
             primary_visible = False
-            for child in direct_children(init_pid):
+            for child in direct_children(init.pid):
                 try:
                     status = Path(f"/proc/{child}/status").read_text()
                 except FileNotFoundError:
@@ -306,9 +494,9 @@ raise SystemExit(7)
             assert time.monotonic() < deadline, "primary status was not collected"
             time.sleep(0.01)
         assert process.poll() is None, "init completed before the late cancellation"
-        os.kill(init_pid, signal.SIGTERM)
+        signal.pidfd_send_signal(init.pidfd, signal.SIGTERM)
         stdout, stderr = process.communicate(timeout=5)
         assert process.returncode == 7, (stdout, stderr)
         assert "cancellation signal 15" in stderr
     finally:
-        finish_owned(process, init_pid)
+        finish_owned(process, init)
