@@ -16390,6 +16390,62 @@ _FROZEN_VALIDATION_PARSER_BOOTSTRAP = (
     "sys.path.insert(0,script.rsplit('/',1)[0])\n"
     "runpy.run_path(script,run_name='__main__')\n"
 )
+_FROZEN_TOOL_AUTHORITY_MODULE = "ci-hub/validate/immutable_tool_authority.py"
+_FROZEN_TOOL_AUTHORITY_BOOTSTRAP = r'''
+import dataclasses, fcntl, importlib.util, json, os, re, stat, sys
+from pathlib import Path
+
+spec = importlib.util.spec_from_file_location("pinned_tool_authority", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+request = json.loads(sys.stdin.buffer.read(1024 * 1024 + 1))
+environment = request["environment"]
+expected = request["expected"]
+
+# These bytes only locate a descriptor. The pinned verifier below remains the
+# authority and rechecks the entire sealed protocol, content digest and state.
+authority_path = Path(environment.get(module.TOOL_AUTHORITY_ENV, ""))
+holder, _descriptor = module.proc_fd_identity(authority_path, role="tool authority")
+descriptor = os.open(authority_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK)
+try:
+    metadata = os.fstat(descriptor)
+    seals = fcntl.F_SEAL_SEAL | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_WRITE
+    if (not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 0
+            or metadata.st_mode & 0o222 or not 0 < metadata.st_size <= 4096
+            or fcntl.fcntl(descriptor, fcntl.F_GET_SEALS) & seals != seals):
+        raise ValueError("tool descriptor locator is not bounded, anonymous and sealed")
+    locator = json.loads(os.read(descriptor, 4097))
+finally:
+    os.close(descriptor)
+if (not isinstance(locator, dict) or type(locator.get("holder_pid")) is not int
+        or locator["holder_pid"] != holder or type(locator.get("root_fd")) is not int
+        or locator["root_fd"] < 0):
+    raise ValueError("tool descriptor locator has invalid holder or root identity")
+tool_root = Path(f"/proc/{holder}/fd/{locator['root_fd']}")
+verified = module.read_immutable_tool_authority(
+    tool_root, Path(expected["state_root"]), environment
+)
+values = dataclasses.asdict(verified)
+pins = {name: value for name, value in values.items() if name.endswith("_sha")}
+product_fields = set(pins) - {"parent_sha", "agent_utils_sha"}
+if (len(pins) != 3 or len(product_fields) != 1
+        or not {"parent_sha", "agent_utils_sha"}.issubset(pins)
+        or any(not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{40}", value) is None
+               for value in pins.values())):
+    raise ValueError("tool authority does not have exactly three unambiguous repository pins")
+product_field = next(iter(product_fields))
+if (pins["parent_sha"] != expected["authority_head"]
+        or pins[product_field] != expected["consumer_head"]
+        or pins["agent_utils_sha"] != expected["agent_head"]):
+    raise ValueError("sealed tool pins differ from the loaded enclosing Git chain")
+for name in ("root_dev", "root_ino", "state_dev", "state_ino"):
+    if type(values.get(name)) is not int or values[name] != expected[name]:
+        raise ValueError(f"sealed tool {name} differs from the loaded authority/state root")
+if str(values["state_root"]) != expected["state_root"]:
+    raise ValueError("sealed tool state root differs from the recovery project root")
+print(json.dumps(expected, sort_keys=True, separators=(",", ":")))
+'''
 
 
 def _trusted_git_capture(
@@ -16535,22 +16591,6 @@ def _frozen_validation_authority_chain(config: Config) -> tuple[Path, Path, Path
     )
     if config_root != config.root.resolve():
         raise Refusal("frozen validation recovery project root is not a Git worktree root")
-    authority_common = _trusted_git_directory(
-        authority,
-        ("rev-parse", "--path-format=absolute", "--git-common-dir"),
-        label="outer authority common Git directory",
-    )
-    config_common = _trusted_git_directory(
-        config_root,
-        ("rev-parse", "--path-format=absolute", "--git-common-dir"),
-        label="frozen validation recovery common Git directory",
-    )
-    if config_common != authority_common:
-        raise Refusal(
-            "frozen validation recovery project root does not share the authenticated "
-            "outer authority Git repository"
-        )
-
     try:
         agent_relative = agent_checkout.relative_to(consumer).as_posix()
         consumer_relative = consumer.relative_to(authority).as_posix()
@@ -16595,7 +16635,124 @@ def _frozen_validation_authority_commit(config: Config) -> tuple[Path, str]:
         raise Refusal(
             "enclosing checkout HEAD differs from the outer authority's pinned Gitlink"
         )
+    authority_common = _trusted_git_directory(
+        authority,
+        ("rev-parse", "--path-format=absolute", "--git-common-dir"),
+        label="outer authority common Git directory",
+    )
+    config_common = _trusted_git_directory(
+        config.root,
+        ("rev-parse", "--path-format=absolute", "--git-common-dir"),
+        label="frozen validation recovery common Git directory",
+    )
+    if config_common != authority_common:
+        try:
+            _authenticate_frozen_tool_state_root(
+                config, authority, consumer, agent_checkout,
+                authority_head, consumer_head, agent_head,
+            )
+        except Refusal as exc:
+            raise Refusal(
+                "frozen validation recovery project root does not share the authenticated "
+                "outer authority Git repository; sealed separate-clone authority refused: "
+                f"{exc}"
+            ) from exc
     return authority, authority_head
+
+
+def _authenticate_frozen_tool_state_root(
+    config: Config,
+    authority: Path,
+    consumer: Path,
+    agent_checkout: Path,
+    authority_head: str,
+    consumer_head: str,
+    agent_head: str,
+) -> None:
+    """Bind a separate state clone through the pinned sealed-tool verifier."""
+
+    relative = _FROZEN_TOOL_AUTHORITY_MODULE
+    _stored, module_path = _relative_inside(authority, relative, "tool authority module")
+
+    def pinned_bytes() -> bytes:
+        working = _read_bounded_regular_file(module_path, "tool authority module", 1024 * 1024)
+        pinned = _trusted_git_capture(
+            authority, ("cat-file", "blob", f"{authority_head}:{relative}"),
+            label="pinned tool authority module",
+        )
+        if working != pinned:
+            raise Refusal("tool authority module differs from authenticated HEAD")
+        return pinned
+
+    def directory_identity(path: Path) -> tuple[int, int]:
+        metadata = path.lstat()
+        if not stat.S_ISDIR(metadata.st_mode) or path.resolve(strict=True) != path:
+            raise Refusal("tool authority and state must remain canonical directories")
+        return metadata.st_dev, metadata.st_ino
+
+    try:
+        root_identity = directory_identity(authority)
+        state_identity = directory_identity(config.root)
+        payload = pinned_bytes()
+        python = _root_owned_executable(Path("/usr/bin/python3").resolve(strict=True), "Python")
+    except OSError as exc:
+        raise Refusal(f"cannot inspect sealed tool authority: {exc}") from exc
+    expected = {
+        "authority_head": authority_head, "consumer_head": consumer_head,
+        "agent_head": agent_head, "state_root": str(config.root),
+        "root_dev": root_identity[0], "root_ino": root_identity[1],
+        "state_dev": state_identity[0], "state_ino": state_identity[1],
+    }
+    # Pass only protocol metadata as data, never ambient interpreter/loader
+    # settings. The pinned module selects and verifies its own exact names.
+    environment = {
+        name: value for name, value in os.environ.items()
+        if re.fullmatch(r"[A-Z0-9_]+_TOOL_(AUTHORITY|ROOT|[A-Z0-9_]+_SHA|[A-Z0-9_]+_SHA256)", name)
+    }
+    request = json.dumps({"environment": environment, "expected": expected}).encode()
+    with tempfile.TemporaryDirectory(prefix="wrkslots-tool-authority-") as raw_temp:
+        directory = Path(raw_temp)
+        directory.chmod(0o700)
+        snapshot = directory / "immutable_tool_authority.py"
+        descriptor = os.open(snapshot, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600)
+        try:
+            view = memoryview(payload)
+            while view:
+                written = os.write(descriptor, view)
+                view = view[written:]
+            os.fchmod(descriptor, 0o400)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        directory.chmod(0o500)
+        try:
+            returncode, stdout, stderr = _run_bounded_read_only_command(
+                (str(python.path), "-I", "-B", "-c", _FROZEN_TOOL_AUTHORITY_BOOTSTRAP, str(snapshot)),
+                timeout_seconds=15, stdout_limit=16 * 1024, stderr_limit=16 * 1024,
+                input_data=request, trusted_executables=(python,),
+            )
+        finally:
+            directory.chmod(0o700)
+    _recheck_trusted_executable(python)
+    try:
+        if directory_identity(authority) != root_identity or directory_identity(config.root) != state_identity:
+            raise Refusal("tool authority or state root changed during inspection")
+        if pinned_bytes() != payload:
+            raise Refusal("pinned tool authority changed during inspection")
+    except OSError as exc:
+        raise Refusal(f"sealed tool authority changed during inspection: {exc}") from exc
+    for checkout, head in ((authority, authority_head), (consumer, consumer_head), (agent_checkout, agent_head)):
+        if _trusted_git_head(checkout, "sealed tool repository recheck") != head:
+            raise Refusal("sealed tool repository HEAD changed during inspection")
+    if returncode != 0 or stderr:
+        detail = stderr.decode("utf-8", errors="replace").strip()
+        raise Refusal(f"pinned sealed tool verifier refused the state-root binding: {detail}")
+    try:
+        result = json.loads(stdout)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise Refusal("pinned sealed tool verifier returned invalid JSON") from exc
+    if result != expected:
+        raise Refusal("pinned sealed tool verifier did not confirm the exact loaded authority")
 
 
 def _authenticated_frozen_parser_blobs(
