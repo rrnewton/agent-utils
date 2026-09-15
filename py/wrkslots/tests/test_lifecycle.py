@@ -1294,10 +1294,14 @@ def prepare_validation_removal_proof(
             "validation-service-result-schema_version: historical schema "
             f"{schema_version} is readable but has no current authority"
         )
-    elif schema_version == 5 or record.get("kind") == "frozen-validate":
+    elif schema_version >= 5 or record.get("kind") == "frozen-validate":
         record["detail"] = None
     else:
         record.pop("detail", None)
+    if schema_version >= 6:
+        record["could_not_run_kind"] = None
+    else:
+        record.pop("could_not_run_kind", None)
     if registered_checkout:
         record["wrkslots_slot"] = slot
         record["wrkslots_generation"] = generation
@@ -1312,6 +1316,7 @@ def prepare_validation_removal_proof(
         "profile": "full",
         "selection_mode": "full",
         "final_validate_status": "PASSED",
+        "could_not_run_kind": None,
         "detail": None,
         "exit_code": 0,
         "executed_nodes": 1,
@@ -1464,6 +1469,20 @@ def validation_service_result_schema(schema_version: int = 4) -> dict[str, objec
             "passed_tests",
             "scorecard_writeback",
         ],
+        6: [
+            "schema_version",
+            "commit",
+            "profile",
+            "selection_mode",
+            "final_validate_status",
+            "could_not_run_kind",
+            "detail",
+            "exit_code",
+            "executed_nodes",
+            "executed_tests",
+            "passed_tests",
+            "scorecard_writeback",
+        ],
     }[schema_version]
     exit_field = "exit_code" if schema_version == 1 else "validation_exit_code"
     result: dict[str, object] = {
@@ -1486,6 +1505,12 @@ def validation_service_result_schema(schema_version: int = 4) -> dict[str, objec
                 "completed": ["status"],
                 "failed": ["status", "error"],
             },
+        }
+    if schema_version >= 6:
+        result["could_not_run_kind"] = {
+            "nullable": True,
+            "required_for": "COULD_NOT_RUN",
+            "variants": ["no_result", "refused", "interrupted"],
         }
     return result
 
@@ -7466,6 +7491,11 @@ def current_terminal_validation_record(
     }
     if schema == 5:
         record["detail"] = "guest execution failed" if status == "COULD_NOT_RUN" else None
+    elif schema == 6:
+        record["detail"] = "guest execution failed" if status == "COULD_NOT_RUN" else None
+        record["could_not_run_kind"] = (
+            "no_result" if status == "COULD_NOT_RUN" else None
+        )
     return record
 
 
@@ -7476,7 +7506,7 @@ def test_current_validation_record_requires_authoritative_counts() -> None:
     mutations: tuple[tuple[str, object], ...] = (
         ("service_result_schema", 4.0),
         ("service_result_schema", True),
-        ("service_result_schema", 6),
+        ("service_result_schema", 7),
         ("exit_code", False),
         ("exit_code", 0.0),
         ("passed_tests", None),
@@ -7557,6 +7587,117 @@ def test_schema_five_terminal_record_requires_status_appropriate_detail() -> Non
     assert not wrkslots._validation_record_is_terminal(
         passed, target_kind="cargo-home"
     )
+
+
+@pytest.mark.parametrize(
+    "kind", ("no_result", "refused", "interrupted")
+)
+def test_schema_six_terminal_record_requires_exact_could_not_run_kind(
+    kind: str,
+) -> None:
+    record = current_terminal_validation_record(schema=6, status="COULD_NOT_RUN")
+    record["could_not_run_kind"] = kind
+    assert wrkslots._validation_record_is_terminal(record, target_kind="cargo-home")
+
+    bad_kinds: tuple[object, ...] = (None, "", "future", True, 6, [], {})
+    for bad in bad_kinds:
+        changed = dict(record)
+        changed["could_not_run_kind"] = bad
+        assert not wrkslots._validation_record_is_terminal(
+            changed, target_kind="cargo-home"
+        ), bad
+    missing = dict(record)
+    del missing["could_not_run_kind"]
+    assert not wrkslots._validation_record_is_terminal(
+        missing, target_kind="cargo-home"
+    )
+
+    passed = current_terminal_validation_record(schema=6)
+    assert wrkslots._validation_record_is_terminal(passed, target_kind="cargo-home")
+    passed["could_not_run_kind"] = "no_result"
+    assert not wrkslots._validation_record_is_terminal(
+        passed, target_kind="cargo-home"
+    )
+
+
+@pytest.mark.parametrize(
+    "kind", ("no_result", "refused", "interrupted")
+)
+def test_schema_six_projection_preserves_exact_could_not_run_kind(
+    kind: str,
+) -> None:
+    payload = {
+        "schema_version": 6,
+        "commit": "a" * 40,
+        "profile": "full",
+        "selection_mode": "full",
+        "final_validate_status": "COULD_NOT_RUN",
+        "could_not_run_kind": kind,
+        "detail": [f"exact {kind} reason"],
+        "exit_code": 75,
+        "executed_nodes": 0,
+        "executed_tests": None,
+        "passed_tests": None,
+        "scorecard_writeback": None,
+    }
+    projection = wrkslots._validation_service_result_projection(
+        json.dumps(payload).encode(),
+        schema=6,
+        schema_fields=wrkslots._VALIDATION_SERVICE_RESULT_FIELDS[6],
+        expected_commit="a" * 40,
+    )
+    assert projection["could_not_run_kind"] == kind
+    assert projection["detail"] == f"exact {kind} reason"
+    for duplicate in (
+        '"could_not_run_kind": "refused"',
+        '"detail": ["different reason"]',
+        '"schema_version": 6',
+    ):
+        repeated = json.dumps(payload)[:-1] + "," + duplicate + "}"
+        with pytest.raises(wrkslots.Refusal, match="duplicate"):
+            wrkslots._validation_service_result_projection(
+                repeated.encode(),
+                schema=6,
+                schema_fields=wrkslots._VALIDATION_SERVICE_RESULT_FIELDS[6],
+                expected_commit="a" * 40,
+            )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "value", "message"),
+    (
+        ("could_not_run_kind", None, "requires a recognized could_not_run_kind"),
+        ("could_not_run_kind", "future", "requires a recognized could_not_run_kind"),
+        ("could_not_run_kind", [], "requires a recognized could_not_run_kind"),
+        ("could_not_run_kind", {}, "requires a recognized could_not_run_kind"),
+        ("detail", None, "COULD_NOT_RUN requires detail"),
+    ),
+)
+def test_schema_six_projection_refuses_incomplete_could_not_run_cause(
+    mutation: str, value: object, message: str
+) -> None:
+    payload = {
+        "schema_version": 6,
+        "commit": "a" * 40,
+        "profile": "full",
+        "selection_mode": "full",
+        "final_validate_status": "COULD_NOT_RUN",
+        "could_not_run_kind": "no_result",
+        "detail": ["exact no-result reason"],
+        "exit_code": 75,
+        "executed_nodes": 0,
+        "executed_tests": None,
+        "passed_tests": None,
+        "scorecard_writeback": None,
+    }
+    payload[mutation] = value
+    with pytest.raises(wrkslots.Refusal, match=message):
+        wrkslots._validation_service_result_projection(
+            json.dumps(payload).encode(),
+            schema=6,
+            schema_fields=wrkslots._VALIDATION_SERVICE_RESULT_FIELDS[6],
+            expected_commit="a" * 40,
+        )
 
 
 @pytest.mark.parametrize(
@@ -10548,13 +10689,19 @@ def test_validate_remove_accepts_exact_validation_removal_proof(
     assert active_slots(project) == []
 
 
-def test_validate_remove_accepts_schema_five_no_result_detail_projection(
+@pytest.mark.parametrize(
+    ("schema_version", "could_not_run_kind"),
+    ((5, None), (6, "refused")),
+)
+def test_validate_remove_accepts_current_no_result_detail_projection(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    schema_version: int,
+    could_not_run_kind: str | None,
 ) -> None:
     project, repository, _remote = make_project(tmp_path)
-    commit_validation_removal_schema(repository, schema_version=5)
+    commit_validation_removal_schema(repository, schema_version=schema_version)
     slot_path = prepare_dead_validate_slots(project, ("slot01",))["slot01"]
     manifest, artifacts = prepare_validation_removal_proof(project, "slot01")
 
@@ -10586,6 +10733,9 @@ def test_validate_remove_accepts_schema_five_no_result_detail_projection(
             "passed_tests": None,
         }
     )
+    if schema_version == 6:
+        record_value["could_not_run_kind"] = could_not_run_kind
+        result_value["could_not_run_kind"] = could_not_run_kind
     artifacts["run-record"].write_text(
         json.dumps(record_value, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",

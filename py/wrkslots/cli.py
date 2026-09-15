@@ -109,6 +109,28 @@ _VALIDATION_SERVICE_RESULT_FIELDS = {
         "passed_tests",
         "scorecard_writeback",
     ),
+    6: (
+        "schema_version",
+        "commit",
+        "profile",
+        "selection_mode",
+        "final_validate_status",
+        "could_not_run_kind",
+        "detail",
+        "exit_code",
+        "executed_nodes",
+        "executed_tests",
+        "passed_tests",
+        "scorecard_writeback",
+    ),
+}
+_VALIDATION_COULD_NOT_RUN_KINDS = frozenset(
+    {"no_result", "refused", "interrupted"}
+)
+_VALIDATION_COULD_NOT_RUN_KIND_SCHEMA = {
+    "nullable": True,
+    "required_for": "COULD_NOT_RUN",
+    "variants": ["no_result", "refused", "interrupted"],
 }
 _VALIDATION_RESULT_OUTCOMES = {
     "PASSED": ("success", 0),
@@ -1529,7 +1551,7 @@ def _validation_removal_record_fields(
     if (
         not isinstance(schema, int)
         or isinstance(schema, bool)
-        or schema not in {1, 2, 3, 4, 5}
+        or schema not in _VALIDATION_SERVICE_RESULT_FIELDS
     ):
         raise Refusal(
             "validation removal run-record has no supported service-result identity"
@@ -1621,6 +1643,8 @@ def _validation_service_result_schema(
     expected_schema_keys = {"schema_version", "fields", "outcomes"}
     if schema >= 2:
         expected_schema_keys.add("scorecard_writeback")
+    if schema >= 6:
+        expected_schema_keys.add("could_not_run_kind")
     outcome_exit_field = "exit_code" if schema == 1 else "validation_exit_code"
     expected_outcomes = {
         "PASSED": {
@@ -1650,6 +1674,13 @@ def _validation_service_result_schema(
             and not _json_equal(
                 producer_schema.get("scorecard_writeback"),
                 _VALIDATION_SCORECARD_WRITEBACK_SCHEMA,
+            )
+        )
+        or (
+            schema >= 6
+            and not _json_equal(
+                producer_schema.get("could_not_run_kind"),
+                _VALIDATION_COULD_NOT_RUN_KIND_SCHEMA,
             )
         )
     ):
@@ -1800,7 +1831,7 @@ def _validation_service_result_projection(
                 "validation removal service-result PASSED counts disagree"
             )
         projection["passed_tests"] = passed_tests
-    if schema == 5:
+    if schema >= 5:
         detail = service_result.get("detail")
         if detail is not None:
             if (
@@ -1816,12 +1847,33 @@ def _validation_service_result_projection(
                     "validation removal service-result detail violates its schema"
                 )
             projection["detail"] = "\n".join(detail)
-        elif status == "COULD_NOT_RUN":
+        elif status == "COULD_NOT_RUN" and schema == 5:
             projection["detail"] = (
                 "validation reported COULD_NOT_RUN without detail"
             )
+        elif status == "COULD_NOT_RUN":
+            raise Refusal(
+                "validation removal service-result COULD_NOT_RUN requires detail"
+            )
         else:
             projection["detail"] = None
+    if schema >= 6:
+        could_not_run_kind = service_result.get("could_not_run_kind")
+        if status == "COULD_NOT_RUN":
+            if (
+                not isinstance(could_not_run_kind, str)
+                or could_not_run_kind not in _VALIDATION_COULD_NOT_RUN_KINDS
+            ):
+                raise Refusal(
+                    "validation removal service-result COULD_NOT_RUN requires a "
+                    "recognized could_not_run_kind"
+                )
+        elif could_not_run_kind is not None:
+            raise Refusal(
+                "validation removal service-result non-COULD_NOT_RUN outcome must "
+                "carry null could_not_run_kind"
+            )
+        projection["could_not_run_kind"] = could_not_run_kind
     return projection
 
 
@@ -17032,7 +17084,7 @@ def _current_validation_result_is_terminal(
         passed_tests is None or passed_tests != executed_tests
     ):
         return False
-    if schema == 5:
+    if schema in {5, 6}:
         if "detail" not in record:
             return False
         detail = record.get("detail")
@@ -17042,6 +17094,20 @@ def _current_validation_result_is_terminal(
         elif detail is not None:
             return False
     elif "detail" in record:
+        return False
+    if schema == 6:
+        if "could_not_run_kind" not in record:
+            return False
+        could_not_run_kind = record.get("could_not_run_kind")
+        if status == "COULD_NOT_RUN":
+            if (
+                not isinstance(could_not_run_kind, str)
+                or could_not_run_kind not in _VALIDATION_COULD_NOT_RUN_KINDS
+            ):
+                return False
+        elif could_not_run_kind is not None:
+            return False
+    elif "could_not_run_kind" in record:
         return False
     if (
         status == "PASSED"
@@ -17152,12 +17218,12 @@ def _validation_record_is_terminal(
     if schema is not None and (
         not isinstance(schema, int)
         or isinstance(schema, bool)
-        or schema not in {1, 2, 3, 4, 5}
+        or schema not in _VALIDATION_SERVICE_RESULT_FIELDS
     ):
         return False
     if schema in {1, 2}:
         expected_exit = None
-    elif schema in {4, 5} and isinstance(status, str):
+    elif schema in {4, 5, 6} and isinstance(status, str):
         return _current_validation_result_is_terminal(
             record, schema=schema, status=status
         )
