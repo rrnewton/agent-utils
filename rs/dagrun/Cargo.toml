@@ -20,6 +20,9 @@ authors.workspace = true
 # `float_roundtrip` makes serde_json's float PARSER correctly rounded, so a float literal loads to
 # the exact f64 represented by the input — a prerequisite for byte-identical re-emission.
 serde_json = { version = "1", features = ["float_roundtrip"] }
+# A manual Deserialize visitor rejects duplicate structured-result keys before
+# serde_json::Value could overwrite their original evidence. No derive macros.
+serde = "1"
 # YAML interchange (FEATURE: YAML is isomorphic to the JSON schema). serde_yaml is ARCHIVED;
 # serde_norway is its maintained, actively-updated fork keeping the same serde API and YAML 1.2
 # core-schema semantics. We deserialize YAML directly into `serde_json::Value` so the YAML path

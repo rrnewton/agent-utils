@@ -333,8 +333,9 @@ def test_run_exit_codes() -> None:
         assert _capture(["run", "--dag", str(bad), "-q", _ACF])[0] == 1
 
 
+@pytest.mark.parametrize("schema", [2, 3])
 def test_structured_result_descriptor_lists_but_run_refuses_before_execution(
-    tmp_path: Path,
+    tmp_path: Path, schema: int,
 ) -> None:
     marker = tmp_path / "ran"
     dag = tmp_path / "structured.json"
@@ -349,7 +350,7 @@ def test_structured_result_descriptor_lists_but_run_refuses_before_execution(
                         "result_manifests": [
                             {
                                 "kind": "structured-test-results",
-                                "schema": 2,
+                                "schema": schema,
                                 "path_env": "DAGRUN_TEST_COUNTS_PATH",
                                 "owner": "test.counts",
                             }

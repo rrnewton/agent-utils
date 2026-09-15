@@ -1494,9 +1494,9 @@ LOADER_REFUSALS: tuple[tuple[str, str, str], ...] = (
     (
         "wrong-structured-result-schema",
         '{"steps":[{"group":"test","job":"counts","cmd":"true",'
-        '"result_manifests":[{"kind":"structured-test-results","schema":3,'
+        '"result_manifests":[{"kind":"structured-test-results","schema":4,'
         '"path_env":"DAGRUN_TEST_COUNTS_PATH","owner":"test.counts"}]}]}',
-        "steps[0].result_manifests[0].schema: structured test results require retained schema 2 or current schema 2, got 3",
+        "steps[0].result_manifests[0].schema: structured test results require default schema 2 or classified schema 3, got 4",
     ),
     (
         "wrong-structured-result-path",
@@ -1583,6 +1583,12 @@ LOADER_REFUSALS: tuple[tuple[str, str, str], ...] = (
 #: the near-miss of a refusal: the boundary is the part that is easy to get wrong in only one
 #: edition.
 LOADER_ACCEPTANCES: tuple[tuple[str, str], ...] = (
+    (
+        "classified-result-schema-is-explicit",
+        '{"steps":[{"group":"test","job":"counts","cmd":"true",'
+        '"result_manifests":[{"kind":"structured-test-results","schema":3,'
+        '"path_env":"DAGRUN_TEST_COUNTS_PATH","owner":"test.counts"}]}]}',
+    ),
     (
         "every-declared-step-field",
         '{"steps":[{"group":"a","job":"one","desc":"d","description":"long","cmd":"true",'

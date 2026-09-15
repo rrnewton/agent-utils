@@ -13,7 +13,9 @@ use std::process::Command;
 /// via a distinct TIMEOUT reason instead of hanging.
 const CPU_DAG: &str = r#"{"steps": [{"group": "cpu", "job": "burn", "desc": "burn CPU past budget",
   "cmd": "while :; do :; done",
-  "cpu_timeout": 1, "timeout": 30}]}"#;
+  "cpu_timeout": 1, "timeout": 30,
+  "result_manifests": [{"kind":"structured-test-results","schema":3,
+    "path_env":"DAGRUN_TEST_COUNTS_PATH","owner":"cpu.burn"}]}]}"#;
 
 #[test]
 fn boxing_cpu_timeout_reaps_a_step_past_its_budget() {
@@ -53,6 +55,12 @@ fn boxing_cpu_timeout_reaps_a_step_past_its_budget() {
         Some(1),
         "boxed run should FAIL (exit 1) when the step exceeds its CPU-time budget; got {code:?}\n\
          {combined}"
+    );
+    assert!(
+        combined.contains(
+            "STRUCTURED TEST RESULTS REFUSED: required structured test results were not written"
+        ),
+        "the required-result refusal must survive beside the real CPU timeout:\n{combined}"
     );
     assert!(
         combined.contains("CPU-TIMEOUT"),
