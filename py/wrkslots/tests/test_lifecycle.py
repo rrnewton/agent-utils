@@ -11868,7 +11868,21 @@ def test_validate_batch_shared_census_explicitly_omits_owner_cgroups(
     assert report["removed"] == [{"generation": 1, "slot": "slot01"}]
 
 
-def test_incomplete_owner_cgroup_census_refuses_owner_check(tmp_path: Path) -> None:
+def test_incomplete_owner_cgroup_census_refuses_only_when_it_will_compare(
+    tmp_path: Path,
+) -> None:
+    """Missing evidence is a reason to refuse only for evidence still consulted.
+
+    ⚠️ THIS ASSERTION WAS NARROWED, and it used to be
+    test_incomplete_owner_cgroup_census_refuses_owner_check, which refused for
+    the dead-owner case below. That became wrong when the owner-cgroup
+    comparison stopped being made for a proven-dead owner: the census was then
+    refusing for the absence of evidence it was no longer going to look at.
+
+    The live-owner half is the control, and it is the reason this is a
+    narrowing rather than a deletion -- where the comparison will still be
+    made, an incomplete census still refuses.
+    """
     project, _repository, _remote = make_project(tmp_path)
     prepare_dead_validate_slots(project, ("slot01",))
     config = wrkslots._load_config(str(project), "testhost")
@@ -11877,11 +11891,13 @@ def test_incomplete_owner_cgroup_census_refuses_owner_check(tmp_path: Path) -> N
     census = wrkslots._ProcessPathCensus(
         (), (), owner_cgroup_complete=False
     )
+    slot = wrkslots._slot_directory(config, "slot01", "validate")
 
+    census.assert_slot_unused(slot, record)
+
+    live = replace(record, owner=wrkslots._read_process_identity(os.getpid()))
     with pytest.raises(wrkslots.Refusal, match="omitted owner-cgroup evidence"):
-        census.assert_slot_unused(
-            wrkslots._slot_directory(config, "slot01", "validate"), record
-        )
+        census.assert_slot_unused(slot, live)
 
 
 def test_process_census_ignores_only_the_invoking_process_ancestry(
@@ -13071,9 +13087,30 @@ def test_validate_batch_refused_finish_retains_all_sidecar_targets(
     }
 
 
-def test_agent_remove_still_refuses_dead_owner_cgroup_with_live_process(
+def test_agent_remove_ignores_a_dead_owner_cgroup_with_a_live_process(
     tmp_path: Path,
 ) -> None:
+    """An agent slot whose exact owner generation is dead is no longer stranded.
+
+    ⚠️ THIS ASSERTION WAS DELIBERATELY REVERSED, and the previous one is worth
+    reading before trusting this one. It was
+    test_agent_remove_still_refuses_dead_owner_cgroup_with_live_process, and it
+    pinned the opposite outcome on purpose: the change that introduced the
+    "omit the recorded cgroup comparison once the exact generation is proven
+    dead" rule applied it only to disposable checkouts, and this test existed
+    to prove the rule had not leaked into ordinary agent slots.
+
+    It is reversed on measurement rather than on preference. On one host the
+    comparison blocked 135 slots; in 131 of them the live process supplying the
+    refusal touched nothing in the checkout -- not cwd, not root, not exe, not
+    any open descriptor -- because a coarse sandbox scope outlives the agent
+    that ran in it, and one surviving process stood in for as many as 50 slots.
+    The four slots that were genuinely in use are caught by the direct-use
+    test, which is unchanged and still runs here.
+
+    What still refuses is covered by the tests around this one: a live owner
+    generation, a slot in direct use, an unread handoff, a hold.
+    """
     project, repository, _remote = make_project(tmp_path)
     made = create(project)
     assert made.returncode == 0, made.stderr
@@ -13084,12 +13121,12 @@ def test_agent_remove_still_refuses_dead_owner_cgroup_with_live_process(
     mark_owner_dead_in_current_cgroup(project)
     set_liveness(project, "dead")
 
-    refused = remove(project)
+    removed = remove(project)
 
-    assert refused.returncode == 3
-    assert "remains in recorded owner cgroup" in refused.stderr
-    assert tree.is_dir()
-    assert active_slots(project)
+    assert removed.returncode == 0, removed.stderr
+    assert "remains in recorded owner cgroup" not in removed.stderr
+    assert not tree.exists()
+    assert not active_slots(project)
 
 
 def test_recover_resumes_dead_validate_owner_cleanup_from_shared_cgroup(

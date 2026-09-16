@@ -7465,6 +7465,45 @@ def _host_id() -> str:
     raise Refusal(f"cannot establish the stable machine identity{detail}")
 
 
+# The machine's own PID 1 and PID 2, recognised by cgroup rather than by number.
+#
+# ⚠️ THE NUMBER ALONE IS THE WRONG TEST, and this was measured rather than
+# reasoned about: a first version of this guard refused PID 1 and 2 outright
+# and broke the process-and-git stress suite, which runs its whole harness
+# under `unshare --pid --fork --mount-proc` where the runner legitimately IS
+# PID 1. Inside such a namespace PID 1 is an ordinary process sitting in an
+# ordinary session scope, its identity is coherent with every other identity
+# recorded in that namespace, and refusing it would forbid a supported way to
+# run. So the guard asks what the process IS, not what it is numbered.
+#
+# Measured on one host: the machine's init is PID 1 in "/init.scope" with 131
+# start ticks; the kernel thread daemon is PID 2 in "/". Inside the namespace
+# above, PID 1 reports the caller's own session scope instead -- so the two
+# cases are distinguishable, and only the first is refused.
+#
+# ⚠️ THIS IS A WRITE-TIME GUARD BECAUSE THE READ-TIME CHECKS ARE CORRECT AND
+# CANNOT HELP. Liveness compares the recorded generation against the live one.
+# If the recorded generation IS the machine's init, that comparison answers
+# "alive" for as long as the machine is up, so the slot can never be reclaimed
+# and nothing downstream can tell it from a real owner. 17 rows of a 252-slot
+# registry were in exactly that state.
+#
+# A related population is NOT refused here, deliberately: 2 rows record PID 1
+# with a real agent's start ticks and sandbox scope, which is a process that
+# read /proc/1 from inside its own PID namespace and faithfully recorded
+# itself. Those are namespace-local rather than wrong, and when compared from
+# the host they resolve to "dead" rather than sticking -- so they are
+# decidable, and refusing them is not this guard's job.
+#
+# Where the signature does not hold -- an init outside "/init.scope" -- this
+# degrades to the previous behaviour of accepting the identity, never to a
+# false refusal.
+_MACHINE_LEVEL_PROCESSES = {
+    1: ("the machine's init process", "/init.scope"),
+    2: ("the kernel thread daemon", "/"),
+}
+
+
 def _read_process_identity(pid: int, *, proc_root: Path = Path("/proc")) -> ProcessIdentity:
     if pid <= 0:
         raise Refusal("owner PID must be positive")
@@ -7473,6 +7512,16 @@ def _read_process_identity(pid: int, *, proc_root: Path = Path("/proc")) -> Proc
     if process_stat is None:
         raise Refusal(f"owner PID {pid} is not live")
     cgroup_path = _read_process_cgroup(pid_dir)
+    machine_level = _MACHINE_LEVEL_PROCESSES.get(pid)
+    if machine_level is not None and cgroup_path == machine_level[1]:
+        raise Refusal(
+            f"PID {pid} is {machine_level[0]}, which can never own, coordinate or act "
+            "on a slot; recording it would store an identity that stays live until the "
+            "machine reboots, so the slot could never be reclaimed and no later check "
+            "could tell it from a real owner. remedy: pass the PID of the real process "
+            "-- if the caller is PID 1 inside its own PID namespace this refusal does "
+            "not apply to it, because such a process is not this machine's init"
+        )
     return ProcessIdentity(
         pid=pid,
         start_ticks=process_stat.start_ticks,
@@ -7480,6 +7529,45 @@ def _read_process_identity(pid: int, *, proc_root: Path = Path("/proc")) -> Proc
         host_id=_host_id(),
         cgroup_path=cgroup_path,
     )
+
+
+def _owner_cgroup_is_evidence(record: ActiveRecord | None) -> bool:
+    """Whether a live process sharing the recorded owner cgroup says anything about this slot.
+
+    A cgroup is a container, not an identity. When the recorded owner's exact
+    process generation is PROVEN DEAD, a live process sitting in the same
+    cgroup is by construction not that owner, so refusing on its presence
+    reports cohabitation as ownership.
+
+    ⚠️ MEASURED, on one host with 252 registered slots and 3,619 live
+    processes: this comparison blocked 135 slots. Four had a live process in
+    the recorded cgroup that actually touched the checkout -- and every one of
+    those four is caught independently by the direct-use test, which looks at
+    cwd, root, exe and open descriptors. The remaining 131 were vouched for by
+    a process that touched nothing in them. Two coarse sandbox scopes supplied
+    97 of the 135, one live process standing in for 50 slots and another for
+    47, because such a scope outlives the agent that ran inside it.
+
+    ⚠️ THIS DELIBERATELY RETIRES A GUARD, and the narrowing is the one already
+    accepted elsewhere in this file rather than a new idea: the same "omit the
+    recorded cgroup comparison once the exact generation is proven dead" rule
+    was introduced for disposable checkouts and scoped out of ordinary agent
+    slots at the time. The reasoning given then -- that unrelated live
+    processes in a coarse shared cgroup must not strand a checkout
+    indefinitely -- holds identically here; only the blast radius differed.
+    What is NOT retired: the direct-use test, the handoff and hold guards, the
+    registered-liveness authority, and the requirement that the recorded owner
+    generation be proven dead in the first place. This function is reached
+    only after that requirement is already satisfied.
+
+    The residual risk, stated rather than dismissed: an orphaned child of the
+    dead owner still working inside the slot through absolute paths while
+    holding no descriptor would no longer be seen here. It would still have to
+    evade the direct-use test to go unnoticed.
+    """
+    if record is None or record.owner is None:
+        return False
+    return _process_state(record.owner)[0] != "dead"
 
 
 def _read_process_cgroup(pid_dir: Path) -> str:
@@ -8120,6 +8208,9 @@ def _assert_slot_unused(
             ancestor = _read_process_parent(ancestor)
     inspected_mount_namespaces: set[str] = set()
     indeterminate_use: Refusal | None = None
+    # Resolved once: it describes the record, not the process being inspected,
+    # and asking per PID would read the owner's /proc entry thousands of times.
+    owner_cgroup_is_evidence = _owner_cgroup_is_evidence(record)
     for pid_dir in sorted(pid_dirs, key=lambda item: int(item.name)):
         pid = int(pid_dir.name)
         if pid == current_pid or pid in invoking_ancestry:
@@ -8127,7 +8218,7 @@ def _assert_slot_unused(
         uids = _process_uids(pid_dir)
         if uids is None:
             continue
-        if record is not None and record.owner is not None:
+        if owner_cgroup_is_evidence and record is not None and record.owner is not None:
             try:
                 cgroup = _read_process_cgroup(pid_dir)
             except Refusal as exc:
@@ -20458,7 +20549,9 @@ def _assert_absent_agent_liveness(
             )
     rows = ((record, tuple(paths)),)
     processes = _assert_absent_validate_processes_unrelated(rows)
-    if record.owner is not None:
+    # The refusal directly above already required a proven-dead owner, so this
+    # comparison could only ever have fired on a process that is not the owner.
+    if _owner_cgroup_is_evidence(record) and record.owner is not None:
         for process in processes:
             if _cgroup_matches(record.owner.cgroup_path, process.cgroup_path):
                 raise Refusal(
@@ -22273,11 +22366,15 @@ class _ProcessPathCensus:
             record is not None
             and record.owner is not None
             and not self.owner_cgroup_complete
+            # Incomplete evidence is only a problem for evidence that is still
+            # consulted. Without this the census would refuse for the absence
+            # of a comparison it is no longer going to make.
+            and _owner_cgroup_is_evidence(record)
         ):
             raise Refusal(
                 "process census omitted owner-cgroup evidence required for this slot"
             )
-        if record is not None and record.owner is not None:
+        if _owner_cgroup_is_evidence(record) and record is not None and record.owner is not None:
             for process in self.processes:
                 if process.pid in ignored:
                     continue

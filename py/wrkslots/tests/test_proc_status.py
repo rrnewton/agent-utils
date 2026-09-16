@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import errno
 import os
 import selectors
@@ -219,3 +220,91 @@ def test_direct_census_refuses_a_live_holder_after_fresh_status(
     with pytest.raises(cli.Refusal, match="live process .* uses slot"):
         cli._assert_slot_unused(slot, use_lsof=False, proc_root=proc_root)
     assert len(calls) == 2
+
+
+def test_the_machines_init_is_refused_as_a_process_identity() -> None:
+    """PID 1 must never be recorded as an owner, coordinator or actor.
+
+    ⚠️ THE READ-TIME CHECKS CANNOT CATCH THIS, which is why the guard is at
+    write time. Liveness compares the recorded generation against the live one,
+    and for the machine's init that comparison answers "alive" until reboot --
+    so a slot registered this way is unreclaimable and nothing downstream can
+    tell it from a genuine owner.
+
+    This runs against the real /proc rather than a fixture, because the
+    property being tested is about this machine's actual init.
+    """
+    if Path("/proc/1/cgroup").read_text(encoding="ascii").strip() != "0::/init.scope":
+        pytest.skip("this machine's init is not in /init.scope")
+    with pytest.raises(cli.Refusal) as refused:
+        cli._read_process_identity(1)
+    rendered = str(refused.value)
+    assert "the machine's init process" in rendered
+    assert "is not live" not in rendered
+
+
+def test_a_namespaced_pid_1_is_still_recorded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The guard asks what the process IS, not what it is numbered.
+
+    ⚠️ THIS IS THE CONTROL, AND IT IS NOT HYPOTHETICAL. A first version of this
+    guard refused PID 1 by number and broke the process-and-git stress suite,
+    which runs its whole harness under a PID namespace where the runner
+    legitimately is PID 1. Inside such a namespace PID 1 reports an ordinary
+    session scope, and it must still be recordable.
+    """
+    real = cli._read_process_cgroup
+
+    def session_scope(pid_dir: Path) -> str:
+        if pid_dir.name == "1":
+            return "/user.slice/user-1000.slice/session-3.scope"
+        return real(pid_dir)
+
+    monkeypatch.setattr(cli, "_read_process_cgroup", session_scope)
+    identity = cli._read_process_identity(1)
+    assert identity.pid == 1
+    assert identity.cgroup_path == "/user.slice/user-1000.slice/session-3.scope"
+
+
+def test_the_kernel_thread_daemon_is_refused_as_a_process_identity() -> None:
+    if Path("/proc/2/cgroup").read_text(encoding="ascii").strip() != "0::/":
+        pytest.skip("this machine's PID 2 is not the kernel thread daemon")
+    with pytest.raises(cli.Refusal) as refused:
+        cli._read_process_identity(2)
+    assert "the kernel thread daemon" in str(refused.value)
+
+
+def test_an_ordinary_live_pid_is_still_recorded() -> None:
+    """The guard must refuse two specific processes, not narrow registration."""
+    identity = cli._read_process_identity(os.getpid())
+    assert identity.pid == os.getpid()
+    assert identity.start_ticks > 0
+
+
+def test_a_live_owner_cgroup_is_still_evidence() -> None:
+    """The narrowing must be conditional, not a deletion.
+
+    ⚠️ THIS IS THE CONTROL FOR THE CGROUP NARROWING. The change it guards makes
+    a shared owner cgroup stop blocking reclaim once the recorded owner
+    generation is proven dead. If the condition were dropped rather than
+    narrowed, this test is what notices: a live recorded owner must still make
+    its cgroup count as evidence.
+    """
+    record = cli.ActiveRecord.__new__(cli.ActiveRecord)
+    object.__setattr__(record, "owner", cli._read_process_identity(os.getpid()))
+    assert cli._owner_cgroup_is_evidence(record) is True
+
+
+def test_a_dead_owner_cgroup_is_not_evidence() -> None:
+    live = cli._read_process_identity(os.getpid())
+    record = cli.ActiveRecord.__new__(cli.ActiveRecord)
+    # A boot that has ended is the cheapest proof of death available here, and
+    # it is the same one the lifecycle fixtures use.
+    object.__setattr__(record, "owner", dataclasses.replace(live, boot_id="finished-boot"))
+    assert cli._owner_cgroup_is_evidence(record) is False
+
+
+def test_no_recorded_owner_is_not_evidence() -> None:
+    record = cli.ActiveRecord.__new__(cli.ActiveRecord)
+    object.__setattr__(record, "owner", None)
+    assert cli._owner_cgroup_is_evidence(record) is False
+    assert cli._owner_cgroup_is_evidence(None) is False
