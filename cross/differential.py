@@ -9270,7 +9270,20 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
                 compare_stderr=True,
             )
 
-        plan = run(py, ("plan", *base_args, "--format", "json", "--batch"))
+        safety_args = ("plan", *base_args, "--format", "json", "--batch")
+        default_safety, _ = _record_exact(
+            rep, "representative:default-freshness", py, rs, safety_args, expected=0
+        )
+        # Preserve the safety table's rebase case under an explicit caller bound.
+        # The production default intentionally applies no freshness reroute.
+        plan, _ = _record_exact(
+            rep,
+            "representative:safety-actions-explicit-freshness",
+            py,
+            rs,
+            (*safety_args, "--freshness-max-behind", "0"),
+            expected=0,
+        )
         ok, parsed = _parsed_json(plan.stdout)
         actions: dict[int, str] = {}
         if ok and isinstance(parsed, dict):
@@ -9304,6 +9317,30 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
             rep.ok("representative:safety-actions")
         else:
             rep.bad("representative:safety-actions", f"expected={expected_actions}; got={actions}")
+
+        default_safety_ok, default_safety_payload = _parsed_json(default_safety.stdout)
+        default_safety_plan = (
+            default_safety_payload.get("plan")
+            if default_safety_ok and isinstance(default_safety_payload, dict)
+            else None
+        )
+        default_pr2_actions = (
+            [
+                decision.get("action")
+                for decision in default_safety_plan.get("per_pr_actions", [])
+                if isinstance(decision, dict) and decision.get("pr") == 2
+            ]
+            if isinstance(default_safety_plan, dict)
+            else []
+        )
+        default_lands_behind = default_pr2_actions == ["land-now"]
+        if default_safety.returncode == 0 and default_lands_behind:
+            rep.ok("representative:default-freshness-lands-behind")
+        else:
+            rep.bad(
+                "representative:default-freshness-lands-behind",
+                f"exit={default_safety.returncode}; land_now={default_lands_behind}",
+            )
 
         if ok and isinstance(parsed, dict):
             nodes = parsed.get("nodes")
@@ -9446,8 +9483,55 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
             "--format",
             "json",
         )
-        _record_exact(rep, "accept:soft-green-earlier-base", py, rs, soft_green_args)
-        soft_green = run(py, soft_green_args)
+        default_soft_green, _ = _record_exact(
+            rep, "accept:soft-green-earlier-base", py, rs, soft_green_args, expected=0
+        )
+        default_soft_ok, default_soft_payload = _parsed_json(default_soft_green.stdout)
+        default_soft_nodes = (
+            default_soft_payload.get("nodes")
+            if default_soft_ok and isinstance(default_soft_payload, dict)
+            else None
+        )
+        default_soft_plan = (
+            default_soft_payload.get("plan")
+            if default_soft_ok and isinstance(default_soft_payload, dict)
+            else None
+        )
+        default_soft_authority = isinstance(default_soft_nodes, list) and any(
+            isinstance(node, dict)
+            and node.get("pr") == 2
+            and node.get("validation_authority") == "soft-green"
+            for node in default_soft_nodes
+        )
+        default_soft_pr2_actions = (
+            [
+                decision.get("action")
+                for decision in default_soft_plan.get("per_pr_actions", [])
+                if isinstance(decision, dict) and decision.get("pr") == 2
+            ]
+            if isinstance(default_soft_plan, dict)
+            else []
+        )
+        default_soft_lands = default_soft_pr2_actions == ["land-now"]
+        if default_soft_green.returncode == 0 and default_soft_authority and default_soft_lands:
+            rep.ok("accept:soft-green-default-authority-lands-without-rebase")
+        else:
+            rep.bad(
+                "accept:soft-green-default-authority-lands-without-rebase",
+                f"exit={default_soft_green.returncode}; authority={default_soft_authority}; "
+                f"land_now={default_soft_lands}",
+            )
+
+        # Keep the original authority/rebase/no-revalidation oracle, now naming
+        # the caller policy that requests a rebase instead of changing the default.
+        soft_green, _ = _record_exact(
+            rep,
+            "accept:soft-green-explicit-freshness",
+            py,
+            rs,
+            (*soft_green_args, "--freshness-max-behind", "0"),
+            expected=0,
+        )
         soft_green_ok, soft_green_payload = _parsed_json(soft_green.stdout)
         soft_green_nodes = (
             soft_green_payload.get("nodes")
