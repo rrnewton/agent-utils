@@ -7969,7 +7969,15 @@ def _mount_namespace(pid_dir: Path) -> str | None:
 
 def _process_uids(pid_dir: Path) -> tuple[int, int, int, int] | None:
     try:
-        status = (pid_dir / "status").read_text(encoding="ascii")
+        try:
+            status = (pid_dir / "status").read_text(encoding="ascii")
+        except OSError as exc:
+            if exc.errno != errno.ESRCH:
+                raise
+            # A proc inode opened before reap can return ESRCH on read. Sample
+            # the pathname once more: a reused PID must expose its current UIDs,
+            # not be declared absent because the earlier generation exited.
+            status = (pid_dir / "status").read_text(encoding="ascii")
     except FileNotFoundError:
         return None
     except (OSError, UnicodeError) as exc:
