@@ -10,7 +10,7 @@ from typing import Iterator
 
 import pytest
 
-from herdr_run.foreign import agent_keeper, lib
+from herdr_run.foreign import agent_keeper, agent_runner, lib
 from herdr_run.client import AgentPaneInfo
 from herdr_run.errors import HerdrUnavailable
 
@@ -55,6 +55,40 @@ def test_mode_selection_prefers_call_then_environment_then_project(
     assert lib.selected_mode("codex", backend="tmux") == lib.HEADLESS_MODE
     assert "project default for codex selected mode 'tui'" in capsys.readouterr().err
     assert lib.selected_mode("agy", backend="tmux") == lib.HEADLESS_MODE
+
+
+@pytest.mark.parametrize(("setting", "expected"), [(None, False), ("0", False), ("1", True)])
+def test_codex_permissions_are_selected_at_launch_and_retained_for_later_turns(
+    fake_backend_state: Path, monkeypatch: pytest.MonkeyPatch, setting: str | None, expected: bool,
+) -> None:
+    fake_backend_state.mkdir(parents=True)
+    if setting is None:
+        monkeypatch.delenv("SUBAGENTS_CODEX_BYPASS_PERMISSIONS", raising=False)
+    else:
+        monkeypatch.setenv("SUBAGENTS_CODEX_BYPASS_PERMISSIONS", setting)
+    monkeypatch.setattr(lib, "backend_available", lambda backend: True)
+    monkeypatch.setattr(lib, "orphan_window_exists", lambda backend, name: False)
+    monkeypatch.setattr(lib, "gc", lambda: [])
+    monkeypatch.setattr(lib, "launch_window", lambda *args: "original:worker")
+    lib.bring_up_agent("worker", cwd=str(fake_backend_state), brief=None, backend="tmux", mode="headless")
+    rec = lib.read_registry()["worker"]
+    assert rec.codex_bypass_permissions is expected
+    monkeypatch.setenv("SUBAGENTS_CODEX_BYPASS_PERMISSIONS", "0" if expected else "1")
+    rec.session_id = "continued-session"
+    argv = agent_runner._build_codex_argv(rec, lib.Message(0, "next task", None, lib.now_iso()))
+    flag = "--dangerously-bypass-approvals-and-sandbox"
+    assert (flag in argv) is expected
+    assert (flag in lib._codex_tui_argv(None, bypass_permissions=rec.codex_bypass_permissions)) is expected
+
+
+@pytest.mark.parametrize("setting", ["", "true", "yes", "2"])
+def test_malformed_codex_permission_setting_fails_before_backend_access(
+    monkeypatch: pytest.MonkeyPatch, setting: str,
+) -> None:
+    monkeypatch.setenv("SUBAGENTS_CODEX_BYPASS_PERMISSIONS", setting)
+    monkeypatch.setattr(lib, "backend_available", lambda backend: pytest.fail("backend must remain untouched"))
+    with pytest.raises(lib.AgentOperationError, match="must be exactly 0"):
+        lib.bring_up_agent("worker", cwd="/work", brief=None, backend="tmux")
 
 
 def test_auto_detection_requires_herdr_environment_socket_and_live_server(
@@ -144,6 +178,7 @@ def test_old_registry_row_defaults_to_tmux_backend(fake_backend_state: Path) -> 
     )
     assert record.backend == "tmux"
     assert record.mode == lib.HEADLESS_MODE
+    assert record.codex_bypass_permissions is True
 
 
 def test_herdr_headless_runner_uses_the_owned_root_pane(
@@ -328,7 +363,7 @@ class _FakeSharedAgentClient:
         assert workspace_id == "wT"
         return lib.HERDR_WORKSPACE_LABEL
 
-    def run(self, pane_id: str, text: str) -> None:
+    def prompt_agent(self, pane_id: str, text: str) -> None:
         assert pane_id == "wT:p2"
         self.runs.append(text)
 
@@ -367,7 +402,6 @@ def test_codex_tui_resume_omits_stale_registry_model_when_session_metadata_is_mi
         "resume",
         "session-kept",
         "--no-alt-screen",
-        "--dangerously-bypass-approvals-and-sandbox",
     ]
 
 
@@ -396,7 +430,7 @@ def test_tui_mode_records_pane_and_delivers_initial_brief(
     delivered: list[str] = []
     probe = lib.TuiProbe(True, True, "idle", os.getpid())
     monkeypatch.setattr(lib, "backend_available", lambda backend: True)
-    monkeypatch.setattr(lib, "_launch_herdr_tui", lambda name, cwd, model: ("wT:t1", "wT:p2", probe))
+    monkeypatch.setattr(lib, "_launch_herdr_tui", lambda name, cwd, model, **kwargs: ("wT:t1", "wT:p2", probe))
     monkeypatch.setattr(lib, "_herdr_tui_probe", lambda pane_id: probe)
     monkeypatch.setattr(lib, "_deliver_tui_messages", lambda rec: delivered.append(rec.name))
 
@@ -1175,7 +1209,8 @@ def test_headless_to_tui_conversion_confirms_response_before_retiring_source(
     probe = lib.TuiProbe(True, True, "idle", 999_991)
 
     def launch_tui(
-        name: str, cwd: str, model: str | None, *, session_id: str | None = None
+        name: str, cwd: str, model: str | None, *, session_id: str | None = None,
+        bypass_permissions: bool | None = None,
     ) -> tuple[str, str, lib.TuiProbe]:
         del name, cwd, model
         calls.append(f"launch:{session_id}")
@@ -1228,7 +1263,7 @@ def test_headless_to_tui_failure_keeps_paused_source_and_removes_destination(
     monkeypatch.setattr(lib, "backend_available", lambda backend: True)
     monkeypatch.setattr(lib, "wait_for_pause_ack", lambda name, old: True)
     monkeypatch.setattr(
-        lib, "_launch_herdr_tui", lambda name, cwd, model, *, session_id=None: ("wT:t9", "wT:p9", probe)
+        lib, "_launch_herdr_tui", lambda name, cwd, model, *, session_id=None, bypass_permissions=None: ("wT:t9", "wT:p9", probe)
     )
     monkeypatch.setattr(
         lib,
@@ -1266,7 +1301,7 @@ def test_legacy_headless_to_tui_failure_restores_tmux_source(
     monkeypatch.setattr(lib, "terminate_runner", lambda rec: True)
     monkeypatch.setattr(lib, "window_exists", lambda rec: False)
     monkeypatch.setattr(
-        lib, "_launch_herdr_tui", lambda name, cwd, model, *, session_id=None: ("wT:t10", "wT:p10", probe)
+        lib, "_launch_herdr_tui", lambda name, cwd, model, *, session_id=None, bypass_permissions=None: ("wT:t10", "wT:p10", probe)
     )
     monkeypatch.setattr(
         lib,

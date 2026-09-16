@@ -56,7 +56,8 @@ def fake_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path
         active_windows.discard(rec.name)
 
     def launch_tui(
-        name: str, cwd: str, model: str | None, *, session_id: str | None = None
+        name: str, cwd: str, model: str | None, *, session_id: str | None = None,
+        bypass_permissions: bool | None = None,
     ) -> tuple[str, str, adapter.lib.TuiProbe]:
         del cwd, model, session_id
         active_windows.add(name)

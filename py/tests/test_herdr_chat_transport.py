@@ -363,7 +363,7 @@ class NamedHarness(HerdrClient):
     def workspace_label(self, workspace_id: str) -> str:
         return "project"
 
-    def run(self, pane_id: str, command: str) -> None:
+    def prompt_agent(self, pane_id: str, command: str) -> None:
         self.prompts.append(command)
 
     def wait_agent_status(self, pane_id: str, status: str, timeout_ms: int) -> None:

@@ -147,7 +147,7 @@ elif args[:2] == ["workspace", "get"]:
         "workspace_id": state.get("workspace_response_id", "w1"),
         "label": "project",
     }})
-elif args[:2] == ["pane", "run"]:
+elif args[:2] == ["agent", "prompt"]:
     state.setdefault("submitted", []).append(args[3])
     if state.get("run_mode") == "gate":
         save()

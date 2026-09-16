@@ -129,6 +129,16 @@ class AgentOperationError(Exception):
         self.message = message
 
 
+def _configured_codex_bypass_permissions() -> bool:
+    value = os.environ.get("SUBAGENTS_CODEX_BYPASS_PERMISSIONS", "0")
+    if value not in {"0", "1"}:
+        raise AgentOperationError(
+            "invalid_permission_policy",
+            "SUBAGENTS_CODEX_BYPASS_PERMISSIONS must be exactly 0 (native permissions) or 1 (bypass approvals and sandbox)",
+        )
+    return value == "1"
+
+
 def die(msg: str, code: int = 1) -> NoReturn:
     """Print an actionable error to stderr and exit non-zero."""
     print(f"error: {msg}", file=sys.stderr)
@@ -414,12 +424,14 @@ class AgentRecord:
     mode: str = HEADLESS_MODE
     # Herdr pane that owns an interactive TUI. Headless rows intentionally omit it.
     presentation_pane: Optional[str] = None
+    # New workers use native permissions unless the caller explicitly opts in.
+    codex_bypass_permissions: bool = False
 
     @staticmethod
     def from_dict(d: dict[str, object]) -> "AgentRecord":
         """Load a worker record, restoring omitted presentation fields from preserved identity metadata."""
         fields = {f.name for f in dataclasses.fields(AgentRecord)}
-        missing = fields - set(d) - {"runner_started_at", "backend", "mode", "presentation_pane"}
+        missing = fields - set(d) - {"runner_started_at", "backend", "mode", "presentation_pane", "codex_bypass_permissions"}
         if missing:
             die(f"registry row for {d.get('name')!r} missing keys: {sorted(missing)}")
         preserved = _load_presentation_identity(d)
@@ -439,6 +451,11 @@ class AgentRecord:
             if raw_pane is not None
             else (preserved.presentation_pane if preserved is not None and mode == TUI_MODE else None)
         )
+        # Every record predating this field came from the legacy runtime,
+        # whose Codex launches always bypassed approvals and sandboxing.
+        bypass = d.get("codex_bypass_permissions", True)
+        if not isinstance(bypass, bool):
+            raise AgentOperationError("invalid_permission_policy", "recorded codex_bypass_permissions must be a boolean")
         return AgentRecord(
             name=str(d["name"]),
             harness=str(d["harness"]),
@@ -457,6 +474,7 @@ class AgentRecord:
             last_turn_at=(None if d["last_turn_at"] is None else str(d["last_turn_at"])),
             mode=mode,
             presentation_pane=presentation_pane,
+            codex_bypass_permissions=bypass,
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -1620,7 +1638,9 @@ def _session_recorded_model(session_id: str) -> Optional[str]:
     return None
 
 
-def _codex_tui_argv(model: Optional[str], session_id: Optional[str] = None) -> list[str]:
+def _codex_tui_argv(
+    model: Optional[str], session_id: Optional[str] = None, *, bypass_permissions: Optional[bool] = None
+) -> list[str]:
     """Build the visible Codex command, preserving a resumed session's model."""
     argv = [CODEX_BIN]
     launch_model = model
@@ -1631,19 +1651,23 @@ def _codex_tui_argv(model: Optional[str], session_id: Optional[str] = None) -> l
         # startup. If local metadata is unavailable, omit -m rather than force
         # a known-mismatching value.
         launch_model = _session_recorded_model(session_id)
-    argv.extend(["--no-alt-screen", "--dangerously-bypass-approvals-and-sandbox"])
+    argv.append("--no-alt-screen")
+    bypass = _configured_codex_bypass_permissions() if bypass_permissions is None else bypass_permissions
+    if bypass:
+        argv.append("--dangerously-bypass-approvals-and-sandbox")
     if launch_model:
         argv.extend(["-m", launch_model])
     return argv
 
 
 def _launch_herdr_tui(
-    name: str, cwd: str, model: Optional[str], *, session_id: Optional[str] = None
+    name: str, cwd: str, model: Optional[str], *, session_id: Optional[str] = None,
+    bypass_permissions: Optional[bool] = None,
 ) -> tuple[str, str, TuiProbe]:
     """Launch one visible Codex TUI in its own Herdr tab and prove its pane."""
     workspace_id = _herdr_workspace_id(cwd)
     tab_id, root_pane_id = _herdr_tab_for_new_agent(workspace_id, cwd)
-    argv = _codex_tui_argv(model, session_id)
+    argv = _codex_tui_argv(model, session_id, bypass_permissions=bypass_permissions)
     try:
         # Migration has its own longer readiness barrier, including known
         # resume prompts. Herdr's synchronous agent-start readiness timeout
@@ -2053,7 +2077,11 @@ def status_snapshot(name: Optional[str] = None, *, run_gc: bool = True) -> Statu
 
 def _child_python_command(script: Path, *args: str) -> str:
     """Carry this runtime's state and policy into presentation-server children."""
-    environment = {"HERDR_SUBAGENTS_HOME": str(BASE), "HERDR_SUBAGENTS_PROJECT_DEFAULTS": str(PROJECT_DEFAULTS_CONFIG)}
+    environment = {
+        "HERDR_SUBAGENTS_HOME": str(BASE),
+        "HERDR_SUBAGENTS_PROJECT_DEFAULTS": str(PROJECT_DEFAULTS_CONFIG),
+        "SUBAGENTS_CODEX_BYPASS_PERMISSIONS": "1" if _configured_codex_bypass_permissions() else "0",
+    }
     if os.environ.get("HERDR_SUBAGENTS_POLICY"):
         environment["HERDR_SUBAGENTS_POLICY"] = str(Path(os.environ["HERDR_SUBAGENTS_POLICY"]).expanduser().resolve())
     for key in ("CODEX_BIN", "AGY_BIN", "HERDR_BIN", "CODEX_HOME", "SUBAGENT_EFFORT", "SUBAGENTS_TMUX_SESSION", "SUBAGENTS_HERDR_WORKSPACE", "SUBAGENTS_TURN_TIMEOUT"):
@@ -2089,6 +2117,7 @@ def bring_up_agent(
 ) -> UpResult:
     """Validate policy and launch a named worker, optionally enqueueing its first task."""
     harness = require_supported_harness(harness)
+    bypass_permissions = _configured_codex_bypass_permissions()
     backend = selected_backend(backend)
     mode = selected_mode(harness, mode, backend=backend)
     if mode == TUI_MODE and backend != "herdr":
@@ -2138,12 +2167,13 @@ def bring_up_agent(
             created_at=now_iso(),
             last_turn_at=None,
             mode=mode,
+            codex_bypass_permissions=bypass_permissions,
         )
 
     ensure_agent_dirs(valid_name)
     try:
         if mode == TUI_MODE:
-            target, pane_id, probe = _launch_herdr_tui(valid_name, str(root), model)
+            target, pane_id, probe = _launch_herdr_tui(valid_name, str(root), model, bypass_permissions=bypass_permissions)
         else:
             target = launch_window(backend, valid_name, str(root), runner_wrapper(valid_name))
             pane_id = None
@@ -3096,7 +3126,8 @@ def _convert_headless_to_tui(name: str, old: AgentRecord) -> MigrationResult:
     source_retired = False
     try:
         target, pane_id, probe = _launch_herdr_tui(
-            name, old.cwd, old.model, session_id=old.session_id
+            name, old.cwd, old.model, session_id=old.session_id,
+            bypass_permissions=old.codex_bypass_permissions,
         )
         destination = dataclasses.replace(
             old,
@@ -3184,7 +3215,8 @@ def _convert_legacy_tmux_headless_to_tui(name: str, old: AgentRecord) -> Migrati
     destination: Optional[AgentRecord] = None
     try:
         target, pane_id, probe = _launch_herdr_tui(
-            name, old.cwd, old.model, session_id=old.session_id
+            name, old.cwd, old.model, session_id=old.session_id,
+            bypass_permissions=old.codex_bypass_permissions,
         )
         destination = dataclasses.replace(
             old,

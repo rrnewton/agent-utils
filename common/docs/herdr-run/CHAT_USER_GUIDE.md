@@ -5,7 +5,10 @@ space. The coordinator keeps its native tools, instructions, context, and termin
 interface. It can manage long-lived workers with `herdr-agent` or
 `herdr-subagents`; only the coordinator needs chat access.
 
-Install `herdr-run`, authenticate your harness, and start a dedicated coordinator:
+Install the Python distribution of `herdr-run`, which provides `herdr-chat`
+alongside `herdr-agent` and requires Python 3.10 or newer.
+
+Authenticate your harness and start a dedicated coordinator:
 
 ```sh
 herdr-agent start coordinator --harness codex --cwd /work/project \
@@ -16,6 +19,10 @@ herdr-agent status --name coordinator --registry /work/project/.herdr-agents
 Use the returned pane and workspace identity in `chat.json`. Choose a model you
 can access with the launch command's `--model` when the harness default is unsuitable.
 Use `--harness claude` for a Claude coordinator.
+Herdr must observe working transitions to confirm prompt delivery. Some Claude
+integrations expose session identity but leave the reported state idle during a
+turn. In that case the bridge records `delivery_uncertain`; a final reply artifact
+still proves execution and permits the threaded response without reinjection.
 
 ```json
 {

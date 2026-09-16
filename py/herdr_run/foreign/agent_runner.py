@@ -155,8 +155,9 @@ def _build_codex_argv(rec: lib.AgentRecord, msg: lib.Message) -> list[str]:
     effort = msg.effort or os.environ.get("SUBAGENT_EFFORT")
     if effort:
         argv += ["-c", f"model_reasoning_effort={json.dumps(effort)}"]
+    if rec.codex_bypass_permissions:
+        argv.append("--dangerously-bypass-approvals-and-sandbox")
     argv += [
-        "--dangerously-bypass-approvals-and-sandbox",
         "--skip-git-repo-check",
         "--json",
         "-o",

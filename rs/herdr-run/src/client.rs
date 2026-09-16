@@ -835,6 +835,17 @@ impl HerdrClient {
         )
     }
 
+    /// Submit agent text using live bracketed-paste mode and encoded Enter.
+    ///
+    /// The native primitive keeps Enter outside the paste interpreted by agent
+    /// composers. This call does not wait for a lifecycle transition.
+    pub fn prompt_agent(&self, pane_id: &str, text: &str) -> Result<()> {
+        self.call_ok(
+            &strings(&["agent", "prompt", pane_id, text]),
+            &format!("agent prompt {pane_id}"),
+        )
+    }
+
     /// Send named `keys` to `pane_id`.
     pub fn send_keys(&self, pane_id: &str, keys: &str) -> Result<()> {
         self.call_ok(
@@ -1692,6 +1703,32 @@ mod tests {
         )]);
         let error = client("direct", wrong_type).process_info("p").unwrap_err();
         assert!(error.to_string().contains("not an integer"));
+    }
+
+    #[test]
+    fn agent_prompt_uses_native_paste_while_shell_run_stays_raw() {
+        let runner = FakeRunner::with_outputs(vec![
+            output(0, r#"{"result":{"type":"agent_prompted"}}"#, ""),
+            output(0, "", ""),
+        ]);
+        let client = client("direct", runner.clone());
+        client
+            .prompt_agent("p", "literal\nmessage $(untouched)")
+            .unwrap();
+        client.run("p", "printf shell").unwrap();
+        assert_eq!(
+            runner.calls(),
+            vec![
+                strings(&[
+                    "/opt/herdr/bin/herdr",
+                    "agent",
+                    "prompt",
+                    "p",
+                    "literal\nmessage $(untouched)"
+                ]),
+                strings(&["/opt/herdr/bin/herdr", "pane", "run", "p", "printf shell"]),
+            ]
+        );
     }
 
     #[test]

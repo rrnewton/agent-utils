@@ -237,7 +237,7 @@ impl AgentApi for HerdrClient {
     }
 
     fn run(&self, pane_id: &str, text: &str) -> crate::error::Result<()> {
-        HerdrClient::run(self, pane_id, text)
+        HerdrClient::prompt_agent(self, pane_id, text)
     }
 
     fn wait_agent_status(
@@ -858,7 +858,7 @@ fn deliver_one<A: AgentApi + ?Sized>(
 ) -> AgentResult<()> {
     client.run(&info.pane_id, text).map_err(|error| {
         AgentError::delivery(format!(
-            "pane {} pane-run outcome is unknown; prompt may have been submitted: {error}",
+            "pane {} agent-prompt outcome is unknown; prompt may have been submitted: {error}",
             info.pane_id
         ))
     })?;

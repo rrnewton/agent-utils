@@ -148,9 +148,9 @@ class _NamedClient(HerdrClient):
     def workspace_label(self, workspace_id: str) -> str:
         return self._delegate.workspace_label(workspace_id)
 
-    def run(self, pane_id: str, command: str) -> None:
+    def prompt_agent(self, pane_id: str, command: str) -> None:
         self.pane_info(pane_id)
-        self._delegate.run(pane_id, command)
+        self._delegate.prompt_agent(pane_id, command)
 
     def wait_agent_status(self, pane_id: str, status: str, timeout_ms: int) -> None:
         self.pane_info(pane_id)

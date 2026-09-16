@@ -112,7 +112,7 @@ class FakeAgentHerdr:
         assert workspace_id == "w1"
         return self.workspace
 
-    def run(self, pane_id: str, text: str) -> None:
+    def prompt_agent(self, pane_id: str, text: str) -> None:
         assert pane_id == "w1:p1"
         self.run_entered.set()
         if self.run_release is not None:
@@ -479,7 +479,7 @@ def test_post_run_transport_crash_is_quarantined_once_as_possibly_submitted(tmp_
         fake.runs.append(text)
         raise RuntimeError("connection vanished after write")
 
-    fake.run = crash_after_possible_accept  # type: ignore[assignment]
+    fake.prompt_agent = crash_after_possible_accept  # type: ignore[assignment]
     with pytest.raises(AgentDeliveryError, match="may have been submitted"):
         send(client(fake), target(), str(tmp_path), "only once", max_attempts=3)
     assert fake.runs == ["only once"]

@@ -350,6 +350,17 @@ def test_agent_status_wait_accepts_and_validates_event_envelope() -> None:
     ]
 
 
+def test_agent_prompt_uses_native_paste_while_shell_run_stays_raw() -> None:
+    runner = RecordingRunner(((0, '{"result":{"type":"agent_prompted"}}', ""), (0, "", "")))
+    client = HerdrClient(herdr_bin="fixture-herdr", run=runner)
+    client.prompt_agent("p1", "literal\nmessage $(untouched)")
+    client.run("p1", "printf shell")
+    assert runner.calls == [
+        ("fixture-herdr", "agent", "prompt", "p1", "literal\nmessage $(untouched)"),
+        ("fixture-herdr", "pane", "run", "p1", "printf shell"),
+    ]
+
+
 def test_agent_status_wait_refuses_wrong_event_identity() -> None:
     event = json.dumps(
         {"result": {"agent": {"pane_id": "other", "agent_status": "idle"}}}

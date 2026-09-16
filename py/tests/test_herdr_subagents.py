@@ -75,7 +75,7 @@ class FakeManagedClient:
             raise HerdrUnavailable("server unavailable")
         return tuple(self.presentations)
 
-    def run(self, pane_id: str, text: str) -> None:
+    def prompt_agent(self, pane_id: str, text: str) -> None:
         assert pane_id in self.infos
         self.submitted.append(text)
 

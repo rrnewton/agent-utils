@@ -525,12 +525,12 @@ def _deliver_one(
     working_timeout: float,
 ) -> None:
     try:
-        client.run(info.pane_id, text)
+        client.prompt_agent(info.pane_id, text)
     except Exception as exc:
         # The terminal server may have accepted the atomic text+Enter before the client lost its
-        # response. Once pane.run is entered, failure is ambiguous and must never be retried.
+        # response. Once agent.prompt is entered, failure is ambiguous and must never be retried.
         raise _PossiblySubmitted(
-            f"pane {info.pane_id} pane-run outcome is unknown; prompt may have been submitted: {exc}"
+            f"pane {info.pane_id} agent-prompt outcome is unknown; prompt may have been submitted: {exc}"
         ) from exc
     try:
         client.wait_agent_status(info.pane_id, "working", max(1, int(working_timeout * 1000)))

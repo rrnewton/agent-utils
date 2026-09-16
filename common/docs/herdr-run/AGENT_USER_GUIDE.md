@@ -9,8 +9,13 @@ model/resume presets; other Herdr-supported harnesses accept literal arguments.
 
 Complete the chosen harness's login and workspace-trust onboarding once in the
 target checkout before starting unattended workers. Herdr must support
-`agent start`, `agent get`, and `agent wait` (the current 0.8 command interface).
+`agent start`, `agent get`, `agent prompt`, and `agent wait` (the current 0.8 command interface).
 The library never adds permission-bypass flags or chooses a model for you.
+Herdr's harness integration must report both ready and working states. Some
+Claude integrations report session identity without tracking working transitions.
+A visibly executed prompt without a working-state acknowledgement remains
+uncertain delivery and is not retried; installing a session-identity integration
+alone does not resolve that limitation.
 
 ```sh
 herdr-agent start reviewer --harness codex --cwd /work/project \
@@ -78,8 +83,9 @@ wake an idle worker: use the managed goal setter for native execution.
 
 `herdr-agent` is the identity-agnostic transport for an interactive agent already
 running in a Herdr pane. It durably queues prompts, waits for native `idle` or
-`done`, submits the complete literal text and Enter in one `pane run`, and requires
-Herdr to observe the subsequent `working` state. One lock serializes overlapping
+`done`, submits the complete literal text through `agent prompt`, and requires
+Herdr to observe the subsequent `working` state. Herdr handles the harness's
+paste and Enter sequence. One lock serializes overlapping
 senders. Safe pre-injection failures remain in `inbox/`; ambiguous post-injection
 failures move to `failed/` after one injection. Neither outcome discards the prompt.
 
@@ -111,7 +117,7 @@ to the same live pane.
 Queue layout:
 
 - `inbox/*.json`: prompts awaiting confirmed submission, including failure details;
-- `inflight/*.json`: prompts durably marked possibly submitted before `pane run`;
+- `inflight/*.json`: prompts durably marked possibly submitted before `agent prompt`;
 - `processed/*.json`: prompts whose idle/done → working transition was confirmed;
 - `failed/*.json`: ambiguous or malformed prompts retained without resubmission;
 - `.delivery.lock`: serialization across cron ticks and interactive callers.

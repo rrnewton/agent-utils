@@ -37,6 +37,18 @@ These tools are independently installable and follow the same package
 documentation and artifact checks. They are explicit exceptions to the
 two-language implementation and behavioral-differential contract.
 
+Install the current `herdr-chat` and `herdr-subagents` companions from this
+checkout, or run their tracked Python entrypoints:
+
+```sh
+python3 -m pip install ./py/herdr_run
+DAGRUN_ENGINE=python ./bin/herdr-chat --help
+DAGRUN_ENGINE=python ./bin/herdr-subagents --help
+```
+
+Both companions require the Python distribution. The repository launcher refuses
+`DAGRUN_ENGINE=rust` for them because they have no Rust implementation.
+
 ## Repository layout
 
 ```text

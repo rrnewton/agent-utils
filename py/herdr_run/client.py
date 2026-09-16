@@ -746,6 +746,15 @@ class HerdrClient:
         """
         self._call_ok(["pane", "run", pane_id, command], f"pane run {pane_id}")
 
+    def prompt_agent(self, pane_id: str, text: str) -> None:
+        """Submit agent text using live bracketed-paste mode and encoded Enter.
+
+        Agent composers can treat a raw text-and-Enter burst as one paste. The
+        native prompt primitive preserves the submission key outside that paste.
+        This call does not wait for a lifecycle transition.
+        """
+        self._call_ok(["agent", "prompt", pane_id, text], f"agent prompt {pane_id}")
+
     def send_keys(self, pane_id: str, keys: str) -> None:
         """Send named key presses (for example ``ctrl+u``) to a pane."""
         self._call_ok(["pane", "send-keys", pane_id, keys], f"pane send-keys {pane_id}")

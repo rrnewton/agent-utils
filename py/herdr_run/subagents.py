@@ -175,7 +175,7 @@ class _WorkspaceClient:
     def workspace_label(self, workspace_id: str) -> str:
         return self.client.workspace_label(workspace_id)
 
-    def run(self, pane_id: str, command: str) -> None:
+    def prompt_agent(self, pane_id: str, command: str) -> None:
         self.goal_objective = None
         if self.queue is not None:
             for identifier, objective in self.record.goal_messages.items():
@@ -185,7 +185,7 @@ class _WorkspaceClient:
                     if isinstance(document, dict) and document.get("text") == command:
                         self.goal_objective = objective
                         break
-        self.client.run(pane_id, command)
+        self.client.prompt_agent(pane_id, command)
 
     def wait_agent_status(self, pane_id: str, status: str, timeout_ms: int) -> None:
         if self.goal_objective is None or status != "working":

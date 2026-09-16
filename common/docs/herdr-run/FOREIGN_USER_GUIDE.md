@@ -5,6 +5,17 @@ tmux windows or Herdr tabs. Codex workers can run as visible interactive TUIs
 or as resumable headless turns with durable transcripts. Antigravity uses
 headless turns. Use `herdr-agent start` for managed Codex and Claude TUIs.
 
+Install the Python distribution of `herdr-run`, which provides `herdr-subagents`
+and requires Python 3.10 or newer.
+
+New Codex workers preserve the harness's approval and sandbox settings by default.
+Set `SUBAGENTS_CODEX_BYPASS_PERMISSIONS=1` when you explicitly want
+`--dangerously-bypass-approvals-and-sandbox` for a headless or TUI worker; `0`
+preserves the native settings. Other values are rejected. The registry records
+this choice at launch and retains it across later turns and migrations. Existing
+registry rows from the earlier runtime, which always enabled bypass, retain that
+behavior when they lack the new field.
+
 Set a separate state directory for each workspace. Models remain the harness
 default unless you supply `--model`; executable overrides are `CODEX_BIN`,
 `AGY_BIN`, and `HERDR_BIN`.
