@@ -23,6 +23,7 @@ from herdr_run import __version__
 from herdr_run.agent import Target, drain, read, send, status
 from herdr_run.client import HerdrClient
 from herdr_run.errors import AgentPending, AgentPossiblySubmitted, HerdrRunError
+from herdr_run.subagents import ManagedAgents
 
 _MAX_WAIT_SECONDS = 31_536_000.0
 _MAX_COUNT = 1_000_000
@@ -55,7 +56,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--version", action="version", version=f"herdr-agent {__version__}")
     parser.add_argument("--userguide", action="store_true", help="print the installed user guide and exit")
-    parser.add_argument("command", nargs="?", choices=("send", "drain", "status", "read", "userguide"))
+    parser.add_argument("command", nargs="?", choices=("start", "stop", "list", "wait", "goal", "bind-session", "send", "drain", "status", "read", "userguide"))
     parser.add_argument("text", nargs="?")
     parser.add_argument("--file", help="read a message from this artifact")
     parser.add_argument("--pane")
@@ -65,12 +66,94 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--workspace", dest="expected_workspace")
     parser.add_argument("--cwd", dest="expected_cwd")
     parser.add_argument("--queue", default=".herdr-agent")
+    parser.add_argument("--name", help="target a registered, named interactive subagent")
+    parser.add_argument("--registry", default=".herdr-agents", help="private managed-agent state directory")
+    parser.add_argument("--workspace-id", help="start in this exact Herdr workspace (default: current or subagents)")
+    parser.add_argument("--harness", default="codex", help="Herdr agent kind; codex and claude have model/resume presets")
+    parser.add_argument("--model")
+    parser.add_argument("--resume")
+    parser.add_argument("--harness-arg", action="append", default=[], help="literal harness argument (repeat; use = for flags)")
+    parser.add_argument("--brief", help="initial task after successful launch")
+    parser.add_argument("--startup-timeout", type=_ascii_float, default=30.0)
+    parser.add_argument("--goal-command-json", help="native Codex goal RPC argv as a JSON string array")
     parser.add_argument("--ready-timeout", type=_ascii_float, default=900.0)
     parser.add_argument("--working-timeout", type=_ascii_float, default=30.0)
     parser.add_argument("--max-attempts", type=_bounded_uint, default=3)
     parser.add_argument("--lines", type=_bounded_uint, default=500)
     parser.add_argument("--herdr-bin", default="herdr")
     return parser
+
+
+def _managed(args: argparse.Namespace, client: HerdrClient) -> int:
+    manager = ManagedAgents(client, args.registry)
+    options: dict[str, object] = {
+        "ready_timeout": args.ready_timeout, "working_timeout": args.working_timeout,
+        "max_attempts": args.max_attempts,
+    }
+    name = args.name
+    command = args.command
+    goal_command: list[str] | None = None
+    if args.goal_command_json is not None:
+        decoded: object = json.loads(args.goal_command_json)
+        if not isinstance(decoded, list) or not decoded or any(not isinstance(item, str) or not item for item in decoded):
+            raise ValueError("goal command must be a nonempty JSON string array")
+        goal_command = [str(item) for item in decoded]
+    if command in ("start", "stop"):
+        if args.text and name:
+            raise ValueError("pass the agent name once, as a positional or --name")
+        name = name or args.text
+    if command != "list" and not name:
+        raise ValueError(f"{command} needs a registered agent --name")
+    if args.pane or args.session or args.session_agent or args.expected_agent or args.expected_workspace:
+        raise ValueError("managed commands use registry identity; do not combine --name with pane/session assertions")
+    if command == "start":
+        if not args.expected_cwd:
+            raise ValueError("start needs --cwd")
+        if args.file is not None and args.brief is not None:
+            raise ValueError("pass --brief or --file, not both")
+        brief = args.brief
+        if args.file is not None:
+            with open(args.file, encoding="utf-8") as source:
+                brief = source.read()
+        result: object = manager.start(
+            name, cwd=args.expected_cwd, workspace_id=args.workspace_id,
+            harness=args.harness, model=args.model, resume=args.resume,
+            harness_args=args.harness_arg, brief=brief,
+            startup_timeout=args.startup_timeout, ready_timeout=args.ready_timeout,
+            working_timeout=args.working_timeout,
+        )
+    elif command == "stop":
+        result = manager.stop(name)
+    elif command == "list":
+        if args.text or args.name:
+            raise ValueError("list does not accept an agent name")
+        result = manager.list()
+    elif command == "send":
+        result = manager.send(name, _message(args), **options).__dict__
+    elif command == "drain":
+        drained = manager.drain(name, **options)
+        result = drained.__dict__
+    elif command == "status":
+        result = manager.status(name)
+    elif command == "read":
+        sys.stdout.write(manager.read(name, lines=args.lines))
+        return 0
+    elif command == "wait":
+        result = manager.wait(name, timeout=args.ready_timeout)
+    elif command == "goal":
+        goal = _message(args) if args.text is not None or args.file is not None else None
+        result = manager.goal(name, goal, goal_command=goal_command, **options)
+    elif command == "bind-session":
+        if args.text is None or args.file is not None:
+            raise ValueError("bind-session needs an explicit session id as its positional argument")
+        result = manager.bind_session(name, args.text, goal_command=goal_command)
+    else:
+        raise ValueError(f"unsupported managed command: {command}")
+    json.dump(result, sys.stdout, indent=2, sort_keys=True)
+    sys.stdout.write("\n")
+    if command == "drain":
+        return 75 if drained.blocked else (76 if drained.quarantined else 0)
+    return 0
 
 
 def _target(args: argparse.Namespace) -> Target:
@@ -127,6 +210,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         or args.working_timeout <= 0
         or args.ready_timeout > _MAX_WAIT_SECONDS
         or args.working_timeout > _MAX_WAIT_SECONDS
+        or not math.isfinite(args.startup_timeout)
+        or not 0 < args.startup_timeout <= 300
         or args.max_attempts <= 0
         or args.lines <= 0
     ):
@@ -138,6 +223,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     target = _target(args)
     queue = os.path.abspath(str(args.queue))
     try:
+        if args.name is not None or args.command in ("start", "stop", "list", "wait", "goal", "bind-session"):
+            return _managed(args, client)
         if args.command == "send":
             result = send(
                 client, target, queue, _message(args), ready_timeout=args.ready_timeout,
@@ -177,7 +264,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         sys.stdout.write("\n")
         return exc.exit_code
-    except (HerdrRunError, ValueError) as exc:
+    except (HerdrRunError, ValueError, OSError) as exc:
         print(f"herdr-agent: {exc}", file=sys.stderr)
         return exc.exit_code if isinstance(exc, HerdrRunError) else 2
 

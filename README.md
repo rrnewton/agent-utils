@@ -18,7 +18,7 @@ schema, CLI, output, error, and state-transition drift.
 | `tick-hub` | Evaluate independently cadenced reminders and freshness checks in one deterministic tick. | `tick-hub` | `tick-hub` |
 | `pr-landing-planner` | Produce advisory, conflict- and CI-aware pull-request landing plans. | `pr-landing-planner` | `pr-landing-planner` |
 | `herdr-run` | Run an allowlisted command in a Herdr pane, outside whatever constrains the caller, with audited, byte-preserving results. An agent whose sandbox blocks the network is one such caller. | `herdr-run` | `herdr-run` |
-| `herdr-agent` | Durably queue, submit, inspect, and read messages for an interactive agent in a Herdr pane. | Companion command in `herdr-run` | Companion binary in `herdr-run` |
+| `herdr-agent` | Start, manage, and durably message long-lived interactive agents in Herdr panes. | Companion command in `herdr-run` | Companion binary in `herdr-run` |
 
 Each distribution is independently installable and documented. Its README and
 embedded user guide describe only that edition, so package-index users do not
@@ -30,6 +30,8 @@ need this source tree or knowledge of the sibling implementation.
 |---|---|---|
 | `wrkviz` | Build durable, zoomable local timelines from coordinator and subagent transcripts. | `wrkviz` |
 | `parallel-experiment-runner` | Run boxed, resource-bounded concurrent seed sweeps through `dagrun`. | `parallel-experiment-runner` |
+| `herdr-subagents` | Persistent foreign-harness workers, headless and terminal backends, and an MCP interface. | Companion command in `herdr-run` |
+| `herdr-chat` | Connect one native coordinator to Google Chat with a durable inbox and threaded replies. | Companion command in `herdr-run` |
 
 These tools are independently installable and follow the same package
 documentation and artifact checks. They are explicit exceptions to the

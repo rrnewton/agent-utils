@@ -522,6 +522,52 @@ class HerdrClient:
         """Relabel an existing tab."""
         self._call(["tab", "rename", tab_id, label], f"tab rename {tab_id}")
 
+    def close_tab(self, tab_id: str) -> None:
+        """Close one explicitly owned tab, without closing its shared workspace."""
+        self._call_ok(["tab", "close", tab_id], f"tab close {tab_id}")
+
+    def start_agent(
+        self, name: str, kind: str, pane_id: str, arguments: Sequence[str] = (),
+        *, timeout: float = 30.0,
+    ) -> None:
+        """Start a visible harness in an existing shell pane (Herdr 0.8 or newer).
+
+        Herdr selects the canonical executable for ``kind``. Arguments are passed
+        literally; no shell command or permission-bypass option is synthesized.
+        A failed readiness barrier leaves the pane available for inspection.
+        """
+        if not 0 < timeout <= 300:
+            raise ValueError("agent startup timeout must be between 0 and 300 seconds")
+        completed = self._invoke(
+            ["agent", "start", name, "--kind", kind, "--pane", pane_id,
+             "--timeout", str(max(1, int(timeout * 1000))), "--", *arguments],
+            timeout=timeout + CONTROL_TIMEOUT_SECONDS,
+        )
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout).strip() or f"exit {completed.returncode}"
+            raise HerdrUnavailable(f"agent start {name!r}: {detail}")
+
+    def agent_pane(self, name: str) -> str:
+        """Resolve an exact live Herdr agent name, rejecting a stale pane occupant."""
+        result = self._call(["agent", "get", name], f"agent get {name!r}")
+        try:
+            info = as_mapping(result.get("agent"), "agent get")
+            if get_str(info, "name", "agent get") != name:
+                raise HerdrUnavailable(f"agent get: returned a different agent name for {name!r}")
+            return get_str(info, "pane_id", "agent get")
+        except TypeError as exc:
+            raise HerdrUnavailable(f"agent get: invalid Herdr response: {exc}") from exc
+
+    def report_agent_session(self, name: str, pane_id: str, kind: str, session_id: str) -> None:
+        """Publish an explicitly supplied native session identity on its named pane."""
+        if self.agent_pane(name) != pane_id:
+            raise HerdrUnavailable("cannot bind a session to a different named agent pane")
+        self._call_ok(
+            ["pane", "report-agent-session", pane_id, "--source", "herdr-agent",
+             "--agent", kind, "--agent-session-id", session_id],
+            "report managed agent session",
+        )
+
     def panes(self, workspace_id: str | None = None) -> tuple[Pane, ...]:
         """Every pane, optionally restricted to one workspace."""
         args = ["pane", "list"]
@@ -602,7 +648,7 @@ class HerdrClient:
         """Wait for a native Herdr agent-state transition."""
         purpose = f"wait for pane {pane_id} status {status}"
         completed = self._invoke(
-            ["wait", "agent-status", pane_id, "--status", status, "--timeout", str(timeout_ms)],
+            ["agent", "wait", pane_id, "--until", status, "--timeout", str(timeout_ms)],
             timeout=max(CONTROL_TIMEOUT_SECONDS, timeout_ms / 1000.0 + 5.0),
         )
         if completed.returncode != 0:
@@ -610,7 +656,8 @@ class HerdrClient:
             raise HerdrUnavailable(f"{purpose}: {detail}")
         try:
             envelope = as_mapping(json.loads(completed.stdout), purpose)
-            data = as_mapping(envelope.get("data"), purpose)
+            result = as_mapping(envelope.get("result"), purpose)
+            data = as_mapping(result.get("agent"), purpose)
             returned_pane = get_str(data, "pane_id", purpose)
             returned_status = get_str(data, "agent_status", purpose)
         except (json.JSONDecodeError, TypeError) as exc:

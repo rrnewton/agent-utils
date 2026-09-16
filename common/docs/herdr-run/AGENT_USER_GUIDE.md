@@ -1,4 +1,80 @@
-# herdr-agent — interactive-agent messaging
+# herdr-agent — long-lived interactive subagents
+
+`herdr-agent` lets a native coordinator manage other harnesses while humans can
+inspect and interact with their real Herdr terminals. Managed agents have durable
+names, a private registry, and independent message queues. Codex and Claude have
+model/resume presets; other Herdr-supported harnesses accept literal arguments.
+
+## Start and manage a worker
+
+Complete the chosen harness's login and workspace-trust onboarding once in the
+target checkout before starting unattended workers. Herdr must support
+`agent start`, `agent get`, and `agent wait` (the current 0.8 command interface).
+The library never adds permission-bypass flags or chooses a model for you.
+
+```sh
+herdr-agent start reviewer --harness codex --cwd /work/project \
+  --registry /work/project/.herdr-agents --brief 'Review the current changes.'
+herdr-agent list --registry /work/project/.herdr-agents
+herdr-agent status --name reviewer --registry /work/project/.herdr-agents
+herdr-agent send 'Check the failure handling too.' --name reviewer \
+  --registry /work/project/.herdr-agents
+herdr-agent wait --name reviewer --registry /work/project/.herdr-agents
+herdr-agent read --name reviewer --registry /work/project/.herdr-agents --lines 500
+```
+
+Start creates a dedicated tab in the caller's Herdr workspace. `--workspace-id`
+selects an exact existing workspace; outside a workspace, the managed `subagents`
+workspace is reused or created. Focus stays with the caller. Use `--harness claude`
+for Claude, `--model` to override the harness model, and `--resume` for a known
+conversation. Repeated `--harness-arg=VALUE` arguments are passed literally. An
+initial prompt can come from `--brief` or `--file`. Startup readiness is bounded by
+`--startup-timeout`, at most 300 seconds.
+
+The registry defaults to `.herdr-agents`. Use the same absolute registry path from
+every coordinator command. It records launch identity and errors even when Herdr
+is unavailable. Failed launches retain their new terminal for diagnosis. `wait`
+means the harness is ready for input; it does not prove its task or goal completed.
+`read` also saves the latest terminal snapshot in the worker's `output.json`.
+
+```sh
+herdr-agent stop reviewer --registry /work/project/.herdr-agents
+```
+
+Stop archives the registry record, queue, and captured output, then releases the
+name for reuse. It refuses to close a tab that acquired another pane or a worker
+whose live identity no longer matches. It never closes the shared workspace.
+
+## Goals and session identity
+
+`herdr-agent goal 'Complete the review and report actionable findings.' --name
+reviewer --registry /work/project/.herdr-agents` starts a native Codex `/goal` in
+the worker's visible conversation. Setting a new goal replaces the existing goal;
+only the exact native goal-replacement confirmation is handled automatically.
+Other harnesses receive a plain goal instruction and report requested intent.
+
+Bind a known session ID, obtained from the worker itself, for native goal inspection.
+Inside Codex, `CODEX_THREAD_ID` identifies that conversation; do not use the lead's
+ID or infer identity from a shared working directory.
+
+```sh
+herdr-agent bind-session WORKER_SESSION_UUID --name reviewer \
+  --registry /work/project/.herdr-agents
+herdr-agent goal --name reviewer --registry /work/project/.herdr-agents \
+  --goal-command-json '["codex", "app-server", "--stdio"]'
+```
+
+Binding records the explicit session assertion alongside the live agent name and
+pane. Existing Herdr session metadata must match when available; some Herdr
+integrations do not report it. Native reads return the actual objective, status, and usage when this Codex version
+supports the goal protocol. The default goal command is `codex app-server proxy`,
+which needs an owning local daemon. `--stdio` uses a separate read-only protocol
+process to query persisted goals on supporting versions; it does not resume the
+conversation. An unbound or unsupported goal remains explicitly unverified.
+Changing persisted goal state through a separate protocol process alone does not
+wake an idle worker: use the managed goal setter for native execution.
+
+## Durable messaging for an existing pane
 
 `herdr-agent` is the identity-agnostic transport for an interactive agent already
 running in a Herdr pane. It durably queues prompts, waits for native `idle` or

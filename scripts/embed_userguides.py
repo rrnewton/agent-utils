@@ -172,6 +172,14 @@ class PackageLink:
 
 
 STANDALONE_DOCUMENTS: tuple[StandaloneDocument, ...] = (
+    StandaloneDocument(
+        tool="herdr-run", document="CHAT_USER_GUIDE", language="python",
+        source="common/docs/herdr-run/CHAT_USER_GUIDE.md",
+    ),
+    StandaloneDocument(
+        tool="herdr-run", document="FOREIGN_USER_GUIDE", language="python",
+        source="common/docs/herdr-run/FOREIGN_USER_GUIDE.md",
+    ),
     # This guide is shared byte-for-byte by both herdr-run packages. Linting it under both rule
     # sets ensures it contains neither edition's package-manager or implementation language.
     StandaloneDocument(
@@ -291,6 +299,14 @@ def _package_links() -> tuple[PackageLink, ...]:
             PackageLink(
                 "py/herdr_run/AGENT_USER_GUIDE.md",
                 "common/docs/herdr-run/AGENT_USER_GUIDE.md",
+            ),
+            PackageLink(
+                "py/herdr_run/CHAT_USER_GUIDE.md",
+                "common/docs/herdr-run/CHAT_USER_GUIDE.md",
+            ),
+            PackageLink(
+                "py/herdr_run/FOREIGN_USER_GUIDE.md",
+                "common/docs/herdr-run/FOREIGN_USER_GUIDE.md",
             ),
             PackageLink(
                 "rs/herdr-run/src/embedded_agent_userguide.md",

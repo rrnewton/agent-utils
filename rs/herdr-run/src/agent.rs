@@ -188,6 +188,12 @@ impl fmt::Display for AgentError {
 
 impl std::error::Error for AgentError {}
 
+impl From<HerdrRunError> for AgentError {
+    fn from(error: HerdrRunError) -> Self {
+        Self::Client(error)
+    }
+}
+
 /// Result type used by durable interactive-agent operations.
 pub type AgentResult<T> = std::result::Result<T, AgentError>;
 
@@ -648,11 +654,43 @@ pub fn send_with_runtime<A: AgentApi + ?Sized, R: AgentRuntime + ?Sized>(
     options: DrainOptions,
     runtime: &R,
 ) -> AgentResult<QueueResult> {
+    send_identified_with_runtime(client, target, root, text, options, runtime, None)
+}
+
+/// Persist a caller-identified prompt without replacing an existing queue artifact.
+pub fn send_identified<A: AgentApi + ?Sized>(
+    client: &A,
+    target: &Target,
+    root: &Path,
+    text: &str,
+    message_id: &str,
+    options: DrainOptions,
+) -> AgentResult<QueueResult> {
+    send_identified_with_runtime(
+        client,
+        target,
+        root,
+        text,
+        options,
+        &SystemRuntime::default(),
+        Some(message_id),
+    )
+}
+
+fn send_identified_with_runtime<A: AgentApi + ?Sized, R: AgentRuntime + ?Sized>(
+    client: &A,
+    target: &Target,
+    root: &Path,
+    text: &str,
+    options: DrainOptions,
+    runtime: &R,
+    message_id: Option<&str>,
+) -> AgentResult<QueueResult> {
     bind_queue(root, target)?;
     // Generated identifiers plus no-replace creation make persistence safe without waiting behind
     // a long-running drain. The drain and terminal-artifact inspection below resolve any message
     // consumed by another sender between these phases.
-    let identifier = enqueue_internal(root, text, None, false)?;
+    let identifier = enqueue_internal(root, text, message_id, false)?;
     let result = drain_with_runtime(client, target, root, options, runtime)?;
     let filename = format!("{identifier}.json");
     let failed_path = root.join("failed").join(&filename);
@@ -874,7 +912,7 @@ fn prepare(root: &Path) -> AgentResult<QueueDirectories> {
     Ok(directories)
 }
 
-fn create_private_directory(
+pub(crate) fn create_private_directory(
     path: &Path,
     purpose: &str,
     recursive: bool,
@@ -890,7 +928,11 @@ fn create_private_directory(
     validate_private_directory(path, purpose, tighten)
 }
 
-fn validate_private_directory(path: &Path, purpose: &str, tighten: bool) -> AgentResult<()> {
+pub(crate) fn validate_private_directory(
+    path: &Path,
+    purpose: &str,
+    tighten: bool,
+) -> AgentResult<()> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| io_error(&format!("inspect {purpose}"), path, error))?;
     let uid = unsafe { libc::getuid() };
@@ -913,7 +955,7 @@ fn validate_private_directory(path: &Path, purpose: &str, tighten: bool) -> Agen
     Ok(())
 }
 
-fn open_private_lock(path: &Path, purpose: &str) -> AgentResult<File> {
+pub(crate) fn open_private_lock(path: &Path, purpose: &str) -> AgentResult<File> {
     let file = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -1056,7 +1098,7 @@ pub(crate) fn validate_target_authority(target: &Target) -> AgentResult<()> {
     }
 }
 
-fn target_lock_path(pane_id: &str) -> AgentResult<PathBuf> {
+pub(crate) fn target_lock_path(pane_id: &str) -> AgentResult<PathBuf> {
     let root = Path::new("/tmp").join(format!("herdr-agent-target-locks-{}", unsafe {
         libc::getuid()
     }));
@@ -1083,7 +1125,7 @@ fn lock_resolved_target<A: AgentApi + ?Sized>(
     Ok((lock, confirmed))
 }
 
-fn atomic_json(path: &Path, value: &Value) -> AgentResult<()> {
+pub(crate) fn atomic_json(path: &Path, value: &Value) -> AgentResult<()> {
     let parent = path.parent().ok_or_else(|| {
         AgentError::delivery(format!("JSON path has no parent: {}", path.display()))
     })?;
@@ -1162,7 +1204,7 @@ fn read_json(path: &Path) -> AgentResult<Value> {
     read_json_with_policy(path, false)
 }
 
-fn read_private_json(path: &Path) -> AgentResult<Value> {
+pub(crate) fn read_private_json(path: &Path) -> AgentResult<Value> {
     read_json_with_policy(path, true)
 }
 
@@ -1376,7 +1418,7 @@ fn message_id_from_path(path: &Path) -> AgentResult<String> {
         })
 }
 
-fn sync_directory(path: &Path) -> AgentResult<()> {
+pub(crate) fn sync_directory(path: &Path) -> AgentResult<()> {
     sync_directory_io(path).map_err(|error| io_error("sync durable queue directory", path, error))
 }
 

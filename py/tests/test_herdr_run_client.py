@@ -340,19 +340,19 @@ def test_workspace_creation_is_no_focus() -> None:
 
 def test_agent_status_wait_accepts_and_validates_event_envelope() -> None:
     event = json.dumps(
-        {"event": "pane.agent_status_changed", "data": {"pane_id": "p1", "agent_status": "working"}}
+        {"result": {"agent": {"pane_id": "p1", "agent_status": "working"}}}
     )
     runner = RecordingRunner(((0, event, ""),))
     client = HerdrClient(herdr_bin="fixture-herdr", run=runner)
     client.wait_agent_status("p1", "working", 5000)
     assert runner.calls == [
-        ("fixture-herdr", "wait", "agent-status", "p1", "--status", "working", "--timeout", "5000")
+        ("fixture-herdr", "agent", "wait", "p1", "--until", "working", "--timeout", "5000")
     ]
 
 
 def test_agent_status_wait_refuses_wrong_event_identity() -> None:
     event = json.dumps(
-        {"event": "pane.agent_status_changed", "data": {"pane_id": "other", "agent_status": "idle"}}
+        {"result": {"agent": {"pane_id": "other", "agent_status": "idle"}}}
     )
     client = HerdrClient(
         herdr_bin="fixture-herdr", run=RecordingRunner(((0, event, ""),))

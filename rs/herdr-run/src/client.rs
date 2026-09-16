@@ -552,6 +552,95 @@ impl HerdrClient {
         Ok(())
     }
 
+    /// Close one explicitly owned tab, without closing its shared workspace.
+    pub fn close_tab(&self, tab_id: &str) -> Result<()> {
+        self.call_ok(
+            &strings(&["tab", "close", tab_id]),
+            &format!("tab close {tab_id}"),
+        )
+    }
+
+    /// Start a visible harness in an existing shell pane with literal arguments.
+    /// Requires Herdr 0.8 or newer and preserves a failed launch for inspection.
+    pub fn start_agent(
+        &self,
+        name: &str,
+        kind: &str,
+        pane_id: &str,
+        arguments: &[String],
+        timeout: Duration,
+    ) -> Result<()> {
+        if timeout.is_zero() || timeout > Duration::from_secs(300) {
+            return Err(HerdrRunError::unavailable(
+                "agent startup timeout must be between 0 and 300 seconds",
+            ));
+        }
+        let mut args = strings(&[
+            "agent",
+            "start",
+            name,
+            "--kind",
+            kind,
+            "--pane",
+            pane_id,
+            "--timeout",
+        ]);
+        args.extend([timeout.as_millis().max(1).to_string(), "--".to_owned()]);
+        args.extend_from_slice(arguments);
+        let result = self.invoke_with_timeout(&args, timeout + CONTROL_TIMEOUT)?;
+        if result.status != 0 {
+            return Err(HerdrRunError::unavailable(format!(
+                "agent start {name:?}: {}",
+                stderr_detail(&result)
+            )));
+        }
+        Ok(())
+    }
+
+    /// Resolve an exact live Herdr agent name, rejecting a stale pane occupant.
+    pub fn agent_pane(&self, name: &str) -> Result<String> {
+        let result = self.call(
+            &strings(&["agent", "get", name]),
+            &format!("agent get {name:?}"),
+        )?;
+        let info = required_object(&result, "agent", "agent get")?;
+        if required_string(info, "name", "agent get")? != name {
+            return Err(HerdrRunError::unavailable(format!(
+                "agent get: returned a different agent name for {name:?}"
+            )));
+        }
+        required_string(info, "pane_id", "agent get")
+    }
+
+    /// Publish an explicitly supplied native session identity on its named pane.
+    pub fn report_agent_session(
+        &self,
+        name: &str,
+        pane_id: &str,
+        kind: &str,
+        session_id: &str,
+    ) -> Result<()> {
+        if self.agent_pane(name)? != pane_id {
+            return Err(HerdrRunError::unavailable(
+                "cannot bind a session to a different named agent pane",
+            ));
+        }
+        self.call_ok(
+            &strings(&[
+                "pane",
+                "report-agent-session",
+                pane_id,
+                "--source",
+                "herdr-agent",
+                "--agent",
+                kind,
+                "--agent-session-id",
+                session_id,
+            ]),
+            "report managed agent session",
+        )
+    }
+
     /// List all panes, optionally restricted to `workspace_id`.
     pub fn panes(&self, workspace_id: Option<&str>) -> Result<Vec<Pane>> {
         let mut args = strings(&["pane", "list"]);
@@ -650,10 +739,10 @@ impl HerdrClient {
         let purpose = format!("wait for pane {pane_id} status {status}");
         let completed = self.invoke_with_timeout(
             &[
+                "agent".to_owned(),
                 "wait".to_owned(),
-                "agent-status".to_owned(),
                 pane_id.to_owned(),
-                "--status".to_owned(),
+                "--until".to_owned(),
                 status.to_owned(),
                 "--timeout".to_owned(),
                 timeout_ms.to_string(),
@@ -673,7 +762,8 @@ impl HerdrClient {
         let envelope = document.as_object().ok_or_else(|| {
             HerdrRunError::unavailable(format!("{purpose}: event response is not an object"))
         })?;
-        let data = required_object(envelope, "data", &purpose)?;
+        let result = required_object(envelope, "result", &purpose)?;
+        let data = required_object(result, "agent", &purpose)?;
         let returned_pane = required_string(data, "pane_id", &purpose)?;
         let returned_status = required_string(data, "agent_status", &purpose)?;
         if returned_pane != pane_id || returned_status != status {
@@ -1394,7 +1484,7 @@ mod tests {
             ),
             output(
                 0,
-                r#"{"data":{"pane_id":"p1","agent_status":"working"}}"#,
+                r#"{"result":{"agent":{"pane_id":"p1","agent_status":"working"}}}"#,
                 "",
             ),
         ]);
@@ -1417,10 +1507,10 @@ mod tests {
         assert_eq!(
             &calls[2][1..],
             strings(&[
+                "agent",
                 "wait",
-                "agent-status",
                 "p1",
-                "--status",
+                "--until",
                 "working",
                 "--timeout",
                 "30000",
@@ -1442,7 +1532,7 @@ mod tests {
 
         let wrong_event = FakeRunner::with_outputs(vec![output(
             0,
-            r#"{"data":{"pane_id":"other","agent_status":"done"}}"#,
+            r#"{"result":{"agent":{"pane_id":"other","agent_status":"done"}}}"#,
             "",
         )]);
         let error = client("direct", wrong_event)

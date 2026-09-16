@@ -24,6 +24,9 @@ dist/
 # Command stdout/stderr/exit codes and the sandbox-crossing audit log land here by default; it is
 # machine-local command OUTPUT, not source, and must never be committed.
 .herdr-run/
+.herdr-agent/
+.herdr-agents/
+.herdr-chat/
 
 # --- default fired-state store (tick-hub) ---
 # `tick-hub tick --flush` writes per-reminder last-fired epochs here by default; it is

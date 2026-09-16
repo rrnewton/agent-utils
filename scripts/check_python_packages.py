@@ -131,7 +131,7 @@ PROJECTS: tuple[Project, ...] = (
         directory="herdr_run",
         distribution="herdr-run",
         package="herdr_run",
-        commands=("herdr-run", "herdr-agent"),
+        commands=("herdr-run", "herdr-agent", "herdr-subagents", "herdr-chat"),
         # The distribution allowlists `cargo` as a target program, so its docs must name it. This is
         # user-visible subject matter, not a reference to the sibling implementation.
         doc_term_exemptions=("cargo",),
@@ -140,6 +140,11 @@ PROJECTS: tuple[Project, ...] = (
             "USER_GUIDE.md",
             "QUICKSTART.md",
             "AGENT_USER_GUIDE.md",
+            "FOREIGN_USER_GUIDE.md",
+            "CHAT_USER_GUIDE.md",
+            "foreign/lib.py",
+            "foreign/agent_runner.py",
+            "foreign/mcp/server.py",
             # There is deliberately no `examples/` here. `config_template.yaml` is what
             # `herdr-run init` writes, and it is the configuration reference; a second, partial
             # example file in the wheel would be a duplicate free to drift away from it.
@@ -147,7 +152,7 @@ PROJECTS: tuple[Project, ...] = (
             "py.typed",
         ),
         required_dependencies=("pyyaml",),
-        command_userguides=(("herdr-agent", "AGENT_USER_GUIDE.md"),),
+        command_userguides=(("herdr-agent", "AGENT_USER_GUIDE.md"), ("herdr-subagents", "FOREIGN_USER_GUIDE.md"), ("herdr-chat", "CHAT_USER_GUIDE.md")),
     ),
     Project(
         directory="wrkslots",

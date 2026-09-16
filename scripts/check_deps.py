@@ -28,6 +28,8 @@ ENTRYPOINT_MODULES = [
     "wrkviz",
     "herdr_run",
     "herdr_run.agent_cli",
+    "herdr_run.chat",
+    "herdr_run.foreign",
     "wrkslots",
 ]
 

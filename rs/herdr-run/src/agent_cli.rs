@@ -12,8 +12,21 @@ use serde_json::json;
 use crate::agent::{self, AgentError, DrainOptions, QueueOutcome, Target};
 use crate::client::HerdrClient;
 use crate::error::HerdrRunError;
+use crate::subagents::{ManagedAgents, StartOptions};
 
-const COMMANDS: [&str; 5] = ["send", "drain", "status", "read", "userguide"];
+const COMMANDS: [&str; 11] = [
+    "start",
+    "stop",
+    "list",
+    "wait",
+    "goal",
+    "bind-session",
+    "send",
+    "drain",
+    "status",
+    "read",
+    "userguide",
+];
 const MAX_WAIT_SECONDS: f64 = 31_536_000.0;
 const MAX_COUNT: u64 = 1_000_000;
 
@@ -34,6 +47,16 @@ struct Args {
     lines: usize,
     herdr_bin: PathBuf,
     userguide: bool,
+    name: Option<String>,
+    registry: PathBuf,
+    workspace_id: Option<String>,
+    harness: String,
+    model: Option<String>,
+    resume: Option<String>,
+    harness_args: Vec<String>,
+    brief: Option<String>,
+    startup_timeout: f64,
+    goal_command_json: Option<String>,
 }
 
 impl Default for Args {
@@ -54,6 +77,16 @@ impl Default for Args {
             lines: 500,
             herdr_bin: PathBuf::from("herdr"),
             userguide: false,
+            name: None,
+            registry: PathBuf::from(".herdr-agents"),
+            workspace_id: None,
+            harness: "codex".to_owned(),
+            model: None,
+            resume: None,
+            harness_args: Vec::new(),
+            brief: None,
+            startup_timeout: 30.0,
+            goal_command_json: None,
         }
     }
 }
@@ -147,6 +180,14 @@ fn run(args: Args) -> Result<i32, CliError> {
         .first()
         .expect("validated command is present")
         .as_str();
+    if args.name.is_some()
+        || matches!(
+            command,
+            "start" | "stop" | "list" | "wait" | "goal" | "bind-session"
+        )
+    {
+        return run_managed(args);
+    }
     let message = if command == "send" {
         Some(message(&args)?)
     } else {
@@ -211,6 +252,140 @@ fn run(args: Args) -> Result<i32, CliError> {
     }
 }
 
+fn run_managed(args: Args) -> Result<i32, CliError> {
+    let command = args.positional[0].as_str();
+    let positional = args.positional.get(1);
+    let mut name = args.name.as_deref();
+    if matches!(command, "start" | "stop") {
+        if positional.is_some() && name.is_some() {
+            return Err(CliError::Usage(
+                "pass the agent name once, as a positional or --name".to_owned(),
+            ));
+        }
+        name = name.or(positional.map(String::as_str));
+    }
+    if command != "list" && name.is_none_or(str::is_empty) {
+        return Err(CliError::Usage(format!(
+            "{command} needs a registered agent --name"
+        )));
+    }
+    if args.pane.is_some()
+        || args.session.is_some()
+        || args.session_agent.is_some()
+        || args.expected_agent.is_some()
+        || args.expected_workspace.is_some()
+    {
+        return Err(CliError::Usage("managed commands use registry identity; do not combine --name with pane/session assertions".to_owned()));
+    }
+    let goal_command = args
+        .goal_command_json
+        .as_ref()
+        .map(|raw| {
+            let command: Vec<String> = serde_json::from_str(raw).map_err(|_| {
+                CliError::Usage("goal command must be a nonempty JSON string array".to_owned())
+            })?;
+            if command.is_empty() || command.iter().any(String::is_empty) {
+                return Err(CliError::Usage(
+                    "goal command must be a nonempty JSON string array".to_owned(),
+                ));
+            }
+            Ok(command)
+        })
+        .transpose()?;
+    let client = HerdrClient::with_executable("direct", &args.herdr_bin)?;
+    let manager = ManagedAgents::new(
+        &client,
+        &absolute_lexical(&args.registry).map_err(CliError::Output)?,
+    )?;
+    let delivery = DrainOptions {
+        ready_timeout: Duration::from_secs_f64(args.ready_timeout),
+        working_timeout: Duration::from_secs_f64(args.working_timeout),
+        max_attempts: args.max_attempts,
+    };
+    let name = name.unwrap_or_default();
+    match command {
+        "start" => {
+            let cwd = args
+                .expected_cwd
+                .as_deref()
+                .ok_or_else(|| CliError::Usage("start needs --cwd".to_owned()))?;
+            if args.file.is_some() && args.brief.is_some() {
+                return Err(CliError::Usage(
+                    "pass --brief or --file, not both".to_owned(),
+                ));
+            }
+            let brief = match args.file {
+                Some(ref path) => Some(fs::read_to_string(path).map_err(|error| {
+                    CliError::Usage(format!("cannot read brief {}: {error}", path.display()))
+                })?),
+                None => args.brief.clone(),
+            };
+            let options = StartOptions {
+                workspace_id: args.workspace_id.clone(),
+                harness: args.harness.clone(),
+                model: args.model.clone(),
+                resume: args.resume.clone(),
+                harness_args: args.harness_args.clone(),
+                brief,
+                startup_timeout: Duration::from_secs_f64(args.startup_timeout),
+                delivery,
+            };
+            write_json(&manager.start(name, cwd, options)?)?;
+        }
+        "stop" => write_json(&manager.stop(name)?)?,
+        "list" => {
+            if positional.is_some() || args.name.is_some() {
+                return Err(CliError::Usage(
+                    "list does not accept an agent name".to_owned(),
+                ));
+            }
+            write_json(&manager.list()?)?;
+        }
+        "send" => write_json(&manager.send(name, &message(&args)?, delivery)?)?,
+        "drain" => {
+            let result = manager.drain(name, delivery)?;
+            write_json(&result)?;
+            return Ok(if result.blocked.is_some() {
+                75
+            } else if result.quarantined.is_empty() {
+                0
+            } else {
+                76
+            });
+        }
+        "status" => write_json(&manager.status(name)?)?,
+        "read" => print!("{}", manager.read(name, args.lines)?),
+        "wait" => write_json(&manager.wait(name, Duration::from_secs_f64(args.ready_timeout))?)?,
+        "goal" => {
+            let text = if positional.is_some() || args.file.is_some() {
+                Some(message(&args)?)
+            } else {
+                None
+            };
+            write_json(&manager.goal(name, text.as_deref(), delivery, goal_command.as_deref())?)?;
+        }
+        "bind-session" => {
+            if args.file.is_some() || positional.is_none() {
+                return Err(CliError::Usage(
+                    "bind-session needs an explicit session id as its positional argument"
+                        .to_owned(),
+                ));
+            }
+            write_json(&manager.bind_session(
+                name,
+                positional.expect("validated session"),
+                goal_command.as_deref(),
+            )?)?;
+        }
+        _ => {
+            return Err(CliError::Usage(format!(
+                "unsupported managed command: {command}"
+            )))
+        }
+    }
+    Ok(0)
+}
+
 fn emit_agent_error(error: &AgentError) -> i32 {
     if let Some(message) = error.undelivered() {
         let document = json!({
@@ -272,6 +447,9 @@ fn validate(args: &Args) -> Result<(), String> {
         || args.working_timeout <= 0.0
         || args.ready_timeout > MAX_WAIT_SECONDS
         || args.working_timeout > MAX_WAIT_SECONDS
+        || !args.startup_timeout.is_finite()
+        || args.startup_timeout <= 0.0
+        || args.startup_timeout > 300.0
         || args.max_attempts == 0
         || args.lines == 0
     {
@@ -377,6 +555,16 @@ fn value_option(option: &str) -> Option<()> {
             | "--max-attempts"
             | "--lines"
             | "--herdr-bin"
+            | "--name"
+            | "--registry"
+            | "--workspace-id"
+            | "--harness"
+            | "--model"
+            | "--resume"
+            | "--harness-arg"
+            | "--brief"
+            | "--startup-timeout"
+            | "--goal-command-json"
     )
     .then_some(())
 }
@@ -401,6 +589,16 @@ fn assign(args: &mut Args, option: &str, value: String) -> Result<(), String> {
                 .expect("MAX_COUNT fits every supported usize");
         }
         "--herdr-bin" => args.herdr_bin = PathBuf::from(value),
+        "--name" => args.name = Some(value),
+        "--registry" => args.registry = PathBuf::from(value),
+        "--workspace-id" => args.workspace_id = Some(value),
+        "--harness" => args.harness = value,
+        "--model" => args.model = Some(value),
+        "--resume" => args.resume = Some(value),
+        "--harness-arg" => args.harness_args.push(value),
+        "--brief" => args.brief = Some(value),
+        "--startup-timeout" => args.startup_timeout = parse_float(option, &value)?,
+        "--goal-command-json" => args.goal_command_json = Some(value),
         _ => return Err(format!("unsupported option {option}")),
     }
     Ok(())
@@ -499,12 +697,12 @@ fn absolute_lexical(path: &Path) -> io::Result<PathBuf> {
 }
 
 fn usage_line() -> &'static str {
-    "herdr-agent [-h] [--version] [--userguide] [OPTIONS] [{send,drain,status,read,userguide}] [text]"
+    "herdr-agent [-h] [--version] [--userguide] [OPTIONS] [{start,stop,list,wait,goal,bind-session,send,drain,status,read,userguide}] [text]"
 }
 
 fn print_help() {
     println!(
-        "usage: {}\n\nQueue, submit, inspect, and read interactive agents hosted in Herdr panes.\n\npositional arguments:\n  {{send,drain,status,read,userguide}}\n  text\n\noptions:\n  -h, --help\n  --version\n  --userguide\n  --file FILE\n  --pane PANE\n  --session-agent SESSION_AGENT\n  --session SESSION\n  --agent AGENT\n  --workspace WORKSPACE\n  --cwd CWD\n  --queue QUEUE\n  --ready-timeout READY_TIMEOUT\n  --working-timeout WORKING_TIMEOUT\n  --max-attempts MAX_ATTEMPTS\n  --lines LINES\n  --herdr-bin HERDR_BIN",
+        "usage: {}\n\nQueue, submit, inspect, and read interactive agents hosted in Herdr panes.\n\npositional arguments:\n  {{start,stop,list,wait,goal,bind-session,send,drain,status,read,userguide}}\n  text\n\noptions:\n  -h, --help\n  --version\n  --userguide\n  --file FILE\n  --pane PANE\n  --session-agent SESSION_AGENT\n  --session SESSION\n  --agent AGENT\n  --workspace WORKSPACE\n  --cwd CWD\n  --queue QUEUE\n  --ready-timeout READY_TIMEOUT\n  --working-timeout WORKING_TIMEOUT\n  --max-attempts MAX_ATTEMPTS\n  --lines LINES\n  --herdr-bin HERDR_BIN\n  --name NAME\n  --registry REGISTRY\n  --workspace-id WORKSPACE_ID\n  --harness HARNESS\n  --model MODEL\n  --resume SESSION\n  --harness-arg ARGUMENT\n  --brief TEXT\n  --startup-timeout SECONDS\n  --goal-command-json ARGV_JSON",
         usage_line()
     );
 }

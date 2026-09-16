@@ -15,6 +15,7 @@ pub mod allowlist;
 pub mod audit;
 pub mod cli;
 pub mod client;
+pub mod codex_goal;
 pub mod config;
 pub mod error;
 pub mod identity;
@@ -25,6 +26,7 @@ pub mod retention;
 pub mod runner;
 pub mod session;
 pub mod status;
+pub mod subagents;
 pub mod sweep;
 
 mod state;

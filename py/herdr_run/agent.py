@@ -660,14 +660,14 @@ def drain(
     return QueueResult("", tuple(delivered), tuple(quarantined), pending, blocked, outcome)
 
 
-def send(client: HerdrClient, target: Target, root: str, text: str, **kwargs: object) -> QueueResult:
+def send(client: HerdrClient, target: Target, root: str, text: str, *, message_id: str | None = None, **kwargs: object) -> QueueResult:
     """Durably enqueue one prompt, drain its bound FIFO, and return confirmed delivery."""
 
     _bind_queue(root, target)
     # Generated identifiers are collision-resistant and the no-replace inbox create is atomic.
     # Do not wait behind a long-running drain merely to persist a new prompt; the subsequent drain
     # and terminal-artifact inspection resolve any cross-sender consumption safely.
-    identifier = _enqueue(root, text, message_id=None, serialize=False)
+    identifier = _enqueue(root, text, message_id=message_id, serialize=False)
     result = drain(client, target, root, **kwargs)  # type: ignore[arg-type]
     filename = f"{identifier}.json"
     failed_path = os.path.join(root, "failed", filename)
