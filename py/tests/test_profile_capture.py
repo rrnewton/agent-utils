@@ -263,19 +263,45 @@ def test_each_wprof_window_is_a_private_separate_recommended_width_trial(
         lambda config: {CaptureKind.WPROF: _usable(CaptureKind.WPROF, str(fake))},
     )
     requests: list[IsolatedTrialRequest] = []
+    successful_interrupts: list[float] = []
+    send_signal = capture._send_pinned_wprof_signal
+
+    def observe_signal(
+        config: CaptureConfig,
+        identity: capture._PinnedProcess,
+        signal_name: str,
+        timeout_s: float,
+    ) -> str:
+        sent_at = time.monotonic()
+        error = send_signal(config, identity, signal_name, timeout_s)
+        if signal_name == "INT" and not error:
+            successful_interrupts.append(sent_at)
+        return error
+
+    monkeypatch.setattr(capture, "_send_pinned_wprof_signal", observe_signal)
 
     def run_trial(request: IsolatedTrialRequest) -> IsolatedTrialResult:
         requests.append(request)
+        interrupts_before = len(successful_interrupts)
+        assert interrupts_before == len(requests) - 1
         assert request.argv_prefix == ()
         assert request.include_in_model is False
         # The callback cannot begin until the readiness line has been persisted.
         log = request.output_dir / "wprof.log"
         assert "Running in flight recorder mode" in log.read_text(encoding="utf-8")
         time.sleep(0.08)
-        request.notify_guest_launched(request.step, os.getpid(), time.monotonic())
+        launched_at = time.monotonic()
+        request.notify_guest_launched(request.step, os.getpid(), launched_at)
         # The controller stops wprof at the selected window end while this workload continues.
         time.sleep(0.09)
-        assert (request.output_dir / "wprof.data").read_bytes() == b"wprof-data"
+        assert len(successful_interrupts) == interrupts_before + 1
+        assert request.window is not None
+        assert (
+            successful_interrupts[interrupts_before]
+            >= launched_at + request.window.end_offset_s
+        )
+        # Export finishes during finalization under profiler_exit_grace_s; requiring
+        # its bytes here imposed an additional, implicit ~20 ms export deadline.
         time.sleep(0.04)
         return IsolatedTrialResult(returncode=0, wall_s=0.13)
 
@@ -286,6 +312,7 @@ def test_each_wprof_window_is_a_private_separate_recommended_width_trial(
     )
 
     assert manifest.state is CaptureState.COMPLETE
+    assert len(successful_interrupts) == len(requests) == 2
     assert [request.trial_id for request in requests] == ["wprof-001", "wprof-002"]
     assert all(request.inner_jobs == 8 for request in requests)
     assert [trial.state for trial in manifest.trials] == [
@@ -299,6 +326,8 @@ def test_each_wprof_window_is_a_private_separate_recommended_width_trial(
             "wprof-log",
         }
         trial_dir = manifest.path.parent / trial.trial_id
+        assert (trial_dir / "wprof.data").read_bytes() == b"wprof-data"
+        assert (trial_dir / "trace.pb").read_bytes() == b"perfetto-trace"
         assert stat.S_IMODE(trial_dir.stat().st_mode) == 0o700
         for artifact in trial.artifacts:
             path = manifest.path.parent / artifact.path
