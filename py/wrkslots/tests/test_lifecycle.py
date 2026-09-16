@@ -14223,6 +14223,66 @@ def test_remove_refuses_unexpected_liveness_exit_status_without_deleting(
     assert len(active_slots(project)) == 1
 
 
+def set_owner_to_machine_init(project: Path, machine: str = "testhost") -> None:
+    """Record the machine's init as the owner, and expire the heartbeat.
+
+    This is the degenerate state measured on a real registry: 17 rows naming
+    PID 1 in /init.scope, written that way at registration.
+    """
+    config = wrkslots._load_config(str(project), machine)
+    state = wrkslots._load_active(config)
+    record = state.slots[0]
+    assert record.owner is not None
+    heartbeat_at = (
+        dt.datetime.now(dt.timezone.utc)
+        - dt.timedelta(seconds=record.heartbeat_ttl_seconds + 1)
+    ).isoformat(timespec="seconds")
+    updated = replace(
+        record,
+        owner=replace(record.owner, pid=1, cgroup_path="/init.scope"),
+        heartbeat_at=heartbeat_at,
+    )
+    wrkslots._write_active_state(
+        config,
+        wrkslots._replace_record(state, updated),
+        action="test-owner-is-machine-init",
+        slot=record.slot,
+    )
+
+
+def test_remove_releases_a_slot_whose_owner_record_is_degenerate(tmp_path: Path) -> None:
+    """A slot owned by the machine's init is removable.
+
+    ⚠️ THIS IS THE WIRING TEST, and it exists because the predicate's own unit
+    tests could not catch a revert. Restoring the old
+    "requires a proven-dead recorded owner" behaviour for degenerate rows makes
+    this fail; nothing else in the suite does.
+
+    ⚠️ WHY THE OLD REFUSAL COULD NEVER BE SATISFIED. PID 1 in /init.scope reads
+    as LIVE for as long as the machine is up, so owner_state is never "dead" and
+    the refusal asked for proof of a historical owner that -- measured across an
+    entire 6,841-entry event log -- was never recorded for any row in this
+    state. The row naming init IS the reason no such proof exists.
+    """
+    project, repository, _remote = make_project(tmp_path)
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    tree = checkout(project)
+    commit_task(repository, tree, "codex/task")
+    handed_off = finish(project)
+    assert handed_off.returncode == 0, handed_off.stderr
+    set_owner_to_machine_init(project)
+    set_liveness(project, "dead")
+
+    removed = remove(project)
+
+    assert removed.returncode == 0, removed.stderr
+    assert "proven-dead recorded owner" not in removed.stderr
+    assert "no recorded owner process" not in removed.stderr
+    assert not tree.exists()
+    assert not active_slots(project)
+
+
 @pytest.mark.parametrize("owner", ["live", "other-machine"])
 def test_remove_refuses_a_not_proven_dead_owner_even_when_the_authority_says_dead(
     tmp_path: Path, owner: str

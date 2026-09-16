@@ -7531,6 +7531,36 @@ def _read_process_identity(pid: int, *, proc_root: Path = Path("/proc")) -> Proc
     )
 
 
+def _owner_record_is_absent(record: ActiveRecord) -> bool:
+    """Whether this row records no usable owner at all.
+
+    ⚠️ A DEGENERATE OWNER IS AN ABSENT OWNER, NOT A REASON TO PRESERVE FOREVER.
+    The machine's init can never have owned a slot, so a row naming it records
+    an error rather than a fact. Treating that error as evidence produced a
+    refusal that demanded proof of a historical owner while the row itself was
+    the reason no such proof can exist.
+
+    ⚠️ AND THAT PROOF DOES NOT EXIST, measured rather than assumed: across an
+    entire 6,841-entry append-only event log, for every row in this state, a
+    non-degenerate identity is NEVER recorded in an `owner` field, in any event,
+    ever. The create journal itself recorded the machine's init for both `owner`
+    and `coordinator_lease`, so the degeneracy was present at the instant of
+    registration and no later observer saw the real process. A rule satisfiable
+    only by data nobody wrote is not a rule, it is a permanent hold -- and it
+    holds hardest on exactly the rows nothing can vouch for.
+
+    ⚠️ KEYING REMOVAL ON A HISTORICAL AGENT IDENTITY IS THE ANTI-PATTERN ITSELF.
+    Agents here die constantly, so a protocol that depends on one surviving into
+    the future cannot hold. What protects work is not knowing who owned a slot;
+    it is the guards that remain and are unchanged: an unread handoff, a live
+    process using the checkout, and salvage before delete.
+    """
+    if record.owner is None:
+        return True
+    machine_level = _MACHINE_LEVEL_PROCESSES.get(record.owner.pid)
+    return machine_level is not None and record.owner.cgroup_path == machine_level[1]
+
+
 def _owner_cgroup_is_evidence(record: ActiveRecord | None) -> bool:
     """Whether a live process sharing the recorded owner cgroup says anything about this slot.
 
@@ -7566,6 +7596,15 @@ def _owner_cgroup_is_evidence(record: ActiveRecord | None) -> bool:
     evade the direct-use test to go unnoticed.
     """
     if record is None or record.owner is None:
+        return False
+    # ⚠️ A DEGENERATE RECORD'S CGROUP IS WORTHLESS FOR THE SAME REASON ITS PID
+    # IS. A row naming the machine's init also names /init.scope, where a live
+    # process always sits, so the comparison refuses forever on the strength of
+    # the same error. This was the SECOND route blocking such rows, found only
+    # because the wiring test still failed after the first was removed: the
+    # generation gate and the cgroup gate read the same bad evidence and had to
+    # be told about it separately.
+    if _owner_record_is_absent(record):
         return False
     return _process_state(record.owner)[0] != "dead"
 
@@ -14666,14 +14705,12 @@ def _cmd_remove(
                 f"{remaining}s without renewal before retrying remove; if the owner is still "
                 "working, have it run 'wrkslots heartbeat' instead"
             )
-        if record.owner is None:
-            raise Refusal(
-                f"slot {record.slot} has no recorded owner process, so owner death is unknown. "
-                "state: REFUSED -- no checkout was salvaged or removed. remedy: preserve this "
-                "slot until an evidence-based migration can establish its historical owner; "
-                "heartbeat expiry alone cannot do that"
-            )
-        if owner_state != "dead" and not live_validate_owner:
+        # An absent or degenerate owner record no longer blocks removal. The
+        # heartbeat has already expired above, and every guard that actually
+        # protects work still runs below: the handoff read, the direct-use
+        # check, and salvage before delete. See _owner_record_is_absent.
+        owner_unrecorded = _owner_record_is_absent(record)
+        if owner_state != "dead" and not live_validate_owner and not owner_unrecorded:
             raise Refusal(
                 f"remove requires a proven-dead recorded owner; owner is {owner_state}: {detail}. "
                 "state: REFUSED -- no checkout was salvaged or removed. remedy: wait for the "

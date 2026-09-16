@@ -308,3 +308,33 @@ def test_no_recorded_owner_is_not_evidence() -> None:
     object.__setattr__(record, "owner", None)
     assert cli._owner_cgroup_is_evidence(record) is False
     assert cli._owner_cgroup_is_evidence(None) is False
+
+
+def _record(owner: "cli.ProcessIdentity | None") -> "cli.ActiveRecord":
+    record = cli.ActiveRecord.__new__(cli.ActiveRecord)
+    object.__setattr__(record, "owner", owner)
+    object.__setattr__(record, "slot", "slot01")
+    return record
+
+
+def test_an_absent_owner_record_no_longer_preserves_a_slot() -> None:
+    assert cli._owner_record_is_absent(_record(None)) is True
+
+
+def test_the_machines_init_as_owner_counts_as_absent() -> None:
+    """A degenerate owner is an error on its face, not a fact to preserve."""
+    live = cli._read_process_identity(os.getpid())
+    init = dataclasses.replace(live, pid=1, cgroup_path="/init.scope")
+    assert cli._owner_record_is_absent(_record(init)) is True
+
+
+def test_a_real_owner_is_not_treated_as_absent() -> None:
+    """⚠️ THE CONTROL. If this ever returns True the unblocking has escaped to
+    every slot, which would drop the proven-dead requirement for rows whose
+    owner is perfectly well recorded."""
+    live = cli._read_process_identity(os.getpid())
+    assert cli._owner_record_is_absent(_record(live)) is False
+    # PID 1 inside its own namespace is a real process in an ordinary scope and
+    # must NOT be swept in.
+    namespaced = dataclasses.replace(live, pid=1, cgroup_path="/user.slice/session-3.scope")
+    assert cli._owner_record_is_absent(_record(namespaced)) is False
