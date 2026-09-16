@@ -451,11 +451,7 @@ class AgentRecord:
             if raw_pane is not None
             else (preserved.presentation_pane if preserved is not None and mode == TUI_MODE else None)
         )
-        # Every record predating this field came from the legacy runtime,
-        # whose Codex launches always bypassed approvals and sandboxing.
-        bypass = d.get("codex_bypass_permissions", True)
-        if not isinstance(bypass, bool):
-            raise AgentOperationError("invalid_permission_policy", "recorded codex_bypass_permissions must be a boolean")
+        bypass = _load_codex_permission_policy(d)
         return AgentRecord(
             name=str(d["name"]),
             harness=str(d["harness"]),
@@ -690,8 +686,44 @@ def _save_presentation_identity(rec: AgentRecord) -> None:
     os.replace(tmp, path)
 
 
+def _permission_policy_path(name: str) -> Path:
+    return STATE / name / "permissions.json"
+
+
+def _load_codex_permission_policy(row: dict[str, object]) -> bool:
+    value = row.get("codex_bypass_permissions")
+    if "codex_bypass_permissions" not in row:
+        # Old runners rewrite every row using their original schema. Preserve
+        # new workers' choices independently so a dropped field cannot enable
+        # bypass. Only genuinely old records retain the historical default.
+        value = True
+        path = _permission_policy_path(str(row["name"]))
+        if path.exists():
+            try:
+                saved = json.loads(path.read_text())
+            except (OSError, json.JSONDecodeError) as exc:
+                raise AgentOperationError("invalid_permission_policy", f"cannot read worker permissions {path}: {exc}") from exc
+            if not isinstance(saved, dict):
+                raise AgentOperationError("invalid_permission_policy", f"worker permissions {path} must contain an object")
+            if saved.get("name") == row.get("name") and saved.get("created_at") == row.get("created_at"):
+                value = saved.get("codex_bypass_permissions")
+    if not isinstance(value, bool):
+        raise AgentOperationError("invalid_permission_policy", "recorded codex_bypass_permissions must be a boolean")
+    return value
+
+
+def _save_codex_permission_policy(rec: AgentRecord) -> None:
+    path = _permission_policy_path(rec.name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"name": rec.name, "created_at": rec.created_at, "codex_bypass_permissions": rec.codex_bypass_permissions}
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload) + "\n")
+    os.replace(tmp, path)
+
+
 def _clear_presentation_identity(name: str) -> None:
     presentation_identity_path(name).unlink(missing_ok=True)
+    _permission_policy_path(name).unlink(missing_ok=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -733,6 +765,7 @@ def _save_unlocked(agents: dict[str, AgentRecord]) -> None:
     # not be misclassified; a TUI row is never published without its fallback.
     for rec in agents.values():
         _save_presentation_identity(rec)
+        _save_codex_permission_policy(rec)
     payload = [agents[name].to_dict() for name in sorted(agents)]
     tmp = REGISTRY.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(payload, indent=2) + "\n")

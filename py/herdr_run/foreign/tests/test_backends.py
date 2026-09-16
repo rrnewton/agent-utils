@@ -91,6 +91,29 @@ def test_malformed_codex_permission_setting_fails_before_backend_access(
         lib.bring_up_agent("worker", cwd="/work", brief=None, backend="tmux")
 
 
+def test_legacy_registry_writer_cannot_enable_bypass_on_a_native_worker(
+    fake_backend_state: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rec = _tui_record("native-worker", fake_backend_state)
+    rec.mode = lib.HEADLESS_MODE
+    rec.codex_bypass_permissions = False
+    with lib.registry_lock() as agents:
+        agents[rec.name] = rec
+    original_rows = json.loads(lib.REGISTRY.read_text())
+    for row in original_rows:
+        row.pop("codex_bypass_permissions")
+    # A still-running pre-upgrade process serializes only fields it knows.
+    lib.REGISTRY.write_text(json.dumps(original_rows))
+    monkeypatch.setenv("SUBAGENTS_CODEX_BYPASS_PERMISSIONS", "1")
+    restored = lib.read_registry()[rec.name]
+    assert restored.codex_bypass_permissions is False
+    argv = agent_runner._build_codex_argv(restored, lib.Message(0, "next task", None, lib.now_iso()))
+    assert "--dangerously-bypass-approvals-and-sandbox" not in argv
+    lib._permission_policy_path(rec.name).write_text("invalid sidecar")
+    with pytest.raises(lib.AgentOperationError, match="cannot read worker permissions"):
+        lib.read_registry()
+
+
 def test_auto_detection_requires_herdr_environment_socket_and_live_server(
     fake_backend_state: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

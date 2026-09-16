@@ -13,8 +13,9 @@ import pytest
 from herdr_run.foreign import agent_runner, lib
 
 
+@pytest.mark.parametrize("bypass_permissions", [False, True])
 def test_packaged_runner_resumes_two_durable_turns(
-    fake_runner_state: Path, monkeypatch: pytest.MonkeyPatch
+    fake_runner_state: Path, monkeypatch: pytest.MonkeyPatch, bypass_permissions: bool,
 ) -> None:
     """A fresh subprocess imports the installed module and consumes the same state."""
     rec = _install_agy_agent(fake_runner_state, "portable")
@@ -22,6 +23,7 @@ def test_packaged_runner_resumes_two_durable_turns(
         agents[rec.name].harness = "codex"
         agents[rec.name].next_seq = 0
         agents[rec.name].session_id = None
+        agents[rec.name].codex_bypass_permissions = bypass_permissions
     executable = fake_runner_state / "fake-codex"
     executable.write_text(
         f"#!{sys.executable}\n"
@@ -42,6 +44,7 @@ def test_packaged_runner_resumes_two_durable_turns(
     env.pop("PYTHONPATH", None)
     env["HERDR_SUBAGENTS_HOME"] = str(fake_runner_state)
     env["CODEX_BIN"] = str(executable)
+    env["SUBAGENTS_CODEX_BYPASS_PERMISSIONS"] = "0" if bypass_permissions else "1"
     proc = subprocess.Popen(
         [sys.executable, str(Path(agent_runner.__file__)), rec.name],
         cwd=fake_runner_state, env=env, text=True,
@@ -63,6 +66,7 @@ def test_packaged_runner_resumes_two_durable_turns(
     assert calls[1]["argv"][:3] == ["exec", "resume", "session-portable"]
     assert 'model_reasoning_effort="high"' in calls[0]["argv"]
     assert 'model_reasoning_effort="low"' in calls[1]["argv"]
+    assert all(("--dangerously-bypass-approvals-and-sandbox" in call["argv"]) is bypass_permissions for call in calls)
     transcript = lib.transcript_path(rec.name).read_text()
     assert "===TURN-DONE 0 rc=0" in transcript
     assert "===TURN-DONE 1 rc=0" in transcript
