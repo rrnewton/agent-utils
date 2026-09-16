@@ -14315,27 +14315,35 @@ def test_remove_refuses_a_not_proven_dead_owner_even_when_the_authority_says_dea
     assert len(active_slots(project)) == 1
 
 
-def test_remove_refuses_an_unbound_owner_with_no_coordinator_recovery_evidence(
+def test_remove_releases_expired_unbound_owner_without_recovery_evidence(
     tmp_path: Path,
 ) -> None:
-    """A row with neither an owner lease nor recovery evidence has no authority to delete.
-
-    Slots left unbound by an older allocation path are exactly the 31 that became
-    unreclaimable. Reclaiming them must go through coordinator recovery, which
-    records why the historical owner is gone; a bare unbound row is refused.
-    """
+    """An expired unbound slot follows the normal live-use and salvage checks."""
     project, _repository, _remote = make_project(tmp_path)
     made = create(project, bind_owner=False)
     assert made.returncode == 0, made.stderr
     set_liveness(project, "dead")
-    expire_heartbeat(project)
-
     refused = remove(project)
-
     assert refused.returncode == 3
-    assert "owner death is unknown" in refused.stderr
+    assert "without renewal before retrying remove" in refused.stderr
     assert checkout(project).is_dir()
     assert len(active_slots(project)) == 1
+    expire_heartbeat(project)
+
+    removed = remove(project)
+
+    assert removed.returncode == 0, removed.stderr
+    assert not checkout(project).exists()
+    assert active_slots(project) == []
+    archive = json.loads(
+        (control_directory(project) / "ARCHIVED.testhost.json").read_text(encoding="utf-8")
+    )
+    assert len(archive["records"]) == 1
+    archived = archive["records"][0]
+    assert (archived["slot"], archived["generation"]) == ("slot01", 1)
+    assert archived["physical_storage"] == "removed"
+    assert archived["validation"]
+    assert archived["checkouts"]
 
 
 def test_cross_shard_duplicate_refuses_before_deletion(tmp_path: Path) -> None:
@@ -14458,7 +14466,7 @@ def test_fresh_registry_status_is_consistent(tmp_path: Path) -> None:
     assert payload["registry_storage_inconsistencies"] == []
 
 
-def test_unbound_owner_remains_unreclaimable_after_recovery_note(
+def test_unbound_owner_is_removable_after_recovery_note_and_expiry(
     tmp_path: Path,
 ) -> None:
     project, _repository, _remote = make_project(tmp_path)
@@ -14487,9 +14495,18 @@ def test_unbound_owner_remains_unreclaimable_after_recovery_note(
     assert row["coordinator_recovery_note"]
     expire_heartbeat(project)
     removed = remove(project)
-    assert removed.returncode == 3
-    assert "owner death is unknown" in removed.stderr
-    assert checkout(project).is_dir()
+    assert removed.returncode == 0, removed.stderr
+    assert not checkout(project).exists()
+    assert active_slots(project) == []
+    archive = json.loads(
+        (control_directory(project) / "ARCHIVED.testhost.json").read_text(encoding="utf-8")
+    )
+    assert len(archive["records"]) == 1
+    archived = archive["records"][0]
+    assert (archived["slot"], archived["generation"]) == ("slot01", 1)
+    assert archived["physical_storage"] == "removed"
+    assert archived["validation"]
+    assert archived["checkouts"]
 
 
 @pytest.mark.ordinary_environment
