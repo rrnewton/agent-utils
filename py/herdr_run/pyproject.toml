@@ -29,7 +29,7 @@ Issues = "https://github.com/rrnewton/agent-utils/issues"
 [project.scripts]
 herdr-run = "herdr_run.cli:main"
 herdr-agent = "herdr_run.agent_cli:main"
-herdr-subagents = "herdr_run.foreign.cli:main"
+herdr-subagents = "herdr_run.foreign_cli:main"
 herdr-chat = "herdr_run.chat:main"
 
 [tool.setuptools]

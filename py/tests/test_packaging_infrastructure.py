@@ -175,7 +175,11 @@ def test_embed_check_rejects_regular_copy_and_wrong_link_target(
 def test_package_docs_and_licenses_are_authoritative_links() -> None:
     docs = _load_script("embed_userguides")
 
-    assert len(docs.PACKAGE_LINKS) == 39
+    assert len(docs.PACKAGE_LINKS) == 41
+    assert {
+        "py/herdr_run/CHAT_USER_GUIDE.md",
+        "py/herdr_run/FOREIGN_USER_GUIDE.md",
+    } <= {link.destination for link in docs.PACKAGE_LINKS}
     for link in docs.PACKAGE_LINKS:
         destination = REPO_ROOT / link.destination
         assert destination.is_symlink(), link.destination
@@ -395,9 +399,9 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
 
     assert ordinary.isdisjoint(mapped)
     assert ordinary | mapped == all_tests
-    assert len(all_tests) == 653
+    assert len(all_tests) == 654
     assert len(ordinary) == 98
-    assert len(mapped) == 555
+    assert len(mapped) == 556
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {
@@ -472,6 +476,14 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     assert replay_test in mapped
     assert replay_test not in ordinary
     assert replay_test not in mapped_root
+
+    degenerate_owner_test = (
+        "wrkslots/tests/test_lifecycle.py::"
+        "test_remove_releases_a_slot_whose_owner_record_is_degenerate"
+    )
+    assert degenerate_owner_test in mapped
+    assert degenerate_owner_test not in ordinary
+    assert degenerate_owner_test not in mapped_root
 
     makefile = re.sub(
         r"\s+",

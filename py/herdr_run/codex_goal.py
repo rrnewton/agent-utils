@@ -284,7 +284,7 @@ def clear_goal(
     _call("thread/goal/clear", _session_params(session_id), command, timeout)
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def _main(argv: Sequence[str] | None = None) -> int:
     """Run with ``python -m herdr_run.codex_goal [--stdio] get SESSION_ID``."""
     parser = argparse.ArgumentParser(description=__doc__)
     transport = parser.add_mutually_exclusive_group()
@@ -327,4 +327,4 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(_main())

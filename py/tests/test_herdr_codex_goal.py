@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 import herdr_run.codex_goal as goal_module
-from herdr_run.codex_goal import CodexGoalError, clear_goal, get_goal, main, set_goal
+from herdr_run.codex_goal import CodexGoalError, _main, clear_goal, get_goal, set_goal
 from herdr_run.jsonx import as_mapping
 
 _SERVER = r'''
@@ -195,7 +195,7 @@ def test_timeout_reaps_transport_descendants(tmp_path: Path) -> None:
 def test_cli_writes_one_json_result(
     tmp_path: Path, capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert main([
+    assert _main([
         "--command-json", json.dumps(_server(tmp_path)), "get", "thread-fixture",
     ]) == 0
     output = capsys.readouterr()
@@ -207,7 +207,7 @@ def test_cli_writes_one_json_result(
 def test_cli_failure_is_nonzero_and_has_no_fake_success_json(
     tmp_path: Path, capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert main([
+    assert _main([
         "--command-json", json.dumps(_server(tmp_path, "error")), "get", "thread-fixture",
     ]) == 1
     output = capsys.readouterr()
