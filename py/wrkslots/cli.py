@@ -7531,6 +7531,24 @@ def _read_process_identity(pid: int, *, proc_root: Path = Path("/proc")) -> Proc
     )
 
 
+def _first_seen_names(names: list[str]) -> list[str]:
+    """The distinct names, in first-seen order.
+
+    Module scope rather than a closure so a test can reach it. The audit's
+    published lists must not repeat a name: `rows` is built from four separate
+    append sites, and the downstream contract refuses the entire census when
+    a published list contains duplicates.
+    """
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for name in names:
+        if name in seen:
+            continue
+        seen.add(name)
+        ordered.append(name)
+    return ordered
+
+
 def _owner_record_is_absent(record: ActiveRecord) -> bool:
     """Whether this row records no usable owner at all.
 
@@ -12603,14 +12621,37 @@ def _cmd_audit(args: argparse.Namespace) -> int:
             )
         )
     ]
-    attention_ids = {(str(row["slot"]), str(row["machine"])) for row in attention}
-    unknown = [
-        row
-        for row in unknown
-        if (str(row["slot"]), str(row["machine"])) not in attention_ids
+    # ⚠️ DEDUPLICATE BOTH LISTS, NOT JUST ONE, AND DEDUPLICATE BY THE PUBLISHED
+    # KEY. `rows` is assembled from FOUR separate append sites, so one slot can
+    # legitimately produce more than one row -- a registry row plus an on-disk
+    # worktree row is the ordinary case, which is why `owner_state ==
+    # "unregistered"` is itself an attention condition.
+    #
+    # The previous code built `attention_ids` precisely because duplicates are
+    # possible, used it to dedupe `unknown` against `attention`, and never
+    # deduped `attention` against itself. The downstream contract then refused
+    # the whole census -- "audit.attention_slots contains duplicates" -- so the
+    # audit could not publish a number at all, and a tick that reports nothing
+    # is indistinguishable from one that found nothing.
+    #
+    # ⚠️ THIS IS A DEADLOCK RATHER THAN A WRONG NUMBER, which is why it is worth
+    # the comment. Nothing downstream can clear the condition: the duplicate is
+    # produced inside this function every time two routes describe one slot, so
+    # no later participant can complete the operation from the record. The
+    # refusal was correct and unclearable at the same time.
+    #
+    # Deduplicating by (slot, machine) alone would not have been enough either:
+    # the PUBLISHED lists carry the slot name only, so two machines registering
+    # one name would still emit a duplicate the key could not see. Both lists
+    # are therefore reduced on the value that is actually published, preserving
+    # first-seen order so the report stays stable between runs.
+    attention_names = _first_seen_names([str(row["slot"]) for row in attention])
+    attention_name_set = set(attention_names)
+    unknown_names = [
+        name
+        for name in _first_seen_names([str(row["slot"]) for row in unknown])
+        if name not in attention_name_set
     ]
-    attention_names = [str(row["slot"]) for row in attention]
-    unknown_names = [str(row["slot"]) for row in unknown]
     if attention_names:
         gate_state = "actionable"
         summary = f"{len(attention_names)} worktree slot(s) need coordinator attention"

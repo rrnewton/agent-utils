@@ -338,3 +338,34 @@ def test_a_real_owner_is_not_treated_as_absent() -> None:
     # must NOT be swept in.
     namespaced = dataclasses.replace(live, pid=1, cgroup_path="/user.slice/session-3.scope")
     assert cli._owner_record_is_absent(_record(namespaced)) is False
+
+
+def test_the_audit_publishes_each_slot_once_even_from_several_routes() -> None:
+    """One slot described by two routes must be published once, not twice.
+
+    ⚠️ A DEADLOCK TEST, NOT A TIDINESS TEST. The audit's `rows` is built from
+    FOUR separate append sites, so a slot present both in the registry and as an
+    on-disk worktree legitimately produces two rows -- which is why
+    `owner_state == "unregistered"` is itself an attention condition. The
+    published list carried both, and the downstream contract then refused the
+    WHOLE census with "audit.attention_slots contains duplicates". Nothing
+    downstream could clear that: the duplicate is produced inside the audit
+    every time two routes describe one slot, so no later participant could
+    complete the operation from the record.
+
+    ⚠️ AND IT CALLS THE REAL FUNCTION. An earlier version of this test
+    reimplemented the dedup inline and passed whatever the production code did,
+    which is the exact shape of a check that cannot fail for the reason it
+    names.
+    """
+    # Two routes to one slot, plus the same NAME on a second machine -- the case
+    # a (slot, machine) key could not have caught, because the published list
+    # carries the name alone.
+    rows = ["slot01", "slot01", "slot02", "slot01"]
+    assert cli._first_seen_names(rows) == ["slot01", "slot02"]
+
+    published = cli._first_seen_names(rows)
+    assert len(published) == len(set(published))
+    # First-seen order, so the report is stable between runs.
+    assert cli._first_seen_names(["b", "a", "b"]) == ["b", "a"]
+    assert cli._first_seen_names([]) == []
