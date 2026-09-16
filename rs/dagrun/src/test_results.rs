@@ -911,7 +911,28 @@ mod additive_tests {
             ],
         )
         .unwrap();
-        let expected = br#"{"executed_tests":2,"filtered_tests":7,"results":[{"attempts":2,"id":"a","result":"pass"},{"attempts":18446744073709551615,"id":"b","result":"fail"}],"schema":2}"#;
+        // Workspace dependencies can enable serde_json's preserve_order feature.
+        // Both wire forms below match the pre-classified writer under the same
+        // feature set. Select independently of the result serializer, then
+        // require one exact byte sequence rather than accepting either form.
+        let mut order_probe = serde_json::Map::new();
+        order_probe.insert("z".into(), Value::Null);
+        order_probe.insert("a".into(), Value::Null);
+        let keys = order_probe.keys().map(String::as_str).collect::<Vec<_>>();
+        let (expected, empty_legacy, empty_classified): (&[u8], &[u8], &[u8]) =
+            match keys.as_slice() {
+                ["a", "z"] => (
+                    br#"{"executed_tests":2,"filtered_tests":7,"results":[{"attempts":2,"id":"a","result":"pass"},{"attempts":18446744073709551615,"id":"b","result":"fail"}],"schema":2}"#,
+                    br#"{"executed_tests":0,"filtered_tests":7,"results":[],"schema":2}"#,
+                    br#"{"executed_tests":0,"filtered_tests":7,"results":[],"schema":3}"#,
+                ),
+                ["z", "a"] => (
+                    br#"{"schema":2,"executed_tests":2,"filtered_tests":7,"results":[{"id":"a","result":"pass","attempts":2},{"id":"b","result":"fail","attempts":18446744073709551615}]}"#,
+                    br#"{"schema":2,"executed_tests":0,"filtered_tests":7,"results":[]}"#,
+                    br#"{"schema":3,"executed_tests":0,"filtered_tests":7,"results":[]}"#,
+                ),
+                other => panic!("unknown serde_json map order: {other:?}"),
+            };
         assert_eq!(report.to_current_json().unwrap(), expected);
         assert_eq!(TestResults::from_json_slice(expected).unwrap(), report);
         assert!(report
@@ -925,14 +946,14 @@ mod additive_tests {
                 .unwrap()
                 .to_current_json()
                 .unwrap(),
-            br#"{"executed_tests":0,"filtered_tests":7,"results":[],"schema":2}"#
+            empty_legacy
         );
         assert_eq!(
             TestResults::classified(0, 7, vec![])
                 .unwrap()
                 .to_classified_json()
                 .unwrap(),
-            br#"{"executed_tests":0,"filtered_tests":7,"results":[],"schema":3}"#
+            empty_classified
         );
     }
 

@@ -6860,9 +6860,38 @@ mod tests {
             ..Default::default()
         };
 
-        let result = run_dag_boxed_limited(&cfg, 2, 2, false, 0, Some(cgroups));
+        // Compare two completed profile rows: the intentional OOM failure must
+        // not abort the independent clamped control before its result arrives.
+        let result = run_dag_boxed_limited(&cfg, 2, 2, true, 0, Some(cgroups));
 
-        assert!(result.ok);
+        assert!(!result.ok);
+        assert_eq!(result.outcomes.len(), 2);
+        let clamped = result
+            .outcomes
+            .iter()
+            .find(|outcome| outcome.tag == "g.clamped")
+            .unwrap();
+        let killed = result
+            .outcomes
+            .iter()
+            .find(|outcome| outcome.tag == "g.killed")
+            .unwrap();
+        assert!(clamped.ok);
+        assert!(!clamped.oomed);
+        assert_eq!(clamped.oom_kills, 0);
+        assert!(!killed.ok);
+        assert!(killed.oomed);
+        assert_eq!(killed.oom_kills, 2);
+        assert_eq!(
+            killed.reason,
+            "OOM-KILLED (hit inner MemoryMax; 2 oom_kill event(s))"
+        );
+        for outcome in [clamped, killed] {
+            assert_eq!(outcome.returncode, Some(0));
+            assert!(!outcome.aborted);
+            assert!(!outcome.timed_out);
+            assert!(!outcome.cpu_timed_out);
+        }
         assert_eq!(
             profile_cell(&result, "g.clamped", "peak_bytes"),
             "8589934592"
