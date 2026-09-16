@@ -479,7 +479,10 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
         (REPO_ROOT / "Makefile").read_text(encoding="utf-8").replace("\\\n", " "),
     )
     assert (
+        'test_python="$$(python3 -c '
+        "'import os, sys; print(os.path.realpath(sys.executable))')\" && "
         "unshare --user --map-root-user --pid --fork --mount-proc "
+        '"$$test_python" ../scripts/pid_namespace_init.py -- '
         "python3 -m pytest -q -c pyproject.toml --rootdir=. "
         "wrkslots/tests/test_lifecycle.py -m 'not ordinary_environment'"
     ) in makefile
