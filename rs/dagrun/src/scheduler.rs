@@ -2704,6 +2704,29 @@ fn structured_test_failure_reason(
 const STRUCTURED_REFUSAL_TAIL_LINES: usize = 5;
 const STRUCTURED_REFUSAL_TAIL_BYTES: usize = 1024;
 
+/// Attach a refusing step's own trailing output to a structured-results refusal.
+///
+/// ⚠️ ALL THREE STRUCTURED CAUSES GO THROUGH HERE, and an earlier version of this
+/// change covered only one of them. `read_structured_test_counts` produces
+/// "cannot read structured test results" and "malformed structured test results"
+/// and never receives `captured`, so those two propagated out of
+/// `resolved_test_counts` by `?` before any tail was attached -- the same defect
+/// as the never-written case, in the two arms nobody looked at. Routing every
+/// cause through one function is what stops that recurring.
+fn with_captured_tail(message: &str, captured: &[u8]) -> String {
+    let tail = last_lines(
+        captured,
+        STRUCTURED_REFUSAL_TAIL_LINES,
+        STRUCTURED_REFUSAL_TAIL_BYTES,
+    );
+    if tail.is_empty() {
+        // A step that refuses and says nothing is a FINDING, not an empty field,
+        // and the record has to report that rather than read as merely unset.
+        return format!("{message}; the step wrote no output explaining why");
+    }
+    format!("{message}; last output: {}", tail.join(" | "))
+}
+
 fn resolved_test_counts(
     mode: TestResultsMode,
     path: Option<&std::path::Path>,
@@ -2712,8 +2735,14 @@ fn resolved_test_counts(
     match mode {
         TestResultsMode::Structured(schema) => {
             if let Some(path) = path {
-                if let Some(counts) = read_structured_test_counts(path, Some(schema))? {
-                    return Ok(counts);
+                // NOT `?`. A bare propagation here is what left "cannot read"
+                // and "malformed" carrying no more than the never-written case
+                // used to: the node's own output is in scope and must reach all
+                // three, not only the one that is easiest to see.
+                match read_structured_test_counts(path, Some(schema)) {
+                    Ok(Some(counts)) => return Ok(counts),
+                    Ok(None) => {}
+                    Err(error) => return Err(with_captured_tail(&error, captured)),
                 }
             }
             let location = path
@@ -2725,24 +2754,9 @@ fn resolved_test_counts(
             // passing, a stale prepared executable, a malformed report and an
             // unsupported event in the stream are byte-identical in the typed
             // record without it.
-            let tail = last_lines(
+            Err(with_captured_tail(
+                &format!("required structured test results were not written to {location}"),
                 captured,
-                STRUCTURED_REFUSAL_TAIL_LINES,
-                STRUCTURED_REFUSAL_TAIL_BYTES,
-            );
-            if tail.is_empty() {
-                // A step that refuses and says nothing is a FINDING, not an empty
-                // field, and the record has to be able to report that rather than
-                // read as merely unset.
-                return Err(format!(
-                    "required structured test results were not written to {location}; \
-                     the step wrote no output explaining why"
-                ));
-            }
-            Err(format!(
-                "required structured test results were not written to {location}; \
-                 last output: {}",
-                tail.join(" | ")
             ))
         }
         TestResultsMode::ExplicitNone => Ok(CapturedTestResults {
@@ -4866,6 +4880,61 @@ run-nextest-counted: cannot derive typed test results from /tmp/tmp.GnIJuuSDYR\n
         assert!(
             refusal.contains("required structured test results were not written"),
             "{refusal}"
+        );
+
+        // ⚠️ ALL THREE STRUCTURED CAUSES MUST CARRY THE OUTPUT, NOT ONLY THE
+        // NEVER-WRITTEN ONE. The first version of this change covered one of
+        // three: "cannot read" and "malformed" come from
+        // read_structured_test_counts, which never sees `captured`, and they
+        // propagated out before any tail was attached. These two assertions are
+        // the ones that would have caught that.
+        let noise = b"suite-runner: 507 tests run: 507 passed, 0 skipped\n\
+nextest-test-results: refusing because the selected set changed\n" as &[u8];
+
+        let malformed_path = std::env::temp_dir().join(format!(
+            "dagrun-malformed-{}-{}.json",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&malformed_path, b"not-json").unwrap();
+        let malformed = resolved_test_counts(
+            TestResultsMode::Structured(crate::test_results::CURRENT_SCHEMA),
+            Some(&malformed_path),
+            noise,
+        )
+        .unwrap_err();
+        std::fs::remove_file(&malformed_path).unwrap();
+        assert!(
+            malformed.contains("malformed structured test results"),
+            "{malformed}"
+        );
+        assert!(
+            malformed.contains("selected set changed"),
+            "the malformed arm discarded the node's own output: {malformed}"
+        );
+
+        // "cannot read" -- a path that exists but is a directory, so the read
+        // fails with something other than NotFound.
+        let unreadable = std::env::temp_dir().join(format!(
+            "dagrun-unreadable-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&unreadable).unwrap();
+        let cannot_read = resolved_test_counts(
+            TestResultsMode::Structured(crate::test_results::CURRENT_SCHEMA),
+            Some(&unreadable),
+            noise,
+        )
+        .unwrap_err();
+        std::fs::remove_dir(&unreadable).unwrap();
+        assert!(
+            cannot_read.contains("cannot read structured test results"),
+            "{cannot_read}"
+        );
+        assert!(
+            cannot_read.contains("selected set changed"),
+            "the cannot-read arm discarded the node's own output: {cannot_read}"
         );
 
         // A step that refuses and says nothing is a FINDING, not an empty field.
