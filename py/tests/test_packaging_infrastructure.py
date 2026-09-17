@@ -399,13 +399,17 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
 
     assert ordinary.isdisjoint(mapped)
     assert ordinary | mapped == all_tests
-    assert len(all_tests) == 806
-    assert len(ordinary) == 247
-    assert len(mapped) == 559
+    assert len(all_tests) == 826
+    assert len(ordinary) == 264
+    assert len(mapped) == 562
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {
         "test_adopt_refuses_pid_outside_invoking_process_ancestry",
+        "test_batch_census_isolated_real_file_alias_mapping_and_socket",
+        "test_batch_census_two_selected_trees_cannot_mask_socket_holder",
+        "test_batch_census_validation_filesystem_outside_hardlink_mapping",
+        "test_batch_maps_filter_preserves_large_inode_strings_and_read_errors",
         "test_bounded_read_only_command_cleans_up_post_spawn_setup_failure",
         "test_bounded_read_only_command_discards_output_before_timeout",
         "test_bounded_read_only_command_kills_descendant_holding_output",

@@ -22841,106 +22841,519 @@ class _ProcessPathCensus:
                 )
 
 
+def _census_nul_records(output: bytes, width: int, label: str) -> list[list[str]]:
+    fields = output.split(b"\0")
+    if fields.pop() != b"" or len(fields) % width:
+        raise Refusal(f"{label} returned a truncated record")
+    decoded = [field.decode("utf-8", errors="surrogateescape") for field in fields]
+    return [decoded[index:index + width] for index in range(0, len(decoded), width)]
+
+
+def _selected_tree_inodes(
+    targets: Mapping[Path, str], budget: _ReadOnlyCommandBudget,
+) -> tuple[dict[tuple[int, int], tuple[tuple[str, str], ...]], bool]:
+    """Stat each selected tree once; outside hardlinks retain the same identity.
+
+    Names inside that already-bound tree are not needed for membership. Keeping
+    only device/inode/type avoids repeating a long checkout prefix per file.
+    """
+
+    collected: dict[tuple[int, int], list[tuple[str, str]]] = {}
+    has_sockets = False
+    for target, slot in targets.items():
+        rc, stdout, stderr = _run_same_uid_command(
+            Path("/usr/bin/find"), ("-P", str(target), "-printf", "%D\\0%i\\0%y\\0"),
+            budget=budget,
+        )
+        if rc or stderr:
+            raise Refusal("selected-tree inode census is incomplete: " +
+                          stderr.decode("utf-8", errors="replace").strip())
+        for device, inode, kind in _census_nul_records(stdout, 3, "selected-tree find"):
+            if kind not in {"b", "c", "d", "f", "l", "p", "s"}:
+                raise Refusal("selected-tree find returned an invalid file type")
+            has_sockets = has_sockets or kind == "s"
+            if not device.isascii() or not device.isdecimal() or not inode.isascii() or not inode.isdecimal():
+                raise Refusal("selected-tree find returned an invalid inode identity")
+            identity = (int(device), int(inode))
+            entries = collected.setdefault(identity, [])
+            entry = (slot, f"{target} [device={device},inode={inode}]")
+            if entry not in entries:
+                entries.append(entry)
+    return {identity: tuple(paths) for identity, paths in collected.items()}, has_sockets
+
+
+def _batch_link_matches(
+    processes: Sequence[_AbsentProcessObservation], targets: Mapping[Path, str],
+    budget: _ReadOnlyCommandBudget,
+) -> tuple[tuple[int, str, str, str], ...]:
+    # Use the same literal link selection as the existing final same-UID pass.
+    # Outside aliases are covered separately by followed device/inode stats.
+    tests: list[str] = []
+    for target in sorted(targets, key=str):
+        literal = str(target)
+        for character in ("\\", "*", "?", "["):
+            literal = literal.replace(character, f"\\{character}")
+        for pattern in (literal, f"{literal}/*", f"{literal} (deleted)"):
+            if tests:
+                tests.append("-o")
+            tests.extend(("-lname", pattern))
+    suffix = ("-ignore_readdir_race", "-maxdepth", "1", "-type", "l",
+              "(", *tests, ")", "-printf", "%p\\0%l\\0")
+    observed = {process.pid: process for process in processes}
+    matches: list[tuple[int, str, str, str]] = []
+    for arguments in _argument_batches(("-P",), _process_symlink_roots(processes), suffix):
+        pids = {_pid_from_proc_evidence(Path(path))
+                for path in arguments[1:len(arguments) - len(suffix)]}
+        rc, stdout, stderr = _run_root_owned_command(Path("/usr/bin/find"), arguments, budget=budget)
+        _allow_only_vanished_process_diagnostics(
+            "find", rc, stderr, {pid: observed[pid] for pid in pids},
+        )
+        matches.extend(_parse_find_path_matches(stdout, observed, targets, census="privileged"))
+    return tuple(matches)
+
+
+def _batch_inode_matches(
+    processes: Sequence[_AbsentProcessObservation],
+    inodes: Mapping[tuple[int, int], tuple[tuple[str, str], ...]],
+    budget: _ReadOnlyCommandBudget,
+) -> tuple[tuple[tuple[int, str, str, str], ...], dict[int, set[int]]]:
+    """Follow proc links with stat, without reading fdinfo contents.
+
+    cwd/root/exe are depth zero. Only the fd directory is enumerated: following
+    cwd/root recursively would accidentally scan arbitrary process filesystems.
+    """
+
+    observed = {process.pid: process for process in processes}
+    links: list[str] = []
+    directories: list[str] = []
+    for process in processes:
+        base = Path("/proc") / str(process.pid)
+        links.extend(str(base / name) for name in ("cwd", "root"))
+        if not process.kernel_thread:
+            links.append(str(base / "exe"))
+        directories.append(str(base / "fd"))
+    matches: list[tuple[int, str, str, str]] = []
+    sockets: dict[int, set[int]] = {}
+    fallback: set[int] = set()
+    unreadable_cwds: set[str] = set()
+    targets = {Path(slot): slot for paths in inodes.values() for slot, _name in paths}
+    for roots, depths in ((links, ("-maxdepth", "0")),
+                           (directories, ("-mindepth", "1", "-maxdepth", "1"))):
+        suffix = ("-ignore_readdir_race", *depths, "-printf", "%p\\0%D\\0%i\\0%y\\0")
+        for arguments in _argument_batches(("-L",), roots, suffix):
+            batch_pids = {_pid_from_proc_evidence(Path(path))
+                          for path in arguments[1:len(arguments) - len(suffix)]}
+            rc, stdout, stderr = _run_root_owned_command(
+                Path("/usr/bin/find"), arguments, budget=budget,
+            )
+            try:
+                _allow_only_vanished_process_diagnostics(
+                    "find", rc, stderr, {pid: observed[pid] for pid in batch_pids},
+                )
+            except Refusal:
+                # An observed disconnected cwd can defeat followed stat while
+                # independent FD evidence remains complete. Only this exact
+                # cwd error may use the historical oracle; unreadable FDs could
+                # hide socket identities that a negative lsof result misses.
+                if rc != 1 or not stderr or not targets:
+                    raise
+                for line in stderr.decode("ascii").splitlines():
+                    diagnostic = re.fullmatch(
+                        r"/usr/bin/find: '(/proc/([0-9]+)/cwd)': Transport endpoint is not connected", line,
+                    )
+                    if diagnostic is None or int(diagnostic[2]) not in batch_pids:
+                        raise Refusal("proc inode find returned unattributed diagnostics")
+                    pid = int(diagnostic[2])
+                    if _process_generation_is_current(observed[pid]):
+                        fallback.add(pid)
+                        unreadable_cwds.add(diagnostic[1])
+            for name, device, inode, kind in _census_nul_records(stdout, 4, "proc inode find"):
+                pid = _pid_from_proc_evidence(Path(name))
+                observation = observed.get(pid)
+                if observation is None or pid not in batch_pids:
+                    raise Refusal("proc inode find returned an unexpected PID")
+                # GNU find reports U for anonymous descriptors whose stat mode
+                # has no file-type bits. Still compare their device/inode.
+                if not device.isascii() or not device.isdecimal() or not inode.isascii() or not inode.isdecimal() or kind not in {"b", "c", "d", "f", "l", "p", "s", "U"}:
+                    raise Refusal("proc inode find returned an invalid inode identity")
+                if kind == "l":
+                    if name not in unreadable_cwds:
+                        raise _ProcessEvidenceChanged(f"PID {pid} proc target changed during inode census")
+                    continue
+                identity = (int(device), int(inode))
+                selected = inodes.get(identity, ())
+                if selected or kind == "s":
+                    if not _process_generation_is_current(observation):
+                        raise _ProcessEvidenceChanged(f"PID {pid} generation changed during inode census")
+                    for slot, path in selected:
+                        matches.append((pid, slot, "inode", f"{name}={path}"))
+                    if kind == "s":
+                        sockets.setdefault(int(inode), set()).add(pid)
+    if fallback:
+        matches.extend(_batch_lsof_fallback(
+            tuple(observed[pid] for pid in sorted(fallback)), targets, budget,
+        ))
+    return tuple(matches), sockets
+
+
+_BATCH_MAPS_AWK = r'''
+BEGIN {
+    while ((r = getline item < "/dev/stdin") > 0) {
+        if (substr(item, 1, 1) == "i") inodes[item] = 1;
+        else paths[++count] = substr(item, 2);
+    }
+    if (r < 0) { print "maps selection input is unreadable" > "/dev/stderr"; exit 2; }
+    close("/dev/stdin");
+    for (file = 1; file < ARGC; file++) {
+        path = ARGV[file];
+        while ((r = getline row < path) > 0) {
+            split(row, fields); selected = (("i" fields[5]) in inodes);
+            for (i = 1; !selected && i <= count; i++) selected = index(row, paths[i]) != 0;
+            if (selected) print path ":" row;
+        }
+        if (r < 0) { print path ": " ERRNO > "/dev/stderr"; failed = 1; }
+        close(path);
+    }
+    exit failed;
+}
+'''
+
+
+def _batch_maps_inode_matches(
+    processes: Sequence[_AbsentProcessObservation], targets: Mapping[Path, str],
+    inodes: Mapping[tuple[int, int], tuple[tuple[str, str], ...]],
+    budget: _ReadOnlyCommandBudget,
+) -> tuple[tuple[int, str, str, str], ...]:
+    # A maps row retains device/inode even when its outside hardlink is the only
+    # visible pathname, and even after the original descriptor has been closed.
+    patterns = {"p" + str(target) for target in targets}
+    # Prefix keys in both the input and awk lookup, with no numeric conversion:
+    # inode strings above 2**53 must not collapse through floating-point keys.
+    patterns.update(f"i{inode}" for _device, inode in inodes if inode)
+    if any("\n" in value or "\0" in value for value in patterns):
+        raise Refusal("validation paths containing line or NUL bytes cannot be probed")
+    pattern_input = ("\n".join(sorted(patterns)) + "\n").encode("utf-8")
+    observed = {process.pid: process for process in processes}
+    files = [f"/proc/{process.pid}/maps" for process in processes]
+    matches: list[tuple[int, str, str, str]] = []
+    inode_numbers = {inode for _device, inode in inodes}
+    unresolved: dict[str, bytes] = {}
+    cache: dict[Path, tuple[Path, str] | None] = {}
+    for arguments in _argument_batches(("--", _BATCH_MAPS_AWK), files, ()):
+        batch_pids = {_pid_from_proc_evidence(Path(path)) for path in arguments[2:]}
+        rc, stdout, stderr = _run_root_owned_command(
+            Path("/usr/bin/gawk"), arguments, input_data=pattern_input, budget=budget,
+        )
+        if rc or stderr:
+            if rc != 1 or not stderr:
+                raise Refusal(f"maps inode filter returned inconsistent exit {rc}")
+            for diagnostic in stderr.decode("utf-8", errors="surrogateescape").splitlines():
+                missing = re.fullmatch(r"/proc/([0-9]+)/maps: No such file or directory", diagnostic)
+                if missing is None or int(missing[1]) not in batch_pids or _process_generation_is_current(observed[int(missing[1])]):
+                    raise Refusal("maps inode filter produced diagnostics: " + diagnostic)
+        for line in stdout.splitlines():
+            raw_path, separator, mapping = line.partition(b":")
+            if not separator:
+                raise Refusal("inode maps census returned an unframed record")
+            path = Path(raw_path.decode("ascii"))
+            pid = _pid_from_proc_evidence(path)
+            fields = mapping.decode("utf-8", errors="surrogateescape").split(maxsplit=5)
+            if pid not in batch_pids or len(fields) not in (5, 6):
+                raise Refusal("inode maps census returned a malformed record")
+            try:
+                major, minor = (int(part, 16) for part in fields[3].split(":"))
+                identity = (os.makedev(major, minor), int(fields[4]))
+            except (ValueError, OverflowError) as exc:
+                raise Refusal("inode maps census returned an invalid identity") from exc
+            selected = list(inodes.get(identity, ()))
+            if not selected and identity[1] in inode_numbers:
+                # Some filesystems expose a different device number in maps
+                # than through stat. Never equate those devices or use inode
+                # alone: ask the kernel-held mapping for its actual file stat.
+                if not re.fullmatch(r"[0-9a-f]+-[0-9a-f]+", fields[0]):
+                    raise Refusal("inode maps census returned an invalid address range")
+                first, last = (int(value, 16) for value in fields[0].split("-"))
+                if first >= last:
+                    raise Refusal("inode maps census returned an invalid address range")
+                unresolved[f"/proc/{pid}/map_files/{fields[0]}"] = line
+            if len(fields) == 6:
+                match = _matching_absent_validate_target(
+                    Path(fields[5].removesuffix(" (deleted)")), targets, cache,
+                )
+                if match is not None:
+                    selected.append((match[1], fields[5]))
+            if selected:
+                if not _process_generation_is_current(observed[pid]):
+                    raise _ProcessEvidenceChanged(f"PID {pid} generation changed during maps census")
+                for slot, name in selected:
+                    matches.append((pid, slot, "map", f"{path}={name}"))
+    if unresolved:
+        matches.extend(_batch_map_file_matches(observed, unresolved, inodes, budget))
+    return tuple(matches)
+
+
+
+def _batch_map_file_matches(
+    processes: Mapping[int, _AbsentProcessObservation], rows: Mapping[str, bytes],
+    inodes: Mapping[tuple[int, int], tuple[tuple[str, str], ...]],
+    budget: _ReadOnlyCommandBudget,
+) -> tuple[tuple[int, str, str, str], ...]:
+    """Resolve a maps/stat device mismatch through the kernel-held file."""
+
+    suffix = ("-maxdepth", "0", "-printf", "%p\\0%D\\0%i\\0%y\\0")
+    seen: set[str] = set()
+    matches: list[tuple[int, str, str, str]] = []
+    for arguments in _argument_batches(("-L",), tuple(rows), suffix):
+        rc, stdout, stderr = _run_root_owned_command(Path("/usr/bin/find"), arguments, budget=budget)
+        if rc or stderr:
+            raise Refusal("map_files inode identity is unreadable: " + stderr.decode("utf-8", errors="replace").strip())
+        for name, device, inode, kind in _census_nul_records(stdout, 4, "map_files find"):
+            if name not in rows or name in seen or kind not in {"f", "c", "b"} or not device.isascii() or not device.isdecimal() or not inode.isascii() or not inode.isdecimal():
+                raise Refusal("map_files inode identity is malformed or unavailable")
+            seen.add(name)
+            pid = _pid_from_proc_evidence(Path(name))
+            if not _process_generation_is_current(processes[pid]):
+                raise _ProcessEvidenceChanged(f"PID {pid} changed during map_files census")
+            for slot, path in inodes.get((int(device), int(inode)), ()):
+                matches.append((pid, slot, "map", f"{name}={path}"))
+    if seen != set(rows):
+        raise Refusal("map_files inode census omitted a requested mapping")
+    # A mapping can be replaced at the same virtual address without PID reuse.
+    # Require every original complete row after following the kernel map link.
+    by_pid: dict[int, set[bytes]] = {}
+    for name, row in rows.items():
+        by_pid.setdefault(_pid_from_proc_evidence(Path(name)), set()).add(row)
+    for pid, expected in by_pid.items():
+        patterns = b"\n".join(row.partition(b":")[2] for row in sorted(expected)) + b"\n"
+        rc, stdout, stderr = _run_root_owned_command(
+            Path("/usr/bin/grep"), ("-F", "-H", "-x", "-f", "-", "--", f"/proc/{pid}/maps"),
+            input_data=patterns, budget=budget,
+        )
+        if rc not in {0, 1} or stderr:
+            raise Refusal("maps readback is unreadable after map_files census")
+        if set(stdout.splitlines()) != expected or not _process_generation_is_current(processes[pid]):
+            raise _ProcessEvidenceChanged(f"PID {pid} mappings changed during map_files census")
+    return tuple(matches)
+
+
+def _batch_lsof_fallback(
+    processes: Sequence[_AbsentProcessObservation], targets: Mapping[Path, str],
+    budget: _ReadOnlyCommandBudget,
+) -> tuple[tuple[int, str, str, str], ...]:
+    """Retain the original oracle only for the attributed disconnected cwd."""
+
+    pids = {process.pid: process for process in processes}
+    arguments = ["-nP", "-Fpcfn", "-a", "-p", ",".join(map(str, sorted(pids)))]
+    for target in targets:
+        arguments.extend(("+D", str(target)))
+    rc, stdout, stderr = _run_same_uid_command(Path("/usr/bin/lsof"), arguments, budget=budget)
+    for process in processes:
+        if not _process_generation_is_current(process):
+            raise _ProcessEvidenceChanged(f"PID {process.pid} changed during lsof fallback")
+    diagnostics = stderr.decode("utf-8", errors="surrogateescape")
+    if rc not in (0, 1) or any(not _unrelated_lsof_warnings(diagnostics, target) for target in targets):
+        raise Refusal("disconnected cwd lsof fallback is incomplete")
+    reported: set[int] = set()
+    attributed: set[int] = set()
+    current: int | None = None
+    matches: list[tuple[int, str, str, str]] = []
+    for line in stdout.decode("utf-8", errors="surrogateescape").splitlines():
+        if line.startswith("p") and line[1:].isdigit():
+            current = int(line[1:])
+            if current not in pids:
+                raise Refusal("disconnected cwd lsof fallback reported an unexpected PID")
+            reported.add(current)
+        elif line.startswith("n") and current is not None:
+            name = line[1:].removesuffix(" (deleted)")
+            matched = _matching_absent_validate_target(Path(name), targets)
+            if matched is not None:
+                attributed.add(current)
+                matches.append((current, matched[1], "lsof", name))
+    if reported != attributed:
+        raise Refusal("disconnected cwd lsof fallback reported unattributed process use")
+    return tuple(matches)
+
+
+def _batch_network_namespaces(
+    processes: Sequence[_AbsentProcessObservation], budget: _ReadOnlyCommandBudget,
+) -> dict[int, str]:
+    """Read exact namespace links with the same trusted full-host visibility."""
+
+    observed = {process.pid: process for process in processes}
+    roots = [f"/proc/{process.pid}/ns/net" for process in processes]
+    suffix = ("-maxdepth", "0", "-printf", "%p\\0%l\\0")
+    result: dict[int, str] = {}
+    for arguments in _argument_batches(("-P",), roots, suffix):
+        batch = {_pid_from_proc_evidence(Path(path)) for path in arguments[1:-len(suffix)]}
+        rc, stdout, stderr = _run_root_owned_command(Path("/usr/bin/find"), arguments, budget=budget)
+        _allow_only_vanished_process_diagnostics("find", rc, stderr, {pid: observed[pid] for pid in batch})
+        for path, namespace in _census_nul_records(stdout, 2, "network namespace find"):
+            pid = _pid_from_proc_evidence(Path(path))
+            if pid not in batch or path != f"/proc/{pid}/ns/net" or pid in result:
+                raise Refusal("network namespace census returned an unexpected path")
+            if not _process_generation_is_current(observed[pid]):
+                continue
+            if not re.fullmatch(r"net:\[[0-9]+\]", namespace):
+                raise Refusal(f"network namespace is unreadable or malformed for PID {pid}")
+            result[pid] = namespace
+    for process in processes:
+        if process.pid not in result and _process_generation_is_current(process):
+            raise Refusal(f"network namespace census omitted PID {process.pid}")
+    return result
+
+
+def _batch_unix_socket_matches(
+    processes: Sequence[_AbsentProcessObservation], targets: Mapping[Path, str],
+    holders: Mapping[int, set[int]], budget: _ReadOnlyCommandBudget,
+    *, selected_has_sockets: bool = False,
+) -> tuple[tuple[int, str, str, str], ...]:
+    """Associate namespace-local Unix names with the sockets held by processes.
+
+    A process can retain a socket after changing network namespaces, so consult
+    every observed namespace, not just the holder's current namespace.
+    """
+
+    namespaces: dict[str, list[_AbsentProcessObservation]] = {}
+    bindings = _batch_network_namespaces(processes, budget)
+    for process in processes:
+        if process.pid in bindings:
+            namespaces.setdefault(bindings[process.pid], []).append(process)
+    matches: list[tuple[int, str, str, str]] = []
+    cache: dict[Path, tuple[Path, str] | None] = {}
+    observed = {process.pid: process for process in processes}
+    unresolved: set[int] = set()
+    accounted: set[int] = set()
+    selected_representatives: list[_AbsentProcessObservation] = []
+    for namespace, representatives in namespaces.items():
+        contents: bytes | None = None
+        for process in representatives:
+            path = Path(f"/proc/{process.pid}/net/unix")
+            try:
+                rc, contents, stderr = _run_root_owned_command(Path("/usr/bin/cat"), ("--", str(path)), budget=budget)
+                if rc or stderr or len(contents) > _MOUNTINFO_FILE_BYTES_LIMIT:
+                    raise Refusal(f"Unix socket census is incomplete for PID {process.pid}")
+                budget.remaining_seconds()
+                if not _process_generation_is_current(process):
+                    contents = None
+                    continue
+            except (OSError, Refusal) as exc:
+                if not _process_generation_is_current(process):
+                    contents = None
+                    continue
+                if isinstance(exc, Refusal):
+                    raise
+                raise Refusal(f"Unix socket census is unreadable for PID {process.pid}: {exc}") from exc
+            selected_representatives.append(process)
+            break
+        if contents is None:
+            raise _ProcessEvidenceChanged("network namespace representatives changed during socket census")
+        lines = contents.decode("utf-8", errors="surrogateescape").split("\n")
+        if lines[-1] != "":
+            raise Refusal("Unix socket census returned a truncated record")
+        lines.pop()
+        if not lines or lines[0].split() != ["Num", "RefCount", "Protocol", "Flags", "Type", "St", "Inode", "Path"]:
+            raise Refusal("Unix socket census returned a malformed header")
+        for line in lines[1:]:
+            # The kernel emits one delimiter after the inode. Keep every byte
+            # after that delimiter: even a whitespace-only relative name is a
+            # legal filesystem socket, distinct from an unnamed socket.
+            fields = re.fullmatch(
+                r"[0-9a-fA-F]+:[ \t]+(?:[0-9a-fA-F]+[ \t]+){5}([0-9]+)(?: (.*))?", line,
+            )
+            if fields is None:
+                raise Refusal("Unix socket census returned a malformed record")
+            inode = int(fields[1])
+            accounted.add(inode)
+            pathname = fields[2]
+            if pathname is None:
+                continue  # An unnamed socket has no bound filesystem path.
+            name = Path(pathname)
+            pids = holders.get(inode, set())
+            if pathname.startswith("@"):
+                # proc renders both abstract addresses and a filesystem-relative
+                # '@name' this way. With selected socket nodes its identity is
+                # unresolved; the prefix alone is never abstract proof.
+                if selected_has_sockets:
+                    unresolved.update(pids)
+                continue
+            if not name.is_absolute():
+                # A namespace table also lists sockets held by other processes.
+                # Only held descriptor identities belong to this census. Relative
+                # bind paths cannot be reconstructed from the holder's later cwd.
+                if selected_has_sockets:
+                    unresolved.update(pids)
+                continue
+            matched = _matching_absent_validate_target(name, targets, cache)
+            if matched is None:
+                if selected_has_sockets:
+                    # The bound name can be an outside hardlink of a socket node
+                    # in a selected tree; its object identity remains unresolved.
+                    unresolved.update(pids)
+                continue
+            if not pids:
+                raise Refusal(f"Unix socket remains bound inside {matched[0]} without a stable observed holder")
+            for pid in pids:
+                if not _process_generation_is_current(observed[pid]):
+                    raise _ProcessEvidenceChanged(f"PID {pid} changed during Unix socket census")
+                matches.append((pid, matched[1], "socket", str(name)))
+    after = _batch_network_namespaces(selected_representatives, budget)
+    if after != {process.pid: bindings[process.pid] for process in selected_representatives}:
+        raise _ProcessEvidenceChanged("network namespace representatives changed during socket census")
+    if selected_has_sockets and set(holders) - accounted:
+        # A socket can outlive the last process in its originating network
+        # namespace. Its FD alone establishes neither its family nor its bound
+        # name, so tables from current process namespaces cannot prove clear.
+        raise Refusal("held socket identities are absent from observed Unix tables; selected socket-node use is unknown")
+    if unresolved:
+        # A positive match for this PID in one selected tree cannot establish
+        # that an unresolved socket does not use another selected tree.
+        raise Refusal("Unix socket census cannot attribute a relative bound pathname or alias")
+    return tuple(matches)
+
+
 def _capture_lsof_process_path_census(
-    slot_paths: Sequence[Path], *, budget: _ReadOnlyCommandBudget
+    slot_paths: Sequence[Path], *, budget: _ReadOnlyCommandBudget,
 ) -> _ProcessPathCensus:
-    """Run the historical lsof proof once for every path in this batch."""
+    """Preserve the batch's historical file/alias/socket proof without fdinfo.
+
+    Keep the internal entrypoint used by batch recovery and its fresh same-UID
+    guard. The general path-only census remains separate: inode and Unix socket
+    evidence are required here before this batch can be declared unused.
+    """
 
     targets = {path: str(path) for path in slot_paths}
     if not targets:
         return _ProcessPathCensus((), (), owner_cgroup_complete=False)
-    lsof = next(
-        (
-            candidate
-            for candidate in (Path("/usr/bin/lsof"), Path("/usr/sbin/lsof"))
-            if candidate.is_file() and os.access(candidate, os.X_OK)
-        ),
-        None,
-    )
-    if lsof is None:
-        raise Refusal("process use is indeterminate because lsof is unavailable")
-    arguments = ["-nP", "-Fpcfn"]
-    for path in targets:
-        arguments.extend(("+D", str(path)))
-    returncode, stdout_bytes, stderr_bytes = _run_same_uid_command(
-        lsof, arguments, budget=budget
-    )
-    stdout = stdout_bytes.decode("utf-8", errors="surrogateescape")
-    stderr = stderr_bytes.decode("utf-8", errors="surrogateescape")
-    if any(not _unrelated_lsof_warnings(stderr, path) for path in targets):
-        detail = stderr.strip().splitlines()
-        raise Refusal(
-            "process use is indeterminate because lsof reported: "
-            + (detail[0] if detail else "an unreadable validation path")
-        )
-    if returncode not in (0, 1):
-        raise Refusal(f"process use is indeterminate because lsof exited {returncode}")
-    current_pid: int | None = None
-    reported_pids: set[int] = set()
-    attributed_pids: set[int] = set()
-    matches: list[tuple[int, str, str, str]] = []
-    match_cache: dict[Path, tuple[Path, str] | None] = {}
-    for line in stdout.splitlines():
-        if line.startswith("p") and line[1:].isdigit():
-            current_pid = int(line[1:])
-            reported_pids.add(current_pid)
-        elif line.startswith("n") and current_pid is not None:
-            raw_path = line[1:].removesuffix(" (deleted)")
-            observed = Path(raw_path)
-            matched = _matching_absent_validate_target(observed, targets, match_cache)
-            if matched is not None:
-                _target, slot = matched
-                matches.append((current_pid, slot, "lsof", raw_path))
-                attributed_pids.add(current_pid)
-    unattributed = sorted(reported_pids - attributed_pids)
-    if unattributed:
-        raise Refusal(
-            "process use is indeterminate because batched lsof did not attribute "
-            f"PID {unattributed[0]} to a requested checkout"
-        )
-    lsns = Path("/usr/bin/lsns")
-    if not lsns.is_file() or not os.access(lsns, os.X_OK):
-        raise Refusal("process use is indeterminate because lsns is unavailable")
-    namespace_rc, namespace_stdout, namespace_stderr = _run_root_owned_command(
-        lsns,
-        ("--type", "mnt", "--output", "NS,PID", "--noheadings", "--raw"),
-        budget=budget,
-    )
-    if namespace_rc != 0 or namespace_stderr:
-        detail = (namespace_stderr or namespace_stdout).decode(
-            "utf-8", errors="replace"
-        ).strip().splitlines()
-        raise Refusal(
-            "process use is indeterminate because lsns could not enumerate mount "
-            "namespaces" + (f": {detail[0]}" if detail else "")
-        )
-    try:
-        namespace_lines = namespace_stdout.decode("ascii").splitlines()
-    except UnicodeError as exc:
-        raise Refusal("process use is indeterminate because lsns output is invalid") from exc
-    if not namespace_lines:
-        raise Refusal("process use is indeterminate because lsns found no mount namespaces")
-    mount_matches: list[tuple[int, str, str, str]] = []
-    seen_namespaces: set[int] = set()
-    for line in namespace_lines:
+    before = {path: _open_directory_identity(path, "selected census tree") for path in targets}
+    inodes, has_sockets = _selected_tree_inodes(targets, budget)
+    if has_sockets:
+        # A Unix bound-name string does not authenticate the held filesystem
+        # object: that name can be unlinked/rebound while a hardlink survives in
+        # another selected tree. Do not declare any member of this cohort unused
+        # without kernel socket-object identity evidence.
+        raise Refusal("selected tree contains a filesystem socket node; socket-object liveness is unproven")
+    for attempt in range(3):
         budget.remaining_seconds()
-        fields = line.split()
-        if len(fields) != 2 or not all(field.isdigit() for field in fields):
-            raise Refusal("process use is indeterminate because lsns output is malformed")
-        namespace, pid = (int(field) for field in fields)
-        if namespace in seen_namespaces or pid <= 0:
-            raise Refusal("process use is indeterminate because lsns output is malformed")
-        seen_namespaces.add(namespace)
-        pid_dir = Path("/proc") / str(pid)
-        for target, slot in targets.items():
-            uses = _process_mounts_slot(pid_dir, target)
-            if uses:
-                mount_matches.append((pid, slot, "mount", uses[0]))
-    return _ProcessPathCensus(
-        (),
-        (*matches, *mount_matches),
-        owner_cgroup_complete=False,
-    )
+        try:
+            processes = _absent_validate_process_snapshot(include_owner_cgroups=False)
+            mounts = _absent_validate_mount_matches(processes, targets, budget)
+            links = _batch_link_matches(processes, targets, budget)
+            inode_matches, sockets = _batch_inode_matches(processes, inodes, budget)
+            maps = _batch_maps_inode_matches(processes, targets, inodes, budget)
+            unix = _batch_unix_socket_matches(
+                processes, targets, sockets, budget, selected_has_sockets=has_sockets,
+            )
+        except _ProcessEvidenceChanged:
+            if attempt < 2:
+                continue
+            raise Refusal("batch process evidence changed during three liveness attempts")
+        if before != {path: _open_directory_identity(path, "selected census tree") for path in targets}:
+            raise Refusal("selected census tree identity changed during process census")
+        budget.remaining_seconds()
+        return _ProcessPathCensus(
+            processes, (*mounts, *links, *inode_matches, *maps, *unix), owner_cgroup_complete=False,
+        )
+    raise Refusal("batch process census is indeterminate")
 
 
 @dataclasses.dataclass(frozen=True)

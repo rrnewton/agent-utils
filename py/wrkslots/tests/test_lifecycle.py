@@ -5900,51 +5900,59 @@ def test_batched_lsof_census_attributes_live_process_to_exact_checkout(
     second = tmp_path / "validate-fresh-second"
     first.mkdir()
     second.mkdir()
-    commands: list[tuple[str, ...]] = []
+    processes = (
+        wrkslots._AbsentProcessObservation(4242, 17, "", "mnt:[1]"),
+        wrkslots._AbsentProcessObservation(4343, 18, "", "mnt:[2]"),
+    )
+    calls: list[str] = []
 
-    def lsof(
-        program: Path,
-        arguments: Sequence[str],
-        *,
-        budget: wrkslots._ReadOnlyCommandBudget,
-        input_data: bytes | None = None,
-    ) -> tuple[int, bytes, bytes]:
-        del budget, input_data
-        commands.append(tuple(arguments))
-        return 0, f"p4242\ncsleep\nfcwd\nn{second}\n".encode(), b""
+    def catalog(
+        targets: Mapping[Path, str], census_budget: wrkslots._ReadOnlyCommandBudget,
+    ) -> tuple[dict[tuple[int, int], tuple[tuple[str, str], ...]], bool]:
+        assert targets == {first: str(first), second: str(second)}
+        assert census_budget is budget
+        calls.append("selected-tree-catalog")
+        return {}, False
 
-    def lsns(
-        _program: Path,
-        arguments: Sequence[str],
-        *,
-        budget: wrkslots._ReadOnlyCommandBudget,
-        input_data: bytes | None = None,
-    ) -> tuple[int, bytes, bytes]:
-        del budget, input_data
-        commands.append(tuple(arguments))
-        return 0, b"4026531840 4242\n", b""
+    def snapshot(*, include_owner_cgroups: bool = True) -> tuple[wrkslots._AbsentProcessObservation, ...]:
+        assert include_owner_cgroups is False
+        calls.append("all-process-snapshot")
+        return processes
 
-    monkeypatch.setattr(wrkslots, "_run_same_uid_command", lsof)
-    monkeypatch.setattr(wrkslots, "_run_root_owned_command", lsns)
-    monkeypatch.setattr(wrkslots, "_process_uids", lambda _pid_dir: None)
+    def mounts(observed: Sequence[wrkslots._AbsentProcessObservation], targets: Mapping[Path, str], _budget: wrkslots._ReadOnlyCommandBudget) -> tuple[tuple[int, str, str, str], ...]:
+        assert tuple(observed) == processes
+        assert targets == {first: str(first), second: str(second)}
+        calls.append("all-mount-namespaces")
+        return ()
+
+    def links(observed: Sequence[wrkslots._AbsentProcessObservation], targets: Mapping[Path, str], _budget: wrkslots._ReadOnlyCommandBudget) -> tuple[tuple[int, str, str, str], ...]:
+        assert tuple(observed) == processes
+        assert targets == {first: str(first), second: str(second)}
+        calls.append("all-process-paths")
+        return ((4242, str(second), "link", str(second)),)
+
+    monkeypatch.setattr(wrkslots, "_selected_tree_inodes", catalog)
+    monkeypatch.setattr(wrkslots, "_absent_validate_process_snapshot", snapshot)
+    monkeypatch.setattr(wrkslots, "_absent_validate_mount_matches", mounts)
+    monkeypatch.setattr(wrkslots, "_batch_link_matches", links)
+    monkeypatch.setattr(wrkslots, "_batch_inode_matches", lambda *_args: ((), {}))
+    monkeypatch.setattr(wrkslots, "_batch_maps_inode_matches", lambda *_args: ())
+    monkeypatch.setattr(wrkslots, "_batch_unix_socket_matches", lambda *_args, **_kwargs: ())
     budget = wrkslots._ReadOnlyCommandBudget.start(
-        timeout_seconds=10,
-        stdout_limit=1024,
-        stderr_limit=1024,
-        input_limit=1024,
+        timeout_seconds=10, stdout_limit=1024, stderr_limit=1024, input_limit=1024,
     )
-
-    census = wrkslots._capture_lsof_process_path_census(
-        (first, second), budget=budget
-    )
+    census = wrkslots._capture_lsof_process_path_census((first, second), budget=budget)
 
     census.assert_slot_unused(first, None)
     with pytest.raises(wrkslots.Refusal, match="live process 4242"):
         census.assert_slot_unused(second, None)
-    assert commands == [
-        ("-nP", "-Fpcfn", "+D", str(first), "+D", str(second)),
-        ("--type", "mnt", "--output", "NS,PID", "--noheadings", "--raw"),
+    # The historical argv assertion excluded a PID filter. Its replacement
+    # verifies the complete snapshot reaches both mount and process-path scans.
+    assert calls == [
+        "selected-tree-catalog", "all-process-snapshot",
+        "all-mount-namespaces", "all-process-paths",
     ]
+    assert census.processes == processes
 
 
 @pytest.fixture
@@ -6062,6 +6070,388 @@ def test_bounded_lsof_reports_installed_binary_file_and_alias_matches(
         assert len(rows) == 6
         _stdout, stderr_text = process.communicate("q", timeout=5)
         assert process.returncode == 0, stderr_text
+    finally:
+        terminate_process(process)
+
+
+@pytest.mark.ordinary_environment
+@pytest.mark.parametrize("kind", ["cwd", "open", "hardlink", "symlink", "mapped", "socket", "socket-at", "socket-space", "socket-abstract", "socket-orphan", "eventfd"])
+def test_batch_census_isolated_real_file_alias_mapping_and_socket(
+    tmp_path: Path, lsof_tmpfs_fixture: Path, monkeypatch: pytest.MonkeyPatch, kind: str,
+) -> None:
+    selected = lsof_tmpfs_fixture / "selected"
+    outside = lsof_tmpfs_fixture / "outside"
+    unrelated = lsof_tmpfs_fixture / "unrelated"
+    for path in (selected, outside, unrelated):
+        path.mkdir()
+    (selected / "file").write_bytes(b"x" * 4096)
+    os.link(selected / "file", outside / "alias")
+    (outside / "symlink").symlink_to(selected / "file")
+    holder = textwrap.dedent(r'''
+        import ctypes, json, os, socket, stat, sys
+        from pathlib import Path
+        selected, outside, kind = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+        if kind == "cwd":
+            os.chdir(selected)
+        elif kind == "eventfd":
+            fd = os.eventfd(0)
+            assert stat.S_IFMT(os.fstat(fd).st_mode) == 0
+        elif kind in ("socket", "socket-at", "socket-space", "socket-abstract", "socket-orphan"):
+            if kind == "socket-orphan":
+                libc = ctypes.CDLL(None, use_errno=True)
+                original = os.open("/proc/self/ns/net", os.O_RDONLY)
+                before = os.readlink("/proc/self/ns/net")
+                assert libc.unshare(0x40000000) == 0, ctypes.get_errno()
+                bound = os.readlink("/proc/self/ns/net")
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            if kind in ("socket-at", "socket-space"):
+                os.chdir(selected)
+                sock.bind("@socket" if kind == "socket-at" else " ")
+                os.chdir("/")
+            elif kind == "socket-abstract":
+                address = b"\0" + os.fsencode(str(selected / "socket"))
+                sock.bind(address)
+                assert sock.getsockname() == address
+            else:
+                sock.bind(str(selected / "socket"))
+            if kind == "socket-orphan":
+                evidence = dict(before=before, bound=bound, inode=os.fstat(sock.fileno()).st_ino,
+                                table=Path("/proc/self/net/unix").read_text())
+                assert libc.setns(original, 0x40000000) == 0, ctypes.get_errno()
+                os.close(original)
+                assert os.readlink("/proc/self/ns/net") == before != bound
+                assert libc.prctl(4, 1, 0, 0, 0) == 0
+                (outside / "orphan.json").write_text(json.dumps(evidence))
+        else:
+            path = outside / "alias" if kind in ("hardlink", "mapped") else (
+                outside / "symlink" if kind == "symlink" else selected / "file")
+            fd = os.open(path, os.O_RDONLY)
+            if kind == "mapped":
+                libc = ctypes.CDLL(None, use_errno=True)
+                libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int,
+                                     ctypes.c_int, ctypes.c_int, ctypes.c_long]
+                libc.mmap.restype = ctypes.c_void_p
+                address = libc.mmap(None, 4096, 1, 2, fd, 0)
+                assert address != ctypes.c_void_p(-1).value
+                os.close(fd)
+        print("ready", flush=True)
+        assert sys.stdin.read(1) == "q"
+    ''')
+    command = [sys.executable, "-B", "-c", holder, str(selected), str(outside), kind]
+    if kind == "socket-orphan":
+        command = ["/usr/bin/unshare", "--user", "--map-root-user", "--net", "--", *command]
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, cwd="/",
+    )
+    try:
+        assert process.stdout is not None
+        assert select.select([process.stdout], [], [], 5)[0], "holder did not become ready"
+        assert process.stdout.readline() == "ready\n"
+        proc = Path(f"/proc/{process.pid}")
+        generation = wrkslots._process_start_ticks(proc)
+        namespace = wrkslots._mount_namespace(proc)
+        assert generation is not None and namespace is not None
+        observation = wrkslots._AbsentProcessObservation(process.pid, generation, "", namespace)
+        # Only the fixture population is selected for this semantic control.
+        # The actual classifier separately exercises the normal full-host scan.
+        monkeypatch.setattr(wrkslots, "_absent_validate_process_snapshot", lambda **_kw: (observation,))
+        cwd = os.readlink(proc / "cwd")
+        if kind != "cwd":
+            assert cwd == "/", "cwd must not mask an omitted file/socket match"
+        if kind == "mapped":
+            row = next(line for line in (proc / "maps").read_text().splitlines()
+                       if line.endswith(str(outside / "alias")))
+            fields = row.split()
+            identity = (selected / "file").stat()
+            evidence = {"device": identity.st_dev, "inode": identity.st_ino, "maps": row}
+            map_path = proc / "map_files" / fields[0]
+            check_budget = wrkslots._ReadOnlyCommandBudget.start(timeout_seconds=22, stdout_limit=4096, stderr_limit=4096)
+            rc, raw, err = wrkslots._run_root_owned_command(
+                Path("/usr/bin/find"), ("-L", str(map_path), "-maxdepth", "0", "-printf", "%D\\0%i\\0%y\\0"), budget=check_budget,
+            )
+            evidence.update(map_files_stdout=raw.decode(), map_files_stderr=err.decode(), map_files_rc=rc)
+            (tmp_path / "mapping-identity.json").write_text(json.dumps(evidence))
+            assert rc == 0 and not err, evidence
+            # The kernel-held mapping must identify exactly the selected file;
+            # raw maps device text is retained, never equated across filesystems.
+            assert raw == f"{identity.st_dev}\0{identity.st_ino}\0f\0".encode(), evidence
+            assert int(fields[4]) == identity.st_ino
+        if kind in ("socket-at", "socket-space", "socket-abstract", "socket-orphan"):
+            (tmp_path / "unix.raw").write_bytes((proc / "net/unix").read_bytes())
+        if kind == "socket-orphan":
+            evidence = json.loads((outside / "orphan.json").read_bytes())
+            (tmp_path / "orphan.json").write_text(json.dumps(evidence))
+            assert (selected / "socket").is_socket()
+            for row in (proc / "net/unix").read_text().splitlines()[1:]:
+                assert int(row.split(maxsplit=7)[6]) != evidence["inode"]
+        if kind in ("socket-at", "socket-space"):
+            assert (selected / ("@socket" if kind == "socket-at" else " ")).is_socket()
+            reference_budget = wrkslots._ReadOnlyCommandBudget.start(
+                timeout_seconds=22, stdout_limit=16 * 1024 * 1024, stderr_limit=64 * 1024,
+            )
+            rc, out, err = wrkslots._run_same_uid_command(
+                Path("/usr/bin/lsof"), ("-nP", "-Fpcfn", "-a", "-p", str(process.pid), "+D", str(selected)), budget=reference_budget,
+            )
+            (tmp_path / "reference-lsof.stdout").write_bytes(out)
+            (tmp_path / "reference-lsof.stderr").write_bytes(err)
+            # The historical oracle itself misses this relative filesystem
+            # binding. Its exact result is retained; it cannot authorize clear.
+            (tmp_path / "reference-lsof.json").write_text(json.dumps({"rc": rc, "stdout": out.decode(), "stderr": err.decode()}))
+            assert rc in (0, 1) and not err, (out, err)
+        budget = wrkslots._ReadOnlyCommandBudget.start(
+            timeout_seconds=22, stdout_limit=16 * 1024 * 1024,
+            stderr_limit=64 * 1024, input_limit=wrkslots._MOUNTINFO_CENSUS_BYTES_LIMIT,
+        )
+        if kind in ("socket", "socket-at", "socket-space", "socket-orphan"):
+            with pytest.raises(wrkslots.Refusal, match="filesystem socket node; socket-object liveness is unproven"):
+                held = wrkslots._capture_lsof_process_path_census((selected, unrelated), budget=budget)
+                held.assert_slot_unused(selected, None)
+            # A selected tree without socket nodes remains a qualifying negative.
+            census = wrkslots._capture_lsof_process_path_census((unrelated,), budget=budget)
+            census.assert_slot_unused(unrelated, None)
+            stdout_text, stderr_text = process.communicate("q", timeout=5)
+            assert process.returncode == 0, (stdout_text, stderr_text)
+            return
+        census = wrkslots._capture_lsof_process_path_census((selected, unrelated), budget=budget)
+        (tmp_path / "census.json").write_text(json.dumps({
+            "kind": kind, "pid": process.pid, "start": generation, "cwd": cwd,
+            "matches": census.matches, "remaining_seconds": budget.remaining_seconds(),
+        }, indent=2))
+        census.assert_slot_unused(unrelated, None)
+        if kind in ("socket-abstract", "eventfd"):
+            assert not (selected / "socket").exists()
+            census.assert_slot_unused(selected, None)
+            stdout_text, stderr_text = process.communicate("q", timeout=5)
+            assert process.returncode == 0, (stdout_text, stderr_text)
+            return
+        with pytest.raises(wrkslots.Refusal, match=f"live process {process.pid}"):
+            census.assert_slot_unused(selected, None)
+        kinds = {row[2] for row in census.matches if row[0] == process.pid and row[1] == str(selected)}
+        if kind == "hardlink":
+            assert "inode" in kinds and "link" not in kinds
+        elif kind == "mapped":
+            assert "map" in kinds and "link" not in kinds and "inode" not in kinds
+        stdout_text, stderr_text = process.communicate("q", timeout=5)
+        assert process.returncode == 0, (stdout_text, stderr_text)
+    finally:
+        terminate_process(process)
+
+
+@pytest.mark.ordinary_environment
+def test_batch_census_validation_filesystem_outside_hardlink_mapping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Exercise the kernel-held map_files identity on the normal validation
+    # evidence filesystem too; its raw maps device may differ from stat.
+    files = tmp_path / "files"
+    files.mkdir()
+    test_batch_census_isolated_real_file_alias_mapping_and_socket(
+        tmp_path, files, monkeypatch, "mapped",
+    )
+
+
+def test_batch_inode_and_maps_census_refuse_incomplete_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = wrkslots._AbsentProcessObservation(4242, 17, "", "mnt:[1]")
+    def budget() -> wrkslots._ReadOnlyCommandBudget:
+        return wrkslots._ReadOnlyCommandBudget.start(
+            timeout_seconds=22, stdout_limit=4096, stderr_limit=4096,
+        )
+    monkeypatch.setattr(wrkslots, "_process_generation_is_current", lambda _p: True)
+    for output, reason in (
+        (b"/proc/4242/fd/3\x005\x0019\x00", "truncated record"),
+        (b"/proc/9999/fd/3\x005\x0019\x00f\x00", "unexpected PID"),
+        (b"/proc/4242/fd/3\x00wrong\x0019\x00f\x00", "invalid inode identity"),
+        (b"/proc/4242/fd/3\x005\x0019\x00\x00", "invalid inode identity"),
+    ):
+        monkeypatch.setattr(wrkslots, "_run_root_owned_command", lambda *_a, data=output, **_k: (0, data, b""))
+        with pytest.raises(wrkslots.Refusal, match=reason):
+            wrkslots._batch_inode_matches((process,), {}, budget())
+    monkeypatch.setattr(wrkslots, "_run_root_owned_command", lambda *_a, **_k: (1, b"", b"/usr/bin/find: '/proc/4242/fd': Permission denied\n"))
+    with pytest.raises(wrkslots.Refusal, match="produced diagnostics"):
+        wrkslots._batch_inode_matches((process,), {}, budget())
+    inodes = {(48, 19): ((str(tmp_path), "selected file"),)}
+    def no_fallback(*_args: object, **_kwargs: object) -> tuple[int, bytes, bytes]:
+        raise AssertionError("missing descriptor evidence must not use negative lsof")
+    monkeypatch.setattr(wrkslots, "_run_same_uid_command", no_fallback)
+    for path, error in (("fd", "Permission denied"), ("fd/3", "Transport endpoint is not connected"), ("exe", "Permission denied"), ("cwd", "Permission denied")):
+        diagnostic = f"/usr/bin/find: '/proc/4242/{path}': {error}\n".encode()
+        monkeypatch.setattr(wrkslots, "_run_root_owned_command", lambda *_a, data=diagnostic, **_k: (1, b"", data))
+        with pytest.raises(wrkslots.Refusal, match="unattributed diagnostics"):
+            wrkslots._batch_inode_matches((process,), inodes, budget())
+    # A disconnected cwd must not discard that same process's independent FD
+    # rows: a socket inode is still needed for namespace attribution.
+    def disconnected_cwd(_program: Path, arguments: Sequence[str], **_kwargs: object) -> tuple[int, bytes, bytes]:
+        if "-mindepth" in arguments:
+            return 0, b"/proc/4242/fd/3\x0010\x00123\x00s\x00", b""
+        return 1, b"/proc/4242/cwd\x006\x001\x00l\x00", b"/usr/bin/find: '/proc/4242/cwd': Transport endpoint is not connected\n"
+    monkeypatch.setattr(wrkslots, "_run_root_owned_command", disconnected_cwd)
+    monkeypatch.setattr(wrkslots, "_run_same_uid_command", lambda *_a, **_k: (1, b"", b""))
+    matches, sockets = wrkslots._batch_inode_matches((process,), inodes, budget())
+    assert not matches and sockets == {123: {4242}}
+    # U is a valid anonymous descriptor type, not permission to drop identity.
+    monkeypatch.setattr(wrkslots, "_run_root_owned_command", lambda *_a, **_k: (0, b"/proc/4242/fd/4\x0048\x0019\x00U\x00", b""))
+    matches, sockets = wrkslots._batch_inode_matches((process,), inodes, budget())
+    assert matches and all(row[0] == 4242 and row[2] == "inode" for row in matches)
+    assert not sockets
+    monkeypatch.setattr(wrkslots, "_run_root_owned_command", lambda *_a, **_k: (0, b"/proc/4242/maps:1-2 r--p 0 broken 19 /outside/file\n", b""))
+    with pytest.raises(wrkslots.Refusal, match="invalid identity"):
+        wrkslots._batch_maps_inode_matches((process,), {tmp_path: str(tmp_path)}, {}, budget())
+    monkeypatch.setattr(wrkslots, "_run_same_uid_command", lambda *_a, **_k: (0, b"48\x0019\x00\x00", b""))
+    with pytest.raises(wrkslots.Refusal, match="invalid file type"):
+        wrkslots._selected_tree_inodes({tmp_path: str(tmp_path)}, budget())
+    rows = {"/proc/4242/map_files/1-2": b"/proc/4242/maps:1-2 r--p 0 00:2f 19 /outside/file"}
+    inodes = {(48, 19): ((str(tmp_path), "selected file"),)}
+    monkeypatch.setattr(wrkslots, "_run_root_owned_command", lambda *_a, **_k: (1, b"", b"unreadable"))
+    with pytest.raises(wrkslots.Refusal, match="map_files inode identity is unreadable"):
+        wrkslots._batch_map_file_matches({4242: process}, rows, inodes, budget())
+    def changed_mapping(program: Path, *_args: object, **_kwargs: object) -> tuple[int, bytes, bytes]:
+        if program.name == "find":
+            return 0, b"/proc/4242/map_files/1-2\x0048\x0019\x00f\x00", b""
+        return 0, b"/proc/4242/maps:1-2 r--p 0 00:2f 20 /other/file\n", b""
+    monkeypatch.setattr(wrkslots, "_run_root_owned_command", changed_mapping)
+    with pytest.raises(wrkslots._ProcessEvidenceChanged, match="mappings changed"):
+        wrkslots._batch_map_file_matches({4242: process}, rows, inodes, budget())
+
+
+
+def test_batch_unix_census_preserves_uncertainty_and_generation_guards(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = wrkslots._AbsentProcessObservation(4242, 17, "", "mnt:[1]")
+    header = b"Num RefCount Protocol Flags Type St Inode Path\n"
+    monkeypatch.setattr(wrkslots, "_batch_network_namespaces", lambda *_args: {4242: "net:[1]"})
+    monkeypatch.setattr(wrkslots, "_process_generation_is_current", lambda _p: True)
+    monkeypatch.setattr(wrkslots, "_run_same_uid_command", lambda *_a, **_k: (127, b"", b"unavailable"))
+    for contents, reason, holders in (
+        (b"bad\n", "malformed header", {}),
+        (header + b"bad\n", "malformed record", {}),
+        (header + b"0: 2 0 0 1 1 123 relative-socket\n", "relative bound pathname", {123: {4242}}),
+        (header + b"0: 2 0 0 1 1 123  \n", "relative bound pathname", {123: {4242}}),
+        (header, "held socket identities are absent", {123: {4242}}),
+        (header + f"0: 2 0 0 1 1 123 {tmp_path}/socket\n".encode(), "without a stable observed holder", {}),
+    ):
+        monkeypatch.setattr(wrkslots, "_run_root_owned_command", lambda *_a, data=contents, **_k: (0, data, b""))
+        with pytest.raises(wrkslots.Refusal, match=reason):
+            wrkslots._batch_unix_socket_matches((process,), {tmp_path: str(tmp_path)}, holders, wrkslots._ReadOnlyCommandBudget.start(timeout_seconds=22, stdout_limit=4096, stderr_limit=4096), selected_has_sockets=True)
+    monkeypatch.setattr(wrkslots, "_run_root_owned_command", lambda *_a, **_k: (0, header, b""))
+    monkeypatch.setattr(wrkslots, "_process_generation_is_current", lambda _p: False)
+    with pytest.raises(wrkslots._ProcessEvidenceChanged, match="representatives changed"):
+        wrkslots._batch_unix_socket_matches((process,), {tmp_path: str(tmp_path)}, {}, wrkslots._ReadOnlyCommandBudget.start(timeout_seconds=22, stdout_limit=4096, stderr_limit=4096))
+
+
+@pytest.mark.ordinary_environment
+def test_batch_maps_filter_preserves_large_inode_strings_and_read_errors(tmp_path: Path) -> None:
+    path = tmp_path / "maps"
+    first = "1-2 r--p 0 00:30 9007199254740992 /outside/one"
+    second = "2-3 r--p 0 00:30 9007199254740993 /outside/two"
+    path.write_text(first + "\n" + second + "\n")
+    def budget() -> wrkslots._ReadOnlyCommandBudget:
+        return wrkslots._ReadOnlyCommandBudget.start(timeout_seconds=22, stdout_limit=4096, stderr_limit=4096)
+    for inode, expected in (("9007199254740992", first), ("9007199254740993", second)):
+        rc, out, err = wrkslots._run_root_owned_command(
+            Path("/usr/bin/gawk"), ("--", wrkslots._BATCH_MAPS_AWK, str(path)),
+            input_data=f"i{inode}\n".encode(), budget=budget(),
+        )
+        assert rc == 0 and not err, (out, err)
+        assert out == f"{path}:{expected}\n".encode()
+    rc, out, err = wrkslots._run_root_owned_command(
+        Path("/usr/bin/gawk"), ("--", wrkslots._BATCH_MAPS_AWK, str(path / "missing")),
+        input_data=b"i9007199254740992\n", budget=budget(),
+    )
+    assert rc == 1 and not out and str(path / "missing").encode() in err
+
+
+def test_batch_network_namespace_links_require_complete_generation_bound_records(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = wrkslots._AbsentProcessObservation(4242, 17, "", "mnt:[1]")
+    monkeypatch.setattr(wrkslots, "_process_generation_is_current", lambda _p: True)
+    for rc, out, err, reason in (
+        (0, b"", b"", "omitted PID"),
+        (0, b"/proc/4242/ns/net\0\0", b"", "unreadable or malformed"),
+        (0, b"/proc/9999/ns/net\0net:[1]\0", b"", "unexpected path"),
+        (1, b"", b"/usr/bin/find: '/proc/4242/ns/net': Permission denied\n", "produced diagnostics"),
+    ):
+        monkeypatch.setattr(wrkslots, "_run_root_owned_command", lambda *_a, value=(rc, out, err), **_k: value)
+        with pytest.raises(wrkslots.Refusal, match=reason):
+            wrkslots._batch_network_namespaces((process,), wrkslots._ReadOnlyCommandBudget.start(timeout_seconds=22, stdout_limit=4096, stderr_limit=4096))
+
+
+@pytest.mark.ordinary_environment
+@pytest.mark.parametrize("kind", ["relative-with-other-fd", "absolute-hardlink", "deleted-original", "rebound-original"])
+def test_batch_census_two_selected_trees_cannot_mask_socket_holder(
+    tmp_path: Path, lsof_tmpfs_fixture: Path, monkeypatch: pytest.MonkeyPatch, kind: str,
+) -> None:
+    first, second, unrelated = (lsof_tmpfs_fixture / name for name in ("first", "second", "unrelated"))
+    for path in (first, second, unrelated):
+        path.mkdir()
+    (first / "open-file").write_bytes(b"a separate selected-tree descriptor")
+    code = textwrap.dedent(r'''
+        import os, socket, sys
+        from pathlib import Path
+        first, second, kind = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        if kind == "relative-with-other-fd":
+            held_file = open(first / "open-file", "rb")
+            os.chdir(second)
+            sock.bind("@socket")
+        else:
+            sock.bind(str(first / "socket"))
+            os.link(first / "socket", second / "hardlink")
+            if kind in ("deleted-original", "rebound-original"):
+                (first / "socket").unlink()
+            if kind == "rebound-original":
+                replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                replacement.bind(str(first / "socket"))
+        os.chdir("/")
+        print("ready", flush=True)
+        assert sys.stdin.read(1) == "q"
+    ''')
+    process = subprocess.Popen(
+        [sys.executable, "-B", "-c", code, str(first), str(second), kind],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, cwd="/",
+    )
+    try:
+        assert process.stdout is not None
+        assert select.select([process.stdout], [], [], 5)[0], "holder did not become ready"
+        assert process.stdout.readline() == "ready\n"
+        proc = Path(f"/proc/{process.pid}")
+        generation = wrkslots._process_start_ticks(proc)
+        namespace = wrkslots._mount_namespace(proc)
+        assert generation is not None and namespace is not None
+        assert os.readlink(proc / "cwd") == "/"
+        bound = second / ("@socket" if kind == "relative-with-other-fd" else "hardlink")
+        assert bound.is_socket()
+        if kind == "absolute-hardlink":
+            a, b = (first / "socket").stat(), bound.stat()
+            assert (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
+        elif kind == "deleted-original":
+            assert not (first / "socket").exists()
+        elif kind == "rebound-original":
+            assert (first / "socket").is_socket()
+            a, b = (first / "socket").stat(), bound.stat()
+            assert (a.st_dev, a.st_ino) != (b.st_dev, b.st_ino)
+        observation = wrkslots._AbsentProcessObservation(process.pid, generation, "", namespace)
+        monkeypatch.setattr(wrkslots, "_absent_validate_process_snapshot", lambda **_kw: (observation,))
+        (tmp_path / "unix.raw").write_bytes((proc / "net/unix").read_bytes())
+        budget = wrkslots._ReadOnlyCommandBudget.start(
+            timeout_seconds=22, stdout_limit=16 * 1024 * 1024, stderr_limit=64 * 1024,
+            input_limit=wrkslots._MOUNTINFO_CENSUS_BYTES_LIMIT,
+        )
+        with pytest.raises(wrkslots.Refusal, match="filesystem socket node; socket-object liveness is unproven") as refused:
+            census = wrkslots._capture_lsof_process_path_census((first, second), budget=budget)
+            # A's known match cannot make B's actual held socket safe to remove.
+            census.assert_slot_unused(second, None)
+        (tmp_path / "REFUSAL.txt").write_text(str(refused.value) + "\n")
+        clear = wrkslots._capture_lsof_process_path_census((unrelated,), budget=budget)
+        clear.assert_slot_unused(unrelated, None)
+        stdout_text, stderr_text = process.communicate("q", timeout=5)
+        assert process.returncode == 0, (stdout_text, stderr_text)
     finally:
         terminate_process(process)
 
