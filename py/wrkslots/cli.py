@@ -17514,6 +17514,7 @@ def _validation_record_is_terminal(
 
 class _FrozenNoProofDisposition(enum.Enum):
     BLOCKS_ENTRY = "blocks-entry"
+    CURRENT_INCOMPLETE_RETAINED = "current-incomplete-retained"
     HISTORICAL_NONBLOCKING = "historical-nonblocking"
     LEGACY_RECOVERY = "legacy-recovery"
 
@@ -17524,6 +17525,243 @@ class _FrozenNoProofClassification:
     historical_schema: int | None = None
 
 
+def _current_incomplete_frozen_result(record: Mapping[str, object]) -> bool:
+    """Recognize a narrow retained no-result, without inferring execution phase."""
+
+    expected: dict[str, object] = {
+        "service_result_schema": 5,
+        "result_source": "validation-service-result",
+        "state": "completed",
+        "result": "no-result",
+        "final_validate_status": "COULD_NOT_RUN",
+        "exit_code": 75,
+        "temporary_checkout": True,
+        "materialized_target": False,
+        "qualifying_receipt": False,
+        "executed_nodes": 0,
+        "executed_tests": None,
+        "passed_tests": None,
+        "selection_mode": None,
+        "scorecard_writeback": None,
+    }
+    admission = record.get("admission_result")
+    return (
+        all(key in record and _json_equal(record[key], value) for key, value in expected.items())
+        and "scorecard_handoff" not in record
+        and "scorecard_writeback_files" not in record
+        and _validation_record_has_typed_admission(record)
+        and isinstance(admission, dict)
+        and admission.get("state") == "admitted"
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class _RetainedValidationGitState:
+    head: str
+    common: Path
+    git_directory: Path
+    index: Path
+    index_identity: _RegularFileIdentity
+    status: str
+    directories: tuple[tuple[int, int, int], ...]
+
+
+def _retained_validation_git_state(
+    repository: Path, *, pristine: bool, cache_globs: Sequence[str] = ()
+) -> _RetainedValidationGitState:
+    """Observe a repository without refreshing its index or changing its files."""
+
+    vcs = _GitVcs()
+    if vcs.repository_root(repository) != repository.absolute():
+        raise Refusal(f"retained validation repository is not its exact root: {repository}")
+    operations = vcs.operation_paths(repository)
+    if operations:
+        raise Refusal(f"retained validation repository has an unfinished Git operation: {operations[0]}")
+    vcs.assert_ordinary_history(repository)
+    vcs.assert_ordinary_index(repository)
+    head = vcs.head(repository)
+    common = vcs.common_directory(repository)
+    git_directory = Path(vcs._run(repository, [
+        "rev-parse", "--path-format=absolute", "--git-dir",
+    ]).stdout.strip())
+    index = Path(vcs._run(repository, [
+        "rev-parse", "--path-format=absolute", "--git-path", "index",
+    ]).stdout.strip())
+    _ensure_no_symlink_components(git_directory, index, "retained validation index")
+    _contents, index_identity = _read_regular_file_identity(
+        index, "retained validation index", _VALIDATION_REMOVAL_ARTIFACT_BYTES_LIMIT
+    )
+    # Local submodule-ignore and filesystem-monitor settings cannot hide an
+    # authored path in the disposable clone. The surviving source may contain
+    # work, including a HANDOFF and ignored investigation files; bind its
+    # observations instead of imposing deletion-only cleanliness on it.
+    pathspecs = ["."]
+    for pattern in cache_globs:
+        pathspecs.extend((f":(exclude,glob){pattern}", f":(exclude,glob){pattern}/**"))
+    status = vcs._run(
+        repository,
+        ["-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false",
+         "status", "--porcelain=v2", "--untracked-files=all",
+         "--ignored=matching", "--ignore-submodules=none", "--", *pathspecs],
+        env_overrides={"GIT_OPTIONAL_LOCKS": "0"},
+    ).stdout
+    if pristine and status:
+        raise Refusal(f"retained validation checkout is not pristine ({status.splitlines()[0]}); preserve it")
+    return _RetainedValidationGitState(
+        head, common, git_directory, index, index_identity, status,
+        (
+            _open_directory_identity(repository, "retained validation repository"),
+            _open_directory_identity(common, "retained validation Git common directory"),
+            _open_directory_identity(git_directory, "retained validation Git directory"),
+        ),
+    )
+
+
+def _pristine_frozen_validation_state(
+    checkout: Path, *, expected_head: str
+) -> tuple[object, ...]:
+    """Bind every initialized gitlink and refuse content hidden by a parent index."""
+
+    vcs = _GitVcs()
+    initialized = tuple(sorted(vcs.initialized_submodules(checkout)))
+    declared = tuple(sorted(
+        path.relative_to(checkout).as_posix()
+        for path in _declared_initialized_submodules(checkout)
+    ))
+    if initialized != declared:
+        raise Refusal("retained validation initialized submodule declarations disagree")
+    remaining = set(initialized)
+    states: list[object] = []
+    for relative in (".", *initialized):
+        repository = checkout / relative
+        _ensure_no_symlink_components(checkout, repository, "retained validation submodule")
+        _ensure_no_mount_components(checkout, repository, "retained validation submodule")
+        state = _retained_validation_git_state(repository, pristine=True)
+        if relative == "." and state.head != expected_head:
+            raise Refusal("retained validation checkout HEAD differs from its recorded target")
+        if not _path_is_within(state.common, checkout):
+            raise Refusal("retained validation submodule Git storage escapes the standalone clone")
+        states.append((relative, state))
+        entries = vcs._run(repository, ["ls-tree", "-r", "-z", "HEAD"]).stdout
+        for entry in entries.split("\x00"):
+            if not entry.startswith("160000 "):
+                continue
+            metadata, separator, raw_path = entry.partition("\t")
+            fields = metadata.split()
+            path = Path(raw_path)
+            if (not separator or len(fields) != 3 or not SHA_RE.fullmatch(fields[2])
+                    or path.is_absolute() or ".." in path.parts):
+                raise Refusal("retained validation contains an unsafe gitlink")
+            child = repository / path
+            child_relative = child.relative_to(checkout).as_posix()
+            _ensure_no_symlink_components(checkout, child, "retained validation gitlink")
+            if child_relative in initialized:
+                if vcs.head(child) != fields[2]:
+                    raise Refusal(f"retained validation submodule HEAD differs from its gitlink: {child_relative}")
+                remaining.discard(child_relative)
+            elif child.exists():
+                if not child.is_dir() or any(child.iterdir()):
+                    raise Refusal(f"uninitialized retained validation gitlink contains files: {child_relative}")
+                states.append((child_relative, _open_directory_identity(child, "uninitialized gitlink")))
+            else:
+                states.append((child_relative, None))
+    if remaining:
+        raise Refusal("retained validation initialized submodule has no committed gitlink")
+    return tuple(states)
+
+
+def _current_incomplete_frozen_retention(
+    config: Config,
+    checkout: Path,
+    record_path: Path,
+    record_contents: bytes,
+    record_identity: _RegularFileIdentity,
+    repository: Path,
+    *,
+    batch_cleanup: _OwnerlessValidationBatchContext,
+) -> _FrozenNoProofClassification:
+    """Preserve one authenticated, pristine and inactive current no-result."""
+
+    record = _strict_json_object(record_contents, "current frozen validation run-record")
+    states, archives = _validate_global_state(config)
+    before_registry = _global_rows(states, archives)
+    if _outstanding_journals(config) or _validate_batch_seal_journals(config):
+        raise Refusal("current frozen validation retention requires completed registry operations")
+    for state in states:
+        for active in state.slots:
+            slot = _slot_directory(config, active.slot, active.slot_type)
+            if _path_is_within(checkout, slot) or _path_is_within(slot, checkout):
+                raise Refusal(f"validation path belongs to registered slot {active.slot}")
+    if not _validation_record_process_is_dead(record):
+        raise Refusal("current frozen validation process state is live or uncertain")
+    relative = record_path.relative_to(config.root).as_posix()
+    _relative, digest, target = _terminal_validation_record(
+        config, relative, checkout, "frozen-checkout", repository=repository,
+        expected_digest=record_identity.sha256,
+    )
+    if target is None:
+        raise StateError("current frozen validation has no exact target")
+    # Keeping the entire clone needs no remote copy and no source-tree
+    # cleanliness. Exact source path/origin and stable local observations are
+    # still required, independently of the source's current HEAD.
+    _head, remote = _validation_checkout_facts(
+        config, checkout, repository, expected_head=target,
+        batch_cleanup=batch_cleanup, standalone=True,
+        require_remote_containment=False,
+    )
+    vcs = _GitVcs()
+    before_clone = _pristine_frozen_validation_state(checkout, expected_head=target)
+    before_source = _retained_validation_git_state(
+        repository, pristine=False, cache_globs=config.cache_globs
+    )
+    if vcs.common_directory(repository) == vcs.common_directory(checkout):
+        raise Refusal("retained validation source shares Git storage with the clone")
+    producer = checkout / _VALIDATION_SERVICE_RESULT_SCHEMA_PATH
+    sidecar = record_path.with_name(f"{record_path.stem}{_VALIDATION_SERVICE_RESULT_SUFFIX}")
+    _ensure_no_symlink_components(checkout, producer, "current frozen validation producer schema")
+    evidence = [(record_path, record_contents, record_identity)]
+    for path in (producer, sidecar):
+        contents, identity = _read_regular_file_identity(
+            path, "current frozen validation evidence", _VALIDATION_REMOVAL_ARTIFACT_BYTES_LIMIT
+        )
+        evidence.append((path, contents, identity))
+    projection = _validation_service_result_projection(
+        evidence[2][1], schema=5,
+        schema_fields=_validation_service_result_schema(evidence[1][1], 5),
+        expected_commit=target,
+    )
+    for field, value in projection.items():
+        if field not in record or not _json_equal(record[field], value):
+            raise Refusal(f"current frozen validation service-result {field} differs from the run-record")
+    batch_cleanup.assert_unused(config, checkout, fresh_same_uid=True)
+    for path, contents, identity in evidence:
+        rebound, rebound_identity = _read_regular_file_identity(
+            path, "current frozen validation evidence", _VALIDATION_REMOVAL_ARTIFACT_BYTES_LIMIT
+        )
+        _assert_regular_file_identity(identity, rebound_identity, "current frozen validation evidence")
+        if rebound != contents:
+            raise Refusal("current frozen validation evidence changed during classification")
+    if (before_clone != _pristine_frozen_validation_state(checkout, expected_head=target)
+            or before_source != _retained_validation_git_state(
+                repository, pristine=False, cache_globs=config.cache_globs
+            )
+            or remote != vcs.remote_url_sha256(repository, config.default_remote)
+            or remote != vcs.remote_url_sha256(checkout, config.default_remote)):
+        raise Refusal("current frozen validation source or checkout changed during classification")
+    _terminal_validation_record(
+        config, relative, checkout, "frozen-checkout", expected_digest=digest,
+        repository=repository, expected_target=target,
+    )
+    if not _validation_record_process_is_dead(record):
+        raise Refusal("current frozen validation process state changed during classification")
+    batch_cleanup.assert_unused(config, checkout, fresh_same_uid=False)
+    states, archives = _validate_global_state(config)
+    if (before_registry != _global_rows(states, archives)
+            or _outstanding_journals(config) or _validate_batch_seal_journals(config)):
+        raise Refusal("registry state changed during current frozen validation classification")
+    return _FrozenNoProofClassification(_FrozenNoProofDisposition.CURRENT_INCOMPLETE_RETAINED)
+
+
 def _frozen_no_proof_disposition(
     config: Config,
     checkout: Path,
@@ -17532,14 +17770,15 @@ def _frozen_no_proof_disposition(
     *,
     batch_cleanup: _OwnerlessValidationBatchContext,
 ) -> _FrozenNoProofClassification:
-    """Prove one old frozen run is inert without authorizing its deletion.
+    """Prove one supported frozen run is inert without authorizing its deletion.
 
     Historical schema-2/3 producers did not retain the four-artifact removal
     proof required by current cleanup.  Such a checkout must remain on disk,
     but it need not prevent an unrelated validation from starting when every
     fact other than deletion authority is still readable and exact.  The
     distinct legacy result-source case keeps its existing recovery behavior;
-    current and malformed shapes block entry.  This is a read-only
+    current incomplete results have a separate stricter preservation path;
+    other current and malformed shapes block entry. This is a read-only
     classification: it neither creates a proof nor grants authority to remove
     the checkout or qualify the historical result.
     """
@@ -17580,6 +17819,11 @@ def _frozen_no_proof_disposition(
             "frozen-checkout",
             repository=repository,
         )
+        if _current_incomplete_frozen_result(record):
+            return _current_incomplete_frozen_retention(
+                config, checkout, record_path, record_contents, record_identity,
+                repository, batch_cleanup=batch_cleanup,
+            )
         return _FrozenNoProofClassification(
             _FrozenNoProofDisposition.BLOCKS_ENTRY
         )
@@ -23936,6 +24180,13 @@ def _cmd_recover_ownerless_validate_batch(args: argparse.Namespace) -> int:
                     repository,
                     batch_cleanup=batch_cleanup,
                 )
+                if classification.disposition is _FrozenNoProofDisposition.CURRENT_INCOMPLETE_RETAINED:
+                    retained.append({
+                        "blocks_entry": False,
+                        "checkout": checkout,
+                        "reason": "current incomplete frozen validation is exact and inactive; the checkout and no-result remain retained",
+                    })
+                    continue
                 if (
                     classification.disposition
                     is not _FrozenNoProofDisposition.LEGACY_RECOVERY
@@ -24183,6 +24434,14 @@ def _cmd_classify_ownerless_validate_batch(args: argparse.Namespace) -> int:
                     repository,
                     batch_cleanup=batch,
                 )
+                if historical.disposition is _FrozenNoProofDisposition.CURRENT_INCOMPLETE_RETAINED:
+                    results.append({
+                        "blocks_entry": False,
+                        "checkout": checkout,
+                        "reason": "current incomplete frozen validation is exact and inactive; the checkout and no-result remain retained",
+                        "state": "current-incomplete-retained",
+                    })
+                    continue
                 if (
                     historical.disposition
                     is _FrozenNoProofDisposition.HISTORICAL_NONBLOCKING

@@ -22555,3 +22555,365 @@ def test_hold_ignores_an_unrelated_directory_without_a_row(tmp_path: Path) -> No
     assert "held slot=slot02" in held.stdout
     assert "orphan" in held.stderr
     assert "RETAINED" in held.stderr
+
+
+def prepare_current_incomplete_frozen_checkout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    nested: bool = False,
+) -> tuple[Path, Path, Path, Path, Path]:
+    project, repository, _remote = make_project(tmp_path, cache_globs=("ignored",))
+    (repository / ".gitignore").write_text("ignored/\n", encoding="utf-8")
+    git(repository, "add", ".gitignore")
+    git(repository, "commit", "-m", "declare ignored output")
+    if nested:
+        add_recursive_submodules(tmp_path, project, repository)
+    commit_validation_removal_schema(repository, schema_version=5)
+    checkout, record, target = prepare_frozen_validation_checkout(
+        project, repository, monkeypatch=monkeypatch, name="current-incomplete"
+    )
+    if nested:
+        git(checkout, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive")
+    value = dict(wrkslots._strict_json_object(record.read_bytes(), "fixture record"))
+    value.update({
+        "service_result_schema": 5, "materialized_target": False,
+        "state": "completed", "result": "no-result",
+        "final_validate_status": "COULD_NOT_RUN", "exit_code": 75,
+        "executed_nodes": 0, "executed_tests": None, "passed_tests": None,
+        "selection_mode": None, "scorecard_writeback": None,
+        "detail": "producer could not prepare validation",
+    })
+    value.pop("scorecard_handoff")
+    value.pop("scorecard_writeback_files")
+    record.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
+    sidecar = record.with_name(f"{record.stem}{wrkslots._VALIDATION_SERVICE_RESULT_SUFFIX}")
+    sidecar.write_text(json.dumps({
+        "schema_version": 5, "commit": target, "profile": "only-full",
+        "final_validate_status": "COULD_NOT_RUN", "exit_code": 75,
+        "executed_nodes": 0, "executed_tests": None, "passed_tests": None,
+        "selection_mode": None, "scorecard_writeback": None,
+        "detail": ["producer could not prepare validation"],
+    }, sort_keys=True) + "\n", encoding="utf-8")
+    stub_canonical_frozen_record_parser(monkeypatch, label="current incomplete fixture")
+    stub_validate_batch_censuses(monkeypatch)
+    return project, repository, checkout, record, sidecar
+
+
+def run_current_incomplete_batch(
+    project: Path, repository: Path, checkout: Path, record: Path, *, action: str
+) -> int:
+    authorization = (
+        ["--coordinator-authorized", "--coordinator-pid", str(os.getpid())]
+        if action == "recover" else []
+    )
+    return wrkslots.main([
+        "--project-root", str(project), f"{action}-ownerless-validate-batch",
+        *authorization, "--frozen-validate-checkout", str(checkout),
+        "--completed-record", record.relative_to(project).as_posix(),
+        "--repository", repository.relative_to(project).as_posix(),
+        "--format", "json",
+    ])
+
+
+def incomplete_batch_row(report: Mapping[str, object], action: str) -> Mapping[str, object]:
+    if action == "recover":
+        assert report["removed"] == []
+    rows = report["retained" if action == "recover" else "classifications"]
+    assert isinstance(rows, list) and len(rows) == 1
+    row = rows[0]
+    assert isinstance(row, dict)
+    return row
+
+
+@pytest.mark.ordinary_environment
+@pytest.mark.parametrize("action", ("recover", "classify"))
+@pytest.mark.parametrize("advanced_source", (False, True))
+def test_current_incomplete_frozen_retains_evidence_and_allows_stable_source_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str], action: str, advanced_source: bool,
+) -> None:
+    project, source, checkout, record, sidecar = prepare_current_incomplete_frozen_checkout(
+        tmp_path, monkeypatch, nested=True
+    )
+    if advanced_source:
+        (source / "seed.txt").write_text("later source commit\n")
+        git(source, "commit", "-am", "advance surviving source")
+        assert git(source, "rev-parse", "HEAD").stdout != git(checkout, "rev-parse", "HEAD").stdout
+    (source / "HANDOFF.md").write_text("preserve active work\n")
+    (source / "ignored").mkdir()
+    (source / "ignored/report.txt").write_text("retained investigation\n")
+    files = [record, sidecar, checkout / wrkslots._VALIDATION_SERVICE_RESULT_SCHEMA_PATH,
+             source / "HANDOFF.md", source / "ignored/report.txt"]
+    contents = {path: (path.read_bytes(), path.stat().st_mode) for path in files}
+    clone_before, source_before = git_metadata_snapshot(checkout), git_metadata_snapshot(source)
+    rc = run_current_incomplete_batch(project, source, checkout, record, action=action)
+    assert rc == 0
+    report = json.loads(capsys.readouterr().out)
+    row = incomplete_batch_row(report, action)
+    assert row["blocks_entry"] is False, row
+    if action == "classify":
+        assert row["state"] == "current-incomplete-retained"
+    assert "no-result remain retained" in str(row["reason"])
+    assert checkout.is_dir()
+    assert git_metadata_snapshot(checkout) == clone_before
+    assert git_metadata_snapshot(source) == source_before
+    assert {path: (path.read_bytes(), path.stat().st_mode) for path in files} == contents
+    config = wrkslots._load_config(str(project), "testhost")
+    assert not wrkslots._journal_path(config).exists()
+    assert not any(item["kind"] == "ownerless-validate-path-removed" for item in wrkslots._load_events(config))
+    assert not (record.parent / "scorecard-handoffs").exists()
+    assert json.loads(record.read_text())["result"] == "no-result"
+
+
+@pytest.mark.ordinary_environment
+@pytest.mark.parametrize("action", ("recover", "classify"))
+@pytest.mark.parametrize(("field", "replacement"), (
+    ("service_result_schema", 4), ("service_result_schema", True),
+    ("materialized_target", True), ("qualifying_receipt", True),
+    ("temporary_checkout", False), ("executed_nodes", 1), ("executed_nodes", False),
+    ("executed_tests", 0), ("passed_tests", 0), ("selection_mode", "only"),
+    ("scorecard_writeback", {"status": "completed"}),
+    ("scorecard_handoff", None), ("scorecard_writeback_files", []),
+    ("admission_result", {"state": "admitted"}), ("process_identity", None),
+))
+def test_current_incomplete_frozen_requires_exact_current_shape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str], action: str, field: str, replacement: object,
+) -> None:
+    project, source, checkout, record, sidecar = prepare_current_incomplete_frozen_checkout(tmp_path, monkeypatch)
+    value = dict(wrkslots._strict_json_object(record.read_bytes(), "fixture record"))
+    value[field] = replacement
+    record.write_text(json.dumps(value) + "\n")
+    before = (record.read_bytes(), sidecar.read_bytes(), git_metadata_snapshot(checkout))
+    assert run_current_incomplete_batch(project, source, checkout, record, action=action) == 0
+    row = incomplete_batch_row(json.loads(capsys.readouterr().out), action)
+    assert row["blocks_entry"] is True, row
+    assert checkout.is_dir()
+    assert (record.read_bytes(), sidecar.read_bytes(), git_metadata_snapshot(checkout)) == before
+
+
+@pytest.mark.ordinary_environment
+@pytest.mark.parametrize("action", ("recover", "classify"))
+@pytest.mark.parametrize("relative", (".", "component", "component/leaf"))
+@pytest.mark.parametrize("mutation", ("tracked", "staged", "untracked", "ignored", "handoff", "assume", "skip", "operation", "history"))
+def test_current_incomplete_frozen_requires_pristine_recursive_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str], action: str, relative: str, mutation: str,
+) -> None:
+    project, source, checkout, record, _sidecar = prepare_current_incomplete_frozen_checkout(tmp_path, monkeypatch, nested=True)
+    repository = checkout / relative
+    tracked = {".": "seed.txt", "component": "component.txt", "component/leaf": "leaf.txt"}[relative]
+    if mutation in {"tracked", "staged"}:
+        (repository / tracked).write_text("authored modification\n")
+        if mutation == "staged":
+            git(repository, "add", tracked)
+    elif mutation in {"untracked", "ignored", "handoff"}:
+        name = "HANDOFF.md" if mutation == "handoff" else "new-file.txt"
+        if mutation == "ignored":
+            exclude = Path(git(repository, "rev-parse", "--path-format=absolute", "--git-path", "info/exclude").stdout.strip())
+            with exclude.open("a") as stream:
+                stream.write(f"\n{name}\n")
+        (repository / name).write_text("authored file\n")
+    elif mutation in {"assume", "skip"}:
+        git(repository, "update-index", "--assume-unchanged" if mutation == "assume" else "--skip-worktree", tracked)
+    else:
+        name = "MERGE_HEAD" if mutation == "operation" else "info/grafts"
+        path = Path(git(repository, "rev-parse", "--path-format=absolute", "--git-path", name).stdout.strip())
+        path.write_text(git(repository, "rev-parse", "HEAD").stdout)
+    # Even a configured submodule-ignore rule must not hide a nested violation.
+    git(checkout, "config", "submodule.component.ignore", "all")
+    before = git_metadata_snapshot(checkout)
+    assert run_current_incomplete_batch(project, source, checkout, record, action=action) == 0
+    row = incomplete_batch_row(json.loads(capsys.readouterr().out), action)
+    assert row["blocks_entry"] is True, row
+    assert checkout.is_dir()
+    assert git_metadata_snapshot(checkout) == before
+
+
+@pytest.mark.ordinary_environment
+@pytest.mark.parametrize("action", ("recover", "classify"))
+@pytest.mark.parametrize("mutation", ("sidecar", "sidecar-replace", "schema", "record", "child-index", "child-file", "child-head", "source-head", "source-index", "source-remote"))
+def test_current_incomplete_frozen_rechecks_after_fresh_census(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str], action: str, mutation: str,
+) -> None:
+    project, source, checkout, record, sidecar = prepare_current_incomplete_frozen_checkout(tmp_path, monkeypatch, nested=True)
+    calls = 0
+    def fresh(_paths: Sequence[Path], *, budget: wrkslots._ReadOnlyCommandBudget) -> wrkslots._ProcessPathCensus:
+        nonlocal calls
+        calls += 1
+        budget.remaining_seconds()
+        if mutation in {"sidecar", "schema", "record"}:
+            path = {"sidecar": sidecar, "schema": checkout / wrkslots._VALIDATION_SERVICE_RESULT_SCHEMA_PATH, "record": record}[mutation]
+            with path.open("a") as stream:
+                stream.write(" ")
+        elif mutation == "sidecar-replace":
+            replacement = sidecar.with_suffix(".replacement")
+            replacement.write_bytes(sidecar.read_bytes())
+            replacement.replace(sidecar)
+        elif mutation == "child-head":
+            git(checkout / "component/leaf", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty", "-m", "child advanced during census")
+        elif mutation == "child-file":
+            (checkout / "component/leaf/new-file.txt").write_text("changed after scan\n")
+        elif mutation == "source-head":
+            git(source, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty", "-m", "source advanced during census")
+        elif mutation == "source-remote":
+            git(source, "remote", "set-url", "origin", str(tmp_path / "changed.git"))
+        else:
+            repo, tracked = (source, "seed.txt") if mutation == "source-index" else (checkout / "component/leaf", "leaf.txt")
+            git(repo, "update-index", "--assume-unchanged", tracked)
+        return wrkslots._ProcessPathCensus((), ())
+    monkeypatch.setattr(wrkslots, "_capture_same_uid_process_path_census", fresh)
+    assert run_current_incomplete_batch(project, source, checkout, record, action=action) == 0
+    row = incomplete_batch_row(json.loads(capsys.readouterr().out), action)
+    assert row["blocks_entry"] is True, row
+    assert calls == 1
+    assert checkout.is_dir()
+    assert not wrkslots._journal_path(wrkslots._load_config(str(project), "testhost")).exists()
+
+
+@pytest.mark.ordinary_environment
+@pytest.mark.parametrize("action", ("recover", "classify"))
+@pytest.mark.parametrize("mutation", ("sidecar-missing", "sidecar-mismatch", "sidecar-duplicate", "live-generation", "unknown-generation", "live-path", "live-mount", "unknown-census", "wrong-source", "wrong-target", "wrong-origin"))
+def test_current_incomplete_frozen_refuses_untrusted_or_live_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str], action: str, mutation: str,
+) -> None:
+    project, source, checkout, record, sidecar = prepare_current_incomplete_frozen_checkout(tmp_path, monkeypatch)
+    if mutation == "sidecar-missing":
+        sidecar.unlink()
+    elif mutation in {"sidecar-mismatch", "sidecar-duplicate"}:
+        if mutation == "sidecar-duplicate":
+            sidecar.write_text(sidecar.read_text().replace('"exit_code": 75', '"exit_code": 75, "exit_code": 75'))
+        else:
+            value = dict(wrkslots._strict_json_object(sidecar.read_bytes(), "fixture sidecar"))
+            value["detail"] = ["contradictory retained result"]
+            sidecar.write_text(json.dumps(value))
+    elif mutation in {"live-generation", "unknown-generation", "wrong-source", "wrong-target"}:
+        value = dict(wrkslots._strict_json_object(record.read_bytes(), "fixture record"))
+        if mutation == "live-generation":
+            identity = wrkslots._read_process_identity(os.getpid())
+            value["process_identity"] = {"pid": identity.pid, "start_ticks": identity.start_ticks, "boot_id": identity.boot_id}
+        elif mutation == "unknown-generation":
+            value["process_identity"] = {"pid": 123, "start_ticks": True, "boot_id": "unknown"}
+        else:
+            value["source_checkout" if mutation == "wrong-source" else "target"] = str(tmp_path / "wrong") if mutation == "wrong-source" else "0" * 40
+        record.write_text(json.dumps(value))
+    elif mutation == "wrong-origin":
+        git(checkout, "remote", "set-url", "origin", str(tmp_path / "other.git"))
+    elif mutation == "unknown-census":
+        def unknown(_paths: Sequence[Path], **_kwargs: object) -> wrkslots._ProcessPathCensus:
+            raise wrkslots.Refusal("test process census is incomplete")
+        monkeypatch.setattr(wrkslots, "_capture_lsof_process_path_census", unknown)
+    else:
+        kind = "mount" if mutation == "live-mount" else "cwd"
+        stub_validate_batch_censuses(monkeypatch, lambda _paths: wrkslots._ProcessPathCensus((), ((os.getpid(), str(checkout), kind, str(checkout)),)))
+    assert run_current_incomplete_batch(project, source, checkout, record, action=action) == 0
+    row = incomplete_batch_row(json.loads(capsys.readouterr().out), action)
+    assert row["blocks_entry"] is True, row
+    assert checkout.is_dir()
+    assert not wrkslots._journal_path(wrkslots._load_config(str(project), "testhost")).exists()
+
+
+@pytest.mark.ordinary_environment
+def test_current_incomplete_frozen_retention_does_not_authorize_direct_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, source, checkout, record, sidecar = prepare_current_incomplete_frozen_checkout(tmp_path, monkeypatch)
+    before = (record.read_bytes(), sidecar.read_bytes(), git_metadata_snapshot(checkout))
+    rc = wrkslots.main([
+        "--project-root", str(project), "recover", "--coordinator-authorized",
+        "--coordinator-pid", str(os.getpid()), "--frozen-validate-checkout", str(checkout),
+        "--completed-record", record.relative_to(project).as_posix(),
+        "--repository", source.relative_to(project).as_posix(),
+    ])
+    assert rc == 3
+    assert "requires --validation-proof-manifest" in capsys.readouterr().err
+    assert checkout.is_dir()
+    assert (record.read_bytes(), sidecar.read_bytes(), git_metadata_snapshot(checkout)) == before
+
+
+@pytest.mark.ordinary_environment
+@pytest.mark.parametrize("action", ("recover", "classify"))
+@pytest.mark.parametrize("mutation", ("changed-gitlink", "uninitialized-files", "ignored-cache", "replaced-clone"))
+def test_current_incomplete_frozen_binds_checkout_and_gitlink_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str], action: str, mutation: str,
+) -> None:
+    project, source, checkout, record, sidecar = prepare_current_incomplete_frozen_checkout(
+        tmp_path, monkeypatch, nested=mutation != "uninitialized-files"
+    )
+    if mutation == "changed-gitlink":
+        git(checkout / "component/leaf", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty", "-m", "different child commit")
+        git(checkout, "config", "submodule.component.ignore", "all")
+    elif mutation == "uninitialized-files":
+        # Advance the fixture target to a commit with a real gitlink, without
+        # initializing that submodule. Hidden content must not count as an
+        # empty uninitialized gitlink.
+        add_recursive_submodules(tmp_path, project, source)
+        target = git(source, "rev-parse", "HEAD").stdout.strip()
+        git(checkout, "fetch", str(source), target)
+        git(checkout, "checkout", "--detach", target)
+        value = dict(wrkslots._strict_json_object(record.read_bytes(), "fixture record"))
+        value["target"] = target
+        record.write_text(json.dumps(value))
+        result = dict(wrkslots._strict_json_object(sidecar.read_bytes(), "fixture result"))
+        result["commit"] = target
+        sidecar.write_text(json.dumps(result))
+        (checkout / "component/authored.txt").write_text("must remain retained\n")
+    elif mutation == "ignored-cache":
+        (checkout / "ignored").mkdir()
+        (checkout / "ignored/result.txt").write_text("never discard retained output\n")
+    else:
+        calls = 0
+        def fresh(_paths: Sequence[Path], *, budget: wrkslots._ReadOnlyCommandBudget) -> wrkslots._ProcessPathCensus:
+            nonlocal calls
+            calls += 1
+            budget.remaining_seconds()
+            preserved = checkout.with_name(checkout.name + "-preserved")
+            checkout.rename(preserved)
+            shutil.copytree(preserved, checkout, symlinks=True)
+            return wrkslots._ProcessPathCensus((), ())
+        monkeypatch.setattr(wrkslots, "_capture_same_uid_process_path_census", fresh)
+    before = (record.read_bytes(), sidecar.read_bytes())
+    assert run_current_incomplete_batch(project, source, checkout, record, action=action) == 0
+    row = incomplete_batch_row(json.loads(capsys.readouterr().out), action)
+    assert row["blocks_entry"] is True, row
+    assert checkout.is_dir()
+    assert (record.read_bytes(), sidecar.read_bytes()) == before
+    if mutation == "replaced-clone":
+        assert calls == 1
+        assert checkout.with_name(checkout.name + "-preserved").is_dir()
+
+
+@pytest.mark.ordinary_environment
+@pytest.mark.parametrize("action", ("recover", "classify"))
+@pytest.mark.parametrize("mutation", ("root-head", "both-origins"))
+def test_current_incomplete_frozen_binds_initial_facts_to_recursive_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str], action: str, mutation: str,
+) -> None:
+    project, source, checkout, record, _sidecar = prepare_current_incomplete_frozen_checkout(
+        tmp_path, monkeypatch
+    )
+    original = wrkslots._retained_validation_git_state
+    changed = False
+    def observe(
+        repository: Path, *, pristine: bool, cache_globs: Sequence[str] = (),
+    ) -> wrkslots._RetainedValidationGitState:
+        nonlocal changed
+        if repository == checkout and not changed:
+            changed = True
+            if mutation == "root-head":
+                git(checkout, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty", "-m", "changed before first snapshot")
+            else:
+                for path in (checkout, source):
+                    git(path, "remote", "set-url", "origin", str(tmp_path / "changed.git"))
+        return original(repository, pristine=pristine, cache_globs=cache_globs)
+    monkeypatch.setattr(wrkslots, "_retained_validation_git_state", observe)
+    assert run_current_incomplete_batch(project, source, checkout, record, action=action) == 0
+    row = incomplete_batch_row(json.loads(capsys.readouterr().out), action)
+    assert changed
+    assert row["blocks_entry"] is True, row
+    assert checkout.is_dir()
