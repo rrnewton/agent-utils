@@ -187,6 +187,22 @@ always replaces the answer file. It does not model failure before that write.
 
 ## Source-only risks and boundaries requiring explicit contracts
 
+### Rust counterparts
+
+A bounded source check found the same four managed/shared control-flow patterns
+in the Rust implementation. These are **source-level matches, not additional
+Rust reproductions**. Fixes and regression coverage need to address both
+implementations.
+
+| Python finding | Matching Rust control flow |
+| --- | --- |
+| Explicit-ID send replay | [`agent.rs`](../../../rs/herdr-run/src/agent.rs#L693) calls `enqueue_internal` without serialization for identified sends. Its cross-directory existence check precedes the inbox-only atomic create. |
+| Startup brief crosses generations | [`subagents.rs`](../../../rs/herdr-run/src/subagents.rs#L573) drops the lifecycle lock before sending the brief and reading status by name, without checking the launch token again. |
+| Partial tab cleanup failure | [`subagents.rs`](../../../rs/herdr-run/src/subagents.rs#L631) persists the tab before pane discovery; stop rejects the surviving pane when the recorded pane is absent. |
+| Stop uses stale tab membership | [`subagents.rs`](../../../rs/herdr-run/src/subagents.rs#L1000) snapshots panes, then reads output and writes state before closing the whole tab. Human membership changes are not serialized with that operation. |
+
+### Other source-only observations
+
 These were identified from control flow and current test coverage; they were
 not independently reproduced during this bounded audit.
 
