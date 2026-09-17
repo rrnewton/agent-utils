@@ -21597,7 +21597,7 @@ def test_absent_validate_process_and_systemd_checks_fail_closed(
     assert cgroup_reads == 0
 
     monkeypatch.setattr(
-        wrkslots, "_mountinfo_path_references", lambda _pid, _budget: ()
+        wrkslots, "_mountinfo_path_references", lambda _pid, _budget, _cache=None: ()
     )
     shared_launcher_cgroup = wrkslots._absent_validate_mount_match(
         (wrkslots._AbsentProcessObservation(123, 17, "/recorded/owner/child", "mnt:[123]"),),
@@ -21743,7 +21743,9 @@ def test_mount_namespace_reselects_after_representative_generation_changes(
     inspected: list[int] = []
 
     def mountinfo(
-        pid: int, _budget: wrkslots._ReadOnlyCommandBudget
+        pid: int,
+        _budget: wrkslots._ReadOnlyCommandBudget,
+        _cache: dict[str, tuple[tuple[Path, str], ...]] | None = None,
     ) -> tuple[tuple[Path, str], ...]:
         inspected.append(pid)
         return ((target, str(target)),) if pid == 123 else ()
@@ -21768,7 +21770,9 @@ def test_mountinfo_census_retries_only_transient_stable_einval(
     calls = 0
 
     def mountinfo(
-        _pid: int, _budget: wrkslots._ReadOnlyCommandBudget
+        _pid: int,
+        _budget: wrkslots._ReadOnlyCommandBudget,
+        _cache: dict[str, tuple[tuple[Path, str], ...]] | None = None,
     ) -> tuple[tuple[Path, str], ...]:
         nonlocal calls
         calls += 1
@@ -21801,7 +21805,9 @@ def test_mountinfo_census_enforces_file_aggregate_and_deadline_bounds(
         return b"abc"
 
     monkeypatch.setattr(wrkslots, "_read_bounded_regular_file", bounded_read)
-    monkeypatch.setattr(wrkslots, "_parse_mountinfo_paths", lambda _text, _label: ())
+    monkeypatch.setattr(
+        wrkslots, "_parse_mountinfo_paths", lambda _text, _label, _cache=None: ()
+    )
     budget = wrkslots._ReadOnlyCommandBudget.start(
         timeout_seconds=30,
         stdout_limit=1,

@@ -5047,9 +5047,7 @@ def _registry_storage_inconsistencies(
                 )
                 continue
             try:
-                checkout_root = vcs.repository_root(path)
-                checkout_common = vcs.common_directory(path)
-                vcs.head(path)
+                checkout_root, checkout_common, _head = vcs.worktree_identity(path)
             except Refusal as exc:
                 note(
                     "git-worktree-unreadable",
@@ -6710,6 +6708,47 @@ class _GitVcs:
             raise Refusal(f"Git reported an unsafe common directory: {common}")
         return common
 
+    def worktree_identity(self, checkout: Path) -> tuple[Path, Path, str]:
+        """Answer repository_root, common_directory and head in ONE Git process.
+
+        The registry audit asks all three of a checkout back to back, so on a
+        251-row registry the separate spellings cost 753 Git processes at about
+        24 ms each -- 18.7 of the audit's 19.1 seconds, measured 2026-09-17 by
+        cProfile.  Nothing here is weakened to buy that: the same three values
+        are read and every refusal below is the one the separate method raises.
+        `git rev-parse` reports the requested options in argument order, and a
+        failure on any of them is still a non-zero exit that `_run` turns into
+        the same Refusal.
+        """
+
+        result = self._run(
+            checkout,
+            [
+                "rev-parse",
+                "--path-format=absolute",
+                "--show-toplevel",
+                "--git-common-dir",
+                "--verify",
+                "HEAD^{commit}",
+            ],
+        )
+        lines = result.stdout.splitlines()
+        if len(lines) != 3:
+            raise Refusal(
+                f"Git did not report one worktree identity for {checkout}: "
+                f"expected three lines, got {len(lines)}"
+            )
+        root = Path(lines[0].strip()).absolute()
+        if root.is_symlink() or not root.is_dir():
+            raise Refusal(f"Git reported an unsafe repository root: {root}")
+        common = Path(lines[1].strip()).absolute()
+        if common.is_symlink() or not common.is_dir():
+            raise Refusal(f"Git reported an unsafe common directory: {common}")
+        sha = lines[2].strip()
+        if not SHA_RE.fullmatch(sha):
+            raise Refusal(f"checkout HEAD is not a full commit: {checkout}")
+        return root, common, sha
+
     def verify_ref(self, repository: Path, ref: str, label: str) -> str:
         _validate_ref(ref, label)
         result = self._run(repository, ["rev-parse", "--verify", f"{ref}^{{commit}}"])
@@ -8054,7 +8093,29 @@ def _process_uses_slot(pid_dir: Path, slot_path: Path) -> list[str]:
     return uses
 
 
-def _parse_mountinfo_paths(text: str, label: str) -> tuple[tuple[Path, str], ...]:
+def _parse_mountinfo_paths(
+    text: str,
+    label: str,
+    cache: dict[str, tuple[tuple[Path, str], ...]] | None = None,
+) -> tuple[tuple[Path, str], ...]:
+    """Parse one process's mount table into the absolute paths it references.
+
+    ``cache`` is keyed on the mount table TEXT, which is what the result depends
+    on; ``label`` only names the PID in a refusal.  A census reads one table per
+    mount namespace, and on a fleet host almost every process has its own
+    namespace while mounting the same tables -- measured 2026-09-17, 3,363
+    namespaces across 3,638 processes.  Re-parsing identical text once per
+    namespace built about 700,000 `Path` objects whose construction and hashing,
+    not the walk over them, was the census's largest single cost.
+
+    Only a SUCCESSFUL parse is cached, so a malformed table still refuses once
+    per process and still names the process it came from.
+    """
+
+    if cache is not None:
+        cached = cache.get(text)
+        if cached is not None:
+            return cached
     references: list[tuple[Path, str]] = []
     for line in text.splitlines():
         left, separator, right = line.partition(" - ")
@@ -8074,7 +8135,10 @@ def _parse_mountinfo_paths(text: str, label: str) -> tuple[tuple[Path, str], ...
             )
             if candidate.is_absolute():
                 references.append((candidate, raw))
-    return tuple(references)
+    parsed = tuple(references)
+    if cache is not None:
+        cache[text] = parsed
+    return parsed
 
 
 def _process_mounts_slot(pid_dir: Path, slot_path: Path) -> list[str]:
@@ -21554,13 +21618,40 @@ def _retained_handles_for_absent_rows(
 
 
 def _matching_absent_validate_target(
-    observed: Path, targets: Mapping[Path, str]
+    observed: Path,
+    targets: Mapping[Path, str],
+    cache: dict[Path, tuple[Path, str] | None] | None = None,
 ) -> tuple[Path, str] | None:
+    """Name the requested target that is ``observed`` or an ancestor of it.
+
+    ``cache`` memoizes the ancestor walk for one census, whose ``targets`` do
+    not change while it runs.  The mount census asks this of every reference in
+    every mount namespace on the box, and on a fleet host that is a very lopsided
+    population: measured 2026-09-17, 660,432 calls over 2,124 DISTINCT paths --
+    311 repeats each, and 236,895 of the calls were the single path ``/``.  The
+    walk itself is cheap; asking it 660,432 times cost 7.61 of the census's 12.0
+    seconds, against a 22-second whole-operation bound that also has to pay for a
+    second census.  The memo changes no answer: this is a pure function of
+    ``observed`` and ``targets``.
+    """
+
+    if cache is not None:
+        try:
+            # Not `.get`: a stored `None` is a real answer -- this path is
+            # dominated by references that match nothing -- so absence has to be
+            # distinguished by the KeyError rather than by the value.
+            return cache[observed]
+        except KeyError:
+            pass
+    matched: tuple[Path, str] | None = None
     for candidate in (observed, *observed.parents):
         slot = targets.get(candidate)
         if slot is not None:
-            return candidate, slot
-    return None
+            matched = (candidate, slot)
+            break
+    if cache is not None:
+        cache[observed] = matched
+    return matched
 
 
 def _cgroup_matches(recorded: str, observed: str) -> bool:
@@ -21684,7 +21775,9 @@ def _absent_validate_process_snapshot(
 
 
 def _mountinfo_path_references(
-    pid: int, budget: _ReadOnlyCommandBudget
+    pid: int,
+    budget: _ReadOnlyCommandBudget,
+    cache: dict[str, tuple[tuple[Path, str], ...]] | None = None,
 ) -> tuple[tuple[Path, str], ...]:
     path = Path("/proc") / str(pid) / "mountinfo"
     try:
@@ -21701,7 +21794,7 @@ def _mountinfo_path_references(
         text = contents.decode("utf-8", errors="surrogateescape")
     except (OSError, UnicodeError) as exc:
         raise Refusal(f"mount evidence is indeterminate for PID {pid}: {exc}") from exc
-    return _parse_mountinfo_paths(text, f"mount evidence for PID {pid}")
+    return _parse_mountinfo_paths(text, f"mount evidence for PID {pid}", cache)
 
 
 def _absent_validate_mount_match(
@@ -21728,6 +21821,12 @@ def _absent_validate_mount_matches(
     for process in processes:
         namespaces.setdefault(process.mount_namespace, []).append(process)
     matches: list[tuple[int, str, str, str]] = []
+    # One memo for this census. Nearly every process on a fleet host has its own
+    # mount namespace -- 3,363 namespaces across 3,638 processes, measured
+    # 2026-09-17 -- and they mount the same handful of paths, so the references
+    # repeat about 311 times each.
+    match_cache: dict[Path, tuple[Path, str] | None] = {}
+    mountinfo_cache: dict[str, tuple[tuple[Path, str], ...]] = {}
     for representatives in namespaces.values():
         selected: _AbsentProcessObservation | None = None
         references: tuple[tuple[Path, str], ...] = ()
@@ -21735,7 +21834,7 @@ def _absent_validate_mount_matches(
         for process in representatives:
             try:
                 candidate_references = _mountinfo_path_references_with_retry(
-                    process, selected_budget
+                    process, selected_budget, mountinfo_cache
                 )
             except Refusal as exc:
                 failures.append((process, exc))
@@ -21751,7 +21850,7 @@ def _absent_validate_mount_matches(
                     raise failure
             continue
         for observed, detail in references:
-            matched = _matching_absent_validate_target(observed, targets)
+            matched = _matching_absent_validate_target(observed, targets, match_cache)
             if matched is not None:
                 _target, slot = matched
                 matches.append((selected.pid, slot, "mount", detail))
@@ -21761,12 +21860,13 @@ def _absent_validate_mount_matches(
 def _mountinfo_path_references_with_retry(
     process: _AbsentProcessObservation,
     budget: _ReadOnlyCommandBudget,
+    cache: dict[str, tuple[tuple[Path, str], ...]] | None = None,
 ) -> tuple[tuple[Path, str], ...]:
     """Retry one stable procfs EINVAL; persistent errors remain refusals."""
 
     for attempt in range(2):
         try:
-            return _mountinfo_path_references(process.pid, budget)
+            return _mountinfo_path_references(process.pid, budget, cache)
         except Refusal as exc:
             cause = exc.__cause__
             if not isinstance(cause, OSError) or cause.errno != errno.EINVAL:
@@ -22292,6 +22392,7 @@ def _parse_find_path_matches(
     if len(fields) % 2:
         raise Refusal(f"{census} find census returned a truncated record")
     matches: list[tuple[int, str, str, str]] = []
+    match_cache: dict[Path, tuple[Path, str] | None] = {}
     for index in range(0, len(fields), 2):
         evidence_path = Path(fields[index].decode("utf-8", errors="surrogateescape"))
         raw_target = fields[index + 1].decode("utf-8", errors="surrogateescape")
@@ -22300,7 +22401,7 @@ def _parse_find_path_matches(
         if process is None:
             raise Refusal(f"{census} find census returned an unexpected PID: {pid}")
         observed = Path(os.path.normpath(raw_target.removesuffix(" (deleted)")))
-        matched = _matching_absent_validate_target(observed, targets)
+        matched = _matching_absent_validate_target(observed, targets, match_cache)
         if matched is None:
             continue
         if not _process_generation_is_current(process):
@@ -22320,6 +22421,7 @@ def _parse_maps_path_matches(
     census: str,
 ) -> tuple[tuple[int, str, str, str], ...]:
     matches: list[tuple[int, str, str, str]] = []
+    match_cache: dict[Path, tuple[Path, str] | None] = {}
     for raw_line in output.splitlines():
         raw_path, separator, raw_mapping = raw_line.partition(b":")
         if not separator:
@@ -22335,7 +22437,7 @@ def _parse_maps_path_matches(
         observed = Path(fields[5].removesuffix(" (deleted)"))
         if not observed.is_absolute():
             continue
-        matched = _matching_absent_validate_target(observed, targets)
+        matched = _matching_absent_validate_target(observed, targets, match_cache)
         if matched is None:
             continue
         pid = _pid_from_proc_evidence(evidence_path)
@@ -22777,6 +22879,7 @@ def _capture_lsof_process_path_census(
     reported_pids: set[int] = set()
     attributed_pids: set[int] = set()
     matches: list[tuple[int, str, str, str]] = []
+    match_cache: dict[Path, tuple[Path, str] | None] = {}
     for line in stdout.splitlines():
         if line.startswith("p") and line[1:].isdigit():
             current_pid = int(line[1:])
@@ -22784,7 +22887,7 @@ def _capture_lsof_process_path_census(
         elif line.startswith("n") and current_pid is not None:
             raw_path = line[1:].removesuffix(" (deleted)")
             observed = Path(raw_path)
-            matched = _matching_absent_validate_target(observed, targets)
+            matched = _matching_absent_validate_target(observed, targets, match_cache)
             if matched is not None:
                 _target, slot = matched
                 matches.append((current_pid, slot, "lsof", raw_path))
