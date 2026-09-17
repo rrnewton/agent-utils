@@ -12,12 +12,15 @@ import io
 import itertools
 import json
 import os
+import select
+import selectors
 import signal
 import shlex
 import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence, Set as AbstractSet
@@ -5942,6 +5945,125 @@ def test_batched_lsof_census_attributes_live_process_to_exact_checkout(
         ("-nP", "-Fpcfn", "+D", str(first), "+D", str(second)),
         ("--type", "mnt", "--output", "NS,PID", "--noheadings", "--raw"),
     ]
+
+
+@pytest.fixture
+def lsof_tmpfs_fixture() -> Iterator[Path]:
+    with tempfile.TemporaryDirectory(prefix="wrkslots-lsof-", dir="/dev/shm") as directory:
+        yield Path(directory)
+
+
+@pytest.mark.ordinary_environment
+def test_bounded_lsof_reports_installed_binary_file_and_alias_matches(
+    tmp_path: Path, lsof_tmpfs_fixture: Path,
+) -> None:
+    selected = lsof_tmpfs_fixture / "selected"
+    outside = lsof_tmpfs_fixture / "outside"
+    selected.mkdir()
+    outside.mkdir()
+    for name in ("open", "mapped", "hardlink", "symlink"):
+        (selected / name).write_bytes(b"x" * 4096)
+    os.link(selected / "hardlink", outside / "hardlink")
+    (outside / "symlink").symlink_to(selected / "symlink")
+    holder = textwrap.dedent(r'''
+        import ctypes, json, os, socket, sys
+        from pathlib import Path
+        selected, outside = map(Path, sys.argv[1:])
+        os.chdir(selected)
+        descriptors = {
+            "open": os.open(selected / "open", os.O_RDONLY),
+            "hardlink": os.open(outside / "hardlink", os.O_RDONLY),
+            "symlink": os.open(outside / "symlink", os.O_RDONLY),
+        }
+        # Use libc directly so no duplicate descriptor keeps the mapping alive.
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int,
+                              ctypes.c_int, ctypes.c_int, ctypes.c_long]
+        libc.mmap.restype = ctypes.c_void_p
+        mapped_fd = os.open(selected / "mapped", os.O_RDONLY)
+        address = libc.mmap(None, 4096, 1, 2, mapped_fd, 0)
+        assert address != ctypes.c_void_p(-1).value
+        os.close(mapped_fd)
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.bind(str(selected / "socket"))
+        descriptors["socket"] = sock.fileno()
+        print(json.dumps(descriptors), flush=True)
+        assert sys.stdin.read(1) == "q"
+    ''')
+    process = subprocess.Popen(
+        [sys.executable, "-c", holder, str(selected), str(outside)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, cwd="/",
+    )
+    try:
+        assert process.stdout is not None
+        assert select.select([process.stdout], [], [], 5)[0], "holder did not become ready"
+        readiness = process.stdout.readline()
+        assert readiness, "holder exited before opening the selected files"
+        descriptors = json.loads(readiness)
+        assert isinstance(descriptors, dict)
+        assert all(isinstance(value, int) for value in descriptors.values())
+        expected_pid = str(process.pid)
+        proc = Path("/proc") / expected_pid
+        visible_maps = [line for line in (proc / "maps").read_text().splitlines() if str(selected) in line]
+        fixture_evidence = {
+            "pid": process.pid,
+            "status": [line for line in (proc / "status").read_text().splitlines()
+                       if line.startswith(("Uid:", "Gid:", "NSpid:", "TracerPid:", "NoNewPrivs:"))],
+            "maps": visible_maps,
+            "cwd": os.readlink(proc / "cwd"),
+            "fds": {name: os.readlink(proc / "fd" / str(fd)) for name, fd in descriptors.items()},
+            "namespaces": {name: os.readlink(proc / "ns" / name) for name in ("user", "pid", "mnt")},
+        }
+        (tmp_path / "fixture.json").write_text(json.dumps(fixture_evidence, indent=2))
+        mapped_rows = [line for line in visible_maps if line.endswith(str(selected / "mapped"))]
+        assert len(mapped_rows) == 1
+        mapped_fields = mapped_rows[0].split()
+        mapped_stat = (selected / "mapped").stat()
+        assert tuple(int(part, 16) for part in mapped_fields[3].split(":")) == (
+            os.major(mapped_stat.st_dev), os.minor(mapped_stat.st_dev)
+        )
+        assert int(mapped_fields[4]) == mapped_stat.st_ino
+        # Assert the owned holder's population with the historical lsof flags.
+        # Production's separate argv assertion retains the full-process census.
+        arguments = ["-nP", "-Fpcfn", "-a", "-p", expected_pid]
+        arguments.extend(("+D", str(selected)))
+        budget = wrkslots._ReadOnlyCommandBudget.start(
+            timeout_seconds=22, stdout_limit=16 * 1024 * 1024,
+            stderr_limit=64 * 1024,
+        )
+        rc, stdout, stderr = wrkslots._run_same_uid_command(
+            Path("/usr/bin/lsof"), arguments, budget=budget,
+        )
+        (tmp_path / "lsof.stdout").write_bytes(stdout)
+        (tmp_path / "lsof.stderr").write_bytes(stderr)
+        (tmp_path / "lsof.returncode").write_text(str(rc))
+        assert rc == 0, (stdout.decode(errors="replace"), stderr.decode(errors="replace"))
+        assert wrkslots._unrelated_lsof_warnings(
+            stderr.decode(errors="surrogateescape"), selected
+        )
+        rows: set[tuple[str, str, str]] = set()
+        pid = descriptor = ""
+        for line in stdout.decode(errors="surrogateescape").splitlines():
+            if line.startswith("p"):
+                pid = line[1:]
+            elif line.startswith("f"):
+                descriptor = line[1:]
+            elif line.startswith("n"):
+                rows.add((pid, descriptor, line[1:]))
+        assert {pid for pid, _fd, _name in rows} == {expected_pid}
+        assert (expected_pid, "cwd", str(selected)) in rows
+        assert (expected_pid, "mem", str(selected / "mapped")) in rows
+        for name in ("open", "hardlink", "symlink"):
+            assert (expected_pid, str(descriptors[name]), str(selected / name)) in rows
+        matching = [row for row in rows if row[:2] == (expected_pid, str(descriptors["socket"]))]
+        assert len(matching) == 1
+        assert matching[0][2].startswith(str(selected / "socket"))
+        assert len(rows) == 6
+        _stdout, stderr_text = process.communicate("q", timeout=5)
+        assert process.returncode == 0, stderr_text
+    finally:
+        terminate_process(process)
 
 
 def test_ownerless_validate_batch_retains_shared_census_use_but_removes_other(
@@ -21934,6 +22056,201 @@ def test_bounded_read_only_command_refuses_output_and_time_overruns() -> None:
             timeout_seconds=0.01,
             input_data=b"x" * (256 * 1024),
         )
+
+
+def test_same_uid_command_preserves_shared_deadline_and_byte_accounting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [10.0]
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    budget = wrkslots._ReadOnlyCommandBudget.start(
+        timeout_seconds=22, stdout_limit=100, stderr_limit=100, input_limit=100
+    )
+    deadline = budget.deadline
+    clock[0] = 13.0
+
+    def bounded(_command: list[str], **kwargs: object) -> tuple[int, bytes, bytes]:
+        assert kwargs["timeout_seconds"] == 19
+        assert kwargs["stdout_limit"] == kwargs["stderr_limit"] == 100
+        return 0, b"out", b"err"
+
+    # Executable trust has separate native controls; this unit exercises the
+    # shared budget and must work in the mapped test partition as well.
+    monkeypatch.setattr(
+        wrkslots, "_root_owned_executable",
+        lambda path, _label: wrkslots._TrustedExecutablePath(path, ()),
+    )
+    monkeypatch.setattr(wrkslots, "_run_bounded_read_only_command", bounded)
+    result = wrkslots._run_same_uid_command(
+        Path("/usr/bin/printf"), ("out",), budget=budget,
+        input_data=b"input",
+    )
+    assert result == (0, b"out", b"err")
+    assert budget.deadline == deadline
+    assert budget.stdout_remaining == budget.stderr_remaining == 97
+    assert budget.input_remaining == 95
+
+
+@pytest.mark.parametrize("delay_at", ["spawn", "wait"])
+def test_bounded_read_only_command_refuses_late_success(
+    monkeypatch: pytest.MonkeyPatch, delay_at: str
+) -> None:
+    clock = [0.0]
+    original_killpg = os.killpg
+    signals: list[tuple[int, int]] = []
+
+    def killpg(pgid: int, signum: int) -> None:
+        signals.append((pgid, signum))
+        original_killpg(pgid, signum)
+
+    class DelayedPopen(subprocess.Popen[bytes]):
+        def __init__(
+            self, args: Sequence[str], *, stdin: int, stdout: int, stderr: int,
+            cwd: str, env: Mapping[str, str], start_new_session: bool,
+        ) -> None:
+            super().__init__(
+                args, stdin=stdin, stdout=stdout, stderr=stderr,
+                cwd=cwd, env=env, start_new_session=start_new_session,
+            )
+            if delay_at == "spawn":
+                clock[0] = 2
+
+        def wait(self, timeout: float | None = None) -> int:
+            assert timeout is not None, "every wait must be bounded"
+            result = super().wait(timeout=timeout)
+            if delay_at == "wait":
+                clock[0] = 2
+            return result
+
+    monkeypatch.setattr(subprocess, "Popen", DelayedPopen)
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(os, "killpg", killpg)
+    with pytest.raises(wrkslots.Refusal, match="exceeded 1s"):
+        wrkslots._run_bounded_read_only_command(
+            ["/usr/bin/printf", "complete-looking output"], timeout_seconds=1
+        )
+    if delay_at == "wait":
+        assert signals == [], "a reaped leader's PID/PGID must never be signalled"
+    else:
+        assert len(signals) == 1 and signals[0][1] == signal.SIGKILL
+
+
+@pytest.mark.ordinary_environment
+def test_bounded_read_only_command_discards_output_before_timeout(tmp_path: Path) -> None:
+    ready = tmp_path / "ready"
+    script = (
+        "import os, pathlib, sys, time; "
+        "pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); "
+        "os.write(1, b'p1234\\nfcwd\\nn/selected\\n'); time.sleep(60)"
+    )
+    with pytest.raises(wrkslots.Refusal, match="exceeded"):
+        wrkslots._run_bounded_read_only_command(
+            [sys.executable, "-c", script, str(ready)], timeout_seconds=1
+        )
+    pid = int(ready.read_text())
+    assert not Path(f"/proc/{pid}").exists(), "direct child was not reaped"
+
+
+@pytest.mark.ordinary_environment
+def test_bounded_read_only_command_kills_descendant_holding_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ready = tmp_path / "descendant"
+    script = textwrap.dedent('''
+        import os, pathlib, signal, sys, time
+        if os.fork():
+            sys.exit(0)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))
+        os.write(1, b"partial output")
+        time.sleep(60)
+    ''')
+    original_killpg = os.killpg
+    pidfds: list[int] = []
+
+    def killpg(pgid: int, signum: int) -> None:
+        try:
+            assert signum == signal.SIGKILL
+            assert not pidfds
+            # Hold this exact descendant's identity before it is killed. A
+            # later /proc read can race with exit or observe a reused PID.
+            pidfds.append(os.pidfd_open(int(ready.read_text())))
+        finally:
+            original_killpg(pgid, signum)
+
+    monkeypatch.setattr(os, "killpg", killpg)
+    terminated = False
+    try:
+        with pytest.raises(wrkslots.Refusal, match="exceeded"):
+            wrkslots._run_bounded_read_only_command(
+                [sys.executable, "-c", script, str(ready)], timeout_seconds=1
+            )
+        assert len(pidfds) == 1
+        assert select.select(pidfds, [], [], 2)[0] == pidfds, (
+            "descendant survived process-group SIGKILL"
+        )
+        terminated = True
+    finally:
+        for pidfd in pidfds:
+            try:
+                if not terminated:
+                    try:
+                        signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+            finally:
+                os.close(pidfd)
+
+
+@pytest.mark.ordinary_environment
+def test_bounded_read_only_command_refuses_when_killed_child_cannot_be_reaped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_wait = subprocess.Popen.wait
+    children: list[subprocess.Popen[bytes]] = []
+
+    def unreapable_wait(process: subprocess.Popen[bytes], timeout: float | None = None) -> int:
+        assert timeout == 1, "post-kill wait must use the one-second bound"
+        children.append(process)
+        raise subprocess.TimeoutExpired(process.args, timeout)
+
+    monkeypatch.setattr(subprocess.Popen, "wait", unreapable_wait)
+    try:
+        with pytest.raises(wrkslots.Refusal, match="was not reaped within 1s after SIGKILL"):
+            wrkslots._run_bounded_read_only_command(
+                ["/usr/bin/sleep", "60"], timeout_seconds=0.01
+            )
+        assert len(children) == 1
+    finally:
+        # This models an unreapable response, without inducing kernel D-state.
+        for process in children:
+            original_wait(process, timeout=5)
+
+
+@pytest.mark.ordinary_environment
+@pytest.mark.parametrize("interrupt", [False, True])
+def test_bounded_read_only_command_cleans_up_post_spawn_setup_failure(
+    monkeypatch: pytest.MonkeyPatch, interrupt: bool,
+) -> None:
+    failure = KeyboardInterrupt() if interrupt else RuntimeError("selector setup failed")
+    original_wait = subprocess.Popen.wait
+    children: list[subprocess.Popen[bytes]] = []
+
+    def fail_selector() -> selectors.BaseSelector:
+        raise failure
+
+    def reap(process: subprocess.Popen[bytes], timeout: float | None = None) -> int:
+        assert timeout == 1
+        children.append(process)
+        return original_wait(process, timeout=timeout)
+
+    monkeypatch.setattr(selectors, "DefaultSelector", fail_selector)
+    monkeypatch.setattr(subprocess.Popen, "wait", reap)
+    with pytest.raises(type(failure)) as observed:
+        wrkslots._run_bounded_read_only_command(["/usr/bin/sleep", "60"])
+    assert observed.value is failure
+    assert len(children) == 1
+    assert children[0].returncode == -signal.SIGKILL
 
 
 @pytest.mark.mapped_root_namespace

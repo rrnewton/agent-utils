@@ -339,6 +339,7 @@ _TRUSTED_EXECUTABLE_DIRECTORY = Path("/usr/bin")
 # one evidence deadline leaves eight seconds for rollback, Git removal, and
 # durable state restoration. The parent batch caller still needs end-to-end timing.
 _VALIDATE_REMOVE_BATCH_CENSUS_SECONDS = 22.0
+_READ_ONLY_COMMAND_REAP_SECONDS = 1.0
 
 
 class Refusal(RuntimeError):
@@ -21938,6 +21939,7 @@ def _run_bounded_read_only_command(
         environment.update(env_overrides)
     for executable in trusted_executables:
         _recheck_trusted_executable(executable)
+    deadline = time.monotonic() + timeout_seconds
     try:
         process = subprocess.Popen(
             list(command),
@@ -21950,41 +21952,39 @@ def _run_bounded_read_only_command(
         )
     except OSError as exc:
         raise Refusal(f"cannot start privileged read-only census: {exc}") from exc
-    assert process.stdout is not None and process.stderr is not None
-    stdout_buffer = bytearray()
-    stderr_buffer = bytearray()
-    streams = {
-        process.stdout.fileno(): (
-            process.stdout,
-            stdout_buffer,
-            stdout_limit,
-            "stdout",
-        ),
-        process.stderr.fileno(): (
-            process.stderr,
-            stderr_buffer,
-            stderr_limit,
-            "stderr",
-        ),
-    }
-    selector = selectors.DefaultSelector()
-    for stream, _buffer, _limit, _label in streams.values():
-        os.set_blocking(stream.fileno(), False)
-        selector.register(stream, selectors.EVENT_READ)
-    input_offset = 0
-    if input_data is not None:
-        assert process.stdin is not None
-        os.set_blocking(process.stdin.fileno(), False)
-        selector.register(process.stdin, selectors.EVENT_WRITE)
-    deadline = time.monotonic() + timeout_seconds
+    selector: selectors.BaseSelector | None = None
     try:
+        assert process.stdout is not None and process.stderr is not None
+        stdout_buffer = bytearray()
+        stderr_buffer = bytearray()
+        streams = {
+            process.stdout.fileno(): (
+                process.stdout,
+                stdout_buffer,
+                stdout_limit,
+                "stdout",
+            ),
+            process.stderr.fileno(): (
+                process.stderr,
+                stderr_buffer,
+                stderr_limit,
+                "stderr",
+            ),
+        }
+        selector = selectors.DefaultSelector()
+        for stream, _buffer, _limit, _label in streams.values():
+            os.set_blocking(stream.fileno(), False)
+            selector.register(stream, selectors.EVENT_READ)
+        input_offset = 0
+        if input_data is not None:
+            assert process.stdin is not None
+            os.set_blocking(process.stdin.fileno(), False)
+            selector.register(process.stdin, selectors.EVENT_WRITE)
         while selector.get_map():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise Refusal(f"privileged read-only census exceeded {timeout_seconds:g}s")
             ready = selector.select(min(remaining, 1.0))
-            if not ready and process.poll() is not None:
-                ready = [(key, selectors.EVENT_READ) for key in selector.get_map().values()]
             for key, _mask in ready:
                 if process.stdin is not None and key.fileobj is process.stdin:
                     assert input_data is not None
@@ -22016,21 +22016,45 @@ def _run_bounded_read_only_command(
         if remaining <= 0:
             raise Refusal(f"privileged read-only census exceeded {timeout_seconds:g}s")
         returncode = process.wait(timeout=remaining)
-    except (Refusal, subprocess.TimeoutExpired) as exc:
+        if time.monotonic() >= deadline:
+            raise Refusal(f"privileged read-only census exceeded {timeout_seconds:g}s")
+    except BaseException as exc:
+        cleanup_error: str | None = None
+        # The unreaped leader reserves its PID/PGID while descendants may hold
+        # the pipes open. After wait() reaps it, that number may be reused: a
+        # late-result refusal must not signal an unrelated process group.
+        if process.returncode is None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except OSError as kill_error:
+                cleanup_error = f"cannot kill census process group {process.pid}: {kill_error}"
         try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        process.wait()
+            process.wait(timeout=_READ_ONLY_COMMAND_REAP_SECONDS)
+        except subprocess.TimeoutExpired:
+            # An uninterruptible kernel operation can outlive SIGKILL. Do not
+            # wait forever or treat its incomplete output as a successful census.
+            cleanup_error = (
+                f"census PID {process.pid} was not reaped within "
+                f"{_READ_ONLY_COMMAND_REAP_SECONDS:g}s after SIGKILL"
+            )
+        if cleanup_error is not None:
+            if not isinstance(exc, (Refusal, subprocess.TimeoutExpired)):
+                raise exc from Refusal(cleanup_error)
+            raise Refusal(f"{exc}; {cleanup_error}") from exc
         if isinstance(exc, subprocess.TimeoutExpired):
             raise Refusal(f"privileged read-only census exceeded {timeout_seconds:g}s") from exc
         raise
     finally:
-        selector.close()
+        if selector is not None:
+            selector.close()
         if process.stdin is not None and not process.stdin.closed:
             process.stdin.close()
-        process.stdout.close()
-        process.stderr.close()
+        if process.stdout is not None:
+            process.stdout.close()
+        if process.stderr is not None:
+            process.stderr.close()
     return returncode, bytes(stdout_buffer), bytes(stderr_buffer)
 
 
@@ -22102,6 +22126,7 @@ def _run_same_uid_command(
         input_data=input_data,
         trusted_executables=(executable,),
     )
+    budget.remaining_seconds()
     budget.consume_output(result[1], result[2])
     return result
 
