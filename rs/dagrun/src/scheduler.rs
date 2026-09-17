@@ -2451,6 +2451,62 @@ fn last_line(bytes: &[u8]) -> String {
     String::new()
 }
 
+/// Best-effort bounded tail: the last few non-empty decoded lines, oldest first.
+///
+/// ⚠️ `last_line` ALONE IS NOT ENOUGH FOR A REFUSAL DIAGNOSTIC, and that is the
+/// whole reason this exists. A wrapper's own generic line is routinely the FINAL
+/// one while the line that names the cause is the one before it -- "cannot derive
+/// typed test results from <dir>" last, "expected 505 tests to execute, saw 507;
+/// refusing because the selected set changed" second to last. A one-line summary
+/// therefore reproduces the uselessness it is meant to cure.
+///
+/// Bounded in BOTH lines and bytes. The captured output is already ring-limited
+/// because a runaway step once OOM-killed the runner, and this string lands in a
+/// typed record that readers keep, so it must not inherit an unbounded size from
+/// a step that printed a great deal. Truncation is STATED rather than silent: a
+/// shortened cause that reads as the whole cause is the same defect one size
+/// smaller.
+fn last_lines(bytes: &[u8], max_lines: usize, max_bytes: usize) -> Vec<String> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut picked: Vec<String> = Vec::new();
+    let mut budget = max_bytes;
+    for line in text.lines().rev() {
+        if picked.len() >= max_lines {
+            break;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let kept = if trimmed.len() <= budget {
+            trimmed.to_string()
+        } else {
+            // The furthest-back byte offset that still fits, rounded UP to a
+            // character boundary. Walking back from the end returns the NEAREST
+            // offset that fits, which is a one-character tail.
+            let start = (trimmed.len() - budget..trimmed.len())
+                .find(|index| trimmed.is_char_boundary(*index))
+                .unwrap_or(trimmed.len());
+            if start >= trimmed.len() {
+                break;
+            }
+            format!(
+                "...(last {} of {} bytes) {}",
+                trimmed.len() - start,
+                trimmed.len(),
+                &trimmed[start..]
+            )
+        };
+        budget = budget.saturating_sub(kept.len());
+        picked.push(kept);
+        if budget == 0 {
+            break;
+        }
+    }
+    picked.reverse();
+    picked
+}
+
 /// Test counts extracted from one step's COMPLETE captured output, before
 /// verbosity decides how much of that output is presented to a human.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2641,6 +2697,13 @@ fn structured_test_failure_reason(
     ))
 }
 
+/// How much of a refusing step's own output is carried into the typed record.
+///
+/// Several lines, because the informative line is often not the last one; bounded,
+/// because captured output is ring-limited for a reason and this value is durable.
+const STRUCTURED_REFUSAL_TAIL_LINES: usize = 5;
+const STRUCTURED_REFUSAL_TAIL_BYTES: usize = 1024;
+
 fn resolved_test_counts(
     mode: TestResultsMode,
     path: Option<&std::path::Path>,
@@ -2656,8 +2719,30 @@ fn resolved_test_counts(
             let location = path
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "<scheduler-owned path unavailable>".into());
+            // The producer's own explanation is ALREADY IN SCOPE here -- `captured`
+            // is both pipes in arrival order -- and discarding it is what collapses
+            // every distinct cause to one message. Count drift with every test
+            // passing, a stale prepared executable, a malformed report and an
+            // unsupported event in the stream are byte-identical in the typed
+            // record without it.
+            let tail = last_lines(
+                captured,
+                STRUCTURED_REFUSAL_TAIL_LINES,
+                STRUCTURED_REFUSAL_TAIL_BYTES,
+            );
+            if tail.is_empty() {
+                // A step that refuses and says nothing is a FINDING, not an empty
+                // field, and the record has to be able to report that rather than
+                // read as merely unset.
+                return Err(format!(
+                    "required structured test results were not written to {location}; \
+                     the step wrote no output explaining why"
+                ));
+            }
             Err(format!(
-                "required structured test results were not written to {location}"
+                "required structured test results were not written to {location}; \
+                 last output: {}",
+                tail.join(" | ")
             ))
         }
         TestResultsMode::ExplicitNone => Ok(CapturedTestResults {
@@ -4752,6 +4837,66 @@ mod tests {
             .contains("required structured test results were not written"),
             "a printed banner must not create receipt evidence in structured mode"
         );
+        // ⚠️ THE REFUSAL MUST CARRY THE PRODUCER'S OWN WORDS. This is the whole
+        // point of the change: without it, count drift with every test passing,
+        // a stale prepared executable and a malformed report are byte-identical
+        // in the typed record. The two lines below are the REAL shape observed
+        // in a validation run -- the informative line is SECOND to last, and the
+        // generic wrapper line is last, which is why a one-line summary is not
+        // enough and why this asserts on the second-to-last line specifically.
+        let real = b"nextest-test-results: expected 505 tests to execute, saw 507; \
+refusing because the selected set changed\n\
+run-nextest-counted: cannot derive typed test results from /tmp/tmp.GnIJuuSDYR\n"
+            as &[u8];
+        let refusal = resolved_test_counts(
+            TestResultsMode::Structured(crate::test_results::CURRENT_SCHEMA),
+            None,
+            real,
+        )
+        .unwrap_err();
+        assert!(
+            refusal.contains("expected 505 tests to execute, saw 507"),
+            "the cause was discarded: {refusal}"
+        );
+        assert!(
+            refusal.contains("selected set changed"),
+            "the cause was discarded: {refusal}"
+        );
+        // ...and the original statement is still there, so nothing was traded away.
+        assert!(
+            refusal.contains("required structured test results were not written"),
+            "{refusal}"
+        );
+
+        // A step that refuses and says nothing is a FINDING, not an empty field.
+        let silent = resolved_test_counts(
+            TestResultsMode::Structured(crate::test_results::CURRENT_SCHEMA),
+            None,
+            b"   \n\t\n",
+        )
+        .unwrap_err();
+        assert!(
+            silent.contains("wrote no output explaining why"),
+            "{silent}"
+        );
+
+        // Bounded, and the truncation is STATED with the true size rather than
+        // silently keeping part of a line.
+        let noisy = format!("{}\nTHE-ACTUAL-CAUSE\n", "x".repeat(4096));
+        let bounded = resolved_test_counts(
+            TestResultsMode::Structured(crate::test_results::CURRENT_SCHEMA),
+            None,
+            noisy.as_bytes(),
+        )
+        .unwrap_err();
+        assert!(bounded.contains("THE-ACTUAL-CAUSE"), "the tail was dropped");
+        assert!(bounded.contains("of 4096 bytes"), "{bounded}");
+        assert!(
+            bounded.len() < STRUCTURED_REFUSAL_TAIL_BYTES + 512,
+            "unbounded refusal detail: {} bytes",
+            bounded.len()
+        );
+
         assert_eq!(
             resolved_test_counts(TestResultsMode::LegacyStdout, None, printed).unwrap(),
             CapturedTestResults {
