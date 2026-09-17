@@ -1877,7 +1877,13 @@ impl StepOutcome {
         }
     }
 
-    /// Build an eager-exit ABORTED outcome (a cancellation, not a genuine failure).
+    /// Build an ABORTED outcome (a cancellation, not a genuine failure).
+    ///
+    /// `cut_by_run_budget` picks which of the two cancellations this was. They call for
+    /// completely different follow-up, and the terminal output has always distinguished them
+    /// while this `reason` did not: it said eager-exit unconditionally, so a run-budget cut
+    /// recorded a failing peer that does not exist. A reader who only has the record — which is
+    /// the reader this field exists for — was then sent hunting for it.
     pub fn aborted_outcome(
         tag: String,
         duration_s: f64,
@@ -1885,6 +1891,7 @@ impl StepOutcome {
         returncode: Option<i64>,
         executed_tests: Option<u64>,
         filtered_tests: Option<u64>,
+        cut_by_run_budget: bool,
     ) -> Self {
         StepOutcome {
             tag,
@@ -1900,12 +1907,27 @@ impl StepOutcome {
             oom_kills: 0,
             timed_out: false,
             cpu_timed_out: false,
-            reason: "ABORTED (eager-exit after another step failed; --keep-going would continue independent work)"
-                .to_string(),
+            reason: if cut_by_run_budget {
+                ABORTED_BY_RUN_BUDGET_REASON.to_string()
+            } else {
+                ABORTED_BY_PEER_FAILURE_REASON.to_string()
+            },
             aborted: true,
         }
     }
 }
+
+/// Cancelled because the whole run exhausted its outer budget, not by any failure.
+///
+/// Kept beside its sibling below so the two cancellations cannot drift into wording that reads
+/// the same. The clause after the comma is the part that matters to a reader deciding whether to
+/// go looking for a failing step.
+pub const ABORTED_BY_RUN_BUDGET_REASON: &str =
+    "ABORTED (cut short by the OUTER run budget, not by a failure of its own or of a peer)";
+
+/// Cancelled by eager-exit after a peer step failed.
+pub const ABORTED_BY_PEER_FAILURE_REASON: &str =
+    "ABORTED (eager-exit after another step failed; --keep-going would continue independent work)";
 
 /// Aggregate outcome of a whole DAG run.
 #[derive(Debug, Clone, Default)]

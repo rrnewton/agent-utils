@@ -852,6 +852,21 @@ def _cpu_timeout_policy_suffix(
     return f" (canonical {canonical}s x{rendered}{label})"
 
 
+#: Cancelled because the whole run exhausted its outer budget, not by any failure.
+#:
+#: Kept beside its sibling below so the two cancellations cannot drift into wording that reads
+#: the same. The clause after the comma is the part that matters to a reader deciding whether to
+#: go looking for a failing step.
+ABORTED_BY_RUN_BUDGET_REASON = (
+    "ABORTED (cut short by the OUTER run budget, not by a failure of its own or of a peer)"
+)
+
+#: Cancelled by eager-exit after a peer step failed.
+ABORTED_BY_PEER_FAILURE_REASON = (
+    "ABORTED (eager-exit after another step failed; --keep-going would continue independent work)"
+)
+
+
 def step_failure_reason(
     *,
     returncode: int | None,

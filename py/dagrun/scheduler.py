@@ -40,6 +40,8 @@ from dagrun.attribution import (
 )
 from dagrun.capabilities import Lane, is_enforced
 from dagrun.model import (
+    ABORTED_BY_PEER_FAILURE_REASON,
+    ABORTED_BY_RUN_BUDGET_REASON,
     DagConfig,
     Step,
     command_with_inner_jobs,
@@ -1918,6 +1920,11 @@ class Runner:
             self.step_profile_rows.append(row)
             was_aborted = step.tag in self.aborted
             if was_aborted:
+                # Which of the two cancellations this was. They call for completely different
+                # follow-up, and the terminal output below has always distinguished them while
+                # this ``reason`` did not: it said eager-exit unconditionally, so a run-budget
+                # cut recorded a failing peer that does not exist, and a reader who only has the
+                # record was sent hunting for it.
                 outcome = StepOutcome(
                     tag=step.tag,
                     ok=False,
@@ -1928,7 +1935,11 @@ class Runner:
                     oom_kills=0,
                     timed_out=False,
                     cpu_timed_out=False,
-                    reason="ABORTED (eager-exit after another step failed; --keep-going would continue independent work)",
+                    reason=(
+                        ABORTED_BY_RUN_BUDGET_REASON
+                        if self.run_timed_out
+                        else ABORTED_BY_PEER_FAILURE_REASON
+                    ),
                     aborted=True,
                     pids_events=pids_events,
                 )
@@ -2067,6 +2078,13 @@ class Runner:
             if wall_budget > 0:
                 fields.append(("wall_limit_s", str(wall_budget)))
             fields.extend(_cpu_journal_fields(cpu_stats))
+            # WHY this step ended as it did. Without it the record says a step was not ok, or was
+            # cancelled, and never what happened -- so a cancelled step could be COUNTED and never
+            # NAMED, and an unknown nobody can name is an unknown nobody can drive down. Empty on
+            # a pass, and absent rather than empty for the same reason the budgets above are: an
+            # empty string in the record would read as a cause that was looked for and not found.
+            if outcome.reason:
+                fields.append(("reason", outcome.reason))
             self.evidence.record("step_end", fields)
 
     def result(self) -> RunResult:

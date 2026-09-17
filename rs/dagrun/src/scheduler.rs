@@ -3806,6 +3806,7 @@ fn run_step(ctx: StepCtx) {
                 returncode,
                 test_counts.executed,
                 test_counts.filtered,
+                cut_by_run_budget,
             )
         } else if ok {
             StepOutcome::passed(
@@ -3974,6 +3975,14 @@ fn run_step(ctx: StepCtx) {
             fields.push(("wall_limit_s", wall_budget.to_string()));
         }
         fields.extend(cpu_journal_fields(cpu_stats.as_ref()));
+        // WHY this step ended as it did. Without it the record says a step was not ok, or was
+        // cancelled, and never what happened -- so a cancelled step could be COUNTED and never
+        // NAMED, and an unknown nobody can name is an unknown nobody can drive down. Empty on a
+        // pass, and absent rather than empty for the same reason the budgets above are: an empty
+        // string in the record would read as a cause that was looked for and not found.
+        if !reason.is_empty() {
+            fields.push(("reason", reason.clone()));
+        }
         if let Some(error) = &structured_test_results_error {
             fields.push(("test_results_error", error.clone()));
         }

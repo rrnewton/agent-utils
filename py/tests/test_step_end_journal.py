@@ -133,3 +133,109 @@ def test_a_genuinely_disabled_cpu_budget_is_absent_not_zero(tmp_path: Path) -> N
     # No budget was in force at all. A `cpu_limit_s` of 0 would read as "bounded at zero seconds",
     # which is the opposite of unbounded.
     assert "cpu_limit_s" not in record
+
+
+def _records(
+    log_dir: Path,
+    steps: tuple[Step, ...],
+    *,
+    jobs: int,
+    run_timeout_s: int | None = None,
+) -> list[dict[str, str]]:
+    """Run a real DAG with its journal in ``log_dir`` and return the ``step_end`` records."""
+    cfg = DagConfig(steps=steps)
+    previous = os.environ.get(LOG_DIR_ENV)
+    os.environ[LOG_DIR_ENV] = str(log_dir)
+    try:
+        Runner(
+            cfg,
+            max_steps=jobs,
+            max_cpus=jobs,
+            cgroups=NoopCgroups(),
+            run_timeout_s=run_timeout_s,
+        ).run()
+    finally:
+        if previous is None:
+            os.environ.pop(LOG_DIR_ENV, None)
+        else:
+            os.environ[LOG_DIR_ENV] = previous
+    records: list[dict[str, str]] = [
+        json.loads(line)
+        for line in (log_dir / "journal.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    return [r for r in records if r.get("event") == "step_end"]
+
+
+def _by_step(records: list[dict[str, str]], tag: str) -> dict[str, str]:
+    match = [r for r in records if r.get("step") == tag]
+    assert len(match) == 1, f"expected exactly one step_end for {tag}, got {records}"
+    return match[0]
+
+
+def test_a_step_that_fails_records_the_cause_it_already_computed(tmp_path: Path) -> None:
+    # Without this the record says a step was not ok and never what happened, so a failure could
+    # be COUNTED and never NAMED -- and an unknown nobody can name is one nobody can drive down.
+    records = _records(
+        tmp_path / "fail",
+        (Step("a", "boom", "fails", "exit 3", timeout=45, cpu_timeout=30),),
+        jobs=1,
+    )
+    record = _by_step(records, "a.boom")
+    assert record["ok"] == "false", record
+    assert record["reason"] == "exit 3", record
+
+
+def test_a_passing_step_carries_no_reason_key_at_all(tmp_path: Path) -> None:
+    record = _step_end(tmp_path / "control", NoopCgroups(), cpu_timeout=30)
+    assert record["ok"] == "true", record
+    # Absent rather than empty, for the same reason an unset budget is absent above: a
+    # ``"reason": ""`` would read as a cause that was looked for and not found.
+    assert "reason" not in record
+
+
+def test_a_peer_failure_cancellation_names_the_peer_and_not_the_run_budget(
+    tmp_path: Path,
+) -> None:
+    records = _records(
+        tmp_path / "peer",
+        (
+            Step("a", "slow", "outlives its peer", "sleep 20", timeout=45, cpu_timeout=30),
+            Step("a", "boom", "fails first", "exit 1", timeout=45, cpu_timeout=30),
+        ),
+        jobs=2,
+    )
+    record = _by_step(records, "a.slow")
+    assert record["aborted"] == "true", record
+    assert "eager-exit after another step failed" in record["reason"], record
+    assert "OUTER run budget" not in record["reason"], record
+
+
+def test_an_outer_budget_cut_names_the_budget_and_never_a_peer(tmp_path: Path) -> None:
+    # No step here fails, so any mention of a failing peer would describe something that never
+    # happened. The predecessor spends most of the budget so the run bound fires while the
+    # successor is still inside its own step budget.
+    records = _records(
+        tmp_path / "outer",
+        (
+            Step("a", "first", "spends the budget", "sleep 2", timeout=3, cpu_timeout=30),
+            Step(
+                "a",
+                "long",
+                "is cut by the run bound",
+                "sleep 30",
+                deps=["a.first"],
+                timeout=3,
+                cpu_timeout=30,
+            ),
+        ),
+        jobs=1,
+        run_timeout_s=4,
+    )
+    record = _by_step(records, "a.long")
+    assert record["aborted"] == "true", record
+    assert "cut short by the OUTER run budget" in record["reason"], record
+    # The control that makes the assertion above mean something: before the reason distinguished
+    # the two cancellations this record claimed a peer had failed, and a reader who only has the
+    # record -- the reader it exists for -- would have gone looking for one.
+    assert "eager-exit" not in record["reason"], record
