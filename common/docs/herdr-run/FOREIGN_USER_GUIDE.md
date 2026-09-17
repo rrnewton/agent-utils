@@ -1,9 +1,24 @@
 # Persistent foreign subagents
 
-`herdr-subagents` manages named, persistent Codex and Antigravity workers in
-tmux windows or Herdr tabs. Codex workers can run as visible interactive TUIs
-or as resumable headless turns with durable transcripts. Antigravity uses
-headless turns. Use `herdr-agent start` for managed Codex and Claude TUIs.
+`herdr-subagents` lets a coordinator delegate work to named Codex or Antigravity
+workers, send follow-up prompts into the same conversations, and read durable
+turn results. A terminal window keeps each worker's activity visible to a human.
+
+| Execution mode | Harness | Terminal host |
+| --- | --- | --- |
+| Headless turns | Codex or Antigravity | tmux or Herdr |
+| Interactive TUI | Codex | Herdr only |
+
+In headless mode, a persistent inbox runner starts or resumes the harness for
+each turn and records its output and final answer. The conversation persists
+between turns; the harness process need not. The terminal displays the runner's
+activity rather than a native harness input composer. Headless mode still
+requires one of the terminal hosts above.
+
+Interactive mode keeps the native Codex TUI running for direct human inspection
+and input. Use `herdr-agent start` for managed Codex and Claude TUIs. Its native
+goal operations require a supporting Codex version; other harnesses receive an
+objective as text. These commands maintain separate worker registries.
 
 Install the Python distribution of `herdr-run`, which provides `herdr-subagents`
 and requires Python 3.10 or newer.

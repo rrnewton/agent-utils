@@ -228,3 +228,17 @@ on an open issue is not a status; it is a deferral.
 If something is delivered but unverified in some respect, close it and say what
 is unverified. A new problem found later is a new issue, not evidence that the
 old one should have stayed open.
+
+## Documentation
+
+`common/docs/` is for settled, user-facing documentation. Put working designs,
+proposals, and other temporary research under `ai_docs/transient/` in dated files
+or dated directories. Do not present an unimplemented interface as a shipped tool.
+
+Every top-level tool needs a `RELATED_WORK.md` comparing relevant public
+open-source systems. Keep private organizational sources and deployment details
+out of that comparison.
+
+Introduce tools by explaining the user's problem, the useful outcome, and the
+dependencies. CLI help must describe every argument, including relevant defaults,
+units, and command applicability, and include useful examples.

@@ -441,16 +441,68 @@ def submit_reply(state: Path, key: str, text: str) -> None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Initialize, inspect, run, or reply through a coordinator bridge."""
-    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
-    parser.add_argument("--version", action="version", version=f"herdr-chat {__version__}")
-    parser.add_argument("--userguide", action="store_true")
-    parser.add_argument("command", nargs="?", choices=("init", "tick", "run", "status", "reply"))
-    parser.add_argument("--state", type=Path, default=Path(".herdr-chat"))
-    parser.add_argument("--config", type=Path)
-    parser.add_argument("--request")
-    parser.add_argument("--file", type=Path)
-    parser.add_argument("--after")
-    parser.add_argument("--interval", type=float, default=3)
+    parser = argparse.ArgumentParser(
+        description=(
+            "Connect a Google Chat space to an existing Codex or Claude agent in Herdr.\n"
+            "The agent submits its final answer explicitly with the reply command; the bridge\n"
+            "posts that answer in the originating Chat thread."
+        ),
+        epilog="""Commands:
+  init    Create private bridge state from a configuration and check the target.
+  tick    Poll once, deliver queued messages, and post ready replies.
+  run     Keep polling and delivering until stopped.
+  status  Show saved target and request phases as JSON without contacting Chat.
+  reply   Queue an answer from a UTF-8 file for the bridge to post.
+
+Examples (all use the default .herdr-chat state directory):
+  herdr-chat init --config chat.json
+  herdr-chat run --interval 10
+  herdr-chat tick
+  herdr-chat status
+  herdr-chat reply --request "$REQUEST_KEY" --file answer.txt
+
+Use the request key supplied in the agent's reply instructions. See --userguide
+for configuration, authentication, and transport-adapter setup.
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        allow_abbrev=False,
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"herdr-chat {__version__}",
+        help="print the installed version and exit; no command needed",
+    )
+    parser.add_argument(
+        "--userguide", action="store_true",
+        help="print the complete setup and usage guide and exit; no command needed",
+    )
+    parser.add_argument(
+        "command", nargs="?", choices=("init", "tick", "run", "status", "reply"),
+        metavar="COMMAND", help="operation listed below (default: show this help)",
+    )
+    parser.add_argument(
+        "--state", type=Path, default=Path(".herdr-chat"), metavar="DIR",
+        help="private state directory used by every command (default: .herdr-chat)",
+    )
+    parser.add_argument(
+        "--config", type=Path, metavar="JSON_FILE",
+        help="init: configuration file with space, allowed senders, and target (required)",
+    )
+    parser.add_argument(
+        "--request", metavar="KEY",
+        help="reply: 64-character hexadecimal request key from the agent's instructions (required)",
+    )
+    parser.add_argument(
+        "--file", type=Path, metavar="UTF8_FILE",
+        help="reply: UTF-8 file containing the final answer (required)",
+    )
+    parser.add_argument(
+        "--after", metavar="RFC3339_TIME",
+        help="init: earliest message time, including timezone (default: current time; no history replay)",
+    )
+    parser.add_argument(
+        "--interval", type=float, default=3, metavar="SECONDS",
+        help="run: polling interval in seconds, 0.1-60 (default: 3); failures back off up to 60 seconds",
+    )
     args = parser.parse_args(argv)
     if args.userguide:
         from importlib.resources import files

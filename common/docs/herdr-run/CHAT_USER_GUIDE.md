@@ -1,12 +1,39 @@
 # herdr-chat — message a native coordinator from Google Chat
 
-`herdr-chat` connects one running Codex or Claude coordinator to one Google Chat
-space. The coordinator keeps its native tools, instructions, context, and terminal
-interface. It can manage long-lived workers with `herdr-agent` or
-`herdr-subagents`; only the coordinator needs chat access.
+`herdr-chat` lets you message an existing Codex or Claude agent **running in a
+Herdr terminal** from one Google Chat space. Use it to send work or ask for
+progress while away from that terminal, and receive the agent's final answer in
+the originating Chat thread. The agent keeps its native tools, instructions,
+conversation, and terminal interface.
+
+One agent is enough: no worker team is required. The agent can also act as a
+coordinator and manage workers with `herdr-agent` or `herdr-subagents`; only that
+coordinator needs chat access.
+
+## How the connection works
+
+The bridge polls Google Chat, accepts messages from configured senders, and
+stores them in a durable queue. It waits for the target's ready state, then calls
+`herdr agent prompt PANE TEXT`. **Herdr submits the text through the terminal's
+paste and Enter sequence.** Input does not arrive through a native harness
+channel or protocol connection. Herdr must report the subsequent working state
+to confirm submission.
+
+For the response, the agent writes an explicit answer file and runs a supplied
+reply command. The bridge posts that answer in the original thread. It does not
+scrape the screen for a final answer or mirror every terminal event.
+
+`herdr-chat run` is a separate, long-running process. The Herdr server owns the
+agent's terminal and harness process. The bridge does not launch or restart the
+agent: stopping either process leaves the other running. The bridge and agent
+must share the local reply-state filesystem and have access to the reply command.
+
+## Setup
 
 Install the Python distribution of `herdr-run`, which provides `herdr-chat`
 alongside `herdr-agent` and requires Python 3.10 or newer.
+Herdr must be installed separately with its `agent prompt`, `agent wait`, and
+pane/session inspection APIs. The supported command interface is Herdr 0.8.
 
 Authenticate your harness and start a dedicated coordinator:
 
@@ -19,6 +46,9 @@ herdr-agent status --name coordinator --registry /work/project/.herdr-agents
 Use the returned pane and workspace identity in `chat.json`. Choose a model you
 can access with the launch command's `--model` when the harness default is unsuitable.
 Use `--harness claude` for a Claude coordinator.
+You can instead target a suitable agent already running in Herdr: supply its exact
+pane and identity assertions, and omit `agent_name` unless it has a registered
+Herdr agent name. No `herdr-agent` process needs to remain running.
 Herdr must observe working transitions to confirm prompt delivery. Some Claude
 integrations expose session identity but leave the reported state idle during a
 turn. In that case the bridge records `delivery_uncertain`; a final reply artifact
@@ -114,6 +144,10 @@ directory when changing this authority. Run one bridge per coordinator and space
 
 ## Existing-client command transport
 
+This adapter replaces Google Chat access, including authentication and polling.
+It does not replace agent delivery: the coordinator must still run in Herdr.
+Headless workers and interactive tmux sessions are not supported chat targets.
+
 Set `transport_command` to an argument array in `chat.json`, for example:
 
 ```json
@@ -153,3 +187,11 @@ Repeated sends with the same request ID must return the same message resource.
 Do not silently fall back to a new thread or another space. A transport adapter can
 wrap an organizational Chat client without putting private endpoints or credentials
 in this package. The public REST adapter uses `https://chat.googleapis.com/v1/`.
+
+## Scope
+
+Each bridge connects one configured space to one coordinator. It handles text
+messages and explicit final replies. It does not discover trigger keywords in
+other spaces, add reaction acknowledgements, forward attachments, or supervise
+the coordinator's lifetime. Keep the input composer empty between automated
+deliveries; direct human input and bridge input need coordination.

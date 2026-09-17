@@ -1,9 +1,17 @@
 # herdr-agent — long-lived interactive subagents
 
-`herdr-agent` lets a native coordinator manage other harnesses while humans can
-inspect and interact with their real Herdr terminals. Managed agents have durable
-names, a private registry, and independent message queues. Codex and Claude have
-model/resume presets; other Herdr-supported harnesses accept literal arguments.
+`herdr-agent` lets a lead coding agent delegate work to other native coding
+agents while a human can inspect and interact with their real Herdr terminals.
+Use it for workers that need their own conversations and several exchanges with
+the lead, such as a reviewer or an implementation assistant. A human or script can
+use the same commands without a lead agent.
+
+Managed agents have durable names, a private registry, and independent message
+queues. Codex and Claude have model/resume presets; other Herdr-supported
+harnesses accept literal arguments. Each command performs its operation and
+exits; sends and waits can block while the worker is busy. The Herdr server keeps
+the native harness process and terminal alive without a manager command running.
+Herdr is required. This command does not manage tmux or headless turn runners.
 
 ## Start and manage a worker
 
@@ -81,9 +89,9 @@ wake an idle worker: use the managed goal setter for native execution.
 
 ## Durable messaging for an existing pane
 
-`herdr-agent` is the identity-agnostic transport for an interactive agent already
-running in a Herdr pane. It durably queues prompts, waits for native `idle` or
-`done`, submits the complete literal text through `agent prompt`, and requires
+`herdr-agent` also accepts explicit target identity assertions for an interactive
+agent already running in a Herdr pane. It durably queues prompts, waits for native
+`idle` or `done`, submits the complete literal text through `agent prompt`, and requires
 Herdr to observe the subsequent `working` state. Herdr handles the harness's
 paste and Enter sequence. One lock serializes overlapping
 senders. Safe pre-injection failures remain in `inbox/`; ambiguous post-injection
