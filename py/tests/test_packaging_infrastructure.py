@@ -399,8 +399,8 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
 
     assert ordinary.isdisjoint(mapped)
     assert ordinary | mapped == all_tests
-    assert len(all_tests) == 654
-    assert len(ordinary) == 98
+    assert len(all_tests) == 797
+    assert len(ordinary) == 241
     assert len(mapped) == 556
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
@@ -408,6 +408,14 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
         "test_adopt_refuses_pid_outside_invoking_process_ancestry",
         "test_create_binds_owner_running_beside_its_assigned_coordinator",
         "test_current_frozen_result_without_removal_proof_blocks_entry",
+        "test_current_incomplete_frozen_binds_checkout_and_gitlink_identity",
+        "test_current_incomplete_frozen_binds_initial_facts_to_recursive_snapshot",
+        "test_current_incomplete_frozen_rechecks_after_fresh_census",
+        "test_current_incomplete_frozen_refuses_untrusted_or_live_evidence",
+        "test_current_incomplete_frozen_requires_exact_current_shape",
+        "test_current_incomplete_frozen_requires_pristine_recursive_checkout",
+        "test_current_incomplete_frozen_retains_evidence_and_allows_stable_source_work",
+        "test_current_incomplete_frozen_retention_does_not_authorize_direct_recovery",
         "test_direct_current_frozen_recovery_refuses_lost_journal_proof",
         "test_direct_current_frozen_recovery_refuses_tampered_proof",
         "test_direct_current_frozen_recovery_requires_removal_proof",
